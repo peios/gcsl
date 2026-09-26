@@ -10,15 +10,23 @@
 //! and a [`IrKind::Store`] writes one. A [`IrKind::Block`] runs its items for
 //! their effect and then yields its result; the items of every block live
 //! in one pool, [`Ir::items`], as the AST's do. A block always has a result
-//! node: lowering gives a block without one an explicit [`IrKind::Unit`], so
-//! a block's type is always its result's. Likewise an [`IrKind::If`] always
-//! has both branches, of the same type.
+//! node: lowering gives a block without one an explicit [`IrKind::Empty`],
+//! and a record block a [`IrKind::MakeRecord`], so a block's value is always
+//! its result's. Likewise an [`IrKind::If`] always has both branches, of
+//! the same kind.
+//!
+//! The IR knows only the *kind* of value each node produces, a
+//! [`ValueKind`], not its full type: that is all evaluation needs to pick
+//! the walker for a node, and two record types differ only in what the
+//! checker already verified. See [`Ir::kind_of`].
 //!
 //! String constants live in [`Ir::string`]'s table of reference-counted
 //! strings, one per literal piece of the program, so evaluating a
 //! [`IrKind::StrConst`] is a reference-count increment, never a copy. An
 //! [`IrKind::Interp`] lists its literal pieces and expressions in the item
-//! pool.
+//! pool. Record layouts, the field names of each record block in definition
+//! order, live in [`Ir::layout`]'s table, shared by reference count with
+//! every record built from them.
 //!
 //! An [`Ir`] can only be built by [`crate::lower::lower`], which is what
 //! guarantees it is well typed.
@@ -29,8 +37,8 @@ use std::rc::Rc;
 use crate::check::Slot;
 use crate::names::{Name, Names};
 use crate::source::Span;
-use crate::strings::Quoted;
-use crate::types::Ty;
+use crate::strings::{FieldName, Quoted};
+use crate::value::{Layout, ValueKind};
 
 /// Index of an [`IrNode`] in its [`Ir`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +65,17 @@ pub struct IrRange {
 pub struct ConstId(u32);
 
 impl ConstId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Index of a record layout in its [`Ir`]'s table. Resolve it with
+/// [`Ir::layout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LayoutId(u32);
+
+impl LayoutId {
     const fn index(self) -> usize {
         self.0 as usize
     }
@@ -124,9 +143,10 @@ pub struct Operands {
 
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
-/// Float-typed nodes, of `Str*` nodes to String-typed nodes, and of
-/// `Bool*`, `And`, `Or` and `Not` nodes and an `If`'s condition to
-/// Bool-typed nodes; see [`Ir::ty_of`].
+/// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
+/// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
+/// and of `RecordEq` and `Field` nodes to record nodes; see
+/// [`Ir::kind_of`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
     /// An `Int` constant.
@@ -147,9 +167,10 @@ pub enum IrKind {
     StrCmp(Cmp, Operands),
     /// Compares two `Bool`s: `==` if the flag is `true`, `!=` if `false`.
     BoolEq(bool, Operands),
-    /// Compares two `Unit`s: evaluates both operands for their effects and
-    /// yields the flag, `true` for `==` and `false` for `!=`.
-    UnitEq(bool, Operands),
+    /// Compares two records of the same type, deeply and by field name (see
+    /// [`crate::value::Record`]'s equality): `==` if the flag is `true`,
+    /// `!=` if `false`.
+    RecordEq(bool, Operands),
     /// `Bool` conjunction, evaluating the right operand only if the left is
     /// `true`.
     And(Operands),
@@ -198,21 +219,40 @@ pub enum IrKind {
     /// Converts an `Int` operand to the nearest `Float`. Inserted by lowering
     /// for concrete `Int` operands of `/`.
     IntToFloat(IrId),
-    /// The `Unit` value `()`.
-    Unit,
-    /// Reads a variable's slot. Carries the variable's type so that the
-    /// node's type is known without looking anything up.
-    Load(Slot, Ty),
-    /// Evaluates the node and writes its value to the slot: a `let` or a
-    /// `:=`. The store itself has type `Unit`.
+    /// The empty record `{}`.
+    Empty,
+    /// Reads a variable's slot. Carries the kind of the variable's value so
+    /// that the node's kind is known without looking anything up.
+    Load(Slot, ValueKind),
+    /// Evaluates the node and writes its value to the slot: a `let`, a
+    /// field or a `:=`. The store itself is `{}`.
     Store(Slot, IrId),
     /// Evaluates each of `items` for its effect, then yields `result`.
     Block {
         /// The items evaluated before the result.
         items: IrRange,
-        /// The block's value: its result expression, or a [`IrKind::Unit`]
-        /// node if it has none.
+        /// The block's value: its result expression, an [`IrKind::Empty`]
+        /// node if it has none, or an [`IrKind::MakeRecord`] if it is a
+        /// record block.
         result: IrId,
+    },
+    /// Builds a record with at least one field from `values`, which are in
+    /// the order of `layout`'s names: the value of a record block.
+    MakeRecord {
+        /// The record's field names.
+        layout: LayoutId,
+        /// The value of each field, in the layout's order.
+        values: IrRange,
+    },
+    /// Reads field `name` of the record `record` evaluates to, which the
+    /// checker guarantees it has.
+    Field {
+        /// The record.
+        record: IrId,
+        /// The field's name.
+        name: Name,
+        /// The kind of the field's value, which is the node's kind.
+        kind: ValueKind,
     },
 }
 
@@ -233,8 +273,8 @@ impl IrKind {
             IrKind::IntCmp(cmp, _) | IrKind::FloatCmp(cmp, _) | IrKind::StrCmp(cmp, _) => {
                 Some(cmp.symbol())
             }
-            IrKind::BoolEq(true, _) | IrKind::UnitEq(true, _) => Some("=="),
-            IrKind::BoolEq(false, _) | IrKind::UnitEq(false, _) => Some("!="),
+            IrKind::BoolEq(true, _) | IrKind::RecordEq(true, _) => Some("=="),
+            IrKind::BoolEq(false, _) | IrKind::RecordEq(false, _) => Some("!="),
             IrKind::And(_) => Some("and"),
             IrKind::Or(_) => Some("or"),
             IrKind::Not(_) => Some("not"),
@@ -245,10 +285,12 @@ impl IrKind {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
-            | IrKind::Unit
+            | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
-            | IrKind::Block { .. } => None,
+            | IrKind::Block { .. }
+            | IrKind::MakeRecord { .. }
+            | IrKind::Field { .. } => None,
         }
     }
 
@@ -264,7 +306,7 @@ impl IrKind {
             IrKind::FloatCmp(..) => "float-cmp",
             IrKind::StrCmp(..) => "str-cmp",
             IrKind::BoolEq(..) => "bool-eq",
-            IrKind::UnitEq(..) => "unit-eq",
+            IrKind::RecordEq(..) => "record-eq",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -282,10 +324,12 @@ impl IrKind {
             IrKind::FloatMul(_) => "float-mul",
             IrKind::FloatDiv(_) => "float-div",
             IrKind::IntToFloat(_) => "int-to-float",
-            IrKind::Unit => "unit",
+            IrKind::Empty => "empty",
             IrKind::Load(..) => "load",
             IrKind::Store(..) => "store",
             IrKind::Block { .. } => "block",
+            IrKind::MakeRecord { .. } => "make-record",
+            IrKind::Field { .. } => "field",
         }
     }
 }
@@ -321,7 +365,7 @@ impl IrNode {
             | IrKind::FloatCmp(_, operands)
             | IrKind::StrCmp(_, operands)
             | IrKind::BoolEq(_, operands)
-            | IrKind::UnitEq(_, operands)
+            | IrKind::RecordEq(_, operands)
             | IrKind::And(operands)
             | IrKind::Or(operands) => operands.op_start,
             // A prefix operator starts its expression.
@@ -333,22 +377,25 @@ impl IrNode {
             | IrKind::If { .. }
             | IrKind::Interp(_)
             | IrKind::IntToFloat(_)
-            | IrKind::Unit
+            | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::Store(..)
-            | IrKind::Block { .. } => return None,
+            | IrKind::Block { .. }
+            | IrKind::MakeRecord { .. }
+            | IrKind::Field { .. } => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
-/// constants, its root, and the frame it needs.
+/// constants, the record layouts, its root, and the frame it needs.
 #[derive(Clone, Debug)]
 pub struct Ir {
     nodes: Vec<IrNode>,
     item_lists: Vec<IrId>,
     strings: Vec<Rc<str>>,
+    layouts: Vec<Rc<Layout>>,
     root: IrId,
     frame_size: u32,
     /// For each slot, the name of the last variable assigned to it. For
@@ -388,6 +435,22 @@ impl Ir {
         &self.strings[id.index()]
     }
 
+    /// Returns the record layout `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this IR.
+    #[must_use]
+    pub fn layout(&self, id: LayoutId) -> &Rc<Layout> {
+        &self.layouts[id.index()]
+    }
+
+    /// The number of distinct record layouts.
+    #[must_use]
+    pub fn layout_count(&self) -> usize {
+        self.layouts.len()
+    }
+
     /// The root node, the file's body, whose value is the program's result.
     #[must_use]
     pub fn root(&self) -> IrId {
@@ -400,16 +463,15 @@ impl Ir {
         self.frame_size
     }
 
-    /// The type of the value node `id` produces. Never [`Ty::UntypedInt`] or
-    /// [`Ty::Error`].
+    /// The kind of value node `id` produces.
     ///
     /// # Panics
     ///
     /// Panics if `id` does not belong to this IR.
     #[must_use]
-    pub fn ty_of(&self, id: IrId) -> Ty {
+    pub fn kind_of(&self, id: IrId) -> ValueKind {
         let mut id = id;
-        // A block's type is its result's, and an `if`'s its branches'; follow
+        // A block's kind is its result's, and an `if`'s its branches'; follow
         // nested ones by looping, not recursing.
         loop {
             return match self.get(id).kind {
@@ -426,27 +488,27 @@ impl Ir {
                 | IrKind::FloatCmp(..)
                 | IrKind::StrCmp(..)
                 | IrKind::BoolEq(..)
-                | IrKind::UnitEq(..)
+                | IrKind::RecordEq(..)
                 | IrKind::And(_)
                 | IrKind::Or(_)
-                | IrKind::Not(_) => Ty::Bool,
-                IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => Ty::String,
+                | IrKind::Not(_) => ValueKind::Bool,
+                IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => ValueKind::String,
                 IrKind::IntConst(_)
                 | IrKind::IntNeg(_)
                 | IrKind::IntAdd(_)
                 | IrKind::IntSub(_)
                 | IrKind::IntMul(_)
                 | IrKind::IntFloorDiv(_)
-                | IrKind::IntRem(_) => Ty::Int,
+                | IrKind::IntRem(_) => ValueKind::Int,
                 IrKind::FloatConst(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::FloatAdd(_)
                 | IrKind::FloatSub(_)
                 | IrKind::FloatMul(_)
                 | IrKind::FloatDiv(_)
-                | IrKind::IntToFloat(_) => Ty::Float,
-                IrKind::Unit | IrKind::Store(..) => Ty::Unit,
-                IrKind::Load(_, ty) => ty,
+                | IrKind::IntToFloat(_) => ValueKind::Float,
+                IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => ValueKind::Record,
+                IrKind::Load(_, kind) | IrKind::Field { kind, .. } => kind,
             };
         }
     }
@@ -458,8 +520,11 @@ impl Ir {
     /// block shows its items and then its result, which is always present,
     /// and an `if` its condition and both branches. String constants show
     /// their text quoted and escaped, as in `(str "a\n" @0..5)`, and
-    /// comparisons their operator, as in `(int-cmp < @0..5 ...)`. There is
-    /// no trailing newline.
+    /// comparisons their operator, as in `(int-cmp < @0..5 ...)`. A record
+    /// shows its layout's names in brackets and then its values, as in
+    /// `(make-record [x y] @0..9 ...)`, and a field access its name, as in
+    /// `(field x @0..3 ...)`, a name that is not a plain identifier quoted.
+    /// There is no trailing newline.
     #[must_use]
     pub fn pretty<'a>(&'a self, names: &'a Names) -> impl fmt::Display + 'a {
         Pretty { ir: self, names }
@@ -472,6 +537,7 @@ pub(crate) struct IrBuilder {
     nodes: Vec<IrNode>,
     item_lists: Vec<IrId>,
     strings: Vec<Rc<str>>,
+    layouts: Vec<Rc<Layout>>,
 }
 
 impl IrBuilder {
@@ -480,14 +546,16 @@ impl IrBuilder {
             nodes: Vec::with_capacity(capacity),
             item_lists: Vec::new(),
             strings: Vec::new(),
+            layouts: Vec::new(),
         }
     }
 
     /// Adds a node and returns its id. The builder holds at most one node
     /// per AST node or item, plus one conversion per `/` operand, one
-    /// `Unit` per block and one constant per literal piece of an
-    /// interpolation, far below `u32::MAX` for any source a `SourceFile`
-    /// accepts; past that, ids would saturate.
+    /// `Empty` or `MakeRecord` per block, one `Load` per field and one
+    /// constant per literal piece of an interpolation, far below `u32::MAX`
+    /// for any source a `SourceFile` accepts; past that, ids would
+    /// saturate.
     pub(crate) fn alloc(&mut self, kind: IrKind, span: Span) -> IrId {
         let id = IrId(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX));
         self.nodes.push(IrNode { kind, span });
@@ -499,6 +567,15 @@ impl IrBuilder {
     pub(crate) fn push_string(&mut self, text: &str) -> ConstId {
         let id = ConstId(u32::try_from(self.strings.len()).unwrap_or(u32::MAX));
         self.strings.push(Rc::from(text));
+        id
+    }
+
+    /// Adds a record layout and returns its id. There is at most one per
+    /// record block, so ids never saturate either. Adding the same names
+    /// twice adds two layouts; deduplicating is the caller's business.
+    pub(crate) fn push_layout(&mut self, layout: Layout) -> LayoutId {
+        let id = LayoutId(u32::try_from(self.layouts.len()).unwrap_or(u32::MAX));
+        self.layouts.push(Rc::new(layout));
         id
     }
 
@@ -517,6 +594,7 @@ impl IrBuilder {
             nodes: self.nodes,
             item_lists: self.item_lists,
             strings: self.strings,
+            layouts: self.layouts,
             root,
             frame_size,
             slot_names,
@@ -530,15 +608,14 @@ struct Pretty<'a> {
 }
 
 impl Pretty<'_> {
-    /// Writes a slot as `name#slot`, or `?#slot` if the IR has no name for
-    /// it.
+    /// Writes a slot as `name#slot`, the name quoted if it is a field's
+    /// that is not a plain identifier, or `?#slot` if the IR has no name
+    /// for it.
     fn slot(&self, f: &mut fmt::Formatter<'_>, slot: Slot) -> fmt::Result {
-        let name = self
-            .ir
-            .slot_names
-            .get(slot.index())
-            .map_or("?", |&name| self.names.get(name));
-        write!(f, " {name}{slot}")
+        match self.ir.slot_names.get(slot.index()) {
+            Some(&name) => write!(f, " {}{slot}", FieldName(self.names.get(name))),
+            None => write!(f, " ?{slot}"),
+        }
     }
 
     fn node(&self, f: &mut fmt::Formatter<'_>, id: IrId, depth: usize) -> fmt::Result {
@@ -553,9 +630,20 @@ impl Pretty<'_> {
             IrKind::IntCmp(cmp, _) | IrKind::FloatCmp(cmp, _) | IrKind::StrCmp(cmp, _) => {
                 write!(f, " {}", cmp.symbol())?;
             }
-            IrKind::BoolEq(eq, _) | IrKind::UnitEq(eq, _) => {
+            IrKind::BoolEq(eq, _) | IrKind::RecordEq(eq, _) => {
                 f.write_str(if eq { " ==" } else { " !=" })?;
             }
+            IrKind::MakeRecord { layout, .. } => {
+                f.write_str(" [")?;
+                for (index, text) in self.ir.layout(layout).texts.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{}", FieldName(text))?;
+                }
+                f.write_str("]")?;
+            }
+            IrKind::Field { name, .. } => write!(f, " {}", FieldName(self.names.get(name)))?,
             _ => {}
         }
         write!(f, " @{}", node.span)?;
@@ -564,12 +652,15 @@ impl Pretty<'_> {
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
             | IrKind::StrConst(_)
-            | IrKind::Unit
+            | IrKind::Empty
             | IrKind::Load(..) => {}
             IrKind::IntNeg(operand)
             | IrKind::FloatNeg(operand)
             | IrKind::IntToFloat(operand)
             | IrKind::Not(operand)
+            | IrKind::Field {
+                record: operand, ..
+            }
             | IrKind::Store(_, operand) => {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
@@ -588,7 +679,7 @@ impl Pretty<'_> {
             | IrKind::FloatCmp(_, operands)
             | IrKind::StrCmp(_, operands)
             | IrKind::BoolEq(_, operands)
-            | IrKind::UnitEq(_, operands)
+            | IrKind::RecordEq(_, operands)
             | IrKind::And(operands)
             | IrKind::Or(operands) => {
                 f.write_str("\n")?;
@@ -602,7 +693,7 @@ impl Pretty<'_> {
                     self.node(f, child, depth + 1)?;
                 }
             }
-            IrKind::Interp(items) => {
+            IrKind::Interp(items) | IrKind::MakeRecord { values: items, .. } => {
                 for &item in self.ir.items(items) {
                     f.write_str("\n")?;
                     self.node(f, item, depth + 1)?;
@@ -667,7 +758,10 @@ mod tests {
         let mut builder = IrBuilder::with_capacity(6);
         let one = builder.alloc(IrKind::IntConst(1), Span::new(8, 9));
         let store = builder.alloc(IrKind::Store(Slot::new(0), one), Span::new(0, 9));
-        let load = builder.alloc(IrKind::Load(Slot::new(0), Ty::Int), Span::new(10, 11));
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Int),
+            Span::new(10, 11),
+        );
         let items = builder.push_item_list(&[store]);
         let block = builder.alloc(
             IrKind::Block {
@@ -676,12 +770,12 @@ mod tests {
             },
             Span::new(0, 11),
         );
-        let unit = builder.alloc(IrKind::Unit, Span::new(12, 14));
+        let nothing = builder.alloc(IrKind::Empty, Span::new(12, 14));
         let empty = builder.push_item_list(&[]);
         let empty_block = builder.alloc(
             IrKind::Block {
                 items: empty,
-                result: unit,
+                result: nothing,
             },
             Span::new(12, 14),
         );
@@ -700,7 +794,7 @@ mod tests {
             ir.pretty(&names).to_string(),
             "(block @0..14\n\
              \x20 (block @12..14\n\
-             \x20   (unit @12..14))\n\
+             \x20   (empty @12..14))\n\
              \x20 (block @0..11\n\
              \x20   (store x#0 @0..9\n\
              \x20     (int 1 @8..9))\n\
@@ -708,7 +802,7 @@ mod tests {
         );
         // A slot the IR has no name for.
         let mut builder = IrBuilder::with_capacity(1);
-        let load = builder.alloc(IrKind::Load(Slot::new(3), Ty::Int), Span::new(0, 1));
+        let load = builder.alloc(IrKind::Load(Slot::new(3), ValueKind::Int), Span::new(0, 1));
         let ir = builder.finish(load, 4, Vec::new());
         assert_eq!(ir.pretty(&names).to_string(), "(load ?#3 @0..1)");
     }
@@ -739,7 +833,7 @@ mod tests {
         assert_eq!(node(IrKind::IntConst(1)).operator_span(), None);
         assert_eq!(node(IrKind::IntToFloat(IrId(0))).operator_span(), None);
         assert_eq!(
-            node(IrKind::Load(Slot::new(0), Ty::Int)).operator_span(),
+            node(IrKind::Load(Slot::new(0), ValueKind::Int)).operator_span(),
             None
         );
         assert_eq!(
@@ -749,7 +843,9 @@ mod tests {
     }
 
     #[test]
-    fn node_types() {
+    fn node_kinds() {
+        let mut names = Names::new();
+        let x = names.intern("x");
         let mut builder = IrBuilder::with_capacity(8);
         let int = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
         let rem = builder.alloc(
@@ -761,9 +857,32 @@ mod tests {
             Span::new(0, 1),
         );
         let float = builder.alloc(IrKind::IntToFloat(int), Span::new(0, 1));
-        let unit = builder.alloc(IrKind::Unit, Span::new(0, 1));
+        let nothing = builder.alloc(IrKind::Empty, Span::new(0, 1));
         let store = builder.alloc(IrKind::Store(Slot::new(0), int), Span::new(0, 1));
-        let load = builder.alloc(IrKind::Load(Slot::new(0), Ty::Float), Span::new(0, 1));
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Float),
+            Span::new(0, 1),
+        );
+        let layout = builder.push_layout(Layout {
+            names: Box::new([x]),
+            texts: Box::new([Box::from("x")]),
+        });
+        let values = builder.push_item_list(&[load]);
+        let record = builder.alloc(IrKind::MakeRecord { layout, values }, Span::new(0, 1));
+        let field = builder.alloc(
+            IrKind::Field {
+                record,
+                name: x,
+                kind: ValueKind::Float,
+            },
+            Span::new(0, 1),
+        );
+        let operands = Operands {
+            lhs: record,
+            rhs: record,
+            op_start: 0,
+        };
+        let record_eq = builder.alloc(IrKind::RecordEq(false, operands), Span::new(0, 1));
         let items = builder.push_item_list(&[store]);
         let inner = builder.alloc(
             IrKind::Block {
@@ -780,14 +899,52 @@ mod tests {
             Span::new(0, 1),
         );
         let ir = builder.finish(outer, 1, Vec::new());
-        assert_eq!(ir.ty_of(int), Ty::Int);
-        assert_eq!(ir.ty_of(rem), Ty::Int);
-        assert_eq!(ir.ty_of(float), Ty::Float);
-        assert_eq!(ir.ty_of(unit), Ty::Unit);
-        assert_eq!(ir.ty_of(store), Ty::Unit);
-        assert_eq!(ir.ty_of(load), Ty::Float);
-        assert_eq!(ir.ty_of(inner), Ty::Float);
-        assert_eq!(ir.ty_of(outer), Ty::Float);
+        assert_eq!(ir.kind_of(int), ValueKind::Int);
+        assert_eq!(ir.kind_of(rem), ValueKind::Int);
+        assert_eq!(ir.kind_of(float), ValueKind::Float);
+        assert_eq!(ir.kind_of(nothing), ValueKind::Record);
+        assert_eq!(ir.kind_of(store), ValueKind::Record);
+        assert_eq!(ir.kind_of(load), ValueKind::Float);
+        assert_eq!(ir.kind_of(record), ValueKind::Record);
+        assert_eq!(ir.kind_of(field), ValueKind::Float);
+        assert_eq!(ir.kind_of(record_eq), ValueKind::Bool);
+        assert_eq!(ir.kind_of(inner), ValueKind::Float);
+        assert_eq!(ir.kind_of(outer), ValueKind::Float);
+        assert_eq!(ir.layout_count(), 1);
+        assert_eq!(&*ir.layout(layout).names, &[x]);
+    }
+
+    #[test]
+    fn records_show_their_layout_and_fields_their_name() {
+        let mut names = Names::new();
+        let (x, spaced) = (names.intern("x"), names.intern("a b"));
+        let mut builder = IrBuilder::with_capacity(5);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(6, 7));
+        let two = builder.alloc(IrKind::IntConst(2), Span::new(17, 18));
+        let layout = builder.push_layout(Layout {
+            names: Box::new([x, spaced]),
+            texts: Box::new([Box::from("x"), Box::from("a b")]),
+        });
+        let values = builder.push_item_list(&[one, two]);
+        let record = builder.alloc(IrKind::MakeRecord { layout, values }, Span::new(0, 20));
+        let field = builder.alloc(
+            IrKind::Field {
+                record,
+                name: spaced,
+                kind: ValueKind::Int,
+            },
+            Span::new(0, 26),
+        );
+        let ir = builder.finish(field, 0, Vec::new());
+        assert_eq!(
+            ir.pretty(&names).to_string(),
+            "(field \"a b\" @0..26\n\
+             \x20 (make-record [x \"a b\"] @0..20\n\
+             \x20   (int 1 @6..7)\n\
+             \x20   (int 2 @17..18)))"
+        );
+        assert_eq!(ir.get(field).operator_span(), None);
+        assert_eq!(ir.get(record).kind.symbol(), None);
     }
 
     #[test]
@@ -822,7 +979,10 @@ mod tests {
         let greeting = builder.push_string("hi \"you\"\n");
         let empty = builder.push_string("");
         let piece = builder.alloc(IrKind::StrConst(greeting), Span::new(0, 14));
-        let load = builder.alloc(IrKind::Load(Slot::new(0), Ty::String), Span::new(4, 5));
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::String),
+            Span::new(4, 5),
+        );
         let tail = builder.alloc(IrKind::StrConst(empty), Span::new(0, 14));
         let pieces = builder.push_item_list(&[piece, load, tail]);
         let interp = builder.alloc(IrKind::Interp(pieces), Span::new(0, 14));
@@ -868,13 +1028,13 @@ mod tests {
         let ir = builder.finish(if_, 1, vec![s]);
         assert_eq!(&**ir.string(greeting), "hi \"you\"\n");
         assert_eq!(&**ir.string(empty), "");
-        assert_eq!(ir.ty_of(if_), Ty::String);
-        assert_eq!(ir.ty_of(and), Ty::Bool);
-        assert_eq!(ir.ty_of(cmp), Ty::Bool);
-        assert_eq!(ir.ty_of(not), Ty::Bool);
-        assert_eq!(ir.ty_of(truth), Ty::Bool);
-        assert_eq!(ir.ty_of(concat), Ty::String);
-        assert_eq!(ir.ty_of(interp), Ty::String);
+        assert_eq!(ir.kind_of(if_), ValueKind::String);
+        assert_eq!(ir.kind_of(and), ValueKind::Bool);
+        assert_eq!(ir.kind_of(cmp), ValueKind::Bool);
+        assert_eq!(ir.kind_of(not), ValueKind::Bool);
+        assert_eq!(ir.kind_of(truth), ValueKind::Bool);
+        assert_eq!(ir.kind_of(concat), ValueKind::String);
+        assert_eq!(ir.kind_of(interp), ValueKind::String);
         assert_eq!(ir.get(cmp).operator_span(), Some(Span::new(25, 27)));
         assert_eq!(ir.get(and).operator_span(), Some(Span::new(30, 33)));
         assert_eq!(ir.get(not).operator_span(), Some(Span::new(14, 17)));
@@ -906,31 +1066,32 @@ mod tests {
     }
 
     #[test]
-    fn equality_of_bools_and_units_shows_its_operator() {
+    fn equality_of_bools_and_records_shows_its_operator() {
         let mut builder = IrBuilder::with_capacity(6);
-        let unit = builder.alloc(IrKind::Unit, Span::new(0, 2));
+        let nothing = builder.alloc(IrKind::Empty, Span::new(0, 2));
         let operands = Operands {
-            lhs: unit,
-            rhs: unit,
+            lhs: nothing,
+            rhs: nothing,
             op_start: 3,
         };
-        let eq = builder.alloc(IrKind::UnitEq(true, operands), Span::new(0, 8));
+        let eq = builder.alloc(IrKind::RecordEq(true, operands), Span::new(0, 8));
         let ne = builder.alloc(IrKind::BoolEq(false, operands), Span::new(0, 8));
         let items = builder.push_item_list(&[eq]);
         let root = builder.alloc(IrKind::Block { items, result: ne }, Span::new(0, 8));
         let ir = builder.finish(root, 0, Vec::new());
         assert_eq!(ir.get(eq).kind.symbol(), Some("=="));
         assert_eq!(ir.get(ne).kind.symbol(), Some("!="));
+        assert_eq!(ir.get(eq).operator_span(), Some(Span::new(3, 5)));
         assert_eq!(ir.get(ne).operator_span(), Some(Span::new(3, 5)));
         assert_eq!(
             ir.pretty(&Names::new()).to_string(),
             "(block @0..8\n\
-             \x20 (unit-eq == @0..8\n\
-             \x20   (unit @0..2)\n\
-             \x20   (unit @0..2))\n\
+             \x20 (record-eq == @0..8\n\
+             \x20   (empty @0..2)\n\
+             \x20   (empty @0..2))\n\
              \x20 (bool-eq != @0..8\n\
-             \x20   (unit @0..2)\n\
-             \x20   (unit @0..2)))"
+             \x20   (empty @0..2)\n\
+             \x20   (empty @0..2)))"
         );
     }
 }

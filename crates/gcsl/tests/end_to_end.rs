@@ -1,19 +1,34 @@
 //! End-to-end tests: source text through every stage via the public API.
 
-use gcsl::{Diagnostic, SourceFile, Ty, Value};
+use gcsl::{Diagnostic, Session, Severity, SourceFile, TypeTable, Value, ValueKind};
 
 fn source(text: &str) -> SourceFile {
     SourceFile::new("calc.gcsl", text).unwrap()
 }
 
+/// Runs `text`, which must not warn, and returns its value.
 fn run(text: &str) -> Result<Value, Vec<Diagnostic>> {
-    gcsl::run(&source(text))
+    gcsl::run(&source(text)).map(|outcome| {
+        assert!(
+            outcome.warnings.is_empty(),
+            "{text}: {:?}",
+            outcome.warnings
+        );
+        outcome.value
+    })
 }
 
 /// The value and its type, as the REPL shows them.
 fn show(text: &str) -> String {
-    match run(text) {
-        Ok(value) => format!("{} : {}", value.repr(), value.ty()),
+    let mut session = Session::new();
+    match session.eval(&source(text)) {
+        Ok(outcome) => format!(
+            "{} : {}",
+            outcome.value.repr(),
+            session
+                .types()
+                .display(session.value_type(), session.names())
+        ),
         Err(diagnostics) => panic!("{text}: unexpected errors {diagnostics:?}"),
     }
 }
@@ -72,8 +87,8 @@ fn newlines_in_parentheses_and_after_operators_are_insignificant() {
 #[test]
 fn programs_with_items_and_blocks() {
     let cases = [
-        ("", "() : Unit"),
-        ("let x = 1", "() : Unit"),
+        ("", "{} : {}"),
+        ("let x = 1", "{} : {}"),
         ("let x = 1\nx", "1 : Int"),
         ("let x = 1; let y = x + 1; = x * y", "2 : Int"),
         (
@@ -89,7 +104,7 @@ fn programs_with_items_and_blocks() {
         ("let n = 7\n(n // 2 : Int) / 2", "1.5 : Float"),
         ("let hello-world = 2\nhello-world - 1", "1 : Int"),
         ("let x-1 = 5\nlet x = 1\nx-1 - x", "4 : Int"),
-        ("{ { {} } }", "() : Unit"),
+        ("{ { {} } }", "{} : {}"),
         (
             "let total = {\n  let a = 1\n  let b = 2\n  a + b\n}\n= total",
             "3 : Int",
@@ -134,7 +149,53 @@ fn programs_with_strings_bools_and_ifs() {
             "\"set -e\\necho 2\" : String",
         ),
         ("if 1 > 2 { 1 } else { 2.5 }", "2.5 : Float"),
-        ("let x = 1\nif x > 0 { let y = x }", "() : Unit"),
+        ("let x = 1\nif x > 0 { let y = x }", "{} : {}"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn programs_with_records() {
+    let cases = [
+        (
+            "{ x = 1; y = \"a\" }",
+            "{x = 1, y = \"a\"} : {x: Int, y: String}",
+        ),
+        (
+            "x = 1\ny = \"a\"",
+            "{x = 1, y = \"a\"} : {x: Int, y: String}",
+        ),
+        (
+            "let origin = { x = 0.0; y = 0.0 }\n\
+             let p = { x = 1.5; y = origin.y + 2 }\n\
+             = p.x * p.y",
+            "3.0 : Float",
+        ),
+        (
+            "let config = {\n  name = \"gcsl\"\n  build = { jobs = 4; \"dry run\" = false }\n}\n\
+             config.build",
+            "{jobs = 4, \"dry run\" = false} : {\"dry run\": Bool, jobs: Int}",
+        ),
+        (
+            "let p: {x: Float, y: Float} = { x = 1; y = 2 }\np",
+            "{x = 1.0, y = 2.0} : {x: Float, y: Float}",
+        ),
+        (
+            "let q = { x = 1; y = 2 }\nlet p: {x: Int} = q\np",
+            "{x = 1, y = 2} : {x: Int}",
+        ),
+        (
+            "if 1 < 2 { { x = 1; y = 2 } } else { { x = 3 } }",
+            "{x = 1, y = 2} : {x: Int}",
+        ),
+        ("{ x = 1 } == { x = 1 }", "true : Bool"),
+        (
+            "let r = { n = 3 }\n\"r is {r}\"",
+            "\"r is {{n = 3}}\" : String",
+        ),
+        ("{ e = {} }.e", "{} : {}"),
     ];
     for (text, expected) in cases {
         assert_eq!(show(text), expected, "{text}");
@@ -144,7 +205,12 @@ fn programs_with_strings_bools_and_ifs() {
 #[test]
 fn value_display_does_not_include_the_type() {
     assert_eq!(run("7 / 2").unwrap().to_string(), "3.5");
-    assert_eq!(run("7 // 2").unwrap().ty(), Ty::Int);
+    assert_eq!(run("7 // 2").unwrap().kind(), ValueKind::Int);
+    // A record displays as it would be written, strings quoted.
+    assert_eq!(
+        run("{ x = 1; y = \"a\" }").unwrap().to_string(),
+        "{x = 1, y = \"a\"}"
+    );
     // A string displays as its text, and shows as a literal only in `repr`.
     let value = run("\"a\\\"b\\n\"").unwrap();
     assert_eq!(value.to_string(), "a\"b\n");
@@ -365,15 +431,58 @@ fn every_stage_handles_maximum_depth() {
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
-            let checked = gcsl::check::check(&ast).unwrap();
-            let ir = gcsl::lower::lower(&ast, &checked).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = gcsl::lower::lower(&ast, &checked, &types).unwrap();
             assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
             if print {
+                let annotation = checked.types.annotation(&types, ast.names());
                 assert!(!ast.pretty().to_string().is_empty());
-                assert!(!ast.pretty_with(&checked.types).to_string().is_empty());
+                assert!(!ast.pretty_with(&annotation).to_string().is_empty());
                 assert!(!ir.pretty(ast.names()).to_string().is_empty());
             }
         }
+    });
+}
+
+/// Records nest as deeply as the parser allows, through every stage: as
+/// record blocks, as chains of field accesses on them, and as record types.
+#[test]
+fn every_stage_handles_maximum_record_depth() {
+    on_recommended_stack(|| {
+        // Each nested record block is two levels of parser recursion (its
+        // body and its field's value), but one level of height, and each
+        // field access one more level of height.
+        let levels = (gcsl::MAX_DEPTH - 1) / 2;
+        let blocks = format!("{}1{}", "{ a = ".repeat(levels), " }".repeat(levels));
+        let chain = source(&format!("{blocks}{}", ".a".repeat(levels)));
+        // The same blocks checked against a record type as deep, which the
+        // checker resolves and checks each block against, level by level.
+        let ty = format!("{}Int{}", "{a: ".repeat(levels), "}".repeat(levels));
+        let annotated = source(&format!("let r: {ty} = {blocks}\nr == r"));
+        for (file, expected) in [(&chain, Value::Int(1)), (&annotated, Value::Bool(true))] {
+            let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
+            let mut types = TypeTable::new();
+            let output = gcsl::check::Checker::new(&ast, &mut types).check().unwrap();
+            let ir = gcsl::lower::lower(&ast, &output.checked, &types).unwrap();
+            assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
+            assert!(!ast.pretty().to_string().is_empty());
+            assert!(!ir.pretty(ast.names()).to_string().is_empty());
+        }
+        // Showing the deepest record, and its type. (Annotating every node
+        // of these trees with its type would show types of every depth, in
+        // time quadratic in the depth, so only the deepest is shown.)
+        let deepest = source(&blocks);
+        let mut session = Session::new();
+        let value = session.eval(&deepest).unwrap().value;
+        let shown = value.to_string();
+        assert!(shown.starts_with("{a = {a = ") && shown.ends_with("}}"));
+        let ty = session
+            .types()
+            .display(session.value_type(), session.names())
+            .to_string();
+        assert!(ty.starts_with("{a: {a: ") && ty.ends_with("}}"));
     });
 }
 
@@ -399,6 +508,13 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
         let text = format!("{}{{}}", "if true {} else ".repeat(200_000));
         let diagnostics = run(&text).unwrap_err();
         assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        // Record types and chains of field accesses.
+        let text = format!("1 : {}Int{}", "{a: ".repeat(200_000), "}".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        let text = format!("x{}", ".a".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
     });
 }
 
@@ -408,10 +524,12 @@ fn stages_can_be_run_individually() {
     let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
     assert_eq!(tokens.len(), 11);
     let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
-    let checked = gcsl::check::check(&ast).unwrap();
+    let mut types = TypeTable::new();
+    let (checked, warnings) = gcsl::check::check(&ast, &mut types).unwrap();
+    assert!(warnings.is_empty());
     assert_eq!(checked.resolution.frame_size(), 1);
-    let ir = gcsl::lower::lower(&ast, &checked).unwrap();
-    assert_eq!(ir.ty_of(ir.root()), Ty::Float);
+    let ir = gcsl::lower::lower(&ast, &checked, &types).unwrap();
+    assert_eq!(ir.kind_of(ir.root()), ValueKind::Float);
     assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Float(3.5));
 }
 
@@ -435,7 +553,109 @@ fn stages_report_every_new_kind_of_error() {
     assert_eq!(message("1 == \"a\""), "cannot compare Int and String");
     assert_eq!(message("true < false"), "cannot order Bool");
     assert_eq!(message("if 1 { 2 } else { 3 }"), "mismatched types");
-    assert_eq!(message("if true { 1 }"), "`if` without `else` must be Unit");
+    assert_eq!(message("if true { 1 }"), "`if` without `else` must be `{}`");
+    assert_eq!(message("let x: Unit = {}"), "unknown type `Unit`");
+    assert_eq!(message("x.1"), "expected a field name after `.`");
+    assert_eq!(
+        message("r\"x\" = 1"),
+        "a field name must be a plain string literal"
+    );
+    assert_eq!(message("let \"x\" = 1"), "variables need plain names");
+    assert_eq!(message("1 : {x Int}"), "expected `:` after field name");
+    assert_eq!(
+        message("{ x = 1; = 2 }"),
+        "a block with fields cannot have a result"
+    );
+    assert_eq!(message("{ x = 1; x = 2 }"), "field `x` is defined twice");
+    assert_eq!(
+        message("1 : {x: Int, x: Int}"),
+        "field `x` appears twice in this type"
+    );
+    assert_eq!(message("1.x"), "cannot access field `x` of Int");
+    assert_eq!(message("{}.x"), "no field `x` in `{}`");
+    assert_eq!(
+        message("{ x = 1 } == { y = 1 }"),
+        "cannot compare `{x: Int}` and `{y: Int}`"
+    );
+    assert_eq!(message("{ x = 1 } < { x = 1 }"), "cannot order `{x: Int}`");
+}
+
+/// Runs `text`, which must succeed, and renders its warnings as the CLI
+/// prints them.
+fn rendered_warnings(text: &str) -> String {
+    let file = source(text);
+    let outcome = gcsl::run(&file).unwrap();
+    outcome
+        .warnings
+        .iter()
+        .map(|diagnostic| diagnostic.render(&file))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn an_excess_field_warning_renders_exactly() {
+    let text = "let point: {x: Int} = { x = 1; z = 2 }\npoint";
+    let outcome = gcsl::run(&source(text)).unwrap();
+    assert_eq!(outcome.value.to_string(), "{x = 1, z = 2}");
+    assert_eq!(outcome.warnings.len(), 1);
+    assert_eq!(outcome.warnings[0].severity, Severity::Warning);
+    assert_eq!(
+        rendered_warnings(text),
+        "warning: field `z` is not in `{x: Int}`\n\
+         \x20--> calc.gcsl:1:32\n\
+         \x20 |\n\
+         1 | let point: {x: Int} = { x = 1; z = 2 }\n\
+         \x20 |            --------            ^\n\
+         \x20 |            |\n\
+         \x20 |            expected because of this annotation\n\
+         \x20 |\n\
+         \x20 = note: it is allowed, but nothing with this type can see it\n"
+    );
+}
+
+#[test]
+fn a_missing_field_error_renders_exactly() {
+    assert_eq!(
+        rendered("let point: {x: Int, y: Int} = {\n  x = 1\n}\n"),
+        "error: missing field `y` in record\n\
+         \x20--> calc.gcsl:3:1\n\
+         \x20 |\n\
+         1 | let point: {x: Int, y: Int} = {\n\
+         \x20 |            ---------------- expected because of this annotation\n\
+         2 |   x = 1\n\
+         3 | }\n\
+         \x20 | ^\n\
+         \x20 |\n\
+         \x20 = note: the type `{x: Int, y: Int}` needs it\n"
+    );
+}
+
+#[test]
+fn rebinding_a_field_renders_exactly() {
+    assert_eq!(
+        rendered("total = 0\ntotal := 1\n"),
+        "error: cannot rebind `total`: it is a field, not a variable\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         1 | total = 0\n\
+         \x20 | --------- declared here\n\
+         2 | total := 1\n\
+         \x20 | ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: rebind with `total = ...` is not allowed either: a field is defined once\n"
+    );
+}
+
+#[test]
+fn warnings_and_errors_render_together_in_source_order() {
+    let text = "let p: {x: Int} = { x = 1; z = 2 }\n= p.z";
+    let file = source(text);
+    let diagnostics = gcsl::run(&file).unwrap_err();
+    let severities: Vec<Severity> = diagnostics.iter().map(|d| d.severity).collect();
+    assert_eq!(severities, vec![Severity::Warning, Severity::Error]);
+    assert!(rendered(text).starts_with("warning: field `z` is not in `{x: Int}`\n"));
+    assert!(rendered(text).contains("\nerror: no field `z` in `{x: Int}`\n"));
 }
 
 #[test]

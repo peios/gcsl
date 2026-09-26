@@ -1,10 +1,12 @@
 //! Diagnostics: errors reported to the user, and their rendering.
 //!
 //! Every stage reports problems as [`Diagnostic`] values. A diagnostic has a
-//! message, a primary [`Span`] that the message is about, any number of
-//! secondary [`Label`]s that point at related spans with a short text, and
-//! notes shown after the source excerpt. Static and runtime errors share
-//! this one representation, so they render identically.
+//! severity, a message, a primary [`Span`] that the message is about, any
+//! number of secondary [`Label`]s that point at related spans with a short
+//! text, and notes shown after the source excerpt. Static and runtime errors
+//! share this one representation, so they render identically, and so do
+//! warnings, which are rendered as `warning: ...` and do not stop a program
+//! from running.
 //!
 //! Rendering is done by [`Renderer`], which wraps the `annotate-snippets`
 //! crate (the rendering engine extracted from rustc). Line and column
@@ -21,12 +23,15 @@ use crate::source::{SourceFile, Span};
 pub enum Severity {
     /// The program cannot be run, or its run failed.
     Error,
+    /// Something is probably a mistake, but the program is valid and runs.
+    Warning,
 }
 
 impl Severity {
     fn level(self) -> Level<'static> {
         match self {
             Severity::Error => Level::ERROR,
+            Severity::Warning => Level::WARNING,
         }
     }
 }
@@ -35,6 +40,7 @@ impl fmt::Display for Severity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Severity::Error => "error",
+            Severity::Warning => "warning",
         })
     }
 }
@@ -79,6 +85,15 @@ impl Diagnostic {
             label: None,
             labels: Vec::new(),
             notes: Vec::new(),
+        }
+    }
+
+    /// Creates a warning diagnostic about `span` with no labels or notes.
+    #[must_use]
+    pub fn warning(message: impl Into<String>, span: Span) -> Self {
+        Self {
+            severity: Severity::Warning,
+            ..Self::error(message, span)
         }
     }
 
@@ -216,6 +231,19 @@ impl Renderer {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// Merges `errors` and `warnings` into one vector in source order: sorted by
+/// where their primary spans start, keeping the order they were reported in
+/// among those that start at the same place. This is how every stage hands
+/// back a failure that follows warnings.
+#[must_use]
+pub fn merge(errors: Vec<Diagnostic>, warnings: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut all = errors;
+    all.extend(warnings);
+    // Stable, so ties keep errors before warnings and each in report order.
+    all.sort_by_key(|diagnostic| diagnostic.span.start);
+    all
 }
 
 /// A violated compiler invariant: a bug in GCSL, not in the user's program.
@@ -452,6 +480,45 @@ mod tests {
                 .render(&diagnostic, &source)
                 .contains("\x1b[")
         );
+    }
+
+    #[test]
+    fn warnings_render_with_their_severity() {
+        let source = file("{ x = 1 }");
+        let diagnostic = Diagnostic::warning("unused", Span::new(2, 3))
+            .with_context(Span::new(6, 7), "here")
+            .with_note("a note");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(Severity::Warning.to_string(), "warning");
+        assert_eq!(Severity::Error.to_string(), "error");
+        assert_eq!(
+            diagnostic.render(&source),
+            "warning: unused\n\
+             \x20--> calc.gcsl:1:3\n\
+             \x20 |\n\
+             1 | { x = 1 }\n\
+             \x20 |   ^   - here\n\
+             \x20 |\n\
+             \x20 = note: a note\n"
+        );
+    }
+
+    #[test]
+    fn merging_puts_diagnostics_in_source_order() {
+        let errors = vec![
+            Diagnostic::error("e5", Span::new(5, 6)),
+            Diagnostic::error("e1", Span::new(1, 2)),
+            Diagnostic::error("e3", Span::new(3, 4)),
+        ];
+        let warnings = vec![
+            Diagnostic::warning("w3", Span::new(3, 9)),
+            Diagnostic::warning("w0", Span::new(0, 1)),
+        ];
+        let messages: Vec<String> = merge(errors, warnings)
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert_eq!(messages, vec!["w0", "e1", "e3", "w3", "e5"]);
     }
 
     #[test]

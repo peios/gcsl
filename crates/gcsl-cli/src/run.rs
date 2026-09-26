@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use clap::Args;
 use gcsl::lexer::TokenKind;
 use gcsl::strings::Quoted;
-use gcsl::{Diagnostic, SourceFile, Value, check, eval, lexer, lower, parser};
+use gcsl::{
+    Diagnostic, SourceFile, TypeTable, Value, check, diagnostic, eval, lexer, lower, parser,
+};
 
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
@@ -110,7 +112,11 @@ pub fn main(args: &RunArgs) -> ExitCode {
 }
 
 /// Runs the pipeline, printing each requested dump and stopping after the
-/// last one; with no dumps, prints the value, as text, unless it is `()`.
+/// last one; with no dumps, prints the value, as text, unless it is `{}`.
+///
+/// Warnings go to stderr once the run has succeeded (after the dumps, or
+/// before the value). If a later stage fails, they are returned with its
+/// error instead, to be printed together in source order.
 fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
     let last = args.last_dump();
     let mut out = io::stdout().lock();
@@ -149,27 +155,44 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
         return Ok(out.flush()?);
     }
 
-    let checked = check::check(&ast).map_err(Failure::Program)?;
+    let mut types = TypeTable::new();
+    let (checked, warnings) = check::check(&ast, &mut types).map_err(Failure::Program)?;
     if args.dump_types {
-        writeln!(out, "{}", ast.pretty_with(&checked.types))?;
+        let annotation = checked.types.annotation(&types, ast.names());
+        writeln!(out, "{}", ast.pretty_with(&annotation))?;
     }
     if last == Some(Stage::Types) {
+        output::diagnostics(source, &warnings);
         return Ok(out.flush()?);
     }
 
-    let ir = lower::lower(&ast, &checked).map_err(Diagnostic::from)?;
+    let ir = match lower::lower(&ast, &checked, &types) {
+        Ok(ir) => ir,
+        Err(error) => return Err(with_warnings(error.into(), warnings)),
+    };
     if args.dump_ir {
         writeln!(out, "{}", ir.pretty(ast.names()))?;
     }
     if last == Some(Stage::Ir) {
+        output::diagnostics(source, &warnings);
         return Ok(out.flush()?);
     }
 
-    let value = eval::eval(&ir)?;
+    let value = match eval::eval(&ir) {
+        Ok(value) => value,
+        Err(error) => return Err(with_warnings(error, warnings)),
+    };
+    output::diagnostics(source, &warnings);
     // A string prints as its text, unquoted, so a program can produce
-    // output verbatim.
-    if value != Value::Unit {
+    // output verbatim. A record prints as it would be written.
+    if !matches!(value, Value::Empty) {
         writeln!(out, "{value}")?;
     }
     Ok(out.flush()?)
+}
+
+/// The failure of a stage after the checker: its `error`, with the
+/// `warnings` the checker found, in source order.
+fn with_warnings(error: Diagnostic, warnings: Vec<Diagnostic>) -> Failure {
+    Failure::Program(diagnostic::merge(vec![error], warnings))
 }

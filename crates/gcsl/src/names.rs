@@ -18,7 +18,11 @@ use std::collections::HashMap;
 ///
 /// Names are only meaningful for the table that produced them; using one
 /// with a different table is a logic error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Names are ordered by when they were first interned, not by their text.
+/// The order exists so that record types can keep their fields sorted (see
+/// [`crate::types::RecordTy`]); it means nothing to a reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Name(u32);
 
 impl Name {

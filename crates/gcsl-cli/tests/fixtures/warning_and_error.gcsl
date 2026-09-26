@@ -1,0 +1,2 @@
+let point: {x: Int} = { x = 1; z = 2 }
+= point.z

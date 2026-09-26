@@ -19,9 +19,10 @@ const PROMPT: &str = "> ";
 /// variables declared at the top level of a line are visible to later
 /// lines. A line prints `value : Type`, with the value as it would be
 /// written in a program (a string quoted and escaped, see
-/// [`Value::repr`]), nothing if its value is `()` (as for a `let`), or its
-/// diagnostics; a line with errors changes nothing. Ctrl-C discards the
-/// current line. History lasts for the session only.
+/// [`Value::repr`]) and the type the checker gave it, nothing if its value
+/// is `{}` (as for a `let`), or its diagnostics; a line with errors changes
+/// nothing. A line's warnings go to stderr before its value. Ctrl-C
+/// discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -55,8 +56,8 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// Evaluates one line in `session`, printing the value and its type or the
-/// diagnostics.
+/// Evaluates one line in `session`, printing any warnings and then the
+/// value and its type, or the diagnostics.
 fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
     let source = match SourceFile::new(SOURCE_NAME, line) {
         Ok(source) => source,
@@ -66,10 +67,16 @@ fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
         }
     };
     match session.eval(&source) {
-        Ok(Value::Unit) => Ok(()),
-        Ok(value) => {
+        Ok(outcome) => {
+            output::diagnostics(&source, &outcome.warnings);
+            if matches!(outcome.value, Value::Empty) {
+                return Ok(());
+            }
+            let ty = session
+                .types()
+                .display(session.value_type(), session.names());
             let mut out = io::stdout().lock();
-            writeln!(out, "{} : {}", value.repr(), value.ty())?;
+            writeln!(out, "{} : {ty}", outcome.value.repr())?;
             out.flush()
         }
         Err(diagnostics) => {

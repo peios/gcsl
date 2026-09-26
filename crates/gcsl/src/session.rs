@@ -2,29 +2,38 @@
 //! the REPL.
 //!
 //! Each input is a block body, like a file, run in the context of every
-//! earlier successful input: variables declared at their top level are
-//! visible, `:=` at top level may rebind them, and new top-level `let`s
-//! persist for later inputs. The session keeps three things between inputs:
+//! earlier successful input: variables and fields declared at their top
+//! level are visible, `:=` at top level may rebind variables, and new
+//! top-level declarations persist for later inputs. The session keeps these
+//! things between inputs:
 //!
 //! - the [`Names`] table, lent to each stage in turn, so that the same name
 //!   in two inputs is the same [`crate::names::Name`];
+//! - the [`TypeTable`], lent to the checker, so that a type interned by one
+//!   input is the same [`TyId`] in the next, and the types of the variables
+//!   carried over stay meaningful;
 //! - the checker's outermost [`Scope`]: each top-level variable with its
 //!   slot and type, from which [`Checker::with_scope`] checks the next
 //!   input exactly as if it continued the same block;
-//! - the frame, holding each top-level variable's value in its slot.
+//! - the frame, holding each top-level variable's value in its slot;
+//! - the type of the last successful input's value, for showing it.
 //!
 //! A failed input, whether it fails to compile or fails at runtime, leaves
 //! the session as it was: the scope is only replaced after evaluation
 //! succeeds, and names interned by the failed input are forgotten. The frame
 //! may have grown, and slots above the last committed variable may hold
 //! values from the failed run, but those slots belong to no variable and are
-//! always written before they are read.
+//! always written before they are read. Types the failed input interned are
+//! kept: a type is a fact about structure, not about the input, so a stale
+//! entry is harmless (see [`crate::types`]); forgetting them would mean
+//! rebuilding the table's lookup map.
 
 use std::mem;
 
+use crate::Outcome;
 use crate::ast::Ast;
-use crate::check::{Checker, Scope};
-use crate::diagnostic::Diagnostic;
+use crate::check::{CheckOutput, Checker, Scope};
+use crate::diagnostic::{self, Diagnostic};
 use crate::eval;
 use crate::ir::Ir;
 use crate::lexer;
@@ -32,32 +41,48 @@ use crate::lower;
 use crate::names::Names;
 use crate::parser;
 use crate::source::SourceFile;
+use crate::types::{TyId, TypeTable};
 use crate::value::Value;
 
 /// A sequence of inputs sharing their top-level variables. See the module
 /// documentation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Session {
     names: Names,
+    types: TypeTable,
     scope: Scope,
     frame: Vec<Value>,
+    value_type: TyId,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Session {
     /// A session with no variables.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            names: Names::new(),
+            types: TypeTable::new(),
+            scope: Scope::new(),
+            frame: Vec::new(),
+            value_type: TyId::EMPTY,
+        }
     }
 
-    /// Runs `source` as the next input and returns its value: the value of
-    /// its body, `()` if it has no result.
+    /// Runs `source` as the next input and returns its value, `{}` if it
+    /// has no result or fields, with its warnings in source order.
     ///
     /// # Errors
     ///
     /// Returns the diagnostics of the first stage that fails, as
-    /// [`crate::run`] does. The session is then unchanged.
-    pub fn eval(&mut self, source: &SourceFile) -> Result<Value, Vec<Diagnostic>> {
+    /// [`crate::run`] does, with the input's warnings among them in source
+    /// order. The session is then unchanged.
+    pub fn eval(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
         let names_before = self.names.len();
         let result = self.eval_uncommitted(source);
         if result.is_err() {
@@ -66,49 +91,86 @@ impl Session {
         result
     }
 
+    /// The table the session's types are interned into, for showing them.
+    #[must_use]
+    pub fn types(&self) -> &TypeTable {
+        &self.types
+    }
+
+    /// The table the session's names are interned into, for showing them.
+    #[must_use]
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// The type of the value of the last input that succeeded, as the
+    /// checker found it: `{}` before any has. Show it with
+    /// [`Session::types`] and [`Session::names`].
+    #[must_use]
+    pub fn value_type(&self) -> TyId {
+        self.value_type
+    }
+
     /// Runs `source`, committing its scope only on success. On failure the
     /// caller must forget the names it interned.
-    fn eval_uncommitted(&mut self, source: &SourceFile) -> Result<Value, Vec<Diagnostic>> {
+    fn eval_uncommitted(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
         let (tokens, strings) =
             lexer::tokenize_with(source, &mut self.names).map_err(|error| vec![error])?;
-        let (builder, root) = parser::parse_parts(&tokens, source).map_err(|error| vec![error])?;
+        let (builder, root) = parser::parse_parts(&tokens, source, &mut self.names, &strings)
+            .map_err(|error| vec![error])?;
         // The tree owns the names while it lives; take them back before
         // anything can fail. The string table belongs to this input alone:
         // lowering copies what the IR needs out of it, and it is dropped
         // with the tree.
         let ast = builder.finish(root, mem::take(&mut self.names), strings);
-        let compiled = compile(&ast, self.scope.clone());
+        let compiled = compile(&ast, self.scope.clone(), &mut self.types);
         self.names = ast.into_names();
-        let (ir, scope) = compiled?;
+        let (ir, output) = compiled?;
         let frame_size = ir.frame_size() as usize;
         if self.frame.len() < frame_size {
-            self.frame.resize(frame_size, Value::Unit);
+            self.frame.resize(frame_size, Value::Empty);
         }
-        let value = eval::eval_in(&ir, &mut self.frame).map_err(|error| vec![error])?;
-        self.scope = scope;
-        Ok(value)
+        match eval::eval_in(&ir, &mut self.frame) {
+            Ok(value) => {
+                self.scope = output.scope;
+                self.value_type = output.ty;
+                Ok(Outcome {
+                    value,
+                    warnings: output.warnings,
+                })
+            }
+            Err(error) => Err(diagnostic::merge(vec![error], output.warnings)),
+        }
     }
 }
 
-/// Checks and lowers `ast` in the context of `scope`, returning the IR and
-/// the scope extended by the input's top-level declarations.
-fn compile(ast: &Ast, scope: Scope) -> Result<(Ir, Scope), Vec<Diagnostic>> {
-    let (checked, scope) = Checker::with_scope(ast, scope).check()?;
-    let ir = lower::lower(ast, &checked).map_err(|error| vec![error.into()])?;
-    Ok((ir, scope))
+/// Checks and lowers `ast` in the context of `scope`, interning types into
+/// `types`, returning the IR and the checker's output: the scope extended by
+/// the input's top-level declarations, the value's type and the warnings.
+fn compile(
+    ast: &Ast,
+    scope: Scope,
+    types: &mut TypeTable,
+) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
+    let output = Checker::with_scope(ast, scope, types).check()?;
+    match lower::lower(ast, &output.checked, types) {
+        Ok(ir) => Ok((ir, output)),
+        Err(error) => Err(diagnostic::merge(vec![error.into()], output.warnings)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
 
-    fn eval(session: &mut Session, text: &str) -> Result<Value, Vec<Diagnostic>> {
+    fn eval(session: &mut Session, text: &str) -> Result<Outcome, Vec<Diagnostic>> {
         session.eval(&SourceFile::new("<test>", text).unwrap())
     }
 
     fn value(session: &mut Session, text: &str) -> Value {
         match eval(session, text) {
-            Ok(value) => value,
+            Ok(outcome) => outcome.value,
             Err(diagnostics) => panic!("{text}: unexpected errors {diagnostics:?}"),
         }
     }
@@ -121,11 +183,19 @@ mod tests {
             .collect()
     }
 
+    /// The type of the last successful input's value, as shown.
+    fn value_type(session: &Session) -> String {
+        session
+            .types()
+            .display(session.value_type(), session.names())
+            .to_string()
+    }
+
     #[test]
     fn three_inputs_share_a_variable() {
         let mut session = Session::new();
-        assert_eq!(value(&mut session, "let x = 1"), Value::Unit);
-        assert_eq!(value(&mut session, "let y = x + 1"), Value::Unit);
+        assert_eq!(value(&mut session, "let x = 1"), Value::Empty);
+        assert_eq!(value(&mut session, "let y = x + 1"), Value::Empty);
         assert_eq!(value(&mut session, "x + y"), Value::Int(3));
         assert_eq!(value(&mut session, "x * 10"), Value::Int(10));
     }
@@ -134,7 +204,7 @@ mod tests {
     fn rebinding_across_inputs() {
         let mut session = Session::new();
         value(&mut session, "let x = 1");
-        assert_eq!(value(&mut session, "x := x + 10"), Value::Unit);
+        assert_eq!(value(&mut session, "x := x + 10"), Value::Empty);
         assert_eq!(value(&mut session, "x"), Value::Int(11));
         // A rebind is a new binding, so it may change the type.
         value(&mut session, "x := 2.5");
@@ -184,6 +254,11 @@ mod tests {
             messages(&mut session, "let y = 1\nlet z = 1 // 0\nx := 0"),
             vec!["division by zero"]
         );
+        // A quoted field name interned by a failed parse is forgotten too.
+        assert_eq!(
+            messages(&mut session, "\"quoted\" = 1 +"),
+            vec!["expected expression, found end of input"]
+        );
         assert_eq!(session.names.len(), names);
         assert_eq!(session.scope, scope);
 
@@ -214,15 +289,26 @@ mod tests {
     #[test]
     fn inputs_have_values_of_every_type() {
         let mut session = Session::new();
-        assert_eq!(value(&mut session, ""), Value::Unit);
+        assert_eq!(value(&mut session, ""), Value::Empty);
+        assert_eq!(value_type(&session), "{}");
         assert_eq!(value(&mut session, "7 / 2"), Value::Float(3.5));
+        assert_eq!(value_type(&session), "Float");
         assert_eq!(value(&mut session, "= 1 + 1"), Value::Int(2));
-        assert_eq!(value(&mut session, "let u = {}\nu"), Value::Unit);
+        assert_eq!(value_type(&session), "Int");
+        assert_eq!(value(&mut session, "let u = {}\nu"), Value::Empty);
         assert_eq!(value(&mut session, "1 < 2"), Value::Bool(true));
         assert_eq!(
             value(&mut session, "\"a\" + \"b\""),
             Value::Str("ab".into())
         );
+        assert_eq!(
+            value(&mut session, "{ x = 1; y = \"a\" }").to_string(),
+            "{x = 1, y = \"a\"}"
+        );
+        assert_eq!(value_type(&session), "{x: Int, y: String}");
+        // A failed input leaves the last type as it was.
+        messages(&mut session, "q");
+        assert_eq!(value_type(&session), "{x: Int, y: String}");
     }
 
     #[test]
@@ -251,5 +337,65 @@ mod tests {
             vec!["cannot add String and Int"]
         );
         assert_eq!(value(&mut session, "greeting"), Value::Str("hello!".into()));
+    }
+
+    #[test]
+    fn records_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let p = { x = 1; inner = { s = \"a\" } }");
+        assert_eq!(value(&mut session, "p.x + 1"), Value::Int(2));
+        assert_eq!(value(&mut session, "p.inner.s"), Value::Str("a".into()));
+        // The type of `p` is the same type in a later input, so equality
+        // with a record built there type-checks.
+        assert_eq!(
+            value(&mut session, "p == { x = 1; inner = { s = \"a\" } }"),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            value(&mut session, "let q: {x: Int} = p\nq").to_string(),
+            "{x = 1, inner = {s = \"a\"}}"
+        );
+        assert_eq!(value_type(&session), "{x: Int}");
+        // Top-level fields are in scope for later inputs, as fields.
+        value(&mut session, "n = 41\nm = n + 1");
+        assert_eq!(value(&mut session, "m"), Value::Int(42));
+        assert_eq!(
+            messages(&mut session, "n := 0"),
+            vec!["cannot rebind `n`: it is a field, not a variable"]
+        );
+        // A failed input's types stay in the table, harmlessly.
+        let types = session.types.len();
+        messages(&mut session, "let r = { brand-new = 1 }\nr.missing");
+        assert!(session.types.len() > types);
+        assert_eq!(value(&mut session, "{ other = 2 }.other"), Value::Int(2));
+    }
+
+    #[test]
+    fn warnings_come_back_with_the_value() {
+        let mut session = Session::new();
+        let outcome = eval(&mut session, "let p: {x: Int} = { x = 1; y = 2 }\np").unwrap();
+        assert_eq!(outcome.value.to_string(), "{x = 1, y = 2}");
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(outcome.warnings[0].severity, Severity::Warning);
+        assert_eq!(
+            outcome.warnings[0].message,
+            "field `y` is not in `{x: Int}`"
+        );
+        // With a runtime error, the warnings come back with it, in source
+        // order.
+        let diagnostics = eval(&mut session, "let r: {} = { z = 1 // 0 }").unwrap_err();
+        let shown: Vec<(Severity, &str)> = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (Severity::Warning, "field `z` is not in `{}`"),
+                (Severity::Error, "division by zero")
+            ]
+        );
+        // No warnings, none returned.
+        assert!(eval(&mut session, "p.x").unwrap().warnings.is_empty());
     }
 }

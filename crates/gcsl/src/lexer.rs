@@ -29,7 +29,9 @@
 //! Operators are lexed greedily: `==` is one token and `=` followed by
 //! anything else is another, and likewise `<=` and `<`, `>=` and `>`, `:=`
 //! and `:`, `//` and `/`. `!` is only accepted as part of `!=`; negation is
-//! `not`.
+//! `not`. A `.` is part of a number literal only between two digits, as in
+//! `1.5`; anywhere else it is a [`TokenKind::Dot`], so `1.x` is `1`, `.`,
+//! `x`. A `,` is a [`TokenKind::Comma`], which only record types use.
 //!
 //! A `-` that is not inside an identifier is classified from the bytes
 //! either side of it (see `Lexer::minus`): subtraction ([`TokenKind::Minus`])
@@ -215,6 +217,10 @@ pub enum TokenKind {
     RBrace,
     /// `;`
     Semi,
+    /// `.` not inside a number literal: field access.
+    Dot,
+    /// `,`, which separates the fields of a record type.
+    Comma,
     /// A `\n` outside parentheses and interpolations. Each newline is its
     /// own token.
     Newline,
@@ -257,6 +263,8 @@ impl TokenKind {
             TokenKind::LBrace => Some("{"),
             TokenKind::RBrace => Some("}"),
             TokenKind::Semi => Some(";"),
+            TokenKind::Dot => Some("."),
+            TokenKind::Comma => Some(","),
             TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Str(_)
@@ -268,6 +276,32 @@ impl TokenKind {
             | TokenKind::Eof => None,
         }
     }
+}
+
+/// The keyword `text` spells, if it is one.
+fn keyword(text: &str) -> Option<TokenKind> {
+    Some(match text {
+        "let" => TokenKind::Let,
+        "if" => TokenKind::If,
+        "else" => TokenKind::Else,
+        "true" => TokenKind::True,
+        "false" => TokenKind::False,
+        "and" => TokenKind::And,
+        "or" => TokenKind::Or,
+        "not" => TokenKind::Not,
+        _ => return None,
+    })
+}
+
+/// Whether `text` is a plain identifier: exactly one [`TokenKind::Ident`]
+/// token, so a name that can be written in source without quotes. Keywords
+/// are not identifiers.
+#[must_use]
+pub fn is_identifier(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    matches!(bytes.first(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && identifier_end(bytes, 0) == bytes.len()
+        && keyword(text).is_none()
 }
 
 /// Lexes the whole of `source`, interning its names into a new table and
@@ -564,6 +598,9 @@ impl<'a> Lexer<'a> {
             b'*' => (TokenKind::Star, 1),
             b'%' => (TokenKind::Percent, 1),
             b';' => (TokenKind::Semi, 1),
+            // A `.` inside a number literal has been consumed by `number`.
+            b'.' => (TokenKind::Dot, 1),
+            b',' => (TokenKind::Comma, 1),
             b'=' => with_eq(TokenKind::Eq, TokenKind::EqEq),
             b':' => with_eq(TokenKind::Colon, TokenKind::ColonEq),
             b'<' => with_eq(TokenKind::Lt, TokenKind::Le),
@@ -632,17 +669,8 @@ impl<'a> Lexer<'a> {
     /// not.
     fn identifier(&mut self, start: usize) -> TokenKind {
         self.pos = identifier_end(self.bytes, start);
-        match &self.text[start..self.pos] {
-            "let" => TokenKind::Let,
-            "if" => TokenKind::If,
-            "else" => TokenKind::Else,
-            "true" => TokenKind::True,
-            "false" => TokenKind::False,
-            "and" => TokenKind::And,
-            "or" => TokenKind::Or,
-            "not" => TokenKind::Not,
-            text => TokenKind::Ident(self.names.intern(text)),
-        }
+        let text = &self.text[start..self.pos];
+        keyword(text).unwrap_or_else(|| TokenKind::Ident(self.names.intern(text)))
     }
 
     /// Classifies a `-` at `start` that is not part of an identifier or a
@@ -1449,7 +1477,7 @@ mod tests {
         let (tokens, names, _) = tokenize(
             &SourceFile::new(
                 "test.gcsl",
-                "1 2.5 + - -x * / // % ( ) x let : := = { } ;\n\
+                "1 2.5 + - -x * / // % ( ) x let : := = { } ; . ,\n\
                  if else true false and or not == != < <= > >=",
             )
             .unwrap(),
@@ -1480,6 +1508,8 @@ mod tests {
                 LBrace,
                 RBrace,
                 Semi,
+                Dot,
+                Comma,
                 Newline,
                 If,
                 Else,
@@ -1905,13 +1935,78 @@ mod tests {
     #[test]
     fn dot_without_digits_on_both_sides_is_not_a_float() {
         assert_eq!(
-            error("1."),
-            ("unexpected character `.`".to_owned(), Span::new(1, 2))
+            kinds("1."),
+            vec![TokenKind::Int(1), TokenKind::Dot, TokenKind::Eof]
         );
         assert_eq!(
-            error(".5"),
-            ("unexpected character `.`".to_owned(), Span::new(0, 1))
+            kinds(".5"),
+            vec![TokenKind::Dot, TokenKind::Int(5), TokenKind::Eof]
         );
+        assert_eq!(spans("1."), vec![(0, 1), (1, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn dots_are_field_access() {
+        assert_eq!(show("a.b"), vec!["Ident(a)", "Dot", "Ident(b)", "Eof"]);
+        assert_eq!(spans("a.b"), vec![(0, 1), (1, 2), (2, 3), (3, 3)]);
+        assert_eq!(
+            show("a.\"b c\""),
+            vec!["Ident(a)", "Dot", "Str(\"b c\")", "Eof"]
+        );
+        assert_eq!(
+            show("a . b.c"),
+            vec!["Ident(a)", "Dot", "Ident(b)", "Dot", "Ident(c)", "Eof"]
+        );
+        // A `.` between digits is part of a float; anywhere else it is not.
+        assert_eq!(kinds("1.5"), vec![TokenKind::Float(1.5), TokenKind::Eof]);
+        assert_eq!(show("1.x"), vec!["Int(1)", "Dot", "Ident(x)", "Eof"]);
+        assert_eq!(show("x.1"), vec!["Ident(x)", "Dot", "Int(1)", "Eof"]);
+        assert_eq!(show("x.1.5"), vec!["Ident(x)", "Dot", "Float(1.5)", "Eof"]);
+        assert_eq!(show("a-b.c"), vec!["Ident(a-b)", "Dot", "Ident(c)", "Eof"]);
+        // Inside an interpolation too.
+        assert_eq!(
+            show("\"{a.b}\""),
+            vec![
+                "StrStart(\"\")",
+                "Ident(a)",
+                "Dot",
+                "Ident(b)",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        assert_eq!(TokenKind::Dot.symbol(), Some("."));
+        assert_eq!(TokenKind::Comma.symbol(), Some(","));
+        assert_eq!(
+            show("{a: Int,\nb: {}}"),
+            vec![
+                "LBrace",
+                "Ident(a)",
+                "Colon",
+                "Ident(Int)",
+                "Comma",
+                "Newline",
+                "Ident(b)",
+                "Colon",
+                "LBrace",
+                "RBrace",
+                "RBrace",
+                "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_identifiers() {
+        for text in ["x", "_", "_1", "hello-world", "x-1", "Int", "r", "lets"] {
+            assert!(is_identifier(text), "{text}");
+        }
+        for text in [
+            "", "1x", "a b", "a-", "-a", "a--b", "é", "let", "if", "else", "true", "false", "and",
+            "or", "not", "a.b",
+        ] {
+            assert!(!is_identifier(text), "{text}");
+        }
     }
 
     #[test]

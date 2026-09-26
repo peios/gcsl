@@ -226,9 +226,98 @@ fn dump_ir_shows_strings_and_ifs() {
 }
 
 #[test]
-fn run_prints_nothing_for_a_unit_result() {
-    let output = gcsl(&["run", "tests/fixtures/unit.gcsl"]);
+fn run_prints_nothing_for_an_empty_record_result() {
+    let output = gcsl(&["run", "tests/fixtures/empty.gcsl"]);
     assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_prints_a_record_as_it_would_be_written() {
+    let output = gcsl(&["run", "tests/fixtures/record.gcsl"]);
+    assert_eq!(stdout(&output), "{x = 1, y = \"a\"}\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The warning `tests/fixtures/warning.gcsl` produces, as rendered.
+const FIXTURE_WARNING: &str = "warning: field `z` is not in `{x: Int}`\n\
+     \x20--> tests/fixtures/warning.gcsl:1:32\n\
+     \x20 |\n\
+     1 | let point: {x: Int} = { x = 1; z = 2 }\n\
+     \x20 |            --------            ^\n\
+     \x20 |            |\n\
+     \x20 |            expected because of this annotation\n\
+     \x20 |\n\
+     \x20 = note: it is allowed, but nothing with this type can see it\n";
+
+#[test]
+fn warnings_go_to_stderr_and_the_value_still_prints() {
+    let output = gcsl(&["run", "tests/fixtures/warning.gcsl"]);
+    assert_eq!(stdout(&output), "1\n");
+    assert_eq!(stderr(&output), FIXTURE_WARNING);
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn with_errors_warnings_go_to_stderr_with_them_in_source_order() {
+    let output = gcsl(&["run", "tests/fixtures/warning_and_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "warning: field `z` is not in `{x: Int}`\n\
+         \x20--> tests/fixtures/warning_and_error.gcsl:1:32\n\
+         \x20 |\n\
+         1 | let point: {x: Int} = { x = 1; z = 2 }\n\
+         \x20 |            --------            ^\n\
+         \x20 |            |\n\
+         \x20 |            expected because of this annotation\n\
+         \x20 |\n\
+         \x20 = note: it is allowed, but nothing with this type can see it\n\
+         \n\
+         error: no field `z` in `{x: Int}`\n\
+         \x20--> tests/fixtures/warning_and_error.gcsl:2:8\n\
+         \x20 |\n\
+         2 | = point.z\n\
+         \x20 |        ^^\n\
+         \x20 |\n\
+         \x20 = note: the only field is `x`\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn dumps_show_record_types_and_record_ir() {
+    let output = gcsl(&["run", "tests/fixtures/warning.gcsl", "--dump-types"]);
+    assert_eq!(
+        stdout(&output),
+        "(file\n\
+         \x20 (let point : {x: Int} @0..38\n\
+         \x20   (block : {x: Int, z: Int} @22..38\n\
+         \x20     (field x @24..29\n\
+         \x20       (int 1 : Int @28..29))\n\
+         \x20     (field z @31..36\n\
+         \x20       (int 2 : Int @35..36))))\n\
+         \x20 (result @39..48\n\
+         \x20   (. x : Int @41..48\n\
+         \x20     (name point : {x: Int} @41..46))))\n"
+    );
+    // A run that stops after a dump still reports its warnings.
+    assert_eq!(stderr(&output), FIXTURE_WARNING);
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/record.gcsl", "--dump-ir"]);
+    assert_eq!(
+        stdout(&output),
+        "(block @32..45\n\
+         \x20 (store x#0 @32..37\n\
+         \x20   (int 1 @36..37))\n\
+         \x20 (store y#1 @38..45\n\
+         \x20   (str \"a\" @42..45))\n\
+         \x20 (make-record [x y] @32..45\n\
+         \x20   (load x#0 @32..33)\n\
+         \x20   (load y#1 @38..39)))\n"
+    );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -237,7 +326,7 @@ fn run_prints_nothing_for_a_unit_result() {
 fn dumps_show_names_and_slots() {
     let output = gcsl(&[
         "run",
-        "tests/fixtures/unit.gcsl",
+        "tests/fixtures/empty.gcsl",
         "--dump-tokens",
         "--dump-ir",
     ]);
@@ -262,7 +351,7 @@ fn dumps_show_names_and_slots() {
          \x20   (int-add @23..32\n\
          \x20     (load count#0 @23..28)\n\
          \x20     (int 1 @31..32)))\n\
-         \x20 (unit @0..32))\n"
+         \x20 (empty @0..32))\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -332,7 +421,7 @@ fn repl_keeps_variables_across_lines() {
          let z = 1.5 + x\n\
          x\n",
     );
-    // Nothing for `let`, `:=` or a Unit value; the failed line changes
+    // Nothing for `let`, `:=` or a `{}` value; the failed line changes
     // nothing.
     assert_eq!(stdout(&output), "3 : Int\n12 : Int\n10 : Int\n");
     assert_eq!(
@@ -367,6 +456,58 @@ fn repl_prints_strings_quoted() {
          \"yes\" : String\n"
     );
     assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_shows_records_with_their_types() {
+    let output = repl(
+        "let p = { x = 1; y = \"a\" }\n\
+         p\n\
+         p.y\n\
+         let q: {x: Int} = p\n\
+         q\n\
+         { inner = { n = 1.5 }; \"a b\" = true }\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{x = 1, y = \"a\"} : {x: Int, y: String}\n\
+         \"a\" : String\n\
+         {x = 1, y = \"a\"} : {x: Int}\n\
+         {inner = {n = 1.5}, \"a b\" = true} : {\"a b\": Bool, inner: {n: Float}}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_prints_warnings_before_the_value() {
+    let output = repl(
+        "let p: {x: Int} = { x = 1; z = 2 }\n\
+         { x = 1; z = 2 } : {x: Int}\n",
+    );
+    // The first line's value is `{}`, so only its warning is shown; the
+    // second shows its warning and then its value.
+    assert_eq!(stdout(&output), "{x = 1, z = 2} : {x: Int}\n");
+    assert_eq!(
+        stderr(&output),
+        "warning: field `z` is not in `{x: Int}`\n\
+         \x20--> <repl>:1:28\n\
+         \x20 |\n\
+         1 | let p: {x: Int} = { x = 1; z = 2 }\n\
+         \x20 |        --------            ^\n\
+         \x20 |        |\n\
+         \x20 |        expected because of this annotation\n\
+         \x20 |\n\
+         \x20 = note: it is allowed, but nothing with this type can see it\n\
+         warning: field `z` is not in `{x: Int}`\n\
+         \x20--> <repl>:1:10\n\
+         \x20 |\n\
+         1 | { x = 1; z = 2 } : {x: Int}\n\
+         \x20 |          ^         -------- ascribed here\n\
+         \x20 |\n\
+         \x20 = note: it is allowed, but nothing with this type can see it\n"
+    );
     assert_eq!(output.status.code(), Some(0));
 }
 

@@ -39,7 +39,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a GCSL file and print its value, unless it is `()`.
+    /// Run a GCSL file and print its value, unless it is `{}`.
     Run(run::RunArgs),
 }
 

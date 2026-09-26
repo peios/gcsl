@@ -115,9 +115,41 @@ impl fmt::Display for Quoted<'_> {
     }
 }
 
+/// Shows the name of a record field as it can be written in source: as it
+/// is if it is a plain identifier (see [`crate::lexer::is_identifier`]), and
+/// otherwise as a string literal, [`Quoted`]: `x`, `hello-world`, `"a b"`,
+/// `"let"`. Used wherever a field name is shown: types, record values,
+/// diagnostics and dumps.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldName<'a>(pub &'a str);
+
+impl fmt::Display for FieldName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if crate::lexer::is_identifier(self.0) {
+            f.write_str(self.0)
+        } else {
+            Quoted(self.0).fmt(f)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_names_are_quoted_unless_plain_identifiers() {
+        assert_eq!(FieldName("x").to_string(), "x");
+        assert_eq!(FieldName("hello-world").to_string(), "hello-world");
+        assert_eq!(FieldName("_1").to_string(), "_1");
+        assert_eq!(FieldName("a b").to_string(), "\"a b\"");
+        assert_eq!(FieldName("").to_string(), "\"\"");
+        assert_eq!(FieldName("1x").to_string(), "\"1x\"");
+        assert_eq!(FieldName("a-").to_string(), "\"a-\"");
+        assert_eq!(FieldName("if").to_string(), "\"if\"");
+        assert_eq!(FieldName("é").to_string(), "\"é\"");
+        assert_eq!(FieldName("{x}").to_string(), "\"{{x}}\"");
+    }
 
     #[test]
     fn pushed_text_comes_back_by_id() {

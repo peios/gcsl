@@ -1,25 +1,30 @@
 //! GCSL: a statically typed scripting language.
 //!
 //! A program is a block body: a sequence of items (`let` declarations,
-//! `:=` rebindings, a `= EXPR` result and expression statements) whose value
-//! is its result. It passes through these stages, each exposed as its own
-//! module so that tools can stop after any of them:
+//! `:=` rebindings, fields, a `= EXPR` result and expression statements)
+//! whose value is its result, or the record of its fields. It passes
+//! through these stages, each exposed as its own module so that tools can
+//! stop after any of them:
 //!
 //! 1. [`lexer::tokenize`]: source text to tokens, interning every name into
 //!    a [`names::Names`] table and storing the processed text of every
 //!    string literal in a [`strings::Strings`] table.
 //! 2. [`parser::parse`]: tokens to an arena-based [`ast::Ast`], which owns
 //!    both tables from then on.
-//! 3. [`check::check`]: types for every expression and a storage slot for
-//!    every variable, in the side tables of a [`check::Checked`].
+//! 3. [`check::check`]: types for every expression, interned into a
+//!    [`TypeTable`] the caller owns, and a storage slot for every variable,
+//!    in the side tables of a [`check::Checked`]; and any warnings.
 //! 4. [`lower::lower`]: AST and tables to a type-specialised [`ir::Ir`],
-//!    which holds its own copies of the string literals it uses.
+//!    which holds its own copies of the string literals and record layouts
+//!    it uses.
 //! 5. [`eval::eval`]: IR to a [`Value`].
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
-//! [`SourceFile`]. The library performs no I/O and never prints.
+//! [`SourceFile`], and so is every warning, which does not stop a program
+//! from running and is returned with its value in an [`Outcome`]. The
+//! library performs no I/O and never prints.
 
 #![warn(
     clippy::unwrap_used,
@@ -50,13 +55,16 @@ pub mod value;
 pub use diagnostic::{Diagnostic, Severity};
 pub use session::Session;
 pub use source::{SourceFile, Span};
-pub use types::Ty;
-pub use value::Value;
+pub use types::{TyId, TypeTable};
+pub use value::{Value, ValueKind};
 
 /// The deepest nesting accepted, measured as the height of the syntax tree:
-/// a leaf is one level, and every operator, parenthesis, ascription, block,
-/// `if` and interpolated string adds one to its tallest child (a block's
-/// children being its items' expressions). Every stage recurses once per
+/// a leaf is one level, and every operator, parenthesis, ascription, field
+/// access, block, `if` and interpolated string adds one to its tallest
+/// child (a block's children being its items' expressions and annotated
+/// types, and an ascription's its expression and type). A type written as a
+/// name is one level, and a record type one more than its tallest field's
+/// type. Every stage recurses once per
 /// level, so the parser rejects anything deeper with an "expression nested
 /// too deeply" error rather than letting a later stage overflow the stack.
 /// The lexer, which recurses through string literals nested in each other's
@@ -78,16 +86,34 @@ pub const MAX_DEPTH: usize = 10_000;
 /// reservation costs nothing.
 pub const STACK_SIZE: usize = 64 * 1024 * 1024;
 
-/// Runs every stage on `source` as a file and returns the value of its body.
+/// What running a program successfully produces: its value, and the
+/// warnings found on the way, in source order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Outcome {
+    /// The value of the program's body.
+    pub value: Value,
+    /// The warnings found, in source order. The program ran regardless.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// Runs every stage on `source` as a file and returns the value of its body
+/// with any warnings.
 ///
 /// # Errors
 ///
 /// Returns the diagnostics of the first stage that fails: one for a lexical,
-/// syntax or runtime error, and every type error found by the checker.
-pub fn run(source: &SourceFile) -> Result<Value, Vec<Diagnostic>> {
+/// syntax or runtime error, and every type error found by the checker. Any
+/// warnings found before the failure are among them, all in source order.
+pub fn run(source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
     let (tokens, names, strings) = lexer::tokenize(source).map_err(|error| vec![error])?;
     let ast = parser::parse(&tokens, names, strings, source).map_err(|error| vec![error])?;
-    let checked = check::check(&ast)?;
-    let ir = lower::lower(&ast, &checked).map_err(|error| vec![error.into()])?;
-    eval::eval(&ir).map_err(|error| vec![error])
+    let mut types = TypeTable::new();
+    let (checked, warnings) = check::check(&ast, &mut types)?;
+    let value = lower::lower(&ast, &checked, &types)
+        .map_err(Diagnostic::from)
+        .and_then(|ir| eval::eval(&ir));
+    match value {
+        Ok(value) => Ok(Outcome { value, warnings }),
+        Err(error) => Err(diagnostic::merge(vec![error], warnings)),
+    }
 }

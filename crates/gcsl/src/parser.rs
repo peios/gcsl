@@ -5,15 +5,35 @@
 //! A file, like the inside of a block `{ ... }`, is a *body*: a sequence of
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
-//! `let NAME (: TYPE)? = EXPR`, `NAME := EXPR`, `= EXPR` or an expression.
-//! After an item the next token must be a separator or the end of the body;
-//! anything else is "expected end of item".
+//! `let NAME (: TYPE)? = EXPR`, `NAME := EXPR`, a field `NAME = EXPR` or
+//! `"quoted name" = EXPR`, `= EXPR` or an expression. An item is a field
+//! when it starts with an identifier or a plain string literal and the next
+//! token is `=`, and a rebind when it starts with an identifier and the next
+//! token is `:=`. After an item the next token must be a separator or the
+//! end of the body; anything else is "expected end of item".
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription), and
 //! after `=`, `:=` and `let`. There the parser skips newlines before going
 //! on. Inside parentheses and interpolations the lexer emits no newlines at
 //! all, so an expression there may span lines freely.
+//!
+//! # Names
+//!
+//! A field's name, where it is declared, accessed or written in a record
+//! type, may be an identifier or a plain string literal: one without the
+//! `r` prefix or interpolations, whose text the parser interns into the
+//! [`Names`] like an identifier, so `"x"` and `x` are the same name. A raw
+//! or interpolated literal there is an error. A variable's name must be an
+//! identifier.
+//!
+//! # Types
+//!
+//! A type is a name, such as `Int`, or a record type: `{` then `}`, or
+//! `NAME: TYPE` entries separated by `,`, with an optional trailing `,`,
+//! then `}`. The lexer does not know it is in a type, so it emits the
+//! newlines inside the braces, and the parser skips them all: a record type
+//! may span lines freely. Repeated field names are left to the checker.
 //!
 //! The one place a newline does not end an item even though the expression
 //! before it could be complete is after the block of an `if`: an `else` may
@@ -47,6 +67,7 @@
 //! | `*` `/` `//` `%`            | 9       | 10                         |
 //! | postfix `:` TYPE            | 11      | (none: parses a type)      |
 //! | prefix `-`                  | (none)  | operand parsed with min 13 |
+//! | postfix `.` NAME            | 15      | (none: takes a name)       |
 //!
 //! A tighter operator has higher powers, so in `1 + 2 * 3` the recursive
 //! call for the right-hand side of `+` (minimum 8) still accepts `*` (left
@@ -71,6 +92,12 @@
 //! tighter than every binary operator, so `1 + 2 : Float` is
 //! `1 + (2 : Float)`, and looser than negation, whose operand is parsed with
 //! minimum 13, so `-5 : Float` is `(-5) : Float`. It chains left to right.
+//!
+//! Field access `EXPR.NAME` is a postfix operator too, binding tighter than
+//! everything: its left power 15 is above every minimum, so a `.` always
+//! applies to the operand just parsed. `-a.b` is `-(a.b)`, `a.b : Int` is
+//! `(a.b) : Int`, and `a.b.c` is `(a.b).c`. The parser does not skip
+//! newlines around `.`, so a `.` starting a line is not a continuation.
 //!
 //! Negation is its own token, [`TokenKind::Neg`], distinct from subtraction's
 //! [`TokenKind::Minus`]; the lexer tells them apart by spacing. `Neg` is only
@@ -99,25 +126,28 @@
 //! diagnostics.
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
-//! two ways. Parentheses, prefix operators, blocks, `if`s and interpolations
-//! nest by recursion, so [`Parser::parse_expr`], the body of every nested
-//! block and every `else if` count their own depth and stop before the
-//! recursion itself could overflow. Left-associative chains such as
-//! `1 + 1 + 1` nest without recursion, since the loop folds each operator
-//! into the left-hand side, so the parser also tracks the height of every
-//! node it allocates, a block being one above the tallest of its items'
-//! expressions and an `if` or an interpolation one above its tallest child,
-//! and rejects a node that would exceed the limit. Together these guarantee
+//! two ways. Parentheses, prefix operators, blocks, `if`s, interpolations
+//! and record types nest by recursion, so [`Parser::parse_expr`], the body
+//! of every nested block, every `else if` and every record type count their
+//! own depth and stop before the recursion itself could overflow.
+//! Left-associative chains such as `1 + 1 + 1` or `a.b.c` nest without
+//! recursion, since the loop folds each operator into the left-hand side, so
+//! the parser also tracks the height of every node it allocates, a block
+//! being one above the tallest of its items' expressions and types, an `if`
+//! or an interpolation one above its tallest child, a field access one above
+//! its record, and an ascription one above the taller of its expression and
+//! its type (a record type being one above its tallest field type), and
+//! rejects a node that would exceed the limit. Together these guarantee
 //! that no tree handed to a later stage is deeper than `MAX_DEPTH`.
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, Item, ItemId, ItemKind, ItemRange, StrPart,
-    TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, FieldTy, Item, ItemId, ItemKind, ItemRange,
+    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
-use crate::names::Names;
+use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span};
 use crate::strings::{StrId, Strings};
 
@@ -133,8 +163,16 @@ const PREFIX_BP: u8 = 13;
 /// binary operator, looser than prefix `-`.
 const ASCRIBE_BP: u8 = 11;
 
-/// Height of a leaf node.
+/// Left binding power of postfix `.` (field access): tighter than
+/// everything, prefix `-` included.
+const FIELD_BP: u8 = 15;
+
+/// Height of a leaf node, and of a type written as a name.
 const LEAF_HEIGHT: u32 = 1;
+
+/// The error for a raw or interpolated string literal where a field name is
+/// expected.
+const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
 
 /// Parses `tokens`, lexed from `source` with its names interned into
 /// `names` and its string literals' text stored in `strings`, as a file: a
@@ -149,34 +187,42 @@ const LEAF_HEIGHT: u32 = 1;
 /// Returns the first syntax error.
 pub fn parse(
     tokens: &[Token],
-    names: Names,
+    mut names: Names,
     strings: Strings,
     source: &SourceFile,
 ) -> Result<Ast, Diagnostic> {
-    let (builder, root) = parse_parts(tokens, source)?;
+    let (builder, root) = parse_parts(tokens, source, &mut names, &strings)?;
     Ok(builder.finish(root, names, strings))
 }
 
 /// Like [`parse`], returning the unfinished arenas and the file's body
-/// instead of an [`Ast`], so that a caller lending its [`Names`] only hands
-/// them over once parsing has succeeded.
+/// instead of an [`Ast`], and borrowing the tables rather than taking them,
+/// so that a caller lending its [`Names`] only hands them over once parsing
+/// has succeeded. The text of every quoted field name is interned into
+/// `names`; on error, names met before the error remain interned.
 pub(crate) fn parse_parts(
     tokens: &[Token],
     source: &SourceFile,
+    names: &mut Names,
+    strings: &Strings,
 ) -> Result<(AstBuilder, ItemRange), Diagnostic> {
     let mut parser = Parser {
         tokens,
         pos: 0,
         source,
+        names,
+        strings,
         // There are never more nodes than tokens, so these never
         // reallocate: every node consumes a token of its own except the
         // empty else block of an `if` without `else`, and that `if`'s own
-        // block consumes two tokens, `{` and `}`, for one node.
+        // block consumes two tokens, `{` and `}`, for one node. (A field
+        // access consumes two, `.` and the name.)
         builder: AstBuilder::with_capacity(tokens.len()),
         heights: Vec::with_capacity(tokens.len()),
         depth: 0,
         item_stack: Vec::new(),
         part_stack: Vec::new(),
+        field_ty_stack: Vec::new(),
         diagnostics: Vec::new(),
     };
     match parser.parse_body(None) {
@@ -201,6 +247,10 @@ struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     source: &'a SourceFile,
+    /// Where quoted field names are interned.
+    names: &'a mut Names,
+    /// The text of the string literals, for quoted field names.
+    strings: &'a Strings,
     builder: AstBuilder,
     /// The height of each allocated expression node, indexed like the
     /// builder's arena: 1 for a leaf, one more than the tallest child
@@ -218,6 +268,10 @@ struct Parser<'a> {
     /// moved to the builder's part pool as each string ends, as for
     /// `item_stack`.
     part_stack: Vec<StrPart>,
+    /// The fields of the record types being parsed, innermost last, moved
+    /// to the builder's field-type pool as each type ends, as for
+    /// `item_stack`.
+    field_ty_stack: Vec<FieldTy>,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -258,22 +312,38 @@ impl Parser<'_> {
         Ok((range, height))
     }
 
-    /// Parses one item. Returns it and the height of its expression.
+    /// Parses one item. Returns it and its height: its expression's, or
+    /// its annotation's if that is taller.
     fn parse_item(&mut self) -> ParseResult<(ItemId, u32)> {
         let token = self.peek();
+        let next = self.peek_at(1).kind;
+        let mut ty_height = 0;
         let (kind, value) = match token.kind {
             TokenKind::Let => {
                 self.advance();
                 self.skip_newlines();
                 let name_token = self.peek();
-                let TokenKind::Ident(name) = name_token.kind else {
-                    return Err(self.error("expected a name after `let`", name_token.span));
+                let name = match name_token.kind {
+                    TokenKind::Ident(name) => name,
+                    TokenKind::Str(_) => {
+                        return Err(self.error("variables need plain names", name_token.span));
+                    }
+                    TokenKind::StrStart(first) => {
+                        let literal = self.parse_interpolation(first)?;
+                        let span = self.span_of(literal);
+                        return Err(self.error("variables need plain names", span));
+                    }
+                    _ => {
+                        return Err(self.error("expected a name after `let`", name_token.span));
+                    }
                 };
                 self.advance();
                 let ty = if self.peek().kind == TokenKind::Colon {
                     self.advance();
                     self.skip_newlines();
-                    Some(self.parse_type()?)
+                    let (ty, height) = self.parse_type()?;
+                    ty_height = height;
+                    Some(ty)
                 } else {
                     None
                 };
@@ -292,7 +362,7 @@ impl Parser<'_> {
                 };
                 (kind, value)
             }
-            TokenKind::Ident(name) if self.peek_at(1).kind == TokenKind::ColonEq => {
+            TokenKind::Ident(name) if next == TokenKind::ColonEq => {
                 self.advance();
                 self.advance();
                 self.skip_newlines();
@@ -304,6 +374,11 @@ impl Parser<'_> {
                 };
                 (kind, value)
             }
+            TokenKind::Ident(name) if next == TokenKind::Eq => self.parse_field(name, token)?,
+            TokenKind::Str(text) if next == TokenKind::Eq => {
+                let name = self.quoted_name(token, text)?;
+                self.parse_field(name, token)?
+            }
             TokenKind::Eq => {
                 self.advance();
                 self.skip_newlines();
@@ -312,12 +387,63 @@ impl Parser<'_> {
             }
             _ => {
                 let value = self.parse_expr(0)?;
+                // `"a{x}" = 1`: an interpolated literal as a field name.
+                if self.peek().kind == TokenKind::Eq
+                    && matches!(self.builder.get(value).kind, ExprKind::Interp(_))
+                {
+                    let span = self.span_of(value);
+                    return Err(self.error(PLAIN_FIELD_NAME, span));
+                }
                 (ItemKind::Expr(value), value)
             }
         };
         let span = Span::join(token.span, self.span_of(value));
         let item = self.builder.alloc_item(Item { kind, span });
-        Ok((item, self.height_of(value)))
+        Ok((item, self.height_of(value).max(ty_height)))
+    }
+
+    /// Parses a field item named `name`, starting at its name, `token`,
+    /// which the `=` follows. Returns the item's kind and its value.
+    fn parse_field(&mut self, name: Name, token: Token) -> ParseResult<(ItemKind, ExprId)> {
+        self.advance();
+        self.advance();
+        self.skip_newlines();
+        let value = self.parse_expr(0)?;
+        let kind = ItemKind::Field {
+            name,
+            name_span: token.span,
+            value,
+        };
+        Ok((kind, value))
+    }
+
+    /// The name a plain string literal `token`, of text `text`, gives a
+    /// field: its text, interned. A raw literal is an error.
+    fn quoted_name(&mut self, token: Token, text: StrId) -> ParseResult<Name> {
+        if self.source.slice(token.span).starts_with('r') {
+            return Err(self.error(PLAIN_FIELD_NAME, token.span));
+        }
+        Ok(self.names.intern(self.strings.get(text)))
+    }
+
+    /// Parses the name of a field after `.` or in a record type, the
+    /// current token: an identifier or a plain string literal. Returns
+    /// `None`, having consumed nothing, if the token is neither; a raw or
+    /// interpolated literal is an error.
+    fn field_name(&mut self) -> ParseResult<Option<Name>> {
+        let token = self.peek();
+        let name = match token.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(text) => self.quoted_name(token, text)?,
+            TokenKind::StrStart(first) => {
+                let literal = self.parse_interpolation(first)?;
+                let span = self.span_of(literal);
+                return Err(self.error(PLAIN_FIELD_NAME, span));
+            }
+            _ => return Ok(None),
+        };
+        self.advance();
+        Ok(Some(name))
     }
 
     /// Checks that the item just parsed is followed by a separator or the
@@ -344,17 +470,81 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses a type expression: a name.
-    fn parse_type(&mut self) -> ParseResult<TypeExprId> {
+    /// Parses a type expression: a name or a record type. Returns it and
+    /// its height: 1 for a name, and one more than its tallest field's type
+    /// for a record type.
+    fn parse_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let token = self.peek();
-        let TokenKind::Ident(name) = token.kind else {
-            return Err(self.error("expected a type", error_span(token)));
-        };
+        match token.kind {
+            TokenKind::Ident(name) => {
+                self.advance();
+                let id = self.builder.alloc_type(TypeExpr {
+                    kind: TypeExprKind::Named(name),
+                    span: token.span,
+                });
+                Ok((id, LEAF_HEIGHT))
+            }
+            // Record types nest by recursion, so they count their depth.
+            TokenKind::LBrace => {
+                self.enter()?;
+                let record = self.parse_record_type();
+                self.depth -= 1;
+                record
+            }
+            _ => Err(self.error("expected a type", error_span(token))),
+        }
+    }
+
+    /// Parses a record type, starting at its `{`. Newlines anywhere inside
+    /// are skipped.
+    fn parse_record_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let open = self.peek();
         self.advance();
-        Ok(self.builder.alloc_type(TypeExpr {
-            kind: TypeExprKind::Named(name),
-            span: token.span,
-        }))
+        let base = self.field_ty_stack.len();
+        let mut tallest = 0;
+        let close = loop {
+            self.skip_newlines();
+            let token = self.peek();
+            if token.kind == TokenKind::RBrace {
+                self.advance();
+                break token;
+            }
+            let Some(name) = self.field_name()? else {
+                return Err(self.error("expected a field name in record type", error_span(token)));
+            };
+            self.skip_newlines();
+            let colon = self.peek();
+            if colon.kind != TokenKind::Colon {
+                return Err(self.error("expected `:` after field name", error_span(colon)));
+            }
+            self.advance();
+            self.skip_newlines();
+            let (ty, height) = self.parse_type()?;
+            tallest = tallest.max(height);
+            self.field_ty_stack.push(FieldTy {
+                name,
+                span: token.span,
+                ty,
+            });
+            self.skip_newlines();
+            let separator = self.peek();
+            match separator.kind {
+                // A `}` after it ends the type at the top of the loop.
+                TokenKind::Comma => self.advance(),
+                TokenKind::RBrace => {
+                    self.advance();
+                    break separator;
+                }
+                _ => return Err(self.error("expected `,` or `}`", error_span(separator))),
+            }
+        };
+        let fields = self.builder.push_field_tys(&self.field_ty_stack[base..]);
+        self.field_ty_stack.truncate(base);
+        let id = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Record(fields),
+            span: Span::join(open.span, close.span),
+        });
+        Ok((id, tallest + 1))
     }
 
     /// Parses an expression whose binary operators all have a left binding
@@ -382,15 +572,31 @@ impl Parser<'_> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let token = self.peek();
+            if token.kind == TokenKind::Dot {
+                if FIELD_BP < min_bp {
+                    break;
+                }
+                self.advance();
+                let name_token = self.peek();
+                let Some(name) = self.field_name()? else {
+                    return Err(
+                        self.error("expected a field name after `.`", error_span(name_token))
+                    );
+                };
+                let span = Span::join(self.span_of(lhs), name_token.span);
+                let height = self.height_of(lhs) + 1;
+                lhs = self.alloc(ExprKind::Field { expr: lhs, name }, span, height)?;
+                continue;
+            }
             if token.kind == TokenKind::Colon {
                 if ASCRIBE_BP < min_bp {
                     break;
                 }
                 self.advance();
                 self.skip_newlines();
-                let ty = self.parse_type()?;
+                let (ty, ty_height) = self.parse_type()?;
                 let span = Span::join(self.span_of(lhs), self.type_span(ty));
-                let height = self.height_of(lhs) + 1;
+                let height = self.height_of(lhs).max(ty_height) + 1;
                 lhs = self.alloc(ExprKind::Ascribe { expr: lhs, ty }, span, height)?;
                 continue;
             }
@@ -434,7 +640,8 @@ impl Parser<'_> {
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
-    /// block, an `if` or a prefix operator application.
+    /// block, an `if` or a prefix operator application. Postfix operators,
+    /// `.` included, are applied by the caller's loop.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
         let token = self.peek();
         let kind = match token.kind {
@@ -495,6 +702,8 @@ impl Parser<'_> {
             | TokenKind::StrMid(_)
             | TokenKind::StrEnd(_)
             | TokenKind::Semi
+            | TokenKind::Dot
+            | TokenKind::Comma
             | TokenKind::Newline
             | TokenKind::Eof => {
                 let found = self.describe(token);
@@ -775,6 +984,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::LBrace
         | TokenKind::RBrace
         | TokenKind::Semi
+        | TokenKind::Dot
+        | TokenKind::Comma
         | TokenKind::Newline
         | TokenKind::Eof => None,
     }
@@ -812,6 +1023,7 @@ mod tests {
     use super::*;
     use crate::ast::ItemKind;
     use crate::lexer::tokenize;
+    use crate::strings::FieldName;
 
     fn parse_text(text: &str) -> Result<Ast, Diagnostic> {
         let source = SourceFile::new("test.gcsl", text).unwrap();
@@ -822,8 +1034,10 @@ mod tests {
     /// Renders a file compactly, making grouping explicit: items are joined
     /// by `; `, binary operations and prefix operations are parenthesised,
     /// parens show as `[ ]`, blocks as `{ }`, ascriptions as `(e : T)`,
-    /// strings as `"text"` with interpolations as `<e>`, and an `if` as
-    /// `(if c {..} else ..)`, or `(if c {..})` without `else`.
+    /// field accesses as `(e . x)`, fields as `x = e`, strings as `"text"`
+    /// with interpolations as `<e>`, and an `if` as `(if c {..} else ..)`,
+    /// or `(if c {..})` without `else`. Record types show as
+    /// `{x: T, "a b": T}`.
     fn shape(text: &str) -> String {
         let ast = parse_text(text).unwrap();
         let mut out = String::new();
@@ -854,6 +1068,11 @@ mod tests {
                     out.push_str(" := ");
                     expr(ast, value, out);
                 }
+                ItemKind::Field { name, value, .. } => {
+                    out.push_str(&FieldName(ast.names().get(name)).to_string());
+                    out.push_str(" = ");
+                    expr(ast, value, out);
+                }
                 ItemKind::Result(value) => {
                     out.push_str("= ");
                     expr(ast, value, out);
@@ -866,6 +1085,18 @@ mod tests {
     fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         match ast.type_expr(id).kind {
             TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
+            TypeExprKind::Record(fields) => {
+                out.push('{');
+                for (index, field) in ast.field_tys(fields).iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&FieldName(ast.names().get(field.name)).to_string());
+                    out.push_str(": ");
+                    type_name(ast, field.ty, out);
+                }
+                out.push('}');
+            }
         }
     }
 
@@ -948,6 +1179,13 @@ mod tests {
                 expr(ast, inner, out);
                 out.push_str(" : ");
                 type_name(ast, ty, out);
+                out.push(')');
+            }
+            ExprKind::Field { expr: inner, name } => {
+                out.push('(');
+                expr(ast, inner, out);
+                out.push_str(" . ");
+                out.push_str(&FieldName(ast.names().get(name)).to_string());
                 out.push(')');
             }
         }
@@ -1151,11 +1389,19 @@ mod tests {
 
     #[test]
     fn eq_is_only_accepted_at_the_start_of_an_item() {
+        // Or after a field's name.
         assert_eq!(
-            error("x = 1"),
+            error("(x) = 1"),
             (
                 "expected end of item, found `=`".to_owned(),
-                Span::new(2, 3)
+                Span::new(4, 5)
+            )
+        );
+        assert_eq!(
+            error("x + 1 = 1"),
+            (
+                "expected end of item, found `=`".to_owned(),
+                Span::new(6, 7)
             )
         );
         assert_eq!(
@@ -1948,6 +2194,282 @@ mod tests {
             panic!("expected an expression part");
         };
         assert!(matches!(ast.get(inner).kind, ExprKind::Interp(_)));
+    }
+
+    #[test]
+    fn field_items_with_plain_and_quoted_names() {
+        assert_eq!(shape("x = 1"), "x = 1");
+        assert_eq!(shape("{ x = 1; y = x + 1 }"), "{x = 1; y = (x + 1)}");
+        assert_eq!(
+            shape("\"a b\" = 1\n\"\"\"c\"\"\" = 2"),
+            "\"a b\" = 1; c = 2"
+        );
+        assert_eq!(shape("x =\n  1"), "x = 1");
+        assert_eq!(shape("hello-world = { n = 1 }"), "hello-world = {n = 1}");
+        // A quoted name is interned like an identifier: `"x"` is `x`.
+        let ast = parse_text("\"x\" = 1; x = 2").unwrap();
+        let names: Vec<Name> = ast
+            .items(ast.root())
+            .iter()
+            .map(|&id| match ast.item(id).kind {
+                ItemKind::Field { name, .. } => name,
+                other => panic!("expected a field, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names[0], names[1]);
+        assert_eq!(ast.names().get(names[0]), "x");
+        // Spans: the item from the name, which includes its quotes.
+        let ast = parse_text("\"a b\" = 1 + 2").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(0, 13));
+        let ItemKind::Field { name_span, .. } = item.kind else {
+            panic!("expected a field");
+        };
+        assert_eq!(name_span, Span::new(0, 5));
+        // `==` is a comparison, not a field.
+        assert_eq!(shape("x == 1"), "(x == 1)");
+        assert_eq!(shape("\"a\" == \"b\""), "(\"a\" == \"b\")");
+    }
+
+    #[test]
+    fn field_names_must_be_plain() {
+        assert_eq!(
+            error("r\"a\" = 1"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(0, 4))
+        );
+        assert_eq!(
+            error("\"a{x}\" = 1"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(0, 6))
+        );
+        assert_eq!(
+            error("a.r\"b\""),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(2, 6))
+        );
+        assert_eq!(
+            error("a.\"{x}\""),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(2, 7))
+        );
+        assert_eq!(
+            error("1 : {r\"a\": Int}"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(5, 9))
+        );
+        assert_eq!(
+            error("1 : {\"{x}\": Int}"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(5, 10))
+        );
+        // An interpolated literal is fine where an expression is.
+        assert_eq!(shape("\"a{x}\" == 1"), "(\"a<x>\" == 1)");
+    }
+
+    #[test]
+    fn variables_need_plain_names() {
+        let message = "variables need plain names".to_owned();
+        assert_eq!(error("let \"x\" = 1"), (message.clone(), Span::new(4, 7)));
+        assert_eq!(error("let r\"x\" = 1"), (message.clone(), Span::new(4, 8)));
+        assert_eq!(error("let \"{y}\" = 1"), (message, Span::new(4, 9)));
+        // A quoted name is never a variable, so `:=` does not follow one.
+        assert_eq!(
+            error("\"x\" := 1"),
+            (
+                "expected end of item, found `:=`".to_owned(),
+                Span::new(4, 6)
+            )
+        );
+    }
+
+    #[test]
+    fn field_access_binds_tighter_than_everything() {
+        assert_eq!(shape("a.b"), "(a . b)");
+        assert_eq!(shape("-a.b"), "(-(a . b))");
+        assert_eq!(shape("a.b.c"), "((a . b) . c)");
+        assert_eq!(shape("a.b : Int"), "((a . b) : Int)");
+        assert_eq!(shape("a.b + c.d"), "((a . b) + (c . d))");
+        assert_eq!(shape("a.b == c.d"), "((a . b) == (c . d))");
+        assert_eq!(shape("not a.b"), "(not (a . b))");
+        assert_eq!(shape("a.\"b c\".d"), "((a . \"b c\") . d)");
+        assert_eq!(shape("a . b"), "(a . b)");
+        assert_eq!(shape("(a).b"), "([a] . b)");
+        assert_eq!(shape("{ x = 1 }.x"), "({x = 1} . x)");
+        assert_eq!(shape("1.x"), "(1 . x)");
+        assert_eq!(shape("\"s\".x"), "(\"s\" . x)");
+        assert_eq!(shape("a.\"x\""), "(a . x)");
+        assert_eq!(shape("a.b * 2 - c.d.e"), "(((a . b) * 2) - ((c . d) . e))");
+        // Spans: the node covers its record through its name.
+        let ast = parse_text("-ab.\"c d\"").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let ExprKind::Unary { operand, .. } = ast.get(root).kind else {
+            panic!("expected a negation");
+        };
+        let access = ast.get(operand);
+        assert_eq!(access.span, Span::new(1, 9));
+        assert_eq!(access.member_span(&ast), Some(Span::new(3, 9)));
+        assert_eq!(ast.get(root).member_span(&ast), None);
+    }
+
+    #[test]
+    fn field_access_errors() {
+        let message = "expected a field name after `.`".to_owned();
+        assert_eq!(error("x.1"), (message.clone(), Span::new(2, 3)));
+        assert_eq!(error("x.1.5"), (message.clone(), Span::new(2, 5)));
+        assert_eq!(error("x."), (message.clone(), Span::new(2, 2)));
+        assert_eq!(error("x.let"), (message.clone(), Span::new(2, 5)));
+        assert_eq!(error("x.(y)"), (message.clone(), Span::new(2, 3)));
+        // Newlines are not skipped around `.`.
+        assert_eq!(error("x.\ny"), (message, Span::new(2, 3)));
+        assert_eq!(
+            error("x\n.y"),
+            ("expected expression, found `.`".to_owned(), Span::new(2, 3))
+        );
+    }
+
+    #[test]
+    fn record_types() {
+        assert_eq!(
+            shape("let p: {x: Int, y: Int} = 1"),
+            "let p: {x: Int, y: Int} = 1"
+        );
+        assert_eq!(shape("1 : {}"), "(1 : {})");
+        assert_eq!(
+            shape("1 : { \"a b\": String, nested: {n: Int}, }"),
+            "(1 : {\"a b\": String, nested: {n: Int}})"
+        );
+        // Newlines anywhere inside the braces.
+        assert_eq!(
+            shape("let p: {\n  x:\n    Int\n  ,\n  y: {\n}\n\n} = 1"),
+            "let p: {x: Int, y: {}} = 1"
+        );
+        // Repeated names are the checker's business.
+        assert_eq!(shape("1 : {x: Int, x: Int}"), "(1 : {x: Int, x: Int})");
+        // A record type ends an ascription as a name does.
+        assert_eq!(shape("x : {a: Int} + 1"), "((x : {a: Int}) + 1)");
+        let ast = parse_text("1 : {a: Int, \"b\": {}}").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let ExprKind::Ascribe { ty, .. } = ast.get(root).kind else {
+            panic!("expected an ascription");
+        };
+        let ty = ast.type_expr(ty);
+        assert_eq!(ty.span, Span::new(4, 21));
+        let TypeExprKind::Record(fields) = ty.kind else {
+            panic!("expected a record type");
+        };
+        let fields = ast.field_tys(fields);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].span, Span::new(5, 6));
+        assert_eq!(fields[1].span, Span::new(13, 16));
+        assert_eq!(ast.names().get(fields[1].name), "b");
+        assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(18, 20));
+    }
+
+    #[test]
+    fn record_type_errors() {
+        assert_eq!(
+            error("1 : {1: Int}"),
+            (
+                "expected a field name in record type".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("1 : {x: Int,,}"),
+            (
+                "expected a field name in record type".to_owned(),
+                Span::new(12, 13)
+            )
+        );
+        assert_eq!(
+            error("1 : {,}"),
+            (
+                "expected a field name in record type".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("1 : {x Int}"),
+            ("expected `:` after field name".to_owned(), Span::new(7, 10))
+        );
+        assert_eq!(
+            error("1 : {x := Int}"),
+            ("expected `:` after field name".to_owned(), Span::new(7, 9))
+        );
+        assert_eq!(
+            error("1 : {x: Int y: Int}"),
+            ("expected `,` or `}`".to_owned(), Span::new(12, 13))
+        );
+        assert_eq!(
+            error("1 : {x: Int"),
+            ("expected `,` or `}`".to_owned(), Span::new(11, 11))
+        );
+        assert_eq!(
+            error("1 : {x: }"),
+            ("expected a type".to_owned(), Span::new(8, 9))
+        );
+        assert_eq!(
+            error("1 : {"),
+            (
+                "expected a field name in record type".to_owned(),
+                Span::new(5, 5)
+            )
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_records() {
+        let text = "let p: {x: Int, \"a b\": {}} = { x = 1; \"a b\" = {} }\n-p.x";
+        let ast = parse_text(text).unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let p : {x: Int, \"a b\": {}} @0..50\n\
+             \x20   (block @29..50\n\
+             \x20     (field x @31..36\n\
+             \x20       (int 1 @35..36))\n\
+             \x20     (field \"a b\" @38..48\n\
+             \x20       (block @46..48))))\n\
+             \x20 (expr @51..55\n\
+             \x20   (neg @51..55\n\
+             \x20     (. x @52..55\n\
+             \x20       (name p @52..53)))))"
+        );
+    }
+
+    #[test]
+    fn field_chains_and_record_types_count_towards_depth() {
+        // A chain of N accesses is N + 1 levels: each is one above its
+        // record. This nests without recursion in the parser.
+        let chain = |accesses: usize| format!("a{}", ".b".repeat(accesses));
+        let deepest = chain(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(chain(MAX_DEPTH));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        // An ascription is one above the taller of its expression and its
+        // type, and a record type one above its tallest field type: N
+        // nested record types are N + 1 levels.
+        let nested =
+            |levels: usize| format!("1 : {}Int{}", "{a: ".repeat(levels), "}".repeat(levels));
+        let deepest = nested(MAX_DEPTH - 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(nested(MAX_DEPTH - 1));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        // Far beyond the limit, record types are stopped by the recursion
+        // count before they could overflow.
+        let diagnostic = too_deep(nested(200_000));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        // In an annotation, the type counts towards its block's height.
+        let annotated = |levels: usize| {
+            format!(
+                "{{ let x: {}Int{} = 1 }}",
+                "{a: ".repeat(levels),
+                "}".repeat(levels)
+            )
+        };
+        let deepest = annotated(MAX_DEPTH - 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(annotated(MAX_DEPTH - 1));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
     }
 
     #[test]

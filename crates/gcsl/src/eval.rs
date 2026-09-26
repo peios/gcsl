@@ -1,18 +1,27 @@
 //! The evaluator: a recursive walk over [`Ir`].
 //!
-//! There is one walker per result type with an unboxed representation:
+//! There is one walker per kind of value (see [`crate::value::ValueKind`]):
 //! `Evaluator::int`, `Evaluator::float`, `Evaluator::bool` and
 //! `Evaluator::string`, returning an `i64`, an `f64`, a `bool` and an
-//! `Rc<str>`. Every IR node states its type, so the walker for a node is
-//! always known from its parent and no runtime value is ever inspected to
-//! choose an operation. Each typed walker handles the nodes of its type and
-//! also loads, blocks and `if`s, which can have any type: an `if` evaluates
-//! its condition through `bool` and then exactly one branch through the
-//! walker it was called with. A general walker, `Evaluator::value`, handles
-//! every node, and hands the typed nodes to the typed walkers, building a
-//! [`Value`] only where a value of statically unknown type is needed: at
-//! the root, in a slot, as an interpolated value, or as a block's result
-//! evaluated through `value`.
+//! `Rc<str>`, and `Evaluator::record`, returning a [`Value`] that is
+//! [`Value::Empty`] or [`Value::Record`], since both are records. Every IR
+//! node states its kind, so the walker for a node is always known from its
+//! parent and no runtime value is ever inspected to choose an operation.
+//! Each typed walker handles the nodes of its kind and also loads, blocks,
+//! `if`s and field accesses, which can be of any kind: an `if` evaluates its
+//! condition through `bool` and then exactly one branch through the walker
+//! it was called with, and a field access evaluates its record through
+//! `record` and extracts the field's value. A general walker,
+//! `Evaluator::value`, handles every node, and hands the typed nodes to the
+//! typed walkers, building a [`Value`] only where a value of statically
+//! unknown kind is needed: at the root, in a slot, in a record, as an
+//! interpolated value, or as a block's result evaluated through `value`.
+//!
+//! A record is built from its record block's shared [`crate::value::Layout`]
+//! and its field values in layout order, the one allocation for the values
+//! and one for the reference-counted record. The empty record is unboxed,
+//! so the statements that produce it allocate nothing. Reading a field finds
+//! it by comparing interned names against the layout's.
 //!
 //! `and` and `or` short-circuit: the right operand is evaluated only when
 //! the left does not decide the result. A string constant is a reference
@@ -33,7 +42,8 @@
 //! Operands are evaluated left to right, so when both would fail, the left
 //! one's error is reported. Items are evaluated in order. Evaluation holds
 //! no per-node state and allocates nothing beyond the frame, except the
-//! strings the program builds and the diagnostic when it fails. A runtime
+//! strings and records the program builds and the diagnostic when it
+//! fails. A runtime
 //! error points at the operator and labels each operand with the value it
 //! had, so the user sees what actually overflowed or divided by zero.
 
@@ -43,9 +53,10 @@ use std::rc::Rc;
 
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Cmp, Ir, IrId, IrKind, IrNode, IrRange, Operands};
+use crate::ir::{Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, Operands};
+use crate::names::Name;
 use crate::source::Span;
-use crate::value::{Value, int_to_float};
+use crate::value::{Record, Value, int_to_float};
 
 /// The room an interpolation reserves for each interpolated value's text,
 /// on top of its literal pieces' lengths.
@@ -60,8 +71,8 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 /// "division by zero" for `//` or `%` by zero. `Float` arithmetic never
 /// fails.
 pub fn eval(ir: &Ir) -> Result<Value, Diagnostic> {
-    // The one allocation of an evaluation.
-    let mut frame = vec![Value::Unit; ir.frame_size() as usize];
+    // The one allocation of an evaluation, besides the values it builds.
+    let mut frame = vec![Value::Empty; ir.frame_size() as usize];
     eval_in(ir, &mut frame)
 }
 
@@ -89,8 +100,8 @@ struct Evaluator<'a> {
     frame: &'a mut [Value],
 }
 
-// The walkers `value`, `int`, `float`, `bool` and `string` are the
-// recursion of evaluation: an expression nested N deep puts about N of
+// The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
+// the recursion of evaluation: an expression nested N deep puts about N of
 // their frames on the stack. Each is therefore only a dispatcher. The work
 // of each operator is in a helper of its own, and every error is returned
 // by a call in tail position, so a walker's frame does not hold the
@@ -98,11 +109,11 @@ struct Evaluator<'a> {
 // a stack slot of its own, which would make the walkers' frames several
 // kilobytes and `crate::STACK_SIZE` too small at `crate::MAX_DEPTH`.
 impl Evaluator<'_> {
-    /// Evaluates a node of any type.
+    /// Evaluates a node of any kind.
     fn value(&mut self, id: IrId) -> Result<Value, Diagnostic> {
         let node = self.ir.get(id);
         match node.kind {
-            IrKind::Unit => Ok(Value::Unit),
+            IrKind::Empty => Ok(Value::Empty),
             IrKind::Load(slot, _) => self.load(slot, node).cloned(),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
@@ -113,6 +124,8 @@ impl Evaluator<'_> {
                 let branch = self.branch(cond, then, else_)?;
                 self.value(branch)
             }
+            IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
+            IrKind::Field { record, name, .. } => self.field(record, name, node),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -132,7 +145,7 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::UnitEq(..)
+            | IrKind::RecordEq(..)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
@@ -165,7 +178,49 @@ impl Evaluator<'_> {
             .get_mut(slot.index())
             .ok_or_else(|| internal("store to a slot outside the frame", node.span))?;
         *target = value;
-        Ok(Value::Unit)
+        Ok(Value::Empty)
+    }
+
+    /// Builds a record of the values of `values`, in the order of `layout`'s
+    /// names: the one allocation for its values, sized exactly, and one for
+    /// the record, which shares the layout.
+    fn make_record(&mut self, layout: LayoutId, values: IrRange) -> Result<Value, Diagnostic> {
+        let items = self.ir.items(values);
+        let mut fields = Vec::with_capacity(items.len());
+        for &item in items {
+            fields.push(self.value(item)?);
+        }
+        Ok(Value::Record(Rc::new(Record {
+            layout: Rc::clone(self.ir.layout(layout)),
+            values: fields.into_boxed_slice(),
+        })))
+    }
+
+    /// Evaluates `record` and returns its field `name`, for the `Field`
+    /// `node`. The checker guarantees the field is there, so a missing
+    /// one, or an empty record, is an internal error.
+    fn field(&mut self, record: IrId, name: Name, node: &IrNode) -> Result<Value, Diagnostic> {
+        match self.record(record)? {
+            Value::Record(fields) => match fields.get(name) {
+                Some(value) => Ok(value.clone()),
+                None => mistyped(node, "a record lacks a field the checker found"),
+            },
+            _ => mistyped(node, "a field of the empty record"),
+        }
+    }
+
+    /// Evaluates the `Field` `node`, reading field `name` of `record`, as a
+    /// value that `extract` accepts: a field of the kind the node states.
+    fn field_as<T>(
+        &mut self,
+        (record, name): (IrId, Name),
+        node: &IrNode,
+        extract: fn(Value) -> Option<T>,
+    ) -> Result<T, Diagnostic> {
+        match extract(self.field(record, name, node)?) {
+            Some(value) => Ok(value),
+            None => mistyped(node, "a field holds a value of another kind than its node"),
+        }
     }
 
     /// The value in `slot`.
@@ -197,6 +252,12 @@ impl Evaluator<'_> {
             IrKind::IntRem(operands) => {
                 self.int_division(node, operands, |lhs, rhs| Some(floor_mod(lhs, rhs)))
             }
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Int(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -209,15 +270,15 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::UnitEq(..)
+            | IrKind::RecordEq(..)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where an Int was expected")
             }
-            IrKind::Unit | IrKind::Store(..) => {
-                mistyped(node, "Unit node where an Int was expected")
+            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+                mistyped(node, "record node where an Int was expected")
             }
         }
     }
@@ -226,7 +287,7 @@ impl Evaluator<'_> {
     fn load_int(&self, slot: Slot, node: &IrNode) -> Result<i64, Diagnostic> {
         match self.load(slot, node)? {
             Value::Int(value) => Ok(*value),
-            Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Unit => {
+            Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
                 mistyped(node, "Int load from a slot holding another type")
             }
         }
@@ -300,6 +361,12 @@ impl Evaluator<'_> {
             IrKind::FloatMul(o) => self.float_arithmetic(o, |lhs, rhs| lhs * rhs),
             IrKind::FloatDiv(o) => self.float_arithmetic(o, |lhs, rhs| lhs / rhs),
             IrKind::IntToFloat(operand) => self.int(operand).map(int_to_float),
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Float(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -312,15 +379,15 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::UnitEq(..)
+            | IrKind::RecordEq(..)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a Float was expected")
             }
-            IrKind::Unit | IrKind::Store(..) => {
-                mistyped(node, "Unit node where a Float was expected")
+            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+                mistyped(node, "record node where a Float was expected")
             }
         }
     }
@@ -329,7 +396,7 @@ impl Evaluator<'_> {
     fn load_float(&self, slot: Slot, node: &IrNode) -> Result<f64, Diagnostic> {
         match self.load(slot, node)? {
             Value::Float(value) => Ok(*value),
-            Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Unit => {
+            Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
                 mistyped(node, "Float load from a slot holding another type")
             }
         }
@@ -370,10 +437,16 @@ impl Evaluator<'_> {
             IrKind::FloatCmp(cmp, o) => self.float_cmp(cmp, o),
             IrKind::StrCmp(cmp, o) => self.str_cmp(cmp, o),
             IrKind::BoolEq(equal, o) => self.bool_eq(equal, o),
-            IrKind::UnitEq(equal, o) => self.unit_eq(equal, o),
+            IrKind::RecordEq(equal, o) => self.record_eq(equal, o),
             IrKind::And(o) => self.logic(o, false),
             IrKind::Or(o) => self.logic(o, true),
             IrKind::Not(operand) => self.not(operand),
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Bool(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -391,8 +464,8 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a Bool was expected")
             }
-            IrKind::Unit | IrKind::Store(..) => {
-                mistyped(node, "Unit node where a Bool was expected")
+            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+                mistyped(node, "record node where a Bool was expected")
             }
         }
     }
@@ -401,7 +474,7 @@ impl Evaluator<'_> {
     fn load_bool(&self, slot: Slot, node: &IrNode) -> Result<bool, Diagnostic> {
         match self.load(slot, node)? {
             Value::Bool(value) => Ok(*value),
-            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Unit => {
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
                 mistyped(node, "Bool load from a slot holding another type")
             }
         }
@@ -434,12 +507,12 @@ impl Evaluator<'_> {
         Ok((lhs == rhs) == equal)
     }
 
-    /// Evaluates a `UnitEq`: `==` if `equal`, `!=` otherwise. Unit values
-    /// are all equal, but the operands may still have effects or fail.
-    fn unit_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
-        self.value(operands.lhs)?;
-        self.value(operands.rhs)?;
-        Ok(equal)
+    /// Evaluates a `RecordEq`: `==` if `equal`, `!=` otherwise. Records
+    /// compare deeply and by field name; empty records are all equal.
+    fn record_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
+        let lhs = self.record(operands.lhs)?;
+        let rhs = self.record(operands.rhs)?;
+        Ok((lhs == rhs) == equal)
     }
 
     /// Evaluates `and`, which a `false` left operand decides, or `or`, which
@@ -475,6 +548,12 @@ impl Evaluator<'_> {
             }
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Str(text) => Some(text),
+                    _ => None,
+                })
+            }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -494,12 +573,12 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::UnitEq(..)
+            | IrKind::RecordEq(..)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a String was expected"),
-            IrKind::Unit | IrKind::Store(..) => {
-                mistyped(node, "Unit node where a String was expected")
+            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+                mistyped(node, "record node where a String was expected")
             }
         }
     }
@@ -509,8 +588,70 @@ impl Evaluator<'_> {
     fn load_string(&self, slot: Slot, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
         match self.load(slot, node)? {
             Value::Str(text) => Ok(Rc::clone(text)),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Unit => {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Empty | Value::Record(_) => {
                 mistyped(node, "String load from a slot holding another type")
+            }
+        }
+    }
+
+    /// Evaluates a record node: [`Value::Empty`] or a [`Value::Record`].
+    fn record(&mut self, id: IrId) -> Result<Value, Diagnostic> {
+        let node = self.ir.get(id);
+        match node.kind {
+            IrKind::Empty => Ok(Value::Empty),
+            IrKind::Load(slot, _) => self.load_record(slot, node),
+            IrKind::Store(slot, value) => self.store(slot, value, node),
+            IrKind::Block { items, result } => {
+                self.items(items)?;
+                self.record(result)
+            }
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.record(branch)
+            }
+            IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Empty | Value::Record(_) => Some(value),
+                    _ => None,
+                })
+            }
+            IrKind::IntConst(_)
+            | IrKind::IntNeg(_)
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_) => mistyped(node, "Int node where a record was expected"),
+            IrKind::FloatConst(_)
+            | IrKind::FloatNeg(_)
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
+            | IrKind::IntToFloat(_) => mistyped(node, "Float node where a record was expected"),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::RecordEq(..)
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+                mistyped(node, "String node where a record was expected")
+            }
+        }
+    }
+
+    /// Reads the record in `slot`, for the `Load` `node`: a new reference to
+    /// it, not a copy.
+    fn load_record(&self, slot: Slot, node: &IrNode) -> Result<Value, Diagnostic> {
+        match self.load(slot, node)? {
+            value @ (Value::Empty | Value::Record(_)) => Ok(value.clone()),
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => {
+                mistyped(node, "record load from a slot holding another type")
             }
         }
     }
@@ -660,14 +801,16 @@ mod tests {
     use crate::lower::lower;
     use crate::parser::parse;
     use crate::source::SourceFile;
-    use crate::types::Ty;
+    use crate::types::TypeTable;
+    use crate::value::ValueKind;
 
     fn compile(text: &str) -> Ir {
         let source = SourceFile::new("test.gcsl", text).unwrap();
         let (tokens, names, strings) = tokenize(&source).unwrap();
         let ast = parse(&tokens, names, strings, &source).unwrap();
-        let checked = check(&ast).unwrap();
-        lower(&ast, &checked).unwrap()
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        lower(&ast, &checked, &types).unwrap()
     }
 
     fn boolean(text: &str) -> bool {
@@ -870,9 +1013,10 @@ mod tests {
 
     #[test]
     fn root_value_type_follows_the_ir() {
-        assert_eq!(run("1").unwrap().ty(), Ty::Int);
-        assert_eq!(run("1 / 1").unwrap().ty(), Ty::Float);
-        assert_eq!(run("").unwrap().ty(), Ty::Unit);
+        assert_eq!(run("1").unwrap().kind(), ValueKind::Int);
+        assert_eq!(run("1 / 1").unwrap().kind(), ValueKind::Float);
+        assert_eq!(run("").unwrap().kind(), ValueKind::Record);
+        assert_eq!(run("x = 1").unwrap().kind(), ValueKind::Record);
     }
 
     #[test]
@@ -928,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_results() {
+    fn empty_record_results() {
         for text in [
             "",
             "{}",
@@ -938,8 +1082,10 @@ mod tests {
             "{ {}; {} }",
             "let x = 1\nx := 2",
             "= {}",
+            "if true {}",
+            "{ e = {} }.e",
         ] {
-            assert_eq!(run(text).unwrap(), Value::Unit, "{text}");
+            assert_eq!(run(text).unwrap(), Value::Empty, "{text}");
         }
     }
 
@@ -963,9 +1109,9 @@ mod tests {
     #[test]
     fn eval_in_uses_the_given_frame() {
         let ir = compile("let x = 7\nlet y = x + 1");
-        let mut frame = vec![Value::Unit; 3];
-        assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Unit);
-        assert_eq!(frame, vec![Value::Int(7), Value::Int(8), Value::Unit]);
+        let mut frame = vec![Value::Empty; 3];
+        assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Empty);
+        assert_eq!(frame, vec![Value::Int(7), Value::Int(8), Value::Empty]);
         let error = eval_in(&ir, &mut frame[..1]).unwrap_err();
         assert_eq!(
             error.message,
@@ -1061,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn bool_and_unit_equality() {
+    fn bool_and_empty_record_equality() {
         booleans(&[
             ("true == true", true),
             ("false == false", true),
@@ -1073,10 +1219,112 @@ mod tests {
             ("{} != {}", false),
             ("let u = {}\nu == { let x = 1 }", true),
         ]);
-        // Unit operands are still evaluated.
+        // Empty record operands are still evaluated.
         assert_eq!(
             error("{ let y = 1 // 0 } == {}"),
             ("division by zero".to_owned(), Span::new(12, 14))
+        );
+    }
+
+    #[test]
+    fn records_are_built_and_read() {
+        assert_eq!(int("{ x = 1; y = 2 }.y"), 2);
+        assert_eq!(float("{ a = { n = 1.5 } }.a.n"), 1.5);
+        assert!(boolean("{ \"a b\" = true }.\"a b\""));
+        assert_eq!(string("{ s = \"hi\" }.s"), "hi");
+        // Fields see earlier fields and private `let`s; later `let`s do not
+        // change a field.
+        assert_eq!(int("{ x = 1; let t = x * 10; y = t + x }.y"), 11);
+        assert_eq!(
+            int("let r = { x = 1; let x = 5; y = x }\nr.x * 10 + r.y"),
+            15
+        );
+        // Stored in a variable and read back, whole and field by field.
+        assert_eq!(
+            run("let p = { x = 1; y = \"a\" }\nlet q = p\nq")
+                .unwrap()
+                .to_string(),
+            "{x = 1, y = \"a\"}"
+        );
+        assert_eq!(int("let p = { x = 3; y = 4 }\np.x * p.x + p.y * p.y"), 25);
+        // A record's field can be a record, read at any depth, and a record
+        // can be rebuilt from another's fields.
+        assert_eq!(
+            run("let p = { a = { b = { c = 7 } } }\n{ c = p.a.b.c; d = p.a }")
+                .unwrap()
+                .to_string(),
+            "{c = 7, d = {b = {c = 7}}}"
+        );
+        // An empty record as a field.
+        assert_eq!(run("{ e = {} }").unwrap().to_string(), "{e = {}}");
+        // Checked against an annotation, a literal is built at the field's
+        // type.
+        assert_eq!(float("let p: {x: Float} = { x = 1 }\np.x / 2"), 0.5);
+        // A file of fields is a record.
+        assert_eq!(
+            run("x = 1\ny = \"a\"").unwrap().to_string(),
+            "{x = 1, y = \"a\"}"
+        );
+    }
+
+    #[test]
+    fn records_display_as_gcsl_syntax() {
+        let value = run("{ x = 1; y = \"a\\n\"; inner = { n = 2.0 }; \"a b\" = true }").unwrap();
+        let shown = "{x = 1, y = \"a\\n\", inner = {n = 2.0}, \"a b\" = true}";
+        assert_eq!(value.to_string(), shown);
+        assert_eq!(value.repr().to_string(), shown);
+    }
+
+    #[test]
+    fn record_equality_is_deep_and_by_name() {
+        booleans(&[
+            ("{ x = 1; y = \"a\" } == { x = 1; y = \"a\" }", true),
+            ("{ x = 1; y = \"a\" } == { x = 1; y = \"b\" }", false),
+            ("{ x = 1; y = \"a\" } != { x = 2; y = \"a\" }", true),
+            // Fields in a different order, of the same type.
+            ("{ x = 1; y = 2 } == { y = 2; x = 1 }", true),
+            ("{ x = 1; y = 2 } == { y = 1; x = 2 }", false),
+            // Nested.
+            ("{ a = { n = 1 } } == { a = { n = 1 } }", true),
+            ("{ a = { n = 1 } } == { a = { n = 2 } }", false),
+            ("{ e = {} } == { e = {} }", true),
+            // Floats compare as IEEE 754 does, so NaN is unequal to itself.
+            ("let r = { f = 0.0 / 0.0 }\nr == r", false),
+            ("let r = { f = 0.0 / 0.0 }\nr != r", true),
+            ("{ f = -0.0 } == { f = 0.0 }", true),
+            // Through variables.
+            ("let p = { x = 1 }\nlet q = { x = 1 }\np == q", true),
+        ]);
+        // Operands are evaluated left to right.
+        assert_eq!(
+            error("{ x = 1 // 0 } == { x = 9223372036854775807 + 1 }"),
+            ("division by zero".to_owned(), Span::new(8, 10))
+        );
+    }
+
+    #[test]
+    fn if_selects_records() {
+        assert_eq!(
+            run("if true { { x = 1; y = 2 } } else { { x = 3 } }")
+                .unwrap()
+                .to_string(),
+            "{x = 1, y = 2}"
+        );
+        assert_eq!(
+            int("let r = if 1 > 2 { { x = 1; y = 2 } } else { { x = 3 } }\nr.x"),
+            3
+        );
+        assert_eq!(
+            int("(if false { { x = 1 } } else { { x = 2; z = 0 } }).x"),
+            2
+        );
+    }
+
+    #[test]
+    fn records_in_interpolations_show_their_repr() {
+        assert_eq!(
+            string("let p = { x = 1; s = \"a\" }\n\"p is {p}, {{}} is { {} }\""),
+            "p is {x = 1, s = \"a\"}, {} is {}"
         );
     }
 
@@ -1128,7 +1376,7 @@ mod tests {
         assert_eq!(string("if 1 < 2 { \"yes\" } else { \"no\" }"), "yes");
         assert_eq!(
             run("if true {} else { let x = 1 // 0 }").unwrap(),
-            Value::Unit
+            Value::Empty
         );
         assert_eq!(int("if false { let x = 1 // 0 }\n5"), 5);
         // The branch taken, and the condition, are evaluated.
@@ -1156,7 +1404,7 @@ mod tests {
             string(
                 "\"{1} {2.5} {3.0} {true} {\"s\"} { {} } {1 == 2} {1.0 / 0.0} {0.0 / 0.0} {-0.0}\""
             ),
-            "1 2.5 3.0 true s () false inf nan -0.0"
+            "1 2.5 3.0 true s {} false inf nan -0.0"
         );
         assert_eq!(
             string("let n = 3\nlet s = \"x\"\nlet b = n > 2\n\"{s}{n}{s} {b}\""),
@@ -1207,15 +1455,15 @@ mod tests {
         assert_eq!(string("let s = \"a\"\ns := s + \"b\"\n{ s }"), "ab");
         assert!(boolean("let s = \"x\"\n{ s } == s"));
         assert_eq!(string("let s = \"q\"\n= { = { s } }"), "q");
-        assert_eq!(run("\"a\"").unwrap().ty(), Ty::String);
-        assert_eq!(run("true").unwrap().ty(), Ty::Bool);
+        assert_eq!(run("\"a\"").unwrap().kind(), ValueKind::String);
+        assert_eq!(run("true").unwrap().kind(), ValueKind::Bool);
     }
 
     #[test]
     fn loading_a_string_shares_it() {
         let ir = compile("let s = \"abc\"\nlet t = s\nlet u = s + \"\"");
-        let mut frame = vec![Value::Unit; 3];
-        assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Unit);
+        let mut frame = vec![Value::Empty; 3];
+        assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Empty);
         let [Value::Str(s), Value::Str(t), Value::Str(u)] = &frame[..] else {
             panic!("expected strings, got {frame:?}");
         };
@@ -1229,7 +1477,7 @@ mod tests {
     fn a_load_of_the_wrong_type_is_an_internal_error() {
         // `x + 1` with `x` loaded as an Int, from a frame holding a Float.
         let mut builder = crate::ir::IrBuilder::with_capacity(3);
-        let load = builder.alloc(IrKind::Load(Slot::new(0), Ty::Int), Span::new(0, 1));
+        let load = builder.alloc(IrKind::Load(Slot::new(0), ValueKind::Int), Span::new(0, 1));
         let one = builder.alloc(IrKind::IntConst(1), Span::new(4, 5));
         let add = builder.alloc(
             IrKind::IntAdd(Operands {
@@ -1247,5 +1495,43 @@ mod tests {
             "internal error: Int load from a slot holding another type"
         );
         assert_eq!(error.span, Span::new(0, 1));
+    }
+
+    #[test]
+    fn a_missing_field_is_an_internal_error() {
+        // `r.y` built by hand, with `r` holding a record without `y`.
+        let mut names = crate::names::Names::new();
+        let (x, y) = (names.intern("x"), names.intern("y"));
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Record),
+            Span::new(0, 1),
+        );
+        let field = builder.alloc(
+            IrKind::Field {
+                record: load,
+                name: y,
+                kind: ValueKind::Int,
+            },
+            Span::new(0, 3),
+        );
+        let ir = builder.finish(field, 1, Vec::new());
+        let record = |value: Value| {
+            Value::Record(Rc::new(Record {
+                layout: Rc::new(crate::value::Layout {
+                    names: Box::new([x]),
+                    texts: Box::new([Box::from("x")]),
+                }),
+                values: Box::new([value]),
+            }))
+        };
+        let error = eval_in(&ir, &mut [record(Value::Int(1))]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "internal error: a record lacks a field the checker found"
+        );
+        assert_eq!(error.span, Span::new(0, 3));
+        let error = eval_in(&ir, &mut [Value::Empty]).unwrap_err();
+        assert_eq!(error.message, "internal error: a field of the empty record");
     }
 }

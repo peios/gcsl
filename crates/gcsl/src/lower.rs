@@ -8,9 +8,23 @@
 //! the checker assigned. Every block, including the file's body, becomes a
 //! `Block` whose items are its declarations and non-final expression
 //! statements, and whose result is its `= EXPR` or final expression
-//! statement, or an explicit `Unit` node if it has neither.
+//! statement, or an explicit `Empty` node if it has neither.
 //!
-//! Comparisons are specialised by their operands' type, and an `if` keeps
+//! A record block's fields become `Store`s to their slots, as `let`s do, so
+//! that later items can read them, and its result is a `MakeRecord` whose
+//! values are `Load`s of those slots in definition order; every expression
+//! statement in it, the last included, is a statement. Each record block's
+//! field names become a [`Layout`], built here once and shared by every
+//! record the block builds; blocks with the same names in the same order
+//! share one layout, found through a map from the names to the layout.
+//!
+//! Only the kind of each node's value matters to the IR (see
+//! [`crate::ir::Ir::kind_of`]), so lowering reads each expression's type
+//! from the checker's tables and keeps only its [`ValueKind`]. A value of a
+//! record subtype where a supertype is expected needs no conversion: a
+//! record is the same value whatever record type it is seen as.
+//!
+//! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. Each
 //! string literal, and each literal piece of an interpolated string,
 //! becomes a `StrConst` whose text is copied from the AST's string table
@@ -22,27 +36,34 @@
 //! combination the checker should have ruled out is reported as an
 //! [`InternalError`] rather than a panic.
 
+use std::collections::HashMap;
+
 use crate::ast::{
-    Ast, BinaryOp, ExprId, ExprKind, ItemKind, ItemRange, PartRange, StrPart, UnaryOp,
+    Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, StrPart, UnaryOp,
 };
 use crate::check::{Checked, Resolution, Slot, Types};
 use crate::diagnostic::InternalError;
-use crate::ir::{Cmp, Ir, IrBuilder, IrId, IrKind, Operands};
+use crate::ir::{Cmp, Ir, IrBuilder, IrId, IrKind, LayoutId, Operands};
+use crate::names::Name;
 use crate::source::Span;
-use crate::types::Ty;
-use crate::value::int_to_float;
+use crate::types::{TyId, TypeTable};
+use crate::value::{Layout, ValueKind, int_to_float};
 
-/// Lowers `ast`, whose types and resolution are `checked`, to IR.
+/// Lowers `ast`, whose types and resolution are `checked`, with its types
+/// interned into `types`, to IR.
 ///
 /// # Errors
 ///
 /// Returns an [`InternalError`] if `checked` was not produced by checking
-/// `ast`, or is otherwise inconsistent with it: a bug in the caller or the
-/// checker, never an error in the user's program.
-pub fn lower(ast: &Ast, checked: &Checked) -> Result<Ir, InternalError> {
-    let Checked { types, resolution } = checked;
+/// `ast` against `types`, or is otherwise inconsistent with it: a bug in
+/// the caller or the checker, never an error in the user's program.
+pub fn lower(ast: &Ast, checked: &Checked, types: &TypeTable) -> Result<Ir, InternalError> {
+    let Checked {
+        types: expr_types,
+        resolution,
+    } = checked;
     let root_span = ast.root_span();
-    if types.len() != ast.len() {
+    if expr_types.len() != ast.len() {
         return Err(InternalError {
             message: "type table does not belong to this AST",
             span: root_span,
@@ -56,15 +77,19 @@ pub fn lower(ast: &Ast, checked: &Checked) -> Result<Ir, InternalError> {
     }
     let mut lowerer = Lowerer {
         ast,
-        types,
+        expr_types,
+        table: types,
         resolution,
         // One IR node per AST node, less parentheses, plus any conversions,
-        // stores and units.
+        // stores, empty records and field loads.
         builder: IrBuilder::with_capacity(ast.len()),
         item_stack: Vec::new(),
+        layouts: HashMap::new(),
+        layout_names: Vec::new(),
     };
     let root = ast.root();
-    let kind = lowerer.lower_body(root, root_span, lowerer.body_ty(root))?;
+    let kind = lowerer.body_kind(root)?;
+    let kind = lowerer.lower_body(root, root_span, kind)?;
     let root = lowerer.builder.alloc(kind, root_span);
     Ok(lowerer.builder.finish(
         root,
@@ -75,39 +100,86 @@ pub fn lower(ast: &Ast, checked: &Checked) -> Result<Ir, InternalError> {
 
 struct Lowerer<'a> {
     ast: &'a Ast,
-    types: &'a Types,
+    expr_types: &'a Types,
+    table: &'a TypeTable,
     resolution: &'a Resolution,
     builder: IrBuilder,
     /// The items of the blocks being lowered, innermost last, moved to the
     /// builder's pool as each block ends, as the parser does for the AST.
+    /// A record's values are collected here in the same way.
     item_stack: Vec<IrId>,
+    /// The layout already made for each sequence of field names.
+    layouts: HashMap<Box<[Name]>, LayoutId>,
+    /// Reused for collecting the field names of each record block.
+    layout_names: Vec<Name>,
 }
 
 impl Lowerer<'_> {
-    /// The type of a body: its result's type, or `Unit` if it has none.
-    fn body_ty(&self, body: ItemRange) -> Ty {
+    /// The kind of the value of expression `id`.
+    fn kind(&self, id: ExprId) -> Result<ValueKind, InternalError> {
+        let span = self.ast.get(id).span;
+        match self.expr_types.get(id) {
+            TyId::UNTYPED_INT => Err(InternalError {
+                message: "an untyped integer survived type checking",
+                span,
+            }),
+            TyId::ERROR => Err(InternalError {
+                message: "a type error survived type checking",
+                span,
+            }),
+            ty => self.table.value_kind(ty).ok_or(InternalError {
+                message: "a type with no values survived type checking",
+                span,
+            }),
+        }
+    }
+
+    /// The kind of a body's value: a record for a record block, its
+    /// result's kind, or a record (`{}`) if it has none.
+    fn body_kind(&self, body: ItemRange) -> Result<ValueKind, InternalError> {
+        if self.is_record_body(body) {
+            return Ok(ValueKind::Record);
+        }
         match self
             .ast
             .items(body)
             .last()
             .map(|&id| self.ast.item(id).kind)
         {
-            Some(ItemKind::Result(value) | ItemKind::Expr(value)) => self.types.get(value),
-            Some(ItemKind::Let { .. } | ItemKind::Rebind { .. }) | None => Ty::Unit,
+            Some(ItemKind::Result(value) | ItemKind::Expr(value)) => self.kind(value),
+            Some(ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. })
+            | None => Ok(ValueKind::Record),
         }
     }
 
-    /// Lowers a body whose checked type is `ty` to a `Block`, which the
+    /// Whether `body` has a field item, which makes it a record block.
+    fn is_record_body(&self, body: ItemRange) -> bool {
+        self.ast
+            .items(body)
+            .iter()
+            .any(|&id| matches!(self.ast.item(id).kind, ItemKind::Field { .. }))
+    }
+
+    /// Lowers a body whose value is of kind `kind` to a `Block`, which the
     /// caller allocates.
-    fn lower_body(&mut self, body: ItemRange, span: Span, ty: Ty) -> Result<IrKind, InternalError> {
+    fn lower_body(
+        &mut self,
+        body: ItemRange,
+        span: Span,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
         let items = self.ast.items(body);
+        let is_record = self.is_record_body(body);
         let base = self.item_stack.len();
         let mut result = None;
         for (index, &id) in items.iter().enumerate() {
-            let is_last = index + 1 == items.len();
+            // A record block's final expression is a statement.
+            let is_result = !is_record && index + 1 == items.len();
             let item = self.ast.item(id);
             match item.kind {
-                ItemKind::Let { value, .. } | ItemKind::Rebind { value, .. } => {
+                ItemKind::Let { value, .. }
+                | ItemKind::Rebind { value, .. }
+                | ItemKind::Field { value, .. } => {
                     let slot = self.resolution.item_slot(id);
                     if slot == Slot::NONE {
                         return Err(InternalError {
@@ -119,76 +191,116 @@ impl Lowerer<'_> {
                     let store = self.builder.alloc(IrKind::Store(slot, value), item.span);
                     self.item_stack.push(store);
                 }
-                ItemKind::Result(value) | ItemKind::Expr(value) if is_last => {
-                    result = Some(self.lower_operand(value, ty)?);
+                ItemKind::Result(value) | ItemKind::Expr(value) if is_result => {
+                    result = Some(self.lower_operand(value, kind)?);
                 }
                 ItemKind::Result(_) => {
                     return Err(InternalError {
-                        message: "a result before the end of its block survived checking",
+                        message: "a result before the end of its block, or in a record block, \
+                                  survived checking",
                         span: item.span,
                     });
                 }
                 ItemKind::Expr(value) => {
-                    // Evaluated for effect only, so it must be Unit.
-                    let statement = self.lower_operand(value, Ty::Unit)?;
+                    // Evaluated for effect only, so it must be `{}`.
+                    let statement = self.lower_operand(value, ValueKind::Record)?;
                     self.item_stack.push(statement);
                 }
             }
         }
         let result = match result {
             Some(result) => result,
-            None if ty == Ty::Unit => self.builder.alloc(IrKind::Unit, span),
-            None => {
+            None if kind != ValueKind::Record => {
                 return Err(InternalError {
-                    message: "a block without a result is not typed Unit",
+                    message: "a block without a result is not a record",
                     span,
                 });
             }
+            None if is_record => self.make_record(items, span)?,
+            None => self.builder.alloc(IrKind::Empty, span),
         };
         let items = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(IrKind::Block { items, result })
     }
 
+    /// Builds the `MakeRecord` of the record block of `items`, spanning
+    /// `span`, whose fields have been stored: a `Load` of each field's slot,
+    /// at its name, in definition order.
+    fn make_record(&mut self, items: &[ItemId], span: Span) -> Result<IrId, InternalError> {
+        self.layout_names.clear();
+        let base = self.item_stack.len();
+        for &id in items {
+            let ItemKind::Field {
+                name,
+                name_span,
+                value,
+            } = self.ast.item(id).kind
+            else {
+                continue;
+            };
+            let kind = self.kind(value)?;
+            let slot = self.resolution.item_slot(id);
+            let load = self.builder.alloc(IrKind::Load(slot, kind), name_span);
+            self.item_stack.push(load);
+            self.layout_names.push(name);
+        }
+        let layout = self.layout();
+        let values = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(self
+            .builder
+            .alloc(IrKind::MakeRecord { layout, values }, span))
+    }
+
+    /// The layout for the names in `layout_names`, made if this is the
+    /// first record block with those names in that order.
+    fn layout(&mut self) -> LayoutId {
+        if let Some(&id) = self.layouts.get(self.layout_names.as_slice()) {
+            return id;
+        }
+        let names: Box<[Name]> = self.layout_names.as_slice().into();
+        let texts = names
+            .iter()
+            .map(|&name| Box::from(self.ast.names().get(name)))
+            .collect();
+        let id = self.builder.push_layout(Layout {
+            names: names.clone(),
+            texts,
+        });
+        self.layouts.insert(names, id);
+        id
+    }
+
     fn lower_expr(&mut self, id: ExprId) -> Result<IrId, InternalError> {
         let expr = *self.ast.get(id);
         let span = expr.span;
-        let ty = self.types.get(id);
-        let kind = match (expr.kind, ty) {
-            (_, Ty::UntypedInt) => {
-                return Err(InternalError {
-                    message: "an untyped integer survived type checking",
-                    span,
-                });
-            }
-            (_, Ty::Error) => {
-                return Err(InternalError {
-                    message: "a type error survived type checking",
-                    span,
-                });
-            }
+        let kind = self.kind(id)?;
+        let lowered = match (expr.kind, kind) {
             (ExprKind::Paren(inner) | ExprKind::Ascribe { expr: inner, .. }, _) => {
-                return self.lower_operand(inner, ty);
+                return self.lower_operand(inner, kind);
             }
-            (ExprKind::Int(value), Ty::Int) => IrKind::IntConst(value),
-            (ExprKind::Int(value), Ty::Float) => IrKind::FloatConst(int_to_float(value)),
-            (ExprKind::Float(value), Ty::Float) => IrKind::FloatConst(value),
-            (ExprKind::Bool(value), Ty::Bool) => IrKind::BoolConst(value),
-            (ExprKind::Str(text), Ty::String) => {
+            (ExprKind::Int(value), ValueKind::Int) => IrKind::IntConst(value),
+            (ExprKind::Int(value), ValueKind::Float) => IrKind::FloatConst(int_to_float(value)),
+            (ExprKind::Float(value), ValueKind::Float) => IrKind::FloatConst(value),
+            (ExprKind::Bool(value), ValueKind::Bool) => IrKind::BoolConst(value),
+            (ExprKind::Str(text), ValueKind::String) => {
                 IrKind::StrConst(self.builder.push_string(self.ast.strings().get(text)))
             }
-            (ExprKind::Interp(parts), Ty::String) => self.lower_interpolation(parts, span)?,
+            (ExprKind::Interp(parts), ValueKind::String) => {
+                self.lower_interpolation(parts, span)?
+            }
             (
                 ExprKind::If {
                     cond, then, else_, ..
                 },
                 _,
             ) => IrKind::If {
-                cond: self.lower_operand(cond, Ty::Bool)?,
-                then: self.lower_operand(then, ty)?,
-                else_: self.lower_operand(else_, ty)?,
+                cond: self.lower_operand(cond, ValueKind::Bool)?,
+                then: self.lower_operand(then, kind)?,
+                else_: self.lower_operand(else_, kind)?,
             },
-            (ExprKind::Unary { op, operand }, _) => self.lower_unary(op, operand, ty, span)?,
+            (ExprKind::Unary { op, operand }, _) => self.lower_unary(op, operand, kind, span)?,
             (
                 ExprKind::Binary {
                     op,
@@ -197,7 +309,7 @@ impl Lowerer<'_> {
                     rhs,
                 },
                 _,
-            ) => self.lower_binary(op, op_start, lhs, rhs, ty, id)?,
+            ) => self.lower_binary(op, op_start, (lhs, rhs), kind, id)?,
             (ExprKind::Name(_), _) => {
                 let slot = self.resolution.expr_slot(id);
                 if slot == Slot::NONE {
@@ -206,16 +318,24 @@ impl Lowerer<'_> {
                         span,
                     });
                 }
-                IrKind::Load(slot, ty)
+                IrKind::Load(slot, kind)
             }
-            (ExprKind::Block(body), _) => self.lower_body(body, span, ty)?,
-            (ExprKind::Float(_), Ty::Int) => {
+            (ExprKind::Block(body), _) => self.lower_body(body, span, kind)?,
+            (ExprKind::Field { expr: record, name }, _) => IrKind::Field {
+                record: self.lower_operand(record, ValueKind::Record)?,
+                name,
+                kind,
+            },
+            (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
                     message: "float literal typed as Int",
                     span,
                 });
             }
-            (ExprKind::Int(_) | ExprKind::Float(_), Ty::Bool | Ty::String | Ty::Unit) => {
+            (
+                ExprKind::Int(_) | ExprKind::Float(_),
+                ValueKind::Bool | ValueKind::String | ValueKind::Record,
+            ) => {
                 return Err(InternalError {
                     message: "numeric literal typed as a non-numeric type",
                     span,
@@ -228,22 +348,28 @@ impl Lowerer<'_> {
                 });
             }
         };
-        Ok(self.builder.alloc(kind, span))
+        Ok(self.builder.alloc(lowered, span))
     }
 
-    /// Lowers the prefix operator `op`, of type `ty` and spanning `span`,
+    /// Lowers the prefix operator `op`, of kind `kind` and spanning `span`,
     /// applied to `operand`.
     fn lower_unary(
         &mut self,
         op: UnaryOp,
         operand: ExprId,
-        ty: Ty,
+        kind: ValueKind,
         span: Span,
     ) -> Result<IrKind, InternalError> {
-        Ok(match (op, ty) {
-            (UnaryOp::Neg, Ty::Int) => IrKind::IntNeg(self.lower_operand(operand, Ty::Int)?),
-            (UnaryOp::Neg, Ty::Float) => IrKind::FloatNeg(self.lower_operand(operand, Ty::Float)?),
-            (UnaryOp::Not, Ty::Bool) => IrKind::Not(self.lower_operand(operand, Ty::Bool)?),
+        Ok(match (op, kind) {
+            (UnaryOp::Neg, ValueKind::Int) => {
+                IrKind::IntNeg(self.lower_operand(operand, ValueKind::Int)?)
+            }
+            (UnaryOp::Neg, ValueKind::Float) => {
+                IrKind::FloatNeg(self.lower_operand(operand, ValueKind::Float)?)
+            }
+            (UnaryOp::Not, ValueKind::Bool) => {
+                IrKind::Not(self.lower_operand(operand, ValueKind::Bool)?)
+            }
             _ => {
                 return Err(InternalError {
                     message: "prefix operator has a result type it cannot have",
@@ -277,31 +403,32 @@ impl Lowerer<'_> {
         Ok(IrKind::Interp(items))
     }
 
+    /// Lowers the binary operator `op`, whose symbol starts at `op_start`,
+    /// of kind `kind`, the expression `id`.
     fn lower_binary(
         &mut self,
         op: BinaryOp,
         op_start: u32,
-        lhs: ExprId,
-        rhs: ExprId,
-        ty: Ty,
+        (lhs, rhs): (ExprId, ExprId),
+        kind: ValueKind,
         id: ExprId,
     ) -> Result<IrKind, InternalError> {
         if let Some(cmp) = comparison(op) {
-            return self.lower_comparison(cmp, op_start, lhs, rhs, ty, id);
+            return self.lower_comparison(cmp, op_start, (lhs, rhs), kind, id);
         }
-        let (make, operand_ty): (fn(Operands) -> IrKind, Ty) = match (op, ty) {
-            (BinaryOp::Add, Ty::String) => (IrKind::StrConcat, Ty::String),
-            (BinaryOp::And, Ty::Bool) => (IrKind::And, Ty::Bool),
-            (BinaryOp::Or, Ty::Bool) => (IrKind::Or, Ty::Bool),
-            (BinaryOp::Add, Ty::Int) => (IrKind::IntAdd, Ty::Int),
-            (BinaryOp::Sub, Ty::Int) => (IrKind::IntSub, Ty::Int),
-            (BinaryOp::Mul, Ty::Int) => (IrKind::IntMul, Ty::Int),
-            (BinaryOp::FloorDiv, Ty::Int) => (IrKind::IntFloorDiv, Ty::Int),
-            (BinaryOp::Rem, Ty::Int) => (IrKind::IntRem, Ty::Int),
-            (BinaryOp::Add, Ty::Float) => (IrKind::FloatAdd, Ty::Float),
-            (BinaryOp::Sub, Ty::Float) => (IrKind::FloatSub, Ty::Float),
-            (BinaryOp::Mul, Ty::Float) => (IrKind::FloatMul, Ty::Float),
-            (BinaryOp::Div, Ty::Float) => {
+        let (make, operand_kind): (fn(Operands) -> IrKind, ValueKind) = match (op, kind) {
+            (BinaryOp::Add, ValueKind::String) => (IrKind::StrConcat, ValueKind::String),
+            (BinaryOp::And, ValueKind::Bool) => (IrKind::And, ValueKind::Bool),
+            (BinaryOp::Or, ValueKind::Bool) => (IrKind::Or, ValueKind::Bool),
+            (BinaryOp::Add, ValueKind::Int) => (IrKind::IntAdd, ValueKind::Int),
+            (BinaryOp::Sub, ValueKind::Int) => (IrKind::IntSub, ValueKind::Int),
+            (BinaryOp::Mul, ValueKind::Int) => (IrKind::IntMul, ValueKind::Int),
+            (BinaryOp::FloorDiv, ValueKind::Int) => (IrKind::IntFloorDiv, ValueKind::Int),
+            (BinaryOp::Rem, ValueKind::Int) => (IrKind::IntRem, ValueKind::Int),
+            (BinaryOp::Add, ValueKind::Float) => (IrKind::FloatAdd, ValueKind::Float),
+            (BinaryOp::Sub, ValueKind::Float) => (IrKind::FloatSub, ValueKind::Float),
+            (BinaryOp::Mul, ValueKind::Float) => (IrKind::FloatMul, ValueKind::Float),
+            (BinaryOp::Div, ValueKind::Float) => {
                 let lhs = self.lower_as_float(lhs)?;
                 let rhs = self.lower_as_float(rhs)?;
                 return Ok(IrKind::FloatDiv(Operands { lhs, rhs, op_start }));
@@ -313,47 +440,46 @@ impl Lowerer<'_> {
                 });
             }
         };
-        let lhs = self.lower_operand(lhs, operand_ty)?;
-        let rhs = self.lower_operand(rhs, operand_ty)?;
+        let lhs = self.lower_operand(lhs, operand_kind)?;
+        let rhs = self.lower_operand(rhs, operand_kind)?;
         Ok(make(Operands { lhs, rhs, op_start }))
     }
 
-    /// Lowers a comparison, of type `ty`, to the node for its operands'
-    /// type, which the checker has made the same on both sides.
+    /// Lowers a comparison, of kind `kind`, to the node for its operands'
+    /// kind, which the checker has made the same on both sides.
     fn lower_comparison(
         &mut self,
         cmp: Cmp,
         op_start: u32,
-        lhs: ExprId,
-        rhs: ExprId,
-        ty: Ty,
+        (lhs, rhs): (ExprId, ExprId),
+        kind: ValueKind,
         id: ExprId,
     ) -> Result<IrKind, InternalError> {
-        if ty != Ty::Bool {
+        let span = self.ast.get(id).span;
+        if kind != ValueKind::Bool {
             return Err(InternalError {
                 message: "operator has a result type it cannot have",
-                span: self.ast.get(id).span,
+                span,
             });
         }
-        let operand_ty = self.types.get(lhs);
+        let operand_kind = self.kind(lhs)?;
         // `Some(true)` for `==`, `Some(false)` for `!=`: the only
-        // comparisons of Bools and Units.
+        // comparisons of Bools and records.
         let equal = match cmp {
             Cmp::Eq => Some(true),
             Cmp::Ne => Some(false),
             Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => None,
         };
-        let span = self.ast.get(id).span;
-        let lhs = self.lower_operand(lhs, operand_ty)?;
-        let rhs = self.lower_operand(rhs, operand_ty)?;
+        let lhs = self.lower_operand(lhs, operand_kind)?;
+        let rhs = self.lower_operand(rhs, operand_kind)?;
         let operands = Operands { lhs, rhs, op_start };
-        Ok(match (operand_ty, equal) {
-            (Ty::Int, _) => IrKind::IntCmp(cmp, operands),
-            (Ty::Float, _) => IrKind::FloatCmp(cmp, operands),
-            (Ty::String, _) => IrKind::StrCmp(cmp, operands),
-            (Ty::Bool, Some(equal)) => IrKind::BoolEq(equal, operands),
-            (Ty::Unit, Some(equal)) => IrKind::UnitEq(equal, operands),
-            (Ty::Bool | Ty::Unit, None) | (Ty::UntypedInt | Ty::Error, _) => {
+        Ok(match (operand_kind, equal) {
+            (ValueKind::Int, _) => IrKind::IntCmp(cmp, operands),
+            (ValueKind::Float, _) => IrKind::FloatCmp(cmp, operands),
+            (ValueKind::String, _) => IrKind::StrCmp(cmp, operands),
+            (ValueKind::Bool, Some(equal)) => IrKind::BoolEq(equal, operands),
+            (ValueKind::Record, Some(equal)) => IrKind::RecordEq(equal, operands),
+            (ValueKind::Bool | ValueKind::Record, None) => {
                 return Err(InternalError {
                     message: "comparison of a type it cannot compare",
                     span,
@@ -362,9 +488,9 @@ impl Lowerer<'_> {
         })
     }
 
-    /// Lowers an operand that must already have type `expected`.
-    fn lower_operand(&mut self, id: ExprId, expected: Ty) -> Result<IrId, InternalError> {
-        if self.types.get(id) == expected {
+    /// Lowers an operand that must already be of kind `expected`.
+    fn lower_operand(&mut self, id: ExprId, expected: ValueKind) -> Result<IrId, InternalError> {
+        if self.kind(id)? == expected {
             self.lower_expr(id)
         } else {
             Err(InternalError {
@@ -376,25 +502,24 @@ impl Lowerer<'_> {
 
     /// Lowers an operand of `/`, converting a concrete `Int` to `Float`.
     fn lower_as_float(&mut self, id: ExprId) -> Result<IrId, InternalError> {
-        match self.types.get(id) {
-            Ty::Float => self.lower_expr(id),
-            Ty::Int => {
+        let span = self.ast.get(id).span;
+        match self.expr_types.get(id) {
+            TyId::FLOAT => self.lower_expr(id),
+            TyId::INT => {
                 let operand = self.lower_expr(id)?;
-                Ok(self
-                    .builder
-                    .alloc(IrKind::IntToFloat(operand), self.ast.get(id).span))
+                Ok(self.builder.alloc(IrKind::IntToFloat(operand), span))
             }
-            Ty::Bool | Ty::String | Ty::Unit => Err(InternalError {
-                message: "operand type does not match its operator",
-                span: self.ast.get(id).span,
-            }),
-            Ty::UntypedInt => Err(InternalError {
+            TyId::UNTYPED_INT => Err(InternalError {
                 message: "an untyped integer survived type checking",
-                span: self.ast.get(id).span,
+                span,
             }),
-            Ty::Error => Err(InternalError {
+            TyId::ERROR => Err(InternalError {
                 message: "a type error survived type checking",
-                span: self.ast.get(id).span,
+                span,
+            }),
+            _ => Err(InternalError {
+                message: "operand type does not match its operator",
+                span,
             }),
         }
     }
@@ -440,12 +565,16 @@ mod tests {
 
     fn lower_text(text: &str) -> Ir {
         let ast = parse_text(text);
-        lower(&ast, &check(&ast).unwrap()).unwrap()
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        lower(&ast, &checked, &types).unwrap()
     }
 
     fn dump(text: &str) -> String {
         let ast = parse_text(text);
-        let ir = lower(&ast, &check(&ast).unwrap()).unwrap();
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let ir = lower(&ast, &checked, &types).unwrap();
         ir.pretty(ast.names()).to_string()
     }
 
@@ -460,7 +589,7 @@ mod tests {
 
     /// `7 / 2` built by hand with both literals given the types in `types`,
     /// e.g. both concrete `Int`, the shape variables produce.
-    fn concrete_int_division(types: Vec<Ty>) -> (Ast, Checked) {
+    fn concrete_int_division(types: Vec<TyId>) -> (Ast, Checked) {
         let mut builder = AstBuilder::new();
         let lhs = builder.alloc(Expr {
             kind: ExprKind::Int(7),
@@ -510,8 +639,8 @@ mod tests {
 
     #[test]
     fn concrete_int_division_operands_are_converted() {
-        let (ast, checked) = concrete_int_division(vec![Ty::Int, Ty::Int, Ty::Float]);
-        let ir = lower(&ast, &checked).unwrap();
+        let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::INT, TyId::FLOAT]);
+        let ir = lower(&ast, &checked, &TypeTable::new()).unwrap();
         assert_eq!(
             ir.pretty(ast.names()).to_string(),
             "(block @0..5\n  (float-div @0..5\n    (int-to-float @0..1\n      (int 7 @0..1))\n    (int-to-float @4..5\n      (int 2 @4..5))))"
@@ -537,7 +666,7 @@ mod tests {
     fn operators_are_specialised_by_type() {
         let ir = lower_text("-(1 + 2 - 3 * 4 // 5 % 6)");
         let result = result_of(&ir);
-        assert_eq!(ir.ty_of(result), Ty::Int);
+        assert_eq!(ir.kind_of(result), ValueKind::Int);
         assert_eq!(
             dump("-(1 + 2 - 3 * 4 // 5 % 6)"),
             "(block @0..25\n  (int-neg @0..25\n    (int-sub @2..24\n      (int-add @2..7\n        (int 1 @2..3)\n        (int 2 @6..7))\n      (int-rem @10..24\n        (int-floor-div @10..20\n          (int-mul @10..15\n            (int 3 @10..11)\n            (int 4 @14..15))\n          (int 5 @19..20))\n        (int 6 @23..24)))))"
@@ -569,7 +698,7 @@ mod tests {
              \x20     (float-mul @38..45\n\
              \x20       (load x#1 @38..39)\n\
              \x20       (float 2.0 @42..45)))\n\
-             \x20   (unit @10..47))\n\
+             \x20   (empty @10..47))\n\
              \x20 (store x#1 @48..58\n\
              \x20   (int-add @53..58\n\
              \x20     (load x#0 @53..54)\n\
@@ -580,12 +709,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_is_an_empty_block_with_a_unit_result() {
-        assert_eq!(dump(""), "(block @0..0\n  (unit @0..0))");
-        assert_eq!(dump("# nothing\n"), "(block @0..0\n  (unit @0..0))");
+    fn empty_file_is_an_empty_block_with_an_empty_result() {
+        assert_eq!(dump(""), "(block @0..0\n  (empty @0..0))");
+        assert_eq!(dump("# nothing\n"), "(block @0..0\n  (empty @0..0))");
         let ir = lower_text("");
-        assert_eq!(ir.ty_of(ir.root()), Ty::Unit);
+        assert_eq!(ir.kind_of(ir.root()), ValueKind::Record);
         assert_eq!(ir.frame_size(), 0);
+        assert_eq!(ir.layout_count(), 0);
     }
 
     #[test]
@@ -610,24 +740,36 @@ mod tests {
 
     #[test]
     fn untyped_entry_is_an_internal_error() {
-        let (ast, checked) = concrete_int_division(vec![Ty::UntypedInt, Ty::Int, Ty::Float]);
-        let error = lower(&ast, &checked).unwrap_err();
+        let (ast, checked) = concrete_int_division(vec![TyId::UNTYPED_INT, TyId::INT, TyId::FLOAT]);
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "an untyped integer survived type checking");
         assert_eq!(error.span, Span::new(0, 1));
     }
 
     #[test]
     fn error_entry_is_an_internal_error() {
-        let (ast, checked) = concrete_int_division(vec![Ty::Int, Ty::Error, Ty::Float]);
-        let error = lower(&ast, &checked).unwrap_err();
+        let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::ERROR, TyId::FLOAT]);
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "a type error survived type checking");
         assert_eq!(error.span, Span::new(4, 5));
     }
 
     #[test]
+    fn a_type_from_another_table_is_an_internal_error() {
+        let ast = parse_text("{ x = 1 }");
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        assert_eq!(
+            error.message,
+            "a type with no values survived type checking"
+        );
+    }
+
+    #[test]
     fn impossible_result_type_is_an_internal_error() {
-        let (ast, checked) = concrete_int_division(vec![Ty::Int, Ty::Int, Ty::Int]);
-        let error = lower(&ast, &checked).unwrap_err();
+        let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::INT, TyId::INT]);
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "operator has a result type it cannot have");
         assert_eq!(error.span, Span::new(0, 5));
     }
@@ -636,10 +778,10 @@ mod tests {
     fn mismatched_operand_type_is_an_internal_error() {
         let ast = parse_text("1 + 2");
         let checked = Checked {
-            types: Types::new(vec![Ty::Int, Ty::Float, Ty::Int]),
+            types: Types::new(vec![TyId::INT, TyId::FLOAT, TyId::INT]),
             resolution: Resolution::without_variables(3, 1),
         };
-        let error = lower(&ast, &checked).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "operand type does not match its operator");
         assert_eq!(error.span, Span::new(4, 5));
     }
@@ -647,12 +789,13 @@ mod tests {
     #[test]
     fn unresolved_variable_is_an_internal_error() {
         let ast = parse_text("let x = 1\nx");
-        let checked = check(&ast).unwrap();
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
         let unresolved = Checked {
             types: checked.types.clone(),
             resolution: Resolution::without_variables(2, 2),
         };
-        let error = lower(&ast, &unresolved).unwrap_err();
+        let error = lower(&ast, &unresolved, &types).unwrap_err();
         assert_eq!(error.message, "a declaration has no slot");
         assert_eq!(error.span, Span::new(0, 9));
     }
@@ -695,7 +838,7 @@ mod tests {
         );
         assert_eq!(
             dump("{} == {}"),
-            "(block @0..8\n  (unit-eq == @0..8\n    (block @0..2\n      (unit @0..2))\n    (block @6..8\n      (unit @6..8))))"
+            "(block @0..8\n  (record-eq == @0..8\n    (block @0..2\n      (empty @0..2))\n    (block @6..8\n      (empty @6..8))))"
         );
     }
 
@@ -711,19 +854,19 @@ mod tests {
              \x20   (block @19..24\n\
              \x20     (int 2 @21..22))))"
         );
-        // The implicit else branch is an empty block yielding unit.
+        // The implicit else branch is an empty block yielding `{}`.
         assert_eq!(
             dump("if true {}"),
             "(block @0..10\n\
              \x20 (if @0..10\n\
              \x20   (bool true @3..7)\n\
              \x20   (block @8..10\n\
-             \x20     (unit @8..10))\n\
+             \x20     (empty @8..10))\n\
              \x20   (block @10..10\n\
-             \x20     (unit @10..10))))"
+             \x20     (empty @10..10))))"
         );
         let ir = lower_text("if true { 1 } else { 2.5 }");
-        assert_eq!(ir.ty_of(result_of(&ir)), Ty::Float);
+        assert_eq!(ir.kind_of(result_of(&ir)), ValueKind::Float);
     }
 
     #[test]
@@ -764,16 +907,132 @@ mod tests {
     fn tables_of_the_wrong_size_are_an_internal_error() {
         let (ast, _) = concrete_int_division(Vec::new());
         let checked = Checked {
-            types: Types::new(vec![Ty::Int]),
+            types: Types::new(vec![TyId::INT]),
             resolution: Resolution::without_variables(3, 1),
         };
-        let error = lower(&ast, &checked).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "type table does not belong to this AST");
         let checked = Checked {
-            types: Types::new(vec![Ty::Int, Ty::Int, Ty::Float]),
+            types: Types::new(vec![TyId::INT, TyId::INT, TyId::FLOAT]),
             resolution: Resolution::without_variables(3, 2),
         };
-        let error = lower(&ast, &checked).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
         assert_eq!(error.message, "resolution does not belong to this AST");
+    }
+
+    #[test]
+    fn a_record_block_stores_its_fields_and_makes_a_record_of_them() {
+        // Private `let`s and statements are items too; the record is the
+        // fields' slots, loaded in definition order.
+        assert_eq!(
+            dump("{ x = 1; let t = x; {}; \"a b\" = t }"),
+            "(block @0..35\n\
+             \x20 (block @0..35\n\
+             \x20   (store x#0 @2..7\n\
+             \x20     (int 1 @6..7))\n\
+             \x20   (store t#1 @9..18\n\
+             \x20     (load x#0 @17..18))\n\
+             \x20   (block @20..22\n\
+             \x20     (empty @20..22))\n\
+             \x20   (store \"a b\"#2 @24..33\n\
+             \x20     (load t#1 @32..33))\n\
+             \x20   (make-record [x \"a b\"] @0..35\n\
+             \x20     (load x#0 @2..3)\n\
+             \x20     (load \"a b\"#2 @24..29))))"
+        );
+        // A file can be a record block too.
+        assert_eq!(
+            dump("y = 2.5\nx = true"),
+            "(block @0..16\n\
+             \x20 (store y#0 @0..7\n\
+             \x20   (float 2.5 @4..7))\n\
+             \x20 (store x#1 @8..16\n\
+             \x20   (bool true @12..16))\n\
+             \x20 (make-record [y x] @0..16\n\
+             \x20   (load y#0 @0..1)\n\
+             \x20   (load x#1 @8..9)))"
+        );
+        let ir = lower_text("{ x = 1 }");
+        assert_eq!(ir.kind_of(ir.root()), ValueKind::Record);
+    }
+
+    #[test]
+    fn field_access_and_nested_records() {
+        // The inner block's `n` takes the slot that `a`, declared after its
+        // initialiser, then reuses, so it shows as `a#0` too.
+        assert_eq!(
+            dump("{ a = { n = 1.5 } }.a.n"),
+            "(block @0..23\n\
+             \x20 (field n @0..23\n\
+             \x20   (field a @0..21\n\
+             \x20     (block @0..19\n\
+             \x20       (store a#0 @2..17\n\
+             \x20         (block @6..17\n\
+             \x20           (store a#0 @8..15\n\
+             \x20             (float 1.5 @12..15))\n\
+             \x20           (make-record [n] @6..17\n\
+             \x20             (load a#0 @8..9))))\n\
+             \x20       (make-record [a] @0..19\n\
+             \x20         (load a#0 @2..3))))))"
+        );
+        let ir = lower_text("{ a = { n = 1.5 } }.a.n");
+        assert_eq!(ir.kind_of(result_of(&ir)), ValueKind::Float);
+        // Record equality and a field of every kind.
+        assert_eq!(
+            dump("{ x = 1 } != { x = 2 }"),
+            "(block @0..22\n\
+             \x20 (record-eq != @0..22\n\
+             \x20   (block @0..9\n\
+             \x20     (store x#0 @2..7\n\
+             \x20       (int 1 @6..7))\n\
+             \x20     (make-record [x] @0..9\n\
+             \x20       (load x#0 @2..3)))\n\
+             \x20   (block @13..22\n\
+             \x20     (store x#0 @15..20\n\
+             \x20       (int 2 @19..20))\n\
+             \x20     (make-record [x] @13..22\n\
+             \x20       (load x#0 @15..16)))))"
+        );
+    }
+
+    #[test]
+    fn a_literal_checked_against_a_record_type_is_lowered_at_that_type() {
+        assert_eq!(
+            dump("let p: {x: Float} = { x = 1 }"),
+            "(block @0..29\n\
+             \x20 (store p#0 @0..29\n\
+             \x20   (block @20..29\n\
+             \x20     (store p#0 @22..27\n\
+             \x20       (float 1.0 @26..27))\n\
+             \x20     (make-record [x] @20..29\n\
+             \x20       (load p#0 @22..23))))\n\
+             \x20 (empty @0..29))"
+        );
+    }
+
+    #[test]
+    fn layouts_are_shared_by_blocks_with_the_same_names() {
+        let ir = lower_text(
+            "let a = { x = 1; y = 2 }\nlet b = { x = \"s\"; y = true }\n{ y = 1; x = 2 }",
+        );
+        // `x y` twice, then `y x`, a different order.
+        assert_eq!(ir.layout_count(), 2);
+        let ir = lower_text("{ x = 1 } == { x = 2 }");
+        assert_eq!(ir.layout_count(), 1);
+        let IrKind::RecordEq(_, operands) = ir.get(result_of(&ir)).kind else {
+            panic!("expected a record comparison");
+        };
+        let layout_of = |block: IrId| {
+            let IrKind::Block { result, .. } = ir.get(block).kind else {
+                panic!("expected a block");
+            };
+            let IrKind::MakeRecord { layout, .. } = ir.get(result).kind else {
+                panic!("expected a record");
+            };
+            layout
+        };
+        let (lhs, rhs) = (layout_of(operands.lhs), layout_of(operands.rhs));
+        assert_eq!(lhs, rhs);
+        assert_eq!(&*ir.layout(lhs).texts, &[Box::from("x")]);
     }
 }

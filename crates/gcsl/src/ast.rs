@@ -13,8 +13,9 @@
 //! while the outer block's are being parsed. Lists of items are therefore
 //! kept in a separate pool, [`Ast::items`], each list a contiguous
 //! [`ItemRange`] within it. The parts of interpolated strings live in a pool
-//! of their own in the same way, [`Ast::parts`], and the same pattern will
-//! serve argument lists.
+//! of their own in the same way, [`Ast::parts`], as do the fields of record
+//! type expressions, [`Ast::field_tys`], and the same pattern will serve
+//! argument lists.
 //!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
@@ -26,7 +27,7 @@ use std::fmt;
 
 use crate::names::{Name, Names};
 use crate::source::Span;
-use crate::strings::{Quoted, StrId, Strings};
+use crate::strings::{FieldName, Quoted, StrId, Strings};
 
 /// Index of an [`Expr`] in the arena of the [`Ast`] (or [`AstBuilder`]) that
 /// allocated it.
@@ -81,6 +82,26 @@ pub struct ItemRange {
 pub struct PartRange {
     start: u32,
     len: u32,
+}
+
+/// The fields of a record type expression: a contiguous range of the
+/// field-type pool of the [`Ast`] that allocated it. Resolve it with
+/// [`Ast::field_tys`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FieldTyRange {
+    start: u32,
+    len: u32,
+}
+
+/// One field of a record type expression, `NAME: TYPE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FieldTy {
+    /// The field's name, plain or quoted in source.
+    pub name: Name,
+    /// Where the name is written.
+    pub span: Span,
+    /// The field's type.
+    pub ty: TypeExprId,
 }
 
 /// One part of an interpolated string.
@@ -289,10 +310,21 @@ pub enum ExprKind {
     /// A parenthesised expression. Kept so `--dump-ast` shows the source
     /// shape; it carries no semantics and is dropped by lowering.
     Paren(ExprId),
-    /// A use of a variable.
+    /// A use of a variable (or of a field, by its name, later in the block
+    /// that declares it).
     Name(Name),
-    /// A block `{ ... }`: a body of items in a scope of its own.
+    /// A block `{ ... }`: a body of items in a scope of its own. With at
+    /// least one [`ItemKind::Field`] it is a record block, whose value is
+    /// the record of its fields.
     Block(ItemRange),
+    /// Field access, `EXPR.NAME` or `EXPR."quoted name"`. The span of the
+    /// `.NAME` part is not stored; see [`Expr::member_span`].
+    Field {
+        /// The record whose field is read.
+        expr: ExprId,
+        /// The field's name.
+        name: Name,
+    },
     /// A type ascription `expr : Type`.
     Ascribe {
         /// The expression whose type is stated.
@@ -311,7 +343,8 @@ pub struct Expr {
     /// its braces, a `Binary` its left operand through its right operand, a
     /// `Unary` its operator through its operand, and an `Ascribe` its
     /// expression through its type. A string literal covers its prefix and
-    /// delimiters, and an `If` its `if` keyword through its last branch.
+    /// delimiters, an `If` its `if` keyword through its last branch, and a
+    /// `Field` its record expression through its name.
     pub span: Span,
 }
 
@@ -331,7 +364,19 @@ impl Expr {
             | ExprKind::Paren(_)
             | ExprKind::Name(_)
             | ExprKind::Block(_)
+            | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. } => None,
+        }
+    }
+
+    /// The span of the `.NAME` part of a `Field` node, for diagnostics about
+    /// the access: from the end of its record expression, found in `ast`,
+    /// to the end of the name. `None` for every other node.
+    #[must_use]
+    pub fn member_span(&self, ast: &Ast) -> Option<Span> {
+        match self.kind {
+            ExprKind::Field { expr, .. } => Some(Span::new(ast.get(expr).span.end, self.span.end)),
+            _ => None,
         }
     }
 
@@ -357,6 +402,17 @@ pub enum ItemKind {
         /// The annotated type, if any.
         ty: Option<TypeExprId>,
         /// The initialiser.
+        value: ExprId,
+    },
+    /// `NAME = EXPR` or `"quoted name" = EXPR`: declares a field of the
+    /// record its block evaluates to, which is also a name in scope for the
+    /// block's later items.
+    Field {
+        /// The field's name.
+        name: Name,
+        /// Where the name is written, quotes included for a quoted name.
+        name_span: Span,
+        /// The field's value.
         value: ExprId,
     },
     /// `NAME := EXPR`: rebinds a variable declared in the same block.
@@ -389,6 +445,9 @@ pub struct Item {
 pub enum TypeExprKind {
     /// A type written as a name, such as `Int`.
     Named(Name),
+    /// A record type, `{x: Int, "a b": String}`: its fields in source
+    /// order. Repeated names are allowed here and reported by the checker.
+    Record(FieldTyRange),
 }
 
 /// A type as written in source, in an annotation or an ascription.
@@ -418,6 +477,7 @@ pub struct AstBuilder {
     item_lists: Vec<ItemId>,
     parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
+    field_tys: Vec<FieldTy>,
 }
 
 impl AstBuilder {
@@ -484,6 +544,17 @@ impl AstBuilder {
         }
     }
 
+    /// Appends `fields` to the field-type pool as one record type's fields
+    /// and returns their range.
+    pub fn push_field_tys(&mut self, fields: &[FieldTy]) -> FieldTyRange {
+        let start = next_id(self.field_tys.len());
+        self.field_tys.extend_from_slice(fields);
+        FieldTyRange {
+            start,
+            len: next_id(fields.len()),
+        }
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -525,6 +596,7 @@ impl AstBuilder {
             item_lists: self.item_lists,
             parts: self.parts,
             type_exprs: self.type_exprs,
+            field_tys: self.field_tys,
             root,
             names,
             strings,
@@ -541,6 +613,7 @@ pub struct Ast {
     item_lists: Vec<ItemId>,
     parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
+    field_tys: Vec<FieldTy>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -598,6 +671,18 @@ impl Ast {
     #[must_use]
     pub fn type_expr(&self, id: TypeExprId) -> &TypeExpr {
         &self.type_exprs[id.index()]
+    }
+
+    /// Returns the fields of the record type expression `range`, in source
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn field_tys(&self, range: FieldTyRange) -> &[FieldTy] {
+        let start = range.start as usize;
+        &self.field_tys[start..start + range.len as usize]
     }
 
     /// The file's body: the outermost block's items.
@@ -696,9 +781,13 @@ impl Annotate for NoAnnotation {
 ///     (name x @17..18)))
 /// ```
 ///
-/// Items print as `(let x ...)`, `(let x : Type ...)`, `(rebind x ...)`,
-/// `(result ...)` and `(expr ...)`, followed by their expression; blocks as
-/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`.
+/// Items print as `(let x ...)`, `(let x : Type ...)`, `(field x ...)`,
+/// `(rebind x ...)`, `(result ...)` and `(expr ...)`, followed by their
+/// expression; blocks as `(block ...)` followed by their items; ascriptions
+/// as `(: Type ...)`; field accesses as `(. x ...)` followed by their record
+/// expression. A field name that is not a plain identifier is quoted, as in
+/// `(field "a b" ...)`. Record types print as written, fields in source
+/// order: `{x: Int, "a b": {}}`.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
 /// followed by their parts, literal text as `(lit "text")` (which has no
@@ -731,8 +820,13 @@ impl<A: Annotate> Pretty<'_, A> {
             } => {
                 write!(f, "let {}", names.get(name))?;
                 if let Some(ty) = ty {
-                    write!(f, " : {}", self.type_name(ty))?;
+                    f.write_str(" : ")?;
+                    self.type_expr(f, ty)?;
                 }
+                value
+            }
+            ItemKind::Field { name, value, .. } => {
+                write!(f, "field {}", FieldName(names.get(name)))?;
                 value
             }
             ItemKind::Rebind { name, value, .. } => {
@@ -753,9 +847,22 @@ impl<A: Annotate> Pretty<'_, A> {
         f.write_str(")")
     }
 
-    fn type_name(&self, id: TypeExprId) -> &str {
+    /// Writes a type expression as it is written in source.
+    fn type_expr(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
+        let names = self.ast.names();
         match self.ast.type_expr(id).kind {
-            TypeExprKind::Named(name) => self.ast.names().get(name),
+            TypeExprKind::Named(name) => f.write_str(names.get(name)),
+            TypeExprKind::Record(fields) => {
+                f.write_str("{")?;
+                for (index, field) in self.ast.field_tys(fields).iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: ", FieldName(names.get(field.name)))?;
+                    self.type_expr(f, field.ty)?;
+                }
+                f.write_str("}")
+            }
         }
     }
 
@@ -777,7 +884,13 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Paren(_) => f.write_str("paren")?,
             ExprKind::Name(name) => write!(f, "name {}", self.ast.names().get(name))?,
             ExprKind::Block(_) => f.write_str("block")?,
-            ExprKind::Ascribe { ty, .. } => write!(f, ": {}", self.type_name(ty))?,
+            ExprKind::Field { name, .. } => {
+                write!(f, ". {}", FieldName(self.ast.names().get(name)))?;
+            }
+            ExprKind::Ascribe { ty, .. } => {
+                f.write_str(": ")?;
+                self.type_expr(f, ty)?;
+            }
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
@@ -789,6 +902,7 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Name(_) => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
+            | ExprKind::Field { expr: operand, .. }
             | ExprKind::Ascribe { expr: operand, .. } => {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
