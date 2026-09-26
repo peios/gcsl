@@ -26,7 +26,9 @@ pub enum ValueKind {
 
 /// The field names of a record, in definition order. Built once per record
 /// block when a program is lowered and shared by every record that block
-/// builds, so building a record never copies names.
+/// builds, so building a record never copies names; a functional update
+/// that replaces a field shares its record's layout too, and one that adds
+/// a field builds a new layout with the name at the end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     /// The name of each field, in definition order. Never empty and never
@@ -205,10 +207,10 @@ impl Value {
 /// a `String` as its text with no quotes or escaping.
 ///
 /// A record shows as GCSL syntax, the same as its [`Value::repr`]: its
-/// fields in definition order, each value in `repr` form, so strings are
-/// quoted, as in `{x = 1, y = "a", inner = {n = 2}}`; a field name that is
-/// not a plain identifier is quoted too (see [`FieldName`]). The empty
-/// record is `{}`.
+/// fields in definition order, separated by `;` as items are, each value in
+/// `repr` form, so strings are quoted, as in
+/// `{x = 1; y = "a"; inner = {n = 2}}`; a field name that is not a plain
+/// identifier is quoted too (see [`FieldName`]). The empty record is `{}`.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -222,7 +224,7 @@ impl fmt::Display for Value {
                     record.layout.texts.iter().zip(&record.values).enumerate()
                 {
                     if index > 0 {
-                        f.write_str(", ")?;
+                        f.write_str("; ")?;
                     }
                     write!(f, "{} = {}", FieldName(text), value.repr())?;
                 }
@@ -438,8 +440,9 @@ mod tests {
                 Value::Empty,
             ],
         );
-        // Definition order, values in `repr` form, quoted names.
-        let shown = "{x = 1, y = \"a\\n\", inner = {n = 2}, \"a b\" = 1.0, e = {}}";
+        // Definition order, separated by `;`, values in `repr` form, quoted
+        // names.
+        let shown = "{x = 1; y = \"a\\n\"; inner = {n = 2}; \"a b\" = 1.0; e = {}}";
         assert_eq!(outer.to_string(), shown);
         assert_eq!(outer.repr().to_string(), shown);
     }

@@ -236,8 +236,48 @@ fn run_prints_nothing_for_an_empty_record_result() {
 #[test]
 fn run_prints_a_record_as_it_would_be_written() {
     let output = gcsl(&["run", "tests/fixtures/record.gcsl"]);
-    assert_eq!(stdout(&output), "{x = 1, y = \"a\"}\n");
+    assert_eq!(stdout(&output), "{x = 1; y = \"a\"}\n");
     assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_prints_merged_dotted_fields_as_one_record() {
+    let output = gcsl(&["run", "tests/fixtures/dotted.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{server = {host = \"localhost\"; port = 8080; tls = {enabled = true}}; name = \"api\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dump_ir_shows_updates() {
+    let output = gcsl(&["run", "tests/fixtures/dotted.gcsl", "--dump-ir"]);
+    assert_eq!(
+        stdout(&output),
+        "(block @39..122\n\
+         \x20 (store server#0 @39..64\n\
+         \x20   (update-field host @39..50\n\
+         \x20     (empty @39..45)\n\
+         \x20     (str \"localhost\" @53..64)))\n\
+         \x20 (store server#0 @65..83\n\
+         \x20   (update-field port @65..76\n\
+         \x20     (load server#0 @65..71)\n\
+         \x20     (int 8080 @79..83)))\n\
+         \x20 (store name#1 @84..96\n\
+         \x20   (str \"api\" @91..96))\n\
+         \x20 (store server#0 @97..122\n\
+         \x20   (update-field tls @97..107\n\
+         \x20     (load server#0 @97..103)\n\
+         \x20     (update-field enabled @97..115\n\
+         \x20       (empty @97..107)\n\
+         \x20       (bool true @118..122))))\n\
+         \x20 (make-record [server name] @39..122\n\
+         \x20   (load server#0 @39..45)\n\
+         \x20   (load name#1 @84..88)))\n"
+    );
     assert_eq!(output.status.code(), Some(0));
 }
 
@@ -471,10 +511,10 @@ fn repl_shows_records_with_their_types() {
     );
     assert_eq!(
         stdout(&output),
-        "{x = 1, y = \"a\"} : {x: Int, y: String}\n\
+        "{x = 1; y = \"a\"} : {x: Int, y: String}\n\
          \"a\" : String\n\
-         {x = 1, y = \"a\"} : {x: Int}\n\
-         {inner = {n = 1.5}, \"a b\" = true} : {\"a b\": Bool, inner: {n: Float}}\n"
+         {x = 1; y = \"a\"} : {x: Int}\n\
+         {inner = {n = 1.5}; \"a b\" = true} : {\"a b\": Bool, inner: {n: Float}}\n"
     );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
@@ -488,7 +528,7 @@ fn repl_prints_warnings_before_the_value() {
     );
     // The first line's value is `{}`, so only its warning is shown; the
     // second shows its warning and then its value.
-    assert_eq!(stdout(&output), "{x = 1, z = 2} : {x: Int}\n");
+    assert_eq!(stdout(&output), "{x = 1; z = 2} : {x: Int}\n");
     assert_eq!(
         stderr(&output),
         "warning: field `z` is not in `{x: Int}`\n\

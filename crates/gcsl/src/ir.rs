@@ -28,9 +28,24 @@
 //! order, live in [`Ir::layout`]'s table, shared by reference count with
 //! every record built from them.
 //!
+//! A functional update, `let a.b = e`, a dotted `:=` or a dotted field,
+//! lowers to a chain of [`IrKind::UpdateField`] nodes, one for each segment
+//! of its path after the first, from the leaf outwards: each builds a new
+//! record from an old one with one field set. When an update adds a field,
+//! the evaluator makes a layout for the new record at runtime, and takes the
+//! added name's text from [`Ir::name_text`], so that it never needs the
+//! names table.
+//!
+//! Typed equality, `==` and `!=` on records, compares only the fields of the
+//! operands' static type, so its node carries that type's [`Shape`]: the
+//! names of its fields, with a shape of its own for each field that is a
+//! record, in [`Ir::shape`]'s table. Total equality, `===` and `!==`,
+//! compares whole values and needs none.
+//!
 //! An [`Ir`] can only be built by [`crate::lower::lower`], which is what
 //! guarantees it is well typed.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -79,6 +94,27 @@ impl LayoutId {
     const fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Index of a record shape in its [`Ir`]'s table. Resolve it with
+/// [`Ir::shape`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShapeId(u32);
+
+impl ShapeId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The static shape of a record type, which typed equality compares over:
+/// the name of each of its fields, sorted by [`Name`], with `Some` shape for
+/// each field that is itself a record, which is compared through that
+/// shape, and `None` for each field compared as a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shape {
+    /// Each field's name and, for a record field, its own shape.
+    pub fields: Box<[(Name, Option<ShapeId>)]>,
 }
 
 /// The relation a comparison node tests.
@@ -141,11 +177,26 @@ pub struct Operands {
     pub op_start: u32,
 }
 
+/// The operands of a typed record comparison, with the shape it compares
+/// over. Unlike [`Operands`], it has no operator position: a shape and a
+/// position would not both fit in a node (see [`IrNode`]), and a record
+/// comparison never fails, so it never needs to point at its operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapedOperands {
+    /// The shape of the operands' static type.
+    pub shape: ShapeId,
+    /// The left operand.
+    pub lhs: IrId,
+    /// The right operand.
+    pub rhs: IrId,
+}
+
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
 /// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
-/// and of `RecordEq` and `Field` nodes to record nodes; see
+/// and of `Record*`, `Field` and `UpdateField` nodes to record nodes (an
+/// `UpdateField`'s value excepted, which may be of any kind); see
 /// [`Ir::kind_of`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
@@ -167,10 +218,20 @@ pub enum IrKind {
     StrCmp(Cmp, Operands),
     /// Compares two `Bool`s: `==` if the flag is `true`, `!=` if `false`.
     BoolEq(bool, Operands),
-    /// Compares two records of the same type, deeply and by field name (see
-    /// [`crate::value::Record`]'s equality): `==` if the flag is `true`,
-    /// `!=` if `false`.
-    RecordEq(bool, Operands),
+    /// `==` on two records of the same type: typed equality, comparing only
+    /// the fields of their shape, recursively through the shapes of record
+    /// fields.
+    RecordEq(ShapedOperands),
+    /// `!=` on two records of the same type: the negation of
+    /// [`IrKind::RecordEq`].
+    RecordNe(ShapedOperands),
+    /// `===` on two records of the same type: total equality, comparing
+    /// whole values deeply and by field name (see
+    /// [`crate::value::Record`]'s equality).
+    RecordSame(Operands),
+    /// `!==` on two records of the same type: the negation of
+    /// [`IrKind::RecordSame`].
+    RecordNotSame(Operands),
     /// `Bool` conjunction, evaluating the right operand only if the left is
     /// `true`.
     And(Operands),
@@ -254,6 +315,20 @@ pub enum IrKind {
         /// The kind of the field's value, which is the node's kind.
         kind: ValueKind,
     },
+    /// Evaluates `record` and then `value`, and yields a new record: the
+    /// record with field `name` set to the value. If the record has the
+    /// field, the new one shares its layout with the value replaced;
+    /// otherwise it has a new layout with `name` added at the end. The empty
+    /// record becomes a record of that one field. The record evaluated is
+    /// never changed.
+    UpdateField {
+        /// The record to update.
+        record: IrId,
+        /// The field to set.
+        name: Name,
+        /// Its new value, of any kind.
+        value: IrId,
+    },
 }
 
 impl IrKind {
@@ -273,8 +348,10 @@ impl IrKind {
             IrKind::IntCmp(cmp, _) | IrKind::FloatCmp(cmp, _) | IrKind::StrCmp(cmp, _) => {
                 Some(cmp.symbol())
             }
-            IrKind::BoolEq(true, _) | IrKind::RecordEq(true, _) => Some("=="),
-            IrKind::BoolEq(false, _) | IrKind::RecordEq(false, _) => Some("!="),
+            IrKind::BoolEq(true, _) | IrKind::RecordEq(_) => Some("=="),
+            IrKind::BoolEq(false, _) | IrKind::RecordNe(_) => Some("!="),
+            IrKind::RecordSame(_) => Some("==="),
+            IrKind::RecordNotSame(_) => Some("!=="),
             IrKind::And(_) => Some("and"),
             IrKind::Or(_) => Some("or"),
             IrKind::Not(_) => Some("not"),
@@ -290,7 +367,8 @@ impl IrKind {
             | IrKind::Store(..)
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
-            | IrKind::Field { .. } => None,
+            | IrKind::Field { .. }
+            | IrKind::UpdateField { .. } => None,
         }
     }
 
@@ -306,7 +384,8 @@ impl IrKind {
             IrKind::FloatCmp(..) => "float-cmp",
             IrKind::StrCmp(..) => "str-cmp",
             IrKind::BoolEq(..) => "bool-eq",
-            IrKind::RecordEq(..) => "record-eq",
+            IrKind::RecordEq(_) | IrKind::RecordNe(_) => "record-eq",
+            IrKind::RecordSame(_) | IrKind::RecordNotSame(_) => "record-same",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -330,11 +409,15 @@ impl IrKind {
             IrKind::Block { .. } => "block",
             IrKind::MakeRecord { .. } => "make-record",
             IrKind::Field { .. } => "field",
+            IrKind::UpdateField { .. } => "update-field",
         }
     }
 }
 
-/// One IR node.
+/// One IR node: 24 bytes, a 16-byte kind and an 8-byte span. Every kind's
+/// payload therefore fits in 15 bytes beside its tag, which is why a typed
+/// record comparison has its shape but not its operator's position (see
+/// [`ShapedOperands`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IrNode {
     /// What the node computes.
@@ -346,7 +429,9 @@ pub struct IrNode {
 
 impl IrNode {
     /// The span of the operator's symbol, for operator nodes: where a
-    /// runtime error in this node is reported.
+    /// runtime error in this node is reported. `None` for typed record
+    /// comparisons, which cannot fail and do not keep it (see
+    /// [`ShapedOperands`]).
     #[must_use]
     pub fn operator_span(&self) -> Option<Span> {
         let symbol = self.kind.symbol()?;
@@ -365,12 +450,15 @@ impl IrNode {
             | IrKind::FloatCmp(_, operands)
             | IrKind::StrCmp(_, operands)
             | IrKind::BoolEq(_, operands)
-            | IrKind::RecordEq(_, operands)
+            | IrKind::RecordSame(operands)
+            | IrKind::RecordNotSame(operands)
             | IrKind::And(operands)
             | IrKind::Or(operands) => operands.op_start,
             // A prefix operator starts its expression.
             IrKind::IntNeg(_) | IrKind::FloatNeg(_) | IrKind::Not(_) => self.span.start,
-            IrKind::IntConst(_)
+            IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
             | IrKind::StrConst(_)
@@ -382,20 +470,26 @@ impl IrNode {
             | IrKind::Store(..)
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
-            | IrKind::Field { .. } => return None,
+            | IrKind::Field { .. }
+            | IrKind::UpdateField { .. } => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
-/// constants, the record layouts, its root, and the frame it needs.
+/// constants, the record layouts and shapes, the text of every name an
+/// update may add to a record, its root, and the frame it needs.
 #[derive(Clone, Debug)]
 pub struct Ir {
     nodes: Vec<IrNode>,
     item_lists: Vec<IrId>,
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
+    shapes: Vec<Shape>,
+    /// The text of the name of every [`IrKind::UpdateField`], which may
+    /// add it to a record's layout at runtime.
+    name_texts: HashMap<Name, Box<str>>,
     root: IrId,
     frame_size: u32,
     /// For each slot, the name of the last variable assigned to it. For
@@ -451,6 +545,29 @@ impl Ir {
         self.layouts.len()
     }
 
+    /// Returns the record shape `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this IR.
+    #[must_use]
+    pub fn shape(&self, id: ShapeId) -> &Shape {
+        &self.shapes[id.index()]
+    }
+
+    /// The number of distinct record shapes.
+    #[must_use]
+    pub fn shape_count(&self) -> usize {
+        self.shapes.len()
+    }
+
+    /// The text of `name`, if it is the name of an [`IrKind::UpdateField`]:
+    /// what the evaluator shows a field it adds to a record as.
+    #[must_use]
+    pub fn name_text(&self, name: Name) -> Option<&str> {
+        self.name_texts.get(&name).map(AsRef::as_ref)
+    }
+
     /// The root node, the file's body, whose value is the program's result.
     #[must_use]
     pub fn root(&self) -> IrId {
@@ -488,7 +605,10 @@ impl Ir {
                 | IrKind::FloatCmp(..)
                 | IrKind::StrCmp(..)
                 | IrKind::BoolEq(..)
-                | IrKind::RecordEq(..)
+                | IrKind::RecordEq(_)
+                | IrKind::RecordNe(_)
+                | IrKind::RecordSame(_)
+                | IrKind::RecordNotSame(_)
                 | IrKind::And(_)
                 | IrKind::Or(_)
                 | IrKind::Not(_) => ValueKind::Bool,
@@ -507,7 +627,10 @@ impl Ir {
                 | IrKind::FloatMul(_)
                 | IrKind::FloatDiv(_)
                 | IrKind::IntToFloat(_) => ValueKind::Float,
-                IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => ValueKind::Record,
+                IrKind::Empty
+                | IrKind::Store(..)
+                | IrKind::MakeRecord { .. }
+                | IrKind::UpdateField { .. } => ValueKind::Record,
                 IrKind::Load(_, kind) | IrKind::Field { kind, .. } => kind,
             };
         }
@@ -522,9 +645,14 @@ impl Ir {
     /// their text quoted and escaped, as in `(str "a\n" @0..5)`, and
     /// comparisons their operator, as in `(int-cmp < @0..5 ...)`. A record
     /// shows its layout's names in brackets and then its values, as in
-    /// `(make-record [x y] @0..9 ...)`, and a field access its name, as in
-    /// `(field x @0..3 ...)`, a name that is not a plain identifier quoted.
-    /// There is no trailing newline.
+    /// `(make-record [x y] @0..9 ...)`, and a field access or an update its
+    /// name, as in `(field x @0..3 ...)` and `(update-field x @0..3 ...)`,
+    /// then its record and, for an update, the value. A name that is not a
+    /// plain identifier is quoted. A typed record comparison shows its
+    /// operator and its shape's field names in the shape's order, each
+    /// record field's own shape after its name, as in
+    /// `(record-eq == [x inner[n]] @0..9 ...)`; a total one its operator,
+    /// as in `(record-same === @0..9 ...)`. There is no trailing newline.
     #[must_use]
     pub fn pretty<'a>(&'a self, names: &'a Names) -> impl fmt::Display + 'a {
         Pretty { ir: self, names }
@@ -538,6 +666,8 @@ pub(crate) struct IrBuilder {
     item_lists: Vec<IrId>,
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
+    shapes: Vec<Shape>,
+    name_texts: HashMap<Name, Box<str>>,
 }
 
 impl IrBuilder {
@@ -547,15 +677,18 @@ impl IrBuilder {
             item_lists: Vec::new(),
             strings: Vec::new(),
             layouts: Vec::new(),
+            shapes: Vec::new(),
+            name_texts: HashMap::new(),
         }
     }
 
     /// Adds a node and returns its id. The builder holds at most one node
     /// per AST node or item, plus one conversion per `/` operand, one
-    /// `Empty` or `MakeRecord` per block, one `Load` per field and one
-    /// constant per literal piece of an interpolation, far below `u32::MAX`
-    /// for any source a `SourceFile` accepts; past that, ids would
-    /// saturate.
+    /// `Empty` or `MakeRecord` per block, one `Load` per field, one
+    /// constant per literal piece of an interpolation, and for each segment
+    /// of a dotted path after the first an update and a record to update,
+    /// far below `u32::MAX` for any source a `SourceFile` accepts; past
+    /// that, ids would saturate.
     pub(crate) fn alloc(&mut self, kind: IrKind, span: Span) -> IrId {
         let id = IrId(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX));
         self.nodes.push(IrNode { kind, span });
@@ -579,6 +712,32 @@ impl IrBuilder {
         id
     }
 
+    /// Adds a record shape and returns its id. There is at most one per
+    /// record type, and fewer record types than bytes of source, so ids
+    /// never saturate either. Deduplicating is the caller's business.
+    pub(crate) fn push_shape(&mut self, shape: Shape) -> ShapeId {
+        let id = ShapeId(u32::try_from(self.shapes.len()).unwrap_or(u32::MAX));
+        self.shapes.push(shape);
+        id
+    }
+
+    /// Replaces the fields of shape `id`, which [`IrBuilder::push_shape`]
+    /// returned, so that a shape can be given its id before its fields are
+    /// known. Does nothing for an id it did not return.
+    pub(crate) fn set_shape(&mut self, id: ShapeId, shape: Shape) {
+        if let Some(entry) = self.shapes.get_mut(id.index()) {
+            *entry = shape;
+        }
+    }
+
+    /// Records `text` as the text of `name`, the name of an
+    /// [`IrKind::UpdateField`], unless it is recorded already.
+    pub(crate) fn add_name_text(&mut self, name: Name, text: &str) {
+        self.name_texts
+            .entry(name)
+            .or_insert_with(|| Box::from(text));
+    }
+
     /// Appends `items` to the item pool as one list and returns its range.
     pub(crate) fn push_item_list(&mut self, items: &[IrId]) -> IrRange {
         let start = u32::try_from(self.item_lists.len()).unwrap_or(u32::MAX);
@@ -595,6 +754,8 @@ impl IrBuilder {
             item_lists: self.item_lists,
             strings: self.strings,
             layouts: self.layouts,
+            shapes: self.shapes,
+            name_texts: self.name_texts,
             root,
             frame_size,
             slot_names,
@@ -608,6 +769,33 @@ struct Pretty<'a> {
 }
 
 impl Pretty<'_> {
+    /// Writes shape `id` as its field names in brackets, each record
+    /// field's shape after its name: `[x inner[n]]`. Nested shapes are
+    /// written through a work list, not recursion, since a record type can
+    /// be nested as deeply as a program is long.
+    fn shape(&self, f: &mut fmt::Formatter<'_>, id: ShapeId) -> fmt::Result {
+        // Each shape being written, with the index of its next field.
+        let mut pending = vec![(id, 0_usize)];
+        f.write_str("[")?;
+        while let Some((shape, index)) = pending.pop() {
+            let fields = self.ir.shapes.get(shape.index()).map(|s| &*s.fields);
+            let Some(&(name, nested)) = fields.unwrap_or_default().get(index) else {
+                f.write_str("]")?;
+                continue;
+            };
+            if index > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{}", FieldName(self.names.get(name)))?;
+            pending.push((shape, index + 1));
+            if let Some(nested) = nested {
+                f.write_str("[")?;
+                pending.push((nested, 0));
+            }
+        }
+        Ok(())
+    }
+
     /// Writes a slot as `name#slot`, the name quoted if it is a field's
     /// that is not a plain identifier, or `?#slot` if the IR has no name
     /// for it.
@@ -618,9 +806,9 @@ impl Pretty<'_> {
         }
     }
 
-    fn node(&self, f: &mut fmt::Formatter<'_>, id: IrId, depth: usize) -> fmt::Result {
-        let node = self.ir.get(id);
-        write!(f, "{:indent$}({}", "", node.kind.name(), indent = depth * 2)?;
+    /// Writes what a node shows between its name and its span: a
+    /// constant's value, a slot, an operator, a layout, a shape or a name.
+    fn details(&self, f: &mut fmt::Formatter<'_>, node: &IrNode) -> fmt::Result {
         match node.kind {
             IrKind::IntConst(value) => write!(f, " {value}")?,
             IrKind::FloatConst(value) => write!(f, " {value:?}")?,
@@ -630,9 +818,14 @@ impl Pretty<'_> {
             IrKind::IntCmp(cmp, _) | IrKind::FloatCmp(cmp, _) | IrKind::StrCmp(cmp, _) => {
                 write!(f, " {}", cmp.symbol())?;
             }
-            IrKind::BoolEq(eq, _) | IrKind::RecordEq(eq, _) => {
-                f.write_str(if eq { " ==" } else { " !=" })?;
+            IrKind::BoolEq(eq, _) => f.write_str(if eq { " ==" } else { " !=" })?,
+            IrKind::RecordEq(operands) | IrKind::RecordNe(operands) => {
+                let eq = matches!(node.kind, IrKind::RecordEq(_));
+                f.write_str(if eq { " == " } else { " != " })?;
+                self.shape(f, operands.shape)?;
             }
+            IrKind::RecordSame(_) => f.write_str(" ===")?,
+            IrKind::RecordNotSame(_) => f.write_str(" !==")?,
             IrKind::MakeRecord { layout, .. } => {
                 f.write_str(" [")?;
                 for (index, text) in self.ir.layout(layout).texts.iter().enumerate() {
@@ -643,10 +836,21 @@ impl Pretty<'_> {
                 }
                 f.write_str("]")?;
             }
-            IrKind::Field { name, .. } => write!(f, " {}", FieldName(self.names.get(name)))?,
+            IrKind::Field { name, .. } | IrKind::UpdateField { name, .. } => {
+                write!(f, " {}", FieldName(self.names.get(name)))?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn node(&self, f: &mut fmt::Formatter<'_>, id: IrId, depth: usize) -> fmt::Result {
+        let node = self.ir.get(id);
+        write!(f, "{:indent$}({}", "", node.kind.name(), indent = depth * 2)?;
+        self.details(f, node)?;
         write!(f, " @{}", node.span)?;
+        // The children, each on a line of its own: inline rather than in a
+        // helper, so that printing recurses one frame per level.
         match node.kind {
             IrKind::IntConst(_)
             | IrKind::FloatConst(_)
@@ -679,13 +883,26 @@ impl Pretty<'_> {
             | IrKind::FloatCmp(_, operands)
             | IrKind::StrCmp(_, operands)
             | IrKind::BoolEq(_, operands)
-            | IrKind::RecordEq(_, operands)
+            | IrKind::RecordSame(operands)
+            | IrKind::RecordNotSame(operands)
             | IrKind::And(operands)
             | IrKind::Or(operands) => {
                 f.write_str("\n")?;
                 self.node(f, operands.lhs, depth + 1)?;
                 f.write_str("\n")?;
                 self.node(f, operands.rhs, depth + 1)?;
+            }
+            IrKind::RecordEq(ShapedOperands { lhs, rhs, .. })
+            | IrKind::RecordNe(ShapedOperands { lhs, rhs, .. })
+            | IrKind::UpdateField {
+                record: lhs,
+                value: rhs,
+                ..
+            } => {
+                f.write_str("\n")?;
+                self.node(f, lhs, depth + 1)?;
+                f.write_str("\n")?;
+                self.node(f, rhs, depth + 1)?;
             }
             IrKind::If { cond, then, else_ } => {
                 for child in [cond, then, else_] {
@@ -882,7 +1099,26 @@ mod tests {
             rhs: record,
             op_start: 0,
         };
-        let record_eq = builder.alloc(IrKind::RecordEq(false, operands), Span::new(0, 1));
+        let shape = builder.push_shape(Shape {
+            fields: Box::new([(x, None)]),
+        });
+        let shaped = ShapedOperands {
+            shape,
+            lhs: record,
+            rhs: record,
+        };
+        let record_eq = builder.alloc(IrKind::RecordEq(shaped), Span::new(0, 1));
+        let record_ne = builder.alloc(IrKind::RecordNe(shaped), Span::new(0, 1));
+        let record_same = builder.alloc(IrKind::RecordSame(operands), Span::new(0, 1));
+        let record_not_same = builder.alloc(IrKind::RecordNotSame(operands), Span::new(0, 1));
+        let update = builder.alloc(
+            IrKind::UpdateField {
+                record,
+                name: x,
+                value: float,
+            },
+            Span::new(0, 1),
+        );
         let items = builder.push_item_list(&[store]);
         let inner = builder.alloc(
             IrKind::Block {
@@ -907,11 +1143,16 @@ mod tests {
         assert_eq!(ir.kind_of(load), ValueKind::Float);
         assert_eq!(ir.kind_of(record), ValueKind::Record);
         assert_eq!(ir.kind_of(field), ValueKind::Float);
-        assert_eq!(ir.kind_of(record_eq), ValueKind::Bool);
+        for comparison in [record_eq, record_ne, record_same, record_not_same] {
+            assert_eq!(ir.kind_of(comparison), ValueKind::Bool);
+        }
+        assert_eq!(ir.kind_of(update), ValueKind::Record);
         assert_eq!(ir.kind_of(inner), ValueKind::Float);
         assert_eq!(ir.kind_of(outer), ValueKind::Float);
         assert_eq!(ir.layout_count(), 1);
         assert_eq!(&*ir.layout(layout).names, &[x]);
+        assert_eq!(ir.shape_count(), 1);
+        assert_eq!(&*ir.shape(shape).fields, &[(x, None)]);
     }
 
     #[test]
@@ -1067,31 +1308,131 @@ mod tests {
 
     #[test]
     fn equality_of_bools_and_records_shows_its_operator() {
-        let mut builder = IrBuilder::with_capacity(6);
+        let mut names = Names::new();
+        let (x, inner, n, spaced) = (
+            names.intern("x"),
+            names.intern("inner"),
+            names.intern("n"),
+            names.intern("a b"),
+        );
+        let mut builder = IrBuilder::with_capacity(8);
         let nothing = builder.alloc(IrKind::Empty, Span::new(0, 2));
         let operands = Operands {
             lhs: nothing,
             rhs: nothing,
             op_start: 3,
         };
-        let eq = builder.alloc(IrKind::RecordEq(true, operands), Span::new(0, 8));
-        let ne = builder.alloc(IrKind::BoolEq(false, operands), Span::new(0, 8));
-        let items = builder.push_item_list(&[eq]);
-        let root = builder.alloc(IrKind::Block { items, result: ne }, Span::new(0, 8));
+        // A shape given its id before its fields, as lowering does.
+        let outer = builder.push_shape(Shape {
+            fields: Box::default(),
+        });
+        let nested = builder.push_shape(Shape {
+            fields: Box::new([(n, None), (spaced, None)]),
+        });
+        builder.set_shape(
+            outer,
+            Shape {
+                fields: Box::new([(x, None), (inner, Some(nested))]),
+            },
+        );
+        let empty = builder.push_shape(Shape {
+            fields: Box::default(),
+        });
+        let shaped = |shape| ShapedOperands {
+            shape,
+            lhs: nothing,
+            rhs: nothing,
+        };
+        let eq = builder.alloc(IrKind::RecordEq(shaped(outer)), Span::new(0, 8));
+        let ne = builder.alloc(IrKind::RecordNe(shaped(empty)), Span::new(0, 8));
+        let same = builder.alloc(IrKind::RecordSame(operands), Span::new(0, 9));
+        let not_same = builder.alloc(IrKind::RecordNotSame(operands), Span::new(0, 9));
+        let bool_ne = builder.alloc(IrKind::BoolEq(false, operands), Span::new(0, 8));
+        let items = builder.push_item_list(&[eq, ne, same, not_same]);
+        let root = builder.alloc(
+            IrKind::Block {
+                items,
+                result: bool_ne,
+            },
+            Span::new(0, 9),
+        );
         let ir = builder.finish(root, 0, Vec::new());
-        assert_eq!(ir.get(eq).kind.symbol(), Some("=="));
-        assert_eq!(ir.get(ne).kind.symbol(), Some("!="));
-        assert_eq!(ir.get(eq).operator_span(), Some(Span::new(3, 5)));
-        assert_eq!(ir.get(ne).operator_span(), Some(Span::new(3, 5)));
+        let symbols = [eq, ne, same, not_same, bool_ne].map(|id| ir.get(id).kind.symbol());
         assert_eq!(
-            ir.pretty(&Names::new()).to_string(),
-            "(block @0..8\n\
-             \x20 (record-eq == @0..8\n\
+            symbols,
+            [Some("=="), Some("!="), Some("==="), Some("!=="), Some("!=")]
+        );
+        // A typed record comparison cannot fail, and keeps no position.
+        assert_eq!(ir.get(eq).operator_span(), None);
+        assert_eq!(ir.get(ne).operator_span(), None);
+        assert_eq!(ir.get(same).operator_span(), Some(Span::new(3, 6)));
+        assert_eq!(ir.get(not_same).operator_span(), Some(Span::new(3, 6)));
+        assert_eq!(ir.get(bool_ne).operator_span(), Some(Span::new(3, 5)));
+        assert_eq!(
+            ir.pretty(&names).to_string(),
+            "(block @0..9\n\
+             \x20 (record-eq == [x inner[n \"a b\"]] @0..8\n\
+             \x20   (empty @0..2)\n\
+             \x20   (empty @0..2))\n\
+             \x20 (record-eq != [] @0..8\n\
+             \x20   (empty @0..2)\n\
+             \x20   (empty @0..2))\n\
+             \x20 (record-same === @0..9\n\
+             \x20   (empty @0..2)\n\
+             \x20   (empty @0..2))\n\
+             \x20 (record-same !== @0..9\n\
              \x20   (empty @0..2)\n\
              \x20   (empty @0..2))\n\
              \x20 (bool-eq != @0..8\n\
              \x20   (empty @0..2)\n\
              \x20   (empty @0..2)))"
+        );
+    }
+
+    #[test]
+    fn updates_show_their_name_record_and_value() {
+        let mut names = Names::new();
+        let (b, spaced) = (names.intern("b"), names.intern("c d"));
+        let mut builder = IrBuilder::with_capacity(5);
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Record),
+            Span::new(4, 5),
+        );
+        let nothing = builder.alloc(IrKind::Empty, Span::new(4, 7));
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(16, 17));
+        let inner = builder.alloc(
+            IrKind::UpdateField {
+                record: nothing,
+                name: spaced,
+                value: one,
+            },
+            Span::new(4, 13),
+        );
+        let outer = builder.alloc(
+            IrKind::UpdateField {
+                record: load,
+                name: b,
+                value: inner,
+            },
+            Span::new(4, 7),
+        );
+        builder.add_name_text(b, "b");
+        builder.add_name_text(spaced, "c d");
+        // Recording a name twice keeps the first text.
+        builder.add_name_text(b, "other");
+        let ir = builder.finish(outer, 1, vec![b]);
+        assert_eq!(ir.name_text(b), Some("b"));
+        assert_eq!(ir.name_text(spaced), Some("c d"));
+        assert_eq!(ir.name_text(names.intern("unused")), None);
+        assert_eq!(ir.get(outer).kind.symbol(), None);
+        assert_eq!(ir.get(outer).operator_span(), None);
+        assert_eq!(
+            ir.pretty(&names).to_string(),
+            "(update-field b @4..7\n\
+             \x20 (load b#0 @4..5)\n\
+             \x20 (update-field \"c d\" @4..13\n\
+             \x20   (empty @4..7)\n\
+             \x20   (int 1 @16..17)))"
         );
     }
 }

@@ -1,0 +1,5 @@
+# Dotted fields merge into one record.
+server.host = "localhost"
+server.port = 8080
+name = "api"
+server.tls.enabled = true

@@ -26,10 +26,10 @@
 //! by `"` begins a raw string literal; anywhere else it is an ordinary
 //! identifier.
 //!
-//! Operators are lexed greedily: `==` is one token and `=` followed by
-//! anything else is another, and likewise `<=` and `<`, `>=` and `>`, `:=`
-//! and `:`, `//` and `/`. `!` is only accepted as part of `!=`; negation is
-//! `not`. A `.` is part of a number literal only between two digits, as in
+//! Operators are lexed greedily: `===` is one token, `==` another and `=`
+//! followed by anything else a third, and likewise `!==` and `!=`, `<=` and
+//! `<`, `>=` and `>`, `:=` and `:`, `//` and `/`. `!` is only accepted as
+//! part of `!=` or `!==`; negation is `not`. A `.` is part of a number literal only between two digits, as in
 //! `1.5`; anywhere else it is a [`TokenKind::Dot`], so `1.x` is `1`, `.`,
 //! `x`. A `,` is a [`TokenKind::Comma`], which only record types use.
 //!
@@ -193,6 +193,10 @@ pub enum TokenKind {
     EqEq,
     /// `!=`
     BangEq,
+    /// `===`
+    EqEqEq,
+    /// `!==`
+    BangEqEq,
     /// `<`
     Lt,
     /// `<=`
@@ -251,6 +255,8 @@ impl TokenKind {
             TokenKind::Percent => Some("%"),
             TokenKind::EqEq => Some("=="),
             TokenKind::BangEq => Some("!="),
+            TokenKind::EqEqEq => Some("==="),
+            TokenKind::BangEqEq => Some("!=="),
             TokenKind::Lt => Some("<"),
             TokenKind::Le => Some("<="),
             TokenKind::Gt => Some(">"),
@@ -601,10 +607,16 @@ impl<'a> Lexer<'a> {
             // A `.` inside a number literal has been consumed by `number`.
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
+            b'=' if self.peek_at(1) == Some(b'=') && self.peek_at(2) == Some(b'=') => {
+                (TokenKind::EqEqEq, 3)
+            }
             b'=' => with_eq(TokenKind::Eq, TokenKind::EqEq),
             b':' => with_eq(TokenKind::Colon, TokenKind::ColonEq),
             b'<' => with_eq(TokenKind::Lt, TokenKind::Le),
             b'>' => with_eq(TokenKind::Gt, TokenKind::Ge),
+            b'!' if self.peek_at(1) == Some(b'=') && self.peek_at(2) == Some(b'=') => {
+                (TokenKind::BangEqEq, 3)
+            }
             b'!' if self.peek_at(1) == Some(b'=') => (TokenKind::BangEq, 2),
             b'/' if self.peek_at(1) == Some(b'/') => (TokenKind::SlashSlash, 2),
             b'/' => (TokenKind::Slash, 1),
@@ -1478,7 +1490,7 @@ mod tests {
             &SourceFile::new(
                 "test.gcsl",
                 "1 2.5 + - -x * / // % ( ) x let : := = { } ; . ,\n\
-                 if else true false and or not == != < <= > >=",
+                 if else true false and or not == != < <= > >= === !==",
             )
             .unwrap(),
         )
@@ -1524,6 +1536,8 @@ mod tests {
                 Le,
                 Gt,
                 Ge,
+                EqEqEq,
+                BangEqEq,
                 Eof
             ]
         );
@@ -1582,9 +1596,26 @@ mod tests {
                 "Gt", "Ident(b)", "Ident(a)", "BangEq", "Ident(b)", "Eof"
             ]
         );
-        // Three `=` are `==` then `=`; spaced, they are separate.
-        assert_eq!(show("==="), vec!["EqEq", "Eq", "Eof"]);
+        // Three `=` are one token, lexed before `==` and `=`; four are `===`
+        // then `=`; spaced, they are separate.
+        assert_eq!(show("==="), vec!["EqEqEq", "Eof"]);
+        assert_eq!(show("===="), vec!["EqEqEq", "Eq", "Eof"]);
+        assert_eq!(show("== ="), vec!["EqEq", "Eq", "Eof"]);
+        assert_eq!(show("= =="), vec!["Eq", "EqEq", "Eof"]);
         assert_eq!(show("= ="), vec!["Eq", "Eq", "Eof"]);
+        assert_eq!(
+            show("a===b a!==b a==b a!=b a=b"),
+            vec![
+                "Ident(a)", "EqEqEq", "Ident(b)", "Ident(a)", "BangEqEq", "Ident(b)", "Ident(a)",
+                "EqEq", "Ident(b)", "Ident(a)", "BangEq", "Ident(b)", "Ident(a)", "Eq", "Ident(b)",
+                "Eof"
+            ]
+        );
+        assert_eq!(show("!=="), vec!["BangEqEq", "Eof"]);
+        assert_eq!(show("!= ="), vec!["BangEq", "Eq", "Eof"]);
+        assert_eq!(show("!==="), vec!["BangEqEq", "Eq", "Eof"]);
+        assert_eq!(spans("a === b"), vec![(0, 1), (2, 5), (6, 7), (7, 7)]);
+        assert_eq!(spans("a !== b"), vec![(0, 1), (2, 5), (6, 7), (7, 7)]);
         assert_eq!(show("< ="), vec!["Lt", "Eq", "Eof"]);
         assert_eq!(show("<<"), vec!["Lt", "Lt", "Eof"]);
         assert_eq!(spans("a <= b"), vec![(0, 1), (2, 4), (5, 6), (6, 6)]);
@@ -2072,6 +2103,8 @@ mod tests {
         assert_eq!(TokenKind::Let.symbol(), Some("let"));
         assert_eq!(TokenKind::Not.symbol(), Some("not"));
         assert_eq!(TokenKind::BangEq.symbol(), Some("!="));
+        assert_eq!(TokenKind::EqEqEq.symbol(), Some("==="));
+        assert_eq!(TokenKind::BangEqEq.symbol(), Some("!=="));
         assert_eq!(TokenKind::Ge.symbol(), Some(">="));
         assert_eq!(TokenKind::Int(1).symbol(), None);
         assert_eq!(TokenKind::Newline.symbol(), None);

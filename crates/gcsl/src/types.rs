@@ -195,6 +195,25 @@ impl TypeTable {
         }))
     }
 
+    /// The record type `record` with field `name` set to type `ty`: the
+    /// field's type replaced if `record` has it, and the field added
+    /// otherwise. `None` if `record` is not a record type. The type of a
+    /// functional update that sets one field.
+    pub fn with_field(&mut self, record: TyId, name: Name, ty: TyId) -> Option<TyId> {
+        let fields = self.record_fields(record)?;
+        let at = fields.partition_point(|&(field, _)| field < name);
+        let replaces = fields.get(at).is_some_and(|&(field, _)| field == name);
+        let mut updated = Vec::with_capacity(fields.len() + usize::from(!replaces));
+        updated.extend_from_slice(fields.get(..at).unwrap_or_default());
+        updated.push((name, ty));
+        let rest = at + usize::from(replaces);
+        updated.extend_from_slice(fields.get(rest..).unwrap_or_default());
+        // Still sorted, so interning does not sort it again.
+        Some(self.intern(TyKind::Record(RecordTy {
+            fields: updated.into_boxed_slice(),
+        })))
+    }
+
     /// The kind of type `id`.
     ///
     /// # Panics
@@ -477,6 +496,32 @@ mod tests {
         assert!(!table.is_record(TyId::INT));
         assert!(table.is_error(TyId::ERROR));
         assert!(!table.is_error(TyId::EMPTY));
+    }
+
+    #[test]
+    fn setting_a_field_replaces_or_adds_it() {
+        let (mut table, _, [a, b, c]) = setup();
+        let ac = table.record([(a, TyId::INT), (c, TyId::BOOL)]);
+        // Added in its place among the sorted fields, at the start, middle
+        // or end.
+        let abc = table.record([(a, TyId::INT), (b, TyId::STRING), (c, TyId::BOOL)]);
+        assert_eq!(table.with_field(ac, b, TyId::STRING), Some(abc));
+        let bc = table.record([(b, TyId::FLOAT), (c, TyId::BOOL)]);
+        let c_only = table.record([(c, TyId::BOOL)]);
+        assert_eq!(table.with_field(c_only, b, TyId::FLOAT), Some(bc));
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_only = table.record([(a, TyId::INT)]);
+        assert_eq!(table.with_field(a_only, b, TyId::INT), Some(ab));
+        assert_eq!(table.with_field(TyId::EMPTY, a, TyId::INT), Some(a_only));
+        // Replaced, the type changing.
+        let ac_float = table.record([(a, TyId::INT), (c, TyId::FLOAT)]);
+        assert_eq!(table.with_field(ac, c, TyId::FLOAT), Some(ac_float));
+        assert_eq!(table.with_field(ac, a, TyId::INT), Some(ac));
+        // Nested records are types like any other.
+        let nested = table.record([(a, ac)]);
+        assert_eq!(table.with_field(TyId::EMPTY, a, ac), Some(nested));
+        // Only records have fields to set.
+        assert_eq!(table.with_field(TyId::INT, a, TyId::INT), None);
     }
 
     #[test]

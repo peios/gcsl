@@ -14,8 +14,18 @@
 //! kept in a separate pool, [`Ast::items`], each list a contiguous
 //! [`ItemRange`] within it. The parts of interpolated strings live in a pool
 //! of their own in the same way, [`Ast::parts`], as do the fields of record
-//! type expressions, [`Ast::field_tys`], and the same pattern will serve
-//! argument lists.
+//! type expressions, [`Ast::field_tys`], and the segments of the paths that
+//! name what a `let`, a field or a `:=` declares, [`Ast::path`]; the same
+//! pattern will serve argument lists.
+//!
+//! # Paths
+//!
+//! A `let`, a field item and a `:=` each declare a [path](PathRange): one or
+//! more names separated by `.`, each an identifier or a plain string
+//! literal, as in `x`, `server.port` or `"log level".format`. A path of one
+//! segment is the plain case, declaring that name; a longer one is a dotted
+//! definition or update, whose meaning the checker gives (see
+//! [`crate::check`]).
 //!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
@@ -91,6 +101,57 @@ pub struct PartRange {
 pub struct FieldTyRange {
     start: u32,
     len: u32,
+}
+
+/// The segments of a path: a contiguous range of the path pool of the
+/// [`Ast`] that allocated it, never empty. Resolve it with [`Ast::path`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PathRange {
+    start: u32,
+    len: u32,
+}
+
+/// One segment of a path: a name, written as an identifier or a plain
+/// string literal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PathSegment {
+    /// The name, interned whether it was written plain or quoted.
+    pub name: Name,
+    /// Where the name is written, quotes included for a quoted name.
+    pub span: Span,
+}
+
+/// The span of the path, or the prefix of one, made of `segments`: from its
+/// first segment through its last. An empty span at offset 0 for no
+/// segments, which no path has.
+#[must_use]
+pub fn path_span(segments: &[PathSegment]) -> Span {
+    match (segments.first(), segments.last()) {
+        (Some(first), Some(last)) => Span::join(first.span, last.span),
+        _ => Span::new(0, 0),
+    }
+}
+
+/// A path, or the prefix of one, shown as it is written: its segments
+/// separated by `.`, each a plain identifier or a quoted string literal as
+/// [`FieldName`] shows it, as in `server.port` or `"log level".format`.
+/// Returned by [`Ast::show_path`].
+#[derive(Clone, Copy, Debug)]
+pub struct PathDisplay<'a> {
+    names: &'a Names,
+    segments: &'a [PathSegment],
+}
+
+impl fmt::Display for PathDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index > 0 {
+                f.write_str(".")?;
+            }
+            FieldName(self.names.get(segment.name)).fmt(f)?;
+        }
+        Ok(())
+    }
 }
 
 /// One field of a record type expression, `NAME: TYPE`.
@@ -177,10 +238,15 @@ pub enum BinaryOp {
     FloorDiv,
     /// `a % b`, the remainder matching [`BinaryOp::FloorDiv`].
     Rem,
-    /// `a == b`
+    /// `a == b`, typed equality: records compare only the fields of their
+    /// static type.
     Eq,
-    /// `a != b`
+    /// `a != b`, the negation of [`BinaryOp::Eq`].
     Ne,
+    /// `a === b`, total equality: records compare as whole runtime values.
+    Same,
+    /// `a !== b`, the negation of [`BinaryOp::Same`].
+    NotSame,
     /// `a < b`
     Lt,
     /// `a <= b`
@@ -210,6 +276,8 @@ impl BinaryOp {
             BinaryOp::Rem => "take modulo of",
             BinaryOp::Eq
             | BinaryOp::Ne
+            | BinaryOp::Same
+            | BinaryOp::NotSame
             | BinaryOp::Lt
             | BinaryOp::Le
             | BinaryOp::Gt
@@ -231,6 +299,8 @@ impl BinaryOp {
             BinaryOp::Rem => "%",
             BinaryOp::Eq => "==",
             BinaryOp::Ne => "!=",
+            BinaryOp::Same => "===",
+            BinaryOp::NotSame => "!==",
             BinaryOp::Lt => "<",
             BinaryOp::Le => "<=",
             BinaryOp::Gt => ">",
@@ -240,13 +310,31 @@ impl BinaryOp {
         }
     }
 
-    /// Whether this is one of the comparison operators, `==`, `!=`, `<`,
-    /// `<=`, `>` and `>=`.
+    /// Whether this is one of the comparison operators, `==`, `!=`, `===`,
+    /// `!==`, `<`, `<=`, `>` and `>=`.
     #[must_use]
     pub const fn is_comparison(self) -> bool {
         matches!(
             self,
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+            BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Same
+                | BinaryOp::NotSame
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+        )
+    }
+
+    /// Whether this is one of the equality operators, `==`, `!=`, `===` and
+    /// `!==`, which accept operands of any one type, rather than an
+    /// ordering.
+    #[must_use]
+    pub const fn is_equality(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Same | BinaryOp::NotSame
         )
     }
 
@@ -393,35 +481,37 @@ impl Expr {
 /// What an [`Item`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ItemKind {
-    /// `let NAME = EXPR` or `let NAME: TYPE = EXPR`: declares a variable.
+    /// `let PATH = EXPR` or `let PATH: TYPE = EXPR`: declares a variable,
+    /// named by the path's first segment, which is always an identifier. A
+    /// dotted path declares it as an update of the variable in scope, if
+    /// any, with the rest of the path set, and an annotation then applies to
+    /// the path's last segment.
     Let {
-        /// The variable's name.
-        name: Name,
-        /// Where the name is written.
-        name_span: Span,
+        /// The variable's name, then any further segments.
+        path: PathRange,
         /// The annotated type, if any.
         ty: Option<TypeExprId>,
         /// The initialiser.
         value: ExprId,
     },
-    /// `NAME = EXPR` or `"quoted name" = EXPR`: declares a field of the
-    /// record its block evaluates to, which is also a name in scope for the
-    /// block's later items.
+    /// `PATH = EXPR`, as in `x = 1`, `"quoted name" = 1` or `a.b = 1`:
+    /// declares a field of the record its block evaluates to, named by the
+    /// path's first segment, which is also a name in scope for the block's
+    /// later items. A dotted path declares or extends a field that is a
+    /// record built by such paths.
     Field {
-        /// The field's name.
-        name: Name,
-        /// Where the name is written, quotes included for a quoted name.
-        name_span: Span,
-        /// The field's value.
+        /// The field's name, then any further segments.
+        path: PathRange,
+        /// The field's value, or the value at the end of the path.
         value: ExprId,
     },
-    /// `NAME := EXPR`: rebinds a variable declared in the same block.
+    /// `PATH := EXPR`: rebinds a variable declared in the same block, named
+    /// by the path's first segment, which is always an identifier; a dotted
+    /// path rebinds it to an update of its value.
     Rebind {
-        /// The variable's name.
-        name: Name,
-        /// Where the name is written.
-        name_span: Span,
-        /// The new value.
+        /// The variable's name, then any further segments.
+        path: PathRange,
+        /// The new value, or the value at the end of the path.
         value: ExprId,
     },
     /// `= EXPR`: the block's result.
@@ -435,7 +525,7 @@ pub enum ItemKind {
 pub struct Item {
     /// What the item is.
     pub kind: ItemKind,
-    /// The source it covers: from `let`, the name, `=` or the start of the
+    /// The source it covers: from `let`, the path, `=` or the start of the
     /// expression, through the end of the expression.
     pub span: Span,
 }
@@ -478,6 +568,7 @@ pub struct AstBuilder {
     parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
     field_tys: Vec<FieldTy>,
+    paths: Vec<PathSegment>,
 }
 
 impl AstBuilder {
@@ -506,6 +597,19 @@ impl AstBuilder {
         let id = ExprId(next_id(self.exprs.len()));
         self.exprs.push(expr);
         id
+    }
+
+    /// The number of expression nodes allocated so far: the id the next one
+    /// gets.
+    pub(crate) fn expr_count(&self) -> usize {
+        self.exprs.len()
+    }
+
+    /// Forgets every expression node allocated after the first `len`, which
+    /// nothing may refer to any more. The parser uses it to drop the nodes
+    /// of an expression it has read a path from.
+    pub(crate) fn truncate_exprs(&mut self, len: usize) {
+        self.exprs.truncate(len);
     }
 
     /// Adds `item` to the item arena and returns its id.
@@ -555,6 +659,17 @@ impl AstBuilder {
         }
     }
 
+    /// Appends `segments` to the path pool as one path and returns its
+    /// range. A path is never empty, so `segments` must not be.
+    pub fn push_path(&mut self, segments: &[PathSegment]) -> PathRange {
+        let start = next_id(self.paths.len());
+        self.paths.extend_from_slice(segments);
+        PathRange {
+            start,
+            len: next_id(segments.len()),
+        }
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -597,6 +712,7 @@ impl AstBuilder {
             parts: self.parts,
             type_exprs: self.type_exprs,
             field_tys: self.field_tys,
+            paths: self.paths,
             root,
             names,
             strings,
@@ -614,6 +730,7 @@ pub struct Ast {
     parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
     field_tys: Vec<FieldTy>,
+    paths: Vec<PathSegment>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -683,6 +800,28 @@ impl Ast {
     pub fn field_tys(&self, range: FieldTyRange) -> &[FieldTy] {
         let start = range.start as usize;
         &self.field_tys[start..start + range.len as usize]
+    }
+
+    /// Returns the segments of the path `range`, in source order. A path
+    /// always has at least one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn path(&self, range: PathRange) -> &[PathSegment] {
+        let start = range.start as usize;
+        &self.paths[start..start + range.len as usize]
+    }
+
+    /// Shows `segments`, a path of this tree or a prefix of one, as it is
+    /// written (see [`PathDisplay`]).
+    #[must_use]
+    pub fn show_path<'a>(&'a self, segments: &'a [PathSegment]) -> PathDisplay<'a> {
+        PathDisplay {
+            names: &self.names,
+            segments,
+        }
     }
 
     /// The file's body: the outermost block's items.
@@ -783,10 +922,11 @@ impl Annotate for NoAnnotation {
 ///
 /// Items print as `(let x ...)`, `(let x : Type ...)`, `(field x ...)`,
 /// `(rebind x ...)`, `(result ...)` and `(expr ...)`, followed by their
-/// expression; blocks as `(block ...)` followed by their items; ascriptions
-/// as `(: Type ...)`; field accesses as `(. x ...)` followed by their record
-/// expression. A field name that is not a plain identifier is quoted, as in
-/// `(field "a b" ...)`. Record types print as written, fields in source
+/// expression, a dotted path in full, as in `(let a.b.c ...)`; blocks as
+/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
+/// field accesses as `(. x ...)` followed by their record expression. A
+/// field name, or a path segment, that is not a plain identifier is quoted,
+/// as in `(field "a b" ...)`. Record types print as written, fields in source
 /// order: `{x: Int, "a b": {}}`.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
@@ -812,25 +952,23 @@ impl<A: Annotate> Pretty<'_, A> {
 
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
-        let names = self.ast.names();
+        let ast = self.ast;
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
         let value = match item.kind {
-            ItemKind::Let {
-                name, ty, value, ..
-            } => {
-                write!(f, "let {}", names.get(name))?;
+            ItemKind::Let { path, ty, value } => {
+                write!(f, "let {}", ast.show_path(ast.path(path)))?;
                 if let Some(ty) = ty {
                     f.write_str(" : ")?;
                     self.type_expr(f, ty)?;
                 }
                 value
             }
-            ItemKind::Field { name, value, .. } => {
-                write!(f, "field {}", FieldName(names.get(name)))?;
+            ItemKind::Field { path, value } => {
+                write!(f, "field {}", ast.show_path(ast.path(path)))?;
                 value
             }
-            ItemKind::Rebind { name, value, .. } => {
-                write!(f, "rebind {}", names.get(name))?;
+            ItemKind::Rebind { path, value } => {
+                write!(f, "rebind {}", ast.show_path(ast.path(path)))?;
                 value
             }
             ItemKind::Result(value) => {
@@ -1085,10 +1223,13 @@ mod tests {
             },
             span: Span::new(23, 30),
         });
+        let y_path = builder.push_path(&[PathSegment {
+            name: y,
+            span: Span::new(18, 19),
+        }]);
         let rebind = builder.alloc_item(Item {
             kind: ItemKind::Rebind {
-                name: y,
-                name_span: Span::new(18, 19),
+                path: y_path,
                 value: ascribed,
             },
             span: Span::new(18, 30),
@@ -1107,10 +1248,13 @@ mod tests {
             kind: TypeExprKind::Named(float),
             span: Span::new(7, 12),
         });
+        let x_path = builder.push_path(&[PathSegment {
+            name: x,
+            span: Span::new(4, 5),
+        }]);
         let with_type = builder.alloc_item(Item {
             kind: ItemKind::Let {
-                name: x,
-                name_span: Span::new(4, 5),
+                path: x_path,
                 ty: Some(float_ty),
                 value: block,
             },
@@ -1121,10 +1265,13 @@ mod tests {
             kind: ExprKind::Block(empty_body),
             span: Span::new(46, 48),
         });
+        let y_path = builder.push_path(&[PathSegment {
+            name: y,
+            span: Span::new(42, 43),
+        }]);
         let without_type = builder.alloc_item(Item {
             kind: ItemKind::Let {
-                name: y,
-                name_span: Span::new(42, 43),
+                path: y_path,
                 ty: None,
                 value: empty,
             },
@@ -1169,18 +1316,22 @@ mod tests {
         assert_eq!(UnaryOp::Neg.symbol(), "-");
         assert_eq!(BinaryOp::FloorDiv.span_at(4), Span::new(4, 6));
         assert_eq!(UnaryOp::Neg.span_at(4), Span::new(4, 5));
-        for (op, symbol) in [
-            (BinaryOp::Eq, "=="),
-            (BinaryOp::Ne, "!="),
-            (BinaryOp::Lt, "<"),
-            (BinaryOp::Le, "<="),
-            (BinaryOp::Gt, ">"),
-            (BinaryOp::Ge, ">="),
+        for (op, symbol, equality) in [
+            (BinaryOp::Eq, "==", true),
+            (BinaryOp::Ne, "!=", true),
+            (BinaryOp::Same, "===", true),
+            (BinaryOp::NotSame, "!==", true),
+            (BinaryOp::Lt, "<", false),
+            (BinaryOp::Le, "<=", false),
+            (BinaryOp::Gt, ">", false),
+            (BinaryOp::Ge, ">=", false),
         ] {
             assert_eq!(op.symbol(), symbol);
             assert_eq!(op.verb(), "compare");
             assert!(op.is_comparison());
+            assert_eq!(op.is_equality(), equality, "{op:?}");
         }
+        assert_eq!(BinaryOp::Same.span_at(4), Span::new(4, 7));
         assert_eq!(BinaryOp::And.verb(), "and");
         assert_eq!(BinaryOp::Or.verb(), "or");
         assert_eq!(UnaryOp::Not.verb(), "not");
@@ -1200,7 +1351,77 @@ mod tests {
             BinaryOp::Or,
         ] {
             assert!(!op.is_comparison(), "{op:?}");
+            assert!(!op.is_equality(), "{op:?}");
         }
+    }
+
+    #[test]
+    fn paths_are_ranges_of_the_pool_and_show_as_written() {
+        // let a.b."c d".let = 1, spans made up.
+        let mut names = Names::new();
+        let (a, b, spaced, keyword) = (
+            names.intern("a"),
+            names.intern("b"),
+            names.intern("c d"),
+            names.intern("let"),
+        );
+        let mut builder = AstBuilder::new();
+        let segment = |name, start, end| PathSegment {
+            name,
+            span: Span::new(start, end),
+        };
+        let segments = [
+            segment(a, 4, 5),
+            segment(b, 6, 7),
+            segment(spaced, 8, 13),
+            segment(keyword, 14, 19),
+        ];
+        let single = builder.push_path(&segments[..1]);
+        let dotted = builder.push_path(&segments);
+        let one = leaf(&mut builder, 1, 22);
+        let items = [
+            ItemKind::Let {
+                path: dotted,
+                ty: None,
+                value: one,
+            },
+            ItemKind::Field {
+                path: dotted,
+                value: one,
+            },
+            ItemKind::Rebind {
+                path: single,
+                value: one,
+            },
+        ]
+        .map(|kind| {
+            builder.alloc_item(Item {
+                kind,
+                span: Span::new(0, 23),
+            })
+        });
+        let root = builder.push_item_list(&items);
+        let ast = builder.finish(root, names, Strings::new());
+        assert_eq!(ast.path(single), &segments[..1]);
+        assert_eq!(ast.path(dotted), &segments);
+        assert_eq!(
+            ast.show_path(ast.path(dotted)).to_string(),
+            "a.b.\"c d\".\"let\""
+        );
+        assert_eq!(ast.show_path(&segments[..2]).to_string(), "a.b");
+        assert_eq!(path_span(ast.path(dotted)), Span::new(4, 19));
+        assert_eq!(path_span(&segments[1..3]), Span::new(6, 13));
+        assert_eq!(path_span(&[]), Span::new(0, 0));
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let a.b.\"c d\".\"let\" @0..23\n\
+             \x20   (int 1 @22..23))\n\
+             \x20 (field a.b.\"c d\".\"let\" @0..23\n\
+             \x20   (int 1 @22..23))\n\
+             \x20 (rebind a @0..23\n\
+             \x20   (int 1 @22..23)))"
+        );
     }
 
     #[test]

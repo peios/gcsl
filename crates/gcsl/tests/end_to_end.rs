@@ -161,11 +161,11 @@ fn programs_with_records() {
     let cases = [
         (
             "{ x = 1; y = \"a\" }",
-            "{x = 1, y = \"a\"} : {x: Int, y: String}",
+            "{x = 1; y = \"a\"} : {x: Int, y: String}",
         ),
         (
             "x = 1\ny = \"a\"",
-            "{x = 1, y = \"a\"} : {x: Int, y: String}",
+            "{x = 1; y = \"a\"} : {x: Int, y: String}",
         ),
         (
             "let origin = { x = 0.0; y = 0.0 }\n\
@@ -176,19 +176,19 @@ fn programs_with_records() {
         (
             "let config = {\n  name = \"gcsl\"\n  build = { jobs = 4; \"dry run\" = false }\n}\n\
              config.build",
-            "{jobs = 4, \"dry run\" = false} : {\"dry run\": Bool, jobs: Int}",
+            "{jobs = 4; \"dry run\" = false} : {\"dry run\": Bool, jobs: Int}",
         ),
         (
             "let p: {x: Float, y: Float} = { x = 1; y = 2 }\np",
-            "{x = 1.0, y = 2.0} : {x: Float, y: Float}",
+            "{x = 1.0; y = 2.0} : {x: Float, y: Float}",
         ),
         (
             "let q = { x = 1; y = 2 }\nlet p: {x: Int} = q\np",
-            "{x = 1, y = 2} : {x: Int}",
+            "{x = 1; y = 2} : {x: Int}",
         ),
         (
             "if 1 < 2 { { x = 1; y = 2 } } else { { x = 3 } }",
-            "{x = 1, y = 2} : {x: Int}",
+            "{x = 1; y = 2} : {x: Int}",
         ),
         ("{ x = 1 } == { x = 1 }", "true : Bool"),
         (
@@ -203,13 +203,85 @@ fn programs_with_records() {
 }
 
 #[test]
+fn programs_with_dotted_paths_and_equality() {
+    let cases = [
+        (
+            "server.host = \"localhost\"\nserver.port = 8080\nserver.tls.enabled = true",
+            "{server = {host = \"localhost\"; port = 8080; tls = {enabled = true}}} : \
+             {server: {host: String, port: Int, tls: {enabled: Bool}}}",
+        ),
+        (
+            "let config = { name = \"gcsl\"; build = { jobs = 4 } }\n\
+             let config.build.jobs = 8\n\
+             let config.build.\"dry run\" = true\n\
+             config.build.\"dry run\" := false\n\
+             config",
+            "{name = \"gcsl\"; build = {jobs = 8; \"dry run\" = false}} : \
+             {build: {\"dry run\": Bool, jobs: Int}, name: String}",
+        ),
+        ("let a.b: Float = 1\na", "{b = 1.0} : {b: Float}"),
+        (
+            "let q: {x: Int} = { x = 1; y = 2 }\n\"{q == { x = 1 }} {q === { x = 1 }}\"",
+            "\"true false\" : String",
+        ),
+        (
+            "let p: {a: {b: Float}} = { a.b = 1 }\np",
+            "{a = {b = 1.0}} : {a: {b: Float}}",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn a_merge_error_renders_exactly() {
+    assert_eq!(
+        rendered("server.port = 8080\nserver.port.number = 1\n"),
+        "error: cannot define `server.port.number`: `server.port` is Int, not a record\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         1 | server.port = 8080\n\
+         \x20 | ----------- `server.port` defined here\n\
+         2 | server.port.number = 1\n\
+         \x20 | ^^^^^^^^^^^^^^^^^^\n"
+    );
+    assert_eq!(
+        rendered("server = { port = 1 }\nserver.host = \"h\"\n"),
+        "error: field `server` is already defined\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         1 | server = { port = 1 }\n\
+         \x20 | ------ defined whole here\n\
+         2 | server.host = \"h\"\n\
+         \x20 | ^^^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a field defined as a whole cannot be extended with dotted paths\n"
+    );
+}
+
+#[test]
+fn an_update_error_renders_exactly() {
+    assert_eq!(
+        rendered("let limits = { cpu = 2 }\nlet limits.cpu.max = 4\n"),
+        "error: cannot update `limits.cpu.max`: `limits.cpu` is Int, not a record\n\
+         \x20--> calc.gcsl:2:5\n\
+         \x20 |\n\
+         2 | let limits.cpu.max = 4\n\
+         \x20 |     ------^^^^^^^^\n\
+         \x20 |     |\n\
+         \x20 |     this is {cpu: Int}\n"
+    );
+}
+
+#[test]
 fn value_display_does_not_include_the_type() {
     assert_eq!(run("7 / 2").unwrap().to_string(), "3.5");
     assert_eq!(run("7 // 2").unwrap().kind(), ValueKind::Int);
     // A record displays as it would be written, strings quoted.
     assert_eq!(
         run("{ x = 1; y = \"a\" }").unwrap().to_string(),
-        "{x = 1, y = \"a\"}"
+        "{x = 1; y = \"a\"}"
     );
     // A string displays as its text, and shows as a literal only in `repr`.
     let value = run("\"a\\\"b\\n\"").unwrap();
@@ -412,6 +484,11 @@ fn every_stage_handles_maximum_depth() {
         let bools = source(&format!("true{}", " and true".repeat(depth - 1)));
         let concatenation = source(&format!("\"a\"{}", " + \"a\"".repeat(depth - 1)));
         let concatenation_value = Value::Str("a".repeat(depth).into());
+        // The longest dotted path, two levels a segment: built from nothing,
+        // then updated all the way down, which reads into each record
+        // before it, then read back.
+        let path = format!("a{}", ".b".repeat((depth - 1) / 2));
+        let dotted = source(&format!("let {path} = 1\nlet {path} = 2\n{path}"));
         // The printers recurse too, but printing a tree this deep takes
         // seconds, since each line is indented by its depth. They recurse
         // one frame per level from a node straight to its children,
@@ -428,6 +505,7 @@ fn every_stage_handles_maximum_depth() {
             (&floats, floats_value, false),
             (&bools, Value::Bool(true), false),
             (&concatenation, concatenation_value, false),
+            (&dotted, Value::Int(2), false),
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
@@ -515,6 +593,13 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
         let text = format!("x{}", ".a".repeat(200_000));
         let diagnostics = run(&text).unwrap_err();
         assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        // Dotted paths.
+        let text = format!("let x{} = 1", ".a".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        let text = format!("x{} = 1", ".a".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
     });
 }
 
@@ -578,6 +663,28 @@ fn stages_report_every_new_kind_of_error() {
         "cannot compare `{x: Int}` and `{y: Int}`"
     );
     assert_eq!(message("{ x = 1 } < { x = 1 }"), "cannot order `{x: Int}`");
+    assert_eq!(message("a.b + 1 = 2"), "expected end of item, found `=`");
+    assert_eq!(message("\"a\".b := 1"), "variables need plain names");
+    assert_eq!(
+        message("{ a = 1; a.b = 2 }"),
+        "field `a` is already defined"
+    );
+    assert_eq!(
+        message("{ a.b = 1; a.b.c = 2 }"),
+        "cannot define `a.b.c`: `a.b` is Int, not a record"
+    );
+    assert_eq!(
+        message("{ a.b = 1; a.b = 2 }"),
+        "field `a.b` is defined twice"
+    );
+    assert_eq!(
+        message("let a = 1\nlet a.b = 2"),
+        "cannot update `a.b`: `a` is Int, not a record"
+    );
+    assert_eq!(
+        message("{ x = 1 } === { y = 1 }"),
+        "cannot compare `{x: Int}` and `{y: Int}`"
+    );
 }
 
 /// Runs `text`, which must succeed, and renders its warnings as the CLI
@@ -597,7 +704,7 @@ fn rendered_warnings(text: &str) -> String {
 fn an_excess_field_warning_renders_exactly() {
     let text = "let point: {x: Int} = { x = 1; z = 2 }\npoint";
     let outcome = gcsl::run(&source(text)).unwrap();
-    assert_eq!(outcome.value.to_string(), "{x = 1, z = 2}");
+    assert_eq!(outcome.value.to_string(), "{x = 1; z = 2}");
     assert_eq!(outcome.warnings.len(), 1);
     assert_eq!(outcome.warnings[0].severity, Severity::Warning);
     assert_eq!(

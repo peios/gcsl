@@ -64,7 +64,10 @@ pub use value::{Value, ValueKind};
 /// child (a block's children being its items' expressions and annotated
 /// types, and an ascription's its expression and type). A type written as a
 /// name is one level, and a record type one more than its tallest field's
-/// type. Every stage recurses once per
+/// type. A `let`, field or `:=` with a dotted path is two levels taller than
+/// its value for each segment of the path after the first, since later
+/// stages build a record for each segment and read the old one's field
+/// through all those before it. Every stage recurses once per
 /// level, so the parser rejects anything deeper with an "expression nested
 /// too deeply" error rather than letting a later stage overflow the stack.
 /// The lexer, which recurses through string literals nested in each other's

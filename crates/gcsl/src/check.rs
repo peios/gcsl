@@ -78,13 +78,124 @@
 //! expected type can see it. Warnings are collected apart from errors and
 //! returned with a successful check.
 //!
+//! # Dotted fields
+//!
+//! A field item whose path has several segments, `a.b.c = e`, declares the
+//! field `a` as a record containing `b`, a record containing `c`. Dotted
+//! definitions with a common prefix merge, as in TOML:
+//!
+//! ```text
+//! server.host = "localhost"
+//! server.port = 8080
+//! server.tls.enabled = true
+//! # one field, server = {host = ...; port = ...; tls = {enabled = true}}
+//! ```
+//!
+//! A field whose first definition is dotted is *open*: it is one field
+//! declaration and one binding, in one slot, and each further dotted path
+//! under it extends it. The binding's type grows with each extension, so
+//! after `server.host = "..."` the name `server` has type `{host: String}`
+//! from the next item on, and after the next line `{host: String, port:
+//! Int}`; its slot holds the record built so far. The record's fields are in
+//! the order they were first mentioned, at every level, and the field takes
+//! its place in its block where it was first mentioned.
+//!
+//! The rules, checked in the block declaring the field, each reported at the
+//! offending path with a label on the earlier definition it conflicts with:
+//!
+//! 1. A field defined whole (`a = e`) cannot be extended: a later dotted
+//!    path under it is "field `a` is already defined". Nor can a segment
+//!    whose value a dotted path defined whole as a record (`a.b = { x = 1 }`,
+//!    then `a.b.y = 2`: "field `a.b` is already defined"). A whole
+//!    definition after a dotted one is "field `a` is defined twice", as for
+//!    any field defined twice.
+//! 2. A segment along the path that exists as some other value cannot hold
+//!    fields: "cannot define `a.b.c`: `a.b` is Int, not a record".
+//! 3. The path's last segment must not exist yet: "field `a.b` is defined
+//!    twice".
+//!
+//! A rejected path declares nothing, but its value is still checked, and
+//! its block's record is erroneous, so that the mistake does not cascade.
+//!
+//! To check these, the checker keeps a small tree of the segments of each
+//! open field (`Node`), in one arena for the whole checker that each block
+//! truncates back when it ends, as it does its field declarations. After an
+//! extension, the types of the segments along its path are interned again,
+//! from the leaf outwards.
+//!
+//! In a record block checked against an expected record type, a dotted
+//! field's value is checked against the type the expected type has at the
+//! value's full path, as a field's value is against its field's type, if it
+//! has one there. If it lacks a segment of the path, the value is checked
+//! on its own and the missing segment is warned about as an extra field, at
+//! its first definition only. When the block ends, each open field is
+//! checked against the expected type at every level of nesting: a missing
+//! field is an error, "missing field `a.x` in record", and a segment that
+//! the expected type has as something other than a record is a mismatch.
+//!
+//! # Dotted `let` and `:=`
+//!
+//! `let a.b.c = e` is a functional update. If no `a` is in scope, it
+//! declares `a` as `{b = {c = e}}`. If `a` is in scope with a record type,
+//! it declares a new binding `a`, shadowing the old one as any `let` does,
+//! whose value is the old value with the path set: each segment between the
+//! first and the last that the old value's type has as a record is updated
+//! inside, each it lacks is created as a record, and the last is replaced
+//! if the type has it (its type may change) or added. An annotation applies
+//! to the last segment: `let a.b: Int = 5`. A segment along the way that is
+//! not a record, or `a` itself not being one, is an error: "cannot update
+//! `a.b.c`: `a.b` is Int, not a record". The new type is computed by walking
+//! the old one along the path and interning the updated record types from
+//! the leaf outwards.
+//!
+//! `a.b.c := e` is an update too, but `:=` is assignment-compatible: `a`
+//! must be something `:=` may rebind, every segment of the path must
+//! already exist (`:=` never adds a field: "cannot rebind `a.b.c`: `a.b`
+//! has no field `c`"), and `e` must fit the leaf's type, a subtype of it or
+//! an adapting literal, which the new binding keeps. Changing a variable's
+//! type, or adding a field, takes a `let`.
+//!
+//! The old value is never changed. An update builds a new record, sharing
+//! the old one's unchanged fields, so another binding holding the old value
+//! still sees the old record:
+//!
+//! ```text
+//! let a = { x = 1 }
+//! let old = a
+//! let a.x = 2      # a is {x = 2}; old is still {x = 1}
+//! ```
+//!
+//! The static type is the truth. An update that creates an intermediate
+//! record where the static type has no such field replaces whatever the
+//! runtime value holds there: a field hidden by subtyping, as in
+//! `let p: {x: Int} = { x = 1; y = 2 }` followed by `let p.y.z = 3`, whose
+//! `y` becomes `{z = 3}`.
+//!
+//! How a dotted item resolves (the slot of the record it updates, and how
+//! many of its path's segments name records that already exist) is
+//! recorded for lowering as a [`PathResolution`].
+//!
+//! # Equality
+//!
+//! `==` and `!=` are *typed* equality, and `===` and `!==` *total*
+//! equality. Both kinds need operands of one identical type. On scalars
+//! they are the same. On records, typed equality compares only the fields
+//! of the operands' static type, and of the static types of their nested
+//! records, so after `let q: {x: Int} = { x = 1; y = 2 }`, `q == { x = 1 }`
+//! is `true`; total equality compares whole runtime values, deeply and by
+//! name, so `q === { x = 1 }` is `false`. The checker records nothing for
+//! either: lowering reads the operands' type from the type table.
+//!
 //! # Scopes
 //!
 //! Every block, including the file's own body, is a scope. A `let` declares
 //! a variable visible from the next item to the end of its block; a later
 //! `let` of the same name shadows it, in the same block or an inner one. A
 //! `:=` is a new declaration too, allowed only for a name already declared
-//! in the same block, and not for a field.
+//! in the same block, and not for a field; its value must fit the
+//! variable's type (a subtype, or an adapting literal), and the new binding
+//! keeps that type, so `:=` reads as assignment: a `let` is needed to
+//! change a variable's type.
 //!
 //! The scopes in effect form a stack, kept as one flat vector of bindings
 //! with the innermost block's bindings last: entering a block records where
@@ -117,8 +228,8 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, StrPart,
-    TypeExprId, TypeExprKind, UnaryOp,
+    Annotate, Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, PathRange,
+    PathSegment, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -222,6 +333,37 @@ impl fmt::Display for Slot {
     }
 }
 
+/// How the path of a dotted `let`, field or `:=` resolves: the record it
+/// updates, and how far into its path that record's static type reaches.
+/// See the module documentation.
+///
+/// For `let a.b.c = e`, with `a` in scope as `{b: {c: Int}}`, the source is
+/// `a`'s slot and all of `a` and `a.b` exist, so `existing` is 2; with `a`
+/// as `{x: Int}`, only `a` exists, and `existing` is 1; with no `a`, there
+/// is no source and `existing` is 0. A dotted field's first definition has
+/// no source; each later one has the field's own slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PathResolution {
+    /// The slot holding the record the item updates, or [`Slot::NONE`] if
+    /// it builds its record from nothing.
+    pub source: Slot,
+    /// How many of the path's leading segments name records that exist in
+    /// the static type of the updated value: 0 without a source, and
+    /// otherwise 1 for the source itself and one more for each following
+    /// segment, short of the last, that the type has as a record. Every
+    /// segment after them, the last excepted, is created as a record.
+    pub existing: u32,
+}
+
+impl PathResolution {
+    /// The resolution of an item that is not a dotted declaration, and of
+    /// one that builds its record from nothing.
+    pub const NONE: PathResolution = PathResolution {
+        source: Slot::NONE,
+        existing: 0,
+    };
+}
+
 /// Where every variable of an [`Ast`] is stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolution {
@@ -229,8 +371,13 @@ pub struct Resolution {
     /// [`Slot::NONE`] for every other expression.
     expr_slots: Vec<Slot>,
     /// The slot each `Let`, `Field` and `Rebind` item writes, indexed by
-    /// [`ItemId`]; [`Slot::NONE`] for every other item.
+    /// [`ItemId`]; [`Slot::NONE`] for every other item. Every definition of
+    /// an open field writes the field's one slot.
     item_slots: Vec<Slot>,
+    /// How the path of each dotted `Let`, `Field` and `Rebind` item
+    /// resolves, indexed by [`ItemId`]; [`PathResolution::NONE`] for every
+    /// other item, and for one that builds its record from nothing.
+    item_paths: Vec<PathResolution>,
     /// The number of slots the frame needs.
     frame_size: u32,
     /// For each slot, the name of the last variable assigned to it.
@@ -262,6 +409,18 @@ impl Resolution {
         self.item_slots[id.index()]
     }
 
+    /// How the path of item `id` resolves: [`PathResolution::NONE`] if it
+    /// is not a dotted declaration or builds its record from nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn item_path(&self, id: ItemId) -> PathResolution {
+        self.item_paths[id.index()]
+    }
+
     /// The number of slots the frame needs: one more than the highest slot
     /// used.
     #[must_use]
@@ -283,6 +442,7 @@ impl Resolution {
         Self {
             expr_slots: vec![Slot::NONE; exprs],
             item_slots: vec![Slot::NONE; items],
+            item_paths: vec![PathResolution::NONE; items],
             frame_size: 0,
             slot_names: Vec::new(),
         }
@@ -294,9 +454,10 @@ impl Resolution {
         self.expr_slots.len()
     }
 
-    /// Number of item entries, equal to the number of items in the [`Ast`].
+    /// Number of item entries in both item tables, equal to the number of
+    /// items in the [`Ast`].
     pub(crate) fn item_len(&self) -> usize {
-        self.item_slots.len()
+        self.item_slots.len().min(self.item_paths.len())
     }
 }
 
@@ -341,8 +502,58 @@ struct Binding {
 #[derive(Clone, Copy, Debug)]
 struct FieldDecl {
     name: Name,
+    /// Where the name is written in the field's first definition.
     name_span: Span,
     ty: TyId,
+    /// For an open field, one first defined by a dotted path, where its
+    /// segments are tracked; `None` for a field defined whole.
+    open: Option<OpenField>,
+    /// Whether a dotted path under it was rejected, which makes its block's
+    /// record erroneous, so that the rejection does not cascade.
+    rejected: bool,
+}
+
+/// An open field: a record built by dotted paths.
+#[derive(Clone, Copy, Debug)]
+struct OpenField {
+    /// Its root node in `Checker::nodes`.
+    node: u32,
+    /// The index of its binding in `Checker::bindings`, whose type grows
+    /// with it.
+    binding: usize,
+}
+
+/// The index of no node, where a node has no parent, child or sibling.
+const NO_NODE: u32 = u32::MAX;
+
+/// What a [`Node`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NodeKind {
+    /// A record being built by dotted paths, which further paths may
+    /// extend: an open field, or a segment before the last of a dotted
+    /// path.
+    Open,
+    /// The value at the end of a dotted path, defined whole.
+    Leaf,
+}
+
+/// One segment of an open field, in `Checker::nodes`: the field itself, or
+/// a segment within it. Its children are a linked list through
+/// `first_child` and `next_sibling`, most recent first.
+#[derive(Clone, Copy, Debug)]
+struct Node {
+    name: Name,
+    /// The path from the field's name through this segment, where the item
+    /// that first defined the segment writes it: where diagnostics about it
+    /// point.
+    span: Span,
+    /// Its type: for an open node the record of its children's types, or
+    /// `Error` if any of them is; for a leaf its value's.
+    ty: TyId,
+    kind: NodeKind,
+    parent: u32,
+    first_child: u32,
+    next_sibling: u32,
 }
 
 /// The record type a record block is checked against, and where the
@@ -423,6 +634,7 @@ pub struct Checker<'a> {
     expr_types: Vec<TyId>,
     expr_slots: Vec<Slot>,
     item_slots: Vec<Slot>,
+    item_paths: Vec<PathResolution>,
     /// Every variable and field in scope, outermost block first.
     bindings: Vec<Binding>,
     /// Index in `bindings` of the innermost block's first binding.
@@ -441,7 +653,18 @@ pub struct Checker<'a> {
     /// name: each field's name, its position in source order and its type.
     /// Nested uses push above the entries of the use enclosing them and
     /// truncate back, so it is a stack and one allocation serves them all.
+    /// Also where the fields of an open node are gathered to intern its
+    /// type.
     sorted_fields: Vec<(Name, u32, TyId)>,
+    /// The segments of the open fields of every block being checked,
+    /// outermost block first; each block truncates it back when it ends.
+    nodes: Vec<Node>,
+    /// Reused for the types of the records along the path of a dotted
+    /// `let` or `:=`.
+    path_types: Vec<TyId>,
+    /// Reused as the work list of open nodes still to check against their
+    /// expected types when a record block ends.
+    pending: Vec<(u32, TyId)>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -473,6 +696,7 @@ impl<'a> Checker<'a> {
             expr_types: vec![TyId::ERROR; ast.len()],
             expr_slots: vec![Slot::NONE; ast.len()],
             item_slots: vec![Slot::NONE; ast.item_count()],
+            item_paths: vec![PathResolution::NONE; ast.item_count()],
             bindings: scope.bindings,
             block_start: 0,
             fields: Vec::new(),
@@ -487,6 +711,9 @@ impl<'a> Checker<'a> {
                 (names.lookup("String"), TyId::STRING),
             ],
             sorted_fields: Vec::new(),
+            nodes: Vec::new(),
+            path_types: Vec::new(),
+            pending: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -540,6 +767,7 @@ impl<'a> Checker<'a> {
             resolution: Resolution {
                 expr_slots: self.expr_slots,
                 item_slots: self.item_slots,
+                item_paths: self.item_paths,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
             },
@@ -559,11 +787,13 @@ impl<'a> Checker<'a> {
     /// an expected record type.
     fn check_block(&mut self, body: ItemRange, expecting: Option<Expecting>) -> TyId {
         let outer = (self.block_start, self.fields_start, self.next_slot);
+        let nodes_start = self.nodes.len();
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
         let ty = self.check_body(body, expecting);
         self.bindings.truncate(self.block_start);
         self.fields.truncate(self.fields_start);
+        self.nodes.truncate(nodes_start);
         (self.block_start, self.fields_start, self.next_slot) = outer;
         ty
     }
@@ -583,19 +813,9 @@ impl<'a> Checker<'a> {
             let next = items.get(index + 1).copied();
             let item = *self.ast.item(id);
             match item.kind {
-                ItemKind::Let {
-                    name, ty, value, ..
-                } => self.check_let(id, name, ty, value),
-                ItemKind::Rebind {
-                    name,
-                    name_span,
-                    value,
-                } => self.check_rebind(id, name, name_span, value),
-                ItemKind::Field {
-                    name,
-                    name_span,
-                    value,
-                } => self.check_field(id, (name, name_span), value, expecting),
+                ItemKind::Let { path, ty, value } => self.check_let(id, path, ty, value),
+                ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
+                ItemKind::Field { path, value } => self.check_field(id, path, value, expecting),
                 ItemKind::Result(value) => {
                     let ty = self.check_expr(value);
                     let eq = Span::new(item.span.start, item.span.start + 1);
@@ -657,8 +877,15 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Checks `let NAME (: TYPE)? = VALUE` and declares the variable.
-    fn check_let(&mut self, id: ItemId, name: Name, annotation: Option<TypeExprId>, value: ExprId) {
+    /// Checks `let PATH (: TYPE)? = VALUE` and declares the variable: with
+    /// the value's type, or for a dotted path the type of the update.
+    fn check_let(
+        &mut self,
+        id: ItemId,
+        path: PathRange,
+        annotation: Option<TypeExprId>,
+        value: ExprId,
+    ) {
         let ty = match annotation {
             None => {
                 let found = self.check_expr(value);
@@ -680,21 +907,29 @@ impl<'a> Checker<'a> {
                 }
             }
         };
-        self.declare(name, ty, id, false);
+        match self.ast.path(path) {
+            [variable] => self.declare(variable.name, ty, id, false),
+            segments => self.declare_update(id, segments, ty),
+        }
     }
 
-    /// Checks the field item `id`, `NAME = VALUE`, whose name is written at
-    /// `name_span`, and declares the field. With `expecting`, its block is
-    /// checked against an expected record type: a field the type has is
-    /// checked against that field's type and then has it, and one the type
-    /// lacks is a warning.
+    /// Checks the field item `id`, `PATH = VALUE`, and declares or extends
+    /// the field. With `expecting`, its block is checked against an
+    /// expected record type: a field the type has is checked against that
+    /// field's type and then has it, and one the type lacks is a warning.
     fn check_field(
         &mut self,
         id: ItemId,
-        (name, name_span): (Name, Span),
+        path: PathRange,
         value: ExprId,
         expecting: Option<Expecting>,
     ) {
+        let segments = self.ast.path(path);
+        let [field] = segments else {
+            self.check_dotted_field(id, segments, value, expecting);
+            return;
+        };
+        let (name, name_span) = (field.name, field.span);
         let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
         let ty = match expected {
             Some((expecting, Some(expected))) => {
@@ -717,7 +952,7 @@ impl<'a> Checker<'a> {
                         name_span,
                     )
                     .with_context(expecting.context, expecting.why)
-                    .with_note("it is allowed, but nothing with this type can see it"),
+                    .with_note(EXTRA_FIELD_NOTE),
                 );
                 ty
             }
@@ -731,14 +966,293 @@ impl<'a> Checker<'a> {
             name,
             name_span,
             ty,
+            open: None,
+            rejected: false,
         });
+    }
+
+    /// Checks the dotted field item `id`, `a.b.c = VALUE`, whose path is
+    /// `segments`, and declares the open field `a` or extends it (see the
+    /// module documentation). A path that breaks the rules is reported, and
+    /// its value checked on its own, without declaring anything.
+    fn check_dotted_field(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        value: ExprId,
+        expecting: Option<Expecting>,
+    ) {
+        let Some(first) = segments.first() else {
+            return;
+        };
+        // Where the path attaches to what the block already has: the field's
+        // declaration and the deepest existing node along the path, with the
+        // number of segments that exist.
+        let declared = self.fields[self.fields_start..]
+            .iter()
+            .position(|field| field.name == first.name)
+            .map(|index| index + self.fields_start);
+        let attach = match declared {
+            None => None,
+            Some(index) => {
+                let field = self.fields[index];
+                let Some(open) = field.open else {
+                    let shown = self.ast.show_path(&segments[..1]);
+                    self.errors.push(
+                        Diagnostic::error(
+                            format!("field `{shown}` is already defined"),
+                            path_span(segments),
+                        )
+                        .with_context(field.name_span, "defined whole here")
+                        .with_note(WHOLE_FIELD_NOTE),
+                    );
+                    self.fields[index].rejected = true;
+                    self.check_alone(value);
+                    return;
+                };
+                let Some((node, existing)) = self.attach_point(open.node, segments) else {
+                    self.fields[index].rejected = true;
+                    self.check_alone(value);
+                    return;
+                };
+                Some((index, open, node, existing))
+            }
+        };
+        let existing = attach.map_or(0, |(_, _, _, existing)| existing);
+        let expected = expecting.and_then(|expecting| {
+            self.expected_at(expecting, segments, existing)
+                .map(|ty| (expecting, ty))
+        });
+        let leaf_ty = match expected {
+            Some((expecting, expected)) => {
+                let found =
+                    self.check_expr_expecting(value, expected, expecting.context, expecting.why);
+                if found == TyId::ERROR {
+                    TyId::ERROR
+                } else {
+                    expected
+                }
+            }
+            None => self.check_alone(value),
+        };
+        // The new nodes, from the first segment that does not exist yet.
+        let (mut parent, root) = if let Some((_, open, node, _)) = attach {
+            (node, open.node)
+        } else {
+            let root = self.add_node(NO_NODE, first.name, first.span, NodeKind::Open);
+            (root, root)
+        };
+        let last = segments.len() - 1;
+        for (index, segment) in segments.iter().enumerate().skip(existing.max(1)) {
+            let span = path_span(&segments[..=index]);
+            let kind = if index == last {
+                NodeKind::Leaf
+            } else {
+                NodeKind::Open
+            };
+            parent = self.add_node(parent, segment.name, span, kind);
+        }
+        // `parent` is now the leaf. Its type is the value's, and the type of
+        // each node above it changes.
+        self.nodes[parent as usize].ty = leaf_ty;
+        let mut node = self.nodes[parent as usize].parent;
+        while node != NO_NODE {
+            let ty = self.node_type(node);
+            let entry = &mut self.nodes[node as usize];
+            entry.ty = ty;
+            node = entry.parent;
+        }
+        let ty = self.nodes[root as usize].ty;
+        match attach {
+            None => {
+                self.declare(first.name, ty, id, true);
+                self.fields.push(FieldDecl {
+                    name: first.name,
+                    name_span: first.span,
+                    ty,
+                    open: Some(OpenField {
+                        node: root,
+                        binding: self.bindings.len() - 1,
+                    }),
+                    rejected: false,
+                });
+            }
+            Some((index, open, _, existing)) => {
+                self.fields[index].ty = ty;
+                let binding = &mut self.bindings[open.binding];
+                binding.ty = ty;
+                self.item_slots[id.index()] = binding.slot;
+                self.item_paths[id.index()] = PathResolution {
+                    source: binding.slot,
+                    existing: position(existing),
+                };
+            }
+        }
+    }
+
+    /// Finds where the path `segments`, whose first segment names the open
+    /// field whose root node is `root`, attaches to that field: the deepest
+    /// node along the path that exists, and the number of the path's
+    /// segments that exist, at least 1 and short of all of them. Reports the
+    /// path and returns `None` if it breaks a rule: a segment that exists as
+    /// a leaf, or a last segment that exists at all.
+    fn attach_point(&mut self, root: u32, segments: &[PathSegment]) -> Option<(u32, usize)> {
+        let mut node = root;
+        let last = segments.len() - 1;
+        for (index, segment) in segments.iter().enumerate().skip(1) {
+            let Some(child) = self.child(node, segment.name) else {
+                return Some((node, index));
+            };
+            let found = self.nodes[child as usize];
+            let prefix = self.ast.show_path(&segments[..=index]);
+            let path = path_span(segments);
+            if index == last {
+                self.errors.push(
+                    Diagnostic::error(format!("field `{prefix}` is defined twice"), path)
+                        .with_context(found.span, "first defined here"),
+                );
+                return None;
+            }
+            match found.kind {
+                NodeKind::Open => node = child,
+                // Reported already.
+                NodeKind::Leaf if found.ty == TyId::ERROR => return None,
+                NodeKind::Leaf if self.types.is_record(found.ty) => {
+                    self.errors.push(
+                        Diagnostic::error(format!("field `{prefix}` is already defined"), path)
+                            .with_context(found.span, "defined whole here")
+                            .with_note(WHOLE_FIELD_NOTE),
+                    );
+                    return None;
+                }
+                NodeKind::Leaf => {
+                    let shown = self.ast.show_path(segments);
+                    let ty = self.in_message(found.ty);
+                    self.errors.push(
+                        Diagnostic::error(
+                            format!("cannot define `{shown}`: `{prefix}` is {ty}, not a record"),
+                            path,
+                        )
+                        .with_context(found.span, format!("`{prefix}` defined here")),
+                    );
+                    return None;
+                }
+            }
+        }
+        // The last segment either exists or does not, and both return
+        // above.
+        None
+    }
+
+    /// The type `expecting` expects at the end of the path `segments`, of
+    /// which the first `existing` segments are defined already, or `None`
+    /// if it has none there. Walking the expected record type along the
+    /// path stops at a segment it does not have, which is warned about as
+    /// an extra field if this path defines it first, or at a type that is
+    /// not a record, which is reported as a mismatch when the block ends.
+    fn expected_at(
+        &mut self,
+        expecting: Expecting,
+        segments: &[PathSegment],
+        existing: usize,
+    ) -> Option<TyId> {
+        let mut expected = expecting.ty;
+        for (index, segment) in segments.iter().enumerate() {
+            // Not a record: reported when the block ends.
+            self.types.record_fields(expected)?;
+            let Some(ty) = self.types.field(expected, segment.name) else {
+                if index >= existing {
+                    let text = self.ast.names().get(segment.name);
+                    let record = self.in_message(expected);
+                    self.warnings.push(
+                        Diagnostic::warning(
+                            format!("field `{}` is not in {record}", FieldName(text)),
+                            segment.span,
+                        )
+                        .with_context(expecting.context, expecting.why)
+                        .with_note(EXTRA_FIELD_NOTE),
+                    );
+                }
+                return None;
+            };
+            expected = ty;
+        }
+        Some(expected)
+    }
+
+    /// Adds a node named `name`, at `span`, as the newest child of `parent`
+    /// (or as a root, for [`NO_NODE`]), and returns its index. Its type is
+    /// set by the caller.
+    fn add_node(&mut self, parent: u32, name: Name, span: Span, kind: NodeKind) -> u32 {
+        let index = position(self.nodes.len());
+        let next_sibling = match self.nodes.get_mut(parent as usize) {
+            Some(parent) => std::mem::replace(&mut parent.first_child, index),
+            None => NO_NODE,
+        };
+        self.nodes.push(Node {
+            name,
+            span,
+            ty: TyId::EMPTY,
+            kind,
+            parent,
+            first_child: NO_NODE,
+            next_sibling,
+        });
+        index
+    }
+
+    /// The child of `node` named `name`, if it has one.
+    fn child(&self, node: u32, name: Name) -> Option<u32> {
+        let mut child = self.nodes.get(node as usize)?.first_child;
+        while let Some(entry) = self.nodes.get(child as usize) {
+            if entry.name == name {
+                return Some(child);
+            }
+            child = entry.next_sibling;
+        }
+        None
+    }
+
+    /// The type of the open node `node`: the record of its children's
+    /// types, or `Error` if any of them is.
+    fn node_type(&mut self, node: u32) -> TyId {
+        let base = self.sorted_fields.len();
+        let mut erroneous = false;
+        let mut child = self
+            .nodes
+            .get(node as usize)
+            .map_or(NO_NODE, |n| n.first_child);
+        while let Some(entry) = self.nodes.get(child as usize) {
+            erroneous |= entry.ty == TyId::ERROR;
+            self.sorted_fields.push((entry.name, 0, entry.ty));
+            child = entry.next_sibling;
+        }
+        let ty = if erroneous {
+            TyId::ERROR
+        } else {
+            let fields = self.sorted_fields.get(base..).unwrap_or_default();
+            self.types
+                .record(fields.iter().map(|&(name, _, ty)| (name, ty)))
+        };
+        self.sorted_fields.truncate(base);
+        ty
+    }
+
+    /// Checks `value` with no expected type, settling an untyped integer to
+    /// `Int`, and returns its type.
+    fn check_alone(&mut self, value: ExprId) -> TyId {
+        let found = self.check_expr(value);
+        self.settle(value, found)
     }
 
     /// The type of the record block whose fields are the innermost block's,
     /// once they are all declared: the record of the fields, or `Error` if
-    /// a field is defined twice or has an erroneous type. With `expecting`,
+    /// a field is defined twice, has an erroneous type or had a dotted path
+    /// under it rejected. With `expecting`,
     /// also reports each field of the expected type that the block lacks,
-    /// which makes the type `Error` too.
+    /// at any level of an open field, and each open field or segment of one
+    /// that the expected type has as something other than a record, which
+    /// make the type `Error` too.
     fn record_type(&mut self, expecting: Option<Expecting>) -> TyId {
         let fields = self.fields.get(self.fields_start..).unwrap_or_default();
         let base = self.sorted_fields.len();
@@ -748,7 +1262,9 @@ impl<'a> Checker<'a> {
                 .enumerate()
                 .map(|(index, field)| (field.name, position(index), field.ty)),
         );
-        let mut erroneous = fields.iter().any(|field| field.ty == TyId::ERROR);
+        let mut erroneous = fields
+            .iter()
+            .any(|field| field.ty == TyId::ERROR || field.rejected);
         let sorted = self.sorted_fields.get_mut(base..).unwrap_or_default();
         sorted.sort_unstable_by_key(|&(name, index, _)| (name, index));
         // A name's first definition sorts first among its definitions, and
@@ -775,6 +1291,7 @@ impl<'a> Checker<'a> {
         }
         if let Some(expecting) = expecting {
             erroneous |= self.report_missing_fields(base, expecting);
+            erroneous |= self.check_open_fields(expecting);
         }
         let ty = if erroneous {
             TyId::ERROR
@@ -823,12 +1340,120 @@ impl<'a> Checker<'a> {
         true
     }
 
-    /// Checks `NAME := VALUE` and declares the new binding. The binding is
+    /// Checks each open field of the innermost block that `expecting`'s
+    /// record type has against the type it has there, at every level of
+    /// nesting, through a work list rather than recursion. A segment is
+    /// checked against a record type by its fields: each one it lacks is
+    /// reported at the block's closing brace as "missing field `a.x` in
+    /// record", and each open segment is checked in turn (a leaf was checked
+    /// against its type when it was defined). A segment expected to be
+    /// something other than a record is a mismatch, reported at its first
+    /// definition. Returns whether anything was reported.
+    fn check_open_fields(&mut self, expecting: Expecting) -> bool {
+        let mut reported = false;
+        for index in self.fields_start..self.fields.len() {
+            let field = self.fields[index];
+            let Some(open) = field.open else {
+                continue;
+            };
+            // An erroneous field has been reported already.
+            if field.ty == TyId::ERROR {
+                continue;
+            }
+            let Some(expected) = self.types.field(expecting.ty, field.name) else {
+                continue;
+            };
+            self.pending.push((open.node, expected));
+            while let Some((node, expected)) = self.pending.pop() {
+                reported |= self.check_open_node(node, expected, expecting);
+            }
+        }
+        reported
+    }
+
+    /// Checks the open node `node` against the type `expected`, reporting a
+    /// mismatch or each missing field, and queues its open children that
+    /// the type has on `pending`. Returns whether anything was reported.
+    fn check_open_node(&mut self, node: u32, expected: TyId, expecting: Expecting) -> bool {
+        let entry = self.nodes[node as usize];
+        // An unknown type has been reported, and a record type never has a
+        // field of one, but nothing is to be checked against it either way.
+        if expected == TyId::ERROR || entry.ty == TyId::ERROR {
+            return false;
+        }
+        let Some(fields) = self.types.record_fields(expected) else {
+            let label = format!(
+                "expected {}, found {}",
+                self.in_label(expected),
+                self.in_label(entry.ty)
+            );
+            self.errors.push(
+                Diagnostic::error("mismatched types", entry.span)
+                    .with_label(label)
+                    .with_context(expecting.context, expecting.why),
+            );
+            return true;
+        };
+        let names = self.ast.names();
+        let mut missing: Vec<&str> = Vec::new();
+        for &(name, ty) in fields {
+            match self.child(node, name) {
+                None => missing.push(names.get(name)),
+                Some(child) if self.nodes[child as usize].kind == NodeKind::Open => {
+                    self.pending.push((child, ty));
+                }
+                Some(_) => {}
+            }
+        }
+        if missing.is_empty() {
+            return false;
+        }
+        missing.sort_unstable();
+        let path = self.node_path(node);
+        let record = self.in_message(expected);
+        for text in missing {
+            self.errors.push(
+                Diagnostic::error(
+                    format!("missing field `{path}.{}` in record", FieldName(text)),
+                    expecting.close,
+                )
+                .with_context(expecting.context, expecting.why)
+                .with_note(format!("the type {record} needs it")),
+            );
+        }
+        true
+    }
+
+    /// The path from its field's name to the node `node`, as it is
+    /// written, for diagnostics.
+    fn node_path(&self, node: u32) -> String {
+        let names = self.ast.names();
+        let mut texts = Vec::new();
+        let mut current = node;
+        while let Some(entry) = self.nodes.get(current as usize) {
+            texts.push(FieldName(names.get(entry.name)).to_string());
+            current = entry.parent;
+        }
+        texts.reverse();
+        texts.join(".")
+    }
+
+    /// Checks `PATH := VALUE` and declares the new binding: with the value's
+    /// type, or for a dotted path the type of the update. The binding is
     /// declared even when the rebind is rejected, so that later uses of the
     /// name do not cascade into "undefined variable" errors.
-    fn check_rebind(&mut self, id: ItemId, name: Name, name_span: Span, value: ExprId) {
+    fn check_rebind(&mut self, id: ItemId, path: PathRange, value: ExprId) {
+        let segments = self.ast.path(path);
+        let Some(&PathSegment {
+            name,
+            span: name_span,
+        }) = segments.first()
+        else {
+            return;
+        };
         let text = self.ast.names().get(name);
-        match self.lookup(name) {
+        // The binding being rebound, once the `:=` rules pass.
+        let target = match self.lookup(name) {
             Some((_, binding)) if binding.is_field => {
                 let mut error = Diagnostic::error(
                     format!("cannot rebind `{text}`: it is a field, not a variable"),
@@ -842,8 +1467,9 @@ impl<'a> Checker<'a> {
                 self.errors.push(error.with_note(format!(
                     "rebind with `{text} = ...` is not allowed either: a field is defined once"
                 )));
+                None
             }
-            Some((index, _)) if index >= self.block_start => {}
+            Some((index, binding)) if index >= self.block_start => Some(binding),
             Some((_, binding)) => {
                 let mut error = Diagnostic::error(
                     format!("cannot rebind `{text}` here: it is declared in an enclosing block"),
@@ -856,6 +1482,7 @@ impl<'a> Checker<'a> {
                 }
                 let error = error.with_note(format!("shadow it with `let {text} = ...` instead"));
                 self.errors.push(error);
+                None
             }
             None => {
                 self.errors.push(
@@ -865,11 +1492,176 @@ impl<'a> Checker<'a> {
                     )
                     .with_note(format!("declare it with `let {text} = ...`")),
                 );
+                None
+            }
+        };
+        let Some(target) = target.filter(|target| target.ty != TyId::ERROR) else {
+            // The rebind was rejected (or the variable is already erroneous):
+            // check the value on its own and declare the name with what it
+            // has, so later uses do not cascade.
+            let ty = self.check_alone(value);
+            if segments.len() == 1 {
+                self.declare(name, ty, id, false);
+            } else {
+                self.declare_update(id, segments, ty);
+            }
+            return;
+        };
+        // `:=` is assignment-compatible: the value must fit the variable's
+        // type (or the path's leaf type), and the binding keeps that type.
+        let context = target
+            .declared
+            .map_or(name_span, |declared| self.ast.item(declared).span);
+        if segments.len() == 1 {
+            self.check_expr_expecting(value, target.ty, context, "the variable was declared here");
+            self.declare(name, target.ty, id, false);
+            return;
+        }
+        if let Some(leaf) = self.rebind_leaf(segments, target.ty) {
+            self.check_expr_expecting(
+                value,
+                leaf,
+                path_span(segments),
+                "`:=` keeps the field's type",
+            );
+            self.declare_update(id, segments, leaf);
+        } else {
+            self.check_alone(value);
+            self.declare(name, TyId::ERROR, id, false);
+        }
+    }
+
+    /// The type of the leaf of the dotted `:=` path `segments`, whose first
+    /// segment has record type `root`. Every segment must already exist,
+    /// since `:=` never adds a field: a missing one, or a segment along the
+    /// way that is not a record, is reported and `None` returned.
+    fn rebind_leaf(&mut self, segments: &[PathSegment], root: TyId) -> Option<TyId> {
+        let mut current = root;
+        for (index, segment) in segments.iter().enumerate().skip(1) {
+            if !self.types.is_record(current) {
+                let message = format!(
+                    "cannot update `{}`: `{}` is {}, not a record",
+                    self.ast.show_path(segments),
+                    self.ast.show_path(&segments[..index]),
+                    self.in_message(current)
+                );
+                let label = format!("this is {}", self.in_label(root));
+                self.errors.push(
+                    Diagnostic::error(message, path_span(segments))
+                        .with_context(segments[0].span, label),
+                );
+                return None;
+            }
+            let Some(ty) = self.types.field(current, segment.name) else {
+                let path = self.ast.show_path(segments);
+                let prefix = self.ast.show_path(&segments[..index]);
+                let field = FieldName(self.ast.names().get(segment.name));
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
+                        path_span(segments),
+                    )
+                    .with_context(segments[0].span, format!("this is {}", self.in_label(root)))
+                    .with_note(format!(
+                        "`:=` cannot add a field; add it with `let {path} = ...`"
+                    )),
+                );
+                return None;
+            };
+            current = ty;
+        }
+        Some(current)
+    }
+
+    /// Declares the variable of the dotted `let` or `:=` item `id`, whose
+    /// path is `segments` and whose value has type `leaf_ty`: a new binding
+    /// of the path's first segment, `a`, whose type is that of `a` in scope,
+    /// or of `{}` if there is none, with the rest of the path set to
+    /// `leaf_ty` (see the module documentation). If `a` or a segment along
+    /// the way is not a record, that is reported and the binding is
+    /// `Error`.
+    fn declare_update(&mut self, id: ItemId, segments: &[PathSegment], leaf_ty: TyId) {
+        let Some((first, rest)) = segments.split_first() else {
+            return;
+        };
+        self.path_types.clear();
+        let old = self.lookup(first.name).map(|(_, binding)| binding);
+        let mut failed = leaf_ty == TyId::ERROR;
+        if let Some(old) = old {
+            if old.ty == TyId::ERROR {
+                // Reported already.
+                failed = true;
+            } else if self.types.is_record(old.ty) {
+                // The type of each record along the path that exists, from
+                // `a` down; the last segment is never one of them.
+                let mut current = old.ty;
+                self.path_types.push(current);
+                for (index, segment) in rest.iter().enumerate() {
+                    if index + 1 == rest.len() {
+                        break;
+                    }
+                    match self.types.field(current, segment.name) {
+                        None => break,
+                        Some(ty) if self.types.is_record(ty) => {
+                            current = ty;
+                            self.path_types.push(current);
+                        }
+                        Some(ty) => {
+                            let prefix = self.ast.show_path(&segments[..index + 2]);
+                            let message = format!(
+                                "cannot update `{}`: `{prefix}` is {}, not a record",
+                                self.ast.show_path(segments),
+                                self.in_message(ty)
+                            );
+                            let label = format!("this is {}", self.in_label(old.ty));
+                            self.errors.push(
+                                Diagnostic::error(message, path_span(segments))
+                                    .with_context(first.span, label),
+                            );
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let message = format!(
+                    "cannot update `{}`: `{}` is {}, not a record",
+                    self.ast.show_path(segments),
+                    self.ast.show_path(&segments[..1]),
+                    self.in_message(old.ty)
+                );
+                let label = format!("this is {}", self.in_label(old.ty));
+                self.errors.push(
+                    Diagnostic::error(message, path_span(segments)).with_context(first.span, label),
+                );
+                failed = true;
             }
         }
-        let found = self.check_expr(value);
-        let ty = self.settle(value, found);
-        self.declare(name, ty, id, false);
+        let existing = self.path_types.len();
+        let ty = if failed {
+            TyId::ERROR
+        } else {
+            // From the leaf outwards: each record along the path, as it was
+            // or created empty, with its segment set.
+            let mut ty = leaf_ty;
+            for (level, segment) in rest.iter().enumerate().rev() {
+                let base = self.path_types.get(level).copied().unwrap_or(TyId::EMPTY);
+                ty = self
+                    .types
+                    .with_field(base, segment.name, ty)
+                    .unwrap_or(TyId::ERROR);
+            }
+            ty
+        };
+        if let Some(old) = old
+            && existing > 0
+        {
+            self.item_paths[id.index()] = PathResolution {
+                source: old.slot,
+                existing: position(existing),
+            };
+        }
+        self.declare(first.name, ty, id, false);
     }
 
     /// Declares a variable, or a field if `is_field`, in the innermost
@@ -1097,6 +1889,8 @@ impl<'a> Checker<'a> {
                     }
                     BinaryOp::Eq
                     | BinaryOp::Ne
+                    | BinaryOp::Same
+                    | BinaryOp::NotSame
                     | BinaryOp::Lt
                     | BinaryOp::Le
                     | BinaryOp::Gt
@@ -1334,9 +2128,9 @@ impl<'a> Checker<'a> {
 
     /// Types a comparison. Both operands must be the same type, untyped
     /// operands adapting as for arithmetic and two untyped operands
-    /// settling to `Int`: any type for `==` and `!=` (two records must be
-    /// exactly the same type), and `Int`, `Float` or `String` for ordering.
-    /// The result is `Bool`.
+    /// settling to `Int`: any type for `==`, `!=`, `===` and `!==` (two
+    /// records must be exactly the same type), and `Int`, `Float` or
+    /// `String` for ordering. The result is `Bool`.
     fn comparison(
         &mut self,
         id: ExprId,
@@ -1344,7 +2138,7 @@ impl<'a> Checker<'a> {
         (lhs, lhs_ty): (ExprId, TyId),
         (rhs, rhs_ty): (ExprId, TyId),
     ) -> TyId {
-        let ordering = !matches!(op, BinaryOp::Eq | BinaryOp::Ne);
+        let ordering = !op.is_equality();
         if ordering && lhs_ty != TyId::ERROR && rhs_ty != TyId::ERROR {
             // An operand of a type with no order is reported as such, before
             // any mismatch.
@@ -1638,11 +2432,18 @@ fn is_numeric(ty: TyId) -> bool {
 }
 
 /// A field's position in its block or type, as stored in
-/// `Checker::sorted_fields`. A block or type has fewer fields than its
-/// source has bytes, so the conversion never saturates.
+/// `Checker::sorted_fields`, a node's index in `Checker::nodes`, or a count
+/// of path segments. There are fewer of each than the source has bytes, so
+/// the conversion never saturates.
 fn position(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
 }
+
+/// The note on a dotted path under a field, or a segment, defined whole.
+const WHOLE_FIELD_NOTE: &str = "a field defined as a whole cannot be extended with dotted paths";
+
+/// The note on a field that the expected record type lacks.
+const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can see it";
 
 #[cfg(test)]
 mod tests {
@@ -2073,7 +2874,7 @@ mod tests {
 
     #[test]
     fn rebinding_in_the_same_block() {
-        assert_eq!(result_type("let x = 1\nx := 2.5\nx"), TyId::FLOAT);
+        assert_eq!(result_type("let x = 1\nx := 2\nx"), TyId::INT);
         assert_eq!(
             result_type("let x = 1\nx := x + 1\nx := x * 2\nx"),
             TyId::INT
@@ -2081,7 +2882,7 @@ mod tests {
         // In an inner block, of a variable declared in that block, even one
         // shadowing an outer variable.
         assert_eq!(
-            result_type("let x = 1\n{ let x = 2; x := 3.5; x }"),
+            result_type("let x = 1\n{ let x = 2.5; x := 3.5; x }"),
             TyId::FLOAT
         );
         // The new value sees the old binding.
@@ -2092,6 +2893,84 @@ mod tests {
         // `:=` takes a fresh slot.
         assert_eq!(resolution.item_slot(items[1]), Slot(1));
         assert_eq!(resolution.expr_slot(result_expr(&ast)), Slot(1));
+    }
+
+    #[test]
+    fn rebinding_is_assignment_compatible() {
+        // The literal adapts to the variable's type, which the rebind keeps.
+        assert_eq!(result_type("let x: Float = 1\nx := 2\nx"), TyId::FLOAT);
+        // A subtype fits, and the variable keeps its wider type.
+        assert_eq!(
+            shown_result("let p: {x: Int} = { x = 1 }\np := { x = 2; y = 3 }\np"),
+            "{x: Int}"
+        );
+        // A different type does not: changing a type takes a `let`.
+        let diagnostic = &diagnostics("let x = 1\nx := 2.5\nx")[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(diagnostic.span, Span::new(15, 18));
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("expected Int, found Float")
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(0, 9), "the variable was declared here")]
+        );
+        // The variable keeps its type afterwards, so nothing cascades.
+        assert_eq!(
+            messages("let x = 1\nx := 2.5\nx + 1"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(
+            result_type("let x = 1\nlet x = 2.5\nx := 3.5\nx"),
+            TyId::FLOAT
+        );
+    }
+
+    #[test]
+    fn a_dotted_rebind_keeps_the_leaf_type_and_adds_nothing() {
+        assert_eq!(
+            shown_result("let a = { x = 1; n = { m = 1 } }\na.n.m := 5\na"),
+            "{n: {m: Int}, x: Int}"
+        );
+        // A subtype fits at the leaf.
+        assert_eq!(
+            shown_result("let a: {r: {x: Int}} = { r = { x = 1 } }\na.r := { x = 2; y = 3 }\na"),
+            "{r: {x: Int}}"
+        );
+        let diagnostic = &diagnostics("let a = { x = 1 }\na.x := \"s\"\na")[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(18, 21), "`:=` keeps the field's type")]
+        );
+        let diagnostic = &diagnostics("let a = { x = 1 }\na.y := 2\na")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot rebind `a.y`: `a` has no field `y`"
+        );
+        assert_eq!(diagnostic.span, Span::new(18, 21));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(18, 19), "this is {x: Int}")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            vec!["`:=` cannot add a field; add it with `let a.y = ...`"]
+        );
+        assert_eq!(
+            messages("let a = { x = 1 }\na.x.z := 2"),
+            vec!["cannot update `a.x.z`: `a.x` is Int, not a record"]
+        );
+        // The rejected rebind declares `a` as an error, so nothing cascades.
+        assert_eq!(
+            messages("let a = { x = 1 }\na.y := 2\na.x + 1"),
+            vec!["cannot rebind `a.y`: `a` has no field `y`"]
+        );
     }
 
     #[test]
@@ -2389,7 +3268,9 @@ mod tests {
             let wanted = names.lookup(text).unwrap();
             all_lets
                 .iter()
-                .filter(|&&id| matches!(ast.item(id).kind, ItemKind::Let { name, .. } if name == wanted))
+                .filter(|&&id| {
+                    matches!(ast.item(id).kind, ItemKind::Let { path, .. } if ast.path(path)[0].name == wanted)
+                })
                 .map(|&id| resolution.item_slot(id).get())
                 .collect()
         };
@@ -3532,6 +4413,608 @@ mod tests {
                 "field `a` appears twice in this type",
                 "field `a` appears twice in this type"
             ]
+        );
+    }
+
+    // ----- Dotted fields -----
+
+    #[test]
+    fn dotted_fields_merge_into_one_record() {
+        assert_eq!(
+            file_type("server.host = \"localhost\"\nserver.port = 8080\nserver.tls.enabled = true"),
+            "{server: {host: String, port: Int, tls: {enabled: Bool}}}"
+        );
+        assert_eq!(
+            shown_result("{ a.b.c = 1; a.b.d = 2.5; a.e = \"s\"; f = 1 }"),
+            "{a: {b: {c: Int, d: Float}, e: String}, f: Int}"
+        );
+        // Quoted segments are names like any other.
+        assert_eq!(
+            shown_result("{ \"log level\".format = \"json\"; \"log level\".\"to file\" = true }"),
+            "{\"log level\": {format: String, \"to file\": Bool}}"
+        );
+        // Interleaved with other fields and with `let`s.
+        assert_eq!(
+            shown_result("{ a.x = 1; b = 2; let t = 3; a.y = t }"),
+            "{a: {x: Int, y: Int}, b: Int}"
+        );
+        // The field is one binding, in one slot, whatever extends it.
+        let ast = parse_text("a.x = 1\nb = 2\na.y = 3\na.z.w = 4");
+        let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
+        let items = ast.items(ast.root());
+        let slots: Vec<Slot> = items.iter().map(|&id| resolution.item_slot(id)).collect();
+        assert_eq!(slots, vec![Slot(0), Slot(1), Slot(0), Slot(0)]);
+        assert_eq!(resolution.frame_size(), 2);
+        // The first definition builds from nothing; each later one updates
+        // the field's slot, through as many segments as exist.
+        let paths: Vec<PathResolution> = items.iter().map(|&id| resolution.item_path(id)).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathResolution::NONE,
+                PathResolution::NONE,
+                PathResolution {
+                    source: Slot(0),
+                    existing: 1
+                },
+                PathResolution {
+                    source: Slot(0),
+                    existing: 1
+                },
+            ]
+        );
+        let ast = parse_text("a.b.c = 1\na.b.d = 2");
+        let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
+        assert_eq!(
+            resolution.item_path(ast.items(ast.root())[1]),
+            PathResolution {
+                source: Slot(0),
+                existing: 2
+            }
+        );
+    }
+
+    #[test]
+    fn the_type_of_an_open_field_grows_item_by_item() {
+        assert_eq!(
+            shown_result("{ a.x = 1; let p = a; a.y = \"s\"; let q = a; r = p; s = q }"),
+            "{a: {x: Int, y: String}, r: {x: Int}, s: {x: Int, y: String}}"
+        );
+        // A later definition sees the field as built so far.
+        assert_eq!(
+            shown_result("{ a.x = 1; a.y = a.x + 1 }"),
+            "{a: {x: Int, y: Int}}"
+        );
+        assert_eq!(
+            messages("{ a.x = 1; a.y = a.z }"),
+            vec!["no field `z` in `{x: Int}`"]
+        );
+        // The first definition does not see its own field.
+        assert_eq!(messages("{ a.x = a }"), vec!["undefined variable `a`"]);
+        // A later `let` shadows the field without changing it.
+        assert_eq!(
+            shown_result("{ a.x = 1; let a = \"s\"; a.y = a }"),
+            "{a: {x: Int, y: String}}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_path_under_a_whole_field_is_an_error() {
+        let diagnostic = &diagnostics("{ a = 1; a.b = 2 }")[0];
+        assert_eq!(diagnostic.message, "field `a` is already defined");
+        assert_eq!(diagnostic.span, Span::new(9, 12));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 3), "defined whole here")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            vec!["a field defined as a whole cannot be extended with dotted paths"]
+        );
+        // Whatever the whole field's type, record or not.
+        assert_eq!(
+            messages("{ a = { b = 1 }; a.c = 2 }"),
+            vec!["field `a` is already defined"]
+        );
+        // A segment defined whole as a record, by a path's last segment.
+        let diagnostic = &diagnostics("{ a.b = { x = 1 }; a.b.y = 2 }")[0];
+        assert_eq!(diagnostic.message, "field `a.b` is already defined");
+        assert_eq!(diagnostic.span, Span::new(19, 24));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 5), "defined whole here")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            vec!["a field defined as a whole cannot be extended with dotted paths"]
+        );
+        assert_eq!(
+            messages("let r = { x = 1 }\n{ a.b = r; a.b.c.d = 1 }"),
+            vec!["field `a.b` is already defined"]
+        );
+        // The rejected path declares nothing, so nothing cascades, but its
+        // value is still checked.
+        assert_eq!(
+            messages("{ a = 1; a.b = 2; c = a + 1 }"),
+            vec!["field `a` is already defined"]
+        );
+        assert_eq!(
+            messages("{ a = 1; a.b = 1.0 // 2 }"),
+            vec!["field `a` is already defined", "cannot floor-divide Float"]
+        );
+        // The block's record is erroneous, so nothing outside cascades.
+        assert_eq!(
+            messages("let r = { a = 1; a.b = 2 }\nr.a + 1.5\nr.q"),
+            vec!["field `a` is already defined"]
+        );
+        assert_eq!(
+            messages("let r = { a.b = 1; a.b.c = 2 }\nr.a.b + 1.5"),
+            vec!["cannot define `a.b.c`: `a.b` is Int, not a record"]
+        );
+    }
+
+    #[test]
+    fn a_whole_field_after_a_dotted_one_is_defined_twice() {
+        let diagnostic = &diagnostics("{ a.b = 1; a = 2 }")[0];
+        assert_eq!(diagnostic.message, "field `a` is defined twice");
+        assert_eq!(diagnostic.span, Span::new(11, 12));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 3), "first defined here")]
+        );
+        // Later dotted paths still extend the first, dotted, field.
+        assert_eq!(
+            messages("{ a.b = 1; a = 2; a.c = 3 }"),
+            vec!["field `a` is defined twice"]
+        );
+    }
+
+    #[test]
+    fn a_segment_that_is_not_a_record_cannot_hold_fields() {
+        let diagnostic = &diagnostics("{ a.b = 1; a.b.c = 2 }")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot define `a.b.c`: `a.b` is Int, not a record"
+        );
+        assert_eq!(diagnostic.span, Span::new(11, 16));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 5), "`a.b` defined here")]
+        );
+        assert!(diagnostic.notes.is_empty());
+        // Deeper, with another type, and quoted.
+        assert_eq!(
+            messages("{ a.b.c = \"s\"; a.b.c.d.e = 1 }"),
+            vec!["cannot define `a.b.c.d.e`: `a.b.c` is String, not a record"]
+        );
+        assert_eq!(
+            messages("{ a.\"b c\" = true; a.\"b c\".d = 1 }"),
+            vec!["cannot define `a.\"b c\".d`: `a.\"b c\"` is Bool, not a record"]
+        );
+        // An erroneous segment has been reported already.
+        assert_eq!(
+            messages("{ a.b = 1.0 // 2; a.b.c = 1 }"),
+            vec!["cannot floor-divide Float"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_path_defined_twice_is_an_error() {
+        let diagnostic = &diagnostics("{ a.b = 1; a.b = 2 }")[0];
+        assert_eq!(diagnostic.message, "field `a.b` is defined twice");
+        assert_eq!(diagnostic.span, Span::new(11, 14));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 5), "first defined here")]
+        );
+        // A record a longer path created is defined too, where that path
+        // wrote it.
+        let diagnostic = &diagnostics("{ a.b.c = 1; a.b = 2 }")[0];
+        assert_eq!(diagnostic.message, "field `a.b` is defined twice");
+        assert_eq!(diagnostic.span, Span::new(13, 16));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 5), "first defined here")]
+        );
+        // A quoted name is the same name.
+        assert_eq!(
+            messages("{ \"a b\".c = 1; \"a b\".\"c\" = 2 }"),
+            vec!["field `\"a b\".c` is defined twice"]
+        );
+        // The record type does not cascade.
+        assert_eq!(
+            messages("let r = { a.b = 1; a.b = 2 }\nr.a.b + 1.5"),
+            vec!["field `a.b` is defined twice"]
+        );
+    }
+
+    #[test]
+    fn dotted_fields_are_checked_against_the_expected_type() {
+        // The leaf is checked against the type at its full path.
+        assert_eq!(
+            all_types("let p: {a: {b: Float}} = { a.b = 1 }")[0],
+            TyId::FLOAT
+        );
+        assert_eq!(
+            shown_result("let p: {a: {b: Float, c: {d: Float}}} = { a.b = 1; a.c.d = 2 }\np"),
+            "{a: {b: Float, c: {d: Float}}}"
+        );
+        assert!(warnings("let p: {a: {b: Int}} = { a.b = 1 }\np").is_empty());
+        // Record blocks at the leaf are checked field by field.
+        assert_eq!(
+            all_types("let p: {a: {b: {n: Float}}} = { a.b = { n = 1 } }")[0],
+            TyId::FLOAT
+        );
+        let diagnostic = &diagnostics("let p: {a: {b: Int}} = { a.b = \"s\" }")[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(diagnostic.span, Span::new(31, 34));
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(7, 20), "expected because of this annotation")]
+        );
+        // In an ascription too.
+        assert_eq!(all_types("{ a.b = 1 } : {a: {b: Float}}")[0], TyId::FLOAT);
+    }
+
+    #[test]
+    fn a_missing_nested_field_of_a_dotted_field_is_an_error() {
+        let text = "let p: {a: {b: Int, c: Int}} = { a.b = 1 }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "missing field `a.c` in record");
+        assert_eq!(diagnostic.span, Span::new(41, 42));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(7, 28), "expected because of this annotation")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            vec!["the type `{b: Int, c: Int}` needs it"]
+        );
+        // At every level, each in alphabetical order, and alongside the
+        // block's own missing fields.
+        assert_eq!(
+            messages("let p: {a: {b: {c: Int, d: Int, e: Int}}, z: Int} = { a.b.d = 1 }"),
+            vec![
+                "missing field `z` in record",
+                "missing field `a.b.c` in record",
+                "missing field `a.b.e` in record"
+            ]
+        );
+        // It does not cascade.
+        assert_eq!(
+            messages("let p: {a: {b: Int, c: Int}} = { a.b = 1 }\np.a.c + 1.5"),
+            vec!["missing field `a.c` in record"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_field_the_expected_type_lacks_is_a_warning() {
+        let text = "let p: {a: {b: Int}} = { a.b = 1; a.c = 2 }\np";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        let warning = &found[0];
+        assert_eq!(warning.message, "field `c` is not in `{b: Int}`");
+        assert_eq!(warning.span, Span::new(36, 37));
+        assert_eq!(
+            labels(warning),
+            vec![(Span::new(7, 20), "expected because of this annotation")]
+        );
+        assert_eq!(
+            warning.notes,
+            vec!["it is allowed, but nothing with this type can see it"]
+        );
+        assert_eq!(shown_result(text), "{a: {b: Int}}");
+        // For the first missing segment only, once per such field.
+        let found = warnings("let p: {a: Int} = { a = 1; x.p = 1; x.q.r = 2; y.s.t = 3 }");
+        let shown: Vec<(&str, Span)> = found
+            .iter()
+            .map(|warning| (warning.message.as_str(), warning.span))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("field `x` is not in `{a: Int}`", Span::new(27, 28)),
+                ("field `y` is not in `{a: Int}`", Span::new(47, 48))
+            ]
+        );
+        let found = warnings("let p: {a: {b: Int}} = { a.b = 1; a.c.d = 2; a.c.e = 3 }");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `c` is not in `{b: Int}`");
+    }
+
+    #[test]
+    fn a_dotted_field_where_the_expected_type_is_not_a_record_mismatches() {
+        let diagnostic = &diagnostics("let p: {a: Int} = { a.b = 1 }")[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(diagnostic.span, Span::new(20, 21));
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("expected Int, found {b: Int}")
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(7, 15), "expected because of this annotation")]
+        );
+        // Nested, at the segment's first definition, and without warnings
+        // about the segments below it.
+        let text = "let p: {a: {b: String}} = { a.b.c = 1; a.b.d = 2 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span, Span::new(28, 31));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected String, found {c: Int, d: Int}")
+        );
+    }
+
+    // ----- Dotted `let` and `:=` -----
+
+    #[test]
+    fn a_dotted_let_without_a_variable_builds_nested_records() {
+        assert_eq!(shown_result("let a.b.c = 1\na"), "{b: {c: Int}}");
+        assert_eq!(shown_result("let a.b = \"s\"\na.b"), "String");
+        // An annotation applies to the leaf.
+        assert_eq!(shown_result("let a.b: Float = 5\na"), "{b: Float}");
+        assert_eq!(all_types("let a.b: Float = 5")[0], TyId::FLOAT);
+        assert_eq!(
+            diagnostics("let a.b: Int = 1.5")[0].label.as_deref(),
+            Some("expected Int, found Float")
+        );
+        let ast = parse_text("let a.b.c = 1");
+        let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
+        assert_eq!(
+            resolution.item_path(ast.items(ast.root())[0]),
+            PathResolution::NONE
+        );
+    }
+
+    #[test]
+    fn a_dotted_let_updates_a_record_variable() {
+        // A field added.
+        assert_eq!(
+            shown_result("let a = { x = 1 }\nlet a.y = \"s\"\na"),
+            "{x: Int, y: String}"
+        );
+        // Intermediate records created, and updated inside.
+        assert_eq!(
+            shown_result("let a = { x = 1 }\nlet a.b.c = true\na"),
+            "{b: {c: Bool}, x: Int}"
+        );
+        assert_eq!(
+            shown_result("let a = { b = { c = 1; d = 2 } }\nlet a.b.e = 3\na"),
+            "{b: {c: Int, d: Int, e: Int}}"
+        );
+        // A leaf replaced, its type changing.
+        assert_eq!(
+            shown_result("let a = { b = { c = 1; d = 2 } }\nlet a.b.c = \"s\"\na"),
+            "{b: {c: String, d: Int}}"
+        );
+        assert_eq!(
+            shown_result("let a = { b = { c = 1 } }\nlet a.b = 2.5\na"),
+            "{b: Float}"
+        );
+        // Through the static type: a field hidden by subtyping is created
+        // anew.
+        assert_eq!(
+            shown_result("let p: {x: Int} = { x = 1; y = 2 }\nlet p.y.z = 3\np"),
+            "{x: Int, y: {z: Int}}"
+        );
+        // How far into the path the old record reaches, for lowering.
+        let ast = parse_text("let a = { b = { c = 1 } }\nlet a.b.c = 2\nlet a.x.y.z = 3");
+        let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
+        let items = ast.items(ast.root());
+        assert_eq!(
+            resolution.item_path(items[1]),
+            PathResolution {
+                source: Slot(0),
+                existing: 2
+            }
+        );
+        assert_eq!(
+            resolution.item_path(items[2]),
+            PathResolution {
+                source: Slot(1),
+                existing: 1
+            }
+        );
+        // The update is a new binding in a new slot.
+        assert_eq!(resolution.item_slot(items[1]), Slot(1));
+        assert_eq!(resolution.item_slot(items[2]), Slot(2));
+    }
+
+    #[test]
+    fn a_dotted_let_leaves_the_old_binding_unchanged() {
+        let text = "let a = { x = 1 }\nlet old = a\nlet a.x = \"s\"\nold";
+        assert_eq!(shown_result(text), "{x: Int}");
+        let text = "let a = { x = 1 }\nlet old = a\nlet a.x = \"s\"\na";
+        assert_eq!(shown_result(text), "{x: String}");
+        // In an inner block, the outer variable is shadowed only there.
+        assert_eq!(
+            shown_result("let a = { x = 1 }\n{ let a.y = 2; a }"),
+            "{x: Int, y: Int}"
+        );
+        assert_eq!(
+            shown_result("let a = { x = 1 }\n{ let a.y = 2 }\na"),
+            "{x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_let_needs_records_along_its_path() {
+        let diagnostic = &diagnostics("let a = 1\nlet a.b = 2")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot update `a.b`: `a` is Int, not a record"
+        );
+        assert_eq!(diagnostic.span, Span::new(14, 17));
+        assert_eq!(labels(diagnostic), vec![(Span::new(14, 15), "this is Int")]);
+        let diagnostic = &diagnostics("let a = { b = 1 }\nlet a.b.c = 2")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot update `a.b.c`: `a.b` is Int, not a record"
+        );
+        assert_eq!(diagnostic.span, Span::new(22, 27));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(22, 23), "this is {b: Int}")]
+        );
+        assert_eq!(
+            messages("let a = { b = { c = \"s\" } }\nlet a.b.c.d.e = 2"),
+            vec!["cannot update `a.b.c.d.e`: `a.b.c` is String, not a record"]
+        );
+        // The variable is declared as an error, so nothing cascades; the
+        // value is still checked.
+        assert_eq!(
+            messages("let a = 1\nlet a.b = 2\na.b + 1.5"),
+            vec!["cannot update `a.b`: `a` is Int, not a record"]
+        );
+        assert_eq!(
+            messages("let a = true\nlet a.b = 1.0 // 2"),
+            vec![
+                "cannot update `a.b`: `a` is Bool, not a record",
+                "cannot floor-divide Float"
+            ]
+        );
+        // An erroneous variable has been reported already.
+        assert_eq!(
+            messages("let a = 1.0 // 2\nlet a.b = 1"),
+            vec!["cannot floor-divide Float"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_rebind_updates_a_variable_of_its_block() {
+        assert_eq!(shown_result("let a = { x = 1 }\na.x := 2\na"), "{x: Int}");
+        assert_eq!(
+            shown_result("let a = { x = 1; y = { z = \"s\" } }\na.y.z := \"t\"\na"),
+            "{x: Int, y: {z: String}}"
+        );
+        // A new binding, like any `:=`.
+        let ast = parse_text("let a = { x = 1 }\na.x := 2");
+        let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
+        let items = ast.items(ast.root());
+        assert_eq!(resolution.item_slot(items[1]), Slot(1));
+        assert_eq!(
+            resolution.item_path(items[1]),
+            PathResolution {
+                source: Slot(0),
+                existing: 1
+            }
+        );
+        let text = "let a = { x = 1 }\nlet old = a\na.x := 2\nold";
+        assert_eq!(shown_result(text), "{x: Int}");
+    }
+
+    #[test]
+    fn a_dotted_rebind_follows_the_rebind_rules() {
+        let diagnostic = &diagnostics("a.x := 1")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot rebind `a`: no variable named `a` is declared"
+        );
+        assert_eq!(diagnostic.span, Span::new(0, 1));
+        assert_eq!(diagnostic.notes, vec!["declare it with `let a = ...`"]);
+        // Declared anyway, so uses do not cascade.
+        assert_eq!(
+            messages("a.x := 1\na.x + 1.5"),
+            vec![
+                "cannot rebind `a`: no variable named `a` is declared",
+                "cannot add Int and Float"
+            ]
+        );
+        let diagnostic = &diagnostics("{ a = { x = 1 }; a.x := 2 }")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot rebind `a`: it is a field, not a variable"
+        );
+        assert_eq!(diagnostic.span, Span::new(17, 18));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(2, 15), "declared here")]
+        );
+        let diagnostic = &diagnostics("let a = { x = 1 }\n{ a.x := 2 }")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot rebind `a` here: it is declared in an enclosing block"
+        );
+        assert_eq!(diagnostic.span, Span::new(20, 21));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(Span::new(0, 17), "declared here")]
+        );
+        // And the update rules.
+        let diagnostic = &diagnostics("let a = 1\na.b := 2")[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot update `a.b`: `a` is Int, not a record"
+        );
+        assert_eq!(diagnostic.span, Span::new(10, 13));
+        assert_eq!(labels(diagnostic), vec![(Span::new(10, 11), "this is Int")]);
+        assert_eq!(
+            messages("let a = { b = 1 }\na.b.c := 2"),
+            vec!["cannot update `a.b.c`: `a.b` is Int, not a record"]
+        );
+    }
+
+    // ----- Total equality -----
+
+    #[test]
+    fn total_equality_needs_identical_types() {
+        for op in ["===", "!=="] {
+            assert_eq!(
+                result_type(&format!("{{ x = 1 }} {op} {{ x = 2 }}")),
+                TyId::BOOL
+            );
+            assert_eq!(result_type(&format!("1 {op} 2")), TyId::BOOL);
+            assert_eq!(result_type(&format!("\"a\" {op} \"b\"")), TyId::BOOL);
+            assert_eq!(result_type(&format!("true {op} false")), TyId::BOOL);
+            assert_eq!(result_type(&format!("{{}} {op} {{}}")), TyId::BOOL);
+            // Untyped literals adapt as for `==`.
+            assert_eq!(
+                all_types(&format!("1 {op} 2.5")),
+                vec![TyId::FLOAT, TyId::FLOAT, TyId::BOOL]
+            );
+            let diagnostic = &diagnostics(&format!("{{ x = 1 }} {op} {{ x = 1; y = 2 }}"))[0];
+            assert_eq!(
+                diagnostic.message,
+                "cannot compare `{x: Int}` and `{x: Int, y: Int}`"
+            );
+            assert_eq!(diagnostic.span, Span::new(10, 13));
+            assert_eq!(
+                labels(diagnostic),
+                vec![
+                    (Span::new(0, 9), "{x: Int}"),
+                    (Span::new(14, 30), "{x: Int, y: Int}")
+                ]
+            );
+            assert_eq!(
+                messages(&format!("true {op} 1")),
+                vec!["cannot compare Bool and Int"]
+            );
+        }
+        // Every pair of types, as for `==`.
+        for (lhs, lhs_ty, lhs_shown) in VARIABLES {
+            for (rhs, rhs_ty, rhs_shown) in VARIABLES {
+                let text = format!("{PRELUDE}{lhs} === {rhs}");
+                if lhs_ty == rhs_ty {
+                    assert_eq!(result_type(&text), TyId::BOOL, "{text}");
+                } else {
+                    assert_eq!(
+                        messages(&text),
+                        vec![format!("cannot compare {lhs_shown} and {rhs_shown}")],
+                        "{text}"
+                    );
+                }
+            }
+        }
+        // A narrowed variable compares with values of its static type.
+        assert_eq!(
+            result_type("let q: {x: Int} = { x = 1; y = 2 }\nq === { x = 1 }"),
+            TyId::BOOL
         );
     }
 }

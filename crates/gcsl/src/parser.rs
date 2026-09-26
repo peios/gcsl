@@ -5,12 +5,30 @@
 //! A file, like the inside of a block `{ ... }`, is a *body*: a sequence of
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
-//! `let NAME (: TYPE)? = EXPR`, `NAME := EXPR`, a field `NAME = EXPR` or
-//! `"quoted name" = EXPR`, `= EXPR` or an expression. An item is a field
-//! when it starts with an identifier or a plain string literal and the next
-//! token is `=`, and a rebind when it starts with an identifier and the next
-//! token is `:=`. After an item the next token must be a separator or the
-//! end of the body; anything else is "expected end of item".
+//! `let PATH (: TYPE)? = EXPR`, `PATH := EXPR`, a field `PATH = EXPR`,
+//! `= EXPR` or an expression. After an item the next token must be a
+//! separator or the end of the body; anything else is "expected end of
+//! item".
+//!
+//! # Paths
+//!
+//! A path is one or more names separated by `.`: `x`, `server.port`,
+//! `"log level".format`. After `let` the parser reads the path directly:
+//! an identifier, then `.` and a name as many times as they follow. A field
+//! item or a rebind is recognised afterwards instead: the parser parses an
+//! expression and, when the next token is `=` or `:=`, converts that
+//! expression to a path and drops its nodes, which were the last allocated.
+//! The expression must be a name, a plain string literal, or a chain of
+//! field accesses on one of those, which is exactly how a path reads as an
+//! expression; anything else before the `=` or `:=` is "expected end of
+//! item". A variable's name must be an identifier, so
+//! the first segment of the path of a `let` or a `:=` cannot be a literal;
+//! later segments may be quoted.
+//!
+//! A dotted path nests what its item declares: later stages build a record
+//! for each segment but the last, updating one record inside another, so a
+//! path of `N` segments makes its item `2(N - 1)` levels taller than its
+//! value (see [`MAX_DEPTH`]).
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription), and
@@ -62,7 +80,8 @@
 //! | `or`                        | 1       | 2                          |
 //! | `and`                       | 3       | 4                          |
 //! | prefix `not`                | (none)  | operand parsed with min 5  |
-//! | `==` `!=` `<` `<=` `>` `>=` | 5       | 6 (non-associative)        |
+//! | `==` `!=` `===` `!==`       | 5       | 6 (non-associative)        |
+//! | `<` `<=` `>` `>=`           | 5       | 6 (non-associative)        |
 //! | `+` `-`                     | 7       | 8                          |
 //! | `*` `/` `//` `%`            | 9       | 10                         |
 //! | postfix `:` TYPE            | 11      | (none: parses a type)      |
@@ -137,13 +156,16 @@
 //! or an interpolation one above its tallest child, a field access one above
 //! its record, and an ascription one above the taller of its expression and
 //! its type (a record type being one above its tallest field type), and
-//! rejects a node that would exceed the limit. Together these guarantee
-//! that no tree handed to a later stage is deeper than `MAX_DEPTH`.
+//! rejects a node that would exceed the limit. An item's height is its
+//! value's, plus two levels for each segment of its path after the first,
+//! or its annotation's if that is taller; an item taller than the limit is
+//! rejected too, at the item. Together these guarantee that no tree handed
+//! to a later stage is deeper than `MAX_DEPTH`.
 
 use crate::MAX_DEPTH;
 use crate::ast::{
     Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, FieldTy, Item, ItemId, ItemKind, ItemRange,
-    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    PathRange, PathSegment, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -173,6 +195,9 @@ const LEAF_HEIGHT: u32 = 1;
 /// The error for a raw or interpolated string literal where a field name is
 /// expected.
 const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
+
+/// The error for a string literal where a variable's name is expected.
+const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 
 /// Parses `tokens`, lexed from `source` with its names interned into
 /// `names` and its string literals' text stored in `strings`, as a file: a
@@ -223,6 +248,7 @@ pub(crate) fn parse_parts(
         item_stack: Vec::new(),
         part_stack: Vec::new(),
         field_ty_stack: Vec::new(),
+        path: Vec::new(),
         diagnostics: Vec::new(),
     };
     match parser.parse_body(None) {
@@ -272,6 +298,10 @@ struct Parser<'a> {
     /// to the builder's field-type pool as each type ends, as for
     /// `item_stack`.
     field_ty_stack: Vec<FieldTy>,
+    /// The segments of the path being read, moved to the builder's path
+    /// pool once it is complete. Reading a path never starts another, so
+    /// one buffer serves them all.
+    path: Vec<PathSegment>,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -312,32 +342,20 @@ impl Parser<'_> {
         Ok((range, height))
     }
 
-    /// Parses one item. Returns it and its height: its expression's, or
-    /// its annotation's if that is taller.
+    /// Parses one item. Returns it and its height: its expression's, plus
+    /// two levels for each segment of its path after the first, or its
+    /// annotation's if that is taller.
     fn parse_item(&mut self) -> ParseResult<(ItemId, u32)> {
         let token = self.peek();
-        let next = self.peek_at(1).kind;
         let mut ty_height = 0;
+        // The number of segments of the item's path, if it has one.
+        let mut segments = 1;
         let (kind, value) = match token.kind {
             TokenKind::Let => {
                 self.advance();
                 self.skip_newlines();
-                let name_token = self.peek();
-                let name = match name_token.kind {
-                    TokenKind::Ident(name) => name,
-                    TokenKind::Str(_) => {
-                        return Err(self.error("variables need plain names", name_token.span));
-                    }
-                    TokenKind::StrStart(first) => {
-                        let literal = self.parse_interpolation(first)?;
-                        let span = self.span_of(literal);
-                        return Err(self.error("variables need plain names", span));
-                    }
-                    _ => {
-                        return Err(self.error("expected a name after `let`", name_token.span));
-                    }
-                };
-                self.advance();
+                let (path, len) = self.parse_let_path()?;
+                segments = len;
                 let ty = if self.peek().kind == TokenKind::Colon {
                     self.advance();
                     self.skip_newlines();
@@ -354,30 +372,7 @@ impl Parser<'_> {
                 self.advance();
                 self.skip_newlines();
                 let value = self.parse_expr(0)?;
-                let kind = ItemKind::Let {
-                    name,
-                    name_span: name_token.span,
-                    ty,
-                    value,
-                };
-                (kind, value)
-            }
-            TokenKind::Ident(name) if next == TokenKind::ColonEq => {
-                self.advance();
-                self.advance();
-                self.skip_newlines();
-                let value = self.parse_expr(0)?;
-                let kind = ItemKind::Rebind {
-                    name,
-                    name_span: token.span,
-                    value,
-                };
-                (kind, value)
-            }
-            TokenKind::Ident(name) if next == TokenKind::Eq => self.parse_field(name, token)?,
-            TokenKind::Str(text) if next == TokenKind::Eq => {
-                let name = self.quoted_name(token, text)?;
-                self.parse_field(name, token)?
+                (ItemKind::Let { path, ty, value }, value)
             }
             TokenKind::Eq => {
                 self.advance();
@@ -386,35 +381,167 @@ impl Parser<'_> {
                 (ItemKind::Result(value), value)
             }
             _ => {
+                let start = self.pos;
+                let first_node = self.builder.expr_count();
+                let expr = self.parse_expr(0)?;
+                let operator = self.peek();
+                let rebind = match operator.kind {
+                    TokenKind::Eq => false,
+                    TokenKind::ColonEq => true,
+                    _ => return self.finish_item(token, (ItemKind::Expr(expr), expr), 0, 1),
+                };
+                let (path, len) = self.expr_to_path(start, expr, operator, rebind)?;
+                segments = len;
+                // The path's nodes were the last allocated, and it replaces
+                // them.
+                self.builder.truncate_exprs(first_node);
+                self.heights.truncate(first_node);
+                self.advance();
+                self.skip_newlines();
                 let value = self.parse_expr(0)?;
-                // `"a{x}" = 1`: an interpolated literal as a field name.
-                if self.peek().kind == TokenKind::Eq
-                    && matches!(self.builder.get(value).kind, ExprKind::Interp(_))
-                {
-                    let span = self.span_of(value);
-                    return Err(self.error(PLAIN_FIELD_NAME, span));
-                }
-                (ItemKind::Expr(value), value)
+                let kind = if rebind {
+                    ItemKind::Rebind { path, value }
+                } else {
+                    ItemKind::Field { path, value }
+                };
+                (kind, value)
             }
         };
-        let span = Span::join(token.span, self.span_of(value));
-        let item = self.builder.alloc_item(Item { kind, span });
-        Ok((item, self.height_of(value).max(ty_height)))
+        self.finish_item(token, (kind, value), ty_height, segments)
     }
 
-    /// Parses a field item named `name`, starting at its name, `token`,
-    /// which the `=` follows. Returns the item's kind and its value.
-    fn parse_field(&mut self, name: Name, token: Token) -> ParseResult<(ItemKind, ExprId)> {
-        self.advance();
-        self.advance();
-        self.skip_newlines();
-        let value = self.parse_expr(0)?;
-        let kind = ItemKind::Field {
-            name,
-            name_span: token.span,
-            value,
+    /// Allocates the item of `kind`, starting at `token` and ending with its
+    /// expression `value`, whose annotation, if any, is `ty_height` tall and
+    /// whose path has `segments` segments. Returns it and its height,
+    /// failing if that exceeds [`MAX_DEPTH`].
+    fn finish_item(
+        &mut self,
+        token: Token,
+        (kind, value): (ItemKind, ExprId),
+        ty_height: u32,
+        segments: u32,
+    ) -> ParseResult<(ItemId, u32)> {
+        let span = Span::join(token.span, self.span_of(value));
+        let path_height = segments.saturating_sub(1).saturating_mul(2);
+        let height = self
+            .height_of(value)
+            .saturating_add(path_height)
+            .max(ty_height);
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(span));
+        }
+        let item = self.builder.alloc_item(Item { kind, span });
+        Ok((item, height))
+    }
+
+    /// Parses the path after `let`, starting at its first segment: an
+    /// identifier, then `.` and a name, plain or quoted, as many times as
+    /// they follow. Returns it and its number of segments.
+    fn parse_let_path(&mut self) -> ParseResult<(PathRange, u32)> {
+        let name_token = self.peek();
+        let name = match name_token.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(_) => {
+                return Err(self.error(PLAIN_VARIABLE_NAME, name_token.span));
+            }
+            TokenKind::StrStart(first) => {
+                let literal = self.parse_interpolation(first)?;
+                let span = self.span_of(literal);
+                return Err(self.error(PLAIN_VARIABLE_NAME, span));
+            }
+            _ => {
+                return Err(self.error("expected a name after `let`", name_token.span));
+            }
         };
-        Ok((kind, value))
+        self.advance();
+        self.path.clear();
+        self.path.push(PathSegment {
+            name,
+            span: name_token.span,
+        });
+        while self.peek().kind == TokenKind::Dot {
+            self.advance();
+            let segment = self.peek();
+            let Some(name) = self.field_name()? else {
+                return Err(self.error("expected a field name after `.`", error_span(segment)));
+            };
+            self.path.push(PathSegment {
+                name,
+                span: segment.span,
+            });
+        }
+        Ok(self.finish_path())
+    }
+
+    /// Converts `expr`, parsed from the tokens starting at `start` and
+    /// followed by `operator`, the `=` of a field item or the `:=` of a
+    /// rebind as `rebind` says, to the path it spells: a name, a plain
+    /// string literal, or a chain of field accesses on one of those. Returns
+    /// it and its number of segments.
+    ///
+    /// Anything else is "expected end of item" at the operator. A raw or
+    /// interpolated literal is not a field name, and no literal is a
+    /// variable's name.
+    fn expr_to_path(
+        &mut self,
+        start: usize,
+        expr: ExprId,
+        operator: Token,
+        rebind: bool,
+    ) -> ParseResult<(PathRange, u32)> {
+        // Walk down to the base, collecting the accessed names from the last
+        // segment to the second.
+        self.path.clear();
+        let mut node = expr;
+        let base = loop {
+            let inner = *self.builder.get(node);
+            match inner.kind {
+                ExprKind::Field { expr, name } => {
+                    self.path.push(PathSegment {
+                        name,
+                        span: inner.span,
+                    });
+                    node = expr;
+                }
+                ExprKind::Name(name) => break name,
+                ExprKind::Str(_) | ExprKind::Interp(_) if rebind => {
+                    return Err(self.error(PLAIN_VARIABLE_NAME, inner.span));
+                }
+                ExprKind::Str(text) => {
+                    let literal = self.token_at(start);
+                    break self.quoted_name(literal, text)?;
+                }
+                ExprKind::Interp(_) => return Err(self.error(PLAIN_FIELD_NAME, inner.span)),
+                _ => {
+                    let found = self.describe(operator);
+                    return Err(self.error(
+                        format!("expected end of item, found {found}"),
+                        operator.span,
+                    ));
+                }
+            }
+        };
+        self.path.push(PathSegment {
+            name: base,
+            span: self.token_at(start).span,
+        });
+        self.path.reverse();
+        // A path's tokens are exactly its base and then `.` and a name for
+        // each access, since newlines are not skipped around `.`: the name
+        // of segment `i` is token `start + 2i`.
+        for (index, segment) in self.path.iter_mut().enumerate().skip(1) {
+            if let Some(token) = self.tokens.get(start + 2 * index) {
+                segment.span = token.span;
+            }
+        }
+        Ok(self.finish_path())
+    }
+
+    /// Moves the path being read to the builder's path pool, returning its
+    /// range and its number of segments.
+    fn finish_path(&mut self) -> (PathRange, u32) {
+        let len = u32::try_from(self.path.len()).unwrap_or(u32::MAX);
+        (self.builder.push_path(&self.path), len)
     }
 
     /// The name a plain string literal `token`, of text `text`, gives a
@@ -686,6 +813,8 @@ impl Parser<'_> {
             | TokenKind::Percent
             | TokenKind::EqEq
             | TokenKind::BangEq
+            | TokenKind::EqEqEq
+            | TokenKind::BangEqEq
             | TokenKind::Lt
             | TokenKind::Le
             | TokenKind::Gt
@@ -895,7 +1024,12 @@ impl Parser<'_> {
     /// The token `ahead` places after the current one, or a synthesised
     /// `Eof` past the end.
     fn peek_at(&self, ahead: usize) -> Token {
-        self.tokens.get(self.pos + ahead).copied().unwrap_or(Token {
+        self.token_at(self.pos + ahead)
+    }
+
+    /// The token at `index`, or a synthesised `Eof` past the end.
+    fn token_at(&self, index: usize) -> Token {
+        self.tokens.get(index).copied().unwrap_or(Token {
             kind: TokenKind::Eof,
             span: Span::new(self.source.len(), self.source.len()),
         })
@@ -956,6 +1090,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         TokenKind::Percent => Some(BinaryOp::Rem),
         TokenKind::EqEq => Some(BinaryOp::Eq),
         TokenKind::BangEq => Some(BinaryOp::Ne),
+        TokenKind::EqEqEq => Some(BinaryOp::Same),
+        TokenKind::BangEqEq => Some(BinaryOp::NotSame),
         TokenKind::Lt => Some(BinaryOp::Lt),
         TokenKind::Le => Some(BinaryOp::Le),
         TokenKind::Gt => Some(BinaryOp::Gt),
@@ -998,9 +1134,14 @@ fn binding_power(op: BinaryOp) -> (u8, u8) {
     match op {
         BinaryOp::Or => (1, 2),
         BinaryOp::And => (3, 4),
-        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-            (5, 6)
-        }
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Same
+        | BinaryOp::NotSame
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Gt
+        | BinaryOp::Ge => (5, 6),
         BinaryOp::Add | BinaryOp::Sub => (7, 8),
         BinaryOp::Mul | BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Rem => (9, 10),
     }
@@ -1051,11 +1192,9 @@ mod tests {
                 out.push_str("; ");
             }
             match ast.item(id).kind {
-                ItemKind::Let {
-                    name, ty, value, ..
-                } => {
+                ItemKind::Let { path, ty, value } => {
                     out.push_str("let ");
-                    out.push_str(ast.names().get(name));
+                    out.push_str(&ast.show_path(ast.path(path)).to_string());
                     if let Some(ty) = ty {
                         out.push_str(": ");
                         type_name(ast, ty, out);
@@ -1063,13 +1202,13 @@ mod tests {
                     out.push_str(" = ");
                     expr(ast, value, out);
                 }
-                ItemKind::Rebind { name, value, .. } => {
-                    out.push_str(ast.names().get(name));
+                ItemKind::Rebind { path, value } => {
+                    out.push_str(&ast.show_path(ast.path(path)).to_string());
                     out.push_str(" := ");
                     expr(ast, value, out);
                 }
-                ItemKind::Field { name, value, .. } => {
-                    out.push_str(&FieldName(ast.names().get(name)).to_string());
+                ItemKind::Field { path, value } => {
+                    out.push_str(&ast.show_path(ast.path(path)).to_string());
                     out.push_str(" = ");
                     expr(ast, value, out);
                 }
@@ -1458,10 +1597,10 @@ mod tests {
                 Span::new(30, 31)
             ]
         );
-        let ItemKind::Let { name_span, .. } = ast.item(ast.items(ast.root())[0]).kind else {
+        let ItemKind::Let { path, .. } = ast.item(ast.items(ast.root())[0]).kind else {
             panic!("expected a let");
         };
-        assert_eq!(name_span, Span::new(4, 5));
+        assert_eq!(ast.path(path)[0].span, Span::new(4, 5));
     }
 
     #[test]
@@ -1875,10 +2014,16 @@ mod tests {
             shape("\"a\" + \"b\" == \"ab\""),
             "((\"a\" + \"b\") == \"ab\")"
         );
-        // Every comparison operator.
-        for op in ["==", "!=", "<", "<=", ">", ">="] {
+        // Every comparison operator, total equality included, at the same
+        // level.
+        for op in ["==", "!=", "===", "!==", "<", "<=", ">", ">="] {
             assert_eq!(shape(&format!("a {op} b")), format!("(a {op} b)"));
+            assert_eq!(
+                shape(&format!("a + 1 {op} b and c")),
+                format!("(((a + 1) {op} b) and c)")
+            );
         }
+        assert_eq!(shape("not a === b"), "(not (a === b))");
     }
 
     #[test]
@@ -1894,6 +2039,11 @@ mod tests {
         assert_eq!(error("1 + 2 < 3 == true").1, Span::new(10, 12));
         assert_eq!(error("x and a >= b > c").1, Span::new(13, 14));
         assert_eq!(error("not a < b <= c").1, Span::new(10, 12));
+        // Total equality is non-associative too, with every comparison.
+        assert_eq!(error("a === b === c").1, Span::new(8, 11));
+        assert_eq!(error("a !== b == c").1, Span::new(8, 10));
+        assert_eq!(error("a == b !== c").1, Span::new(7, 10));
+        assert_eq!(shape("(a === b) !== c"), "([(a === b)] !== c)");
         // Parentheses and logic operators separate comparisons.
         assert_eq!(shape("(a < b) == c"), "([(a < b)] == c)");
         assert_eq!(shape("a == (b < c)"), "(a == [(b < c)])");
@@ -1902,7 +2052,7 @@ mod tests {
 
     #[test]
     fn items_continue_after_logic_and_comparison_operators() {
-        for op in ["==", "!=", "<", "<=", ">", ">=", "and", "or"] {
+        for op in ["==", "!=", "===", "!==", "<", "<=", ">", ">=", "and", "or"] {
             let text = format!("a {op}\n\n  b");
             assert_eq!(shape(&text), format!("(a {op} b)"), "{text}");
         }
@@ -2212,7 +2362,7 @@ mod tests {
             .items(ast.root())
             .iter()
             .map(|&id| match ast.item(id).kind {
-                ItemKind::Field { name, .. } => name,
+                ItemKind::Field { path, .. } => ast.path(path)[0].name,
                 other => panic!("expected a field, got {other:?}"),
             })
             .collect();
@@ -2222,10 +2372,10 @@ mod tests {
         let ast = parse_text("\"a b\" = 1 + 2").unwrap();
         let item = ast.item(ast.items(ast.root())[0]);
         assert_eq!(item.span, Span::new(0, 13));
-        let ItemKind::Field { name_span, .. } = item.kind else {
+        let ItemKind::Field { path, .. } = item.kind else {
             panic!("expected a field");
         };
-        assert_eq!(name_span, Span::new(0, 5));
+        assert_eq!(ast.path(path)[0].span, Span::new(0, 5));
         // `==` is a comparison, not a field.
         assert_eq!(shape("x == 1"), "(x == 1)");
         assert_eq!(shape("\"a\" == \"b\""), "(\"a\" == \"b\")");
@@ -2266,15 +2416,182 @@ mod tests {
         let message = "variables need plain names".to_owned();
         assert_eq!(error("let \"x\" = 1"), (message.clone(), Span::new(4, 7)));
         assert_eq!(error("let r\"x\" = 1"), (message.clone(), Span::new(4, 8)));
-        assert_eq!(error("let \"{y}\" = 1"), (message, Span::new(4, 9)));
-        // A quoted name is never a variable, so `:=` does not follow one.
+        assert_eq!(error("let \"{y}\" = 1"), (message.clone(), Span::new(4, 9)));
+        // A quoted name is never a variable, so the base of a `:=` path
+        // cannot be one either, whatever follows it.
+        assert_eq!(error("\"x\" := 1"), (message.clone(), Span::new(0, 3)));
+        assert_eq!(error("r\"x\" := 1"), (message.clone(), Span::new(0, 4)));
+        assert_eq!(error("\"{y}\" := 1"), (message.clone(), Span::new(0, 5)));
+        assert_eq!(error("\"x\".y := 1"), (message.clone(), Span::new(0, 3)));
+        assert_eq!(error("let \"x\".y = 1"), (message, Span::new(4, 7)));
+    }
+
+    #[test]
+    fn paths_in_fields_lets_and_rebinds() {
+        assert_eq!(shape("a.b = 1"), "a.b = 1");
+        assert_eq!(shape("a.b.c = 1"), "a.b.c = 1");
+        assert_eq!(shape("a.b := 1"), "a.b := 1");
+        assert_eq!(shape("let a.b.c = 1"), "let a.b.c = 1");
+        assert_eq!(shape("let a.b: Int = 1"), "let a.b: Int = 1");
+        assert_eq!(shape("let a . b = 1"), "let a.b = 1");
+        // Quoted segments, anywhere but the start of a variable's path.
         assert_eq!(
-            error("\"x\" := 1"),
+            shape("\"log level\".format = \"json\""),
+            "\"log level\".format = \"json\""
+        );
+        assert_eq!(shape("a.\"b c\".d = 1"), "a.\"b c\".d = 1");
+        assert_eq!(shape("let a.\"b c\" = 1"), "let a.\"b c\" = 1");
+        assert_eq!(shape("a.\"b c\" := 1"), "a.\"b c\" := 1");
+        // A quoted segment is the same name as a plain one.
+        assert_eq!(shape("a.\"b\" = 1"), "a.b = 1");
+        // In blocks, and as values.
+        assert_eq!(
+            shape("{ server.host = \"h\"; server.port = 80 }"),
+            "{server.host = \"h\"; server.port = 80}"
+        );
+        assert_eq!(shape("a.b =\n  1"), "a.b = 1");
+        // `==` after a path is a comparison, and a path alone an access.
+        assert_eq!(shape("a.b == 1"), "((a . b) == 1)");
+        assert_eq!(shape("a.b"), "(a . b)");
+        // Spans: each segment, quotes included, and the item from its first.
+        let ast = parse_text("  a . \"b c\".d = 1").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(2, 17));
+        let ItemKind::Field { path, .. } = item.kind else {
+            panic!("expected a field");
+        };
+        let spans: Vec<Span> = ast.path(path).iter().map(|s| s.span).collect();
+        assert_eq!(
+            spans,
+            vec![Span::new(2, 3), Span::new(6, 11), Span::new(12, 13)]
+        );
+        let ast = parse_text("\"x\".y := 1").unwrap_err();
+        assert_eq!(ast.span, Span::new(0, 3));
+        let ast = parse_text("let a.\"b\".c: Int = 1").unwrap();
+        let ItemKind::Let { path, ty, .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected a let");
+        };
+        assert!(ty.is_some());
+        let spans: Vec<Span> = ast.path(path).iter().map(|s| s.span).collect();
+        assert_eq!(
+            spans,
+            vec![Span::new(4, 5), Span::new(6, 9), Span::new(10, 11)]
+        );
+        let ast = parse_text("\"q\".r = 1").unwrap();
+        let ItemKind::Field { path, .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected a field");
+        };
+        let spans: Vec<Span> = ast.path(path).iter().map(|s| s.span).collect();
+        assert_eq!(spans, vec![Span::new(0, 3), Span::new(4, 5)]);
+        // The expression a path was read from leaves no nodes behind: only
+        // the values remain.
+        assert_eq!(parse_text("a.b.c = 1; d := 2; \"e\" = 3").unwrap().len(), 3);
+        assert_eq!(parse_text("{ a.b = { c.d = 1 } }").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn anything_else_before_eq_is_not_a_path() {
+        let found_eq = |at: u32| {
+            (
+                "expected end of item, found `=`".to_owned(),
+                Span::new(at, at + 1),
+            )
+        };
+        assert_eq!(error("a.b + 1 = 2"), found_eq(8));
+        assert_eq!(error("(a).b = 1"), found_eq(6));
+        assert_eq!(error("(a.b) = 1"), found_eq(6));
+        assert_eq!(error("-a.b = 1"), found_eq(5));
+        assert_eq!(error("a.b : Int = 1"), found_eq(10));
+        assert_eq!(error("{ x = 1 }.x = 1"), found_eq(12));
+        assert_eq!(error("1.x = 1"), found_eq(4));
+        assert_eq!(
+            error("a.b + 1 := 2"),
             (
                 "expected end of item, found `:=`".to_owned(),
-                Span::new(4, 6)
+                Span::new(8, 10)
             )
         );
+        assert_eq!(
+            error("(a).b := 2"),
+            (
+                "expected end of item, found `:=`".to_owned(),
+                Span::new(6, 8)
+            )
+        );
+        // A raw or interpolated literal is not a field name, at the start of
+        // a path as alone.
+        assert_eq!(
+            error("r\"a\".b = 1"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(0, 4))
+        );
+        assert_eq!(
+            error("\"a{x}\".b = 1"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(0, 6))
+        );
+        // After `let`, a segment must be a name.
+        assert_eq!(
+            error("let a.1 = 1"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        assert_eq!(
+            error("let a. = 1"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(7, 8)
+            )
+        );
+        assert_eq!(
+            error("let a.r\"b\" = 1"),
+            (PLAIN_FIELD_NAME.to_owned(), Span::new(6, 10))
+        );
+        assert_eq!(
+            error("let a.b 1"),
+            (
+                "expected `=` after variable name".to_owned(),
+                Span::new(8, 9)
+            )
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_paths() {
+        let ast = parse_text("let a.b.c = 1\nx.\"y z\" = 2\na.b := 3").unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let a.b.c @0..13\n\
+             \x20   (int 1 @12..13))\n\
+             \x20 (field x.\"y z\" @14..25\n\
+             \x20   (int 2 @24..25))\n\
+             \x20 (rebind a.b @26..34\n\
+             \x20   (int 3 @33..34)))"
+        );
+    }
+
+    #[test]
+    fn paths_count_towards_height() {
+        // A path of N segments is 2(N - 1) levels above its value: with a
+        // literal, one short of the limit when 2(N - 1) + 1 is.
+        let segments = (MAX_DEPTH - 1) / 2 + 1;
+        let path = |segments: usize| format!("a{}", ".b".repeat(segments - 1));
+        let deepest = format!("let {} = 1", path(segments));
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(format!("let {} = 1", path(segments + 1)));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        assert_eq!(diagnostic.span.start, 0);
+        // A field's path too, and in blocks, whose height it adds to: the
+        // deepest item is at the limit in one block and over it in two.
+        let field = format!("{} = 1", path(segments));
+        on_big_stack(move || parse_text(&field).unwrap());
+        too_deep(format!("{} = 1", path(segments + 1)));
+        let one = format!("{{ {} = 1 }}", path(segments));
+        on_big_stack(move || parse_text(&one).unwrap());
+        too_deep(format!("{{ {{ {} = 1 }} }}", path(segments)));
+        // Far beyond the limit, a `let` path is stopped at its item.
+        too_deep(format!("let {} = 1", path(200_000)));
     }
 
     #[test]

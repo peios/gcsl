@@ -206,9 +206,9 @@ mod tests {
         value(&mut session, "let x = 1");
         assert_eq!(value(&mut session, "x := x + 10"), Value::Empty);
         assert_eq!(value(&mut session, "x"), Value::Int(11));
-        // A rebind is a new binding, so it may change the type.
-        value(&mut session, "x := 2.5");
-        assert_eq!(value(&mut session, "x"), Value::Float(2.5));
+        // A rebind keeps the variable's type; changing it takes a `let`.
+        assert_eq!(messages(&mut session, "x := 2.5"), vec!["mismatched types"]);
+        assert_eq!(value(&mut session, "x"), Value::Int(11));
         // Only at the top level: an input's block is an inner block.
         assert_eq!(
             messages(&mut session, "{ x := 1.5 }"),
@@ -303,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             value(&mut session, "{ x = 1; y = \"a\" }").to_string(),
-            "{x = 1, y = \"a\"}"
+            "{x = 1; y = \"a\"}"
         );
         assert_eq!(value_type(&session), "{x: Int, y: String}");
         // A failed input leaves the last type as it was.
@@ -353,7 +353,7 @@ mod tests {
         );
         assert_eq!(
             value(&mut session, "let q: {x: Int} = p\nq").to_string(),
-            "{x = 1, inner = {s = \"a\"}}"
+            "{x = 1; inner = {s = \"a\"}}"
         );
         assert_eq!(value_type(&session), "{x: Int}");
         // Top-level fields are in scope for later inputs, as fields.
@@ -371,10 +371,60 @@ mod tests {
     }
 
     #[test]
+    fn dotted_fields_and_updates_across_inputs() {
+        let mut session = Session::new();
+        // An input's merged field is one top-level field, visible later with
+        // its full type.
+        value(&mut session, "server.host = \"h\"\nserver.port = 80");
+        assert_eq!(value_type(&session), "{server: {host: String, port: Int}}");
+        assert_eq!(value(&mut session, "server.port"), Value::Int(80));
+        // A later input's dotted field is a field of that input's record,
+        // declared anew, so it builds from nothing.
+        assert_eq!(
+            value(&mut session, "server.tls = true").to_string(),
+            "{server = {tls = true}}"
+        );
+        assert_eq!(value(&mut session, "server").to_string(), "{tls = true}");
+        // A dotted `let` updates a record from an earlier input, which is
+        // left as it was for anything holding it.
+        value(
+            &mut session,
+            "let config = { name = \"gcsl\"; build = { jobs = 4 } }",
+        );
+        value(&mut session, "let before = config");
+        value(&mut session, "let config.build.jobs = 8");
+        value(&mut session, "let config.build.dry-run = false");
+        value(&mut session, "config.build.dry-run := true");
+        assert_eq!(
+            value(&mut session, "config").to_string(),
+            "{name = \"gcsl\"; build = {jobs = 8; dry-run = true}}"
+        );
+        assert_eq!(
+            value_type(&session),
+            "{build: {dry-run: Bool, jobs: Int}, name: String}"
+        );
+        assert_eq!(
+            value(&mut session, "before").to_string(),
+            "{name = \"gcsl\"; build = {jobs = 4}}"
+        );
+        // A field of an earlier input cannot be rebound, dotted or not.
+        assert_eq!(
+            messages(&mut session, "server.tls := false"),
+            vec!["cannot rebind `server`: it is a field, not a variable"]
+        );
+        // A failed update leaves the variable as it was.
+        assert_eq!(
+            messages(&mut session, "let config.name.first = 1"),
+            vec!["cannot update `config.name.first`: `config.name` is String, not a record"]
+        );
+        assert_eq!(value(&mut session, "config.build.jobs"), Value::Int(8));
+    }
+
+    #[test]
     fn warnings_come_back_with_the_value() {
         let mut session = Session::new();
         let outcome = eval(&mut session, "let p: {x: Int} = { x = 1; y = 2 }\np").unwrap();
-        assert_eq!(outcome.value.to_string(), "{x = 1, y = 2}");
+        assert_eq!(outcome.value.to_string(), "{x = 1; y = 2}");
         assert_eq!(outcome.warnings.len(), 1);
         assert_eq!(outcome.warnings[0].severity, Severity::Warning);
         assert_eq!(

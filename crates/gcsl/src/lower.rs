@@ -24,8 +24,31 @@
 //! record subtype where a supertype is expected needs no conversion: a
 //! record is the same value whatever record type it is seen as.
 //!
+//! A dotted `let`, `:=` or field lowers to a `Store` of a chain of
+//! `UpdateField` nodes, one for each segment of its path after the first,
+//! from the leaf outwards, each setting its segment in the record at the
+//! path before it. That record is the updated variable's or field's slot,
+//! loaded, for the first segment, and a `Field` of the record before it for
+//! each later one that the static type has (see
+//! [`crate::check::PathResolution`]); a record the path creates is `Empty`,
+//! as is the first record of a dotted field's first definition. So
+//! `let a.b.c = e`, with `a: {b: {c: Int}}` in scope, lowers to
+//! `Store(a', UpdateField(Load(a), b, UpdateField(Field(Load(a), b), c,
+//! e)))`, where each record node is shared by the update that builds on it
+//! and the access into it, and with `a: {x: Int}` to
+//! `Store(a', UpdateField(Load(a), b, UpdateField(Empty, c, e)))`. A dotted
+//! field stores back into its field's one slot. Each record block's field
+//! is loaded for its record once, from the slot its first definition
+//! declared. The text of each name an update sets is recorded in the IR,
+//! for the evaluator to show a field it adds.
+//!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
-//! the empty else block the parser gave it if the source had none. Each
+//! the empty else block the parser gave it if the source had none. `===`
+//! and `!==` lower exactly as `==` and `!=` on every kind but records. `==`
+//! and `!=` on records compare over the [`Shape`] of the operands' static
+//! type, read from the type table: one shape per distinct record type met
+//! in such a comparison, nested record types included, memoised by type
+//! and built through a work list rather than recursion. Each
 //! string literal, and each literal piece of an interpolated string,
 //! becomes a `StrConst` whose text is copied from the AST's string table
 //! into the IR's own, so the AST's table is not needed after lowering. A
@@ -39,11 +62,14 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, StrPart, UnaryOp,
+    Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, PathRange,
+    PathSegment, StrPart, UnaryOp, path_span,
 };
 use crate::check::{Checked, Resolution, Slot, Types};
 use crate::diagnostic::InternalError;
-use crate::ir::{Cmp, Ir, IrBuilder, IrId, IrKind, LayoutId, Operands};
+use crate::ir::{
+    Cmp, Ir, IrBuilder, IrId, IrKind, LayoutId, Operands, Shape, ShapeId, ShapedOperands,
+};
 use crate::names::Name;
 use crate::source::Span;
 use crate::types::{TyId, TypeTable};
@@ -86,6 +112,8 @@ pub fn lower(ast: &Ast, checked: &Checked, types: &TypeTable) -> Result<Ir, Inte
         item_stack: Vec::new(),
         layouts: HashMap::new(),
         layout_names: Vec::new(),
+        shapes: HashMap::new(),
+        shape_pending: Vec::new(),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -112,6 +140,11 @@ struct Lowerer<'a> {
     layouts: HashMap<Box<[Name]>, LayoutId>,
     /// Reused for collecting the field names of each record block.
     layout_names: Vec<Name>,
+    /// The shape already made for each record type.
+    shapes: HashMap<TyId, ShapeId>,
+    /// Reused as the work list of record types whose shapes have ids but no
+    /// fields yet.
+    shape_pending: Vec<TyId>,
 }
 
 impl Lowerer<'_> {
@@ -177,9 +210,9 @@ impl Lowerer<'_> {
             let is_result = !is_record && index + 1 == items.len();
             let item = self.ast.item(id);
             match item.kind {
-                ItemKind::Let { value, .. }
-                | ItemKind::Rebind { value, .. }
-                | ItemKind::Field { value, .. } => {
+                ItemKind::Let { path, value, .. }
+                | ItemKind::Rebind { path, value }
+                | ItemKind::Field { path, value } => {
                     let slot = self.resolution.item_slot(id);
                     if slot == Slot::NONE {
                         return Err(InternalError {
@@ -187,7 +220,7 @@ impl Lowerer<'_> {
                             span: item.span,
                         });
                     }
-                    let value = self.lower_expr(value)?;
+                    let value = self.lower_declaration(id, path, value)?;
                     let store = self.builder.alloc(IrKind::Store(slot, value), item.span);
                     self.item_stack.push(store);
                 }
@@ -224,26 +257,116 @@ impl Lowerer<'_> {
         Ok(IrKind::Block { items, result })
     }
 
+    /// Lowers the value that the declaration `id`, whose path is `path`,
+    /// stores: its expression `value` for a plain path, and for a dotted
+    /// one the chain of updates that sets the path to it.
+    fn lower_declaration(
+        &mut self,
+        id: ItemId,
+        path: PathRange,
+        value: ExprId,
+    ) -> Result<IrId, InternalError> {
+        match self.ast.path(path) {
+            [_] => self.lower_expr(value),
+            segments => self.lower_update(id, segments, value),
+        }
+    }
+
+    /// Lowers the dotted declaration `id`, whose path is `segments`, to the
+    /// chain of `UpdateField`s setting the path to `value`, from the leaf
+    /// outwards, each on the record at the path before its segment: the
+    /// updated slot or a `Field` of the record before it where they exist,
+    /// and `Empty` where the path creates a record.
+    fn lower_update(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        value: ExprId,
+    ) -> Result<IrId, InternalError> {
+        let resolution = self.resolution.item_path(id);
+        let existing = resolution.existing as usize;
+        let base = self.item_stack.len();
+        // The record at each proper prefix of the path, `segments[..=end]`,
+        // on the item stack: the record that setting `segments[end + 1]`
+        // builds on.
+        for end in 0..segments.len().saturating_sub(1) {
+            let span = path_span(&segments[..=end]);
+            let kind = if end >= existing {
+                IrKind::Empty
+            } else if end == 0 {
+                if resolution.source == Slot::NONE {
+                    return Err(InternalError {
+                        message: "an update of an existing record has no source slot",
+                        span,
+                    });
+                }
+                IrKind::Load(resolution.source, ValueKind::Record)
+            } else {
+                let Some(&record) = self.item_stack.get(base + end - 1) else {
+                    return Err(InternalError {
+                        message: "an update's record is missing",
+                        span,
+                    });
+                };
+                IrKind::Field {
+                    record,
+                    name: segments[end].name,
+                    kind: ValueKind::Record,
+                }
+            };
+            let record = self.builder.alloc(kind, span);
+            self.item_stack.push(record);
+        }
+        // The evaluator shows a field it adds by this text.
+        for segment in segments.get(1..).unwrap_or_default() {
+            let text = self.ast.names().get(segment.name);
+            self.builder.add_name_text(segment.name, text);
+        }
+        let mut update = self.lower_expr(value)?;
+        for (level, segment) in segments.iter().enumerate().skip(1).rev() {
+            let Some(&record) = self.item_stack.get(base + level - 1) else {
+                return Err(InternalError {
+                    message: "an update's record is missing",
+                    span: path_span(segments),
+                });
+            };
+            update = self.builder.alloc(
+                IrKind::UpdateField {
+                    record,
+                    name: segment.name,
+                    value: update,
+                },
+                path_span(&segments[..=level]),
+            );
+        }
+        self.item_stack.truncate(base);
+        Ok(update)
+    }
+
     /// Builds the `MakeRecord` of the record block of `items`, spanning
     /// `span`, whose fields have been stored: a `Load` of each field's slot,
-    /// at its name, in definition order.
+    /// at its name, in the order the fields were declared. An open field is
+    /// loaded once, from the slot its first definition declared, as a
+    /// record.
     fn make_record(&mut self, items: &[ItemId], span: Span) -> Result<IrId, InternalError> {
         self.layout_names.clear();
         let base = self.item_stack.len();
         for &id in items {
-            let ItemKind::Field {
-                name,
-                name_span,
-                value,
-            } = self.ast.item(id).kind
-            else {
+            let ItemKind::Field { path, value } = self.ast.item(id).kind else {
                 continue;
             };
-            let kind = self.kind(value)?;
+            let (kind, field) = match self.ast.path(path) {
+                [field] => (self.kind(value)?, field),
+                // A later definition of an open field extends it.
+                [field, ..] if self.resolution.item_path(id).source == Slot::NONE => {
+                    (ValueKind::Record, field)
+                }
+                _ => continue,
+            };
             let slot = self.resolution.item_slot(id);
-            let load = self.builder.alloc(IrKind::Load(slot, kind), name_span);
+            let load = self.builder.alloc(IrKind::Load(slot, kind), field.span);
             self.item_stack.push(load);
-            self.layout_names.push(name);
+            self.layout_names.push(field.name);
         }
         let layout = self.layout();
         let values = self.builder.push_item_list(&self.item_stack[base..]);
@@ -414,7 +537,7 @@ impl Lowerer<'_> {
         id: ExprId,
     ) -> Result<IrKind, InternalError> {
         if let Some(cmp) = comparison(op) {
-            return self.lower_comparison(cmp, op_start, (lhs, rhs), kind, id);
+            return self.lower_comparison((op, cmp), op_start, (lhs, rhs), kind, id);
         }
         let (make, operand_kind): (fn(Operands) -> IrKind, ValueKind) = match (op, kind) {
             (BinaryOp::Add, ValueKind::String) => (IrKind::StrConcat, ValueKind::String),
@@ -445,11 +568,12 @@ impl Lowerer<'_> {
         Ok(make(Operands { lhs, rhs, op_start }))
     }
 
-    /// Lowers a comparison, of kind `kind`, to the node for its operands'
-    /// kind, which the checker has made the same on both sides.
+    /// Lowers the comparison `op`, which tests `cmp` on every kind but
+    /// records, of kind `kind`, to the node for its operands' kind, which
+    /// the checker has made the same on both sides.
     fn lower_comparison(
         &mut self,
-        cmp: Cmp,
+        (op, cmp): (BinaryOp, Cmp),
         op_start: u32,
         (lhs, rhs): (ExprId, ExprId),
         kind: ValueKind,
@@ -463,29 +587,93 @@ impl Lowerer<'_> {
             });
         }
         let operand_kind = self.kind(lhs)?;
-        // `Some(true)` for `==`, `Some(false)` for `!=`: the only
-        // comparisons of Bools and records.
-        let equal = match cmp {
-            Cmp::Eq => Some(true),
-            Cmp::Ne => Some(false),
-            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => None,
+        // Typed equality on records compares over the operands' type.
+        let shape = match (operand_kind, op) {
+            (ValueKind::Record, BinaryOp::Eq | BinaryOp::Ne) => {
+                Some(self.shape(self.expr_types.get(lhs), span)?)
+            }
+            _ => None,
         };
         let lhs = self.lower_operand(lhs, operand_kind)?;
         let rhs = self.lower_operand(rhs, operand_kind)?;
         let operands = Operands { lhs, rhs, op_start };
-        Ok(match (operand_kind, equal) {
-            (ValueKind::Int, _) => IrKind::IntCmp(cmp, operands),
-            (ValueKind::Float, _) => IrKind::FloatCmp(cmp, operands),
-            (ValueKind::String, _) => IrKind::StrCmp(cmp, operands),
-            (ValueKind::Bool, Some(equal)) => IrKind::BoolEq(equal, operands),
-            (ValueKind::Record, Some(equal)) => IrKind::RecordEq(equal, operands),
-            (ValueKind::Bool | ValueKind::Record, None) => {
+        Ok(match (operand_kind, op, shape) {
+            (ValueKind::Int, ..) => IrKind::IntCmp(cmp, operands),
+            (ValueKind::Float, ..) => IrKind::FloatCmp(cmp, operands),
+            (ValueKind::String, ..) => IrKind::StrCmp(cmp, operands),
+            (ValueKind::Bool, BinaryOp::Eq | BinaryOp::Same, _) => IrKind::BoolEq(true, operands),
+            (ValueKind::Bool, BinaryOp::Ne | BinaryOp::NotSame, _) => {
+                IrKind::BoolEq(false, operands)
+            }
+            (ValueKind::Record, BinaryOp::Eq, Some(shape)) => {
+                IrKind::RecordEq(ShapedOperands { shape, lhs, rhs })
+            }
+            (ValueKind::Record, BinaryOp::Ne, Some(shape)) => {
+                IrKind::RecordNe(ShapedOperands { shape, lhs, rhs })
+            }
+            (ValueKind::Record, BinaryOp::Same, _) => IrKind::RecordSame(operands),
+            (ValueKind::Record, BinaryOp::NotSame, _) => IrKind::RecordNotSame(operands),
+            (ValueKind::Bool | ValueKind::Record, ..) => {
                 return Err(InternalError {
                     message: "comparison of a type it cannot compare",
                     span,
                 });
             }
         })
+    }
+
+    /// The shape of the record type `ty`, made, with the shapes of the
+    /// record types nested in it, if this is the first comparison of it.
+    /// Each shape is given its id when it is first met and its fields when
+    /// it is taken off the work list, so that nesting does not recurse.
+    fn shape(&mut self, ty: TyId, span: Span) -> Result<ShapeId, InternalError> {
+        if let Some(&id) = self.shapes.get(&ty) {
+            return Ok(id);
+        }
+        let table = self.table;
+        let id = self.new_shape(ty);
+        while let Some(ty) = self.shape_pending.pop() {
+            let Some(fields) = table.record_fields(ty) else {
+                self.shape_pending.clear();
+                return Err(InternalError {
+                    message: "a record comparison of a type that is not a record",
+                    span,
+                });
+            };
+            let mut shaped = Vec::with_capacity(fields.len());
+            for &(name, field_ty) in fields {
+                let nested = if table.is_record(field_ty) {
+                    Some(match self.shapes.get(&field_ty) {
+                        Some(&nested) => nested,
+                        None => self.new_shape(field_ty),
+                    })
+                } else {
+                    None
+                };
+                shaped.push((name, nested));
+            }
+            let Some(&shape) = self.shapes.get(&ty) else {
+                continue;
+            };
+            self.builder.set_shape(
+                shape,
+                Shape {
+                    fields: shaped.into_boxed_slice(),
+                },
+            );
+        }
+        Ok(id)
+    }
+
+    /// Gives the record type `ty` a shape with no fields yet, and queues it
+    /// to be given them.
+    fn new_shape(&mut self, ty: TyId) -> ShapeId {
+        let id = self.builder.push_shape(Shape {
+            fields: Box::default(),
+        });
+        self.shapes.insert(ty, id);
+        self.shape_pending.push(ty);
+        id
     }
 
     /// Lowers an operand that must already be of kind `expected`.
@@ -525,12 +713,13 @@ impl Lowerer<'_> {
     }
 }
 
-/// The relation a comparison operator tests, or `None` for any other
+/// The relation a comparison operator tests on values other than records,
+/// where `===` and `!==` are `==` and `!=`, or `None` for any other
 /// operator.
 const fn comparison(op: BinaryOp) -> Option<Cmp> {
     match op {
-        BinaryOp::Eq => Some(Cmp::Eq),
-        BinaryOp::Ne => Some(Cmp::Ne),
+        BinaryOp::Eq | BinaryOp::Same => Some(Cmp::Eq),
+        BinaryOp::Ne | BinaryOp::NotSame => Some(Cmp::Ne),
         BinaryOp::Lt => Some(Cmp::Lt),
         BinaryOp::Le => Some(Cmp::Le),
         BinaryOp::Gt => Some(Cmp::Gt),
@@ -838,7 +1027,7 @@ mod tests {
         );
         assert_eq!(
             dump("{} == {}"),
-            "(block @0..8\n  (record-eq == @0..8\n    (block @0..2\n      (empty @0..2))\n    (block @6..8\n      (empty @6..8))))"
+            "(block @0..8\n  (record-eq == [] @0..8\n    (block @0..2\n      (empty @0..2))\n    (block @6..8\n      (empty @6..8))))"
         );
     }
 
@@ -981,7 +1170,7 @@ mod tests {
         assert_eq!(
             dump("{ x = 1 } != { x = 2 }"),
             "(block @0..22\n\
-             \x20 (record-eq != @0..22\n\
+             \x20 (record-eq != [x] @0..22\n\
              \x20   (block @0..9\n\
              \x20     (store x#0 @2..7\n\
              \x20       (int 1 @6..7))\n\
@@ -1019,7 +1208,7 @@ mod tests {
         assert_eq!(ir.layout_count(), 2);
         let ir = lower_text("{ x = 1 } == { x = 2 }");
         assert_eq!(ir.layout_count(), 1);
-        let IrKind::RecordEq(_, operands) = ir.get(result_of(&ir)).kind else {
+        let IrKind::RecordEq(operands) = ir.get(result_of(&ir)).kind else {
             panic!("expected a record comparison");
         };
         let layout_of = |block: IrId| {
@@ -1034,5 +1223,199 @@ mod tests {
         let (lhs, rhs) = (layout_of(operands.lhs), layout_of(operands.rhs));
         assert_eq!(lhs, rhs);
         assert_eq!(&*ir.layout(lhs).texts, &[Box::from("x")]);
+    }
+
+    #[test]
+    fn a_merged_field_updates_its_slot() {
+        // The first definition builds from nothing; later ones update the
+        // slot, reading into the records that exist, and creating the rest.
+        // The field is loaded once for the record.
+        assert_eq!(
+            dump("a.x = 1\na.y.z = 2\na.y.w = 3"),
+            "(block @0..27\n\
+             \x20 (store a#0 @0..7\n\
+             \x20   (update-field x @0..3\n\
+             \x20     (empty @0..1)\n\
+             \x20     (int 1 @6..7)))\n\
+             \x20 (store a#0 @8..17\n\
+             \x20   (update-field y @8..11\n\
+             \x20     (load a#0 @8..9)\n\
+             \x20     (update-field z @8..13\n\
+             \x20       (empty @8..11)\n\
+             \x20       (int 2 @16..17))))\n\
+             \x20 (store a#0 @18..27\n\
+             \x20   (update-field y @18..21\n\
+             \x20     (load a#0 @18..19)\n\
+             \x20     (update-field w @18..23\n\
+             \x20       (field y @18..21\n\
+             \x20         (load a#0 @18..19))\n\
+             \x20       (int 3 @26..27))))\n\
+             \x20 (make-record [a] @0..27\n\
+             \x20   (load a#0 @0..1)))"
+        );
+        // The name of every update is recorded for the evaluator.
+        let ast = parse_text("a.x = 1\na.\"y z\".w = 2");
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let ir = lower(&ast, &checked, &types).unwrap();
+        let text = |text: &str| ir.name_text(ast.names().lookup(text).unwrap());
+        assert_eq!(text("x"), Some("x"));
+        assert_eq!(text("y z"), Some("y z"));
+        assert_eq!(text("w"), Some("w"));
+        // Not the field's own name, which no update adds.
+        assert_eq!(text("a"), None);
+    }
+
+    #[test]
+    fn a_merged_field_takes_its_place_where_first_mentioned() {
+        assert_eq!(
+            dump("{ a.x = 1; b = 2; a.y = 3 }"),
+            "(block @0..27\n\
+             \x20 (block @0..27\n\
+             \x20   (store a#0 @2..9\n\
+             \x20     (update-field x @2..5\n\
+             \x20       (empty @2..3)\n\
+             \x20       (int 1 @8..9)))\n\
+             \x20   (store b#1 @11..16\n\
+             \x20     (int 2 @15..16))\n\
+             \x20   (store a#0 @18..25\n\
+             \x20     (update-field y @18..21\n\
+             \x20       (load a#0 @18..19)\n\
+             \x20       (int 3 @24..25)))\n\
+             \x20   (make-record [a b] @0..27\n\
+             \x20     (load a#0 @2..3)\n\
+             \x20     (load b#1 @11..12))))"
+        );
+    }
+
+    #[test]
+    fn a_dotted_let_updates_the_old_record_into_a_new_slot() {
+        assert_eq!(
+            dump("let a = { b = { c = 1 } }\nlet a.b.c = 2"),
+            "(block @0..39\n\
+             \x20 (store a#0 @0..25\n\
+             \x20   (block @8..25\n\
+             \x20     (store a#0 @10..23\n\
+             \x20       (block @14..23\n\
+             \x20         (store a#0 @16..21\n\
+             \x20           (int 1 @20..21))\n\
+             \x20         (make-record [c] @14..23\n\
+             \x20           (load a#0 @16..17))))\n\
+             \x20     (make-record [b] @8..25\n\
+             \x20       (load a#0 @10..11))))\n\
+             \x20 (store a#1 @26..39\n\
+             \x20   (update-field b @30..33\n\
+             \x20     (load a#0 @30..31)\n\
+             \x20     (update-field c @30..35\n\
+             \x20       (field b @30..33\n\
+             \x20         (load a#0 @30..31))\n\
+             \x20       (int 2 @38..39))))\n\
+             \x20 (empty @0..39))"
+        );
+        // Where the static type lacks a segment, its record is created.
+        assert_eq!(
+            dump("let a = 1\nlet b.c.d = a\nb.c := { d = 2 }"),
+            "(block @0..40\n\
+             \x20 (store a#0 @0..9\n\
+             \x20   (int 1 @8..9))\n\
+             \x20 (store b#1 @10..23\n\
+             \x20   (update-field c @14..17\n\
+             \x20     (empty @14..15)\n\
+             \x20     (update-field d @14..19\n\
+             \x20       (empty @14..17)\n\
+             \x20       (load a#0 @22..23))))\n\
+             \x20 (store b#2 @24..40\n\
+             \x20   (update-field c @24..27\n\
+             \x20     (load b#1 @24..25)\n\
+             \x20     (block @31..40\n\
+             \x20       (store b#2 @33..38\n\
+             \x20         (int 2 @37..38))\n\
+             \x20       (make-record [d] @31..40\n\
+             \x20         (load b#2 @33..34)))))\n\
+             \x20 (empty @0..40))"
+        );
+    }
+
+    #[test]
+    fn typed_record_equality_compares_over_a_shape() {
+        assert_eq!(
+            dump("let p = { x = 1; inner = { n = 2 } }\np == p"),
+            "(block @0..43\n\
+             \x20 (store p#0 @0..36\n\
+             \x20   (block @8..36\n\
+             \x20     (store p#0 @10..15\n\
+             \x20       (int 1 @14..15))\n\
+             \x20     (store inner#1 @17..34\n\
+             \x20       (block @25..34\n\
+             \x20         (store inner#1 @27..32\n\
+             \x20           (int 2 @31..32))\n\
+             \x20         (make-record [n] @25..34\n\
+             \x20           (load inner#1 @27..28))))\n\
+             \x20     (make-record [x inner] @8..36\n\
+             \x20       (load p#0 @10..11)\n\
+             \x20       (load inner#1 @17..22))))\n\
+             \x20 (record-eq == [x inner[n]] @37..43\n\
+             \x20   (load p#0 @37..38)\n\
+             \x20   (load p#0 @42..43)))"
+        );
+        // The shape is the static type's, not the value's.
+        let text = "let q: {x: Int} = { x = 1; y = 2 }\nq != { x = 1 }";
+        assert!(dump(text).contains("(record-eq != [x] @"));
+        // One shape per record type, nested ones included, shared by every
+        // comparison of it.
+        let ir = lower_text(
+            "let p = { x = 1; inner = { n = 2 } }\n\
+             let a = p == p\n\
+             let b = p.inner != p.inner\n\
+             let c = { n = 3 } == p.inner\n\
+             = { e = {} } == { e = {} }",
+        );
+        assert_eq!(ir.shape_count(), 4);
+        // An empty record's shape has no fields.
+        assert_eq!(
+            dump("{ e = {} } == { e = {} }").lines().nth(1),
+            Some("  (record-eq == [e[]] @0..24")
+        );
+    }
+
+    #[test]
+    fn total_equality_lowers_like_typed_equality_but_on_records() {
+        assert_eq!(
+            dump("{ x = 1 } !== { x = 1 }"),
+            "(block @0..23\n\
+             \x20 (record-same !== @0..23\n\
+             \x20   (block @0..9\n\
+             \x20     (store x#0 @2..7\n\
+             \x20       (int 1 @6..7))\n\
+             \x20     (make-record [x] @0..9\n\
+             \x20       (load x#0 @2..3)))\n\
+             \x20   (block @14..23\n\
+             \x20     (store x#0 @16..21\n\
+             \x20       (int 1 @20..21))\n\
+             \x20     (make-record [x] @14..23\n\
+             \x20       (load x#0 @16..17)))))"
+        );
+        assert_eq!(
+            dump("{} === {}"),
+            "(block @0..9\n  (record-same === @0..9\n    (block @0..2\n      (empty @0..2))\n    (block @7..9\n      (empty @7..9))))"
+        );
+        // Scalars lower exactly as `==` and `!=` do.
+        assert_eq!(
+            dump("1 === 2"),
+            "(block @0..7\n  (int-cmp == @0..7\n    (int 1 @0..1)\n    (int 2 @6..7)))"
+        );
+        assert_eq!(
+            dump("1.5 !== 2"),
+            "(block @0..9\n  (float-cmp != @0..9\n    (float 1.5 @0..3)\n    (float 2.0 @8..9)))"
+        );
+        assert_eq!(
+            dump("\"a\" === \"b\""),
+            "(block @0..11\n  (str-cmp == @0..11\n    (str \"a\" @0..3)\n    (str \"b\" @8..11)))"
+        );
+        assert_eq!(
+            dump("true !== false"),
+            "(block @0..14\n  (bool-eq != @0..14\n    (bool true @0..4)\n    (bool false @9..14)))"
+        );
+        assert_eq!(lower_text("{ x = 1 } === { x = 2 }").shape_count(), 0);
     }
 }

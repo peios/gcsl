@@ -23,6 +23,28 @@
 //! so the statements that produce it allocate nothing. Reading a field finds
 //! it by comparing interned names against the layout's.
 //!
+//! An `UpdateField` builds a new record and never changes the old one. It
+//! clones the old record's values into a new boxed slice, one allocation,
+//! with the updated field's value replaced or appended. A replacement
+//! shares the old record's layout. An addition needs a new layout: the old
+//! one's names and texts with the added name after them, whose text the
+//! evaluator takes from [`Ir::name_text`], since it has no names table and
+//! must never need one. Every addition of a name to a record of a given
+//! layout makes an equal layout anew; caching the result per old layout and
+//! name is the optimisation for a bytecode VM, which will have a place to
+//! keep such a cache at each update site. Updating the empty record makes a
+//! record of the one field.
+//!
+//! Typed equality, `RecordEq` and `RecordNe`, compares two records over the
+//! [`crate::ir::Shape`] of their static type: for each field of the shape,
+//! it looks the field up in both records by name, compares a record field
+//! through its own shape and any other field with `==` on [`Value`], and
+//! ignores every field the shape lacks. Nested records are compared through
+//! a work list, as total equality compares them (see
+//! [`crate::value::Record`]), so nesting does not recurse and comparing flat
+//! records allocates nothing. Total equality, `RecordSame` and
+//! `RecordNotSame`, is [`Value`]'s `PartialEq`.
+//!
 //! `and` and `or` short-circuit: the right operand is evaluated only when
 //! the left does not decide the result. A string constant is a reference
 //! to the IR's copy, so producing one increments a reference count and
@@ -53,10 +75,12 @@ use std::rc::Rc;
 
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, Operands};
+use crate::ir::{
+    Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, Operands, ShapeId, ShapedOperands,
+};
 use crate::names::Name;
 use crate::source::Span;
-use crate::value::{Record, Value, int_to_float};
+use crate::value::{Layout, Record, Value, int_to_float};
 
 /// The room an interpolation reserves for each interpolated value's text,
 /// on top of its literal pieces' lengths.
@@ -126,6 +150,11 @@ impl Evaluator<'_> {
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
             IrKind::Field { record, name, .. } => self.field(record, name, node),
+            IrKind::UpdateField {
+                record,
+                name,
+                value,
+            } => self.update_field((record, name, value), node),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -145,7 +174,10 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::RecordEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
@@ -270,16 +302,20 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::RecordEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where an Int was expected")
             }
-            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
-                mistyped(node, "record node where an Int was expected")
-            }
+            IrKind::Empty
+            | IrKind::Store(..)
+            | IrKind::MakeRecord { .. }
+            | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
         }
     }
 
@@ -379,14 +415,20 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::RecordEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a Float was expected")
             }
-            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+            IrKind::Empty
+            | IrKind::Store(..)
+            | IrKind::MakeRecord { .. }
+            | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a Float was expected")
             }
         }
@@ -437,7 +479,10 @@ impl Evaluator<'_> {
             IrKind::FloatCmp(cmp, o) => self.float_cmp(cmp, o),
             IrKind::StrCmp(cmp, o) => self.str_cmp(cmp, o),
             IrKind::BoolEq(equal, o) => self.bool_eq(equal, o),
-            IrKind::RecordEq(equal, o) => self.record_eq(equal, o),
+            IrKind::RecordEq(o) => self.record_eq(o, true, node),
+            IrKind::RecordNe(o) => self.record_eq(o, false, node),
+            IrKind::RecordSame(o) => self.record_same(o, true),
+            IrKind::RecordNotSame(o) => self.record_same(o, false),
             IrKind::And(o) => self.logic(o, false),
             IrKind::Or(o) => self.logic(o, true),
             IrKind::Not(operand) => self.not(operand),
@@ -464,9 +509,10 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a Bool was expected")
             }
-            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
-                mistyped(node, "record node where a Bool was expected")
-            }
+            IrKind::Empty
+            | IrKind::Store(..)
+            | IrKind::MakeRecord { .. }
+            | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
         }
     }
 
@@ -507,9 +553,27 @@ impl Evaluator<'_> {
         Ok((lhs == rhs) == equal)
     }
 
-    /// Evaluates a `RecordEq`: `==` if `equal`, `!=` otherwise. Records
-    /// compare deeply and by field name; empty records are all equal.
-    fn record_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
+    /// Evaluates the typed record comparison `node`, a `RecordEq` if `equal`
+    /// and a `RecordNe` otherwise: the operands compare over their shape
+    /// (see [`record_eq_shaped`]).
+    fn record_eq(
+        &mut self,
+        operands: ShapedOperands,
+        equal: bool,
+        node: &IrNode,
+    ) -> Result<bool, Diagnostic> {
+        let lhs = self.record(operands.lhs)?;
+        let rhs = self.record(operands.rhs)?;
+        match record_eq_shaped(self.ir, operands.shape, &lhs, &rhs) {
+            Some(same) => Ok(same == equal),
+            None => mistyped(node, "a record lacks a field of its shape"),
+        }
+    }
+
+    /// Evaluates a total record comparison, a `RecordSame` if `equal` and a
+    /// `RecordNotSame` otherwise: records compare whole, deeply and by field
+    /// name; empty records are all equal.
+    fn record_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
         let lhs = self.record(operands.lhs)?;
         let rhs = self.record(operands.rhs)?;
         Ok((lhs == rhs) == equal)
@@ -573,11 +637,17 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::RecordEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a String was expected"),
-            IrKind::Empty | IrKind::Store(..) | IrKind::MakeRecord { .. } => {
+            IrKind::Empty
+            | IrKind::Store(..)
+            | IrKind::MakeRecord { .. }
+            | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a String was expected")
             }
         }
@@ -616,6 +686,11 @@ impl Evaluator<'_> {
                     _ => None,
                 })
             }
+            IrKind::UpdateField {
+                record,
+                name,
+                value,
+            } => self.update_field((record, name, value), node),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -635,7 +710,10 @@ impl Evaluator<'_> {
             | IrKind::FloatCmp(..)
             | IrKind::StrCmp(..)
             | IrKind::BoolEq(..)
-            | IrKind::RecordEq(..)
+            | IrKind::RecordEq(_)
+            | IrKind::RecordNe(_)
+            | IrKind::RecordSame(_)
+            | IrKind::RecordNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
@@ -643,6 +721,67 @@ impl Evaluator<'_> {
                 mistyped(node, "String node where a record was expected")
             }
         }
+    }
+
+    /// Evaluates the `UpdateField` `node`, setting field `name` of `record`
+    /// to `value`: a new record, the old one unchanged. See the module
+    /// documentation.
+    fn update_field(
+        &mut self,
+        (record, name, value): (IrId, Name, IrId),
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let old = self.record(record)?;
+        let value = self.value(value)?;
+        let old = match old {
+            Value::Record(old) => old,
+            Value::Empty => {
+                let Some(text) = self.ir.name_text(name) else {
+                    return mistyped(node, "an update's name has no text");
+                };
+                return Ok(Value::Record(Rc::new(Record {
+                    layout: Rc::new(Layout {
+                        names: Box::new([name]),
+                        texts: Box::new([Box::from(text)]),
+                    }),
+                    values: Box::new([value]),
+                })));
+            }
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => {
+                return mistyped(node, "an update of a value that is not a record");
+            }
+        };
+        if let Some(index) = old.layout.names.iter().position(|&field| field == name) {
+            // The same fields: the layout is shared.
+            let mut values = old.values.clone();
+            if let Some(slot) = values.get_mut(index) {
+                *slot = value;
+            }
+            return Ok(Value::Record(Rc::new(Record {
+                layout: Rc::clone(&old.layout),
+                values,
+            })));
+        }
+        let Some(text) = self.ir.name_text(name) else {
+            return mistyped(node, "an update's name has no text");
+        };
+        let len = old.values.len() + 1;
+        let mut names = Vec::with_capacity(len);
+        names.extend_from_slice(&old.layout.names);
+        names.push(name);
+        let mut texts = Vec::with_capacity(len);
+        texts.extend(old.layout.texts.iter().cloned());
+        texts.push(Box::from(text));
+        let mut values = Vec::with_capacity(len);
+        values.extend(old.values.iter().cloned());
+        values.push(value);
+        Ok(Value::Record(Rc::new(Record {
+            layout: Rc::new(Layout {
+                names: names.into_boxed_slice(),
+                texts: texts.into_boxed_slice(),
+            }),
+            values: values.into_boxed_slice(),
+        })))
     }
 
     /// Reads the record in `slot`, for the `Load` `node`: a new reference to
@@ -775,6 +914,44 @@ fn floor_mod(a: i64, b: NonZeroI64) -> i64 {
         r + b
     } else {
         r
+    }
+}
+
+/// Typed equality: whether records `a` and `b` are equal over shape
+/// `shape`, comparing, for each field of the shape, the two records' fields
+/// of that name, a record field through its own shape and any other with
+/// `==` on [`Value`]. Fields the shape lacks are ignored, so a record with
+/// no fields in its shape is equal to any other.
+///
+/// Nested records are compared through a work list rather than recursion,
+/// as [`Record`]'s total equality does, and the list only grows when a
+/// shape has a record field, so comparing flat records allocates nothing.
+///
+/// `None` if a record lacks a field of its shape, or holds something other
+/// than a record in a field the shape has as a record: the checker
+/// guarantees neither happens, so either is an internal error.
+fn record_eq_shaped(ir: &Ir, shape: ShapeId, a: &Value, b: &Value) -> Option<bool> {
+    let mut pending: Vec<(ShapeId, &Value, &Value)> = Vec::new();
+    let (mut shape, mut a, mut b) = (shape, a, b);
+    loop {
+        let fields = &ir.shape(shape).fields;
+        if !fields.is_empty() {
+            let (Value::Record(a), Value::Record(b)) = (a, b) else {
+                return None;
+            };
+            for &(name, nested) in fields {
+                let (mine, theirs) = (a.get(name)?, b.get(name)?);
+                match nested {
+                    Some(nested) => pending.push((nested, mine, theirs)),
+                    None if mine == theirs => {}
+                    None => return Some(false),
+                }
+            }
+        }
+        let Some(next) = pending.pop() else {
+            return Some(true);
+        };
+        (shape, a, b) = next;
     }
 }
 
@@ -1045,7 +1222,8 @@ mod tests {
     #[test]
     fn rebinding() {
         assert_eq!(int("let x = 1\nx := x + 1\nx := x * 3\nx"), 6);
-        assert_eq!(float("let x = 1\nx := 2.5\nx"), 2.5);
+        // The literal adapts to the variable's type.
+        assert_eq!(float("let x: Float = 1\nx := 2\nx"), 2.0);
         assert_eq!(int("{ let n = 1; n := n + 1; n }"), 2);
     }
 
@@ -1244,7 +1422,7 @@ mod tests {
             run("let p = { x = 1; y = \"a\" }\nlet q = p\nq")
                 .unwrap()
                 .to_string(),
-            "{x = 1, y = \"a\"}"
+            "{x = 1; y = \"a\"}"
         );
         assert_eq!(int("let p = { x = 3; y = 4 }\np.x * p.x + p.y * p.y"), 25);
         // A record's field can be a record, read at any depth, and a record
@@ -1253,7 +1431,7 @@ mod tests {
             run("let p = { a = { b = { c = 7 } } }\n{ c = p.a.b.c; d = p.a }")
                 .unwrap()
                 .to_string(),
-            "{c = 7, d = {b = {c = 7}}}"
+            "{c = 7; d = {b = {c = 7}}}"
         );
         // An empty record as a field.
         assert_eq!(run("{ e = {} }").unwrap().to_string(), "{e = {}}");
@@ -1263,14 +1441,14 @@ mod tests {
         // A file of fields is a record.
         assert_eq!(
             run("x = 1\ny = \"a\"").unwrap().to_string(),
-            "{x = 1, y = \"a\"}"
+            "{x = 1; y = \"a\"}"
         );
     }
 
     #[test]
     fn records_display_as_gcsl_syntax() {
         let value = run("{ x = 1; y = \"a\\n\"; inner = { n = 2.0 }; \"a b\" = true }").unwrap();
-        let shown = "{x = 1, y = \"a\\n\", inner = {n = 2.0}, \"a b\" = true}";
+        let shown = "{x = 1; y = \"a\\n\"; inner = {n = 2.0}; \"a b\" = true}";
         assert_eq!(value.to_string(), shown);
         assert_eq!(value.repr().to_string(), shown);
     }
@@ -1308,7 +1486,7 @@ mod tests {
             run("if true { { x = 1; y = 2 } } else { { x = 3 } }")
                 .unwrap()
                 .to_string(),
-            "{x = 1, y = 2}"
+            "{x = 1; y = 2}"
         );
         assert_eq!(
             int("let r = if 1 > 2 { { x = 1; y = 2 } } else { { x = 3 } }\nr.x"),
@@ -1324,7 +1502,7 @@ mod tests {
     fn records_in_interpolations_show_their_repr() {
         assert_eq!(
             string("let p = { x = 1; s = \"a\" }\n\"p is {p}, {{}} is { {} }\""),
-            "p is {x = 1, s = \"a\"}, {} is {}"
+            "p is {x = 1; s = \"a\"}, {} is {}"
         );
     }
 
@@ -1495,6 +1673,334 @@ mod tests {
             "internal error: Int load from a slot holding another type"
         );
         assert_eq!(error.span, Span::new(0, 1));
+    }
+
+    /// The record in `value`, which must be one.
+    fn record_of(value: &Value) -> &Rc<Record> {
+        match value {
+            Value::Record(record) => record,
+            other => panic!("expected a record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotted_fields_merge_into_records() {
+        assert_eq!(
+            run("server.host = \"localhost\"\nserver.port = 8080\nserver.tls.enabled = true")
+                .unwrap()
+                .to_string(),
+            "{server = {host = \"localhost\"; port = 8080; tls = {enabled = true}}}"
+        );
+        // Fields in the order of first mention, at every level.
+        assert_eq!(
+            run("{ a.b.c = 1; d = 2; a.e = 3; a.b.f = 4 }")
+                .unwrap()
+                .to_string(),
+            "{a = {b = {c = 1; f = 4}; e = 3}; d = 2}"
+        );
+        // Later items see the record built so far.
+        assert_eq!(
+            run("{ a.x = 1; let p = a; a.y = a.x + 1; q = p }")
+                .unwrap()
+                .to_string(),
+            "{a = {x = 1; y = 2}; q = {x = 1}}"
+        );
+        assert_eq!(int("{ a.x = 1; a.y = 2 }.a.y"), 2);
+    }
+
+    #[test]
+    fn an_update_that_replaces_a_field_shares_the_layout() {
+        let ir = compile(
+            "let a = { x = 1; s = \"text\" }\n\
+             let b = a\n\
+             let b.x = 5\n\
+             let c = a\n\
+             let c.z = true",
+        );
+        let mut frame = vec![Value::Empty; 5];
+        eval_in(&ir, &mut frame).unwrap();
+        let [a, _, replaced, _, added] = &frame[..] else {
+            panic!("expected five slots, got {frame:?}");
+        };
+        // The old record is intact.
+        assert_eq!(a.to_string(), "{x = 1; s = \"text\"}");
+        assert_eq!(replaced.to_string(), "{x = 5; s = \"text\"}");
+        let (a, replaced) = (record_of(a), record_of(replaced));
+        assert!(Rc::ptr_eq(&a.layout, &replaced.layout));
+        assert!(!Rc::ptr_eq(a, replaced));
+        // An addition makes a new layout, with the name at the end.
+        assert_eq!(added.to_string(), "{x = 1; s = \"text\"; z = true}");
+        let added = record_of(added);
+        assert!(!Rc::ptr_eq(&a.layout, &added.layout));
+        assert_eq!(added.layout.names.len(), 3);
+        assert_eq!(added.layout.names[..2], a.layout.names[..]);
+        assert!(!a.layout.names.contains(&added.layout.names[2]));
+        assert_eq!(
+            &*added.layout.texts,
+            &[Box::from("x"), Box::from("s"), Box::from("z")]
+        );
+        // The unchanged fields are shared, not copied.
+        let shared = |record: &Record| match &record.values[1] {
+            Value::Str(text) => Rc::clone(text),
+            other => panic!("expected a string, got {other:?}"),
+        };
+        assert!(Rc::ptr_eq(&shared(a), &shared(replaced)));
+        assert!(Rc::ptr_eq(&shared(a), &shared(added)));
+    }
+
+    #[test]
+    fn updates_nest_and_create_records() {
+        assert_eq!(
+            run("let a = { b = { c = 1; d = 2 } }\nlet a.b.c = 10\na")
+                .unwrap()
+                .to_string(),
+            "{b = {c = 10; d = 2}}"
+        );
+        assert_eq!(
+            run("let a = { x = 1 }\nlet a.b.c = 2\na")
+                .unwrap()
+                .to_string(),
+            "{x = 1; b = {c = 2}}"
+        );
+        assert_eq!(
+            run("let a.b.c = \"s\"\na").unwrap().to_string(),
+            "{b = {c = \"s\"}}"
+        );
+        assert_eq!(
+            run("let a = { x = 1 }\na.x := a.x + 1\nlet a.y.z = false\na.y.z := true\na")
+                .unwrap()
+                .to_string(),
+            "{x = 2; y = {z = true}}"
+        );
+        // A leaf replaced by a value of another type.
+        assert_eq!(
+            run("let a = { b = { c = 1 } }\nlet a.b = 2.5\na")
+                .unwrap()
+                .to_string(),
+            "{b = 2.5}"
+        );
+        // A field the static type has as `{}` may hold the empty record.
+        assert_eq!(
+            run("let a = { e = {} }\nlet a.e.x = 1\na")
+                .unwrap()
+                .to_string(),
+            "{e = {x = 1}}"
+        );
+        // A field hidden by subtyping is replaced where the path creates a
+        // record, since the static type is the truth.
+        assert_eq!(
+            run("let p: {x: Int} = { x = 1; y = 2 }\nlet p.y.z = 3\np")
+                .unwrap()
+                .to_string(),
+            "{x = 1; y = {z = 3}}"
+        );
+        // The value is evaluated after the record, and its errors reported.
+        assert_eq!(
+            error("let a = { x = 1 }\nlet a.y = 1 // 0").0,
+            "division by zero"
+        );
+    }
+
+    #[test]
+    fn an_update_leaves_the_old_value_intact() {
+        assert_eq!(
+            string("let a = { x = 1; n = { m = 2 } }\nlet old = a\nlet a.n.m = 3\n\"{old} {a}\""),
+            "{x = 1; n = {m = 2}} {x = 1; n = {m = 3}}"
+        );
+        assert_eq!(
+            string("let a = { x = 1 }\nlet old = a\na.x := 2\n\"{old} {a}\""),
+            "{x = 1} {x = 2}"
+        );
+        // Through a field: the field's record is extended in its slot, and
+        // what was read from it before is unchanged.
+        assert_eq!(
+            run("{ a.x = 1; let p = a; a.y = 2; q = p }")
+                .unwrap()
+                .to_string(),
+            "{a = {x = 1; y = 2}; q = {x = 1}}"
+        );
+    }
+
+    #[test]
+    fn typed_equality_compares_the_static_fields() {
+        let narrowed = "let q: {x: Int} = { x = 1; y = 2 }\n";
+        booleans(&[
+            (&format!("{narrowed}q == {{ x = 1 }}"), true),
+            (&format!("{narrowed}q === {{ x = 1 }}"), false),
+            (&format!("{narrowed}q != {{ x = 1 }}"), false),
+            (&format!("{narrowed}q !== {{ x = 1 }}"), true),
+            (&format!("{narrowed}q == {{ x = 2 }}"), false),
+            (&format!("{narrowed}q === q"), true),
+            (&format!("{narrowed}q == q"), true),
+        ]);
+        // Nested records compare over their static fields too.
+        let nested = "let q: {a: {n: Int}} = { a = { n = 1; m = 2 }; b = 3 }\n";
+        booleans(&[
+            (&format!("{nested}q == {{ a = {{ n = 1 }} }}"), true),
+            (&format!("{nested}q === {{ a = {{ n = 1 }} }}"), false),
+            (&format!("{nested}q == {{ a = {{ n = 2 }} }}"), false),
+            (&format!("{nested}q != {{ a = {{ n = 2 }} }}"), true),
+            (&format!("{nested}q.a == {{ n = 1 }}"), true),
+        ]);
+        // A record typed `{}` equals every other.
+        booleans(&[
+            ("let u: {} = { x = 1 }\nu == {}", true),
+            ("let u: {} = { x = 1 }\nu === {}", false),
+            ("let u: {} = { x = 1 }\nu != {}", false),
+            ("let e: {e: {}} = { e = { x = 1 } }\ne == { e = {} }", true),
+        ]);
+        // Floats compare as IEEE 754 does either way.
+        booleans(&[
+            ("let r = { f = 0.0 / 0.0 }\nr == r", false),
+            ("let r = { f = 0.0 / 0.0 }\nr === r", false),
+            ("let r = { f = 0.0 / 0.0 }\nr != r", true),
+            ("{ f = -0.0 } == { f = 0.0 }", true),
+            ("{ f = -0.0 } === { f = 0.0 }", true),
+        ]);
+        // Scalars are the same under both.
+        booleans(&[
+            ("1 === 1", true),
+            ("1 !== 1", false),
+            ("\"a\" === \"b\"", false),
+            ("true !== false", true),
+            ("1.5 === 1.5", true),
+        ]);
+        // Operands are evaluated left to right.
+        assert_eq!(
+            error("{ x = 1 // 0 } == { x = 9223372036854775807 + 1 }"),
+            ("division by zero".to_owned(), Span::new(8, 10))
+        );
+        assert_eq!(
+            error("{ x = 1 // 0 } === { x = 9223372036854775807 + 1 }"),
+            ("division by zero".to_owned(), Span::new(8, 10))
+        );
+    }
+
+    /// A record nested `depth` deep through the field named `inner`,
+    /// ending in `leaf`.
+    fn nested_record(inner: Name, depth: usize, leaf: Value) -> Value {
+        let layout = Rc::new(Layout {
+            names: Box::new([inner]),
+            texts: Box::new([Box::from("inner")]),
+        });
+        let mut value = leaf;
+        for _ in 0..depth {
+            value = Value::Record(Rc::new(Record {
+                layout: Rc::clone(&layout),
+                values: Box::new([value]),
+            }));
+        }
+        value
+    }
+
+    #[test]
+    fn typed_equality_of_deep_records_does_not_recurse() {
+        // Far deeper than a test thread's stack could take recursively: a
+        // shape for each level, the last comparing the leaf as a value.
+        const DEPTH: usize = 1_000_000;
+        let mut names = crate::names::Names::new();
+        let inner = names.intern("inner");
+        let mut builder = crate::ir::IrBuilder::with_capacity(1);
+        let first = builder.push_shape(crate::ir::Shape {
+            fields: Box::default(),
+        });
+        let mut shape = first;
+        for _ in 1..DEPTH {
+            let next = builder.push_shape(crate::ir::Shape {
+                fields: Box::default(),
+            });
+            builder.set_shape(
+                shape,
+                crate::ir::Shape {
+                    fields: Box::new([(inner, Some(next))]),
+                },
+            );
+            shape = next;
+        }
+        builder.set_shape(
+            shape,
+            crate::ir::Shape {
+                fields: Box::new([(inner, None)]),
+            },
+        );
+        let root = builder.alloc(IrKind::Empty, Span::new(0, 0));
+        let ir = builder.finish(root, 0, Vec::new());
+        let a = nested_record(inner, DEPTH, Value::Int(0));
+        let b = nested_record(inner, DEPTH, Value::Int(0));
+        let c = nested_record(inner, DEPTH, Value::Int(1));
+        assert_eq!(record_eq_shaped(&ir, first, &a, &b), Some(true));
+        assert_eq!(record_eq_shaped(&ir, first, &a, &c), Some(false));
+        // Shallower records lack a field the shape has at the bottom.
+        let shallow = nested_record(inner, DEPTH - 1, Value::Int(0));
+        assert_eq!(record_eq_shaped(&ir, first, &a, &shallow), None);
+    }
+
+    #[test]
+    fn a_record_lacking_a_field_of_its_shape_is_an_internal_error() {
+        // `r == r` built by hand, with `r` holding a record without the
+        // shape's `y`.
+        let mut names = crate::names::Names::new();
+        let (x, y) = (names.intern("x"), names.intern("y"));
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let shape = builder.push_shape(crate::ir::Shape {
+            fields: Box::new([(y, None)]),
+        });
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Record),
+            Span::new(0, 1),
+        );
+        let eq = builder.alloc(
+            IrKind::RecordEq(ShapedOperands {
+                shape,
+                lhs: load,
+                rhs: load,
+            }),
+            Span::new(0, 6),
+        );
+        let ir = builder.finish(eq, 1, Vec::new());
+        let record = Value::Record(Rc::new(Record {
+            layout: Rc::new(Layout {
+                names: Box::new([x]),
+                texts: Box::new([Box::from("x")]),
+            }),
+            values: Box::new([Value::Int(1)]),
+        }));
+        let error = eval_in(&ir, &mut [record]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "internal error: a record lacks a field of its shape"
+        );
+        assert_eq!(error.span, Span::new(0, 6));
+        // So is the empty record, where the shape has fields.
+        let error = eval_in(&ir, &mut [Value::Empty]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "internal error: a record lacks a field of its shape"
+        );
+    }
+
+    #[test]
+    fn an_update_without_its_name_text_is_an_internal_error() {
+        let mut names = crate::names::Names::new();
+        let x = names.intern("x");
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let nothing = builder.alloc(IrKind::Empty, Span::new(0, 1));
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(4, 5));
+        let update = builder.alloc(
+            IrKind::UpdateField {
+                record: nothing,
+                name: x,
+                value: one,
+            },
+            Span::new(0, 5),
+        );
+        let ir = builder.finish(update, 0, Vec::new());
+        let error = eval(&ir).unwrap_err();
+        assert_eq!(
+            error.message,
+            "internal error: an update's name has no text"
+        );
+        assert_eq!(error.span, Span::new(0, 5));
     }
 
     #[test]
