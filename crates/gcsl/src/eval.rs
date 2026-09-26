@@ -32,7 +32,7 @@ pub fn eval(ir: &Ir) -> Result<Value, Diagnostic> {
     match root.kind.ty() {
         Ty::Int => evaluator.int(ir.root()).map(Value::Int),
         Ty::Float => evaluator.float(ir.root()).map(Value::Float),
-        Ty::UntypedInt => Err(internal("IR node has no concrete type", root.span)),
+        Ty::UntypedInt | Ty::Error => Err(internal("IR node has no concrete type", root.span)),
     }
 }
 

@@ -27,7 +27,17 @@
 //! parser stops at the first error for now; recovery can be added later by
 //! catching an `Err` at a synchronisation point and continuing, with the sink
 //! then holding several diagnostics.
+//!
+//! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
+//! two ways. Parentheses and prefix operators nest by recursion, so
+//! [`Parser::parse_expr`] counts its own depth and stops before the recursion
+//! itself could overflow. Left-associative chains such as `1 + 1 + 1` nest
+//! without recursion, since the loop folds each operator into the left-hand
+//! side, so the parser also tracks the height of every node it allocates and
+//! rejects a node that would exceed the limit. Together these guarantee that
+//! no tree handed to a later stage is deeper than `MAX_DEPTH`.
 
+use crate::MAX_DEPTH;
 use crate::ast::{Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, UnaryOp};
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -36,6 +46,9 @@ use crate::source::{SourceFile, Span};
 /// Binding power of the operand of prefix `-`: tighter than every binary
 /// operator.
 const PREFIX_BP: u8 = 5;
+
+/// Height of a leaf node.
+const LEAF_HEIGHT: u32 = 1;
 
 /// Parses `tokens`, lexed from `source`, as one expression.
 ///
@@ -51,8 +64,10 @@ pub fn parse(tokens: &[Token], source: &SourceFile) -> Result<Ast, Diagnostic> {
         tokens,
         pos: 0,
         source,
-        // Every node consumes at least one token, so this never reallocates.
+        // Every node consumes at least one token, so these never reallocate.
         builder: AstBuilder::with_capacity(tokens.len()),
+        heights: Vec::with_capacity(tokens.len()),
+        depth: 0,
         diagnostics: Vec::new(),
     };
     match parser.parse_root() {
@@ -78,6 +93,11 @@ struct Parser<'a> {
     pos: usize,
     source: &'a SourceFile,
     builder: AstBuilder,
+    /// The height of each allocated node, indexed like the builder's arena:
+    /// 1 for a leaf, one more than the tallest child otherwise.
+    heights: Vec<u32>,
+    /// Current recursion depth of [`Parser::parse_expr`].
+    depth: usize,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -98,6 +118,25 @@ impl Parser<'_> {
     /// Parses an expression whose binary operators all have a left binding
     /// power of at least `min_bp`.
     fn parse_expr(&mut self, min_bp: u8) -> ParseResult<ExprId> {
+        self.enter()?;
+        let result = self.parse_expr_inner(min_bp);
+        self.depth -= 1;
+        result
+    }
+
+    /// Records one more level of recursion, failing if it would exceed
+    /// [`MAX_DEPTH`]. Every successful call is paired with a decrement in
+    /// [`Parser::parse_expr`].
+    fn enter(&mut self) -> ParseResult<()> {
+        if self.depth >= MAX_DEPTH {
+            let span = self.peek().span;
+            return Err(self.too_deep(span));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn parse_expr_inner(&mut self, min_bp: u8) -> ParseResult<ExprId> {
         let mut lhs = self.parse_prefix()?;
         while let Some(op) = binary_op(self.peek().kind) {
             let (left_bp, right_bp) = binding_power(op);
@@ -107,10 +146,8 @@ impl Parser<'_> {
             self.advance();
             let rhs = self.parse_expr(right_bp)?;
             let span = Span::join(self.span_of(lhs), self.span_of(rhs));
-            lhs = self.builder.alloc(Expr {
-                kind: ExprKind::Binary { op, lhs, rhs },
-                span,
-            });
+            let height = self.height_of(lhs).max(self.height_of(rhs)) + 1;
+            lhs = self.alloc(ExprKind::Binary { op, lhs, rhs }, span, height)?;
         }
         Ok(lhs)
     }
@@ -132,13 +169,15 @@ impl Parser<'_> {
                 self.advance();
                 let operand = self.parse_expr(PREFIX_BP)?;
                 let span = Span::join(token.span, self.span_of(operand));
-                return Ok(self.builder.alloc(Expr {
-                    kind: ExprKind::Unary {
+                let height = self.height_of(operand) + 1;
+                return self.alloc(
+                    ExprKind::Unary {
                         op: UnaryOp::Neg,
                         operand,
                     },
                     span,
-                }));
+                    height,
+                );
             }
             TokenKind::LParen => {
                 self.advance();
@@ -148,10 +187,12 @@ impl Parser<'_> {
                     return Err(self.error("expected `)`", close.span));
                 }
                 self.advance();
-                return Ok(self.builder.alloc(Expr {
-                    kind: ExprKind::Paren(inner),
-                    span: Span::join(token.span, close.span),
-                }));
+                let height = self.height_of(inner) + 1;
+                return self.alloc(
+                    ExprKind::Paren(inner),
+                    Span::join(token.span, close.span),
+                    height,
+                );
             }
             TokenKind::Plus
             | TokenKind::Star
@@ -164,10 +205,30 @@ impl Parser<'_> {
                 return Err(self.error(format!("expected expression, found {found}"), token.span));
             }
         };
-        Ok(self.builder.alloc(Expr {
-            kind,
-            span: token.span,
-        }))
+        self.alloc(kind, token.span, LEAF_HEIGHT)
+    }
+
+    /// Allocates a node of the given `height`, failing if that height
+    /// exceeds [`MAX_DEPTH`].
+    fn alloc(&mut self, kind: ExprKind, span: Span, height: u32) -> ParseResult<ExprId> {
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(span));
+        }
+        let id = self.builder.alloc(Expr { kind, span });
+        self.heights.push(height);
+        Ok(id)
+    }
+
+    fn height_of(&self, id: ExprId) -> u32 {
+        // Every id came from `alloc`, which pushes a height for each node.
+        self.heights.get(id.index()).copied().unwrap_or(LEAF_HEIGHT)
+    }
+
+    fn too_deep(&mut self, span: Span) -> Reported {
+        self.report(
+            Diagnostic::error("expression nested too deeply", span)
+                .with_note(format!("the limit is {MAX_DEPTH} levels")),
+        )
     }
 
     /// The current token. Past the end of a token slice that lacks a final
@@ -202,7 +263,13 @@ impl Parser<'_> {
     /// Records an error in the sink and returns the proof that it was
     /// recorded.
     fn error(&mut self, message: impl Into<String>, span: Span) -> Reported {
-        self.diagnostics.push(Diagnostic::error(message, span));
+        self.report(Diagnostic::error(message, span))
+    }
+
+    /// Records a diagnostic in the sink and returns the proof that it was
+    /// recorded.
+    fn report(&mut self, diagnostic: Diagnostic) -> Reported {
+        self.diagnostics.push(diagnostic);
         Reported
     }
 }
@@ -429,6 +496,52 @@ mod tests {
                 Span::new(2, 3)
             )
         );
+    }
+
+    /// Runs `f` on a thread with [`crate::STACK_SIZE`] of stack, as the
+    /// pipeline is meant to be run. Test threads are far smaller by default.
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn too_deep(text: String) -> Diagnostic {
+        on_big_stack(move || parse_text(&text).unwrap_err())
+    }
+
+    #[test]
+    fn nesting_by_recursion_is_limited() {
+        // MAX_DEPTH parentheses around a literal is MAX_DEPTH + 1 levels.
+        let just_over = format!("{}1{}", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
+        let diagnostic = too_deep(just_over);
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        assert_eq!(
+            diagnostic.notes,
+            vec![format!("the limit is {MAX_DEPTH} levels")]
+        );
+        let deepest = format!(
+            "{}1{}",
+            "(".repeat(MAX_DEPTH - 1),
+            ")".repeat(MAX_DEPTH - 1)
+        );
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let negations = format!("{}1", "-".repeat(MAX_DEPTH));
+        too_deep(negations);
+    }
+
+    #[test]
+    fn nesting_by_left_chaining_is_limited() {
+        // Each `+` is one level above its left operand, so N terms are N
+        // levels deep. This nests without recursion in the parser.
+        let just_over = format!("1{}", " + 1".repeat(MAX_DEPTH));
+        let diagnostic = too_deep(just_over);
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        let deepest = format!("1{}", " + 1".repeat(MAX_DEPTH - 1));
+        on_big_stack(move || parse_text(&deepest).unwrap());
     }
 
     #[test]

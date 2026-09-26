@@ -161,6 +161,21 @@ fn dump_then_error_prints_dumped_stages_and_the_error() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// The binary runs the pipeline on a thread with enough stack for the
+/// deepest accepted expression, whatever the main thread's stack is.
+#[test]
+fn deepest_accepted_expression_runs() {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deep.gcsl");
+    std::fs::write(&path, format!("1{}", " + 1".repeat(gcsl::MAX_DEPTH - 1))).unwrap();
+    let output = gcsl(&["run", path.to_str().unwrap()]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(stderr(&output), "");
+    assert_eq!(stdout(&output), format!("{}\n", gcsl::MAX_DEPTH));
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn repl_evaluates_each_line() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))

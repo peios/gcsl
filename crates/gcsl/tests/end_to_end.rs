@@ -168,6 +168,59 @@ fn left_operand_error_wins() {
     assert_eq!(diagnostics[0].message, "division by zero");
 }
 
+/// Runs `f` on a thread with the stack size the library asks for.
+fn on_recommended_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// Every stage, including the dump printers, survives the deepest tree the
+/// parser accepts, on the stack size the library recommends. This is the
+/// test that keeps `STACK_SIZE` honest: it runs unoptimised under
+/// `cargo test`, where stack frames are largest.
+#[test]
+fn every_stage_handles_maximum_depth() {
+    on_recommended_stack(|| {
+        let depth = gcsl::MAX_DEPTH;
+        // Left-nested chain: N terms is N levels.
+        let chain = source(&format!("1{}", " + 1".repeat(depth - 1)));
+        let chain_value = Value::Int(i64::try_from(depth).unwrap());
+        // Nested parentheses and negations: recursion in the parser too.
+        let pairs = (depth - 1) / 2;
+        let nested = source(&format!("{}1{}", "-(".repeat(pairs), ")".repeat(pairs)));
+        let nested_value = Value::Int(if pairs.is_multiple_of(2) { 1 } else { -1 });
+        for (file, expected) in [(&chain, chain_value), (&nested, nested_value)] {
+            let tokens = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, file).unwrap();
+            let types = gcsl::check::check(&ast).unwrap();
+            let ir = gcsl::lower::lower(&ast, &types).unwrap();
+            assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
+            // The printers recurse too.
+            assert!(!ast.pretty().to_string().is_empty());
+            assert!(!ast.pretty_with(&types).to_string().is_empty());
+            assert!(!ir.pretty().to_string().is_empty());
+        }
+    });
+}
+
+#[test]
+fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
+    on_recommended_stack(|| {
+        // Far beyond the limit, where a missing check would overflow.
+        let text = format!("{}1{}", "(".repeat(200_000), ")".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        let text = format!("1{}", " + 1".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
+    });
+}
+
 #[test]
 fn stages_can_be_run_individually() {
     let file = source("1 + 2.5");

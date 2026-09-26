@@ -46,8 +46,26 @@ enum Command {
 fn main() -> ExitCode {
     // Exits with code 2 on a usage error, and 0 after `--help`/`--version`.
     let cli = Cli::parse();
-    match cli.command {
-        None => repl::main(),
-        Some(Command::Run(args)) => run::main(&args),
+    // Every stage of the pipeline recurses once per level of nesting, up to
+    // `gcsl::MAX_DEPTH`. The main thread's stack is platform-dependent and
+    // often too small for that, so all the work runs on a thread with the
+    // stack the library asks for. The memory is only reserved, not used.
+    let worker = std::thread::Builder::new()
+        .name("gcsl".to_owned())
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(move || match cli.command {
+            None => repl::main(),
+            Some(Command::Run(args)) => run::main(&args),
+        });
+    match worker.map(std::thread::JoinHandle::join) {
+        Ok(Ok(code)) => code,
+        Ok(Err(_)) => {
+            output::error("internal error: the interpreter thread panicked");
+            ExitCode::from(EXIT_USAGE_OR_IO)
+        }
+        Err(error) => {
+            output::error(format_args!("cannot start the interpreter thread: {error}"));
+            ExitCode::from(EXIT_USAGE_OR_IO)
+        }
     }
 }

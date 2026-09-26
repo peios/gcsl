@@ -71,8 +71,8 @@ impl TokenKind {
 /// # Errors
 ///
 /// Returns the first lexical error: an unexpected character, a malformed
-/// number (misplaced `_`, missing exponent digits) or an integer literal too
-/// large for `Int`.
+/// number (misplaced `_`, missing exponent digits) or a literal too large for
+/// its type.
 pub fn tokenize(source: &SourceFile) -> Result<Vec<Token>, Diagnostic> {
     let mut lexer = Lexer::new(source);
     let mut tokens = Vec::new();
@@ -190,7 +190,7 @@ impl<'a> Lexer<'a> {
     ///
     /// ```text
     /// number   = digits ( "." digits )? exponent?
-    /// exponent = "e" ( "+" | "-" )? digits
+    /// exponent = ( "e" | "E" ) ( "+" | "-" )? digits
     /// ```
     ///
     /// A literal with a fraction or an exponent is a float. A `.` not followed
@@ -211,7 +211,7 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        if self.peek() == Some(b'e') {
+        if matches!(self.peek(), Some(b'e' | b'E')) {
             let exponent_start = self.pos;
             self.pos += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
@@ -243,11 +243,21 @@ impl<'a> Lexer<'a> {
         if is_float {
             // The grammar above only admits text that `f64::from_str` accepts,
             // so this cannot fail; the error arm keeps that assumption out of
-            // the control flow. Literals beyond `f64::MAX` round to infinity.
-            digits
+            // the control flow.
+            let value: f64 = digits
                 .parse()
-                .map(TokenKind::Float)
-                .map_err(|_| Diagnostic::error("malformed float literal", literal_span))
+                .map_err(|_| Diagnostic::error("malformed float literal", literal_span))?;
+            // `f64::from_str` rounds a literal beyond `f64::MAX` to infinity.
+            // A literal that does not denote the value written is an error,
+            // not a silent infinity.
+            if value.is_infinite() {
+                return Err(Diagnostic::error(
+                    "float literal out of range for Float",
+                    literal_span,
+                )
+                .with_note(format!("the largest Float literal is {:?}", f64::MAX)));
+            }
+            Ok(TokenKind::Float(value))
         } else {
             // Only digits reach here, so the one possible failure is overflow.
             digits.parse().map(TokenKind::Int).map_err(|_| {
@@ -471,10 +481,12 @@ mod tests {
     }
 
     #[test]
-    fn uppercase_exponent_is_not_part_of_the_literal() {
+    fn uppercase_exponent_is_accepted() {
+        assert_eq!(kinds("1E5")[0], TokenKind::Float(1e5));
+        assert_eq!(kinds("2.5E-1")[0], TokenKind::Float(0.25));
         assert_eq!(
-            error("1E5"),
-            ("unexpected character `E`".to_owned(), Span::new(1, 2))
+            error("1E"),
+            ("missing digits in exponent".to_owned(), Span::new(1, 2))
         );
     }
 
@@ -506,8 +518,20 @@ mod tests {
     }
 
     #[test]
-    fn huge_float_literal_rounds_to_infinity() {
-        assert_eq!(kinds("1e400")[0], TokenKind::Float(f64::INFINITY));
+    fn float_literal_limits() {
+        assert_eq!(
+            kinds("1.7976931348623157e308")[0],
+            TokenKind::Float(f64::MAX)
+        );
+        let diagnostic = lex("1 + 1e400").unwrap_err();
+        assert_eq!(diagnostic.message, "float literal out of range for Float");
+        assert_eq!(diagnostic.span, Span::new(4, 9));
+        assert_eq!(
+            diagnostic.notes,
+            vec!["the largest Float literal is 1.7976931348623157e308"]
+        );
+        // Underflow is not an error: the literal rounds to zero.
+        assert_eq!(kinds("1e-400")[0], TokenKind::Float(0.0));
     }
 
     #[test]

@@ -42,6 +42,23 @@ pub use source::{SourceFile, Span};
 pub use types::Ty;
 pub use value::Value;
 
+/// The deepest expression nesting accepted, measured as the height of the
+/// syntax tree. Every stage recurses once per level, so the parser rejects
+/// anything deeper with an "expression nested too deeply" error rather than
+/// letting a later stage overflow the stack.
+///
+/// The limit counts left-nested chains too: `1 + 1 + ... + 1` with ten
+/// thousand terms is ten thousand levels deep, because each `+` is the left
+/// operand of the next.
+pub const MAX_DEPTH: usize = 10_000;
+
+/// The stack size, in bytes, that guarantees no stage overflows at
+/// [`MAX_DEPTH`], even in an unoptimised build. Run the pipeline on a thread
+/// with at least this much stack: the `gcsl` binary does, and so should any
+/// embedder. Stack memory is reserved, not committed, so an unused
+/// reservation costs nothing.
+pub const STACK_SIZE: usize = 64 * 1024 * 1024;
+
 /// Runs every stage on `source` and returns the value of its expression.
 ///
 /// # Errors

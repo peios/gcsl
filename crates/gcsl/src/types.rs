@@ -13,6 +13,19 @@ pub enum Ty {
     /// context yet. Checker-internal: it never survives checking, and it
     /// displays as `Int` so users never see it.
     UntypedInt,
+    /// The type of an expression that already has a reported type error.
+    /// Checker-internal: every operator accepts it and produces it without
+    /// reporting anything, so one mistake is reported once rather than at
+    /// every enclosing operator. It never survives a successful check.
+    Error,
+}
+
+impl Ty {
+    /// Whether this is [`Ty::Error`].
+    #[must_use]
+    pub const fn is_error(self) -> bool {
+        matches!(self, Ty::Error)
+    }
 }
 
 impl fmt::Display for Ty {
@@ -20,6 +33,7 @@ impl fmt::Display for Ty {
         f.write_str(match self {
             Ty::Int | Ty::UntypedInt => "Int",
             Ty::Float => "Float",
+            Ty::Error => "<error>",
         })
     }
 }
@@ -33,5 +47,8 @@ mod tests {
         assert_eq!(Ty::Int.to_string(), "Int");
         assert_eq!(Ty::Float.to_string(), "Float");
         assert_eq!(Ty::UntypedInt.to_string(), "Int");
+        assert_eq!(Ty::Error.to_string(), "<error>");
+        assert!(Ty::Error.is_error());
+        assert!(!Ty::Int.is_error());
     }
 }

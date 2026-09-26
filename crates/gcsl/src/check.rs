@@ -19,6 +19,12 @@
 //! Finalisation defaults an untyped root to `Int`. Every untyped node is
 //! either coerced by the nearest concrete ancestor or reaches the root through
 //! untyped ancestors, so afterwards the table contains no `UntypedInt`.
+//!
+//! A node whose operator rejects its operands is reported once and given
+//! [`Ty::Error`]. Every operator accepts `Error` operands silently and
+//! produces `Error` itself, so the mistake does not cascade into a spurious
+//! error at each enclosing operator. Independent mistakes elsewhere in the
+//! tree are still reported, so one run shows every real error.
 
 use std::fmt;
 
@@ -28,8 +34,8 @@ use crate::types::Ty;
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
-/// A `Types` returned by [`check`] contains no [`Ty::UntypedInt`] for any
-/// node reachable from the root.
+/// A `Types` returned by [`check`] contains neither [`Ty::UntypedInt`] nor
+/// [`Ty::Error`] for any node reachable from the root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Types {
     types: Vec<Ty>,
@@ -70,10 +76,8 @@ impl Annotate for Types {
 /// # Errors
 ///
 /// Returns every type error found. Checking continues after an error by
-/// giving the offending node the recovery type `Int`, so one run reports all
-/// independent errors. The recovery type is a guess, so an error can cascade
-/// into a spurious one further up (`(1.0 // 2) + 1.5` reports the `//` and
-/// then an `Int + Float` mix).
+/// giving the offending node [`Ty::Error`], which every enclosing operator
+/// accepts silently, so one run reports each independent error exactly once.
 pub fn check(ast: &Ast) -> Result<Types, Vec<Diagnostic>> {
     let mut checker = Checker {
         ast,
@@ -92,11 +96,6 @@ pub fn check(ast: &Ast) -> Result<Types, Vec<Diagnostic>> {
         Err(checker.errors)
     }
 }
-
-/// The type given to a node whose operator rejected its operands, so that
-/// checking can continue. `Int` is the spec's choice; it lets `//` and `%`
-/// errors recover to the type those operators produce anyway.
-const RECOVERY: Ty = Ty::Int;
 
 struct Checker<'a> {
     ast: &'a Ast,
@@ -130,7 +129,11 @@ impl Checker<'_> {
                         // operands are converted by lowering.
                         self.coerce(lhs, Ty::Float);
                         self.coerce(rhs, Ty::Float);
-                        Ty::Float
+                        if lhs_ty.is_error() || rhs_ty.is_error() {
+                            Ty::Error
+                        } else {
+                            Ty::Float
+                        }
                     }
                     BinaryOp::FloorDiv | BinaryOp::Rem => {
                         self.integer_only(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
@@ -152,6 +155,16 @@ impl Checker<'_> {
         (rhs, rhs_ty): (ExprId, Ty),
     ) -> Ty {
         match (lhs_ty, rhs_ty) {
+            // An erroneous operand has been reported already. The other
+            // operand still needs a concrete type in case it is untyped.
+            (Ty::Error, _) => {
+                self.coerce(rhs, Ty::Int);
+                Ty::Error
+            }
+            (_, Ty::Error) => {
+                self.coerce(lhs, Ty::Int);
+                Ty::Error
+            }
             (Ty::UntypedInt, Ty::UntypedInt) => Ty::UntypedInt,
             (Ty::UntypedInt, concrete @ (Ty::Int | Ty::Float)) => {
                 self.coerce(lhs, concrete);
@@ -168,7 +181,7 @@ impl Checker<'_> {
                     format!("cannot {} {lhs_ty} and {rhs_ty}", op.verb()),
                     self.ast.get(id).span,
                 ));
-                RECOVERY
+                Ty::Error
             }
         }
     }
@@ -183,20 +196,26 @@ impl Checker<'_> {
         (lhs, lhs_ty): (ExprId, Ty),
         (rhs, rhs_ty): (ExprId, Ty),
     ) -> Ty {
+        // Whatever the outcome, untyped operands settle to Int: these
+        // operators never accept Float, so nothing else could decide them.
+        self.coerce(lhs, Ty::Int);
+        self.coerce(rhs, Ty::Int);
+        if lhs_ty.is_error() || rhs_ty.is_error() {
+            return Ty::Error;
+        }
         if lhs_ty == Ty::Float || rhs_ty == Ty::Float {
             self.errors.push(Diagnostic::error(
                 format!("cannot {} {}", op.verb(), Ty::Float),
                 self.ast.get(id).span,
             ));
-            return RECOVERY;
+            return Ty::Error;
         }
-        self.coerce(lhs, Ty::Int);
-        self.coerce(rhs, Ty::Int);
         Ty::Int
     }
 
     /// Pushes the concrete type `ty` down into the untyped subtree rooted at
-    /// `id`. Does nothing if `id` already has a concrete type.
+    /// `id`. Does nothing if `id` already has a concrete type (or is an
+    /// error).
     ///
     /// Only literals, parentheses, negation and `+ - *` can be untyped, and
     /// an untyped node's children are untyped or concrete of the same kind,
@@ -391,17 +410,30 @@ mod tests {
     }
 
     #[test]
-    fn recovery_type_is_int() {
-        // The failed `//` recovers as Int, so adding an Int is fine...
-        assert_eq!(
-            messages("(1.0 // 2) + (7 // 2)"),
-            vec!["cannot floor-divide Float"]
-        );
-        // ...and adding a Float cascades.
-        assert_eq!(
-            messages("(1.0 // 2) + 1.5"),
-            vec!["cannot floor-divide Float", "cannot add Int and Float"]
-        );
+    fn errors_do_not_cascade() {
+        // The failed `//` becomes an error type that every enclosing operator
+        // accepts, whatever the other operand is.
+        for text in [
+            "(1.0 // 2) + (7 // 2)",
+            "(1.0 // 2) + 1.5",
+            "(1.0 // 2) + 1",
+            "1.5 * (1.0 // 2)",
+            "-(1.0 // 2) // 2",
+            "(1.0 // 2) / 2.5",
+            "2 % (1.0 // 2)",
+        ] {
+            assert_eq!(messages(text), vec!["cannot floor-divide Float"], "{text}");
+        }
+    }
+
+    #[test]
+    fn error_type_never_escapes_a_successful_check() {
+        // Every node of a successful check has a concrete type.
+        for text in ["1", "1.5", "(1 + 2) * 3.0", "7 / 2", "(7 // 2) / 2"] {
+            for ty in all_types(text) {
+                assert!(!ty.is_error() && ty != Ty::UntypedInt, "{text}: {ty:?}");
+            }
+        }
     }
 
     #[test]

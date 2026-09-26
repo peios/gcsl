@@ -57,6 +57,12 @@ impl Lowerer<'_> {
                     span,
                 });
             }
+            (_, Ty::Error) => {
+                return Err(InternalError {
+                    message: "a type error survived type checking",
+                    span,
+                });
+            }
             (ExprKind::Paren(inner), _) => return self.lower_operand(inner, ty),
             (ExprKind::Int(value), Ty::Int) => IrKind::IntConst(value),
             (ExprKind::Int(value), Ty::Float) => IrKind::FloatConst(int_to_float(value)),
@@ -144,6 +150,10 @@ impl Lowerer<'_> {
             }
             Ty::UntypedInt => Err(InternalError {
                 message: "an untyped integer survived type checking",
+                span: self.ast.get(id).span,
+            }),
+            Ty::Error => Err(InternalError {
+                message: "a type error survived type checking",
                 span: self.ast.get(id).span,
             }),
         }
@@ -261,6 +271,14 @@ mod tests {
         let error = lower(&ast, &types).unwrap_err();
         assert_eq!(error.message, "an untyped integer survived type checking");
         assert_eq!(error.span, Span::new(0, 1));
+    }
+
+    #[test]
+    fn error_entry_is_an_internal_error() {
+        let (ast, types) = concrete_int_division(vec![Ty::Int, Ty::Error, Ty::Float]);
+        let error = lower(&ast, &types).unwrap_err();
+        assert_eq!(error.message, "a type error survived type checking");
+        assert_eq!(error.span, Span::new(4, 5));
     }
 
     #[test]
