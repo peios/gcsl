@@ -55,7 +55,9 @@
 //!
 //! # Types
 //!
-//! A type is a name, such as `Int`, a record type or a function type. A
+//! A type is a name, such as `Int`, a name applied to a type argument, such
+//! as `Future<Int>`, a record type, a function type, a type in parentheses,
+//! or a union of types. A
 //! record type is `{` then `}`, or `NAME: TYPE` entries separated by `,`,
 //! with an optional trailing `,`, then `}`. The lexer does not know it is
 //! in a type, so it emits the newlines inside the braces, and the parser
@@ -64,6 +66,21 @@
 //! separated by `,` with an optional trailing `,`, `)`, the marker `:` or
 //! `->`, and the return type; a parameter type is `NAME: TYPE`, recognised
 //! by an identifier followed by `:`, or just `TYPE`.
+//!
+//! An applied type is any identifier directly followed by `<`, a type, and
+//! `>`, which must follow the type directly; there is no `>>` token, so
+//! `Future<Future<Int>>` closes with two `>`. Which names take an argument
+//! is the checker's business. A union is two types separated by `|`, which
+//! binds looser than everything else in a type: after any type, while a `|`
+//! follows, the parser reads another and makes the union of the two, so a
+//! union is left-associative. A function type's return type is a whole
+//! type, so it takes a union that follows it: `fn() -> Int | Future<Int>`
+//! returns the union. Parentheses group a type, `(` TYPE `)`, so that
+//! `(fn(): Int) | Future<fn(): Int>` is the union of a function type and a
+//! future; they leave no node of their own, the type inside standing for
+//! itself, and a missing `)` is "expected `)` to close the type". Newlines
+//! are skipped after `<`, `|` and `(`, as after `:`. In expression position
+//! `|` is not an operator, so it is "expected expression".
 //!
 //! # Functions and calls
 //!
@@ -80,6 +97,18 @@
 //! same line starts a trailing block: an ordinary block, passed as the
 //! call's last argument. The parser accepts arguments in any order; binding
 //! them to parameters is the checker's business.
+//!
+//! # Futures
+//!
+//! `lazy EXPR` is a prefix expression that takes the longest expression it
+//! can: its operand is parsed at minimum binding power 0, so `lazy a + b`
+//! defers the sum and `lazy { ... }` a block. The operand becomes the body
+//! of a parameterless function in the function arena, with no return type,
+//! impure, whose marker is the `lazy` keyword. `await` is a prefix operator
+//! binding exactly as tightly as `-`: `await x + 1` is `(await x) + 1`,
+//! `await f()` awaits the call's result, and `await x.y` the field.
+//!
+//! # Trailing blocks
 //!
 //! A trailing block would make `if x { ... }` a call of `x`, so while the
 //! parser is in the condition of an `if` (or `else if`) a `{` after an
@@ -105,9 +134,9 @@
 //! function, [`Parser::parse_expr`], parses any expression whose operators
 //! bind at least as tightly as a given *minimum binding power*. It first
 //! parses a *prefix* expression (a literal, a name, a string, a
-//! parenthesised expression, a block, an `if`, a function expression, or a
-//! prefix operator applied to an operand), which becomes the left-hand
-//! side. Then it loops: if the
+//! parenthesised expression, a block, an `if`, a function expression, a
+//! `lazy`, or a prefix operator applied to an operand), which becomes the
+//! left-hand side. Then it loops: if the
 //! next token is a binary operator whose left binding power is at least the
 //! minimum, it consumes the operator, parses the right-hand side by calling
 //! itself with the operator's right binding power as the new minimum, and
@@ -126,7 +155,7 @@
 //! | `+` `-`                     | 7       | 8                          |
 //! | `*` `/` `//` `%`            | 9       | 10                         |
 //! | postfix `:` TYPE            | 11      | (none: parses a type)      |
-//! | prefix `-`                  | (none)  | operand parsed with min 13 |
+//! | prefix `-` and `await`      | (none)  | operand parsed with min 13 |
 //! | postfix `.` NAME            | 15      | (none: takes a name)       |
 //! | postfix call `(`...`)` `{`  | 15      | (none: arguments at min 0) |
 //!
@@ -191,23 +220,29 @@
 //! diagnostics.
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
-//! two ways. Parentheses, prefix operators, blocks, `if`s, interpolations,
-//! function expressions, argument lists, and record and function types nest
-//! by recursion, so [`Parser::parse_expr`], the body of every nested block,
-//! every `else if` and every record and function type count their own depth
-//! and stop before the recursion itself could overflow; a function
-//! expression and an argument list recurse only through those.
-//! Left-associative chains such as `1 + 1 + 1` or `a.b.c` nest without
-//! recursion, since the loop folds each operator into the left-hand side, so
-//! the parser also tracks the height of every node it allocates, a block
-//! being one above the tallest of its items' expressions and types, an `if`
-//! or an interpolation one above its tallest child, a field access one above
-//! its record, an ascription one above the taller of its expression and its
-//! type (a record type being one above its tallest field type, and a
-//! function type one above the tallest of its parameter and return types),
-//! a function expression one above the tallest of its parameter types, its
-//! return type and its body, and a call one above the tallest of its callee
-//! and arguments, and rejects a node that would exceed the limit. An item's height is its
+//! two ways. Parentheses, prefix operators (`await` included), blocks, `if`s,
+//! interpolations, function expressions, `lazy`s, argument lists, and
+//! record, function, applied and parenthesised types nest by recursion, so
+//! [`Parser::parse_expr`], the body of every nested block, every `else if`
+//! and every record, function, applied and parenthesised type count their
+//! own depth and stop before the recursion itself could overflow; a
+//! function expression, a `lazy` and an argument list recurse only through
+//! those.
+//! Left-associative chains such as `1 + 1 + 1`, `a.b.c` or a union of many
+//! types nest without recursion, since the loop folds each operator into the
+//! left-hand side, so the parser also tracks the height of every node it
+//! allocates, a block being one above the tallest of its items' expressions
+//! and types, an `if` or an interpolation one above its tallest child, a
+//! field access one above its record, an ascription one above the taller of
+//! its expression and its type (a record type being one above its tallest
+//! field type, a function type one above the tallest of its parameter and
+//! return types, an applied type one above its argument, a parenthesised
+//! type one above the type inside, though it leaves no node of its own, and
+//! a union one above the taller of its two sides), a function expression
+//! one above the tallest of its parameter types, its return type and its
+//! body, a `lazy`
+//! one above its operand, and a call one above the tallest of its callee and
+//! arguments, and rejects a node that would exceed the limit. An item's height is its
 //! value's, plus two levels for each segment of its path after the first,
 //! or its annotation's if that is taller; an item taller than the limit is
 //! rejected too, at the item. Together these guarantee that no tree handed
@@ -711,13 +746,50 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses a type expression: a name, a record type or a function type.
-    /// Returns it and its height: 1 for a name, one more than its tallest
-    /// field's type for a record type, and one more than the tallest of its
-    /// parameter and return types for a function type.
+    /// Parses a type expression: a name, an applied type, a record type, a
+    /// function type or a parenthesised type, or a union of such types.
+    /// Returns it and its height: 1 for a name, one more than its argument
+    /// for an applied type, one more than its tallest field's type for a
+    /// record type, one more than the tallest of its parameter and return
+    /// types for a function type, one more than the type inside for a
+    /// parenthesised type, and one more than the taller of its two sides
+    /// for a union.
     fn parse_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let (mut ty, mut height) = self.parse_type_member()?;
+        // A union is left-associative and built by this loop, not by
+        // recursion, so its height is checked here.
+        while self.peek().kind == TokenKind::Pipe {
+            let bar = self.peek().span;
+            self.advance();
+            self.skip_newlines();
+            let (rhs, rhs_height) = self.parse_type_member()?;
+            let span = Span::join(self.type_span(ty), self.type_span(rhs));
+            height = height.max(rhs_height).saturating_add(1);
+            if height as usize > MAX_DEPTH {
+                return Err(self.too_deep(span));
+            }
+            ty = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::Union { lhs: ty, rhs, bar },
+                span,
+            });
+        }
+        Ok((ty, height))
+    }
+
+    /// Parses a type that is not a union, unless in parentheses: a name, an
+    /// applied type, a record type, a function type or a parenthesised
+    /// type. Returns it and its height, as [`Parser::parse_type`] does.
+    fn parse_type_member(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let token = self.peek();
         match token.kind {
+            TokenKind::Ident(name) if self.peek_at(1).kind == TokenKind::Lt => {
+                // Applied types nest by recursion, so they count their
+                // depth.
+                self.enter()?;
+                let applied = self.parse_applied_type(name, token.span);
+                self.depth -= 1;
+                applied
+            }
             TokenKind::Ident(name) => {
                 self.advance();
                 let id = self.builder.alloc_type(TypeExpr {
@@ -740,8 +812,76 @@ impl Parser<'_> {
                 self.depth -= 1;
                 function
             }
+            // Parenthesised types nest by recursion too.
+            TokenKind::LParen => {
+                self.enter()?;
+                let inner = self.parse_paren_type();
+                self.depth -= 1;
+                inner
+            }
             _ => Err(self.error("expected a type", error_span(token))),
         }
+    }
+
+    /// Parses a parenthesised type, starting at its `(`: the `(`, newlines,
+    /// the type, and the `)`. Returns the type inside itself, with a height
+    /// one more than its own, since the parentheses leave no node of their
+    /// own.
+    fn parse_paren_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let open = self.peek();
+        self.advance();
+        self.skip_newlines();
+        let (inner, inner_height) = self.parse_type()?;
+        let close = self.peek();
+        if close.kind != TokenKind::RParen {
+            return Err(self.report(
+                Diagnostic::error("expected `)` to close the type", error_span(close))
+                    .with_context(open.span, "unclosed `(`"),
+            ));
+        }
+        self.advance();
+        let height = inner_height.saturating_add(1);
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(Span::join(open.span, close.span)));
+        }
+        Ok((inner, height))
+    }
+
+    /// Parses the applied type whose name, `name` at `name_span`, is the
+    /// current token and is followed by `<`: the `<`, newlines, the type
+    /// argument, and the `>`, which must follow the argument directly.
+    fn parse_applied_type(
+        &mut self,
+        name: Name,
+        name_span: Span,
+    ) -> ParseResult<(TypeExprId, u32)> {
+        self.advance();
+        let open = self.peek();
+        self.advance();
+        self.skip_newlines();
+        let (arg, arg_height) = self.parse_type()?;
+        let close = self.peek();
+        if close.kind != TokenKind::Gt {
+            return Err(self.report(
+                Diagnostic::error("expected `>` to close the type argument", error_span(close))
+                    .with_context(open.span, "unclosed `<`"),
+            ));
+        }
+        self.advance();
+        let span = Span::join(name_span, close.span);
+        let height = arg_height.saturating_add(1);
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(span));
+        }
+        let id = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Applied {
+                name,
+                span: name_span,
+                arg,
+            },
+            span,
+        });
+        Ok((id, height))
     }
 
     /// Parses a function type, starting at its `fn`: `(`, parameter types
@@ -1004,7 +1144,7 @@ impl Parser<'_> {
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
-    /// block, an `if`, a function expression or a prefix operator
+    /// block, an `if`, a function expression, a `lazy` or a prefix operator
     /// application. Postfix operators, `.` and calls included, are applied
     /// by the caller's loop.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
@@ -1019,7 +1159,9 @@ impl Parser<'_> {
             TokenKind::StrStart(first) => return self.parse_interpolation(first),
             TokenKind::If => return self.parse_if(),
             TokenKind::Fn => return self.parse_fn_expr(),
+            TokenKind::Lazy => return self.parse_lazy(),
             TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
+            TokenKind::Await => return self.parse_unary(UnaryOp::Await, PREFIX_BP),
             TokenKind::Not => return self.parse_unary(UnaryOp::Not, NOT_BP),
             TokenKind::LParen => {
                 self.advance();
@@ -1076,6 +1218,7 @@ impl Parser<'_> {
             | TokenKind::Semi
             | TokenKind::Dot
             | TokenKind::Comma
+            | TokenKind::Pipe
             | TokenKind::Newline
             | TokenKind::Eof => {
                 let found = self.describe(token);
@@ -1180,12 +1323,33 @@ impl Parser<'_> {
         let span = Span::join(keyword.span, self.span_of(body));
         let id = self.builder.push_fn(FnDecl {
             params,
-            ret,
+            ret: Some(ret),
             pure,
             marker,
             body,
         });
         self.alloc(ExprKind::Fn(id), span, height)
+    }
+
+    /// Parses `lazy EXPR`, starting at its `lazy` keyword: the operand,
+    /// parsed at minimum binding power 0, becomes the body of a function
+    /// with no parameters and no return type, impure, whose marker is the
+    /// keyword. The expression spans the keyword through the operand.
+    fn parse_lazy(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let body = self.parse_expr(0)?;
+        let height = self.height_of(body) + 1;
+        let span = Span::join(keyword.span, self.span_of(body));
+        let params = self.builder.push_params(&[]);
+        let id = self.builder.push_fn(FnDecl {
+            params,
+            ret: None,
+            pure: false,
+            marker: keyword.span,
+            body,
+        });
+        self.alloc(ExprKind::Lazy(id), span, height)
     }
 
     /// Parses the call of `callee`, starting at its `(` or, for a call with
@@ -1528,6 +1692,9 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::False
         | TokenKind::Not
         | TokenKind::Fn
+        | TokenKind::Lazy
+        | TokenKind::Await
+        | TokenKind::Pipe
         | TokenKind::Neg
         | TokenKind::Colon
         | TokenKind::ColonEq
@@ -1669,6 +1836,19 @@ mod tests {
                 out.push_str(if pure { "): " } else { ") -> " });
                 type_name(ast, ret, out);
             }
+            TypeExprKind::Applied { name, arg, .. } => {
+                out.push_str(ast.names().get(name));
+                out.push('<');
+                type_name(ast, arg, out);
+                out.push('>');
+            }
+            TypeExprKind::Union { lhs, rhs, .. } => {
+                out.push('(');
+                type_name(ast, lhs, out);
+                out.push_str(" | ");
+                type_name(ast, rhs, out);
+                out.push(')');
+            }
         }
     }
 
@@ -1721,10 +1901,15 @@ mod tests {
             ExprKind::Unary { op, operand } => {
                 out.push('(');
                 out.push_str(op.symbol());
-                if op == UnaryOp::Not {
+                if op != UnaryOp::Neg {
                     out.push(' ');
                 }
                 expr(ast, operand, out);
+                out.push(')');
+            }
+            ExprKind::Lazy(function) => {
+                out.push_str("(lazy ");
+                expr(ast, ast.fn_decl(function).body, out);
                 out.push(')');
             }
             ExprKind::Binary { op, lhs, rhs, .. } => {
@@ -1778,7 +1963,7 @@ mod tests {
             type_name(ast, param.ty, out);
         }
         out.push_str(if decl.pure { "): " } else { ") -> " });
-        type_name(ast, decl.ret, out);
+        type_name(ast, decl.ret.unwrap(), out);
         out.push(' ');
         expr(ast, decl.body, out);
     }
@@ -2302,9 +2487,11 @@ mod tests {
             error("1 :"),
             ("expected a type".to_owned(), Span::new(3, 3))
         );
+        // A type may be parenthesised, and what is inside must be a type.
+        assert_eq!(shape("1 : (Int)"), "(1 : Int)");
         assert_eq!(
-            error("1 : (Int)"),
-            ("expected a type".to_owned(), Span::new(4, 5))
+            error("1 : (2)"),
+            ("expected a type".to_owned(), Span::new(5, 6))
         );
     }
 
@@ -3337,7 +3524,7 @@ mod tests {
         let decl = ast.fn_decl(function);
         assert!(!decl.pure);
         assert_eq!(decl.marker, Span::new(25, 27));
-        assert_eq!(ast.type_expr(decl.ret).span, Span::new(28, 31));
+        assert_eq!(ast.type_expr(decl.ret.unwrap()).span, Span::new(28, 31));
         assert_eq!(ast.get(decl.body).span, Span::new(32, 37));
         let spans: Vec<Span> = ast.params(decl.params).iter().map(|p| p.span).collect();
         assert_eq!(spans, vec![Span::new(3, 9), Span::new(11, 23)]);
@@ -3810,6 +3997,385 @@ mod tests {
         on_big_stack(move || parse_text(&deepest).unwrap());
         assert_eq!(
             too_deep(trailing(200_000)).message,
+            "expression nested too deeply"
+        );
+    }
+
+    // ----- Futures -----
+
+    #[test]
+    fn lazy_takes_the_longest_expression() {
+        assert_eq!(shape("lazy a + b"), "(lazy (a + b))");
+        assert_eq!(shape("lazy a and b"), "(lazy (a and b))");
+        assert_eq!(
+            shape("lazy a + b * c : Int"),
+            "(lazy (a + (b * (c : Int))))"
+        );
+        assert_eq!(shape("lazy { x = 1 }"), "(lazy {x = 1})");
+        assert_eq!(shape("lazy { run(compiler) }"), "(lazy {run(compiler)})");
+        assert_eq!(shape("lazy f(x) { y = 1 }"), "(lazy f(x){y = 1})");
+        assert_eq!(
+            shape("lazy if a { 1 } else { 2 }"),
+            "(lazy (if a {1} else {2}))"
+        );
+        assert_eq!(shape("lazy lazy 1"), "(lazy (lazy 1))");
+        // As an operand, it still takes everything after it.
+        assert_eq!(shape("1 + lazy 2 * 3"), "(1 + (lazy (2 * 3)))");
+        assert_eq!(shape("let x = lazy 5 + 5"), "let x = (lazy (5 + 5))");
+        assert_eq!(
+            shape("build = lazy { run(compiler) }"),
+            "build = (lazy {run(compiler)})"
+        );
+        // A block after a condition is still the `if`'s.
+        assert_eq!(shape("if lazy a { 1 }"), "(if (lazy a) {1})");
+        // The body is a parameterless, impure function without a return
+        // type, whose marker is the keyword; the expression spans the
+        // keyword through the operand.
+        let ast = parse_text("  lazy a + b").unwrap();
+        let expr = ast.get(only_value(&ast));
+        assert_eq!(expr.span, Span::new(2, 12));
+        let ExprKind::Lazy(function) = expr.kind else {
+            panic!("expected a lazy, got {expr:?}");
+        };
+        let decl = ast.fn_decl(function);
+        assert!(decl.params.is_empty());
+        assert_eq!(decl.ret, None);
+        assert!(!decl.pure);
+        assert_eq!(decl.marker, Span::new(2, 6));
+        assert_eq!(ast.get(decl.body).span, Span::new(7, 12));
+        assert!(matches!(ast.get(decl.body).kind, ExprKind::Binary { .. }));
+        assert_eq!(expr.operator_span(), None);
+        // Lazies and functions share one table.
+        let ast = parse_text("let f = fn(): Future<Int> { lazy 1 }\nlazy f").unwrap();
+        assert_eq!(ast.fn_count(), 3);
+        assert_eq!(
+            error("lazy"),
+            (
+                "expected expression, found end of input".to_owned(),
+                Span::new(4, 4)
+            )
+        );
+    }
+
+    #[test]
+    fn await_binds_as_tightly_as_negation() {
+        assert_eq!(shape("await x + 1"), "((await x) + 1)");
+        assert_eq!(shape("await f()"), "(await f())");
+        assert_eq!(shape("await x.y"), "(await (x . y))");
+        assert_eq!(shape("-await x"), "(-(await x))");
+        assert_eq!(shape("not await x"), "(not (await x))");
+        assert_eq!(shape("await -x"), "(await (-x))");
+        assert_eq!(shape("await x : Int"), "((await x) : Int)");
+        assert_eq!(shape("await await x"), "(await (await x))");
+        assert_eq!(shape("await x * await y"), "((await x) * (await y))");
+        // A bare `await` item.
+        assert_eq!(shape("await conf.build"), "(await (conf . build))");
+        let ast = parse_text("await conf.build").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let expr = ast.get(root);
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Await,
+                ..
+            }
+        ));
+        assert_eq!(expr.span, Span::new(0, 16));
+        assert_eq!(expr.operator_span(), Some(Span::new(0, 5)));
+        assert_eq!(
+            error("await"),
+            (
+                "expected expression, found end of input".to_owned(),
+                Span::new(5, 5)
+            )
+        );
+    }
+
+    #[test]
+    fn applied_and_union_types() {
+        assert_eq!(shape("let x: Future<Int> = y"), "let x: Future<Int> = y");
+        assert_eq!(
+            shape("let x: Future<Future<Int>> = y"),
+            "let x: Future<Future<Int>> = y"
+        );
+        assert_eq!(
+            shape("let x: Future<{a: Int}> = y"),
+            "let x: Future<{a: Int}> = y"
+        );
+        assert_eq!(shape("let x: Present<Int> = y"), "let x: Present<Int> = y");
+        assert_eq!(
+            shape("let x: Int | Future<Int> = y"),
+            "let x: (Int | Future<Int>) = y"
+        );
+        // In parameters, return types, record fields and function types.
+        assert_eq!(
+            shape("fn(x: Future<Int>, y: Int | Future<Int>): Int | Future<Int> { x }"),
+            "fn(x: Future<Int>, y: (Int | Future<Int>)): (Int | Future<Int>) {x}"
+        );
+        assert_eq!(
+            shape("fn plan(): {build: Future<{}>} { build = lazy { run(compiler) } }"),
+            "let plan = fn(): {build: Future<{}>} {build = (lazy {run(compiler)})}"
+        );
+        assert_eq!(
+            shape("1 : {a: Int | Future<Int>, b: Present<{c: Int}>}"),
+            "(1 : {a: (Int | Future<Int>), b: Present<{c: Int}>})"
+        );
+        assert_eq!(
+            shape("let f: fn(Int | Future<Int>) -> Future<fn(): Int> = g"),
+            "let f: fn((Int | Future<Int>)) -> Future<fn(): Int> = g"
+        );
+        // A function type's return type takes the union.
+        assert_eq!(
+            shape("let f: fn() -> Int | Future<Int> = g"),
+            "let f: fn() -> (Int | Future<Int>) = g"
+        );
+        // Newlines after `<` and `|`, but not before `>`.
+        assert_eq!(
+            shape("let x: Future<\n  Int> = y"),
+            "let x: Future<Int> = y"
+        );
+        assert_eq!(
+            shape("let x: Int |\n  Future<Int> = y"),
+            "let x: (Int | Future<Int>) = y"
+        );
+        // Unions of three are left-associative; the checker rejects them.
+        assert_eq!(
+            shape("let x: Int | Int | Future<Int> = y"),
+            "let x: ((Int | Int) | Future<Int>) = y"
+        );
+        // Any name may be applied; `Future` alone is a name.
+        assert_eq!(shape("let x: Foo<Int> = y"), "let x: Foo<Int> = y");
+        assert_eq!(shape("let x: Future = y"), "let x: Future = y");
+        // `Future` and `Present` are ordinary names in expressions.
+        assert_eq!(shape("Future < Present"), "(Future < Present)");
+        // Spans: the name, the whole, and the bar.
+        let ast = parse_text("1 : Int | Future<Int>").unwrap();
+        let ExprKind::Ascribe { ty, .. } = ast.get(only_value(&ast)).kind else {
+            panic!("expected an ascription");
+        };
+        let union = ast.type_expr(ty);
+        assert_eq!(union.span, Span::new(4, 21));
+        let TypeExprKind::Union { lhs, rhs, bar } = union.kind else {
+            panic!("expected a union, got {union:?}");
+        };
+        assert_eq!(bar, Span::new(8, 9));
+        assert_eq!(ast.type_expr(lhs).span, Span::new(4, 7));
+        let applied = ast.type_expr(rhs);
+        assert_eq!(applied.span, Span::new(10, 21));
+        let TypeExprKind::Applied { name, span, arg } = applied.kind else {
+            panic!("expected an applied type, got {applied:?}");
+        };
+        assert_eq!(ast.names().get(name), "Future");
+        assert_eq!(span, Span::new(10, 16));
+        assert_eq!(ast.type_expr(arg).span, Span::new(17, 20));
+    }
+
+    #[test]
+    fn parenthesised_types() {
+        // A function type in parentheses is a member of the union, not a
+        // function returning it.
+        let text = "let f: (fn(): Int) | Future<fn(): Int> = g";
+        assert_eq!(shape(text), "let f: (fn(): Int | Future<fn(): Int>) = g");
+        let ast = parse_text(text).unwrap();
+        let ItemKind::Let { ty: Some(ty), .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an annotated let");
+        };
+        let TypeExprKind::Union { lhs, rhs, .. } = ast.type_expr(ty).kind else {
+            panic!("expected a union");
+        };
+        assert!(matches!(
+            ast.type_expr(lhs).kind,
+            TypeExprKind::Fn { pure: true, .. }
+        ));
+        assert!(matches!(
+            ast.type_expr(rhs).kind,
+            TypeExprKind::Applied { .. }
+        ));
+        // The parentheses leave no node: the type inside stands for itself,
+        // with its own span.
+        assert_eq!(ast.type_expr(lhs).span, Span::new(8, 17));
+        // The pretty printer shows the parentheses a function type in a
+        // union needs.
+        assert!(
+            ast.pretty()
+                .to_string()
+                .contains("(let f : (fn(): Int) | Future<fn(): Int> @")
+        );
+        // A union in parentheses as a function type's return type is what
+        // the return type takes without them.
+        assert_eq!(
+            shape("let f: fn() -> (Int | Future<Int>) = g"),
+            "let f: fn() -> (Int | Future<Int>) = g"
+        );
+        assert_eq!(
+            shape("let f: fn() -> (Int | Future<Int>) = g"),
+            shape("let f: fn() -> Int | Future<Int> = g")
+        );
+        // Anywhere a type is, nested, and with newlines after `(`.
+        assert_eq!(shape("let x: ((Int)) = y"), "let x: Int = y");
+        assert_eq!(
+            shape("1 : {a: (fn() -> Int) | Future<fn() -> Int>}"),
+            "(1 : {a: (fn() -> Int | Future<fn() -> Int>)})"
+        );
+        assert_eq!(shape("let x: Future<(Int)> = y"), "let x: Future<Int> = y");
+        assert_eq!(
+            shape("let x: (\n  Int |\n  Future<Int>\n) = y"),
+            "let x: (Int | Future<Int>) = y"
+        );
+    }
+
+    #[test]
+    fn parenthesised_type_errors() {
+        let diagnostic = parse_text("let x: (Int = 1").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `)` to close the type");
+        assert_eq!(diagnostic.span, Span::new(12, 13));
+        assert_eq!(labels(&diagnostic), vec![(Span::new(7, 8), "unclosed `(`")]);
+        assert_eq!(
+            error("let x: () = 1"),
+            ("expected a type".to_owned(), Span::new(8, 9))
+        );
+        assert_eq!(
+            error("let x: (Int | ) = 1"),
+            ("expected a type".to_owned(), Span::new(14, 15))
+        );
+    }
+
+    #[test]
+    fn applied_type_errors() {
+        let diagnostic = parse_text("let x: Future<Int = 1").unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "expected `>` to close the type argument"
+        );
+        assert_eq!(diagnostic.span, Span::new(18, 19));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![(Span::new(13, 14), "unclosed `<`")]
+        );
+        // `>` must follow the argument directly.
+        assert_eq!(
+            error("let x: Future<Int\n> = 1"),
+            (
+                "expected `>` to close the type argument".to_owned(),
+                Span::new(17, 18)
+            )
+        );
+        assert_eq!(
+            error("let x: Future<> = 1"),
+            ("expected a type".to_owned(), Span::new(14, 15))
+        );
+        assert_eq!(
+            error("let x: Int | = 1"),
+            ("expected a type".to_owned(), Span::new(13, 14))
+        );
+        // `|` is not an expression operator.
+        assert_eq!(
+            error("1 + | 2"),
+            ("expected expression, found `|`".to_owned(), Span::new(4, 5))
+        );
+        assert_eq!(
+            error("| 2"),
+            ("expected expression, found `|`".to_owned(), Span::new(0, 1))
+        );
+        assert_eq!(
+            error("a | b"),
+            (
+                "expected end of item, found `|`".to_owned(),
+                Span::new(2, 3)
+            )
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_futures() {
+        let ast = parse_text(
+            "let x: Int | Future<Int> = lazy 1 + 2\nawait x\nlet p: Present<Future<Int>> = x",
+        )
+        .unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let x : Int | Future<Int> @0..37\n\
+             \x20   (lazy @27..37\n\
+             \x20     (+ @32..37\n\
+             \x20       (int 1 @32..33)\n\
+             \x20       (int 2 @36..37))))\n\
+             \x20 (expr @38..45\n\
+             \x20   (await @38..45\n\
+             \x20     (name x @44..45)))\n\
+             \x20 (let p : Present<Future<Int>> @46..77\n\
+             \x20   (name x @76..77)))"
+        );
+    }
+
+    #[test]
+    fn nested_futures_and_future_types_count_towards_depth() {
+        // N nested lazies around a literal are N + 1 levels, and so are N
+        // nested awaits.
+        for keyword in ["lazy ", "await "] {
+            let nested = |depth: usize| format!("{}1", keyword.repeat(depth));
+            let deepest = nested(MAX_DEPTH - 1);
+            on_big_stack(move || parse_text(&deepest).unwrap());
+            assert_eq!(
+                too_deep(nested(MAX_DEPTH)).message,
+                "expression nested too deeply",
+                "{keyword}"
+            );
+            assert_eq!(
+                too_deep(nested(10_000)).message,
+                "expression nested too deeply"
+            );
+            // Far beyond the limit, stopped by the recursion count.
+            assert_eq!(
+                too_deep(nested(200_000)).message,
+                "expression nested too deeply"
+            );
+        }
+        // N nested applied types around a name are N + 1 levels, in an
+        // annotation, whose height is its item's.
+        let applied = |depth: usize| {
+            format!(
+                "let x: {}Int{} = y",
+                "Future<".repeat(depth),
+                ">".repeat(depth)
+            )
+        };
+        let deepest = applied(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(applied(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(applied(200_000)).message,
+            "expression nested too deeply"
+        );
+        // So are N nested parentheses around a type, though they leave no
+        // node of their own.
+        let parenthesised =
+            |depth: usize| format!("let x: {}Int{} = y", "(".repeat(depth), ")".repeat(depth));
+        let deepest = parenthesised(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(parenthesised(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(parenthesised(200_000)).message,
+            "expression nested too deeply"
+        );
+        // A union of N types is N levels, built without recursion.
+        let union = |members: usize| format!("let x: Int{} = y", " | Int".repeat(members - 1));
+        let deepest = union(MAX_DEPTH);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(union(MAX_DEPTH + 1)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(union(200_000)).message,
             "expression nested too deeply"
         );
     }

@@ -67,21 +67,41 @@
 //! literal piece has no span of its own in the AST, so its node has its
 //! whole interpolated string's span.
 //!
+//! A `lazy` lowers like a function expression: its body, any expression,
+//! into the function table, as code of [`FnKind::Future`], and the
+//! expression to a `MakeFuture` that captures as a `MakeClosure` does.
+//!
+//! An expression the checker marked to be awaited (see
+//! [`crate::check::Resolution::await_of`]) is lowered as it would be
+//! otherwise, of the kind of its type before the await, which is
+//! [`ValueKind::Deferred`] for a future or an either, and wrapped in an
+//! `Await` whose kind is that of its type once awaited: its type stripped of
+//! every future layer at its top, whose kind is the same as its type's once
+//! awaited deeply. A deep await carries a [`LazyShape`] of that type, listing
+//! the record fields to await, made once per type, as record shapes are,
+//! and built from the leaves up through a work list. An explicit `await e`
+//! is that `Await` itself, spanning the `await` expression, rather than an
+//! `Await` of `e`; one of a present value is just its operand. Everywhere a
+//! node of kind `Deferred` is expected, as a branch of an `if` or the result
+//! of a block of such a type, a node of any kind is accepted, since a
+//! present value may be where a future may.
+//!
 //! Once every node is built, one post-pass computes what the evaluator's
-//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s depth in
-//! the body of its frame, the body node being at depth 0, and each
-//! function's body height, the number of nodes on its longest path to a
-//! leaf. It walks the root and then each function's body, depth first and
-//! iteratively, with an explicit stack, since a body can be `MAX_DEPTH`
-//! deep: a call gets its depth on the way down, and every node its height,
-//! in one vector indexed by node, on the way up. A `MakeClosure`'s captures
-//! are its children, loads in the creating frame; the function it makes is
-//! not, since that body is another frame, walked on its own. The nodes of
-//! a frame form a tree, except the record nodes an update chain shares
-//! between the update that builds on a record and the access into it: such
-//! a node's depth is counted from the first path the walk reaches it by.
-//! That does not matter, because the shared nodes are loads, captures,
-//! the callee, field accesses and `Empty`, never calls.
+//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s and each
+//! `Await`'s depth in the body of its frame, the body node being at depth 0,
+//! and each function's body height, the number of nodes on its longest path
+//! to a leaf. It walks the root and then each function's body, depth first
+//! and iteratively, with an explicit stack, since a body can be `MAX_DEPTH`
+//! deep: a call or an await gets its depth on the way down, and every node
+//! its height, in one vector indexed by node, on the way up. A
+//! `MakeClosure`'s or a `MakeFuture`'s captures are its children, loads in
+//! the creating frame; the function it makes is not, since that body is
+//! another frame, walked on its own. The nodes of a frame form a tree,
+//! except the record nodes an update chain shares between the update that
+//! builds on a record and the access into it: such a node's depth is
+//! counted from the first path the walk reaches it by. That does not
+//! matter, because the shared nodes are loads, captures, the callee, field
+//! accesses and `Empty`, never calls or awaits.
 //!
 //! Lowering cannot fail on tables produced by [`crate::check::check`]. Any
 //! combination the checker should have ruled out is reported as an
@@ -93,15 +113,15 @@ use crate::ast::{
     ArgRange, Ast, BinaryOp, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange, PartRange,
     PathRange, PathSegment, StrPart, UnaryOp, path_span,
 };
-use crate::check::{Checked, Resolution, Slot, Types, VarRef};
+use crate::check::{AwaitMark, Checked, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
 use crate::ir::{
-    Cmp, FnCode, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, Operands, Shape, ShapeId,
-    ShapedOperands,
+    Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField, LazyShape,
+    LazyShapeId, Operands, Shape, ShapeId, ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{TyId, TypeTable};
+use crate::types::{Laziness, TyId, TypeTable};
 use crate::value::{Layout, ValueKind, int_to_float};
 
 /// Lowers `ast`, whose types and resolution are `checked`, with its types
@@ -153,6 +173,8 @@ pub fn lower(
         layout_names: Vec::new(),
         shapes: HashMap::new(),
         shape_pending: Vec::new(),
+        lazy_shapes: HashMap::new(),
+        lazy_pending: Vec::new(),
         functions: vec![None; ast.fn_count()],
     };
     let root = ast.root();
@@ -197,15 +219,45 @@ struct Lowerer<'a> {
     /// Reused as the work list of record types whose shapes have ids but no
     /// fields yet.
     shape_pending: Vec<TyId>,
+    /// The lazy shape already made for each record type, or
+    /// [`LazyShapeId::NONE`] if it has no lazy fields at any depth.
+    lazy_shapes: HashMap<TyId, LazyShapeId>,
+    /// Reused as the work list of record types whose lazy shapes are being
+    /// made, each with whether its fields' types have been queued.
+    lazy_pending: Vec<(TyId, bool)>,
     /// Each function lowered so far, indexed by [`FnId`].
     functions: Vec<Option<FnCode>>,
 }
 
 impl Lowerer<'_> {
-    /// The kind of the value of expression `id`.
+    /// The type of expression `id` where it is used: its type once awaited
+    /// at the top, if it is awaited, and its type otherwise.
+    fn used_type(&self, id: ExprId) -> TyId {
+        let ty = self.expr_types.get(id);
+        match self.resolution.await_of(id) {
+            AwaitMark::None => ty,
+            AwaitMark::Top | AwaitMark::Deep => self.table.strip(ty),
+        }
+    }
+
+    /// The kind of the value of expression `id` where it is used: once
+    /// awaited, if it is awaited. A deep await changes a record's fields,
+    /// not its kind, so the type stripped at the top gives it.
     fn kind(&self, id: ExprId) -> Result<ValueKind, InternalError> {
+        self.kind_of_type(id, self.used_type(id))
+    }
+
+    /// The kind of the value of expression `id` before any await: what the
+    /// node it lowers to yields.
+    fn plain_kind(&self, id: ExprId) -> Result<ValueKind, InternalError> {
+        self.kind_of_type(id, self.expr_types.get(id))
+    }
+
+    /// The kind of the values of `ty`, the type of expression `id`, or an
+    /// internal error if it has none.
+    fn kind_of_type(&self, id: ExprId, ty: TyId) -> Result<ValueKind, InternalError> {
         let span = self.ast.get(id).span;
-        match self.expr_types.get(id) {
+        match ty {
             TyId::UNTYPED_INT => Err(InternalError {
                 message: "an untyped integer survived type checking",
                 span,
@@ -237,6 +289,17 @@ impl Lowerer<'_> {
             Some(ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. })
             | None => Ok(ValueKind::Record),
         }
+    }
+
+    /// Whether `value` is directly an `await` expression.
+    fn is_await(&self, value: ExprId) -> bool {
+        matches!(
+            self.ast.get(value).kind,
+            ExprKind::Unary {
+                op: UnaryOp::Await,
+                ..
+            }
+        )
     }
 
     /// Whether `body` has a field item, which makes it a record block.
@@ -289,8 +352,14 @@ impl Lowerer<'_> {
                     });
                 }
                 ItemKind::Expr(value) => {
-                    // Evaluated for effect only, so it must be `{}`.
-                    let statement = self.lower_operand(value, ValueKind::Record)?;
+                    // Evaluated for effect only, so it must be `{}`, unless
+                    // it is a bare `await`, whose value is discarded
+                    // whatever it is.
+                    let statement = if self.is_await(value) {
+                        self.lower_expr(value)?
+                    } else {
+                        self.lower_operand(value, ValueKind::Record)?
+                    };
                     self.item_stack.push(statement);
                 }
             }
@@ -446,13 +515,68 @@ impl Lowerer<'_> {
         id
     }
 
+    /// Lowers expression `id`, wrapped in an `Await` if the checker marked
+    /// it to be awaited where it is used.
     fn lower_expr(&mut self, id: ExprId) -> Result<IrId, InternalError> {
+        match self.resolution.await_of(id) {
+            AwaitMark::None => {
+                let kind = self.kind(id)?;
+                self.lower_plain(id, kind)
+            }
+            mark => self.lower_awaited(id, mark, self.ast.get(id).span),
+        }
+    }
+
+    /// Lowers expression `id`, which the checker marked to be awaited as
+    /// `mark` says, to an `Await` spanning `span` of the node it lowers to
+    /// otherwise: at the top, or deeply through the lazy shape of its type.
+    fn lower_awaited(
+        &mut self,
+        id: ExprId,
+        mark: AwaitMark,
+        span: Span,
+    ) -> Result<IrId, InternalError> {
+        let plain = self.plain_kind(id)?;
+        let value = self.lower_plain(id, plain)?;
+        let kind = self.kind(id)?;
+        let shape = match mark {
+            AwaitMark::Deep => self.lazy_shape(self.used_type(id)),
+            AwaitMark::Top | AwaitMark::None => LazyShapeId::NONE,
+        };
+        Ok(self.builder.alloc(
+            IrKind::Await {
+                value,
+                kind,
+                shape,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
+            },
+            span,
+        ))
+    }
+
+    /// Lowers expression `id`, of kind `kind`, as it is, without any await
+    /// the checker marked it for.
+    fn lower_plain(&mut self, id: ExprId, kind: ValueKind) -> Result<IrId, InternalError> {
         let expr = *self.ast.get(id);
         let span = expr.span;
-        let kind = self.kind(id)?;
         let lowered = match (expr.kind, kind) {
             (ExprKind::Paren(inner) | ExprKind::Ascribe { expr: inner, .. }, _) => {
                 return self.lower_operand(inner, kind);
+            }
+            (
+                ExprKind::Unary {
+                    op: UnaryOp::Await,
+                    operand,
+                },
+                _,
+            ) => {
+                // An await of a present value does nothing; any other is
+                // the operand's own await, spanning the whole expression.
+                return match self.resolution.await_of(operand) {
+                    AwaitMark::None => self.lower_operand(operand, kind),
+                    mark => self.lower_awaited(operand, mark, span),
+                };
             }
             (ExprKind::Int(value), ValueKind::Int) => IrKind::IntConst(value),
             (ExprKind::Int(value), ValueKind::Float) => IrKind::FloatConst(int_to_float(value)),
@@ -484,9 +608,10 @@ impl Lowerer<'_> {
                 },
                 _,
             ) => self.lower_binary(op, op_start, (lhs, rhs), kind, id)?,
-            (ExprKind::Name(_) | ExprKind::Fn(_) | ExprKind::Call { .. }, _) => {
-                self.lower_use_or_function(id, kind)?
-            }
+            (
+                ExprKind::Name(_) | ExprKind::Fn(_) | ExprKind::Call { .. } | ExprKind::Lazy(_),
+                _,
+            ) => self.lower_use_or_function(id, kind)?,
             (ExprKind::Block(body), _) => self.lower_body(body, span, kind)?,
             (ExprKind::Field { expr: record, name }, _) => IrKind::Field {
                 record: self.lower_operand(record, ValueKind::Record)?,
@@ -501,7 +626,11 @@ impl Lowerer<'_> {
             }
             (
                 ExprKind::Int(_) | ExprKind::Float(_),
-                ValueKind::Bool | ValueKind::String | ValueKind::Record | ValueKind::Fn,
+                ValueKind::Bool
+                | ValueKind::String
+                | ValueKind::Record
+                | ValueKind::Fn
+                | ValueKind::Deferred,
             ) => {
                 return Err(InternalError {
                     message: "numeric literal typed as a non-numeric type",
@@ -519,9 +648,9 @@ impl Lowerer<'_> {
     }
 
     /// Lowers `id`, of kind `kind`, which is a variable use, a function
-    /// expression or a call. Apart from `lower_expr`, which is on the
-    /// recursion path of every expression, so that its frame does not hold
-    /// the temporaries of these cases.
+    /// expression, a call or a `lazy`. Apart from `lower_plain`, which is on
+    /// the recursion path of every expression, so that its frame does not
+    /// hold the temporaries of these cases.
     fn lower_use_or_function(
         &mut self,
         id: ExprId,
@@ -536,6 +665,11 @@ impl Lowerer<'_> {
                 })
             }
             (ExprKind::Fn(function), ValueKind::Fn) => self.lower_fn(id, function),
+            (ExprKind::Lazy(function), ValueKind::Deferred) => self.lower_lazy(id, function),
+            (ExprKind::Lazy(_), _) => Err(InternalError {
+                message: "a `lazy` typed as something other than a future",
+                span: expr.span,
+            }),
             (ExprKind::Call { callee, args }, _) => Ok(IrKind::Call {
                 callee: self.lower_operand(callee, ValueKind::Fn)?,
                 args: self.lower_args(args, expr.span)?,
@@ -559,10 +693,45 @@ impl Lowerer<'_> {
     /// `MakeClosure` that captures, in the current frame, what the checker
     /// found the function captures.
     fn lower_fn(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
-        let (ast, resolution) = (self.ast, self.resolution);
-        let span = ast.get(id).span;
-        let resolution = resolution.function(function);
-        let body = self.lower_expr(ast.fn_decl(function).body)?;
+        let captures = self.lower_function(id, function, FnKind::Function)?;
+        Ok(IrKind::MakeClosure { function, captures })
+    }
+
+    /// Lowers the `lazy` `id`, whose body is function `function`: the body
+    /// into the function table, and the expression to the `MakeFuture` that
+    /// captures, in the current frame, what the checker found it captures.
+    fn lower_lazy(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
+        let captures = self.lower_function(id, function, FnKind::Future)?;
+        Ok(IrKind::MakeFuture { function, captures })
+    }
+
+    /// Lowers the body of function `function`, of kind `kind`, the function
+    /// expression or `lazy` `id`, into the function table, and returns the
+    /// list of the loads, in the current frame, of what it captures. On the
+    /// recursion path of nested functions and lazies, so the work after the
+    /// body is in a helper whose temporaries this frame does not hold.
+    fn lower_function(
+        &mut self,
+        id: ExprId,
+        function: FnId,
+        kind: FnKind,
+    ) -> Result<IrRange, InternalError> {
+        let body = self.lower_expr(self.ast.fn_decl(function).body)?;
+        self.enter_function(id, function, (kind, body))
+    }
+
+    /// Enters function `function`, of kind `kind`, the function expression
+    /// or `lazy` `id`, whose body lowered to `body`, into the function
+    /// table, and returns the list of the loads, in the current frame, of
+    /// what it captures.
+    fn enter_function(
+        &mut self,
+        id: ExprId,
+        function: FnId,
+        (kind, body): (FnKind, IrId),
+    ) -> Result<IrRange, InternalError> {
+        let span = self.ast.get(id).span;
+        let resolution = self.resolution.function(function);
         let display = self
             .table
             .display(self.expr_types.get(id), self.ast.names())
@@ -570,6 +739,7 @@ impl Lowerer<'_> {
             .into_boxed_str();
         let code = FnCode {
             body,
+            kind,
             frame_size: resolution.frame_size,
             param_count: resolution.param_count,
             capture_count: u32::try_from(resolution.captures.len()).unwrap_or(u32::MAX),
@@ -601,7 +771,7 @@ impl Lowerer<'_> {
         }
         let captures = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
-        Ok(IrKind::MakeClosure { function, captures })
+        Ok(captures)
     }
 
     /// Lowers the arguments `args` of the call spanning `span` to `Arg`
@@ -742,10 +912,11 @@ impl Lowerer<'_> {
             });
         }
         let operand_kind = self.kind(lhs)?;
-        // Typed equality on records compares over the operands' type.
+        // Typed equality on records compares over the operands' type, once
+        // awaited.
         let shape = match (operand_kind, op) {
             (ValueKind::Record, BinaryOp::Eq | BinaryOp::Ne) => {
-                Some(self.shape(self.expr_types.get(lhs), span)?)
+                Some(self.shape(self.used_type(lhs), span)?)
             }
             _ => None,
         };
@@ -768,7 +939,7 @@ impl Lowerer<'_> {
             }
             (ValueKind::Record, BinaryOp::Same, _) => IrKind::RecordSame(operands),
             (ValueKind::Record, BinaryOp::NotSame, _) => IrKind::RecordNotSame(operands),
-            (ValueKind::Bool | ValueKind::Record | ValueKind::Fn, ..) => {
+            (ValueKind::Bool | ValueKind::Record | ValueKind::Fn | ValueKind::Deferred, ..) => {
                 return Err(InternalError {
                     message: "comparison of a type it cannot compare",
                     span,
@@ -780,7 +951,10 @@ impl Lowerer<'_> {
     /// The shape of the record type `ty`, made, with the shapes of the
     /// record types nested in it, if this is the first comparison of it.
     /// Each shape is given its id when it is first met and its fields when
-    /// it is taken off the work list, so that nesting does not recurse.
+    /// it is taken off the work list, so that nesting does not recurse. A
+    /// field that may be a future is compared as its value once awaited,
+    /// which the deep await of the operands has done, so the shape follows
+    /// its type stripped.
     fn shape(&mut self, ty: TyId, span: Span) -> Result<ShapeId, InternalError> {
         if let Some(&id) = self.shapes.get(&ty) {
             return Ok(id);
@@ -797,6 +971,7 @@ impl Lowerer<'_> {
             };
             let mut shaped = Vec::with_capacity(fields.len());
             for &(name, field_ty) in fields {
+                let field_ty = table.strip(field_ty);
                 let nested = if table.is_record(field_ty) {
                     Some(match self.shapes.get(&field_ty) {
                         Some(&nested) => nested,
@@ -831,9 +1006,70 @@ impl Lowerer<'_> {
         id
     }
 
-    /// Lowers an operand that must already be of kind `expected`.
+    /// The lazy shape of `ty`, a type present at its top: for a record type,
+    /// each field whose type is a future or an either, with the lazy shape
+    /// of its type stripped, and each present record field with lazy fields
+    /// somewhere inside, with its own; [`LazyShapeId::NONE`] if it has no
+    /// such field, or is not a record type. Made once per type, and the
+    /// shapes of the record types inside it first, through a work list
+    /// rather than recursion, since record types can nest as deeply as a
+    /// program is long.
+    fn lazy_shape(&mut self, ty: TyId) -> LazyShapeId {
+        let table = self.table;
+        if let Some(&id) = self.lazy_shapes.get(&ty) {
+            return id;
+        }
+        self.lazy_pending.push((ty, false));
+        while let Some((record, queued)) = self.lazy_pending.pop() {
+            if self.lazy_shapes.contains_key(&record) {
+                continue;
+            }
+            let fields = table.record_fields(record).unwrap_or_default();
+            if !queued {
+                // Its fields' record types first, then it again.
+                self.lazy_pending.push((record, true));
+                for &(_, field_ty) in fields {
+                    let field_ty = table.strip(field_ty);
+                    if table.is_record(field_ty) && !self.lazy_shapes.contains_key(&field_ty) {
+                        self.lazy_pending.push((field_ty, false));
+                    }
+                }
+                continue;
+            }
+            let mut lazy = Vec::new();
+            for &(name, field_ty) in fields {
+                let inner = self
+                    .lazy_shapes
+                    .get(&table.strip(field_ty))
+                    .copied()
+                    .unwrap_or(LazyShapeId::NONE);
+                if table.laziness(field_ty) != Laziness::Present {
+                    lazy.push((name, LazyField::Await(inner)));
+                } else if inner != LazyShapeId::NONE {
+                    lazy.push((name, LazyField::Within(inner)));
+                }
+            }
+            let id = if lazy.is_empty() {
+                LazyShapeId::NONE
+            } else {
+                self.builder.push_lazy_shape(LazyShape {
+                    fields: lazy.into_boxed_slice(),
+                })
+            };
+            self.lazy_shapes.insert(record, id);
+        }
+        self.lazy_shapes
+            .get(&ty)
+            .copied()
+            .unwrap_or(LazyShapeId::NONE)
+    }
+
+    /// Lowers an operand that must already be of kind `expected`, where it
+    /// is used. Where a value of kind `Deferred` is expected, a value of
+    /// any kind is accepted, since a present value may be where a future
+    /// may.
     fn lower_operand(&mut self, id: ExprId, expected: ValueKind) -> Result<IrId, InternalError> {
-        if self.kind(id)? == expected {
+        if expected == ValueKind::Deferred || self.kind(id)? == expected {
             self.lower_expr(id)
         } else {
             Err(InternalError {
@@ -846,7 +1082,7 @@ impl Lowerer<'_> {
     /// Lowers an operand of `/`, converting a concrete `Int` to `Float`.
     fn lower_as_float(&mut self, id: ExprId) -> Result<IrId, InternalError> {
         let span = self.ast.get(id).span;
-        match self.expr_types.get(id) {
+        match self.used_type(id) {
             TyId::FLOAT => self.lower_expr(id),
             TyId::INT => {
                 let operand = self.lower_expr(id)?;
@@ -1731,7 +1967,12 @@ mod tests {
         assert_eq!(ir.input(), 7);
         assert_eq!(ir.function_count(), 2);
         let scale = ir.function(FnId::new(0));
-        assert_eq!(&*scale.display, "fn(x: Int, by: {f: Float}) -> Float");
+        assert_eq!(
+            &*scale.display,
+            "fn(x: Int | Future<Int>, by: {f: Float | Future<Float>} | Future<{f: Float | \
+             Future<Float>}>) -> Float | Future<Float>"
+        );
+        assert_eq!(scale.kind, FnKind::Function);
         assert_eq!(scale.frame_size, 3);
         assert_eq!(scale.param_count, 2);
         assert_eq!(scale.capture_count, 1);
@@ -1861,5 +2102,299 @@ mod tests {
         };
         let error = lower(&ast, &unresolved, &types, 0).unwrap_err();
         assert_eq!(error.message, "resolution does not belong to this AST");
+    }
+
+    // ----- Futures -----
+
+    #[test]
+    fn a_lazy_makes_a_future_capturing_in_the_creating_frame() {
+        let text = "let x = 1\nlet f = lazy x + 1";
+        assert_eq!(
+            dump(text),
+            "(block @0..28\n\
+             \x20 (store x#0 @0..9\n\
+             \x20   (int 1 @8..9))\n\
+             \x20 (store f#1 @10..28\n\
+             \x20   (make-future #0 @18..28\n\
+             \x20     (load x#0 @18..28)))\n\
+             \x20 (empty @0..28))\n\
+             future #0 (frame 0, params 0, captures 1, height 2)\n\
+             \x20 (int-add @23..28\n\
+             \x20   (load-capture 0 @23..24)\n\
+             \x20   (int 1 @27..28))"
+        );
+        let ir = lower_text(text);
+        let code = ir.function(FnId::new(0));
+        assert_eq!(code.kind, FnKind::Future);
+        assert_eq!(&*code.display, "Future<Int>");
+        assert_eq!(
+            (code.param_count, code.capture_count, code.name),
+            (0, 1, None)
+        );
+        // A future's body is any node, of the kind of what it yields.
+        assert_eq!(ir.kind_of(code.body), ValueKind::Int);
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        let IrKind::Store(_, future) = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected a store");
+        };
+        assert_eq!(ir.kind_of(future), ValueKind::Deferred);
+        // A future made in a function body is made in that frame.
+        let ir = lower_text("fn f(n: Int): Future<Int> { lazy n * 2 }");
+        assert_eq!(ir.function(FnId::new(0)).kind, FnKind::Future);
+        assert_eq!(ir.function(FnId::new(1)).kind, FnKind::Function);
+        let IrKind::Block { result, .. } = ir.get(ir.function(FnId::new(1)).body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::MakeFuture { function, captures } = ir.get(result).kind else {
+            panic!("expected a future");
+        };
+        assert_eq!(function, FnId::new(0));
+        assert_eq!(
+            ir.items(captures)
+                .iter()
+                .map(|&id| ir.get(id).kind)
+                .collect::<Vec<_>>(),
+            vec![IrKind::Load(Slot::new(0), ValueKind::Int)]
+        );
+    }
+
+    #[test]
+    fn an_await_wraps_what_is_awaited() {
+        // At the top, of the kind of what is awaited once present.
+        let text = "let x = lazy 1\nx + 1";
+        assert_eq!(
+            dump(text),
+            "(block @0..20\n\
+             \x20 (store x#0 @0..14\n\
+             \x20   (make-future #0 @8..14))\n\
+             \x20 (int-add @15..20\n\
+             \x20   (await @15..16\n\
+             \x20     (load x#0 @15..16))\n\
+             \x20   (int 1 @19..20)))\n\
+             future #0 (frame 0, params 0, captures 0, height 1)\n\
+             \x20 (int 1 @13..14)"
+        );
+        let ir = lower_text(text);
+        let IrKind::IntAdd(operands) = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected an addition");
+        };
+        let IrKind::Await {
+            value, kind, shape, ..
+        } = ir.get(operands.lhs).kind
+        else {
+            panic!("expected an await");
+        };
+        assert_eq!(kind, ValueKind::Int);
+        assert_eq!(shape, LazyShapeId::NONE);
+        assert_eq!(ir.kind_of(operands.lhs), ValueKind::Int);
+        assert_eq!(ir.kind_of(value), ValueKind::Deferred);
+        // An explicit await is one node, spanning the `await`.
+        assert_eq!(
+            dump("let x = lazy 1\nawait x").lines().nth(3),
+            Some("  (await @15..22")
+        );
+        let ir = lower_text("let x = lazy 1\nawait x");
+        let awaited = result_after_items(&ir);
+        let IrKind::Await { value, .. } = ir.get(awaited).kind else {
+            panic!("expected an await");
+        };
+        assert!(matches!(ir.get(value).kind, IrKind::Load(..)));
+        // Of a present value, it is its operand.
+        assert_eq!(
+            dump("let x = 1\nawait x"),
+            "(block @0..17\n\
+             \x20 (store x#0 @0..9\n\
+             \x20   (int 1 @8..9))\n\
+             \x20 (load x#0 @16..17))"
+        );
+        // A parenthesis is dropped, and the await spans it.
+        assert_eq!(
+            dump("let x = lazy 1\n(x) + 1").lines().nth(4),
+            Some("    (await @15..18")
+        );
+    }
+
+    #[test]
+    fn a_deep_await_carries_a_lazy_shape() {
+        let text = "let r = { a = lazy 1; b = { c = lazy 2; d = 3 }; e = 4 }\n\"{r}\"";
+        let shown = dump(text);
+        assert!(
+            shown.contains(
+                "\n  (interp @57..62\n\
+                 \x20   (str \"\" @57..62)\n\
+                 \x20   (await [a! b[c!]] @59..60\n\
+                 \x20     (load r#0 @59..60))\n"
+            ),
+            "{shown}"
+        );
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let ir = lower(&ast, &checked, &types, 0).unwrap();
+        assert_eq!(ir.lazy_shape_count(), 2);
+        let IrKind::Interp(items) = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected an interpolation");
+        };
+        let IrKind::Await { shape, kind, .. } = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected an await");
+        };
+        assert_eq!(kind, ValueKind::Record);
+        let name = |text: &str| ast.names().lookup(text).unwrap();
+        let [
+            (a, LazyField::Await(LazyShapeId::NONE)),
+            (b, LazyField::Within(inner)),
+        ] = *ir.lazy_shape(shape).fields
+        else {
+            panic!("unexpected shape {:?}", ir.lazy_shape(shape));
+        };
+        assert_eq!((a, b), (name("a"), name("b")));
+        assert_eq!(
+            &*ir.lazy_shape(inner).fields,
+            &[(name("c"), LazyField::Await(LazyShapeId::NONE))]
+        );
+        assert_eq!(ir.find_lazy_shape(LazyShapeId::NONE), None);
+        // A field that is lazy and descended into, and a present record
+        // with lazy fields.
+        let shown = dump(
+            "let r = { a = lazy { x = lazy 1; y = 2 }; b = { c = { d = lazy 3 } } }\n= \"{r}\"",
+        );
+        assert!(shown.contains("(await [a![x!] b[c[d!]]] @"), "{shown}");
+        // Only the lazy parts are listed; a record with none needs no
+        // shape, and is not awaited.
+        let shown = dump("let r = { a = 1; b = { c = 2 } }\n\"{r}\"");
+        assert!(!shown.contains("await"), "{shown}");
+        // Shapes are shared by the deep awaits of one type.
+        let ir = lower_text("let r = { a = lazy 1 }\nlet s = \"{r}\"\nlet t = \"{r} {r}\"");
+        assert_eq!(ir.lazy_shape_count(), 1);
+        // An equality awaits deeply and compares over the present fields;
+        // the nested record type, in an impure signature, may be a future
+        // itself.
+        let shown = dump("fn f(r: {a: {b: Int}}) -> Bool { r == r }");
+        assert!(shown.contains("\n    (record-eq == [a[b]] @"), "{shown}");
+        assert!(shown.contains("\n      (await [a![b!]] @"), "{shown}");
+    }
+
+    #[test]
+    fn values_that_may_be_futures_are_of_kind_deferred() {
+        // An `if` of such a type, with a present branch.
+        let text = "let x = lazy 1\nlet y = if true { x } else { 2 }";
+        assert_eq!(
+            dump(text),
+            "(block @0..47\n\
+             \x20 (store x#0 @0..14\n\
+             \x20   (make-future #0 @8..14))\n\
+             \x20 (store y#1 @15..47\n\
+             \x20   (if @23..47\n\
+             \x20     (bool true @26..30)\n\
+             \x20     (block @31..36\n\
+             \x20       (load x#0 @33..34))\n\
+             \x20     (block @42..47\n\
+             \x20       (int 2 @44..45))))\n\
+             \x20 (empty @0..47))\n\
+             future #0 (frame 0, params 0, captures 0, height 1)\n\
+             \x20 (int 1 @13..14)"
+        );
+        let ir = lower_text(text);
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        let IrKind::Store(_, choice) = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected a store");
+        };
+        assert_eq!(ir.kind_of(choice), ValueKind::Deferred);
+        // A present value stored in a slot of such a type.
+        assert_eq!(
+            dump("let x: Int | Future<Int> = 1"),
+            "(block @0..28\n\
+             \x20 (store x#0 @0..28\n\
+             \x20   (int 1 @27..28))\n\
+             \x20 (empty @0..28))"
+        );
+        // A pure function passing an either parameter along: a load of
+        // kind `Deferred`, stored in a record, never awaited.
+        let text = "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }";
+        assert_eq!(
+            dump(text),
+            "(block @0..63\n\
+             \x20 (store keep#0 @0..63\n\
+             \x20   (make-closure #0 @0..63))\n\
+             \x20 (empty @0..63))\n\
+             fn #0 keep (frame 2, params 1, captures 0, height 3)\n\
+             \x20 (block @54..63\n\
+             \x20   (store v#1 @56..61\n\
+             \x20     (load x#0 @60..61))\n\
+             \x20   (make-record [v] @54..63\n\
+             \x20     (load v#1 @56..57)))"
+        );
+        let ir = lower_text(text);
+        let IrKind::Block { items, .. } = ir.get(ir.function(FnId::new(0)).body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::Store(_, load) = ir.get(ir.items(items)[0]).kind else {
+            panic!("expected a store");
+        };
+        assert_eq!(
+            ir.get(load).kind,
+            IrKind::Load(Slot::new(0), ValueKind::Deferred)
+        );
+        // A bare `await` item of a value that is not `{}`.
+        let ir = lower_text("let x = lazy 1\nawait x\n2");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        assert!(matches!(
+            ir.get(ir.items(items)[1]).kind,
+            IrKind::Await {
+                kind: ValueKind::Int,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn awaits_are_as_deep_as_their_path_from_their_frames_body() {
+        // In the file's body: the block (0), the `let`'s store (1), the `+`
+        // (2), the await (3). And the explicit await of the result (1).
+        let ir = lower_text("let x = lazy 1\nlet y = x + 1\nawait x");
+        assert_eq!(
+            ir.awaits_in(ir.root())
+                .into_iter()
+                .map(|(depth, _)| depth)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        // In a function's body, which counts the await in its height: the
+        // block (1), the `*` (2), the await (3), the load (4).
+        let ir = lower_text("fn f(x: Int) -> Int { x * 2 }");
+        let code = ir.function(FnId::new(0));
+        assert_eq!(
+            ir.awaits_in(code.body)
+                .into_iter()
+                .map(|(depth, _)| depth)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(code.height, 4);
+        // In a future's body: the await (0), the capture (1).
+        let ir = lower_text("let x = lazy 1\nlet y = lazy x + 1");
+        let code = ir.function(FnId::new(1));
+        assert_eq!(
+            ir.awaits_in(code.body)
+                .into_iter()
+                .map(|(depth, _)| depth)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(code.height, 3);
+    }
+
+    /// The result of the root block of `ir`, whatever items come before it.
+    fn result_after_items(ir: &Ir) -> IrId {
+        match ir.get(ir.root()).kind {
+            IrKind::Block { result, .. } => result,
+            other => panic!("the root is not a block: {other:?}"),
+        }
     }
 }

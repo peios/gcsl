@@ -64,14 +64,37 @@
 //! Calls nest on the Rust stack, so the evaluator keeps them within a
 //! budget of nesting levels, [`crate::MAX_DEPTH`], which they share with
 //! expressions (see [`crate::CALL_LEVELS`]). For it, every
-//! [`IrKind::Call`] records its depth in the body of the frame it is
-//! evaluated in, the body node being at depth 0, and every function the
-//! height of its body, [`FnCode::height`]: both counted in nodes, through
-//! the children that `IrKind::children` lists. Lowering computes them once,
-//! after building the nodes; the evaluator only adds and compares.
+//! [`IrKind::Call`] and [`IrKind::Await`] records its depth in the body of
+//! the frame it is evaluated in, the body node being at depth 0, and every
+//! function the height of its body, [`FnCode::height`]: both counted in
+//! nodes, through the children that `IrKind::children` lists. Lowering
+//! computes them once, after building the nodes; the evaluator only adds
+//! and compares.
+//!
+//! # Futures
+//!
+//! A `lazy` is a function of the table too, of [`FnKind::Future`], with no
+//! parameters, whose body is its operand, any node. It lowers to a
+//! [`IrKind::MakeFuture`], which captures as a `MakeClosure` does and builds
+//! a future instead of a closure.
+//!
+//! A node whose static type is a `Future` or an either, `T | Future<T>`, is
+//! of kind [`ValueKind::Deferred`]: its value may be a future or not. Only
+//! the evaluator's general walker evaluates such nodes; every typed walker
+//! treats one as mistyped. They are loads, captures, field accesses, calls,
+//! blocks and `if`s of such types, and `MakeFuture`s. Where the checker
+//! found that a value that may be a future is used as its bits, lowering
+//! wraps its node in an [`IrKind::Await`], which evaluates it through the
+//! general walker, awaits it fully, and yields a value of its own, present
+//! kind; so nothing else ever inspects a runtime value to see whether it is
+//! a future. An await is *deep* when it also awaits the lazy fields of a
+//! record, as the [`LazyShape`] it carries lists them, from
+//! [`Ir::lazy_shape`]'s table. An await runs a future's body in a frame of
+//! its own, so, like a call, it records its depth in its frame's body for
+//! the nesting budget.
 //!
 //! An `Ir` is shared, by reference count, between the evaluator and every
-//! closure made from its code, and records which session input it was
+//! closure and future made from its code, and records which session input it was
 //! lowered from, [`Ir::input`], so that a runtime error in a function of an
 //! earlier input can be shown against that input's source.
 //!
@@ -163,6 +186,50 @@ pub struct Shape {
     pub fields: Box<[(Name, Option<ShapeId>)]>,
 }
 
+/// Index of a lazy shape in its [`Ir`]'s table, or [`LazyShapeId::NONE`].
+/// Resolve it with [`Ir::lazy_shape`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LazyShapeId(u32);
+
+impl LazyShapeId {
+    /// No shape: nothing below the top of the value to await.
+    pub const NONE: LazyShapeId = LazyShapeId(u32::MAX);
+
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// What a deep [`IrKind::Await`] awaits in a record: each field, by name,
+/// that is lazy itself or holds a record with lazy fields somewhere inside.
+/// The fields are sorted by [`Name`], as a record type's are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LazyShape {
+    /// Each such field's name and what is done with its value.
+    pub fields: Box<[(Name, LazyField)]>,
+}
+
+/// What a deep await does with one field of a record (see [`LazyShape`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LazyField {
+    /// The field is a future or an either: its value is awaited fully and
+    /// then, unless the shape is [`LazyShapeId::NONE`], its own lazy fields
+    /// are awaited as the shape says.
+    Await(LazyShapeId),
+    /// The field is a present record with lazy fields somewhere inside:
+    /// they are awaited as the shape says.
+    Within(LazyShapeId),
+}
+
+/// Whether a function of the table is a function expression or a `lazy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FnKind {
+    /// A function expression, made into closures by `MakeClosure`.
+    Function,
+    /// The body of a `lazy`, made into futures by `MakeFuture`.
+    Future,
+}
+
 /// The relation a comparison node tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cmp {
@@ -243,7 +310,9 @@ pub struct ShapedOperands {
 /// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
 /// and of `Record*`, `Field` and `UpdateField` nodes to record nodes (an
 /// `UpdateField`'s value excepted, which may be of any kind), and a `Call`'s
-/// callee is a function node; see [`Ir::kind_of`].
+/// callee is a function node; see [`Ir::kind_of`]. No typed operand is ever
+/// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
+/// [`IrKind::Await`] of it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
     /// An `Int` constant.
@@ -415,6 +484,32 @@ pub enum IrKind {
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// Builds a future of function `function` of the IR, a `lazy`'s body,
+    /// capturing the values of `captures` as [`IrKind::MakeClosure`] does.
+    /// Of kind [`ValueKind::Deferred`].
+    MakeFuture {
+        /// The function.
+        function: FnId,
+        /// What it captures.
+        captures: IrRange,
+    },
+    /// Evaluates `value`, a node of any kind, awaits it fully if it is a
+    /// future, running its body if it has not run, and then, unless
+    /// `shape` is [`LazyShapeId::NONE`], awaits the lazy fields of the
+    /// record it is as the shape says; and yields the result, of kind
+    /// `kind`, never [`ValueKind::Deferred`].
+    Await {
+        /// What is awaited.
+        value: IrId,
+        /// The kind of the awaited value: its type's, once present.
+        kind: ValueKind,
+        /// The record fields to await deeply, or [`LazyShapeId::NONE`].
+        shape: LazyShapeId,
+        /// The await's depth in the body of the frame it is evaluated in,
+        /// for the nesting budget, as a call's (see [`IrKind::Call`]).
+        /// Lowering sets it once every node is built.
+        depth: u16,
+    },
 }
 
 // A call's depth is a `u16` (see `IrKind::Call`), which keeps `IrNode` at
@@ -431,13 +526,14 @@ impl IrKind {
     /// an `if`'s condition and branches, a block's items and then its
     /// result, a call's callee and then its arguments, an argument's value,
     /// a store's value, a field access's record, an update's record and
-    /// value, an interpolation's pieces, a record's values, and a closure's
-    /// captures. A closure's function is not a child: its body is evaluated
-    /// in a frame of its own. This is the one list of every node's children,
-    /// and its match is exhaustive, so a new kind of node cannot be missed:
-    /// [`Ir::pretty`] prints the children it gives, and lowering's walk that
-    /// computes call depths and body heights follows them, and the two must
-    /// agree.
+    /// value, an interpolation's pieces, a record's values, a closure's and
+    /// a future's captures, and an await's value. A closure's or a future's
+    /// function is not a child: its body is evaluated in a frame of its own.
+    /// This is the one list of every node's children, and its match is
+    /// exhaustive, so a new kind of node cannot be missed: [`Ir::pretty`]
+    /// prints the children it gives, and lowering's walk that computes the
+    /// depths of calls and awaits and the heights of bodies follows them,
+    /// and the two must agree.
     ///
     /// # Panics
     ///
@@ -462,7 +558,8 @@ impl IrKind {
                 record: operand, ..
             }
             | IrKind::Store(_, operand)
-            | IrKind::Arg { value: operand, .. } => (None, &[], [Some(operand), None, None]),
+            | IrKind::Arg { value: operand, .. }
+            | IrKind::Await { value: operand, .. } => (None, &[], [Some(operand), None, None]),
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
             | IrKind::IntMul(Operands { lhs, rhs, .. })
@@ -492,6 +589,9 @@ impl IrKind {
             IrKind::Interp(items)
             | IrKind::MakeRecord { values: items, .. }
             | IrKind::MakeClosure {
+                captures: items, ..
+            }
+            | IrKind::MakeFuture {
                 captures: items, ..
             } => (None, items.resolve(pool), NONE),
             IrKind::Block { items, result } => {
@@ -545,7 +645,9 @@ impl IrKind {
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
             | IrKind::LoadCapture(..)
-            | IrKind::LoadCallee => None,
+            | IrKind::LoadCallee
+            | IrKind::MakeFuture { .. }
+            | IrKind::Await { .. } => None,
         }
     }
 
@@ -592,6 +694,8 @@ impl IrKind {
             IrKind::Arg { .. } => "arg",
             IrKind::LoadCapture(..) => "load-capture",
             IrKind::LoadCallee => "load-callee",
+            IrKind::MakeFuture { .. } => "make-future",
+            IrKind::Await { .. } => "await",
         }
     }
 }
@@ -658,18 +762,25 @@ impl IrNode {
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
             | IrKind::LoadCapture(..)
-            | IrKind::LoadCallee => return None,
+            | IrKind::LoadCallee
+            | IrKind::MakeFuture { .. }
+            | IrKind::Await { .. } => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
 }
 
-/// One function of a program, in [`Ir::function`]'s table.
+/// One function of a program, or one `lazy`'s body, in [`Ir::function`]'s
+/// table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnCode {
-    /// The body: a [`IrKind::Block`] in the same node arena as the rest of
-    /// the program.
+    /// The body, in the same node arena as the rest of the program: a
+    /// [`IrKind::Block`] for a function (or an [`IrKind::Await`] of one,
+    /// where its value is awaited to fit its return type), and any node
+    /// for a `lazy`.
     pub body: IrId,
+    /// Whether this is a function expression's code or a `lazy`'s.
+    pub kind: FnKind,
     /// The number of slots the body's frame needs, its parameters included.
     pub frame_size: u32,
     /// The number of parameters, which occupy slots `0..param_count`.
@@ -685,8 +796,8 @@ pub struct FnCode {
     /// `let`, field or named function item it initialises. For
     /// [`Ir::pretty`].
     pub name: Option<Name>,
-    /// The function's type as text, `fn(x: Int): Int`: what its closures
-    /// display as.
+    /// The function's type as text, `fn(x: Int): Int`, or a `lazy`'s,
+    /// `Future<Int>`: what its closures or futures display as.
     pub display: Box<str>,
     /// For each slot of the body's frame, the name of the last variable
     /// assigned to it. For [`Ir::pretty`] only.
@@ -694,9 +805,9 @@ pub struct FnCode {
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
-/// constants, the record layouts and shapes, the text of every name an
-/// update may add to a record, the functions, its root, the frame it needs,
-/// and the session input it was lowered from.
+/// constants, the record layouts, shapes and lazy shapes, the text of every
+/// name an update may add to a record, the functions, its root, the frame
+/// it needs, and the session input it was lowered from.
 #[derive(Clone, Debug)]
 pub struct Ir {
     nodes: Vec<IrNode>,
@@ -704,6 +815,7 @@ pub struct Ir {
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
     shapes: Vec<Shape>,
+    lazy_shapes: Vec<LazyShape>,
     /// The text of the name of every [`IrKind::UpdateField`], which may
     /// add it to a record's layout at runtime.
     name_texts: HashMap<Name, Box<str>>,
@@ -766,6 +878,23 @@ impl Ir {
         calls
     }
 
+    /// Every await in the frame whose body is `body`, with its depth and
+    /// span, in the order a depth-first walk meets them, for tests, as
+    /// [`Ir::calls_in`] finds calls.
+    #[cfg(test)]
+    pub(crate) fn awaits_in(&self, body: IrId) -> Vec<(u16, Span)> {
+        let mut awaits = Vec::new();
+        let mut pending = vec![body];
+        while let Some(id) = pending.pop() {
+            let node = self.get(id);
+            if let IrKind::Await { depth, .. } = node.kind {
+                awaits.push((depth, node.span));
+            }
+            pending.extend(self.children(id).rev());
+        }
+        awaits
+    }
+
     /// Returns the string constant `id`.
     ///
     /// # Panics
@@ -806,6 +935,30 @@ impl Ir {
     #[must_use]
     pub fn shape_count(&self) -> usize {
         self.shapes.len()
+    }
+
+    /// Returns the lazy shape `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this IR, as
+    /// [`LazyShapeId::NONE`] never does.
+    #[must_use]
+    pub fn lazy_shape(&self, id: LazyShapeId) -> &LazyShape {
+        &self.lazy_shapes[id.index()]
+    }
+
+    /// Returns the lazy shape `id`, or `None` for [`LazyShapeId::NONE`] and
+    /// for an id this IR does not have.
+    #[must_use]
+    pub fn find_lazy_shape(&self, id: LazyShapeId) -> Option<&LazyShape> {
+        self.lazy_shapes.get(id.index())
+    }
+
+    /// The number of distinct lazy shapes.
+    #[must_use]
+    pub fn lazy_shape_count(&self) -> usize {
+        self.lazy_shapes.len()
     }
 
     /// The text of `name`, if it is the name of an [`IrKind::UpdateField`]:
@@ -858,7 +1011,9 @@ impl Ir {
         self.input
     }
 
-    /// The kind of value node `id` produces.
+    /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
+    /// `MakeFuture` and for a load, capture, field access or call of a
+    /// value that may be a future, and never for an `Await`.
     ///
     /// # Panics
     ///
@@ -916,8 +1071,10 @@ impl Ir {
                 IrKind::Load(_, kind)
                 | IrKind::Field { kind, .. }
                 | IrKind::Call { kind, .. }
-                | IrKind::LoadCapture(_, kind) => kind,
+                | IrKind::LoadCapture(_, kind)
+                | IrKind::Await { kind, .. } => kind,
                 IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
+                IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
         }
     }
@@ -943,12 +1100,18 @@ impl Ir {
     /// ...)`, a call its callee and then its arguments, each as
     /// `(arg 0 @4..5 ...)` with the parameter it fills, and the reads of a
     /// capture and of the callee as `(load-capture 0 @4..5)` and
-    /// `(load-callee @4..5)`. A call's depth is not shown. After the root,
-    /// each function is shown on a line of its own as
+    /// `(load-callee @4..5)`. A future shows its function's number and then
+    /// what it captures, as in `(make-future #1 @0..9 ...)`, and an await
+    /// its value, as in `(await @0..9 ...)`, or, for a deep await, its
+    /// shape first: the names of the fields it awaits, each followed by `!`
+    /// if its value is awaited and by its own shape in brackets if the
+    /// await descends into it, as in `(await [a! b[c!]] @0..9 ...)`. The
+    /// depths of calls and awaits are not shown. After the root, each
+    /// function is shown on a line of its own as
     /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
-    /// `fn #1 (frame ...)` if it has no name, followed by its body, whose
-    /// slots are named by its own frame's variables. There is no trailing
-    /// newline.
+    /// `fn #1 (frame ...)` if it has no name, and each `lazy`'s body as
+    /// `future #2 (frame ...)`, followed by its body, whose slots are named
+    /// by its own frame's variables. There is no trailing newline.
     #[must_use]
     pub fn pretty<'a>(&'a self, names: &'a Names) -> impl fmt::Display + 'a {
         Pretty {
@@ -967,6 +1130,7 @@ pub(crate) struct IrBuilder {
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
     shapes: Vec<Shape>,
+    lazy_shapes: Vec<LazyShape>,
     name_texts: HashMap<Name, Box<str>>,
 }
 
@@ -978,6 +1142,7 @@ impl IrBuilder {
             strings: Vec::new(),
             layouts: Vec::new(),
             shapes: Vec::new(),
+            lazy_shapes: Vec::new(),
             name_texts: HashMap::new(),
         }
     }
@@ -987,7 +1152,8 @@ impl IrBuilder {
     /// `Empty` or `MakeRecord` per block, one `Load` per field, one
     /// constant per literal piece of an interpolation, for each segment of
     /// a dotted path after the first an update and a record to update, one
-    /// `Arg` per argument of a call, and one load per value a closure
+    /// `Arg` per argument of a call, one `Await` per expression awaited
+    /// where it is used, and one load per value a closure or a future
     /// captures (a variable used inside functions nested `n` deep in the
     /// one declaring it is captured by each of the `n`), far below
     /// `u32::MAX` for any realistic source; past that, ids would saturate.
@@ -1032,6 +1198,15 @@ impl IrBuilder {
         }
     }
 
+    /// Adds a lazy shape and returns its id. There is at most one per record
+    /// type, so ids never saturate, nor reach [`LazyShapeId::NONE`].
+    /// Deduplicating is the caller's business.
+    pub(crate) fn push_lazy_shape(&mut self, shape: LazyShape) -> LazyShapeId {
+        let id = LazyShapeId(u32::try_from(self.lazy_shapes.len()).unwrap_or(u32::MAX));
+        self.lazy_shapes.push(shape);
+        id
+    }
+
     /// Records `text` as the text of `name`, the name of an
     /// [`IrKind::UpdateField`], unless it is recorded already.
     pub(crate) fn add_name_text(&mut self, name: Name, text: &str) {
@@ -1059,12 +1234,12 @@ impl IrBuilder {
         self.finish_program(root, (frame_size, slot_names), Vec::new(), 0)
     }
 
-    /// Gives every [`IrKind::Call`] of the program whose root is `root` and
-    /// whose functions are `functions` its depth in its frame, and every
-    /// function its body's height, [`FnCode::height`]: one walk of the root
-    /// and one of each function's body, through [`IrKind::children`]. The
-    /// heights of all the nodes are kept in one vector, and the walks share
-    /// one stack.
+    /// Gives every [`IrKind::Call`] and [`IrKind::Await`] of the program
+    /// whose root is `root` and whose functions are `functions` its depth
+    /// in its frame, and every function its body's height,
+    /// [`FnCode::height`]: one walk of the root and one of each function's
+    /// body, through [`IrKind::children`]. The heights of all the nodes are
+    /// kept in one vector, and the walks share one stack.
     ///
     /// The nodes of each frame form a tree, apart from the record nodes an
     /// update chain shares between an update and the field access into the
@@ -1083,12 +1258,12 @@ impl IrBuilder {
     }
 
     /// Walks the frame whose body is `body` depth first, giving each call
-    /// its depth on the way down and each node its height in `heights` on
-    /// the way up, and returns the body's height. Iterative, with `stack`
-    /// as the work list, since a body can be [`crate::MAX_DEPTH`] deep: each
-    /// entry is a node, its depth, and whether its children have been
-    /// pushed, in which case they have all been walked when it is popped
-    /// again.
+    /// and await its depth on the way down and each node its height in
+    /// `heights` on the way up, and returns the body's height. Iterative,
+    /// with `stack` as the work list, since a body can be
+    /// [`crate::MAX_DEPTH`] deep: each entry is a node, its depth, and
+    /// whether its children have been pushed, in which case they have all
+    /// been walked when it is popped again.
     fn walk(&mut self, body: IrId, heights: &mut [u32], stack: &mut Vec<(IrId, u32, bool)>) -> u32 {
         let Self {
             nodes, item_lists, ..
@@ -1111,10 +1286,13 @@ impl IrBuilder {
                 }
             } else if height == 0 {
                 if let IrKind::Call {
-                    depth: call_depth, ..
+                    depth: node_depth, ..
+                }
+                | IrKind::Await {
+                    depth: node_depth, ..
                 } = &mut node.kind
                 {
-                    *call_depth = u16::try_from(depth).unwrap_or(u16::MAX);
+                    *node_depth = u16::try_from(depth).unwrap_or(u16::MAX);
                 }
                 stack.push((id, depth, true));
                 // Reversed, so that the children are walked in order.
@@ -1143,6 +1321,7 @@ impl IrBuilder {
             strings: self.strings,
             layouts: self.layouts,
             shapes: self.shapes,
+            lazy_shapes: self.lazy_shapes,
             name_texts: self.name_texts,
             functions,
             root,
@@ -1182,6 +1361,41 @@ impl Pretty<'_> {
             write!(f, "{}", FieldName(self.names.get(name)))?;
             pending.push((shape, index + 1));
             if let Some(nested) = nested {
+                f.write_str("[")?;
+                pending.push((nested, 0));
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes lazy shape `id` as the names of the fields it awaits in
+    /// brackets, each followed by `!` if its value is awaited and by its own
+    /// shape if the await descends into it: `[a! b[c!]]`. Nested shapes are
+    /// written through a work list, not recursion, as `Pretty::shape`
+    /// writes record shapes.
+    fn lazy_shape(&self, f: &mut fmt::Formatter<'_>, id: LazyShapeId) -> fmt::Result {
+        // Each shape being written, with the index of its next field.
+        let mut pending = vec![(id, 0_usize)];
+        f.write_str("[")?;
+        while let Some((shape, index)) = pending.pop() {
+            let fields = self.ir.find_lazy_shape(shape).map(|s| &*s.fields);
+            let Some(&(name, field)) = fields.unwrap_or_default().get(index) else {
+                f.write_str("]")?;
+                continue;
+            };
+            if index > 0 {
+                f.write_str(" ")?;
+            }
+            write!(f, "{}", FieldName(self.names.get(name)))?;
+            pending.push((shape, index + 1));
+            let nested = match field {
+                LazyField::Await(nested) => {
+                    f.write_str("!")?;
+                    nested
+                }
+                LazyField::Within(nested) => nested,
+            };
+            if nested != LazyShapeId::NONE {
                 f.write_str("[")?;
                 pending.push((nested, 0));
             }
@@ -1232,7 +1446,13 @@ impl Pretty<'_> {
             IrKind::Field { name, .. } | IrKind::UpdateField { name, .. } => {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }
-            IrKind::MakeClosure { function, .. } => write!(f, " {function}")?,
+            IrKind::MakeClosure { function, .. } | IrKind::MakeFuture { function, .. } => {
+                write!(f, " {function}")?;
+            }
+            IrKind::Await { shape, .. } if shape != LazyShapeId::NONE => {
+                f.write_str(" ")?;
+                self.lazy_shape(f, shape)?;
+            }
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             _ => {}
         }
@@ -1258,7 +1478,11 @@ impl fmt::Display for Pretty<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.node(f, self.ir.root, 0)?;
         for (index, code) in self.ir.functions.iter().enumerate() {
-            write!(f, "\nfn #{index}")?;
+            let head = match code.kind {
+                FnKind::Function => "fn",
+                FnKind::Future => "future",
+            };
+            write!(f, "\n{head} #{index}")?;
             if let Some(name) = code.name {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }

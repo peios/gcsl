@@ -1,13 +1,22 @@
 //! Runtime values.
 //!
-//! Scalars are unboxed; strings, records and closures are reference-counted,
-//! so copying a value, into a variable, a record or a closure's captures, is
-//! at most a reference-count increment. Records and closures can nest as
-//! deeply as a program runs (a record holding a record, a closure capturing
-//! a closure), so dropping one frees what it uniquely owns iteratively,
-//! through a work list, rather than recursively (see [`Record`] and
-//! [`Closure`]).
+//! Scalars are unboxed; strings, records, closures and futures are
+//! reference-counted, so copying a value, into a variable, a record or a
+//! closure's captures, is at most a reference-count increment. Records,
+//! closures and futures can nest as deeply as a program runs (a record
+//! holding a record, a closure capturing a closure, a future capturing a
+//! future), so dropping one frees what it uniquely owns iteratively, through
+//! a work list, rather than recursively (see [`Record`], [`Closure`] and
+//! [`Future`]).
+//!
+//! A [`Future`] is a memoised thunk: the function of a `lazy` with the
+//! values it captured, run by its first await, after which it holds the
+//! value it yielded and has dropped its captures. It is shared by
+//! reference, so a future stored in two places is one future, run at most
+//! once. Its state changes behind a [`RefCell`], which is only ever
+//! borrowed briefly by the evaluator, never across running the body.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -34,6 +43,11 @@ pub enum ValueKind {
     Record,
     /// A function, [`Value::Fn`].
     Fn,
+    /// A value whose static type is a `Future` or `T | Future<T>`, so which
+    /// may be a [`Value::Future`] or a present value of `T`'s kind. Only
+    /// the evaluator's general walker evaluates such nodes; see
+    /// [`crate::ir::Ir::kind_of`].
+    Deferred,
 }
 
 /// The field names of a record, in definition order. Built once per record
@@ -93,18 +107,20 @@ impl Drop for Record {
 }
 
 /// A uniquely owned value that holds other values: what the iterative drop
-/// of records and closures frees level by level.
+/// of records, closures and futures frees level by level.
 enum Nested {
     /// A record, holding its fields.
     Record(Rc<Record>),
     /// A closure, holding its captured values.
     Closure(Rc<Closure>),
+    /// A future, holding its captured values or the value it yielded.
+    Future(Rc<Future>),
 }
 
-/// Frees the records and closures among `values` that nothing else holds,
-/// and all those they hold in turn, through a work list rather than
-/// recursion: each is emptied of the records and closures it holds, which
-/// go on the list, before it is dropped, so no drop recurses.
+/// Frees the records, closures and futures among `values` that nothing else
+/// holds, and all those they hold in turn, through a work list rather than
+/// recursion: each is emptied of the records, closures and futures it
+/// holds, which go on the list, before it is dropped, so no drop recurses.
 fn drop_nested(values: &mut [Value]) {
     let mut pending = Vec::new();
     take_nested(values, &mut pending);
@@ -122,20 +138,26 @@ fn drop_nested(values: &mut [Value]) {
                     take_nested(&mut closure.captures, &mut pending);
                 }
             }
+            Nested::Future(future) => {
+                if let Ok(mut future) = Rc::try_unwrap(future) {
+                    take_nested(future.held_mut(), &mut pending);
+                }
+            }
         }
     }
 }
 
-/// Moves the records and closures among `values` onto `pending`, leaving
-/// `{}` in their places.
+/// Moves the records, closures and futures among `values` onto `pending`,
+/// leaving `{}` in their places.
 fn take_nested(values: &mut [Value], pending: &mut Vec<Nested>) {
     for value in values {
-        if !matches!(value, Value::Record(_) | Value::Fn(_)) {
+        if !matches!(value, Value::Record(_) | Value::Fn(_) | Value::Future(_)) {
             continue;
         }
         match std::mem::replace(value, Value::Empty) {
             Value::Record(record) => pending.push(Nested::Record(record)),
             Value::Fn(closure) => pending.push(Nested::Closure(closure)),
+            Value::Future(future) => pending.push(Nested::Future(future)),
             _ => {}
         }
     }
@@ -194,6 +216,159 @@ impl PartialEq for Closure {
 impl Drop for Closure {
     fn drop(&mut self) {
         drop_nested(&mut self.captures);
+    }
+}
+
+/// Where a [`Future`] is in its life.
+#[derive(Debug)]
+pub(crate) enum FutureState {
+    /// Not yet run: the values its body captured, until its first await
+    /// succeeds.
+    Pending(Box<[Value]>),
+    /// Its body is running, for an await in progress.
+    Running,
+    /// Run: the value it yielded, which every later await yields.
+    Done(Value),
+}
+
+/// What an await finds when it starts to await a [`Future`], from
+/// [`Future::begin`].
+pub(crate) enum Begin {
+    /// The future has yielded this value already.
+    Done(Value),
+    /// The future's body is running: the await depends on itself.
+    Running,
+    /// The future had not run: its captured values, taken out, and it is
+    /// now running. The await must end it with [`Future::finish`].
+    Pending(Box<[Value]>),
+}
+
+/// A future: the function of a `lazy` in a program's IR, with the values it
+/// captured when the `lazy` was evaluated, run once, by its first await,
+/// after which it holds the value it yielded instead. See the module
+/// documentation.
+pub struct Future {
+    /// The IR the function belongs to, kept alive by the future as by a
+    /// closure.
+    pub code: Rc<Ir>,
+    /// Which of `code`'s functions this is.
+    pub function: FnId,
+    /// Where the future is in its life. Borrowed only briefly, and never
+    /// across running the body.
+    state: RefCell<FutureState>,
+}
+
+impl Future {
+    /// A future of `function` of `code`, not yet run, holding the values
+    /// its body captured.
+    #[must_use]
+    pub fn new(code: Rc<Ir>, function: FnId, captures: Box<[Value]>) -> Self {
+        Self {
+            code,
+            function,
+            state: RefCell::new(FutureState::Pending(captures)),
+        }
+    }
+
+    /// The future's type as text, `Future<Int>`: what it displays as,
+    /// whether it has run or not. Empty if `function` is not one of
+    /// `code`'s, which the evaluator never builds.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        self.code
+            .find_function(self.function)
+            .map_or("", |code| &code.display)
+    }
+
+    /// Whether the future has run and holds its value.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        matches!(self.state.try_borrow().as_deref(), Ok(FutureState::Done(_)))
+    }
+
+    /// Starts an await of the future: a copy of its value if it has run; a
+    /// note that it is running; or, if it has not run, its captured values,
+    /// taken out, leaving it running. `None` only if the state is borrowed,
+    /// which never happens, since no borrow outlives a call of this or of
+    /// [`Future::finish`].
+    pub(crate) fn begin(&self) -> Option<Begin> {
+        let mut state = self.state.try_borrow_mut().ok()?;
+        if let FutureState::Done(value) = &*state {
+            return Some(Begin::Done(value.clone()));
+        }
+        Some(match std::mem::replace(&mut *state, FutureState::Running) {
+            FutureState::Pending(captures) => Begin::Pending(captures),
+            FutureState::Running => Begin::Running,
+            // Handled above; put back unchanged if it were reached.
+            FutureState::Done(value) => {
+                *state = FutureState::Done(value.clone());
+                Begin::Done(value)
+            }
+        })
+    }
+
+    /// Ends the await that [`Future::begin`] started on a pending future:
+    /// `Done` with the value its body yielded, or `Pending` with its
+    /// captured values back if the body failed, so that a later await runs
+    /// it again. Returns `false`, changing nothing, only if the state is
+    /// borrowed, which never happens.
+    pub(crate) fn finish(&self, state: FutureState) -> bool {
+        match self.state.try_borrow_mut() {
+            Ok(mut current) => {
+                *current = state;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The values the future holds, for dropping: its captures if it has
+    /// not run, the value it yielded if it has, and none while it runs.
+    fn held_mut(&mut self) -> &mut [Value] {
+        match self.state.get_mut() {
+            FutureState::Pending(captures) => captures,
+            FutureState::Done(value) => std::slice::from_mut(value),
+            FutureState::Running => &mut [],
+        }
+    }
+
+    /// The name of the future's state, for its debug form.
+    fn state_name(&self) -> &'static str {
+        match self.state.try_borrow().as_deref() {
+            Ok(FutureState::Pending(_)) => "pending",
+            Ok(FutureState::Running) | Err(_) => "running",
+            Ok(FutureState::Done(_)) => "done",
+        }
+    }
+}
+
+/// Shows the function, its type and its state, not the IR it belongs to or
+/// the values it holds.
+impl fmt::Debug for Future {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Future")
+            .field("function", &self.function)
+            .field("type", &self.display())
+            .field("state", &self.state_name())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Futures compare by identity, as closures do: two are equal only if they
+/// are the same future. No program can compare futures, since the checker
+/// awaits or rejects them first; this exists for [`Value`]'s equality.
+impl PartialEq for Future {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+/// Dropping a future frees what it holds, its captures or its value,
+/// iteratively, as dropping a record does, so a chain of futures each
+/// capturing the last is freed without recursion.
+impl Drop for Future {
+    fn drop(&mut self) {
+        drop_nested(self.held_mut());
     }
 }
 
@@ -257,7 +432,8 @@ fn fields_equal<'a>(
 /// Strings and records have value semantics but are shared: cloning a
 /// `Value::Str` or a `Value::Record` increments a reference count and never
 /// copies the text or the fields. So does cloning a `Value::Fn`, whose
-/// closure is immutable.
+/// closure is immutable, and a `Value::Future`, which is shared by
+/// reference: every copy is the same future, run at most once.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// An `Int`.
@@ -276,10 +452,12 @@ pub enum Value {
     Record(Rc<Record>),
     /// A function: a closure over the values it captured.
     Fn(Rc<Closure>),
+    /// A future: a deferred computation, run by its first await.
+    Future(Rc<Future>),
 }
 
 impl Value {
-    /// The kind of the value.
+    /// The kind of the value: [`ValueKind::Deferred`] for a future.
     #[must_use]
     pub const fn kind(&self) -> ValueKind {
         match self {
@@ -289,6 +467,7 @@ impl Value {
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
             Value::Fn(_) => ValueKind::Fn,
+            Value::Future(_) => ValueKind::Deferred,
         }
     }
 
@@ -316,7 +495,8 @@ impl Value {
 /// identifier is quoted too (see [`FieldName`]). The empty record is `{}`.
 ///
 /// A function shows as its type, `fn(x: Int): Int`, in both forms, since it
-/// has no source form of its own to show.
+/// has no source form of its own to show, and so does a future, as
+/// `Future<Int>`, whether it has run or not: showing it never awaits it.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -325,6 +505,7 @@ impl fmt::Display for Value {
             Value::Str(text) => f.write_str(text),
             Value::Empty => f.write_str("{}"),
             Value::Fn(closure) => f.write_str(closure.display()),
+            Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;
                 for (index, (text, value)) in
@@ -609,6 +790,7 @@ mod tests {
         let root = builder.alloc(crate::ir::IrKind::Empty, crate::source::Span::new(0, 0));
         let code = crate::ir::FnCode {
             body,
+            kind: crate::ir::FnKind::Function,
             frame_size: 0,
             param_count: 0,
             capture_count: 1,
@@ -712,5 +894,110 @@ mod tests {
         assert_eq!(int_to_float(3), 3.0);
         assert_eq!(int_to_float(9_007_199_254_740_993), 9_007_199_254_740_992.0);
         assert_eq!(int_to_float(i64::MIN), -9_223_372_036_854_775_808.0);
+    }
+
+    // ----- Futures -----
+
+    /// A pending future of `code`'s one function, holding `captures`.
+    fn future(code: &Rc<Ir>, captures: Vec<Value>) -> Rc<Future> {
+        Rc::new(Future::new(
+            Rc::clone(code),
+            FnId::new(0),
+            captures.into_boxed_slice(),
+        ))
+    }
+
+    #[test]
+    fn a_future_displays_as_its_type_and_compares_by_identity() {
+        let code = one_function("Future<Int>");
+        let pending = future(&code, vec![Value::Int(1)]);
+        let value = Value::Future(Rc::clone(&pending));
+        assert_eq!(value.kind(), ValueKind::Deferred);
+        assert_eq!(value.to_string(), "Future<Int>");
+        assert_eq!(value.repr().to_string(), "Future<Int>");
+        let mut names = Names::new();
+        let fields = layout(&mut names, &["f"]);
+        assert_eq!(
+            record(&fields, vec![value.clone()]).to_string(),
+            "{f = Future<Int>}"
+        );
+        // Its debug form shows the function, the type and the state, and
+        // neither the IR nor the values it holds.
+        let shown = format!("{pending:?}");
+        assert_eq!(
+            shown,
+            "Future { function: FnId(0), type: \"Future<Int>\", state: \"pending\", .. }"
+        );
+        assert!(!pending.is_done());
+        assert!(pending.finish(FutureState::Done(Value::Int(2))));
+        assert!(pending.is_done());
+        assert_eq!(
+            format!("{pending:?}"),
+            "Future { function: FnId(0), type: \"Future<Int>\", state: \"done\", .. }"
+        );
+        // Done or not, it shows as its type.
+        assert_eq!(value.to_string(), "Future<Int>");
+        assert!(pending.finish(FutureState::Running));
+        assert!(format!("{pending:?}").contains("state: \"running\""));
+        // By identity: equal only to itself.
+        let other = Value::Future(future(&code, vec![Value::Int(1)]));
+        assert_eq!(value, value.clone());
+        assert_ne!(value, other);
+        // A future of a function its IR lacks shows as nothing.
+        let stray = Future::new(Rc::clone(&code), FnId::new(5), Box::default());
+        assert_eq!(stray.display(), "");
+    }
+
+    #[test]
+    fn beginning_an_await_takes_the_captures_and_marks_it_running() {
+        let code = one_function("Future<Int>");
+        let pending = future(&code, vec![Value::Int(7)]);
+        let Some(Begin::Pending(captures)) = pending.begin() else {
+            panic!("expected the captures");
+        };
+        assert_eq!(&*captures, &[Value::Int(7)]);
+        assert!(matches!(pending.begin(), Some(Begin::Running)));
+        assert!(pending.finish(FutureState::Done(Value::Int(8))));
+        assert!(matches!(pending.begin(), Some(Begin::Done(Value::Int(8)))));
+        // Still done.
+        assert!(matches!(pending.begin(), Some(Begin::Done(Value::Int(8)))));
+    }
+
+    #[test]
+    fn dropping_a_long_chain_of_futures_does_not_recurse() {
+        // A million pending futures, each capturing the one before.
+        let code = one_function("Future<Int>");
+        let mut value = Value::Int(0);
+        for _ in 0..1_000_000 {
+            value = Value::Future(future(&code, vec![value]));
+        }
+        drop(value);
+        // A million done futures, each holding the one before as its value.
+        let mut value = Value::Int(0);
+        for _ in 0..1_000_000 {
+            let done = future(&code, Vec::new());
+            assert!(done.finish(FutureState::Done(value)));
+            value = Value::Future(done);
+        }
+        drop(value);
+        // Futures, closures and records nested in each other, alternately.
+        let mut names = Names::new();
+        let fields = layout(&mut names, &["f"]);
+        let mut value = Value::Empty;
+        for index in 0..1_000_000 {
+            value = match index % 3 {
+                0 => Value::Future(future(&code, vec![value])),
+                1 => closure(&code, vec![value]),
+                _ => record(&fields, vec![value]),
+            };
+        }
+        drop(value);
+        // A future still held elsewhere is released, not freed.
+        let inner = future(&code, vec![Value::Int(1)]);
+        let outer = Value::Future(future(&code, vec![Value::Future(Rc::clone(&inner))]));
+        drop(outer);
+        assert_eq!(Rc::strong_count(&inner), 1);
+        drop(inner);
+        assert_eq!(Rc::strong_count(&code), 1);
     }
 }

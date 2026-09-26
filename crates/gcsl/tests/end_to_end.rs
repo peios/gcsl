@@ -520,6 +520,14 @@ fn every_stage_handles_maximum_depth() {
             "fn(): Int { let g = ".repeat(functions_deep - 1),
             "\n1 }".repeat(functions_deep - 1)
         ));
+        // Lazies nested in each other, each a function of its own, awaited
+        // fully by one await, which runs them one after the other.
+        let lazies = source(&format!("await {}1", "lazy ".repeat(depth - 2)));
+        // Awaits nested in lazies nested in awaits: each await runs the
+        // future inside it from inside the one around it, so they nest at
+        // runtime too, and the budget stops them.
+        let pairs = (depth - 1) / 2;
+        let awaits = source(&format!("{}1", "await lazy ".repeat(pairs)));
         // The printers recurse too, but printing a tree this deep takes
         // seconds, since each line is indented by its depth. They recurse
         // one frame per level from a node straight to its children,
@@ -545,6 +553,8 @@ fn every_stage_handles_maximum_depth() {
             (&calls_within_budget, Ok(Value::Int(1)), false),
             (&calls_past_budget, Err(BUDGET_ERROR), false),
             (&functions, Ok(Value::Int(1)), false),
+            (&lazies, Ok(Value::Int(1)), false),
+            (&awaits, Err(BUDGET_ERROR), false),
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
@@ -655,6 +665,15 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
                 "fn(".repeat(200_000),
                 "): Int".repeat(200_000)
             ),
+            // Futures and their types.
+            format!("{}1", "lazy ".repeat(200_000)),
+            format!("{}1", "await ".repeat(200_000)),
+            format!(
+                "let x: {}Int{} = 1",
+                "Future<".repeat(200_000),
+                ">".repeat(200_000)
+            ),
+            format!("let x: Int{} = 1", " | Int".repeat(200_000)),
         ] {
             let diagnostics = run(&text).unwrap_err();
             assert_eq!(diagnostics[0].message, "expression nested too deeply");
@@ -859,7 +878,8 @@ fn programs_with_functions() {
         ),
         (
             "fn run(body: {steps: Int}) -> Int { body.steps }\nrun { steps = 3 }",
-            "3 : Int",
+            // An impure function's bare result may be a future.
+            "3 : Int | Future<Int>",
         ),
         ("let x = 1\nlet f = fn(): Int { x }\nx := 2\nf()", "1 : Int"),
         (
@@ -880,7 +900,7 @@ fn programs_with_functions() {
 #[test]
 fn an_impure_call_error_renders_exactly() {
     assert_eq!(
-        rendered("fn f() -> Int { 1 }\nfn g(): Int { f() }\n"),
+        rendered("fn f() -> Present<Int> { 1 }\nfn g(): Int { f() }\n"),
         "error: cannot call an impure function from a pure function\n\
          \x20--> calc.gcsl:2:15\n\
          \x20 |\n\
@@ -1100,5 +1120,114 @@ fn annotation_mismatch_renders_exactly() {
          \x20 |        ---   ^^^ expected Int, found Float\n\
          \x20 |        |\n\
          \x20 |        expected because of this annotation\n"
+    );
+}
+
+/// A build script: a pure plan whose steps run when an impure wrapper
+/// awaits them.
+const BUILD_SCRIPT: &str = "\
+fn compile(target: String) -> String { \"compiled {target}\" }
+fn plan(name: String): {name: String, build: Future<String>, check: Future<{}>} {
+  name = name
+  build = lazy compile(name)
+  check = lazy { }
+}
+fn build(package: fn(String): {name: String, build: Future<String>, check: Future<{}>}, name: String) -> {name: String, log: String} {
+  let conf = package(name)
+  await conf.check
+  name = conf.name
+  log = await conf.build
+}
+fn keep(step: String | Future<String>): {step: String | Future<String>} { step = step }
+let planned = plan(\"gcsl\")
+let built = build(plan, \"gcsl\")
+name = built.name
+log = built.log
+later = keep(planned.build).step
+";
+
+#[test]
+fn a_build_script_plans_purely_and_builds_on_await() {
+    assert_eq!(
+        run(BUILD_SCRIPT).unwrap().to_string(),
+        "{name = \"gcsl\"; log = \"compiled gcsl\"; later = Future<String>}"
+    );
+    assert_eq!(
+        show(BUILD_SCRIPT),
+        "{name = \"gcsl\"; log = \"compiled gcsl\"; later = Future<String>} : \
+         {later: String | Future<String>, log: String | Future<String>, \
+         name: String | Future<String>}"
+    );
+    // The planned step, passed through, runs where it is awaited.
+    assert_eq!(
+        run(&format!("{BUILD_SCRIPT}ran = await later"))
+            .unwrap()
+            .to_string(),
+        "{name = \"gcsl\"; log = \"compiled gcsl\"; later = Future<String>; \
+         ran = \"compiled gcsl\"}"
+    );
+}
+
+#[test]
+fn an_await_in_a_pure_function_renders_exactly() {
+    assert_eq!(
+        rendered("fn plan(step: Future<{}>): {} {\n  await step\n  = {}\n}\n"),
+        "error: cannot await in a pure function\n\
+         \x20--> calc.gcsl:2:3\n\
+         \x20 |\n\
+         1 | fn plan(step: Future<{}>): {} {\n\
+         \x20 |                          - this function is pure, declared with `:`\n\
+         2 |   await step\n\
+         \x20 |   ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: awaiting runs a deferred expression, which may have effects; declare the \
+         function with `->` to make it impure\n"
+    );
+    assert_eq!(
+        rendered("fn total(x: Int | Future<Int>): Int { x + 1 }\n"),
+        "error: cannot use a value that may be a future in a pure function\n\
+         \x20--> calc.gcsl:1:39\n\
+         \x20 |\n\
+         1 | fn total(x: Int | Future<Int>): Int { x + 1 }\n\
+         \x20 |                               -       ^ this is Int | Future<Int>\n\
+         \x20 |                               |\n\
+         \x20 |                               this function is pure, declared with `:`\n\
+         \x20 |\n\
+         \x20 = note: using the value here would await it, which may run effects; a pure \
+         function may hold and pass on a future but not await it. Declare the function with \
+         `->` to make it impure\n"
+    );
+}
+
+#[test]
+fn a_callback_that_cannot_take_futures_renders_exactly() {
+    assert_eq!(
+        rendered(
+            "fn double(x: Int): Int { x * 2 }\nfn run(f: fn(Int) -> Int) -> Int { f(1) }\nrun(double)\n"
+        ),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:3:5\n\
+         \x20 |\n\
+         3 | run(double)\n\
+         \x20 | --- ^^^^^^ expected fn(Int | Future<Int>) -> Int | Future<Int>, found fn(x: Int): Int\n\
+         \x20 | |\n\
+         \x20 | the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | \
+         Future<Int>\n"
+    );
+}
+
+#[test]
+fn a_runtime_error_in_a_future_renders_where_it_happens() {
+    assert_eq!(
+        rendered("let x = lazy 1 // 0\nawait x\n"),
+        "error: division by zero\n\
+         \x20--> calc.gcsl:1:16\n\
+         \x20 |\n\
+         1 | let x = lazy 1 // 0\n\
+         \x20 |              - ^^ - 0\n\
+         \x20 |              |\n\
+         \x20 |              1\n\
+         2 | await x\n\
+         \x20 | ------- awaited here\n"
     );
 }

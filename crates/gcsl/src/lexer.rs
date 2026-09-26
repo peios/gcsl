@@ -22,15 +22,20 @@
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `if`,
-//! `else`, `true`, `false`, `and`, `or`, `not` and `fn`; the whole
-//! identifier is scanned before it is compared with them, so `fn-x` is an
-//! identifier. An `r` directly followed by `"` begins a raw string literal;
-//! anywhere else it is an ordinary identifier.
+//! `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy` and `await`;
+//! the whole identifier is scanned before it is compared with them, so
+//! `fn-x`, `lazy-x` and `await-x` are identifiers. An `r` directly followed
+//! by `"` begins a raw string literal; anywhere else it is an ordinary
+//! identifier. `Future` and `Present` are not keywords: they are ordinary
+//! identifiers, which only the checker gives a meaning, in types.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
 //! followed by anything else a third, and likewise `!==` and `!=`, `<=` and
-//! `<`, `>=` and `>`, `:=` and `:`, `//` and `/`. `!` is only accepted as
-//! part of `!=` or `!==`; negation is `not`. A `.` is part of a number literal only between two digits, as in
+//! `<`, `>=` and `>`, `:=` and `:`, `//` and `/`. There is no `>>` token, so
+//! the two `>` closing `Future<Future<Int>>` are two [`TokenKind::Gt`]s. A
+//! `|` is a [`TokenKind::Pipe`], used only in union types. `!` is only
+//! accepted as part of `!=` or `!==`; negation is `not`. A `.` is part of a
+//! number literal only between two digits, as in
 //! `1.5`; anywhere else it is a [`TokenKind::Dot`], so `1.x` is `1`, `.`,
 //! `x`. A `,` is a [`TokenKind::Comma`], which separates the fields of a
 //! record type, the parameters of a function and the arguments of a call.
@@ -180,6 +185,10 @@ pub enum TokenKind {
     Not,
     /// The keyword `fn`.
     Fn,
+    /// The keyword `lazy`, which defers the expression after it.
+    Lazy,
+    /// The keyword `await`, which awaits the value after it.
+    Await,
     /// `+`
     Plus,
     /// `-` as subtraction: not directly after an operand, and followed by
@@ -235,6 +244,8 @@ pub enum TokenKind {
     /// `,`, which separates the fields of a record type, the parameters of
     /// a function and the arguments of a call.
     Comma,
+    /// `|`, which separates the members of a union type.
+    Pipe,
     /// A `\n` outside parentheses and interpolations. Each newline is its
     /// own token.
     Newline,
@@ -258,6 +269,8 @@ impl TokenKind {
             TokenKind::Or => Some("or"),
             TokenKind::Not => Some("not"),
             TokenKind::Fn => Some("fn"),
+            TokenKind::Lazy => Some("lazy"),
+            TokenKind::Await => Some("await"),
             TokenKind::Plus => Some("+"),
             TokenKind::Minus | TokenKind::Neg => Some("-"),
             TokenKind::Star => Some("*"),
@@ -283,6 +296,7 @@ impl TokenKind {
             TokenKind::Semi => Some(";"),
             TokenKind::Dot => Some("."),
             TokenKind::Comma => Some(","),
+            TokenKind::Pipe => Some("|"),
             TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Str(_)
@@ -308,6 +322,8 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
         "fn" => TokenKind::Fn,
+        "lazy" => TokenKind::Lazy,
+        "await" => TokenKind::Await,
         _ => return None,
     })
 }
@@ -635,6 +651,7 @@ impl<'a> Lexer<'a> {
             // A `.` inside a number literal has been consumed by `number`.
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
+            b'|' => (TokenKind::Pipe, 1),
             b'=' if self.peek_at(1) == Some(b'=') && self.peek_at(2) == Some(b'=') => {
                 (TokenKind::EqEqEq, 3)
             }
@@ -1547,7 +1564,7 @@ mod tests {
             &SourceFile::new(
                 "test.gcsl",
                 "1 2.5 + - -x * / // % ( ) x let : := = { } ; . ,\n\
-                 if else true false and or not == != < <= > >= === !== fn ->",
+                 if else true false and or not == != < <= > >= === !== fn -> lazy await |",
             )
             .unwrap(),
         )
@@ -1597,11 +1614,74 @@ mod tests {
                 BangEqEq,
                 Fn,
                 Arrow,
+                Lazy,
+                Await,
+                Pipe,
                 Eof
             ]
         );
         assert_eq!(Fn.symbol(), Some("fn"));
         assert_eq!(Arrow.symbol(), Some("->"));
+        assert_eq!(Lazy.symbol(), Some("lazy"));
+        assert_eq!(Await.symbol(), Some("await"));
+        assert_eq!(Pipe.symbol(), Some("|"));
+    }
+
+    #[test]
+    fn lazy_and_await_are_keywords_only_as_whole_words() {
+        assert_eq!(
+            show("lazy lazy-x lazyx await await-x awaits Lazy Future Present"),
+            vec![
+                "Lazy",
+                "Ident(lazy-x)",
+                "Ident(lazyx)",
+                "Await",
+                "Ident(await-x)",
+                "Ident(awaits)",
+                "Ident(Lazy)",
+                "Ident(Future)",
+                "Ident(Present)",
+                "Eof"
+            ]
+        );
+        assert!(!is_identifier("lazy"));
+        assert!(!is_identifier("await"));
+        assert!(is_identifier("lazy-x"));
+        assert!(is_identifier("await-x"));
+        // A negation before `await`, and `await` before a negation.
+        assert_eq!(show("-await x"), vec!["Neg", "Await", "Ident(x)", "Eof"]);
+        assert_eq!(show("await -x"), vec!["Await", "Neg", "Ident(x)", "Eof"]);
+    }
+
+    #[test]
+    fn a_pipe_is_one_token_and_closing_angles_are_two() {
+        assert_eq!(
+            show("Int|Future<Int>"),
+            vec![
+                "Ident(Int)",
+                "Pipe",
+                "Ident(Future)",
+                "Lt",
+                "Ident(Int)",
+                "Gt",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("Future<Future<Int>>"),
+            vec![
+                "Ident(Future)",
+                "Lt",
+                "Ident(Future)",
+                "Lt",
+                "Ident(Int)",
+                "Gt",
+                "Gt",
+                "Eof"
+            ]
+        );
+        assert_eq!(show("||"), vec!["Pipe", "Pipe", "Eof"]);
+        assert_eq!(spans("a | b"), vec![(0, 1), (2, 3), (4, 5), (5, 5)]);
     }
 
     #[test]
@@ -2257,7 +2337,7 @@ mod tests {
         }
         for text in [
             "", "1x", "a b", "a-", "-a", "a--b", "é", "let", "if", "else", "true", "false", "and",
-            "or", "not", "a.b",
+            "or", "not", "a.b", "fn", "lazy", "await", "a|b",
         ] {
             assert!(!is_identifier(text), "{text}");
         }

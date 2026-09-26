@@ -17,9 +17,10 @@
 //!    in the side tables of a [`check::Checked`]; and any warnings.
 //! 4. [`lower::lower`]: AST and tables to a type-specialised [`ir::Ir`],
 //!    which holds its own copies of the string literals and record layouts
-//!    it uses, and the code of every function.
-//! 5. [`eval::eval`]: IR, shared by reference count with the closures made
-//!    from it, to a [`Value`].
+//!    it uses, and the code of every function and `lazy`, with an explicit
+//!    await wherever a value that may be a future is used as its bits.
+//! 5. [`eval::eval`]: IR, shared by reference count with the closures and
+//!    futures made from it, to a [`Value`].
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. Every
@@ -63,14 +64,17 @@ pub use types::{TyId, TypeTable};
 pub use value::{Value, ValueKind};
 
 /// The deepest nesting accepted, measured as the height of the syntax tree:
-/// a leaf is one level, and every operator, parenthesis, ascription, field
-/// access, block, `if`, interpolated string, function expression and call
-/// adds one to its tallest child (a block's children being its items'
-/// expressions and annotated types, an ascription's its expression and
-/// type, a function's its parameter types, return type and body, and a
-/// call's its callee and arguments). A type written as a name is one level,
-/// a record type one more than its tallest field's type, and a function
-/// type one more than the tallest of its parameter and return types. A `let`, field or `:=` with a dotted path is two levels taller than
+/// a leaf is one level, and every operator (`await` included), parenthesis,
+/// ascription, field access, block, `if`, interpolated string, function
+/// expression, `lazy` and call adds one to its tallest child (a block's
+/// children being its items' expressions and annotated types, an
+/// ascription's its expression and type, a function's its parameter types,
+/// return type and body, a `lazy`'s its operand, and a call's its callee
+/// and arguments). A type written as a name is one level, a record type one
+/// more than its tallest field's type, a function type one more than the
+/// tallest of its parameter and return types, an applied type such as
+/// `Future<Int>` one more than its argument, and a union one more than the
+/// taller of its sides. A `let`, field or `:=` with a dotted path is two levels taller than
 /// its value for each segment of the path after the first, since later
 /// stages build a record for each segment and read the old one's field
 /// through all those before it. Every stage recurses once per
@@ -95,9 +99,12 @@ pub use value::{Value, ValueKind};
 /// top of the nesting around it. A call is made only if the nesting it
 /// would reach, the whole height of its callee's body included, stays
 /// within this budget; otherwise it fails with "call nested too deeply".
-/// Nesting built by calls therefore never exceeds `MAX_DEPTH` levels,
-/// whatever shape the recursion has. (The top level's own nesting is not
-/// checked: it is bounded by the parser's limit alone.)
+/// An await that runs a future's body is charged as a call of a
+/// parameterless function is, and a deep await one more level for each
+/// level of record nesting it has descended. Nesting built by calls and
+/// awaits therefore never exceeds `MAX_DEPTH` levels, whatever shape the
+/// recursion has. (The top level's own nesting is not checked: it is
+/// bounded by the parser's limit alone.)
 pub const MAX_DEPTH: usize = 10_000;
 
 /// The levels of [`MAX_DEPTH`]'s runtime budget that a call costs on top of

@@ -4,10 +4,11 @@
 //! variable. Its results are side tables indexed by the AST's ids:
 //! [`Types`], the type of every expression, and [`Resolution`], where every
 //! variable use reads from and every declaration writes to, what each
-//! function's frame and captures are, and which parameter each argument
-//! fills. Both are returned together as [`Checked`]. Types are [`TyId`]s interned into a [`TypeTable`] the caller
-//! owns, so that a [`crate::session::Session`] can keep one table across
-//! inputs.
+//! function's and `lazy`'s frame and captures are, which parameter each
+//! argument fills, and which expressions are awaited where they are used.
+//! Both are returned together as [`Checked`]. Types are [`TyId`]s interned
+//! into a [`TypeTable`] the caller owns, so that a
+//! [`crate::session::Session`] can keep one table across inputs.
 //!
 //! # Types
 //!
@@ -53,9 +54,10 @@
 //! real error.
 //!
 //! In a diagnostic's message and notes, a type written as a name, such as
-//! `Int`, is shown plainly, and a record type in backticks, since it
-//! contains spaces and punctuation: "cannot add Int and `{}`". Labels show
-//! every type plainly: "expected {x: Int}, found Int".
+//! `Int`, is shown plainly, and a structural type (a record, function,
+//! future or union type) in backticks, since it contains spaces and
+//! punctuation: "cannot add Int and `{}`". Labels show every type plainly:
+//! "expected {x: Int}, found Int".
 //!
 //! # Records
 //!
@@ -252,8 +254,84 @@
 //! **Purity.** A function declared with `:` is pure, and one declared with
 //! `->` impure; the top level is impure, and a block has the purity of the
 //! function it is in. Calling an impure function from a pure one is an
-//! error. Calling is the only gated operation: a pure function may create,
-//! pass, store and return impure functions.
+//! error, and so is awaiting (see [Futures](#futures)). Those are the only
+//! gated operations: a pure function may create, pass, store and return
+//! impure functions and futures.
+//!
+//! # Futures
+//!
+//! `lazy e` is checked as the body of an anonymous, parameterless function
+//! (a `Function` of its own on the stack, with a frame of its own, capturing
+//! as a closure does), which is always **impure**, wherever it is written;
+//! its type is `Future<T>`, `T` being the body's type, an untyped integer
+//! settled to `Int`, with every future layer at its top stripped, since
+//! awaiting resolves fully (so `lazy lazy 1` is `Future<Int>`, and so is
+//! `lazy f()` where `f()` is `Int | Future<Int>`; see
+//! [`TypeTable::future`]). The name a `let` or a field binds is not in scope in
+//! its own `lazy` initialiser, as for any initialiser.
+//!
+//! **Bare types.** In a type expression, a type written as a name or a
+//! record type means what the position it is written in says (`Bareness`):
+//! the either shape, `T | Future<T>`, in the parameters and the return type
+//! of an impure function expression and of a written impure function type,
+//! at that position and at every bare position inside it, through record
+//! types (so `{a: Int}` there is `{a: Int | Future<Int>} | Future<{a: Int |
+//! Future<Int>}>`) but not into a nested function type, which has its own
+//! rule; and a present `T` everywhere else: annotations, ascriptions, and
+//! the parameters and return types of pure functions and of written pure
+//! function types. A function type is the one bare type that is never the
+//! either shape at its own position: its interior follows its own purity
+//! marker, and a function value that may be a future must be written so,
+//! as `Future<fn(): Int>` or `(fn(): Int) | Future<fn(): Int>` (in
+//! parentheses, since a function type's return type would take the union).
+//! An applied type and a union are explicit, and so never wrapped either.
+//! `Future<T>` and `Present<T>` override that at their
+//! position, their own interiors being present, and `T | Future<T>` may be
+//! written, with the same `T` either side; any other union, any other name
+//! applied to a type, and `Future` or `Present` without a type argument are
+//! errors. So an impure function takes and returns values that may be
+//! futures, since its body awaits them on demand, while a pure function
+//! takes present values unless it declares otherwise, since its body cannot
+//! await; and a pure `fn(Int): Int` is not a subtype of the impure
+//! `fn(Int) -> Int`, which promises to pass futures (parameters are
+//! contravariant), though it is of `fn(Present<Int>) -> Int`.
+//!
+//! **Awaits.** Every place a value is used as its bits decides whether it
+//! is awaited there, and records it in [`Resolution::await_of`] for
+//! lowering, which inserts the await; nothing is decided at runtime. A
+//! measuring operator (arithmetic, ordering, `and`, `or`, `not`, negation),
+//! a call of a value and a field access into one await it at the top if its
+//! type is a `Future` or an either (`Checker::measure`), and type the
+//! operation on the type it has once awaited, stripped of every future
+//! layer at its top (see [`TypeTable::strip`]). An interpolated expression
+//! and an operand of an equality are awaited deeply (`Checker::measure_deep`):
+//! at the top and in every lazy field of the record it is, at any depth (see
+//! [`TypeTable::present`]). Where a type is expected, as for an argument,
+//! an annotated initialiser, a function's body or an `if` condition, a value
+//! that is not a subtype of it is awaited if it is one once awaited, at the
+//! top or deeply (see [`TypeTable::needs_await`]); otherwise the mismatch is
+//! reported, with a note when a future is expected and a value that is not
+//! one is found. `await e` awaits `e` fully and has its type stripped; on a
+//! present value it does nothing, which is a warning. A bare `await e` item
+//! is never an unused value. A statement is a position expecting `{}`: a
+//! statement whose value is `{}` once awaited (a `Future<{}>`, or the
+//! `{}` an impure function returns, which may be one) is awaited there,
+//! so that its effects are not lost; any other statement not of type `{}`
+//! is an unused value.
+//!
+//! Futures have no equality: an operand of `==`, `!=`, `===` or `!==` whose
+//! type, once awaited at the top, has a `Future` in a field at any depth is
+//! an error (a field of the either shape is not: the deep await resolves
+//! it). Two `if` branches of which either may be a future have their join
+//! (see [`TypeTable::join`]).
+//!
+//! **Purity.** Awaiting runs a deferred expression, which may have effects,
+//! so it is impure: an await in the body of a pure function, explicit or
+//! implicit, is an error, reported where the await is decided, entirely
+//! statically. A pure function may still build, hold, store, pass on and
+//! return futures, and build them with `lazy`, whose body is impure. A
+//! pure function's bare parameters are present, so measuring one is never
+//! an error.
 //!
 //! # Scopes
 //!
@@ -306,12 +384,14 @@ use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
-use crate::types::{FnTy, TyId, TyKind, TypeTable};
+use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
 /// A `Types` returned by [`check`] contains neither [`TyId::UNTYPED_INT`]
-/// nor [`TyId::ERROR`], nor any union.
+/// nor [`TyId::ERROR`], nor any union other than the either shape, `T |
+/// Future<T>`. An expression that is awaited where it is used keeps the type
+/// it has before the await; see [`Resolution::await_of`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Types {
     types: Vec<TyId>,
@@ -419,7 +499,29 @@ pub enum VarRef {
     None,
 }
 
-/// What the checker learns about one function expression, in
+/// Whether and how an expression's value is awaited where it is used, in
+/// [`Resolution::await_of`]. See the module documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AwaitMark {
+    /// Not awaited: the value is used as it is.
+    None,
+    /// Awaited fully at the top, through every level of future.
+    Top,
+    /// Awaited fully at the top and then in every lazy field of the record
+    /// it is, at any depth.
+    Deep,
+}
+
+impl From<AwaitKind> for AwaitMark {
+    fn from(kind: AwaitKind) -> Self {
+        match kind {
+            AwaitKind::Top => AwaitMark::Top,
+            AwaitKind::Deep => AwaitMark::Deep,
+        }
+    }
+}
+
+/// What the checker learns about one function expression or `lazy`, in
 /// [`Resolution::function`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FnResolution {
@@ -477,6 +579,9 @@ pub struct Resolution {
     /// Where each `Name` expression reads, indexed by [`ExprId`];
     /// [`VarRef::None`] for every other expression.
     expr_vars: Vec<VarRef>,
+    /// Whether and how each expression is awaited where it is used,
+    /// indexed by [`ExprId`].
+    awaits: Vec<AwaitMark>,
     /// The slot each `Let`, `Field` and `Rebind` item writes, indexed by
     /// [`ItemId`]; [`Slot::NONE`] for every other item. Every definition of
     /// an open field writes the field's one slot.
@@ -510,6 +615,19 @@ impl Resolution {
     #[must_use]
     pub fn expr_var(&self, id: ExprId) -> VarRef {
         self.expr_vars[id.index()]
+    }
+
+    /// Whether and how expression `id` is awaited where it is used:
+    /// [`AwaitMark::None`] if it is used as it is. An awaited expression's
+    /// type in [`Types`] is its type before the await.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn await_of(&self, id: ExprId) -> AwaitMark {
+        self.awaits[id.index()]
     }
 
     /// What the checker found for function expression `id`.
@@ -582,6 +700,7 @@ impl Resolution {
     pub(crate) fn without_variables(exprs: usize, items: usize) -> Self {
         Self {
             expr_vars: vec![VarRef::None; exprs],
+            awaits: vec![AwaitMark::None; exprs],
             item_slots: vec![Slot::NONE; items],
             item_paths: vec![PathResolution::NONE; items],
             frame_size: 0,
@@ -598,10 +717,10 @@ impl Resolution {
         self.arg_params.fill(u32::MAX);
     }
 
-    /// Number of expression entries, equal to the number of expressions in
-    /// the [`Ast`].
+    /// Number of expression entries in both expression tables, equal to
+    /// the number of expressions in the [`Ast`].
     pub(crate) fn expr_len(&self) -> usize {
-        self.expr_vars.len()
+        self.expr_vars.len().min(self.awaits.len())
     }
 
     /// Number of function entries, equal to the number of function
@@ -674,8 +793,21 @@ enum BindingKind {
     Callee,
 }
 
-/// A function expression being checked: one entry of the checker's stack
-/// of the functions it is inside, innermost last.
+/// What a bare type written in a type expression means: see the module
+/// documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bareness {
+    /// A bare type is present: `Int` is `Int`.
+    Present,
+    /// A bare type written as a name or a record type is the either shape:
+    /// `Int` is `Int | Future<Int>`, and `{a: Int}` is `{a: Int |
+    /// Future<Int>} | Future<{a: Int | Future<Int>}>`. A function type is
+    /// not (see `Checker::resolve_type`).
+    Either,
+}
+
+/// A function expression or a `lazy` being checked: one entry of the
+/// checker's stack of the functions it is inside, innermost last.
 #[derive(Debug)]
 struct Function {
     fn_id: FnId,
@@ -689,9 +821,10 @@ struct Function {
     outer_slot_names: Vec<Name>,
     /// What the function captures, in capture order.
     captures: Vec<Capture>,
-    /// Whether the function is pure, declared with `:`.
+    /// Whether the function is pure, declared with `:`; never for a
+    /// `lazy`.
     pure: bool,
-    /// Its `:` or `->`.
+    /// Its `:` or `->`, or a `lazy`'s keyword.
     marker: Span,
 }
 
@@ -841,6 +974,8 @@ pub struct Checker<'a> {
     /// The type of each expression, indexed by [`ExprId`].
     expr_types: Vec<TyId>,
     expr_vars: Vec<VarRef>,
+    /// Whether and how each expression is awaited, indexed by [`ExprId`].
+    awaits: Vec<AwaitMark>,
     item_slots: Vec<Slot>,
     item_paths: Vec<PathResolution>,
     /// What has been found for each function expression, indexed by
@@ -877,6 +1012,12 @@ pub struct Checker<'a> {
     frame_size: u32,
     slot_names: Vec<Name>,
     builtin_types: BuiltinTypes,
+    /// The name `Future`, which applied to a type is a future of it, if the
+    /// program mentions it.
+    future_name: Option<Name>,
+    /// The name `Present`, which applied to a type is it with every bare
+    /// type in it present, if the program mentions it.
+    present_name: Option<Name>,
     /// Reused for sorting the fields of a record block or a record type by
     /// name: each field's name, its position in source order and its type.
     /// Nested uses push above the entries of the use enclosing them and
@@ -923,6 +1064,7 @@ impl<'a> Checker<'a> {
             // are not.
             expr_types: vec![TyId::ERROR; ast.len()],
             expr_vars: vec![VarRef::None; ast.len()],
+            awaits: vec![AwaitMark::None; ast.len()],
             item_slots: vec![Slot::NONE; ast.item_count()],
             item_paths: vec![PathResolution::NONE; ast.item_count()],
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
@@ -944,6 +1086,8 @@ impl<'a> Checker<'a> {
                 (names.lookup("Bool"), TyId::BOOL),
                 (names.lookup("String"), TyId::STRING),
             ],
+            future_name: names.lookup("Future"),
+            present_name: names.lookup("Present"),
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
             path_types: Vec::new(),
@@ -974,11 +1118,10 @@ impl<'a> Checker<'a> {
             return Err(diagnostic::merge(self.errors, self.warnings));
         }
         let types = &*self.types;
-        if self.expr_types.iter().any(|&ty| {
-            matches!(
-                types.kind(ty),
-                TyKind::Error | TyKind::UntypedInt | TyKind::Union(_)
-            )
+        if self.expr_types.iter().any(|&ty| match types.kind(ty) {
+            TyKind::Error | TyKind::UntypedInt => true,
+            TyKind::Union(_) => !types.is_deferrable(ty),
+            _ => false,
         }) {
             let error = InternalError {
                 message: "a type table entry is untyped, erroneous or a union after a successful \
@@ -1001,6 +1144,7 @@ impl<'a> Checker<'a> {
             types: Types::new(self.expr_types),
             resolution: Resolution {
                 expr_vars: self.expr_vars,
+                awaits: self.awaits,
                 item_slots: self.item_slots,
                 item_paths: self.item_paths,
                 frame_size: self.frame_size,
@@ -1091,19 +1235,20 @@ impl<'a> Checker<'a> {
                     // statement.
                     if next.is_none() && first_field.is_none() {
                         result = ty;
+                    } else if self.is_await(value) {
+                        // A bare `await` is run for its effects, and its
+                        // value discarded, whatever it is.
+                        self.settle(value, ty);
+                    } else if ty != TyId::EMPTY
+                        && ty != TyId::ERROR
+                        && self.types.strip(ty) == TyId::EMPTY
+                    {
+                        // A statement is a position expecting `{}`: a value
+                        // that is `{}` once awaited is awaited here, so its
+                        // effects are not lost, subject to the purity rule.
+                        self.await_here(value, ty, AwaitKind::Top, None);
                     } else if ty != TyId::EMPTY && ty != TyId::ERROR {
-                        let ty = self.settle(value, ty);
-                        let shown = self.in_message(ty);
-                        self.errors.push(
-                            Diagnostic::error(
-                                format!("unused value of type {shown}"),
-                                self.ast.get(value).span,
-                            )
-                            .with_note(
-                                "make it the block's result with `= ...`, bind it with `let`, \
-                                 or remove it",
-                            ),
-                        );
+                        self.unused_value(value, ty);
                     }
                 }
             }
@@ -1112,6 +1257,36 @@ impl<'a> Checker<'a> {
             Some(_) => self.record_type(expecting),
             None => result,
         }
+    }
+
+    /// Whether `value` is directly an `await` expression.
+    fn is_await(&self, value: ExprId) -> bool {
+        matches!(
+            self.ast.get(value).kind,
+            ExprKind::Unary {
+                op: UnaryOp::Await,
+                ..
+            }
+        )
+    }
+
+    /// Reports the statement `value`, of type `ty`, which is neither `{}`
+    /// nor erroneous, as an unused value.
+    fn unused_value(&mut self, value: ExprId, ty: TyId) {
+        let ty = self.settle(value, ty);
+        let shown = self.in_message(ty);
+        let note = if self.types.laziness(ty) == Laziness::Present {
+            "make it the block's result with `= ...`, bind it with `let`, or remove it"
+        } else {
+            "await it with `await`, bind it with `let`, or remove it"
+        };
+        self.errors.push(
+            Diagnostic::error(
+                format!("unused value of type {shown}"),
+                self.ast.get(value).span,
+            )
+            .with_note(note),
+        );
     }
 
     /// Checks `let PATH (: TYPE)? = VALUE` and declares the variable: with
@@ -1125,7 +1300,7 @@ impl<'a> Checker<'a> {
     ) {
         let expected = annotation.map(|annotation| {
             (
-                self.resolve_type(annotation),
+                self.resolve_type(annotation, Bareness::Present),
                 self.ast.type_expr(annotation).span,
             )
         });
@@ -2021,11 +2196,20 @@ impl<'a> Checker<'a> {
         source
     }
 
-    /// The type a type expression denotes, or `Error` (reported) if it names
-    /// no type, or is a record type with a field that names none or a name
+    /// The type a type expression denotes, with a bare type meaning what
+    /// `mode` says (see the module documentation): in `Either` mode, a type
+    /// written as a name or a record type is the either shape, a record
+    /// type's fields being resolved in `Either` mode too. A function type
+    /// is never made the either shape at its own position, whatever the
+    /// mode: its interior follows its own purity marker, and a function
+    /// value that may be a future is written `Future<fn...>` or `fn... |
+    /// Future<fn...>`. Nor are an applied type or a union, which say
+    /// themselves what they are. `Error` (reported) if the type names no
+    /// type, or is a record type with a field that names none or a name
     /// that appears twice, or a function type with a parameter or return
-    /// type that is erroneous.
-    fn resolve_type(&mut self, id: TypeExprId) -> TyId {
+    /// type that is erroneous, or an applied type or a union that is not
+    /// one of those accepted, or contains one that is erroneous.
+    fn resolve_type(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
         let ty = *self.ast.type_expr(id);
         match ty.kind {
             TypeExprKind::Named(name) => {
@@ -2034,12 +2218,38 @@ impl<'a> Checker<'a> {
                     .iter()
                     .find(|(builtin, _)| *builtin == Some(name))
                 {
-                    return builtin;
+                    return self.bare(builtin, mode);
                 }
                 let text = self.ast.names().get(name);
-                self.errors
-                    .push(Diagnostic::error(format!("unknown type `{text}`"), ty.span));
+                let message = if self.is_type_constructor(name) {
+                    format!("type `{text}` needs a type argument, as in `{text}<Int>`")
+                } else {
+                    format!("unknown type `{text}`")
+                };
+                self.errors.push(Diagnostic::error(message, ty.span));
                 TyId::ERROR
+            }
+            TypeExprKind::Applied { name, span, arg } => self.resolve_applied(name, span, arg),
+            TypeExprKind::Union { lhs, rhs, bar } => {
+                let lhs = self.resolve_type(lhs, Bareness::Present);
+                let rhs = self.resolve_type(rhs, Bareness::Present);
+                if lhs == TyId::ERROR || rhs == TyId::ERROR {
+                    return TyId::ERROR;
+                }
+                let future_of = |future: TyId, of: TyId, types: &TypeTable| {
+                    types.kind(future) == &TyKind::Future(of)
+                };
+                if future_of(rhs, lhs, self.types) {
+                    self.types.deferrable(lhs)
+                } else if future_of(lhs, rhs, self.types) {
+                    self.types.deferrable(rhs)
+                } else {
+                    self.errors.push(Diagnostic::error(
+                        "unions other than `T | Future<T>` are not supported yet",
+                        bar,
+                    ));
+                    TyId::ERROR
+                }
             }
             TypeExprKind::Record(range) => {
                 let fields = self.ast.field_tys(range);
@@ -2048,7 +2258,7 @@ impl<'a> Checker<'a> {
                 for (index, field) in fields.iter().enumerate() {
                     // Resolving a nested record type uses `sorted_fields`
                     // above this one's entries and truncates back.
-                    let field_ty = self.resolve_type(field.ty);
+                    let field_ty = self.resolve_type(field.ty, mode);
                     erroneous |= field_ty == TyId::ERROR;
                     self.sorted_fields
                         .push((field.name, position(index), field_ty));
@@ -2075,26 +2285,81 @@ impl<'a> Checker<'a> {
                     TyId::ERROR
                 } else {
                     let sorted = self.sorted_fields.get(base..).unwrap_or_default();
-                    self.types
-                        .record(sorted.iter().map(|&(name, _, ty)| (name, ty)))
+                    let record = self
+                        .types
+                        .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
+                    self.bare(record, mode)
                 };
                 self.sorted_fields.truncate(base);
                 resolved
             }
             TypeExprKind::Fn { params, ret, pure } => {
+                // A function type has its own rule, whatever surrounds it.
+                let inner = if pure {
+                    Bareness::Present
+                } else {
+                    Bareness::Either
+                };
                 let base = self.fn_params.len();
                 for param in self.ast.param_tys(params) {
                     // Resolving a nested function type uses `fn_params`
                     // above this one's entries and truncates back.
-                    let param_ty = self.resolve_type(param.ty);
+                    let param_ty = self.resolve_type(param.ty, inner);
                     self.fn_params.push((param.name, param_ty));
                 }
-                let ret = self.resolve_type(ret);
+                let ret = self.resolve_type(ret, inner);
                 let resolved = self.intern_fn_type(base, ret, pure);
                 self.fn_params.truncate(base);
                 resolved
             }
         }
+    }
+
+    /// What the type `ty`, written bare, means in `mode`: `ty` itself in
+    /// `Present` mode, and its either shape in `Either` mode.
+    fn bare(&mut self, ty: TyId, mode: Bareness) -> TyId {
+        match mode {
+            Bareness::Present => ty,
+            Bareness::Either => self.types.deferrable(ty),
+        }
+    }
+
+    /// Whether `name` is `Future` or `Present`, which take a type argument.
+    fn is_type_constructor(&self, name: Name) -> bool {
+        Some(name) == self.future_name || Some(name) == self.present_name
+    }
+
+    /// The type the applied type `NAME<ARG>` denotes, the name `name`
+    /// written at `span`: `Future<T>` for `Future` (`T` stripped, as
+    /// [`TypeTable::future`] does, so `Future<Future<Int>>` is
+    /// `Future<Int>`), and `T` for `Present`, where `T` is the argument
+    /// resolved with every bare type present; or
+    /// `Error` (reported) for any other name, or an erroneous argument. The
+    /// argument is resolved, and its errors reported, whatever the name.
+    fn resolve_applied(&mut self, name: Name, span: Span, arg: TypeExprId) -> TyId {
+        let arg = self.resolve_type(arg, Bareness::Present);
+        let text = self.ast.names().get(name);
+        if Some(name) == self.future_name {
+            return if arg == TyId::ERROR {
+                TyId::ERROR
+            } else {
+                self.types.future(arg)
+            };
+        }
+        if Some(name) == self.present_name {
+            return arg;
+        }
+        let builtin = self
+            .builtin_types
+            .iter()
+            .any(|(builtin, _)| *builtin == Some(name));
+        let message = if builtin {
+            format!("type `{text}` takes no type argument")
+        } else {
+            format!("unknown type `{text}`")
+        };
+        self.errors.push(Diagnostic::error(message, span));
+        TyId::ERROR
     }
 
     /// Interns the function type whose parameters are `fn_params[base..]`
@@ -2109,9 +2374,13 @@ impl<'a> Checker<'a> {
     }
 
     /// Checks that `expr`, of type `found`, can have type `expected`: an
-    /// untyped integer is coerced to `Int` or `Float`, and any other type
-    /// must be a subtype of `expected`. A mismatch is reported at `expr`
-    /// with a context label on `context`, the source of the expectation.
+    /// untyped integer is coerced to `Int` or `Float`, the type of the
+    /// `Int` or `Float` expected or of the either shape of one, and any
+    /// other type must be a subtype of `expected`, or become one once
+    /// awaited, in which case `expr` is marked to be awaited (see
+    /// [`TypeTable::needs_await`]), subject to the purity rule. A mismatch
+    /// is reported at `expr` with a context label on `context`, the source
+    /// of the expectation.
     fn expect(&mut self, expr: ExprId, found: TyId, expected: TyId, context: Span, why: &str) {
         match (found, expected) {
             (TyId::ERROR, _) => {}
@@ -2120,33 +2389,146 @@ impl<'a> Checker<'a> {
                 self.settle(expr, found);
             }
             (TyId::UNTYPED_INT, TyId::INT | TyId::FLOAT) => self.coerce(expr, expected),
+            // A literal is present, so it satisfies the either shape of its
+            // type, `Int | Future<Int>`, as it would `Int`.
+            (TyId::UNTYPED_INT, _)
+                if self.types.laziness(expected) == Laziness::Either
+                    && matches!(self.types.strip(expected), TyId::INT | TyId::FLOAT) =>
+            {
+                let present = self.types.strip(expected);
+                self.coerce(expr, present);
+            }
             _ if self.types.is_subtype(found, expected) => {}
-            _ => {
-                let found = self.settle(expr, found);
-                let label = format!(
-                    "expected {}, found {}",
-                    self.in_label(expected),
-                    self.in_label(found)
-                );
-                self.errors.push(
-                    Diagnostic::error("mismatched types", self.ast.get(expr).span)
-                        .with_label(label)
-                        .with_context(context, why),
-                );
+            _ => match self.types.needs_await(found, expected) {
+                Some(kind) => self.await_here(expr, found, kind, None),
+                None => self.mismatch(expr, found, expected, (context, why)),
+            },
+        }
+    }
+
+    /// Reports that `expr`, of type `found`, does not fit the type
+    /// `expected` stated at `context`, labelled `why`; with a note when a
+    /// future is expected and what is found is not one.
+    fn mismatch(
+        &mut self,
+        expr: ExprId,
+        found: TyId,
+        expected: TyId,
+        (context, why): (Span, &str),
+    ) {
+        let found = self.settle(expr, found);
+        let label = format!(
+            "expected {}, found {}",
+            self.in_label(expected),
+            self.in_label(found)
+        );
+        let mut error = Diagnostic::error("mismatched types", self.ast.get(expr).span)
+            .with_label(label)
+            .with_context(context, why);
+        if self.types.laziness(expected) == Laziness::Future {
+            let shown = self.in_message(expected);
+            match self.types.laziness(found) {
+                Laziness::Present => {
+                    error = error.with_note(format!(
+                        "a present value does not satisfy {shown}; write `lazy` before the \
+                         expression to defer it"
+                    ));
+                }
+                Laziness::Either => {
+                    error = error.with_note(format!(
+                        "this value may already be present; a {shown} must be deferred"
+                    ));
+                }
+                Laziness::Future => {}
             }
         }
+        self.errors.push(error);
+    }
+
+    /// Where `expr`, of type `ty`, is used as its bits at the top, by a
+    /// measuring operator, a call of it or a field access into it: if it
+    /// may be a future, marks it to be awaited at the top, subject to the
+    /// purity rule, and returns the type it has once awaited; otherwise, or
+    /// if it is erroneous, returns `ty`.
+    fn measure(&mut self, expr: ExprId, ty: TyId) -> TyId {
+        if ty == TyId::ERROR || self.types.laziness(ty) == Laziness::Present {
+            return ty;
+        }
+        self.await_here(expr, ty, AwaitKind::Top, None);
+        self.types.strip(ty)
+    }
+
+    /// Where `expr`, of type `ty`, is used as its bits all the way down, as
+    /// an interpolated expression or an operand of an equality: if it, or a
+    /// field of the record it is at any depth, may be a future, marks it to
+    /// be awaited (deeply, if the fields need it), subject to the purity
+    /// rule, and returns the type it has once awaited; otherwise, or if it
+    /// is erroneous, returns `ty`.
+    fn measure_deep(&mut self, expr: ExprId, ty: TyId) -> TyId {
+        if ty == TyId::ERROR {
+            return ty;
+        }
+        let present = self.types.present(ty);
+        if present == ty {
+            return ty;
+        }
+        let kind = if present == self.types.strip(ty) {
+            AwaitKind::Top
+        } else {
+            AwaitKind::Deep
+        };
+        self.await_here(expr, ty, kind, None);
+        present
+    }
+
+    /// Marks `expr`, of type `ty`, to be awaited as `kind` says, and applies
+    /// the purity rule: awaiting is impure, so inside a pure function it is
+    /// an error, "cannot await in a pure function" at the `await` keyword
+    /// for an explicit await, whose keyword is `explicit`, and "cannot use a
+    /// value that may be a future in a pure function" at `expr` for an
+    /// implicit one. The mark is recorded regardless, so that the error does
+    /// not cascade. The body of a `lazy` is impure, wherever it is written.
+    fn await_here(&mut self, expr: ExprId, ty: TyId, kind: AwaitKind, explicit: Option<Span>) {
+        self.awaits[expr.index()] = kind.into();
+        let Some(function) = self.functions.last() else {
+            return;
+        };
+        if !function.pure {
+            return;
+        }
+        let marker = function.marker;
+        let error = match explicit {
+            Some(keyword) => Diagnostic::error("cannot await in a pure function", keyword)
+                .with_context(marker, PURE_CONTEXT)
+                .with_note(
+                    "awaiting runs a deferred expression, which may have effects; declare the \
+                     function with `->` to make it impure",
+                ),
+            None => Diagnostic::error(
+                "cannot use a value that may be a future in a pure function",
+                self.ast.get(expr).span,
+            )
+            .with_label(format!("this is {}", self.in_label(ty)))
+            .with_context(marker, PURE_CONTEXT)
+            .with_note(
+                "using the value here would await it, which may run effects; a pure function \
+                 may hold and pass on a future but not await it. Declare the function with `->` \
+                 to make it impure",
+            ),
+        };
+        self.errors.push(error);
     }
 
     /// Checks `id` where a value of type `expected` is expected, as stated
     /// at `context`, labelled `why`, and returns the type it has.
     ///
-    /// If `expected` is a record type and `id` is, through any parentheses,
-    /// a record block, the block is checked against it field by field (see
-    /// the module documentation) and its type, and that of each parenthesis
-    /// around it, is the record of its fields, a subtype of `expected`, or
-    /// `Error` if a field is missing. Otherwise `id` is checked bottom-up
-    /// and then must be a subtype of `expected`, as [`Checker::expect`]
-    /// says.
+    /// If `expected` is a record type, or the either shape of one, and `id`
+    /// is, through any parentheses, a record block, the block is checked
+    /// against the record type field by field (see the module
+    /// documentation) and its type, and that of each parenthesis around it,
+    /// is the record of its fields, a subtype of `expected`, or `Error` if a
+    /// field is missing. Otherwise `id` is checked bottom-up and then must
+    /// be a subtype of `expected`, as [`Checker::expect`] says.
     fn check_expr_expecting(
         &mut self,
         id: ExprId,
@@ -2154,12 +2536,16 @@ impl<'a> Checker<'a> {
         context: Span,
         why: &str,
     ) -> TyId {
-        if self.types.is_record(expected)
+        // A record block is present, so it is checked against the present
+        // member of an either shape.
+        let record = self.types.strip(expected);
+        if self.types.laziness(expected) != Laziness::Future
+            && self.types.is_record(record)
             && let Some((block, body)) = self.record_block_within(id)
         {
             let span = self.ast.get(block).span;
             let expecting = Expecting {
-                ty: expected,
+                ty: record,
                 context,
                 why,
                 close: Span::new(span.end.saturating_sub(1), span.end),
@@ -2228,33 +2614,7 @@ impl<'a> Checker<'a> {
             ExprKind::Binary { op, lhs, rhs, .. } => {
                 let lhs_ty = self.check_expr(lhs);
                 let rhs_ty = self.check_expr(rhs);
-                match op {
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
-                        self.arithmetic(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
-                    }
-                    BinaryOp::Div => self.division(id, (lhs, lhs_ty), (rhs, rhs_ty)),
-                    BinaryOp::FloorDiv | BinaryOp::Rem => {
-                        self.integer_only(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
-                    }
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Same
-                    | BinaryOp::NotSame
-                    | BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge => self.comparison(id, op, (lhs, lhs_ty), (rhs, rhs_ty)),
-                    BinaryOp::And | BinaryOp::Or => {
-                        let op_span = expr.operator_span().unwrap_or(expr.span);
-                        self.logic_operand(op.verb(), op_span, lhs, lhs_ty);
-                        self.logic_operand(op.verb(), op_span, rhs, rhs_ty);
-                        if lhs_ty == TyId::ERROR || rhs_ty == TyId::ERROR {
-                            TyId::ERROR
-                        } else {
-                            TyId::BOOL
-                        }
-                    }
-                }
+                self.binary(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
             }
             ExprKind::Name(name) => self.check_name(id, name, expr.span),
             ExprKind::Block(body) => self.check_block(body, None),
@@ -2263,7 +2623,7 @@ impl<'a> Checker<'a> {
                 self.field_access(id, (record, record_ty), name)
             }
             ExprKind::Ascribe { expr: inner, ty } => {
-                let expected = self.resolve_type(ty);
+                let expected = self.resolve_type(ty, Bareness::Present);
                 let context = self.ast.type_expr(ty).span;
                 let found = self.check_expr_expecting(inner, expected, context, "ascribed here");
                 if found == TyId::ERROR {
@@ -2274,26 +2634,189 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Fn(function) => self.check_fn(id, function),
             ExprKind::Call { callee, args } => self.check_call(id, callee, args),
+            ExprKind::Lazy(function) => self.check_lazy(function),
         };
         self.expr_types[id.index()] = ty;
         ty
+    }
+
+    /// Types the binary operator `op` of expression `id` applied to `lhs`
+    /// and `rhs`, of types `lhs_ty` and `rhs_ty`: each operand is awaited
+    /// at the top if it may be a future, or deeply for an equality, and the
+    /// operator typed on what they are once awaited.
+    fn binary(
+        &mut self,
+        id: ExprId,
+        op: BinaryOp,
+        (lhs, lhs_ty): (ExprId, TyId),
+        (rhs, rhs_ty): (ExprId, TyId),
+    ) -> TyId {
+        if op.is_equality() {
+            return self.equality(id, op, (lhs, lhs_ty), (rhs, rhs_ty));
+        }
+        let lhs_ty = self.measure(lhs, lhs_ty);
+        let rhs_ty = self.measure(rhs, rhs_ty);
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                self.arithmetic(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
+            }
+            BinaryOp::Div => self.division(id, (lhs, lhs_ty), (rhs, rhs_ty)),
+            BinaryOp::FloorDiv | BinaryOp::Rem => {
+                self.integer_only(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
+            }
+            BinaryOp::And | BinaryOp::Or => {
+                let expr = self.ast.get(id);
+                let op_span = expr.operator_span().unwrap_or(expr.span);
+                self.logic_operand(op.verb(), op_span, lhs, lhs_ty);
+                self.logic_operand(op.verb(), op_span, rhs, rhs_ty);
+                if lhs_ty == TyId::ERROR || rhs_ty == TyId::ERROR {
+                    TyId::ERROR
+                } else {
+                    TyId::BOOL
+                }
+            }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Same
+            | BinaryOp::NotSame
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => self.comparison(id, op, (lhs, lhs_ty), (rhs, rhs_ty)),
+        }
+    }
+
+    /// Types the equality `op` of expression `id`: futures have no equality,
+    /// so a type with a `Future` anywhere below its top is an error; and
+    /// otherwise each operand is awaited deeply if it needs to be, and the
+    /// comparison typed on what they are once awaited.
+    fn equality(
+        &mut self,
+        id: ExprId,
+        op: BinaryOp,
+        (lhs, lhs_ty): (ExprId, TyId),
+        (rhs, rhs_ty): (ExprId, TyId),
+    ) -> TyId {
+        // A future at the top is awaited as for any operator; one in a field
+        // is not, since it is part of the value compared.
+        let with_future = [lhs_ty, rhs_ty]
+            .into_iter()
+            .map(|ty| self.types.strip(ty))
+            .find(|&ty| ty != TyId::ERROR && self.types.contains_future(ty));
+        if let Some(ty) = with_future {
+            self.settle(lhs, lhs_ty);
+            self.settle(rhs, rhs_ty);
+            let expr = self.ast.get(id);
+            let span = expr.operator_span().unwrap_or(expr.span);
+            let lhs_label = format!("this is {}", self.in_label(self.types.strip(lhs_ty)));
+            let rhs_label = format!("this is {}", self.in_label(self.types.strip(rhs_ty)));
+            self.errors.push(
+                Diagnostic::error(
+                    format!(
+                        "cannot compare {}: it contains a future",
+                        self.in_message(ty)
+                    ),
+                    span,
+                )
+                .with_context(self.ast.get(lhs).span, lhs_label)
+                .with_context(self.ast.get(rhs).span, rhs_label)
+                .with_note("futures have no equality; await the future and compare its value"),
+            );
+            return TyId::ERROR;
+        }
+        let lhs_ty = self.measure_deep(lhs, lhs_ty);
+        let rhs_ty = self.measure_deep(rhs, rhs_ty);
+        self.comparison(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
+    }
+
+    /// Types a `lazy` expression, whose body is function `function`:
+    /// the body is checked as that of an anonymous, parameterless, impure
+    /// function, in a frame of its own, capturing what it uses of the
+    /// enclosing scopes as a closure does, and the expression's type is
+    /// `Future<T>`, `T` being the body's type with an untyped integer
+    /// settled to `Int`, stripped (see [`TypeTable::future`]: `lazy lazy 1`
+    /// is `Future<Int>`); or `Error` if the body is erroneous.
+    fn check_lazy(&mut self, function: FnId) -> TyId {
+        // A function in the body must not see a name meant for another.
+        self.callee_name = None;
+        let decl = *self.ast.fn_decl(function);
+        self.functions.push(Function {
+            fn_id: function,
+            bindings_start: self.bindings.len(),
+            outer_next_slot: self.next_slot,
+            outer_frame_size: self.frame_size,
+            outer_slot_names: std::mem::take(&mut self.slot_names),
+            captures: Vec::new(),
+            pure: false,
+            marker: decl.marker,
+        });
+        (self.next_slot, self.frame_size) = (0, 0);
+        let found = self.check_expr(decl.body);
+        let body_ty = self.settle(decl.body, found);
+        self.finish_function(0, None);
+        if body_ty == TyId::ERROR {
+            TyId::ERROR
+        } else {
+            self.types.future(body_ty)
+        }
+    }
+
+    /// Pops the innermost function off the stack of functions being
+    /// checked, recording what was found for it, with `param_count`
+    /// parameters and the callee name `callee`, and restores the enclosing
+    /// frame's slot allocation.
+    fn finish_function(&mut self, param_count: u32, callee: Option<Name>) {
+        let Some(finished) = self.functions.pop() else {
+            return;
+        };
+        let slot_names = std::mem::replace(&mut self.slot_names, finished.outer_slot_names);
+        self.fn_resolutions[finished.fn_id.index()] = FnResolution {
+            frame_size: self.frame_size,
+            param_count,
+            captures: finished
+                .captures
+                .iter()
+                .map(|capture| (capture.source, capture.ty))
+                .collect(),
+            callee,
+            slot_names,
+        };
+        (self.next_slot, self.frame_size) = (finished.outer_next_slot, finished.outer_frame_size);
     }
 
     /// Types the function expression `id`, whose details are `function`,
     /// and checks its body in a frame of its own (see the module
     /// documentation). Its type is known, and recorded, before the body is
     /// checked: the function type of its declared parameter and return
-    /// types, or `Error` if any of them is.
+    /// types, or `Error` if any of them is. A bare type in them is present
+    /// for a pure function and the either shape for an impure one.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
+        let mode = if decl.pure {
+            Bareness::Present
+        } else {
+            Bareness::Either
+        };
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
         for param in params {
-            let ty = self.resolve_type(param.ty);
+            let ty = self.resolve_type(param.ty, mode);
             self.fn_params.push((Some(param.name), ty));
         }
-        let ret = self.resolve_type(decl.ret);
+        let ret = if let Some(ret) = decl.ret {
+            self.resolve_type(ret, mode)
+        } else {
+            // The parser gives every function expression a return type.
+            self.errors.push(
+                InternalError {
+                    message: "a function expression has no return type",
+                    span: self.ast.get(id).span,
+                }
+                .into(),
+            );
+            TyId::ERROR
+        };
         let ty = self.intern_fn_type(base, ret, decl.pure);
         self.expr_types[id.index()] = ty;
         self.functions.push(Function {
@@ -2310,31 +2833,18 @@ impl<'a> Checker<'a> {
         let span = self.ast.get(id).span;
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
         self.fn_params.truncate(base);
-        if let Some(finished) = self.functions.pop() {
-            let slot_names = std::mem::replace(&mut self.slot_names, finished.outer_slot_names);
-            self.fn_resolutions[finished.fn_id.index()] = FnResolution {
-                frame_size: self.frame_size,
-                param_count: decl.params.len(),
-                captures: finished
-                    .captures
-                    .iter()
-                    .map(|capture| (capture.source, capture.ty))
-                    .collect(),
-                callee,
-                slot_names,
-            };
-            (self.next_slot, self.frame_size) =
-                (finished.outer_next_slot, finished.outer_frame_size);
-        }
+        self.finish_function(decl.params.len(), callee);
         ty
     }
 
     /// Types the call `id` of `callee` with the arguments `args` (see the
     /// module documentation): the callee's return type, or `Error` if the
     /// callee is not a function or the arguments do not fit its parameters.
-    /// Every argument is checked whatever goes wrong.
+    /// Every argument is checked whatever goes wrong. A callee that may be
+    /// a future is awaited.
     fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
         let callee_ty = self.check_expr(callee);
+        let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
             if callee_ty != TyId::ERROR {
                 let callee_ty = self.settle(callee, callee_ty);
@@ -2364,7 +2874,7 @@ impl<'a> Checker<'a> {
                     self.ast.get(id).span,
                 )
                 .with_context(self.ast.get(callee).span, label)
-                .with_context(marker, "this function is pure, declared with `:`")
+                .with_context(marker, PURE_CONTEXT)
                 .with_note(
                     "a pure function, declared with `:`, may call only pure functions; declare \
                      it with `->` to make it impure",
@@ -2642,10 +3152,12 @@ impl<'a> Checker<'a> {
                 .map_or(TyId::ERROR, |&(_, ty)| ty);
             self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
         }
-        let context = self.ast.type_expr(decl.ret).span;
-        let why = "the return type is declared here";
         let body = decl.body;
         let block = *self.ast.get(body);
+        let context = decl
+            .ret
+            .map_or(block.span, |ret| self.ast.type_expr(ret).span);
+        let why = "the return type is declared here";
         let ExprKind::Block(items) = block.kind else {
             // The parser only makes blocks bodies.
             self.errors.push(
@@ -2659,9 +3171,15 @@ impl<'a> Checker<'a> {
             (self.block_start, self.fields_start, self.next_slot) = outer;
             return;
         };
-        if self.types.is_record(ret) && self.is_record_body(items) {
+        // As for any record block, against the present member of the
+        // either shape of a record type too.
+        let record = self.types.strip(ret);
+        if self.types.laziness(ret) != Laziness::Future
+            && self.types.is_record(record)
+            && self.is_record_body(items)
+        {
             let expecting = Expecting {
-                ty: ret,
+                ty: record,
                 context,
                 why,
                 close: Span::new(block.span.end.saturating_sub(1), block.span.end),
@@ -2680,15 +3198,17 @@ impl<'a> Checker<'a> {
     }
 
     /// Types the field access `id`, reading field `name` of `record`, of
-    /// type `record_ty`: the field's type. Reading a field the record type
-    /// lacks, or reading any field of a value that is not a record, is
-    /// reported at the `.NAME`.
+    /// type `record_ty`: the field's type, as the record type declares it.
+    /// A record that may be a future is awaited at the top first. Reading a
+    /// field the record type lacks, or reading any field of a value that is
+    /// not a record, is reported at the `.NAME`.
     fn field_access(
         &mut self,
         id: ExprId,
         (record, record_ty): (ExprId, TyId),
         name: Name,
     ) -> TyId {
+        let record_ty = self.measure(record, record_ty);
         if record_ty == TyId::ERROR {
             return TyId::ERROR;
         }
@@ -2769,11 +3289,18 @@ impl<'a> Checker<'a> {
 
     /// Types the prefix operator `op`, at `op_span`, applied to `operand`
     /// of type `operand_ty`. Negation accepts every numeric type and
-    /// preserves it; `not` needs a `Bool`.
+    /// preserves it; `not` needs a `Bool`; both await an operand that may be
+    /// a future first. `await` awaits its operand fully, and its type is
+    /// the operand's stripped of every future layer at its top; on an
+    /// operand that is present it does nothing, which is a warning.
     fn unary(&mut self, op: UnaryOp, op_span: Span, (operand, operand_ty): (ExprId, TyId)) -> TyId {
         if operand_ty == TyId::ERROR {
             return TyId::ERROR;
         }
+        if op == UnaryOp::Await {
+            return self.explicit_await(op_span, operand, operand_ty);
+        }
+        let operand_ty = self.measure(operand, operand_ty);
         match op {
             UnaryOp::Neg if is_numeric(operand_ty) => operand_ty,
             UnaryOp::Neg => {
@@ -2789,7 +3316,27 @@ impl<'a> Checker<'a> {
                 self.logic_operand(op.verb(), op_span, operand, operand_ty);
                 TyId::BOOL
             }
+            // Handled above.
+            UnaryOp::Await => operand_ty,
         }
+    }
+
+    /// Types `await OPERAND`, whose keyword is at `keyword`, `operand` being
+    /// of type `ty`, which is not erroneous (see [`Checker::unary`]).
+    fn explicit_await(&mut self, keyword: Span, operand: ExprId, ty: TyId) -> TyId {
+        if self.types.laziness(ty) == Laziness::Present {
+            let label = format!("this is {}", self.in_label(ty));
+            self.warnings.push(
+                Diagnostic::warning(
+                    "this value is already present; `await` does nothing",
+                    keyword,
+                )
+                .with_context(self.ast.get(operand).span, label),
+            );
+            return ty;
+        }
+        self.await_here(operand, ty, AwaitKind::Top, Some(keyword));
+        self.types.strip(ty)
     }
 
     /// Resolves a use of the variable `name` at expression `id`, recording
@@ -2986,6 +3533,11 @@ impl<'a> Checker<'a> {
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
     ) -> TyId {
+        let lazy = self.types.laziness(then_ty) != Laziness::Present
+            || self.types.laziness(else_ty) != Laziness::Present;
+        if lazy {
+            return self.lazy_branches(keyword, (then, then_ty), (else_, else_ty));
+        }
         let joinable = (self.types.is_record(then_ty) && self.types.is_record(else_ty))
             || (self.types.fn_sig(then_ty).is_some() && self.types.fn_sig(else_ty).is_some());
         let common = if joinable {
@@ -2993,16 +3545,63 @@ impl<'a> Checker<'a> {
         } else {
             self.agree((then, then_ty), (else_, else_ty))
         };
-        common.unwrap_or_else(|| {
-            let then_label = format!("this is {}", self.in_label(then_ty));
-            let else_label = format!("this is {}", self.in_label(else_ty));
-            self.errors.push(
-                Diagnostic::error("`if` branches have different types", keyword)
-                    .with_context(self.ast.get(then).span, then_label)
-                    .with_context(self.ast.get(else_).span, else_label),
-            );
-            TyId::ERROR
-        })
+        common.unwrap_or_else(|| self.branch_mismatch(keyword, (then, then_ty), (else_, else_ty)))
+    }
+
+    /// Types the branches of an `if` with `else`, whose keyword is at
+    /// `keyword`, when either may be a future: they have their join (see
+    /// [`TypeTable::join`]). An untyped branch first adapts to the other
+    /// branch's `Int` or `Float` once stripped, or settles to `Int`.
+    fn lazy_branches(
+        &mut self,
+        keyword: Span,
+        (then, then_ty): (ExprId, TyId),
+        (else_, else_ty): (ExprId, TyId),
+    ) -> TyId {
+        let then_ty = self.adapt_to(then, then_ty, else_ty);
+        let else_ty = self.adapt_to(else_, else_ty, then_ty);
+        if then_ty == TyId::ERROR || else_ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        match self.types.join(then_ty, else_ty) {
+            Some(common) => common,
+            None => self.branch_mismatch(keyword, (then, then_ty), (else_, else_ty)),
+        }
+    }
+
+    /// The type of `expr`, of type `ty`, once an untyped integer in it
+    /// adapts to `other`, the type of the expression it must agree with:
+    /// to `Int` or `Float` if `other` stripped is one, and to `Int`
+    /// otherwise. Any other type is returned as it is.
+    fn adapt_to(&mut self, expr: ExprId, ty: TyId, other: TyId) -> TyId {
+        if ty != TyId::UNTYPED_INT {
+            return ty;
+        }
+        match self.types.strip(other) {
+            concrete @ (TyId::INT | TyId::FLOAT) => {
+                self.coerce(expr, concrete);
+                concrete
+            }
+            _ => self.settle(expr, ty),
+        }
+    }
+
+    /// Reports that the branches of the `if` whose keyword is at `keyword`
+    /// have no common type, and returns `Error`.
+    fn branch_mismatch(
+        &mut self,
+        keyword: Span,
+        (then, then_ty): (ExprId, TyId),
+        (else_, else_ty): (ExprId, TyId),
+    ) -> TyId {
+        let then_label = format!("this is {}", self.in_label(then_ty));
+        let else_label = format!("this is {}", self.in_label(else_ty));
+        self.errors.push(
+            Diagnostic::error("`if` branches have different types", keyword)
+                .with_context(self.ast.get(then).span, then_label)
+                .with_context(self.ast.get(else_).span, else_label),
+        );
+        TyId::ERROR
     }
 
     /// Types an `if` without `else`, whose keyword is at `keyword`: it is
@@ -3025,7 +3624,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Types an interpolated string: each interpolated expression is
-    /// checked, and an untyped one settles to `Int`. The result is a
+    /// checked, an untyped one settles to `Int`, and one that may be a
+    /// future, or hold one in a field, is awaited deeply. The result is a
     /// `String`, or an error, without a further report, if a part is one.
     fn check_interpolation(&mut self, parts: PartRange) -> TyId {
         let mut ty = TyId::STRING;
@@ -3037,7 +3637,8 @@ impl<'a> Checker<'a> {
             // A value of every type can be shown as text today, a record in
             // its `repr` form. Once some type's values cannot be, it is
             // reported here as "cannot display".
-            if self.settle(expr, found) == TyId::ERROR {
+            let found = self.settle(expr, found);
+            if self.measure_deep(expr, found) == TyId::ERROR {
                 ty = TyId::ERROR;
             }
         }
@@ -3134,8 +3735,9 @@ impl<'a> Checker<'a> {
     /// `id`. Does nothing if `id` already has a concrete type (or is an
     /// error).
     ///
-    /// Only integer literals, parentheses, negation, `+ - *`, blocks and
-    /// `if`s with `else` can be untyped, and an untyped node's children
+    /// Only integer literals, parentheses, negation, `await` of a present
+    /// value, `+ - *`, blocks and `if`s with `else` can be untyped, and an
+    /// untyped node's children
     /// (an `if`'s branches, not its condition) are untyped or concrete of
     /// the same kind, so the walk only ever meets those nodes. Every other
     /// node always has a concrete type; a record block, in particular, is
@@ -3155,7 +3757,10 @@ impl<'a> Checker<'a> {
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
             | ExprKind::Fn(_)
-            | ExprKind::Call { .. } => {}
+            | ExprKind::Call { .. }
+            | ExprKind::Lazy(_) => {}
+            // An `await` of an untyped operand is one of a present value,
+            // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
                 self.coerce(inner, ty);
             }
@@ -3186,11 +3791,13 @@ impl<'a> Checker<'a> {
 
     /// Type `ty` as a diagnostic's message or notes show it: plainly if it
     /// is written as a name, and in backticks if it is structural, as a
-    /// record or function type is.
+    /// record, function, future or union type is.
     fn in_message(&self, ty: TyId) -> String {
         let shown = self.types.display(ty, self.ast.names());
         match self.types.kind(ty) {
-            TyKind::Record(_) | TyKind::Fn(_) | TyKind::Union(_) => format!("`{shown}`"),
+            TyKind::Record(_) | TyKind::Fn(_) | TyKind::Future(_) | TyKind::Union(_) => {
+                format!("`{shown}`")
+            }
             TyKind::Int
             | TyKind::Float
             | TyKind::Bool
@@ -3224,6 +3831,10 @@ const WHOLE_FIELD_NOTE: &str = "a field defined as a whole cannot be extended wi
 
 /// The note on a field that the expected record type lacks.
 const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can see it";
+
+/// The label on a pure function's marker, where it does something only an
+/// impure function may.
+const PURE_CONTEXT: &str = "this function is pure, declared with `:`";
 
 #[cfg(test)]
 mod tests {
@@ -4016,7 +4627,9 @@ mod tests {
                         }
                     }
                 }
-                ExprKind::Fn(function) => visit(ast, ast.fn_decl(function).body, out),
+                ExprKind::Fn(function) | ExprKind::Lazy(function) => {
+                    visit(ast, ast.fn_decl(function).body, out);
+                }
                 ExprKind::Call { callee, args } => {
                     visit(ast, callee, out);
                     for arg in ast.args(args) {
@@ -5877,10 +6490,10 @@ mod tests {
             shown_result("fn(x: Int, y: String): Bool { true }"),
             "fn(x: Int, y: String): Bool"
         );
-        assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {}");
+        assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {} | Future<{}>");
         assert_eq!(
             shown_result("fn(f: fn(Int): Int): {r: fn() -> Int} { r = fn() -> Int { f(1) } }"),
-            "fn(f: fn(Int): Int): {r: fn() -> Int}"
+            "fn(f: fn(Int): Int): {r: fn() -> Int | Future<Int>}"
         );
         assert_eq!(
             shown_result("let f = fn(x: Int): Int { x }\nf"),
@@ -5968,7 +6581,10 @@ mod tests {
             messages("fn(): Int { let x = 1 }"),
             vec!["mismatched types"]
         );
-        assert_eq!(shown_result("fn() -> {} { let x = 1 }"), "fn() -> {}");
+        assert_eq!(
+            shown_result("fn() -> {} { let x = 1 }"),
+            "fn() -> {} | Future<{}>"
+        );
     }
 
     #[test]
@@ -6486,13 +7102,15 @@ mod tests {
             result_type("fn x(r: {x: Int}): Int { r.x }\nlet p = { x = 1; y = 2 }\nx(p)"),
             TyId::INT
         );
-        // A function argument, by the function subtyping rules.
+        // A function argument, by the function subtyping rules. A pure
+        // function whose parameter is present fits an impure callback type
+        // that promises to send it present values.
         assert_eq!(
-            result_type(
-                "fn apply(f: fn(Int) -> Int, v: Int) -> Int { f(v) }\n\
+            shown_result(
+                "fn apply(f: fn(Present<Int>) -> Int, v: Int) -> Int { f(v) }\n\
                  apply(fn(n: Int): Int { n + 1 }, 1)"
             ),
-            TyId::INT
+            "Int | Future<Int>"
         );
         assert_eq!(
             messages(
@@ -6601,12 +7219,39 @@ mod tests {
             messages(&format!("{ADD}add(1, 2)\n1")),
             vec!["unused value of type Int"]
         );
+        assert_eq!(
+            result_type("fn tick() -> Present<{}> {}\ntick()\n1"),
+            TyId::INT
+        );
+        // An impure function's bare `{}` result may be a future: a statement
+        // expects `{}`, so it is awaited there, and its effects are not lost.
+        assert_eq!(
+            marks("fn tick() -> {} {}\ntick()\n1"),
+            vec![("tick()", AwaitMark::Top)]
+        );
         assert_eq!(result_type("fn tick() -> {} {}\ntick()\n1"), TyId::INT);
+        assert_eq!(
+            result_type("fn tick() -> {} {}\nawait tick()\n1"),
+            TyId::INT
+        );
+        // Which a pure function cannot do (the call is reported first: it
+        // is checked before the statement's value is used).
+        assert_eq!(
+            messages("fn tick() -> {} {}\nfn p(): Int { tick()\n1 }"),
+            vec![
+                "cannot call an impure function from a pure function",
+                "cannot use a value that may be a future in a pure function"
+            ]
+        );
     }
 
     #[test]
     fn a_pure_function_cannot_call_an_impure_one() {
-        let text = "fn tick() -> Int { 1 }\nfn pure(): Int { tick() }";
+        // `tick` returns a present `Int`, so that a pure caller does no
+        // more than call it: an impure function's bare `Int` result may be
+        // a future, which a pure caller could not use either (see
+        // `a_pure_function_cannot_await`).
+        let text = "fn tick() -> Present<Int> { 1 }\nfn pure(): Int { tick() }";
         let found = diagnostics(text);
         assert_eq!(found.len(), 1);
         assert_eq!(
@@ -6628,7 +7273,7 @@ mod tests {
                  with `->` to make it impure"
             ]
         );
-        let tick = "fn tick() -> Int { 1 }\n";
+        let tick = "fn tick() -> Present<Int> { 1 }\n";
         // At any depth of blocks in the pure function.
         assert_eq!(
             messages(&format!(
@@ -6645,8 +7290,17 @@ mod tests {
         );
         // Receiving an impure function and calling it.
         assert_eq!(
-            messages("fn call(f: fn() -> Int): Int { f() }"),
+            messages("fn call(f: fn() -> Present<Int>): Int { f() }"),
             vec!["cannot call an impure function from a pure function"]
+        );
+        // One whose result may be a future is also used as its bits, as the
+        // body's value, which is reported at the body.
+        assert_eq!(
+            messages("fn call(f: fn() -> Int): Int { f() }"),
+            vec![
+                "cannot use a value that may be a future in a pure function",
+                "cannot call an impure function from a pure function"
+            ]
         );
         // Allowed: pure in impure, pure in pure, impure in impure, impure
         // at the top level, and a pure function creating, storing,
@@ -6670,7 +7324,8 @@ mod tests {
         // pass an impure one along.
         assert_eq!(
             messages(&format!(
-                "{tick}fn pass(f: fn() -> Int): fn() -> Int {{ f }}\nfn p(): Int {{ pass(tick)() }}"
+                "{tick}fn pass(f: fn() -> Present<Int>): fn() -> Present<Int> {{ f }}\n\
+                 fn p(): Int {{ pass(tick)() }}"
             )),
             vec!["cannot call an impure function from a pure function"]
         );
@@ -6705,7 +7360,10 @@ mod tests {
             let text = format!("let r = {{ a = {{ b = {{ f = fn() -> {{}} {{}} }} }} }}\nr {op} r");
             assert_eq!(
                 messages(&text),
-                vec!["cannot compare `{a: {b: {f: fn() -> {}}}}`: it contains a function"]
+                vec![
+                    "cannot compare `{a: {b: {f: fn() -> {} | Future<{}>}}}`: it contains a \
+                     function"
+                ]
             );
         }
         // The operands must first have one identical type.
@@ -6740,12 +7398,18 @@ mod tests {
         );
         // A function can be shown as text.
         assert_eq!(result_type("\"{fn(): Int { 1 }}\""), TyId::STRING);
-        // `if` branches of function types join.
+        // `if` branches of function types join, their parameters identical.
         assert_eq!(
             shown_result(
-                "let f = if true { fn(a: Int): Int { a } } else { fn(b: Int) -> Int { b } }\nf"
+                "let f = if true { fn(a: Int): Int { a } } \
+                 else { fn(b: Present<Int>) -> Int { b } }\nf"
             ),
-            "fn(Int) -> Int"
+            "fn(Int) -> Int | Future<Int>"
+        );
+        // An impure function's bare parameter is not a pure one's.
+        assert_eq!(
+            messages("if true { fn(a: Int): Int { a } } else { fn(b: Int) -> Int { b } }"),
+            vec!["`if` branches have different types"]
         );
         assert_eq!(
             shown_result(
@@ -6760,8 +7424,8 @@ mod tests {
         );
         // Annotations and ascriptions with function types.
         assert_eq!(
-            shown_result("let f: fn(Int) -> Int = fn(x: Int): Int { x }\nf"),
-            "fn(Int) -> Int"
+            shown_result("let f: fn(Present<Int>) -> Int = fn(x: Int): Int { x }\nf"),
+            "fn(Int) -> Int | Future<Int>"
         );
         assert_eq!(
             messages("let f: fn(Int): Int = fn(x: Int) -> Int { x }"),
@@ -6771,5 +7435,903 @@ mod tests {
             messages("let f: fn(Nope): Int = g"),
             vec!["unknown type `Nope`", "undefined variable `g`"]
         );
+    }
+
+    // ----- Futures -----
+
+    /// Every expression of `text`, which must check, that is awaited where
+    /// it is used, as its source text and its mark, in allocation order.
+    fn marks(text: &str) -> Vec<(&str, AwaitMark)> {
+        let (ast, resolution) = resolved(text);
+        ast.expr_ids()
+            .filter_map(|id| match resolution.await_of(id) {
+                AwaitMark::None => None,
+                mark => {
+                    let span = ast.get(id).span;
+                    Some((&text[span.start as usize..span.end as usize], mark))
+                }
+            })
+            .collect()
+    }
+
+    /// The note of the error for an implicit await in a pure function.
+    const IMPLICIT_AWAIT_NOTE: &str = "using the value here would await it, which may run \
+                                       effects; a pure function may hold and pass on a future \
+                                       but not await it. Declare the function with `->` to \
+                                       make it impure";
+
+    /// Checks that `text` has exactly one error, the error for an implicit
+    /// await in a pure function of `awaited`, whose type is shown as
+    /// `shown`, the function being the last declared with `:`.
+    fn assert_implicit_await_error(text: &str, awaited: Span, shown: &str) {
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{text}: {found:?}");
+        let error = &found[0];
+        assert_eq!(
+            error.message, "cannot use a value that may be a future in a pure function",
+            "{text}"
+        );
+        assert_eq!(error.span, awaited, "{text}");
+        assert_eq!(
+            error.label.as_deref(),
+            Some(format!("this is {shown}").as_str()),
+            "{text}"
+        );
+        let marker = last(text, "):");
+        let marker = Span::new(marker.start + 1, marker.end);
+        assert_eq!(labels(error), vec![(marker, PURE_CONTEXT)], "{text}");
+        assert_eq!(error.notes, vec![IMPLICIT_AWAIT_NOTE], "{text}");
+    }
+
+    #[test]
+    fn bare_types_are_either_in_impure_signatures_and_present_elsewhere() {
+        // An impure function's parameters and result, a record type being
+        // the either shape at its own position and through its fields.
+        assert_eq!(
+            shown_result("fn(x: Int, r: {a: String}) -> {v: Int} { v = x }"),
+            "fn(x: Int | Future<Int>, r: {a: String | Future<String>} | Future<{a: String | \
+             Future<String>}>) -> {v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+        );
+        assert_eq!(
+            shown_result("fn f(r: {a: String}) -> {v: Int} { v = 1 }\nf"),
+            "fn(r: {a: String | Future<String>} | Future<{a: String | Future<String>}>) -> {v: \
+             Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+        );
+        assert_eq!(
+            shown_result("fn(r: {a: {b: Int}}) -> Int { 1 }"),
+            "fn(r: {a: {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>} | Future<{a: \
+             {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>}>) -> Int | Future<Int>"
+        );
+        // But not a function type, at its own position: it has its own rule
+        // inside, and a function that may be a future is written so.
+        assert_eq!(
+            shown_result("fn(f: fn(): Int, r: {g: fn(): Int}) -> Int { 1 }"),
+            "fn(f: fn(): Int, r: {g: fn(): Int} | Future<{g: fn(): Int}>) -> Int | Future<Int>"
+        );
+        // A pure function's are present.
+        assert_eq!(
+            shown_result("fn(x: Int, r: {a: String}): {v: Int} { v = x }"),
+            "fn(x: Int, r: {a: String}): {v: Int}"
+        );
+        // A written impure function type's, and a pure one's; and each has
+        // its own rule inside the other.
+        assert_eq!(
+            shown_result("fn(x: Int) -> {v: Int} { v = x } : fn(Int) -> {v: Int}"),
+            "fn(Int | Future<Int>) -> {v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+        );
+        assert_eq!(
+            shown_result("fn(x: Int): Int { x } : fn(Int): Int"),
+            "fn(Int): Int"
+        );
+        assert_eq!(
+            shown_result("fn(f: fn(Int): Int) -> Int { 1 }"),
+            "fn(f: fn(Int): Int) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn(f: fn(Int) -> Int): Int { 1 }"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>): Int"
+        );
+        // Annotations and ascriptions are present.
+        assert_eq!(shown_result("let x: {a: Int} = { a = 1 }\nx"), "{a: Int}");
+        assert_eq!(shown_result("1 : Int"), "Int");
+        // `Present<T>` and `Future<T>` override, their interiors present.
+        assert_eq!(
+            shown_result("fn(r: Present<{a: Int}>) -> Present<Int> { 1 }"),
+            "fn(r: {a: Int}) -> Int"
+        );
+        assert_eq!(
+            shown_result("fn(r: Future<{a: Int}>) -> Int { 1 }"),
+            "fn(r: Future<{a: Int}>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn(r: Future<{a: Int}>): Future<{a: Int}> { r }"),
+            "fn(r: Future<{a: Int}>): Future<{a: Int}>"
+        );
+        // The either shape may be written anywhere.
+        assert_eq!(
+            shown_result("let x: Int | Future<Int> = 1\nx"),
+            "Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("let x: Future<Int> | Int = lazy 1\nx"),
+            "Int | Future<Int>"
+        );
+        // The two functions of the specification.
+        assert_eq!(
+            shown_result("fn double(x: Int): Int { x * 2 }\ndouble"),
+            "fn(x: Int): Int"
+        );
+        assert_eq!(
+            shown_result("fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\nkeep"),
+            "fn(x: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+    }
+
+    #[test]
+    fn an_impure_function_takes_a_future_record() {
+        let run = "fn run(step: {}) -> {} { }\n";
+        assert_eq!(
+            shown_result(&format!("{run}run")),
+            "fn(step: {} | Future<{}>) -> {} | Future<{}>"
+        );
+        // A future of a record is passed as it is, unawaited.
+        let text = format!("{run}run(lazy {{}})");
+        assert_eq!(shown_result(&text), "{} | Future<{}>");
+        assert!(marks(&text).is_empty());
+        let text = format!("{run}run({{}})");
+        assert!(marks(&text).is_empty());
+    }
+
+    #[test]
+    fn an_either_record_parameter_is_awaited_by_a_field_access() {
+        let text = "fn f(r: {a: Int}) -> Int { r.a }\nf(lazy { a = 1 })";
+        // The record is awaited at the top; its field, of the either shape,
+        // is passed on as the result unawaited.
+        assert_eq!(marks(text), vec![("r", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "Int | Future<Int>");
+        // Measured, the field is awaited in turn.
+        assert_eq!(
+            marks("fn f(r: {a: Int}) -> Int { r.a + 1 }"),
+            vec![("r", AwaitMark::Top), ("r.a", AwaitMark::Top)]
+        );
+    }
+
+    #[test]
+    fn a_pure_function_record_parameter_stays_present() {
+        let text = "fn f(r: {a: Int}): Int { r.a + 1 }\nf";
+        assert_eq!(shown_result(text), "fn(r: {a: Int}): Int");
+        assert!(marks(text).is_empty());
+        // So a future of one is awaited at the call, in impure code.
+        assert_eq!(
+            marks("fn f(r: {a: Int}): Int { r.a }\nf(lazy { a = 1 })"),
+            vec![("lazy { a = 1 }", AwaitMark::Top)]
+        );
+    }
+
+    #[test]
+    fn a_written_function_type_record_parameter_follows_its_marker() {
+        assert_eq!(
+            shown_result("fn(r: {a: Int}) -> Int { r.a } : fn({a: Int}) -> Int"),
+            "fn({a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn(r: {a: Int}): Int { r.a } : fn({a: Int}): Int"),
+            "fn({a: Int}): Int"
+        );
+        // In an annotation, whose own bare types are present.
+        assert_eq!(
+            shown_result("let g: {f: fn({a: Int}) -> {}} = { f = fn(r: {a: Int}) -> {} { } }\ng"),
+            "{f: fn({a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>) -> {} | Future<{}>}"
+        );
+        // A pure function taking a present record does not fit the impure
+        // type, which promises it may pass a future.
+        assert_eq!(
+            messages("let g: fn({a: Int}) -> Int = fn(r: {a: Int}): Int { r.a }"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn an_either_function_type_displays_in_parentheses_and_round_trips() {
+        let branches = "if true { fn(): Int { 1 } } else { lazy fn(): Int { 2 } }";
+        assert_eq!(shown_result(branches), "(fn(): Int) | Future<fn(): Int>");
+        let annotated = format!("let f: (fn(): Int) | Future<fn(): Int> = {branches}\nf");
+        assert_eq!(shown_result(&annotated), "(fn(): Int) | Future<fn(): Int>");
+        // Without the parentheses it is a function returning a union.
+        assert_eq!(
+            messages("let f: fn(): Int | Future<fn(): Int> = g"),
+            vec![
+                "unions other than `T | Future<T>` are not supported yet",
+                "undefined variable `g`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lazy_is_a_future_of_its_body() {
+        // A literal settles to Int.
+        assert_eq!(shown_result("lazy 1"), "Future<Int>");
+        assert_eq!(shown_result("lazy 1 + 2.5"), "Future<Float>");
+        assert_eq!(shown_result("lazy { let a = 1; a + 1 }"), "Future<Int>");
+        assert_eq!(
+            shown_result("lazy { a = 1; b = \"s\" }"),
+            "Future<{a: Int, b: String}>"
+        );
+        assert_eq!(shown_result("lazy { }"), "Future<{}>");
+        assert_eq!(shown_result("lazy fn(): Int { 1 }"), "Future<fn(): Int>");
+        // A future of a future is a future, since awaiting resolves fully;
+        // so is a future of an either.
+        assert_eq!(shown_result("lazy lazy 1"), "Future<Int>");
+        assert_eq!(
+            shown_result("let x: Int | Future<Int> = 1\nlazy x"),
+            "Future<Int>"
+        );
+        assert_eq!(
+            shown_result("let x: Future<Future<Int>> = lazy 1\nx"),
+            "Future<Int>"
+        );
+        assert_eq!(
+            shown_result("let x: Future<Int | Future<Int>> = lazy lazy 1\nx"),
+            "Future<Int>"
+        );
+        // An impure function's bare result is the either shape, and a lazy
+        // of its call fits a declared future.
+        let compile = "fn compile(target: String) -> String { \"built {target}\" }\n";
+        assert_eq!(
+            shown_result(&format!("{compile}lazy compile(\"a\")")),
+            "Future<String>"
+        );
+        assert_eq!(
+            shown_result(&format!(
+                "{compile}let build: Future<String> = lazy compile(\"a\")\nbuild"
+            )),
+            "Future<String>"
+        );
+        // The fields of a record it yields are untouched.
+        assert_eq!(
+            shown_result("lazy { a = lazy 1 }"),
+            "Future<{a: Future<Int>}>"
+        );
+        let ast = parse_text("lazy 1");
+        let checked = check(&ast, &mut TypeTable::new()).unwrap().0;
+        let ExprKind::Lazy(function) = ast.get(result_expr(&ast)).kind else {
+            panic!("expected a lazy");
+        };
+        assert_eq!(checked.types.get(ast.fn_decl(function).body), TyId::INT);
+        // An erroneous body is reported once.
+        assert_eq!(
+            messages("let x = lazy 1 + \"a\"\nx + 1"),
+            vec!["cannot add Int and String"]
+        );
+        // The name it initialises is not in scope in it.
+        assert_eq!(
+            errors("let x = lazy x"),
+            vec![("undefined variable `x`".to_owned(), Span::new(13, 14))]
+        );
+    }
+
+    #[test]
+    fn a_lazy_captures_as_a_closure_does() {
+        // A top-level variable, in a frame of its own.
+        let text = "let x = 1\nlet f = lazy { let y = x; y + x }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            uses(&ast, &resolution, "x"),
+            vec![VarRef::Capture(0), VarRef::Capture(0)]
+        );
+        assert_eq!(uses(&ast, &resolution, "y"), vec![VarRef::Local(Slot(0))]);
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Local(Slot(0)), "Int".to_owned())]
+        );
+        let function = resolution.function(FnId::new(0));
+        assert_eq!(
+            (function.frame_size, function.param_count, function.callee),
+            (1, 0, None)
+        );
+        // A parameter, through a function nested in the body: the lazy is
+        // number 1, finished after the function nested in it, number 0, and
+        // before the function it is in, number 2.
+        let text = "fn f(n: Present<Int>) -> Future<fn(): Int> { lazy fn(): Int { n + 1 } }";
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Capture(0), "Int".to_owned())]
+        );
+        assert_eq!(
+            captures(text, 1),
+            vec![(VarRef::Local(Slot(0)), "Int".to_owned())]
+        );
+        // And the callee of the function it is in.
+        let text = "fn f(n: Int): Future<Int> { lazy await f(n) }";
+        assert_eq!(
+            captures(text, 0),
+            vec![
+                (VarRef::Callee, "fn(n: Int): Future<Int>".to_owned()),
+                (VarRef::Local(Slot(0)), "Int".to_owned())
+            ]
+        );
+        // A lazy in a function's initialiser does not see the function's
+        // name, and a function in the lazy does not either.
+        assert_eq!(
+            messages("let f = lazy fn(): Int { f() }"),
+            vec!["undefined variable `f`"]
+        );
+        // `:=` on a captured variable is rebinding one of an enclosing
+        // block.
+        assert_eq!(
+            messages("let x = 1\nlet f = lazy { x := 2\nx }"),
+            vec!["cannot rebind `x` here: it is declared in an enclosing block"]
+        );
+    }
+
+    #[test]
+    fn a_lazy_body_is_impure_wherever_it_is_written() {
+        let tick = "fn tick() -> Present<Int> { 1 }\nfn step() -> {} { }\n";
+        for text in [
+            format!("{tick}fn plan(): Future<Int> {{ lazy tick() }}"),
+            format!("{tick}fn plan(): {{build: Future<{{}}>}} {{ build = lazy {{ step() }} }}"),
+            "fn plan(x: Future<Int>): Future<Int> { lazy await x + 1 }".to_owned(),
+            "fn plan(x: Future<Int>): Future<Int> { lazy x + 1 }".to_owned(),
+            "fn plan(x: Future<Int>): Future<String> { lazy \"{x}\" }".to_owned(),
+        ] {
+            assert_eq!(
+                check(&parse_text(&text), &mut TypeTable::new()).err(),
+                None,
+                "{text}"
+            );
+        }
+        // A pure function in the lazy is pure.
+        assert_eq!(
+            messages(&format!("{tick}let p = lazy fn(): Int {{ tick() }}")),
+            vec!["cannot call an impure function from a pure function"]
+        );
+    }
+
+    #[test]
+    fn await_resolves_its_operand_fully() {
+        assert_eq!(shown_result("let x = lazy 1\nawait x"), "Int");
+        assert_eq!(shown_result("let x = lazy lazy 1\nawait x"), "Int");
+        assert_eq!(shown_result("let x: Int | Future<Int> = 1\nawait x"), "Int");
+        // The fields of a record keep their declared types.
+        assert_eq!(
+            shown_result("let r = lazy { a = lazy 1 }\nawait r"),
+            "{a: Future<Int>}"
+        );
+        assert_eq!(shown_result("let x = lazy 2\nawait x + 1"), "Int");
+        assert_eq!(
+            marks("let x = lazy lazy 1\nawait x"),
+            vec![("x", AwaitMark::Top)]
+        );
+        // Accepted at the top level, in an impure function and in a lazy.
+        assert_eq!(
+            shown_result("fn f(x: Int) -> Present<Int> { await x }\nf"),
+            "fn(x: Int | Future<Int>) -> Int"
+        );
+    }
+
+    #[test]
+    fn awaiting_a_present_value_is_a_warning() {
+        let text = "let x = 1\nawait x";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "this value is already present; `await` does nothing"
+        );
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert_eq!(found[0].span, at(text, "await"));
+        assert_eq!(labels(&found[0]), vec![(last(text, "x"), "this is Int")]);
+        assert_eq!(shown_result(text), "Int");
+        assert!(marks(text).is_empty());
+        // An untyped operand stays untyped, and adapts.
+        assert_eq!(shown_result("await 5 + 1.5"), "Float");
+        assert_eq!(
+            labels(&warnings("await 5")[0]),
+            vec![(Span::new(6, 7), "this is Int")]
+        );
+    }
+
+    #[test]
+    fn a_pure_function_cannot_await() {
+        // Explicitly.
+        let text = "fn f(x: Future<Int>): Int { await x }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "cannot await in a pure function");
+        assert_eq!(found[0].span, at(text, "await"));
+        assert_eq!(labels(&found[0]), vec![(nth(text, ":", 1), PURE_CONTEXT)]);
+        assert_eq!(
+            found[0].notes,
+            vec![
+                "awaiting runs a deferred expression, which may have effects; declare the \
+                 function with `->` to make it impure"
+            ]
+        );
+        // Implicitly, by each measuring operator.
+        let either = "Int | Future<Int>";
+        for (body, ret) in [
+            ("x + 1", "Int"),
+            ("1 - x", "Int"),
+            ("x * 2", "Int"),
+            ("x / 2", "Float"),
+            ("x // 2", "Int"),
+            ("x % 2", "Int"),
+            ("-x", "Int"),
+            ("x < 1", "Bool"),
+            ("x >= 1", "Bool"),
+        ] {
+            let text = format!("fn f(x: Int | Future<Int>): {ret} {{ {body} }}");
+            assert_implicit_await_error(&text, last(&text, "x"), either);
+        }
+        for body in ["b and true", "false or b", "not b"] {
+            let text = format!("fn f(b: Bool | Future<Bool>): Bool {{ {body} }}");
+            assert_implicit_await_error(&text, last(&text, "b"), "Bool | Future<Bool>");
+        }
+        // An `if` condition.
+        let text = "fn f(b: Future<Bool>): Int { if b { 1 } else { 2 } }";
+        assert_implicit_await_error(text, last(text, "b"), "Future<Bool>");
+        // A field access, and a call of the value.
+        let text = "fn f(r: Future<{a: Int}>): Int { r.a }";
+        assert_implicit_await_error(text, last(text, "r"), "Future<{a: Int}>");
+        let text = "fn f(g: Future<fn(): Int>): Int { g() }";
+        assert_implicit_await_error(text, last(text, "g"), "Future<fn(): Int>");
+        // An argument against a present parameter.
+        let text = "fn h(n: Int): Int { n }\nfn f(x: Future<Int>): Int { h(x) }";
+        assert_implicit_await_error(text, last(text, "x"), "Future<Int>");
+        // A body against a present return type.
+        let text = "fn f(x: Int | Future<Int>): Int { x }";
+        assert_implicit_await_error(text, last(text, "{ x }"), either);
+        // A record field against a present field, deeply.
+        let text = "fn f(r: {a: Future<Int>}): {a: Int} { r }";
+        assert_implicit_await_error(text, last(text, "{ r }"), "{a: Future<Int>}");
+        // An interpolation and an equality, at any depth of blocks.
+        let text = "fn f(x: Future<Int>): String { { { \"{x}\" } } }";
+        assert_implicit_await_error(text, last(text, "x"), "Future<Int>");
+        let text = "fn f(x: Future<Int>): Bool { if true { x == 1 } else { false } }";
+        assert_implicit_await_error(text, last(text, "x"), "Future<Int>");
+        let text = "fn f(r: {a: Int | Future<Int>}): Bool { r == r }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].span, nth(text, "r", 2));
+        assert_eq!(found[1].span, nth(text, "r", 3));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("this is {a: Int | Future<Int>}")
+        );
+        // A pure function nested in an impure one is pure; a pure
+        // function's own bare parameter is present, so measuring it is
+        // fine.
+        assert_eq!(
+            messages("fn f(x: Int) -> Int { let g = fn(): Int { x + 1 }\ng() }"),
+            vec!["cannot use a value that may be a future in a pure function"]
+        );
+        assert!(marks("fn f(x: Int): Int { x + 1 }").is_empty());
+    }
+
+    #[test]
+    fn a_pure_function_may_hold_and_pass_on_futures() {
+        for text in [
+            "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }",
+            "fn pass(x: Future<Int>): Future<Int> { x }",
+            "fn pass(x: Future<Int>): Int | Future<Int> { x }",
+            "fn bind(x: Future<Int>): Future<Int> { let y = x\ny }",
+            "fn store(x: Future<Int>): {f: Future<Int>} { f = x }",
+            "fn later(x: Future<Int>): fn() -> Int { fn() -> Int { x } }",
+            "fn g(y: Future<Int>): Future<Int> { y }\nfn f(x: Future<Int>): Future<Int> { g(x) }",
+            "fn g(y: Int | Future<Int>): Int | Future<Int> { y }\n\
+             fn f(x: Future<Int>): Int | Future<Int> { g(x) }",
+            "fn pick(b: Bool, x: Future<Int>): Int | Future<Int> { if b { x } else { 1 } }",
+        ] {
+            let (ast, resolution) = resolved(text);
+            assert!(
+                ast.expr_ids()
+                    .all(|id| resolution.await_of(id) == AwaitMark::None),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_programs_await_when_impure() {
+        // The programs `a_pure_function_cannot_await` rejects, impure: each
+        // use as bits is marked, and nothing is an error.
+        for (body, ret) in [
+            ("x + 1", "Int"),
+            ("1 - x", "Int"),
+            ("x * 2", "Int"),
+            ("x / 2", "Float"),
+            ("x // 2", "Int"),
+            ("x % 2", "Int"),
+            ("-x", "Int"),
+            ("x < 1", "Bool"),
+            ("x >= 1", "Bool"),
+            ("\"{x}\"", "String"),
+            ("x == 1", "Bool"),
+        ] {
+            let text = format!("fn f(x: Future<Int>) -> {ret} {{ {body} }}");
+            assert_eq!(marks(&text), vec![("x", AwaitMark::Top)], "{text}");
+            // And at the top level.
+            let text = format!("let x = lazy 1\nlet y: {ret} = {body}");
+            assert_eq!(marks(&text), vec![("x", AwaitMark::Top)], "{text}");
+        }
+        for (params, body, awaited) in [
+            ("b: Future<Bool>", "if b { 1 } else { 2 }", "b"),
+            ("b: Future<Bool>", "if not b { 1 } else { 2 }", "b"),
+            ("r: Future<{a: Int}>", "r.a", "r"),
+            ("g: Future<fn(): Int>", "g()", "g"),
+            (
+                "x: Int | Future<Int>",
+                "{ { x } } : Present<Int>",
+                "{ { x } }",
+            ),
+        ] {
+            let text = format!("fn f({params}) -> Int {{ {body} }}");
+            assert_eq!(marks(&text), vec![(awaited, AwaitMark::Top)], "{text}");
+        }
+        assert_eq!(
+            marks("fn h(n: Int): Int { n }\nfn f(x: Future<Int>) -> Int { h(x) }"),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(r: {a: Future<Int>}) -> Present<{a: Int}> { r }"),
+            vec![("{ r }", AwaitMark::Deep)]
+        );
+        // In an impure function, and at the top level, each use as bits is
+        // marked.
+        assert_eq!(
+            marks("fn f(x: Int) -> Int { x + 1 }"),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("let x = lazy 1\nlet y = -x * 2\ny"),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(b: Bool, c: Bool) -> Bool { b and not c }"),
+            vec![("b", AwaitMark::Top), ("c", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("let b = lazy true\nif b { 1 } else { 2 }"),
+            vec![("b", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("let r = lazy { a = 1 }\nr.a"),
+            vec![("r", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("let g = lazy fn(): Int { 1 }\ng()"),
+            vec![("g", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn h(n: Int): Int { n }\nlet x = lazy 1\nh(x)"),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(x: Int) -> Present<Int> { x }"),
+            vec![("{ x }", AwaitMark::Top)]
+        );
+        // Through parentheses and ascriptions, the outermost is marked.
+        assert_eq!(
+            marks("let x = lazy 1\n(x) + 1"),
+            vec![("(x)", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("let x = lazy 1\nlet y: Int = x : Int | Future<Int>\ny"),
+            vec![("x : Int | Future<Int>", AwaitMark::Top)]
+        );
+        // Deeply, where fields must be present, in interpolations and in
+        // equalities; at the top where only the top is lazy.
+        assert_eq!(
+            marks("let r = { a = lazy 1; b = 2 }\nlet s: {a: Int} = r\ns"),
+            vec![("r", AwaitMark::Deep)]
+        );
+        assert_eq!(
+            marks("let r = { a = lazy 1 }\n\"{r}\""),
+            vec![("r", AwaitMark::Deep)]
+        );
+        assert_eq!(
+            marks("let x = lazy 1\n\"{x}\""),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(r: {a: Int}) -> Bool { r == { a = 1 } }"),
+            vec![("r", AwaitMark::Deep)]
+        );
+        assert_eq!(marks("let x = lazy 1\nx == 1"), vec![("x", AwaitMark::Top)]);
+        // A record with no lazy field inside is not awaited.
+        assert!(marks("let r = { a = 1 }\nlet s = \"{r}\"\nr == r").is_empty());
+    }
+
+    #[test]
+    fn a_present_value_where_a_future_is_expected() {
+        let note = "a present value does not satisfy `Future<Int>`; write `lazy` before the \
+                    expression to defer it";
+        // An annotation.
+        let text = "let x: Future<Int> = 1";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "1"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Future<Int>, found Int")
+        );
+        assert_eq!(found[0].notes, vec![note]);
+        // A parameter, a `:=` and a field.
+        for text in [
+            "fn f(x: Future<Int>): Future<Int> { x }\nf(1)",
+            "let x = lazy 1\nx := 2",
+            "let r: {f: Future<Int>} = { f = 1 }",
+            "fn plan(): {build: Future<Int>} { build = 1 }",
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].message, "mismatched types", "{text}");
+            assert_eq!(found[0].notes, vec![note], "{text}");
+        }
+        // An either where a future is expected.
+        let text = "fn f(x: Int) -> Future<Int> { x }";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Future<Int>, found Int | Future<Int>")
+        );
+        assert_eq!(
+            found[0].notes,
+            vec!["this value may already be present; a `Future<Int>` must be deferred"]
+        );
+        // A future of another type: no note.
+        let text = "let x: Future<Float> = lazy 1";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Future<Float>, found Future<Int>")
+        );
+        assert!(found[0].notes.is_empty());
+        // A record block is checked against the present member of the
+        // either shape of a record type, as against the record type.
+        assert_eq!(
+            shown_result("let r: {a: Float} | Future<{a: Float}> = { a = 1 }\nr"),
+            "{a: Float} | Future<{a: Float}>"
+        );
+        assert_eq!(
+            shown_result("fn() -> {a: Float} | Future<{a: Float}> { a = 1 }"),
+            "fn() -> {a: Float} | Future<{a: Float}>"
+        );
+        assert_eq!(
+            messages("let r: {a: Int} | Future<{a: Int}> = { b = 1 }"),
+            vec![
+                "field `b` is not in `{a: Int}`",
+                "missing field `a` in record"
+            ]
+        );
+        // The either shape accepts both, and adapts a literal.
+        assert_eq!(
+            check(
+                &parse_text("let a: Int | Future<Int> = 1\nlet b: Int | Future<Int> = lazy 1"),
+                &mut TypeTable::new()
+            )
+            .err(),
+            None
+        );
+        assert_eq!(
+            shown_result("let a: Float | Future<Float> = 1\na"),
+            "Float | Future<Float>"
+        );
+        let ast = parse_text("let a: Float | Future<Float> = 1");
+        let (checked, _) = check(&ast, &mut TypeTable::new()).unwrap();
+        let one = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).kind == ExprKind::Int(1))
+            .unwrap();
+        assert_eq!(checked.types.get(one), TyId::FLOAT);
+    }
+
+    #[test]
+    fn unions_other_than_the_either_shape_are_rejected() {
+        for (text, bar) in [
+            ("let x: Int | String = 1", 11),
+            ("let x: Int | Future<Float> = 1", 11),
+            ("let x: Future<Int> | Future<Int> = lazy 1", 19),
+            ("let x: Int | Future<Int> | Future<Int> = 1", 25),
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(
+                found[0].message, "unions other than `T | Future<T>` are not supported yet",
+                "{text}"
+            );
+            assert_eq!(found[0].span, Span::new(bar, bar + 1), "{text}");
+        }
+        // An erroneous member is reported once.
+        assert_eq!(
+            messages("let x: Nope | Future<Int> = 1"),
+            vec!["unknown type `Nope`"]
+        );
+    }
+
+    #[test]
+    fn unknown_applied_types() {
+        assert_eq!(
+            errors("let x: Foo<Int> = 1"),
+            vec![("unknown type `Foo`".to_owned(), Span::new(7, 10))]
+        );
+        assert_eq!(
+            errors("let x: Int<Int> = 1"),
+            vec![(
+                "type `Int` takes no type argument".to_owned(),
+                Span::new(7, 10)
+            )]
+        );
+        assert_eq!(
+            errors("let x: Future = 1"),
+            vec![(
+                "type `Future` needs a type argument, as in `Future<Int>`".to_owned(),
+                Span::new(7, 13)
+            )]
+        );
+        assert_eq!(
+            messages("let x: Present = 1"),
+            vec!["type `Present` needs a type argument, as in `Present<Int>`"]
+        );
+        // The argument is checked too.
+        assert_eq!(
+            messages("let x: Foo<Nope> = 1"),
+            vec!["unknown type `Foo`", "unknown type `Nope`"]
+        );
+        // `Future` and `Present` are ordinary names outside types.
+        assert_eq!(shown_result("let Future = 1\nFuture + 1"), "Int");
+    }
+
+    #[test]
+    fn callbacks_must_accept_what_they_are_promised() {
+        let double = "fn double(x: Int): Int { x * 2 }\n";
+        // `run` promises to pass its callback values that may be futures.
+        let text = format!("{double}fn run(f: fn(Int) -> Int) -> Int {{ f(1) }}\nrun(double)");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, last(&text, "double"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected fn(Int | Future<Int>) -> Int | Future<Int>, found fn(x: Int): Int")
+        );
+        // One that promises present values accepts it.
+        assert_eq!(
+            shown_result(&format!(
+                "{double}fn run(f: fn(Present<Int>) -> Int) -> Int {{ f(1) }}\nrun(double)"
+            )),
+            "Int | Future<Int>"
+        );
+        // A pure function declared to pass values through fits both.
+        let keep = "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\n";
+        assert_eq!(
+            shown_result(&format!(
+                "{keep}fn run(f: fn(Int) -> {{v: Int}}) -> {{v: Int}} {{ f(1) }}\nrun(keep)"
+            )),
+            "{v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+        );
+    }
+
+    #[test]
+    fn if_branches_that_may_be_futures_join() {
+        assert_eq!(
+            shown_result("if true { lazy 1 } else { lazy 2 }"),
+            "Future<Int>"
+        );
+        assert_eq!(
+            shown_result("if true { 1 } else { lazy 2 }"),
+            "Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("if true { lazy 1.5 } else { 2 }"),
+            "Float | Future<Float>"
+        );
+        assert_eq!(
+            shown_result("let x: Int | Future<Int> = 1\nif true { lazy 1 } else { x }"),
+            "Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("if true { { a = lazy 1; b = 1 } } else { { a = 2 } }"),
+            "{a: Int | Future<Int>}"
+        );
+        assert_eq!(
+            shown_result("if true { lazy { a = 1; b = 1 } } else { lazy { a = 2 } }"),
+            "Future<{a: Int}>"
+        );
+        let text = "if true { lazy 1 } else { lazy \"s\" }";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "`if` branches have different types");
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (at(text, "{ lazy 1 }"), "this is Future<Int>"),
+                (at(text, "{ lazy \"s\" }"), "this is Future<String>")
+            ]
+        );
+        // An erroneous branch is reported once.
+        assert_eq!(
+            messages("if true { lazy 1 } else { nope }"),
+            vec!["undefined variable `nope`"]
+        );
+    }
+
+    #[test]
+    fn futures_have_no_equality() {
+        let text = "let r = { a = lazy 1 }\nr == r";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "cannot compare `{a: Future<Int>}`: it contains a future"
+        );
+        assert_eq!(found[0].span, at(text, "=="));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (nth(text, "r", 1), "this is {a: Future<Int>}"),
+                (nth(text, "r", 2), "this is {a: Future<Int>}")
+            ]
+        );
+        assert_eq!(
+            found[0].notes,
+            vec!["futures have no equality; await the future and compare its value"]
+        );
+        // Under a future at the top, for every equality.
+        for op in ["==", "!=", "===", "!=="] {
+            assert_eq!(
+                messages(&format!("let r = lazy {{ a = lazy 1 }}\nr {op} r")),
+                vec!["cannot compare `{a: Future<Int>}`: it contains a future"],
+                "{op}"
+            );
+        }
+        // A field of the either shape is awaited deeply and compared.
+        assert_eq!(
+            shown_result("fn f(r: {a: Int}) -> Bool { r == { a = 1 } }\nf({ a = 1 })"),
+            "Bool | Future<Bool>"
+        );
+        // A future at the top is awaited as for any operator.
+        assert_eq!(shown_result("(lazy 1) === 1"), "Bool");
+    }
+
+    #[test]
+    fn unused_futures() {
+        let text = "let x = lazy 1\nx\n1";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "unused value of type `Future<Int>`");
+        assert_eq!(
+            found[0].notes,
+            vec!["await it with `await`, bind it with `let`, or remove it"]
+        );
+        // A statement expects `{}`: a future of `{}`, or a value that may
+        // be one, is awaited there, so its effects are not lost.
+        assert_eq!(marks("lazy { }\n1"), vec![("lazy { }", AwaitMark::Top)]);
+        assert_eq!(
+            marks("let x = lazy { }\nlet y: {} | Future<{}> = {}\nx\ny\n1"),
+            vec![("x", AwaitMark::Top), ("y", AwaitMark::Top)]
+        );
+        assert_eq!(
+            messages("fn p(x: Future<{}>): Int { x\n1 }"),
+            vec!["cannot use a value that may be a future in a pure function"]
+        );
+        assert_eq!(
+            diagnostics("let x: Int | Future<Int> = 1\nx\n1")[0].notes,
+            vec!["await it with `await`, bind it with `let`, or remove it"]
+        );
+        // A bare `await` is exempt, whatever its value, in any block.
+        for text in [
+            "let x = lazy 1\nawait x\n2",
+            "let x = lazy { }\n{ await x; = 1 }",
+            "let x = lazy 1\n{ a = 1; await x }",
+            "fn run(step: Future<Int>) -> {} { await step\n= {} }",
+        ] {
+            assert_eq!(
+                check(&parse_text(text), &mut TypeTable::new()).err(),
+                None,
+                "{text}"
+            );
+        }
     }
 }

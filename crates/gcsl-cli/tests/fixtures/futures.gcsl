@@ -1,0 +1,15 @@
+# A build script: a pure plan whose build step runs later, when awaited.
+fn compile(target: String) -> String { "compiled {target}" }
+fn plan(name: String): {name: String, build: Future<String>} {
+  name = name
+  build = lazy compile(name)
+}
+fn build(package: fn(String): {name: String, build: Future<String>}, name: String) -> {name: String, build: Future<String>} {
+  let conf = package(name)
+  await conf.build
+  = conf
+}
+fn keep(step: String | Future<String>): {step: String | Future<String>} { step = step }
+let built = build(plan, "gcsl")
+name = built.name
+step = keep(built.build).step

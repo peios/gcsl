@@ -9,15 +9,17 @@
 //! parent and no runtime value is ever inspected to choose an operation.
 //! `Evaluator::function` returns the closure of a function value. Each
 //! typed walker handles the nodes of its kind and also loads, captures,
-//! blocks, `if`s, field accesses and calls, which can be of any kind: an
-//! `if` evaluates its condition through `bool` and then exactly one branch
-//! through the walker it was called with, and a field access or a call
-//! produces a [`Value`] from which the walker extracts its kind's. A general
-//! walker, `Evaluator::value`, handles every node, and hands the typed nodes
-//! to the typed walkers, building a [`Value`] only where a value of
-//! statically unknown kind is needed: at the root, in a slot, in a record,
-//! in a closure's captures, as an interpolated value, or as a block's or a
-//! function body's result evaluated through `value`.
+//! blocks, `if`s, field accesses, calls and awaits, which can be of any
+//! kind: an `if` evaluates its condition through `bool` and then exactly
+//! one branch through the walker it was called with, and a field access, a
+//! call or an await produces a [`Value`] from which the walker extracts its
+//! kind's. A general walker, `Evaluator::value`, handles every node, and
+//! hands the typed nodes to the typed walkers, building a [`Value`] only
+//! where a value of statically unknown kind is needed: at the root, in a
+//! slot, in a record, in a closure's or a future's captures, as an
+//! interpolated value, as a block's or a function body's result evaluated
+//! through `value`, or where the value may be a future (see
+//! [Futures](#futures)).
 //!
 //! A record is built from its record block's shared [`crate::value::Layout`]
 //! and its field values in layout order, the one allocation for the values
@@ -110,6 +112,34 @@
 //! diagnostic, [`Diagnostic::input`], unless an inner call has already, so
 //! the innermost foreign frame wins.
 //!
+//! # Futures
+//!
+//! `MakeFuture` builds a future as `MakeClosure` builds a closure: its
+//! captured values in one boxed slice and a reference to the IR, two
+//! allocations. Nothing runs. Only the general walker evaluates a node of
+//! kind [`crate::value::ValueKind::Deferred`], whose value may be a future;
+//! every typed walker treats one as mistyped, so no typed walker ever
+//! inspects a value to see whether it is a future, and code that never
+//! awaits pays nothing for futures. An `Await` node, placed by the checker
+//! wherever such a value is used as its bits, evaluates its value through
+//! `value`, and while it is a future, runs it: the future equivalent of a
+//! call, `run_future`, charged to the nesting budget as a call of a
+//! parameterless function would be, the await's depth in its frame's body
+//! plus [`CALL_LEVELS`] plus the body's height, and one more level for each
+//! level of record nesting a deep await has descended to reach it. Its first
+//! await runs the body in a frame of its own, on the value stack above the
+//! awaiting frame's, and records the value, dropping the captures; every
+//! later await is a borrow and a clone of that value. A deep await then
+//! awaits the lazy fields its shape lists, recursively, building a new
+//! record, sharing the layout and the untouched values, only if a field
+//! changed. An error inside a body leaves the future unrun, with its
+//! captures, so a later await runs it again, and gets the context label
+//! "awaited here" on the await that ran it, when both are of the same
+//! session input; otherwise the future's input is stamped on it, as a call
+//! stamps a closure's. A future is marked as running while its body runs,
+//! so that an await of it from inside its own body, which the checker never
+//! lets through, is an error rather than an endless loop.
+//!
 //! Operands are evaluated left to right, so when both would fail, the left
 //! one's error is reported. Items are evaluated in order, and so are a
 //! call's arguments, whatever parameters they fill. Evaluation holds no
@@ -127,11 +157,14 @@ use crate::ast::FnId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, Operands, ShapeId, ShapedOperands,
+    Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId, Operands, ShapeId,
+    ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
-use crate::value::{Closure, Layout, Record, Value, int_to_float};
+use crate::value::{
+    Begin, Closure, Future, FutureState, Layout, Record, Value, ValueKind, int_to_float,
+};
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
 /// The room an interpolation reserves for each interpolated value's text,
@@ -144,10 +177,12 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 ///
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
-/// "division by zero" for `//` or `%` by zero; and at a call's span, "call
-/// nested too deeply" for a call that would take the program's nesting,
-/// calls included, past [`MAX_DEPTH`] levels (see the module
-/// documentation). `Float` arithmetic never fails.
+/// "division by zero" for `//` or `%` by zero; and at a call's or an
+/// await's span, "call nested too deeply" for a call, or an await running a
+/// future, that would take the program's nesting, calls included, past
+/// [`MAX_DEPTH`] levels (see the module documentation). An error inside a
+/// future's body is reported where it happens, as one inside a function
+/// is. `Float` arithmetic never fails.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
     // The top level's frame; calls grow the stack beyond it.
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
@@ -245,6 +280,8 @@ impl Evaluator<'_> {
                 depth,
                 ..
             } => self.call((callee, args, depth), node),
+            IrKind::MakeFuture { function, captures } => self.make_future(function, captures),
+            IrKind::Await { .. } => self.await_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -382,6 +419,239 @@ impl Evaluator<'_> {
         }))
     }
 
+    /// Builds a future of `function` capturing the values of `captures`,
+    /// read in this frame, as [`Evaluator::make_closure`] builds a closure:
+    /// one allocation for the captured values and one for the future, which
+    /// shares the IR. Nothing is run.
+    fn make_future(&mut self, function: FnId, captures: IrRange) -> Result<Value, Diagnostic> {
+        let items = self.ir.items(captures);
+        let mut values = Vec::with_capacity(items.len());
+        for &item in items {
+            values.push(self.value(item)?);
+        }
+        Ok(Value::Future(Rc::new(Future::new(
+            Rc::clone(self.ir),
+            function,
+            values.into_boxed_slice(),
+        ))))
+    }
+
+    /// Evaluates the `Await` `node` (see the module documentation) as a
+    /// value, which must be of the kind the node states.
+    fn await_node(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        let value = self.await_value(node)?;
+        match node.kind {
+            IrKind::Await { kind, .. } if value.kind() == kind => Ok(value),
+            _ => mistyped(
+                node,
+                "an await produced a value of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates the `Await` `node` as a value that `extract` accepts: one
+    /// of the kind the node states.
+    fn await_as<T>(
+        &mut self,
+        node: &IrNode,
+        extract: fn(Value) -> Option<T>,
+    ) -> Result<T, Diagnostic> {
+        match extract(self.await_value(node)?) {
+            Some(value) => Ok(value),
+            None => mistyped(
+                node,
+                "an await produced a value of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates the `Await` `node`: its value, through the general walker,
+    /// awaited fully and then, if it has a lazy shape, deeply.
+    fn await_value(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        let IrKind::Await {
+            value,
+            shape,
+            depth,
+            ..
+        } = node.kind
+        else {
+            return mistyped(node, "a node that is not an await awaited");
+        };
+        let awaited = self.value(value)?;
+        let awaited = self.await_fully(awaited, depth, 0, node)?;
+        if shape == LazyShapeId::NONE {
+            Ok(awaited)
+        } else {
+            // The fields of the record awaited are one level of nesting
+            // below it.
+            self.await_deep(awaited, shape, depth, 1, node)
+        }
+    }
+
+    /// Awaits `value` fully, for the await `node` at depth `depth` in this
+    /// frame's body, `level` levels of record nesting below the value it
+    /// awaits: while it is a future, runs it and continues with what it
+    /// yields.
+    fn await_fully(
+        &mut self,
+        value: Value,
+        depth: u16,
+        level: usize,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let mut value = value;
+        loop {
+            match value {
+                Value::Future(future) => value = self.run_future(&future, depth, level, node)?,
+                present => return Ok(present),
+            }
+        }
+    }
+
+    /// Awaits the lazy fields of `value`, a record, as lazy shape `shape`
+    /// lists them, for the await `node` at depth `depth` in this frame's
+    /// body, the record being `level` levels of record nesting below the
+    /// value the await awaits: each field that is lazy is awaited fully and
+    /// then, if its shape says so, deeply, and each present record field
+    /// with lazy fields inside is awaited deeply. If any field changed, the
+    /// result is a new record sharing the layout and the values that did
+    /// not; otherwise it is the record as it was. The empty record has no
+    /// fields to await.
+    fn await_deep(
+        &mut self,
+        value: Value,
+        shape: LazyShapeId,
+        depth: u16,
+        level: usize,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let Value::Record(record) = &value else {
+            return Ok(value);
+        };
+        let ir = self.ir;
+        let Some(lazy) = ir.find_lazy_shape(shape) else {
+            return mistyped(node, "an await of a lazy shape its IR lacks");
+        };
+        let mut changed: Option<Vec<Value>> = None;
+        for &(name, field) in &lazy.fields {
+            let found = record.layout.names.iter().position(|&field| field == name);
+            let Some((index, old)) =
+                found.and_then(|index| Some((index, record.values.get(index)?)))
+            else {
+                return mistyped(node, "a record lacks a field of its lazy shape");
+            };
+            let new = match field {
+                LazyField::Await(inner) => {
+                    let awaited = self.await_fully(old.clone(), depth, level, node)?;
+                    if inner == LazyShapeId::NONE {
+                        awaited
+                    } else {
+                        self.await_deep(awaited, inner, depth, level + 1, node)?
+                    }
+                }
+                LazyField::Within(inner) => {
+                    self.await_deep(old.clone(), inner, depth, level + 1, node)?
+                }
+            };
+            let differs = match (old, &new) {
+                (Value::Future(_), _) => true,
+                (Value::Record(old), Value::Record(new)) => !Rc::ptr_eq(old, new),
+                _ => false,
+            };
+            if differs {
+                let values = changed.get_or_insert_with(|| record.values.to_vec());
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = new;
+                }
+            }
+        }
+        match changed {
+            Some(values) => Ok(Value::Record(Rc::new(Record {
+                layout: Rc::clone(&record.layout),
+                values: values.into_boxed_slice(),
+            }))),
+            None => Ok(value),
+        }
+    }
+
+    /// Runs `future` for the await `node` at depth `depth` in this frame's
+    /// body, `level` levels of record nesting below the value the await
+    /// awaits (see the module documentation), and returns what it yields:
+    /// the value it recorded, if it has run; otherwise its body's value,
+    /// run in a frame of its own, which it then records. The future
+    /// equivalent of [`Evaluator::call`]: it keeps only the future, its
+    /// frame's base and the new evaluator across the body's evaluation.
+    fn run_future(
+        &mut self,
+        future: &Rc<Future>,
+        depth: u16,
+        level: usize,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let Some(code) = future.code.find_function(future.function) else {
+            return mistyped(node, "a future of a function its IR lacks");
+        };
+        let entering = self.levels + usize::from(depth) + level + CALL_LEVELS;
+        if entering + code.height as usize > MAX_DEPTH {
+            return Err(nested_too_deeply(node));
+        }
+        let captures = match future.begin() {
+            Some(Begin::Done(value)) => return Ok(value),
+            Some(Begin::Running) => return Err(depends_on_itself(node)),
+            Some(Begin::Pending(captures)) => captures,
+            None => return mistyped(node, "a future's state is in use"),
+        };
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        let result = Evaluator {
+            ir: &future.code,
+            stack: self.stack,
+            base,
+            captures: &captures,
+            callee: None,
+            levels: entering,
+        }
+        .value(code.body);
+        self.stack.truncate(base);
+        match result {
+            Ok(value) => {
+                // The captures are dropped on return: a future that has
+                // run holds only its value.
+                if future.finish(FutureState::Done(value.clone())) {
+                    Ok(value)
+                } else {
+                    mistyped(node, "a future's state is in use")
+                }
+            }
+            Err(error) => {
+                // Left unrun, so that a later await runs it again.
+                if future.finish(FutureState::Pending(captures)) {
+                    Err(self.awaited_error(error, future, node))
+                } else {
+                    mistyped(node, "a future's state is in use")
+                }
+            }
+        }
+    }
+
+    /// `error`, raised while `future` ran for the await `node`, as it is
+    /// reported: labelled "awaited here" at the await when the future's
+    /// code is of the same session input as this frame's, and stamped with
+    /// the future's input when it is not, unless an inner frame has stamped
+    /// an input on it already.
+    fn awaited_error(&self, mut error: Diagnostic, future: &Future, node: &IrNode) -> Diagnostic {
+        if error.input.is_some() {
+            return error;
+        }
+        if future.code.input() == self.ir.input() {
+            error.with_context(node.span, "awaited here")
+        } else {
+            error.input = Some(future.code.input());
+            error
+        }
+    }
+
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
     /// at depth `depth` in this frame's body (see the module documentation),
     /// and returns the body's value.
@@ -464,6 +734,21 @@ impl Evaluator<'_> {
     fn function(&mut self, id: IrId) -> Result<Rc<Closure>, Diagnostic> {
         let node = self.ir.get(id);
         match node.kind {
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FUNCTION),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Fn(closure) => Some(closure),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node),
@@ -549,6 +834,21 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Int(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
             IrKind::Call {
@@ -667,6 +967,21 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FLOAT),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Float(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
             IrKind::Call {
@@ -754,6 +1069,21 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::BoolConst(value) => Ok(value),
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_BOOL),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Bool(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
             IrKind::Call {
@@ -892,6 +1222,21 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_STRING),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Str(text) => Some(text),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
             IrKind::Call {
@@ -962,6 +1307,21 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty => Ok(Value::Empty),
+            IrKind::Load(_, ValueKind::Deferred)
+            | IrKind::LoadCapture(_, ValueKind::Deferred)
+            | IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Deferred,
+                ..
+            }
+            | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_RECORD),
+            IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Empty | Value::Record(_) => Some(value),
+                _ => None,
+            }),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
             IrKind::Call {
@@ -1053,7 +1413,12 @@ impl Evaluator<'_> {
                     values: Box::new([value]),
                 })));
             }
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Fn(_) => {
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Str(_)
+            | Value::Fn(_)
+            | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }
         };
@@ -1158,6 +1523,15 @@ impl Evaluator<'_> {
 
 const OVERFLOW: &str = "integer overflow";
 const DIVISION_BY_ZERO: &str = "division by zero";
+
+// The internal errors of a typed walker meeting a node whose value may be a
+// future, which only the general walker evaluates.
+const DEFERRED_INT: &str = "a node that may be a future where an Int was expected";
+const DEFERRED_FLOAT: &str = "a node that may be a future where a Float was expected";
+const DEFERRED_BOOL: &str = "a node that may be a future where a Bool was expected";
+const DEFERRED_STRING: &str = "a node that may be a future where a String was expected";
+const DEFERRED_RECORD: &str = "a node that may be a future where a record was expected";
+const DEFERRED_FUNCTION: &str = "a node that may be a future where a function was expected";
 
 /// Floor division: the quotient rounded toward negative infinity. Returns
 /// `None` on overflow, which only `i64::MIN // -1` causes.
@@ -1267,6 +1641,15 @@ fn nested_too_deeply(node: &IrNode) -> Diagnostic {
         "every level of expression nesting around a call counts, and so does the body of the \
          function called; GCSL does not eliminate tail calls, so recursion this deep is not \
          supported",
+    )
+}
+
+/// The error for the await `node` of a future whose body is running: an
+/// await of the future from inside its own body.
+fn depends_on_itself(node: &IrNode) -> Diagnostic {
+    Diagnostic::error(
+        "this deferred expression depends on its own value",
+        node.span,
     )
 }
 
@@ -2757,12 +3140,16 @@ mod tests {
     #[test]
     fn function_values_and_their_internal_errors() {
         // A closure shows as its type.
-        let value = run("fn(x: Int, s: String) -> {x: Int} { x = x }").unwrap();
+        let value = run("fn(x: Int, s: String): {x: Int} { x = x }").unwrap();
         assert_eq!(value.kind(), ValueKind::Fn);
-        assert_eq!(value.to_string(), "fn(x: Int, s: String) -> {x: Int}");
+        assert_eq!(value.to_string(), "fn(x: Int, s: String): {x: Int}");
+        assert_eq!(value.repr().to_string(), "fn(x: Int, s: String): {x: Int}");
+        // An impure function's bare types are the either shape.
+        let value = run("fn(x: Int, s: String) -> {x: Int} { x = x }").unwrap();
         assert_eq!(
-            value.repr().to_string(),
-            "fn(x: Int, s: String) -> {x: Int}"
+            value.to_string(),
+            "fn(x: Int | Future<Int>, s: String | Future<String>) -> {x: Int | Future<Int>} | \
+             Future<{x: Int | Future<Int>}>"
         );
         assert_eq!(
             string("let f = fn(): Int { 1 }\n\"f is {f}\""),
@@ -2814,5 +3201,623 @@ mod tests {
             eval(&ir).unwrap_err().message,
             "internal error: a closure of a function its IR lacks"
         );
+    }
+
+    // ----- Futures -----
+
+    /// The labels of a diagnostic as `(span, text)` pairs.
+    fn labels(diagnostic: &Diagnostic) -> Vec<(Span, &str)> {
+        diagnostic
+            .labels
+            .iter()
+            .map(|label| (label.span, label.text.as_str()))
+            .collect()
+    }
+
+    /// Runs `text` on a frame of its own and returns the frame afterwards,
+    /// holding the value of each top-level variable.
+    fn frame_after(text: &str) -> Vec<Value> {
+        let ir = compile(text);
+        let mut frame = vec![Value::Empty; ir.frame_size() as usize];
+        eval_in(&ir, &mut frame).unwrap();
+        frame
+    }
+
+    #[test]
+    fn a_lazy_runs_nothing_until_awaited() {
+        assert_eq!(int("let x = lazy 1 // 0\n5"), 5);
+        assert_eq!(run("lazy 1 // 0").unwrap().to_string(), "Future<Int>");
+        let text = "let x = lazy 1 // 0\nawait x";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "division by zero");
+        // At the failing operator in the body, with "awaited here" on the
+        // await that ran it.
+        assert_eq!(diagnostic.span, Span::new(15, 17));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![
+                (Span::new(13, 14), "1"),
+                (Span::new(18, 19), "0"),
+                (Span::new(20, 27), "awaited here")
+            ]
+        );
+        assert_eq!(diagnostic.input, None);
+        // Through an implicit await, on the expression awaited.
+        let diagnostic = run("let x = lazy 1 // 0\nx + 1").unwrap_err();
+        assert_eq!(diagnostic.span, Span::new(15, 17));
+        assert_eq!(labels(&diagnostic)[2], (Span::new(20, 21), "awaited here"));
+        // An await that runs another's body labels its own await too.
+        let diagnostic = run("let x = lazy 1 // 0\nlet y = lazy x + 1\nawait y").unwrap_err();
+        assert_eq!(
+            labels(&diagnostic)[2..],
+            [
+                (Span::new(33, 34), "awaited here"),
+                (Span::new(39, 46), "awaited here")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_future_captures_by_value_and_runs_once() {
+        assert_eq!(int("let x = 1\nlet f = lazy x\nx := 2\nawait f"), 1);
+        assert_eq!(int("let x = 1\nlet f = lazy x\nlet x = 5\nf + x"), 6);
+        // A future shared by a variable and a closure's capture is one
+        // future: its value is the same record, built once.
+        let frame = frame_after(
+            "let f = lazy { a = 1 }\n\
+             let g = fn() -> {a: Int} { await f }\n\
+             let p = await f\n\
+             let q = g()",
+        );
+        let [Value::Future(future), _, Value::Record(p), Value::Record(q)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(Rc::ptr_eq(p, q));
+        assert!(future.is_done());
+        // Awaited twice, directly and through a record field.
+        assert_eq!(
+            string("let f = lazy 20 + 1\nlet r = { a = f }\n\"{f} {r.a} {await f}\""),
+            "21 21 21"
+        );
+    }
+
+    #[test]
+    fn awaits_through_every_walker() {
+        let text = "let i = lazy 20\n\
+                    let x = lazy 1.5\n\
+                    let b = lazy true\n\
+                    let s = lazy \"s\"\n\
+                    let r = lazy { v = 2 }\n\
+                    let g = lazy fn(): Int { 3 }\n\
+                    \"{i + 1} {x * 2.0} {not b} {s + \"!\"} {r.v} {g()} {await i} {i} {r}\"";
+        assert_eq!(string(text), "21 3.0 false s! 2 3 20 20 {v = 2}");
+        // Each typed walker, at the root.
+        assert_eq!(int("let i = lazy 20\nawait i"), 20);
+        assert_eq!(float("let x = lazy 1.5\nx * 2"), 3.0);
+        assert!(boolean("let b = lazy false\nnot b"));
+        assert_eq!(string("let s = lazy \"a\"\ns + s"), "aa");
+        assert_eq!(int("let r = lazy { v = 2 }\nr.v"), 2);
+        assert_eq!(int("let g = lazy fn(): Int { 3 }\ng()"), 3);
+        assert_eq!(
+            run("let r = lazy { v = 2 }\nawait r").unwrap().to_string(),
+            "{v = 2}"
+        );
+        // A future of a future, awaited fully.
+        assert_eq!(int("let x = lazy lazy 7\nawait x + 1"), 8);
+        assert_eq!(int("let x = lazy lazy 7\nx + 1"), 8);
+        // An impure function taking and returning values that may be
+        // futures, and a pure one passing one through.
+        assert_eq!(int("fn f(x: Int) -> Int { x * 2 }\nf(lazy 20) + f(1)"), 42);
+        assert_eq!(
+            int(
+                "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\n\
+                 let k = keep(lazy 40)\n\
+                 k.v + 2"
+            ),
+            42
+        );
+        // An `if` of futures and present values.
+        assert_eq!(
+            int("let x = lazy 1\nlet y = if true { x } else { 2 }\ny + 1"),
+            2
+        );
+        assert_eq!(
+            int("let x = lazy 1\nlet y = if false { x } else { 2 }\ny + 1"),
+            3
+        );
+    }
+
+    #[test]
+    fn a_deep_await_shares_what_it_does_not_change() {
+        let frame = frame_after(
+            "fn f(r: {a: Int, b: String}): {a: Int, b: String} { r }\n\
+             let r = { a = lazy 1; b = \"text\" }\n\
+             let s = f(r)",
+        );
+        let [_, Value::Record(r), Value::Record(s)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        // A new record, sharing the layout and the untouched field.
+        assert!(!Rc::ptr_eq(r, s));
+        assert!(Rc::ptr_eq(&r.layout, &s.layout));
+        let (Value::Str(old), Value::Str(new)) = (&r.values[1], &s.values[1]) else {
+            panic!("expected strings");
+        };
+        assert!(Rc::ptr_eq(old, new));
+        assert_eq!(s.values[0], Value::Int(1));
+        // The original still holds the future, now run.
+        let Value::Future(future) = &r.values[0] else {
+            panic!("expected a future");
+        };
+        assert!(future.is_done());
+        // A record with nothing lazy in it is passed through as it is.
+        let frame = frame_after(
+            "let r: {a: Int | Future<Int>, b: {c: Int | Future<Int>}} = { a = 1; b = { c = 2 } }\n\
+             let s: {a: Int, b: {c: Int}} = r",
+        );
+        let [Value::Record(r), Value::Record(s)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(Rc::ptr_eq(r, s));
+        // Nested records are rebuilt only where they change.
+        let frame = frame_after(
+            "let r = { a = { b = lazy 1 }; c = { d = 2 }; e = lazy { f = lazy 3 } }\n\
+             let s: {a: {b: Int}, c: {d: Int}, e: {f: Int}} = r",
+        );
+        assert_eq!(
+            frame[1].to_string(),
+            "{a = {b = 1}; c = {d = 2}; e = {f = 3}}"
+        );
+        // (The record block's temporaries leave values in later slots.)
+        let [Value::Record(r), Value::Record(s), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        let (Value::Record(old), Value::Record(new)) = (&r.values[1], &s.values[1]) else {
+            panic!("expected records");
+        };
+        assert!(Rc::ptr_eq(old, new));
+        let (Value::Record(old), Value::Record(new)) = (&r.values[0], &s.values[0]) else {
+            panic!("expected records");
+        };
+        assert!(!Rc::ptr_eq(old, new));
+        // Equality and interpolation await deeply too.
+        assert!(boolean(
+            "fn f(r: {a: Int}) -> Bool { r == { a = 1 } }\nlet r = { a = lazy 1 }\nawait f(r)"
+        ));
+        assert_eq!(
+            string("let r = { a = lazy 1; b = { c = lazy \"x\" } }\n\"{r}\""),
+            "{a = 1; b = {c = \"x\"}}"
+        );
+    }
+
+    #[test]
+    fn a_future_displays_as_its_type() {
+        let frame =
+            frame_after("let f = lazy 1\nlet r = { a = f; b = lazy \"s\" }\nlet v = await f");
+        let [Value::Future(future), record, Value::Int(1)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        // Whether it has run or not.
+        assert!(future.is_done());
+        assert_eq!(frame[0].to_string(), "Future<Int>");
+        assert_eq!(frame[0].repr().to_string(), "Future<Int>");
+        assert_eq!(frame[0].kind(), ValueKind::Deferred);
+        assert_eq!(record.to_string(), "{a = Future<Int>; b = Future<String>}");
+    }
+
+    #[test]
+    fn a_failed_await_truncates_the_stack() {
+        let ir = compile("let x = lazy { let a = 1\nlet b = a // 0\nb }\nlet y = await x");
+        let frame = ir.frame_size() as usize;
+        let mut stack = vec![Value::Empty; frame];
+        let (result, len) = run_on(&ir, &mut stack);
+        assert_eq!(result.unwrap_err().message, "division by zero");
+        assert_eq!(len, frame);
+    }
+
+    #[test]
+    fn a_future_that_depends_on_itself_is_an_error() {
+        // A future whose body stores the future, which it captured, in a
+        // slot of its frame and awaits it: the checker never lets this
+        // through, since no name is in scope in its own `lazy`.
+        let mut builder = crate::ir::IrBuilder::with_capacity(8);
+        let capture = builder.alloc(
+            IrKind::LoadCapture(0, ValueKind::Deferred),
+            Span::new(10, 11),
+        );
+        let store = builder.alloc(IrKind::Store(Slot::new(0), capture), Span::new(10, 11));
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Deferred),
+            Span::new(20, 21),
+        );
+        let inner = builder.alloc(
+            IrKind::Await {
+                value: load,
+                kind: ValueKind::Int,
+                shape: LazyShapeId::NONE,
+                depth: 0,
+            },
+            Span::new(14, 21),
+        );
+        let items = builder.push_item_list(&[store]);
+        let body = builder.alloc(
+            IrKind::Block {
+                items,
+                result: inner,
+            },
+            Span::new(8, 23),
+        );
+        let root_load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Deferred),
+            Span::new(30, 31),
+        );
+        let root = builder.alloc(
+            IrKind::Await {
+                value: root_load,
+                kind: ValueKind::Int,
+                shape: LazyShapeId::NONE,
+                depth: 0,
+            },
+            Span::new(24, 31),
+        );
+        let mut functions = vec![crate::ir::FnCode {
+            body,
+            kind: crate::ir::FnKind::Future,
+            frame_size: 1,
+            param_count: 0,
+            capture_count: 1,
+            height: 0,
+            name: None,
+            display: Box::from("Future<Int>"),
+            slot_names: Box::default(),
+        }];
+        builder.measure(root, &mut functions);
+        let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, 0));
+        let future = Rc::new(Future::new(Rc::clone(&ir), FnId::new(0), Box::default()));
+        // The future captures itself.
+        assert!(
+            future.finish(FutureState::Pending(Box::new([Value::Future(Rc::clone(
+                &future
+            ))])))
+        );
+        let mut stack = vec![Value::Future(Rc::clone(&future))];
+        let diagnostic = eval_in(&ir, &mut stack).unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "this deferred expression depends on its own value"
+        );
+        assert_eq!(diagnostic.span, Span::new(14, 21));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![(Span::new(24, 31), "awaited here")]
+        );
+        assert_eq!(stack.len(), 1);
+        // Left unrun; the cycle is broken so that nothing leaks.
+        assert!(!future.is_done());
+        assert!(future.finish(FutureState::Pending(Box::default())));
+    }
+
+    #[test]
+    fn the_nesting_budget_covers_awaits() {
+        on_big_stack(|| {
+            // Each call awaits a future whose body makes the next call.
+            let recurse = "fn f(n: Int) -> Int {\n\
+                           \x20 let x = lazy { if n == 0 { 0 } else { f(n - 1) + 1 } }\n\
+                           \x20 await x\n\
+                           }\n";
+            let ir = compile(&format!("{recurse}f(0)"));
+            let [(outer, _)] = ir.calls_in(ir.root())[..] else {
+                panic!("expected one call at the top level");
+            };
+            // The lazy is function 0, finished before `f`, function 1.
+            let (future, function) = (ir.function(FnId::new(0)), ir.function(FnId::new(1)));
+            let [(inner, call_span)] = ir.calls_in(future.body)[..] else {
+                panic!("expected one call in the future's body");
+            };
+            let [(awaited, await_span)] = ir.awaits_in(function.body)[..] else {
+                panic!("expected one await in the function's body");
+            };
+            let (future_height, function_height) =
+                (future.height as usize, function.height as usize);
+            // Walk the chain as the evaluator charges it: each call enters
+            // its frame at its depth plus `CALL_LEVELS` further in, and the
+            // body's await enters the future's frame the same way. `f(n)`
+            // makes n + 1 calls and runs as many futures; count how many
+            // pairs fit.
+            let mut pairs = 0_usize;
+            let mut levels = 0;
+            let mut depth = usize::from(outer);
+            loop {
+                let entering = levels + depth + CALL_LEVELS;
+                if entering + function_height > MAX_DEPTH {
+                    break;
+                }
+                let running = entering + usize::from(awaited) + CALL_LEVELS;
+                if running + future_height > MAX_DEPTH {
+                    break;
+                }
+                pairs += 1;
+                levels = running;
+                depth = usize::from(inner);
+            }
+            assert!(pairs > 100, "{pairs}");
+            let last = i64::try_from(pairs - 1).unwrap();
+            assert_eq!(
+                run(&format!("{recurse}f({last})")).unwrap(),
+                Value::Int(last)
+            );
+            let diagnostic = run(&format!("{recurse}f({})", last + 1)).unwrap_err();
+            assert_eq!(diagnostic.message, BUDGET_ERROR);
+            assert_eq!(diagnostic.notes, vec![BUDGET_NOTE]);
+            assert!(
+                diagnostic.span == call_span || diagnostic.span == await_span,
+                "{diagnostic:?}"
+            );
+        });
+    }
+
+    /// A kind of nesting to wrap a recursive call in, for
+    /// `the_nesting_budget_fits_the_stack_for_awaits`: its name, the return
+    /// type of the function whose call it wraps, how it wraps an
+    /// expression in 60 levels, and the value of a recursion making the
+    /// number of calls given.
+    type AwaitNesting = (
+        &'static str,
+        &'static str,
+        fn(&str) -> String,
+        fn(i64) -> Value,
+    );
+
+    /// The levels of nesting each kind of `AwaitNesting` wraps a call in.
+    const AWAIT_WRAP: usize = 60;
+
+    /// The costly kinds of nesting, as the end-to-end tests list them for
+    /// calls.
+    fn await_nesting_kinds() -> [AwaitNesting; 5] {
+        [
+            (
+                "additions",
+                "Int",
+                |inner| format!("{inner}{}", " + 1".repeat(AWAIT_WRAP)),
+                |calls| Value::Int(calls * i64::try_from(AWAIT_WRAP).unwrap() - 1),
+            ),
+            (
+                "negations",
+                "Int",
+                |inner| {
+                    format!(
+                        "{}{inner}{}",
+                        "-(".repeat(AWAIT_WRAP),
+                        ")".repeat(AWAIT_WRAP)
+                    )
+                },
+                |_| Value::Int(-1),
+            ),
+            (
+                "interpolated strings",
+                "String",
+                |inner| {
+                    format!(
+                        "{}{inner}{}",
+                        "\"{".repeat(AWAIT_WRAP),
+                        "}\"".repeat(AWAIT_WRAP)
+                    )
+                },
+                |_| Value::Str("-1".into()),
+            ),
+            (
+                "nested blocks",
+                "Int",
+                |inner| {
+                    format!(
+                        "{}{inner}{}",
+                        "{ ".repeat(AWAIT_WRAP),
+                        " }".repeat(AWAIT_WRAP)
+                    )
+                },
+                |_| Value::Int(-1),
+            ),
+            (
+                "blocks with a declaration each",
+                "Int",
+                |inner| {
+                    format!(
+                        "{}{inner}{}{}",
+                        "{ let v = 1\n".repeat(AWAIT_WRAP / 2),
+                        " + v".repeat(AWAIT_WRAP / 2),
+                        "\n}".repeat(AWAIT_WRAP / 2)
+                    )
+                },
+                |calls| Value::Int(calls * i64::try_from(AWAIT_WRAP / 2).unwrap() - 1),
+            ),
+        ]
+    }
+
+    /// `STACK_SIZE` covers the nesting budget when it is spent on awaits as
+    /// well as calls, unoptimised, whatever kind of nesting they are made
+    /// from: for each costly kind, a recursion through futures, each call
+    /// awaiting a future whose body makes the next call wrapped in that
+    /// nesting, runs as many calls as the budget allows, which takes the
+    /// deepest future's body to exactly `MAX_DEPTH` levels, and one more
+    /// call fails.
+    #[test]
+    fn the_nesting_budget_fits_the_stack_for_awaits() {
+        on_big_stack(|| {
+            let wrap = AWAIT_WRAP;
+            for (kind, ret, wrap_in, value) in await_nesting_kinds() {
+                // `f(n)` makes n + 1 calls, each running a future.
+                let program = |calls: usize, padding: usize| {
+                    format!(
+                        "fn f(n: Int) -> {ret} {{\n\
+                         \x20 await lazy {{ if n == 0 {{ {} }} else {{ {} }} }}\n\
+                         }}\n{}f({}){}",
+                        wrap_in("-(-(n - 1))"),
+                        wrap_in("f(n - 1)"),
+                        "{ ".repeat(padding),
+                        calls - 1,
+                        " }".repeat(padding)
+                    )
+                };
+                // The shape of the IR does not depend on the count, and the
+                // padding only moves the first call deeper.
+                let ir = compile(&program(1, 0));
+                let [(outer, _)] = ir.calls_in(ir.root())[..] else {
+                    panic!("{kind}: expected one call at the top level");
+                };
+                let (future, function) = (ir.function(FnId::new(0)), ir.function(FnId::new(1)));
+                let [(inner, _)] = ir.calls_in(future.body)[..] else {
+                    panic!("{kind}: expected one call in the future's body");
+                };
+                let [(awaited, _)] = ir.awaits_in(function.body)[..] else {
+                    panic!("{kind}: expected one await in the function's body");
+                };
+                let (outer, inner, awaited) =
+                    (usize::from(outer), usize::from(inner), usize::from(awaited));
+                assert!(inner > wrap, "{kind}: {inner}");
+                let (future_height, function_height) =
+                    (future.height as usize, function.height as usize);
+                // Each call enters its frame at its depth plus `CALL_LEVELS`
+                // further in, and its body's await enters the future's frame
+                // the same way; the deepest future's body is the tallest
+                // part. With the padding making up the remainder, it
+                // reaches exactly `MAX_DEPTH`.
+                let first = outer + CALL_LEVELS + awaited + CALL_LEVELS + future_height;
+                let step = inner + CALL_LEVELS + awaited + CALL_LEVELS;
+                let room = MAX_DEPTH - first;
+                let (calls, padding) = (1 + room / step, room % step);
+                assert!(calls > 50, "{kind}: {calls}");
+                // Every call's frame fits too.
+                let mut entering = padding + outer + CALL_LEVELS;
+                for _ in 0..calls {
+                    assert!(entering + function_height <= MAX_DEPTH, "{kind}");
+                    let running = entering + awaited + CALL_LEVELS;
+                    assert!(running + future_height <= MAX_DEPTH, "{kind}");
+                    entering = running + inner + CALL_LEVELS;
+                }
+                let expected = value(i64::try_from(calls).unwrap());
+                assert_eq!(run(&program(calls, padding)), Ok(expected), "{kind}");
+                // One more call, or one more level of padding, is past the
+                // budget: it is used exactly.
+                for past in [program(calls + 1, padding), program(calls, padding + 1)] {
+                    let diagnostic = run(&past).unwrap_err();
+                    assert_eq!(diagnostic.message, BUDGET_ERROR, "{kind}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_deep_await_of_a_deep_record() {
+        on_big_stack(|| {
+            // Record nesting is limited by the parser's, two levels a
+            // record; the deep await descends it all, one frame a level,
+            // and runs the future at the bottom.
+            let depth = 4_000;
+            let text = format!(
+                "let r = {}lazy 1{}\n\"{{r}}\"",
+                "{ a = ".repeat(depth),
+                " }".repeat(depth)
+            );
+            let shown = string(&text);
+            assert!(shown.starts_with("{a = {a = "));
+            assert!(shown.ends_with(&format!("{{a = 1{}", "}".repeat(depth))));
+            assert_eq!(shown.len(), depth * "{a = }".len() + 1);
+        });
+    }
+
+    #[test]
+    fn mistyped_awaits_are_internal_errors() {
+        // An await whose value is of another kind than it states, through
+        // the general walker and a typed one.
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
+        let awaited = builder.alloc(
+            IrKind::Await {
+                value: one,
+                kind: ValueKind::Bool,
+                shape: LazyShapeId::NONE,
+                depth: 0,
+            },
+            Span::new(0, 7),
+        );
+        let ir = Rc::new(builder.finish(awaited, 0, Vec::new()));
+        assert_eq!(
+            eval(&ir).unwrap_err().message,
+            "internal error: an await produced a value of another kind than its node"
+        );
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
+        let awaited = builder.alloc(
+            IrKind::Await {
+                value: one,
+                kind: ValueKind::Bool,
+                shape: LazyShapeId::NONE,
+                depth: 0,
+            },
+            Span::new(0, 7),
+        );
+        let not = builder.alloc(IrKind::Not(awaited), Span::new(0, 11));
+        let ir = Rc::new(builder.finish(not, 0, Vec::new()));
+        assert_eq!(
+            eval(&ir).unwrap_err().message,
+            "internal error: an await produced a value of another kind than its node"
+        );
+        // A typed walker meeting a node that may be a future, whatever the
+        // slot holds.
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Deferred),
+            Span::new(0, 1),
+        );
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(4, 5));
+        let add = builder.alloc(
+            IrKind::IntAdd(Operands {
+                lhs: load,
+                rhs: one,
+                op_start: 2,
+            }),
+            Span::new(0, 5),
+        );
+        let ir = Rc::new(builder.finish(add, 1, Vec::new()));
+        let error = eval_in(&ir, &mut vec![Value::Int(2)]).unwrap_err();
+        assert_eq!(
+            error.message,
+            "internal error: a node that may be a future where an Int was expected"
+        );
+        assert_eq!(error.span, Span::new(0, 1));
+        // A deep await of a record lacking a field of its shape.
+        let mut names = crate::names::Names::new();
+        let (x, y) = (names.intern("x"), names.intern("y"));
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let shape = builder.push_lazy_shape(crate::ir::LazyShape {
+            fields: Box::new([(y, crate::ir::LazyField::Await(LazyShapeId::NONE))]),
+        });
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Record),
+            Span::new(0, 1),
+        );
+        let awaited = builder.alloc(
+            IrKind::Await {
+                value: load,
+                kind: ValueKind::Record,
+                shape,
+                depth: 0,
+            },
+            Span::new(0, 1),
+        );
+        let ir = Rc::new(builder.finish(awaited, 1, Vec::new()));
+        let record = Value::Record(Rc::new(Record {
+            layout: Rc::new(Layout {
+                names: Box::new([x]),
+                texts: Box::new([Box::from("x")]),
+            }),
+            values: Box::new([Value::Int(1)]),
+        }));
+        assert_eq!(
+            eval_in(&ir, &mut vec![record]).unwrap_err().message,
+            "internal error: a record lacks a field of its lazy shape"
+        );
+        // The empty record has no fields to await.
+        assert_eq!(eval_in(&ir, &mut vec![Value::Empty]).unwrap(), Value::Empty);
     }
 }

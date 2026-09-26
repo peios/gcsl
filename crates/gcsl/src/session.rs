@@ -21,10 +21,11 @@
 //! - the type of the last successful input's value, for showing it;
 //! - the source of every committed input, in order: input `n` is the `n`th
 //!   to succeed, counting from 0, and each input is lowered with its
-//!   number. A closure outlives the input that made it, and when one made
-//!   by an earlier input fails, its diagnostic names that input (see
-//!   [`crate::Diagnostic::input`]), whose source [`Session::source`]
-//!   returns for rendering it.
+//!   number. A closure or a future outlives the input that made it, keeping
+//!   its code alive, and when one made by an earlier input fails, its
+//!   diagnostic names that input (see [`crate::Diagnostic::input`]), whose
+//!   source [`Session::source`] returns for rendering it. A future that
+//!   fails is left unrun, so a later input that awaits it runs it again.
 //!
 //! A failed input, whether it fails to compile or fails at runtime, leaves
 //! the session as it was: the scope is only replaced after evaluation
@@ -519,6 +520,60 @@ mod tests {
         // A file names no input: everything in it is input 0.
         let file = SourceFile::new("f.gcsl", "fn f(): Int { 1 // 0 }\nf()").unwrap();
         assert_eq!(crate::run(&file).unwrap_err()[0].input, None);
+    }
+
+    #[test]
+    fn futures_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let r = { a = 20 }");
+        value(&mut session, "let f = lazy r.a + 1");
+        // The future holds a copy of the record until it has run.
+        let Value::Record(record) = session.frame[0].clone() else {
+            panic!("expected a record");
+        };
+        assert_eq!(Rc::strong_count(&record), 3);
+        // It shows as its type, and is run by a later input.
+        assert_eq!(value(&mut session, "f").to_string(), "Future<Int>");
+        assert_eq!(value_type(&session), "Future<Int>");
+        assert_eq!(value(&mut session, "f * 2"), Value::Int(42));
+        // Having run, it has dropped its captures, and keeps its value.
+        assert_eq!(Rc::strong_count(&record), 2);
+        assert_eq!(value(&mut session, "await f"), Value::Int(21));
+        assert_eq!(value_type(&session), "Int");
+    }
+
+    #[test]
+    fn a_failing_future_names_its_input_and_runs_again() {
+        let mut session = Session::new();
+        let first = "let bad = lazy 1 // 0";
+        value(&mut session, first);
+        // Awaited by a later input, it fails in the input that made it,
+        // whose source the spans refer to; there is no await of that input
+        // to label.
+        for _ in 0..2 {
+            let diagnostics = eval(&mut session, "await bad").unwrap_err();
+            assert_eq!(diagnostics.len(), 1);
+            let diagnostic = &diagnostics[0];
+            assert_eq!(diagnostic.message, "division by zero");
+            assert_eq!(diagnostic.input, Some(0));
+            assert_eq!(session.source(0).unwrap().slice(diagnostic.span), "//");
+            assert!(
+                diagnostic
+                    .labels
+                    .iter()
+                    .all(|label| label.text != "awaited here")
+            );
+        }
+        // Left unrun, so each await runs it again; one of the input that
+        // made it, awaited there, is labelled.
+        let diagnostics = eval(&mut session, "let again = lazy 1 // 0\nawait again").unwrap_err();
+        assert_eq!(diagnostics[0].input, None);
+        assert!(
+            diagnostics[0]
+                .labels
+                .iter()
+                .any(|label| label.text == "awaited here")
+        );
     }
 
     #[test]

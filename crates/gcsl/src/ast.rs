@@ -33,6 +33,14 @@
 //! source order, each positional, named or the trailing block, which is
 //! always last.
 //!
+//! A `lazy EXPR`, [`ExprKind::Lazy`], is a deferred expression: its operand
+//! is the body of an anonymous, parameterless function, run when the
+//! future it builds is first awaited. It is a function of the same arena,
+//! with its own [`FnId`] among the functions' (one table for both): an
+//! [`FnDecl`] with no parameters, no return type, impure, whose marker is
+//! the `lazy` keyword and whose body is the operand, any expression. `await
+//! EXPR` is a prefix operator, [`UnaryOp::Await`].
+//!
 //! # Paths
 //!
 //! A `let`, a field item and a `:=` each declare a [path](PathRange): one or
@@ -219,21 +227,23 @@ pub struct Param {
     pub ty: TypeExprId,
 }
 
-/// A function expression: `fn (PARAMS) : RET BODY` or `fn (PARAMS) -> RET
-/// BODY`. Held in the [`Ast`]'s function arena; the expression node is an
-/// [`ExprKind::Fn`] with its [`FnId`].
+/// A function expression, `fn (PARAMS) : RET BODY` or `fn (PARAMS) -> RET
+/// BODY`, or the body of a `lazy`. Held in the [`Ast`]'s function arena; the
+/// expression node is an [`ExprKind::Fn`] or an [`ExprKind::Lazy`] with its
+/// [`FnId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FnDecl {
-    /// The parameters, in order.
+    /// The parameters, in order; none for a `lazy`.
     pub params: ParamRange,
-    /// The declared return type.
-    pub ret: TypeExprId,
+    /// The declared return type; `None` for a `lazy`, which declares none.
+    pub ret: Option<TypeExprId>,
     /// Whether the function is pure, declared with `:`, rather than impure,
-    /// declared with `->`.
+    /// declared with `->`. A `lazy` is always impure.
     pub pure: bool,
-    /// The `:` or `->` before the return type.
+    /// The `:` or `->` before the return type, or a `lazy`'s keyword.
     pub marker: Span,
-    /// The body, always an [`ExprKind::Block`].
+    /// The body: an [`ExprKind::Block`] for a function expression, and any
+    /// expression, the operand, for a `lazy`.
     pub body: ExprId,
 }
 
@@ -359,6 +369,8 @@ pub enum UnaryOp {
     Neg,
     /// `not x`
     Not,
+    /// `await x`: the value of `x`, awaited fully if it is a future.
+    Await,
 }
 
 impl UnaryOp {
@@ -369,6 +381,7 @@ impl UnaryOp {
         match self {
             UnaryOp::Neg => "negate",
             UnaryOp::Not => "not",
+            UnaryOp::Await => "await",
         }
     }
 
@@ -378,6 +391,7 @@ impl UnaryOp {
         match self {
             UnaryOp::Neg => "-",
             UnaryOp::Not => "not",
+            UnaryOp::Await => "await",
         }
     }
 
@@ -604,6 +618,10 @@ pub enum ExprKind {
         /// The arguments, in source order, the trailing block last.
         args: ArgRange,
     },
+    /// `lazy EXPR`: a future of `EXPR`, which is not evaluated where it is
+    /// written. Its details are in the function arena (see
+    /// [`Ast::fn_decl`]), the operand being the body.
+    Lazy(FnId),
 }
 
 /// One node of the tree.
@@ -617,8 +635,9 @@ pub struct Expr {
     /// expression through its type. A string literal covers its prefix and
     /// delimiters, an `If` its `if` keyword through its last branch, and a
     /// `Field` its record expression through its name. A `Fn` covers its
-    /// `fn` keyword through its body's `}`, and a `Call` its callee through
-    /// its `)` or its trailing block's `}`.
+    /// `fn` keyword through its body's `}`, a `Call` its callee through
+    /// its `)` or its trailing block's `}`, and a `Lazy` its `lazy` keyword
+    /// through its operand.
     pub span: Span,
 }
 
@@ -641,7 +660,8 @@ impl Expr {
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
             | ExprKind::Fn(_)
-            | ExprKind::Call { .. } => None,
+            | ExprKind::Call { .. }
+            | ExprKind::Lazy(_) => None,
         }
     }
 
@@ -748,6 +768,27 @@ pub enum TypeExprKind {
         ret: TypeExprId,
         /// Whether it is pure, written with `:`, rather than `->`.
         pure: bool,
+    },
+    /// A name applied to a type argument, `NAME<TYPE>`, as in
+    /// `Future<Int>`. The parser accepts any name; the checker knows which
+    /// take an argument.
+    Applied {
+        /// The name.
+        name: Name,
+        /// Where the name is written.
+        span: Span,
+        /// The type argument.
+        arg: TypeExprId,
+    },
+    /// A union, `TYPE | TYPE`. `|` binds looser than everything else in a
+    /// type, and a union of three is the union of a union and the third.
+    Union {
+        /// The left member.
+        lhs: TypeExprId,
+        /// The right member.
+        rhs: TypeExprId,
+        /// Where the `|` is written.
+        bar: Span,
     },
 }
 
@@ -885,8 +926,9 @@ impl AstBuilder {
         }
     }
 
-    /// Adds the function expression `decl` to the function arena and
-    /// returns its id, which its [`ExprKind::Fn`] node then carries.
+    /// Adds the function expression or `lazy` `decl` to the function arena
+    /// and returns its id, which its [`ExprKind::Fn`] or [`ExprKind::Lazy`]
+    /// node then carries.
     pub fn push_fn(&mut self, decl: FnDecl) -> FnId {
         let id = FnId(next_id(self.fns.len()));
         self.fns.push(decl);
@@ -1078,7 +1120,7 @@ impl Ast {
         &self.paths[start..start + range.len as usize]
     }
 
-    /// Returns the function expression `id`.
+    /// Returns the function expression or `lazy` `id`.
     ///
     /// # Panics
     ///
@@ -1088,8 +1130,8 @@ impl Ast {
         &self.fns[id.index()]
     }
 
-    /// The number of function expressions in the tree, which bounds every
-    /// [`FnId`] in it: they are `0..fn_count()`.
+    /// The number of function expressions and `lazy`s in the tree, which
+    /// bounds every [`FnId`] in it: they are `0..fn_count()`.
     #[must_use]
     pub fn fn_count(&self) -> usize {
         self.fns.len()
@@ -1263,7 +1305,13 @@ impl Annotate for NoAnnotation {
 /// `(call ...)` followed by its callee and its arguments in source order, a
 /// named one as `(named x EXPR)` and the trailing block as
 /// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
-/// `(let f (fn ...))`.
+/// `(let f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its body,
+/// and an `await` as `(await ...)` followed by its operand. Applied and
+/// union types print as written, `Future<Int>`, `Present<Int>` and
+/// `Int | Future<Int>`, a function type that is a member of a union in
+/// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
+/// would otherwise take the rest of the union; other parentheses in a type
+/// leave no trace in the tree and are not printed.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
 /// followed by their parts, literal text as `(lit "text")` (which has no
@@ -1351,6 +1399,29 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str(if pure { "): " } else { ") -> " })?;
                 self.type_expr(f, ret)
             }
+            TypeExprKind::Applied { name, arg, .. } => {
+                write!(f, "{}<", names.get(name))?;
+                self.type_expr(f, arg)?;
+                f.write_str(">")
+            }
+            TypeExprKind::Union { lhs, rhs, .. } => {
+                self.union_member(f, lhs)?;
+                f.write_str(" | ")?;
+                self.union_member(f, rhs)
+            }
+        }
+    }
+
+    /// Writes the type expression `id`, a member of a union, in parentheses
+    /// if it is a function type, whose return type would otherwise take
+    /// what follows.
+    fn union_member(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
+        if matches!(self.ast.type_expr(id).kind, TypeExprKind::Fn { .. }) {
+            f.write_str("(")?;
+            self.type_expr(f, id)?;
+            f.write_str(")")
+        } else {
+            self.type_expr(f, id)
         }
     }
 
@@ -1366,8 +1437,13 @@ impl<A: Annotate> Pretty<'_, A> {
         }
         f.write_str(")")?;
         let purity = if decl.pure { "pure" } else { "impure" };
-        write!(f, "\n{:indent$}(ret {purity} ", "", indent = depth * 2)?;
-        self.type_expr(f, decl.ret)?;
+        write!(f, "\n{:indent$}(ret {purity}", "", indent = depth * 2)?;
+        // A function expression always has a return type; only a `lazy`,
+        // which is not printed through here, has none.
+        if let Some(ret) = decl.ret {
+            f.write_str(" ")?;
+            self.type_expr(f, ret)?;
+        }
         f.write_str(")")
     }
 
@@ -1407,6 +1483,7 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Unary { op, .. } => match op {
                 UnaryOp::Neg => f.write_str("neg")?,
                 UnaryOp::Not => f.write_str("not")?,
+                UnaryOp::Await => f.write_str("await")?,
             },
             ExprKind::Binary { op, .. } => f.write_str(op.symbol())?,
             ExprKind::Paren(_) => f.write_str("paren")?,
@@ -1421,12 +1498,17 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ExprKind::Fn(_) => f.write_str("fn")?,
             ExprKind::Call { .. } => f.write_str("call")?,
+            ExprKind::Lazy(_) => f.write_str("lazy")?,
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
         match expr.kind {
             ExprKind::Fn(function) => {
                 self.fn_head(f, function, depth + 1)?;
+                f.write_str("\n")?;
+                self.node(f, self.ast.fn_decl(function).body, depth + 1)?;
+            }
+            ExprKind::Lazy(function) => {
                 f.write_str("\n")?;
                 self.node(f, self.ast.fn_decl(function).body, depth + 1)?;
             }
@@ -1742,6 +1824,9 @@ mod tests {
         assert_eq!(UnaryOp::Not.symbol(), "not");
         assert_eq!(BinaryOp::Or.span_at(4), Span::new(4, 6));
         assert_eq!(UnaryOp::Not.span_at(4), Span::new(4, 7));
+        assert_eq!(UnaryOp::Await.verb(), "await");
+        assert_eq!(UnaryOp::Await.symbol(), "await");
+        assert_eq!(UnaryOp::Await.span_at(4), Span::new(4, 9));
         for op in [
             BinaryOp::Add,
             BinaryOp::Sub,

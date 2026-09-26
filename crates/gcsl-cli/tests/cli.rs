@@ -345,10 +345,110 @@ fn dumps_show_functions_and_calls() {
         ir.contains("\nfn #0 service (frame 2, params 2, captures 0, height 4)\n"),
         "{ir}"
     );
+    // An impure function's `String` parameter may be a future, which the
+    // concatenation awaits.
     assert!(
-        ir.contains("\nfn #1 shout (frame 1, params 1, captures 0, height 3)\n"),
+        ir.contains(
+            "\nfn #1 shout (frame 1, params 1, captures 0, height 4)\n\
+             \x20 (block @223..237\n\
+             \x20   (str-concat @225..235\n\
+             \x20     (await @225..229\n\
+             \x20       (load text#0 @225..229))\n"
+        ),
         "{ir}"
     );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_awaits_a_planned_build_step() {
+    let output = gcsl(&["run", "tests/fixtures/futures.gcsl"]);
+    // A future shows as its type, once run as before.
+    assert_eq!(
+        stdout(&output),
+        "{name = \"gcsl\"; step = Future<String>}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_futures() {
+    let output = gcsl(&["run", "tests/fixtures/futures.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in [
+        "\nLazy @221..225\n",
+        "\nAwait @397..402\n",
+        "\nPipe @446..447\n",
+        "\nIdent(Future) @179..185\nLt @185..186\nIdent(String) @186..192\n",
+    ] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/futures.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n      (ret pure {name: String, build: Future<String>})\n",
+        "\n        (field build @213..239\n\
+         \x20         (lazy @221..239\n\
+         \x20           (call @226..239\n",
+        "\n        (expr @397..413\n\
+         \x20         (await @397..413\n\
+         \x20           (. build @403..413\n",
+        "\n      (params (step String | Future<String>))\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/futures.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        // A future of the call's either result is a future of a string.
+        "(lazy : Future<String> @221..239\n",
+        "(name compile : fn(target: String | Future<String>) -> String | Future<String> @",
+        "(await : String @397..413\n",
+        "(name keep : fn(step: String | Future<String>): {step: String | Future<String>} @",
+        // An impure function's bare record result may be a future too.
+        "(name built : {build: Future<String>, name: String | Future<String>} | \
+         Future<{build: Future<String>, name: String | Future<String>}> @552..557)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/futures.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        "\n    (store build#2 @213..239\n\
+         \x20     (make-future #1 @221..239\n\
+         \x20       (load-capture 0 @221..239)\n\
+         \x20       (load name#1 @221..239)))\n",
+        "\nfuture #1 (frame 0, params 0, captures 2, height 3)\n",
+        "\n    (await @397..413\n\
+         \x20     (field build @403..413\n\
+         \x20       (load conf#2 @403..407)))\n",
+        "\n        (arg 0 @389..393\n\
+         \x20         (await @389..393\n\
+         \x20           (load name#1 @389..393)))))\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_shows_futures_as_their_types() {
+    let output = repl(
+        "let x = lazy 20 + 1\n\
+         x\n\
+         x * 2\n\
+         await x\n\
+         { f = x }\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "Future<Int> : Future<Int>\n\
+         42 : Int\n\
+         21 : Int\n\
+         {f = Future<Int>} : {f: Future<Int>}\n"
+    );
+    assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
 }
 
