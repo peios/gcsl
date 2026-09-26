@@ -37,8 +37,7 @@ fn values_and_types() {
         ("8 - 3 - 2", "3 : Int"),
         ("2 * 3 // 4", "1 : Int"),
         ("-2 * 3", "-6 : Int"),
-        ("- 2 * 3", "-6 : Int"),
-        ("--2", "2 : Int"),
+        ("-(-2)", "2 : Int"),
         ("2 * -3", "-6 : Int"),
         ("((((4))))", "4 : Int"),
         ("1_000_000 * 3", "3000000 : Int"),
@@ -65,9 +64,41 @@ fn values_and_types() {
 }
 
 #[test]
-fn whitespace_newlines_and_comments_are_insignificant() {
-    let text = "# a calculation\n(1 +   # one\n   2)\n\t* 3 # times three\n";
+fn newlines_in_parentheses_and_after_operators_are_insignificant() {
+    let text = "# a calculation\n(1 +   # one\n   2\n) *\n\t3 # times three\n";
     assert_eq!(show(text), "9 : Int");
+}
+
+#[test]
+fn programs_with_items_and_blocks() {
+    let cases = [
+        ("", "() : Unit"),
+        ("let x = 1", "() : Unit"),
+        ("let x = 1\nx", "1 : Int"),
+        ("let x = 1; let y = x + 1; = x * y", "2 : Int"),
+        (
+            "# totals\nlet price = 250\nlet count = 3\n\nprice * count\n",
+            "750 : Int",
+        ),
+        ("let x = { let y = 1; y + 1 }\nx", "2 : Int"),
+        ("let x = 1\nlet x = x * 2\nx", "2 : Int"),
+        ("let x = 1.0\nlet x = x + 0.5\nx", "1.5 : Float"),
+        ("let x = 1\nx := x + 1\nx := x * 10\nx", "20 : Int"),
+        ("let rate: Float = 3\nrate / 2", "1.5 : Float"),
+        ("let n = 7.0\nn * 2 : Float", "14.0 : Float"),
+        ("let n = 7\n(n // 2 : Int) / 2", "1.5 : Float"),
+        ("let hello-world = 2\nhello-world - 1", "1 : Int"),
+        ("let x-1 = 5\nlet x = 1\nx-1 - x", "4 : Int"),
+        ("{ { {} } }", "() : Unit"),
+        (
+            "let total = {\n  let a = 1\n  let b = 2\n  a + b\n}\n= total",
+            "3 : Int",
+        ),
+        ("{ 1 } : Float", "1.0 : Float"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
 }
 
 #[test]
@@ -207,16 +238,36 @@ fn every_stage_handles_maximum_depth() {
         let pairs = (depth - 1) / 2;
         let nested = source(&format!("{}1{}", "-(".repeat(pairs), ")".repeat(pairs)));
         let nested_value = Value::Int(if pairs.is_multiple_of(2) { 1 } else { -1 });
-        for (file, expected) in [(&chain, chain_value), (&nested, nested_value)] {
-            let tokens = gcsl::lexer::tokenize(file).unwrap();
-            let ast = gcsl::parser::parse(&tokens, file).unwrap();
-            let types = gcsl::check::check(&ast).unwrap();
-            let ir = gcsl::lower::lower(&ast, &types).unwrap();
+        // Nested blocks: two levels of parser recursion each.
+        let blocks = (depth - 1) / 2;
+        let nested_blocks = source(&format!("{}1{}", "{".repeat(blocks), "}".repeat(blocks)));
+        // Blocks with a declaration each, around a chain using it: as tall as
+        // the limit allows, and nesting both ways at once, so the later
+        // stages recurse through blocks, items and operators together.
+        let outer = 4_000;
+        let terms = depth - outer;
+        let mixed = source(&format!(
+            "{}1{}{}",
+            "{ let v = 1\n".repeat(outer),
+            " + v".repeat(terms - 1),
+            "\n}".repeat(outer)
+        ));
+        let mixed_value = Value::Int(i64::try_from(terms).unwrap());
+        for (file, expected) in [
+            (&chain, chain_value),
+            (&nested, nested_value),
+            (&nested_blocks, Value::Int(1)),
+            (&mixed, mixed_value),
+        ] {
+            let (tokens, names) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, file).unwrap();
+            let checked = gcsl::check::check(&ast).unwrap();
+            let ir = gcsl::lower::lower(&ast, &checked).unwrap();
             assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
             // The printers recurse too.
             assert!(!ast.pretty().to_string().is_empty());
-            assert!(!ast.pretty_with(&types).to_string().is_empty());
-            assert!(!ir.pretty().to_string().is_empty());
+            assert!(!ast.pretty_with(&checked.types).to_string().is_empty());
+            assert!(!ir.pretty(ast.names()).to_string().is_empty());
         }
     });
 }
@@ -232,17 +283,61 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
         let text = format!("1{}", " + 1".repeat(200_000));
         let diagnostics = run(&text).unwrap_err();
         assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        let text = format!("{}1{}", "{".repeat(200_000), "}".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
     });
 }
 
 #[test]
 fn stages_can_be_run_individually() {
-    let file = source("1 + 2.5");
-    let tokens = gcsl::lexer::tokenize(&file).unwrap();
-    assert_eq!(tokens.len(), 4);
-    let ast = gcsl::parser::parse(&tokens, &file).unwrap();
-    let types = gcsl::check::check(&ast).unwrap();
-    assert_eq!(types.get(ast.root()), Ty::Float);
-    let ir = gcsl::lower::lower(&ast, &types).unwrap();
+    let file = source("let x = 1 : Float\nx + 2.5");
+    let (tokens, names) = gcsl::lexer::tokenize(&file).unwrap();
+    assert_eq!(tokens.len(), 11);
+    let ast = gcsl::parser::parse(&tokens, names, &file).unwrap();
+    let checked = gcsl::check::check(&ast).unwrap();
+    assert_eq!(checked.resolution.frame_size(), 1);
+    let ir = gcsl::lower::lower(&ast, &checked).unwrap();
+    assert_eq!(ir.ty_of(ir.root()), Ty::Float);
     assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Float(3.5));
+}
+
+#[test]
+fn stages_report_every_new_kind_of_error() {
+    let message = |text: &str| run(text).unwrap_err()[0].message.clone();
+    assert_eq!(message("1-2"), "`-` here is ambiguous");
+    assert_eq!(message("{ 1"), "expected `}`, found end of input");
+    assert_eq!(message("1 + 2\n3"), "unused value of type Int");
+    assert_eq!(message("x"), "undefined variable `x`");
+}
+
+#[test]
+fn rebind_in_an_enclosing_block_renders_exactly() {
+    assert_eq!(
+        rendered("let total = 0\n{\n  total := 1\n}\n"),
+        "error: cannot rebind `total` here: it is declared in an enclosing block\n\
+         \x20--> calc.gcsl:3:3\n\
+         \x20 |\n\
+         1 | let total = 0\n\
+         \x20 | ------------- declared here\n\
+         2 | {\n\
+         3 |   total := 1\n\
+         \x20 |   ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: shadow it with `let total = ...` instead\n"
+    );
+}
+
+#[test]
+fn annotation_mismatch_renders_exactly() {
+    assert_eq!(
+        rendered("let x: Int = 5.0\n"),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:1:14\n\
+         \x20 |\n\
+         1 | let x: Int = 5.0\n\
+         \x20 |        ---   ^^^ expected Int, found Float\n\
+         \x20 |        |\n\
+         \x20 |        expected because of this annotation\n"
+    );
 }

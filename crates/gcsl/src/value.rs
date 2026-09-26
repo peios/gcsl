@@ -11,6 +11,8 @@ pub enum Value {
     Int(i64),
     /// A `Float`.
     Float(f64),
+    /// `()`, the only `Unit` value.
+    Unit,
 }
 
 impl Value {
@@ -20,6 +22,7 @@ impl Value {
         match self {
             Value::Int(_) => Ty::Int,
             Value::Float(_) => Ty::Float,
+            Value::Unit => Ty::Unit,
         }
     }
 }
@@ -29,11 +32,12 @@ impl Value {
 /// A `Float` always shows a decimal point or an exponent, so it cannot be
 /// mistaken for an `Int`: `3.0`, `1.5`, `1e300`, `1e-7`. It uses the
 /// shortest text that reads back as the same value. The non-finite values
-/// show as `inf`, `-inf` and `nan`.
+/// show as `inf`, `-inf` and `nan`. `Unit` shows as `()`.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Int(value) => write!(f, "{value}"),
+            Value::Unit => f.write_str("()"),
             // `{:?}` would show NaN as `NaN`.
             Value::Float(value) if value.is_nan() => f.write_str("nan"),
             // `{:?}` on f64 is the shortest round-trip representation and
@@ -104,6 +108,12 @@ mod tests {
     fn types() {
         assert_eq!(Value::Int(1).ty(), Ty::Int);
         assert_eq!(Value::Float(1.0).ty(), Ty::Float);
+        assert_eq!(Value::Unit.ty(), Ty::Unit);
+    }
+
+    #[test]
+    fn unit_displays_as_empty_parentheses() {
+        assert_eq!(Value::Unit.to_string(), "()");
     }
 
     #[test]

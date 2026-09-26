@@ -1,0 +1,10 @@
+# Items, blocks and variables.
+let width = 5
+let height: Float = 3
+
+let area = {
+  let half = width / 2    # `/` always yields a Float
+  half * height * 2
+}
+width := width + 1
+= area * 2.5

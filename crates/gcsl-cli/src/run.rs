@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Args;
-use gcsl::{Diagnostic, SourceFile, check, eval, lexer, lower, parser};
+use gcsl::lexer::TokenKind;
+use gcsl::{Diagnostic, SourceFile, Value, check, eval, lexer, lower, parser};
 
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
@@ -108,22 +109,27 @@ pub fn main(args: &RunArgs) -> ExitCode {
 }
 
 /// Runs the pipeline, printing each requested dump and stopping after the
-/// last one; with no dumps, prints the value.
+/// last one; with no dumps, prints the value unless it is `()`.
 fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
     let last = args.last_dump();
     let mut out = io::stdout().lock();
 
-    let tokens = lexer::tokenize(source)?;
+    let (tokens, names) = lexer::tokenize(source)?;
     if args.dump_tokens {
         for token in &tokens {
-            writeln!(out, "{:?} @{}", token.kind, token.span)?;
+            match token.kind {
+                TokenKind::Ident(name) => {
+                    writeln!(out, "Ident({}) @{}", names.get(name), token.span)?;
+                }
+                kind => writeln!(out, "{kind:?} @{}", token.span)?,
+            }
         }
     }
     if last == Some(Stage::Tokens) {
         return Ok(out.flush()?);
     }
 
-    let ast = parser::parse(&tokens, source)?;
+    let ast = parser::parse(&tokens, names, source)?;
     if args.dump_ast {
         writeln!(out, "{}", ast.pretty())?;
     }
@@ -131,23 +137,25 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
         return Ok(out.flush()?);
     }
 
-    let types = check::check(&ast).map_err(Failure::Program)?;
+    let checked = check::check(&ast).map_err(Failure::Program)?;
     if args.dump_types {
-        writeln!(out, "{}", ast.pretty_with(&types))?;
+        writeln!(out, "{}", ast.pretty_with(&checked.types))?;
     }
     if last == Some(Stage::Types) {
         return Ok(out.flush()?);
     }
 
-    let ir = lower::lower(&ast, &types).map_err(Diagnostic::from)?;
+    let ir = lower::lower(&ast, &checked).map_err(Diagnostic::from)?;
     if args.dump_ir {
-        writeln!(out, "{}", ir.pretty())?;
+        writeln!(out, "{}", ir.pretty(ast.names()))?;
     }
     if last == Some(Stage::Ir) {
         return Ok(out.flush()?);
     }
 
     let value = eval::eval(&ir)?;
-    writeln!(out, "{value}")?;
+    if value != Value::Unit {
+        writeln!(out, "{value}")?;
+    }
     Ok(out.flush()?)
 }

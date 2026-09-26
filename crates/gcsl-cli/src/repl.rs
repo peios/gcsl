@@ -1,9 +1,9 @@
-//! The interactive REPL: one expression per line.
+//! The interactive REPL: one input per line, sharing variables.
 
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use gcsl::SourceFile;
+use gcsl::{Session, SourceFile, Value};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -15,9 +15,11 @@ const PROMPT: &str = "> ";
 
 /// Runs the REPL until end of input (Ctrl-D) and returns the exit code.
 ///
-/// Each non-blank line is evaluated on its own and prints `value : Type` or
-/// its diagnostics. Ctrl-C discards the current line. History lasts for the
-/// session only.
+/// Each non-blank line is a block body evaluated in one [`Session`], so
+/// variables declared at the top level of a line are visible to later
+/// lines. A line prints `value : Type`, nothing if its value is `()` (as
+/// for a `let`), or its diagnostics; a line with errors changes nothing.
+/// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -26,6 +28,7 @@ pub fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE_OR_IO);
         }
     };
+    let mut session = Session::new();
     loop {
         match editor.readline(PROMPT) {
             Ok(line) => {
@@ -35,7 +38,7 @@ pub fn main() -> ExitCode {
                 // Only fails if the history is misconfigured; history is a
                 // convenience, so the line is still evaluated.
                 let _ = editor.add_history_entry(line.as_str());
-                if let Err(error) = evaluate(line) {
+                if let Err(error) = evaluate(&mut session, line) {
                     output::error(format_args!("cannot write output: {error}"));
                     return ExitCode::from(EXIT_USAGE_OR_IO);
                 }
@@ -50,8 +53,9 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// Evaluates one line, printing the value and its type or the diagnostics.
-fn evaluate(line: String) -> io::Result<()> {
+/// Evaluates one line in `session`, printing the value and its type or the
+/// diagnostics.
+fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
     let source = match SourceFile::new(SOURCE_NAME, line) {
         Ok(source) => source,
         Err(error) => {
@@ -59,7 +63,8 @@ fn evaluate(line: String) -> io::Result<()> {
             return Ok(());
         }
     };
-    match gcsl::run(&source) {
+    match session.eval(&source) {
+        Ok(Value::Unit) => Ok(()),
         Ok(value) => {
             let mut out = io::stdout().lock();
             writeln!(out, "{value} : {}", value.ty())?;

@@ -1,17 +1,27 @@
-//! The abstract syntax tree, stored in an arena.
+//! The abstract syntax tree, stored in arenas.
 //!
-//! Nodes live contiguously in one `Vec<Expr>` and refer to each other by
-//! [`ExprId`], a `u32` index. Compared with boxed recursive enums this keeps
-//! the tree in one allocation, makes nodes small and `Copy`-friendly, and lets
-//! later passes keep per-node data in side tables indexed by `ExprId` (see
-//! [`crate::check::Types`]).
+//! Expression nodes live contiguously in one `Vec<Expr>` and refer to each
+//! other by [`ExprId`], a `u32` index. Compared with boxed recursive enums
+//! this keeps the tree in one allocation, makes nodes small and
+//! `Copy`-friendly, and lets later passes keep per-node data in side tables
+//! indexed by `ExprId` (see [`crate::check::Types`]).
+//!
+//! Items (the statements of a block body) and type expressions get arenas
+//! of their own, indexed by [`ItemId`] and [`TypeExprId`]. A block body is a
+//! list of items. Nodes are allocated children-first, so a block's items are
+//! not contiguous in the item arena: a nested block's items are allocated
+//! while the outer block's are being parsed. Lists of items are therefore
+//! kept in a separate pool, [`Ast::items`], each list a contiguous
+//! [`ItemRange`] within it. The same pool pattern will serve argument lists.
 //!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
-//! `Ast` always has a valid root.
+//! `Ast` always has a valid root. The `Ast` also owns the [`Names`] table its
+//! identifiers were interned into.
 
 use std::fmt;
 
+use crate::names::{Name, Names};
 use crate::source::Span;
 
 /// Index of an [`Expr`] in the arena of the [`Ast`] (or [`AstBuilder`]) that
@@ -27,6 +37,38 @@ impl ExprId {
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Index of an [`Item`] in the item arena of the [`Ast`] (or [`AstBuilder`])
+/// that allocated it. Like [`ExprId`], only meaningful for that arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ItemId(u32);
+
+impl ItemId {
+    /// The id as an index into the arena and into side tables.
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Index of a [`TypeExpr`] in the type arena of the [`Ast`] (or
+/// [`AstBuilder`]) that allocated it. Like [`ExprId`], only meaningful for
+/// that arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TypeExprId(u32);
+
+impl TypeExprId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A list of items (a block body): a contiguous range of the item-list pool
+/// of the [`Ast`] that allocated it. Resolve it with [`Ast::items`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ItemRange {
+    start: u32,
+    len: u32,
 }
 
 /// A prefix operator.
@@ -152,6 +194,17 @@ pub enum ExprKind {
     /// A parenthesised expression. Kept so `--dump-ast` shows the source
     /// shape; it carries no semantics and is dropped by lowering.
     Paren(ExprId),
+    /// A use of a variable.
+    Name(Name),
+    /// A block `{ ... }`: a body of items in a scope of its own.
+    Block(ItemRange),
+    /// A type ascription `expr : Type`.
+    Ascribe {
+        /// The expression whose type is stated.
+        expr: ExprId,
+        /// The stated type.
+        ty: TypeExprId,
+    },
 }
 
 /// One node of the tree.
@@ -159,9 +212,10 @@ pub enum ExprKind {
 pub struct Expr {
     /// What the node is.
     pub kind: ExprKind,
-    /// The source it covers. A `Paren` covers its parentheses, a `Binary` its
-    /// left operand through its right operand, a `Unary` its operator through
-    /// its operand.
+    /// The source it covers. A `Paren` covers its parentheses and a `Block`
+    /// its braces, a `Binary` its left operand through its right operand, a
+    /// `Unary` its operator through its operand, and an `Ascribe` its
+    /// expression through its type.
     pub span: Span,
 }
 
@@ -172,16 +226,88 @@ impl Expr {
         match self.kind {
             ExprKind::Unary { op, .. } => Some(op.span_at(self.span.start)),
             ExprKind::Binary { op, op_start, .. } => Some(op.span_at(op_start)),
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Paren(_) => None,
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Paren(_)
+            | ExprKind::Name(_)
+            | ExprKind::Block(_)
+            | ExprKind::Ascribe { .. } => None,
         }
     }
 }
 
-/// An arena under construction. Allocate children before their parents, then
+/// What an [`Item`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKind {
+    /// `let NAME = EXPR` or `let NAME: TYPE = EXPR`: declares a variable.
+    Let {
+        /// The variable's name.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// The annotated type, if any.
+        ty: Option<TypeExprId>,
+        /// The initialiser.
+        value: ExprId,
+    },
+    /// `NAME := EXPR`: rebinds a variable declared in the same block.
+    Rebind {
+        /// The variable's name.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// The new value.
+        value: ExprId,
+    },
+    /// `= EXPR`: the block's result.
+    Result(ExprId),
+    /// An expression evaluated on its own.
+    Expr(ExprId),
+}
+
+/// One item of a block body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Item {
+    /// What the item is.
+    pub kind: ItemKind,
+    /// The source it covers: from `let`, the name, `=` or the start of the
+    /// expression, through the end of the expression.
+    pub span: Span,
+}
+
+/// What a [`TypeExpr`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeExprKind {
+    /// A type written as a name, such as `Int`.
+    Named(Name),
+}
+
+/// A type as written in source, in an annotation or an ascription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeExpr {
+    /// What the type expression is.
+    pub kind: TypeExprKind,
+    /// The source it covers.
+    pub span: Span,
+}
+
+/// Converts an arena length to the next id, saturating past `u32::MAX`.
+///
+/// An arena holds at most `u32::MAX` entries. Every entry consumes at least
+/// one byte of source and sources are limited to `u32::MAX` bytes, so a
+/// parser can never reach the limit; past it, ids would saturate.
+fn next_id(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+/// Arenas under construction. Allocate children before their parents, then
 /// call [`AstBuilder::finish`] with the root.
 #[derive(Clone, Debug, Default)]
 pub struct AstBuilder {
     exprs: Vec<Expr>,
+    items: Vec<Item>,
+    item_lists: Vec<ItemId>,
+    type_exprs: Vec<TypeExpr>,
 }
 
 impl AstBuilder {
@@ -191,11 +317,12 @@ impl AstBuilder {
         Self::default()
     }
 
-    /// Creates an empty builder with room for `capacity` nodes.
+    /// Creates an empty builder with room for `capacity` expression nodes.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             exprs: Vec::with_capacity(capacity),
+            ..Self::default()
         }
     }
 
@@ -203,11 +330,37 @@ impl AstBuilder {
     ///
     /// An arena holds at most `u32::MAX` nodes. Every node consumes at least
     /// one byte of source and sources are limited to `u32::MAX` bytes, so a
-    /// parser can never reach the limit; past it, ids would saturate.
+    /// parser can never reach the limit; past it, ids would saturate. The
+    /// same holds for the item and type arenas.
     pub fn alloc(&mut self, expr: Expr) -> ExprId {
-        let id = ExprId(u32::try_from(self.exprs.len()).unwrap_or(u32::MAX));
+        let id = ExprId(next_id(self.exprs.len()));
         self.exprs.push(expr);
         id
+    }
+
+    /// Adds `item` to the item arena and returns its id.
+    pub fn alloc_item(&mut self, item: Item) -> ItemId {
+        let id = ItemId(next_id(self.items.len()));
+        self.items.push(item);
+        id
+    }
+
+    /// Adds `ty` to the type arena and returns its id.
+    pub fn alloc_type(&mut self, ty: TypeExpr) -> TypeExprId {
+        let id = TypeExprId(next_id(self.type_exprs.len()));
+        self.type_exprs.push(ty);
+        id
+    }
+
+    /// Appends `items` to the item-list pool as one list and returns its
+    /// range.
+    pub fn push_item_list(&mut self, items: &[ItemId]) -> ItemRange {
+        let start = next_id(self.item_lists.len());
+        self.item_lists.extend_from_slice(items);
+        ItemRange {
+            start,
+            len: next_id(items.len()),
+        }
     }
 
     /// Returns the node `id`.
@@ -220,21 +373,50 @@ impl AstBuilder {
         &self.exprs[id.index()]
     }
 
-    /// Finishes the arena with `root` as the root expression.
+    /// Returns the item `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` was not allocated by this builder.
     #[must_use]
-    pub fn finish(self, root: ExprId) -> Ast {
+    pub fn item(&self, id: ItemId) -> &Item {
+        &self.items[id.index()]
+    }
+
+    /// Returns the type expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` was not allocated by this builder.
+    #[must_use]
+    pub fn type_expr(&self, id: TypeExprId) -> &TypeExpr {
+        &self.type_exprs[id.index()]
+    }
+
+    /// Finishes the arenas with `root` as the file's body, taking ownership
+    /// of the `names` its identifiers were interned into.
+    #[must_use]
+    pub fn finish(self, root: ItemRange, names: Names) -> Ast {
         Ast {
             exprs: self.exprs,
+            items: self.items,
+            item_lists: self.item_lists,
+            type_exprs: self.type_exprs,
             root,
+            names,
         }
     }
 }
 
-/// A complete expression tree: an arena of [`Expr`] nodes and its root.
+/// A complete syntax tree: the arenas, the file's body and the names.
 #[derive(Clone, Debug)]
 pub struct Ast {
     exprs: Vec<Expr>,
-    root: ExprId,
+    items: Vec<Item>,
+    item_lists: Vec<ItemId>,
+    type_exprs: Vec<TypeExpr>,
+    root: ItemRange,
+    names: Names,
 }
 
 impl Ast {
@@ -248,15 +430,75 @@ impl Ast {
         &self.exprs[id.index()]
     }
 
-    /// The root expression.
+    /// Returns the item `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
     #[must_use]
-    pub fn root(&self) -> ExprId {
+    pub fn item(&self, id: ItemId) -> &Item {
+        &self.items[id.index()]
+    }
+
+    /// Returns the items of the list `range`, in source order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn items(&self, range: ItemRange) -> &[ItemId] {
+        let start = range.start as usize;
+        &self.item_lists[start..start + range.len as usize]
+    }
+
+    /// Returns the type expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn type_expr(&self, id: TypeExprId) -> &TypeExpr {
+        &self.type_exprs[id.index()]
+    }
+
+    /// The file's body: the outermost block's items.
+    #[must_use]
+    pub fn root(&self) -> ItemRange {
         self.root
     }
 
-    /// Number of nodes in the arena, which bounds every [`ExprId`] in it.
+    /// The span of the file's body: from its first item to its last, or an
+    /// empty span at offset 0 if it has none.
+    #[must_use]
+    pub fn root_span(&self) -> Span {
+        let items = self.items(self.root);
+        match (items.first(), items.last()) {
+            (Some(&first), Some(&last)) => Span::join(self.item(first).span, self.item(last).span),
+            _ => Span::new(0, 0),
+        }
+    }
+
+    /// The names the tree's identifiers were interned into.
+    #[must_use]
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// Consumes the tree, returning its names.
+    #[must_use]
+    pub fn into_names(self) -> Names {
+        self.names
+    }
+
+    /// Number of expression nodes in the arena, which bounds every
+    /// [`ExprId`] in it.
     pub(crate) fn len(&self) -> usize {
         self.exprs.len()
+    }
+
+    /// Number of items in the arena, which bounds every [`ItemId`] in it.
+    pub(crate) fn item_count(&self) -> usize {
+        self.items.len()
     }
 
     /// Returns a `Display` rendering of the tree as indented S-expressions,
@@ -266,8 +508,8 @@ impl Ast {
         self.pretty_with(&NoAnnotation)
     }
 
-    /// Like [`Ast::pretty`], with `annotation` written after each node's
-    /// head, e.g. its type for `--dump-types`.
+    /// Like [`Ast::pretty`], with `annotation` written after each expression
+    /// node's head, e.g. its type for `--dump-types`.
     #[must_use]
     pub fn pretty_with<'a, A: Annotate>(&'a self, annotation: &'a A) -> Pretty<'a, A> {
         Pretty {
@@ -300,20 +542,71 @@ impl Annotate for NoAnnotation {
 /// An [`Ast`] rendered as indented S-expressions, one node per line:
 ///
 /// ```text
-/// (+ @0..9
-///   (int 1 @0..1)
-///   (* @4..9
-///     (int 2 @4..5)
-///     (int 3 @8..9)))
+/// (file
+///   (let x : Float @0..16
+///     (+ @10..16
+///       (int 1 @10..11)
+///       (int 2 @15..16)))
+///   (expr @17..18
+///     (name x @17..18)))
 /// ```
 ///
-/// There is no trailing newline.
+/// Items print as `(let x ...)`, `(let x : Type ...)`, `(rebind x ...)`,
+/// `(result ...)` and `(expr ...)`, followed by their expression; blocks as
+/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`. The
+/// file has no span. There is no trailing newline.
 pub struct Pretty<'a, A> {
     ast: &'a Ast,
     annotation: &'a A,
 }
 
 impl<A: Annotate> Pretty<'_, A> {
+    fn items(&self, f: &mut fmt::Formatter<'_>, range: ItemRange, depth: usize) -> fmt::Result {
+        for &item in self.ast.items(range) {
+            f.write_str("\n")?;
+            self.item(f, item, depth)?;
+        }
+        Ok(())
+    }
+
+    fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
+        let item = self.ast.item(id);
+        let names = self.ast.names();
+        write!(f, "{:indent$}(", "", indent = depth * 2)?;
+        let value = match item.kind {
+            ItemKind::Let {
+                name, ty, value, ..
+            } => {
+                write!(f, "let {}", names.get(name))?;
+                if let Some(ty) = ty {
+                    write!(f, " : {}", self.type_name(ty))?;
+                }
+                value
+            }
+            ItemKind::Rebind { name, value, .. } => {
+                write!(f, "rebind {}", names.get(name))?;
+                value
+            }
+            ItemKind::Result(value) => {
+                f.write_str("result")?;
+                value
+            }
+            ItemKind::Expr(value) => {
+                f.write_str("expr")?;
+                value
+            }
+        };
+        writeln!(f, " @{}", item.span)?;
+        self.node(f, value, depth + 1)?;
+        f.write_str(")")
+    }
+
+    fn type_name(&self, id: TypeExprId) -> &str {
+        match self.ast.type_expr(id).kind {
+            TypeExprKind::Named(name) => self.ast.names().get(name),
+        }
+    }
+
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
         let expr = self.ast.get(id);
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
@@ -325,12 +618,17 @@ impl<A: Annotate> Pretty<'_, A> {
             },
             ExprKind::Binary { op, .. } => f.write_str(op.symbol())?,
             ExprKind::Paren(_) => f.write_str("paren")?,
+            ExprKind::Name(name) => write!(f, "name {}", self.ast.names().get(name))?,
+            ExprKind::Block(_) => f.write_str("block")?,
+            ExprKind::Ascribe { ty, .. } => write!(f, ": {}", self.type_name(ty))?,
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
         match expr.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) => {}
-            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Name(_) => {}
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Paren(operand)
+            | ExprKind::Ascribe { expr: operand, .. } => {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
             }
@@ -340,6 +638,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("\n")?;
                 self.node(f, rhs, depth + 1)?;
             }
+            ExprKind::Block(items) => self.items(f, items, depth + 1)?,
         }
         f.write_str(")")
     }
@@ -347,7 +646,9 @@ impl<A: Annotate> Pretty<'_, A> {
 
 impl<A: Annotate> fmt::Display for Pretty<'_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.node(f, self.ast.root, 0)
+        f.write_str("(file")?;
+        self.items(f, self.ast.root, 1)?;
+        f.write_str(")")
     }
 }
 
@@ -360,6 +661,17 @@ mod tests {
             kind: ExprKind::Int(value),
             span: Span::new(at, at + 1),
         })
+    }
+
+    /// Finishes `builder` with a body of one expression item, `root`.
+    fn finish_expr(mut builder: AstBuilder, root: ExprId) -> Ast {
+        let span = builder.get(root).span;
+        let item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(root),
+            span,
+        });
+        let body = builder.push_item_list(&[item]);
+        builder.finish(body, Names::new())
     }
 
     #[test]
@@ -375,9 +687,38 @@ mod tests {
         let b = leaf(&mut builder, 2, 4);
         assert_eq!((a.index(), b.index()), (0, 1));
         assert_eq!(builder.get(b).kind, ExprKind::Int(2));
-        let ast = builder.finish(b);
-        assert_eq!(ast.root(), b);
+        let ast = finish_expr(builder, b);
+        assert_eq!(ast.items(ast.root()).len(), 1);
         assert_eq!(ast.len(), 2);
+        assert_eq!(ast.item_count(), 1);
+    }
+
+    #[test]
+    fn item_lists_are_ranges_of_the_pool() {
+        let mut builder = AstBuilder::new();
+        let one = leaf(&mut builder, 1, 0);
+        let two = leaf(&mut builder, 2, 2);
+        let items: Vec<ItemId> = [one, two]
+            .into_iter()
+            .map(|value| {
+                builder.alloc_item(Item {
+                    kind: ItemKind::Expr(value),
+                    span: builder.get(value).span,
+                })
+            })
+            .collect();
+        let inner = builder.push_item_list(&items[1..]);
+        let outer = builder.push_item_list(&items);
+        let empty = builder.push_item_list(&[]);
+        let ast = builder.finish(outer, Names::new());
+        assert_eq!(ast.items(inner), &items[1..]);
+        assert_eq!(ast.items(outer), &items[..]);
+        assert!(ast.items(empty).is_empty());
+        assert_eq!(ast.root_span(), Span::new(0, 3));
+        let mut builder = AstBuilder::new();
+        let empty = builder.push_item_list(&[]);
+        let ast = builder.finish(empty, Names::new());
+        assert_eq!(ast.root_span(), Span::new(0, 0));
     }
 
     #[test]
@@ -411,11 +752,109 @@ mod tests {
         });
         assert_eq!(builder.get(neg).operator_span(), Some(Span::new(0, 1)));
         assert_eq!(builder.get(paren).operator_span(), None);
-        let ast = builder.finish(neg);
+        let ast = finish_expr(builder, neg);
         assert_eq!(
             ast.pretty().to_string(),
-            "(neg @0..9\n  (paren @0..9\n    (+ @1..8\n      (int 1 @1..2)\n      (float 2.0 @5..8))))"
+            "(file\n  (expr @0..9\n    (neg @0..9\n      (paren @0..9\n        (+ @1..8\n          (int 1 @1..2)\n          (float 2.0 @5..8))))))"
         );
+    }
+
+    #[test]
+    fn pretty_prints_items_blocks_names_and_types() {
+        // let x: Float = { y := z : Int; = 1 }
+        // (The text is only for orientation; spans are made up.)
+        let mut names = Names::new();
+        let (x, y, z, int, float) = (
+            names.intern("x"),
+            names.intern("y"),
+            names.intern("z"),
+            names.intern("Int"),
+            names.intern("Float"),
+        );
+        let mut builder = AstBuilder::new();
+        let z_use = builder.alloc(Expr {
+            kind: ExprKind::Name(z),
+            span: Span::new(23, 24),
+        });
+        let int_ty = builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Named(int),
+            span: Span::new(27, 30),
+        });
+        let ascribed = builder.alloc(Expr {
+            kind: ExprKind::Ascribe {
+                expr: z_use,
+                ty: int_ty,
+            },
+            span: Span::new(23, 30),
+        });
+        let rebind = builder.alloc_item(Item {
+            kind: ItemKind::Rebind {
+                name: y,
+                name_span: Span::new(18, 19),
+                value: ascribed,
+            },
+            span: Span::new(18, 30),
+        });
+        let one = leaf(&mut builder, 1, 34);
+        let result = builder.alloc_item(Item {
+            kind: ItemKind::Result(one),
+            span: Span::new(32, 35),
+        });
+        let body = builder.push_item_list(&[rebind, result]);
+        let block = builder.alloc(Expr {
+            kind: ExprKind::Block(body),
+            span: Span::new(16, 37),
+        });
+        let float_ty = builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Named(float),
+            span: Span::new(7, 12),
+        });
+        let with_type = builder.alloc_item(Item {
+            kind: ItemKind::Let {
+                name: x,
+                name_span: Span::new(4, 5),
+                ty: Some(float_ty),
+                value: block,
+            },
+            span: Span::new(0, 37),
+        });
+        let empty_body = builder.push_item_list(&[]);
+        let empty = builder.alloc(Expr {
+            kind: ExprKind::Block(empty_body),
+            span: Span::new(46, 48),
+        });
+        let without_type = builder.alloc_item(Item {
+            kind: ItemKind::Let {
+                name: y,
+                name_span: Span::new(42, 43),
+                ty: None,
+                value: empty,
+            },
+            span: Span::new(38, 48),
+        });
+        let root = builder.push_item_list(&[with_type, without_type]);
+        let ast = builder.finish(root, names);
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let x : Float @0..37\n\
+             \x20   (block @16..37\n\
+             \x20     (rebind y @18..30\n\
+             \x20       (: Int @23..30\n\
+             \x20         (name z @23..24)))\n\
+             \x20     (result @32..35\n\
+             \x20       (int 1 @34..35))))\n\
+             \x20 (let y @38..48\n\
+             \x20   (block @46..48)))"
+        );
+    }
+
+    #[test]
+    fn empty_file_prints_without_items() {
+        let mut builder = AstBuilder::new();
+        let root = builder.push_item_list(&[]);
+        let ast = builder.finish(root, Names::new());
+        assert_eq!(ast.pretty().to_string(), "(file)");
     }
 
     #[test]

@@ -114,20 +114,23 @@ fn dumps_print_in_pipeline_order_and_stop_before_evaluation() {
     ]);
     assert_eq!(
         stdout(&output),
-        "LParen @34..35\n\
+        "Newline @33..34\n\
+         LParen @34..35\n\
          Int(7) @35..36\n\
          SlashSlash @37..39\n\
          Int(2) @40..41\n\
          RParen @41..42\n\
          Slash @43..44\n\
          Int(2) @45..46\n\
+         Newline @46..47\n\
          Eof @46..46\n\
-         (float-div @34..46\n\
-         \x20 (int-to-float @34..42\n\
-         \x20   (int-floor-div @35..41\n\
-         \x20     (int 7 @35..36)\n\
-         \x20     (int 2 @40..41)))\n\
-         \x20 (float 2.0 @45..46))\n"
+         (block @34..46\n\
+         \x20 (float-div @34..46\n\
+         \x20   (int-to-float @34..42\n\
+         \x20     (int-floor-div @35..41\n\
+         \x20       (int 7 @35..36)\n\
+         \x20       (int 2 @40..41)))\n\
+         \x20   (float 2.0 @45..46)))\n"
     );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
@@ -143,18 +146,72 @@ fn dump_ast_and_types() {
     ]);
     assert_eq!(
         stdout(&output),
-        "(/ @34..46\n\
-         \x20 (paren @34..42\n\
-         \x20   (// @35..41\n\
-         \x20     (int 7 @35..36)\n\
-         \x20     (int 2 @40..41)))\n\
-         \x20 (int 2 @45..46))\n\
-         (/ : Float @34..46\n\
-         \x20 (paren : Int @34..42\n\
-         \x20   (// : Int @35..41\n\
-         \x20     (int 7 : Int @35..36)\n\
-         \x20     (int 2 : Int @40..41)))\n\
-         \x20 (int 2 : Float @45..46))\n"
+        "(file\n\
+         \x20 (expr @34..46\n\
+         \x20   (/ @34..46\n\
+         \x20     (paren @34..42\n\
+         \x20       (// @35..41\n\
+         \x20         (int 7 @35..36)\n\
+         \x20         (int 2 @40..41)))\n\
+         \x20     (int 2 @45..46))))\n\
+         (file\n\
+         \x20 (expr @34..46\n\
+         \x20   (/ : Float @34..46\n\
+         \x20     (paren : Int @34..42\n\
+         \x20       (// : Int @35..41\n\
+         \x20         (int 7 : Int @35..36)\n\
+         \x20         (int 2 : Int @40..41)))\n\
+         \x20     (int 2 : Float @45..46))))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_evaluates_a_file_of_items() {
+    let output = gcsl(&["run", "tests/fixtures/items.gcsl"]);
+    assert_eq!(stdout(&output), "37.5\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_prints_nothing_for_a_unit_result() {
+    let output = gcsl(&["run", "tests/fixtures/unit.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_names_and_slots() {
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/unit.gcsl",
+        "--dump-tokens",
+        "--dump-ir",
+    ]);
+    assert_eq!(
+        stdout(&output),
+        "Let @0..3\n\
+         Ident(count) @4..9\n\
+         Eq @10..11\n\
+         Int(1) @12..13\n\
+         Newline @13..14\n\
+         Ident(count) @14..19\n\
+         ColonEq @20..22\n\
+         Ident(count) @23..28\n\
+         Plus @29..30\n\
+         Int(1) @31..32\n\
+         Newline @32..33\n\
+         Eof @32..32\n\
+         (block @0..32\n\
+         \x20 (store count#0 @0..13\n\
+         \x20   (int 1 @12..13))\n\
+         \x20 (store count#1 @14..32\n\
+         \x20   (int-add @23..32\n\
+         \x20     (load count#0 @23..28)\n\
+         \x20     (int 1 @31..32)))\n\
+         \x20 (unit @0..32))\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -162,7 +219,7 @@ fn dump_ast_and_types() {
 #[test]
 fn dump_stops_before_a_runtime_error() {
     let output = gcsl(&["run", "tests/fixtures/runtime_error.gcsl", "--dump-ir"]);
-    assert!(stdout(&output).starts_with("(int-add @0..36\n"));
+    assert!(stdout(&output).starts_with("(block @0..36\n  (int-add @0..36\n"));
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -175,7 +232,7 @@ fn dump_then_error_prints_dumped_stages_and_the_error() {
         "--dump-ast",
         "--dump-ir",
     ]);
-    assert!(stdout(&output).starts_with("(+ @0..16\n"));
+    assert!(stdout(&output).starts_with("(file\n  (expr @0..16\n    (+ @0..16\n"));
     assert!(!stdout(&output).contains("float-"));
     assert!(stderr(&output).starts_with("error: cannot floor-divide Float\n"));
     assert_eq!(output.status.code(), Some(1));
@@ -196,8 +253,8 @@ fn deepest_accepted_expression_runs() {
     assert_eq!(output.status.code(), Some(0));
 }
 
-#[test]
-fn repl_evaluates_each_line() {
+/// Runs the REPL with `input` on stdin until it ends.
+fn repl(input: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -208,9 +265,41 @@ fn repl_evaluates_each_line() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n")
+        .write_all(input.as_bytes())
         .unwrap();
-    let output = child.wait_with_output().unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn repl_keeps_variables_across_lines() {
+    let output = repl(
+        "let x = 1\n\
+         let y = x + 1\n\
+         x + y\n\
+         x := x * 10; x + y\n\
+         {}\n\
+         let z = 1.5 + x\n\
+         x\n",
+    );
+    // Nothing for `let`, `:=` or a Unit value; the failed line changes
+    // nothing.
+    assert_eq!(stdout(&output), "3 : Int\n12 : Int\n10 : Int\n");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot add Float and Int\n\
+         \x20--> <repl>:1:13\n\
+         \x20 |\n\
+         1 | let z = 1.5 + x\n\
+         \x20 |         --- ^ - Int\n\
+         \x20 |         |\n\
+         \x20 |         Float\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_evaluates_each_line() {
+    let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");
     assert_eq!(stdout(&output), "3 : Int\n3.5 : Float\n-0.0 : Float\n");
     assert_eq!(
         stderr(&output),
