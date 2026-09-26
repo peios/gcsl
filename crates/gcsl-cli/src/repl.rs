@@ -17,9 +17,11 @@ const PROMPT: &str = "> ";
 ///
 /// Each non-blank line is a block body evaluated in one [`Session`], so
 /// variables declared at the top level of a line are visible to later
-/// lines. A line prints `value : Type`, nothing if its value is `()` (as
-/// for a `let`), or its diagnostics; a line with errors changes nothing.
-/// Ctrl-C discards the current line. History lasts for the session only.
+/// lines. A line prints `value : Type`, with the value as it would be
+/// written in a program (a string quoted and escaped, see
+/// [`Value::repr`]), nothing if its value is `()` (as for a `let`), or its
+/// diagnostics; a line with errors changes nothing. Ctrl-C discards the
+/// current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -67,7 +69,7 @@ fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
         Ok(Value::Unit) => Ok(()),
         Ok(value) => {
             let mut out = io::stdout().lock();
-            writeln!(out, "{value} : {}", value.ty())?;
+            writeln!(out, "{} : {}", value.repr(), value.ty())?;
             out.flush()
         }
         Err(diagnostics) => {

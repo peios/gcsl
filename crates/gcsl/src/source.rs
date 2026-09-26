@@ -90,7 +90,14 @@ impl SourceFile {
     /// Returns [`SourceError::TooLarge`] if `text` is longer than `u32::MAX`
     /// bytes.
     pub fn new(name: impl Into<String>, text: impl Into<String>) -> Result<Self, SourceError> {
-        let text = text.into();
+        let mut text = text.into();
+        // CRLF line endings are normalised to LF, as rustc does, so that
+        // every later stage (item separation, string literals and their
+        // indentation stripping, line continuations) sees one kind of line
+        // break. Offsets in spans refer to the normalised text.
+        if text.contains("\r\n") {
+            text = text.replace("\r\n", "\n");
+        }
         if u32::try_from(text.len()).is_err() {
             return Err(SourceError::TooLarge { len: text.len() });
         }
@@ -260,6 +267,15 @@ mod tests {
     }
 
     #[test]
+    fn crlf_is_normalised_to_lf() {
+        let source = file("a\r\nb\r\n");
+        assert_eq!(source.text(), "a\nb\n");
+        assert_eq!(source.line_col(2), (2, 1));
+        // A lone `\r` is not a line ending and is kept.
+        assert_eq!(file("a\rb").text(), "a\rb");
+    }
+
+    #[test]
     fn line_col_is_one_based() {
         let source = file("1 + 2\n  3\n");
         assert_eq!(source.line_col(0), (1, 1));
@@ -303,19 +319,19 @@ mod tests {
 
     #[test]
     fn excerpt_covers_whole_lines() {
-        let source = file("one\r\ntwo\nthree\nfour");
+        let source = file("one\ntwo\nthree\nfour");
         let lines = |span| {
             let excerpt = source.excerpt(span);
             (excerpt.first_line, source.slice(excerpt.span))
         };
         assert_eq!(lines(Span::new(1, 2)), (1, "one"));
-        assert_eq!(lines(Span::new(6, 7)), (2, "two"));
-        assert_eq!(lines(Span::new(1, 7)), (1, "one\r\ntwo"));
+        assert_eq!(lines(Span::new(5, 6)), (2, "two"));
+        assert_eq!(lines(Span::new(1, 6)), (1, "one\ntwo"));
         assert_eq!(lines(Span::new(9, 16)), (3, "three\nfour"));
         // An empty span at the very end.
-        assert_eq!(lines(Span::new(19, 19)), (4, "four"));
+        assert_eq!(lines(Span::new(18, 18)), (4, "four"));
         // The end offset on a terminator belongs to the line it ends.
-        assert_eq!(lines(Span::new(0, 4)), (1, "one"));
+        assert_eq!(lines(Span::new(0, 3)), (1, "one"));
         assert_eq!(
             source.excerpt(Span::new(0, 0)),
             Excerpt {

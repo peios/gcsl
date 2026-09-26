@@ -9,6 +9,10 @@ pub enum Ty {
     Int,
     /// IEEE 754 binary64 floating point.
     Float,
+    /// `true` or `false`.
+    Bool,
+    /// An immutable UTF-8 string.
+    String,
     /// The type with one value, `()`: the value of a block with no result.
     Unit,
     /// The type of an integer literal whose type has not been settled by its
@@ -35,6 +39,8 @@ impl fmt::Display for Ty {
         f.write_str(match self {
             Ty::Int | Ty::UntypedInt => "Int",
             Ty::Float => "Float",
+            Ty::Bool => "Bool",
+            Ty::String => "String",
             Ty::Unit => "Unit",
             Ty::Error => "<error>",
         })
@@ -49,6 +55,8 @@ mod tests {
     fn untyped_int_displays_as_int() {
         assert_eq!(Ty::Int.to_string(), "Int");
         assert_eq!(Ty::Float.to_string(), "Float");
+        assert_eq!(Ty::Bool.to_string(), "Bool");
+        assert_eq!(Ty::String.to_string(), "String");
         assert_eq!(Ty::Unit.to_string(), "Unit");
         assert_eq!(Ty::UntypedInt.to_string(), "Int");
         assert_eq!(Ty::Error.to_string(), "<error>");

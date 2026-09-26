@@ -13,7 +13,7 @@ fn run(text: &str) -> Result<Value, Vec<Diagnostic>> {
 /// The value and its type, as the REPL shows them.
 fn show(text: &str) -> String {
     match run(text) {
-        Ok(value) => format!("{value} : {}", value.ty()),
+        Ok(value) => format!("{} : {}", value.repr(), value.ty()),
         Err(diagnostics) => panic!("{text}: unexpected errors {diagnostics:?}"),
     }
 }
@@ -102,9 +102,81 @@ fn programs_with_items_and_blocks() {
 }
 
 #[test]
+fn programs_with_strings_bools_and_ifs() {
+    let cases = [
+        ("true", "true : Bool"),
+        ("1 < 2 and not (2.5 == 2.5)", "false : Bool"),
+        ("\"hi\"", "\"hi\" : String"),
+        ("\"a\\tb\\n\"", "\"a\\tb\\n\" : String"),
+        (
+            "\"\"\"say \"hi\" now\"\"\"",
+            "\"say \\\"hi\\\" now\" : String",
+        ),
+        (
+            "let n = 3\n\"{n} / 2 = {n / 2}, {n} * {n} = {n * n}\"",
+            "\"3 / 2 = 1.5, 3 * 3 = 9\" : String",
+        ),
+        (
+            "let name = \"GCSL\"\nlet greeting = \"hello, \" + name\n\
+             = if greeting == \"hello, GCSL\" { \"yes\" } else { \"no\" }",
+            "\"yes\" : String",
+        ),
+        (
+            "let n = 15\n\
+             = if n % 15 == 0 { \"FizzBuzz\" }\n\
+             else if n % 3 == 0 { \"Fizz\" }\n\
+             else if n % 5 == 0 { \"Buzz\" }\n\
+             else { \"{n}\" }",
+            "\"FizzBuzz\" : String",
+        ),
+        (
+            "let script = \"\n    set -e\n    echo {1 + 1}\n  \"\nscript",
+            "\"set -e\\necho 2\" : String",
+        ),
+        ("if 1 > 2 { 1 } else { 2.5 }", "2.5 : Float"),
+        ("let x = 1\nif x > 0 { let y = x }", "() : Unit"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
 fn value_display_does_not_include_the_type() {
     assert_eq!(run("7 / 2").unwrap().to_string(), "3.5");
     assert_eq!(run("7 // 2").unwrap().ty(), Ty::Int);
+    // A string displays as its text, and shows as a literal only in `repr`.
+    let value = run("\"a\\\"b\\n\"").unwrap();
+    assert_eq!(value.to_string(), "a\"b\n");
+    assert_eq!(value.repr().to_string(), "\"a\\\"b\\n\"");
+}
+
+#[test]
+fn if_branch_mismatch_renders_exactly() {
+    assert_eq!(
+        rendered("let x = if true { 1 } else { \"no\" }\n"),
+        "error: `if` branches have different types\n\
+         \x20--> calc.gcsl:1:9\n\
+         \x20 |\n\
+         1 | let x = if true { 1 } else { \"no\" }\n\
+         \x20 |         ^^      -----      -------- this is String\n\
+         \x20 |                 |\n\
+         \x20 |                 this is Int\n"
+    );
+}
+
+#[test]
+fn unterminated_triple_quoted_string_renders_exactly() {
+    assert_eq!(
+        rendered("let s = \"\"\"\n  She said \"\"hi\"\"\n"),
+        "error: unterminated string literal\n\
+         \x20--> calc.gcsl:1:9\n\
+         \x20 |\n\
+         1 | let s = \"\"\"\n\
+         \x20 |         ^^^\n\
+         \x20 |\n\
+         \x20 = note: this string closes with 3 quotes\n"
+    );
 }
 
 #[test]
@@ -253,21 +325,54 @@ fn every_stage_handles_maximum_depth() {
             "\n}".repeat(outer)
         ));
         let mixed_value = Value::Int(i64::try_from(terms).unwrap());
-        for (file, expected) in [
-            (&chain, chain_value),
-            (&nested, nested_value),
-            (&nested_blocks, Value::Int(1)),
-            (&mixed, mixed_value),
+        // String literals nested in each other's interpolations, each one
+        // level above the last: the lexer recurses through them too.
+        let literals = depth - 1;
+        let nested_strings = source(&format!(
+            "{}1{}",
+            "\"{".repeat(literals),
+            "}\"".repeat(literals)
+        ));
+        // An `else if` chain whose every condition is false, so that
+        // evaluation walks all of it. The innermost `if` is one above its
+        // blocks, which are one above their literals, so N `if`s are N + 2
+        // levels.
+        let ifs = depth - 2;
+        let else_ifs = source(&format!("{}{{ 7 }}", "if false { 0 } else ".repeat(ifs)));
+        // Left-nested chains of the other types, each evaluated by its own
+        // walker.
+        let floats = source(&format!("0.5{}", " + 0.5".repeat(depth - 1)));
+        let floats_value = Value::Float(0.5 * f64::from(u32::try_from(depth).unwrap()));
+        let bools = source(&format!("true{}", " and true".repeat(depth - 1)));
+        let concatenation = source(&format!("\"a\"{}", " + \"a\"".repeat(depth - 1)));
+        let concatenation_value = Value::Str("a".repeat(depth).into());
+        // The printers recurse too, but printing a tree this deep takes
+        // seconds, since each line is indented by its depth. They recurse
+        // one frame per level from a node straight to its children,
+        // whatever the node, except through a block's items, so the trees
+        // printed here already cover every way they recurse; printing the
+        // others would only add time.
+        for (file, expected, print) in [
+            (&chain, chain_value, true),
+            (&nested, nested_value, true),
+            (&nested_blocks, Value::Int(1), true),
+            (&mixed, mixed_value, true),
+            (&nested_strings, Value::Str("1".into()), false),
+            (&else_ifs, Value::Int(7), false),
+            (&floats, floats_value, false),
+            (&bools, Value::Bool(true), false),
+            (&concatenation, concatenation_value, false),
         ] {
-            let (tokens, names) = gcsl::lexer::tokenize(file).unwrap();
-            let ast = gcsl::parser::parse(&tokens, names, file).unwrap();
+            let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
             let checked = gcsl::check::check(&ast).unwrap();
             let ir = gcsl::lower::lower(&ast, &checked).unwrap();
             assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
-            // The printers recurse too.
-            assert!(!ast.pretty().to_string().is_empty());
-            assert!(!ast.pretty_with(&checked.types).to_string().is_empty());
-            assert!(!ir.pretty(ast.names()).to_string().is_empty());
+            if print {
+                assert!(!ast.pretty().to_string().is_empty());
+                assert!(!ast.pretty_with(&checked.types).to_string().is_empty());
+                assert!(!ir.pretty(ast.names()).to_string().is_empty());
+            }
         }
     });
 }
@@ -286,15 +391,23 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
         let text = format!("{}1{}", "{".repeat(200_000), "}".repeat(200_000));
         let diagnostics = run(&text).unwrap_err();
         assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        // String literals nested in each other's interpolations: the
+        // lexer's limit.
+        let text = format!("{}1{}", "\"{".repeat(200_000), "}\"".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        let text = format!("{}{{}}", "if true {} else ".repeat(200_000));
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics[0].message, "expression nested too deeply");
     });
 }
 
 #[test]
 fn stages_can_be_run_individually() {
     let file = source("let x = 1 : Float\nx + 2.5");
-    let (tokens, names) = gcsl::lexer::tokenize(&file).unwrap();
+    let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
     assert_eq!(tokens.len(), 11);
-    let ast = gcsl::parser::parse(&tokens, names, &file).unwrap();
+    let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
     let checked = gcsl::check::check(&ast).unwrap();
     assert_eq!(checked.resolution.frame_size(), 1);
     let ir = gcsl::lower::lower(&ast, &checked).unwrap();
@@ -309,6 +422,20 @@ fn stages_report_every_new_kind_of_error() {
     assert_eq!(message("{ 1"), "expected `}`, found end of input");
     assert_eq!(message("1 + 2\n3"), "unused value of type Int");
     assert_eq!(message("x"), "undefined variable `x`");
+    assert_eq!(message("\"abc"), "unterminated string literal");
+    assert_eq!(message("\"\\q\""), "unknown escape `\\q`");
+    assert_eq!(message("\"a } b\""), "unmatched `}` in string");
+    assert_eq!(message("\"{x"), "unterminated interpolation");
+    assert_eq!(message("!x"), "unexpected character `!`");
+    assert_eq!(
+        message("1 < 2 < 3"),
+        "comparison operators cannot be chained"
+    );
+    assert_eq!(message("if true 1"), "expected `{` after `if` condition");
+    assert_eq!(message("1 == \"a\""), "cannot compare Int and String");
+    assert_eq!(message("true < false"), "cannot order Bool");
+    assert_eq!(message("if 1 { 2 } else { 3 }"), "mismatched types");
+    assert_eq!(message("if true { 1 }"), "`if` without `else` must be Unit");
 }
 
 #[test]

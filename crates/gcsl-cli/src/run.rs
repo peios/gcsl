@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use clap::Args;
 use gcsl::lexer::TokenKind;
+use gcsl::strings::Quoted;
 use gcsl::{Diagnostic, SourceFile, Value, check, eval, lexer, lower, parser};
 
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
@@ -109,19 +110,30 @@ pub fn main(args: &RunArgs) -> ExitCode {
 }
 
 /// Runs the pipeline, printing each requested dump and stopping after the
-/// last one; with no dumps, prints the value unless it is `()`.
+/// last one; with no dumps, prints the value, as text, unless it is `()`.
 fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
     let last = args.last_dump();
     let mut out = io::stdout().lock();
 
-    let (tokens, names) = lexer::tokenize(source)?;
+    let (tokens, names, strings) = lexer::tokenize(source)?;
     if args.dump_tokens {
+        // Names by their text and string pieces by their quoted text, as in
+        // `Ident(x)` and `StrStart("a\n")`.
         for token in &tokens {
+            let span = token.span;
             match token.kind {
-                TokenKind::Ident(name) => {
-                    writeln!(out, "Ident({}) @{}", names.get(name), token.span)?;
+                TokenKind::Ident(name) => writeln!(out, "Ident({}) @{span}", names.get(name))?,
+                TokenKind::Str(id) => writeln!(out, "Str({}) @{span}", Quoted(strings.get(id)))?,
+                TokenKind::StrStart(id) => {
+                    writeln!(out, "StrStart({}) @{span}", Quoted(strings.get(id)))?;
                 }
-                kind => writeln!(out, "{kind:?} @{}", token.span)?,
+                TokenKind::StrMid(id) => {
+                    writeln!(out, "StrMid({}) @{span}", Quoted(strings.get(id)))?;
+                }
+                TokenKind::StrEnd(id) => {
+                    writeln!(out, "StrEnd({}) @{span}", Quoted(strings.get(id)))?;
+                }
+                kind => writeln!(out, "{kind:?} @{span}")?,
             }
         }
     }
@@ -129,7 +141,7 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
         return Ok(out.flush()?);
     }
 
-    let ast = parser::parse(&tokens, names, source)?;
+    let ast = parser::parse(&tokens, names, strings, source)?;
     if args.dump_ast {
         writeln!(out, "{}", ast.pretty())?;
     }
@@ -154,6 +166,8 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
     }
 
     let value = eval::eval(&ir)?;
+    // A string prints as its text, unquoted, so a program can produce
+    // output verbatim.
     if value != Value::Unit {
         writeln!(out, "{value}")?;
     }

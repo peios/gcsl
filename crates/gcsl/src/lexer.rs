@@ -1,16 +1,18 @@
 //! The lexer: source text to a vector of tokens.
 //!
-//! A single hand-written pass over the source bytes. Spaces, tabs, `\r` and
+//! A hand-written pass over the source bytes. Spaces, tabs, `\r` and
 //! comments (`#` to end of line) are skipped. Each `\n` becomes a
 //! [`TokenKind::Newline`] token, because newlines separate items, except
-//! inside parentheses: the lexer tracks the depth of open `(` and emits no
-//! `Newline` while it is above zero, so an expression in parentheses may
-//! span lines freely. Braces do not affect the depth, since a block body
-//! inside `{ }` is newline-sensitive again.
+//! inside parentheses and interpolations: the lexer tracks the depth of open
+//! `(` and emits no `Newline` while it is above zero, so an expression in
+//! parentheses may span lines freely, and it never emits one inside an
+//! interpolation (see [String literals](#string-literals)). Braces do not
+//! affect the depth, since a block body inside `{ }` is newline-sensitive
+//! again.
 //!
 //! Known limitation: because only parentheses are tracked, a newline inside
-//! a `{ }` that is itself inside `( )` is not emitted either, so a
-//! multi-line block written in parentheses runs its items together. No
+//! a `{ }` that is itself inside `( )` or an interpolation is not emitted
+//! either, so a multi-line block written there runs its items together. No
 //! construct needs that yet; when function calls arrive (`f({ ... })`), the
 //! parser will have to handle it, for instance by having the lexer track a
 //! stack of bracket kinds rather than a depth.
@@ -19,7 +21,15 @@
 //! [`TokenKind::Ident`] carries a [`Name`], not text. An identifier starts
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
-//! `hello-world` and `x-1` are single names. `let` is the only keyword.
+//! `hello-world` and `x-1` are single names. The keywords are `let`, `if`,
+//! `else`, `true`, `false`, `and`, `or` and `not`. An `r` directly followed
+//! by `"` begins a raw string literal; anywhere else it is an ordinary
+//! identifier.
+//!
+//! Operators are lexed greedily: `==` is one token and `=` followed by
+//! anything else is another, and likewise `<=` and `<`, `>=` and `>`, `:=`
+//! and `:`, `//` and `/`. `!` is only accepted as part of `!=`; negation is
+//! `not`.
 //!
 //! A `-` that is not inside an identifier is classified from the bytes
 //! either side of it (see `Lexer::minus`): subtraction ([`TokenKind::Minus`])
@@ -27,13 +37,84 @@
 //! followed by an operand, and an error when it directly follows an operand,
 //! where `a-b` and `a - b` would be too easily confused.
 //!
-//! The only allocations besides the output vector are one scratch `String`,
-//! reused for every numeric literal that contains `_` separators, and the
+//! # String literals
+//!
+//! A literal is delimited by `n` quotes on each side, where `n` is 1 or at
+//! least 3, and `""` is the empty string. The opening run of quotes is
+//! counted whole; inside, a run of fewer than `n` quotes is content, and the
+//! first `n` quotes of a longer run close the literal. With the `r` prefix
+//! the literal is raw: every byte is content. Otherwise `\` begins an escape
+//! and a single `{` an interpolation, whose expression is lexed as ordinary
+//! tokens between the literal's pieces. A literal without interpolations is
+//! one [`TokenKind::Str`]; one with interpolations is a
+//! [`TokenKind::StrStart`], the tokens of each expression, a
+//! [`TokenKind::StrMid`] between each two, and a [`TokenKind::StrEnd`]. Each
+//! of these carries a [`StrId`] into the [`Strings`] table, which holds the
+//! piece's final text: indentation stripped and escapes replaced.
+//!
+//! ## Contexts
+//!
+//! Lexing an interpolation's expression is lexing in a different context:
+//! newlines are never emitted, and the `}` that matches the interpolation's
+//! `{` resumes the literal instead of being a token. The lexer keeps a stack
+//! of the interpolations it is inside, innermost last, each with its own
+//! brace and parenthesis counts and the layout of its literal; the base
+//! context's parenthesis count is kept apart from the stack. A literal
+//! nested in an interpolation is lexed by the same routine and pushes its
+//! own interpolations. The stack is empty outside interpolations, so a
+//! program without any allocates nothing for it.
+//!
+//! ## Two passes per literal
+//!
+//! Whether a line's indentation is stripped depends on every other line of
+//! the literal, so each literal is lexed in two passes.
+//!
+//! **The scan** (pass 1, `Lexer::scan`) walks from the opening delimiter to
+//! the closing one to find the literal's extent. In a literal's text it
+//! skips escapes whole, so that neither `\"` nor the braces of `\u{...}` are
+//! taken for delimiters, and skips `{{`. At a single `{` it walks the
+//! interpolation as the lexer would tokenise it: it counts braces to find
+//! the matching `}`, skips comments to the end of their line, skips
+//! identifiers and numbers whole (so an `r` ending one is not taken for a
+//! raw prefix), and walks each nested literal the same way, recursively,
+//! since a `"` inside a nested literal is not the closer. At every line
+//! break in the extent, including those inside interpolations and nested
+//! literals, it measures the line that follows: the length of its leading
+//! spaces and tabs, and whether it is blank. The common prefix of the
+//! non-blank lines is the indentation to strip. Finally it looks back from
+//! the closing delimiter to decide whether the final line break is removed.
+//! The scan allocates nothing. It reports only the errors that leave the
+//! extent unknown: an unterminated literal or interpolation (the innermost,
+//! when several are), and nesting deeper than [`MAX_DEPTH`], which bounds its
+//! recursion. Everything else is left to pass 2, so errors are reported in
+//! source order.
+//!
+//! **Pass 2** (`Lexer::piece`) produces the text of one piece at a time,
+//! starting at the opening delimiter or at the `}` that ends an
+//! interpolation: it strips the indentation at the start of each line of the
+//! literal's own text, replaces escapes, and stops at the next interpolation
+//! or at the end of the text. Each piece is built in a reused buffer and
+//! copied into the table at its exact length.
+//!
+//! A nested literal is scanned again when the lexer reaches it, so lexing
+//! takes time proportional to the source's length times the depth to which
+//! literals are nested in each other's interpolations.
+//!
+//! A line break inside a literal is a `\n` byte, and only spaces and tabs are
+//! indentation: a `\r` before a line break is ordinary content.
+//!
+//! # Allocation
+//!
+//! Besides the output vector and the pieces, the lexer allocates only one
+//! scratch `String`, reused for every numeric literal that contains `_`
+//! separators and for building every piece, the interpolation stack, and the
 //! interning of each distinct name.
 
-use crate::diagnostic::Diagnostic;
+use crate::MAX_DEPTH;
+use crate::diagnostic::{Diagnostic, InternalError};
 use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span, offset_to_u32};
+use crate::strings::{StrId, Strings};
 
 /// One token: its kind (with the value, for literals) and where it came from.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +125,13 @@ pub struct Token {
     /// just after the last token other than a [`TokenKind::Newline`] (or at
     /// offset 0 if there is none), so that "found end of input" errors point
     /// at the end of the last line with code on it.
+    ///
+    /// A [`TokenKind::Str`] covers its whole literal, prefix and delimiters
+    /// included. A [`TokenKind::StrStart`] covers the opening delimiter
+    /// through the first interpolation's `{`, a [`TokenKind::StrMid`] one
+    /// interpolation's `}` through the next one's `{`, and a
+    /// [`TokenKind::StrEnd`] the last interpolation's `}` through the
+    /// closing delimiter.
     pub span: Span,
 }
 
@@ -54,10 +142,35 @@ pub enum TokenKind {
     Int(i64),
     /// A float literal, already converted.
     Float(f64),
+    /// A string literal without interpolations: its whole text.
+    Str(StrId),
+    /// The text of an interpolated string literal before its first
+    /// interpolation.
+    StrStart(StrId),
+    /// The text of an interpolated string literal between two
+    /// interpolations.
+    StrMid(StrId),
+    /// The text of an interpolated string literal after its last
+    /// interpolation.
+    StrEnd(StrId),
     /// An identifier other than a keyword.
     Ident(Name),
     /// The keyword `let`.
     Let,
+    /// The keyword `if`.
+    If,
+    /// The keyword `else`.
+    Else,
+    /// The keyword `true`.
+    True,
+    /// The keyword `false`.
+    False,
+    /// The keyword `and`.
+    And,
+    /// The keyword `or`.
+    Or,
+    /// The keyword `not`.
+    Not,
     /// `+`
     Plus,
     /// `-` as subtraction: not directly after an operand, and followed by
@@ -74,6 +187,18 @@ pub enum TokenKind {
     SlashSlash,
     /// `%`
     Percent,
+    /// `==`
+    EqEq,
+    /// `!=`
+    BangEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
     /// `:`
     Colon,
     /// `:=`
@@ -90,7 +215,8 @@ pub enum TokenKind {
     RBrace,
     /// `;`
     Semi,
-    /// A `\n` outside parentheses. Each newline is its own token.
+    /// A `\n` outside parentheses and interpolations. Each newline is its
+    /// own token.
     Newline,
     /// End of input. Always the last token.
     Eof,
@@ -104,12 +230,25 @@ impl TokenKind {
     pub const fn symbol(self) -> Option<&'static str> {
         match self {
             TokenKind::Let => Some("let"),
+            TokenKind::If => Some("if"),
+            TokenKind::Else => Some("else"),
+            TokenKind::True => Some("true"),
+            TokenKind::False => Some("false"),
+            TokenKind::And => Some("and"),
+            TokenKind::Or => Some("or"),
+            TokenKind::Not => Some("not"),
             TokenKind::Plus => Some("+"),
             TokenKind::Minus | TokenKind::Neg => Some("-"),
             TokenKind::Star => Some("*"),
             TokenKind::Slash => Some("/"),
             TokenKind::SlashSlash => Some("//"),
             TokenKind::Percent => Some("%"),
+            TokenKind::EqEq => Some("=="),
+            TokenKind::BangEq => Some("!="),
+            TokenKind::Lt => Some("<"),
+            TokenKind::Le => Some("<="),
+            TokenKind::Gt => Some(">"),
+            TokenKind::Ge => Some(">="),
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
             TokenKind::Eq => Some("="),
@@ -120,6 +259,10 @@ impl TokenKind {
             TokenKind::Semi => Some(";"),
             TokenKind::Int(_)
             | TokenKind::Float(_)
+            | TokenKind::Str(_)
+            | TokenKind::StrStart(_)
+            | TokenKind::StrMid(_)
+            | TokenKind::StrEnd(_)
             | TokenKind::Ident(_)
             | TokenKind::Newline
             | TokenKind::Eof => None,
@@ -127,38 +270,172 @@ impl TokenKind {
     }
 }
 
-/// Lexes the whole of `source`, interning its names into a new table.
+/// Lexes the whole of `source`, interning its names into a new table and
+/// storing the text of its string literals in another.
 ///
 /// The returned vector always ends with exactly one [`TokenKind::Eof`].
 ///
 /// # Errors
 ///
 /// Returns the first lexical error: an unexpected character, an ambiguous
-/// `-`, a malformed number (misplaced `_`, missing exponent digits) or a
-/// literal too large for its type.
-pub fn tokenize(source: &SourceFile) -> Result<(Vec<Token>, Names), Diagnostic> {
+/// `-`, a malformed number (misplaced `_`, missing exponent digits), a
+/// literal too large for its type, or a malformed string literal
+/// (unterminated, an unknown or invalid escape, a stray `}`, an
+/// unterminated interpolation, or literals nested more than
+/// [`MAX_DEPTH`] deep in each other's interpolations).
+pub fn tokenize(source: &SourceFile) -> Result<(Vec<Token>, Names, Strings), Diagnostic> {
     let mut names = Names::new();
-    let tokens = tokenize_with(source, &mut names)?;
-    Ok((tokens, names))
+    let (tokens, strings) = tokenize_with(source, &mut names)?;
+    Ok((tokens, names, strings))
 }
 
 /// Like [`tokenize`], interning names into an existing table, so that they
-/// compare equal to names lexed earlier into it.
+/// compare equal to names lexed earlier into it. The string table is always
+/// new, since it belongs to this input alone.
 ///
 /// On error, names met before the error remain interned.
 ///
 /// # Errors
 ///
 /// As [`tokenize`].
-pub fn tokenize_with(source: &SourceFile, names: &mut Names) -> Result<Vec<Token>, Diagnostic> {
+pub fn tokenize_with(
+    source: &SourceFile,
+    names: &mut Names,
+) -> Result<(Vec<Token>, Strings), Diagnostic> {
     let mut lexer = Lexer::new(source, names);
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token()?;
         tokens.push(token);
         if token.kind == TokenKind::Eof {
-            return Ok(tokens);
+            return Ok((tokens, lexer.strings));
         }
+    }
+}
+
+/// The opening delimiter of a string literal, as [`Lexer::delimiter`]
+/// finds it.
+#[derive(Clone, Copy, Debug)]
+struct Delimiter {
+    /// Whether the literal has the `r` prefix.
+    raw: bool,
+    /// Offset of the first quote.
+    quotes_start: usize,
+    /// The number of quotes in each of the literal's delimiters.
+    quotes: usize,
+    /// Offset of the first byte of content, just after the opening quotes.
+    content_start: usize,
+}
+
+/// How the lines of a literal's content lose their indentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Indent {
+    /// Not at all: the content does not start with a line break.
+    None,
+    /// Every line loses the common indentation, the `len` bytes of source
+    /// at offset `start`. A non-blank line always starts with them; a blank
+    /// line loses them if it starts with them and becomes empty otherwise.
+    Common {
+        /// Offset of a line that starts with the common indentation.
+        start: usize,
+        /// Length of the common indentation in bytes.
+        len: usize,
+    },
+    /// Every line is blank, so every line becomes empty.
+    AllBlank,
+}
+
+/// Where the parts of a string literal are, as the scan finds them.
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    /// Whether the literal is raw: no escapes and no interpolations.
+    raw: bool,
+    /// Offset where the text to produce starts: just after the opening
+    /// delimiter, or just after the first line break when the literal is
+    /// stripped.
+    text_start: usize,
+    /// Offset where the text to produce ends: the closing delimiter, or the
+    /// final line break when stripping removes it.
+    text_end: usize,
+    /// Offset of the closing delimiter.
+    content_end: usize,
+    /// Offset just after the closing delimiter.
+    end: usize,
+    /// How the content's lines are stripped.
+    indent: Indent,
+}
+
+/// An interpolation being lexed: a context entered at the `{` of a non-raw
+/// string literal and left at the matching `}`.
+#[derive(Clone, Copy, Debug)]
+struct Interpolation {
+    /// The literal it belongs to, whose text resumes after the `}`.
+    layout: Layout,
+    /// Offset of the `{`.
+    open: usize,
+    /// Number of `{` inside the interpolation not yet closed. A `}` at
+    /// depth zero ends the interpolation.
+    brace_depth: u32,
+    /// Number of `(` inside the interpolation not yet closed. Newlines are
+    /// never emitted in an interpolation whatever its value; it is kept so
+    /// that parentheses inside cannot affect the enclosing context.
+    paren_depth: u32,
+}
+
+/// Why pass 2 stopped building a piece.
+#[derive(Clone, Copy, Debug)]
+enum Stop {
+    /// At the end of the literal's text.
+    End,
+    /// At the `{` of an interpolation, at this offset.
+    Interpolation(usize),
+}
+
+/// The scan's running measurement of a literal's indentation.
+#[derive(Clone, Copy, Debug)]
+struct Measure {
+    /// Whether the literal is stripped at all. If not, nothing is measured.
+    active: bool,
+    /// The common indentation of the non-blank lines measured so far, as
+    /// the offset of a line starting with it and its length. `None` until a
+    /// non-blank line is measured.
+    common: Option<(usize, usize)>,
+}
+
+impl Measure {
+    /// Measures the line after the line break at `newline`.
+    ///
+    /// A line is blank if only spaces and tabs precede its end. When
+    /// `own_quotes` is `Some(n)`, the line break is in the text of the
+    /// literal being measured, whose delimiters have `n` quotes, and the
+    /// line may also end at that literal's closing delimiter. Elsewhere,
+    /// the closing delimiter of a nested literal is part of the measured
+    /// literal's line, so such a line is not blank.
+    fn line(&mut self, bytes: &[u8], newline: usize, own_quotes: Option<usize>) {
+        if !self.active {
+            return;
+        }
+        let start = newline + 1;
+        let indent = whitespace_len(bytes, start);
+        let after = start + indent;
+        let blank = match bytes.get(after) {
+            None | Some(b'\n') => true,
+            Some(b'"') => own_quotes.is_some_and(|quotes| quote_run(bytes, after) >= quotes),
+            Some(_) => false,
+        };
+        if blank {
+            return;
+        }
+        self.common = Some(match self.common {
+            None => (start, indent),
+            Some((common, len)) => {
+                let shared = common_prefix_len(
+                    bytes.get(common..common + len).unwrap_or_default(),
+                    bytes.get(start..after).unwrap_or_default(),
+                );
+                (common, shared)
+            }
+        });
     }
 }
 
@@ -167,21 +444,28 @@ struct Lexer<'a> {
     text: &'a str,
     bytes: &'a [u8],
     /// Byte offset of the next unread byte. Always on a character boundary:
-    /// outside comments the lexer only consumes ASCII bytes and stops with an
-    /// error at the first byte it does not recognise, and a comment is
-    /// skipped up to a `\n` or the end of the text. Slicing `text` at `pos`
-    /// is therefore safe.
+    /// outside comments and string literals the lexer only consumes ASCII
+    /// bytes and stops with an error at the first byte it does not
+    /// recognise, a comment is skipped up to a `\n` or the end of the text,
+    /// and every piece of a string literal ends at an ASCII `{` or quote.
+    /// Slicing `text` at `pos` is therefore safe.
     pos: usize,
     /// End of the most recent token other than a newline, used to place the
     /// `Eof` token.
     last_end: usize,
-    /// Number of `(` not yet closed. Newlines are only emitted at zero.
-    /// Saturates at zero on an unmatched `)`, which the parser reports.
+    /// Number of `(` not yet closed outside interpolations. Newlines are
+    /// only emitted at zero, outside interpolations. Saturates at zero on
+    /// an unmatched `)`, which the parser reports.
     paren_depth: u32,
-    /// Reused buffer for literals whose `_` separators must be removed.
+    /// The interpolations being lexed, innermost last.
+    interpolations: Vec<Interpolation>,
+    /// Reused buffer for literals whose `_` separators must be removed and
+    /// for building each piece of a string literal.
     scratch: String,
     /// Where identifiers are interned.
     names: &'a mut Names,
+    /// Where the pieces of string literals are stored.
+    strings: Strings,
 }
 
 impl<'a> Lexer<'a> {
@@ -192,8 +476,10 @@ impl<'a> Lexer<'a> {
             pos: 0,
             last_end: 0,
             paren_depth: 0,
+            interpolations: Vec::new(),
             scratch: String::new(),
             names,
+            strings: Strings::new(),
         }
     }
 
@@ -209,13 +495,19 @@ impl<'a> Lexer<'a> {
         self.skip_trivia();
         let start = self.pos;
         let Some(byte) = self.peek() else {
+            // The scan checks that every interpolation of a literal closes
+            // before the literal is lexed, so this only guards against the
+            // two passes disagreeing.
+            if let Some(interpolation) = self.interpolations.last() {
+                return Err(unterminated_interpolation(interpolation.open));
+            }
             return Ok(Token {
                 kind: TokenKind::Eof,
                 span: span(self.last_end, self.last_end),
             });
         };
         let kind = match byte {
-            // `skip_trivia` only stops at a newline outside parentheses.
+            // `skip_trivia` only stops at a newline where it is significant.
             b'\n' => {
                 self.pos += 1;
                 return Ok(Token {
@@ -223,41 +515,28 @@ impl<'a> Lexer<'a> {
                     span: span(start, self.pos),
                 });
             }
-            b'+' => self.single(TokenKind::Plus),
-            b'-' => self.minus(start)?,
-            b'*' => self.single(TokenKind::Star),
-            b'%' => self.single(TokenKind::Percent),
+            b'"' => self.string(start)?,
+            b'r' if self.peek_at(1) == Some(b'"') => self.string(start)?,
+            b'{' => {
+                if let Some(interpolation) = self.interpolations.last_mut() {
+                    interpolation.brace_depth = interpolation.brace_depth.saturating_add(1);
+                }
+                self.single(TokenKind::LBrace)
+            }
+            b'}' => self.close_brace(start)?,
             b'(' => {
-                self.paren_depth = self.paren_depth.saturating_add(1);
+                let depth = self.paren_depth_mut();
+                *depth = depth.saturating_add(1);
                 self.single(TokenKind::LParen)
             }
             b')' => {
-                self.paren_depth = self.paren_depth.saturating_sub(1);
+                let depth = self.paren_depth_mut();
+                *depth = depth.saturating_sub(1);
                 self.single(TokenKind::RParen)
-            }
-            b'{' => self.single(TokenKind::LBrace),
-            b'}' => self.single(TokenKind::RBrace),
-            b';' => self.single(TokenKind::Semi),
-            b'=' => self.single(TokenKind::Eq),
-            b':' => {
-                if self.peek_at(1) == Some(b'=') {
-                    self.pos += 2;
-                    TokenKind::ColonEq
-                } else {
-                    self.single(TokenKind::Colon)
-                }
-            }
-            b'/' => {
-                if self.peek_at(1) == Some(b'/') {
-                    self.pos += 2;
-                    TokenKind::SlashSlash
-                } else {
-                    self.single(TokenKind::Slash)
-                }
             }
             b'0'..=b'9' => self.number(start)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.identifier(start),
-            _ => return Err(self.unexpected_character()),
+            _ => self.operator(start)?,
         };
         self.last_end = self.pos;
         Ok(Token {
@@ -266,30 +545,80 @@ impl<'a> Lexer<'a> {
         })
     }
 
+    /// Lexes an operator or punctuation token starting at `start`.
+    fn operator(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        let Some(byte) = self.peek() else {
+            return Err(self.unexpected_character());
+        };
+        // For operators that are one byte alone or two with a following `=`.
+        let with_eq = |alone: TokenKind, with: TokenKind| {
+            if self.peek_at(1) == Some(b'=') {
+                (with, 2)
+            } else {
+                (alone, 1)
+            }
+        };
+        let (kind, len) = match byte {
+            b'+' => (TokenKind::Plus, 1),
+            b'-' => return self.minus(start),
+            b'*' => (TokenKind::Star, 1),
+            b'%' => (TokenKind::Percent, 1),
+            b';' => (TokenKind::Semi, 1),
+            b'=' => with_eq(TokenKind::Eq, TokenKind::EqEq),
+            b':' => with_eq(TokenKind::Colon, TokenKind::ColonEq),
+            b'<' => with_eq(TokenKind::Lt, TokenKind::Le),
+            b'>' => with_eq(TokenKind::Gt, TokenKind::Ge),
+            b'!' if self.peek_at(1) == Some(b'=') => (TokenKind::BangEq, 2),
+            b'/' if self.peek_at(1) == Some(b'/') => (TokenKind::SlashSlash, 2),
+            b'/' => (TokenKind::Slash, 1),
+            _ => return Err(self.unexpected_character()),
+        };
+        self.pos += len;
+        Ok(kind)
+    }
+
     /// Consumes a one-byte token.
     fn single(&mut self, kind: TokenKind) -> TokenKind {
         self.pos += 1;
         kind
     }
 
+    /// The parenthesis count of the current context: the innermost
+    /// interpolation's, or the base context's outside interpolations.
+    fn paren_depth_mut(&mut self) -> &mut u32 {
+        match self.interpolations.last_mut() {
+            Some(interpolation) => &mut interpolation.paren_depth,
+            None => &mut self.paren_depth,
+        }
+    }
+
+    /// Lexes a `}` at `start`: the end of the innermost interpolation if it
+    /// matches that interpolation's `{`, and a [`TokenKind::RBrace`]
+    /// otherwise.
+    fn close_brace(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        if let Some(interpolation) = self.interpolations.last_mut() {
+            if interpolation.brace_depth > 0 {
+                interpolation.brace_depth -= 1;
+            } else {
+                let layout = interpolation.layout;
+                self.interpolations.pop();
+                return self.piece(layout, start + 1, false);
+            }
+        }
+        Ok(self.single(TokenKind::RBrace))
+    }
+
     /// Skips whitespace and comments, stopping at a `\n` that must become a
     /// [`TokenKind::Newline`] token.
     fn skip_trivia(&mut self) {
+        let newlines_are_trivia = !self.interpolations.is_empty() || self.paren_depth > 0;
         while let Some(byte) = self.peek() {
             match byte {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
-                b'\n' if self.paren_depth > 0 => self.pos += 1,
-                b'#' => {
-                    // Skip to the newline, which is then either skipped or
-                    // emitted like any other.
-                    self.pos = self
-                        .bytes
-                        .get(self.pos..)
-                        .unwrap_or_default()
-                        .iter()
-                        .position(|&b| b == b'\n')
-                        .map_or(self.bytes.len(), |offset| self.pos + offset);
-                }
+                b'\n' if newlines_are_trivia => self.pos += 1,
+                // Skip to the newline, which is then either skipped or
+                // emitted like any other.
+                b'#' => self.pos = end_of_line(self.bytes, self.pos),
                 _ => break,
             }
         }
@@ -302,21 +631,17 @@ impl<'a> Lexer<'a> {
     /// identifier character, so `a-b` is one name but `a-` and `a- b` are
     /// not.
     fn identifier(&mut self, start: usize) -> TokenKind {
-        while let Some(byte) = self.peek() {
-            if is_identifier_byte(byte) {
-                self.pos += 1;
-            } else if byte == b'-' && self.peek_at(1).is_some_and(is_identifier_byte) {
-                // Consume the `-` and the character after it together.
-                self.pos += 2;
-            } else {
-                break;
-            }
-        }
-        let text = &self.text[start..self.pos];
-        if text == "let" {
-            TokenKind::Let
-        } else {
-            TokenKind::Ident(self.names.intern(text))
+        self.pos = identifier_end(self.bytes, start);
+        match &self.text[start..self.pos] {
+            "let" => TokenKind::Let,
+            "if" => TokenKind::If,
+            "else" => TokenKind::Else,
+            "true" => TokenKind::True,
+            "false" => TokenKind::False,
+            "and" => TokenKind::And,
+            "or" => TokenKind::Or,
+            "not" => TokenKind::Not,
+            text => TokenKind::Ident(self.names.intern(text)),
         }
     }
 
@@ -329,7 +654,7 @@ impl<'a> Lexer<'a> {
     /// 2. Otherwise, followed by whitespace or the end of input:
     ///    subtraction, [`TokenKind::Minus`].
     /// 3. Otherwise, directly followed by an operand start (a letter, digit,
-    ///    `_`, `(` or `{`): negation, [`TokenKind::Neg`].
+    ///    `_`, `(`, `{` or `"`): negation, [`TokenKind::Neg`].
     /// 4. Otherwise, as in `--x`: an unexpected character.
     fn minus(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         let previous = start.checked_sub(1).and_then(|at| self.bytes.get(at));
@@ -342,7 +667,7 @@ impl<'a> Lexer<'a> {
         }
         match self.peek_at(1) {
             None | Some(b' ' | b'\t' | b'\r' | b'\n') => Ok(self.single(TokenKind::Minus)),
-            Some(byte) if is_identifier_byte(byte) || byte == b'(' || byte == b'{' => {
+            Some(byte) if is_identifier_byte(byte) || matches!(byte, b'(' | b'{' | b'"') => {
                 Ok(self.single(TokenKind::Neg))
             }
             Some(_) => Err(self.unexpected_character()),
@@ -473,6 +798,403 @@ impl<'a> Lexer<'a> {
             span(self.pos, self.pos + ch.len_utf8()),
         )
     }
+
+    /// Lexes the string literal starting at `start`, at its `r` prefix or
+    /// first quote: scans it, then produces its first piece.
+    fn string(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        let layout = self.scan(start, self.interpolations.len() + 1)?;
+        self.piece(layout, layout.text_start, true)
+    }
+
+    /// The opening delimiter of the literal starting at `start`, which holds
+    /// its `r` prefix or its first quote.
+    fn delimiter(&self, start: usize) -> Delimiter {
+        let raw = self.bytes.get(start) == Some(&b'r');
+        let quotes_start = start + usize::from(raw);
+        let run = quote_run(self.bytes, quotes_start);
+        // `""` is the empty string, delimited by one quote on each side.
+        // Every other run opens the literal whole.
+        let quotes = if run == 2 { 1 } else { run };
+        Delimiter {
+            raw,
+            quotes_start,
+            quotes,
+            content_start: quotes_start + quotes,
+        }
+    }
+
+    // ----- Pass 1: the scan. -----
+
+    /// Scans the literal starting at `start`, whose nesting `level` is 1
+    /// outside any interpolation and one more for each interpolation it is
+    /// in, and returns its layout. Allocates nothing.
+    fn scan(&self, start: usize, level: usize) -> Result<Layout, Diagnostic> {
+        let delimiter = self.delimiter(start);
+        if level > MAX_DEPTH {
+            return Err(too_deep(start, &delimiter));
+        }
+        // Stripping applies when the content starts with a line break,
+        // optionally after spaces and tabs.
+        let first_break =
+            delimiter.content_start + whitespace_len(self.bytes, delimiter.content_start);
+        let stripped = self.bytes.get(first_break) == Some(&b'\n');
+        let mut measure = Measure {
+            active: stripped,
+            common: None,
+        };
+        let content_end = self.skip_content(&delimiter, level, &mut measure, true)?;
+        let end = content_end + delimiter.quotes;
+        if !stripped {
+            return Ok(Layout {
+                raw: delimiter.raw,
+                text_start: delimiter.content_start,
+                text_end: content_end,
+                content_end,
+                end,
+                indent: Indent::None,
+            });
+        }
+        let text_start = first_break + 1;
+        let indent = match measure.common {
+            Some((start, len)) => Indent::Common { start, len },
+            None => Indent::AllBlank,
+        };
+        Ok(Layout {
+            raw: delimiter.raw,
+            text_start,
+            text_end: self.stripped_end(&delimiter, text_start, content_end),
+            content_end,
+            end,
+            indent,
+        })
+    }
+
+    /// Where the text of a stripped literal ends: at its final line break
+    /// if only spaces and tabs follow it before the closing delimiter and it
+    /// is not the first line break, which stripping removes anyway;
+    /// otherwise at the closing delimiter.
+    ///
+    /// A line break escaped by a `\` is not removed here: the escape is a
+    /// line continuation, which removes it itself, and removing it here
+    /// would leave the `\` escaping nothing.
+    fn stripped_end(&self, delimiter: &Delimiter, text_start: usize, content_end: usize) -> usize {
+        let mut last_line = content_end;
+        while last_line > text_start && matches!(self.bytes.get(last_line - 1), Some(b' ' | b'\t'))
+        {
+            last_line -= 1;
+        }
+        if last_line <= text_start || self.bytes.get(last_line - 1) != Some(&b'\n') {
+            return content_end;
+        }
+        let line_break = last_line - 1;
+        // In a run of backslashes, each pair is one escaped backslash, so an
+        // odd run ends with a backslash escaping the line break.
+        let backslashes = self
+            .bytes
+            .get(text_start..line_break)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count();
+        if !delimiter.raw && !backslashes.is_multiple_of(2) {
+            content_end
+        } else {
+            line_break
+        }
+    }
+
+    /// Walks a literal's content to its closing delimiter and returns the
+    /// delimiter's offset. `own` says whether this is the literal being
+    /// measured rather than one nested in it.
+    fn skip_content(
+        &self,
+        delimiter: &Delimiter,
+        level: usize,
+        measure: &mut Measure,
+        own: bool,
+    ) -> Result<usize, Diagnostic> {
+        let own_quotes = own.then_some(delimiter.quotes);
+        let mut pos = delimiter.content_start;
+        loop {
+            let Some(&byte) = self.bytes.get(pos) else {
+                return Err(unterminated_string(delimiter));
+            };
+            pos = match byte {
+                b'"' => {
+                    let run = quote_run(self.bytes, pos);
+                    if run >= delimiter.quotes {
+                        return Ok(pos);
+                    }
+                    pos + run
+                }
+                b'\n' => {
+                    measure.line(self.bytes, pos, own_quotes);
+                    pos + 1
+                }
+                b'\\' if !delimiter.raw => match self.bytes.get(pos + 1) {
+                    Some(b'u') => unicode_escape(self.bytes, pos).0,
+                    Some(b'\n') => {
+                        measure.line(self.bytes, pos + 1, own_quotes);
+                        pos + 2
+                    }
+                    // Any other escape is two bytes. If the second is part
+                    // of a multi-byte character, the rest of it is skipped
+                    // byte by byte: continuation bytes are never special.
+                    Some(_) => pos + 2,
+                    None => pos + 1,
+                },
+                b'{' if !delimiter.raw => {
+                    if self.bytes.get(pos + 1) == Some(&b'{') {
+                        pos + 2
+                    } else {
+                        self.skip_interpolation(pos, level, measure)?
+                    }
+                }
+                _ => pos + 1,
+            };
+        }
+    }
+
+    /// Walks the interpolation whose `{` is at `open`, in a literal at
+    /// nesting `level`, and returns the offset just after its matching `}`.
+    fn skip_interpolation(
+        &self,
+        open: usize,
+        level: usize,
+        measure: &mut Measure,
+    ) -> Result<usize, Diagnostic> {
+        let mut depth = 0_usize;
+        let mut pos = open + 1;
+        loop {
+            let Some(&byte) = self.bytes.get(pos) else {
+                return Err(unterminated_interpolation(open));
+            };
+            pos = match byte {
+                b'\n' => {
+                    measure.line(self.bytes, pos, None);
+                    pos + 1
+                }
+                b'#' => end_of_line(self.bytes, pos),
+                b'{' => {
+                    depth += 1;
+                    pos + 1
+                }
+                b'}' if depth == 0 => return Ok(pos + 1),
+                b'}' => {
+                    depth -= 1;
+                    pos + 1
+                }
+                b'"' => self.skip_nested(pos, level + 1, measure)?,
+                b'r' if self.bytes.get(pos + 1) == Some(&b'"') => {
+                    self.skip_nested(pos, level + 1, measure)?
+                }
+                b'0'..=b'9' => number_end(self.bytes, pos),
+                b'a'..=b'z' | b'A'..=b'Z' | b'_' => identifier_end(self.bytes, pos),
+                _ => pos + 1,
+            };
+        }
+    }
+
+    /// Walks a literal nested at `level` inside the one being scanned,
+    /// starting at `start`, and returns the offset just after it.
+    fn skip_nested(
+        &self,
+        start: usize,
+        level: usize,
+        measure: &mut Measure,
+    ) -> Result<usize, Diagnostic> {
+        let delimiter = self.delimiter(start);
+        if level > MAX_DEPTH {
+            return Err(too_deep(start, &delimiter));
+        }
+        let content_end = self.skip_content(&delimiter, level, measure, false)?;
+        Ok(content_end + delimiter.quotes)
+    }
+
+    // ----- Pass 2: the pieces. -----
+
+    /// Produces the piece of the literal laid out by `layout` that starts at
+    /// `from`: the literal's first piece if `first`, or the piece after an
+    /// interpolation's `}`. Stores its text and returns its token kind,
+    /// leaving the lexer after the piece: inside the next interpolation,
+    /// with its context pushed, or after the literal.
+    fn piece(&mut self, layout: Layout, from: usize, first: bool) -> Result<TokenKind, Diagnostic> {
+        // The first piece starts the literal's first content line; a piece
+        // after an interpolation starts mid-line.
+        let stop = self.build_piece(&layout, from, first)?;
+        let id = self.strings.push(&self.scratch);
+        Ok(match stop {
+            Stop::End => {
+                self.pos = layout.end;
+                if first {
+                    TokenKind::Str(id)
+                } else {
+                    TokenKind::StrEnd(id)
+                }
+            }
+            Stop::Interpolation(open) => {
+                self.pos = open + 1;
+                self.interpolations.push(Interpolation {
+                    layout,
+                    open,
+                    brace_depth: 0,
+                    paren_depth: 0,
+                });
+                if first {
+                    TokenKind::StrStart(id)
+                } else {
+                    TokenKind::StrMid(id)
+                }
+            }
+        })
+    }
+
+    /// Builds the text of the piece starting at `from` in `self.scratch`,
+    /// stripping indentation at line starts and replacing escapes, and
+    /// returns where it stopped. `line_start` says whether `from` is the
+    /// start of a line.
+    fn build_piece(
+        &mut self,
+        layout: &Layout,
+        from: usize,
+        line_start: bool,
+    ) -> Result<Stop, Diagnostic> {
+        self.scratch.clear();
+        let mut pos = from;
+        let mut at_line_start = line_start;
+        loop {
+            if at_line_start {
+                pos = self.strip_indentation(layout, pos);
+                at_line_start = false;
+            }
+            // Copy the run of ordinary bytes up to the next one that needs
+            // attention in one go.
+            let rest = self.bytes.get(pos..layout.text_end).unwrap_or_default();
+            let run = rest
+                .iter()
+                .position(|&byte| {
+                    byte == b'\n' || (!layout.raw && matches!(byte, b'\\' | b'{' | b'}'))
+                })
+                .unwrap_or(rest.len());
+            let Some(text) = self.text.get(pos..pos + run) else {
+                return Err(internal(
+                    "a string piece is not on character boundaries",
+                    pos,
+                ));
+            };
+            self.scratch.push_str(text);
+            pos += run;
+            if pos >= layout.text_end {
+                return Ok(Stop::End);
+            }
+            let next_is =
+                |byte: u8| pos + 1 < layout.text_end && self.bytes.get(pos + 1) == Some(&byte);
+            match self.bytes.get(pos) {
+                Some(b'\n') => {
+                    self.scratch.push('\n');
+                    pos += 1;
+                    at_line_start = true;
+                }
+                Some(b'\\') => pos = self.escape(layout, pos)?,
+                Some(b'{') if next_is(b'{') => {
+                    self.scratch.push('{');
+                    pos += 2;
+                }
+                Some(b'{') => return Ok(Stop::Interpolation(pos)),
+                Some(b'}') if next_is(b'}') => {
+                    self.scratch.push('}');
+                    pos += 2;
+                }
+                Some(b'}') => {
+                    return Err(
+                        Diagnostic::error("unmatched `}` in string", span(pos, pos + 1))
+                            .with_note("write `}}` for a literal `}`"),
+                    );
+                }
+                _ => return Err(internal("a string piece stopped at an ordinary byte", pos)),
+            }
+        }
+    }
+
+    /// Strips the indentation of the line of the literal's text starting at
+    /// `pos`, returning the offset where its text starts.
+    fn strip_indentation(&self, layout: &Layout, pos: usize) -> usize {
+        let indent = whitespace_len(self.bytes, pos);
+        let (common, len) = match layout.indent {
+            Indent::None => return pos,
+            Indent::AllBlank => return pos + indent,
+            Indent::Common { start, len } => (start, len),
+        };
+        let after = pos + indent;
+        let blank =
+            after >= layout.content_end || matches!(self.bytes.get(after), None | Some(b'\n'));
+        if !blank {
+            // A non-blank line has at least the common indentation.
+            return pos + len.min(indent);
+        }
+        let has_common =
+            indent >= len && self.bytes.get(pos..pos + len) == self.bytes.get(common..common + len);
+        if has_common { pos + len } else { after }
+    }
+
+    /// Replaces the escape whose `\` is at `pos`, returning the offset after
+    /// it.
+    fn escape(&mut self, layout: &Layout, pos: usize) -> Result<usize, Diagnostic> {
+        let next = self
+            .bytes
+            .get(pos + 1)
+            .copied()
+            .filter(|_| pos + 1 < layout.text_end);
+        let ch = match next {
+            Some(b'n') => '\n',
+            Some(b'r') => '\r',
+            Some(b't') => '\t',
+            Some(b'\\') => '\\',
+            Some(b'"') => '"',
+            Some(b'u') => {
+                let (end, value) = unicode_escape(self.bytes, pos);
+                let Some(ch) = value else {
+                    return Err(Diagnostic::error("invalid unicode escape", span(pos, end)));
+                };
+                self.scratch.push(ch);
+                return Ok(end);
+            }
+            // A line continuation: the line break and the next line's
+            // leading spaces and tabs are removed. Stripping has happened
+            // first, so what it removes is whatever indentation the line has
+            // beyond the common indentation.
+            Some(b'\n') => return Ok(pos + 2 + whitespace_len(self.bytes, pos + 2)),
+            Some(_) => return Err(self.unknown_escape(pos)),
+            // The scan never ends a piece's text just after an unescaped
+            // `\`: before a closing quote it is an escaped quote, and before
+            // a final line break it stops that line break being removed.
+            None => return Err(internal("a string piece ends with a lone `\\`", pos)),
+        };
+        self.scratch.push(ch);
+        Ok(pos + 2)
+    }
+
+    /// The error for an unknown escape whose `\` is at `pos`.
+    fn unknown_escape(&self, pos: usize) -> Diagnostic {
+        let ch = self
+            .text
+            .get(pos + 1..)
+            .and_then(|rest| rest.chars().next())
+            .unwrap_or('\u{FFFD}');
+        // Show a control character by its escape, since it is invisible;
+        // show anything else as written, even `'`, which `escape_debug`
+        // would escape.
+        let shown = if ch.is_control() {
+            ch.escape_debug().to_string()
+        } else {
+            ch.to_string()
+        };
+        Diagnostic::error(
+            format!("unknown escape `\\{shown}`"),
+            span(pos, pos + 1 + ch.len_utf8()),
+        )
+    }
 }
 
 /// Whether `byte` is an identifier character: an ASCII letter, digit or `_`.
@@ -480,8 +1202,170 @@ const fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// The offset just after the identifier starting at `start`: identifier
+/// characters, and `-` where directly followed by one. Shared by the lexer
+/// and the scan, so they always agree.
+fn identifier_end(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while let Some(&byte) = bytes.get(pos) {
+        if is_identifier_byte(byte) {
+            pos += 1;
+        } else if byte == b'-'
+            && bytes
+                .get(pos + 1)
+                .is_some_and(|&next| is_identifier_byte(next))
+        {
+            // Consume the `-` and the character after it together.
+            pos += 2;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
+/// The offset just after the number literal starting at `start`, as far as
+/// the scan needs to know: digits and `_`, a `.` followed by a digit and
+/// more of them, and an exponent. For every literal the lexer accepts, this
+/// is where `Lexer::number` ends it; for the others the lexer reports an
+/// error when it reaches the literal.
+fn number_end(bytes: &[u8], start: usize) -> usize {
+    let digits = |from: usize| {
+        from + bytes
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|&&byte| byte.is_ascii_digit() || byte == b'_')
+            .count()
+    };
+    let mut pos = digits(start);
+    if bytes.get(pos) == Some(&b'.') && bytes.get(pos + 1).is_some_and(u8::is_ascii_digit) {
+        pos = digits(pos + 1);
+    }
+    if matches!(bytes.get(pos), Some(b'e' | b'E')) {
+        pos += 1;
+        if matches!(bytes.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        pos = digits(pos);
+    }
+    pos
+}
+
+/// The offset of the `\n` ending the line that `from` is on, or the end of
+/// `bytes`.
+fn end_of_line(bytes: &[u8], from: usize) -> usize {
+    bytes
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .map_or(bytes.len(), |offset| from + offset)
+}
+
+/// The number of spaces and tabs starting at `from`.
+fn whitespace_len(bytes: &[u8], from: usize) -> usize {
+    bytes
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|&&byte| matches!(byte, b' ' | b'\t'))
+        .count()
+}
+
+/// The number of `"` starting at `from`.
+fn quote_run(bytes: &[u8], from: usize) -> usize {
+    bytes
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|&&byte| byte == b'"')
+        .count()
+}
+
+/// The length of the longest common prefix of `a` and `b`.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The `\u` escape whose `\` is at `start`: the offset just after it, and
+/// the character it denotes if it is valid. Shared by the scan and pass 2,
+/// so they agree on its extent.
+///
+/// The escape is `\u`, then, if present, a `{`, a run of ASCII letters and
+/// digits, and a `}`. It is valid if it has both braces and between them 1
+/// to 6 hex digits denoting a Unicode scalar value.
+fn unicode_escape(bytes: &[u8], start: usize) -> (usize, Option<char>) {
+    let mut pos = start + 2;
+    if bytes.get(pos) != Some(&b'{') {
+        return (pos, None);
+    }
+    pos += 1;
+    let digits_start = pos;
+    while bytes.get(pos).is_some_and(u8::is_ascii_alphanumeric) {
+        pos += 1;
+    }
+    let digits = bytes.get(digits_start..pos).unwrap_or_default();
+    if bytes.get(pos) != Some(&b'}') {
+        return (pos, None);
+    }
+    pos += 1;
+    if digits.is_empty() || digits.len() > 6 {
+        return (pos, None);
+    }
+    let value = digits.iter().try_fold(0_u32, |value, &digit| {
+        char::from(digit)
+            .to_digit(16)
+            .map(|digit| value * 16 + digit)
+    });
+    (pos, value.and_then(char::from_u32))
+}
+
 fn leading_underscore(at: usize) -> Diagnostic {
     Diagnostic::error("leading `_` in number literal", span(at, at + 1))
+}
+
+/// The error for a literal with no closing delimiter, at its opening one.
+fn unterminated_string(delimiter: &Delimiter) -> Diagnostic {
+    let opening = span(
+        delimiter.quotes_start,
+        delimiter.quotes_start + delimiter.quotes,
+    );
+    let error = Diagnostic::error("unterminated string literal", opening);
+    if delimiter.quotes >= 3 {
+        error.with_note(format!(
+            "this string closes with {} quotes",
+            delimiter.quotes
+        ))
+    } else {
+        error
+    }
+}
+
+/// The error for an interpolation with no matching `}`, at its `{`.
+fn unterminated_interpolation(open: usize) -> Diagnostic {
+    Diagnostic::error("unterminated interpolation", span(open, open + 1))
+        .with_note("write `{{` for a literal `{`")
+}
+
+/// The error for a literal nested more than [`MAX_DEPTH`] deep, at its
+/// prefix and opening delimiter. No tree the parser accepts is that deep,
+/// since each level of nesting is a level of the tree.
+fn too_deep(start: usize, delimiter: &Delimiter) -> Diagnostic {
+    Diagnostic::error(
+        "expression nested too deeply",
+        span(start, delimiter.content_start),
+    )
+    .with_note(format!("the limit is {MAX_DEPTH} levels"))
+}
+
+/// A violated invariant of the lexer, at `at`.
+fn internal(message: &'static str, at: usize) -> Diagnostic {
+    InternalError {
+        message,
+        span: span(at, at),
+    }
+    .into()
 }
 
 /// Builds a span from byte offsets within a [`SourceFile`], which always fit
@@ -493,30 +1377,64 @@ fn span(start: usize, end: usize) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::Quoted;
 
     fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
-        tokenize(&SourceFile::new("test.gcsl", text).unwrap()).map(|(tokens, _)| tokens)
+        tokenize(&SourceFile::new("test.gcsl", text).unwrap()).map(|(tokens, _, _)| tokens)
     }
 
     fn kinds(text: &str) -> Vec<TokenKind> {
         lex(text).unwrap().into_iter().map(|t| t.kind).collect()
     }
 
-    /// The tokens with identifiers shown by their text, e.g. `Ident(x)`.
+    /// The tokens with identifiers shown by their text, e.g. `Ident(x)`, and
+    /// string pieces by their quoted text, e.g. `Str("a")`.
     fn show(text: &str) -> Vec<String> {
-        let (tokens, names) = tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap();
+        let (tokens, names, strings) =
+            tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap();
         tokens
             .iter()
             .map(|token| match token.kind {
                 TokenKind::Ident(name) => format!("Ident({})", names.get(name)),
+                TokenKind::Str(id) => format!("Str({})", Quoted(strings.get(id))),
+                TokenKind::StrStart(id) => format!("StrStart({})", Quoted(strings.get(id))),
+                TokenKind::StrMid(id) => format!("StrMid({})", Quoted(strings.get(id))),
+                TokenKind::StrEnd(id) => format!("StrEnd({})", Quoted(strings.get(id))),
                 kind => format!("{kind:?}"),
             })
             .collect()
     }
 
+    /// The text of the single string literal without interpolations that
+    /// `text` consists of.
+    fn string(text: &str) -> String {
+        let (tokens, _, strings) = tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap();
+        match tokens[..] {
+            [
+                Token {
+                    kind: TokenKind::Str(id),
+                    ..
+                },
+                Token {
+                    kind: TokenKind::Eof,
+                    ..
+                },
+            ] => strings.get(id).to_owned(),
+            _ => panic!("{text:?} is not a single string literal: {tokens:?}"),
+        }
+    }
+
     fn error(text: &str) -> (String, Span) {
         let diagnostic = lex(text).unwrap_err();
         (diagnostic.message, diagnostic.span)
+    }
+
+    fn spans(text: &str) -> Vec<(u32, u32)> {
+        lex(text)
+            .unwrap()
+            .iter()
+            .map(|t| (t.span.start, t.span.end))
+            .collect()
     }
 
     #[test]
@@ -528,10 +1446,11 @@ mod tests {
     #[test]
     fn every_token_kind() {
         use TokenKind::*;
-        let (tokens, names) = tokenize(
+        let (tokens, names, _) = tokenize(
             &SourceFile::new(
                 "test.gcsl",
-                "1 2.5 + - -x * / // % ( ) x let : := = { } ;\n",
+                "1 2.5 + - -x * / // % ( ) x let : := = { } ;\n\
+                 if else true false and or not == != < <= > >=",
             )
             .unwrap(),
         )
@@ -562,6 +1481,19 @@ mod tests {
                 RBrace,
                 Semi,
                 Newline,
+                If,
+                Else,
+                True,
+                False,
+                And,
+                Or,
+                Not,
+                EqEq,
+                BangEq,
+                Lt,
+                Le,
+                Gt,
+                Ge,
                 Eof
             ]
         );
@@ -569,10 +1501,8 @@ mod tests {
 
     #[test]
     fn spans_are_exact() {
-        let tokens = lex("12 +\t3.25//(  7)").unwrap();
-        let spans: Vec<(u32, u32)> = tokens.iter().map(|t| (t.span.start, t.span.end)).collect();
         assert_eq!(
-            spans,
+            spans("12 +\t3.25//(  7)"),
             vec![
                 (0, 2),
                 (3, 4),
@@ -613,6 +1543,37 @@ mod tests {
     }
 
     #[test]
+    fn comparison_operators_are_greedy() {
+        assert_eq!(
+            show("a==b a=b a<=b a<b a>=b a>b a!=b"),
+            vec![
+                "Ident(a)", "EqEq", "Ident(b)", "Ident(a)", "Eq", "Ident(b)", "Ident(a)", "Le",
+                "Ident(b)", "Ident(a)", "Lt", "Ident(b)", "Ident(a)", "Ge", "Ident(b)", "Ident(a)",
+                "Gt", "Ident(b)", "Ident(a)", "BangEq", "Ident(b)", "Eof"
+            ]
+        );
+        // Three `=` are `==` then `=`; spaced, they are separate.
+        assert_eq!(show("==="), vec!["EqEq", "Eq", "Eof"]);
+        assert_eq!(show("= ="), vec!["Eq", "Eq", "Eof"]);
+        assert_eq!(show("< ="), vec!["Lt", "Eq", "Eof"]);
+        assert_eq!(show("<<"), vec!["Lt", "Lt", "Eof"]);
+        assert_eq!(spans("a <= b"), vec![(0, 1), (2, 4), (5, 6), (6, 6)]);
+    }
+
+    #[test]
+    fn a_lone_bang_is_rejected() {
+        assert_eq!(
+            error("!x"),
+            ("unexpected character `!`".to_owned(), Span::new(0, 1))
+        );
+        assert_eq!(
+            error("a ! = b"),
+            ("unexpected character `!`".to_owned(), Span::new(2, 3))
+        );
+        assert_eq!(show("a != b")[1], "BangEq");
+    }
+
+    #[test]
     fn comments_are_skipped_and_their_newlines_kept() {
         assert_eq!(
             show("# leading\n1 # one\r\n+ # plus\n2 #"),
@@ -624,6 +1585,7 @@ mod tests {
 
     #[test]
     fn each_newline_is_a_token() {
+        // A `\r\n` is normalised to `\n` when the source is loaded.
         let tokens = lex("1\n\n2\r\n").unwrap();
         let kinds: Vec<(TokenKind, Span)> = tokens.iter().map(|t| (t.kind, t.span)).collect();
         assert_eq!(
@@ -633,7 +1595,7 @@ mod tests {
                 (TokenKind::Newline, Span::new(1, 2)),
                 (TokenKind::Newline, Span::new(2, 3)),
                 (TokenKind::Int(2), Span::new(3, 4)),
-                (TokenKind::Newline, Span::new(5, 6)),
+                (TokenKind::Newline, Span::new(4, 5)),
                 (TokenKind::Eof, Span::new(4, 4)),
             ]
         );
@@ -705,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn let_is_the_only_keyword() {
+    fn keywords_are_whole_words() {
         assert_eq!(
             show("let letter le lets let-x Let"),
             vec![
@@ -718,11 +1680,40 @@ mod tests {
                 "Eof"
             ]
         );
+        assert_eq!(
+            show("if iffy else-if true_ False nota and-or or not"),
+            vec![
+                "If",
+                "Ident(iffy)",
+                "Ident(else-if)",
+                "Ident(true_)",
+                "Ident(False)",
+                "Ident(nota)",
+                "Ident(and-or)",
+                "Or",
+                "Not",
+                "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn r_is_an_identifier_unless_a_quote_follows() {
+        assert_eq!(show("r + 1"), vec!["Ident(r)", "Plus", "Int(1)", "Eof"]);
+        assert_eq!(show("r"), vec!["Ident(r)", "Eof"]);
+        assert_eq!(show("r \"a\""), vec!["Ident(r)", "Str(\"a\")", "Eof"]);
+        // Inside a longer identifier, `r` is part of it and the quote starts
+        // an ordinary literal.
+        assert_eq!(
+            show("bar\"\\n\""),
+            vec!["Ident(bar)", "Str(\"\\n\")", "Eof"]
+        );
+        assert_eq!(show("r\"\\n\""), vec!["Str(\"\\\\n\")", "Eof"]);
     }
 
     #[test]
     fn interning_gives_equal_names_for_equal_text() {
-        let (tokens, names) =
+        let (tokens, names, _) =
             tokenize(&SourceFile::new("test.gcsl", "x y x-1 x y").unwrap()).unwrap();
         let name = |i: usize| match tokens[i].kind {
             TokenKind::Ident(name) => name,
@@ -736,12 +1727,16 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_with_shares_the_table() {
+    fn tokenize_with_shares_the_name_table_but_not_the_string_table() {
         let mut names = Names::new();
-        let first = tokenize_with(&SourceFile::new("a", "x").unwrap(), &mut names).unwrap();
-        let second = tokenize_with(&SourceFile::new("b", "y x").unwrap(), &mut names).unwrap();
+        let (first, first_strings) =
+            tokenize_with(&SourceFile::new("a", "x \"s\"").unwrap(), &mut names).unwrap();
+        let (second, second_strings) =
+            tokenize_with(&SourceFile::new("b", "y x").unwrap(), &mut names).unwrap();
         assert_eq!(first[0].kind, second[1].kind);
         assert_eq!(names.len(), 2);
+        assert_eq!(first_strings.len(), 1);
+        assert!(second_strings.is_empty());
     }
 
     #[test]
@@ -795,12 +1790,14 @@ mod tests {
         assert_eq!(show("-_")[0], "Neg");
         assert_eq!(show("-(1)")[0], "Neg");
         assert_eq!(show("-{1}")[0], "Neg");
+        assert_eq!(show("-\"a\"")[..2], ["Neg", "Str(\"a\")"]);
         assert_eq!(show("a -b"), vec!["Ident(a)", "Neg", "Ident(b)", "Eof"]);
         // Directly after punctuation other than `)`.
         assert_eq!(show("x=-1")[1..3], ["Eq", "Neg"]);
         assert_eq!(show("1+-1")[1..3], ["Plus", "Neg"]);
         assert_eq!(show("x:-1")[1..3], ["Colon", "Neg"]);
         assert_eq!(show(";-1")[1], "Neg");
+        assert_eq!(show("a<-1")[1..3], ["Lt", "Neg"]);
     }
 
     #[test]
@@ -841,6 +1838,11 @@ mod tests {
                 TokenKind::Int(34),
                 TokenKind::Eof
             ]
+        );
+        // And between numbers and string pieces, which share it.
+        assert_eq!(
+            show("1_2 \"ab\" 3_4 \"c\""),
+            vec!["Int(12)", "Str(\"ab\")", "Int(34)", "Str(\"c\")", "Eof"]
         );
     }
 
@@ -973,8 +1975,520 @@ mod tests {
         assert_eq!(TokenKind::ColonEq.symbol(), Some(":="));
         assert_eq!(TokenKind::Neg.symbol(), Some("-"));
         assert_eq!(TokenKind::Let.symbol(), Some("let"));
+        assert_eq!(TokenKind::Not.symbol(), Some("not"));
+        assert_eq!(TokenKind::BangEq.symbol(), Some("!="));
+        assert_eq!(TokenKind::Ge.symbol(), Some(">="));
         assert_eq!(TokenKind::Int(1).symbol(), None);
         assert_eq!(TokenKind::Newline.symbol(), None);
         assert_eq!(TokenKind::Eof.symbol(), None);
+        let (tokens, _, _) = tokenize(&SourceFile::new("t", "\"a\"").unwrap()).unwrap();
+        assert_eq!(tokens[0].kind.symbol(), None);
+    }
+
+    // ----- String literals -----
+
+    #[test]
+    fn delimiters() {
+        assert_eq!(string("\"\""), "");
+        assert_eq!(string("\"a\""), "a");
+        assert_eq!(string("\"\"\"a\"b\"\"\""), "a\"b");
+        assert_eq!(string("\"\"\"\"a\"\"\"b\"\"\"\""), "a\"\"\"b");
+        assert_eq!(string("\"\"\"a\"\"b\"\"\""), "a\"\"b");
+        // Non-ASCII content.
+        assert_eq!(string("\"héllo 😀\""), "héllo 😀");
+        // Strings may span lines.
+        assert_eq!(string("\"a\nb\""), "a\nb");
+    }
+
+    #[test]
+    fn the_first_n_quotes_of_a_longer_run_close_the_literal() {
+        // `"""a"""` then `""`, the empty string.
+        assert_eq!(
+            show("\"\"\"a\"\"\"\"\""),
+            vec!["Str(\"a\")", "Str(\"\")", "Eof"]
+        );
+        // `""` then `"b"`.
+        assert_eq!(show("\"\" \"b\""), vec!["Str(\"\")", "Str(\"b\")", "Eof"]);
+        // `"a"` then `"`, unterminated.
+        assert_eq!(
+            error("\"a\"\""),
+            ("unterminated string literal".to_owned(), Span::new(3, 4))
+        );
+    }
+
+    #[test]
+    fn raw_strings_keep_every_byte() {
+        assert_eq!(string("r\"\\n{x}\""), "\\n{x}");
+        assert_eq!(string("r\"}{ \\ \\u{41}\""), "}{ \\ \\u{41}");
+        assert_eq!(string("r\"\""), "");
+        // A backslash cannot escape the closing quote.
+        assert_eq!(string("r\"a\\\""), "a\\");
+        assert_eq!(string("r\"\"\"say \"hi\"\\n\"\"\""), "say \"hi\"\\n");
+    }
+
+    #[test]
+    fn every_escape() {
+        assert_eq!(string(r#""\n\r\t\\\"""#), "\n\r\t\\\"");
+        assert_eq!(string(r#""a\"b""#), "a\"b");
+        assert_eq!(string("\"\"\"\\\"\"\"\""), "\"");
+        assert_eq!(string(r#""{{}}""#), "{}");
+        assert_eq!(string(r#""{{x}} {{{{""#), "{x} {{");
+    }
+
+    #[test]
+    fn unknown_escapes() {
+        assert_eq!(
+            error(r#"x = "a\qb""#),
+            ("unknown escape `\\q`".to_owned(), Span::new(6, 8))
+        );
+        assert_eq!(
+            error(r#""\{""#),
+            ("unknown escape `\\{`".to_owned(), Span::new(1, 3))
+        );
+        assert_eq!(
+            error(r#""\'""#),
+            ("unknown escape `\\'`".to_owned(), Span::new(1, 3))
+        );
+        // A multi-byte character is shown and spanned whole.
+        assert_eq!(
+            error("\"\\é\""),
+            ("unknown escape `\\é`".to_owned(), Span::new(1, 4))
+        );
+        // A control character is shown by its escape.
+        assert_eq!(
+            error("\"\\\t\""),
+            ("unknown escape `\\\\t`".to_owned(), Span::new(1, 3))
+        );
+    }
+
+    #[test]
+    fn unicode_escapes() {
+        assert_eq!(string(r#""\u{41}\u{e9}\u{1F600}""#), "Aé😀");
+        assert_eq!(string(r#""\u{0}\u{000041}\u{10FFFF}""#), "\0A\u{10FFFF}");
+        let invalid = |text: &str, start: u32, end: u32| {
+            assert_eq!(
+                error(text),
+                ("invalid unicode escape".to_owned(), Span::new(start, end)),
+                "{text}"
+            );
+        };
+        invalid(r#""\u{}""#, 1, 5);
+        invalid(r#""\u{1234567}""#, 1, 12);
+        invalid(r#""\u{D800}""#, 1, 9);
+        invalid(r#""\u{110000}""#, 1, 11);
+        invalid(r#""\u{zz}""#, 1, 7);
+        invalid(r#""a\u41""#, 2, 4);
+        invalid(r#""\u{41""#, 1, 6);
+        invalid(r#""\u{4_1}""#, 1, 5);
+    }
+
+    #[test]
+    fn the_braces_of_a_unicode_escape_are_not_an_interpolation() {
+        assert_eq!(string(r#""\u{7B}\u{7D}""#), "{}");
+        // An invalid escape's braces are not one either: the error is the
+        // escape, not an unterminated interpolation.
+        assert_eq!(error(r#""\u{x""#).0, "invalid unicode escape");
+    }
+
+    #[test]
+    fn line_continuations() {
+        assert_eq!(string("\"a \\\n     b\""), "a b");
+        assert_eq!(string("\"a\\\n\t \tb\""), "ab");
+        // Only the next line's leading whitespace goes, not further lines.
+        assert_eq!(string("\"a\\\n\nb\""), "a\nb");
+        // An escaped backslash before a line break is not a continuation.
+        assert_eq!(string("\"a\\\\\nb\""), "a\\\nb");
+        // In a raw string it is content.
+        assert_eq!(string("r\"a\\\n b\""), "a\\\n b");
+    }
+
+    #[test]
+    fn simple_interpolation() {
+        assert_eq!(
+            show("\"a {x} b\""),
+            vec!["StrStart(\"a \")", "Ident(x)", "StrEnd(\" b\")", "Eof"]
+        );
+        assert_eq!(
+            show("\"{x}\""),
+            vec!["StrStart(\"\")", "Ident(x)", "StrEnd(\"\")", "Eof"]
+        );
+        assert_eq!(
+            show("\"{1 + 2}\" + 3"),
+            vec![
+                "StrStart(\"\")",
+                "Int(1)",
+                "Plus",
+                "Int(2)",
+                "StrEnd(\"\")",
+                "Plus",
+                "Int(3)",
+                "Eof"
+            ]
+        );
+        // `{{` and `}}` next to an interpolation.
+        assert_eq!(
+            show("\"{{{x}}}\""),
+            vec!["StrStart(\"{{\")", "Ident(x)", "StrEnd(\"}}\")", "Eof"]
+        );
+    }
+
+    #[test]
+    fn multiple_interpolations() {
+        assert_eq!(
+            show("\"{a}, {b} and {c}.\""),
+            vec![
+                "StrStart(\"\")",
+                "Ident(a)",
+                "StrMid(\", \")",
+                "Ident(b)",
+                "StrMid(\" and \")",
+                "Ident(c)",
+                "StrEnd(\".\")",
+                "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_interpolations() {
+        assert_eq!(
+            show("\"{ \"{x}\" }\""),
+            vec![
+                "StrStart(\"\")",
+                "StrStart(\"\")",
+                "Ident(x)",
+                "StrEnd(\"\")",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        // A `"` or `}` inside a nested literal does not end the outer one.
+        assert_eq!(
+            show("\"a{\"}}\"}b\""),
+            vec!["StrStart(\"a\")", "Str(\"}}\")", "StrEnd(\"b\")", "Eof"]
+        );
+        assert_eq!(
+            show("\"a{r\"\\\"}b\""),
+            vec!["StrStart(\"a\")", "Str(\"\\\\\")", "StrEnd(\"b\")", "Eof"]
+        );
+        // Blocks and braces inside an interpolation.
+        assert_eq!(
+            show("\"{ {} }\""),
+            vec!["StrStart(\"\")", "LBrace", "RBrace", "StrEnd(\"\")", "Eof"]
+        );
+        assert_eq!(
+            show("\"{ { \"}}\" } }x\""),
+            vec![
+                "StrStart(\"\")",
+                "LBrace",
+                "Str(\"}}\")",
+                "RBrace",
+                "StrEnd(\"x\")",
+                "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolations_are_tokenised_as_the_lexer_reads_them() {
+        // An `r` ending an identifier or following a number is not a raw
+        // prefix only where the lexer agrees.
+        assert_eq!(
+            show("\"{bar\"\\\"\"}\""),
+            vec![
+                "StrStart(\"\")",
+                "Ident(bar)",
+                "Str(\"\\\"\")",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("\"{2r\"\\\"}\""),
+            vec![
+                "StrStart(\"\")",
+                "Int(2)",
+                "Str(\"\\\\\")",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        // A comment runs to the end of its line, braces and quotes included.
+        assert_eq!(
+            show("\"{x # }\"\n}\""),
+            vec!["StrStart(\"\")", "Ident(x)", "StrEnd(\"\")", "Eof"]
+        );
+    }
+
+    #[test]
+    fn newlines_inside_an_interpolation_are_not_emitted() {
+        assert_eq!(
+            show("\"{\n  a\n  +\n  b\n}\"\n1"),
+            vec![
+                "StrStart(\"\")",
+                "Ident(a)",
+                "Plus",
+                "Ident(b)",
+                "StrEnd(\"\")",
+                "Newline",
+                "Int(1)",
+                "Eof"
+            ]
+        );
+        // Parentheses inside an interpolation do not leak out of it.
+        assert_eq!(
+            show("\"{(}\"\n1"),
+            vec![
+                "StrStart(\"\")",
+                "LParen",
+                "StrEnd(\"\")",
+                "Newline",
+                "Int(1)",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("(\"{)}\"\n1"),
+            vec![
+                "LParen",
+                "StrStart(\"\")",
+                "RParen",
+                "StrEnd(\"\")",
+                "Int(1)",
+                "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_strings() {
+        let diagnostic = lex("x = \"abc").unwrap_err();
+        assert_eq!(diagnostic.message, "unterminated string literal");
+        assert_eq!(diagnostic.span, Span::new(4, 5));
+        assert!(diagnostic.notes.is_empty());
+        let diagnostic = lex("\"\"\"abc\"\"").unwrap_err();
+        assert_eq!(diagnostic.message, "unterminated string literal");
+        assert_eq!(diagnostic.span, Span::new(0, 3));
+        assert_eq!(diagnostic.notes, vec!["this string closes with 3 quotes"]);
+        let diagnostic = lex("r\"\"\"\"x").unwrap_err();
+        assert_eq!(diagnostic.span, Span::new(1, 5));
+        assert_eq!(diagnostic.notes, vec!["this string closes with 4 quotes"]);
+        // An escaped quote does not close it.
+        assert_eq!(error("\"a\\\"").1, Span::new(0, 1));
+        // The innermost unterminated literal is reported.
+        assert_eq!(
+            error("\"{ \"abc"),
+            ("unterminated string literal".to_owned(), Span::new(3, 4))
+        );
+    }
+
+    #[test]
+    fn unterminated_interpolations() {
+        let diagnostic = lex("\"a {x").unwrap_err();
+        assert_eq!(diagnostic.message, "unterminated interpolation");
+        assert_eq!(diagnostic.span, Span::new(3, 4));
+        assert_eq!(diagnostic.notes, vec!["write `{{` for a literal `{`"]);
+        // A brace inside the interpolation needs its own match.
+        assert_eq!(
+            error("\"{ { x }"),
+            ("unterminated interpolation".to_owned(), Span::new(1, 2))
+        );
+        // A nested literal that closes leaves the interpolation open.
+        assert_eq!(
+            error("\"{ \"}\" "),
+            ("unterminated interpolation".to_owned(), Span::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn a_stray_close_brace_in_a_string() {
+        let diagnostic = lex("\"a } b\"").unwrap_err();
+        assert_eq!(diagnostic.message, "unmatched `}` in string");
+        assert_eq!(diagnostic.span, Span::new(3, 4));
+        assert_eq!(diagnostic.notes, vec!["write `}}` for a literal `}`"]);
+        assert_eq!(error("\"{x}}\"").1, Span::new(4, 5));
+        // Errors inside a literal are reported in source order.
+        assert_eq!(error("\"\\q }\"").0, "unknown escape `\\q`");
+        assert_eq!(error("\"} \\q\"").0, "unmatched `}` in string");
+    }
+
+    #[test]
+    fn string_token_spans() {
+        assert_eq!(
+            spans("x \"ab\" r\"c\""),
+            vec![(0, 1), (2, 6), (7, 11), (11, 11)]
+        );
+        assert_eq!(spans("\"\"\"a\"\"\""), vec![(0, 7), (7, 7)]);
+        // `StrStart` through the `{`, `StrMid` from `}` through `{`, `StrEnd`
+        // from `}` through the closing delimiter.
+        assert_eq!(
+            spans("\"ab{x}cd{y}e\""),
+            vec![(0, 4), (4, 5), (5, 9), (9, 10), (10, 13), (13, 13)]
+        );
+        assert_eq!(
+            spans("\"\"\"{x}\"\"\""),
+            vec![(0, 4), (4, 5), (5, 9), (9, 9)]
+        );
+    }
+
+    #[test]
+    fn nesting_is_limited() {
+        fn nested(levels: usize) -> String {
+            format!("{}x{}", "\"{".repeat(levels), "}\"".repeat(levels))
+        }
+        // The scan recurses per level, so give it the stack the pipeline is
+        // meant to run with. Lexing the deepest literals whole takes time
+        // quadratic in their depth, as each is scanned again when reached,
+        // so only the outermost literal's scan, which walks every level, is
+        // run here; the end-to-end depth test lexes such literals whole.
+        let (deepest, too_deep) = std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(|| {
+                let source = SourceFile::new("test.gcsl", nested(MAX_DEPTH)).unwrap();
+                let mut names = Names::new();
+                let deepest = Lexer::new(&source, &mut names)
+                    .scan(0, 1)
+                    .map(|layout| layout.end);
+                (deepest, lex(&nested(MAX_DEPTH + 1)))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // The outermost literal is the whole source.
+        assert_eq!(deepest.unwrap(), 4 * MAX_DEPTH + 1);
+        let diagnostic = too_deep.unwrap_err();
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        let at = u32::try_from(2 * MAX_DEPTH).unwrap();
+        assert_eq!(diagnostic.span, Span::new(at, at + 1));
+        assert_eq!(
+            diagnostic.notes,
+            vec![format!("the limit is {MAX_DEPTH} levels")]
+        );
+    }
+
+    // ----- Indentation stripping -----
+
+    #[test]
+    fn stripping_the_specification_examples() {
+        assert_eq!(
+            string("\"\n    echo hello\n    echo world\n\""),
+            "echo hello\necho world"
+        );
+        assert_eq!(
+            string("\"\n    echo hello \\\n      echo world\n\""),
+            "echo hello echo world"
+        );
+        assert_eq!(string("\"  hello\n   world\""), "  hello\n   world");
+        assert_eq!(
+            string("\"\"\"\n  She said \"hi\"\n\"\"\""),
+            "She said \"hi\""
+        );
+    }
+
+    #[test]
+    fn stripping_as_code_is_usually_indented() {
+        let text = "let script = \"\n    set -e\n      make all\n    make install\n  \"";
+        let (tokens, _, strings) = tokenize(&SourceFile::new("t", text).unwrap()).unwrap();
+        let TokenKind::Str(id) = tokens[3].kind else {
+            panic!("expected a string, got {:?}", tokens[3]);
+        };
+        assert_eq!(strings.get(id), "set -e\n  make all\nmake install");
+    }
+
+    #[test]
+    fn stripping_with_tabs_compares_bytes() {
+        assert_eq!(string("\"\n\t\ta\n\t\t\tb\n\t\""), "a\n\tb");
+        // A tab and spaces share no prefix, so nothing is stripped.
+        assert_eq!(string("\"\n\ta\n    b\n\""), "\ta\n    b");
+        // Mixed, sharing a leading tab.
+        assert_eq!(string("\"\n\t a\n\t\tb\n\""), " a\n\tb");
+    }
+
+    #[test]
+    fn blank_lines_do_not_count_and_lose_the_indentation() {
+        // An empty line, a shorter blank line, and a longer one.
+        assert_eq!(string("\"\n    a\n\n  \n      \n    b\n\""), "a\n\n\n  \nb");
+        // A blank line without the common indentation becomes empty.
+        assert_eq!(string("\"\n    a\n\t\t\t\t\t\n    b\n\""), "a\n\nb");
+        // A literal whose lines are all blank.
+        assert_eq!(string("\"\n   \n\n  \""), "\n");
+        assert_eq!(string("\"\n\""), "");
+        assert_eq!(string("\"  \n  \""), "");
+    }
+
+    #[test]
+    fn the_common_indentation_is_the_minimum() {
+        // Whichever line is least indented sets it, first, middle or last.
+        assert_eq!(string("\"\n  a\n    b\n      c\n\""), "a\n  b\n    c");
+        assert_eq!(string("\"\n    a\n  b\n      c\n\""), "  a\nb\n    c");
+        assert_eq!(string("\"\n    a\n      b\n  c\""), "  a\n    b\nc");
+        // The closing line counts when it has content.
+        assert_eq!(string("\"\n    a\n  b\""), "  a\nb");
+    }
+
+    #[test]
+    fn content_on_the_quote_line_is_untouched() {
+        assert_eq!(string("\"a\n    b\n  \""), "a\n    b\n  ");
+        assert_eq!(string("\" \n  x\""), "x");
+        // Something other than whitespace before the line break.
+        assert_eq!(string("\"\\n\n  x\n\""), "\n\n  x\n");
+    }
+
+    #[test]
+    fn the_final_line_break_goes_only_when_the_last_line_is_blank() {
+        assert_eq!(string("\"\n  a\n  \""), "a");
+        assert_eq!(string("\"\n  a\n\n  \""), "a\n");
+        assert_eq!(string("\"\n  a\n  b\""), "a\nb");
+        // A continuation escaping the final line break removes it itself.
+        assert_eq!(string("\"\n  a \\\n  \""), "a ");
+        assert_eq!(string("\"\n  a \\\\\n  \""), "a \\");
+    }
+
+    #[test]
+    fn stripping_applies_to_raw_strings() {
+        assert_eq!(
+            string("r\"\"\"\n    C:\\path\\{x}\n      \"quoted\"\n    \"\"\""),
+            "C:\\path\\{x}\n  \"quoted\""
+        );
+        assert_eq!(string("r\"\n  a \\\n  \""), "a \\");
+    }
+
+    #[test]
+    fn stripping_happens_before_escapes() {
+        // An escaped line break or tab is not indentation.
+        assert_eq!(string("\"\n    \\ta\n    b\n\""), "\ta\nb");
+        assert_eq!(string("\"\\\n    a\n    b\""), "a\n    b");
+    }
+
+    #[test]
+    fn stripping_with_interpolations() {
+        // On a stripped line.
+        assert_eq!(
+            show("\"\n    a {x}\n    b\n\""),
+            vec!["StrStart(\"a \")", "Ident(x)", "StrEnd(\"\\nb\")", "Eof"]
+        );
+        // An interpolation spanning lines is measured too, and its own lines
+        // are not stripped of anything, being expression.
+        assert_eq!(
+            show("\"\n    a {\n  x\n    } b\n    c\n\""),
+            vec![
+                "StrStart(\"  a \")",
+                "Ident(x)",
+                "StrEnd(\" b\\n  c\")",
+                "Eof"
+            ]
+        );
+        // A nested literal is stripped by its own lines, and its lines count
+        // for the outer literal too: the outer literal's common indentation
+        // is the nested `  x`'s two spaces.
+        assert_eq!(
+            show("\"\n    {\"\n  x\n      \"}\n    y\n\""),
+            vec![
+                "StrStart(\"  \")",
+                "Str(\"x\")",
+                "StrEnd(\"\\n  y\")",
+                "Eof"
+            ]
+        );
     }
 }

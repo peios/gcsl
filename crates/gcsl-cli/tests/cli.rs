@@ -175,6 +175,57 @@ fn run_evaluates_a_file_of_items() {
 }
 
 #[test]
+fn run_prints_a_string_as_its_text() {
+    let output = gcsl(&["run", "tests/fixtures/strings.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "GCSL has 3 items\nready: true\nC:\\{done}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    // The string's own escapes are its text: a tab, and a final newline
+    // before the one `run` adds.
+    let output = gcsl(&["run", "tests/fixtures/greeting.gcsl"]);
+    assert_eq!(stdout(&output), "hello,\tworld!\n\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dump_tokens_shows_string_pieces_quoted() {
+    let output = gcsl(&["run", "tests/fixtures/greeting.gcsl", "--dump-tokens"]);
+    assert_eq!(
+        stdout(&output),
+        "Let @0..3\n\
+         Ident(who) @4..7\n\
+         Eq @8..9\n\
+         Str(\"world\") @10..17\n\
+         Newline @17..18\n\
+         StrStart(\"hello,\\t\") @18..28\n\
+         Ident(who) @28..31\n\
+         StrEnd(\"!\\n\") @31..36\n\
+         Newline @36..37\n\
+         Eof @36..36\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dump_ir_shows_strings_and_ifs() {
+    let output = gcsl(&["run", "tests/fixtures/greeting.gcsl", "--dump-ir"]);
+    assert_eq!(
+        stdout(&output),
+        "(block @0..36\n\
+         \x20 (store who#0 @0..17\n\
+         \x20   (str \"world\" @10..17))\n\
+         \x20 (interp @18..36\n\
+         \x20   (str \"hello,\\t\" @18..36)\n\
+         \x20   (load who#0 @28..31)\n\
+         \x20   (str \"!\\n\" @18..36)))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn run_prints_nothing_for_a_unit_result() {
     let output = gcsl(&["run", "tests/fixtures/unit.gcsl"]);
     assert_eq!(stdout(&output), "");
@@ -294,6 +345,28 @@ fn repl_keeps_variables_across_lines() {
          \x20 |         |\n\
          \x20 |         Float\n"
     );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_prints_strings_quoted() {
+    let output = repl(
+        "let s = \"a\\tb\"\n\
+         s\n\
+         s + \"\\\"c\\\"\"\n\
+         \"{s} {1 < 2}\"\n\
+         1 < 2\n\
+         if true { \"yes\" } else { \"no\" }\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "\"a\\tb\" : String\n\
+         \"a\\tb\\\"c\\\"\" : String\n\
+         \"a\\tb true\" : String\n\
+         true : Bool\n\
+         \"yes\" : String\n"
+    );
+    assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
 }
 

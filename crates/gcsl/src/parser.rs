@@ -12,8 +12,13 @@
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription), and
 //! after `=`, `:=` and `let`. There the parser skips newlines before going
-//! on. Inside parentheses the lexer emits no newlines at all, so an
-//! expression in parentheses may span lines freely.
+//! on. Inside parentheses and interpolations the lexer emits no newlines at
+//! all, so an expression there may span lines freely.
+//!
+//! The one place a newline does not end an item even though the expression
+//! before it could be complete is after the block of an `if`: an `else` may
+//! start the next line, so the parser looks past newlines for one, and puts
+//! them back for the item separator if it finds none.
 //!
 //! # Expressions
 //!
@@ -21,41 +26,68 @@
 //! climbing. Instead of one grammar function per precedence level, a single
 //! function, [`Parser::parse_expr`], parses any expression whose operators
 //! bind at least as tightly as a given *minimum binding power*. It first
-//! parses a *prefix* expression (a literal, a name, a parenthesised
-//! expression, a block, or a unary operator applied to an operand), which
-//! becomes the left-hand side. Then it loops: if the next token is a binary
-//! operator whose left binding power is at least the minimum, it consumes
-//! the operator, parses the right-hand side by calling itself with the
-//! operator's right binding power as the new minimum, and folds the result
-//! into a new left-hand side. Otherwise the operator belongs to an enclosing
-//! call, and the loop stops.
+//! parses a *prefix* expression (a literal, a name, a string, a
+//! parenthesised expression, a block, an `if`, or a prefix operator applied
+//! to an operand), which becomes the left-hand side. Then it loops: if the
+//! next token is a binary operator whose left binding power is at least the
+//! minimum, it consumes the operator, parses the right-hand side by calling
+//! itself with the operator's right binding power as the new minimum, and
+//! folds the result into a new left-hand side. Otherwise the operator
+//! belongs to an enclosing call, and the loop stops.
 //!
 //! Precedence and associativity both fall out of the binding-power pairs:
 //!
-//! | operator            | left bp | right bp / operand min bp |
-//! |---------------------|---------|---------------------------|
-//! | `+` `-`             | 1       | 2                         |
-//! | `*` `/` `//` `%`    | 3       | 4                         |
-//! | postfix `:` TYPE    | 5       | (none: parses a type)     |
-//! | prefix `-`          | (none)  | operand parsed with min 7 |
+//! | operator                    | left bp | right bp / operand min bp  |
+//! |-----------------------------|---------|----------------------------|
+//! | `or`                        | 1       | 2                          |
+//! | `and`                       | 3       | 4                          |
+//! | prefix `not`                | (none)  | operand parsed with min 5  |
+//! | `==` `!=` `<` `<=` `>` `>=` | 5       | 6 (non-associative)        |
+//! | `+` `-`                     | 7       | 8                          |
+//! | `*` `/` `//` `%`            | 9       | 10                         |
+//! | postfix `:` TYPE            | 11      | (none: parses a type)      |
+//! | prefix `-`                  | (none)  | operand parsed with min 13 |
 //!
 //! A tighter operator has higher powers, so in `1 + 2 * 3` the recursive
-//! call for the right-hand side of `+` (minimum 2) still accepts `*` (left
-//! power 3). Left associativity comes from making the right power one higher
+//! call for the right-hand side of `+` (minimum 8) still accepts `*` (left
+//! power 9). Left associativity comes from making the right power one higher
 //! than the left: in `8 - 3 - 2`, the right-hand side of the first `-` is
-//! parsed with minimum 2, which rejects the second `-` (left power 1), so the
+//! parsed with minimum 8, which rejects the second `-` (left power 7), so the
 //! first subtraction completes before the second begins.
 //!
+//! Comparison is non-associative rather than left-associative: its right
+//! operand stops before another comparison as usual, and the parser then
+//! reports "comparison operators cannot be chained" if one follows, since
+//! `a < b < c` would otherwise mean `(a < b) < c`.
+//!
+//! `not` is a prefix operator whose operand is parsed with minimum 5, the
+//! left power of comparison, so it takes in a comparison but not `and` or
+//! `or`: `not a == b` is `not (a == b)`, and `not a and b` is
+//! `(not a) and b`.
+//!
 //! Type ascription `EXPR : TYPE` is a postfix operator in the same loop: when
-//! the next token is `:` and its left power 5 is at least the minimum, the
+//! the next token is `:` and its left power 11 is at least the minimum, the
 //! parser consumes it, parses a type, and wraps the left-hand side. It binds
 //! tighter than every binary operator, so `1 + 2 : Float` is
 //! `1 + (2 : Float)`, and looser than negation, whose operand is parsed with
-//! minimum 7, so `-5 : Float` is `(-5) : Float`. It chains left to right.
+//! minimum 13, so `-5 : Float` is `(-5) : Float`. It chains left to right.
 //!
 //! Negation is its own token, [`TokenKind::Neg`], distinct from subtraction's
 //! [`TokenKind::Minus`]; the lexer tells them apart by spacing. `Neg` is only
 //! accepted in prefix position and `Minus` only as a binary operator.
+//!
+//! An `if` is a prefix expression: `if`, a condition parsed at minimum 0, a
+//! block, and optionally `else` followed by a block or another `if`. An `if`
+//! without `else` gets an empty block as its else branch, allocated by the
+//! parser with an empty span at the end of the `if`'s block.
+//!
+//! An interpolated string arrives from the lexer as a
+//! [`TokenKind::StrStart`], each expression's tokens, a
+//! [`TokenKind::StrMid`] between each two expressions, and a
+//! [`TokenKind::StrEnd`]. The parser parses each expression at minimum 0
+//! and collects the parts on a stack shared by all the interpolations being
+//! parsed, as it does for items, so nested interpolations need no
+//! allocation of their own.
 //!
 //! # Errors and depth
 //!
@@ -67,39 +99,46 @@
 //! diagnostics.
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
-//! two ways. Parentheses, prefix operators and blocks nest by recursion, so
-//! [`Parser::parse_expr`] and the body of every nested block count their own
-//! depth and stop before the recursion itself could overflow. Left-associative
-//! chains such as `1 + 1 + 1` nest without recursion, since the loop folds
-//! each operator into the left-hand side, so the parser also tracks the
-//! height of every node it allocates, a block being one above the tallest of
-//! its items' expressions, and rejects a node that would exceed the limit.
-//! Together these guarantee that no tree handed to a later stage is deeper
-//! than `MAX_DEPTH`.
+//! two ways. Parentheses, prefix operators, blocks, `if`s and interpolations
+//! nest by recursion, so [`Parser::parse_expr`], the body of every nested
+//! block and every `else if` count their own depth and stop before the
+//! recursion itself could overflow. Left-associative chains such as
+//! `1 + 1 + 1` nest without recursion, since the loop folds each operator
+//! into the left-hand side, so the parser also tracks the height of every
+//! node it allocates, a block being one above the tallest of its items'
+//! expressions and an `if` or an interpolation one above its tallest child,
+//! and rejects a node that would exceed the limit. Together these guarantee
+//! that no tree handed to a later stage is deeper than `MAX_DEPTH`.
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, Item, ItemId, ItemKind, ItemRange, TypeExpr,
-    TypeExprId, TypeExprKind, UnaryOp,
+    Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, Item, ItemId, ItemKind, ItemRange, StrPart,
+    TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
 use crate::names::Names;
 use crate::source::{SourceFile, Span};
+use crate::strings::{StrId, Strings};
+
+/// Minimum binding power of the operand of prefix `not`: the left power of
+/// comparison, so the operand takes in a comparison but not `and` or `or`.
+const NOT_BP: u8 = 5;
 
 /// Minimum binding power of the operand of prefix `-`: tighter than every
 /// binary operator and than ascription.
-const PREFIX_BP: u8 = 7;
+const PREFIX_BP: u8 = 13;
 
 /// Left binding power of postfix `:` (type ascription): tighter than every
 /// binary operator, looser than prefix `-`.
-const ASCRIBE_BP: u8 = 5;
+const ASCRIBE_BP: u8 = 11;
 
 /// Height of a leaf node.
 const LEAF_HEIGHT: u32 = 1;
 
 /// Parses `tokens`, lexed from `source` with its names interned into
-/// `names`, as a file: a body of items. The returned [`Ast`] owns `names`.
+/// `names` and its string literals' text stored in `strings`, as a file: a
+/// body of items. The returned [`Ast`] owns `names` and `strings`.
 ///
 /// All tokens must be consumed. `tokens` should end with
 /// [`TokenKind::Eof`], as [`crate::lexer::tokenize`] guarantees; if it does
@@ -108,9 +147,14 @@ const LEAF_HEIGHT: u32 = 1;
 /// # Errors
 ///
 /// Returns the first syntax error.
-pub fn parse(tokens: &[Token], names: Names, source: &SourceFile) -> Result<Ast, Diagnostic> {
+pub fn parse(
+    tokens: &[Token],
+    names: Names,
+    strings: Strings,
+    source: &SourceFile,
+) -> Result<Ast, Diagnostic> {
     let (builder, root) = parse_parts(tokens, source)?;
-    Ok(builder.finish(root, names))
+    Ok(builder.finish(root, names, strings))
 }
 
 /// Like [`parse`], returning the unfinished arenas and the file's body
@@ -124,11 +168,15 @@ pub(crate) fn parse_parts(
         tokens,
         pos: 0,
         source,
-        // Every node consumes at least one token, so these never reallocate.
+        // There are never more nodes than tokens, so these never
+        // reallocate: every node consumes a token of its own except the
+        // empty else block of an `if` without `else`, and that `if`'s own
+        // block consumes two tokens, `{` and `}`, for one node.
         builder: AstBuilder::with_capacity(tokens.len()),
         heights: Vec::with_capacity(tokens.len()),
         depth: 0,
         item_stack: Vec::new(),
+        part_stack: Vec::new(),
         diagnostics: Vec::new(),
     };
     match parser.parse_body(None) {
@@ -166,6 +214,10 @@ struct Parser<'a> {
     /// builder's item-list pool when it ends, so nested bodies need no
     /// allocation of their own.
     item_stack: Vec<ItemId>,
+    /// The parts of the interpolated strings being parsed, innermost last,
+    /// moved to the builder's part pool as each string ends, as for
+    /// `item_stack`.
+    part_stack: Vec<StrPart>,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -296,7 +348,7 @@ impl Parser<'_> {
     fn parse_type(&mut self) -> ParseResult<TypeExprId> {
         let token = self.peek();
         let TokenKind::Ident(name) = token.kind else {
-            return Err(self.error("expected a type", token.span));
+            return Err(self.error("expected a type", error_span(token)));
         };
         self.advance();
         Ok(self.builder.alloc_type(TypeExpr {
@@ -365,41 +417,37 @@ impl Parser<'_> {
                 span,
                 height,
             )?;
+            // The right operand stopped before any further comparison, since
+            // its minimum is above comparison's left power; one following
+            // directly would chain.
+            if op.is_comparison() {
+                let next = self.peek();
+                if binary_op(next.kind).is_some_and(BinaryOp::is_comparison) {
+                    return Err(self.report(
+                        Diagnostic::error("comparison operators cannot be chained", next.span)
+                            .with_note("write `a < b and b < c`, or add parentheses"),
+                    ));
+                }
+            }
         }
         Ok(lhs)
     }
 
-    /// Parses a literal, a name, a parenthesised expression, a block or a
-    /// prefix operator application.
+    /// Parses a literal, a name, a string, a parenthesised expression, a
+    /// block, an `if` or a prefix operator application.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
         let token = self.peek();
         let kind = match token.kind {
-            TokenKind::Int(value) => {
-                self.advance();
-                ExprKind::Int(value)
-            }
-            TokenKind::Float(value) => {
-                self.advance();
-                ExprKind::Float(value)
-            }
-            TokenKind::Ident(name) => {
-                self.advance();
-                ExprKind::Name(name)
-            }
-            TokenKind::Neg => {
-                self.advance();
-                let operand = self.parse_expr(PREFIX_BP)?;
-                let span = Span::join(token.span, self.span_of(operand));
-                let height = self.height_of(operand) + 1;
-                return self.alloc(
-                    ExprKind::Unary {
-                        op: UnaryOp::Neg,
-                        operand,
-                    },
-                    span,
-                    height,
-                );
-            }
+            TokenKind::Int(value) => ExprKind::Int(value),
+            TokenKind::Float(value) => ExprKind::Float(value),
+            TokenKind::True => ExprKind::Bool(true),
+            TokenKind::False => ExprKind::Bool(false),
+            TokenKind::Str(id) => ExprKind::Str(id),
+            TokenKind::Ident(name) => ExprKind::Name(name),
+            TokenKind::StrStart(first) => return self.parse_interpolation(first),
+            TokenKind::If => return self.parse_if(),
+            TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
+            TokenKind::Not => return self.parse_unary(UnaryOp::Not, NOT_BP),
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_expr(0)?;
@@ -407,8 +455,11 @@ impl Parser<'_> {
                 if close.kind != TokenKind::RParen {
                     let found = self.describe(close);
                     return Err(self.report(
-                        Diagnostic::error(format!("expected `)`, found {found}"), close.span)
-                            .with_context(token.span, "unclosed `(`"),
+                        Diagnostic::error(
+                            format!("expected `)`, found {found}"),
+                            error_span(close),
+                        )
+                        .with_context(token.span, "unclosed `(`"),
                     ));
                 }
                 self.advance();
@@ -419,41 +470,174 @@ impl Parser<'_> {
                     height,
                 );
             }
-            TokenKind::LBrace => {
-                self.advance();
-                self.enter()?;
-                let body = self.parse_body(Some(token.span));
-                self.depth -= 1;
-                let (items, tallest) = body?;
-                // `parse_body` only returns successfully at the matching `}`.
-                let close = self.peek();
-                self.advance();
-                return self.alloc(
-                    ExprKind::Block(items),
-                    Span::join(token.span, close.span),
-                    tallest + 1,
-                );
-            }
+            TokenKind::LBrace => return self.parse_block(),
             TokenKind::Minus
             | TokenKind::Plus
             | TokenKind::Star
             | TokenKind::Slash
             | TokenKind::SlashSlash
             | TokenKind::Percent
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::Le
+            | TokenKind::Gt
+            | TokenKind::Ge
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::Else
             | TokenKind::Let
             | TokenKind::Colon
             | TokenKind::ColonEq
             | TokenKind::Eq
             | TokenKind::RParen
             | TokenKind::RBrace
+            | TokenKind::StrMid(_)
+            | TokenKind::StrEnd(_)
             | TokenKind::Semi
             | TokenKind::Newline
             | TokenKind::Eof => {
                 let found = self.describe(token);
-                return Err(self.error(format!("expected expression, found {found}"), token.span));
+                return Err(self.error(
+                    format!("expected expression, found {found}"),
+                    error_span(token),
+                ));
             }
         };
+        self.advance();
         self.alloc(kind, token.span, LEAF_HEIGHT)
+    }
+
+    /// Parses a prefix operator `op`, the current token, and its operand,
+    /// parsed with minimum binding power `operand_bp`.
+    fn parse_unary(&mut self, op: UnaryOp, operand_bp: u8) -> ParseResult<ExprId> {
+        let token = self.peek();
+        self.advance();
+        let operand = self.parse_expr(operand_bp)?;
+        let span = Span::join(token.span, self.span_of(operand));
+        let height = self.height_of(operand) + 1;
+        self.alloc(ExprKind::Unary { op, operand }, span, height)
+    }
+
+    /// Parses a block `{ ... }`, starting at its `{`.
+    fn parse_block(&mut self) -> ParseResult<ExprId> {
+        let open = self.peek();
+        self.advance();
+        self.enter()?;
+        let body = self.parse_body(Some(open.span));
+        self.depth -= 1;
+        let (items, tallest) = body?;
+        // `parse_body` only returns successfully at the matching `}`.
+        let close = self.peek();
+        self.advance();
+        self.alloc(
+            ExprKind::Block(items),
+            Span::join(open.span, close.span),
+            tallest + 1,
+        )
+    }
+
+    /// Parses an `if` expression, starting at its `if`.
+    fn parse_if(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let cond = self.parse_expr(0)?;
+        let open = self.peek();
+        if open.kind != TokenKind::LBrace {
+            return Err(self.error("expected `{` after `if` condition", error_span(open)));
+        }
+        let then = self.parse_block()?;
+        // An `else` may start a later line. If none does, the newlines are
+        // put back to end the item.
+        let after_then = self.pos;
+        self.skip_newlines();
+        let (else_, has_else) = if self.peek().kind == TokenKind::Else {
+            self.advance();
+            let next = self.peek();
+            let else_ = match next.kind {
+                TokenKind::LBrace => self.parse_block()?,
+                // `else if` recurses directly rather than through
+                // `parse_expr`, so it counts its own depth.
+                TokenKind::If => {
+                    self.enter()?;
+                    let nested = self.parse_if();
+                    self.depth -= 1;
+                    nested?
+                }
+                _ => {
+                    return Err(self.error("expected `{` or `if` after `else`", error_span(next)));
+                }
+            };
+            (else_, true)
+        } else {
+            self.pos = after_then;
+            let end = self.span_of(then).end;
+            let empty = self.builder.push_item_list(&[]);
+            let else_ = self.alloc(ExprKind::Block(empty), Span::new(end, end), LEAF_HEIGHT)?;
+            (else_, false)
+        };
+        let span = Span::join(keyword.span, self.span_of(else_));
+        let height = self
+            .height_of(cond)
+            .max(self.height_of(then))
+            .max(self.height_of(else_))
+            + 1;
+        self.alloc(
+            ExprKind::If {
+                cond,
+                then,
+                else_,
+                has_else,
+            },
+            span,
+            height,
+        )
+    }
+
+    /// Parses an interpolated string, starting at its
+    /// [`TokenKind::StrStart`], whose text is `first`.
+    fn parse_interpolation(&mut self, first: StrId) -> ParseResult<ExprId> {
+        let start = self.peek();
+        self.advance();
+        let base = self.part_stack.len();
+        self.part_stack.push(StrPart::Lit(first));
+        let mut tallest = 0;
+        // The `{` the current interpolation opened with: the last byte of
+        // the token before it.
+        let mut open = start.span;
+        let end = loop {
+            let expr = self.parse_expr(0)?;
+            tallest = tallest.max(self.height_of(expr));
+            self.part_stack.push(StrPart::Expr(expr));
+            let token = self.peek();
+            match token.kind {
+                TokenKind::StrMid(text) => {
+                    self.advance();
+                    self.part_stack.push(StrPart::Lit(text));
+                    open = token.span;
+                }
+                TokenKind::StrEnd(text) => {
+                    self.advance();
+                    self.part_stack.push(StrPart::Lit(text));
+                    break token.span;
+                }
+                _ => {
+                    let found = self.describe(token);
+                    let brace = Span::new(open.end.saturating_sub(1), open.end);
+                    return Err(self.report(
+                        Diagnostic::error(format!("expected `}}`, found {found}"), token.span)
+                            .with_context(brace, "unclosed `{`"),
+                    ));
+                }
+            }
+        };
+        let parts = self.builder.push_parts(&self.part_stack[base..]);
+        self.part_stack.truncate(base);
+        self.alloc(
+            ExprKind::Interp(parts),
+            Span::join(start.span, end),
+            tallest + 1,
+        )
     }
 
     /// Allocates a node of the given `height`, failing if that height
@@ -524,13 +708,16 @@ impl Parser<'_> {
 
     /// Describes a token for "found ..." messages: literals and names by
     /// their source text, operators and keywords by their symbol, both in
-    /// backticks.
+    /// backticks. The piece of a string after an interpolation is found
+    /// where an expression's tokens end, so it is described by the `}` that
+    /// ends the interpolation, as [`error_span`] points at.
     fn describe(&self, token: Token) -> String {
-        match token.kind.symbol() {
-            Some(symbol) => format!("`{symbol}`"),
-            None if token.kind == TokenKind::Eof => "end of input".to_owned(),
-            None if token.kind == TokenKind::Newline => "newline".to_owned(),
-            None => format!("`{}`", self.source.slice(token.span)),
+        match (token.kind, token.kind.symbol()) {
+            (_, Some(symbol)) => format!("`{symbol}`"),
+            (TokenKind::Eof, None) => "end of input".to_owned(),
+            (TokenKind::Newline, None) => "newline".to_owned(),
+            (TokenKind::StrMid(_) | TokenKind::StrEnd(_), None) => "`}`".to_owned(),
+            (_, None) => format!("`{}`", self.source.slice(token.span)),
         }
     }
 
@@ -558,10 +745,27 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         TokenKind::Slash => Some(BinaryOp::Div),
         TokenKind::SlashSlash => Some(BinaryOp::FloorDiv),
         TokenKind::Percent => Some(BinaryOp::Rem),
+        TokenKind::EqEq => Some(BinaryOp::Eq),
+        TokenKind::BangEq => Some(BinaryOp::Ne),
+        TokenKind::Lt => Some(BinaryOp::Lt),
+        TokenKind::Le => Some(BinaryOp::Le),
+        TokenKind::Gt => Some(BinaryOp::Gt),
+        TokenKind::Ge => Some(BinaryOp::Ge),
+        TokenKind::And => Some(BinaryOp::And),
+        TokenKind::Or => Some(BinaryOp::Or),
         TokenKind::Int(_)
         | TokenKind::Float(_)
+        | TokenKind::Str(_)
+        | TokenKind::StrStart(_)
+        | TokenKind::StrMid(_)
+        | TokenKind::StrEnd(_)
         | TokenKind::Ident(_)
         | TokenKind::Let
+        | TokenKind::If
+        | TokenKind::Else
+        | TokenKind::True
+        | TokenKind::False
+        | TokenKind::Not
         | TokenKind::Neg
         | TokenKind::Colon
         | TokenKind::ColonEq
@@ -577,11 +781,29 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
 }
 
 /// `(left, right)` binding powers of a binary operator. Right is left + 1,
-/// which makes every level left-associative.
+/// which makes every level left-associative, except comparison, which
+/// [`Parser::parse_expr`] makes non-associative.
 fn binding_power(op: BinaryOp) -> (u8, u8) {
     match op {
-        BinaryOp::Add | BinaryOp::Sub => (1, 2),
-        BinaryOp::Mul | BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Rem => (3, 4),
+        BinaryOp::Or => (1, 2),
+        BinaryOp::And => (3, 4),
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+            (5, 6)
+        }
+        BinaryOp::Add | BinaryOp::Sub => (7, 8),
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Rem => (9, 10),
+    }
+}
+
+/// Where to point an error about finding `token`: its span, except for the
+/// piece of a string after an interpolation, where it is the `}` ending the
+/// interpolation, not the text after it.
+fn error_span(token: Token) -> Span {
+    match token.kind {
+        TokenKind::StrMid(_) | TokenKind::StrEnd(_) => {
+            Span::new(token.span.start, token.span.start + 1)
+        }
+        _ => token.span,
     }
 }
 
@@ -593,13 +815,15 @@ mod tests {
 
     fn parse_text(text: &str) -> Result<Ast, Diagnostic> {
         let source = SourceFile::new("test.gcsl", text).unwrap();
-        let (tokens, names) = tokenize(&source)?;
-        parse(&tokens, names, &source)
+        let (tokens, names, strings) = tokenize(&source)?;
+        parse(&tokens, names, strings, &source)
     }
 
     /// Renders a file compactly, making grouping explicit: items are joined
-    /// by `; `, binary operations and negations are parenthesised, parens
-    /// show as `[ ]`, blocks as `{ }` and ascriptions as `(e : T)`.
+    /// by `; `, binary operations and prefix operations are parenthesised,
+    /// parens show as `[ ]`, blocks as `{ }`, ascriptions as `(e : T)`,
+    /// strings as `"text"` with interpolations as `<e>`, and an `if` as
+    /// `(if c {..} else ..)`, or `(if c {..})` without `else`.
     fn shape(text: &str) -> String {
         let ast = parse_text(text).unwrap();
         let mut out = String::new();
@@ -650,10 +874,53 @@ mod tests {
         match ast.get(id).kind {
             ExprKind::Int(value) => write!(out, "{value}").unwrap(),
             ExprKind::Float(value) => write!(out, "{value:?}").unwrap(),
+            ExprKind::Bool(value) => write!(out, "{value}").unwrap(),
+            ExprKind::Str(text) => write!(out, "\"{}\"", ast.strings().get(text)).unwrap(),
+            ExprKind::Interp(parts) => {
+                out.push('"');
+                for &part in ast.parts(parts) {
+                    match part {
+                        StrPart::Lit(text) => out.push_str(ast.strings().get(text)),
+                        StrPart::Expr(inner) => {
+                            out.push('<');
+                            expr(ast, inner, out);
+                            out.push('>');
+                        }
+                    }
+                }
+                out.push('"');
+            }
+            ExprKind::If {
+                cond,
+                then,
+                else_,
+                has_else,
+            } => {
+                out.push_str("(if ");
+                expr(ast, cond, out);
+                out.push(' ');
+                expr(ast, then, out);
+                if has_else {
+                    out.push_str(" else ");
+                    expr(ast, else_, out);
+                } else {
+                    // The implicit else branch is an empty block with an
+                    // empty span.
+                    let empty = ast.get(else_);
+                    assert_eq!(empty.span.start, empty.span.end);
+                    assert!(
+                        matches!(empty.kind, ExprKind::Block(items) if ast.items(items).is_empty())
+                    );
+                }
+                out.push(')');
+            }
             ExprKind::Name(name) => out.push_str(ast.names().get(name)),
             ExprKind::Unary { op, operand } => {
                 out.push('(');
                 out.push_str(op.symbol());
+                if op == UnaryOp::Not {
+                    out.push(' ');
+                }
                 expr(ast, operand, out);
                 out.push(')');
             }
@@ -1344,11 +1611,351 @@ mod tests {
     }
 
     #[test]
+    fn precedence_of_logic_and_comparison() {
+        assert_eq!(shape("not a == b"), "(not (a == b))");
+        assert_eq!(shape("a + 1 < b"), "((a + 1) < b)");
+        assert_eq!(shape("a or b and c"), "(a or (b and c))");
+        assert_eq!(shape("not not a"), "(not (not a))");
+        assert_eq!(shape("-x < y : Int"), "((-x) < (y : Int))");
+        assert_eq!(shape("not a and b"), "((not a) and b)");
+        assert_eq!(shape("a and b or c and d"), "((a and b) or (c and d))");
+        assert_eq!(shape("a or b or c"), "((a or b) or c)");
+        assert_eq!(shape("a and b and c"), "((a and b) and c)");
+        assert_eq!(shape("a == b and c != d"), "((a == b) and (c != d))");
+        assert_eq!(shape("1 + 2 * 3 >= 7 // 2"), "((1 + (2 * 3)) >= (7 // 2))");
+        assert_eq!(shape("not -x <= y"), "(not ((-x) <= y))");
+        assert_eq!(shape("true or false"), "(true or false)");
+        assert_eq!(
+            shape("\"a\" + \"b\" == \"ab\""),
+            "((\"a\" + \"b\") == \"ab\")"
+        );
+        // Every comparison operator.
+        for op in ["==", "!=", "<", "<=", ">", ">="] {
+            assert_eq!(shape(&format!("a {op} b")), format!("(a {op} b)"));
+        }
+    }
+
+    #[test]
+    fn comparisons_cannot_be_chained() {
+        let diagnostic = parse_text("a < b < c").unwrap_err();
+        assert_eq!(diagnostic.message, "comparison operators cannot be chained");
+        assert_eq!(diagnostic.span, Span::new(6, 7));
+        assert_eq!(
+            diagnostic.notes,
+            vec!["write `a < b and b < c`, or add parentheses"]
+        );
+        assert_eq!(error("a == b != c").1, Span::new(7, 9));
+        assert_eq!(error("1 + 2 < 3 == true").1, Span::new(10, 12));
+        assert_eq!(error("x and a >= b > c").1, Span::new(13, 14));
+        assert_eq!(error("not a < b <= c").1, Span::new(10, 12));
+        // Parentheses and logic operators separate comparisons.
+        assert_eq!(shape("(a < b) == c"), "([(a < b)] == c)");
+        assert_eq!(shape("a == (b < c)"), "(a == [(b < c)])");
+        assert_eq!(shape("a < b and b < c"), "((a < b) and (b < c))");
+    }
+
+    #[test]
+    fn items_continue_after_logic_and_comparison_operators() {
+        for op in ["==", "!=", "<", "<=", ">", ">=", "and", "or"] {
+            let text = format!("a {op}\n\n  b");
+            assert_eq!(shape(&text), format!("(a {op} b)"), "{text}");
+        }
+    }
+
+    #[test]
+    fn if_shapes() {
+        assert_eq!(shape("if a { 1 } else { 2 }"), "(if a {1} else {2})");
+        assert_eq!(
+            shape("if a { 1 } else if b { 2 } else { 3 }"),
+            "(if a {1} else (if b {2} else {3}))"
+        );
+        assert_eq!(
+            shape("if a { 1 } else if b { 2 }"),
+            "(if a {1} else (if b {2}))"
+        );
+        assert_eq!(shape("if a { 1 }"), "(if a {1})");
+        assert_eq!(shape("if a {}"), "(if a {})");
+        assert_eq!(shape("if a == b and c { x }"), "(if ((a == b) and c) {x})");
+        assert_eq!(shape("if { a } { 1 }"), "(if {a} {1})");
+        assert_eq!(
+            shape("let x = if a { 1 } else { 2 }"),
+            "let x = (if a {1} else {2})"
+        );
+        // An `if` is an operand like any other prefix expression.
+        assert_eq!(
+            shape("1 + if a { 2 } else { 3 }"),
+            "(1 + (if a {2} else {3}))"
+        );
+        assert_eq!(
+            shape("if a { 1 } else { 2 } * 3"),
+            "((if a {1} else {2}) * 3)"
+        );
+        assert_eq!(
+            shape("if a { 1 } else { 2 } : Float"),
+            "((if a {1} else {2}) : Float)"
+        );
+        assert_eq!(
+            shape("if if a { b } else { c } { 1 }"),
+            "(if (if a {b} else {c}) {1})"
+        );
+        // Blocks keep their items.
+        assert_eq!(
+            shape("if a {\n  let y = 1\n  y\n} else {\n  2\n}"),
+            "(if a {let y = 1; y} else {2})"
+        );
+    }
+
+    #[test]
+    fn else_may_start_a_later_line() {
+        assert_eq!(shape("if a { 1 }\nelse { 2 }"), "(if a {1} else {2})");
+        assert_eq!(
+            shape("if a { 1 }\n\n# comment\nelse if b { 2 }\nelse { 3 }"),
+            "(if a {1} else (if b {2} else {3}))"
+        );
+    }
+
+    #[test]
+    fn without_else_the_newlines_still_separate_items() {
+        assert_eq!(shape("if a { 1 }\n2"), "(if a {1}); 2");
+        assert_eq!(shape("if a { 1 }\n\n\nx := 2"), "(if a {1}); x := 2");
+        assert_eq!(shape("{ if a { 1 }\n}"), "{(if a {1})}");
+        assert_eq!(shape("if a { 1 }\n"), "(if a {1})");
+        // The empty else block sits at the end of the `if`'s block, and the
+        // `if` spans only its keyword through that block.
+        let ast = parse_text("if a { 1 }\n").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let ExprKind::If {
+            else_, has_else, ..
+        } = ast.get(root).kind
+        else {
+            panic!("expected an if");
+        };
+        assert!(!has_else);
+        assert_eq!(ast.get(root).span, Span::new(0, 10));
+        assert_eq!(ast.get(else_).span, Span::new(10, 10));
+    }
+
+    #[test]
+    fn if_errors() {
+        assert_eq!(
+            error("if a 1"),
+            (
+                "expected `{` after `if` condition".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("if a\n{ 1 }"),
+            (
+                "expected `{` after `if` condition".to_owned(),
+                Span::new(4, 5)
+            )
+        );
+        assert_eq!(
+            error("if (a) + 1"),
+            (
+                "expected `{` after `if` condition".to_owned(),
+                Span::new(10, 10)
+            )
+        );
+        assert_eq!(
+            error("if a { 1 } else 2"),
+            (
+                "expected `{` or `if` after `else`".to_owned(),
+                Span::new(16, 17)
+            )
+        );
+        assert_eq!(
+            error("if a { 1 } else\n{ 2 }"),
+            (
+                "expected `{` or `if` after `else`".to_owned(),
+                Span::new(15, 16)
+            )
+        );
+        assert_eq!(
+            error("if { 1 }"),
+            (
+                "expected `{` after `if` condition".to_owned(),
+                Span::new(8, 8)
+            )
+        );
+        assert_eq!(
+            error("else { 1 }"),
+            (
+                "expected expression, found `else`".to_owned(),
+                Span::new(0, 4)
+            )
+        );
+        assert_eq!(
+            error("if a { 1 } 2"),
+            (
+                "expected end of item, found `2`".to_owned(),
+                Span::new(11, 12)
+            )
+        );
+    }
+
+    #[test]
+    fn literals_of_the_new_types() {
+        assert_eq!(shape("true; false"), "true; false");
+        assert_eq!(shape("\"hi\""), "\"hi\"");
+        assert_eq!(shape("r\"\\n\""), "\"\\n\"");
+        let ast = parse_text("\"a\" + \"\"").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let ExprKind::Binary { lhs, rhs, .. } = ast.get(root).kind else {
+            panic!("expected a sum");
+        };
+        assert_eq!(ast.get(lhs).span, Span::new(0, 3));
+        assert_eq!(ast.get(rhs).span, Span::new(6, 8));
+    }
+
+    #[test]
+    fn interpolation_parts() {
+        assert_eq!(shape("\"a{x}b{y + 1}\""), "\"a<x>b<(y + 1)>\"");
+        assert_eq!(shape("\"{ \"{x}\" }\""), "\"<\"<x>\">\"");
+        assert_eq!(shape("\"{ {} }\""), "\"<{}>\"");
+        assert_eq!(
+            shape("\"status: {if ok { \"ok\" } else { \"failed\" }}\""),
+            "\"status: <(if ok {\"ok\"} else {\"failed\"})>\""
+        );
+        let ast = parse_text("\"a{x}b{y}\"").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let interp = ast.get(root);
+        assert_eq!(interp.span, Span::new(0, 10));
+        let ExprKind::Interp(parts) = interp.kind else {
+            panic!("expected an interpolation, got {interp:?}");
+        };
+        let parts = ast.parts(parts);
+        let text = |part: &StrPart| match *part {
+            StrPart::Lit(id) => ast.strings().get(id).to_owned(),
+            StrPart::Expr(id) => format!("<{:?}>", ast.get(id).kind),
+        };
+        let shown: Vec<String> = parts.iter().map(text).collect();
+        assert_eq!(shown.len(), 5);
+        assert_eq!(shown[0], "a");
+        assert!(shown[1].starts_with("<Name"));
+        assert_eq!(shown[2], "b");
+        assert!(shown[3].starts_with("<Name"));
+        assert_eq!(shown[4], "");
+    }
+
+    #[test]
+    fn interpolation_errors() {
+        let diagnostic = parse_text("\"{1 2}\"").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `}`, found `2`");
+        assert_eq!(diagnostic.span, Span::new(4, 5));
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].span, Span::new(1, 2));
+        assert_eq!(diagnostic.labels[0].text, "unclosed `{`");
+        // In a later interpolation, the label is on that one's `{`.
+        let diagnostic = parse_text("\"{a}{b c}\"").unwrap_err();
+        assert_eq!(diagnostic.labels[0].span, Span::new(4, 5));
+        // An empty interpolation, and one missing its closing parenthesis,
+        // are reported at the `}`.
+        assert_eq!(
+            error("\"{}\""),
+            ("expected expression, found `}`".to_owned(), Span::new(2, 3))
+        );
+        assert_eq!(
+            error("\"{a}{}b\""),
+            ("expected expression, found `}`".to_owned(), Span::new(5, 6))
+        );
+        assert_eq!(
+            error("\"{(1}\""),
+            ("expected `)`, found `}`".to_owned(), Span::new(4, 5))
+        );
+        // Only an expression may be interpolated.
+        assert_eq!(
+            message("\"{let x = 1}\""),
+            "expected expression, found `let`"
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_a_program_with_strings_and_ifs() {
+        let text = "let s = \"n: {n}\"\n\
+                    if not a == b and c { s } else if d { \"x\" }";
+        let ast = parse_text(text).unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let s @0..16\n\
+             \x20   (interp @8..16\n\
+             \x20     (lit \"n: \")\n\
+             \x20     (name n @13..14)\n\
+             \x20     (lit \"\")))\n\
+             \x20 (expr @17..60\n\
+             \x20   (if @17..60\n\
+             \x20     (and @20..36\n\
+             \x20       (not @20..30\n\
+             \x20         (== @24..30\n\
+             \x20           (name a @24..25)\n\
+             \x20           (name b @29..30)))\n\
+             \x20       (name c @35..36))\n\
+             \x20     (block @37..42\n\
+             \x20       (expr @39..40\n\
+             \x20         (name s @39..40)))\n\
+             \x20     (if @48..60\n\
+             \x20       (name d @51..52)\n\
+             \x20       (block @53..60\n\
+             \x20         (expr @55..58\n\
+             \x20           (str \"x\" @55..58)))\n\
+             \x20       (block @60..60)))))"
+        );
+    }
+
+    #[test]
+    fn else_if_chains_are_limited() {
+        // A chain of N `if`s is N + 1 levels deep: the innermost `if` is one
+        // above its blocks.
+        let chain = |ifs: usize| format!("{}{{}}", "if a {} else ".repeat(ifs));
+        let deepest = chain(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(chain(MAX_DEPTH));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        // Far beyond the limit, where uncounted recursion would overflow.
+        let diagnostic = too_deep(chain(200_000));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+    }
+
+    #[test]
+    fn interpolations_count_towards_depth() {
+        // An interpolation is one level above its expression: around N
+        // parentheses and a name, N + 2 levels. (Literals nested in each
+        // other's interpolations are limited the same way; the lexer test
+        // `nesting_is_limited` and the end-to-end depth test cover them.)
+        let wrapped =
+            |parens: usize| format!("\"{{{}x{}}}\"", "(".repeat(parens), ")".repeat(parens));
+        let deepest = wrapped(MAX_DEPTH - 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(wrapped(MAX_DEPTH - 1));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        // Two levels of literal around one name.
+        let ast = parse_text("\"{\"{x}\"}\"").unwrap();
+        let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an expression item");
+        };
+        let ExprKind::Interp(parts) = ast.get(root).kind else {
+            panic!("expected an interpolation");
+        };
+        let StrPart::Expr(inner) = ast.parts(parts)[1] else {
+            panic!("expected an expression part");
+        };
+        assert!(matches!(ast.get(inner).kind, ExprKind::Interp(_)));
+    }
+
+    #[test]
     fn tokens_without_eof_are_treated_as_ending() {
         let source = SourceFile::new("test.gcsl", "1 +").unwrap();
-        let (tokens, names) = tokenize(&source).unwrap();
+        let (tokens, names, strings) = tokenize(&source).unwrap();
         let without_eof = &tokens[..tokens.len() - 1];
-        let diagnostic = parse(without_eof, names, &source).unwrap_err();
+        let diagnostic = parse(without_eof, names, strings, &source).unwrap_err();
         assert_eq!(
             diagnostic.message,
             "expected expression, found end of input"

@@ -10,14 +10,24 @@
 //! statements, and whose result is its `= EXPR` or final expression
 //! statement, or an explicit `Unit` node if it has neither.
 //!
+//! Comparisons are specialised by their operands' type, and an `if` keeps
+//! the empty else block the parser gave it if the source had none. Each
+//! string literal, and each literal piece of an interpolated string,
+//! becomes a `StrConst` whose text is copied from the AST's string table
+//! into the IR's own, so the AST's table is not needed after lowering. A
+//! literal piece has no span of its own in the AST, so its node has its
+//! whole interpolated string's span.
+//!
 //! Lowering cannot fail on tables produced by [`crate::check::check`]. Any
 //! combination the checker should have ruled out is reported as an
 //! [`InternalError`] rather than a panic.
 
-use crate::ast::{Ast, BinaryOp, ExprId, ExprKind, ItemKind, ItemRange, UnaryOp};
+use crate::ast::{
+    Ast, BinaryOp, ExprId, ExprKind, ItemKind, ItemRange, PartRange, StrPart, UnaryOp,
+};
 use crate::check::{Checked, Resolution, Slot, Types};
 use crate::diagnostic::InternalError;
-use crate::ir::{Ir, IrBuilder, IrId, IrKind, Operands};
+use crate::ir::{Cmp, Ir, IrBuilder, IrId, IrKind, Operands};
 use crate::source::Span;
 use crate::types::Ty;
 use crate::value::int_to_float;
@@ -163,20 +173,22 @@ impl Lowerer<'_> {
             (ExprKind::Int(value), Ty::Int) => IrKind::IntConst(value),
             (ExprKind::Int(value), Ty::Float) => IrKind::FloatConst(int_to_float(value)),
             (ExprKind::Float(value), Ty::Float) => IrKind::FloatConst(value),
+            (ExprKind::Bool(value), Ty::Bool) => IrKind::BoolConst(value),
+            (ExprKind::Str(text), Ty::String) => {
+                IrKind::StrConst(self.builder.push_string(self.ast.strings().get(text)))
+            }
+            (ExprKind::Interp(parts), Ty::String) => self.lower_interpolation(parts, span)?,
             (
-                ExprKind::Unary {
-                    op: UnaryOp::Neg,
-                    operand,
+                ExprKind::If {
+                    cond, then, else_, ..
                 },
-                Ty::Int,
-            ) => IrKind::IntNeg(self.lower_operand(operand, Ty::Int)?),
-            (
-                ExprKind::Unary {
-                    op: UnaryOp::Neg,
-                    operand,
-                },
-                Ty::Float,
-            ) => IrKind::FloatNeg(self.lower_operand(operand, Ty::Float)?),
+                _,
+            ) => IrKind::If {
+                cond: self.lower_operand(cond, Ty::Bool)?,
+                then: self.lower_operand(then, ty)?,
+                else_: self.lower_operand(else_, ty)?,
+            },
+            (ExprKind::Unary { op, operand }, _) => self.lower_unary(op, operand, ty, span)?,
             (
                 ExprKind::Binary {
                     op,
@@ -203,14 +215,66 @@ impl Lowerer<'_> {
                     span,
                 });
             }
-            (ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Unary { .. }, Ty::Unit) => {
+            (ExprKind::Int(_) | ExprKind::Float(_), Ty::Bool | Ty::String | Ty::Unit) => {
                 return Err(InternalError {
-                    message: "numeric expression typed as Unit",
+                    message: "numeric literal typed as a non-numeric type",
+                    span,
+                });
+            }
+            (ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Interp(_), _) => {
+                return Err(InternalError {
+                    message: "literal typed as a type it cannot have",
                     span,
                 });
             }
         };
         Ok(self.builder.alloc(kind, span))
+    }
+
+    /// Lowers the prefix operator `op`, of type `ty` and spanning `span`,
+    /// applied to `operand`.
+    fn lower_unary(
+        &mut self,
+        op: UnaryOp,
+        operand: ExprId,
+        ty: Ty,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        Ok(match (op, ty) {
+            (UnaryOp::Neg, Ty::Int) => IrKind::IntNeg(self.lower_operand(operand, Ty::Int)?),
+            (UnaryOp::Neg, Ty::Float) => IrKind::FloatNeg(self.lower_operand(operand, Ty::Float)?),
+            (UnaryOp::Not, Ty::Bool) => IrKind::Not(self.lower_operand(operand, Ty::Bool)?),
+            _ => {
+                return Err(InternalError {
+                    message: "prefix operator has a result type it cannot have",
+                    span,
+                });
+            }
+        })
+    }
+
+    /// Lowers the parts of an interpolated string spanning `span` to an
+    /// `Interp` whose items are a `StrConst` for each literal piece and the
+    /// lowered expressions, in order.
+    fn lower_interpolation(
+        &mut self,
+        parts: PartRange,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        let base = self.item_stack.len();
+        for &part in self.ast.parts(parts) {
+            let item = match part {
+                StrPart::Lit(text) => {
+                    let text = self.builder.push_string(self.ast.strings().get(text));
+                    self.builder.alloc(IrKind::StrConst(text), span)
+                }
+                StrPart::Expr(expr) => self.lower_expr(expr)?,
+            };
+            self.item_stack.push(item);
+        }
+        let items = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(IrKind::Interp(items))
     }
 
     fn lower_binary(
@@ -222,7 +286,13 @@ impl Lowerer<'_> {
         ty: Ty,
         id: ExprId,
     ) -> Result<IrKind, InternalError> {
+        if let Some(cmp) = comparison(op) {
+            return self.lower_comparison(cmp, op_start, lhs, rhs, ty, id);
+        }
         let (make, operand_ty): (fn(Operands) -> IrKind, Ty) = match (op, ty) {
+            (BinaryOp::Add, Ty::String) => (IrKind::StrConcat, Ty::String),
+            (BinaryOp::And, Ty::Bool) => (IrKind::And, Ty::Bool),
+            (BinaryOp::Or, Ty::Bool) => (IrKind::Or, Ty::Bool),
             (BinaryOp::Add, Ty::Int) => (IrKind::IntAdd, Ty::Int),
             (BinaryOp::Sub, Ty::Int) => (IrKind::IntSub, Ty::Int),
             (BinaryOp::Mul, Ty::Int) => (IrKind::IntMul, Ty::Int),
@@ -248,6 +318,50 @@ impl Lowerer<'_> {
         Ok(make(Operands { lhs, rhs, op_start }))
     }
 
+    /// Lowers a comparison, of type `ty`, to the node for its operands'
+    /// type, which the checker has made the same on both sides.
+    fn lower_comparison(
+        &mut self,
+        cmp: Cmp,
+        op_start: u32,
+        lhs: ExprId,
+        rhs: ExprId,
+        ty: Ty,
+        id: ExprId,
+    ) -> Result<IrKind, InternalError> {
+        if ty != Ty::Bool {
+            return Err(InternalError {
+                message: "operator has a result type it cannot have",
+                span: self.ast.get(id).span,
+            });
+        }
+        let operand_ty = self.types.get(lhs);
+        // `Some(true)` for `==`, `Some(false)` for `!=`: the only
+        // comparisons of Bools and Units.
+        let equal = match cmp {
+            Cmp::Eq => Some(true),
+            Cmp::Ne => Some(false),
+            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => None,
+        };
+        let span = self.ast.get(id).span;
+        let lhs = self.lower_operand(lhs, operand_ty)?;
+        let rhs = self.lower_operand(rhs, operand_ty)?;
+        let operands = Operands { lhs, rhs, op_start };
+        Ok(match (operand_ty, equal) {
+            (Ty::Int, _) => IrKind::IntCmp(cmp, operands),
+            (Ty::Float, _) => IrKind::FloatCmp(cmp, operands),
+            (Ty::String, _) => IrKind::StrCmp(cmp, operands),
+            (Ty::Bool, Some(equal)) => IrKind::BoolEq(equal, operands),
+            (Ty::Unit, Some(equal)) => IrKind::UnitEq(equal, operands),
+            (Ty::Bool | Ty::Unit, None) | (Ty::UntypedInt | Ty::Error, _) => {
+                return Err(InternalError {
+                    message: "comparison of a type it cannot compare",
+                    span,
+                });
+            }
+        })
+    }
+
     /// Lowers an operand that must already have type `expected`.
     fn lower_operand(&mut self, id: ExprId, expected: Ty) -> Result<IrId, InternalError> {
         if self.types.get(id) == expected {
@@ -270,7 +384,7 @@ impl Lowerer<'_> {
                     .builder
                     .alloc(IrKind::IntToFloat(operand), self.ast.get(id).span))
             }
-            Ty::Unit => Err(InternalError {
+            Ty::Bool | Ty::String | Ty::Unit => Err(InternalError {
                 message: "operand type does not match its operator",
                 span: self.ast.get(id).span,
             }),
@@ -286,6 +400,27 @@ impl Lowerer<'_> {
     }
 }
 
+/// The relation a comparison operator tests, or `None` for any other
+/// operator.
+const fn comparison(op: BinaryOp) -> Option<Cmp> {
+    match op {
+        BinaryOp::Eq => Some(Cmp::Eq),
+        BinaryOp::Ne => Some(Cmp::Ne),
+        BinaryOp::Lt => Some(Cmp::Lt),
+        BinaryOp::Le => Some(Cmp::Le),
+        BinaryOp::Gt => Some(Cmp::Gt),
+        BinaryOp::Ge => Some(Cmp::Ge),
+        BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::FloorDiv
+        | BinaryOp::Rem
+        | BinaryOp::And
+        | BinaryOp::Or => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,11 +430,12 @@ mod tests {
     use crate::names::Names;
     use crate::parser::parse;
     use crate::source::SourceFile;
+    use crate::strings::Strings;
 
     fn parse_text(text: &str) -> Ast {
         let source = SourceFile::new("test.gcsl", text).unwrap();
-        let (tokens, names) = tokenize(&source).unwrap();
-        parse(&tokens, names, &source).unwrap()
+        let (tokens, names, strings) = tokenize(&source).unwrap();
+        parse(&tokens, names, strings, &source).unwrap()
     }
 
     fn lower_text(text: &str) -> Ir {
@@ -348,7 +484,7 @@ mod tests {
             span: Span::new(0, 5),
         });
         let root = builder.push_item_list(&[item]);
-        let ast = builder.finish(root, Names::new());
+        let ast = builder.finish(root, Names::new(), Strings::new());
         let checked = Checked {
             types: Types::new(types),
             resolution: Resolution::without_variables(3, 1),
@@ -519,6 +655,109 @@ mod tests {
         let error = lower(&ast, &unresolved).unwrap_err();
         assert_eq!(error.message, "a declaration has no slot");
         assert_eq!(error.span, Span::new(0, 9));
+    }
+
+    #[test]
+    fn interpolations_list_pieces_and_expressions() {
+        assert_eq!(
+            dump("let n = 1\n\"n = {n}, {n + 1}.\""),
+            "(block @0..29\n\
+             \x20 (store n#0 @0..9\n\
+             \x20   (int 1 @8..9))\n\
+             \x20 (interp @10..29\n\
+             \x20   (str \"n = \" @10..29)\n\
+             \x20   (load n#0 @16..17)\n\
+             \x20   (str \", \" @10..29)\n\
+             \x20   (int-add @21..26\n\
+             \x20     (load n#0 @21..22)\n\
+             \x20     (int 1 @25..26))\n\
+             \x20   (str \".\" @10..29)))"
+        );
+    }
+
+    #[test]
+    fn comparisons_are_specialised_by_operand_type() {
+        assert_eq!(
+            dump("1 < 2.5"),
+            "(block @0..7\n  (float-cmp < @0..7\n    (float 1.0 @0..1)\n    (float 2.5 @4..7)))"
+        );
+        assert_eq!(
+            dump("1 >= 2"),
+            "(block @0..6\n  (int-cmp >= @0..6\n    (int 1 @0..1)\n    (int 2 @5..6)))"
+        );
+        assert_eq!(
+            dump("\"a\" != \"b\""),
+            "(block @0..10\n  (str-cmp != @0..10\n    (str \"a\" @0..3)\n    (str \"b\" @7..10)))"
+        );
+        assert_eq!(
+            dump("true != false"),
+            "(block @0..13\n  (bool-eq != @0..13\n    (bool true @0..4)\n    (bool false @8..13)))"
+        );
+        assert_eq!(
+            dump("{} == {}"),
+            "(block @0..8\n  (unit-eq == @0..8\n    (block @0..2\n      (unit @0..2))\n    (block @6..8\n      (unit @6..8))))"
+        );
+    }
+
+    #[test]
+    fn if_keeps_both_branches() {
+        assert_eq!(
+            dump("if true { 1 } else { 2 }"),
+            "(block @0..24\n\
+             \x20 (if @0..24\n\
+             \x20   (bool true @3..7)\n\
+             \x20   (block @8..13\n\
+             \x20     (int 1 @10..11))\n\
+             \x20   (block @19..24\n\
+             \x20     (int 2 @21..22))))"
+        );
+        // The implicit else branch is an empty block yielding unit.
+        assert_eq!(
+            dump("if true {}"),
+            "(block @0..10\n\
+             \x20 (if @0..10\n\
+             \x20   (bool true @3..7)\n\
+             \x20   (block @8..10\n\
+             \x20     (unit @8..10))\n\
+             \x20   (block @10..10\n\
+             \x20     (unit @10..10))))"
+        );
+        let ir = lower_text("if true { 1 } else { 2.5 }");
+        assert_eq!(ir.ty_of(result_of(&ir)), Ty::Float);
+    }
+
+    #[test]
+    fn logic_and_concatenation() {
+        assert_eq!(
+            dump("true and false"),
+            "(block @0..14\n  (and @0..14\n    (bool true @0..4)\n    (bool false @9..14)))"
+        );
+        assert_eq!(
+            dump("not true or false"),
+            "(block @0..17\n  (or @0..17\n    (not @0..8\n      (bool true @4..8))\n    (bool false @12..17)))"
+        );
+        assert_eq!(
+            dump("\"a\" + r\"b\""),
+            "(block @0..10\n  (str-concat @0..10\n    (str \"a\" @0..3)\n    (str \"b\" @6..10)))"
+        );
+    }
+
+    #[test]
+    fn string_constants_are_resolved_into_the_irs_table() {
+        let ir = lower_text("\"a{1}b\" + \"c\\n\"");
+        let IrKind::StrConcat(operands) = ir.get(result_of(&ir)).kind else {
+            panic!("expected a concatenation");
+        };
+        let IrKind::Interp(items) = ir.get(operands.lhs).kind else {
+            panic!("expected an interpolation");
+        };
+        let text = |id: IrId| match ir.get(id).kind {
+            IrKind::StrConst(constant) => ir.string(constant).to_string(),
+            other => format!("{other:?}"),
+        };
+        let items: Vec<String> = ir.items(items).iter().map(|&id| text(id)).collect();
+        assert_eq!(items, vec!["a", "IntConst(1)", "b"]);
+        assert_eq!(text(operands.rhs), "c\n");
     }
 
     #[test]

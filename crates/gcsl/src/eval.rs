@@ -1,37 +1,55 @@
 //! The evaluator: a recursive walk over [`Ir`].
 //!
-//! There is one walker per numeric result type, [`Evaluator::int`] and
-//! [`Evaluator::float`], each returning an unboxed `i64` or `f64`. Every IR
-//! node states its type, so the walker for a node is always known from its
-//! parent and no runtime value is ever inspected to choose an operation.
-//! A general walker, `Evaluator::value`, handles the nodes that are not
-//! arithmetic (units, loads, stores and blocks, including the root) and
-//! hands arithmetic to the typed walkers, building a [`Value`] only where a
-//! value of statically unknown type is needed: at the root, in a slot, or
-//! as a block's result evaluated through `value`.
+//! There is one walker per result type with an unboxed representation:
+//! `Evaluator::int`, `Evaluator::float`, `Evaluator::bool` and
+//! `Evaluator::string`, returning an `i64`, an `f64`, a `bool` and an
+//! `Rc<str>`. Every IR node states its type, so the walker for a node is
+//! always known from its parent and no runtime value is ever inspected to
+//! choose an operation. Each typed walker handles the nodes of its type and
+//! also loads, blocks and `if`s, which can have any type: an `if` evaluates
+//! its condition through `bool` and then exactly one branch through the
+//! walker it was called with. A general walker, `Evaluator::value`, handles
+//! every node, and hands the typed nodes to the typed walkers, building a
+//! [`Value`] only where a value of statically unknown type is needed: at
+//! the root, in a slot, as an interpolated value, or as a block's result
+//! evaluated through `value`.
+//!
+//! `and` and `or` short-circuit: the right operand is evaluated only when
+//! the left does not decide the result. A string constant is a reference
+//! to the IR's copy, so producing one increments a reference count and
+//! copies nothing. Concatenation allocates exactly the length it needs, and
+//! an interpolation builds its text in one buffer sized from its literal
+//! pieces before sharing it.
 //!
 //! Variables live in a frame: one [`Value`] per slot, allocated once before
-//! evaluation starts, sized by the checker's slot assignment. A `Load` in
-//! an `Int` or `Float` context reads its slot and extracts the number; a
-//! slot holding a value of another type there is an internal error, since
-//! lowering typed the load. Storing values in separate typed slots
-//! (`Vec<i64>`, `Vec<f64>`) would avoid the tag check; that is a later
-//! optimisation for a bytecode VM, not something this tree walker needs.
+//! evaluation starts, sized by the checker's slot assignment. A `Load` in a
+//! typed context reads its slot and extracts the unboxed value, cloning a
+//! string's reference; a slot holding a value of another type there is an
+//! internal error, since lowering typed the load. Storing values in
+//! separate typed slots (`Vec<i64>`, `Vec<f64>`) would avoid the tag check;
+//! that is a later optimisation for a bytecode VM, not something this tree
+//! walker needs.
 //!
 //! Operands are evaluated left to right, so when both would fail, the left
 //! one's error is reported. Items are evaluated in order. Evaluation holds
 //! no per-node state and allocates nothing beyond the frame, except the
-//! diagnostic when it fails. A runtime error points at the operator and
-//! labels each operand with the value it had, so the user sees what
-//! actually overflowed or divided by zero.
+//! strings the program builds and the diagnostic when it fails. A runtime
+//! error points at the operator and labels each operand with the value it
+//! had, so the user sees what actually overflowed or divided by zero.
 
+use std::fmt::Write as _;
 use std::num::NonZeroI64;
+use std::rc::Rc;
 
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Ir, IrId, IrKind, IrNode, IrRange, Operands};
+use crate::ir::{Cmp, Ir, IrId, IrKind, IrNode, IrRange, Operands};
 use crate::source::Span;
 use crate::value::{Value, int_to_float};
+
+/// The room an interpolation reserves for each interpolated value's text,
+/// on top of its literal pieces' lengths.
+const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 
 /// Evaluates `ir` to a value, in a fresh frame.
 ///
@@ -71,25 +89,29 @@ struct Evaluator<'a> {
     frame: &'a mut [Value],
 }
 
+// The walkers `value`, `int`, `float`, `bool` and `string` are the
+// recursion of evaluation: an expression nested N deep puts about N of
+// their frames on the stack. Each is therefore only a dispatcher. The work
+// of each operator is in a helper of its own, and every error is returned
+// by a call in tail position, so a walker's frame does not hold the
+// temporaries of every operator; an unoptimised build gives each of those
+// a stack slot of its own, which would make the walkers' frames several
+// kilobytes and `crate::STACK_SIZE` too small at `crate::MAX_DEPTH`.
 impl Evaluator<'_> {
     /// Evaluates a node of any type.
     fn value(&mut self, id: IrId) -> Result<Value, Diagnostic> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Unit => Ok(Value::Unit),
-            IrKind::Load(slot, _) => self.load(slot, node),
-            IrKind::Store(slot, value) => {
-                let value = self.value(value)?;
-                let target = self
-                    .frame
-                    .get_mut(slot.index())
-                    .ok_or_else(|| internal("store to a slot outside the frame", node.span))?;
-                *target = value;
-                Ok(Value::Unit)
-            }
+            IrKind::Load(slot, _) => self.load(slot, node).cloned(),
+            IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.value(result)
+            }
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.value(branch)
             }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -105,6 +127,20 @@ impl Evaluator<'_> {
             | IrKind::FloatMul(_)
             | IrKind::FloatDiv(_)
             | IrKind::IntToFloat(_) => self.float(id).map(Value::Float),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::UnitEq(..)
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => self.bool(id).map(Value::Bool),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) => self.string(id).map(Value::Str),
+            // Directly rather than through `string`: an interpolation
+            // evaluates its parts through `value`, so interpolations nested
+            // in each other then recurse two frames per level, not three.
+            IrKind::Interp(items) => self.interpolate(items, node.span).map(Value::Str),
         }
     }
 
@@ -116,11 +152,26 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Reads the value in `slot`.
-    fn load(&self, slot: Slot, node: &IrNode) -> Result<Value, Diagnostic> {
+    /// Evaluates the condition of an `if` and returns the branch it selects.
+    fn branch(&mut self, cond: IrId, then: IrId, else_: IrId) -> Result<IrId, Diagnostic> {
+        Ok(if self.bool(cond)? { then } else { else_ })
+    }
+
+    /// Evaluates `value` and writes it to `slot`, for the `Store` `node`.
+    fn store(&mut self, slot: Slot, value: IrId, node: &IrNode) -> Result<Value, Diagnostic> {
+        let value = self.value(value)?;
+        let target = self
+            .frame
+            .get_mut(slot.index())
+            .ok_or_else(|| internal("store to a slot outside the frame", node.span))?;
+        *target = value;
+        Ok(Value::Unit)
+    }
+
+    /// The value in `slot`.
+    fn load(&self, slot: Slot, node: &IrNode) -> Result<&Value, Diagnostic> {
         self.frame
             .get(slot.index())
-            .copied()
             .ok_or_else(|| internal("load from a slot outside the frame", node.span))
     }
 
@@ -129,50 +180,22 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
-            IrKind::Load(slot, _) => match self.load(slot, node)? {
-                Value::Int(value) => Ok(value),
-                Value::Float(_) | Value::Unit => Err(internal(
-                    "Int load from a slot holding another type",
-                    node.span,
-                )),
-            },
+            IrKind::Load(slot, _) => self.load_int(slot, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
             }
-            IrKind::IntNeg(operand) => {
-                let value = self.int(operand)?;
-                value
-                    .checked_neg()
-                    .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value))
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.int(branch)
             }
-            IrKind::IntAdd(operands) => {
-                let (lhs, rhs) = self.ints(operands)?;
-                lhs.checked_add(rhs)
-                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
-            }
-            IrKind::IntSub(operands) => {
-                let (lhs, rhs) = self.ints(operands)?;
-                lhs.checked_sub(rhs)
-                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
-            }
-            IrKind::IntMul(operands) => {
-                let (lhs, rhs) = self.ints(operands)?;
-                lhs.checked_mul(rhs)
-                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
-            }
-            IrKind::IntFloorDiv(operands) => {
-                let (lhs, rhs) = self.ints(operands)?;
-                let divisor = NonZeroI64::new(rhs)
-                    .ok_or_else(|| self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs))?;
-                floor_div(lhs, divisor)
-                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
-            }
+            IrKind::IntNeg(operand) => self.int_neg(node, operand),
+            IrKind::IntAdd(operands) => self.int_arithmetic(node, operands, i64::checked_add),
+            IrKind::IntSub(operands) => self.int_arithmetic(node, operands, i64::checked_sub),
+            IrKind::IntMul(operands) => self.int_arithmetic(node, operands, i64::checked_mul),
+            IrKind::IntFloorDiv(operands) => self.int_division(node, operands, floor_div),
             IrKind::IntRem(operands) => {
-                let (lhs, rhs) = self.ints(operands)?;
-                let divisor = NonZeroI64::new(rhs)
-                    .ok_or_else(|| self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs))?;
-                Ok(floor_mod(lhs, divisor))
+                self.int_division(node, operands, |lhs, rhs| Some(floor_mod(lhs, rhs)))
             }
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
@@ -180,11 +203,31 @@ impl Evaluator<'_> {
             | IrKind::FloatSub(_)
             | IrKind::FloatMul(_)
             | IrKind::FloatDiv(_)
-            | IrKind::IntToFloat(_) => {
-                Err(internal("Float node where an Int was expected", node.span))
+            | IrKind::IntToFloat(_) => mistyped(node, "Float node where an Int was expected"),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::UnitEq(..)
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+                mistyped(node, "String node where an Int was expected")
             }
             IrKind::Unit | IrKind::Store(..) => {
-                Err(internal("Unit node where an Int was expected", node.span))
+                mistyped(node, "Unit node where an Int was expected")
+            }
+        }
+    }
+
+    /// Reads the `Int` in `slot`, for the `Load` `node`.
+    fn load_int(&self, slot: Slot, node: &IrNode) -> Result<i64, Diagnostic> {
+        match self.load(slot, node)? {
+            Value::Int(value) => Ok(*value),
+            Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Unit => {
+                mistyped(node, "Int load from a slot holding another type")
             }
         }
     }
@@ -196,40 +239,317 @@ impl Evaluator<'_> {
         Ok((lhs, rhs))
     }
 
+    /// Evaluates the `IntNeg` `node` of `operand`.
+    fn int_neg(&mut self, node: &IrNode, operand: IrId) -> Result<i64, Diagnostic> {
+        let value = self.int(operand)?;
+        value
+            .checked_neg()
+            .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value))
+    }
+
+    /// Evaluates the `+`, `-` or `*` `node`, which `op` computes, `None`
+    /// meaning overflow.
+    fn int_arithmetic(
+        &mut self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, i64) -> Option<i64>,
+    ) -> Result<i64, Diagnostic> {
+        // Not through `ints`: this is on the recursion path of every
+        // arithmetic chain, so it saves that frame.
+        let lhs = self.int(operands.lhs)?;
+        let rhs = self.int(operands.rhs)?;
+        op(lhs, rhs).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
+    }
+
+    /// Evaluates the `//` or `%` `node`, which `op` computes for a nonzero
+    /// divisor, `None` meaning overflow.
+    fn int_division(
+        &mut self,
+        node: &IrNode,
+        operands: Operands,
+        op: fn(i64, NonZeroI64) -> Option<i64>,
+    ) -> Result<i64, Diagnostic> {
+        let lhs = self.int(operands.lhs)?;
+        let rhs = self.int(operands.rhs)?;
+        let Some(divisor) = NonZeroI64::new(rhs) else {
+            return Err(self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs));
+        };
+        op(lhs, divisor).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
+    }
+
     /// Evaluates a `Float`-typed node. IEEE 754 semantics; never fails except
-    /// through an `Int` operand of `IntToFloat` or an item of a block.
+    /// through an `Int` operand of `IntToFloat`, an item of a block or the
+    /// condition of an `if`.
     fn float(&mut self, id: IrId) -> Result<f64, Diagnostic> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
-            IrKind::Load(slot, _) => match self.load(slot, node)? {
-                Value::Float(value) => Ok(value),
-                Value::Int(_) | Value::Unit => Err(internal(
-                    "Float load from a slot holding another type",
-                    node.span,
-                )),
-            },
+            IrKind::Load(slot, _) => self.load_float(slot, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
             }
-            IrKind::FloatNeg(operand) => Ok(-self.float(operand)?),
-            IrKind::FloatAdd(o) => Ok(self.float(o.lhs)? + self.float(o.rhs)?),
-            IrKind::FloatSub(o) => Ok(self.float(o.lhs)? - self.float(o.rhs)?),
-            IrKind::FloatMul(o) => Ok(self.float(o.lhs)? * self.float(o.rhs)?),
-            IrKind::FloatDiv(o) => Ok(self.float(o.lhs)? / self.float(o.rhs)?),
-            IrKind::IntToFloat(operand) => Ok(int_to_float(self.int(operand)?)),
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.float(branch)
+            }
+            IrKind::FloatNeg(operand) => self.float_neg(operand),
+            IrKind::FloatAdd(o) => self.float_arithmetic(o, |lhs, rhs| lhs + rhs),
+            IrKind::FloatSub(o) => self.float_arithmetic(o, |lhs, rhs| lhs - rhs),
+            IrKind::FloatMul(o) => self.float_arithmetic(o, |lhs, rhs| lhs * rhs),
+            IrKind::FloatDiv(o) => self.float_arithmetic(o, |lhs, rhs| lhs / rhs),
+            IrKind::IntToFloat(operand) => self.int(operand).map(int_to_float),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => Err(internal("Int node where a Float was expected", node.span)),
+            | IrKind::IntRem(_) => mistyped(node, "Int node where a Float was expected"),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::UnitEq(..)
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+                mistyped(node, "String node where a Float was expected")
+            }
             IrKind::Unit | IrKind::Store(..) => {
-                Err(internal("Unit node where a Float was expected", node.span))
+                mistyped(node, "Unit node where a Float was expected")
             }
         }
+    }
+
+    /// Reads the `Float` in `slot`, for the `Load` `node`.
+    fn load_float(&self, slot: Slot, node: &IrNode) -> Result<f64, Diagnostic> {
+        match self.load(slot, node)? {
+            Value::Float(value) => Ok(*value),
+            Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Unit => {
+                mistyped(node, "Float load from a slot holding another type")
+            }
+        }
+    }
+
+    /// Evaluates a `FloatNeg` of `operand`.
+    fn float_neg(&mut self, operand: IrId) -> Result<f64, Diagnostic> {
+        Ok(-self.float(operand)?)
+    }
+
+    /// Evaluates a `Float` operator that `op` computes.
+    fn float_arithmetic(
+        &mut self,
+        operands: Operands,
+        op: fn(f64, f64) -> f64,
+    ) -> Result<f64, Diagnostic> {
+        let lhs = self.float(operands.lhs)?;
+        let rhs = self.float(operands.rhs)?;
+        Ok(op(lhs, rhs))
+    }
+
+    /// Evaluates a `Bool`-typed node. `and` and `or` evaluate their right
+    /// operand only when the left does not decide the result.
+    fn bool(&mut self, id: IrId) -> Result<bool, Diagnostic> {
+        let node = self.ir.get(id);
+        match node.kind {
+            IrKind::BoolConst(value) => Ok(value),
+            IrKind::Load(slot, _) => self.load_bool(slot, node),
+            IrKind::Block { items, result } => {
+                self.items(items)?;
+                self.bool(result)
+            }
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.bool(branch)
+            }
+            IrKind::IntCmp(cmp, o) => self.int_cmp(cmp, o),
+            IrKind::FloatCmp(cmp, o) => self.float_cmp(cmp, o),
+            IrKind::StrCmp(cmp, o) => self.str_cmp(cmp, o),
+            IrKind::BoolEq(equal, o) => self.bool_eq(equal, o),
+            IrKind::UnitEq(equal, o) => self.unit_eq(equal, o),
+            IrKind::And(o) => self.logic(o, false),
+            IrKind::Or(o) => self.logic(o, true),
+            IrKind::Not(operand) => self.not(operand),
+            IrKind::IntConst(_)
+            | IrKind::IntNeg(_)
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_) => mistyped(node, "Int node where a Bool was expected"),
+            IrKind::FloatConst(_)
+            | IrKind::FloatNeg(_)
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
+            | IrKind::IntToFloat(_) => mistyped(node, "Float node where a Bool was expected"),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+                mistyped(node, "String node where a Bool was expected")
+            }
+            IrKind::Unit | IrKind::Store(..) => {
+                mistyped(node, "Unit node where a Bool was expected")
+            }
+        }
+    }
+
+    /// Reads the `Bool` in `slot`, for the `Load` `node`.
+    fn load_bool(&self, slot: Slot, node: &IrNode) -> Result<bool, Diagnostic> {
+        match self.load(slot, node)? {
+            Value::Bool(value) => Ok(*value),
+            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Unit => {
+                mistyped(node, "Bool load from a slot holding another type")
+            }
+        }
+    }
+
+    /// Evaluates an `IntCmp` testing `cmp`.
+    fn int_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+        let (lhs, rhs) = self.ints(operands)?;
+        Ok(cmp.test(&lhs, &rhs))
+    }
+
+    /// Evaluates a `FloatCmp` testing `cmp`.
+    fn float_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+        let lhs = self.float(operands.lhs)?;
+        let rhs = self.float(operands.rhs)?;
+        Ok(cmp.test(&lhs, &rhs))
+    }
+
+    /// Evaluates a `StrCmp` testing `cmp`.
+    fn str_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+        let lhs = self.string(operands.lhs)?;
+        let rhs = self.string(operands.rhs)?;
+        Ok(cmp.test(&*lhs, &*rhs))
+    }
+
+    /// Evaluates a `BoolEq`: `==` if `equal`, `!=` otherwise.
+    fn bool_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
+        let lhs = self.bool(operands.lhs)?;
+        let rhs = self.bool(operands.rhs)?;
+        Ok((lhs == rhs) == equal)
+    }
+
+    /// Evaluates a `UnitEq`: `==` if `equal`, `!=` otherwise. Unit values
+    /// are all equal, but the operands may still have effects or fail.
+    fn unit_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
+        self.value(operands.lhs)?;
+        self.value(operands.rhs)?;
+        Ok(equal)
+    }
+
+    /// Evaluates `and`, which a `false` left operand decides, or `or`, which
+    /// a `true` one decides, as `decisive` says. The right operand is only
+    /// evaluated when the left does not decide.
+    fn logic(&mut self, operands: Operands, decisive: bool) -> Result<bool, Diagnostic> {
+        let lhs = self.bool(operands.lhs)?;
+        if lhs == decisive {
+            Ok(lhs)
+        } else {
+            self.bool(operands.rhs)
+        }
+    }
+
+    /// Evaluates a `Not` of `operand`.
+    fn not(&mut self, operand: IrId) -> Result<bool, Diagnostic> {
+        Ok(!self.bool(operand)?)
+    }
+
+    /// Evaluates a `String`-typed node.
+    fn string(&mut self, id: IrId) -> Result<Rc<str>, Diagnostic> {
+        let node = self.ir.get(id);
+        match node.kind {
+            IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
+            IrKind::Load(slot, _) => self.load_string(slot, node),
+            IrKind::Block { items, result } => {
+                self.items(items)?;
+                self.string(result)
+            }
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.string(branch)
+            }
+            IrKind::StrConcat(operands) => self.concat(operands),
+            IrKind::Interp(items) => self.interpolate(items, node.span),
+            IrKind::IntConst(_)
+            | IrKind::IntNeg(_)
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_) => mistyped(node, "Int node where a String was expected"),
+            IrKind::FloatConst(_)
+            | IrKind::FloatNeg(_)
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
+            | IrKind::IntToFloat(_) => mistyped(node, "Float node where a String was expected"),
+            IrKind::BoolConst(_)
+            | IrKind::IntCmp(..)
+            | IrKind::FloatCmp(..)
+            | IrKind::StrCmp(..)
+            | IrKind::BoolEq(..)
+            | IrKind::UnitEq(..)
+            | IrKind::And(_)
+            | IrKind::Or(_)
+            | IrKind::Not(_) => mistyped(node, "Bool node where a String was expected"),
+            IrKind::Unit | IrKind::Store(..) => {
+                mistyped(node, "Unit node where a String was expected")
+            }
+        }
+    }
+
+    /// Reads the `String` in `slot`, for the `Load` `node`: a new reference
+    /// to it, not a copy.
+    fn load_string(&self, slot: Slot, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
+        match self.load(slot, node)? {
+            Value::Str(text) => Ok(Rc::clone(text)),
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Unit => {
+                mistyped(node, "String load from a slot holding another type")
+            }
+        }
+    }
+
+    /// Evaluates a `StrConcat`, allocating exactly the length the result
+    /// needs.
+    fn concat(&mut self, operands: Operands) -> Result<Rc<str>, Diagnostic> {
+        let lhs = self.string(operands.lhs)?;
+        let rhs = self.string(operands.rhs)?;
+        let mut text = String::with_capacity(lhs.len() + rhs.len());
+        text.push_str(&lhs);
+        text.push_str(&rhs);
+        Ok(Rc::from(text))
+    }
+
+    /// Builds the text of an interpolation, spanning `span`, from its
+    /// `items`: a `StrConst` is literal text, pushed as it is, and any other
+    /// item is a value shown with its `Display`. The text is built in one
+    /// buffer, reserved for the literal pieces and a little per value.
+    fn interpolate(&mut self, items: IrRange, span: Span) -> Result<Rc<str>, Diagnostic> {
+        let items = self.ir.items(items);
+        let estimate = items.iter().fold(0_usize, |total, &item| {
+            let len = match self.ir.get(item).kind {
+                IrKind::StrConst(constant) => self.ir.string(constant).len(),
+                _ => INTERPOLATED_VALUE_ESTIMATE,
+            };
+            total.saturating_add(len)
+        });
+        let mut text = String::with_capacity(estimate);
+        for &item in items {
+            if let IrKind::StrConst(constant) = self.ir.get(item).kind {
+                text.push_str(self.ir.string(constant));
+            } else {
+                let value = self.value(item)?;
+                write!(text, "{value}")
+                    .map_err(|_| internal("showing a value as text failed", span))?;
+            }
+        }
+        Ok(Rc::from(text))
     }
 
     /// A runtime error in a binary operator: the message points at the
@@ -321,6 +641,13 @@ fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
 
+/// Fails with the internal error `message` at `node`: a node of a type its
+/// walker does not handle. Returned directly by the walkers' error arms, so
+/// that they hold no temporary for it (see the note on `Evaluator`).
+fn mistyped<T>(node: &IrNode, message: &'static str) -> Result<T, Diagnostic> {
+    Err(internal(message, node.span))
+}
+
 #[cfg(test)]
 #[expect(
     clippy::float_cmp,
@@ -337,10 +664,31 @@ mod tests {
 
     fn compile(text: &str) -> Ir {
         let source = SourceFile::new("test.gcsl", text).unwrap();
-        let (tokens, names) = tokenize(&source).unwrap();
-        let ast = parse(&tokens, names, &source).unwrap();
+        let (tokens, names, strings) = tokenize(&source).unwrap();
+        let ast = parse(&tokens, names, strings, &source).unwrap();
         let checked = check(&ast).unwrap();
         lower(&ast, &checked).unwrap()
+    }
+
+    fn boolean(text: &str) -> bool {
+        match run(text).unwrap() {
+            Value::Bool(value) => value,
+            other => panic!("{text}: expected a Bool, got {other:?}"),
+        }
+    }
+
+    fn string(text: &str) -> String {
+        match run(text) {
+            Ok(Value::Str(value)) => value.to_string(),
+            other => panic!("{text}: expected a String, got {other:?}"),
+        }
+    }
+
+    /// Checks that each program evaluates to the Bool given.
+    fn booleans(cases: &[(&str, bool)]) {
+        for &(text, expected) in cases {
+            assert_eq!(boolean(text), expected, "{text}");
+        }
     }
 
     fn run(text: &str) -> Result<Value, Diagnostic> {
@@ -623,6 +971,258 @@ mod tests {
             error.message,
             "internal error: frame is smaller than the IR needs"
         );
+    }
+
+    #[test]
+    fn int_comparisons() {
+        booleans(&[
+            ("1 == 1", true),
+            ("1 == 2", false),
+            ("1 != 2", true),
+            ("1 != 1", false),
+            ("1 < 2", true),
+            ("2 < 1", false),
+            ("1 < 1", false),
+            ("1 <= 1", true),
+            ("2 <= 1", false),
+            ("2 > 1", true),
+            ("1 > 1", false),
+            ("1 >= 1", true),
+            ("1 >= 2", false),
+            ("-5 < 3", true),
+            ("(-9223372036854775807 - 1) < 9223372036854775807", true),
+            ("let x = 7\nx // 2 == 3", true),
+        ]);
+    }
+
+    #[test]
+    fn float_comparisons_follow_ieee_754() {
+        booleans(&[
+            ("1.5 == 1.5", true),
+            ("1.5 != 1.5", false),
+            ("1.5 < 2.5", true),
+            ("2.5 <= 2.5", true),
+            ("2.5 > 1", true),
+            ("1 >= 1.5", false),
+            ("0.1 + 0.2 == 0.3", false),
+            ("-0.0 == 0.0", true),
+            ("-0.0 != 0.0", false),
+            ("-0.0 < 0.0", false),
+            ("-0.0 >= 0.0", true),
+            ("1.0 / 0.0 > 1e308", true),
+            ("-1.0 / 0.0 < -1e308", true),
+        ]);
+        // NaN is unequal and unordered to everything, itself included.
+        let nan = "let nan = 0.0 / 0.0\n";
+        for (comparison, expected) in [
+            ("nan == nan", false),
+            ("nan != nan", true),
+            ("nan < nan", false),
+            ("nan <= nan", false),
+            ("nan > nan", false),
+            ("nan >= nan", false),
+            ("nan == 1.0", false),
+            ("nan != 1.0", true),
+            ("nan < 1.0", false),
+            ("1.0 < nan", false),
+            ("nan >= 1.0", false),
+            ("1.0 >= nan", false),
+        ] {
+            assert_eq!(
+                boolean(&format!("{nan}{comparison}")),
+                expected,
+                "{comparison}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_comparisons_are_bytewise() {
+        booleans(&[
+            ("\"a\" < \"b\"", true),
+            ("\"Z\" < \"a\"", true),
+            ("\"\" < \"a\"", true),
+            ("\"ab\" < \"b\"", true),
+            ("\"b\" < \"ab\"", false),
+            ("\"a\" <= \"a\"", true),
+            ("\"a\" > \"A\"", true),
+            ("\"abc\" >= \"abd\"", false),
+            ("\"é\" > \"z\"", true),
+            ("\"a\" == \"a\"", true),
+            ("\"a\" == \"b\"", false),
+            ("\"a\" != \"b\"", true),
+            ("\"\" == \"\"", true),
+            ("\"a\" == \"a \"", false),
+            // Equality compares content, however the strings were built.
+            ("\"{1}{2}\" == \"12\"", true),
+            ("\"a\" + \"b\" == r\"ab\"", true),
+            ("\"\"\"a\"\"\" == \"a\"", true),
+        ]);
+    }
+
+    #[test]
+    fn bool_and_unit_equality() {
+        booleans(&[
+            ("true == true", true),
+            ("false == false", true),
+            ("true == false", false),
+            ("true != false", true),
+            ("false != false", false),
+            ("(1 < 2) == (2 > 1)", true),
+            ("{} == {}", true),
+            ("{} != {}", false),
+            ("let u = {}\nu == { let x = 1 }", true),
+        ]);
+        // Unit operands are still evaluated.
+        assert_eq!(
+            error("{ let y = 1 // 0 } == {}"),
+            ("division by zero".to_owned(), Span::new(12, 14))
+        );
+    }
+
+    #[test]
+    fn logic() {
+        booleans(&[
+            ("true and true", true),
+            ("true and false", false),
+            ("false and true", false),
+            ("true or false", true),
+            ("false or false", false),
+            ("not true", false),
+            ("not false", true),
+            ("not not true", true),
+            ("not 1 == 2 and 3 > 2 or false", true),
+        ]);
+    }
+
+    #[test]
+    fn and_and_or_short_circuit() {
+        // The right operand would fail, so it is never evaluated.
+        booleans(&[
+            ("false and 1 // 0 == 0", false),
+            ("true or 1 // 0 == 0", true),
+            ("not (false and 1 // 0 == 0)", true),
+            ("false and (true or 1 // 0 == 0)", false),
+        ]);
+        // When the left operand does not decide, it is.
+        assert_eq!(
+            error("true and 1 // 0 == 0"),
+            ("division by zero".to_owned(), Span::new(11, 13))
+        );
+        assert_eq!(
+            error("false or 1 // 0 == 0"),
+            ("division by zero".to_owned(), Span::new(11, 13))
+        );
+    }
+
+    #[test]
+    fn if_evaluates_exactly_one_branch() {
+        assert_eq!(int("if true { 1 } else { 1 // 0 }"), 1);
+        assert_eq!(int("if false { 1 // 0 } else { 2 }"), 2);
+        assert_eq!(
+            int("if 1 > 2 { 1 // 0 } else if 2 > 1 { 3 } else { 1 // 0 }"),
+            3
+        );
+        assert_eq!(float("if true { 1.5 } else { 1.0 / 0.0 }"), 1.5);
+        assert!(!boolean("if false { true } else { false }"));
+        assert_eq!(string("if 1 < 2 { \"yes\" } else { \"no\" }"), "yes");
+        assert_eq!(
+            run("if true {} else { let x = 1 // 0 }").unwrap(),
+            Value::Unit
+        );
+        assert_eq!(int("if false { let x = 1 // 0 }\n5"), 5);
+        // The branch taken, and the condition, are evaluated.
+        assert_eq!(
+            error("if true { 1 // 0 } else { 2 }"),
+            ("division by zero".to_owned(), Span::new(12, 14))
+        );
+        assert_eq!(
+            error("if 1 // 0 == 0 { 1 } else { 2 }"),
+            ("division by zero".to_owned(), Span::new(5, 7))
+        );
+        assert_eq!(
+            error("if true { let y = 1 // 0 }"),
+            ("division by zero".to_owned(), Span::new(20, 22))
+        );
+        // Adapted and defaulted branches.
+        assert_eq!(float("if true { 1 } else { 2.5 }"), 1.0);
+        assert_eq!(float("(if false { 1 } else { 2 }) * 0.5"), 1.0);
+        assert_eq!(int("let x = if true { 7 } else { 8 }\nx + 1"), 8);
+    }
+
+    #[test]
+    fn interpolating_every_type() {
+        assert_eq!(
+            string(
+                "\"{1} {2.5} {3.0} {true} {\"s\"} { {} } {1 == 2} {1.0 / 0.0} {0.0 / 0.0} {-0.0}\""
+            ),
+            "1 2.5 3.0 true s () false inf nan -0.0"
+        );
+        assert_eq!(
+            string("let n = 3\nlet s = \"x\"\nlet b = n > 2\n\"{s}{n}{s} {b}\""),
+            "x3x true"
+        );
+        assert_eq!(string("\"{ { let a = 2; a * 3 } }\""), "6");
+        assert_eq!(string("\"{\"\"}\""), "");
+        assert_eq!(string("\"say \\\"{\"hi\"}\\\" {{ok}}\""), "say \"hi\" {ok}");
+        assert_eq!(
+            string("\"status: {if 1 > 2 { \"ok\" } else { \"failed\" }}\""),
+            "status: failed"
+        );
+    }
+
+    #[test]
+    fn nested_interpolation() {
+        assert_eq!(string("\"a{ \"b{ \"c{1}\" }\" }d\""), "abc1d");
+        assert_eq!(string("\"{ \"{ \"{ 1 + 1 }\" }\" }\""), "2");
+        assert_eq!(
+            string("let who = \"world\"\n\"<{ \"{who} and {\"{who}!\"}\" }>\""),
+            "<world and world!>"
+        );
+    }
+
+    #[test]
+    fn interpolation_errors_come_from_its_values() {
+        assert_eq!(
+            error("\"a{1 // 0}\""),
+            ("division by zero".to_owned(), Span::new(5, 7))
+        );
+    }
+
+    #[test]
+    fn concatenation() {
+        assert_eq!(string("\"a\" + \"b\""), "ab");
+        assert_eq!(string("\"\" + \"\""), "");
+        assert_eq!(string("\"x\" + \"{1 + 1}\" + \"y\""), "x2y");
+        assert_eq!(string("let s = \"ab\"\ns + s + s"), "ababab");
+        assert_eq!(string("\"é\" + \"😀\""), "é😀");
+    }
+
+    #[test]
+    fn strings_round_trip_through_variables_and_blocks() {
+        assert_eq!(
+            string("let s = \"hello\"\nlet t = { let u = s; u }\nt"),
+            "hello"
+        );
+        assert_eq!(string("let s = \"a\"\ns := s + \"b\"\n{ s }"), "ab");
+        assert!(boolean("let s = \"x\"\n{ s } == s"));
+        assert_eq!(string("let s = \"q\"\n= { = { s } }"), "q");
+        assert_eq!(run("\"a\"").unwrap().ty(), Ty::String);
+        assert_eq!(run("true").unwrap().ty(), Ty::Bool);
+    }
+
+    #[test]
+    fn loading_a_string_shares_it() {
+        let ir = compile("let s = \"abc\"\nlet t = s\nlet u = s + \"\"");
+        let mut frame = vec![Value::Unit; 3];
+        assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Unit);
+        let [Value::Str(s), Value::Str(t), Value::Str(u)] = &frame[..] else {
+            panic!("expected strings, got {frame:?}");
+        };
+        // A load copies the reference, and concatenation makes a new string.
+        assert!(Rc::ptr_eq(s, t));
+        assert!(!Rc::ptr_eq(s, u));
+        assert_eq!(u.as_ref(), "abc");
     }
 
     #[test]

@@ -12,17 +12,21 @@
 //! not contiguous in the item arena: a nested block's items are allocated
 //! while the outer block's are being parsed. Lists of items are therefore
 //! kept in a separate pool, [`Ast::items`], each list a contiguous
-//! [`ItemRange`] within it. The same pool pattern will serve argument lists.
+//! [`ItemRange`] within it. The parts of interpolated strings live in a pool
+//! of their own in the same way, [`Ast::parts`], and the same pattern will
+//! serve argument lists.
 //!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
 //! `Ast` always has a valid root. The `Ast` also owns the [`Names`] table its
-//! identifiers were interned into.
+//! identifiers were interned into and the [`Strings`] table holding the text
+//! of its string literals.
 
 use std::fmt;
 
 use crate::names::{Name, Names};
 use crate::source::Span;
+use crate::strings::{Quoted, StrId, Strings};
 
 /// Index of an [`Expr`] in the arena of the [`Ast`] (or [`AstBuilder`]) that
 /// allocated it.
@@ -71,19 +75,44 @@ pub struct ItemRange {
     len: u32,
 }
 
+/// The parts of an interpolated string: a contiguous range of the part pool
+/// of the [`Ast`] that allocated it. Resolve it with [`Ast::parts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PartRange {
+    start: u32,
+    len: u32,
+}
+
+/// One part of an interpolated string.
+///
+/// The parts of an [`ExprKind::Interp`] alternate, starting and ending with
+/// a [`StrPart::Lit`], which may be empty: `"a{x}b{y}"` is `a`, `x`, `b`,
+/// `y` and the empty text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StrPart {
+    /// Literal text.
+    Lit(StrId),
+    /// An interpolated expression, whose value is shown as text.
+    Expr(ExprId),
+}
+
 /// A prefix operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     /// `-x`
     Neg,
+    /// `not x`
+    Not,
 }
 
 impl UnaryOp {
-    /// The verb used in diagnostics, e.g. "cannot negate ...".
+    /// The verb used in diagnostics, e.g. "cannot negate ..." or "`not`
+    /// requires Bool operands".
     #[must_use]
     pub const fn verb(self) -> &'static str {
         match self {
             UnaryOp::Neg => "negate",
+            UnaryOp::Not => "not",
         }
     }
 
@@ -92,6 +121,7 @@ impl UnaryOp {
     pub const fn symbol(self) -> &'static str {
         match self {
             UnaryOp::Neg => "-",
+            UnaryOp::Not => "not",
         }
     }
 
@@ -126,11 +156,28 @@ pub enum BinaryOp {
     FloorDiv,
     /// `a % b`, the remainder matching [`BinaryOp::FloorDiv`].
     Rem,
+    /// `a == b`
+    Eq,
+    /// `a != b`
+    Ne,
+    /// `a < b`
+    Lt,
+    /// `a <= b`
+    Le,
+    /// `a > b`
+    Gt,
+    /// `a >= b`
+    Ge,
+    /// `a and b`, short-circuiting.
+    And,
+    /// `a or b`, short-circuiting.
+    Or,
 }
 
 impl BinaryOp {
-    /// The verb used in diagnostics, e.g. "cannot add Int and Float" or
-    /// "cannot take modulo of Float".
+    /// The verb used in diagnostics, e.g. "cannot add Int and Float",
+    /// "cannot take modulo of Float", "cannot compare Int and String" or
+    /// "`and` requires Bool operands".
     #[must_use]
     pub const fn verb(self) -> &'static str {
         match self {
@@ -140,6 +187,14 @@ impl BinaryOp {
             BinaryOp::Div => "divide",
             BinaryOp::FloorDiv => "floor-divide",
             BinaryOp::Rem => "take modulo of",
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => "compare",
+            BinaryOp::And => "and",
+            BinaryOp::Or => "or",
         }
     }
 
@@ -153,7 +208,25 @@ impl BinaryOp {
             BinaryOp::Div => "/",
             BinaryOp::FloorDiv => "//",
             BinaryOp::Rem => "%",
+            BinaryOp::Eq => "==",
+            BinaryOp::Ne => "!=",
+            BinaryOp::Lt => "<",
+            BinaryOp::Le => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::Ge => ">=",
+            BinaryOp::And => "and",
+            BinaryOp::Or => "or",
         }
+    }
+
+    /// Whether this is one of the comparison operators, `==`, `!=`, `<`,
+    /// `<=`, `>` and `>=`.
+    #[must_use]
+    pub const fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
+        )
     }
 
     /// The span of this operator's symbol when it starts at byte `start`.
@@ -170,6 +243,28 @@ pub enum ExprKind {
     Int(i64),
     /// A float literal.
     Float(f64),
+    /// `true` or `false`.
+    Bool(bool),
+    /// A string literal without interpolations.
+    Str(StrId),
+    /// A string literal with interpolations: its parts, alternating literal
+    /// text and expressions (see [`StrPart`]).
+    Interp(PartRange),
+    /// `if COND { ... } else ...`, including `else if` chains and an `if`
+    /// without `else`.
+    If {
+        /// The condition.
+        cond: ExprId,
+        /// The block run when the condition is true.
+        then: ExprId,
+        /// What runs otherwise: a block, another `if` for `else if`, or,
+        /// when the source has no `else`, an empty block the parser adds
+        /// with an empty span at the end of `then`, so that no later stage
+        /// has to handle a missing branch.
+        else_: ExprId,
+        /// Whether the source has an `else`.
+        has_else: bool,
+    },
     /// A prefix operator applied to an operand.
     Unary {
         /// The operator.
@@ -215,7 +310,8 @@ pub struct Expr {
     /// The source it covers. A `Paren` covers its parentheses and a `Block`
     /// its braces, a `Binary` its left operand through its right operand, a
     /// `Unary` its operator through its operand, and an `Ascribe` its
-    /// expression through its type.
+    /// expression through its type. A string literal covers its prefix and
+    /// delimiters, and an `If` its `if` keyword through its last branch.
     pub span: Span,
 }
 
@@ -228,10 +324,23 @@ impl Expr {
             ExprKind::Binary { op, op_start, .. } => Some(op.span_at(op_start)),
             ExprKind::Int(_)
             | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Interp(_)
+            | ExprKind::If { .. }
             | ExprKind::Paren(_)
             | ExprKind::Name(_)
             | ExprKind::Block(_)
             | ExprKind::Ascribe { .. } => None,
+        }
+    }
+
+    /// The span of the `if` keyword, for `If` nodes.
+    #[must_use]
+    pub const fn keyword_span(&self) -> Option<Span> {
+        match self.kind {
+            ExprKind::If { .. } => Some(symbol_span("if", self.span.start)),
+            _ => None,
         }
     }
 }
@@ -307,6 +416,7 @@ pub struct AstBuilder {
     exprs: Vec<Expr>,
     items: Vec<Item>,
     item_lists: Vec<ItemId>,
+    parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
 }
 
@@ -363,6 +473,17 @@ impl AstBuilder {
         }
     }
 
+    /// Appends `parts` to the part pool as one interpolated string's parts
+    /// and returns their range.
+    pub fn push_parts(&mut self, parts: &[StrPart]) -> PartRange {
+        let start = next_id(self.parts.len());
+        self.parts.extend_from_slice(parts);
+        PartRange {
+            start,
+            len: next_id(parts.len()),
+        }
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -394,29 +515,35 @@ impl AstBuilder {
     }
 
     /// Finishes the arenas with `root` as the file's body, taking ownership
-    /// of the `names` its identifiers were interned into.
+    /// of the `names` its identifiers were interned into and the `strings`
+    /// holding the text of its string literals.
     #[must_use]
-    pub fn finish(self, root: ItemRange, names: Names) -> Ast {
+    pub fn finish(self, root: ItemRange, names: Names, strings: Strings) -> Ast {
         Ast {
             exprs: self.exprs,
             items: self.items,
             item_lists: self.item_lists,
+            parts: self.parts,
             type_exprs: self.type_exprs,
             root,
             names,
+            strings,
         }
     }
 }
 
-/// A complete syntax tree: the arenas, the file's body and the names.
+/// A complete syntax tree: the arenas, the file's body, the names and the
+/// string literals' text.
 #[derive(Clone, Debug)]
 pub struct Ast {
     exprs: Vec<Expr>,
     items: Vec<Item>,
     item_lists: Vec<ItemId>,
+    parts: Vec<StrPart>,
     type_exprs: Vec<TypeExpr>,
     root: ItemRange,
     names: Names,
+    strings: Strings,
 }
 
 impl Ast {
@@ -449,6 +576,18 @@ impl Ast {
     pub fn items(&self, range: ItemRange) -> &[ItemId] {
         let start = range.start as usize;
         &self.item_lists[start..start + range.len as usize]
+    }
+
+    /// Returns the parts of the interpolated string `range`, in source
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn parts(&self, range: PartRange) -> &[StrPart] {
+        let start = range.start as usize;
+        &self.parts[start..start + range.len as usize]
     }
 
     /// Returns the type expression `id`.
@@ -488,6 +627,12 @@ impl Ast {
     #[must_use]
     pub fn into_names(self) -> Names {
         self.names
+    }
+
+    /// The text of the tree's string literals.
+    #[must_use]
+    pub fn strings(&self) -> &Strings {
+        &self.strings
     }
 
     /// Number of expression nodes in the arena, which bounds every
@@ -553,8 +698,15 @@ impl Annotate for NoAnnotation {
 ///
 /// Items print as `(let x ...)`, `(let x : Type ...)`, `(rebind x ...)`,
 /// `(result ...)` and `(expr ...)`, followed by their expression; blocks as
-/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`. The
-/// file has no span. There is no trailing newline.
+/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`.
+/// Booleans print as `(bool true)`, string literals as `(str "text")` with
+/// the text quoted and escaped, and interpolated strings as `(interp ...)`
+/// followed by their parts, literal text as `(lit "text")` (which has no
+/// span) and expressions as their nodes. `(if ...)` is followed by its
+/// condition, its block and its else branch, which for an `if` without
+/// `else` is the parser's empty block. Operators print as their symbol,
+/// except negation, `(neg ...)`. The file has no span. There is no trailing
+/// newline.
 pub struct Pretty<'a, A> {
     ast: &'a Ast,
     annotation: &'a A,
@@ -613,8 +765,13 @@ impl<A: Annotate> Pretty<'_, A> {
         match expr.kind {
             ExprKind::Int(value) => write!(f, "int {value}")?,
             ExprKind::Float(value) => write!(f, "float {value:?}")?,
+            ExprKind::Bool(value) => write!(f, "bool {value}")?,
+            ExprKind::Str(id) => write!(f, "str {}", Quoted(self.ast.strings().get(id)))?,
+            ExprKind::Interp(_) => f.write_str("interp")?,
+            ExprKind::If { .. } => f.write_str("if")?,
             ExprKind::Unary { op, .. } => match op {
                 UnaryOp::Neg => f.write_str("neg")?,
+                UnaryOp::Not => f.write_str("not")?,
             },
             ExprKind::Binary { op, .. } => f.write_str(op.symbol())?,
             ExprKind::Paren(_) => f.write_str("paren")?,
@@ -625,7 +782,11 @@ impl<A: Annotate> Pretty<'_, A> {
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
         match expr.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Name(_) => {}
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Name(_) => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::Ascribe { expr: operand, .. } => {
@@ -637,6 +798,29 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.node(f, lhs, depth + 1)?;
                 f.write_str("\n")?;
                 self.node(f, rhs, depth + 1)?;
+            }
+            ExprKind::If {
+                cond, then, else_, ..
+            } => {
+                for child in [cond, then, else_] {
+                    f.write_str("\n")?;
+                    self.node(f, child, depth + 1)?;
+                }
+            }
+            ExprKind::Interp(parts) => {
+                for &part in self.ast.parts(parts) {
+                    f.write_str("\n")?;
+                    match part {
+                        StrPart::Lit(text) => write!(
+                            f,
+                            "{:indent$}(lit {})",
+                            "",
+                            Quoted(self.ast.strings().get(text)),
+                            indent = (depth + 1) * 2
+                        )?,
+                        StrPart::Expr(expr) => self.node(f, expr, depth + 1)?,
+                    }
+                }
             }
             ExprKind::Block(items) => self.items(f, items, depth + 1)?,
         }
@@ -671,7 +855,7 @@ mod tests {
             span,
         });
         let body = builder.push_item_list(&[item]);
-        builder.finish(body, Names::new())
+        builder.finish(body, Names::new(), Strings::new())
     }
 
     #[test]
@@ -710,14 +894,14 @@ mod tests {
         let inner = builder.push_item_list(&items[1..]);
         let outer = builder.push_item_list(&items);
         let empty = builder.push_item_list(&[]);
-        let ast = builder.finish(outer, Names::new());
+        let ast = builder.finish(outer, Names::new(), Strings::new());
         assert_eq!(ast.items(inner), &items[1..]);
         assert_eq!(ast.items(outer), &items[..]);
         assert!(ast.items(empty).is_empty());
         assert_eq!(ast.root_span(), Span::new(0, 3));
         let mut builder = AstBuilder::new();
         let empty = builder.push_item_list(&[]);
-        let ast = builder.finish(empty, Names::new());
+        let ast = builder.finish(empty, Names::new(), Strings::new());
         assert_eq!(ast.root_span(), Span::new(0, 0));
     }
 
@@ -833,7 +1017,7 @@ mod tests {
             span: Span::new(38, 48),
         });
         let root = builder.push_item_list(&[with_type, without_type]);
-        let ast = builder.finish(root, names);
+        let ast = builder.finish(root, names, Strings::new());
         assert_eq!(
             ast.pretty().to_string(),
             "(file\n\
@@ -853,7 +1037,7 @@ mod tests {
     fn empty_file_prints_without_items() {
         let mut builder = AstBuilder::new();
         let root = builder.push_item_list(&[]);
-        let ast = builder.finish(root, Names::new());
+        let ast = builder.finish(root, Names::new(), Strings::new());
         assert_eq!(ast.pretty().to_string(), "(file)");
     }
 
@@ -871,5 +1055,138 @@ mod tests {
         assert_eq!(UnaryOp::Neg.symbol(), "-");
         assert_eq!(BinaryOp::FloorDiv.span_at(4), Span::new(4, 6));
         assert_eq!(UnaryOp::Neg.span_at(4), Span::new(4, 5));
+        for (op, symbol) in [
+            (BinaryOp::Eq, "=="),
+            (BinaryOp::Ne, "!="),
+            (BinaryOp::Lt, "<"),
+            (BinaryOp::Le, "<="),
+            (BinaryOp::Gt, ">"),
+            (BinaryOp::Ge, ">="),
+        ] {
+            assert_eq!(op.symbol(), symbol);
+            assert_eq!(op.verb(), "compare");
+            assert!(op.is_comparison());
+        }
+        assert_eq!(BinaryOp::And.verb(), "and");
+        assert_eq!(BinaryOp::Or.verb(), "or");
+        assert_eq!(UnaryOp::Not.verb(), "not");
+        assert_eq!(BinaryOp::And.symbol(), "and");
+        assert_eq!(BinaryOp::Or.symbol(), "or");
+        assert_eq!(UnaryOp::Not.symbol(), "not");
+        assert_eq!(BinaryOp::Or.span_at(4), Span::new(4, 6));
+        assert_eq!(UnaryOp::Not.span_at(4), Span::new(4, 7));
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::FloorDiv,
+            BinaryOp::Rem,
+            BinaryOp::And,
+            BinaryOp::Or,
+        ] {
+            assert!(!op.is_comparison(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn nodes_with_strings_and_ifs_print_and_resolve() {
+        // if c { "a{x}" } else { "b" }, spans made up.
+        let mut names = Names::new();
+        let (c, x) = (names.intern("c"), names.intern("x"));
+        let mut strings = Strings::new();
+        let (a, empty, b) = (strings.push("a\n"), strings.push(""), strings.push("\"b\""));
+        let mut builder = AstBuilder::new();
+        let cond = builder.alloc(Expr {
+            kind: ExprKind::Name(c),
+            span: Span::new(3, 4),
+        });
+        let x_use = builder.alloc(Expr {
+            kind: ExprKind::Name(x),
+            span: Span::new(10, 11),
+        });
+        let parts =
+            builder.push_parts(&[StrPart::Lit(a), StrPart::Expr(x_use), StrPart::Lit(empty)]);
+        let interp = builder.alloc(Expr {
+            kind: ExprKind::Interp(parts),
+            span: Span::new(7, 13),
+        });
+        let then_item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(interp),
+            span: Span::new(7, 13),
+        });
+        let then_body = builder.push_item_list(&[then_item]);
+        let then = builder.alloc(Expr {
+            kind: ExprKind::Block(then_body),
+            span: Span::new(5, 15),
+        });
+        let lit = builder.alloc(Expr {
+            kind: ExprKind::Str(b),
+            span: Span::new(23, 26),
+        });
+        let else_item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(lit),
+            span: Span::new(23, 26),
+        });
+        let else_body = builder.push_item_list(&[else_item]);
+        let else_ = builder.alloc(Expr {
+            kind: ExprKind::Block(else_body),
+            span: Span::new(21, 28),
+        });
+        let if_ = builder.alloc(Expr {
+            kind: ExprKind::If {
+                cond,
+                then,
+                else_,
+                has_else: true,
+            },
+            span: Span::new(0, 28),
+        });
+        assert_eq!(builder.get(if_).keyword_span(), Some(Span::new(0, 2)));
+        assert_eq!(builder.get(if_).operator_span(), None);
+        assert_eq!(builder.get(cond).keyword_span(), None);
+        let truth = builder.alloc(Expr {
+            kind: ExprKind::Bool(true),
+            span: Span::new(33, 37),
+        });
+        let not = builder.alloc(Expr {
+            kind: ExprKind::Unary {
+                op: UnaryOp::Not,
+                operand: truth,
+            },
+            span: Span::new(29, 37),
+        });
+        let items = [if_, not].map(|value| {
+            builder.alloc_item(Item {
+                kind: ItemKind::Expr(value),
+                span: builder.get(value).span,
+            })
+        });
+        let root = builder.push_item_list(&items);
+        let ast = builder.finish(root, names, strings);
+        assert_eq!(
+            ast.parts(parts),
+            &[StrPart::Lit(a), StrPart::Expr(x_use), StrPart::Lit(empty)]
+        );
+        assert_eq!(ast.strings().get(b), "\"b\"");
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..28\n\
+             \x20   (if @0..28\n\
+             \x20     (name c @3..4)\n\
+             \x20     (block @5..15\n\
+             \x20       (expr @7..13\n\
+             \x20         (interp @7..13\n\
+             \x20           (lit \"a\\n\")\n\
+             \x20           (name x @10..11)\n\
+             \x20           (lit \"\"))))\n\
+             \x20     (block @21..28\n\
+             \x20       (expr @23..26\n\
+             \x20         (str \"\\\"b\\\"\" @23..26)))))\n\
+             \x20 (expr @29..37\n\
+             \x20   (not @29..37\n\
+             \x20     (bool true @33..37))))"
+        );
     }
 }

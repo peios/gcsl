@@ -1,0 +1,9 @@
+# Strings, booleans, comparison and `if`.
+let name = "GCSL"
+let count = 3
+let plural = if count == 1 { "" } else { "s" }
+let summary = "
+    {name} has {count} item{plural}
+    ready: {count > 0 and not (name == "")}
+"
+= summary + "\n" + r"C:\{done}"

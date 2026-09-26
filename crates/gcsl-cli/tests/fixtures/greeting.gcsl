@@ -1,0 +1,2 @@
+let who = "world"
+"hello,\t{who}!\n"

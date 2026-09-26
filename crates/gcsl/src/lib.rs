@@ -6,12 +6,14 @@
 //! module so that tools can stop after any of them:
 //!
 //! 1. [`lexer::tokenize`]: source text to tokens, interning every name into
-//!    a [`names::Names`] table.
+//!    a [`names::Names`] table and storing the processed text of every
+//!    string literal in a [`strings::Strings`] table.
 //! 2. [`parser::parse`]: tokens to an arena-based [`ast::Ast`], which owns
-//!    the names from then on.
+//!    both tables from then on.
 //! 3. [`check::check`]: types for every expression and a storage slot for
 //!    every variable, in the side tables of a [`check::Checked`].
-//! 4. [`lower::lower`]: AST and tables to a type-specialised [`ir::Ir`].
+//! 4. [`lower::lower`]: AST and tables to a type-specialised [`ir::Ir`],
+//!    which holds its own copies of the string literals it uses.
 //! 5. [`eval::eval`]: IR to a [`Value`].
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
@@ -41,6 +43,7 @@ pub mod names;
 pub mod parser;
 pub mod session;
 pub mod source;
+pub mod strings;
 pub mod types;
 pub mod value;
 
@@ -51,11 +54,14 @@ pub use types::Ty;
 pub use value::Value;
 
 /// The deepest nesting accepted, measured as the height of the syntax tree:
-/// a leaf is one level, and every operator, parenthesis, ascription and
-/// block adds one to its tallest child (a block's children being its items'
-/// expressions). Every stage recurses once per level, so the parser rejects
-/// anything deeper with an "expression nested too deeply" error rather than
-/// letting a later stage overflow the stack.
+/// a leaf is one level, and every operator, parenthesis, ascription, block,
+/// `if` and interpolated string adds one to its tallest child (a block's
+/// children being its items' expressions). Every stage recurses once per
+/// level, so the parser rejects anything deeper with an "expression nested
+/// too deeply" error rather than letting a later stage overflow the stack.
+/// The lexer, which recurses through string literals nested in each other's
+/// interpolations, rejects those nested more than this many deep with the
+/// same error.
 ///
 /// The limit counts left-nested chains too: `1 + 1 + ... + 1` with ten
 /// thousand terms is ten thousand levels deep, because each `+` is the left
@@ -79,8 +85,8 @@ pub const STACK_SIZE: usize = 64 * 1024 * 1024;
 /// Returns the diagnostics of the first stage that fails: one for a lexical,
 /// syntax or runtime error, and every type error found by the checker.
 pub fn run(source: &SourceFile) -> Result<Value, Vec<Diagnostic>> {
-    let (tokens, names) = lexer::tokenize(source).map_err(|error| vec![error])?;
-    let ast = parser::parse(&tokens, names, source).map_err(|error| vec![error])?;
+    let (tokens, names, strings) = lexer::tokenize(source).map_err(|error| vec![error])?;
+    let ast = parser::parse(&tokens, names, strings, source).map_err(|error| vec![error])?;
     let checked = check::check(&ast)?;
     let ir = lower::lower(&ast, &checked).map_err(|error| vec![error.into()])?;
     eval::eval(&ir).map_err(|error| vec![error])

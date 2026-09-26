@@ -69,11 +69,14 @@ impl Session {
     /// Runs `source`, committing its scope only on success. On failure the
     /// caller must forget the names it interned.
     fn eval_uncommitted(&mut self, source: &SourceFile) -> Result<Value, Vec<Diagnostic>> {
-        let tokens = lexer::tokenize_with(source, &mut self.names).map_err(|error| vec![error])?;
+        let (tokens, strings) =
+            lexer::tokenize_with(source, &mut self.names).map_err(|error| vec![error])?;
         let (builder, root) = parser::parse_parts(&tokens, source).map_err(|error| vec![error])?;
         // The tree owns the names while it lives; take them back before
-        // anything can fail.
-        let ast = builder.finish(root, mem::take(&mut self.names));
+        // anything can fail. The string table belongs to this input alone:
+        // lowering copies what the IR needs out of it, and it is dropped
+        // with the tree.
+        let ast = builder.finish(root, mem::take(&mut self.names), strings);
         let compiled = compile(&ast, self.scope.clone());
         self.names = ast.into_names();
         let (ir, scope) = compiled?;
@@ -215,5 +218,38 @@ mod tests {
         assert_eq!(value(&mut session, "7 / 2"), Value::Float(3.5));
         assert_eq!(value(&mut session, "= 1 + 1"), Value::Int(2));
         assert_eq!(value(&mut session, "let u = {}\nu"), Value::Unit);
+        assert_eq!(value(&mut session, "1 < 2"), Value::Bool(true));
+        assert_eq!(
+            value(&mut session, "\"a\" + \"b\""),
+            Value::Str("ab".into())
+        );
+    }
+
+    #[test]
+    fn strings_and_bools_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let greeting = \"hello\"");
+        value(&mut session, "let loud = true");
+        // The first input's string table is gone; its string lives on in
+        // the frame.
+        assert_eq!(
+            value(&mut session, "\"{greeting}, world\""),
+            Value::Str("hello, world".into())
+        );
+        value(&mut session, "greeting := greeting + \"!\"");
+        assert_eq!(
+            value(&mut session, "if loud { greeting } else { \"quiet\" }"),
+            Value::Str("hello!".into())
+        );
+        assert_eq!(
+            value(&mut session, "greeting == \"hello!\""),
+            Value::Bool(true)
+        );
+        // A failing input leaves string variables intact.
+        assert_eq!(
+            messages(&mut session, "greeting := greeting + 1"),
+            vec!["cannot add String and Int"]
+        );
+        assert_eq!(value(&mut session, "greeting"), Value::Str("hello!".into()));
     }
 }
