@@ -1,0 +1,12 @@
+[package]
+name = "gcsl"
+description = "The GCSL language: lexer, parser, type checker and evaluator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

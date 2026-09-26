@@ -1,0 +1,2 @@
+# Mixed Int and Float arithmetic.
+(7 // 2) / 2

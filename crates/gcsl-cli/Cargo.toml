@@ -1,0 +1,21 @@
+[package]
+name = "gcsl-cli"
+description = "Command-line interface for the GCSL language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gcsl"
+path = "src/main.rs"
+
+[dependencies]
+gcsl = { path = "../gcsl" }
+clap = { version = "4.6", features = ["derive"] }
+# Default features are off: they only add persistent (file-backed) history,
+# which the REPL deliberately does not use.
+rustyline = { version = "18", default-features = false }
+
+[lints]
+workspace = true
