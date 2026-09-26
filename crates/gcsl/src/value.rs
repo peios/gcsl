@@ -612,6 +612,8 @@ mod tests {
             frame_size: 0,
             param_count: 0,
             capture_count: 1,
+            // The body is a leaf.
+            height: 1,
             name: None,
             display: Box::from(display),
             slot_names: Box::default(),

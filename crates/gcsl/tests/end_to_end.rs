@@ -492,13 +492,25 @@ fn every_stage_handles_maximum_depth() {
         let path = format!("a{}", ".b".repeat((depth - 1) / 2));
         let dotted = source(&format!("let {path} = 1\nlet {path} = 2\n{path}"));
         // Calls nested in each other's arguments: N calls around a literal
-        // are N + 1 levels, and each is made from its caller's frame, so
-        // they nest in Rust but not in GCSL.
-        let calls = source(&format!(
-            "fn id(x: Int): Int {{ x }}\n{}1{}",
-            "id(".repeat(depth - 1),
-            ")".repeat(depth - 1)
-        ));
+        // are N + 1 levels of the syntax tree, the deepest the parser
+        // accepts, and each is made from its caller's frame. In the IR each
+        // call is two levels, the call and its argument, so the calls
+        // deeper than the nesting budget allows fail at runtime.
+        let nested_calls = |calls: usize| {
+            source(&format!(
+                "fn id(x: Int): Int {{ x }}\n{}1{}",
+                "id(".repeat(calls),
+                ")".repeat(calls)
+            ))
+        };
+        let calls = nested_calls(depth - 1);
+        // As many as the budget allows: the innermost call, at depth
+        // 2N - 1 in the file's body, enters its frame at 2N - 1 +
+        // CALL_LEVELS levels, and `id`'s body, a block around a load, is 2
+        // tall, so 2N - 1 + CALL_LEVELS + 2 <= MAX_DEPTH.
+        let budgeted = (depth - gcsl::CALL_LEVELS - 1) / 2;
+        let calls_within_budget = nested_calls(budgeted);
+        let calls_past_budget = nested_calls(budgeted + 1);
         // Function expressions nested in each other's bodies, two levels
         // each, the innermost using a variable of the top level, which every
         // one of them therefore captures.
@@ -514,28 +526,33 @@ fn every_stage_handles_maximum_depth() {
         // whatever the node, except through a block's items, so the trees
         // printed here already cover every way they recurse; printing the
         // others would only add time.
+        // Each program's value, or the message of the runtime error it
+        // fails with.
         for (file, expected, print) in [
-            (&chain, chain_value, true),
-            (&nested, nested_value, true),
-            (&nested_blocks, Value::Int(1), true),
-            (&mixed, mixed_value, true),
-            (&nested_strings, Value::Str("1".into()), false),
-            (&else_ifs, Value::Int(7), false),
-            (&floats, floats_value, false),
-            (&bools, Value::Bool(true), false),
-            (&concatenation, concatenation_value, false),
-            (&dotted, Value::Int(2), false),
+            (&chain, Ok(chain_value), true),
+            (&nested, Ok(nested_value), true),
+            (&nested_blocks, Ok(Value::Int(1)), true),
+            (&mixed, Ok(mixed_value), true),
+            (&nested_strings, Ok(Value::Str("1".into())), false),
+            (&else_ifs, Ok(Value::Int(7)), false),
+            (&floats, Ok(floats_value), false),
+            (&bools, Ok(Value::Bool(true)), false),
+            (&concatenation, Ok(concatenation_value), false),
+            (&dotted, Ok(Value::Int(2)), false),
             // Printing a call recurses through its arguments; a function's
             // body prints as the blocks above do.
-            (&calls, Value::Int(1), true),
-            (&functions, Value::Int(1), false),
+            (&calls, Err(BUDGET_ERROR), true),
+            (&calls_within_budget, Ok(Value::Int(1)), false),
+            (&calls_past_budget, Err(BUDGET_ERROR), false),
+            (&functions, Ok(Value::Int(1)), false),
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
             let mut types = TypeTable::new();
             let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
             let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
-            assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
+            let value = gcsl::eval::eval(&ir).map_err(|diagnostic| diagnostic.message);
+            assert_eq!(value, expected.map_err(str::to_owned));
             if print {
                 let annotation = checked.types.annotation(&types, ast.names());
                 assert!(!ast.pretty().to_string().is_empty());
@@ -645,63 +662,165 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
     });
 }
 
-/// `STACK_SIZE` covers `MAX_CALL_DEPTH` calls in progress with an
-/// expression as deep as the parser accepts evaluated in the deepest of
-/// them, whatever kind of nesting it is, unoptimised.
+/// The error of a call past the nesting budget.
+const BUDGET_ERROR: &str =
+    "call nested too deeply: the limit is 10000 levels of nesting, calls included";
+
+/// The note of a call past the nesting budget.
+const BUDGET_NOTE: &str = "every level of expression nesting around a call counts, and so does \
+                           the body of the function called; GCSL does not eliminate tail calls, \
+                           so recursion this deep is not supported";
+
+/// A recursion that used to overflow the stack of an unoptimised build, when
+/// only the number of calls was limited, now fails with a diagnostic.
 #[test]
-fn the_deepest_calls_with_the_deepest_expression() {
+fn a_recursion_past_the_nesting_budget_is_a_diagnostic_not_a_crash() {
     on_recommended_stack(|| {
-        // The function around the expression takes four levels: itself,
-        // its body, the `if` and its block.
-        let levels = gcsl::MAX_DEPTH - 4;
-        let calls = gcsl::MAX_CALL_DEPTH - 1;
-        let recurse = |ret: &str, deepest: &str| {
-            source(&format!(
-                "fn f(n: Int): {ret} {{ if n == 0 {{ {deepest} }} else {{ f(n - 1) }} }}\n\
-                 f({calls})"
-            ))
-        };
-        let terms = i64::try_from(levels).unwrap();
-        let chain = recurse("Int", &format!("1{}", " + 1".repeat(levels - 1)));
-        let pairs = (levels - 1) / 2;
-        let negations = recurse(
-            "Int",
-            &format!("{}1{}", "-(".repeat(pairs), ")".repeat(pairs)),
+        // 999 calls, each made 60 levels deep in its function's body.
+        let text = format!(
+            "fn f(n: Int): Int {{ if n == 0 {{ 0 }} else {{ {}f(n - 1){} }} }}\nf(998)",
+            "(".repeat(60),
+            " + 0)".repeat(60)
         );
-        let literals = levels - 1;
-        let strings = recurse(
-            "String",
-            &format!("{}n{}", "\"{".repeat(literals), "}\"".repeat(literals)),
-        );
-        let blocks = (levels - 1) / 2;
-        let nested_blocks = recurse(
-            "Int",
-            &format!("{}n{}", "{".repeat(blocks), "}".repeat(blocks)),
-        );
-        let outer = 2_000;
-        let mixed = recurse(
-            "Int",
-            &format!(
-                "{}n{}{}",
-                "{ let v = 1\n".repeat(outer),
-                " + v".repeat(levels - outer - 1),
-                "\n}".repeat(outer)
-            ),
-        );
-        for (file, expected) in [
-            (&chain, Value::Int(terms)),
-            (
-                &negations,
-                Value::Int(if pairs.is_multiple_of(2) { 1 } else { -1 }),
-            ),
-            (&strings, Value::Str("0".into())),
-            (&nested_blocks, Value::Int(0)),
-            (
-                &mixed,
-                Value::Int(i64::try_from(levels - outer - 1).unwrap()),
-            ),
-        ] {
-            assert_eq!(run(file.text()).unwrap(), expected);
+        let diagnostics = run(&text).unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, BUDGET_ERROR);
+        assert_eq!(diagnostics[0].notes, vec![BUDGET_NOTE]);
+        // At the recursive call that would have exceeded the budget.
+        let start = u32::try_from(text.find("f(n - 1)").unwrap()).unwrap();
+        assert_eq!(diagnostics[0].span, gcsl::Span::new(start, start + 8));
+    });
+}
+
+/// A kind of nesting to wrap a recursive call in.
+struct Nesting {
+    /// What it is, for failure messages.
+    name: &'static str,
+    /// The return type of the function whose call it wraps.
+    ret: &'static str,
+    /// Wraps an expression in `WRAP` levels of the nesting.
+    wrap: fn(&str) -> String,
+    /// The value of the recursion that makes the number of calls given.
+    value: fn(i64) -> Value,
+}
+
+/// The levels of nesting that
+/// `the_nesting_budget_fits_the_stack_for_every_kind_of_nesting` wraps each
+/// recursive call in.
+const WRAP: usize = 60;
+
+/// `STACK_SIZE` covers the nesting budget, unoptimised, whatever kind of
+/// nesting the calls are made from: for each costly kind, a recursion whose
+/// recursive call is wrapped in that nesting, and whose deepest frame is as
+/// tall, makes as many calls as the budget allows, which takes its nesting
+/// to exactly `MAX_DEPTH` levels, and one more call fails.
+#[test]
+fn the_nesting_budget_fits_the_stack_for_every_kind_of_nesting() {
+    on_recommended_stack(|| {
+        let kinds = [
+            Nesting {
+                name: "additions",
+                ret: "Int",
+                wrap: |inner| format!("{inner}{}", " + 1".repeat(WRAP)),
+                // `f(0)` is `-1 + WRAP`, and each call adds `WRAP`.
+                value: |calls| Value::Int(calls * i64::try_from(WRAP).unwrap() - 1),
+            },
+            Nesting {
+                name: "negations",
+                ret: "Int",
+                wrap: |inner| format!("{}{inner}{}", "-(".repeat(WRAP), ")".repeat(WRAP)),
+                // An even number of negations.
+                value: |_| Value::Int(-1),
+            },
+            Nesting {
+                name: "interpolated strings",
+                ret: "String",
+                wrap: |inner| format!("{}{inner}{}", "\"{".repeat(WRAP), "}\"".repeat(WRAP)),
+                value: |_| Value::Str("-1".into()),
+            },
+            Nesting {
+                name: "nested blocks",
+                ret: "Int",
+                wrap: |inner| format!("{}{inner}{}", "{ ".repeat(WRAP), " }".repeat(WRAP)),
+                value: |_| Value::Int(-1),
+            },
+            Nesting {
+                name: "blocks with a declaration each",
+                ret: "Int",
+                // Half the levels are blocks, and half additions of the
+                // variables they declare.
+                wrap: |inner| {
+                    format!(
+                        "{}{inner}{}{}",
+                        "{ let v = 1\n".repeat(WRAP / 2),
+                        " + v".repeat(WRAP / 2),
+                        "\n}".repeat(WRAP / 2)
+                    )
+                },
+                value: |calls| Value::Int(calls * i64::try_from(WRAP / 2).unwrap() - 1),
+            },
+        ];
+        // In the function's body, the block (0), the `if` (1) and the
+        // branch's block (2) are around the wrapping, so the recursive call
+        // is at depth `WRAP + 3`, and it is as tall as its argument, its
+        // subtraction and its load: the body is `WRAP + 7` tall, and so is
+        // the other branch, whose negations and subtraction stand in for
+        // the call.
+        let depth = WRAP + 3;
+        let height = WRAP + 7;
+        let step = depth + gcsl::CALL_LEVELS;
+        // The first call, `padding + 1` deep in the file's body, enters its
+        // frame at `padding + 1 + CALL_LEVELS` levels, and each nested call
+        // `step` further in. With the padding making up the remainder, the
+        // deepest frame's body reaches exactly `MAX_DEPTH`.
+        let room = gcsl::MAX_DEPTH - height - gcsl::CALL_LEVELS - 1;
+        let padding = room % step;
+        let calls = 1 + room / step;
+        assert!(calls > 100, "{calls}");
+        for Nesting {
+            name: kind,
+            ret,
+            wrap,
+            value,
+        } in kinds
+        {
+            // `f(n)` makes n + 1 calls.
+            let program = |calls: usize, padding: usize| {
+                format!(
+                    "fn f(n: Int): {ret} {{ if n == 0 {{ {} }} else {{ {} }} }}\n{}f({}){}",
+                    wrap("-(-(n - 1))"),
+                    wrap("f(n - 1)"),
+                    "{ ".repeat(padding),
+                    calls - 1,
+                    " }".repeat(padding)
+                )
+            };
+            let text = program(calls, padding);
+            let file = source(&text);
+            let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+            assert_eq!(ir.function_count(), 1, "{kind}");
+            let gcsl::ir::IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+                panic!("{kind}: the root is not a block");
+            };
+            let gcsl::ir::IrKind::Store(_, closure) = ir.get(ir.items(items)[0]).kind else {
+                panic!("{kind}: the first item is not a store");
+            };
+            let gcsl::ir::IrKind::MakeClosure { function, .. } = ir.get(closure).kind else {
+                panic!("{kind}: the function item is not a closure");
+            };
+            assert_eq!(ir.function(function).height as usize, height, "{kind}");
+            let expected = value(i64::try_from(calls).unwrap());
+            assert_eq!(gcsl::eval::eval(&ir), Ok(expected), "{kind}");
+            // One more call is past the budget, and so is one more level of
+            // padding: the budget is used exactly.
+            for past in [program(calls + 1, padding), program(calls, padding + 1)] {
+                let diagnostics = run(&past).unwrap_err();
+                assert_eq!(diagnostics[0].message, BUDGET_ERROR, "{kind}");
+            }
         }
     });
 }

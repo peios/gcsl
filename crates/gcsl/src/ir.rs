@@ -61,6 +61,15 @@
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
 //! value is passed as.
 //!
+//! Calls nest on the Rust stack, so the evaluator keeps them within a
+//! budget of nesting levels, [`crate::MAX_DEPTH`], which they share with
+//! expressions (see [`crate::CALL_LEVELS`]). For it, every
+//! [`IrKind::Call`] records its depth in the body of the frame it is
+//! evaluated in, the body node being at depth 0, and every function the
+//! height of its body, [`FnCode::height`]: both counted in nodes, through
+//! the children that `IrKind::children` lists. Lowering computes them once,
+//! after building the nodes; the evaluator only adds and compares.
+//!
 //! An `Ir` is shared, by reference count, between the evaluator and every
 //! closure made from its code, and records which session input it was
 //! lowered from, [`Ir::input`], so that a runtime error in a function of an
@@ -97,6 +106,18 @@ impl IrId {
 pub struct IrRange {
     start: u32,
     len: u32,
+}
+
+impl IrRange {
+    /// The nodes of this list in `pool`, the item pool holding it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list does not belong to `pool`.
+    fn resolve(self, pool: &[IrId]) -> &[IrId] {
+        let start = self.start as usize;
+        &pool[start..start + self.len as usize]
+    }
 }
 
 /// Index of a string constant in its [`Ir`]'s table. Resolve it with
@@ -373,6 +394,12 @@ pub enum IrKind {
         args: IrRange,
         /// The kind of the call's value: its function's return type's.
         kind: ValueKind,
+        /// The call's depth in the body of the frame it is evaluated in,
+        /// whose body node is at depth 0, for the nesting budget (see
+        /// [`crate::MAX_DEPTH`]). Lowering sets it once every node is built;
+        /// a depth past `u16::MAX` is stored as `u16::MAX`, which changes
+        /// nothing, since any depth past `MAX_DEPTH` exceeds the budget.
+        depth: u16,
     },
     /// One argument of a [`IrKind::Call`], and only ever among its
     /// arguments: `value`, evaluated in the caller's frame, passed as
@@ -390,7 +417,93 @@ pub enum IrKind {
     LoadCallee,
 }
 
+// A call's depth is a `u16` (see `IrKind::Call`), which keeps `IrNode` at
+// 24 bytes. Storing depths past `u16::MAX` as `u16::MAX` is only harmless
+// while the budget is within a `u16`.
+const _: () = assert!(
+    crate::MAX_DEPTH <= u16::MAX as usize,
+    "a call's depth is a u16, so MAX_DEPTH must fit in one"
+);
+
 impl IrKind {
+    /// The children of a node of this kind, in order, which are the nodes
+    /// in `pool`, the item pool, of any list it has: an operator's operands,
+    /// an `if`'s condition and branches, a block's items and then its
+    /// result, a call's callee and then its arguments, an argument's value,
+    /// a store's value, a field access's record, an update's record and
+    /// value, an interpolation's pieces, a record's values, and a closure's
+    /// captures. A closure's function is not a child: its body is evaluated
+    /// in a frame of its own. This is the one list of every node's children,
+    /// and its match is exhaustive, so a new kind of node cannot be missed:
+    /// [`Ir::pretty`] prints the children it gives, and lowering's walk that
+    /// computes call depths and body heights follows them, and the two must
+    /// agree.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a list of this node does not belong to `pool`.
+    pub(crate) fn children(self, pool: &[IrId]) -> impl DoubleEndedIterator<Item = IrId> + '_ {
+        const NONE: [Option<IrId>; 3] = [None; 3];
+        // The child before the list, the list, and the children after it.
+        let (head, list, tail): (Option<IrId>, &[IrId], [Option<IrId>; 3]) = match self {
+            IrKind::IntConst(_)
+            | IrKind::FloatConst(_)
+            | IrKind::BoolConst(_)
+            | IrKind::StrConst(_)
+            | IrKind::Empty
+            | IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::LoadCallee => (None, &[], NONE),
+            IrKind::IntNeg(operand)
+            | IrKind::FloatNeg(operand)
+            | IrKind::IntToFloat(operand)
+            | IrKind::Not(operand)
+            | IrKind::Field {
+                record: operand, ..
+            }
+            | IrKind::Store(_, operand)
+            | IrKind::Arg { value: operand, .. } => (None, &[], [Some(operand), None, None]),
+            IrKind::IntAdd(Operands { lhs, rhs, .. })
+            | IrKind::IntSub(Operands { lhs, rhs, .. })
+            | IrKind::IntMul(Operands { lhs, rhs, .. })
+            | IrKind::IntFloorDiv(Operands { lhs, rhs, .. })
+            | IrKind::IntRem(Operands { lhs, rhs, .. })
+            | IrKind::FloatAdd(Operands { lhs, rhs, .. })
+            | IrKind::FloatSub(Operands { lhs, rhs, .. })
+            | IrKind::FloatMul(Operands { lhs, rhs, .. })
+            | IrKind::FloatDiv(Operands { lhs, rhs, .. })
+            | IrKind::StrConcat(Operands { lhs, rhs, .. })
+            | IrKind::IntCmp(_, Operands { lhs, rhs, .. })
+            | IrKind::FloatCmp(_, Operands { lhs, rhs, .. })
+            | IrKind::StrCmp(_, Operands { lhs, rhs, .. })
+            | IrKind::BoolEq(_, Operands { lhs, rhs, .. })
+            | IrKind::RecordSame(Operands { lhs, rhs, .. })
+            | IrKind::RecordNotSame(Operands { lhs, rhs, .. })
+            | IrKind::And(Operands { lhs, rhs, .. })
+            | IrKind::Or(Operands { lhs, rhs, .. })
+            | IrKind::RecordEq(ShapedOperands { lhs, rhs, .. })
+            | IrKind::RecordNe(ShapedOperands { lhs, rhs, .. })
+            | IrKind::UpdateField {
+                record: lhs,
+                value: rhs,
+                ..
+            } => (None, &[], [Some(lhs), Some(rhs), None]),
+            IrKind::If { cond, then, else_ } => (None, &[], [Some(cond), Some(then), Some(else_)]),
+            IrKind::Interp(items)
+            | IrKind::MakeRecord { values: items, .. }
+            | IrKind::MakeClosure {
+                captures: items, ..
+            } => (None, items.resolve(pool), NONE),
+            IrKind::Block { items, result } => {
+                (None, items.resolve(pool), [Some(result), None, None])
+            }
+            IrKind::Call { callee, args, .. } => (Some(callee), args.resolve(pool), NONE),
+        };
+        head.into_iter()
+            .chain(list.iter().copied())
+            .chain(tail.into_iter().flatten())
+    }
+
     /// The source symbol of an operator node, or `None` for every other
     /// node, including the implicit [`IrKind::IntToFloat`].
     #[must_use]
@@ -563,6 +676,11 @@ pub struct FnCode {
     pub param_count: u32,
     /// The number of values a closure of the function captures.
     pub capture_count: u32,
+    /// The height of the body: the number of nodes on the longest path
+    /// from the body node to a leaf, a leaf being 1. A call charges it to
+    /// the nesting budget up front (see [`crate::MAX_DEPTH`]). Lowering
+    /// sets it once every node is built.
+    pub height: u32,
     /// The name the function refers to itself by, if it has one: the
     /// `let`, field or named function item it initialises. For
     /// [`Ir::pretty`].
@@ -618,8 +736,34 @@ impl Ir {
     /// Panics if `range` does not belong to this IR.
     #[must_use]
     pub fn items(&self, range: IrRange) -> &[IrId] {
-        let start = range.start as usize;
-        &self.item_lists[start..start + range.len as usize]
+        range.resolve(&self.item_lists)
+    }
+
+    /// The children of node `id`, in order: see [`IrKind::children`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this IR.
+    pub(crate) fn children(&self, id: IrId) -> impl DoubleEndedIterator<Item = IrId> + '_ {
+        self.get(id).kind.children(&self.item_lists)
+    }
+
+    /// Every call in the frame whose body is `body`, with its depth and
+    /// span, in the order a depth-first walk meets them, for tests. The
+    /// calls in the bodies of the functions the frame makes closures of are
+    /// not in it.
+    #[cfg(test)]
+    pub(crate) fn calls_in(&self, body: IrId) -> Vec<(u16, Span)> {
+        let mut calls = Vec::new();
+        let mut pending = vec![body];
+        while let Some(id) = pending.pop() {
+            let node = self.get(id);
+            if let IrKind::Call { depth, .. } = node.kind {
+                calls.push((depth, node.span));
+            }
+            pending.extend(self.children(id).rev());
+        }
+        calls
     }
 
     /// Returns the string constant `id`.
@@ -799,8 +943,9 @@ impl Ir {
     /// ...)`, a call its callee and then its arguments, each as
     /// `(arg 0 @4..5 ...)` with the parameter it fills, and the reads of a
     /// capture and of the callee as `(load-capture 0 @4..5)` and
-    /// `(load-callee @4..5)`. After the root, each function is shown on a
-    /// line of its own as `fn #0 name (frame 3, params 2, captures 1)`, or
+    /// `(load-callee @4..5)`. A call's depth is not shown. After the root,
+    /// each function is shown on a line of its own as
+    /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
     /// `fn #1 (frame ...)` if it has no name, followed by its body, whose
     /// slots are named by its own frame's variables. There is no trailing
     /// newline.
@@ -906,10 +1051,79 @@ impl IrBuilder {
     }
 
     /// Finishes a program without functions, lowered from input 0, for
-    /// building IR by hand in tests.
+    /// building IR by hand in tests: its calls are given their depths as
+    /// lowering gives them.
     #[cfg(test)]
-    pub(crate) fn finish(self, root: IrId, frame_size: u32, slot_names: Vec<Name>) -> Ir {
+    pub(crate) fn finish(mut self, root: IrId, frame_size: u32, slot_names: Vec<Name>) -> Ir {
+        self.measure(root, &mut []);
         self.finish_program(root, (frame_size, slot_names), Vec::new(), 0)
+    }
+
+    /// Gives every [`IrKind::Call`] of the program whose root is `root` and
+    /// whose functions are `functions` its depth in its frame, and every
+    /// function its body's height, [`FnCode::height`]: one walk of the root
+    /// and one of each function's body, through [`IrKind::children`]. The
+    /// heights of all the nodes are kept in one vector, and the walks share
+    /// one stack.
+    ///
+    /// The nodes of each frame form a tree, apart from the record nodes an
+    /// update chain shares between an update and the field access into the
+    /// record it updates (see [`crate::lower`]). The walk visits such a node
+    /// once, from the first parent it reaches it by, and every other parent
+    /// takes its height as computed then.
+    pub(crate) fn measure(&mut self, root: IrId, functions: &mut [FnCode]) {
+        // A node's height, or 0 while it is unvisited: a height is at
+        // least 1.
+        let mut heights = vec![0_u32; self.nodes.len()];
+        let mut stack = Vec::new();
+        self.walk(root, &mut heights, &mut stack);
+        for code in functions {
+            code.height = self.walk(code.body, &mut heights, &mut stack);
+        }
+    }
+
+    /// Walks the frame whose body is `body` depth first, giving each call
+    /// its depth on the way down and each node its height in `heights` on
+    /// the way up, and returns the body's height. Iterative, with `stack`
+    /// as the work list, since a body can be [`crate::MAX_DEPTH`] deep: each
+    /// entry is a node, its depth, and whether its children have been
+    /// pushed, in which case they have all been walked when it is popped
+    /// again.
+    fn walk(&mut self, body: IrId, heights: &mut [u32], stack: &mut Vec<(IrId, u32, bool)>) -> u32 {
+        let Self {
+            nodes, item_lists, ..
+        } = self;
+        stack.push((body, 0, false));
+        while let Some((id, depth, entered)) = stack.pop() {
+            let (Some(node), Some(&height)) = (nodes.get_mut(id.index()), heights.get(id.index()))
+            else {
+                continue;
+            };
+            if entered {
+                let tallest = node
+                    .kind
+                    .children(item_lists)
+                    .filter_map(|child| heights.get(child.index()).copied())
+                    .max()
+                    .unwrap_or(0);
+                if let Some(entry) = heights.get_mut(id.index()) {
+                    *entry = tallest.saturating_add(1);
+                }
+            } else if height == 0 {
+                if let IrKind::Call {
+                    depth: call_depth, ..
+                } = &mut node.kind
+                {
+                    *call_depth = u16::try_from(depth).unwrap_or(u16::MAX);
+                }
+                stack.push((id, depth, true));
+                // Reversed, so that the children are walked in order.
+                for child in node.kind.children(item_lists).rev() {
+                    stack.push((child, depth.saturating_add(1), false));
+                }
+            }
+        }
+        heights.get(body.index()).copied().unwrap_or(0)
     }
 
     /// Finishes the program whose root is `root`, whose root frame has
@@ -1032,94 +1246,9 @@ impl Pretty<'_> {
         write!(f, " @{}", node.span)?;
         // The children, each on a line of its own: inline rather than in a
         // helper, so that printing recurses one frame per level.
-        match node.kind {
-            IrKind::IntConst(_)
-            | IrKind::FloatConst(_)
-            | IrKind::BoolConst(_)
-            | IrKind::StrConst(_)
-            | IrKind::Empty
-            | IrKind::Load(..)
-            | IrKind::LoadCapture(..)
-            | IrKind::LoadCallee => {}
-            IrKind::IntNeg(operand)
-            | IrKind::FloatNeg(operand)
-            | IrKind::IntToFloat(operand)
-            | IrKind::Not(operand)
-            | IrKind::Field {
-                record: operand, ..
-            }
-            | IrKind::Store(_, operand)
-            | IrKind::Arg { value: operand, .. } => {
-                f.write_str("\n")?;
-                self.node(f, operand, depth + 1)?;
-            }
-            IrKind::Call { callee, args, .. } => {
-                f.write_str("\n")?;
-                self.node(f, callee, depth + 1)?;
-                for &arg in self.ir.items(args) {
-                    f.write_str("\n")?;
-                    self.node(f, arg, depth + 1)?;
-                }
-            }
-            IrKind::IntAdd(operands)
-            | IrKind::IntSub(operands)
-            | IrKind::IntMul(operands)
-            | IrKind::IntFloorDiv(operands)
-            | IrKind::IntRem(operands)
-            | IrKind::FloatAdd(operands)
-            | IrKind::FloatSub(operands)
-            | IrKind::FloatMul(operands)
-            | IrKind::FloatDiv(operands)
-            | IrKind::StrConcat(operands)
-            | IrKind::IntCmp(_, operands)
-            | IrKind::FloatCmp(_, operands)
-            | IrKind::StrCmp(_, operands)
-            | IrKind::BoolEq(_, operands)
-            | IrKind::RecordSame(operands)
-            | IrKind::RecordNotSame(operands)
-            | IrKind::And(operands)
-            | IrKind::Or(operands) => {
-                f.write_str("\n")?;
-                self.node(f, operands.lhs, depth + 1)?;
-                f.write_str("\n")?;
-                self.node(f, operands.rhs, depth + 1)?;
-            }
-            IrKind::RecordEq(ShapedOperands { lhs, rhs, .. })
-            | IrKind::RecordNe(ShapedOperands { lhs, rhs, .. })
-            | IrKind::UpdateField {
-                record: lhs,
-                value: rhs,
-                ..
-            } => {
-                f.write_str("\n")?;
-                self.node(f, lhs, depth + 1)?;
-                f.write_str("\n")?;
-                self.node(f, rhs, depth + 1)?;
-            }
-            IrKind::If { cond, then, else_ } => {
-                for child in [cond, then, else_] {
-                    f.write_str("\n")?;
-                    self.node(f, child, depth + 1)?;
-                }
-            }
-            IrKind::Interp(items)
-            | IrKind::MakeRecord { values: items, .. }
-            | IrKind::MakeClosure {
-                captures: items, ..
-            } => {
-                for &item in self.ir.items(items) {
-                    f.write_str("\n")?;
-                    self.node(f, item, depth + 1)?;
-                }
-            }
-            IrKind::Block { items, result } => {
-                for &item in self.ir.items(items) {
-                    f.write_str("\n")?;
-                    self.node(f, item, depth + 1)?;
-                }
-                f.write_str("\n")?;
-                self.node(f, result, depth + 1)?;
-            }
+        for child in self.ir.children(id) {
+            f.write_str("\n")?;
+            self.node(f, child, depth + 1)?;
         }
         f.write_str(")")
     }
@@ -1135,8 +1264,8 @@ impl fmt::Display for Pretty<'_> {
             }
             writeln!(
                 f,
-                " (frame {}, params {}, captures {})",
-                code.frame_size, code.param_count, code.capture_count
+                " (frame {}, params {}, captures {}, height {})",
+                code.frame_size, code.param_count, code.capture_count, code.height
             )?;
             let body = Pretty {
                 ir: self.ir,

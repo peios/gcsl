@@ -74,18 +74,34 @@
 //! refers to itself without holding itself.
 //!
 //! A call evaluates its callee to a closure through the `function` walker,
-//! checks the call depth against [`MAX_CALL_DEPTH`], and grows the stack by
-//! the callee's frame size with `Vec::resize`; then it evaluates each
-//! argument in the caller's frame, in source order, into its parameter's
-//! slot of the new frame, runs the body in a new `Evaluator` whose base is
-//! the new frame's, and finally truncates the stack back, whether the body
-//! succeeded or failed. The stack keeps its capacity, so once it has grown
-//! to a program's deepest recursion, a call allocates nothing: not its
-//! frame, not its arguments' slots, and nothing to look anything up, since
-//! every variable is a slot or a capture index. Calls nest on the Rust
-//! stack, one `call` and a few walker frames per GCSL call, which is why
-//! the depth is limited; `call` keeps only the closure, its frame's base
-//! and the new evaluator across the body's evaluation.
+//! checks the nesting budget, and grows the stack by the callee's frame
+//! size with `Vec::resize`; then it evaluates each argument in the caller's
+//! frame, in source order, into its parameter's slot of the new frame, runs
+//! the body in a new `Evaluator` whose base is the new frame's, and finally
+//! truncates the stack back, whether the body succeeded or failed. The
+//! stack keeps its capacity, so once it has grown to a program's deepest
+//! recursion, a call allocates nothing: not its frame, not its arguments'
+//! slots, and nothing to look anything up, since every variable is a slot
+//! or a capture index. `call` keeps only the closure, its frame's base and
+//! the new evaluator across the body's evaluation.
+//!
+//! Calls nest on the Rust stack, one `call` and a few walker frames per
+//! GCSL call, and so does every level of expression nesting between a
+//! frame's body and a call in it; GCSL does not eliminate tail calls. So
+//! calls and expressions share one budget of nesting levels,
+//! [`MAX_DEPTH`], which keeps a program within [`crate::STACK_SIZE`]
+//! whatever shape its recursion has. Each evaluator carries `levels`, the
+//! nesting its enclosing frames have consumed where its frame's body
+//! starts: 0 at the top level. A call at depth `d` in its frame's body (see
+//! [`IrKind::Call`]), of a function whose body's height is `h` (see
+//! [`crate::ir::FnCode::height`]), enters its callee's frame at
+//! `entering = levels + d + CALL_LEVELS` levels, and fails with "call
+//! nested too deeply" if `entering + h` exceeds `MAX_DEPTH`, before its
+//! arguments are evaluated; otherwise the callee's body runs with
+//! `levels = entering`. The whole height of the body is charged up front,
+//! so that nothing inside the body, however deep, needs a check of its own:
+//! the budget costs the evaluator three additions and a comparison per
+//! call, and nothing per node.
 //!
 //! A function defined by an earlier input of a session can fail while a
 //! later input runs; its error's spans then refer to the earlier input's
@@ -107,7 +123,6 @@ use std::fmt::Write as _;
 use std::num::NonZeroI64;
 use std::rc::Rc;
 
-use crate::MAX_CALL_DEPTH;
 use crate::ast::FnId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
@@ -117,6 +132,7 @@ use crate::ir::{
 use crate::names::Name;
 use crate::source::Span;
 use crate::value::{Closure, Layout, Record, Value, int_to_float};
+use crate::{CALL_LEVELS, MAX_DEPTH};
 
 /// The room an interpolation reserves for each interpolated value's text,
 /// on top of its literal pieces' lengths.
@@ -128,9 +144,10 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 ///
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
-/// "division by zero" for `//` or `%` by zero; and at a call's span, "too
-/// many nested calls" for a call nested more than [`MAX_CALL_DEPTH`] deep.
-/// `Float` arithmetic never fails.
+/// "division by zero" for `//` or `%` by zero; and at a call's span, "call
+/// nested too deeply" for a call that would take the program's nesting,
+/// calls included, past [`MAX_DEPTH`] levels (see the module
+/// documentation). `Float` arithmetic never fails.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
     // The top level's frame; calls grow the stack beyond it.
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
@@ -164,7 +181,7 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
         base: 0,
         captures: &[],
         callee: None,
-        depth: 0,
+        levels: 0,
     }
     .value(root);
     stack.truncate(frame_size);
@@ -183,8 +200,10 @@ struct Evaluator<'a> {
     captures: &'a [Value],
     /// The running closure; `None` at the top level.
     callee: Option<&'a Rc<Closure>>,
-    /// How many calls deep this frame is: 0 at the top level.
-    depth: usize,
+    /// The levels of nesting the enclosing frames have consumed where this
+    /// frame's body starts: 0 at the top level. See the module
+    /// documentation.
+    levels: usize,
 }
 
 // The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
@@ -220,7 +239,12 @@ impl Evaluator<'_> {
             } => self.update_field((record, name, value), node),
             IrKind::LoadCapture(index, _) => self.capture_value(index, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
-            IrKind::Call { callee, args, .. } => self.call(callee, args, node),
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call((callee, args, depth), node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -358,15 +382,21 @@ impl Evaluator<'_> {
         }))
     }
 
-    /// Evaluates the `Call` `node` of `callee` with the arguments `args`
-    /// (see the module documentation) and returns the body's value.
-    fn call(&mut self, callee: IrId, args: IrRange, node: &IrNode) -> Result<Value, Diagnostic> {
+    /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
+    /// at depth `depth` in this frame's body (see the module documentation),
+    /// and returns the body's value.
+    fn call(
+        &mut self,
+        (callee, args, depth): (IrId, IrRange, u16),
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
         let closure = self.function(callee)?;
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
         };
-        if self.depth == MAX_CALL_DEPTH {
-            return Err(too_many_calls(node));
+        let entering = self.levels + usize::from(depth) + CALL_LEVELS;
+        if entering + code.height as usize > MAX_DEPTH {
+            return Err(nested_too_deeply(node));
         }
         let base = self.stack.len();
         self.stack
@@ -381,7 +411,7 @@ impl Evaluator<'_> {
             base,
             captures: &closure.captures,
             callee: Some(&closure),
-            depth: self.depth + 1,
+            levels: entering,
         }
         .value(code.body);
         self.stack.truncate(base);
@@ -412,15 +442,16 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    /// Evaluates the `Call` `node` of `callee` with the arguments `args` as
-    /// a value that `extract` accepts: one of the kind the node states.
+    /// Evaluates the `Call` `node` of `callee` with the arguments `args`, at
+    /// depth `depth`, as a value that `extract` accepts: one of the kind the
+    /// node states.
     fn call_as<T>(
         &mut self,
-        (callee, args): (IrId, IrRange),
+        call: (IrId, IrRange, u16),
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
     ) -> Result<T, Diagnostic> {
-        match extract(self.call(callee, args, node)?) {
+        match extract(self.call(call, node)?) {
             Some(value) => Ok(value),
             None => mistyped(
                 node,
@@ -451,12 +482,15 @@ impl Evaluator<'_> {
                     _ => None,
                 })
             }
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Fn(closure) => Some(closure),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Fn(closure) => Some(closure),
+                _ => None,
+            }),
             _ => mistyped(node, "a node of another kind where a function was expected"),
         }
     }
@@ -517,12 +551,15 @@ impl Evaluator<'_> {
             IrKind::IntConst(value) => Ok(value),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Int(value) => Some(value),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Int(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
@@ -632,12 +669,15 @@ impl Evaluator<'_> {
             IrKind::FloatConst(value) => Ok(value),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Float(value) => Some(value),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Float(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
@@ -716,12 +756,15 @@ impl Evaluator<'_> {
             IrKind::BoolConst(value) => Ok(value),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Bool(value) => Some(value),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Bool(value) => Some(value),
+                _ => None,
+            }),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.bool(result)
@@ -851,12 +894,15 @@ impl Evaluator<'_> {
             IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Str(text) => Some(text),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Str(text) => Some(text),
+                _ => None,
+            }),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.string(result)
@@ -918,12 +964,15 @@ impl Evaluator<'_> {
             IrKind::Empty => Ok(Value::Empty),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
-            IrKind::Call { callee, args, .. } => {
-                self.call_as((callee, args), node, |value| match value {
-                    Value::Empty | Value::Record(_) => Some(value),
-                    _ => None,
-                })
-            }
+            IrKind::Call {
+                callee,
+                args,
+                depth,
+                ..
+            } => self.call_as((callee, args, depth), node, |value| match value {
+                Value::Empty | Value::Record(_) => Some(value),
+                _ => None,
+            }),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -1205,14 +1254,20 @@ fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
 
-/// The error for the call `node`, which would nest calls more than
-/// [`MAX_CALL_DEPTH`] deep.
-fn too_many_calls(node: &IrNode) -> Diagnostic {
+/// The error for the call `node`, which would take the program's nesting,
+/// calls included, past [`MAX_DEPTH`] levels.
+fn nested_too_deeply(node: &IrNode) -> Diagnostic {
     Diagnostic::error(
-        format!("too many nested calls: the limit is {MAX_CALL_DEPTH}"),
+        format!(
+            "call nested too deeply: the limit is {MAX_DEPTH} levels of nesting, calls included"
+        ),
         node.span,
     )
-    .with_note("GCSL does not eliminate tail calls, so recursion this deep is not supported")
+    .with_note(
+        "every level of expression nesting around a call counts, and so does the body of the \
+         function called; GCSL does not eliminate tail calls, so recursion this deep is not \
+         supported",
+    )
 }
 
 /// Extracts a value of one kind from a slot or capture, for the node
@@ -2562,7 +2617,7 @@ mod tests {
             base: 0,
             captures: &[],
             callee: None,
-            depth: 0,
+            levels: 0,
         }
         .value(ir.root());
         (result, stack.len())
@@ -2616,38 +2671,86 @@ mod tests {
         assert_eq!(stack.len(), frame);
     }
 
+    const BUDGET_ERROR: &str =
+        "call nested too deeply: the limit is 10000 levels of nesting, calls included";
+    const BUDGET_NOTE: &str = "every level of expression nesting around a call counts, and so \
+                               does the body of the function called; GCSL does not eliminate \
+                               tail calls, so recursion this deep is not supported";
+
     #[test]
-    fn calls_nest_up_to_the_limit() {
+    fn the_first_call_past_the_nesting_budget_fails() {
         on_big_stack(|| {
             let recurse = "fn f(n: Int): Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n";
-            // `f(n)` makes n + 1 calls: exactly the limit is allowed.
-            let depth = i64::try_from(MAX_CALL_DEPTH).unwrap();
+            // The shape of the IR does not depend on the argument.
+            let ir = compile(&format!("{recurse}f(0)"));
+            let [(outer, _)] = ir.calls_in(ir.root())[..] else {
+                panic!("expected one call at the top level");
+            };
+            let code = ir.function(FnId::new(0));
+            let [(inner, inner_span)] = ir.calls_in(code.body)[..] else {
+                panic!("expected one call in the body");
+            };
+            let (outer, inner) = (usize::from(outer), usize::from(inner));
+            let height = code.height as usize;
+            // The first call enters its frame at `outer + CALL_LEVELS`
+            // levels, and each nested call `inner + CALL_LEVELS` further in;
+            // each is made while the body it enters fits within the budget.
+            let allowed = 1 + (MAX_DEPTH - height - outer - CALL_LEVELS) / (inner + CALL_LEVELS);
+            // `f(n)` makes n + 1 calls: exactly the allowed number succeeds.
+            let last = i64::try_from(allowed - 1).unwrap();
             assert_eq!(
-                run(&format!("{recurse}f({})", depth - 1)).unwrap(),
-                Value::Int(depth - 1)
+                run(&format!("{recurse}f({last})")).unwrap(),
+                Value::Int(last)
             );
-            let text = format!("{recurse}f({depth})");
+            // One more fails, at the innermost call, which would exceed it.
+            let text = format!("{recurse}f({})", last + 1);
             let diagnostic = run(&text).unwrap_err();
+            assert_eq!(diagnostic.message, BUDGET_ERROR);
             assert_eq!(
                 diagnostic.message,
-                format!("too many nested calls: the limit is {MAX_CALL_DEPTH}")
+                format!(
+                    "call nested too deeply: the limit is {MAX_DEPTH} levels of nesting, calls \
+                     included"
+                )
             );
-            assert_eq!(
-                diagnostic.message,
-                "too many nested calls: the limit is 1000"
-            );
-            // The innermost call, which would have exceeded it.
+            assert_eq!(diagnostic.notes, vec![BUDGET_NOTE]);
+            assert_eq!(diagnostic.span, inner_span);
             assert_eq!(diagnostic.span, Span::new(43, 51));
-            assert_eq!(
-                diagnostic.notes,
-                vec!["GCSL does not eliminate tail calls, so recursion this deep is not supported"]
-            );
+            assert!(diagnostic.labels.is_empty());
             // Nothing is left on the stack by the failure.
             let ir = compile(&text);
             let mut stack = vec![Value::Empty; ir.frame_size() as usize];
             let (result, len) = run_on(&ir, &mut stack);
-            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().message, BUDGET_ERROR);
             assert_eq!(len, ir.frame_size() as usize);
+        });
+    }
+
+    #[test]
+    fn the_nesting_around_a_top_level_call_counts() {
+        on_big_stack(|| {
+            // `f()` as the left operand of `terms` additions, which put it
+            // `terms + 1` levels deep in the file's body.
+            let program =
+                |terms: usize| format!("fn f(): Int {{ 1 }}\nf(){}", " + 1".repeat(terms));
+            let ir = compile(&program(1));
+            let [(depth, _)] = ir.calls_in(ir.root())[..] else {
+                panic!("expected one call at the top level");
+            };
+            assert_eq!(depth, 2);
+            let height = ir.function(FnId::new(0)).height as usize;
+            // The deepest the call may be, and so the most additions.
+            let terms = MAX_DEPTH - CALL_LEVELS - height - 1;
+            let ir = compile(&program(terms));
+            let [(depth, _)] = ir.calls_in(ir.root())[..] else {
+                panic!("expected one call at the top level");
+            };
+            assert_eq!(usize::from(depth), terms + 1);
+            let sum = i64::try_from(terms + 1).unwrap();
+            assert_eq!(eval(&ir).unwrap(), Value::Int(sum));
+            let diagnostic = run(&program(terms + 1)).unwrap_err();
+            assert_eq!(diagnostic.message, BUDGET_ERROR);
+            assert_eq!(diagnostic.span, Span::new(18, 21));
         });
     }
 
@@ -2702,6 +2805,7 @@ mod tests {
                 callee: closure,
                 args: empty,
                 kind: ValueKind::Int,
+                depth: 0,
             },
             Span::new(0, 3),
         );

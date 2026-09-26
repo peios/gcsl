@@ -333,7 +333,7 @@ fn dumps_show_functions_and_calls() {
     );
     assert!(
         ir.contains(
-            "fn #2 at (frame 1, params 1, captures 1)\n\
+            "fn #2 at (frame 1, params 1, captures 1, height 3)\n\
              \x20 (block @284..301\n\
              \x20   (int-add @286..299\n\
              \x20     (load-capture 0 @286..290)\n\
@@ -342,11 +342,11 @@ fn dumps_show_functions_and_calls() {
         "{ir}"
     );
     assert!(
-        ir.contains("\nfn #0 service (frame 2, params 2, captures 0)\n"),
+        ir.contains("\nfn #0 service (frame 2, params 2, captures 0, height 4)\n"),
         "{ir}"
     );
     assert!(
-        ir.contains("\nfn #1 shout (frame 1, params 1, captures 0)\n"),
+        ir.contains("\nfn #1 shout (frame 1, params 1, captures 0, height 3)\n"),
         "{ir}"
     );
     assert_eq!(output.status.code(), Some(0));

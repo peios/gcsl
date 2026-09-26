@@ -67,6 +67,22 @@
 //! literal piece has no span of its own in the AST, so its node has its
 //! whole interpolated string's span.
 //!
+//! Once every node is built, one post-pass computes what the evaluator's
+//! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s depth in
+//! the body of its frame, the body node being at depth 0, and each
+//! function's body height, the number of nodes on its longest path to a
+//! leaf. It walks the root and then each function's body, depth first and
+//! iteratively, with an explicit stack, since a body can be `MAX_DEPTH`
+//! deep: a call gets its depth on the way down, and every node its height,
+//! in one vector indexed by node, on the way up. A `MakeClosure`'s captures
+//! are its children, loads in the creating frame; the function it makes is
+//! not, since that body is another frame, walked on its own. The nodes of
+//! a frame form a tree, except the record nodes an update chain shares
+//! between the update that builds on a record and the access into it: such
+//! a node's depth is counted from the first path the walk reaches it by.
+//! That does not matter, because the shared nodes are loads, captures,
+//! the callee, field accesses and `Empty`, never calls.
+//!
 //! Lowering cannot fail on tables produced by [`crate::check::check`]. Any
 //! combination the checker should have ruled out is reported as an
 //! [`InternalError`] rather than a panic.
@@ -145,7 +161,7 @@ pub fn lower(
     let root = lowerer.builder.alloc(kind, root_span);
     // Every function expression is reachable from the root, so each has
     // been lowered.
-    let functions = lowerer
+    let mut functions = lowerer
         .functions
         .into_iter()
         .collect::<Option<Vec<FnCode>>>()
@@ -153,6 +169,7 @@ pub fn lower(
             message: "a function expression was never lowered",
             span: root_span,
         })?;
+    lowerer.builder.measure(root, &mut functions);
     Ok(lowerer.builder.finish_program(
         root,
         (resolution.frame_size(), resolution.slot_names().to_vec()),
@@ -523,6 +540,8 @@ impl Lowerer<'_> {
                 callee: self.lower_operand(callee, ValueKind::Fn)?,
                 args: self.lower_args(args, expr.span)?,
                 kind,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
             }),
             (ExprKind::Fn(_), _) => Err(InternalError {
                 message: "a function expression typed as a non-function type",
@@ -554,6 +573,8 @@ impl Lowerer<'_> {
             frame_size: resolution.frame_size,
             param_count: resolution.param_count,
             capture_count: u32::try_from(resolution.captures.len()).unwrap_or(u32::MAX),
+            // Set by `IrBuilder::measure` once every node is built.
+            height: 0,
             name: resolution.callee,
             display,
             slot_names: resolution.slot_names.clone().into_boxed_slice(),
@@ -1575,7 +1596,7 @@ mod tests {
              \x20   (make-closure #0 @18..43\n\
              \x20     (load x#0 @18..43)))\n\
              \x20 (empty @0..43))\n\
-             fn #0 f (frame 1, params 1, captures 1)\n\
+             fn #0 f (frame 1, params 1, captures 1, height 3)\n\
              \x20 (block @34..43\n\
              \x20   (int-add @36..41\n\
              \x20     (load-capture 0 @36..37)\n\
@@ -1597,7 +1618,7 @@ mod tests {
              \x20     (str \"s\" @41..44))\n\
              \x20   (arg 0 @46..51\n\
              \x20     (int 1 @50..51))))\n\
-             fn #0 f (frame 2, params 2, captures 0)\n\
+             fn #0 f (frame 2, params 2, captures 0, height 2)\n\
              \x20 (block @29..34\n\
              \x20   (load a#0 @31..32))"
         );
@@ -1638,7 +1659,7 @@ mod tests {
              \x20 (store fact#0 @0..65\n\
              \x20   (make-closure #0 @0..65))\n\
              \x20 (empty @0..65))\n\
-             fn #0 fact (frame 1, params 1, captures 0)\n\
+             fn #0 fact (frame 1, params 1, captures 0, height 8)\n\
              \x20 (block @21..65\n\
              \x20   (if @23..63\n\
              \x20     (int-cmp <= @26..32\n\
@@ -1667,14 +1688,14 @@ mod tests {
              \x20 (store outer#0 @0..73\n\
              \x20   (make-closure #2 @0..73))\n\
              \x20 (empty @0..73))\n\
-             fn #0 (frame 0, params 0, captures 1)\n\
+             fn #0 (frame 0, params 0, captures 1, height 2)\n\
              \x20 (block @64..69\n\
              \x20   (load-capture 0 @66..67))\n\
-             fn #1 (frame 0, params 0, captures 1)\n\
+             fn #1 (frame 0, params 0, captures 1, height 3)\n\
              \x20 (block @52..71\n\
              \x20   (make-closure #0 @54..69\n\
              \x20     (load-capture 0 @54..69)))\n\
-             fn #2 outer (frame 1, params 1, captures 0)\n\
+             fn #2 outer (frame 1, params 1, captures 0, height 3)\n\
              \x20 (block @34..73\n\
              \x20   (make-closure #1 @36..71\n\
              \x20     (load a#0 @36..71)))"
@@ -1734,6 +1755,92 @@ mod tests {
         // A closure is a function.
         let ir = lower_text("fn f(): fn(): Int { fn(): Int { 1 } }");
         assert_eq!(ir.kind_of(ir.function(FnId::new(1)).body), ValueKind::Fn);
+    }
+
+    /// The depth of each call in the frame whose body is `body`, in the
+    /// order a depth-first walk meets them.
+    fn depths(ir: &Ir, body: IrId) -> Vec<u16> {
+        ir.calls_in(body)
+            .into_iter()
+            .map(|(depth, _)| depth)
+            .collect()
+    }
+
+    #[test]
+    fn a_call_is_as_deep_as_its_path_from_its_frames_body() {
+        let g = "fn g(n: Int): Int { n }\n";
+        // In a function's body: the block (0), the `+` (1), the `*` (2),
+        // the call (3).
+        let ir = lower_text(&format!("{g}fn f(n: Int): Int {{ 1 + g(n) * 2 }}"));
+        assert_eq!(depths(&ir, ir.function(FnId::new(1)).body), vec![3]);
+        // In the file's body: the block (0), the `let`'s store (1), the
+        // outer call (2), its argument (3), the inner call (4).
+        let ir = lower_text(&format!("{g}let x = g(g(1))\nx"));
+        assert_eq!(depths(&ir, ir.root()), vec![2, 4]);
+        // A callee is a child of its call: the block (0), the call of the
+        // closure (1), the call that makes it (2).
+        let ir = lower_text("fn make(): fn(): Int { fn(): Int { 1 } }\nmake()()");
+        assert_eq!(depths(&ir, ir.root()), vec![1, 2]);
+    }
+
+    #[test]
+    fn the_shared_nodes_of_an_update_chain_do_not_disturb_depths() {
+        let g = "fn g(n: Int): Int { n }\n";
+        // `let a.b.c = g(a.b.c)`: the block (0), the store (1), the update
+        // of `b` (2), the update of `c` (3), the call (4). The update of `b`
+        // shares its load of `a` with the access `a.b` that the update of
+        // `c` builds on, so the walk reaches that load twice; the call's
+        // depth is its own path's, and so is the later call's (1).
+        let ir = lower_text(&format!(
+            "{g}let a = {{ b = {{ c = 1 }} }}\nlet a.b.c = g(a.b.c)\n= g(a.b.c)"
+        ));
+        assert_eq!(depths(&ir, ir.root()), vec![4, 1]);
+        // In a function's body, where the chain's longest path is through
+        // the call: the block (1), the store (2), the update of `b` (3), the
+        // update of `c` (4), the call (5), its argument (6), the literal (7).
+        let ir = lower_text(&format!(
+            "{g}fn u(r: {{b: {{c: Int}}}}): {{b: {{c: Int}}}} {{ let r.b.c = g(1)\nr }}"
+        ));
+        let u = ir.function(FnId::new(1));
+        assert_eq!(depths(&ir, u.body), vec![4]);
+        assert_eq!(u.height, 7);
+    }
+
+    #[test]
+    fn a_closures_body_is_a_frame_of_its_own() {
+        let text = "fn g(n: Int): Int { n }\nlet k = { { fn(): Int { g(1) } } }\ng(k())";
+        let ir = lower_text(text);
+        // In the frame creating the closure: the block (0), the call of `g`
+        // (1), its argument (2), the call of `k` (3). The call in the
+        // closure's body is not in this frame.
+        assert_eq!(depths(&ir, ir.root()), vec![1, 3]);
+        // In the closure's own, however deep it was made: the block (0), the
+        // call (1). Its body's height: the block, the call, its argument, the
+        // literal.
+        let closure = ir.function(FnId::new(1));
+        assert_eq!(depths(&ir, closure.body), vec![1]);
+        assert_eq!(closure.height, 4);
+        // A body that makes a closure is as tall as the loads of what it
+        // captures, not the closure's body: the block, the closure, its
+        // capture of `g`.
+        let ir = lower_text(
+            "fn g(n: Int): Int { n }\nfn outer(): fn(): Int { fn(): Int { g(g(g(1))) } }",
+        );
+        assert_eq!(ir.function(FnId::new(2)).height, 3);
+        // The block, three calls and their arguments, and the literal.
+        assert_eq!(ir.function(FnId::new(1)).height, 8);
+    }
+
+    #[test]
+    fn a_function_body_is_as_tall_as_its_longest_path() {
+        // The block (1), the `if` (2), the then-block (3), the negations (4
+        // and 5), the load (6); the condition and the else branch are
+        // shorter.
+        let ir = lower_text("fn h(n: Int): Int { if n > 0 { -(-n) } else { 0 } }");
+        assert_eq!(ir.function(FnId::new(0)).height, 6);
+        // An empty body is a block with an empty result.
+        let ir = lower_text("fn e(): {} {}");
+        assert_eq!(ir.function(FnId::new(0)).height, 2);
     }
 
     #[test]

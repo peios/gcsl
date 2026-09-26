@@ -86,31 +86,39 @@ pub use value::{Value, ValueKind};
 /// also limited by its recursion depth, where a nested block counts two
 /// levels (its body and the expressions in it), so blocks nest at most
 /// about `MAX_DEPTH / 2` deep.
+///
+/// It is also the budget for nesting at runtime, which calls share with
+/// expressions, since calls nest on the Rust stack as expressions do and
+/// GCSL does not eliminate tail calls. There, a level is a node of the IR:
+/// every node on the path from a frame's body to the node being evaluated
+/// is one level, and each call in progress costs [`CALL_LEVELS`] more on
+/// top of the nesting around it. A call is made only if the nesting it
+/// would reach, the whole height of its callee's body included, stays
+/// within this budget; otherwise it fails with "call nested too deeply".
+/// Nesting built by calls therefore never exceeds `MAX_DEPTH` levels,
+/// whatever shape the recursion has. (The top level's own nesting is not
+/// checked: it is bounded by the parser's limit alone.)
 pub const MAX_DEPTH: usize = 10_000;
 
-/// The deepest nesting of calls at runtime: a call made from a frame
-/// already this many calls deep fails with "too many nested calls". Calls
-/// nest on the Rust stack, and GCSL does not eliminate tail calls, so this
-/// bounds recursion. Counting the top level as depth 0, a program may have
-/// exactly this many calls in progress at once.
-pub const MAX_CALL_DEPTH: usize = 1_000;
+/// The levels of [`MAX_DEPTH`]'s runtime budget that a call costs on top of
+/// the nesting around it: the Rust frames a call itself adds, expressed in
+/// levels of expression nesting. Measured in an unoptimised build, a call
+/// takes about 9 KB of Rust stack, against 2.4 to 3.3 KB for a level of
+/// expression nesting, depending on its kind, so a call is charged as four
+/// levels.
+pub const CALL_LEVELS: usize = 4;
 
 /// The stack size, in bytes, that the pipeline is run with, even in an
 /// unoptimised build. Run the pipeline on a thread with at least this much
 /// stack: the `gcsl` binary does, and so should any embedder. Stack memory
 /// is reserved, not committed, so an unused reservation costs nothing.
 ///
-/// It must cover every stage at [`MAX_DEPTH`], and evaluation with
-/// [`MAX_CALL_DEPTH`] calls in progress and an expression [`MAX_DEPTH`]
-/// deep evaluated in the deepest of them; the end-to-end tests check both,
-/// unoptimised. It does not cover `MAX_CALL_DEPTH` calls *each* made from
-/// an expression nested `MAX_DEPTH` deep: every level of nesting between a
-/// function's body and a call in it is a few Rust frames for every call in
-/// progress, so that would need thousands of times this. In an unoptimised
-/// build, a recursion `MAX_CALL_DEPTH` deep fits only if its recursive
-/// call is nested at most a couple of dozen levels deep in its function's
-/// body; deeper, the thread's stack overflows before the call limit is
-/// reached.
+/// It must cover every stage at [`MAX_DEPTH`], and evaluation at the
+/// runtime budget `MAX_DEPTH` sets: `MAX_DEPTH` levels of the costliest kind
+/// of nesting, calls included, which the budget guarantees a program never
+/// exceeds. The end-to-end tests check both, unoptimised: every stage on
+/// trees `MAX_DEPTH` deep, and recursions that use the whole budget with
+/// their calls wrapped in each costly kind of nesting.
 pub const STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// What running a program successfully produces: its value, and the
