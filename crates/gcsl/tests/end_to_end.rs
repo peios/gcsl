@@ -1124,7 +1124,9 @@ fn annotation_mismatch_renders_exactly() {
 }
 
 /// A build script: a pure plan whose steps run when an impure wrapper
-/// awaits them.
+/// awaits them, and a pure function passing a step through, whose bare
+/// parameter is inferred to be `String | Future<String>`, since its body
+/// never measures it.
 const BUILD_SCRIPT: &str = "\
 fn compile(target: String) -> String { \"compiled {target}\" }
 fn plan(name: String): {name: String, build: Future<String>, check: Future<{}>} {
@@ -1138,7 +1140,7 @@ fn build(package: fn(String): {name: String, build: Future<String>, check: Futur
   name = conf.name
   log = await conf.build
 }
-fn keep(step: String | Future<String>): {step: String | Future<String>} { step = step }
+fn keep(step: String): {step: String | Future<String>} { step = step }
 let planned = plan(\"gcsl\")
 let built = build(plan, \"gcsl\")
 name = built.name
@@ -1165,6 +1167,61 @@ fn a_build_script_plans_purely_and_builds_on_await() {
             .to_string(),
         "{name = \"gcsl\"; log = \"compiled gcsl\"; later = Future<String>; \
          ran = \"compiled gcsl\"}"
+    );
+    // `keep`'s parameter shows as inferred.
+    let mut session = Session::new();
+    session.eval(&source(BUILD_SCRIPT)).unwrap();
+    assert_eq!(
+        session.eval(&source("keep")).unwrap().value.to_string(),
+        "fn(step: String | Future<String>): {step: String | Future<String>}"
+    );
+}
+
+#[test]
+fn a_future_passed_through_a_pure_function_runs_when_awaited_after() {
+    let keep = "fn keep(x: Int): {v: Int | Future<Int>} { v = x }\n";
+    // Passed through unawaited: a failing future is not run by `keep`.
+    assert_eq!(
+        run(&format!("{keep}let r = keep(lazy 1 // 0)\n= 7")).unwrap(),
+        Value::Int(7)
+    );
+    // And runs where it is awaited after.
+    assert_eq!(
+        run(&format!("{keep}let r = keep(lazy 20 + 1)\n= await r.v")).unwrap(),
+        Value::Int(21)
+    );
+    let diagnostics = run(&format!("{keep}let r = keep(lazy 1 // 0)\n= await r.v")).unwrap_err();
+    assert_eq!(diagnostics[0].message, "division by zero");
+    // A present value passes through as it is.
+    assert_eq!(run(&format!("{keep}keep(5).v + 1")).unwrap(), Value::Int(6));
+    // A function that measures its parameter makes it present, and an
+    // impure caller awaits the argument at the call.
+    assert_eq!(
+        run("fn double(x: Int): Int { x * 2 }\nlet f = lazy 21\ndouble(f)").unwrap(),
+        Value::Int(42)
+    );
+}
+
+#[test]
+fn an_argument_awaited_inside_a_pure_function_renders_exactly() {
+    assert_eq!(
+        rendered(
+            "fn my_pure_func(x: Int): Int {\n  let y = x + 5\n  y\n}\n\
+             fn caller(my_future: Future<Int>): Int {\n  my_pure_func(my_future)\n}\n"
+        ),
+        "error: argument `my_future` would be awaited inside `my_pure_func`, which is pure\n\
+         \x20--> calc.gcsl:6:16\n\
+         \x20 |\n\
+         2 |   let y = x + 5\n\
+         \x20 |           - `x` is measured here\n\
+         ...\n\
+         5 | fn caller(my_future: Future<Int>): Int {\n\
+         \x20 |                                  - this function is pure, declared with `:`\n\
+         6 |   my_pure_func(my_future)\n\
+         \x20 |                ^^^^^^^^^ this is Future<Int>\n\
+         \x20 |\n\
+         \x20 = note: a pure function cannot await; await the argument before the call, in an \
+         impure function: `my_pure_func(await my_future)`\n"
     );
 }
 

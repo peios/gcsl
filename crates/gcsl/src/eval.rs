@@ -2871,10 +2871,10 @@ mod tests {
             55
         );
         assert_eq!(
-            int(
-                "fn down(n: Int): fn(): Int { fn(): Int { if n == 0 { 0 } else { down(n - 1)() + 1 } } }\n\
-                 down(5)()"
-            ),
+            int("fn down(n: Int): fn(): Int {\n\
+                 \x20 fn(): Int { if n == 0 { 0 } else { down(n - 1)() + 1 } }\n\
+                 }\n\
+                 down(5)()"),
             5
         );
         // An overflow deep in a recursion is reported where it happens.
@@ -2926,6 +2926,8 @@ mod tests {
     #[test]
     fn nested_closures_and_closures_called_later() {
         assert_eq!(
+            // The innermost function measures every parameter, through the
+            // pure functions around it, so each is present.
             int("fn adder(a: Int): fn(Int): fn(Int): Int {\n\
                    fn(b: Int): fn(Int): Int { fn(c: Int): Int { a * 100 + b * 10 + c } }\n\
                  }\n\
@@ -3139,11 +3141,17 @@ mod tests {
 
     #[test]
     fn function_values_and_their_internal_errors() {
-        // A closure shows as its type.
+        // A closure shows as its type, its parameters' laziness inferred.
         let value = run("fn(x: Int, s: String): {x: Int} { x = x }").unwrap();
         assert_eq!(value.kind(), ValueKind::Fn);
-        assert_eq!(value.to_string(), "fn(x: Int, s: String): {x: Int}");
-        assert_eq!(value.repr().to_string(), "fn(x: Int, s: String): {x: Int}");
+        assert_eq!(
+            value.to_string(),
+            "fn(x: Int, s: String | Future<String>): {x: Int}"
+        );
+        assert_eq!(
+            value.repr().to_string(),
+            "fn(x: Int, s: String | Future<String>): {x: Int}"
+        );
         // An impure function's bare types are the either shape.
         let value = run("fn(x: Int, s: String) -> {x: Int} { x = x }").unwrap();
         assert_eq!(

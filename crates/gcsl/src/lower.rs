@@ -1917,6 +1917,8 @@ mod tests {
 
     #[test]
     fn nested_functions_chain_their_captures() {
+        // The innermost, pure, function measures `a` as its result, which
+        // makes `a` present for `outer`.
         let text = "fn outer(a: Int): fn(): fn(): Int { fn(): fn(): Int { fn(): Int { a } } }";
         assert_eq!(
             dump(text),
@@ -2140,7 +2142,9 @@ mod tests {
             panic!("expected a store");
         };
         assert_eq!(ir.kind_of(future), ValueKind::Deferred);
-        // A future made in a function body is made in that frame.
+        // A future made in a function body is made in that frame. `n` is
+        // only captured by the `lazy`, which does not measure it for `f`,
+        // so it is the either shape and its load `Deferred`.
         let ir = lower_text("fn f(n: Int): Future<Int> { lazy n * 2 }");
         assert_eq!(ir.function(FnId::new(0)).kind, FnKind::Future);
         assert_eq!(ir.function(FnId::new(1)).kind, FnKind::Function);
@@ -2156,7 +2160,7 @@ mod tests {
                 .iter()
                 .map(|&id| ir.get(id).kind)
                 .collect::<Vec<_>>(),
-            vec![IrKind::Load(Slot::new(0), ValueKind::Int)]
+            vec![IrKind::Load(Slot::new(0), ValueKind::Deferred)]
         );
     }
 

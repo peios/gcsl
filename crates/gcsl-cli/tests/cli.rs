@@ -379,7 +379,7 @@ fn dumps_show_futures() {
     for token in [
         "\nLazy @221..225\n",
         "\nAwait @397..402\n",
-        "\nPipe @446..447\n",
+        "\nPipe @537..538\n",
         "\nIdent(Future) @179..185\nLt @185..186\nIdent(String) @186..192\n",
     ] {
         assert!(tokens.contains(token), "{token}: {tokens}");
@@ -394,7 +394,7 @@ fn dumps_show_futures() {
         "\n        (expr @397..413\n\
          \x20         (await @397..413\n\
          \x20           (. build @403..413\n",
-        "\n      (params (step String | Future<String>))\n",
+        "\n      (params (step String))\n",
     ] {
         assert!(ast.contains(node), "{node}: {ast}");
     }
@@ -405,10 +405,12 @@ fn dumps_show_futures() {
         "(lazy : Future<String> @221..239\n",
         "(name compile : fn(target: String | Future<String>) -> String | Future<String> @",
         "(await : String @397..413\n",
+        // Written bare, passed through unmeasured: inferred to be either.
         "(name keep : fn(step: String | Future<String>): {step: String | Future<String>} @",
+        "(name step : String | Future<String> @564..568)",
         // An impure function's bare record result may be a future too.
         "(name built : {build: Future<String>, name: String | Future<String>} | \
-         Future<{build: Future<String>, name: String | Future<String>}> @552..557)",
+         Future<{build: Future<String>, name: String | Future<String>}> @610..615)",
     ] {
         assert!(types.contains(node), "{node}: {types}");
     }

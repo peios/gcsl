@@ -202,7 +202,9 @@
 //! the body is checked as a block whose scope starts with the parameters,
 //! against the return type as an annotated initialiser is checked against
 //! its annotation. The parameters are bindings like any other, so a `let`
-//! may shadow one and a `:=` rebind one.
+//! may shadow one and a `:=` rebind one. (The one thing the body decides is
+//! whether a pure function's bare parameters may be futures: see [Inferred
+//! parameters](#inferred-parameters).)
 //!
 //! **Frames.** Each function runs in a frame of its own. The checker keeps a
 //! stack of the functions it is inside (`Function`); entering one saves the
@@ -249,7 +251,9 @@
 //! initialiser is. The parameter each argument fills is recorded for
 //! lowering in [`Resolution::arg_params`]. Too many positional arguments, an
 //! unknown or unusable name, a parameter filled twice and parameters left
-//! unfilled are each reported, and make the call erroneous.
+//! unfilled are each reported, and make the call erroneous. A binding
+//! initialised directly with a function expression remembers which, so
+//! that a call through its name knows the function's [`FnResolution`].
 //!
 //! **Purity.** A function declared with `:` is pure, and one declared with
 //! `->` impure; the top level is impure, and a block has the purity of the
@@ -277,9 +281,12 @@
 //! at that position and at every bare position inside it, through record
 //! types (so `{a: Int}` there is `{a: Int | Future<Int>} | Future<{a: Int |
 //! Future<Int>}>`) but not into a nested function type, which has its own
-//! rule; and a present `T` everywhere else: annotations, ascriptions, and
-//! the parameters and return types of pure functions and of written pure
-//! function types. A function type is the one bare type that is never the
+//! rule; and a present `T` everywhere else: annotations, ascriptions, the
+//! return types of pure functions, and the parameters and return types of
+//! written pure function types. (A pure function expression's bare
+//! parameters are inferred: see [Inferred
+//! parameters](#inferred-parameters).) A function type is the one bare type
+//! that is never the
 //! either shape at its own position: its interior follows its own purity
 //! marker, and a function value that may be a future must be written so,
 //! as `Future<fn(): Int>` or `(fn(): Int) | Future<fn(): Int>` (in
@@ -291,7 +298,7 @@
 //! applied to a type, and `Future` or `Present` without a type argument are
 //! errors. So an impure function takes and returns values that may be
 //! futures, since its body awaits them on demand, while a pure function
-//! takes present values unless it declares otherwise, since its body cannot
+//! takes present values where its body needs them, since its body cannot
 //! await; and a pure `fn(Int): Int` is not a subtype of the impure
 //! `fn(Int) -> Int`, which promises to pass futures (parameters are
 //! contravariant), though it is of `fn(Present<Int>) -> Int`.
@@ -330,8 +337,118 @@
 //! implicit, is an error, reported where the await is decided, entirely
 //! statically. A pure function may still build, hold, store, pass on and
 //! return futures, and build them with `lazy`, whose body is impure. A
-//! pure function's bare parameters are present, so measuring one is never
-//! an error.
+//! pure function measuring its own bare parameter is never an error: it
+//! makes the parameter present (see below), so the await happens in the
+//! caller, where an argument that may be a future is awaited at the call.
+//!
+//! # Inferred parameters
+//!
+//! A pure function's bare parameter, one whose type is written as a name or
+//! a record type (not `Present<...>`, `Future<...>`, a union or a function
+//! type, which say what they are), is present if the function's body
+//! *measures* it, and the either shape if it never does, so that a pure
+//! function can pass a future through without declaring it: `fn double(x:
+//! Int): Int { x * 2 }` is `fn(x: Int): Int`, and `fn keep(x: Int): {v: Int
+//! | Future<Int>} { v = x }` is `fn(x: Int | Future<Int>): {v: Int |
+//! Future<Int>}`. The result is not inferred: a pure function's bare result
+//! is present, so `fn id(x: Int): Int { x }` measures `x` through it.
+//!
+//! While the body is checked, such a parameter has a provisional type,
+//! `provisional(function, index, T)` (see [`TypeTable::provisional`]), in
+//! the function's type as first interned, in the callee binding and in the
+//! parameter's binding, and the function's entry on the stack
+//! (`Function::demanded`) records, for each parameter, the first place in
+//! source order where it is measured. A value keeps the provisional type
+//! through *blind assignment*, with no code of its own: a `let` without an
+//! annotation binds it, a record field holds it and gives it back when read,
+//! and an `if` both of whose branches have it has it. The parameter is
+//! measured where a value of its provisional type is used as its bits,
+//! which is exactly where a value that may be a future would be awaited:
+//!
+//! - `Checker::measure` (the operands of the measuring operators, the
+//!   callee of a call, the record of a field access, a statement that is
+//!   `{}` once awaited) measures a provisional type at the top, and gives
+//!   its present type, with no await and no purity error;
+//! - `Checker::measure_deep` (an interpolated expression, an operand of an
+//!   equality) measures each provisional type in the value's type, at the
+//!   top or in a field, before deciding the await for the rest;
+//! - `Checker::expect`, where the value is not a subtype of what is
+//!   expected as it is, measures each parameter whose provisional type sits
+//!   where the expected type is present (a present parameter, annotation,
+//!   ascription, `:=` target, field type or return type, or the `Bool` of a
+//!   condition or a logic operand) and tries again with them present; a
+//!   provisional type is a subtype of the either shape as it is, so passing
+//!   it to an either parameter, storing it in an either field and returning
+//!   it against an either return type measure nothing;
+//! - an explicit `await` of it (an error in any case, the function being
+//!   pure) and an update of the record it is (`let p.x = ...`) measure it;
+//! - a recursive call through the function's own name measures every
+//!   argument whose type is a provisional type of the function,
+//!   conservatively;
+//! - an `if` whose branches have different types measures every parameter
+//!   whose provisional type is in either branch, conservatively, and the
+//!   branches then agree as they would with those parameters present: a
+//!   parameter and a present value join to the present type, and a
+//!   parameter and a future to the either shape. (Joining a parameter with
+//!   a present value as the either shape instead would leave the `if` an
+//!   either, which the pure function could then not measure, and would
+//!   reject `if n < 2 { n } else { ... }` against an `Int` result.)
+//!
+//! Capturing a parameter in a closure or a `lazy`, and binding it with a
+//! `let` without an annotation, measure nothing.
+//!
+//! When the body's check ends, each parameter is decided: present if it
+//! was measured. [`TypeTable::settle`] then replaces the function's
+//! provisional types in the type of every expression of the function, the
+//! ids of its subtree (which the parser allocates contiguously: see
+//! [`Ast`]), and in what every function and `lazy` nested in it captures,
+//! and the function's own type is its settled type; which parameters were
+//! measured, and where, is recorded in [`FnResolution::param_demands`]. A
+//! provisional type reaches nothing outside the function but through the
+//! function's type, which is settled with the rest, so this one pass is
+//! enough, and a successful check leaves none (the final invariant check
+//! says so). A nested function is settled when it ends, for its own
+//! parameters, and again when the function enclosing it ends, for that
+//! one's, which is why settling names the function.
+//!
+//! **Nested functions.** A provisional type of an *enclosing* function,
+//! seen in a nested body through a capture, is measured for the function it
+//! belongs to when every function between, the nested one included, is
+//! pure (`Checker::claimable`): a pure closure can only ever see what the
+//! function around it was given, so measuring the parameter there makes it
+//! present, and the caller awaits it before the enclosing function runs, as
+//! for a measurement in the enclosing body itself; `fn make(n: Int): fn():
+//! Int { fn(): Int { n } }` therefore takes a present `n`. Through an impure
+//! function or a `lazy`, which may await, the provisional type is instead
+//! treated as the either shape it may become: measuring it there is an
+//! await, which measures nothing for the function it belongs to, and inside
+//! a pure function nested in that impure one it is the purity error. This is
+//! conservative and correct: the enclosing function's decision is not known
+//! while the nested body is checked, and if nothing measures the parameter
+//! a future may indeed arrive, which the `lazy` or impure function awaits
+//! when it runs. (An await of a parameter that turns out present finds a
+//! present value, and does nothing.)
+//!
+//! **Where a provisional type is shown.** A diagnostic shows a provisional
+//! type as what it stands for at that point (`Checker::shown`): one of a
+//! function the body being checked may measure (`Checker::claimable`) as
+//! present if its parameter has been measured so far and the either shape
+//! otherwise, and any other enclosing function's as the either shape.
+//! [`TypeTable::display`] shows one as `Int?`, which nothing the checker
+//! returns holds.
+//!
+//! **The call-site error.** An argument that is awaited at the top, in a
+//! pure caller, because the parameter it fills is present by inference, is
+//! the error "argument `x` would be awaited inside `f`, which is pure",
+//! labelled with where `f`'s body first measures the parameter when `f` is
+//! known (`Checker::argument_await_error`). A callee is known when it is a
+//! plain name whose binding was initialised directly with a function
+//! expression, of this input ([`FnResolution::param_demands`] says which
+//! parameters were measured, and where) or of an earlier session input,
+//! whose [`Scope`] keeps which parameters its functions' bodies measure, but
+//! not where, since that input's source is gone: the error then has no label
+//! on the measuring use. A parameter written present, or of a callee that is
+//! not known, gives the generic implicit-await error.
 //!
 //! # Scopes
 //!
@@ -390,8 +507,9 @@ use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable};
 ///
 /// A `Types` returned by [`check`] contains neither [`TyId::UNTYPED_INT`]
 /// nor [`TyId::ERROR`], nor any union other than the either shape, `T |
-/// Future<T>`. An expression that is awaited where it is used keeps the type
-/// it has before the await; see [`Resolution::await_of`].
+/// Future<T>`, nor any provisional type. An expression that is awaited where
+/// it is used keeps the type it has before the await; see
+/// [`Resolution::await_of`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Types {
     types: Vec<TyId>,
@@ -538,6 +656,11 @@ pub struct FnResolution {
     /// For each slot of the body's frame, the name of the last variable
     /// assigned to it. Only for showing slots to people.
     pub slot_names: Vec<Name>,
+    /// For each parameter, in order, where the body first measures it, in
+    /// source order, if it is a pure function's bare parameter that the
+    /// body measures, which makes it present; `None` for every other
+    /// parameter. Empty for a `lazy`. See the module documentation.
+    pub param_demands: Vec<Option<Span>>,
 }
 
 /// How the path of a dotted `let`, field or `:=` resolves: the record it
@@ -779,6 +902,12 @@ struct Binding {
     /// not this one.
     declared: Option<Span>,
     kind: BindingKind,
+    /// The function expression a single-name `let`, field or named function
+    /// item was initialised with directly, for the call-site form of the
+    /// implicit-await error (see `Checker::argument_await_error`); `None`
+    /// for every other binding, and for one declared by an earlier input of
+    /// a session, whose [`FnId`]s belong to another tree.
+    function: Option<FnId>,
 }
 
 /// What a [`Binding`] is.
@@ -826,6 +955,50 @@ struct Function {
     pure: bool,
     /// Its `:` or `->`, or a `lazy`'s keyword.
     marker: Span,
+    /// For each parameter, where the body first measures it, in source
+    /// order, so far; only a pure function's bare parameters, whose types
+    /// are provisional, are ever measured. Empty for a `lazy`.
+    demanded: Vec<Option<Span>>,
+}
+
+/// Where an await is decided, for the purity rule's error in a pure
+/// function: see `Checker::await_here`.
+#[derive(Clone, Copy, Debug)]
+enum AwaitSite {
+    /// Implicitly, where a value is used as its bits.
+    Implicit,
+    /// Explicitly, by an `await` whose keyword is at the span.
+    Explicit(Span),
+    /// Implicitly, at the top, as an argument of a call that fills a
+    /// parameter the callee's body measures.
+    Argument(CallSite),
+}
+
+/// An argument awaited because the parameter it fills is present by
+/// inference, which the call-site form of the implicit-await error
+/// describes.
+#[derive(Clone, Copy, Debug)]
+struct CallSite {
+    /// The call.
+    call: ExprId,
+    /// Its callee.
+    callee: ExprId,
+    /// Where the callee's body first measures the parameter, and the
+    /// parameter's name, if the callee's function is known: one of this
+    /// input's function expressions.
+    measured: Option<(Span, Name)>,
+}
+
+/// A callee whose function is known well enough to tell which of its
+/// parameters are present because its body measures them.
+#[derive(Clone, Copy, Debug)]
+enum KnownCallee {
+    /// A function expression of the input being checked.
+    Current(FnId),
+    /// A binding of an earlier session input, by its index in
+    /// `Checker::bindings`, which is also its index in
+    /// `Checker::scope_measured`.
+    Earlier(usize),
 }
 
 /// One value a function captures.
@@ -920,6 +1093,12 @@ struct Expecting<'w> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scope {
     bindings: Vec<Binding>,
+    /// For each binding, if it was initialised directly with a function
+    /// expression, which of that function's parameters are present because
+    /// its body measures them: what the call-site form of the
+    /// implicit-await error needs of a function declared by an earlier
+    /// input, whose tree and spans are gone.
+    measured: Vec<Option<Box<[bool]>>>,
 }
 
 impl Scope {
@@ -985,9 +1164,14 @@ pub struct Checker<'a> {
     arg_params: Vec<u32>,
     /// Every variable, field and callee in scope, outermost block first.
     bindings: Vec<Binding>,
+    /// For each binding of the scope the check started from, its entry of
+    /// [`Scope`]'s `measured`.
+    scope_measured: Vec<Option<Box<[bool]>>>,
     /// The functions being checked, innermost last; empty at the top
     /// level.
     functions: Vec<Function>,
+    /// Reused for collecting the parameters of provisional types in a type.
+    claimed: Vec<u32>,
     /// The name the next function expression checked sees itself by: set by
     /// a single-name `let` or field whose initialiser is directly a
     /// function expression, and taken by that function when its check
@@ -1070,7 +1254,9 @@ impl<'a> Checker<'a> {
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
             arg_params: vec![u32::MAX; ast.arg_count()],
             bindings: scope.bindings,
+            scope_measured: scope.measured,
             functions: Vec::new(),
+            claimed: Vec::new(),
             callee_name: None,
             fn_params: Vec::new(),
             filled: Vec::new(),
@@ -1118,25 +1304,48 @@ impl<'a> Checker<'a> {
             return Err(diagnostic::merge(self.errors, self.warnings));
         }
         let types = &*self.types;
-        if self.expr_types.iter().any(|&ty| match types.kind(ty) {
-            TyKind::Error | TyKind::UntypedInt => true,
-            TyKind::Union(_) => !types.is_deferrable(ty),
-            _ => false,
-        }) {
+        let unsettled = |ty: TyId| types.contains_provisional(ty, None);
+        if self.expr_types.iter().any(|&ty| {
+            unsettled(ty)
+                || match types.kind(ty) {
+                    TyKind::Error | TyKind::UntypedInt => true,
+                    TyKind::Union(_) => !types.is_deferrable(ty),
+                    _ => false,
+                }
+        }) || self
+            .fn_resolutions
+            .iter()
+            .any(|function| function.captures.iter().any(|&(_, ty)| unsettled(ty)))
+        {
             let error = InternalError {
-                message: "a type table entry is untyped, erroneous or a union after a successful \
-                          check",
+                message: "a type table entry is untyped, erroneous, provisional or a union after \
+                          a successful check",
                 span: self.ast.root_span(),
             };
             return Err(vec![error.into()]);
         }
-        // Spans are meaningless for a later input, which has its own
-        // source.
+        // What the call-site form of the implicit-await error needs to know
+        // of this input's functions in a later input, whose tree is gone.
+        let mut measured = self.scope_measured;
+        for binding in self.bindings.get(measured.len()..).unwrap_or_default() {
+            measured.push(binding.function.and_then(|function| {
+                self.fn_resolutions.get(function.index()).map(|resolution| {
+                    resolution
+                        .param_demands
+                        .iter()
+                        .map(Option::is_some)
+                        .collect()
+                })
+            }));
+        }
+        // Spans and function ids are meaningless for a later input, which
+        // has its own source and tree.
         let bindings = self
             .bindings
             .into_iter()
             .map(|binding| Binding {
                 declared: None,
+                function: None,
                 ..binding
             })
             .collect();
@@ -1157,7 +1366,7 @@ impl<'a> Checker<'a> {
         warnings.sort_by_key(|warning| warning.span.start);
         Ok(CheckOutput {
             checked,
-            scope: Scope { bindings },
+            scope: Scope { bindings, measured },
             ty,
             warnings,
         })
@@ -1245,8 +1454,9 @@ impl<'a> Checker<'a> {
                     {
                         // A statement is a position expecting `{}`: a value
                         // that is `{}` once awaited is awaited here, so its
-                        // effects are not lost, subject to the purity rule.
-                        self.await_here(value, ty, AwaitKind::Top, None);
+                        // effects are not lost, subject to the purity rule;
+                        // a parameter of this function is measured.
+                        self.measure(value, ty);
                     } else if ty != TyId::EMPTY && ty != TyId::ERROR {
                         self.unused_value(value, ty);
                     }
@@ -1275,7 +1485,8 @@ impl<'a> Checker<'a> {
     fn unused_value(&mut self, value: ExprId, ty: TyId) {
         let ty = self.settle(value, ty);
         let shown = self.in_message(ty);
-        let note = if self.types.laziness(ty) == Laziness::Present {
+        let resolved = self.shown(ty);
+        let note = if self.types.laziness(resolved) == Laziness::Present {
             "make it the block's result with `= ...`, bind it with `let`, or remove it"
         } else {
             "await it with `await`, bind it with `let`, or remove it"
@@ -1327,8 +1538,21 @@ impl<'a> Checker<'a> {
         };
         self.callee_name = None;
         match segments {
-            [variable] => self.declare(variable.name, ty, id, BindingKind::Variable),
+            [variable] => {
+                let function = self.direct_function(segments, value);
+                self.declare_initialised(variable.name, ty, id, (BindingKind::Variable, function));
+            }
             segments => self.declare_update(id, segments, ty),
+        }
+    }
+
+    /// The function expression that the initialiser `value` of a `let` or
+    /// field whose path is `segments` directly is, if the path is a single
+    /// name: the same condition as [`Checker::name_callee`]'s.
+    fn direct_function(&self, segments: &[PathSegment], value: ExprId) -> Option<FnId> {
+        match (segments, self.ast.get(value).kind) {
+            ([_], ExprKind::Fn(function)) => Some(function),
+            _ => None,
         }
     }
 
@@ -1394,7 +1618,8 @@ impl<'a> Checker<'a> {
             }
         };
         self.callee_name = None;
-        self.declare(name, ty, id, BindingKind::Field);
+        let function = self.direct_function(segments, value);
+        self.declare_initialised(name, ty, id, (BindingKind::Field, function));
         self.fields.push(FieldDecl {
             name,
             name_span,
@@ -1978,6 +2203,12 @@ impl<'a> Checker<'a> {
     /// since `:=` never adds a field: a missing one, or a segment along the
     /// way that is not a record, is reported and `None` returned.
     fn rebind_leaf(&mut self, segments: &[PathSegment], root: TyId) -> Option<TyId> {
+        // Updating a record reads it: a parameter of this function is
+        // measured.
+        let root = match segments.first() {
+            Some(first) => self.claim_top(first.span, root),
+            None => root,
+        };
         let mut current = root;
         for (index, segment) in segments.iter().enumerate().skip(1) {
             if !self.types.is_record(current) {
@@ -1998,12 +2229,13 @@ impl<'a> Checker<'a> {
                 let path = self.ast.show_path(segments);
                 let prefix = self.ast.show_path(&segments[..index]);
                 let field = FieldName(self.ast.names().get(segment.name));
+                let label = format!("this is {}", self.in_label(root));
                 self.errors.push(
                     Diagnostic::error(
                         format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
                         path_span(segments),
                     )
-                    .with_context(segments[0].span, format!("this is {}", self.in_label(root)))
+                    .with_context(segments[0].span, label)
                     .with_note(format!(
                         "`:=` cannot add a field; add it with `let {path} = ...`"
                     )),
@@ -2028,7 +2260,12 @@ impl<'a> Checker<'a> {
         };
         self.path_types.clear();
         let found = self.lookup(first.name);
-        let old = found.map(|(_, binding)| binding);
+        // Updating a record reads it: a parameter of this function is
+        // measured.
+        let old = found.map(|(_, binding)| Binding {
+            ty: self.claim_top(first.span, binding.ty),
+            ..binding
+        });
         let mut failed = leaf_ty == TyId::ERROR;
         if let Some(old) = old {
             if old.ty == TyId::ERROR {
@@ -2113,14 +2350,31 @@ impl<'a> Checker<'a> {
     /// Declares a variable or field, as `kind` says, for the item `id`, in
     /// the innermost block, in the next free slot, which the item writes.
     fn declare(&mut self, name: Name, ty: TyId, id: ItemId, kind: BindingKind) {
+        self.declare_initialised(name, ty, id, (kind, None));
+    }
+
+    /// Declares a variable or field, as `kind` says, for the item `id`, as
+    /// [`Checker::declare`] does, initialised directly with the function
+    /// expression `function`, if it is `Some`.
+    fn declare_initialised(
+        &mut self,
+        name: Name,
+        ty: TyId,
+        id: ItemId,
+        (kind, function): (BindingKind, Option<FnId>),
+    ) {
         let span = self.ast.item(id).span;
         let slot = self.declare_binding(name, ty, Some(span), kind);
+        if let Some(binding) = self.bindings.last_mut() {
+            binding.function = function;
+        }
         self.item_slots[id.index()] = slot;
     }
 
     /// Declares a binding of `kind` in the innermost block, in the next free
     /// slot of the current frame, and returns that slot. `declared` is where
-    /// its declaration is written.
+    /// its declaration is written. It is initialised with no known function
+    /// expression.
     fn declare_binding(
         &mut self,
         name: Name,
@@ -2143,6 +2397,7 @@ impl<'a> Checker<'a> {
             ty,
             declared,
             kind,
+            function: None,
         });
         slot
     }
@@ -2381,7 +2636,25 @@ impl<'a> Checker<'a> {
     /// [`TypeTable::needs_await`]), subject to the purity rule. A mismatch
     /// is reported at `expr` with a context label on `context`, the source
     /// of the expectation.
+    ///
+    /// Where `found` has a provisional type of the innermost function's at a
+    /// position where `expected` is present, that parameter is measured
+    /// here, and the test is retried with every provisional type of the
+    /// function in `found` made present.
     fn expect(&mut self, expr: ExprId, found: TyId, expected: TyId, context: Span, why: &str) {
+        self.expect_at(expr, found, expected, (context, why), AwaitSite::Implicit);
+    }
+
+    /// As [`Checker::expect`], with `site` saying how an await at the top is
+    /// reported in a pure function (see [`Checker::await_here`]).
+    fn expect_at(
+        &mut self,
+        expr: ExprId,
+        found: TyId,
+        expected: TyId,
+        (context, why): (Span, &str),
+        site: AwaitSite,
+    ) {
         match (found, expected) {
             (TyId::ERROR, _) => {}
             // The expected type is unknown and has been reported.
@@ -2390,20 +2663,151 @@ impl<'a> Checker<'a> {
             }
             (TyId::UNTYPED_INT, TyId::INT | TyId::FLOAT) => self.coerce(expr, expected),
             // A literal is present, so it satisfies the either shape of its
-            // type, `Int | Future<Int>`, as it would `Int`.
+            // type, `Int | Future<Int>`, as it would `Int`, and a provisional
+            // one, which stands for its present type as a supertype.
             (TyId::UNTYPED_INT, _)
-                if self.types.laziness(expected) == Laziness::Either
-                    && matches!(self.types.strip(expected), TyId::INT | TyId::FLOAT) =>
+                if matches!(
+                    self.types.laziness(expected),
+                    Laziness::Either | Laziness::Provisional
+                ) && matches!(self.types.strip(expected), TyId::INT | TyId::FLOAT) =>
             {
                 let present = self.types.strip(expected);
                 self.coerce(expr, present);
             }
             _ if self.types.is_subtype(found, expected) => {}
-            _ => match self.types.needs_await(found, expected) {
-                Some(kind) => self.await_here(expr, found, kind, None),
-                None => self.mismatch(expr, found, expected, (context, why)),
-            },
+            _ => {
+                let found = match self.claim_against(expr, found, expected) {
+                    Some(claimed) if self.types.is_subtype(claimed, expected) => return,
+                    Some(claimed) => claimed,
+                    None => found,
+                };
+                match self.types.needs_await(found, expected) {
+                    Some(kind) => {
+                        // Only an await at the top is the parameter's doing.
+                        let site = match (kind, site) {
+                            (AwaitKind::Top, site) => site,
+                            (AwaitKind::Deep, _) => AwaitSite::Implicit,
+                        };
+                        self.await_here(expr, found, kind, site);
+                    }
+                    None => self.mismatch(expr, found, expected, (context, why)),
+                }
+            }
         }
+    }
+
+    /// The functions, as indices into the stack of functions being checked,
+    /// whose parameters a use in the innermost body may measure: the
+    /// innermost function, and each function enclosing it that is reached
+    /// through pure functions only (see the module documentation). Empty at
+    /// the top level.
+    fn claimable(&self) -> std::ops::Range<usize> {
+        let end = self.functions.len();
+        let mut start = end.saturating_sub(1);
+        while start > 0
+            && self
+                .functions
+                .get(start)
+                .is_some_and(|function| function.pure)
+        {
+            start -= 1;
+        }
+        start..end
+    }
+
+    /// Where `expr`, of type `found`, is expected to have type `expected`,
+    /// and does not as it is: measures each parameter of a claimable
+    /// function (see [`Checker::claimable`]) whose provisional type sits in
+    /// `found` where `expected` is present (see
+    /// [`TypeTable::provisionals_at_present`]), and returns `found` with
+    /// every provisional type of those functions made present; or `None` if
+    /// there is no such parameter.
+    fn claim_against(&mut self, expr: ExprId, found: TyId, expected: TyId) -> Option<TyId> {
+        let mut found = found;
+        let mut claimed = false;
+        for index in self.claimable().rev() {
+            let Some(function) = self.functions.get(index).map(|function| function.fn_id) else {
+                continue;
+            };
+            if !self.types.contains_provisional(found, Some(function)) {
+                continue;
+            }
+            let mut params = std::mem::take(&mut self.claimed);
+            params.clear();
+            self.types
+                .provisionals_at_present(found, expected, function, &mut params);
+            if !params.is_empty() {
+                let span = self.ast.get(expr).span;
+                found = self.make_present(index, span, &params, found);
+                claimed = true;
+            }
+            self.claimed = params;
+        }
+        claimed.then_some(found)
+    }
+
+    /// Where `expr`, of type `ty`, is used as its bits, or must agree with
+    /// another type: measures every parameter of a claimable function (see
+    /// [`Checker::claimable`]) whose provisional type is in `ty`, at any
+    /// depth, and returns `ty` with all of them present. `ty` itself if it
+    /// has none.
+    fn claim(&mut self, expr: ExprId, ty: TyId) -> TyId {
+        let mut ty = ty;
+        for index in self.claimable().rev() {
+            let Some(function) = self.functions.get(index).map(|function| function.fn_id) else {
+                continue;
+            };
+            if !self.types.contains_provisional(ty, Some(function)) {
+                continue;
+            }
+            let mut params = std::mem::take(&mut self.claimed);
+            params.clear();
+            self.types.provisional_params(ty, function, &mut params);
+            let span = self.ast.get(expr).span;
+            ty = self.make_present(index, span, &params, ty);
+            self.claimed = params;
+        }
+        ty
+    }
+
+    /// Where the value at `span`, of type `ty`, is used as its bits at the
+    /// top, as a record is by an update: if `ty` is a provisional type of a
+    /// claimable function (see [`Checker::claimable`]), measures its
+    /// parameter and returns its present type; otherwise returns `ty`.
+    fn claim_top(&mut self, span: Span, ty: TyId) -> TyId {
+        let TyKind::Provisional {
+            function, param, ..
+        } = *self.types.kind(ty)
+        else {
+            return ty;
+        };
+        let index = self
+            .claimable()
+            .find(|&index| self.functions.get(index).map(|f| f.fn_id) == Some(function));
+        match index {
+            Some(index) => self.make_present(index, span, &[param], ty),
+            None => ty,
+        }
+    }
+
+    /// Records that each of `params`, parameters of the function at `index`
+    /// of the stack of functions being checked, is measured at `span`, and
+    /// returns `ty` with every provisional type of that function in it made
+    /// present.
+    fn make_present(&mut self, index: usize, span: Span, params: &[u32], ty: TyId) -> TyId {
+        let Some(function) = self.functions.get_mut(index) else {
+            return ty;
+        };
+        for &param in params {
+            if let Some(entry) = function.demanded.get_mut(param as usize) {
+                // The first measuring use in source order.
+                if entry.is_none_or(|first| span.start < first.start) {
+                    *entry = Some(span);
+                }
+            }
+        }
+        let (fn_id, count) = (function.fn_id, function.demanded.len());
+        self.types.settle(ty, fn_id, &vec![true; count])
     }
 
     /// Reports that `expr`, of type `found`, does not fit the type
@@ -2427,6 +2831,7 @@ impl<'a> Checker<'a> {
             .with_context(context, why);
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);
+            let found = self.shown(found);
             match self.types.laziness(found) {
                 Laziness::Present => {
                     error = error.with_note(format!(
@@ -2434,7 +2839,9 @@ impl<'a> Checker<'a> {
                          expression to defer it"
                     ));
                 }
-                Laziness::Either => {
+                // A provisional type is shown as what it may be, but none is
+                // left once shown.
+                Laziness::Either | Laziness::Provisional => {
                     error = error.with_note(format!(
                         "this value may already be present; a {shown} must be deferred"
                     ));
@@ -2447,27 +2854,38 @@ impl<'a> Checker<'a> {
 
     /// Where `expr`, of type `ty`, is used as its bits at the top, by a
     /// measuring operator, a call of it or a field access into it: if it
-    /// may be a future, marks it to be awaited at the top, subject to the
-    /// purity rule, and returns the type it has once awaited; otherwise, or
-    /// if it is erroneous, returns `ty`.
+    /// is a parameter of the innermost function whose type is provisional,
+    /// the parameter is measured, which makes it present, and its present
+    /// type returned; if it may be a future, it is marked to be awaited at
+    /// the top, subject to the purity rule, and the type it has once
+    /// awaited returned; otherwise, or if it is erroneous, `ty` is.
     fn measure(&mut self, expr: ExprId, ty: TyId) -> TyId {
         if ty == TyId::ERROR || self.types.laziness(ty) == Laziness::Present {
             return ty;
         }
-        self.await_here(expr, ty, AwaitKind::Top, None);
+        let claimed = self.claim_top(self.ast.get(expr).span, ty);
+        if claimed != ty {
+            return claimed;
+        }
+        // A future, an either, or a provisional type of an enclosing
+        // function, which may be a future for all this body knows.
+        self.await_here(expr, ty, AwaitKind::Top, AwaitSite::Implicit);
         self.types.strip(ty)
     }
 
     /// Where `expr`, of type `ty`, is used as its bits all the way down, as
-    /// an interpolated expression or an operand of an equality: if it, or a
-    /// field of the record it is at any depth, may be a future, marks it to
-    /// be awaited (deeply, if the fields need it), subject to the purity
-    /// rule, and returns the type it has once awaited; otherwise, or if it
-    /// is erroneous, returns `ty`.
+    /// an interpolated expression or an operand of an equality: every
+    /// parameter of the innermost function whose provisional type is in it,
+    /// at the top or in a field, is measured; then if it, or a field of the
+    /// record it is at any depth, may be a future, it is marked to be
+    /// awaited (deeply, if the fields need it), subject to the purity rule,
+    /// and the type it has once awaited returned; otherwise, or if it is
+    /// erroneous, its type with the measured parameters present is.
     fn measure_deep(&mut self, expr: ExprId, ty: TyId) -> TyId {
         if ty == TyId::ERROR {
             return ty;
         }
+        let ty = self.claim(expr, ty);
         let present = self.types.present(ty);
         if present == ty {
             return ty;
@@ -2477,34 +2895,31 @@ impl<'a> Checker<'a> {
         } else {
             AwaitKind::Deep
         };
-        self.await_here(expr, ty, kind, None);
+        self.await_here(expr, ty, kind, AwaitSite::Implicit);
         present
     }
 
     /// Marks `expr`, of type `ty`, to be awaited as `kind` says, and applies
     /// the purity rule: awaiting is impure, so inside a pure function it is
     /// an error, "cannot await in a pure function" at the `await` keyword
-    /// for an explicit await, whose keyword is `explicit`, and "cannot use a
+    /// for an explicit await ([`AwaitSite::Explicit`]), and "cannot use a
     /// value that may be a future in a pure function" at `expr` for an
-    /// implicit one. The mark is recorded regardless, so that the error does
-    /// not cascade. The body of a `lazy` is impure, wherever it is written.
-    fn await_here(&mut self, expr: ExprId, ty: TyId, kind: AwaitKind, explicit: Option<Span>) {
+    /// implicit one, or its call-site form for an argument that fills a
+    /// parameter the callee's body measures ([`AwaitSite::Argument`]; see
+    /// [`Checker::argument_await_error`]). The mark is recorded regardless,
+    /// so that the error does not cascade. The body of a `lazy` is impure,
+    /// wherever it is written.
+    fn await_here(&mut self, expr: ExprId, ty: TyId, kind: AwaitKind, site: AwaitSite) {
         self.awaits[expr.index()] = kind.into();
-        let Some(function) = self.functions.last() else {
+        let Some(marker) = self.pure_marker() else {
             return;
         };
-        if !function.pure {
-            return;
-        }
-        let marker = function.marker;
-        let error = match explicit {
-            Some(keyword) => Diagnostic::error("cannot await in a pure function", keyword)
-                .with_context(marker, PURE_CONTEXT)
-                .with_note(
-                    "awaiting runs a deferred expression, which may have effects; declare the \
-                     function with `->` to make it impure",
-                ),
-            None => Diagnostic::error(
+        let error = match site {
+            AwaitSite::Explicit(keyword) => explicit_await_error(keyword, marker),
+            AwaitSite::Argument(call_site) => {
+                self.argument_await_error(expr, ty, marker, call_site)
+            }
+            AwaitSite::Implicit => Diagnostic::error(
                 "cannot use a value that may be a future in a pure function",
                 self.ast.get(expr).span,
             )
@@ -2517,6 +2932,109 @@ impl<'a> Checker<'a> {
             ),
         };
         self.errors.push(error);
+    }
+
+    /// The marker of the innermost function, if it is pure: where the
+    /// purity rule's errors say the function is pure.
+    fn pure_marker(&self) -> Option<Span> {
+        self.functions
+            .last()
+            .filter(|function| function.pure)
+            .map(|function| function.marker)
+    }
+
+    /// The call-site form of the implicit-await error, in a pure function
+    /// whose marker is at `marker`, for the argument `arg`, of type `ty`,
+    /// which fills a parameter that is present because the callee's body
+    /// measures it, as `site` describes: "argument `x` would be awaited
+    /// inside `f`, which is pure", the argument and the callee named by
+    /// their source text if each is a plain name or a dotted path ("this
+    /// argument" and "the function" otherwise); labelled with the
+    /// argument's type, with where the callee's body measures the
+    /// parameter if its function is known, and with the pure function's
+    /// marker; and a note saying how to await the argument first, with the
+    /// call written so if every argument is a name or a dotted path.
+    fn argument_await_error(
+        &mut self,
+        arg: ExprId,
+        ty: TyId,
+        marker: Span,
+        site: CallSite,
+    ) -> Diagnostic {
+        let inside = self
+            .path_text(site.callee)
+            .map_or_else(|| "the function".to_owned(), |text| format!("`{text}`"));
+        let message = match self.path_text(arg) {
+            Some(text) => {
+                format!("argument `{text}` would be awaited inside {inside}, which is pure")
+            }
+            None => format!("this argument would be awaited inside {inside}, which is pure"),
+        };
+        let label = format!("this is {}", self.in_label(ty));
+        let mut error = Diagnostic::error(message, self.ast.get(arg).span).with_label(label);
+        if let Some((span, param)) = site.measured {
+            let text = self.ast.names().get(param);
+            error = error.with_context(span, format!("`{text}` is measured here"));
+        }
+        let mut note = "a pure function cannot await; await the argument before the call, in an \
+                        impure function"
+            .to_owned();
+        if let Some(call) = self.awaited_call_text(site.call, arg) {
+            note = format!("{note}: `{call}`");
+        }
+        error.with_context(marker, PURE_CONTEXT).with_note(note)
+    }
+
+    /// The source text of `expr` if it is a plain name or a dotted path, a
+    /// chain of field accesses on a name, as in `server.port`; `None`
+    /// otherwise.
+    fn path_text(&self, expr: ExprId) -> Option<String> {
+        let names = self.ast.names();
+        let mut fields = Vec::new();
+        let mut node = expr;
+        let root = loop {
+            match self.ast.get(node).kind {
+                ExprKind::Name(name) => break name,
+                ExprKind::Field { expr, name } => {
+                    fields.push(name);
+                    node = expr;
+                }
+                _ => return None,
+            }
+        };
+        let mut text = names.get(root).to_owned();
+        for &field in fields.iter().rev() {
+            text.push('.');
+            text.push_str(&FieldName(names.get(field)).to_string());
+        }
+        Some(text)
+    }
+
+    /// The call `call` written with `await` before its argument `awaited`,
+    /// as in `f(await x)`, if its callee and every argument, named ones by
+    /// their values, is a plain name or a dotted path, so that it can be
+    /// written from them; `None` otherwise.
+    fn awaited_call_text(&self, call: ExprId, awaited: ExprId) -> Option<String> {
+        let ExprKind::Call { callee, args } = self.ast.get(call).kind else {
+            return None;
+        };
+        let mut text = self.path_text(callee)?;
+        text.push('(');
+        for (index, arg) in self.ast.args(args).iter().enumerate() {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            if let ArgKind::Named { name, .. } = arg.kind {
+                text.push_str(self.ast.names().get(name));
+                text.push_str(" = ");
+            }
+            if arg.value == awaited {
+                text.push_str("await ");
+            }
+            text.push_str(&self.path_text(arg.value)?);
+        }
+        text.push(')');
+        Some(text)
     }
 
     /// Checks `id` where a value of type `expected` is expected, as stated
@@ -2536,8 +3054,21 @@ impl<'a> Checker<'a> {
         context: Span,
         why: &str,
     ) -> TyId {
+        self.check_expr_expecting_at(id, expected, (context, why), AwaitSite::Implicit)
+    }
+
+    /// As [`Checker::check_expr_expecting`], with `site` saying how an
+    /// await of `id` at the top is reported in a pure function (see
+    /// [`Checker::await_here`]).
+    fn check_expr_expecting_at(
+        &mut self,
+        id: ExprId,
+        expected: TyId,
+        (context, why): (Span, &str),
+        site: AwaitSite,
+    ) -> TyId {
         // A record block is present, so it is checked against the present
-        // member of an either shape.
+        // member of an either shape (or of a provisional type).
         let record = self.types.strip(expected);
         if self.types.laziness(expected) != Laziness::Future
             && self.types.is_record(record)
@@ -2562,7 +3093,7 @@ impl<'a> Checker<'a> {
             return ty;
         }
         let found = self.check_expr(id);
-        self.expect(id, found, expected, context, why);
+        self.expect_at(id, found, expected, (context, why), site);
         found
     }
 
@@ -2710,17 +3241,15 @@ impl<'a> Checker<'a> {
             let span = expr.operator_span().unwrap_or(expr.span);
             let lhs_label = format!("this is {}", self.in_label(self.types.strip(lhs_ty)));
             let rhs_label = format!("this is {}", self.in_label(self.types.strip(rhs_ty)));
+            let message = format!(
+                "cannot compare {}: it contains a future",
+                self.in_message(ty)
+            );
             self.errors.push(
-                Diagnostic::error(
-                    format!(
-                        "cannot compare {}: it contains a future",
-                        self.in_message(ty)
-                    ),
-                    span,
-                )
-                .with_context(self.ast.get(lhs).span, lhs_label)
-                .with_context(self.ast.get(rhs).span, rhs_label)
-                .with_note("futures have no equality; await the future and compare its value"),
+                Diagnostic::error(message, span)
+                    .with_context(self.ast.get(lhs).span, lhs_label)
+                    .with_context(self.ast.get(rhs).span, rhs_label)
+                    .with_note("futures have no equality; await the future and compare its value"),
             );
             return TyId::ERROR;
         }
@@ -2749,6 +3278,7 @@ impl<'a> Checker<'a> {
             captures: Vec::new(),
             pure: false,
             marker: decl.marker,
+            demanded: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let found = self.check_expr(decl.body);
@@ -2764,10 +3294,11 @@ impl<'a> Checker<'a> {
     /// Pops the innermost function off the stack of functions being
     /// checked, recording what was found for it, with `param_count`
     /// parameters and the callee name `callee`, and restores the enclosing
-    /// frame's slot allocation.
-    fn finish_function(&mut self, param_count: u32, callee: Option<Name>) {
+    /// frame's slot allocation. Returns which of its parameters its body
+    /// measures: where it first does, for each.
+    fn finish_function(&mut self, param_count: u32, callee: Option<Name>) -> Vec<Option<Span>> {
         let Some(finished) = self.functions.pop() else {
-            return;
+            return Vec::new();
         };
         let slot_names = std::mem::replace(&mut self.slot_names, finished.outer_slot_names);
         self.fn_resolutions[finished.fn_id.index()] = FnResolution {
@@ -2780,8 +3311,10 @@ impl<'a> Checker<'a> {
                 .collect(),
             callee,
             slot_names,
+            param_demands: finished.demanded.clone(),
         };
         (self.next_slot, self.frame_size) = (finished.outer_next_slot, finished.outer_frame_size);
+        finished.demanded
     }
 
     /// Types the function expression `id`, whose details are `function`,
@@ -2789,7 +3322,12 @@ impl<'a> Checker<'a> {
     /// documentation). Its type is known, and recorded, before the body is
     /// checked: the function type of its declared parameter and return
     /// types, or `Error` if any of them is. A bare type in them is present
-    /// for a pure function and the either shape for an impure one.
+    /// for a pure function and the either shape for an impure one, except
+    /// that a pure function's parameter whose type is written as a name or
+    /// a record type has a provisional type while the body is checked, and
+    /// is present if the body measures it and the either shape otherwise:
+    /// once the body is checked, the type of every expression in the
+    /// function is settled accordingly, and so is the function's type.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
@@ -2800,8 +3338,13 @@ impl<'a> Checker<'a> {
         };
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
-        for param in params {
-            let ty = self.resolve_type(param.ty, mode);
+        let mut provisional = false;
+        for (index, param) in params.iter().enumerate() {
+            let mut ty = self.resolve_type(param.ty, mode);
+            if decl.pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
+                ty = self.types.provisional(function, position(index), ty);
+                provisional = true;
+            }
             self.fn_params.push((Some(param.name), ty));
         }
         let ret = if let Some(ret) = decl.ret {
@@ -2828,13 +3371,59 @@ impl<'a> Checker<'a> {
             captures: Vec::new(),
             pure: decl.pure,
             marker: decl.marker,
+            demanded: vec![None; params.len()],
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let span = self.ast.get(id).span;
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
         self.fn_params.truncate(base);
-        self.finish_function(decl.params.len(), callee);
-        ty
+        let demanded = self.finish_function(decl.params.len(), callee);
+        if !provisional {
+            return ty;
+        }
+        let decisions: Vec<bool> = demanded.iter().map(Option::is_some).collect();
+        self.settle_function(id, function, &decisions);
+        self.expr_types[id.index()]
+    }
+
+    /// Whether a pure function's parameter whose type is written as `ty` is
+    /// inferred: present if the body measures it, the either shape if not.
+    /// So is one written as a name or a record type; not one written as
+    /// `Present<...>` or `Future<...>` or a union, which says what it is,
+    /// nor as a function type, which is never made the either shape at its
+    /// own position (see the module documentation).
+    fn is_inferred(&self, ty: TypeExprId) -> bool {
+        matches!(
+            self.ast.type_expr(ty).kind,
+            TypeExprKind::Named(_) | TypeExprKind::Record(_)
+        )
+    }
+
+    /// Settles every provisional type of function `function`, the function
+    /// expression `id`, whose body has been checked, by `decisions`, which
+    /// says for each of its parameters whether the body measures it: in the
+    /// type of every expression of the function, its own included, which
+    /// are the ids of its subtree, and in what every function and `lazy`
+    /// nested in it captures. A provisional type reaches nothing outside
+    /// the function but through the function's type, which is settled here
+    /// with the rest.
+    fn settle_function(&mut self, id: ExprId, function: FnId, decisions: &[bool]) {
+        let ast = self.ast;
+        for node in ast.subtree(id) {
+            if let Some(ty) = self.expr_types.get(node.index()).copied() {
+                let settled = self.types.settle(ty, function, decisions);
+                self.expr_types[node.index()] = settled;
+            }
+            let (ExprKind::Fn(nested) | ExprKind::Lazy(nested)) = ast.get(node).kind else {
+                continue;
+            };
+            let Some(resolution) = self.fn_resolutions.get_mut(nested.index()) else {
+                continue;
+            };
+            for (_, ty) in &mut resolution.captures {
+                *ty = self.types.settle(*ty, function, decisions);
+            }
+        }
     }
 
     /// Types the call `id` of `callee` with the arguments `args` (see the
@@ -2892,6 +3481,13 @@ impl<'a> Checker<'a> {
     /// fills none, and records the parameter each fills. Reports every
     /// argument that cannot be bound and every parameter left unfilled, and
     /// returns whether there was any.
+    ///
+    /// An argument awaited at the top because the parameter it fills is
+    /// present by inference, as far as the callee is known, is reported in
+    /// a pure caller in the call-site form (see
+    /// [`Checker::argument_await_error`]). In a recursive call through the
+    /// function's own name, an argument whose type is a provisional type of
+    /// the function is measured.
     fn bind_arguments(
         &mut self,
         id: ExprId,
@@ -2902,6 +3498,8 @@ impl<'a> Checker<'a> {
         let ast = self.ast;
         let call = ast.get(id);
         let callee_span = ast.get(callee).span;
+        let known = self.known_callee(callee);
+        let recursive = self.is_recursive(callee);
         let function_label = format!("the function is {}", self.in_label(callee_ty));
         let arg_list = ast.args(args);
         let count = sig.params.len();
@@ -2959,7 +3557,21 @@ impl<'a> Checker<'a> {
                 *entry = position(index);
             }
             let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
-            self.check_expr_expecting(arg.value, param_ty, callee_span, &function_label);
+            let site = match known {
+                Some(known) => self.argument_site(known, param, (id, callee)),
+                None => AwaitSite::Implicit,
+            };
+            let found = self.check_expr_expecting_at(
+                arg.value,
+                param_ty,
+                (callee_span, &function_label),
+                site,
+            );
+            // A recursive call measures every argument that is a parameter
+            // of the function, conservatively.
+            if recursive && self.types.laziness(found) == Laziness::Provisional {
+                self.claim_top(ast.get(arg.value).span, found);
+            }
         }
         erroneous |= self.report_unfilled(
             base,
@@ -2982,6 +3594,80 @@ impl<'a> Checker<'a> {
         }
         self.filled.truncate(base);
         erroneous
+    }
+
+    /// The function that `callee` calls, if it is known: `callee` is a
+    /// plain name whose binding was initialised directly with a function
+    /// expression of this input, or declared by an earlier session input
+    /// (whose measured parameters the scope carries).
+    fn known_callee(&self, callee: ExprId) -> Option<KnownCallee> {
+        let ExprKind::Name(name) = self.ast.get(callee).kind else {
+            return None;
+        };
+        let (index, binding) = self.lookup(name)?;
+        match binding.function {
+            Some(function) => Some(KnownCallee::Current(function)),
+            None if index < self.scope_measured.len() => Some(KnownCallee::Earlier(index)),
+            None => None,
+        }
+    }
+
+    /// How an await of an argument of the call `call` of `callee`, a known
+    /// callee `known`, that fills its parameter number `param` is reported
+    /// in a pure caller: [`AwaitSite::Argument`] if the parameter is present
+    /// because the function's body measures it, with where the body first
+    /// does and the parameter's name if the function is one of this
+    /// input's; [`AwaitSite::Implicit`] otherwise.
+    fn argument_site(
+        &self,
+        known: KnownCallee,
+        param: usize,
+        (call, callee): (ExprId, ExprId),
+    ) -> AwaitSite {
+        let argument = |measured| {
+            AwaitSite::Argument(CallSite {
+                call,
+                callee,
+                measured,
+            })
+        };
+        match known {
+            KnownCallee::Current(function) => {
+                let demand = self
+                    .fn_resolutions
+                    .get(function.index())
+                    .and_then(|resolution| resolution.param_demands.get(param).copied().flatten());
+                let decl = self.ast.fn_decl(function);
+                let name = self.ast.params(decl.params).get(param);
+                match (demand, name) {
+                    (Some(span), Some(name)) => argument(Some((span, name.name))),
+                    _ => AwaitSite::Implicit,
+                }
+            }
+            KnownCallee::Earlier(index) => {
+                let measured = self
+                    .scope_measured
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .and_then(|measured| measured.get(param).copied());
+                if measured == Some(true) {
+                    argument(None)
+                } else {
+                    AwaitSite::Implicit
+                }
+            }
+        }
+    }
+
+    /// Whether `callee`, through any parentheses, is the innermost
+    /// function's own name for itself: whether the call is a recursive
+    /// call through the callee binding.
+    fn is_recursive(&self, callee: ExprId) -> bool {
+        let mut node = callee;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        self.expr_vars.get(node.index()) == Some(&VarRef::Callee)
     }
 
     /// Reports that the call `call`, whose callee is at `callee_span` and
@@ -3132,6 +3818,7 @@ impl<'a> Checker<'a> {
                 ty: fn_ty,
                 declared: Some(fn_span),
                 kind: BindingKind::Callee,
+                function: None,
             });
         }
         let params = self.ast.params(decl.params);
@@ -3335,7 +4022,17 @@ impl<'a> Checker<'a> {
             );
             return ty;
         }
-        self.await_here(operand, ty, AwaitKind::Top, Some(keyword));
+        let claimed = self.claim_top(self.ast.get(operand).span, ty);
+        if claimed != ty {
+            // A parameter of this function, which is pure (only a pure
+            // function's parameters are provisional), so the `await` is an
+            // error before anything else; the parameter is measured.
+            if let Some(marker) = self.pure_marker() {
+                self.errors.push(explicit_await_error(keyword, marker));
+            }
+            return claimed;
+        }
+        self.await_here(operand, ty, AwaitKind::Top, AwaitSite::Explicit(keyword));
         self.types.strip(ty)
     }
 
@@ -3527,12 +4224,23 @@ impl<'a> Checker<'a> {
     /// join, and otherwise the branches must agree, untyped branches
     /// adapting as operands of arithmetic do, and two untyped branches
     /// leaving the `if` untyped.
+    ///
+    /// Two branches of the same type have it, a provisional type of the
+    /// innermost function's included, so a parameter passes through an
+    /// `if` unmeasured. Otherwise every parameter of the function whose
+    /// provisional type is in either branch is measured, conservatively,
+    /// and the branches agree on their types with those parameters present.
     fn branches(
         &mut self,
         keyword: Span,
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
     ) -> TyId {
+        let (then_ty, else_ty) = if then_ty == else_ty {
+            (then_ty, else_ty)
+        } else {
+            (self.claim(then, then_ty), self.claim(else_, else_ty))
+        };
         let lazy = self.types.laziness(then_ty) != Laziness::Present
             || self.types.laziness(else_ty) != Laziness::Present;
         if lazy {
@@ -3605,9 +4313,10 @@ impl<'a> Checker<'a> {
     }
 
     /// Types an `if` without `else`, whose keyword is at `keyword`: it is
-    /// `{}`, so its block must be too.
+    /// `{}`, so its block must be too, which measures a parameter of the
+    /// innermost function whose provisional type is in the block's type.
     fn empty_branch(&mut self, keyword: Span, then: ExprId, then_ty: TyId) -> TyId {
-        match then_ty {
+        match self.claim(then, then_ty) {
             TyId::EMPTY => TyId::EMPTY,
             TyId::ERROR => TyId::ERROR,
             _ => {
@@ -3789,13 +4498,19 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Type `ty` as a diagnostic's message or notes show it: plainly if it
-    /// is written as a name, and in backticks if it is structural, as a
-    /// record, function, future or union type is.
-    fn in_message(&self, ty: TyId) -> String {
+    /// Type `ty` as a diagnostic's message or notes show it (see
+    /// [`Checker::shown`]): plainly if it is written as a name, and in
+    /// backticks if it is structural, as a record, function, future or
+    /// union type is.
+    fn in_message(&mut self, ty: TyId) -> String {
+        let ty = self.shown(ty);
         let shown = self.types.display(ty, self.ast.names());
         match self.types.kind(ty) {
-            TyKind::Record(_) | TyKind::Fn(_) | TyKind::Future(_) | TyKind::Union(_) => {
+            TyKind::Record(_)
+            | TyKind::Fn(_)
+            | TyKind::Future(_)
+            | TyKind::Union(_)
+            | TyKind::Provisional { .. } => {
                 format!("`{shown}`")
             }
             TyKind::Int
@@ -3807,9 +4522,38 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Type `ty` as a diagnostic's labels show it: always plainly.
-    fn in_label(&self, ty: TyId) -> String {
+    /// Type `ty` as a diagnostic's labels show it (see
+    /// [`Checker::shown`]): always plainly.
+    fn in_label(&mut self, ty: TyId) -> String {
+        let ty = self.shown(ty);
         self.types.display(ty, self.ast.names()).to_string()
+    }
+
+    /// Type `ty` as a diagnostic shows it, with no provisional type in it,
+    /// since it is shown before the parameters are decided: each of a
+    /// claimable function's (see [`Checker::claimable`]) as what its
+    /// parameter is if nothing more measures it, present if the body has
+    /// measured it so far and the either shape otherwise, and each of any
+    /// other enclosing function's as the either shape, which is what the
+    /// body being checked treats it as.
+    fn shown(&mut self, ty: TyId) -> TyId {
+        if !self.types.contains_provisional(ty, None) {
+            return ty;
+        }
+        let mut ty = ty;
+        let claimable = self.claimable();
+        for (index, function) in self.functions.iter().enumerate() {
+            if function.demanded.is_empty() {
+                continue;
+            }
+            let decisions: Vec<bool> = if claimable.contains(&index) {
+                function.demanded.iter().map(Option::is_some).collect()
+            } else {
+                vec![false; function.demanded.len()]
+            };
+            ty = self.types.settle(ty, function.fn_id, &decisions);
+        }
+        ty
     }
 }
 
@@ -3835,6 +4579,17 @@ const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can se
 /// The label on a pure function's marker, where it does something only an
 /// impure function may.
 const PURE_CONTEXT: &str = "this function is pure, declared with `:`";
+
+/// The error for an explicit `await`, whose keyword is at `keyword`, in a
+/// pure function whose marker is at `marker`.
+fn explicit_await_error(keyword: Span, marker: Span) -> Diagnostic {
+    Diagnostic::error("cannot await in a pure function", keyword)
+        .with_context(marker, PURE_CONTEXT)
+        .with_note(
+            "awaiting runs a deferred expression, which may have effects; declare the function \
+             with `->` to make it impure",
+        )
+}
 
 #[cfg(test)]
 mod tests {
@@ -6486,8 +7241,14 @@ mod tests {
 
     #[test]
     fn a_function_expression_has_its_declared_type() {
+        // A pure function's bare parameters that its body never measures
+        // are the either shape.
         assert_eq!(
             shown_result("fn(x: Int, y: String): Bool { true }"),
+            "fn(x: Int | Future<Int>, y: String | Future<String>): Bool"
+        );
+        assert_eq!(
+            shown_result("fn(x: Present<Int>, y: Present<String>): Bool { true }"),
             "fn(x: Int, y: String): Bool"
         );
         assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {} | Future<{}>");
@@ -6589,14 +7350,15 @@ mod tests {
 
     #[test]
     fn parameters_are_bindings_of_the_body() {
-        // Shadowable, in the body and in blocks within it.
+        // Shadowable, in the body and in blocks within it; a shadowed
+        // parameter is never measured, so it is the either shape.
         assert_eq!(
             shown_result("fn(x: Int): String { let x = \"s\"\nx }"),
-            "fn(x: Int): String"
+            "fn(x: Int | Future<Int>): String"
         );
         assert_eq!(
             shown_result("fn(x: Int): Float { { let x = 1.5; x } }"),
-            "fn(x: Int): Float"
+            "fn(x: Int | Future<Int>): Float"
         );
         // Rebindable with `:=`, keeping their type.
         assert_eq!(
@@ -6762,7 +7524,8 @@ mod tests {
         );
         // A parameter, through one level and through two: each function
         // captures from the one enclosing it. The innermost function is
-        // number 0, since it is finished first.
+        // number 0, since it is finished first. The innermost, pure,
+        // function measures the parameters, which makes them present.
         let text = "fn outer(a: Int, b: String): fn(): fn(): String {\n\
                     \x20 fn(): fn(): String { fn(): String { \"{b}{a}\" } }\n}";
         let (ast, resolution) = resolved(text);
@@ -6783,13 +7546,18 @@ mod tests {
             ]
         );
         assert!(captures(text, 2).is_empty());
-        // The callee, through one level and through two.
+        // The callee, through one level and through two. `n` is only passed
+        // back to `f`, unmeasured, so it is the either shape, and so are
+        // the captures' types, settled with it.
         let text = "fn f(n: Int): fn(): Int { fn(): Int { f(n)() } }";
         assert_eq!(
             captures(text, 0),
             vec![
-                (VarRef::Callee, "fn(n: Int): fn(): Int".to_owned()),
-                (VarRef::Local(Slot(0)), "Int".to_owned())
+                (
+                    VarRef::Callee,
+                    "fn(n: Int | Future<Int>): fn(): Int".to_owned()
+                ),
+                (VarRef::Local(Slot(0)), "Int | Future<Int>".to_owned())
             ]
         );
         let text = "fn f(): Int {\n\
@@ -6902,7 +7670,7 @@ mod tests {
             ]
         );
         // The trailing block counts, as the last.
-        let text = "fn one(r: {x: Int}): Int { 1 }\none({ x = 1 }) { x = 2 }";
+        let text = "fn one(r: {x: Int}): Int { r.x }\none({ x = 1 }) { x = 2 }";
         let diagnostic = &diagnostics(text)[0];
         assert_eq!(diagnostic.message, "expected 1 argument, found 2");
         assert_eq!(
@@ -7017,7 +7785,7 @@ mod tests {
 
     #[test]
     fn parameters_left_unfilled() {
-        let three = "fn three(a: Int, b: Int, c: Int): Int { a }\n";
+        let three = "fn three(a: Int, b: Int, c: Int): Int { a + b + c }\n";
         // With positional arguments only, the call is short as a whole.
         let text = format!("{three}three(1)");
         let found = diagnostics(&text);
@@ -7123,8 +7891,8 @@ mod tests {
 
     #[test]
     fn binding_arguments_to_parameters() {
-        let service =
-            "fn service(name: String, config: {port: Int, image: String}): String { name }\n";
+        let service = "fn service(name: String, config: {port: Int, image: String}): String \
+             { \"{name}:{config.port}\" }\n";
         let bound = |text: &str| {
             let (ast, resolution) = resolved(text);
             let call = ast
@@ -7508,9 +8276,15 @@ mod tests {
             shown_result("fn(f: fn(): Int, r: {g: fn(): Int}) -> Int { 1 }"),
             "fn(f: fn(): Int, r: {g: fn(): Int} | Future<{g: fn(): Int}>) -> Int | Future<Int>"
         );
-        // A pure function's are present.
+        // A pure function's result is present, and so are its parameters
+        // that its body measures; those it does not are inferred to be the
+        // either shape (see `pure_parameters_are_inferred`).
         assert_eq!(
             shown_result("fn(x: Int, r: {a: String}): {v: Int} { v = x }"),
+            "fn(x: Int, r: {a: String} | Future<{a: String}>): {v: Int}"
+        );
+        assert_eq!(
+            shown_result("fn(x: Int, r: {a: String}): {v: Int} { v = x; w = r.a }"),
             "fn(x: Int, r: {a: String}): {v: Int}"
         );
         // A written impure function type's, and a pure one's; and each has
@@ -7556,13 +8330,19 @@ mod tests {
             shown_result("let x: Future<Int> | Int = lazy 1\nx"),
             "Int | Future<Int>"
         );
-        // The two functions of the specification.
+        // The two functions of the specification; `keep`'s parameter,
+        // written as the either shape here, is inferred to be one when it is
+        // written bare too.
         assert_eq!(
             shown_result("fn double(x: Int): Int { x * 2 }\ndouble"),
             "fn(x: Int): Int"
         );
         assert_eq!(
             shown_result("fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\nkeep"),
+            "fn(x: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+        assert_eq!(
+            shown_result("fn keep(x: Int): {v: Int | Future<Int>} { v = x }\nkeep"),
             "fn(x: Int | Future<Int>): {v: Int | Future<Int>}"
         );
     }
@@ -7741,13 +8521,17 @@ mod tests {
             captures(text, 1),
             vec![(VarRef::Local(Slot(0)), "Int".to_owned())]
         );
-        // And the callee of the function it is in.
+        // And the callee of the function it is in; `n` is passed back to
+        // it unmeasured, so it is the either shape.
         let text = "fn f(n: Int): Future<Int> { lazy await f(n) }";
         assert_eq!(
             captures(text, 0),
             vec![
-                (VarRef::Callee, "fn(n: Int): Future<Int>".to_owned()),
-                (VarRef::Local(Slot(0)), "Int".to_owned())
+                (
+                    VarRef::Callee,
+                    "fn(n: Int | Future<Int>): Future<Int>".to_owned()
+                ),
+                (VarRef::Local(Slot(0)), "Int | Future<Int>".to_owned())
             ]
         );
         // A lazy in a function's initialiser does not see the function's
@@ -7875,8 +8659,10 @@ mod tests {
         assert_implicit_await_error(text, last(text, "r"), "Future<{a: Int}>");
         let text = "fn f(g: Future<fn(): Int>): Int { g() }";
         assert_implicit_await_error(text, last(text, "g"), "Future<fn(): Int>");
-        // An argument against a present parameter.
-        let text = "fn h(n: Int): Int { n }\nfn f(x: Future<Int>): Int { h(x) }";
+        // An argument against a parameter written present. (One present by
+        // inference has the call-site form: see
+        // `the_call_site_form_of_the_implicit_await_error`.)
+        let text = "fn h(n: Present<Int>): Int { n }\nfn f(x: Future<Int>): Int { h(x) }";
         assert_implicit_await_error(text, last(text, "x"), "Future<Int>");
         // A body against a present return type.
         let text = "fn f(x: Int | Future<Int>): Int { x }";
@@ -7899,8 +8685,8 @@ mod tests {
             Some("this is {a: Int | Future<Int>}")
         );
         // A pure function nested in an impure one is pure; a pure
-        // function's own bare parameter is present, so measuring it is
-        // fine.
+        // function's own bare parameter is measured, which makes it present,
+        // so measuring it is fine.
         assert_eq!(
             messages("fn f(x: Int) -> Int { let g = fn(): Int { x + 1 }\ng() }"),
             vec!["cannot use a value that may be a future in a pure function"]
@@ -8204,14 +8990,26 @@ mod tests {
             )),
             "Int | Future<Int>"
         );
-        // A pure function declared to pass values through fits both.
-        let keep = "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\n";
-        assert_eq!(
-            shown_result(&format!(
-                "{keep}fn run(f: fn(Int) -> {{v: Int}}) -> {{v: Int}} {{ f(1) }}\nrun(keep)"
-            )),
-            "{v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
-        );
+        // A pure function that passes values through fits both, whether its
+        // parameter is declared the either shape or inferred to be one.
+        for keep in [
+            "fn keep(x: Int | Future<Int>): {v: Int | Future<Int>} { v = x }\n",
+            "fn keep(x: Int): {v: Int | Future<Int>} { v = x }\n",
+        ] {
+            assert_eq!(
+                shown_result(&format!(
+                    "{keep}fn run(f: fn(Int) -> {{v: Int}}) -> {{v: Int}} {{ f(1) }}\nrun(keep)"
+                )),
+                "{v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+            );
+            assert_eq!(
+                shown_result(&format!(
+                    "{keep}fn run(f: fn(Present<Int>) -> {{v: Int}}) -> {{v: Int}} {{ f(1) }}\n\
+                     run(keep)"
+                )),
+                "{v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+            );
+        }
     }
 
     #[test]
@@ -8333,5 +9131,489 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // ----- Inferred parameters -----
+
+    /// The type of the function `f` that `text` declares, as shown.
+    fn type_of_f(text: &str) -> String {
+        shown_result(&format!("{text}\nf"))
+    }
+
+    /// Where the body of function number `n` of `text` first measures each
+    /// of its parameters, as source text, whether the check succeeds or
+    /// not.
+    fn demands(text: &str, n: u32) -> Vec<Option<&str>> {
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let mut checker = Checker::new(&ast, &mut types);
+        checker.check_body(ast.root(), None);
+        checker.fn_resolutions[FnId::new(n).index()]
+            .param_demands
+            .iter()
+            .map(|demand| demand.map(|span| &text[span.start as usize..span.end as usize]))
+            .collect()
+    }
+
+    #[test]
+    fn pure_parameters_are_inferred() {
+        // The functions of the specification.
+        assert_eq!(type_of_f("fn f(x: Int): Int { x * 2 }"), "fn(x: Int): Int");
+        assert_eq!(
+            type_of_f("fn f(x: Int): {v: Int | Future<Int>} { v = x }"),
+            "fn(x: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+        // A pure function's bare result is still present, so returning a
+        // parameter measures it.
+        assert_eq!(type_of_f("fn f(x: Int): Int { x }"), "fn(x: Int): Int");
+        // Each parameter on its own; a record type too.
+        assert_eq!(
+            type_of_f("fn f(a: Int, r: {n: Int}, s: String): Int { a + r.n }"),
+            "fn(a: Int, r: {n: Int}, s: String | Future<String>): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(r: {n: Int}): {r: {n: Int} | Future<{n: Int}>} { r = r }"),
+            "fn(r: {n: Int} | Future<{n: Int}>): {r: {n: Int} | Future<{n: Int}>}"
+        );
+        // Not a parameter written `Present<...>`, `Future<...>`, a union or
+        // a function type, which says what it is.
+        assert_eq!(
+            type_of_f(
+                "fn f(a: Present<Int>, b: Future<Int>, c: Int | Future<Int>, g: fn(): Int): Int { 1 }"
+            ),
+            "fn(a: Int, b: Future<Int>, c: Int | Future<Int>, g: fn(): Int): Int"
+        );
+        // Nor an impure function's, which is always the either shape.
+        assert_eq!(
+            type_of_f("fn f(x: Int) -> Int { 1 }"),
+            "fn(x: Int | Future<Int>) -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn each_measuring_position_measures_a_parameter() {
+        // Measuring operators, whatever else they find.
+        for (body, ret) in [
+            ("x + 1", "Int"),
+            ("1 - x", "Int"),
+            ("x * 2", "Int"),
+            ("x / 2", "Float"),
+            ("x // 2", "Int"),
+            ("x % 2", "Int"),
+            ("x < 1", "Bool"),
+            ("x <= 1", "Bool"),
+            ("x > 1", "Bool"),
+            ("x >= 1", "Bool"),
+            ("x == 1", "Bool"),
+            ("x != 1", "Bool"),
+            ("x === 1", "Bool"),
+            ("x !== 1", "Bool"),
+            ("-x", "Int"),
+            ("\"{x}\"", "String"),
+            // Present positions: an annotation, an ascription, a `:=`
+            // target, a field, the result.
+            ("let y: Int = x\ny", "Int"),
+            ("let y = (x : Int)\ny", "Int"),
+            ("let y = 0\ny := x\ny", "Int"),
+        ] {
+            let text = format!("fn f(x: Int): {ret} {{ {body} }}");
+            assert_eq!(demands(&text, 0), vec![Some("x")], "{text}");
+            assert_eq!(type_of_f(&text), format!("fn(x: Int): {ret}"), "{text}");
+        }
+        // The result, measured where the body is checked against the
+        // return type.
+        let text = "fn f(x: Int): Int { x }";
+        assert_eq!(demands(text, 0), vec![Some("{ x }")]);
+        for body in [
+            "b and true",
+            "false or b",
+            "not b",
+            "if b { true } else { false }",
+        ] {
+            let text = format!("fn f(b: Bool): Bool {{ {body} }}");
+            assert_eq!(demands(&text, 0), vec![Some("b")], "{text}");
+            assert_eq!(type_of_f(&text), "fn(b: Bool): Bool", "{text}");
+        }
+        // A field access; a field of a present record type.
+        let text = "fn f(r: {a: Int}): Int { r.a }";
+        assert_eq!(demands(text, 0), vec![Some("r")]);
+        let text = "fn f(x: Int): {v: Int} { v = x }";
+        assert_eq!(demands(text, 0), vec![Some("x")]);
+        assert_eq!(type_of_f(text), "fn(x: Int): {v: Int}");
+        // A call of it, which is an error, since no parameter written as a
+        // name or a record type is a function.
+        let text = "fn f(x: {}): Int { x() }";
+        assert_eq!(demands(text, 0), vec![Some("x")]);
+        assert_eq!(messages(text), vec!["cannot call a value of type `{}`"]);
+        // An argument against a present parameter, written so or inferred.
+        let text = "fn h(n: Present<Int>): Int { n }\nfn f(x: Int): Int { h(x) }";
+        assert_eq!(demands(text, 1), vec![Some("x")]);
+        let text = "fn h(n: Int): Int { n + 1 }\nfn f(x: Int): Int { h(x) }";
+        assert_eq!(demands(text, 1), vec![Some("x")]);
+        assert_eq!(type_of_f(text), "fn(x: Int): Int");
+        // A recursive call, every argument that is a parameter, even
+        // against a parameter that is passed through.
+        let text = "fn f(x: Int, n: Int): Int | Future<Int> {\n\
+                    \x20 if n == 0 { 0 } else { f(x, n - 1) }\n}";
+        assert_eq!(demands(text, 0), vec![Some("x"), Some("n")]);
+        assert_eq!(type_of_f(text), "fn(x: Int, n: Int): Int | Future<Int>");
+        let text = "fn f(x: Int, y: Int): Int { if true { 0 } else { f(y, x) } }";
+        assert_eq!(demands(text, 0), vec![Some("x"), Some("y")]);
+        // A statement whose value is `{}` once awaited.
+        let text = "fn f(x: {}): Int { x\n1 }";
+        assert_eq!(demands(text, 0), vec![Some("x")]);
+        assert_eq!(type_of_f(text), "fn(x: {}): Int");
+        // An update of a record reads it.
+        let text = "fn f(r: {a: Int}): {a: Int, b: Int} { let r.b = 2\nr }";
+        assert_eq!(demands(text, 0), vec![Some("r")]);
+        assert_eq!(type_of_f(text), "fn(r: {a: Int}): {a: Int, b: Int}");
+        // The first measuring use in source order is the one recorded.
+        let text = "fn f(x: Int): Int { let y = x + 1\nlet z: Int = x\ny + z }";
+        let first = at(text, "x + 1");
+        assert_eq!(
+            resolved(text).1.function(FnId::new(0)).param_demands,
+            vec![Some(Span::new(first.start, first.start + 1))]
+        );
+        // Also when a later use in source order is checked first: the body
+        // is checked against the return type after its items.
+        let text = "fn f(x: Int): {a: Int, b: Int} { a = x; b = x + 1 }";
+        assert_eq!(
+            resolved(text).1.function(FnId::new(0)).param_demands,
+            vec![Some(nth(text, "x", 1))]
+        );
+    }
+
+    #[test]
+    fn a_parameter_passed_on_is_not_measured() {
+        for (text, shown) in [
+            // Passed to an either parameter.
+            (
+                "fn h(n: Int | Future<Int>): Int { 1 }\nfn f(x: Int): Int { h(x) }",
+                "fn(x: Int | Future<Int>): Int",
+            ),
+            // Stored in a record whose field is the either shape, and
+            // returned against an either return type.
+            (
+                "fn f(x: Int): {v: Int | Future<Int>} { v = x }",
+                "fn(x: Int | Future<Int>): {v: Int | Future<Int>}",
+            ),
+            (
+                "fn f(x: Int): Int | Future<Int> { x }",
+                "fn(x: Int | Future<Int>): Int | Future<Int>",
+            ),
+            // Captured by a closure or a `lazy`, which measure it on their
+            // own account.
+            (
+                "fn f(x: Int): fn() -> Int { fn() -> Int { x + 1 } }",
+                "fn(x: Int | Future<Int>): fn() -> Int | Future<Int>",
+            ),
+            (
+                "fn f(x: Int): Future<Int> { lazy x + 1 }",
+                "fn(x: Int | Future<Int>): Future<Int>",
+            ),
+            // Bound by a `let` without an annotation.
+            (
+                "fn f(x: Int): Int | Future<Int> { let y = x\ny }",
+                "fn(x: Int | Future<Int>): Int | Future<Int>",
+            ),
+            // Unused.
+            ("fn f(x: Int): Int { 1 }", "fn(x: Int | Future<Int>): Int"),
+        ] {
+            assert_eq!(type_of_f(text), shown, "{text}");
+            // `f` is the last function finished, so the last numbered.
+            let (ast, resolution) = resolved(text);
+            let f = FnId::new(u32::try_from(ast.fn_count() - 1).unwrap());
+            assert_eq!(resolution.function(f).param_demands, vec![None], "{text}");
+        }
+    }
+
+    #[test]
+    fn blind_assignment_keeps_the_parameter() {
+        // Through a `let`, a record's field read back, and an `if` whose
+        // branches are both the parameter: measured where it is used.
+        let text = "fn f(x: Int): Int { let y = x\ny + 1 }";
+        assert_eq!(demands(text, 0), vec![Some("y")]);
+        let text = "fn f(x: Int): Int { let r = { v = x }\nr.v + 1 }";
+        assert_eq!(demands(text, 0), vec![Some("r.v")]);
+        let text = "fn f(c: Bool, x: Int): Int { (if c { x } else { x }) + 1 }";
+        assert_eq!(
+            demands(text, 0),
+            vec![Some("c"), Some("(if c { x } else { x })")]
+        );
+        // And passed on unmeasured through each.
+        for text in [
+            "fn f(x: Int): {v: Int | Future<Int>} { let y = x\nv = y }",
+            "fn f(x: Int): {v: Int | Future<Int>} { let r = { w = x }\nv = r.w }",
+            "fn f(c: Bool, x: Int): Int | Future<Int> { if c { x } else { x } }",
+        ] {
+            assert_eq!(demands(text, 0).last(), Some(&None), "{text}");
+        }
+        // Two parameters joined are both measured, conservatively, and so
+        // is a parameter joined with anything else.
+        let text = "fn f(c: Bool, x: Int, y: Int): Int | Future<Int> { if c { x } else { y } }";
+        assert_eq!(
+            demands(text, 0),
+            vec![Some("c"), Some("{ x }"), Some("{ y }")]
+        );
+        assert_eq!(
+            type_of_f(text),
+            "fn(c: Bool, x: Int, y: Int): Int | Future<Int>"
+        );
+        let text = "fn f(c: Bool, x: Int): Int { if c { x } else { 1 } }";
+        assert_eq!(demands(text, 0), vec![Some("c"), Some("{ x }")]);
+        assert_eq!(type_of_f(text), "fn(c: Bool, x: Int): Int");
+        // (The `lazy` is function number 0, finished first.)
+        let text = "fn f(c: Bool, x: Int): Int | Future<Int> { if c { x } else { lazy 1 } }";
+        assert_eq!(demands(text, 1), vec![Some("c"), Some("{ x }")]);
+        assert_eq!(
+            shown_result(&format!("{text}\nf(true, 1)")),
+            "Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_nested_function_measures_an_enclosing_parameter_through_pure_functions() {
+        // A nested pure function measuring it makes it present for the
+        // function it belongs to, which is where its caller awaits it.
+        let text = "fn f(x: Int): fn(): Int { fn(): Int { x + 1 } }";
+        assert_eq!(type_of_f(text), "fn(x: Int): fn(): Int");
+        assert_eq!(demands(text, 1), vec![Some("x")]);
+        assert!(marks(text).is_empty());
+        // Through two pure functions, and where the nested function uses
+        // it as its result.
+        let text = "fn f(x: Int): fn(): fn(): Int { fn(): fn(): Int { fn(): Int { x } } }";
+        assert_eq!(type_of_f(text), "fn(x: Int): fn(): fn(): Int");
+        assert_eq!(demands(text, 2), vec![Some("{ x }")]);
+        // Passed on unmeasured by the nested function, it stays the either
+        // shape, and the nested function's own type says so.
+        let text = "fn f(x: Int): fn(): Int | Future<Int> { fn(): Int | Future<Int> { x } }";
+        assert_eq!(
+            type_of_f(text),
+            "fn(x: Int | Future<Int>): fn(): Int | Future<Int>"
+        );
+        assert_eq!(demands(text, 1), vec![None]);
+        // Through a `lazy` or an impure function, a pure function cannot
+        // measure it: the `lazy` may await it, so it may be a future there.
+        let text = "fn f(x: Int): Future<Int> { lazy { let g = fn(): Int { x + 1 }\ng() } }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "cannot use a value that may be a future in a pure function"
+        );
+        assert_eq!(found[0].span, nth(text, "x", 1));
+        assert_eq!(found[0].label.as_deref(), Some("this is Int | Future<Int>"));
+        // The nested function's marker, and nothing measured for `f`.
+        assert_eq!(labels(&found[0]), vec![(nth(text, ":", 2), PURE_CONTEXT)]);
+        assert_eq!(demands(text, 2), vec![None]);
+        // A nested `lazy` or impure function awaits it where it measures it.
+        assert_eq!(
+            marks("fn f(x: Int): Future<Int> { lazy x + 1 }"),
+            vec![("x", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(x: Int): fn() -> Int { fn() -> Int { x + 1 } }"),
+            vec![("x", AwaitMark::Top)]
+        );
+        // Even where the enclosing function measures it too, so it is in
+        // fact present: the await then finds a present value.
+        let text = "fn f(x: Int): Future<Int> { let y = x + 1\nlazy x + y }";
+        assert_eq!(type_of_f(text), "fn(x: Int): Future<Int>");
+        assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn every_type_in_a_body_is_settled() {
+        let text = "fn f(x: Int, r: {a: Int}, s: String): {v: Int | Future<Int>, w: Int} {\n\
+                    \x20 let y = x\n\
+                    \x20 let q = { k = y; t = s }\n\
+                    \x20 let g = fn() -> Int { r.a }\n\
+                    \x20 v = if true { q.k } else { y }\n\
+                    \x20 w = r.a\n\
+                    }\nf";
+        let (ast, types, output) = check_text(text);
+        let output = output.unwrap_or_else(|errors| panic!("{errors:?}"));
+        let dump = ast
+            .pretty_with(&output.checked.types.annotation(&types, ast.names()))
+            .to_string();
+        assert!(!dump.contains('?'), "{dump}");
+        assert!(
+            dump.contains(
+                "fn(x: Int | Future<Int>, r: {a: Int}, s: String | Future<String>): \
+                 {v: Int | Future<Int>, w: Int}"
+            ),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("(name s : String | Future<String> @"),
+            "{dump}"
+        );
+        // The captures of a nested function are settled too.
+        let (ast, types, output) = check_text(text);
+        let output = output.unwrap_or_else(|errors| panic!("{errors:?}"));
+        let captured: Vec<String> = output
+            .checked
+            .resolution
+            .function(FnId::new(0))
+            .captures
+            .iter()
+            .map(|&(_, ty)| types.display(ty, ast.names()).to_string())
+            .collect();
+        assert_eq!(captured, vec!["{a: Int}"]);
+        // A function is settled even when its check fails, so no `?` is
+        // left in a failed check's types either.
+        let text = "fn f(x: Int): Int { x + \"a\" }";
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let table = {
+            let mut checker = Checker::new(&ast, &mut types);
+            checker.check_body(ast.root(), None);
+            assert_eq!(checker.errors.len(), 1);
+            Types::new(checker.expr_types)
+        };
+        let dump = ast
+            .pretty_with(&table.annotation(&types, ast.names()))
+            .to_string();
+        assert!(dump.contains("(name x : Int @20..21)"), "{dump}");
+        assert!(!dump.contains('?'), "{dump}");
+    }
+
+    /// The note of the call-site form of the implicit-await error, with the
+    /// call written with its await, if any.
+    fn call_site_note(call: Option<&str>) -> String {
+        let note = "a pure function cannot await; await the argument before the call, in an \
+                    impure function";
+        match call {
+            Some(call) => format!("{note}: `{call}`"),
+            None => note.to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_call_site_form_of_the_implicit_await_error() {
+        let text = "fn double(x: Int): Int {\n  let y = x + 5\n  y\n}\n\
+                    fn caller(my_future: Future<Int>): Int {\n  double(my_future)\n}";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        let error = &found[0];
+        assert_eq!(
+            error.message,
+            "argument `my_future` would be awaited inside `double`, which is pure"
+        );
+        assert_eq!(error.span, last(text, "my_future"));
+        assert_eq!(error.label.as_deref(), Some("this is Future<Int>"));
+        let marker = nth(text, "):", 1);
+        assert_eq!(
+            labels(error),
+            vec![
+                (nth(text, "x", 1), "`x` is measured here"),
+                (Span::new(marker.start + 1, marker.end), PURE_CONTEXT)
+            ]
+        );
+        assert_eq!(
+            error.notes,
+            vec![call_site_note(Some("double(await my_future)"))]
+        );
+        // An either argument; a dotted path, among other arguments, one
+        // named; an argument that is neither a name nor a dotted path.
+        let double = "fn double(x: Int, n: Int): Int { x * n }\n";
+        let text = format!("{double}fn caller(v: Int | Future<Int>): Int {{ double(v, 2) }}");
+        let error = &diagnostics(&text)[0];
+        assert_eq!(
+            error.message,
+            "argument `v` would be awaited inside `double`, which is pure"
+        );
+        assert_eq!(error.label.as_deref(), Some("this is Int | Future<Int>"));
+        // `2` is not a name, so the call is not written out.
+        assert_eq!(error.notes, vec![call_site_note(None)]);
+        let text = format!(
+            "{double}fn caller(r: {{f: Future<Int>}}, m: Int): Int {{ double(n = m, x = r.f) }}"
+        );
+        let error = &diagnostics(&text)[0];
+        assert_eq!(
+            error.message,
+            "argument `r.f` would be awaited inside `double`, which is pure"
+        );
+        assert_eq!(
+            error.notes,
+            vec![call_site_note(Some("double(n = m, x = await r.f)"))]
+        );
+        let text = format!("{double}fn caller(): Int {{ double(lazy 1, 2) }}");
+        let error = &diagnostics(&text)[0];
+        assert_eq!(
+            error.message,
+            "this argument would be awaited inside `double`, which is pure"
+        );
+        assert_eq!(error.span, at(&text, "lazy 1"));
+        // An impure caller awaits the argument at the call.
+        let text = format!("{double}fn caller(v: Future<Int>) -> Int {{ double(v, 2) }}");
+        assert_eq!(marks(&text), vec![("v", AwaitMark::Top)]);
+        // A parameter written present, or of a function that is not known,
+        // gets the generic form.
+        for text in [
+            "fn double(x: Present<Int>): Int { x * 2 }\nfn caller(v: Future<Int>): Int { double(v) }",
+            "fn double(x: Int): Int { x * 2 }\nlet d = double\nfn caller(v: Future<Int>): Int { d(v) }",
+            "fn caller(d: fn(Int): Int, v: Future<Int>): Int { d(v) }",
+        ] {
+            assert_eq!(
+                messages(text),
+                vec!["cannot use a value that may be a future in a pure function"],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_call_site_form_for_a_function_of_an_earlier_input() {
+        let mut names = Names::new();
+        let mut types = TypeTable::new();
+        let parse_with = |text: &str, names: &mut Names| {
+            let source = SourceFile::new("test.gcsl", text).unwrap();
+            let (tokens, strings) = tokenize_with(&source, names).unwrap();
+            parse(&tokens, names.clone(), strings, &source).unwrap()
+        };
+        let first = parse_with(
+            "fn double(x: Int): Int { x * 2 }\nfn keep(x: Int): {v: Int | Future<Int>} { v = x }\n\
+             fn written(x: Present<Int>): Int { x }",
+            &mut names,
+        );
+        let scope = Checker::new(&first, &mut types).check().unwrap().scope;
+        // The call-site form, without the label on the measuring use, which
+        // is in the earlier input's source.
+        let text = "fn caller(v: Future<Int>): Int { double(v) }";
+        let second = parse_with(text, &mut names);
+        let found = Checker::with_scope(&second, scope.clone(), &mut types)
+            .check()
+            .unwrap_err();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "argument `v` would be awaited inside `double`, which is pure"
+        );
+        assert_eq!(found[0].span, last(text, "v"));
+        assert_eq!(labels(&found[0]), vec![(nth(text, ":", 1), PURE_CONTEXT)]);
+        assert_eq!(
+            found[0].notes,
+            vec![call_site_note(Some("double(await v)"))]
+        );
+        // Passed through, nothing is awaited; written present, the generic
+        // form.
+        let third = parse_with(
+            "fn caller(v: Future<Int>): {v: Int | Future<Int>} { keep(v) }",
+            &mut names,
+        );
+        assert!(
+            Checker::with_scope(&third, scope.clone(), &mut types)
+                .check()
+                .is_ok()
+        );
+        let fourth = parse_with("fn caller(v: Future<Int>): Int { written(v) }", &mut names);
+        let found = Checker::with_scope(&fourth, scope, &mut types)
+            .check()
+            .unwrap_err();
+        assert_eq!(
+            found[0].message,
+            "cannot use a value that may be a future in a pure function"
+        );
     }
 }

@@ -86,6 +86,32 @@
 //! of the join of what they yield, and a future or an either with anything
 //! else to the either of the join of both sides stripped.
 //!
+//! # Provisional types
+//!
+//! A pure function's bare parameter is present if the function's body
+//! measures it and the either shape if it never does, which the checker
+//! knows only once it has checked the body. While it checks the body, the
+//! parameter has a checker-internal *provisional* type,
+//! [`TyKind::Provisional`], shown as its type followed by `?` (`Int?`):
+//! the parameter's type, `inner`, standing for either `inner` or
+//! `deferrable(inner)`, tagged with the function and the parameter's
+//! position. Like [`TyId::UNTYPED_INT`], it never survives a successful
+//! check: when the body's check ends, [`TypeTable::settle`] replaces each of
+//! the function's provisionals, wherever it sits inside a type, with what
+//! was decided for its parameter.
+//!
+//! Until then a provisional is treated as whichever of its two outcomes is
+//! the safer where it is: [`TypeTable::strip`] and [`TypeTable::present`]
+//! remove it like a future layer; [`TypeTable::laziness`] has a variant of
+//! its own for it; as a subtype and in a join it is its either shape
+//! (whatever is decided, a value of the parameter satisfies what the either
+//! shape does); and as a supertype, which it is only as the parameter of the
+//! function's own type, in a recursive call or where the function is used
+//! as a value in its own body, it is its present type `inner` (whatever is
+//! decided, a present value satisfies it). Two provisionals of the same
+//! parameter are one type, so a value passed through unmeasured keeps the
+//! parameter's decision.
+//!
 //! # Lifetime
 //!
 //! A table only grows. It lives outside the checker so that a
@@ -95,11 +121,16 @@
 //! it, so a stale entry is harmless. (If the failed input's names are
 //! forgotten and their `Name`s reused for other text, the entry simply
 //! describes a record over the new names, which is still a valid type; no
-//! live id can refer to it unless an equal type is interned again.)
+//! live id can refer to it unless an equal type is interned again.) The
+//! same holds for a provisional type: it names a function by its
+//! [`FnId`] in the input that interned it, and a later input's function of
+//! the same number, parameter and type interns to the same id, which is
+//! harmless, since no settled type of the earlier input refers to it.
 
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::ast::FnId;
 use crate::names::{Name, Names};
 use crate::strings::FieldName;
 use crate::value::ValueKind;
@@ -164,6 +195,20 @@ pub enum TyKind {
     /// shape, `T | Future<T>`, through [`TypeTable::deferrable`]; see the
     /// module documentation.
     Union(Box<[TyId]>),
+    /// A pure function's bare parameter whose laziness is not decided yet:
+    /// `inner` if the function's body measures it, and `inner`'s either
+    /// shape if it never does. Checker-internal, like
+    /// [`TyKind::UntypedInt`]: it never survives a successful check, and
+    /// [`TypeTable::provisional`] builds one. See the module documentation.
+    Provisional {
+        /// The function whose parameter it is.
+        function: FnId,
+        /// The parameter's position among the function's parameters.
+        param: u32,
+        /// The parameter's type as written, resolved: never a future, an
+        /// either shape or a provisional.
+        inner: TyId,
+    },
     /// See [`TyId::UNTYPED_INT`].
     UntypedInt,
     /// See [`TyId::ERROR`].
@@ -199,6 +244,9 @@ pub enum Laziness {
     Future,
     /// A future or not: `T | Future<T>`.
     Either,
+    /// A pure function's parameter whose laziness is not decided yet: see
+    /// [`TyKind::Provisional`].
+    Provisional,
 }
 
 /// How a value is awaited where it is used as its bits: see
@@ -220,6 +268,12 @@ pub struct TypeTable {
     kinds: Vec<TyKind>,
     /// The id of each kind, the inverse of `kinds`.
     lookup: HashMap<TyKind, TyId>,
+    /// Whether each type is or contains a [`TyKind::Provisional`] at any
+    /// depth, function types included, indexed by [`TyId`]: computed when
+    /// the type is interned, from its parts, which are interned first, so
+    /// that the types without one, nearly all of them, are passed over in
+    /// constant time.
+    provisional: Vec<bool>,
 }
 
 impl Default for TypeTable {
@@ -236,6 +290,7 @@ impl TypeTable {
         let mut table = Self {
             kinds: Vec::new(),
             lookup: HashMap::new(),
+            provisional: Vec::new(),
         };
         // In the order of the constants' numbers.
         for kind in [
@@ -258,16 +313,17 @@ impl TypeTable {
     ///
     /// A record's fields are sorted by name here, so they may be given in
     /// any order; they must not repeat a name (the checker reports repeated
-    /// names before it builds a type). A future and a union must already
-    /// satisfy the invariants documented on [`TyKind::Future`] and
-    /// [`TyKind::Union`].
+    /// names before it builds a type). A future, a union and a provisional
+    /// type must already satisfy the invariants documented on
+    /// [`TyKind::Future`], [`TyKind::Union`] and [`TyKind::Provisional`].
     ///
     /// A table holds at most `u32::MAX` types. Every type but the
     /// pre-interned ones is built from source (a record block, a record or
-    /// function type expression or a function expression, each at least two
-    /// bytes of it, or the join of two types already in the table, which is
-    /// no larger than either), so the limit is far beyond any table; past
-    /// it, ids would saturate.
+    /// function type expression, a function expression or a parameter, each
+    /// at least two bytes of it, the join of two types already in the table,
+    /// which is no larger than either, or a type already in the table with
+    /// its provisionals settled, which is no larger than it), so the limit is
+    /// far beyond any table; past it, ids would saturate.
     pub fn intern(&mut self, kind: TyKind) -> TyId {
         let kind = match kind {
             TyKind::Record(RecordTy { mut fields }) => {
@@ -282,9 +338,35 @@ impl TypeTable {
             return id;
         }
         let id = TyId(u32::try_from(self.kinds.len()).unwrap_or(u32::MAX));
+        let provisional = match &kind {
+            TyKind::Provisional { .. } => true,
+            TyKind::Record(record) => record
+                .fields
+                .iter()
+                .any(|&(_, field)| self.has_provisional(field)),
+            TyKind::Fn(sig) => {
+                self.has_provisional(sig.ret)
+                    || sig.params.iter().any(|&(_, ty)| self.has_provisional(ty))
+            }
+            TyKind::Future(inner) => self.has_provisional(*inner),
+            TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
+            TyKind::Int
+            | TyKind::Float
+            | TyKind::Bool
+            | TyKind::String
+            | TyKind::UntypedInt
+            | TyKind::Error => false,
+        };
+        self.provisional.push(provisional);
         self.kinds.push(kind.clone());
         self.lookup.insert(kind, id);
         id
+    }
+
+    /// Whether `id` is or contains a provisional type at any depth; `false`
+    /// for an id this table did not produce.
+    fn has_provisional(&self, id: TyId) -> bool {
+        self.provisional.get(id.index()).copied().unwrap_or(false)
     }
 
     /// Returns the id of the record type with `fields`, in any order, adding
@@ -322,11 +404,12 @@ impl TypeTable {
     }
 
     /// Whether `id` is a function type, or a record type with a field of a
-    /// type that is or contains one, at any depth, looking through futures
-    /// and unions: a type whose values cannot be compared, since functions
-    /// have no equality.
+    /// type that is or contains one, at any depth, looking through futures,
+    /// unions and provisional types: a type whose values cannot be compared,
+    /// since functions have no equality.
     ///
-    /// Recurses once per level of record, future or union nesting.
+    /// Recurses once per level of record, future, union or provisional
+    /// nesting.
     #[must_use]
     pub fn contains_fn(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
@@ -335,7 +418,9 @@ impl TypeTable {
                 .fields
                 .iter()
                 .any(|&(_, field)| self.contains_fn(field)),
-            Some(TyKind::Future(inner)) => self.contains_fn(*inner),
+            Some(TyKind::Future(inner) | TyKind::Provisional { inner, .. }) => {
+                self.contains_fn(*inner)
+            }
             Some(TyKind::Union(members)) => members.iter().any(|&member| self.contains_fn(member)),
             _ => false,
         }
@@ -396,29 +481,260 @@ impl TypeTable {
         self.either_member(id).is_some()
     }
 
+    /// The provisional type of parameter number `param` of function
+    /// `function`, whose type as written is `inner`, adding it to the table
+    /// if it is new (see [`TyKind::Provisional`]). `inner` must be neither a
+    /// future, an either shape, a provisional type nor `Error`: the checker
+    /// only makes one for a parameter whose type is written as a name or a
+    /// record type and names a type.
+    pub fn provisional(&mut self, function: FnId, param: u32, inner: TyId) -> TyId {
+        self.intern(TyKind::Provisional {
+            function,
+            param,
+            inner,
+        })
+    }
+
+    /// Type `id` with every provisional type of function `function` in it,
+    /// at any depth, through records, futures, unions and function types,
+    /// replaced by what was decided for its parameter: its present type if
+    /// `decisions[param]` is `true`, the parameter being measured, and the
+    /// either shape of it otherwise. Provisional types of other functions
+    /// are left as they are, and so is one whose parameter has no decision.
+    /// Interns the types it makes; returns `id` itself, in constant time, if
+    /// it has no provisional type in it.
+    ///
+    /// Recurses once per level of nesting in the type.
+    pub fn settle(&mut self, id: TyId, function: FnId, decisions: &[bool]) -> TyId {
+        if !self.has_provisional(id) {
+            return id;
+        }
+        // A copy of the kind (ids only, apart from the boxed lists), since
+        // settling a part may intern new types.
+        let Some(kind) = self.kinds.get(id.index()).cloned() else {
+            return id;
+        };
+        match kind {
+            TyKind::Provisional {
+                function: of,
+                param,
+                inner,
+            } if of == function => match decisions.get(param as usize) {
+                Some(true) => inner,
+                Some(false) => self.deferrable(inner),
+                None => id,
+            },
+            TyKind::Record(record) => {
+                let fields: Vec<(Name, TyId)> = record
+                    .fields
+                    .iter()
+                    .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
+                    .collect();
+                // Still sorted, so interning does not sort it again.
+                self.record(fields)
+            }
+            TyKind::Fn(sig) => {
+                let params: Vec<(Option<Name>, TyId)> = sig
+                    .params
+                    .iter()
+                    .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
+                    .collect();
+                let ret = self.settle(sig.ret, function, decisions);
+                self.fn_type(params, ret, sig.pure)
+            }
+            TyKind::Future(inner) => {
+                let inner = self.settle(inner, function, decisions);
+                self.future(inner)
+            }
+            TyKind::Union(members) => {
+                if let Some(present) = self.either_member(id) {
+                    let present = self.settle(present, function, decisions);
+                    return self.deferrable(present);
+                }
+                let mut members: Vec<TyId> = members
+                    .iter()
+                    .map(|&member| self.settle(member, function, decisions))
+                    .collect();
+                members.sort_unstable();
+                members.dedup();
+                self.intern(TyKind::Union(members.into_boxed_slice()))
+            }
+            TyKind::Provisional { .. }
+            | TyKind::Int
+            | TyKind::Float
+            | TyKind::Bool
+            | TyKind::String
+            | TyKind::UntypedInt
+            | TyKind::Error => id,
+        }
+    }
+
+    /// Whether type `id` is or contains, at any depth, through records,
+    /// futures, unions and function types, a provisional type: one of
+    /// function `function`'s parameters, or of any function's for `None`.
+    /// Constant time for `None`, and for a type with no provisional type at
+    /// all.
+    ///
+    /// Recurses once per level of nesting in the type.
+    #[must_use]
+    pub fn contains_provisional(&self, id: TyId, function: Option<FnId>) -> bool {
+        if !self.has_provisional(id) {
+            return false;
+        }
+        let Some(function) = function else {
+            return true;
+        };
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Provisional { function: of, .. }) => *of == function,
+            Some(TyKind::Record(record)) => record
+                .fields
+                .iter()
+                .any(|&(_, field)| self.contains_provisional(field, Some(function))),
+            Some(TyKind::Fn(sig)) => {
+                self.contains_provisional(sig.ret, Some(function))
+                    || sig
+                        .params
+                        .iter()
+                        .any(|&(_, ty)| self.contains_provisional(ty, Some(function)))
+            }
+            Some(TyKind::Future(inner)) => self.contains_provisional(*inner, Some(function)),
+            Some(TyKind::Union(members)) => members
+                .iter()
+                .any(|&member| self.contains_provisional(member, Some(function))),
+            _ => false,
+        }
+    }
+
+    /// Adds to `out` the parameter of each provisional type of function
+    /// `function` in type `id`, at any depth, through records, futures,
+    /// unions and function types, in no particular order and possibly more
+    /// than once.
+    ///
+    /// Recurses once per level of nesting in the type.
+    pub fn provisional_params(&self, id: TyId, function: FnId, out: &mut Vec<u32>) {
+        if !self.has_provisional(id) {
+            return;
+        }
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Provisional {
+                function: of,
+                param,
+                ..
+            }) if *of == function => out.push(*param),
+            Some(TyKind::Record(record)) => {
+                for &(_, field) in &record.fields {
+                    self.provisional_params(field, function, out);
+                }
+            }
+            Some(TyKind::Fn(sig)) => {
+                for &(_, ty) in &sig.params {
+                    self.provisional_params(ty, function, out);
+                }
+                self.provisional_params(sig.ret, function, out);
+            }
+            Some(TyKind::Future(inner)) => self.provisional_params(*inner, function, out),
+            Some(TyKind::Union(members)) => {
+                for &member in members {
+                    self.provisional_params(member, function, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Adds to `out` the parameter of each provisional type of function
+    /// `function` in type `found` that sits where `expected` has a present
+    /// type (or a provisional one, which stands for its present type as a
+    /// supertype): the parameters that a value of type `found` would need
+    /// to be present to fit `expected`, in no particular order and possibly
+    /// more than once. The two types are walked together, through record
+    /// fields that both have, through future and either layers (with
+    /// `expected` stripped to match), and through the return types of
+    /// function types, but not their parameters: a parameter is
+    /// contravariant, so a provisional one fits no worse for being left
+    /// undecided. Nothing is added where `expected` is a `Future`, which no
+    /// present value fits.
+    ///
+    /// Recurses once per level of nesting shared by the two types.
+    pub fn provisionals_at_present(
+        &self,
+        found: TyId,
+        expected: TyId,
+        function: FnId,
+        out: &mut Vec<u32>,
+    ) {
+        if !self.has_provisional(found) || expected == TyId::ERROR {
+            return;
+        }
+        match self.kinds.get(found.index()) {
+            Some(TyKind::Provisional {
+                function: of,
+                param,
+                ..
+            }) => {
+                if *of == function
+                    && matches!(
+                        self.laziness(expected),
+                        Laziness::Present | Laziness::Provisional
+                    )
+                {
+                    out.push(*param);
+                }
+            }
+            Some(TyKind::Record(record)) => {
+                if self.laziness(expected) == Laziness::Future {
+                    return;
+                }
+                let expected = self.strip(expected);
+                for &(name, field) in &record.fields {
+                    if let Some(expected_field) = self.field(expected, name) {
+                        self.provisionals_at_present(field, expected_field, function, out);
+                    }
+                }
+            }
+            Some(TyKind::Future(inner)) => {
+                self.provisionals_at_present(*inner, self.strip(expected), function, out);
+            }
+            Some(TyKind::Union(members)) => {
+                let expected = self.strip(expected);
+                for &member in members {
+                    self.provisionals_at_present(member, expected, function, out);
+                }
+            }
+            Some(TyKind::Fn(sig)) => {
+                if let Some(required) = self.fn_sig(self.strip(expected)) {
+                    self.provisionals_at_present(sig.ret, required.ret, function, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// What the top of type `id` says about whether its values are futures:
     /// [`Laziness::Future`] for a `Future<T>`, [`Laziness::Either`] for a
-    /// `T | Future<T>`, and [`Laziness::Present`] for everything else, a
-    /// record with futures in its fields included.
+    /// `T | Future<T>`, [`Laziness::Provisional`] for a provisional type,
+    /// and [`Laziness::Present`] for everything else, a record with futures
+    /// in its fields included.
     #[must_use]
     pub fn laziness(&self, id: TyId) -> Laziness {
         match self.kinds.get(id.index()) {
             Some(TyKind::Future(_)) => Laziness::Future,
             Some(TyKind::Union(_)) if self.is_deferrable(id) => Laziness::Either,
+            Some(TyKind::Provisional { .. }) => Laziness::Provisional,
             _ => Laziness::Present,
         }
     }
 
-    /// Type `id` with every `Future` and either layer at its top removed:
-    /// the type of its value once awaited fully. `Future<Int>`, `Int |
-    /// Future<Int>` and `Int` all strip to `Int`; a record's fields are left
-    /// as they are.
+    /// Type `id` with every `Future`, either and provisional layer at its
+    /// top removed: the type of its value once awaited fully. `Future<Int>`,
+    /// `Int | Future<Int>`, `Int?` and `Int` all strip to `Int`; a record's
+    /// fields are left as they are.
     #[must_use]
     pub fn strip(&self, id: TyId) -> TyId {
         let mut id = id;
         loop {
             match self.kinds.get(id.index()) {
-                Some(TyKind::Future(inner)) => id = *inner,
+                Some(TyKind::Future(inner) | TyKind::Provisional { inner, .. }) => id = *inner,
                 Some(TyKind::Union(_)) => match self.either_member(id) {
                     Some(present) => id = present,
                     None => return id,
@@ -430,7 +746,8 @@ impl TypeTable {
 
     /// Type `id` stripped (see [`TypeTable::strip`]) and then, if it is a
     /// record type, with each field's type made present in the same way,
-    /// recursively: the type of its value once awaited deeply. Function
+    /// recursively: the type of its value once awaited deeply. Provisional
+    /// types are stripped like the either shapes they may become. Function
     /// types are left as they are, parameters and results alike. Interns the
     /// record types it makes.
     ///
@@ -482,13 +799,15 @@ impl TypeTable {
     /// Whether type `id` is a `Future`, or a record type with a field of a
     /// type that is or contains one, at any depth of record nesting. An
     /// either shape counts only through its present member, so `Int |
-    /// Future<Int>` contains none, and function types are not looked into.
+    /// Future<Int>` contains none, a provisional type likewise through its
+    /// present type, and function types are not looked into.
     ///
     /// Recurses once per level of record nesting.
     #[must_use]
     pub fn contains_future(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
             Some(TyKind::Future(_)) => true,
+            Some(TyKind::Provisional { inner, .. }) => self.contains_future(*inner),
             Some(TyKind::Union(_)) => self
                 .either_member(id)
                 .is_some_and(|present| self.contains_future(present)),
@@ -581,7 +900,10 @@ impl TypeTable {
     /// are function types and `sub`'s signature fits `sup`'s; or `sup` is
     /// `Future<T>` and `sub` is `Future<S>` with `S <: T`; or `sup` is `T |
     /// Future<T>` and `sub` stripped is a subtype of `T` (see the module
-    /// documentation). Nothing lazy is a subtype of a present type.
+    /// documentation). Nothing lazy is a subtype of a present type. A
+    /// provisional type, `T?`, is its either shape as `sub` (so it is a
+    /// subtype of exactly what `T | Future<T>` is) and its present type `T`
+    /// as `sup`, unless the two are the same provisional type.
     ///
     /// Recurses once per level of record, function type or future nesting
     /// in the two types.
@@ -591,6 +913,7 @@ impl TypeTable {
             return true;
         }
         match self.kinds.get(sup.index()) {
+            Some(TyKind::Provisional { inner, .. }) => return self.is_subtype(sub, *inner),
             Some(TyKind::Future(required)) => {
                 return match self.kinds.get(sub.index()) {
                     Some(TyKind::Future(offered)) => self.is_subtype(*offered, *required),
@@ -640,9 +963,10 @@ impl TypeTable {
     /// with that join (the empty record if there are none); for two
     /// function types, the join described in the module documentation, if
     /// they have one; for two futures, the future of the join of what they
-    /// yield; for a future or an either with anything else, the either of
-    /// the join of both stripped; each of the last two existing if the inner
-    /// join does; and `None` otherwise. Numeric adaptation of untyped
+    /// yield; for a future, an either or a provisional type (which joins as
+    /// its either shape) with anything else, the either of the join of both
+    /// stripped; each of the last two existing if the inner join does; and
+    /// `None` otherwise. Numeric adaptation of untyped
     /// integers is the checker's business, not the table's, so `Int` and an
     /// untyped integer have no join here.
     ///
@@ -711,8 +1035,9 @@ impl TypeTable {
 
     /// The kind of value an expression of type `id` produces at runtime, or
     /// `None` for the checker-internal types and the unions other than the
-    /// either shape, which no value has: an untyped integer or an error
-    /// never survives a successful check, and no other union is built. A
+    /// either shape, which no value has: an untyped integer, a provisional
+    /// type or an error never survives a successful check, and no other
+    /// union is built. A
     /// `Future` and an either shape are [`ValueKind::Deferred`]: a value
     /// that may be a future. Also `None`, rather than a panic, for an id
     /// this table did not produce, so that lowering can report a mismatched
@@ -728,7 +1053,9 @@ impl TypeTable {
             TyKind::Fn(_) => Some(ValueKind::Fn),
             TyKind::Future(_) => Some(ValueKind::Deferred),
             TyKind::Union(_) if self.is_deferrable(id) => Some(ValueKind::Deferred),
-            TyKind::Union(_) | TyKind::UntypedInt | TyKind::Error => None,
+            TyKind::Union(_) | TyKind::Provisional { .. } | TyKind::UntypedInt | TyKind::Error => {
+                None
+            }
         }
     }
 
@@ -744,9 +1071,12 @@ impl TypeTable {
     /// Future<Int>`, present member first, in parentheses if it is a
     /// function type, `(fn(): Int) | Future<fn(): Int>`, since a function
     /// type's return type takes a union that follows it, as in `fn() -> Int
-    /// | Future<Int>`, which returns the either. An untyped integer shows as
-    /// `Int`, an error as `<error>`, and any other union as its members
-    /// separated by ` | `.
+    /// | Future<Int>`, which returns the either. A provisional type, which
+    /// only the types of a failed check hold, shows as its present type
+    /// followed by `?`, `Int?`, the present type in parentheses if it is a
+    /// function type, `(fn(): Int)?`, as for the either shape. An untyped
+    /// integer shows as `Int`, an error as `<error>`, and any other union as
+    /// its members separated by ` | `.
     ///
     /// `names` must be the table the names were interned into. Recurses
     /// once per level of record or function type nesting.
@@ -787,6 +1117,15 @@ impl fmt::Display for Display<'_> {
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
+            TyKind::Provisional { inner, .. } => {
+                let shown = self.nested(*inner);
+                // A function type's return type would take the `?`.
+                if self.table.fn_sig(*inner).is_some() {
+                    write!(f, "({shown})?")
+                } else {
+                    write!(f, "{shown}?")
+                }
+            }
             TyKind::Union(members) => {
                 if let Some(present) = self.table.either_member(self.id) {
                     let shown = self.nested(present);
@@ -1616,5 +1955,277 @@ mod tests {
             show(&table, record_either),
             "{x: Int | Future<Int>} | Future<{x: Int | Future<Int>}>"
         );
+    }
+
+    // ----- Provisional types -----
+
+    const F: FnId = FnId::new(0);
+    const G: FnId = FnId::new(1);
+
+    #[test]
+    fn provisional_types_intern_by_function_parameter_and_type() {
+        let (mut table, _, [a, _, _]) = setup();
+        let x = table.provisional(F, 0, TyId::INT);
+        assert_eq!(table.provisional(F, 0, TyId::INT), x);
+        assert_eq!(
+            table.kind(x),
+            &TyKind::Provisional {
+                function: F,
+                param: 0,
+                inner: TyId::INT
+            }
+        );
+        // Another parameter, function or type is another type.
+        assert_ne!(table.provisional(F, 1, TyId::INT), x);
+        assert_ne!(table.provisional(G, 0, TyId::INT), x);
+        assert_ne!(table.provisional(F, 0, TyId::FLOAT), x);
+        // No values have one: it never survives a successful check.
+        assert_eq!(table.value_kind(x), None);
+        let record = table.record([(a, TyId::INT)]);
+        let r = table.provisional(F, 1, record);
+        assert_eq!(table.value_kind(r), None);
+    }
+
+    #[test]
+    fn strip_present_and_laziness_of_provisional_types() {
+        let (mut table, _, [a, b, _]) = setup();
+        let int = table.provisional(F, 0, TyId::INT);
+        assert_eq!(table.laziness(int), Laziness::Provisional);
+        assert_eq!(table.strip(int), TyId::INT);
+        assert_eq!(table.present(int), TyId::INT);
+        // In a record's fields, stripped by `present` only.
+        let holder = table.record([(a, int), (b, TyId::STRING)]);
+        assert_eq!(table.laziness(holder), Laziness::Present);
+        assert_eq!(table.strip(holder), holder);
+        let holder_present = table.record([(a, TyId::INT), (b, TyId::STRING)]);
+        assert_eq!(table.present(holder), holder_present);
+        // Of a record type, stripped to it.
+        let record = table.record([(a, TyId::INT)]);
+        let of_record = table.provisional(F, 1, record);
+        assert_eq!(table.strip(of_record), record);
+        // A future or an either of one is of its present type.
+        assert_eq!(table.future(int), table.future(TyId::INT));
+        assert_eq!(table.deferrable(int), table.deferrable(TyId::INT));
+        // Looked through as a union is by `contains_fn`, `contains_future`
+        // and `needs_await`.
+        let function = table.fn_type([], TyId::INT, true);
+        let with_fn = table.record([(a, function)]);
+        let of_fn_record = table.provisional(F, 2, with_fn);
+        assert!(table.contains_fn(of_fn_record));
+        assert!(!table.contains_fn(int));
+        let future = table.future(TyId::INT);
+        let with_future = table.record([(a, future)]);
+        let of_future_record = table.provisional(F, 3, with_future);
+        assert!(table.contains_future(of_future_record));
+        assert!(!table.contains_future(int));
+        assert_eq!(table.needs_await(int, TyId::INT), Some(AwaitKind::Top));
+        let either = table.deferrable(TyId::INT);
+        assert_eq!(table.needs_await(int, either), None);
+        assert!(table.is_subtype(int, either));
+        let present_record = table.record([(a, TyId::INT)]);
+        assert_eq!(
+            table.needs_await(of_future_record, present_record),
+            Some(AwaitKind::Deep)
+        );
+    }
+
+    #[test]
+    fn provisional_types_are_their_either_shape_as_subtypes_and_present_as_supertypes() {
+        let (mut table, _, [a, _, _]) = setup();
+        let x = table.provisional(F, 0, TyId::INT);
+        let y = table.provisional(F, 1, TyId::INT);
+        let either = table.deferrable(TyId::INT);
+        let future = table.future(TyId::INT);
+        // As a subtype, what the either shape is a subtype of.
+        assert!(table.is_subtype(x, x));
+        assert!(table.is_subtype(x, either));
+        assert!(!table.is_subtype(x, TyId::INT));
+        assert!(!table.is_subtype(x, future));
+        assert!(!table.is_subtype(x, TyId::FLOAT));
+        // As a supertype, its present type, unless it is the same one.
+        assert!(table.is_subtype(TyId::INT, x));
+        assert!(!table.is_subtype(either, x));
+        assert!(!table.is_subtype(future, x));
+        assert!(!table.is_subtype(y, x));
+        // Through records and function types: a parameter is contravariant.
+        let holder = table.record([(a, x)]);
+        let holds_either = table.record([(a, either)]);
+        let holds_int = table.record([(a, TyId::INT)]);
+        assert!(table.is_subtype(holder, holds_either));
+        assert!(!table.is_subtype(holder, holds_int));
+        let takes_x = table.fn_type([(None, x)], TyId::INT, true);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        let takes_either = table.fn_type([(None, either)], TyId::INT, true);
+        assert!(table.is_subtype(takes_x, takes_int));
+        assert!(!table.is_subtype(takes_x, takes_either));
+        let gives_x = table.fn_type([], x, true);
+        let gives_either = table.fn_type([], either, true);
+        let gives_int = table.fn_type([], TyId::INT, true);
+        assert!(table.is_subtype(gives_x, gives_either));
+        assert!(!table.is_subtype(gives_x, gives_int));
+    }
+
+    #[test]
+    fn provisional_types_join_as_their_either_shape() {
+        let (mut table, _, [a, _, _]) = setup();
+        let x = table.provisional(F, 0, TyId::INT);
+        let y = table.provisional(F, 1, TyId::INT);
+        let other = table.provisional(G, 0, TyId::INT);
+        let either = table.deferrable(TyId::INT);
+        let future = table.future(TyId::INT);
+        // With itself, itself; with anything else, the either shape of the
+        // join.
+        assert_eq!(table.join(x, x), Some(x));
+        assert_eq!(table.join(x, y), Some(either));
+        assert_eq!(table.join(x, other), Some(either));
+        assert_eq!(table.join(x, TyId::INT), Some(either));
+        assert_eq!(table.join(TyId::INT, x), Some(either));
+        assert_eq!(table.join(x, future), Some(either));
+        assert_eq!(table.join(x, either), Some(either));
+        assert_eq!(table.join(x, TyId::FLOAT), None);
+        // Through records, field by field.
+        let holder = table.record([(a, x)]);
+        let holds_int = table.record([(a, TyId::INT)]);
+        let holds_either = table.record([(a, either)]);
+        assert_eq!(table.join(holder, holder), Some(holder));
+        assert_eq!(table.join(holder, holds_int), Some(holds_either));
+    }
+
+    #[test]
+    fn settling_replaces_a_functions_provisional_types_everywhere() {
+        let (mut table, _, [a, b, _]) = setup();
+        let x = table.provisional(F, 0, TyId::INT);
+        let y = table.provisional(F, 1, TyId::STRING);
+        let other = table.provisional(G, 0, TyId::INT);
+        let int_either = table.deferrable(TyId::INT);
+        let string_either = table.deferrable(TyId::STRING);
+        // At the top, by the decision for its parameter.
+        assert_eq!(table.settle(x, F, &[true, false]), TyId::INT);
+        assert_eq!(table.settle(x, F, &[false, false]), int_either);
+        assert_eq!(table.settle(y, F, &[true, false]), string_either);
+        // Another function's are left as they are, and so is one with no
+        // decision.
+        assert_eq!(table.settle(other, F, &[true, true]), other);
+        assert_eq!(table.settle(y, F, &[true]), y);
+        // A type with none is itself, interning nothing.
+        let plain = table.record([(a, TyId::INT)]);
+        let before = table.len();
+        assert_eq!(table.settle(plain, F, &[true]), plain);
+        assert_eq!(table.len(), before);
+        // Through records, futures, the either shape and function types,
+        // parameters and results.
+        let holder = table.record([(a, x), (b, other)]);
+        let settled = table.record([(a, TyId::INT), (b, other)]);
+        assert_eq!(table.settle(holder, F, &[true, true]), settled);
+        let future = table.future(holder);
+        let settled_future = table.future(settled);
+        assert_eq!(table.settle(future, F, &[true, true]), settled_future);
+        let either = table.deferrable(holder);
+        let settled_either = table.deferrable(settled);
+        assert_eq!(table.settle(either, F, &[true, true]), settled_either);
+        let function = table.fn_type([(Some(a), x), (Some(b), y)], holder, true);
+        let settled_function = {
+            let lazy_holder = table.record([(a, int_either), (b, other)]);
+            table.fn_type(
+                [(Some(a), int_either), (Some(b), TyId::STRING)],
+                lazy_holder,
+                true,
+            )
+        };
+        assert_eq!(table.settle(function, F, &[false, true]), settled_function);
+        // Only `other` is left, until its own function settles it.
+        assert!(table.contains_provisional(settled_function, None));
+        assert!(!table.contains_provisional(settled_function, Some(F)));
+        let fully = table.settle(settled_function, G, &[true]);
+        assert!(!table.contains_provisional(fully, None));
+    }
+
+    #[test]
+    fn finding_provisional_types() {
+        let (mut table, _, [a, b, c]) = setup();
+        let first = table.provisional(F, 0, TyId::INT);
+        let second = table.provisional(F, 1, TyId::INT);
+        let other = table.provisional(G, 0, TyId::INT);
+        let either = table.deferrable(TyId::INT);
+        let future = table.future(TyId::INT);
+        // Anywhere, through every kind of type.
+        for id in [first, other] {
+            assert!(table.contains_provisional(id, None));
+        }
+        assert!(table.contains_provisional(first, Some(F)));
+        assert!(!table.contains_provisional(other, Some(F)));
+        assert!(!table.contains_provisional(TyId::INT, None));
+        let holder = table.record([(a, first)]);
+        let in_future = table.future(holder);
+        let in_either = table.deferrable(holder);
+        let in_param = table.fn_type([(None, first)], TyId::INT, true);
+        let in_result = table.fn_type([], holder, true);
+        for id in [holder, in_future, in_either, in_param, in_result] {
+            assert!(table.contains_provisional(id, Some(F)), "{id:?}");
+            assert!(!table.contains_provisional(id, Some(G)), "{id:?}");
+        }
+        // Their parameters, anywhere.
+        let both = table.record([(a, first), (b, in_param), (c, other)]);
+        let mut found = Vec::new();
+        table.provisional_params(both, F, &mut found);
+        found.sort_unstable();
+        assert_eq!(found, vec![0, 0]);
+        // Those at positions where a type expected is present: not where it
+        // is the either shape or a future, nor in a function's parameters,
+        // nor in a field it lacks.
+        let at_present = |table: &TypeTable, found: TyId, expected: TyId| {
+            let mut out = Vec::new();
+            table.provisionals_at_present(found, expected, F, &mut out);
+            out.sort_unstable();
+            out
+        };
+        assert_eq!(at_present(&table, first, TyId::INT), vec![0]);
+        assert_eq!(at_present(&table, first, second), vec![0]);
+        assert_eq!(at_present(&table, first, either), Vec::<u32>::new());
+        assert_eq!(at_present(&table, first, future), Vec::<u32>::new());
+        assert_eq!(at_present(&table, other, TyId::INT), Vec::<u32>::new());
+        let pair = table.record([(a, first), (b, second)]);
+        let wants_a = table.record([(a, TyId::INT), (b, either)]);
+        assert_eq!(at_present(&table, pair, wants_a), vec![0]);
+        let wants_both = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        assert_eq!(at_present(&table, pair, wants_both), vec![0, 1]);
+        let wants_b_only = table.record([(b, TyId::INT)]);
+        assert_eq!(at_present(&table, pair, wants_b_only), vec![1]);
+        // Through the either shape and futures of records.
+        let either_wants_both = table.deferrable(wants_both);
+        assert_eq!(at_present(&table, pair, either_wants_both), vec![0, 1]);
+        let future_pair = table.future(pair);
+        assert_eq!(at_present(&table, future_pair, wants_both), vec![0, 1]);
+        let future_wants_both = table.future(wants_both);
+        assert_eq!(
+            at_present(&table, pair, future_wants_both),
+            Vec::<u32>::new()
+        );
+        // A function's result, not its parameters.
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        assert_eq!(at_present(&table, in_param, takes_int), Vec::<u32>::new());
+        let gives_first = table.fn_type([], first, true);
+        let gives_int = table.fn_type([], TyId::INT, true);
+        assert_eq!(at_present(&table, gives_first, gives_int), vec![0]);
+    }
+
+    #[test]
+    fn display_provisional_types() {
+        let mut names = Names::new();
+        let x = names.intern("x");
+        let mut table = TypeTable::new();
+        let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+        let int = table.provisional(F, 0, TyId::INT);
+        assert_eq!(show(&table, int), "Int?");
+        let record = table.record([(x, TyId::INT)]);
+        let r = table.provisional(F, 1, record);
+        assert_eq!(show(&table, r), "{x: Int}?");
+        let holder = table.record([(x, int)]);
+        assert_eq!(show(&table, holder), "{x: Int?}");
+        let function = table.fn_type([], TyId::INT, true);
+        let f = table.provisional(F, 2, function);
+        assert_eq!(show(&table, f), "(fn(): Int)?");
+        let takes = table.fn_type([(Some(x), int)], int, true);
+        assert_eq!(show(&table, takes), "fn(x: Int?): Int?");
     }
 }

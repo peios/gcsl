@@ -9,7 +9,8 @@ fn build(package: fn(String): {name: String, build: Future<String>}, name: Strin
   await conf.build
   = conf
 }
-fn keep(step: String | Future<String>): {step: String | Future<String>} { step = step }
+# Passed through unmeasured, `step` may be a future: its type is inferred.
+fn keep(step: String): {step: String | Future<String>} { step = step }
 let built = build(plan, "gcsl")
 name = built.name
 step = keep(built.build).step

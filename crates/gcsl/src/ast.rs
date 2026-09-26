@@ -1242,6 +1242,73 @@ impl Ast {
         (0..next_id(self.exprs.len())).map(ExprId)
     }
 
+    /// The ids of the nodes of expression `id`'s subtree, its descendants
+    /// and itself, in allocation order. They are contiguous, ending at `id`:
+    /// nodes are allocated children-first, and while the parser parses an
+    /// expression it allocates only that expression's nodes (the nodes of a
+    /// path it reads back are dropped before anything else is allocated).
+    /// The first is found by following, from `id`, the child the parser
+    /// parses first down to a leaf: a block's first item's value, an `if`'s
+    /// condition, a call's callee, a binary operator's left operand, a
+    /// function's or `lazy`'s body, an interpolated string's first
+    /// expression. Debug builds check that every node of the range lies
+    /// within `id`'s span and the node before it starts before `id`.
+    pub(crate) fn subtree(&self, id: ExprId) -> impl Iterator<Item = ExprId> + use<> {
+        let first = self.first_node(id);
+        debug_assert!(
+            (first.0..=id.0).all(|node| {
+                let span = self.get(ExprId(node)).span;
+                span.start >= self.get(id).span.start && span.end <= self.get(id).span.end
+            }) && (first.0 == 0
+                || self.get(ExprId(first.0 - 1)).span.start < self.get(id).span.start),
+            "the subtree of an expression is not contiguous"
+        );
+        (first.0..=id.0).map(ExprId)
+    }
+
+    /// The first node the parser allocates for expression `id`: see
+    /// [`Ast::subtree`].
+    fn first_node(&self, id: ExprId) -> ExprId {
+        let mut node = id;
+        loop {
+            node = match self.get(node).kind {
+                ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Str(_)
+                | ExprKind::Name(_) => return node,
+                ExprKind::Interp(parts) => {
+                    let first = self.parts(parts).iter().find_map(|&part| match part {
+                        StrPart::Expr(expr) => Some(expr),
+                        StrPart::Lit(_) => None,
+                    });
+                    match first {
+                        Some(expr) => expr,
+                        None => return node,
+                    }
+                }
+                ExprKind::Block(items) => match self.items(items).first() {
+                    Some(&item) => match self.item(item).kind {
+                        ItemKind::Let { value, .. }
+                        | ItemKind::Field { value, .. }
+                        | ItemKind::Rebind { value, .. }
+                        | ItemKind::Result(value)
+                        | ItemKind::Expr(value) => value,
+                    },
+                    None => return node,
+                },
+                ExprKind::If { cond, .. } => cond,
+                ExprKind::Unary { operand, .. } => operand,
+                ExprKind::Binary { lhs, .. } => lhs,
+                ExprKind::Paren(inner)
+                | ExprKind::Field { expr: inner, .. }
+                | ExprKind::Ascribe { expr: inner, .. } => inner,
+                ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
+                ExprKind::Call { callee, .. } => callee,
+            };
+        }
+    }
+
     /// Returns a `Display` rendering of the tree as indented S-expressions,
     /// for `--dump-ast`.
     #[must_use]
