@@ -3,41 +3,45 @@
 //! A hand-written pass over the source bytes. Spaces, tabs, `\r` and
 //! comments (`#` to end of line) are skipped. Each `\n` becomes a
 //! [`TokenKind::Newline`] token, because newlines separate items, except
-//! inside parentheses and interpolations: the lexer tracks the depth of open
-//! `(` and emits no `Newline` while it is above zero, so an expression in
-//! parentheses may span lines freely, and it never emits one inside an
-//! interpolation (see [String literals](#string-literals)). Braces do not
-//! affect the depth, since a block body inside `{ }` is newline-sensitive
-//! again.
-//!
-//! Known limitation: because only parentheses are tracked, a newline inside
-//! a `{ }` that is itself inside `( )` or an interpolation is not emitted
-//! either, so a multi-line block written there runs its items together. No
-//! construct needs that yet; when function calls arrive (`f({ ... })`), the
-//! parser will have to handle it, for instance by having the lexer track a
-//! stack of bracket kinds rather than a depth.
+//! where the innermost open bracket is a `(`, or an interpolation's `{`: the
+//! lexer keeps a stack of the open brackets, and emits no `Newline` while a
+//! `(` is on top, so an expression, a parameter list or an argument list in
+//! parentheses may span lines freely, nor directly inside an interpolation
+//! (see [String literals](#string-literals)). A `{` on top makes newlines
+//! significant again, since a block body is newline-sensitive wherever it
+//! is written: a block or a function body passed as an argument inside a
+//! call's parentheses, `f({ ... })` or `f(fn(): Int { ... })`, may span
+//! lines, and so may one inside an interpolation. The stack is one byte per
+//! open bracket, and a program with no bracket allocates nothing for it. An
+//! unmatched closing bracket, which the parser reports, closes nothing: a
+//! `)` closes only a `(` on top of the stack, and a `}` closes the nearest
+//! `{`, together with any `(` left open inside it.
 //!
 //! Identifiers are interned into a [`Names`] table as they are lexed, so a
 //! [`TokenKind::Ident`] carries a [`Name`], not text. An identifier starts
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `if`,
-//! `else`, `true`, `false`, `and`, `or` and `not`. An `r` directly followed
-//! by `"` begins a raw string literal; anywhere else it is an ordinary
-//! identifier.
+//! `else`, `true`, `false`, `and`, `or`, `not` and `fn`; the whole
+//! identifier is scanned before it is compared with them, so `fn-x` is an
+//! identifier. An `r` directly followed by `"` begins a raw string literal;
+//! anywhere else it is an ordinary identifier.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
 //! followed by anything else a third, and likewise `!==` and `!=`, `<=` and
 //! `<`, `>=` and `>`, `:=` and `:`, `//` and `/`. `!` is only accepted as
 //! part of `!=` or `!==`; negation is `not`. A `.` is part of a number literal only between two digits, as in
 //! `1.5`; anywhere else it is a [`TokenKind::Dot`], so `1.x` is `1`, `.`,
-//! `x`. A `,` is a [`TokenKind::Comma`], which only record types use.
+//! `x`. A `,` is a [`TokenKind::Comma`], which separates the fields of a
+//! record type, the parameters of a function and the arguments of a call.
 //!
 //! A `-` that is not inside an identifier is classified from the bytes
-//! either side of it (see `Lexer::minus`): subtraction ([`TokenKind::Minus`])
-//! when followed by whitespace, negation ([`TokenKind::Neg`]) when directly
-//! followed by an operand, and an error when it directly follows an operand,
-//! where `a-b` and `a - b` would be too easily confused.
+//! either side of it (see `Lexer::minus`). Directly followed by `>` it is
+//! always the arrow `->` ([`TokenKind::Arrow`]), whatever is around it.
+//! Otherwise it is subtraction ([`TokenKind::Minus`]) when followed by
+//! whitespace, negation ([`TokenKind::Neg`]) when directly followed by an
+//! operand, and an error when it directly follows an operand, where `a-b`
+//! and `a - b` would be too easily confused.
 //!
 //! # String literals
 //!
@@ -57,11 +61,12 @@
 //! ## Contexts
 //!
 //! Lexing an interpolation's expression is lexing in a different context:
-//! newlines are never emitted, and the `}` that matches the interpolation's
-//! `{` resumes the literal instead of being a token. The lexer keeps a stack
-//! of the interpolations it is inside, innermost last, each with its own
-//! brace and parenthesis counts and the layout of its literal; the base
-//! context's parenthesis count is kept apart from the stack. A literal
+//! newlines are not emitted directly inside it (only inside a block within
+//! it), and the `}` that matches the interpolation's `{` resumes the literal
+//! instead of being a token. The lexer keeps a stack of the interpolations
+//! it is inside, innermost last, each with its own brace count, the layout
+//! of its literal and where its brackets start on the bracket stack, so that
+//! a `(` left open inside cannot affect the enclosing context. A literal
 //! nested in an interpolation is lexed by the same routine and pushes its
 //! own interpolations. The stack is empty outside interpolations, so a
 //! program without any allocates nothing for it.
@@ -109,8 +114,8 @@
 //!
 //! Besides the output vector and the pieces, the lexer allocates only one
 //! scratch `String`, reused for every numeric literal that contains `_`
-//! separators and for building every piece, the interpolation stack, and the
-//! interning of each distinct name.
+//! separators and for building every piece, the bracket stack, the
+//! interpolation stack, and the interning of each distinct name.
 
 use crate::MAX_DEPTH;
 use crate::diagnostic::{Diagnostic, InternalError};
@@ -173,6 +178,8 @@ pub enum TokenKind {
     Or,
     /// The keyword `not`.
     Not,
+    /// The keyword `fn`.
+    Fn,
     /// `+`
     Plus,
     /// `-` as subtraction: not directly after an operand, and followed by
@@ -209,6 +216,8 @@ pub enum TokenKind {
     Colon,
     /// `:=`
     ColonEq,
+    /// `->`, which marks an impure function's return type.
+    Arrow,
     /// `=`
     Eq,
     /// `(`
@@ -223,7 +232,8 @@ pub enum TokenKind {
     Semi,
     /// `.` not inside a number literal: field access.
     Dot,
-    /// `,`, which separates the fields of a record type.
+    /// `,`, which separates the fields of a record type, the parameters of
+    /// a function and the arguments of a call.
     Comma,
     /// A `\n` outside parentheses and interpolations. Each newline is its
     /// own token.
@@ -247,6 +257,7 @@ impl TokenKind {
             TokenKind::And => Some("and"),
             TokenKind::Or => Some("or"),
             TokenKind::Not => Some("not"),
+            TokenKind::Fn => Some("fn"),
             TokenKind::Plus => Some("+"),
             TokenKind::Minus | TokenKind::Neg => Some("-"),
             TokenKind::Star => Some("*"),
@@ -263,6 +274,7 @@ impl TokenKind {
             TokenKind::Ge => Some(">="),
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
+            TokenKind::Arrow => Some("->"),
             TokenKind::Eq => Some("="),
             TokenKind::LParen => Some("("),
             TokenKind::RParen => Some(")"),
@@ -295,6 +307,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "and" => TokenKind::And,
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
+        "fn" => TokenKind::Fn,
         _ => return None,
     })
 }
@@ -416,10 +429,22 @@ struct Interpolation {
     /// Number of `{` inside the interpolation not yet closed. A `}` at
     /// depth zero ends the interpolation.
     brace_depth: u32,
-    /// Number of `(` inside the interpolation not yet closed. Newlines are
-    /// never emitted in an interpolation whatever its value; it is kept so
-    /// that parentheses inside cannot affect the enclosing context.
-    paren_depth: u32,
+    /// The length of the bracket stack when the interpolation began: the
+    /// brackets above it are the ones open inside the interpolation, and
+    /// the stack is cut back to it when the interpolation ends, so that a
+    /// `(` left open inside cannot affect the enclosing context.
+    brackets_start: usize,
+}
+
+/// An open bracket on the lexer's stack, which decides whether newlines
+/// are significant: they are trivia while a `(` is on top.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bracket {
+    /// `(`
+    Paren,
+    /// `{` of a block or a record type; not an interpolation's `{`, which
+    /// is a context of its own.
+    Brace,
 }
 
 /// Why pass 2 stopped building a piece.
@@ -493,10 +518,10 @@ struct Lexer<'a> {
     /// End of the most recent token other than a newline, used to place the
     /// `Eof` token.
     last_end: usize,
-    /// Number of `(` not yet closed outside interpolations. Newlines are
-    /// only emitted at zero, outside interpolations. Saturates at zero on
-    /// an unmatched `)`, which the parser reports.
-    paren_depth: u32,
+    /// The open brackets, outermost first, across every context: the
+    /// innermost open one, within the current context, decides whether
+    /// newlines are significant (see `Lexer::skip_trivia`).
+    brackets: Vec<Bracket>,
     /// The interpolations being lexed, innermost last.
     interpolations: Vec<Interpolation>,
     /// Reused buffer for literals whose `_` separators must be removed and
@@ -515,7 +540,7 @@ impl<'a> Lexer<'a> {
             bytes: source.text().as_bytes(),
             pos: 0,
             last_end: 0,
-            paren_depth: 0,
+            brackets: Vec::new(),
             interpolations: Vec::new(),
             scratch: String::new(),
             names,
@@ -561,17 +586,20 @@ impl<'a> Lexer<'a> {
                 if let Some(interpolation) = self.interpolations.last_mut() {
                     interpolation.brace_depth = interpolation.brace_depth.saturating_add(1);
                 }
+                self.brackets.push(Bracket::Brace);
                 self.single(TokenKind::LBrace)
             }
             b'}' => self.close_brace(start)?,
             b'(' => {
-                let depth = self.paren_depth_mut();
-                *depth = depth.saturating_add(1);
+                self.brackets.push(Bracket::Paren);
                 self.single(TokenKind::LParen)
             }
             b')' => {
-                let depth = self.paren_depth_mut();
-                *depth = depth.saturating_sub(1);
+                // An unmatched `)` closes nothing, in this context or an
+                // enclosing one; the parser reports it.
+                if self.context_brackets().last() == Some(&Bracket::Paren) {
+                    self.brackets.pop();
+                }
                 self.single(TokenKind::RParen)
             }
             b'0'..=b'9' => self.number(start)?,
@@ -632,35 +660,58 @@ impl<'a> Lexer<'a> {
         kind
     }
 
-    /// The parenthesis count of the current context: the innermost
-    /// interpolation's, or the base context's outside interpolations.
-    fn paren_depth_mut(&mut self) -> &mut u32 {
-        match self.interpolations.last_mut() {
-            Some(interpolation) => &mut interpolation.paren_depth,
-            None => &mut self.paren_depth,
-        }
-    }
-
     /// Lexes a `}` at `start`: the end of the innermost interpolation if it
     /// matches that interpolation's `{`, and a [`TokenKind::RBrace`]
-    /// otherwise.
+    /// otherwise, closing the nearest open `{` on the bracket stack with
+    /// any `(` left open inside it. An unmatched `}` closes nothing; the
+    /// parser reports it.
     fn close_brace(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         if let Some(interpolation) = self.interpolations.last_mut() {
             if interpolation.brace_depth > 0 {
                 interpolation.brace_depth -= 1;
             } else {
-                let layout = interpolation.layout;
+                let (layout, brackets_start) = (interpolation.layout, interpolation.brackets_start);
                 self.interpolations.pop();
+                self.brackets.truncate(brackets_start);
                 return self.piece(layout, start + 1, false);
             }
+        }
+        let context_start = self.context_start();
+        if let Some(brace) = self
+            .context_brackets()
+            .iter()
+            .rposition(|&bracket| bracket == Bracket::Brace)
+        {
+            self.brackets.truncate(context_start + brace);
         }
         Ok(self.single(TokenKind::RBrace))
     }
 
+    /// Where the current context's brackets start on the bracket stack: the
+    /// innermost interpolation's start, or the bottom outside interpolations.
+    fn context_start(&self) -> usize {
+        self.interpolations
+            .last()
+            .map_or(0, |interpolation| interpolation.brackets_start)
+    }
+
+    /// The brackets open in the current context, outermost first.
+    fn context_brackets(&self) -> &[Bracket] {
+        self.brackets
+            .get(self.context_start()..)
+            .unwrap_or_default()
+    }
+
     /// Skips whitespace and comments, stopping at a `\n` that must become a
-    /// [`TokenKind::Newline`] token.
+    /// [`TokenKind::Newline`] token: one not directly inside a `(` or an
+    /// interpolation, which is decided by the innermost open bracket of the
+    /// current context, or by the context itself if it has none open.
     fn skip_trivia(&mut self) {
-        let newlines_are_trivia = !self.interpolations.is_empty() || self.paren_depth > 0;
+        let newlines_are_trivia = match self.context_brackets().last() {
+            Some(Bracket::Paren) => true,
+            Some(Bracket::Brace) => false,
+            None => !self.interpolations.is_empty(),
+        };
         while let Some(byte) = self.peek() {
             match byte {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
@@ -688,15 +739,21 @@ impl<'a> Lexer<'a> {
     /// Classifies a `-` at `start` that is not part of an identifier or a
     /// number literal, from the bytes on either side of it:
     ///
-    /// 1. Directly after an operand end (an identifier character or `)`):
+    /// 1. Directly followed by `>`: the arrow, [`TokenKind::Arrow`],
+    ///    whatever precedes it, so `a->b`, `x -> y` and `)->{` all have one.
+    /// 2. Directly after an operand end (an identifier character or `)`):
     ///    an error, since `a-b` would be a single name and `a -b` a
     ///    negation.
-    /// 2. Otherwise, followed by whitespace or the end of input:
+    /// 3. Otherwise, followed by whitespace or the end of input:
     ///    subtraction, [`TokenKind::Minus`].
-    /// 3. Otherwise, directly followed by an operand start (a letter, digit,
+    /// 4. Otherwise, directly followed by an operand start (a letter, digit,
     ///    `_`, `(`, `{` or `"`): negation, [`TokenKind::Neg`].
-    /// 4. Otherwise, as in `--x`: an unexpected character.
+    /// 5. Otherwise, as in `--x`: an unexpected character.
     fn minus(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        if self.peek_at(1) == Some(b'>') {
+            self.pos += 2;
+            return Ok(TokenKind::Arrow);
+        }
         let previous = start.checked_sub(1).and_then(|at| self.bytes.get(at));
         if previous.is_some_and(|&byte| is_identifier_byte(byte) || byte == b')') {
             return Err(
@@ -1079,7 +1136,7 @@ impl<'a> Lexer<'a> {
                     layout,
                     open,
                     brace_depth: 0,
-                    paren_depth: 0,
+                    brackets_start: self.brackets.len(),
                 });
                 if first {
                     TokenKind::StrStart(id)
@@ -1490,7 +1547,7 @@ mod tests {
             &SourceFile::new(
                 "test.gcsl",
                 "1 2.5 + - -x * / // % ( ) x let : := = { } ; . ,\n\
-                 if else true false and or not == != < <= > >= === !==",
+                 if else true false and or not == != < <= > >= === !== fn ->",
             )
             .unwrap(),
         )
@@ -1538,9 +1595,62 @@ mod tests {
                 Ge,
                 EqEqEq,
                 BangEqEq,
+                Fn,
+                Arrow,
                 Eof
             ]
         );
+        assert_eq!(Fn.symbol(), Some("fn"));
+        assert_eq!(Arrow.symbol(), Some("->"));
+    }
+
+    #[test]
+    fn fn_is_a_keyword_only_as_a_whole_word() {
+        assert_eq!(
+            show("fn fn-x fnx f n _fn fn_ Fn"),
+            vec![
+                "Fn",
+                "Ident(fn-x)",
+                "Ident(fnx)",
+                "Ident(f)",
+                "Ident(n)",
+                "Ident(_fn)",
+                "Ident(fn_)",
+                "Ident(Fn)",
+                "Eof"
+            ]
+        );
+        assert_eq!(show("fn(")[..2], ["Fn", "LParen"]);
+        assert!(!is_identifier("fn"));
+        assert!(is_identifier("fn-x"));
+    }
+
+    #[test]
+    fn arrow_in_every_spacing() {
+        // Directly after an operand, before one, between parentheses and
+        // braces, and spaced: always one token.
+        assert_eq!(show("a->b"), vec!["Ident(a)", "Arrow", "Ident(b)", "Eof"]);
+        assert_eq!(show("x -> y"), vec!["Ident(x)", "Arrow", "Ident(y)", "Eof"]);
+        assert_eq!(show(")->{"), vec!["RParen", "Arrow", "LBrace", "Eof"]);
+        assert_eq!(show("->"), vec!["Arrow", "Eof"]);
+        assert_eq!(show("1->2"), vec!["Int(1)", "Arrow", "Int(2)", "Eof"]);
+        // Only the `-` directly before the `>` joins it.
+        assert_eq!(
+            error("-->"),
+            ("unexpected character `-`".to_owned(), Span::new(0, 1))
+        );
+        assert_eq!(show("- ->")[..2], ["Minus", "Arrow"]);
+        assert_eq!(spans("a -> b"), vec![(0, 1), (2, 4), (5, 6), (6, 6)]);
+        assert_eq!(spans("a->b"), vec![(0, 1), (1, 3), (3, 4), (4, 4)]);
+        // `->` then `>` is the arrow and a greater-than.
+        assert_eq!(show("->>"), vec!["Arrow", "Gt", "Eof"]);
+        // A `-` not directly followed by `>` follows the usual rules.
+        assert_eq!(show("a - > b")[1..3], ["Minus", "Gt"]);
+        assert_eq!(
+            error("a- >b"),
+            ("`-` here is ambiguous".to_owned(), Span::new(1, 2))
+        );
+        assert_eq!(show("-x")[0], "Neg");
     }
 
     #[test]
@@ -1671,13 +1781,42 @@ mod tests {
                 "Int(3)", "Eof"
             ]
         );
-        // Braces do not reset the suppression (a known limitation), and do
-        // not cause it either.
+        // Braces do not cause the suppression, and a block inside the
+        // parentheses is newline-sensitive again, as is a block inside a
+        // block inside them; parentheses inside that suppress again.
         assert_eq!(
             show("({\n1\n})\n{\n2\n}"),
             vec![
-                "LParen", "LBrace", "Int(1)", "RBrace", "RParen", "Newline", "LBrace", "Newline",
-                "Int(2)", "Newline", "RBrace", "Eof"
+                "LParen", "LBrace", "Newline", "Int(1)", "Newline", "RBrace", "RParen", "Newline",
+                "LBrace", "Newline", "Int(2)", "Newline", "RBrace", "Eof"
+            ]
+        );
+        assert_eq!(
+            show("f(fn(): Int {\nlet y = (1 +\n2)\ny\n})"),
+            vec![
+                "Ident(f)",
+                "LParen",
+                "Fn",
+                "LParen",
+                "RParen",
+                "Colon",
+                "Ident(Int)",
+                "LBrace",
+                "Newline",
+                "Let",
+                "Ident(y)",
+                "Eq",
+                "LParen",
+                "Int(1)",
+                "Plus",
+                "Int(2)",
+                "RParen",
+                "Newline",
+                "Ident(y)",
+                "Newline",
+                "RBrace",
+                "RParen",
+                "Eof"
             ]
         );
         // A comment inside parentheses ends at a suppressed newline.
@@ -1685,8 +1824,92 @@ mod tests {
             show("(1 # one\n)"),
             vec!["LParen", "Int(1)", "RParen", "Eof"]
         );
-        // An unmatched `)` does not make the depth negative.
+        // An unmatched `)` closes nothing: not the `{` it is inside, and
+        // nothing at the top level.
         assert_eq!(show(")\n1"), vec!["RParen", "Newline", "Int(1)", "Eof"]);
+        assert_eq!(
+            show("{ )\n1 }"),
+            vec!["LBrace", "RParen", "Newline", "Int(1)", "RBrace", "Eof"]
+        );
+        // A `}` closes the nearest `{`, with a `(` left open inside it.
+        assert_eq!(
+            show("{ (\n1 }\n2"),
+            vec![
+                "LBrace", "LParen", "Int(1)", "RBrace", "Newline", "Int(2)", "Eof"
+            ]
+        );
+        assert_eq!(show("}\n1"), vec!["RBrace", "Newline", "Int(1)", "Eof"]);
+    }
+
+    #[test]
+    fn newlines_in_interpolations_follow_the_brackets() {
+        // Directly inside an interpolation, and inside parentheses there,
+        // newlines are trivia; inside a block there they are tokens.
+        assert_eq!(
+            show("\"{\n1\n}\""),
+            vec!["StrStart(\"\")", "Int(1)", "StrEnd(\"\")", "Eof"]
+        );
+        assert_eq!(
+            show("\"{(\n1\n)}\""),
+            vec![
+                "StrStart(\"\")",
+                "LParen",
+                "Int(1)",
+                "RParen",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("\"{ {\n1\n} }\""),
+            vec![
+                "StrStart(\"\")",
+                "LBrace",
+                "Newline",
+                "Int(1)",
+                "Newline",
+                "RBrace",
+                "StrEnd(\"\")",
+                "Eof"
+            ]
+        );
+        // A `(` left open inside an interpolation does not suppress the
+        // newlines after the literal, nor does one inside a block; and a
+        // `)` inside an interpolation does not close a `(` around the
+        // literal.
+        assert_eq!(
+            show("(\"{)}\"\n2)\n3"),
+            vec![
+                "LParen",
+                "StrStart(\"\")",
+                "RParen",
+                "StrEnd(\"\")",
+                "Int(2)",
+                "RParen",
+                "Newline",
+                "Int(3)",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("\"{(1}\"\n2"),
+            vec![
+                "StrStart(\"\")",
+                "LParen",
+                "Int(1)",
+                "StrEnd(\"\")",
+                "Newline",
+                "Int(2)",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("({ (1 }\n2)\n3"),
+            vec![
+                "LParen", "LBrace", "LParen", "Int(1)", "RBrace", "Int(2)", "RParen", "Newline",
+                "Int(3)", "Eof"
+            ]
+        );
     }
 
     #[test]

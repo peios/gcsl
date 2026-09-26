@@ -1,8 +1,18 @@
 //! Runtime values.
+//!
+//! Scalars are unboxed; strings, records and closures are reference-counted,
+//! so copying a value, into a variable, a record or a closure's captures, is
+//! at most a reference-count increment. Records and closures can nest as
+//! deeply as a program runs (a record holding a record, a closure capturing
+//! a closure), so dropping one frees what it uniquely owns iteratively,
+//! through a work list, rather than recursively (see [`Record`] and
+//! [`Closure`]).
 
 use std::fmt;
 use std::rc::Rc;
 
+use crate::ast::FnId;
+use crate::ir::Ir;
 use crate::names::Name;
 use crate::strings::{FieldName, Quoted};
 
@@ -22,6 +32,8 @@ pub enum ValueKind {
     String,
     /// A record: [`Value::Empty`] or [`Value::Record`].
     Record,
+    /// A function, [`Value::Fn`].
+    Fn,
 }
 
 /// The field names of a record, in definition order. Built once per record
@@ -63,38 +75,125 @@ impl Record {
     }
 }
 
-/// Dropping a record frees its nested records iteratively, not recursively.
+/// Dropping a record frees its nested records and closures iteratively, not
+/// recursively.
 ///
 /// The default drop would recurse once per level of nesting, and a record
 /// nested through variables (`let a = { x = a }` repeated) can be nested as
-/// deeply as the program is long, far beyond any stack. Instead, the nested
-/// records this record uniquely owns are moved onto a work list and freed
-/// level by level. A record with no nested records allocates nothing here:
-/// the list only grows when there is something to put on it. A nested
-/// record that is still shared elsewhere is merely released.
+/// deeply as the program is long, far beyond any stack; so can a closure
+/// capturing a closure. Instead, the nested records and closures this
+/// record uniquely owns are moved onto a work list and freed level by level
+/// (see `drop_nested`). A record with none allocates nothing here: the list
+/// only grows when there is something to put on it. A nested value that is
+/// still shared elsewhere is merely released.
 impl Drop for Record {
     fn drop(&mut self) {
-        let mut pending = Vec::new();
-        take_nested(&mut self.values, &mut pending);
-        while let Some(child) = pending.pop() {
-            if let Ok(mut child) = Rc::try_unwrap(child) {
-                // Emptied of nested records, `child` drops without adding
-                // to the list or recursing.
-                take_nested(&mut child.values, &mut pending);
+        drop_nested(&mut self.values);
+    }
+}
+
+/// A uniquely owned value that holds other values: what the iterative drop
+/// of records and closures frees level by level.
+enum Nested {
+    /// A record, holding its fields.
+    Record(Rc<Record>),
+    /// A closure, holding its captured values.
+    Closure(Rc<Closure>),
+}
+
+/// Frees the records and closures among `values` that nothing else holds,
+/// and all those they hold in turn, through a work list rather than
+/// recursion: each is emptied of the records and closures it holds, which
+/// go on the list, before it is dropped, so no drop recurses.
+fn drop_nested(values: &mut [Value]) {
+    let mut pending = Vec::new();
+    take_nested(values, &mut pending);
+    while let Some(nested) = pending.pop() {
+        match nested {
+            Nested::Record(record) => {
+                if let Ok(mut record) = Rc::try_unwrap(record) {
+                    // Emptied, it drops without adding to the list or
+                    // recursing.
+                    take_nested(&mut record.values, &mut pending);
+                }
+            }
+            Nested::Closure(closure) => {
+                if let Ok(mut closure) = Rc::try_unwrap(closure) {
+                    take_nested(&mut closure.captures, &mut pending);
+                }
             }
         }
     }
 }
 
-/// Moves the records among `values` onto `pending`, leaving `{}` in their
-/// places.
-fn take_nested(values: &mut [Value], pending: &mut Vec<Rc<Record>>) {
+/// Moves the records and closures among `values` onto `pending`, leaving
+/// `{}` in their places.
+fn take_nested(values: &mut [Value], pending: &mut Vec<Nested>) {
     for value in values {
-        if let Value::Record(_) = value
-            && let Value::Record(child) = std::mem::replace(value, Value::Empty)
-        {
-            pending.push(child);
+        if !matches!(value, Value::Record(_) | Value::Fn(_)) {
+            continue;
         }
+        match std::mem::replace(value, Value::Empty) {
+            Value::Record(record) => pending.push(Nested::Record(record)),
+            Value::Fn(closure) => pending.push(Nested::Closure(closure)),
+            _ => {}
+        }
+    }
+}
+
+/// A function value: a function of a program's IR with the values it
+/// captured when its function expression was evaluated.
+pub struct Closure {
+    /// The IR the function belongs to. Holding it keeps the code alive: a
+    /// session drops each input's IR once the input has run, but a closure
+    /// made by that input may be called by a later one.
+    pub code: Rc<Ir>,
+    /// Which of `code`'s functions this is.
+    pub function: FnId,
+    /// The captured values, in the function's capture order.
+    pub captures: Box<[Value]>,
+}
+
+impl Closure {
+    /// The closure's type as text, `fn(x: Int): Int`: what it displays as.
+    /// Empty if `function` is not one of `code`'s, which the evaluator
+    /// never builds.
+    #[must_use]
+    pub fn display(&self) -> &str {
+        self.code
+            .find_function(self.function)
+            .map_or("", |code| &code.display)
+    }
+}
+
+/// Shows the function and what it captured, not the IR it belongs to.
+impl fmt::Debug for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Closure")
+            .field("function", &self.function)
+            .field("type", &self.display())
+            .field("captures", &self.captures)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Closures compare by identity: two are equal only if they are the same
+/// closure. No program can compare functions, since the checker rejects
+/// `==`, `!=`, `===` and `!==` on any type containing one; this exists for
+/// [`Value`]'s equality, which a closure inside a record would otherwise
+/// have none for.
+impl PartialEq for Closure {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+/// Dropping a closure frees its captured records and closures iteratively,
+/// as dropping a record does, so a chain of closures each capturing the
+/// last is freed without recursion.
+impl Drop for Closure {
+    fn drop(&mut self) {
+        drop_nested(&mut self.captures);
     }
 }
 
@@ -157,7 +256,8 @@ fn fields_equal<'a>(
 ///
 /// Strings and records have value semantics but are shared: cloning a
 /// `Value::Str` or a `Value::Record` increments a reference count and never
-/// copies the text or the fields.
+/// copies the text or the fields. So does cloning a `Value::Fn`, whose
+/// closure is immutable.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// An `Int`.
@@ -174,6 +274,8 @@ pub enum Value {
     /// A record with at least one field; the empty record is always
     /// [`Value::Empty`].
     Record(Rc<Record>),
+    /// A function: a closure over the values it captured.
+    Fn(Rc<Closure>),
 }
 
 impl Value {
@@ -186,6 +288,7 @@ impl Value {
             Value::Bool(_) => ValueKind::Bool,
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
+            Value::Fn(_) => ValueKind::Fn,
         }
     }
 
@@ -211,6 +314,9 @@ impl Value {
 /// `repr` form, so strings are quoted, as in
 /// `{x = 1; y = "a"; inner = {n = 2}}`; a field name that is not a plain
 /// identifier is quoted too (see [`FieldName`]). The empty record is `{}`.
+///
+/// A function shows as its type, `fn(x: Int): Int`, in both forms, since it
+/// has no source form of its own to show.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -218,6 +324,7 @@ impl fmt::Display for Value {
             Value::Bool(value) => write!(f, "{value}"),
             Value::Str(text) => f.write_str(text),
             Value::Empty => f.write_str("{}"),
+            Value::Fn(closure) => f.write_str(closure.display()),
             Value::Record(record) => {
                 f.write_str("{")?;
                 for (index, (text, value)) in
@@ -340,11 +447,12 @@ mod tests {
     #[test]
     fn values_are_small() {
         // A string is a fat `Rc<str>` pointer, 16 bytes, plus the tag; a
-        // record is a thin `Rc<Record>`. A thin string pointer would bring
-        // this back to 16 bytes; that is a later optimisation for the VM's
-        // value representation, not this tree walker's.
-        assert!(size_of::<Value>() <= 24);
+        // record and a closure are thin pointers. A thin string pointer
+        // would bring this back to 16 bytes; that is a later optimisation
+        // for the VM's value representation, not this tree walker's.
+        assert_eq!(size_of::<Value>(), 24);
         assert_eq!(size_of::<Rc<Record>>(), size_of::<usize>());
+        assert_eq!(size_of::<Rc<Closure>>(), size_of::<usize>());
     }
 
     #[test]
@@ -492,6 +600,109 @@ mod tests {
         // Equality compares content, not identity.
         assert_eq!(string("x"), string("x"));
         assert_ne!(string("x"), string("y"));
+    }
+
+    /// An IR with one function, displayed as `display`, whose body is `{}`.
+    fn one_function(display: &str) -> Rc<Ir> {
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let body = builder.alloc(crate::ir::IrKind::Empty, crate::source::Span::new(0, 0));
+        let root = builder.alloc(crate::ir::IrKind::Empty, crate::source::Span::new(0, 0));
+        let code = crate::ir::FnCode {
+            body,
+            frame_size: 0,
+            param_count: 0,
+            capture_count: 1,
+            name: None,
+            display: Box::from(display),
+            slot_names: Box::default(),
+        };
+        Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], 0))
+    }
+
+    fn closure(code: &Rc<Ir>, captures: Vec<Value>) -> Value {
+        Value::Fn(Rc::new(Closure {
+            code: Rc::clone(code),
+            function: FnId::new(0),
+            captures: captures.into_boxed_slice(),
+        }))
+    }
+
+    #[test]
+    fn a_closure_displays_as_its_type() {
+        let code = one_function("fn(x: Int): Int");
+        let value = closure(&code, vec![Value::Int(1)]);
+        assert_eq!(value.kind(), ValueKind::Fn);
+        assert_eq!(value.to_string(), "fn(x: Int): Int");
+        assert_eq!(value.repr().to_string(), "fn(x: Int): Int");
+        // In a record, as a field's value.
+        let mut names = Names::new();
+        let record = record(&layout(&mut names, &["f"]), vec![value.clone()]);
+        assert_eq!(record.to_string(), "{f = fn(x: Int): Int}");
+        // Its debug form shows the function and captures, not the IR.
+        let shown = format!("{value:?}");
+        assert!(shown.contains("function: FnId(0)"), "{shown}");
+        assert!(shown.contains("type: \"fn(x: Int): Int\""), "{shown}");
+        assert!(shown.contains("captures: [Int(1)]"), "{shown}");
+        // A closure of a function its IR lacks shows as nothing.
+        let stray = Value::Fn(Rc::new(Closure {
+            code: Rc::clone(&code),
+            function: FnId::new(5),
+            captures: Box::default(),
+        }));
+        assert_eq!(stray.to_string(), "");
+    }
+
+    #[test]
+    fn closures_compare_by_identity() {
+        let code = one_function("fn(): Int");
+        let a = closure(&code, Vec::new());
+        let b = closure(&code, Vec::new());
+        assert_eq!(a, a.clone());
+        assert_ne!(a, b);
+        let mut names = Names::new();
+        let fields = layout(&mut names, &["f"]);
+        assert_eq!(
+            record(&fields, vec![a.clone()]),
+            record(&fields, vec![a.clone()])
+        );
+        assert_ne!(record(&fields, vec![a]), record(&fields, vec![b]));
+    }
+
+    #[test]
+    fn dropping_a_long_chain_of_closures_does_not_recurse() {
+        // A million closures, each capturing the one before, far more than a
+        // recursive drop could take on a test thread's stack.
+        let code = one_function("fn(): Int");
+        let mut value = Value::Int(0);
+        for _ in 0..1_000_000 {
+            value = closure(&code, vec![value]);
+        }
+        // A capture still held elsewhere is released, not freed.
+        let Value::Fn(outer) = &value else {
+            panic!("expected a closure");
+        };
+        let shared = outer.captures[0].clone();
+        drop(value);
+        let Value::Fn(shared) = shared else {
+            panic!("expected a closure");
+        };
+        assert!(matches!(shared.captures[0], Value::Fn(_)));
+        drop(shared);
+        // Closures and records nested in each other, alternately.
+        let mut names = Names::new();
+        let fields = layout(&mut names, &["f"]);
+        let mut value = Value::Empty;
+        for index in 0..1_000_000 {
+            value = if index % 2 == 0 {
+                closure(&code, vec![value])
+            } else {
+                record(&fields, vec![value])
+            };
+        }
+        drop(value);
+        // The IR outlives every closure made from it only as long as they
+        // hold it.
+        assert_eq!(Rc::strong_count(&code), 1);
     }
 
     #[test]

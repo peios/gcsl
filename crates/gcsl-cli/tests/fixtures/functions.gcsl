@@ -1,0 +1,9 @@
+# A named function, a closure, named arguments and a trailing block.
+fn service(name: String, config: {port: Int, image: String}): String {
+  "{name} runs {config.image} on {config.port}"
+}
+fn shout(text: String) -> String { text + "!" }
+let base = 8000
+let at = fn(offset: Int): Int { base + offset }
+web = service("web") { port = at(80); image = "nginx" }
+api = shout(service(config = { port = at(1); image = "api" }, name = "api"))

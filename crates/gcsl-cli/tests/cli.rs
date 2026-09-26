@@ -281,6 +281,77 @@ fn dump_ir_shows_updates() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+#[test]
+fn run_calls_functions() {
+    let output = gcsl(&["run", "tests/fixtures/functions.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{web = \"web runs nginx on 8080\"; api = \"api runs api on 8001!\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_functions_and_calls() {
+    let output = gcsl(&["run", "tests/fixtures/functions.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    assert!(tokens.starts_with("Newline @68..69\nFn @69..71\nIdent(service) @72..79\n"));
+    assert!(tokens.contains("\nArrow @213..215\n"), "{tokens}");
+    let output = gcsl(&["run", "tests/fixtures/functions.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    assert!(
+        ast.starts_with(
+            "(file\n\
+             \x20 (let service @69..189\n\
+             \x20   (fn @69..189\n\
+             \x20     (params (name String) (config {port: Int, image: String}))\n\
+             \x20     (ret pure String)\n"
+        ),
+        "{ast}"
+    );
+    assert!(ast.contains("\n        (named config\n"), "{ast}");
+    assert!(ast.contains("\n      (trailing\n        (block @"), "{ast}");
+    let output = gcsl(&["run", "tests/fixtures/functions.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    assert!(
+        types.contains(
+            "(let at @254..301\n\
+             \x20   (fn : fn(offset: Int): Int @263..301\n"
+        ),
+        "{types}"
+    );
+    let output = gcsl(&["run", "tests/fixtures/functions.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    assert!(
+        ir.contains(
+            "  (store at#3 @254..301\n\
+             \x20   (make-closure #2 @263..301\n\
+             \x20     (load base#2 @263..301)))\n"
+        ),
+        "{ir}"
+    );
+    assert!(
+        ir.contains(
+            "fn #2 at (frame 1, params 1, captures 1)\n\
+             \x20 (block @284..301\n\
+             \x20   (int-add @286..299\n\
+             \x20     (load-capture 0 @286..290)\n\
+             \x20     (load offset#0 @293..299)))"
+        ),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("\nfn #0 service (frame 2, params 2, captures 0)\n"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("\nfn #1 shout (frame 1, params 1, captures 0)\n"),
+        "{ir}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// The warning `tests/fixtures/warning.gcsl` produces, as rendered.
 const FIXTURE_WARNING: &str = "warning: field `z` is not in `{x: Int}`\n\
      \x20--> tests/fixtures/warning.gcsl:1:32\n\
@@ -547,6 +618,38 @@ fn repl_prints_warnings_before_the_value() {
          \x20 |          ^         -------- ascribed here\n\
          \x20 |\n\
          \x20 = note: it is allowed, but nothing with this type can see it\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_shows_functions_and_their_errors_against_their_own_line() {
+    let output = repl(
+        "fn div(a: Int, b: Int): Int { a // b }\n\
+         let x = 10\n\
+         let get = fn(): Int { x }\n\
+         x := 20\n\
+         get()\n\
+         get\n\
+         div(1, 0)\n\
+         div(4, 2)\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "10 : Int\n\
+         fn(): Int : fn(): Int\n\
+         2 : Int\n"
+    );
+    // The error inside `div` is shown against the line that defined it.
+    assert_eq!(
+        stderr(&output),
+        "error: division by zero\n\
+         \x20--> <repl>:1:33\n\
+         \x20 |\n\
+         1 | fn div(a: Int, b: Int): Int { a // b }\n\
+         \x20 |                               - ^^ - 0\n\
+         \x20 |                               |\n\
+         \x20 |                               1\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

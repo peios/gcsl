@@ -42,6 +42,30 @@
 //! record, in [`Ir::shape`]'s table. Total equality, `===` and `!==`,
 //! compares whole values and needs none.
 //!
+//! # Functions
+//!
+//! Every function expression of the program has an entry in the function
+//! table, [`Ir::function`], indexed by the [`FnId`] the parser gave it: its
+//! body, a [`IrKind::Block`] in the same node arena as the rest of the
+//! program, and the sizes of its frame, parameters and captures. Each
+//! function runs in a frame of its own, so a [`IrKind::Load`] or
+//! [`IrKind::Store`] in a body is of a slot of that function's frame, whose
+//! first slots are its parameters. A [`IrKind::LoadCapture`] reads one of
+//! the values the closure being run captured, and a [`IrKind::LoadCallee`]
+//! yields that closure itself, which is how a function refers to itself
+//! without capturing itself.
+//!
+//! A function expression lowers to a [`IrKind::MakeClosure`], whose items
+//! are loads, in the frame creating the closure, of the values it captures,
+//! in capture order. A call is a [`IrKind::Call`] whose items are
+//! [`IrKind::Arg`] nodes in source order, each naming the parameter its
+//! value is passed as.
+//!
+//! An `Ir` is shared, by reference count, between the evaluator and every
+//! closure made from its code, and records which session input it was
+//! lowered from, [`Ir::input`], so that a runtime error in a function of an
+//! earlier input can be shown against that input's source.
+//!
 //! An [`Ir`] can only be built by [`crate::lower::lower`], which is what
 //! guarantees it is well typed.
 
@@ -49,6 +73,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::ast::FnId;
 use crate::check::Slot;
 use crate::names::{Name, Names};
 use crate::source::Span;
@@ -196,8 +221,8 @@ pub struct ShapedOperands {
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
 /// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
 /// and of `Record*`, `Field` and `UpdateField` nodes to record nodes (an
-/// `UpdateField`'s value excepted, which may be of any kind); see
-/// [`Ir::kind_of`].
+/// `UpdateField`'s value excepted, which may be of any kind), and a `Call`'s
+/// callee is a function node; see [`Ir::kind_of`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
     /// An `Int` constant.
@@ -329,6 +354,40 @@ pub enum IrKind {
         /// Its new value, of any kind.
         value: IrId,
     },
+    /// Builds a closure of function `function` of the IR, capturing the
+    /// values of `captures`: loads in the frame creating it, one for each
+    /// value the function captures, in capture order.
+    MakeClosure {
+        /// The function.
+        function: FnId,
+        /// What it captures.
+        captures: IrRange,
+    },
+    /// Calls the function `callee` evaluates to with the arguments `args`,
+    /// which are [`IrKind::Arg`] nodes in source order, and yields its
+    /// result, of kind `kind`.
+    Call {
+        /// The function called.
+        callee: IrId,
+        /// The arguments, in source order.
+        args: IrRange,
+        /// The kind of the call's value: its function's return type's.
+        kind: ValueKind,
+    },
+    /// One argument of a [`IrKind::Call`], and only ever among its
+    /// arguments: `value`, evaluated in the caller's frame, passed as
+    /// parameter number `param`.
+    Arg {
+        /// The index of the parameter it fills.
+        param: u32,
+        /// Its value.
+        value: IrId,
+    },
+    /// Reads one of the values the closure being run captured, by its index
+    /// in capture order. Carries the value's kind, as a `Load` does.
+    LoadCapture(u32, ValueKind),
+    /// Yields the closure being run: a function's reference to itself.
+    LoadCallee,
 }
 
 impl IrKind {
@@ -368,7 +427,12 @@ impl IrKind {
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
             | IrKind::Field { .. }
-            | IrKind::UpdateField { .. } => None,
+            | IrKind::UpdateField { .. }
+            | IrKind::MakeClosure { .. }
+            | IrKind::Call { .. }
+            | IrKind::Arg { .. }
+            | IrKind::LoadCapture(..)
+            | IrKind::LoadCallee => None,
         }
     }
 
@@ -410,6 +474,11 @@ impl IrKind {
             IrKind::MakeRecord { .. } => "make-record",
             IrKind::Field { .. } => "field",
             IrKind::UpdateField { .. } => "update-field",
+            IrKind::MakeClosure { .. } => "make-closure",
+            IrKind::Call { .. } => "call",
+            IrKind::Arg { .. } => "arg",
+            IrKind::LoadCapture(..) => "load-capture",
+            IrKind::LoadCallee => "load-callee",
         }
     }
 }
@@ -471,15 +540,45 @@ impl IrNode {
             | IrKind::Block { .. }
             | IrKind::MakeRecord { .. }
             | IrKind::Field { .. }
-            | IrKind::UpdateField { .. } => return None,
+            | IrKind::UpdateField { .. }
+            | IrKind::MakeClosure { .. }
+            | IrKind::Call { .. }
+            | IrKind::Arg { .. }
+            | IrKind::LoadCapture(..)
+            | IrKind::LoadCallee => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
 }
 
+/// One function of a program, in [`Ir::function`]'s table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FnCode {
+    /// The body: a [`IrKind::Block`] in the same node arena as the rest of
+    /// the program.
+    pub body: IrId,
+    /// The number of slots the body's frame needs, its parameters included.
+    pub frame_size: u32,
+    /// The number of parameters, which occupy slots `0..param_count`.
+    pub param_count: u32,
+    /// The number of values a closure of the function captures.
+    pub capture_count: u32,
+    /// The name the function refers to itself by, if it has one: the
+    /// `let`, field or named function item it initialises. For
+    /// [`Ir::pretty`].
+    pub name: Option<Name>,
+    /// The function's type as text, `fn(x: Int): Int`: what its closures
+    /// display as.
+    pub display: Box<str>,
+    /// For each slot of the body's frame, the name of the last variable
+    /// assigned to it. For [`Ir::pretty`] only.
+    pub slot_names: Box<[Name]>,
+}
+
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string
 /// constants, the record layouts and shapes, the text of every name an
-/// update may add to a record, its root, and the frame it needs.
+/// update may add to a record, the functions, its root, the frame it needs,
+/// and the session input it was lowered from.
 #[derive(Clone, Debug)]
 pub struct Ir {
     nodes: Vec<IrNode>,
@@ -490,11 +589,15 @@ pub struct Ir {
     /// The text of the name of every [`IrKind::UpdateField`], which may
     /// add it to a record's layout at runtime.
     name_texts: HashMap<Name, Box<str>>,
+    /// Every function of the program, indexed by [`FnId`].
+    functions: Vec<FnCode>,
     root: IrId,
     frame_size: u32,
-    /// For each slot, the name of the last variable assigned to it. For
-    /// [`Ir::pretty`] only.
+    /// For each slot of the root's frame, the name of the last variable
+    /// assigned to it. For [`Ir::pretty`] only.
     slot_names: Vec<Name>,
+    /// The session input the program was lowered from; 0 for a file.
+    input: u32,
 }
 
 impl Ir {
@@ -574,10 +677,41 @@ impl Ir {
         self.root
     }
 
-    /// The number of variable slots evaluation needs.
+    /// The number of variable slots evaluation of the root needs.
     #[must_use]
     pub fn frame_size(&self) -> u32 {
         self.frame_size
+    }
+
+    /// Returns function `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this IR.
+    #[must_use]
+    pub fn function(&self, id: FnId) -> &FnCode {
+        &self.functions[id.index()]
+    }
+
+    /// Returns function `id`, or `None` if it does not belong to this IR.
+    #[must_use]
+    pub fn find_function(&self, id: FnId) -> Option<&FnCode> {
+        self.functions.get(id.index())
+    }
+
+    /// The number of functions in the program, which bounds every [`FnId`]
+    /// in it.
+    #[must_use]
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// The session input the program was lowered from, which its spans
+    /// refer to: 0 for a file, and the input's number in a
+    /// [`crate::session::Session`].
+    #[must_use]
+    pub fn input(&self) -> u32 {
+        self.input
     }
 
     /// The kind of value node `id` produces.
@@ -598,6 +732,10 @@ impl Ir {
                 }
                 IrKind::If { then, .. } => {
                     id = then;
+                    continue;
+                }
+                IrKind::Arg { value, .. } => {
+                    id = value;
                     continue;
                 }
                 IrKind::BoolConst(_)
@@ -631,7 +769,11 @@ impl Ir {
                 | IrKind::Store(..)
                 | IrKind::MakeRecord { .. }
                 | IrKind::UpdateField { .. } => ValueKind::Record,
-                IrKind::Load(_, kind) | IrKind::Field { kind, .. } => kind,
+                IrKind::Load(_, kind)
+                | IrKind::Field { kind, .. }
+                | IrKind::Call { kind, .. }
+                | IrKind::LoadCapture(_, kind) => kind,
+                IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
             };
         }
     }
@@ -652,10 +794,23 @@ impl Ir {
     /// operator and its shape's field names in the shape's order, each
     /// record field's own shape after its name, as in
     /// `(record-eq == [x inner[n]] @0..9 ...)`; a total one its operator,
-    /// as in `(record-same === @0..9 ...)`. There is no trailing newline.
+    /// as in `(record-same === @0..9 ...)`. A closure shows its function's
+    /// number and then what it captures, as in `(make-closure #0 @0..9
+    /// ...)`, a call its callee and then its arguments, each as
+    /// `(arg 0 @4..5 ...)` with the parameter it fills, and the reads of a
+    /// capture and of the callee as `(load-capture 0 @4..5)` and
+    /// `(load-callee @4..5)`. After the root, each function is shown on a
+    /// line of its own as `fn #0 name (frame 3, params 2, captures 1)`, or
+    /// `fn #1 (frame ...)` if it has no name, followed by its body, whose
+    /// slots are named by its own frame's variables. There is no trailing
+    /// newline.
     #[must_use]
     pub fn pretty<'a>(&'a self, names: &'a Names) -> impl fmt::Display + 'a {
-        Pretty { ir: self, names }
+        Pretty {
+            ir: self,
+            names,
+            slot_names: &self.slot_names,
+        }
     }
 }
 
@@ -685,10 +840,12 @@ impl IrBuilder {
     /// Adds a node and returns its id. The builder holds at most one node
     /// per AST node or item, plus one conversion per `/` operand, one
     /// `Empty` or `MakeRecord` per block, one `Load` per field, one
-    /// constant per literal piece of an interpolation, and for each segment
-    /// of a dotted path after the first an update and a record to update,
-    /// far below `u32::MAX` for any source a `SourceFile` accepts; past
-    /// that, ids would saturate.
+    /// constant per literal piece of an interpolation, for each segment of
+    /// a dotted path after the first an update and a record to update, one
+    /// `Arg` per argument of a call, and one load per value a closure
+    /// captures (a variable used inside functions nested `n` deep in the
+    /// one declaring it is captured by each of the `n`), far below
+    /// `u32::MAX` for any realistic source; past that, ids would saturate.
     pub(crate) fn alloc(&mut self, kind: IrKind, span: Span) -> IrId {
         let id = IrId(u32::try_from(self.nodes.len()).unwrap_or(u32::MAX));
         self.nodes.push(IrNode { kind, span });
@@ -748,7 +905,24 @@ impl IrBuilder {
         }
     }
 
+    /// Finishes a program without functions, lowered from input 0, for
+    /// building IR by hand in tests.
+    #[cfg(test)]
     pub(crate) fn finish(self, root: IrId, frame_size: u32, slot_names: Vec<Name>) -> Ir {
+        self.finish_program(root, (frame_size, slot_names), Vec::new(), 0)
+    }
+
+    /// Finishes the program whose root is `root`, whose root frame has
+    /// `frame_size` slots named by `slot_names`, whose functions are
+    /// `functions`, indexed by [`FnId`], and which was lowered from session
+    /// input `input`.
+    pub(crate) fn finish_program(
+        self,
+        root: IrId,
+        (frame_size, slot_names): (u32, Vec<Name>),
+        functions: Vec<FnCode>,
+        input: u32,
+    ) -> Ir {
         Ir {
             nodes: self.nodes,
             item_lists: self.item_lists,
@@ -756,9 +930,11 @@ impl IrBuilder {
             layouts: self.layouts,
             shapes: self.shapes,
             name_texts: self.name_texts,
+            functions,
             root,
             frame_size,
             slot_names,
+            input,
         }
     }
 }
@@ -766,6 +942,9 @@ impl IrBuilder {
 struct Pretty<'a> {
     ir: &'a Ir,
     names: &'a Names,
+    /// The names of the slots of the frame being shown: the root's or a
+    /// function's.
+    slot_names: &'a [Name],
 }
 
 impl Pretty<'_> {
@@ -800,7 +979,7 @@ impl Pretty<'_> {
     /// that is not a plain identifier, or `?#slot` if the IR has no name
     /// for it.
     fn slot(&self, f: &mut fmt::Formatter<'_>, slot: Slot) -> fmt::Result {
-        match self.ir.slot_names.get(slot.index()) {
+        match self.slot_names.get(slot.index()) {
             Some(&name) => write!(f, " {}{slot}", FieldName(self.names.get(name))),
             None => write!(f, " ?{slot}"),
         }
@@ -839,6 +1018,8 @@ impl Pretty<'_> {
             IrKind::Field { name, .. } | IrKind::UpdateField { name, .. } => {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }
+            IrKind::MakeClosure { function, .. } => write!(f, " {function}")?,
+            IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
             _ => {}
         }
         Ok(())
@@ -857,7 +1038,9 @@ impl Pretty<'_> {
             | IrKind::BoolConst(_)
             | IrKind::StrConst(_)
             | IrKind::Empty
-            | IrKind::Load(..) => {}
+            | IrKind::Load(..)
+            | IrKind::LoadCapture(..)
+            | IrKind::LoadCallee => {}
             IrKind::IntNeg(operand)
             | IrKind::FloatNeg(operand)
             | IrKind::IntToFloat(operand)
@@ -865,9 +1048,18 @@ impl Pretty<'_> {
             | IrKind::Field {
                 record: operand, ..
             }
-            | IrKind::Store(_, operand) => {
+            | IrKind::Store(_, operand)
+            | IrKind::Arg { value: operand, .. } => {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
+            }
+            IrKind::Call { callee, args, .. } => {
+                f.write_str("\n")?;
+                self.node(f, callee, depth + 1)?;
+                for &arg in self.ir.items(args) {
+                    f.write_str("\n")?;
+                    self.node(f, arg, depth + 1)?;
+                }
             }
             IrKind::IntAdd(operands)
             | IrKind::IntSub(operands)
@@ -910,7 +1102,11 @@ impl Pretty<'_> {
                     self.node(f, child, depth + 1)?;
                 }
             }
-            IrKind::Interp(items) | IrKind::MakeRecord { values: items, .. } => {
+            IrKind::Interp(items)
+            | IrKind::MakeRecord { values: items, .. }
+            | IrKind::MakeClosure {
+                captures: items, ..
+            } => {
                 for &item in self.ir.items(items) {
                     f.write_str("\n")?;
                     self.node(f, item, depth + 1)?;
@@ -931,7 +1127,25 @@ impl Pretty<'_> {
 
 impl fmt::Display for Pretty<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.node(f, self.ir.root, 0)
+        self.node(f, self.ir.root, 0)?;
+        for (index, code) in self.ir.functions.iter().enumerate() {
+            write!(f, "\nfn #{index}")?;
+            if let Some(name) = code.name {
+                write!(f, " {}", FieldName(self.names.get(name)))?;
+            }
+            writeln!(
+                f,
+                " (frame {}, params {}, captures {})",
+                code.frame_size, code.param_count, code.capture_count
+            )?;
+            let body = Pretty {
+                ir: self.ir,
+                names: self.names,
+                slot_names: &code.slot_names,
+            };
+            body.node(f, code.body, 1)?;
+        }
+        Ok(())
     }
 }
 

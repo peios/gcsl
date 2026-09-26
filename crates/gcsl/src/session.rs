@@ -15,20 +15,30 @@
 //! - the checker's outermost [`Scope`]: each top-level variable with its
 //!   slot and type, from which [`Checker::with_scope`] checks the next
 //!   input exactly as if it continued the same block;
-//! - the frame, holding each top-level variable's value in its slot;
-//! - the type of the last successful input's value, for showing it.
+//! - the value stack, whose bottom is the top level's frame, holding each
+//!   top-level variable's value in its slot, and which calls grow and
+//!   shrink back while an input runs;
+//! - the type of the last successful input's value, for showing it;
+//! - the source of every committed input, in order: input `n` is the `n`th
+//!   to succeed, counting from 0, and each input is lowered with its
+//!   number. A closure outlives the input that made it, and when one made
+//!   by an earlier input fails, its diagnostic names that input (see
+//!   [`crate::Diagnostic::input`]), whose source [`Session::source`]
+//!   returns for rendering it.
 //!
 //! A failed input, whether it fails to compile or fails at runtime, leaves
 //! the session as it was: the scope is only replaced after evaluation
-//! succeeds, and names interned by the failed input are forgotten. The frame
-//! may have grown, and slots above the last committed variable may hold
-//! values from the failed run, but those slots belong to no variable and are
-//! always written before they are read. Types the failed input interned are
+//! succeeds, names interned by the failed input are forgotten, and its
+//! source is not kept, so it takes no number. The frame may have grown, and
+//! slots above the last committed variable may hold values from the failed
+//! run, but those slots belong to no variable and are always written before
+//! they are read. Types the failed input interned are
 //! kept: a type is a fact about structure, not about the input, so a stale
 //! entry is harmless (see [`crate::types`]); forgetting them would mean
 //! rebuilding the table's lookup map.
 
 use std::mem;
+use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::Ast;
@@ -51,8 +61,11 @@ pub struct Session {
     names: Names,
     types: TypeTable,
     scope: Scope,
+    /// The value stack; its bottom is the top level's frame.
     frame: Vec<Value>,
     value_type: TyId,
+    /// The source of each committed input, indexed by its number.
+    sources: Vec<SourceFile>,
 }
 
 impl Default for Session {
@@ -71,7 +84,17 @@ impl Session {
             scope: Scope::new(),
             frame: Vec::new(),
             value_type: TyId::EMPTY,
+            sources: Vec::new(),
         }
+    }
+
+    /// The source of committed input number `input`, the `input`th to have
+    /// succeeded, counting from 0; `None` if no input of that number has
+    /// been committed, as for the input being run. Diagnostics whose
+    /// [`Diagnostic::input`] is set are rendered against it.
+    #[must_use]
+    pub fn source(&self, input: u32) -> Option<&SourceFile> {
+        self.sources.get(input as usize)
     }
 
     /// Runs `source` as the next input and returns its value, `{}` if it
@@ -123,9 +146,11 @@ impl Session {
         // lowering copies what the IR needs out of it, and it is dropped
         // with the tree.
         let ast = builder.finish(root, mem::take(&mut self.names), strings);
-        let compiled = compile(&ast, self.scope.clone(), &mut self.types);
+        let input = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
+        let compiled = compile(&ast, self.scope.clone(), &mut self.types, input);
         self.names = ast.into_names();
         let (ir, output) = compiled?;
+        let ir = Rc::new(ir);
         let frame_size = ir.frame_size() as usize;
         if self.frame.len() < frame_size {
             self.frame.resize(frame_size, Value::Empty);
@@ -134,26 +159,37 @@ impl Session {
             Ok(value) => {
                 self.scope = output.scope;
                 self.value_type = output.ty;
+                self.sources.push(source.clone());
                 Ok(Outcome {
                     value,
                     warnings: output.warnings,
                 })
             }
-            Err(error) => Err(diagnostic::merge(vec![error], output.warnings)),
+            Err(mut error) => {
+                // A closure of this input called from a closure of an
+                // earlier one stamps this input's number: that is the input
+                // being run, which is what no number means.
+                if error.input == Some(input) {
+                    error.input = None;
+                }
+                Err(diagnostic::merge(vec![error], output.warnings))
+            }
         }
     }
 }
 
-/// Checks and lowers `ast` in the context of `scope`, interning types into
-/// `types`, returning the IR and the checker's output: the scope extended by
-/// the input's top-level declarations, the value's type and the warnings.
+/// Checks and lowers `ast`, session input number `input`, in the context
+/// of `scope`, interning types into `types`, returning the IR and the
+/// checker's output: the scope extended by the input's top-level
+/// declarations, the value's type and the warnings.
 fn compile(
     ast: &Ast,
     scope: Scope,
     types: &mut TypeTable,
+    input: u32,
 ) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
     let output = Checker::with_scope(ast, scope, types).check()?;
-    match lower::lower(ast, &output.checked, types) {
+    match lower::lower(ast, &output.checked, types, input) {
         Ok(ir) => Ok((ir, output)),
         Err(error) => Err(diagnostic::merge(vec![error.into()], output.warnings)),
     }
@@ -279,10 +315,13 @@ mod tests {
         value(&mut session, "let a = 1");
         assert_eq!(session.frame.len(), 1);
         value(&mut session, "{ let t = 1; let u = 2; let v = 3 }");
+        // After each input, the stack is its top level's frame: the
+        // temporaries' slots are gone, and reused by later variables, but
+        // the capacity stays.
         assert_eq!(session.frame.len(), 4);
-        // The temporaries' slots are reused by later variables.
         value(&mut session, "let b = 2");
-        assert_eq!(session.frame.len(), 4);
+        assert_eq!(session.frame.len(), 2);
+        assert!(session.frame.capacity() >= 4);
         assert_eq!(value(&mut session, "a + b"), Value::Int(3));
     }
 
@@ -418,6 +457,68 @@ mod tests {
             vec!["cannot update `config.name.first`: `config.name` is String, not a record"]
         );
         assert_eq!(value(&mut session, "config.build.jobs"), Value::Int(8));
+    }
+
+    #[test]
+    fn functions_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "fn double(n: Int): Int { n * 2 }");
+        value(&mut session, "let x = 10");
+        value(&mut session, "let get = fn(): Int { x }");
+        // A function of an earlier input is called by a later one, and
+        // captured what was in scope when it was made.
+        assert_eq!(value(&mut session, "double(21)"), Value::Int(42));
+        value(&mut session, "x := 20");
+        assert_eq!(value(&mut session, "get()"), Value::Int(10));
+        assert_eq!(value(&mut session, "x"), Value::Int(20));
+        // Its value shows as its type.
+        assert_eq!(value(&mut session, "double").to_string(), "fn(n: Int): Int");
+        assert_eq!(value_type(&session), "fn(n: Int): Int");
+        // A closure made by one input and passed to a function of another.
+        value(
+            &mut session,
+            "fn apply(f: fn(Int): Int, v: Int): Int { f(v) }",
+        );
+        assert_eq!(
+            value(&mut session, "apply(fn(n: Int): Int { n + x }, 1)"),
+            Value::Int(21)
+        );
+    }
+
+    #[test]
+    fn an_error_in_a_function_of_an_earlier_input_names_that_input() {
+        let mut session = Session::new();
+        let first = "fn div(a: Int, b: Int): Int { a // b }";
+        value(&mut session, first);
+        value(&mut session, "let unrelated = 1");
+        // Input 2 fails at runtime inside input 0's function.
+        let diagnostics = eval(&mut session, "div(1, 0)").unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.message, "division by zero");
+        assert_eq!(diagnostic.input, Some(0));
+        let source = session.source(0).unwrap();
+        assert_eq!(source.text(), first);
+        assert_eq!(source.slice(diagnostic.span), "//");
+        assert_eq!(session.source(1).unwrap().text(), "let unrelated = 1");
+        // The failed input takes no number, and the one being run has none
+        // yet.
+        assert!(session.source(2).is_none());
+        // An error in the input being run names no input, even from inside
+        // a closure of its own called by a function of an earlier input.
+        value(&mut session, "fn call(f: fn(): Int): Int { f() }");
+        let diagnostics = eval(&mut session, "call(fn(): Int { 1 // 0 })").unwrap_err();
+        assert_eq!(diagnostics[0].input, None);
+        // The innermost foreign function names its input: input 0's `div`,
+        // called by input 3's `bad`, called by input 2's `call`.
+        value(&mut session, "fn bad(): Int { div(1, 0) }");
+        let diagnostics = eval(&mut session, "call(bad)").unwrap_err();
+        assert_eq!(diagnostics[0].input, Some(0));
+        let diagnostics = eval(&mut session, "bad()").unwrap_err();
+        assert_eq!(diagnostics[0].input, Some(0));
+        // A file names no input: everything in it is input 0.
+        let file = SourceFile::new("f.gcsl", "fn f(): Int { 1 // 0 }\nf()").unwrap();
+        assert_eq!(crate::run(&file).unwrap_err()[0].input, None);
     }
 
     #[test]

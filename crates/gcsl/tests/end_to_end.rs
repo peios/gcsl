@@ -1,5 +1,7 @@
 //! End-to-end tests: source text through every stage via the public API.
 
+use std::rc::Rc;
+
 use gcsl::{Diagnostic, Session, Severity, SourceFile, TypeTable, Value, ValueKind};
 
 fn source(text: &str) -> SourceFile {
@@ -489,6 +491,23 @@ fn every_stage_handles_maximum_depth() {
         // before it, then read back.
         let path = format!("a{}", ".b".repeat((depth - 1) / 2));
         let dotted = source(&format!("let {path} = 1\nlet {path} = 2\n{path}"));
+        // Calls nested in each other's arguments: N calls around a literal
+        // are N + 1 levels, and each is made from its caller's frame, so
+        // they nest in Rust but not in GCSL.
+        let calls = source(&format!(
+            "fn id(x: Int): Int {{ x }}\n{}1{}",
+            "id(".repeat(depth - 1),
+            ")".repeat(depth - 1)
+        ));
+        // Function expressions nested in each other's bodies, two levels
+        // each, the innermost using a variable of the top level, which every
+        // one of them therefore captures.
+        let functions_deep = (depth - 1) / 2;
+        let functions = source(&format!(
+            "let v = 7\nlet f = {}fn(): Int {{ v }}{}\nf()",
+            "fn(): Int { let g = ".repeat(functions_deep - 1),
+            "\n1 }".repeat(functions_deep - 1)
+        ));
         // The printers recurse too, but printing a tree this deep takes
         // seconds, since each line is indented by its depth. They recurse
         // one frame per level from a node straight to its children,
@@ -506,12 +525,16 @@ fn every_stage_handles_maximum_depth() {
             (&bools, Value::Bool(true), false),
             (&concatenation, concatenation_value, false),
             (&dotted, Value::Int(2), false),
+            // Printing a call recurses through its arguments; a function's
+            // body prints as the blocks above do.
+            (&calls, Value::Int(1), true),
+            (&functions, Value::Int(1), false),
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
             let mut types = TypeTable::new();
             let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
-            let ir = gcsl::lower::lower(&ast, &checked, &types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
             assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
             if print {
                 let annotation = checked.types.annotation(&types, ast.names());
@@ -543,7 +566,7 @@ fn every_stage_handles_maximum_record_depth() {
             let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
             let mut types = TypeTable::new();
             let output = gcsl::check::Checker::new(&ast, &mut types).check().unwrap();
-            let ir = gcsl::lower::lower(&ast, &output.checked, &types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &output.checked, &types, 0).unwrap());
             assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
             assert!(!ast.pretty().to_string().is_empty());
             assert!(!ir.pretty(ast.names()).to_string().is_empty());
@@ -600,7 +623,172 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
         let text = format!("x{} = 1", ".a".repeat(200_000));
         let diagnostics = run(&text).unwrap_err();
         assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        // Calls, function expressions and function types.
+        for text in [
+            format!("{}1{}", "f(".repeat(200_000), ")".repeat(200_000)),
+            format!("{}1{}", "f { ".repeat(200_000), " }".repeat(200_000)),
+            format!(
+                "{}1{}",
+                "fn(): Int { ".repeat(200_000),
+                " }".repeat(200_000)
+            ),
+            format!("let f: {}Int = g", "fn(): ".repeat(200_000)),
+            format!(
+                "let f: fn({}Int{}): Int = g",
+                "fn(".repeat(200_000),
+                "): Int".repeat(200_000)
+            ),
+        ] {
+            let diagnostics = run(&text).unwrap_err();
+            assert_eq!(diagnostics[0].message, "expression nested too deeply");
+        }
     });
+}
+
+/// `STACK_SIZE` covers `MAX_CALL_DEPTH` calls in progress with an
+/// expression as deep as the parser accepts evaluated in the deepest of
+/// them, whatever kind of nesting it is, unoptimised.
+#[test]
+fn the_deepest_calls_with_the_deepest_expression() {
+    on_recommended_stack(|| {
+        // The function around the expression takes four levels: itself,
+        // its body, the `if` and its block.
+        let levels = gcsl::MAX_DEPTH - 4;
+        let calls = gcsl::MAX_CALL_DEPTH - 1;
+        let recurse = |ret: &str, deepest: &str| {
+            source(&format!(
+                "fn f(n: Int): {ret} {{ if n == 0 {{ {deepest} }} else {{ f(n - 1) }} }}\n\
+                 f({calls})"
+            ))
+        };
+        let terms = i64::try_from(levels).unwrap();
+        let chain = recurse("Int", &format!("1{}", " + 1".repeat(levels - 1)));
+        let pairs = (levels - 1) / 2;
+        let negations = recurse(
+            "Int",
+            &format!("{}1{}", "-(".repeat(pairs), ")".repeat(pairs)),
+        );
+        let literals = levels - 1;
+        let strings = recurse(
+            "String",
+            &format!("{}n{}", "\"{".repeat(literals), "}\"".repeat(literals)),
+        );
+        let blocks = (levels - 1) / 2;
+        let nested_blocks = recurse(
+            "Int",
+            &format!("{}n{}", "{".repeat(blocks), "}".repeat(blocks)),
+        );
+        let outer = 2_000;
+        let mixed = recurse(
+            "Int",
+            &format!(
+                "{}n{}{}",
+                "{ let v = 1\n".repeat(outer),
+                " + v".repeat(levels - outer - 1),
+                "\n}".repeat(outer)
+            ),
+        );
+        for (file, expected) in [
+            (&chain, Value::Int(terms)),
+            (
+                &negations,
+                Value::Int(if pairs.is_multiple_of(2) { 1 } else { -1 }),
+            ),
+            (&strings, Value::Str("0".into())),
+            (&nested_blocks, Value::Int(0)),
+            (
+                &mixed,
+                Value::Int(i64::try_from(levels - outer - 1).unwrap()),
+            ),
+        ] {
+            assert_eq!(run(file.text()).unwrap(), expected);
+        }
+    });
+}
+
+#[test]
+fn programs_with_functions() {
+    let cases = [
+        (
+            "fn fact(n: Int): Int { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(10)",
+            "3628800 : Int",
+        ),
+        (
+            "fn apply(f: fn(Int): Int, v: Int): Int { f(v) }\n\
+             apply(fn(n: Int): Int {\n\
+             \x20 let doubled = n * 2\n\
+             \x20 doubled + 1\n\
+             }, 20)",
+            "41 : Int",
+        ),
+        (
+            "fn greet(name: String, times: Int): String { \"hello {name} x{times}\" }\n\
+             greet(times = 2, name = \"jack\")",
+            "\"hello jack x2\" : String",
+        ),
+        (
+            "fn service(name: String, config: {port: Int, image: String}): {name: String, url: String} {\n\
+             \x20 name = name\n\
+             \x20 url = \"{config.image}:{config.port}\"\n\
+             }\n\
+             service(\"web\") { port = 80; image = \"nginx\" }",
+            "{name = \"web\"; url = \"nginx:80\"} : {name: String, url: String}",
+        ),
+        (
+            "let f = fn(x: Int): Int { x }\nf",
+            "fn(x: Int): Int : fn(x: Int): Int",
+        ),
+        (
+            "fn run(body: {steps: Int}) -> Int { body.steps }\nrun { steps = 3 }",
+            "3 : Int",
+        ),
+        ("let x = 1\nlet f = fn(): Int { x }\nx := 2\nf()", "1 : Int"),
+        (
+            "let math = { square = fn(n: Int): Int { n * n } }\nmath.square(4)",
+            "16 : Int",
+        ),
+        (
+            "fn compose(f: fn(Int): Int, g: fn(Int): Int): fn(Int): Int { fn(x: Int): Int { g(f(x)) } }\n\
+             compose(fn(x: Int): Int { x + 1 }, fn(x: Int): Int { x * 10 })(4)",
+            "50 : Int",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn an_impure_call_error_renders_exactly() {
+    assert_eq!(
+        rendered("fn f() -> Int { 1 }\nfn g(): Int { f() }\n"),
+        "error: cannot call an impure function from a pure function\n\
+         \x20--> calc.gcsl:2:15\n\
+         \x20 |\n\
+         2 | fn g(): Int { f() }\n\
+         \x20 |       -       -^^\n\
+         \x20 |       |       |\n\
+         \x20 |       |       this is fn() -> Int\n\
+         \x20 |       this function is pure, declared with `:`\n\
+         \x20 |\n\
+         \x20 = note: a pure function, declared with `:`, may call only pure functions; declare it \
+         with `->` to make it impure\n"
+    );
+}
+
+#[test]
+fn a_call_error_renders_exactly() {
+    assert_eq!(
+        rendered("fn add(a: Int, b: Int): Int { a + b }\nadd(1, 2, 3)\n"),
+        "error: expected 2 arguments, found 3\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         2 | add(1, 2, 3)\n\
+         \x20 | ---^^^^^^^-^\n\
+         \x20 | |         |\n\
+         \x20 | |         unexpected argument\n\
+         \x20 | the function is fn(a: Int, b: Int): Int\n"
+    );
 }
 
 #[test]
@@ -613,7 +801,7 @@ fn stages_can_be_run_individually() {
     let (checked, warnings) = gcsl::check::check(&ast, &mut types).unwrap();
     assert!(warnings.is_empty());
     assert_eq!(checked.resolution.frame_size(), 1);
-    let ir = gcsl::lower::lower(&ast, &checked, &types).unwrap();
+    let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
     assert_eq!(ir.kind_of(ir.root()), ValueKind::Float);
     assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Float(3.5));
 }

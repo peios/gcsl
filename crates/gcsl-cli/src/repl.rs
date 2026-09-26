@@ -21,8 +21,9 @@ const PROMPT: &str = "> ";
 /// written in a program (a string quoted and escaped, see
 /// [`Value::repr`]) and the type the checker gave it, nothing if its value
 /// is `{}` (as for a `let`), or its diagnostics; a line with errors changes
-/// nothing. A line's warnings go to stderr before its value. Ctrl-C
-/// discards the current line. History lasts for the session only.
+/// nothing. A line's warnings go to stderr before its value. A runtime error
+/// inside a function an earlier line defined is shown against that line.
+/// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
         Ok(editor) => editor,
@@ -80,7 +81,14 @@ fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
             out.flush()
         }
         Err(diagnostics) => {
-            output::diagnostics(&source, &diagnostics);
+            // A diagnostic from a function of an earlier line refers to
+            // that line's source.
+            output::diagnostics_from(&diagnostics, |diagnostic| {
+                diagnostic
+                    .input
+                    .and_then(|input| session.source(input))
+                    .unwrap_or(&source)
+            });
             Ok(())
         }
     }

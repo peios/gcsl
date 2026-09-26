@@ -30,6 +30,25 @@
 //! they share whose types have a join, so it always exists; see
 //! [`TypeTable::join`].
 //!
+//! # Functions
+//!
+//! A function type, [`FnTy`], lists its parameters' types, each with the
+//! parameter's name if the type gives one, its return type, and whether it
+//! is pure. Names are part of the type as interned and displayed, so
+//! `fn(x: Int): Int` and `fn(Int): Int` are different ids, and they are
+//! what named arguments match, but subtyping ignores them, so each of those
+//! is a subtype of the other.
+//!
+//! `fn(P1, ..., Pn) m R` is a subtype of `fn(Q1, ..., Qn) m' R'` when the
+//! arities are equal, each `Qi` is a subtype of `Pi` (parameters are
+//! contravariant: a function that accepts more can stand in for one that
+//! accepts less), `R` is a subtype of `R'` (the return type is covariant),
+//! and `m` is pure or `m'` impure (a pure function can stand in for an
+//! impure one, not the reverse). Two function types have a join when their
+//! arities are equal, their parameter types are identical pairwise and
+//! their return types have a join: its parameters keep the names both sides
+//! agree on, its return type is that join, and it is pure only if both are.
+//!
 //! # Lifetime
 //!
 //! A table only grows. It lives outside the checker so that a
@@ -97,6 +116,8 @@ pub enum TyKind {
     String,
     /// A record type: its fields, sorted by [`Name`], with no duplicates.
     Record(RecordTy),
+    /// A function type. See the module documentation.
+    Fn(FnTy),
     /// A union of at least two types, sorted, deduplicated and flattened
     /// (no member is itself a union). Nothing produces one yet; the kind
     /// exists so that the table's shape does not change when unions arrive.
@@ -112,6 +133,18 @@ pub enum TyKind {
 pub struct RecordTy {
     /// Each field's name and type, sorted by name, with no name twice.
     pub fields: Box<[(Name, TyId)]>,
+}
+
+/// The signature of a function type.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FnTy {
+    /// Each parameter's name, if the type gives one, and type, in order.
+    pub params: Box<[(Option<Name>, TyId)]>,
+    /// The return type.
+    pub ret: TyId,
+    /// Whether the function is pure, declared with `:`, rather than impure,
+    /// declared with `->`.
+    pub pure: bool,
 }
 
 /// The interning table: each distinct type once, with its [`TyId`]. See the
@@ -164,10 +197,11 @@ impl TypeTable {
     /// invariants documented on [`TyKind::Union`].
     ///
     /// A table holds at most `u32::MAX` types. Every type but the
-    /// pre-interned ones is built from source (a record block or a record
-    /// type expression, each at least two bytes of it, or the join of two
-    /// types already in the table, which is no larger than either), so the
-    /// limit is far beyond any table; past it, ids would saturate.
+    /// pre-interned ones is built from source (a record block, a record or
+    /// function type expression or a function expression, each at least two
+    /// bytes of it, or the join of two types already in the table, which is
+    /// no larger than either), so the limit is far beyond any table; past
+    /// it, ids would saturate.
     pub fn intern(&mut self, kind: TyKind) -> TyId {
         let kind = match kind {
             TyKind::Record(RecordTy { mut fields }) => {
@@ -193,6 +227,49 @@ impl TypeTable {
         self.intern(TyKind::Record(RecordTy {
             fields: fields.into_iter().collect(),
         }))
+    }
+
+    /// Returns the id of the function type with `params`, each a parameter's
+    /// name, if it has one, and type, returning `ret`, pure if `pure`,
+    /// adding it to the table if it is new.
+    pub fn fn_type(
+        &mut self,
+        params: impl IntoIterator<Item = (Option<Name>, TyId)>,
+        ret: TyId,
+        pure: bool,
+    ) -> TyId {
+        self.intern(TyKind::Fn(FnTy {
+            params: params.into_iter().collect(),
+            ret,
+            pure,
+        }))
+    }
+
+    /// The signature of function type `id`, or `None` if it is not a
+    /// function type.
+    #[must_use]
+    pub fn fn_sig(&self, id: TyId) -> Option<&FnTy> {
+        match self.kinds.get(id.index())? {
+            TyKind::Fn(sig) => Some(sig),
+            _ => None,
+        }
+    }
+
+    /// Whether `id` is a function type, or a record type with a field of a
+    /// type that is or contains one, at any depth: a type whose values
+    /// cannot be compared, since functions have no equality.
+    ///
+    /// Recurses once per level of record nesting.
+    #[must_use]
+    pub fn contains_fn(&self, id: TyId) -> bool {
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Fn(_)) => true,
+            Some(TyKind::Record(record)) => record
+                .fields
+                .iter()
+                .any(|&(_, field)| self.contains_fn(field)),
+            _ => false,
+        }
     }
 
     /// The record type `record` with field `name` set to type `ty`: the
@@ -271,14 +348,27 @@ impl TypeTable {
     }
 
     /// Whether a value of type `sub` may be used where `sup` is expected:
-    /// `sub` is `sup`, or both are record types and `sub` has every field
-    /// of `sup`, each of a subtype of that field's type in `sup`.
+    /// `sub` is `sup`; or both are record types and `sub` has every field
+    /// of `sup`, each of a subtype of that field's type in `sup`; or both
+    /// are function types and `sub`'s signature fits `sup`'s (see the
+    /// module documentation).
     ///
-    /// Recurses once per level of record nesting in `sup`.
+    /// Recurses once per level of record or function type nesting in the
+    /// two types.
     #[must_use]
     pub fn is_subtype(&self, sub: TyId, sup: TyId) -> bool {
         if sub == sup {
             return true;
+        }
+        if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
+            return offered.params.len() == required.params.len()
+                && (offered.pure || !required.pure)
+                && self.is_subtype(offered.ret, required.ret)
+                && offered
+                    .params
+                    .iter()
+                    .zip(&required.params)
+                    .all(|(&(_, accepted), &(_, passed))| self.is_subtype(passed, accepted));
         }
         let (Some(offered), Some(required)) = (self.record_fields(sub), self.record_fields(sup))
         else {
@@ -300,15 +390,39 @@ impl TypeTable {
     /// The least common supertype of `a` and `b`, for the branches of an
     /// `if`: `a` itself if the two are the same type; for two record types,
     /// the record of the fields they share whose types have a join, each
-    /// with that join (the empty record if there are none); and `None`
-    /// otherwise. Numeric adaptation of untyped integers is the checker's
-    /// business, not the table's, so `Int` and an untyped integer have no
-    /// join here.
+    /// with that join (the empty record if there are none); for two
+    /// function types, the join described in the module documentation, if
+    /// they have one; and `None` otherwise. Numeric adaptation of untyped
+    /// integers is the checker's business, not the table's, so `Int` and an
+    /// untyped integer have no join here.
     ///
-    /// Recurses once per level of record nesting shared by `a` and `b`.
+    /// Recurses once per level of record or return type nesting shared by
+    /// `a` and `b`.
     pub fn join(&mut self, a: TyId, b: TyId) -> Option<TyId> {
         if a == b {
             return Some(a);
+        }
+        if let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) {
+            let same_params = a_sig.params.len() == b_sig.params.len()
+                && a_sig
+                    .params
+                    .iter()
+                    .zip(&b_sig.params)
+                    .all(|(&(_, a_param), &(_, b_param))| a_param == b_param);
+            if !same_params {
+                return None;
+            }
+            // A copy of the parameters, since joining the return types may
+            // intern new types and so needs the table mutably.
+            let params: Vec<(Option<Name>, TyId)> = a_sig
+                .params
+                .iter()
+                .zip(&b_sig.params)
+                .map(|(&(a_name, ty), &(b_name, _))| (a_name.filter(|_| a_name == b_name), ty))
+                .collect();
+            let (a_ret, b_ret, pure) = (a_sig.ret, b_sig.ret, a_sig.pure && b_sig.pure);
+            let ret = self.join(a_ret, b_ret)?;
+            return Some(self.fn_type(params, ret, pure));
         }
         let (TyKind::Record(a_record), TyKind::Record(b_record)) = (self.kind(a), self.kind(b))
         else {
@@ -348,20 +462,24 @@ impl TypeTable {
             TyKind::Bool => Some(ValueKind::Bool),
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) => Some(ValueKind::Record),
+            TyKind::Fn(_) => Some(ValueKind::Fn),
             TyKind::Union(_) | TyKind::UntypedInt | TyKind::Error => None,
         }
     }
 
     /// Shows type `id` as it is written in source, using `names` for the
-    /// names of record fields: `Int`, `{x: Int, y: String}`. A record shows
-    /// its fields in alphabetical order of their text, a field whose name is
-    /// not a plain identifier quoted as a string literal (`{"a b": Int}`),
-    /// and a nested record nested. The empty record is `{}`. An untyped
-    /// integer shows as `Int`, an error as `<error>`, and a union as its
-    /// members separated by ` | `.
+    /// names of record fields and parameters: `Int`, `{x: Int, y: String}`,
+    /// `fn(Int, name: String): Bool`, `fn() -> Int`. A record shows its
+    /// fields in alphabetical order of their text, a field whose name is not
+    /// a plain identifier quoted as a string literal (`{"a b": Int}`), and a
+    /// nested record nested. The empty record is `{}`. A function shows its
+    /// parameters in order, each with its name if it has one, then `: ` and
+    /// its return type if it is pure, or ` -> ` and its return type if not.
+    /// An untyped integer shows as `Int`, an error as `<error>`, and a union
+    /// as its members separated by ` | `.
     ///
-    /// `names` must be the table the fields' names were interned into.
-    /// Recurses once per level of record nesting.
+    /// `names` must be the table the names were interned into. Recurses
+    /// once per level of record or function type nesting.
     #[must_use]
     pub fn display<'a>(&'a self, id: TyId, names: &'a Names) -> impl fmt::Display + 'a {
         Display {
@@ -423,6 +541,20 @@ impl fmt::Display for Display<'_> {
                     write!(f, "{}: {}", FieldName(text), self.nested(ty))?;
                 }
                 f.write_str("}")
+            }
+            TyKind::Fn(sig) => {
+                f.write_str("fn(")?;
+                for (index, &(name, ty)) in sig.params.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    if let Some(name) = name {
+                        write!(f, "{}: ", FieldName(self.names.get(name)))?;
+                    }
+                    self.nested(ty).fmt(f)?;
+                }
+                f.write_str(if sig.pure { "): " } else { ") -> " })?;
+                self.nested(sig.ret).fmt(f)
             }
         }
     }
@@ -653,6 +785,205 @@ mod tests {
     }
 
     #[test]
+    fn function_types_intern_with_their_names() {
+        let (mut table, _, [a, b, _]) = setup();
+        let named = table.fn_type([(Some(a), TyId::INT)], TyId::INT, true);
+        let unnamed = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        assert_ne!(named, unnamed);
+        assert_eq!(
+            table.fn_type([(Some(a), TyId::INT)], TyId::INT, true),
+            named
+        );
+        // Names, types, arity, return type and purity all distinguish.
+        assert_ne!(
+            table.fn_type([(Some(b), TyId::INT)], TyId::INT, true),
+            named
+        );
+        assert_ne!(
+            table.fn_type([(Some(a), TyId::FLOAT)], TyId::INT, true),
+            named
+        );
+        assert_ne!(table.fn_type([], TyId::INT, true), named);
+        assert_ne!(
+            table.fn_type([(Some(a), TyId::INT)], TyId::BOOL, true),
+            named
+        );
+        assert_ne!(
+            table.fn_type([(Some(a), TyId::INT)], TyId::INT, false),
+            named
+        );
+        let sig = table.fn_sig(named).unwrap();
+        assert_eq!(&*sig.params, &[(Some(a), TyId::INT)]);
+        assert_eq!(sig.ret, TyId::INT);
+        assert!(sig.pure);
+        assert!(table.fn_sig(TyId::INT).is_none());
+        assert!(table.fn_sig(TyId::EMPTY).is_none());
+        assert!(!table.is_record(named));
+    }
+
+    #[test]
+    fn display_function_types() {
+        let mut names = Names::new();
+        let (name, times, x) = (
+            names.intern("name"),
+            names.intern("times"),
+            names.intern("x"),
+        );
+        let mut table = TypeTable::new();
+        let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+        let plain = table.fn_type([(None, TyId::INT), (None, TyId::STRING)], TyId::BOOL, true);
+        assert_eq!(show(&table, plain), "fn(Int, String): Bool");
+        let with_names = table.fn_type(
+            [(Some(name), TyId::STRING), (Some(times), TyId::INT)],
+            TyId::STRING,
+            false,
+        );
+        assert_eq!(
+            show(&table, with_names),
+            "fn(name: String, times: Int) -> String"
+        );
+        let record = table.record([(x, TyId::INT)]);
+        let returns_record = table.fn_type([], record, true);
+        assert_eq!(show(&table, returns_record), "fn(): {x: Int}");
+        let int_to_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        let higher = table.fn_type([(None, int_to_int)], TyId::INT, true);
+        assert_eq!(show(&table, higher), "fn(fn(Int): Int): Int");
+        let returns_fn = table.fn_type([], int_to_int, false);
+        assert_eq!(show(&table, returns_fn), "fn() -> fn(Int): Int");
+        let in_record = table.record([(x, int_to_int)]);
+        assert_eq!(show(&table, in_record), "{x: fn(Int): Int}");
+        let mixed = table.fn_type(
+            [(Some(x), TyId::INT), (None, TyId::EMPTY)],
+            TyId::EMPTY,
+            true,
+        );
+        assert_eq!(show(&table, mixed), "fn(x: Int, {}): {}");
+    }
+
+    #[test]
+    fn function_subtyping() {
+        let (mut table, _, [a, b, c]) = setup();
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_only = table.record([(a, TyId::INT)]);
+        let f = |table: &mut TypeTable, params: &[TyId], ret, pure| {
+            table.fn_type(params.iter().map(|&ty| (None, ty)), ret, pure)
+        };
+        // Arity must match.
+        let unary = f(&mut table, &[TyId::INT], TyId::INT, true);
+        let binary = f(&mut table, &[TyId::INT, TyId::INT], TyId::INT, true);
+        assert!(!table.is_subtype(unary, binary));
+        assert!(!table.is_subtype(binary, unary));
+        // Parameters are contravariant: accepting `{a}` is more than
+        // accepting `{a, b}`.
+        let takes_a = f(&mut table, &[a_only], TyId::INT, true);
+        let takes_ab = f(&mut table, &[ab], TyId::INT, true);
+        assert!(table.is_subtype(takes_a, takes_ab));
+        assert!(!table.is_subtype(takes_ab, takes_a));
+        // The return type is covariant.
+        let gives_ab = f(&mut table, &[], ab, true);
+        let gives_a = f(&mut table, &[], a_only, true);
+        assert!(table.is_subtype(gives_ab, gives_a));
+        assert!(!table.is_subtype(gives_a, gives_ab));
+        // Pure may stand in for impure, not the reverse.
+        let impure = f(&mut table, &[TyId::INT], TyId::INT, false);
+        assert!(table.is_subtype(unary, impure));
+        assert!(!table.is_subtype(impure, unary));
+        // Names are ignored.
+        let named = table.fn_type([(Some(c), TyId::INT)], TyId::INT, true);
+        assert!(table.is_subtype(named, unary));
+        assert!(table.is_subtype(unary, named));
+        // Different parameter types, or a function and anything else.
+        let takes_float = f(&mut table, &[TyId::FLOAT], TyId::INT, true);
+        assert!(!table.is_subtype(unary, takes_float));
+        assert!(!table.is_subtype(unary, TyId::INT));
+        assert!(!table.is_subtype(unary, TyId::EMPTY));
+        assert!(!table.is_subtype(TyId::EMPTY, unary));
+        // Nested: a function of functions, and a record of functions.
+        let takes_takes_a = f(&mut table, &[takes_a], TyId::INT, true);
+        let takes_takes_ab = f(&mut table, &[takes_ab], TyId::INT, true);
+        assert!(table.is_subtype(takes_takes_ab, takes_takes_a));
+        assert!(!table.is_subtype(takes_takes_a, takes_takes_ab));
+        let record_pure = table.record([(a, unary), (b, TyId::INT)]);
+        let record_impure = table.record([(a, impure)]);
+        assert!(table.is_subtype(record_pure, record_impure));
+        assert!(!table.is_subtype(record_impure, record_pure));
+    }
+
+    #[test]
+    fn function_joins() {
+        let (mut table, _, [a, b, _]) = setup();
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_only = table.record([(a, TyId::INT)]);
+        let b_only = table.record([(b, TyId::INT)]);
+        // Names kept where both sides agree, dropped otherwise; the return
+        // types' join; pure only if both are.
+        let left = table.fn_type([(Some(a), TyId::INT), (Some(a), TyId::BOOL)], ab, true);
+        let right = table.fn_type([(Some(a), TyId::INT), (Some(b), TyId::BOOL)], a_only, false);
+        let joined = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], a_only, false);
+        assert_eq!(table.join(left, right), Some(joined));
+        assert_eq!(table.join(right, left), Some(joined));
+        let pure_right = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], b_only, true);
+        let pure_join = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], b_only, true);
+        assert_eq!(table.join(left, pure_right), Some(pure_join));
+        let gives_a = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], a_only, true);
+        let gives_empty = table.fn_type(
+            [(Some(a), TyId::INT), (None, TyId::BOOL)],
+            TyId::EMPTY,
+            true,
+        );
+        assert_eq!(table.join(pure_right, gives_a), Some(gives_empty));
+        // Parameter types must be identical, not merely related.
+        let takes_a = table.fn_type([(None, a_only)], TyId::INT, true);
+        let takes_ab = table.fn_type([(None, ab)], TyId::INT, true);
+        assert_eq!(table.join(takes_a, takes_ab), None);
+        // Arities must match, and the return types must have a join.
+        let nullary = table.fn_type([], TyId::INT, true);
+        let unary = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        assert_eq!(table.join(nullary, unary), None);
+        let gives_float = table.fn_type([], TyId::FLOAT, true);
+        assert_eq!(table.join(nullary, gives_float), None);
+        // A function and anything else have none; a function and itself is
+        // itself.
+        assert_eq!(table.join(nullary, TyId::INT), None);
+        assert_eq!(table.join(nullary, TyId::EMPTY), None);
+        assert_eq!(table.join(nullary, nullary), Some(nullary));
+        // Through records: a field whose function types do not join is not
+        // shared.
+        let with_nullary = table.record([(a, nullary), (b, TyId::INT)]);
+        let with_unary = table.record([(a, unary), (b, TyId::INT)]);
+        assert_eq!(table.join(with_nullary, with_unary), Some(b_only));
+    }
+
+    #[test]
+    fn containing_a_function() {
+        let (mut table, _, [a, b, c]) = setup();
+        let function = table.fn_type([], TyId::INT, true);
+        assert!(table.contains_fn(function));
+        for id in [
+            TyId::INT,
+            TyId::FLOAT,
+            TyId::BOOL,
+            TyId::STRING,
+            TyId::EMPTY,
+        ] {
+            assert!(!table.contains_fn(id));
+        }
+        let flat = table.record([(a, TyId::INT)]);
+        assert!(!table.contains_fn(flat));
+        let direct = table.record([(a, TyId::INT), (b, function)]);
+        assert!(table.contains_fn(direct));
+        let deep = table.record([(c, direct)]);
+        assert!(table.contains_fn(deep));
+        let deeper = table.record([(a, deep), (b, flat)]);
+        assert!(table.contains_fn(deeper));
+        // A function taking or returning records is a function.
+        let takes_flat = table.fn_type([(None, flat)], flat, true);
+        assert!(table.contains_fn(takes_flat));
+        // An id from a bigger table contains nothing.
+        assert!(!TypeTable::new().contains_fn(deep));
+    }
+
+    #[test]
     fn value_kinds() {
         let (mut table, _, [a, _, _]) = setup();
         assert_eq!(table.value_kind(TyId::INT), Some(ValueKind::Int));
@@ -666,6 +997,8 @@ mod tests {
         assert_eq!(table.value_kind(TyId::ERROR), None);
         let union = table.intern(TyKind::Union(Box::new([TyId::INT, TyId::BOOL])));
         assert_eq!(table.value_kind(union), None);
+        let function = table.fn_type([(None, record)], TyId::INT, false);
+        assert_eq!(table.value_kind(function), Some(ValueKind::Fn));
         // An id from a bigger table.
         assert_eq!(TypeTable::new().value_kind(record), None);
     }

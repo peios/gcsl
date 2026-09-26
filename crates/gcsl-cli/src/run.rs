@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use clap::Args;
 use gcsl::lexer::TokenKind;
@@ -166,8 +167,8 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
         return Ok(out.flush()?);
     }
 
-    let ir = match lower::lower(&ast, &checked, &types) {
-        Ok(ir) => ir,
+    let ir = match lower::lower(&ast, &checked, &types, 0) {
+        Ok(ir) => Rc::new(ir),
         Err(error) => return Err(with_warnings(error.into(), warnings)),
     };
     if args.dump_ir {

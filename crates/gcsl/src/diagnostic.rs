@@ -11,6 +11,13 @@
 //! Rendering is done by [`Renderer`], which wraps the `annotate-snippets`
 //! crate (the rendering engine extracted from rustc). Line and column
 //! numbers are computed only at render time.
+//!
+//! A diagnostic's spans refer to one source. Normally that is the source
+//! being run, but a function defined by an earlier input of a
+//! [`crate::session::Session`] can fail while a later input runs, and its
+//! error then refers to the earlier input's source, which the diagnostic
+//! records in [`Diagnostic::input`] so that it can be rendered against the
+//! right text.
 
 use std::fmt;
 
@@ -72,6 +79,12 @@ pub struct Diagnostic {
     pub labels: Vec<Label>,
     /// Additional lines rendered as `= note: ...` after the source excerpt.
     pub notes: Vec<String>,
+    /// The session input whose source the spans refer to, when it is not
+    /// the input being run: set on a runtime error raised inside a function
+    /// that an earlier input of a [`crate::session::Session`] defined.
+    /// `None`, as every builder leaves it, means the input being run (or
+    /// the file, outside a session).
+    pub input: Option<u32>,
 }
 
 impl Diagnostic {
@@ -85,6 +98,7 @@ impl Diagnostic {
             label: None,
             labels: Vec::new(),
             notes: Vec::new(),
+            input: None,
         }
     }
 

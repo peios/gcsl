@@ -2,9 +2,10 @@
 //!
 //! One pass over the tree both types every expression and resolves every
 //! variable. Its results are side tables indexed by the AST's ids:
-//! [`Types`], the type of every expression, and [`Resolution`], the storage
-//! slot of every variable use and declaration. Both are returned together as
-//! [`Checked`]. Types are [`TyId`]s interned into a [`TypeTable`] the caller
+//! [`Types`], the type of every expression, and [`Resolution`], where every
+//! variable use reads from and every declaration writes to, what each
+//! function's frame and captures are, and which parameter each argument
+//! fills. Both are returned together as [`Checked`]. Types are [`TyId`]s interned into a [`TypeTable`] the caller
 //! owns, so that a [`crate::session::Session`] can keep one table across
 //! inputs.
 //!
@@ -186,6 +187,74 @@
 //! name, so `q === { x = 1 }` is `false`. The checker records nothing for
 //! either: lowering reads the operands' type from the type table.
 //!
+//! Functions have no equality: once the operands are found to have one
+//! identical type, a type that is a function type, or a record type
+//! containing one at any depth (see [`TypeTable::contains_fn`]), is an
+//! error. Nor do they have an order.
+//!
+//! # Functions
+//!
+//! A function expression's type is known before its body is checked, since
+//! every parameter and the return type are declared: its parameter and
+//! return types are resolved and its function type interned first, and then
+//! the body is checked as a block whose scope starts with the parameters,
+//! against the return type as an annotated initialiser is checked against
+//! its annotation. The parameters are bindings like any other, so a `let`
+//! may shadow one and a `:=` rebind one.
+//!
+//! **Frames.** Each function runs in a frame of its own. The checker keeps a
+//! stack of the functions it is inside (`Function`); entering one saves the
+//! enclosing frame's slot allocation and starts a fresh one at slot 0, in
+//! which the parameters take the first slots, and leaving it records the
+//! function's frame size and restores the enclosing allocation. The
+//! top-level body is the outermost frame. What the checker learns about each
+//! function is recorded in [`Resolution`] as a [`FnResolution`], indexed by
+//! its [`FnId`].
+//!
+//! **Captures.** A use of a name resolves to a [`VarRef`]: a slot of the
+//! current frame, a captured value, or the function being called. `lookup`
+//! finds the binding as for any variable; if it lies below the innermost
+//! function's first binding, it belongs to an enclosing function (or the
+//! top level), and the use is a capture. Every function between the
+//! binding's home and the use captures it: the outermost of them copies it
+//! from its home frame (its slot, or the home function's callee), and each
+//! function nested in that one copies it from the captures of the function
+//! enclosing it, so the use reads its own function's capture. This is the
+//! upvalue chain of Lua and the free-variable cells of Python, except that
+//! there are no cells: each closure holds copies, made when its function
+//! expression is evaluated. Capturing by value is the only choice consistent
+//! with `:=`, which declares a new binding rather than assigning to the old
+//! one: after `let x = 1; let f = fn(): Int { x }; x := 2`, the `x` that `f`
+//! uses is the first binding, whose value is 1 whenever it is read, so `f()`
+//! is 1. A capture list is searched linearly, since it is short.
+//!
+//! **Self-reference.** A function expression that is the direct initialiser
+//! of a single-name `let`, field or named function item (not through
+//! parentheses) sees that name throughout its body as the function being
+//! called: a binding declared before the parameters, so a parameter of the
+//! same name shadows it, of kind `BindingKind::Callee`, with no slot. It
+//! resolves to [`VarRef::Callee`], which the evaluator serves from the
+//! closure being run, so a recursive closure never holds a reference to
+//! itself and reference counts stay free of cycles. It cannot be rebound
+//! with `:=`, and never reaches a session's [`Scope`]. Functions are
+//! visible only from the item after their own, so there is no mutual
+//! recursion or forward reference.
+//!
+//! **Calls.** The callee must have a function type. Positional arguments
+//! fill its parameters left to right, the trailing block fills the last,
+//! and named arguments fill the parameters of their names; each argument
+//! is then checked against its parameter's type as an annotated
+//! initialiser is. The parameter each argument fills is recorded for
+//! lowering in [`Resolution::arg_params`]. Too many positional arguments, an
+//! unknown or unusable name, a parameter filled twice and parameters left
+//! unfilled are each reported, and make the call erroneous.
+//!
+//! **Purity.** A function declared with `:` is pure, and one declared with
+//! `->` impure; the top level is impure, and a block has the purity of the
+//! function it is in. Calling an impure function from a pure one is an
+//! error. Calling is the only gated operation: a pure function may create,
+//! pass, store and return impure functions.
+//!
 //! # Scopes
 //!
 //! Every block, including the file's own body, is a scope. A `let` declares
@@ -207,13 +276,14 @@
 //!
 //! # Slots
 //!
-//! Every variable and field is stored in a [`Slot`] of one flat frame,
-//! assigned stack-fashion, as in Lua and clox: entering a block records the
-//! next free slot; each declaration (`let`, a field, and `:=`, which is a
-//! new binding) takes the next free slot; leaving the block restores the
-//! next free slot to what it was on entry, so the slots of a finished block
-//! are reused by whatever comes after it. The highest slot count reached is
-//! the frame size. A variable's slot is therefore known statically and never
+//! Every variable and field is stored in a [`Slot`] of its function's flat
+//! frame (the top level's, outside functions), assigned stack-fashion, as
+//! in Lua and clox: entering a block records the next free slot; each
+//! declaration (a parameter, a `let`, a field, and `:=`, which is a new
+//! binding) takes the next free slot; leaving the block restores the next
+//! free slot to what it was on entry, so the slots of a finished block are
+//! reused by whatever comes after it. The highest slot count reached is the
+//! frame size. A variable's slot is therefore known statically and never
 //! changes, and evaluation needs no environment lookups and no allocation
 //! per block.
 //!
@@ -228,14 +298,15 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, PathRange,
-    PathSegment, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Expr, ExprId, ExprKind, FnDecl, FnId, ItemId,
+    ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart, TypeExprId, TypeExprKind,
+    UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
-use crate::types::{TyId, TyKind, TypeTable};
+use crate::types::{FnTy, TyId, TyKind, TypeTable};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
@@ -333,20 +404,55 @@ impl fmt::Display for Slot {
     }
 }
 
+/// Where a use of a variable reads its value from. See the module
+/// documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VarRef {
+    /// A slot of the current function's frame, or of the top level's.
+    Local(Slot),
+    /// One of the values the current closure captured, by its index in the
+    /// function's capture order.
+    Capture(u32),
+    /// The closure being called: a function's reference to itself.
+    Callee,
+    /// Nothing: the expression or item is not a variable use.
+    None,
+}
+
+/// What the checker learns about one function expression, in
+/// [`Resolution::function`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FnResolution {
+    /// The number of slots the body's frame needs, its parameters included.
+    pub frame_size: u32,
+    /// The number of parameters, which take slots `0..param_count`.
+    pub param_count: u32,
+    /// What the function captures, in capture order: where each value is
+    /// read from in the frame that creates the closure, with its type.
+    pub captures: Vec<(VarRef, TyId)>,
+    /// The name the function sees itself by, if it is the direct
+    /// initialiser of a single-name `let`, field or named function item.
+    pub callee: Option<Name>,
+    /// For each slot of the body's frame, the name of the last variable
+    /// assigned to it. Only for showing slots to people.
+    pub slot_names: Vec<Name>,
+}
+
 /// How the path of a dotted `let`, field or `:=` resolves: the record it
 /// updates, and how far into its path that record's static type reaches.
 /// See the module documentation.
 ///
 /// For `let a.b.c = e`, with `a` in scope as `{b: {c: Int}}`, the source is
-/// `a`'s slot and all of `a` and `a.b` exist, so `existing` is 2; with `a`
-/// as `{x: Int}`, only `a` exists, and `existing` is 1; with no `a`, there
-/// is no source and `existing` is 0. A dotted field's first definition has
-/// no source; each later one has the field's own slot.
+/// where `a` is read from and all of `a` and `a.b` exist, so `existing` is
+/// 2; with `a` as `{x: Int}`, only `a` exists, and `existing` is 1; with no
+/// `a`, there is no source and `existing` is 0. A dotted field's first
+/// definition has no source; each later one has the field's own slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PathResolution {
-    /// The slot holding the record the item updates, or [`Slot::NONE`] if
-    /// it builds its record from nothing.
-    pub source: Slot,
+    /// Where the record the item updates is read from, as a use of its
+    /// variable would read it (a slot, or a captured value), or
+    /// [`VarRef::None`] if it builds its record from nothing.
+    pub source: VarRef,
     /// How many of the path's leading segments name records that exist in
     /// the static type of the updated value: 0 without a source, and
     /// otherwise 1 for the source itself and one more for each following
@@ -359,17 +465,18 @@ impl PathResolution {
     /// The resolution of an item that is not a dotted declaration, and of
     /// one that builds its record from nothing.
     pub const NONE: PathResolution = PathResolution {
-        source: Slot::NONE,
+        source: VarRef::None,
         existing: 0,
     };
 }
 
-/// Where every variable of an [`Ast`] is stored.
+/// Where every variable of an [`Ast`] is stored, what every function's
+/// frame and captures are, and which parameter every argument fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolution {
-    /// The slot each `Name` expression reads, indexed by [`ExprId`];
-    /// [`Slot::NONE`] for every other expression.
-    expr_slots: Vec<Slot>,
+    /// Where each `Name` expression reads, indexed by [`ExprId`];
+    /// [`VarRef::None`] for every other expression.
+    expr_vars: Vec<VarRef>,
     /// The slot each `Let`, `Field` and `Rebind` item writes, indexed by
     /// [`ItemId`]; [`Slot::NONE`] for every other item. Every definition of
     /// an open field writes the field's one slot.
@@ -378,23 +485,55 @@ pub struct Resolution {
     /// resolves, indexed by [`ItemId`]; [`PathResolution::NONE`] for every
     /// other item, and for one that builds its record from nothing.
     item_paths: Vec<PathResolution>,
-    /// The number of slots the frame needs.
+    /// The number of slots the top level's frame needs.
     frame_size: u32,
-    /// For each slot, the name of the last variable assigned to it.
+    /// For each slot of the top level's frame, the name of the last
+    /// variable assigned to it.
     slot_names: Vec<Name>,
+    /// What the checker found for each function expression, indexed by
+    /// [`FnId`].
+    functions: Vec<FnResolution>,
+    /// The index of the parameter each argument fills, indexed like the
+    /// [`Ast`]'s argument pool; `u32::MAX` for an argument of an erroneous
+    /// call.
+    arg_params: Vec<u32>,
 }
 
 impl Resolution {
-    /// The slot read by expression `id`, or [`Slot::NONE`] if it is not a
-    /// variable use.
+    /// Where expression `id` reads its value from, or [`VarRef::None`] if it
+    /// is not a variable use.
     ///
     /// # Panics
     ///
     /// Panics if `id` does not belong to the [`Ast`] this table was built
     /// for.
     #[must_use]
-    pub fn expr_slot(&self, id: ExprId) -> Slot {
-        self.expr_slots[id.index()]
+    pub fn expr_var(&self, id: ExprId) -> VarRef {
+        self.expr_vars[id.index()]
+    }
+
+    /// What the checker found for function expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn function(&self, id: FnId) -> &FnResolution {
+        &self.functions[id.index()]
+    }
+
+    /// The parameter each argument of `args`, a call's arguments, fills,
+    /// in the order of [`Ast::args`]; `u32::MAX` for an argument of an
+    /// erroneous call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `args` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn arg_params(&self, args: ArgRange) -> &[u32] {
+        &self.arg_params[args.start()..args.start() + args.count()]
     }
 
     /// The slot written by item `id`, or [`Slot::NONE`] if it is not a
@@ -421,37 +560,60 @@ impl Resolution {
         self.item_paths[id.index()]
     }
 
-    /// The number of slots the frame needs: one more than the highest slot
-    /// used.
+    /// The number of slots the top level's frame needs: one more than the
+    /// highest slot used.
     #[must_use]
     pub fn frame_size(&self) -> u32 {
         self.frame_size
     }
 
-    /// For each slot, the name of the last variable assigned to it. Only
-    /// for showing slots to people, as `--dump-ir` does.
+    /// For each slot of the top level's frame, the name of the last
+    /// variable assigned to it. Only for showing slots to people, as
+    /// `--dump-ir` does.
     #[must_use]
     pub fn slot_names(&self) -> &[Name] {
         &self.slot_names
     }
 
     /// A resolution for a tree with `exprs` expressions and `items` items and
-    /// no variables, for building checked trees by hand in tests.
+    /// no variables, functions or calls, for building checked trees by hand
+    /// in tests.
     #[cfg(test)]
     pub(crate) fn without_variables(exprs: usize, items: usize) -> Self {
         Self {
-            expr_slots: vec![Slot::NONE; exprs],
+            expr_vars: vec![VarRef::None; exprs],
             item_slots: vec![Slot::NONE; items],
             item_paths: vec![PathResolution::NONE; items],
             frame_size: 0,
             slot_names: Vec::new(),
+            functions: Vec::new(),
+            arg_params: Vec::new(),
         }
+    }
+
+    /// Forgets the parameter of every argument, as for an erroneous call,
+    /// for testing what lowering makes of that.
+    #[cfg(test)]
+    pub(crate) fn unbind_arguments(&mut self) {
+        self.arg_params.fill(u32::MAX);
     }
 
     /// Number of expression entries, equal to the number of expressions in
     /// the [`Ast`].
     pub(crate) fn expr_len(&self) -> usize {
-        self.expr_slots.len()
+        self.expr_vars.len()
+    }
+
+    /// Number of function entries, equal to the number of function
+    /// expressions in the [`Ast`].
+    pub(crate) fn function_len(&self) -> usize {
+        self.functions.len()
+    }
+
+    /// Number of argument entries, equal to the number of arguments in the
+    /// [`Ast`].
+    pub(crate) fn arg_len(&self) -> usize {
+        self.arg_params.len()
     }
 
     /// Number of item entries in both item tables, equal to the number of
@@ -485,17 +647,63 @@ pub struct CheckOutput {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// A variable or field in scope.
+/// A variable, field or callee in scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Binding {
     name: Name,
+    /// Its slot in its function's frame; [`Slot::NONE`] for a callee.
     slot: Slot,
     ty: TyId,
-    /// The `let`, field or `:=` item that declared it, or `None` if it was
-    /// declared by an earlier input of a session, whose tree is gone.
-    declared: Option<ItemId>,
-    /// Whether it is a field, which `:=` may not rebind.
-    is_field: bool,
+    /// Where it was declared: the span of the `let`, field or `:=` item, or
+    /// of the parameter, or of the function expression for a callee; `None`
+    /// if it was declared by an earlier input of a session, whose source is
+    /// not this one.
+    declared: Option<Span>,
+    kind: BindingKind,
+}
+
+/// What a [`Binding`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingKind {
+    /// A variable: declared by a `let`, a `:=` or a parameter.
+    Variable,
+    /// A field, which `:=` may not rebind.
+    Field,
+    /// A function's name for itself, inside its own body, which `:=` may
+    /// not rebind either; it has no slot.
+    Callee,
+}
+
+/// A function expression being checked: one entry of the checker's stack
+/// of the functions it is inside, innermost last.
+#[derive(Debug)]
+struct Function {
+    fn_id: FnId,
+    /// The index in `Checker::bindings` of the function's first binding:
+    /// every binding below it belongs to an enclosing function or the top
+    /// level, and must be captured to be used.
+    bindings_start: usize,
+    /// The enclosing frame's slot allocation, restored on exit.
+    outer_next_slot: u32,
+    outer_frame_size: u32,
+    outer_slot_names: Vec<Name>,
+    /// What the function captures, in capture order.
+    captures: Vec<Capture>,
+    /// Whether the function is pure, declared with `:`.
+    pure: bool,
+    /// Its `:` or `->`.
+    marker: Span,
+}
+
+/// One value a function captures.
+#[derive(Clone, Copy, Debug)]
+struct Capture {
+    /// The index in `Checker::bindings` of the binding captured.
+    binding: usize,
+    /// Where the value is read from in the frame creating the closure.
+    source: VarRef,
+    /// Its type.
+    ty: TyId,
 }
 
 /// A field declared in the record block being checked.
@@ -559,13 +767,13 @@ struct Node {
 /// The record type a record block is checked against, and where the
 /// expectation comes from, for [`Checker::check_expr_expecting`].
 #[derive(Clone, Copy, Debug)]
-struct Expecting {
+struct Expecting<'w> {
     /// The expected record type.
     ty: TyId,
-    /// The annotation or ascription stating it.
+    /// The annotation, ascription, return type or callee stating it.
     context: Span,
     /// The label on `context`.
-    why: &'static str,
+    why: &'w str,
     /// The block's closing brace, where a missing field is reported.
     close: Span,
 }
@@ -632,11 +840,31 @@ pub struct Checker<'a> {
     types: &'a mut TypeTable,
     /// The type of each expression, indexed by [`ExprId`].
     expr_types: Vec<TyId>,
-    expr_slots: Vec<Slot>,
+    expr_vars: Vec<VarRef>,
     item_slots: Vec<Slot>,
     item_paths: Vec<PathResolution>,
-    /// Every variable and field in scope, outermost block first.
+    /// What has been found for each function expression, indexed by
+    /// [`FnId`].
+    fn_resolutions: Vec<FnResolution>,
+    /// The parameter each argument fills, indexed like the argument pool.
+    arg_params: Vec<u32>,
+    /// Every variable, field and callee in scope, outermost block first.
     bindings: Vec<Binding>,
+    /// The functions being checked, innermost last; empty at the top
+    /// level.
+    functions: Vec<Function>,
+    /// The name the next function expression checked sees itself by: set by
+    /// a single-name `let` or field whose initialiser is directly a
+    /// function expression, and taken by that function when its check
+    /// starts, so no function nested in it sees it.
+    callee_name: Option<Name>,
+    /// Reused for building function types: each parameter's name and type.
+    /// Nested uses push above the entries of the use enclosing them and
+    /// truncate back, as `sorted_fields` does.
+    fn_params: Vec<(Option<Name>, TyId)>,
+    /// Reused for binding a call's arguments: for each parameter, the index
+    /// in the call's arguments of the argument filling it, or `u32::MAX`.
+    filled: Vec<u32>,
     /// Index in `bindings` of the innermost block's first binding.
     block_start: usize,
     /// The fields of every block being checked, outermost block first.
@@ -694,10 +922,16 @@ impl<'a> Checker<'a> {
             // it is read, and the final invariant check catches any that
             // are not.
             expr_types: vec![TyId::ERROR; ast.len()],
-            expr_slots: vec![Slot::NONE; ast.len()],
+            expr_vars: vec![VarRef::None; ast.len()],
             item_slots: vec![Slot::NONE; ast.item_count()],
             item_paths: vec![PathResolution::NONE; ast.item_count()],
+            fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
+            arg_params: vec![u32::MAX; ast.arg_count()],
             bindings: scope.bindings,
+            functions: Vec::new(),
+            callee_name: None,
+            fn_params: Vec::new(),
+            filled: Vec::new(),
             block_start: 0,
             fields: Vec::new(),
             fields_start: 0,
@@ -753,7 +987,8 @@ impl<'a> Checker<'a> {
             };
             return Err(vec![error.into()]);
         }
-        // Item ids are meaningless once this tree is gone.
+        // Spans are meaningless for a later input, which has its own
+        // source.
         let bindings = self
             .bindings
             .into_iter()
@@ -765,11 +1000,13 @@ impl<'a> Checker<'a> {
         let checked = Checked {
             types: Types::new(self.expr_types),
             resolution: Resolution {
-                expr_slots: self.expr_slots,
+                expr_vars: self.expr_vars,
                 item_slots: self.item_slots,
                 item_paths: self.item_paths,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
+                functions: self.fn_resolutions,
+                arg_params: self.arg_params,
             },
         };
         let mut warnings = self.warnings;
@@ -785,7 +1022,7 @@ impl<'a> Checker<'a> {
     /// Checks a nested block's body in a scope of its own, returning its
     /// type. With `expecting`, the block is a record block checked against
     /// an expected record type.
-    fn check_block(&mut self, body: ItemRange, expecting: Option<Expecting>) -> TyId {
+    fn check_block(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let outer = (self.block_start, self.fields_start, self.next_slot);
         let nodes_start = self.nodes.len();
         self.block_start = self.bindings.len();
@@ -802,7 +1039,7 @@ impl<'a> Checker<'a> {
     /// for a record block, the record of its fields; otherwise the type of
     /// its result, the `= EXPR` or final expression statement, or `{}` if
     /// it has none.
-    fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting>) -> TyId {
+    fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let items = self.ast.items(body);
         let first_field = items
             .iter()
@@ -886,14 +1123,20 @@ impl<'a> Checker<'a> {
         annotation: Option<TypeExprId>,
         value: ExprId,
     ) {
-        let ty = match annotation {
+        let expected = annotation.map(|annotation| {
+            (
+                self.resolve_type(annotation),
+                self.ast.type_expr(annotation).span,
+            )
+        });
+        let segments = self.ast.path(path);
+        self.name_callee(segments, value);
+        let ty = match expected {
             None => {
                 let found = self.check_expr(value);
                 self.settle(value, found)
             }
-            Some(annotation) => {
-                let expected = self.resolve_type(annotation);
-                let context = self.ast.type_expr(annotation).span;
+            Some((expected, context)) => {
                 let found = self.check_expr_expecting(
                     value,
                     expected,
@@ -907,10 +1150,23 @@ impl<'a> Checker<'a> {
                 }
             }
         };
-        match self.ast.path(path) {
-            [variable] => self.declare(variable.name, ty, id, false),
+        self.callee_name = None;
+        match segments {
+            [variable] => self.declare(variable.name, ty, id, BindingKind::Variable),
             segments => self.declare_update(id, segments, ty),
         }
+    }
+
+    /// Before the initialiser `value` of a `let` or field whose path is
+    /// `segments` is checked: if the path is a single name and `value` is
+    /// directly a function expression, lets that function see itself by
+    /// the name (see the module documentation). The caller clears the name
+    /// afterwards, in case the function did not take it.
+    fn name_callee(&mut self, segments: &[PathSegment], value: ExprId) {
+        self.callee_name = match (segments, self.ast.get(value).kind) {
+            ([single], ExprKind::Fn(_)) => Some(single.name),
+            _ => None,
+        };
     }
 
     /// Checks the field item `id`, `PATH = VALUE`, and declares or extends
@@ -922,7 +1178,7 @@ impl<'a> Checker<'a> {
         id: ItemId,
         path: PathRange,
         value: ExprId,
-        expecting: Option<Expecting>,
+        expecting: Option<Expecting<'_>>,
     ) {
         let segments = self.ast.path(path);
         let [field] = segments else {
@@ -931,6 +1187,7 @@ impl<'a> Checker<'a> {
         };
         let (name, name_span) = (field.name, field.span);
         let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
+        self.name_callee(segments, value);
         let ty = match expected {
             Some((expecting, Some(expected))) => {
                 let found =
@@ -961,7 +1218,8 @@ impl<'a> Checker<'a> {
                 self.settle(value, found)
             }
         };
-        self.declare(name, ty, id, true);
+        self.callee_name = None;
+        self.declare(name, ty, id, BindingKind::Field);
         self.fields.push(FieldDecl {
             name,
             name_span,
@@ -980,7 +1238,7 @@ impl<'a> Checker<'a> {
         id: ItemId,
         segments: &[PathSegment],
         value: ExprId,
-        expecting: Option<Expecting>,
+        expecting: Option<Expecting<'_>>,
     ) {
         let Some(first) = segments.first() else {
             return;
@@ -1065,7 +1323,7 @@ impl<'a> Checker<'a> {
         let ty = self.nodes[root as usize].ty;
         match attach {
             None => {
-                self.declare(first.name, ty, id, true);
+                self.declare(first.name, ty, id, BindingKind::Field);
                 self.fields.push(FieldDecl {
                     name: first.name,
                     name_span: first.span,
@@ -1082,8 +1340,9 @@ impl<'a> Checker<'a> {
                 let binding = &mut self.bindings[open.binding];
                 binding.ty = ty;
                 self.item_slots[id.index()] = binding.slot;
+                // The field is in this block, so in the current frame.
                 self.item_paths[id.index()] = PathResolution {
-                    source: binding.slot,
+                    source: VarRef::Local(binding.slot),
                     existing: position(existing),
                 };
             }
@@ -1152,7 +1411,7 @@ impl<'a> Checker<'a> {
     /// not a record, which is reported as a mismatch when the block ends.
     fn expected_at(
         &mut self,
-        expecting: Expecting,
+        expecting: Expecting<'_>,
         segments: &[PathSegment],
         existing: usize,
     ) -> Option<TyId> {
@@ -1253,7 +1512,7 @@ impl<'a> Checker<'a> {
     /// at any level of an open field, and each open field or segment of one
     /// that the expected type has as something other than a record, which
     /// make the type `Error` too.
-    fn record_type(&mut self, expecting: Option<Expecting>) -> TyId {
+    fn record_type(&mut self, expecting: Option<Expecting<'_>>) -> TyId {
         let fields = self.fields.get(self.fields_start..).unwrap_or_default();
         let base = self.sorted_fields.len();
         self.sorted_fields.extend(
@@ -1307,7 +1566,7 @@ impl<'a> Checker<'a> {
     /// Reports each field of `expecting`'s record type that is not among the
     /// block's fields, `sorted_fields[base..]`, in alphabetical order.
     /// Returns whether any was missing.
-    fn report_missing_fields(&mut self, base: usize, expecting: Expecting) -> bool {
+    fn report_missing_fields(&mut self, base: usize, expecting: Expecting<'_>) -> bool {
         let names = self.ast.names();
         let present = self.sorted_fields.get(base..).unwrap_or_default();
         let mut missing: Vec<&str> = self
@@ -1349,7 +1608,7 @@ impl<'a> Checker<'a> {
     /// against its type when it was defined). A segment expected to be
     /// something other than a record is a mismatch, reported at its first
     /// definition. Returns whether anything was reported.
-    fn check_open_fields(&mut self, expecting: Expecting) -> bool {
+    fn check_open_fields(&mut self, expecting: Expecting<'_>) -> bool {
         let mut reported = false;
         for index in self.fields_start..self.fields.len() {
             let field = self.fields[index];
@@ -1374,7 +1633,7 @@ impl<'a> Checker<'a> {
     /// Checks the open node `node` against the type `expected`, reporting a
     /// mismatch or each missing field, and queues its open children that
     /// the type has on `pending`. Returns whether anything was reported.
-    fn check_open_node(&mut self, node: u32, expected: TyId, expecting: Expecting) -> bool {
+    fn check_open_node(&mut self, node: u32, expected: TyId, expecting: Expecting<'_>) -> bool {
         let entry = self.nodes[node as usize];
         // An unknown type has been reported, and a record type never has a
         // field of one, but nothing is to be checked against it either way.
@@ -1454,7 +1713,7 @@ impl<'a> Checker<'a> {
         let text = self.ast.names().get(name);
         // The binding being rebound, once the `:=` rules pass.
         let target = match self.lookup(name) {
-            Some((_, binding)) if binding.is_field => {
+            Some((_, binding)) if binding.kind == BindingKind::Field => {
                 let mut error = Diagnostic::error(
                     format!("cannot rebind `{text}`: it is a field, not a variable"),
                     name_span,
@@ -1462,11 +1721,21 @@ impl<'a> Checker<'a> {
                 // A field from an earlier session input has no item here to
                 // point at.
                 if let Some(declared) = binding.declared {
-                    error = error.with_context(self.ast.item(declared).span, "declared here");
+                    error = error.with_context(declared, "declared here");
                 }
                 self.errors.push(error.with_note(format!(
                     "rebind with `{text} = ...` is not allowed either: a field is defined once"
                 )));
+                None
+            }
+            Some((_, binding)) if binding.kind == BindingKind::Callee => {
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("cannot rebind `{text}`: it is the function being defined"),
+                        name_span,
+                    )
+                    .with_note("shadow it with `let` instead"),
+                );
                 None
             }
             Some((index, binding)) if index >= self.block_start => Some(binding),
@@ -1478,7 +1747,7 @@ impl<'a> Checker<'a> {
                 // A binding from an earlier session input has no item here
                 // to point at.
                 if let Some(declared) = binding.declared {
-                    error = error.with_context(self.ast.item(declared).span, "declared here");
+                    error = error.with_context(declared, "declared here");
                 }
                 let error = error.with_note(format!("shadow it with `let {text} = ...` instead"));
                 self.errors.push(error);
@@ -1501,7 +1770,7 @@ impl<'a> Checker<'a> {
             // has, so later uses do not cascade.
             let ty = self.check_alone(value);
             if segments.len() == 1 {
-                self.declare(name, ty, id, false);
+                self.declare(name, ty, id, BindingKind::Variable);
             } else {
                 self.declare_update(id, segments, ty);
             }
@@ -1509,12 +1778,10 @@ impl<'a> Checker<'a> {
         };
         // `:=` is assignment-compatible: the value must fit the variable's
         // type (or the path's leaf type), and the binding keeps that type.
-        let context = target
-            .declared
-            .map_or(name_span, |declared| self.ast.item(declared).span);
+        let context = target.declared.unwrap_or(name_span);
         if segments.len() == 1 {
             self.check_expr_expecting(value, target.ty, context, "the variable was declared here");
-            self.declare(name, target.ty, id, false);
+            self.declare(name, target.ty, id, BindingKind::Variable);
             return;
         }
         if let Some(leaf) = self.rebind_leaf(segments, target.ty) {
@@ -1527,7 +1794,7 @@ impl<'a> Checker<'a> {
             self.declare_update(id, segments, leaf);
         } else {
             self.check_alone(value);
-            self.declare(name, TyId::ERROR, id, false);
+            self.declare(name, TyId::ERROR, id, BindingKind::Variable);
         }
     }
 
@@ -1585,7 +1852,8 @@ impl<'a> Checker<'a> {
             return;
         };
         self.path_types.clear();
-        let old = self.lookup(first.name).map(|(_, binding)| binding);
+        let found = self.lookup(first.name);
+        let old = found.map(|(_, binding)| binding);
         let mut failed = leaf_ty == TyId::ERROR;
         if let Some(old) = old {
             if old.ty == TyId::ERROR {
@@ -1653,20 +1921,38 @@ impl<'a> Checker<'a> {
             }
             ty
         };
-        if let Some(old) = old
+        if let Some((index, old)) = found
             && existing > 0
         {
+            // The old record may belong to an enclosing function, and is
+            // then read from the closure's captures.
+            let source = self.resolve(index, old);
             self.item_paths[id.index()] = PathResolution {
-                source: old.slot,
+                source,
                 existing: position(existing),
             };
         }
-        self.declare(first.name, ty, id, false);
+        self.declare(first.name, ty, id, BindingKind::Variable);
     }
 
-    /// Declares a variable, or a field if `is_field`, in the innermost
-    /// block, in the next free slot.
-    fn declare(&mut self, name: Name, ty: TyId, id: ItemId, is_field: bool) {
+    /// Declares a variable or field, as `kind` says, for the item `id`, in
+    /// the innermost block, in the next free slot, which the item writes.
+    fn declare(&mut self, name: Name, ty: TyId, id: ItemId, kind: BindingKind) {
+        let span = self.ast.item(id).span;
+        let slot = self.declare_binding(name, ty, Some(span), kind);
+        self.item_slots[id.index()] = slot;
+    }
+
+    /// Declares a binding of `kind` in the innermost block, in the next free
+    /// slot of the current frame, and returns that slot. `declared` is where
+    /// its declaration is written.
+    fn declare_binding(
+        &mut self,
+        name: Name,
+        ty: TyId,
+        declared: Option<Span>,
+        kind: BindingKind,
+    ) -> Slot {
         let slot = Slot(self.next_slot);
         self.next_slot = self.next_slot.saturating_add(1);
         self.frame_size = self.frame_size.max(self.next_slot);
@@ -1676,14 +1962,14 @@ impl<'a> Checker<'a> {
             // next one.
             None => self.slot_names.push(name),
         }
-        self.item_slots[id.index()] = slot;
         self.bindings.push(Binding {
             name,
             slot,
             ty,
-            declared: Some(id),
-            is_field,
+            declared,
+            kind,
         });
+        slot
     }
 
     /// The innermost, latest binding of `name`, with its index in
@@ -1697,9 +1983,48 @@ impl<'a> Checker<'a> {
             .map(|(index, &binding)| (index, binding))
     }
 
+    /// Where a use of `binding`, at `index` in `bindings`, reads its value
+    /// from in the current function: its slot, or the callee, if it is the
+    /// current function's or the top level's own; and otherwise a capture,
+    /// which this adds to every function between the binding's home and
+    /// the current one that lacks it (see the module documentation).
+    fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
+        let home = match binding.kind {
+            BindingKind::Callee => VarRef::Callee,
+            BindingKind::Variable | BindingKind::Field => VarRef::Local(binding.slot),
+        };
+        // The outermost function the binding is not in: every function from
+        // there inwards must capture it.
+        let Some(first) = self
+            .functions
+            .iter()
+            .position(|function| function.bindings_start > index)
+        else {
+            return home;
+        };
+        let mut source = home;
+        for function in &mut self.functions[first..] {
+            let existing = function
+                .captures
+                .iter()
+                .position(|capture| capture.binding == index);
+            let capture = existing.unwrap_or_else(|| {
+                function.captures.push(Capture {
+                    binding: index,
+                    source,
+                    ty: binding.ty,
+                });
+                function.captures.len() - 1
+            });
+            source = VarRef::Capture(position(capture));
+        }
+        source
+    }
+
     /// The type a type expression denotes, or `Error` (reported) if it names
     /// no type, or is a record type with a field that names none or a name
-    /// that appears twice.
+    /// that appears twice, or a function type with a parameter or return
+    /// type that is erroneous.
     fn resolve_type(&mut self, id: TypeExprId) -> TyId {
         let ty = *self.ast.type_expr(id);
         match ty.kind {
@@ -1756,7 +2081,31 @@ impl<'a> Checker<'a> {
                 self.sorted_fields.truncate(base);
                 resolved
             }
+            TypeExprKind::Fn { params, ret, pure } => {
+                let base = self.fn_params.len();
+                for param in self.ast.param_tys(params) {
+                    // Resolving a nested function type uses `fn_params`
+                    // above this one's entries and truncates back.
+                    let param_ty = self.resolve_type(param.ty);
+                    self.fn_params.push((param.name, param_ty));
+                }
+                let ret = self.resolve_type(ret);
+                let resolved = self.intern_fn_type(base, ret, pure);
+                self.fn_params.truncate(base);
+                resolved
+            }
         }
+    }
+
+    /// Interns the function type whose parameters are `fn_params[base..]`
+    /// and whose return type is `ret`, or returns `Error` if any of them is
+    /// erroneous, having been reported.
+    fn intern_fn_type(&mut self, base: usize, ret: TyId, pure: bool) -> TyId {
+        let params = self.fn_params.get(base..).unwrap_or_default();
+        if ret == TyId::ERROR || params.iter().any(|&(_, ty)| ty == TyId::ERROR) {
+            return TyId::ERROR;
+        }
+        self.types.fn_type(params.iter().copied(), ret, pure)
     }
 
     /// Checks that `expr`, of type `found`, can have type `expected`: an
@@ -1803,7 +2152,7 @@ impl<'a> Checker<'a> {
         id: ExprId,
         expected: TyId,
         context: Span,
-        why: &'static str,
+        why: &str,
     ) -> TyId {
         if self.types.is_record(expected)
             && let Some((block, body)) = self.record_block_within(id)
@@ -1923,9 +2272,411 @@ impl<'a> Checker<'a> {
                     expected
                 }
             }
+            ExprKind::Fn(function) => self.check_fn(id, function),
+            ExprKind::Call { callee, args } => self.check_call(id, callee, args),
         };
         self.expr_types[id.index()] = ty;
         ty
+    }
+
+    /// Types the function expression `id`, whose details are `function`,
+    /// and checks its body in a frame of its own (see the module
+    /// documentation). Its type is known, and recorded, before the body is
+    /// checked: the function type of its declared parameter and return
+    /// types, or `Error` if any of them is.
+    fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
+        let callee = self.callee_name.take();
+        let decl = *self.ast.fn_decl(function);
+        let params = self.ast.params(decl.params);
+        let base = self.fn_params.len();
+        for param in params {
+            let ty = self.resolve_type(param.ty);
+            self.fn_params.push((Some(param.name), ty));
+        }
+        let ret = self.resolve_type(decl.ret);
+        let ty = self.intern_fn_type(base, ret, decl.pure);
+        self.expr_types[id.index()] = ty;
+        self.functions.push(Function {
+            fn_id: function,
+            bindings_start: self.bindings.len(),
+            outer_next_slot: self.next_slot,
+            outer_frame_size: self.frame_size,
+            outer_slot_names: std::mem::take(&mut self.slot_names),
+            captures: Vec::new(),
+            pure: decl.pure,
+            marker: decl.marker,
+        });
+        (self.next_slot, self.frame_size) = (0, 0);
+        let span = self.ast.get(id).span;
+        self.check_fn_body(&decl, base, (callee, ty, span), ret);
+        self.fn_params.truncate(base);
+        if let Some(finished) = self.functions.pop() {
+            let slot_names = std::mem::replace(&mut self.slot_names, finished.outer_slot_names);
+            self.fn_resolutions[finished.fn_id.index()] = FnResolution {
+                frame_size: self.frame_size,
+                param_count: decl.params.len(),
+                captures: finished
+                    .captures
+                    .iter()
+                    .map(|capture| (capture.source, capture.ty))
+                    .collect(),
+                callee,
+                slot_names,
+            };
+            (self.next_slot, self.frame_size) =
+                (finished.outer_next_slot, finished.outer_frame_size);
+        }
+        ty
+    }
+
+    /// Types the call `id` of `callee` with the arguments `args` (see the
+    /// module documentation): the callee's return type, or `Error` if the
+    /// callee is not a function or the arguments do not fit its parameters.
+    /// Every argument is checked whatever goes wrong.
+    fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
+        let callee_ty = self.check_expr(callee);
+        let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
+            if callee_ty != TyId::ERROR {
+                let callee_ty = self.settle(callee, callee_ty);
+                let message = format!("cannot call a value of type {}", self.in_message(callee_ty));
+                let label = format!("this is {}", self.in_label(callee_ty));
+                self.errors.push(
+                    Diagnostic::error(message, self.ast.get(id).span)
+                        .with_context(self.ast.get(callee).span, label)
+                        .with_note("only functions can be called"),
+                );
+            }
+            for arg in self.ast.args(args) {
+                self.check_alone(arg.value);
+            }
+            return TyId::ERROR;
+        };
+        let erroneous = self.bind_arguments(id, (callee, callee_ty), args, &sig);
+        if let Some(function) = self.functions.last()
+            && function.pure
+            && !sig.pure
+        {
+            let marker = function.marker;
+            let label = format!("this is {}", self.in_label(callee_ty));
+            self.errors.push(
+                Diagnostic::error(
+                    "cannot call an impure function from a pure function",
+                    self.ast.get(id).span,
+                )
+                .with_context(self.ast.get(callee).span, label)
+                .with_context(marker, "this function is pure, declared with `:`")
+                .with_note(
+                    "a pure function, declared with `:`, may call only pure functions; declare \
+                     it with `->` to make it impure",
+                ),
+            );
+        }
+        if erroneous { TyId::ERROR } else { sig.ret }
+    }
+
+    /// Binds the arguments `args` of the call `id` to the parameters of
+    /// its callee, of function type `callee_ty` with signature `sig`:
+    /// positional arguments fill parameters left to right, the trailing
+    /// block the last, and named arguments the parameters of their names.
+    /// Checks each argument against its parameter's type, or alone if it
+    /// fills none, and records the parameter each fills. Reports every
+    /// argument that cannot be bound and every parameter left unfilled, and
+    /// returns whether there was any.
+    fn bind_arguments(
+        &mut self,
+        id: ExprId,
+        (callee, callee_ty): (ExprId, TyId),
+        args: ArgRange,
+        sig: &FnTy,
+    ) -> bool {
+        let ast = self.ast;
+        let call = ast.get(id);
+        let callee_span = ast.get(callee).span;
+        let function_label = format!("the function is {}", self.in_label(callee_ty));
+        let arg_list = ast.args(args);
+        let count = sig.params.len();
+        // `positional` counts the positional arguments before the trailing
+        // block; the trailing block, if any, comes after them all.
+        let positional = arg_list
+            .iter()
+            .filter(|arg| arg.kind == ArgKind::Positional)
+            .count();
+        let trailing = arg_list.iter().any(|arg| arg.kind == ArgKind::Trailing);
+        let named = arg_list
+            .iter()
+            .any(|arg| matches!(arg.kind, ArgKind::Named { .. }));
+        let found = positional + usize::from(trailing);
+        let mut erroneous = false;
+        if found > count {
+            self.report_extra_arguments((call, callee_span, &function_label), args, count);
+            erroneous = true;
+        }
+        let base = self.filled.len();
+        self.filled.resize(base + count, u32::MAX);
+        let mut next_positional = 0;
+        for (index, arg) in arg_list.iter().enumerate() {
+            let target = match arg.kind {
+                ArgKind::Positional => {
+                    next_positional += 1;
+                    Some(next_positional - 1).filter(|&param| param < count)
+                }
+                ArgKind::Trailing => (positional < count).then(|| count - 1),
+                ArgKind::Named { name, span } => {
+                    let param = sig
+                        .params
+                        .iter()
+                        .position(|&(param, _)| param == Some(name));
+                    if param.is_none() {
+                        self.report_unknown_argument((name, span), (callee, callee_ty), sig);
+                        erroneous = true;
+                    }
+                    param
+                }
+            };
+            let Some(param) = target else {
+                self.check_alone(arg.value);
+                continue;
+            };
+            let first = self.filled.get(base + param).copied().unwrap_or(u32::MAX);
+            if let Some(first) = arg_list.get(first as usize) {
+                let name = sig.params.get(param).and_then(|&(name, _)| name);
+                self.report_given_twice((param, name), first.span(ast), arg.span(ast));
+                erroneous = true;
+                self.check_alone(arg.value);
+                continue;
+            }
+            if let Some(entry) = self.filled.get_mut(base + param) {
+                *entry = position(index);
+            }
+            let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
+            self.check_expr_expecting(arg.value, param_ty, callee_span, &function_label);
+        }
+        erroneous |= self.report_unfilled(
+            base,
+            (call, callee_span, &function_label),
+            sig,
+            (found, named, trailing),
+        );
+        if !erroneous {
+            for (param, &arg) in self
+                .filled
+                .get(base..)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                if let Some(entry) = self.arg_params.get_mut(args.start() + arg as usize) {
+                    *entry = position(param);
+                }
+            }
+        }
+        self.filled.truncate(base);
+        erroneous
+    }
+
+    /// Reports that the call `call`, whose callee is at `callee_span` and
+    /// labelled `function_label`, has more positional arguments, among
+    /// `args`, than its callee's `count` parameters, labelling each one
+    /// beyond them (the trailing block counting as the last).
+    fn report_extra_arguments(
+        &mut self,
+        (call, callee_span, function_label): (&Expr, Span, &str),
+        args: ArgRange,
+        count: usize,
+    ) {
+        let ast = self.ast;
+        let positional = ast
+            .args(args)
+            .iter()
+            .filter(|arg| !matches!(arg.kind, ArgKind::Named { .. }));
+        let found = positional.clone().count();
+        let noun = if count == 1 { "argument" } else { "arguments" };
+        let mut error =
+            Diagnostic::error(format!("expected {count} {noun}, found {found}"), call.span)
+                .with_context(callee_span, function_label);
+        for extra in positional.skip(count) {
+            error = error.with_context(extra.span(ast), "unexpected argument");
+        }
+        self.errors.push(error);
+    }
+
+    /// Reports the argument written at `second` for parameter number
+    /// `param`, named `name` if it has one, which the argument at `first`
+    /// already fills.
+    fn report_given_twice(
+        &mut self,
+        (param, name): (usize, Option<Name>),
+        first: Span,
+        second: Span,
+    ) {
+        let shown = match name {
+            Some(name) => format!("`{}`", self.ast.names().get(name)),
+            None => (param + 1).to_string(),
+        };
+        self.errors.push(
+            Diagnostic::error(format!("argument {shown} is given twice"), second)
+                .with_context(first, "first given here"),
+        );
+    }
+
+    /// Reports the named argument `name`, written at `span`, that no
+    /// parameter of the callee, of type `callee_ty` with signature `sig`,
+    /// is named: an unknown argument, or, if none of its parameters has a
+    /// name, a function that takes none.
+    fn report_unknown_argument(
+        &mut self,
+        (name, span): (Name, Span),
+        (callee, callee_ty): (ExprId, TyId),
+        sig: &FnTy,
+    ) {
+        let callee_span = self.ast.get(callee).span;
+        let shown = self.in_label(callee_ty);
+        let error = if !sig.params.is_empty() && sig.params.iter().all(|(name, _)| name.is_none()) {
+            Diagnostic::error("the parameters of this function have no names", span)
+                .with_context(callee_span, format!("this is {shown}"))
+                .with_note("call it with positional arguments")
+        } else {
+            let text = self.ast.names().get(name);
+            Diagnostic::error(format!("unknown argument `{text}`"), span)
+                .with_context(callee_span, format!("the function is {shown}"))
+        };
+        self.errors.push(error);
+    }
+
+    /// Reports the parameters of the call `call`'s callee, at
+    /// `callee_span` and labelled `function_label`, with signature `sig`,
+    /// that `filled[base..]` shows no argument fills. A call with only
+    /// positional arguments, of which it has `found`, is short of arguments
+    /// as a whole; one with named arguments or a trailing block is missing
+    /// each unfilled parameter. Returns whether any was unfilled.
+    fn report_unfilled(
+        &mut self,
+        base: usize,
+        (call, callee_span, function_label): (&Expr, Span, &str),
+        sig: &FnTy,
+        (found, named, trailing): (usize, bool, bool),
+    ) -> bool {
+        let filled = self.filled.get(base..).unwrap_or_default();
+        if filled.iter().all(|&arg| arg != u32::MAX) {
+            return false;
+        }
+        let count = sig.params.len();
+        if !named && !trailing {
+            let noun = if count == 1 { "argument" } else { "arguments" };
+            self.errors.push(
+                Diagnostic::error(format!("expected {count} {noun}, found {found}"), call.span)
+                    .with_context(callee_span, function_label),
+            );
+            return true;
+        }
+        let close = call.close_span().unwrap_or(call.span);
+        let unfilled: Vec<usize> = filled
+            .iter()
+            .enumerate()
+            .filter(|&(_, &arg)| arg == u32::MAX)
+            .map(|(param, _)| param)
+            .collect();
+        for param in unfilled {
+            let message = match sig.params.get(param) {
+                Some(&(Some(name), _)) => {
+                    format!("missing argument `{}`", self.ast.names().get(name))
+                }
+                Some(&(None, ty)) => {
+                    format!(
+                        "missing argument {} of type {}",
+                        param + 1,
+                        self.in_message(ty)
+                    )
+                }
+                None => continue,
+            };
+            self.errors
+                .push(Diagnostic::error(message, close).with_context(callee_span, function_label));
+        }
+        true
+    }
+
+    /// Checks the body of the function expression `decl`, whose parameters'
+    /// types are `fn_params[base..]`, against its return type `ret`, in a
+    /// scope of its own. The scope starts with the callee binding, if the
+    /// function has a `callee` name (with the function's type and span),
+    /// then the parameters, each in the next slot; then the items are
+    /// checked, and the body's value against `ret` as an annotated
+    /// initialiser's is against its annotation, a record block against a
+    /// record return type field by field.
+    fn check_fn_body(
+        &mut self,
+        decl: &FnDecl,
+        base: usize,
+        (callee, fn_ty, fn_span): (Option<Name>, TyId, Span),
+        ret: TyId,
+    ) {
+        let outer = (self.block_start, self.fields_start, self.next_slot);
+        let nodes_start = self.nodes.len();
+        self.block_start = self.bindings.len();
+        self.fields_start = self.fields.len();
+        if let Some(name) = callee {
+            self.bindings.push(Binding {
+                name,
+                slot: Slot::NONE,
+                ty: fn_ty,
+                declared: Some(fn_span),
+                kind: BindingKind::Callee,
+            });
+        }
+        let params = self.ast.params(decl.params);
+        for (index, param) in params.iter().enumerate() {
+            if let Some(first) = params[..index]
+                .iter()
+                .find(|first| first.name == param.name)
+            {
+                let text = self.ast.names().get(param.name);
+                self.errors.push(
+                    Diagnostic::error(format!("parameter `{text}` is declared twice"), param.span)
+                        .with_context(first.span, "first declared here"),
+                );
+            }
+            let ty = self
+                .fn_params
+                .get(base + index)
+                .map_or(TyId::ERROR, |&(_, ty)| ty);
+            self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
+        }
+        let context = self.ast.type_expr(decl.ret).span;
+        let why = "the return type is declared here";
+        let body = decl.body;
+        let block = *self.ast.get(body);
+        let ExprKind::Block(items) = block.kind else {
+            // The parser only makes blocks bodies.
+            self.errors.push(
+                InternalError {
+                    message: "a function body is not a block",
+                    span: block.span,
+                }
+                .into(),
+            );
+            self.bindings.truncate(self.block_start);
+            (self.block_start, self.fields_start, self.next_slot) = outer;
+            return;
+        };
+        if self.types.is_record(ret) && self.is_record_body(items) {
+            let expecting = Expecting {
+                ty: ret,
+                context,
+                why,
+                close: Span::new(block.span.end.saturating_sub(1), block.span.end),
+            };
+            let found = self.check_body(items, Some(expecting));
+            self.expr_types[body.index()] = found;
+        } else {
+            let found = self.check_body(items, None);
+            self.expr_types[body.index()] = found;
+            self.expect(body, found, ret, context, why);
+        }
+        self.bindings.truncate(self.block_start);
+        self.fields.truncate(self.fields_start);
+        self.nodes.truncate(nodes_start);
+        (self.block_start, self.fields_start, self.next_slot) = outer;
     }
 
     /// Types the field access `id`, reading field `name` of `record`, of
@@ -2042,10 +2793,11 @@ impl<'a> Checker<'a> {
     }
 
     /// Resolves a use of the variable `name` at expression `id`, recording
-    /// its slot, and returns its type.
+    /// where it reads from, capturing it if it belongs to an enclosing
+    /// function, and returns its type.
     fn check_name(&mut self, id: ExprId, name: Name, span: Span) -> TyId {
-        if let Some((_, binding)) = self.lookup(name) {
-            self.expr_slots[id.index()] = binding.slot;
+        if let Some((index, binding)) = self.lookup(name) {
+            self.expr_vars[id.index()] = self.resolve(index, binding);
             return binding.ty;
         }
         let text = self.ast.names().get(name);
@@ -2128,9 +2880,9 @@ impl<'a> Checker<'a> {
 
     /// Types a comparison. Both operands must be the same type, untyped
     /// operands adapting as for arithmetic and two untyped operands
-    /// settling to `Int`: any type for `==`, `!=`, `===` and `!==` (two
-    /// records must be exactly the same type), and `Int`, `Float` or
-    /// `String` for ordering. The result is `Bool`.
+    /// settling to `Int`: any type without functions in it for `==`, `!=`,
+    /// `===` and `!==` (two records must be exactly the same type), and
+    /// `Int`, `Float` or `String` for ordering. The result is `Bool`.
     fn comparison(
         &mut self,
         id: ExprId,
@@ -2142,9 +2894,9 @@ impl<'a> Checker<'a> {
         if ordering && lhs_ty != TyId::ERROR && rhs_ty != TyId::ERROR {
             // An operand of a type with no order is reported as such, before
             // any mismatch.
-            let unordered = [lhs_ty, rhs_ty]
-                .into_iter()
-                .find(|&ty| ty == TyId::BOOL || self.types.is_record(ty));
+            let unordered = [lhs_ty, rhs_ty].into_iter().find(|&ty| {
+                ty == TyId::BOOL || self.types.is_record(ty) || self.types.fn_sig(ty).is_some()
+            });
             if let Some(unordered) = unordered {
                 self.coerce(lhs, TyId::INT);
                 self.coerce(rhs, TyId::INT);
@@ -2161,6 +2913,26 @@ impl<'a> Checker<'a> {
                 self.coerce(rhs, TyId::INT);
                 TyId::BOOL
             }
+            // Functions have no equality, even inside records.
+            Some(ty) if self.types.contains_fn(ty) => {
+                let message = if self.types.fn_sig(ty).is_some() {
+                    "cannot compare functions".to_owned()
+                } else {
+                    format!(
+                        "cannot compare {}: it contains a function",
+                        self.in_message(ty)
+                    )
+                };
+                let expr = self.ast.get(id);
+                let span = expr.operator_span().unwrap_or(expr.span);
+                let label = format!("this is {}", self.in_label(ty));
+                self.errors.push(
+                    Diagnostic::error(message, span)
+                        .with_context(self.ast.get(lhs).span, label.as_str())
+                        .with_context(self.ast.get(rhs).span, label),
+                );
+                TyId::ERROR
+            }
             Some(_) => TyId::BOOL,
             None => {
                 let message = format!(
@@ -2176,16 +2948,19 @@ impl<'a> Checker<'a> {
     }
 
     /// Decides the common type of two expressions that must have the same
-    /// type: `Bool`, `String` and record types must match exactly, and
-    /// numeric types agree as for [`Checker::numeric`], whose results this
-    /// returns.
+    /// type: `Bool`, `String`, record and function types must match
+    /// exactly, and numeric types agree as for [`Checker::numeric`], whose
+    /// results this returns.
     fn agree(
         &mut self,
         (lhs, lhs_ty): (ExprId, TyId),
         (rhs, rhs_ty): (ExprId, TyId),
     ) -> Option<TyId> {
         if lhs_ty == rhs_ty
-            && (lhs_ty == TyId::BOOL || lhs_ty == TyId::STRING || self.types.is_record(lhs_ty))
+            && (lhs_ty == TyId::BOOL
+                || lhs_ty == TyId::STRING
+                || self.types.is_record(lhs_ty)
+                || self.types.fn_sig(lhs_ty).is_some())
         {
             Some(lhs_ty)
         } else {
@@ -2201,16 +2976,19 @@ impl<'a> Checker<'a> {
     }
 
     /// Types the branches of an `if` with `else`, whose keyword is at
-    /// `keyword`: two record branches have their join, and otherwise the
-    /// branches must agree, untyped branches adapting as operands of
-    /// arithmetic do, and two untyped branches leaving the `if` untyped.
+    /// `keyword`: two record branches, or two function branches, have their
+    /// join, and otherwise the branches must agree, untyped branches
+    /// adapting as operands of arithmetic do, and two untyped branches
+    /// leaving the `if` untyped.
     fn branches(
         &mut self,
         keyword: Span,
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
     ) -> TyId {
-        let common = if self.types.is_record(then_ty) && self.types.is_record(else_ty) {
+        let joinable = (self.types.is_record(then_ty) && self.types.is_record(else_ty))
+            || (self.types.fn_sig(then_ty).is_some() && self.types.fn_sig(else_ty).is_some());
+        let common = if joinable {
             self.types.join(then_ty, else_ty)
         } else {
             self.agree((then, then_ty), (else_, else_ty))
@@ -2375,7 +3153,9 @@ impl<'a> Checker<'a> {
             | ExprKind::Interp(_)
             | ExprKind::Name(_)
             | ExprKind::Field { .. }
-            | ExprKind::Ascribe { .. } => {}
+            | ExprKind::Ascribe { .. }
+            | ExprKind::Fn(_)
+            | ExprKind::Call { .. } => {}
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
                 self.coerce(inner, ty);
             }
@@ -2406,11 +3186,11 @@ impl<'a> Checker<'a> {
 
     /// Type `ty` as a diagnostic's message or notes show it: plainly if it
     /// is written as a name, and in backticks if it is structural, as a
-    /// record type is.
+    /// record or function type is.
     fn in_message(&self, ty: TyId) -> String {
         let shown = self.types.display(ty, self.ast.names());
         match self.types.kind(ty) {
-            TyKind::Record(_) | TyKind::Union(_) => format!("`{shown}`"),
+            TyKind::Record(_) | TyKind::Fn(_) | TyKind::Union(_) => format!("`{shown}`"),
             TyKind::Int
             | TyKind::Float
             | TyKind::Bool
@@ -2833,7 +3613,10 @@ mod tests {
         assert_eq!(result_type("let x = 1\nlet x = 2.5\nx"), TyId::FLOAT);
         let ast = parse_text("let x = 1\nlet x = 2.5\nx");
         let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
-        assert_eq!(resolution.expr_slot(result_expr(&ast)), Slot(1));
+        assert_eq!(
+            resolution.expr_var(result_expr(&ast)),
+            VarRef::Local(Slot(1))
+        );
     }
 
     #[test]
@@ -2892,7 +3675,10 @@ mod tests {
         assert_eq!(resolution.item_slot(items[0]), Slot(0));
         // `:=` takes a fresh slot.
         assert_eq!(resolution.item_slot(items[1]), Slot(1));
-        assert_eq!(resolution.expr_slot(result_expr(&ast)), Slot(1));
+        assert_eq!(
+            resolution.expr_var(result_expr(&ast)),
+            VarRef::Local(Slot(1))
+        );
     }
 
     #[test]
@@ -3230,6 +4016,13 @@ mod tests {
                         }
                     }
                 }
+                ExprKind::Fn(function) => visit(ast, ast.fn_decl(function).body, out),
+                ExprKind::Call { callee, args } => {
+                    visit(ast, callee, out);
+                    for arg in ast.args(args) {
+                        visit(ast, arg.value, out);
+                    }
+                }
                 ExprKind::Int(_)
                 | ExprKind::Float(_)
                 | ExprKind::Bool(_)
@@ -3295,14 +4088,14 @@ mod tests {
         let ExprKind::Binary { lhs, rhs, .. } = ast.get(result_expr(&ast)).kind else {
             panic!("expected a sum");
         };
-        assert_eq!(resolution.expr_slot(rhs), Slot(2));
+        assert_eq!(resolution.expr_var(rhs), VarRef::Local(Slot(2)));
         let ExprKind::Binary { lhs: a, rhs: b, .. } = ast.get(lhs).kind else {
             panic!("expected a sum");
         };
-        assert_eq!(resolution.expr_slot(a), Slot(0));
-        assert_eq!(resolution.expr_slot(b), Slot(1));
+        assert_eq!(resolution.expr_var(a), VarRef::Local(Slot(0)));
+        assert_eq!(resolution.expr_var(b), VarRef::Local(Slot(1)));
         // Nodes that are not variables have no slot.
-        assert_eq!(resolution.expr_slot(lhs), Slot::NONE);
+        assert_eq!(resolution.expr_var(lhs), VarRef::None);
     }
 
     #[test]
@@ -3315,7 +4108,10 @@ mod tests {
         // `b` was in slot 1; `d` reuses it.
         assert_eq!(resolution.item_slot(items[2]), Slot(1));
         assert_eq!(resolution.frame_size(), 3);
-        assert_eq!(resolution.expr_slot(result_expr(&ast)), Slot(1));
+        assert_eq!(
+            resolution.expr_var(result_expr(&ast)),
+            VarRef::Local(Slot(1))
+        );
         assert_eq!(Slot(3).to_string(), "#3");
     }
 
@@ -4454,11 +5250,11 @@ mod tests {
                 PathResolution::NONE,
                 PathResolution::NONE,
                 PathResolution {
-                    source: Slot(0),
+                    source: VarRef::Local(Slot(0)),
                     existing: 1
                 },
                 PathResolution {
-                    source: Slot(0),
+                    source: VarRef::Local(Slot(0)),
                     existing: 1
                 },
             ]
@@ -4468,7 +5264,7 @@ mod tests {
         assert_eq!(
             resolution.item_path(ast.items(ast.root())[1]),
             PathResolution {
-                source: Slot(0),
+                source: VarRef::Local(Slot(0)),
                 existing: 2
             }
         );
@@ -4810,14 +5606,14 @@ mod tests {
         assert_eq!(
             resolution.item_path(items[1]),
             PathResolution {
-                source: Slot(0),
+                source: VarRef::Local(Slot(0)),
                 existing: 2
             }
         );
         assert_eq!(
             resolution.item_path(items[2]),
             PathResolution {
-                source: Slot(1),
+                source: VarRef::Local(Slot(1)),
                 existing: 1
             }
         );
@@ -4901,7 +5697,7 @@ mod tests {
         assert_eq!(
             resolution.item_path(items[1]),
             PathResolution {
-                source: Slot(0),
+                source: VarRef::Local(Slot(0)),
                 existing: 1
             }
         );
@@ -5015,6 +5811,965 @@ mod tests {
         assert_eq!(
             result_type("let q: {x: Int} = { x = 1; y = 2 }\nq === { x = 1 }"),
             TyId::BOOL
+        );
+    }
+
+    // ----- Functions -----
+
+    /// The span of the `n`th (from 0) occurrence of `needle` in `text`.
+    fn nth(text: &str, needle: &str, n: usize) -> Span {
+        let start = text
+            .match_indices(needle)
+            .nth(n)
+            .unwrap_or_else(|| panic!("{needle:?} does not occur {} times in {text:?}", n + 1))
+            .0;
+        let start = u32::try_from(start).unwrap();
+        Span::new(start, start + u32::try_from(needle.len()).unwrap())
+    }
+
+    /// The span of the first occurrence of `needle` in `text`.
+    fn at(text: &str, needle: &str) -> Span {
+        nth(text, needle, 0)
+    }
+
+    /// The span of the last occurrence of `needle` in `text`.
+    fn last(text: &str, needle: &str) -> Span {
+        let start = u32::try_from(text.rfind(needle).unwrap()).unwrap();
+        Span::new(start, start + u32::try_from(needle.len()).unwrap())
+    }
+
+    /// Checks `text`, which must succeed, returning its tree and resolution.
+    fn resolved(text: &str) -> (Ast, Resolution) {
+        let (ast, _, output) = check_text(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        (ast, output.checked.resolution)
+    }
+
+    /// Where each use of the variable `name` reads from, in allocation
+    /// order.
+    fn uses(ast: &Ast, resolution: &Resolution, name: &str) -> Vec<VarRef> {
+        let name = ast.names().lookup(name).unwrap();
+        ast.expr_ids()
+            .filter(|&id| ast.get(id).kind == ExprKind::Name(name))
+            .map(|id| resolution.expr_var(id))
+            .collect()
+    }
+
+    /// Function number `n`'s captures, as `(VarRef, shown type)` pairs.
+    fn captures(text: &str, n: u32) -> Vec<(VarRef, String)> {
+        let (ast, types, output) = check_text(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        output
+            .checked
+            .resolution
+            .function(FnId::new(n))
+            .captures
+            .iter()
+            .map(|&(var, ty)| (var, types.display(ty, ast.names()).to_string()))
+            .collect()
+    }
+
+    const ADD: &str = "fn add(a: Int, b: Int): Int { a + b }\n";
+
+    #[test]
+    fn a_function_expression_has_its_declared_type() {
+        assert_eq!(
+            shown_result("fn(x: Int, y: String): Bool { true }"),
+            "fn(x: Int, y: String): Bool"
+        );
+        assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {}");
+        assert_eq!(
+            shown_result("fn(f: fn(Int): Int): {r: fn() -> Int} { r = fn() -> Int { f(1) } }"),
+            "fn(f: fn(Int): Int): {r: fn() -> Int}"
+        );
+        assert_eq!(
+            shown_result("let f = fn(x: Int): Int { x }\nf"),
+            "fn(x: Int): Int"
+        );
+        assert_eq!(shown_result("fn f(x: Int): Float { 1 }\nf(1)"), "Float");
+        assert_eq!(file_type("fn f(): Int { 1 }"), "{}");
+        // An unknown parameter or return type is reported once; the function
+        // is erroneous, and so is every call of it, without cascading.
+        assert_eq!(
+            messages("fn f(x: Nope): Int { 1 }\nf(1) + 1.5"),
+            vec!["unknown type `Nope`"]
+        );
+        assert_eq!(
+            messages("fn f(x: Int): Nope { x }\nlet y: Int = f(1)"),
+            vec!["unknown type `Nope`"]
+        );
+        // The parameters are still declared, with the type they have.
+        assert_eq!(
+            messages("fn f(x: Nope, y: Int): Int { y + 1.5 }"),
+            vec!["unknown type `Nope`", "cannot add Int and Float"]
+        );
+    }
+
+    #[test]
+    fn a_body_is_checked_against_the_return_type() {
+        // A literal adapts to the return type.
+        assert_eq!(shown_result("let f = fn(): Float { 1 }\nf()"), "Float");
+        let ast = parse_text("fn(): Float { 1 + 2 }");
+        let checked = check(&ast, &mut TypeTable::new()).unwrap().0;
+        let ExprKind::Fn(function) = ast.get(result_expr(&ast)).kind else {
+            panic!("expected a function");
+        };
+        let body = ast.fn_decl(function).body;
+        assert_eq!(checked.types.get(body), TyId::FLOAT);
+        // A mismatch, labelled with the return type.
+        let text = "fn(): Int { \"a\" }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(diagnostic.span, at(text, "{ \"a\" }"));
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "Int"), "the return type is declared here")]
+        );
+        // A subtype is accepted.
+        assert_eq!(
+            shown_result("fn(r: {x: Int, y: Int}): {x: Int} { r }"),
+            "fn(r: {x: Int, y: Int}): {x: Int}"
+        );
+        // A record block is checked against a record return type, field by
+        // field.
+        let text = "fn(): {x: Int, y: Int} { x = 1 }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "missing field `y` in record");
+        assert_eq!(diagnostic.span, Span::new(31, 32));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(
+                at(text, "{x: Int, y: Int}"),
+                "the return type is declared here"
+            )]
+        );
+        let text = "fn(): {x: Float} { x = 1; z = 2 }";
+        let warning = &warnings(text)[0];
+        assert_eq!(warning.message, "field `z` is not in `{x: Float}`");
+        assert_eq!(warning.span, at(text, "z"));
+        assert_eq!(
+            labels(warning),
+            vec![(at(text, "{x: Float}"), "the return type is declared here")]
+        );
+        // The literal field adapted to the expected field's type.
+        let ast = parse_text(text);
+        let (checked, _) = check(&ast, &mut TypeTable::new()).unwrap();
+        let int = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).kind == ExprKind::Int(1))
+            .unwrap();
+        assert_eq!(checked.types.get(int), TyId::FLOAT);
+        // Through a result, and without one.
+        assert_eq!(
+            messages("fn(): Int { let x = 1 }"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(shown_result("fn() -> {} { let x = 1 }"), "fn() -> {}");
+    }
+
+    #[test]
+    fn parameters_are_bindings_of_the_body() {
+        // Shadowable, in the body and in blocks within it.
+        assert_eq!(
+            shown_result("fn(x: Int): String { let x = \"s\"\nx }"),
+            "fn(x: Int): String"
+        );
+        assert_eq!(
+            shown_result("fn(x: Int): Float { { let x = 1.5; x } }"),
+            "fn(x: Int): Float"
+        );
+        // Rebindable with `:=`, keeping their type.
+        assert_eq!(
+            shown_result("fn(x: Int): Int { x := x + 1\nx }"),
+            "fn(x: Int): Int"
+        );
+        let text = "fn(x: Int): Int { x := 1.5\nx }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "mismatched types");
+        assert_eq!(diagnostic.span, at(text, "1.5"));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "x: Int"), "the variable was declared here")]
+        );
+        // But not from a block inside the body.
+        assert_eq!(
+            messages("fn(x: Int): Int { { x := 2 }\nx }"),
+            vec!["cannot rebind `x` here: it is declared in an enclosing block"]
+        );
+        // Declared twice.
+        let text = "fn(x: Int, x: Float): Float { x }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "parameter `x` is declared twice");
+        assert_eq!(found[0].span, at(text, "x: Float"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "x: Int"), "first declared here")]
+        );
+        // The parameters take the frame's first slots.
+        let (ast, resolution) = resolved("fn(x: Int, y: Int): Int { let z = x\nz + y }");
+        let function = resolution.function(FnId::new(0));
+        assert_eq!(function.param_count, 2);
+        assert_eq!(function.frame_size, 3);
+        let slot_names: Vec<&str> = function
+            .slot_names
+            .iter()
+            .map(|&name| ast.names().get(name))
+            .collect();
+        assert_eq!(slot_names, vec!["x", "y", "z"]);
+        assert_eq!(uses(&ast, &resolution, "y"), vec![VarRef::Local(Slot(1))]);
+        assert_eq!(uses(&ast, &resolution, "z"), vec![VarRef::Local(Slot(2))]);
+    }
+
+    #[test]
+    fn a_function_has_a_frame_of_its_own() {
+        let text = "let a = 1\nlet f = fn(x: Int): Int { let y = x\ny }\nlet b = 2\nb";
+        let (ast, resolution) = resolved(text);
+        // The top level's frame holds only its own variables.
+        assert_eq!(resolution.frame_size(), 3);
+        let slot_names: Vec<&str> = resolution
+            .slot_names()
+            .iter()
+            .map(|&name| ast.names().get(name))
+            .collect();
+        assert_eq!(slot_names, vec!["a", "f", "b"]);
+        assert_eq!(resolution.function(FnId::new(0)).frame_size, 2);
+        assert_eq!(uses(&ast, &resolution, "b"), vec![VarRef::Local(Slot(2))]);
+        // A function in a block of a function has its own frame too, and
+        // its enclosing frame's allocation continues after it.
+        let text =
+            "fn(p: Int): Int {\n  let g = fn(q: Int): Int { let r = q\nr }\n  let s = p\n  s\n}";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(resolution.function(FnId::new(0)).frame_size, 2);
+        assert_eq!(resolution.function(FnId::new(1)).frame_size, 3);
+        assert_eq!(uses(&ast, &resolution, "s"), vec![VarRef::Local(Slot(2))]);
+        assert_eq!(resolution.function(FnId::new(1)).callee, None);
+    }
+
+    #[test]
+    fn a_function_sees_itself_by_the_name_it_initialises() {
+        // A `let`, a field and a named function item.
+        for text in [
+            "let fib = fn(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }",
+            "{ fib = fn(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } } }",
+            "fn fib(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }",
+            "let fib: fn(Int): Int = fn(n: Int): Int { fib(n - 1) + fib(n - 2) }",
+        ] {
+            let (ast, resolution) = resolved(text);
+            assert_eq!(
+                uses(&ast, &resolution, "fib"),
+                vec![VarRef::Callee, VarRef::Callee],
+                "{text}"
+            );
+            let fib = ast.names().lookup("fib");
+            assert_eq!(resolution.function(FnId::new(0)).callee, fib, "{text}");
+            assert!(resolution.function(FnId::new(0)).captures.is_empty());
+        }
+        // Not through parentheses, nor for a dotted path.
+        assert_eq!(
+            messages("let f = (fn(): Int { f() })"),
+            vec!["undefined variable `f`"]
+        );
+        assert_eq!(
+            messages("let a.f = fn(): Int { f() }"),
+            vec!["undefined variable `f`"]
+        );
+        // A parameter of the same name shadows it.
+        let text = "fn f(f: Int): Int { f }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(uses(&ast, &resolution, "f"), vec![VarRef::Local(Slot(0))]);
+        assert_eq!(
+            shown_result("fn f(f: Int): Int { f }\nf"),
+            "fn(f: Int): Int"
+        );
+        // A `let` in the body shadows it too.
+        assert_eq!(shown_result("fn f(): Int { let f = 2\nf }\nf()"), "Int");
+        // `:=` cannot rebind it.
+        let text = "fn f(): Int { f := f\n1 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `f`: it is the function being defined"
+        );
+        assert_eq!(found[0].span, nth(text, "f", 2));
+        assert_eq!(found[0].notes, vec!["shadow it with `let` instead"]);
+        assert!(found[0].labels.is_empty());
+        // No hoisting, and so no mutual recursion.
+        assert_eq!(
+            messages("f()\nfn f(): Int { 1 }"),
+            vec!["undefined variable `f`"]
+        );
+        assert_eq!(
+            messages("fn a(): Int { b() }\nfn b(): Int { a() }"),
+            vec!["undefined variable `b`"]
+        );
+    }
+
+    #[test]
+    fn a_callee_is_captured_like_a_variable() {
+        // A function nested in the body does not see itself by the outer
+        // name, but captures the outer function.
+        let text = "let f = fn(): fn(): Int { fn(): Int { f()() } }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(uses(&ast, &resolution, "f"), vec![VarRef::Capture(0)]);
+        assert_eq!(resolution.function(FnId::new(0)).callee, None);
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Callee, "fn(): fn(): Int".to_owned())]
+        );
+        assert!(captures(text, 1).is_empty());
+    }
+
+    #[test]
+    fn captures_are_chained_through_enclosing_functions() {
+        // A top-level variable, captured once however often it is used.
+        let text = "let x = 1\nlet f = fn(): Int { x + x }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            uses(&ast, &resolution, "x"),
+            vec![VarRef::Capture(0), VarRef::Capture(0)]
+        );
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Local(Slot(0)), "Int".to_owned())]
+        );
+        // A field of a record block.
+        let text = "{ x = 1.5; f = fn(): Float { x } }";
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Local(Slot(0)), "Float".to_owned())]
+        );
+        // A parameter, through one level and through two: each function
+        // captures from the one enclosing it. The innermost function is
+        // number 0, since it is finished first.
+        let text = "fn outer(a: Int, b: String): fn(): fn(): String {\n\
+                    \x20 fn(): fn(): String { fn(): String { \"{b}{a}\" } }\n}";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(uses(&ast, &resolution, "a"), vec![VarRef::Capture(1)]);
+        assert_eq!(uses(&ast, &resolution, "b"), vec![VarRef::Capture(0)]);
+        assert_eq!(
+            captures(text, 0),
+            vec![
+                (VarRef::Capture(0), "String".to_owned()),
+                (VarRef::Capture(1), "Int".to_owned())
+            ]
+        );
+        assert_eq!(
+            captures(text, 1),
+            vec![
+                (VarRef::Local(Slot(1)), "String".to_owned()),
+                (VarRef::Local(Slot(0)), "Int".to_owned())
+            ]
+        );
+        assert!(captures(text, 2).is_empty());
+        // The callee, through one level and through two.
+        let text = "fn f(n: Int): fn(): Int { fn(): Int { f(n)() } }";
+        assert_eq!(
+            captures(text, 0),
+            vec![
+                (VarRef::Callee, "fn(n: Int): fn(): Int".to_owned()),
+                (VarRef::Local(Slot(0)), "Int".to_owned())
+            ]
+        );
+        let text = "fn f(): Int {\n\
+                    \x20 let g = fn(): Int {\n\
+                    \x20   let h = fn(): Int { f() }\n\
+                    \x20   h()\n\
+                    \x20 }\n\
+                    \x20 g()\n}";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(uses(&ast, &resolution, "f"), vec![VarRef::Capture(0)]);
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Capture(0), "fn(): Int".to_owned())]
+        );
+        assert_eq!(
+            captures(text, 1),
+            vec![(VarRef::Callee, "fn(): Int".to_owned())]
+        );
+        // A local of the function itself is not a capture, and neither is
+        // a variable shadowing a captured one.
+        let text = "let x = 1\nlet f = fn(): Int { let y = x\nlet x = y\nx }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            uses(&ast, &resolution, "x"),
+            vec![VarRef::Capture(0), VarRef::Local(Slot(1))]
+        );
+        assert_eq!(uses(&ast, &resolution, "y"), vec![VarRef::Local(Slot(0))]);
+        // A dotted `let` updating a captured record reads it from the
+        // captures.
+        let text = "let r = { a = 1 }\nlet f = fn(): {a: Int, b: Int} { let r.b = 2\nr }";
+        let (ast, resolution) = resolved(text);
+        let update = ast
+            .expr_ids()
+            .filter_map(|id| match ast.get(id).kind {
+                ExprKind::Block(body) => Some(body),
+                _ => None,
+            })
+            .flat_map(|body| ast.items(body).iter().copied())
+            .find(|&item| matches!(ast.item(item).kind, ItemKind::Let { .. }))
+            .unwrap();
+        assert_eq!(
+            resolution.item_path(update),
+            PathResolution {
+                source: VarRef::Capture(0),
+                existing: 1
+            }
+        );
+        // `:=` on a captured variable is rebinding one of an enclosing
+        // block.
+        let text = "let x = 1\nlet f = fn(): Int { x := 2\nx }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(
+            diagnostic.message,
+            "cannot rebind `x` here: it is declared in an enclosing block"
+        );
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "let x = 1"), "declared here")]
+        );
+    }
+
+    #[test]
+    fn calling_what_is_not_a_function() {
+        let text = "let x = 1\nx(2)";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "cannot call a value of type Int");
+        assert_eq!(diagnostic.span, at(text, "x(2)"));
+        assert_eq!(labels(diagnostic), vec![(Span::new(10, 11), "this is Int")]);
+        assert_eq!(diagnostic.notes, vec!["only functions can be called"]);
+        assert_eq!(
+            messages("\"s\"(1)"),
+            vec!["cannot call a value of type String"]
+        );
+        assert_eq!(
+            messages("{ x = 1 }()"),
+            vec!["cannot call a value of type `{x: Int}`"]
+        );
+        // An untyped literal callee settles to Int, and the arguments are
+        // checked on their own.
+        assert_eq!(
+            messages("1(2 + 1.5, 3 // 0.5)"),
+            vec![
+                "cannot call a value of type Int",
+                "cannot floor-divide Float"
+            ]
+        );
+        // An erroneous callee is not reported again, but its arguments are
+        // checked.
+        assert_eq!(
+            messages("nope(1.5 // 2) + 2.5"),
+            vec!["undefined variable `nope`", "cannot floor-divide Float"]
+        );
+    }
+
+    #[test]
+    fn too_many_arguments() {
+        let text = format!("{ADD}add(1, 2, 3)");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "expected 2 arguments, found 3");
+        assert_eq!(found[0].span, at(&text, "add(1, 2, 3)"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (
+                    nth(&text, "add", 1),
+                    "the function is fn(a: Int, b: Int): Int"
+                ),
+                (at(&text, "3"), "unexpected argument")
+            ]
+        );
+        // The trailing block counts, as the last.
+        let text = "fn one(r: {x: Int}): Int { 1 }\none({ x = 1 }) { x = 2 }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "expected 1 argument, found 2");
+        assert_eq!(
+            labels(diagnostic),
+            vec![
+                (nth(text, "one", 1), "the function is fn(r: {x: Int}): Int"),
+                (at(text, "{ x = 2 }"), "unexpected argument")
+            ]
+        );
+        // Every argument is still checked, and the call is erroneous without
+        // cascading.
+        assert_eq!(
+            messages(&format!("{ADD}add(1, 2, 1.5 // 2) + 2.5")),
+            vec!["expected 2 arguments, found 3", "cannot floor-divide Float"]
+        );
+        assert_eq!(
+            messages("fn z(): Int { 1 }\nz(1, 2)"),
+            vec!["expected 0 arguments, found 2"]
+        );
+    }
+
+    #[test]
+    fn named_arguments_that_match_no_parameter() {
+        let text = format!("{ADD}add(1, z = 2)");
+        let found = diagnostics(&text);
+        assert_eq!(found[0].message, "unknown argument `z`");
+        assert_eq!(found[0].span, at(&text, "z"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                nth(&text, "add", 1),
+                "the function is fn(a: Int, b: Int): Int"
+            )]
+        );
+        // `b` is then missing.
+        assert_eq!(found[1].message, "missing argument `b`");
+        assert_eq!(found.len(), 2);
+        // A function whose parameters have no names.
+        let text = format!("{ADD}let f: fn(Int, Int): Int = add\nf(1, x = 2)");
+        let found = diagnostics(&text);
+        assert_eq!(
+            found[0].message,
+            "the parameters of this function have no names"
+        );
+        assert_eq!(found[0].span, last(&text, "x"));
+        let callee = last(&text, "f(");
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                Span::new(callee.start, callee.start + 1),
+                "this is fn(Int, Int): Int"
+            )]
+        );
+        assert_eq!(found[0].notes, vec!["call it with positional arguments"]);
+        assert_eq!(found[1].message, "missing argument 2 of type Int");
+        // With some names, a named argument matches a named parameter only.
+        let with_b = format!("{ADD}let f: fn(Int, b: Int): Int = add\n");
+        assert_eq!(result_type(&format!("{with_b}f(b = 2, 1)")), TyId::INT);
+        assert_eq!(
+            messages(&format!("{with_b}f(1, c = 2)")),
+            vec!["unknown argument `c`", "missing argument `b`"]
+        );
+        // With no parameters at all, a name is unknown.
+        assert_eq!(
+            messages("fn z(): Int { 1 }\nz(x = 1)"),
+            vec!["unknown argument `x`"]
+        );
+    }
+
+    #[test]
+    fn a_parameter_given_twice() {
+        // Named after positional.
+        let text = format!("{ADD}add(1, a = 2, b = 3)");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "argument `a` is given twice");
+        assert_eq!(found[0].span, at(&text, "a = 2"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(&text, "1, a"), "first given here")]
+                .into_iter()
+                .map(|(span, label)| (Span::new(span.start, span.start + 1), label))
+                .collect::<Vec<_>>()
+        );
+        // Positional after named.
+        let text = format!("{ADD}add(a = 1, 2, b = 3)");
+        let found = diagnostics(&text);
+        assert_eq!(found[0].message, "argument `a` is given twice");
+        assert_eq!(found[0].span, at(&text, "2"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(&text, "a = 1"), "first given here")]
+        );
+        // Named twice.
+        assert_eq!(
+            messages(&format!("{ADD}add(b = 1, b = 2, a = 3)")),
+            vec!["argument `b` is given twice"]
+        );
+        // The trailing block and a named argument for the last parameter.
+        let text = "fn g(a: Int, r: {x: Int}): Int { a }\ng(1, r = { x = 1 }) { x = 2 }";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "argument `r` is given twice");
+        assert_eq!(found[0].span, at(text, "{ x = 2 }"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "r = { x = 1 }"), "first given here")]
+        );
+        // An unnamed parameter given twice is numbered.
+        let text = format!("{ADD}let f: fn(Int, a: Int): Int = add\nf(a = 1, 2, 3)");
+        assert_eq!(messages(&text), vec!["argument `a` is given twice"]);
+    }
+
+    #[test]
+    fn parameters_left_unfilled() {
+        let three = "fn three(a: Int, b: Int, c: Int): Int { a }\n";
+        // With positional arguments only, the call is short as a whole.
+        let text = format!("{three}three(1)");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "expected 3 arguments, found 1");
+        assert_eq!(found[0].span, at(&text, "three(1)"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                nth(&text, "three", 1),
+                "the function is fn(a: Int, b: Int, c: Int): Int"
+            )]
+        );
+        assert_eq!(
+            messages(&format!("{three}three()")),
+            vec!["expected 3 arguments, found 0"]
+        );
+        // With a named argument, each missing parameter, at the `)`.
+        let text = format!("{three}three(c = 1)");
+        let found = diagnostics(&text);
+        let shown: Vec<(&str, Span)> = found.iter().map(|d| (d.message.as_str(), d.span)).collect();
+        let close = last(&text, ")");
+        assert_eq!(
+            shown,
+            vec![
+                ("missing argument `a`", close),
+                ("missing argument `b`", close)
+            ]
+        );
+        assert_eq!(
+            labels(&found[1]),
+            vec![(
+                nth(&text, "three", 1),
+                "the function is fn(a: Int, b: Int, c: Int): Int"
+            )]
+        );
+        // With a trailing block, at its `}`; an unnamed parameter by its
+        // number and type.
+        let text = "fn g(a: Int, b: {}, c: Int): Int { a }\n\
+                    let f: fn(Int, {}, Int): Int = g\nf(1) { 3 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "missing argument 2 of type `{}`");
+        assert_eq!(found[0].span, last(text, "}"));
+        let callee = last(text, "f(");
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                Span::new(callee.start, callee.start + 1),
+                "the function is fn(Int, {}, Int): Int"
+            )]
+        );
+    }
+
+    #[test]
+    fn arguments_are_checked_against_their_parameters() {
+        let text = format!("{ADD}add(1, \"s\")");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(&text, "\"s\""));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                nth(&text, "add", 1),
+                "the function is fn(a: Int, b: Int): Int"
+            )]
+        );
+        // Literals adapt, and subtypes are accepted.
+        let ast = parse_text("fn half(x: Float): Float { x / 2 }\nhalf(3)");
+        let (checked, _) = check(&ast, &mut TypeTable::new()).unwrap();
+        let three = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).kind == ExprKind::Int(3))
+            .unwrap();
+        assert_eq!(checked.types.get(three), TyId::FLOAT);
+        assert_eq!(
+            result_type("fn x(r: {x: Int}): Int { r.x }\nlet p = { x = 1; y = 2 }\nx(p)"),
+            TyId::INT
+        );
+        // A function argument, by the function subtyping rules.
+        assert_eq!(
+            result_type(
+                "fn apply(f: fn(Int) -> Int, v: Int) -> Int { f(v) }\n\
+                 apply(fn(n: Int): Int { n + 1 }, 1)"
+            ),
+            TyId::INT
+        );
+        assert_eq!(
+            messages(
+                "fn apply(f: fn(Int): Int): Int { f(1) }\n\
+                 apply(fn(n: Int) -> Int { n })"
+            ),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn binding_arguments_to_parameters() {
+        let service =
+            "fn service(name: String, config: {port: Int, image: String}): String { name }\n";
+        let bound = |text: &str| {
+            let (ast, resolution) = resolved(text);
+            let call = ast
+                .expr_ids()
+                .filter(|&id| matches!(ast.get(id).kind, ExprKind::Call { .. }))
+                .last()
+                .unwrap();
+            let ExprKind::Call { args, .. } = ast.get(call).kind else {
+                unreachable!();
+            };
+            resolution.arg_params(args).to_vec()
+        };
+        // The trailing block fills the last parameter, after positional or
+        // named arguments.
+        assert_eq!(
+            bound(&format!(
+                "{service}service(\"web\") {{ port = 80; image = \"nginx\" }}"
+            )),
+            vec![0, 1]
+        );
+        assert_eq!(
+            bound(&format!(
+                "{service}service(name = \"web\") {{ port = 80; image = \"nginx\" }}"
+            )),
+            vec![0, 1]
+        );
+        // Named arguments in any order, and mixed with positional ones.
+        let f = "fn f(a: Int, b: String, c: Bool): Int { a }\n";
+        assert_eq!(
+            bound(&format!("{f}f(c = true, a = 1, b = \"s\")")),
+            vec![2, 0, 1]
+        );
+        assert_eq!(
+            bound(&format!("{f}f(1, c = true, b = \"s\")")),
+            vec![0, 2, 1]
+        );
+        assert_eq!(bound(&format!("{f}f(c = true, 1, \"s\")")), vec![2, 0, 1]);
+        // A call with only a trailing block.
+        assert_eq!(bound("fn run(body: {}): Int { 1 }\nrun { }"), vec![0]);
+        // A trailing block is checked against a record parameter field by
+        // field.
+        let text = format!("{service}service(\"web\") {{ port = 80 }}");
+        let diagnostic = &diagnostics(&text)[0];
+        assert_eq!(diagnostic.message, "missing field `image` in record");
+        assert_eq!(
+            labels(diagnostic),
+            vec![(
+                nth(&text, "service", 1),
+                "the function is fn(name: String, config: {image: String, port: Int}): String"
+            )]
+        );
+        let text = format!("{service}service(\"web\") {{ port = 80; image = \"x\"; extra = 1 }}");
+        let warning = &warnings(&text)[0];
+        assert_eq!(
+            warning.message,
+            "field `extra` is not in `{image: String, port: Int}`"
+        );
+        // An erroneous call binds nothing.
+        let ast = parse_text(&format!("{ADD}add(1, 2, 3)"));
+        let mut types = TypeTable::new();
+        let mut checker = Checker::new(&ast, &mut types);
+        let ExprKind::Call { args, .. } = ast.get(result_expr(&ast)).kind else {
+            panic!("expected a call");
+        };
+        checker.check_expr(result_expr(&ast));
+        assert!(
+            checker.arg_params[args.start()..args.start() + args.count()]
+                .iter()
+                .all(|&param| param == u32::MAX)
+        );
+    }
+
+    #[test]
+    fn calls_have_their_return_type() {
+        assert_eq!(shown_result(&format!("{ADD}add(1, 2)")), "Int");
+        assert_eq!(shown_result("fn r(): {x: Int} { x = 1 }\nr()"), "{x: Int}");
+        assert_eq!(shown_result("fn r(): {x: Int} { x = 1 }\nr().x"), "Int");
+        assert_eq!(
+            shown_result("fn make(): fn(Int): Int { fn(n: Int): Int { n } }\nmake()(1)"),
+            "Int"
+        );
+        assert_eq!(
+            shown_result("let m = { square = fn(v: Int): Int { v * v } }\nm.square(4)"),
+            "Int"
+        );
+        // A call's value is used like any other.
+        assert_eq!(
+            messages(&format!("{ADD}add(1, 2) + 1.5")),
+            vec!["cannot add Int and Float"]
+        );
+        assert_eq!(
+            messages(&format!("{ADD}add(1, 2)\n1")),
+            vec!["unused value of type Int"]
+        );
+        assert_eq!(result_type("fn tick() -> {} {}\ntick()\n1"), TyId::INT);
+    }
+
+    #[test]
+    fn a_pure_function_cannot_call_an_impure_one() {
+        let text = "fn tick() -> Int { 1 }\nfn pure(): Int { tick() }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "cannot call an impure function from a pure function"
+        );
+        assert_eq!(found[0].span, nth(text, "tick()", 1));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (last(text, "tick"), "this is fn() -> Int"),
+                (last(text, ":"), "this function is pure, declared with `:`")
+            ]
+        );
+        assert_eq!(
+            found[0].notes,
+            vec![
+                "a pure function, declared with `:`, may call only pure functions; declare it \
+                 with `->` to make it impure"
+            ]
+        );
+        let tick = "fn tick() -> Int { 1 }\n";
+        // At any depth of blocks in the pure function.
+        assert_eq!(
+            messages(&format!(
+                "{tick}fn pure(): Int {{ if true {{ {{ let x = tick()\nx }} }} else {{ 0 }} }}"
+            )),
+            vec!["cannot call an impure function from a pure function"]
+        );
+        // A pure function in an impure one is pure.
+        assert_eq!(
+            messages(&format!(
+                "{tick}fn outer() -> Int {{ let g = fn(): Int {{ tick() }}\ng() }}"
+            )),
+            vec!["cannot call an impure function from a pure function"]
+        );
+        // Receiving an impure function and calling it.
+        assert_eq!(
+            messages("fn call(f: fn() -> Int): Int { f() }"),
+            vec!["cannot call an impure function from a pure function"]
+        );
+        // Allowed: pure in impure, pure in pure, impure in impure, impure
+        // at the top level, and a pure function creating, storing,
+        // receiving and returning impure ones.
+        for text in [
+            format!("{tick}fn pure(): Int {{ 1 }}\nfn impure() -> Int {{ pure() + tick() }}"),
+            format!("{tick}fn a(): Int {{ 1 }}\nfn b(): Int {{ a() }}"),
+            format!("{tick}tick()"),
+            format!("{tick}fn make(): fn() -> Int {{ fn() -> Int {{ tick() }} }}\nmake()()"),
+            format!(
+                "{tick}fn keep(f: fn() -> Int): {{f: fn() -> Int}} {{ f = f }}\nkeep(tick).f()"
+            ),
+        ] {
+            assert_eq!(
+                check(&parse_text(&text), &mut TypeTable::new()).err(),
+                None,
+                "{text}"
+            );
+        }
+        // The purity of a call, not of its arguments: a pure function may
+        // pass an impure one along.
+        assert_eq!(
+            messages(&format!(
+                "{tick}fn pass(f: fn() -> Int): fn() -> Int {{ f }}\nfn p(): Int {{ pass(tick)() }}"
+            )),
+            vec!["cannot call an impure function from a pure function"]
+        );
+    }
+
+    #[test]
+    fn functions_have_no_equality() {
+        for op in ["==", "!=", "===", "!=="] {
+            let text = format!("let f = fn(x: Int): Int {{ x }}\nf {op} f");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(found[0].message, "cannot compare functions");
+            let operator = last(&text, op);
+            assert_eq!(found[0].span, operator);
+            let lhs = Span::new(operator.start - 2, operator.start - 1);
+            let rhs = Span::new(operator.end + 1, operator.end + 2);
+            assert_eq!(
+                labels(&found[0]),
+                vec![
+                    (lhs, "this is fn(x: Int): Int"),
+                    (rhs, "this is fn(x: Int): Int")
+                ]
+            );
+            // Nor do records containing them, at any depth.
+            let text = format!("let r = {{ f = fn(): Int {{ 1 }} }}\nr {op} r");
+            let found = diagnostics(&text);
+            assert_eq!(
+                found[0].message,
+                "cannot compare `{f: fn(): Int}`: it contains a function"
+            );
+            assert_eq!(labels(&found[0])[0].1, "this is {f: fn(): Int}");
+            let text = format!("let r = {{ a = {{ b = {{ f = fn() -> {{}} {{}} }} }} }}\nr {op} r");
+            assert_eq!(
+                messages(&text),
+                vec!["cannot compare `{a: {b: {f: fn() -> {}}}}`: it contains a function"]
+            );
+        }
+        // The operands must first have one identical type.
+        assert_eq!(
+            messages("let f = fn(): Int { 1 }\nlet g = fn(): Float { 1.0 }\nf == g"),
+            vec!["cannot compare `fn(): Int` and `fn(): Float`"]
+        );
+        assert_eq!(
+            messages("let f = fn(): Int { 1 }\nf == 1"),
+            vec!["cannot compare `fn(): Int` and Int"]
+        );
+        // Nor an order.
+        assert_eq!(
+            messages("let f = fn(): Int { 1 }\nf < f"),
+            vec!["cannot order `fn(): Int`"]
+        );
+    }
+
+    #[test]
+    fn functions_with_other_operators() {
+        assert_eq!(
+            messages("fn(): Int { 1 } + 1"),
+            vec!["cannot add `fn(): Int` and Int"]
+        );
+        assert_eq!(
+            messages("let f = fn(): Int { 1 }\nf.x"),
+            vec!["cannot access field `x` of `fn(): Int`"]
+        );
+        assert_eq!(
+            messages("if fn(): Bool { true } { 1 } else { 2 }"),
+            vec!["mismatched types"]
+        );
+        // A function can be shown as text.
+        assert_eq!(result_type("\"{fn(): Int { 1 }}\""), TyId::STRING);
+        // `if` branches of function types join.
+        assert_eq!(
+            shown_result(
+                "let f = if true { fn(a: Int): Int { a } } else { fn(b: Int) -> Int { b } }\nf"
+            ),
+            "fn(Int) -> Int"
+        );
+        assert_eq!(
+            shown_result(
+                "let f = if true { fn(a: Int): {x: Int, y: Int} { x = a; y = a } } \
+                 else { fn(a: Int): {x: Int} { x = a } }\nf"
+            ),
+            "fn(a: Int): {x: Int}"
+        );
+        assert_eq!(
+            messages("if true { fn(a: Int): Int { a } } else { fn(): Int { 1 } }"),
+            vec!["`if` branches have different types"]
+        );
+        // Annotations and ascriptions with function types.
+        assert_eq!(
+            shown_result("let f: fn(Int) -> Int = fn(x: Int): Int { x }\nf"),
+            "fn(Int) -> Int"
+        );
+        assert_eq!(
+            messages("let f: fn(Int): Int = fn(x: Int) -> Int { x }"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(
+            messages("let f: fn(Nope): Int = g"),
+            vec!["unknown type `Nope`", "undefined variable `g`"]
         );
     }
 }

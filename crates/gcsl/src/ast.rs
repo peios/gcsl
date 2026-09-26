@@ -14,9 +14,24 @@
 //! kept in a separate pool, [`Ast::items`], each list a contiguous
 //! [`ItemRange`] within it. The parts of interpolated strings live in a pool
 //! of their own in the same way, [`Ast::parts`], as do the fields of record
-//! type expressions, [`Ast::field_tys`], and the segments of the paths that
-//! name what a `let`, a field or a `:=` declares, [`Ast::path`]; the same
-//! pattern will serve argument lists.
+//! type expressions, [`Ast::field_tys`], the segments of the paths that
+//! name what a `let`, a field or a `:=` declares, [`Ast::path`], the
+//! parameters of function expressions, [`Ast::params`], the arguments of
+//! calls, [`Ast::args`], and the parameters of function types,
+//! [`Ast::param_tys`].
+//!
+//! # Functions
+//!
+//! A function expression, `fn(x: Int): Int { ... }`, has more to it than
+//! fits in an [`Expr`], so its node, [`ExprKind::Fn`], holds only a
+//! [`FnId`] into an arena of [`FnDecl`]s, [`Ast::fn_decl`]: its parameters,
+//! return type, purity and body. Every function expression of a tree has
+//! an id, from 0 to [`Ast::fn_count`], which later stages use to index
+//! their own per-function tables. A named function item, `fn f(...) ...`,
+//! is a `let` whose value is a function expression; the tree does not
+//! distinguish them. A call, [`ExprKind::Call`], lists its arguments in
+//! source order, each positional, named or the trailing block, which is
+//! always last.
 //!
 //! # Paths
 //!
@@ -109,6 +124,165 @@ pub struct FieldTyRange {
 pub struct PathRange {
     start: u32,
     len: u32,
+}
+
+/// Index of a function expression's [`FnDecl`] in the function arena of the
+/// [`Ast`] (or [`AstBuilder`]) that allocated it. Like [`ExprId`], only
+/// meaningful for that arena; later stages index their per-function tables
+/// by it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FnId(u32);
+
+impl FnId {
+    /// The function numbered `number`. Ids are normally assigned by the
+    /// parser; this is for building trees and IR by hand in tests.
+    #[cfg(test)]
+    pub(crate) const fn new(number: u32) -> Self {
+        Self(number)
+    }
+
+    /// The id as an index into the arena and into side tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl fmt::Display for FnId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#{}", self.0)
+    }
+}
+
+/// The parameters of a function expression: a contiguous range of the
+/// parameter pool of the [`Ast`] that allocated it. Resolve it with
+/// [`Ast::params`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParamRange {
+    start: u32,
+    len: u32,
+}
+
+impl ParamRange {
+    /// The number of parameters.
+    #[must_use]
+    pub const fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Whether there are no parameters.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The arguments of a call: a contiguous range of the argument pool of the
+/// [`Ast`] that allocated it. Resolve it with [`Ast::args`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArgRange {
+    start: u32,
+    len: u32,
+}
+
+impl ArgRange {
+    /// The index of the range's first argument in the argument pool, which
+    /// side tables indexed like the pool (see
+    /// [`crate::check::Resolution::arg_params`]) share.
+    pub(crate) const fn start(self) -> usize {
+        self.start as usize
+    }
+
+    /// The number of arguments.
+    pub(crate) const fn count(self) -> usize {
+        self.len as usize
+    }
+}
+
+/// The parameters of a function type expression: a contiguous range of the
+/// parameter-type pool of the [`Ast`] that allocated it. Resolve it with
+/// [`Ast::param_tys`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParamTyRange {
+    start: u32,
+    len: u32,
+}
+
+/// One parameter of a function expression, `NAME: TYPE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Param {
+    /// The parameter's name, always an identifier.
+    pub name: Name,
+    /// Where it is written: its name through its type.
+    pub span: Span,
+    /// Its type.
+    pub ty: TypeExprId,
+}
+
+/// A function expression: `fn (PARAMS) : RET BODY` or `fn (PARAMS) -> RET
+/// BODY`. Held in the [`Ast`]'s function arena; the expression node is an
+/// [`ExprKind::Fn`] with its [`FnId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FnDecl {
+    /// The parameters, in order.
+    pub params: ParamRange,
+    /// The declared return type.
+    pub ret: TypeExprId,
+    /// Whether the function is pure, declared with `:`, rather than impure,
+    /// declared with `->`.
+    pub pure: bool,
+    /// The `:` or `->` before the return type.
+    pub marker: Span,
+    /// The body, always an [`ExprKind::Block`].
+    pub body: ExprId,
+}
+
+/// How an [`Arg`] is passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArgKind {
+    /// `EXPR`, filling the parameters left to right.
+    Positional,
+    /// `NAME = EXPR`, filling the parameter named `NAME`.
+    Named {
+        /// The parameter's name.
+        name: Name,
+        /// Where the name is written.
+        span: Span,
+    },
+    /// The block after the argument list, or in place of one, filling the
+    /// last parameter. Always the call's last argument.
+    Trailing,
+}
+
+/// One argument of a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Arg {
+    /// How it is passed.
+    pub kind: ArgKind,
+    /// Its value; for a trailing argument, an [`ExprKind::Block`].
+    pub value: ExprId,
+}
+
+impl Arg {
+    /// The span of the whole argument in `ast`: its name through its value
+    /// for a named argument, and its value otherwise.
+    #[must_use]
+    pub fn span(&self, ast: &Ast) -> Span {
+        let value = ast.get(self.value).span;
+        match self.kind {
+            ArgKind::Named { span, .. } => Span::join(span, value),
+            ArgKind::Positional | ArgKind::Trailing => value,
+        }
+    }
+}
+
+/// One parameter of a function type expression: `NAME: TYPE` or `TYPE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParamTy {
+    /// The parameter's name, if the type gives one.
+    pub name: Option<Name>,
+    /// Its type.
+    pub ty: TypeExprId,
 }
 
 /// One segment of a path: a name, written as an identifier or a plain
@@ -420,6 +594,16 @@ pub enum ExprKind {
         /// The stated type.
         ty: TypeExprId,
     },
+    /// A function expression, whose details are in the function arena (see
+    /// [`Ast::fn_decl`]).
+    Fn(FnId),
+    /// A call, `callee(ARGS)`, `callee(ARGS) { ... }` or `callee { ... }`.
+    Call {
+        /// The function called.
+        callee: ExprId,
+        /// The arguments, in source order, the trailing block last.
+        args: ArgRange,
+    },
 }
 
 /// One node of the tree.
@@ -432,7 +616,9 @@ pub struct Expr {
     /// `Unary` its operator through its operand, and an `Ascribe` its
     /// expression through its type. A string literal covers its prefix and
     /// delimiters, an `If` its `if` keyword through its last branch, and a
-    /// `Field` its record expression through its name.
+    /// `Field` its record expression through its name. A `Fn` covers its
+    /// `fn` keyword through its body's `}`, and a `Call` its callee through
+    /// its `)` or its trailing block's `}`.
     pub span: Span,
 }
 
@@ -453,7 +639,21 @@ impl Expr {
             | ExprKind::Name(_)
             | ExprKind::Block(_)
             | ExprKind::Field { .. }
-            | ExprKind::Ascribe { .. } => None,
+            | ExprKind::Ascribe { .. }
+            | ExprKind::Fn(_)
+            | ExprKind::Call { .. } => None,
+        }
+    }
+
+    /// The span of a `Call` node's closing `)` or `}`: its last byte.
+    /// `None` for every other node.
+    #[must_use]
+    pub const fn close_span(&self) -> Option<Span> {
+        match self.kind {
+            ExprKind::Call { .. } => {
+                Some(Span::new(self.span.end.saturating_sub(1), self.span.end))
+            }
+            _ => None,
         }
     }
 
@@ -485,7 +685,9 @@ pub enum ItemKind {
     /// named by the path's first segment, which is always an identifier. A
     /// dotted path declares it as an update of the variable in scope, if
     /// any, with the rest of the path set, and an annotation then applies to
-    /// the path's last segment.
+    /// the path's last segment. A named function item, `fn NAME(...) ...`,
+    /// is one of these too: a `let` of `NAME`, without an annotation, whose
+    /// value is the function expression.
     Let {
         /// The variable's name, then any further segments.
         path: PathRange,
@@ -538,6 +740,15 @@ pub enum TypeExprKind {
     /// A record type, `{x: Int, "a b": String}`: its fields in source
     /// order. Repeated names are allowed here and reported by the checker.
     Record(FieldTyRange),
+    /// A function type, `fn(Int, name: String): Bool` or `fn() -> Int`.
+    Fn {
+        /// The parameters, each with its name if it has one.
+        params: ParamTyRange,
+        /// The return type.
+        ret: TypeExprId,
+        /// Whether it is pure, written with `:`, rather than `->`.
+        pure: bool,
+    },
 }
 
 /// A type as written in source, in an annotation or an ascription.
@@ -569,6 +780,10 @@ pub struct AstBuilder {
     type_exprs: Vec<TypeExpr>,
     field_tys: Vec<FieldTy>,
     paths: Vec<PathSegment>,
+    fns: Vec<FnDecl>,
+    params: Vec<Param>,
+    args: Vec<Arg>,
+    param_tys: Vec<ParamTy>,
 }
 
 impl AstBuilder {
@@ -670,6 +885,47 @@ impl AstBuilder {
         }
     }
 
+    /// Adds the function expression `decl` to the function arena and
+    /// returns its id, which its [`ExprKind::Fn`] node then carries.
+    pub fn push_fn(&mut self, decl: FnDecl) -> FnId {
+        let id = FnId(next_id(self.fns.len()));
+        self.fns.push(decl);
+        id
+    }
+
+    /// Appends `params` to the parameter pool as one function's parameters
+    /// and returns their range.
+    pub fn push_params(&mut self, params: &[Param]) -> ParamRange {
+        let start = next_id(self.params.len());
+        self.params.extend_from_slice(params);
+        ParamRange {
+            start,
+            len: next_id(params.len()),
+        }
+    }
+
+    /// Appends `args` to the argument pool as one call's arguments and
+    /// returns their range. A trailing argument must be the last.
+    pub fn push_args(&mut self, args: &[Arg]) -> ArgRange {
+        let start = next_id(self.args.len());
+        self.args.extend_from_slice(args);
+        ArgRange {
+            start,
+            len: next_id(args.len()),
+        }
+    }
+
+    /// Appends `params` to the parameter-type pool as one function type's
+    /// parameters and returns their range.
+    pub fn push_param_tys(&mut self, params: &[ParamTy]) -> ParamTyRange {
+        let start = next_id(self.param_tys.len());
+        self.param_tys.extend_from_slice(params);
+        ParamTyRange {
+            start,
+            len: next_id(params.len()),
+        }
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -713,6 +969,10 @@ impl AstBuilder {
             type_exprs: self.type_exprs,
             field_tys: self.field_tys,
             paths: self.paths,
+            fns: self.fns,
+            params: self.params,
+            args: self.args,
+            param_tys: self.param_tys,
             root,
             names,
             strings,
@@ -731,6 +991,10 @@ pub struct Ast {
     type_exprs: Vec<TypeExpr>,
     field_tys: Vec<FieldTy>,
     paths: Vec<PathSegment>,
+    fns: Vec<FnDecl>,
+    params: Vec<Param>,
+    args: Vec<Arg>,
+    param_tys: Vec<ParamTy>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -814,6 +1078,65 @@ impl Ast {
         &self.paths[start..start + range.len as usize]
     }
 
+    /// Returns the function expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn fn_decl(&self, id: FnId) -> &FnDecl {
+        &self.fns[id.index()]
+    }
+
+    /// The number of function expressions in the tree, which bounds every
+    /// [`FnId`] in it: they are `0..fn_count()`.
+    #[must_use]
+    pub fn fn_count(&self) -> usize {
+        self.fns.len()
+    }
+
+    /// Returns the parameters of the function expression whose parameters
+    /// are `range`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn params(&self, range: ParamRange) -> &[Param] {
+        let start = range.start as usize;
+        &self.params[start..start + range.len as usize]
+    }
+
+    /// Returns the arguments of the call whose arguments are `range`, in
+    /// source order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn args(&self, range: ArgRange) -> &[Arg] {
+        let start = range.start as usize;
+        &self.args[start..start + range.len as usize]
+    }
+
+    /// The number of arguments of every call in the tree: the length of
+    /// the argument pool, which side tables indexed like it share.
+    pub(crate) fn arg_count(&self) -> usize {
+        self.args.len()
+    }
+
+    /// Returns the parameters of the function type expression whose
+    /// parameters are `range`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn param_tys(&self, range: ParamTyRange) -> &[ParamTy] {
+        let start = range.start as usize;
+        &self.param_tys[start..start + range.len as usize]
+    }
+
     /// Shows `segments`, a path of this tree or a prefix of one, as it is
     /// written (see [`PathDisplay`]).
     #[must_use]
@@ -868,6 +1191,13 @@ impl Ast {
     /// Number of items in the arena, which bounds every [`ItemId`] in it.
     pub(crate) fn item_count(&self) -> usize {
         self.items.len()
+    }
+
+    /// Every expression's id, in allocation order, for tests that look for
+    /// nodes of a kind.
+    #[cfg(test)]
+    pub(crate) fn expr_ids(&self) -> impl Iterator<Item = ExprId> {
+        (0..next_id(self.exprs.len())).map(ExprId)
     }
 
     /// Returns a `Display` rendering of the tree as indented S-expressions,
@@ -926,8 +1256,14 @@ impl Annotate for NoAnnotation {
 /// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
 /// field accesses as `(. x ...)` followed by their record expression. A
 /// field name, or a path segment, that is not a plain identifier is quoted,
-/// as in `(field "a b" ...)`. Record types print as written, fields in source
-/// order: `{x: Int, "a b": {}}`.
+/// as in `(field "a b" ...)`. Types print as written, a record type's fields
+/// in source order: `{x: Int, "a b": {}}`, `fn(x: Int) -> String`. A function
+/// expression prints as `(fn ...)` followed by `(params (x Int) (y String))`,
+/// `(ret pure Int)` or `(ret impure Int)`, and its body; a call as
+/// `(call ...)` followed by its callee and its arguments in source order, a
+/// named one as `(named x EXPR)` and the trailing block as
+/// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
+/// `(let f (fn ...))`.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
 /// followed by their parts, literal text as `(lit "text")` (which has no
@@ -1001,7 +1337,61 @@ impl<A: Annotate> Pretty<'_, A> {
                 }
                 f.write_str("}")
             }
+            TypeExprKind::Fn { params, ret, pure } => {
+                f.write_str("fn(")?;
+                for (index, param) in self.ast.param_tys(params).iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    if let Some(name) = param.name {
+                        write!(f, "{}: ", FieldName(names.get(name)))?;
+                    }
+                    self.type_expr(f, param.ty)?;
+                }
+                f.write_str(if pure { "): " } else { ") -> " })?;
+                self.type_expr(f, ret)
+            }
         }
+    }
+
+    /// Writes the parameters and return type of the function expression
+    /// `id`, each on a line of its own at `depth`, with a leading newline.
+    fn fn_head(&self, f: &mut fmt::Formatter<'_>, id: FnId, depth: usize) -> fmt::Result {
+        let decl = self.ast.fn_decl(id);
+        write!(f, "\n{:indent$}(params", "", indent = depth * 2)?;
+        for param in self.ast.params(decl.params) {
+            write!(f, " ({} ", FieldName(self.ast.names().get(param.name)))?;
+            self.type_expr(f, param.ty)?;
+            f.write_str(")")?;
+        }
+        f.write_str(")")?;
+        let purity = if decl.pure { "pure" } else { "impure" };
+        write!(f, "\n{:indent$}(ret {purity} ", "", indent = depth * 2)?;
+        self.type_expr(f, decl.ret)?;
+        f.write_str(")")
+    }
+
+    /// Writes the arguments `range` of a call, each on a line of its own at
+    /// `depth`, with a leading newline.
+    fn args(&self, f: &mut fmt::Formatter<'_>, range: ArgRange, depth: usize) -> fmt::Result {
+        for arg in self.ast.args(range) {
+            f.write_str("\n")?;
+            match arg.kind {
+                ArgKind::Positional => self.node(f, arg.value, depth)?,
+                ArgKind::Named { name, .. } => {
+                    let name = FieldName(self.ast.names().get(name));
+                    writeln!(f, "{:indent$}(named {name}", "", indent = depth * 2)?;
+                    self.node(f, arg.value, depth + 1)?;
+                    f.write_str(")")?;
+                }
+                ArgKind::Trailing => {
+                    writeln!(f, "{:indent$}(trailing", "", indent = depth * 2)?;
+                    self.node(f, arg.value, depth + 1)?;
+                    f.write_str(")")?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
@@ -1029,10 +1419,22 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str(": ")?;
                 self.type_expr(f, ty)?;
             }
+            ExprKind::Fn(_) => f.write_str("fn")?,
+            ExprKind::Call { .. } => f.write_str("call")?,
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
         match expr.kind {
+            ExprKind::Fn(function) => {
+                self.fn_head(f, function, depth + 1)?;
+                f.write_str("\n")?;
+                self.node(f, self.ast.fn_decl(function).body, depth + 1)?;
+            }
+            ExprKind::Call { callee, args } => {
+                f.write_str("\n")?;
+                self.node(f, callee, depth + 1)?;
+                self.args(f, args, depth + 1)?;
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Bool(_)

@@ -26,6 +26,23 @@ pub fn diagnostics(source: &SourceFile, diagnostics: &[Diagnostic]) {
     let _ = stderr.write_all(renderer().render_all(diagnostics, source).as_bytes());
 }
 
+/// Renders `diagnostics` to stderr as [`diagnostics`] does, each against
+/// the source `source_of` gives for it, for diagnostics that do not all
+/// refer to one source.
+pub fn diagnostics_from<'a>(
+    diagnostics: &[Diagnostic],
+    source_of: impl Fn(&Diagnostic) -> &'a SourceFile,
+) {
+    let renderer = renderer();
+    let text = diagnostics
+        .iter()
+        .map(|diagnostic| renderer.render(diagnostic, source_of(diagnostic)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+}
+
 /// Styled output when stderr is a terminal and colour has not been disabled
 /// through the `NO_COLOR` convention (any non-empty value disables it).
 fn renderer() -> Renderer {

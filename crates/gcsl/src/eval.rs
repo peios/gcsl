@@ -7,15 +7,17 @@
 //! [`Value::Empty`] or [`Value::Record`], since both are records. Every IR
 //! node states its kind, so the walker for a node is always known from its
 //! parent and no runtime value is ever inspected to choose an operation.
-//! Each typed walker handles the nodes of its kind and also loads, blocks,
-//! `if`s and field accesses, which can be of any kind: an `if` evaluates its
-//! condition through `bool` and then exactly one branch through the walker
-//! it was called with, and a field access evaluates its record through
-//! `record` and extracts the field's value. A general walker,
-//! `Evaluator::value`, handles every node, and hands the typed nodes to the
-//! typed walkers, building a [`Value`] only where a value of statically
-//! unknown kind is needed: at the root, in a slot, in a record, as an
-//! interpolated value, or as a block's result evaluated through `value`.
+//! `Evaluator::function` returns the closure of a function value. Each
+//! typed walker handles the nodes of its kind and also loads, captures,
+//! blocks, `if`s, field accesses and calls, which can be of any kind: an
+//! `if` evaluates its condition through `bool` and then exactly one branch
+//! through the walker it was called with, and a field access or a call
+//! produces a [`Value`] from which the walker extracts its kind's. A general
+//! walker, `Evaluator::value`, handles every node, and hands the typed nodes
+//! to the typed walkers, building a [`Value`] only where a value of
+//! statically unknown kind is needed: at the root, in a slot, in a record,
+//! in a closure's captures, as an interpolated value, or as a block's or a
+//! function body's result evaluated through `value`.
 //!
 //! A record is built from its record block's shared [`crate::value::Layout`]
 //! and its field values in layout order, the one allocation for the values
@@ -52,27 +54,61 @@
 //! an interpolation builds its text in one buffer sized from its literal
 //! pieces before sharing it.
 //!
-//! Variables live in a frame: one [`Value`] per slot, allocated once before
-//! evaluation starts, sized by the checker's slot assignment. A `Load` in a
-//! typed context reads its slot and extracts the unboxed value, cloning a
-//! string's reference; a slot holding a value of another type there is an
-//! internal error, since lowering typed the load. Storing values in
-//! separate typed slots (`Vec<i64>`, `Vec<f64>`) would avoid the tag check;
-//! that is a later optimisation for a bytecode VM, not something this tree
-//! walker needs.
+//! Variables live in frames on one value stack, a `Vec<Value>`: the top
+//! level's frame at its bottom, sized by the checker's slot assignment, and
+//! each call's frame above its caller's. A local [`Slot`] is an offset from
+//! the current frame's base. A `Load` in a typed context reads its slot and
+//! extracts the unboxed value, cloning a string's reference; a slot holding
+//! a value of another type there is an internal error, since lowering typed
+//! the load. Storing values in separate typed slots (`Vec<i64>`,
+//! `Vec<f64>`) would avoid the tag check; that is a later optimisation for
+//! a bytecode VM, not something this tree walker needs.
+//!
+//! # Calls
+//!
+//! A closure is built by `MakeClosure` from its captured values, read in
+//! the creating frame into one boxed slice, and a reference to the IR,
+//! which the closure keeps alive: two allocations. `LoadCapture` reads the
+//! running closure's captures, and `LoadCallee` yields the running closure
+//! itself, which the evaluator holds while it runs, so a recursive function
+//! refers to itself without holding itself.
+//!
+//! A call evaluates its callee to a closure through the `function` walker,
+//! checks the call depth against [`MAX_CALL_DEPTH`], and grows the stack by
+//! the callee's frame size with `Vec::resize`; then it evaluates each
+//! argument in the caller's frame, in source order, into its parameter's
+//! slot of the new frame, runs the body in a new `Evaluator` whose base is
+//! the new frame's, and finally truncates the stack back, whether the body
+//! succeeded or failed. The stack keeps its capacity, so once it has grown
+//! to a program's deepest recursion, a call allocates nothing: not its
+//! frame, not its arguments' slots, and nothing to look anything up, since
+//! every variable is a slot or a capture index. Calls nest on the Rust
+//! stack, one `call` and a few walker frames per GCSL call, which is why
+//! the depth is limited; `call` keeps only the closure, its frame's base
+//! and the new evaluator across the body's evaluation.
+//!
+//! A function defined by an earlier input of a session can fail while a
+//! later input runs; its error's spans then refer to the earlier input's
+//! source. When an error comes out of the body of a closure whose IR is of
+//! another input than the caller's, the call records that input on the
+//! diagnostic, [`Diagnostic::input`], unless an inner call has already, so
+//! the innermost foreign frame wins.
 //!
 //! Operands are evaluated left to right, so when both would fail, the left
-//! one's error is reported. Items are evaluated in order. Evaluation holds
-//! no per-node state and allocates nothing beyond the frame, except the
-//! strings and records the program builds and the diagnostic when it
-//! fails. A runtime
-//! error points at the operator and labels each operand with the value it
-//! had, so the user sees what actually overflowed or divided by zero.
+//! one's error is reported. Items are evaluated in order, and so are a
+//! call's arguments, whatever parameters they fill. Evaluation holds no
+//! per-node state and allocates nothing beyond the stack, except the
+//! strings, records and closures the program builds and the diagnostic
+//! when it fails. A runtime error points at the operator and labels each
+//! operand with the value it had, so the user sees what actually
+//! overflowed or divided by zero.
 
 use std::fmt::Write as _;
 use std::num::NonZeroI64;
 use std::rc::Rc;
 
+use crate::MAX_CALL_DEPTH;
+use crate::ast::FnId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
@@ -80,48 +116,75 @@ use crate::ir::{
 };
 use crate::names::Name;
 use crate::source::Span;
-use crate::value::{Layout, Record, Value, int_to_float};
+use crate::value::{Closure, Layout, Record, Value, int_to_float};
 
 /// The room an interpolation reserves for each interpolated value's text,
 /// on top of its literal pieces' lengths.
 const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 
-/// Evaluates `ir` to a value, in a fresh frame.
+/// Evaluates `ir` to a value, on a fresh stack.
 ///
 /// # Errors
 ///
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
-/// "division by zero" for `//` or `%` by zero. `Float` arithmetic never
-/// fails.
-pub fn eval(ir: &Ir) -> Result<Value, Diagnostic> {
-    // The one allocation of an evaluation, besides the values it builds.
-    let mut frame = vec![Value::Empty; ir.frame_size() as usize];
-    eval_in(ir, &mut frame)
+/// "division by zero" for `//` or `%` by zero; and at a call's span, "too
+/// many nested calls" for a call nested more than [`MAX_CALL_DEPTH`] deep.
+/// `Float` arithmetic never fails.
+pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
+    // The top level's frame; calls grow the stack beyond it.
+    let mut stack = vec![Value::Empty; ir.frame_size() as usize];
+    eval_in(ir, &mut stack)
 }
 
-/// Evaluates `ir` to a value in an existing `frame`, which must have at
-/// least [`Ir::frame_size`] slots. Slots the program does not write keep
-/// their values, which is how a [`crate::session::Session`] keeps its
-/// variables from one input to the next.
+/// Evaluates `ir` to a value with an existing `stack`, which must hold at
+/// least [`Ir::frame_size`] values: the top level's frame, at its bottom.
+/// Slots the program does not write keep their values, which is how a
+/// [`crate::session::Session`] keeps its variables from one input to the
+/// next. On return, whether evaluation succeeded or failed, the stack is
+/// truncated to the frame size, dropping whatever calls left above it; its
+/// capacity is kept, so a later evaluation's calls need not allocate it
+/// again.
 ///
 /// # Errors
 ///
-/// As [`eval`]; and an internal error if `frame` is too small.
-pub fn eval_in(ir: &Ir, frame: &mut [Value]) -> Result<Value, Diagnostic> {
+/// As [`eval`]; and an internal error if `stack` is too small.
+pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
     let root = ir.root();
-    if frame.len() < ir.frame_size() as usize {
+    let frame_size = ir.frame_size() as usize;
+    if stack.len() < frame_size {
         return Err(internal(
             "frame is smaller than the IR needs",
             ir.get(root).span,
         ));
     }
-    Evaluator { ir, frame }.value(root)
+    let result = Evaluator {
+        ir,
+        stack,
+        base: 0,
+        captures: &[],
+        callee: None,
+        depth: 0,
+    }
+    .value(root);
+    stack.truncate(frame_size);
+    result
 }
 
+/// The state of one frame's evaluation: the top level's, or a call's.
 struct Evaluator<'a> {
-    ir: &'a Ir,
-    frame: &'a mut [Value],
+    /// The IR being run: the program's, or the running closure's.
+    ir: &'a Rc<Ir>,
+    /// The value stack, holding every frame.
+    stack: &'a mut Vec<Value>,
+    /// Where this frame starts on the stack: slot `n` is `stack[base + n]`.
+    base: usize,
+    /// The running closure's captured values; none at the top level.
+    captures: &'a [Value],
+    /// The running closure; `None` at the top level.
+    callee: Option<&'a Rc<Closure>>,
+    /// How many calls deep this frame is: 0 at the top level.
+    depth: usize,
 }
 
 // The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
@@ -138,7 +201,7 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty => Ok(Value::Empty),
-            IrKind::Load(slot, _) => self.load(slot, node).cloned(),
+            IrKind::Load(slot, _) => self.load_value(slot, node),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -155,6 +218,10 @@ impl Evaluator<'_> {
                 name,
                 value,
             } => self.update_field((record, name, value), node),
+            IrKind::LoadCapture(index, _) => self.capture_value(index, node),
+            IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
+            IrKind::Call { callee, args, .. } => self.call(callee, args, node),
+            IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -206,11 +273,192 @@ impl Evaluator<'_> {
     fn store(&mut self, slot: Slot, value: IrId, node: &IrNode) -> Result<Value, Diagnostic> {
         let value = self.value(value)?;
         let target = self
-            .frame
-            .get_mut(slot.index())
+            .stack
+            .get_mut(self.base + slot.index())
             .ok_or_else(|| internal("store to a slot outside the frame", node.span))?;
         *target = value;
         Ok(Value::Empty)
+    }
+
+    /// The captured value number `index` of the running closure, for the
+    /// `LoadCapture` `node`.
+    fn capture(&self, index: u32, node: &IrNode) -> Result<&Value, Diagnostic> {
+        self.captures
+            .get(index as usize)
+            .ok_or_else(|| internal("load of a capture the closure lacks", node.span))
+    }
+
+    /// A copy of the value in `slot`, of any kind, for the `Load` `node`.
+    fn load_value(&self, slot: Slot, node: &IrNode) -> Result<Value, Diagnostic> {
+        self.load(slot, node).cloned()
+    }
+
+    /// A copy of the captured value number `index`, of any kind, for the
+    /// `LoadCapture` `node`.
+    fn capture_value(&self, index: u32, node: &IrNode) -> Result<Value, Diagnostic> {
+        self.capture(index, node).cloned()
+    }
+
+    /// The value in `slot`, read by the `Load` `node` as `extract` accepts
+    /// it. The walkers read slots through this and `capture_as`, returning
+    /// the call, so that they hold no temporaries for the reads.
+    fn slot_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Result<T, Diagnostic> {
+        extract(self.load(slot, node)?, node)
+    }
+
+    /// The captured value number `index`, read by the `LoadCapture` `node`
+    /// as `extract` accepts it.
+    fn capture_as<T>(
+        &self,
+        index: u32,
+        node: &IrNode,
+        extract: Extract<T>,
+    ) -> Result<T, Diagnostic> {
+        extract(self.capture(index, node)?, node)
+    }
+
+    /// The closure the `LoadCallee` or `MakeClosure` `node` yields, as a
+    /// value.
+    fn closure_value(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        match node.kind {
+            IrKind::LoadCallee => self.callee(node).map(Value::Fn),
+            IrKind::MakeClosure { function, captures } => {
+                self.make_closure(function, captures).map(Value::Fn)
+            }
+            _ => mistyped(node, "a node that is not a closure where one was expected"),
+        }
+    }
+
+    /// A new reference to the running closure, for the `LoadCallee`
+    /// `node`.
+    fn callee(&self, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> {
+        self.callee
+            .map(Rc::clone)
+            .ok_or_else(|| internal("load of the callee outside a function", node.span))
+    }
+
+    /// Builds a closure of `function` capturing the values of `captures`,
+    /// read in this frame: one allocation for the captured values, sized
+    /// exactly (none if there are none), and one for the closure, which
+    /// shares the IR.
+    fn make_closure(
+        &mut self,
+        function: FnId,
+        captures: IrRange,
+    ) -> Result<Rc<Closure>, Diagnostic> {
+        let items = self.ir.items(captures);
+        let mut values = Vec::with_capacity(items.len());
+        for &item in items {
+            values.push(self.value(item)?);
+        }
+        Ok(Rc::new(Closure {
+            code: Rc::clone(self.ir),
+            function,
+            captures: values.into_boxed_slice(),
+        }))
+    }
+
+    /// Evaluates the `Call` `node` of `callee` with the arguments `args`
+    /// (see the module documentation) and returns the body's value.
+    fn call(&mut self, callee: IrId, args: IrRange, node: &IrNode) -> Result<Value, Diagnostic> {
+        let closure = self.function(callee)?;
+        let Some(code) = closure.code.find_function(closure.function) else {
+            return mistyped(node, "a closure of a function its IR lacks");
+        };
+        if self.depth == MAX_CALL_DEPTH {
+            return Err(too_many_calls(node));
+        }
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        if let Err(error) = self.arguments(args, base) {
+            self.stack.truncate(base);
+            return Err(error);
+        }
+        let result = Evaluator {
+            ir: &closure.code,
+            stack: self.stack,
+            base,
+            captures: &closure.captures,
+            callee: Some(&closure),
+            depth: self.depth + 1,
+        }
+        .value(code.body);
+        self.stack.truncate(base);
+        match result {
+            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
+                error.input = Some(closure.code.input());
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    /// Evaluates the arguments `args` of a call, `Arg` nodes, in order, in
+    /// this frame, writing each to its parameter's slot of the frame that
+    /// starts at `base`.
+    fn arguments(&mut self, args: IrRange, base: usize) -> Result<(), Diagnostic> {
+        for &arg in self.ir.items(args) {
+            let node = self.ir.get(arg);
+            let IrKind::Arg { param, value } = node.kind else {
+                return mistyped(node, "a call's argument is not an argument");
+            };
+            let value = self.value(value)?;
+            let Some(slot) = self.stack.get_mut(base + param as usize) else {
+                return mistyped(node, "an argument for a parameter outside the frame");
+            };
+            *slot = value;
+        }
+        Ok(())
+    }
+
+    /// Evaluates the `Call` `node` of `callee` with the arguments `args` as
+    /// a value that `extract` accepts: one of the kind the node states.
+    fn call_as<T>(
+        &mut self,
+        (callee, args): (IrId, IrRange),
+        node: &IrNode,
+        extract: fn(Value) -> Option<T>,
+    ) -> Result<T, Diagnostic> {
+        match extract(self.call(callee, args, node)?) {
+            Some(value) => Ok(value),
+            None => mistyped(
+                node,
+                "a call returned a value of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates a function-typed node to its closure.
+    fn function(&mut self, id: IrId) -> Result<Rc<Closure>, Diagnostic> {
+        let node = self.ir.get(id);
+        match node.kind {
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
+            IrKind::LoadCallee => self.callee(node),
+            IrKind::MakeClosure { function, captures } => self.make_closure(function, captures),
+            IrKind::Block { items, result } => {
+                self.items(items)?;
+                self.function(result)
+            }
+            IrKind::If { cond, then, else_ } => {
+                let branch = self.branch(cond, then, else_)?;
+                self.function(branch)
+            }
+            IrKind::Field { record, name, .. } => {
+                self.field_as((record, name), node, |value| match value {
+                    Value::Fn(closure) => Some(closure),
+                    _ => None,
+                })
+            }
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Fn(closure) => Some(closure),
+                    _ => None,
+                })
+            }
+            _ => mistyped(node, "a node of another kind where a function was expected"),
+        }
     }
 
     /// Builds a record of the values of `values`, in the order of `layout`'s
@@ -255,10 +503,10 @@ impl Evaluator<'_> {
         }
     }
 
-    /// The value in `slot`.
+    /// The value in `slot` of this frame.
     fn load(&self, slot: Slot, node: &IrNode) -> Result<&Value, Diagnostic> {
-        self.frame
-            .get(slot.index())
+        self.stack
+            .get(self.base + slot.index())
             .ok_or_else(|| internal("load from a slot outside the frame", node.span))
     }
 
@@ -267,7 +515,14 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
-            IrKind::Load(slot, _) => self.load_int(slot, node),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Int(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
@@ -316,15 +571,8 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
-        }
-    }
-
-    /// Reads the `Int` in `slot`, for the `Load` `node`.
-    fn load_int(&self, slot: Slot, node: &IrNode) -> Result<i64, Diagnostic> {
-        match self.load(slot, node)? {
-            Value::Int(value) => Ok(*value),
-            Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
-                mistyped(node, "Int load from a slot holding another type")
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where an Int was expected")
             }
         }
     }
@@ -382,7 +630,14 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
-            IrKind::Load(slot, _) => self.load_float(slot, node),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Float(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
@@ -431,15 +686,8 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a Float was expected")
             }
-        }
-    }
-
-    /// Reads the `Float` in `slot`, for the `Load` `node`.
-    fn load_float(&self, slot: Slot, node: &IrNode) -> Result<f64, Diagnostic> {
-        match self.load(slot, node)? {
-            Value::Float(value) => Ok(*value),
-            Value::Int(_) | Value::Bool(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
-                mistyped(node, "Float load from a slot holding another type")
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a Float was expected")
             }
         }
     }
@@ -466,7 +714,14 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::BoolConst(value) => Ok(value),
-            IrKind::Load(slot, _) => self.load_bool(slot, node),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Bool(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.bool(result)
@@ -513,15 +768,8 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
-        }
-    }
-
-    /// Reads the `Bool` in `slot`, for the `Load` `node`.
-    fn load_bool(&self, slot: Slot, node: &IrNode) -> Result<bool, Diagnostic> {
-        match self.load(slot, node)? {
-            Value::Bool(value) => Ok(*value),
-            Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Empty | Value::Record(_) => {
-                mistyped(node, "Bool load from a slot holding another type")
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a Bool was expected")
             }
         }
     }
@@ -601,7 +849,14 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
-            IrKind::Load(slot, _) => self.load_string(slot, node),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Str(text) => Some(text),
+                    _ => None,
+                })
+            }
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.string(result)
@@ -650,16 +905,8 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a String was expected")
             }
-        }
-    }
-
-    /// Reads the `String` in `slot`, for the `Load` `node`: a new reference
-    /// to it, not a copy.
-    fn load_string(&self, slot: Slot, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
-        match self.load(slot, node)? {
-            Value::Str(text) => Ok(Rc::clone(text)),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Empty | Value::Record(_) => {
-                mistyped(node, "String load from a slot holding another type")
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a String was expected")
             }
         }
     }
@@ -669,7 +916,14 @@ impl Evaluator<'_> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty => Ok(Value::Empty),
-            IrKind::Load(slot, _) => self.load_record(slot, node),
+            IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
+            IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
+            IrKind::Call { callee, args, .. } => {
+                self.call_as((callee, args), node, |value| match value {
+                    Value::Empty | Value::Record(_) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -720,6 +974,9 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a record was expected")
             }
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a record was expected")
+            }
         }
     }
 
@@ -747,7 +1004,7 @@ impl Evaluator<'_> {
                     values: Box::new([value]),
                 })));
             }
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Fn(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }
         };
@@ -782,17 +1039,6 @@ impl Evaluator<'_> {
             }),
             values: values.into_boxed_slice(),
         })))
-    }
-
-    /// Reads the record in `slot`, for the `Load` `node`: a new reference to
-    /// it, not a copy.
-    fn load_record(&self, slot: Slot, node: &IrNode) -> Result<Value, Diagnostic> {
-        match self.load(slot, node)? {
-            value @ (Value::Empty | Value::Record(_)) => Ok(value.clone()),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) => {
-                mistyped(node, "record load from a slot holding another type")
-            }
-        }
     }
 
     /// Evaluates a `StrConcat`, allocating exactly the length the result
@@ -959,6 +1205,71 @@ fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
 
+/// The error for the call `node`, which would nest calls more than
+/// [`MAX_CALL_DEPTH`] deep.
+fn too_many_calls(node: &IrNode) -> Diagnostic {
+    Diagnostic::error(
+        format!("too many nested calls: the limit is {MAX_CALL_DEPTH}"),
+        node.span,
+    )
+    .with_note("GCSL does not eliminate tail calls, so recursion this deep is not supported")
+}
+
+/// Extracts a value of one kind from a slot or capture, for the node
+/// reading it: [`as_int`], [`as_float`], and so on.
+type Extract<T> = fn(&Value, &IrNode) -> Result<T, Diagnostic>;
+
+/// The `Int` in `value`, read by the load or capture read `node`.
+fn as_int(value: &Value, node: &IrNode) -> Result<i64, Diagnostic> {
+    match value {
+        Value::Int(value) => Ok(*value),
+        _ => mistyped(node, "Int load from a slot holding another type"),
+    }
+}
+
+/// The `Float` in `value`, read by the load or capture read `node`.
+fn as_float(value: &Value, node: &IrNode) -> Result<f64, Diagnostic> {
+    match value {
+        Value::Float(value) => Ok(*value),
+        _ => mistyped(node, "Float load from a slot holding another type"),
+    }
+}
+
+/// The `Bool` in `value`, read by the load or capture read `node`.
+fn as_bool(value: &Value, node: &IrNode) -> Result<bool, Diagnostic> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        _ => mistyped(node, "Bool load from a slot holding another type"),
+    }
+}
+
+/// A new reference to the `String` in `value`, read by the load or capture
+/// read `node`: not a copy.
+fn as_string(value: &Value, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
+    match value {
+        Value::Str(text) => Ok(Rc::clone(text)),
+        _ => mistyped(node, "String load from a slot holding another type"),
+    }
+}
+
+/// A new reference to the record in `value`, read by the load or capture
+/// read `node`: not a copy.
+fn as_record(value: &Value, node: &IrNode) -> Result<Value, Diagnostic> {
+    match value {
+        Value::Empty | Value::Record(_) => Ok(value.clone()),
+        _ => mistyped(node, "record load from a slot holding another type"),
+    }
+}
+
+/// A new reference to the closure in `value`, read by the load or capture
+/// read `node`.
+fn as_function(value: &Value, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> {
+    match value {
+        Value::Fn(closure) => Ok(Rc::clone(closure)),
+        _ => mistyped(node, "function load from a slot holding another type"),
+    }
+}
+
 /// Fails with the internal error `message` at `node`: a node of a type its
 /// walker does not handle. Returned directly by the walkers' error arms, so
 /// that they hold no temporary for it (see the note on `Evaluator`).
@@ -981,13 +1292,13 @@ mod tests {
     use crate::types::TypeTable;
     use crate::value::ValueKind;
 
-    fn compile(text: &str) -> Ir {
+    fn compile(text: &str) -> Rc<Ir> {
         let source = SourceFile::new("test.gcsl", text).unwrap();
         let (tokens, names, strings) = tokenize(&source).unwrap();
         let ast = parse(&tokens, names, strings, &source).unwrap();
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        lower(&ast, &checked, &types).unwrap()
+        Rc::new(lower(&ast, &checked, &types, 0).unwrap())
     }
 
     fn boolean(text: &str) -> bool {
@@ -1289,8 +1600,10 @@ mod tests {
         let ir = compile("let x = 7\nlet y = x + 1");
         let mut frame = vec![Value::Empty; 3];
         assert_eq!(eval_in(&ir, &mut frame).unwrap(), Value::Empty);
-        assert_eq!(frame, vec![Value::Int(7), Value::Int(8), Value::Empty]);
-        let error = eval_in(&ir, &mut frame[..1]).unwrap_err();
+        // The stack is truncated to the frame on return.
+        assert_eq!(frame, vec![Value::Int(7), Value::Int(8)]);
+        frame.truncate(1);
+        let error = eval_in(&ir, &mut frame).unwrap_err();
         assert_eq!(
             error.message,
             "internal error: frame is smaller than the IR needs"
@@ -1665,9 +1978,12 @@ mod tests {
             }),
             Span::new(0, 5),
         );
-        let ir = builder.finish(add, 1, Vec::new());
-        assert_eq!(eval_in(&ir, &mut [Value::Int(2)]).unwrap(), Value::Int(3));
-        let error = eval_in(&ir, &mut [Value::Float(1.5)]).unwrap_err();
+        let ir = Rc::new(builder.finish(add, 1, Vec::new()));
+        assert_eq!(
+            eval_in(&ir, &mut vec![Value::Int(2)]).unwrap(),
+            Value::Int(3)
+        );
+        let error = eval_in(&ir, &mut vec![Value::Float(1.5)]).unwrap_err();
         assert_eq!(
             error.message,
             "internal error: Int load from a slot holding another type"
@@ -1957,7 +2273,7 @@ mod tests {
             }),
             Span::new(0, 6),
         );
-        let ir = builder.finish(eq, 1, Vec::new());
+        let ir = Rc::new(builder.finish(eq, 1, Vec::new()));
         let record = Value::Record(Rc::new(Record {
             layout: Rc::new(Layout {
                 names: Box::new([x]),
@@ -1965,14 +2281,14 @@ mod tests {
             }),
             values: Box::new([Value::Int(1)]),
         }));
-        let error = eval_in(&ir, &mut [record]).unwrap_err();
+        let error = eval_in(&ir, &mut vec![record]).unwrap_err();
         assert_eq!(
             error.message,
             "internal error: a record lacks a field of its shape"
         );
         assert_eq!(error.span, Span::new(0, 6));
         // So is the empty record, where the shape has fields.
-        let error = eval_in(&ir, &mut [Value::Empty]).unwrap_err();
+        let error = eval_in(&ir, &mut vec![Value::Empty]).unwrap_err();
         assert_eq!(
             error.message,
             "internal error: a record lacks a field of its shape"
@@ -1994,7 +2310,7 @@ mod tests {
             },
             Span::new(0, 5),
         );
-        let ir = builder.finish(update, 0, Vec::new());
+        let ir = Rc::new(builder.finish(update, 0, Vec::new()));
         let error = eval(&ir).unwrap_err();
         assert_eq!(
             error.message,
@@ -2021,7 +2337,7 @@ mod tests {
             },
             Span::new(0, 3),
         );
-        let ir = builder.finish(field, 1, Vec::new());
+        let ir = Rc::new(builder.finish(field, 1, Vec::new()));
         let record = |value: Value| {
             Value::Record(Rc::new(Record {
                 layout: Rc::new(crate::value::Layout {
@@ -2031,13 +2347,368 @@ mod tests {
                 values: Box::new([value]),
             }))
         };
-        let error = eval_in(&ir, &mut [record(Value::Int(1))]).unwrap_err();
+        let error = eval_in(&ir, &mut vec![record(Value::Int(1))]).unwrap_err();
         assert_eq!(
             error.message,
             "internal error: a record lacks a field the checker found"
         );
         assert_eq!(error.span, Span::new(0, 3));
-        let error = eval_in(&ir, &mut [Value::Empty]).unwrap_err();
+        let error = eval_in(&ir, &mut vec![Value::Empty]).unwrap_err();
         assert_eq!(error.message, "internal error: a field of the empty record");
+    }
+
+    // ----- Functions -----
+
+    /// Runs `f` on a thread with [`crate::STACK_SIZE`] of stack, as the
+    /// pipeline is meant to be run. Test threads are far smaller by default.
+    fn on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn calls_of_every_kind_of_result() {
+        // Through each typed walker.
+        assert_eq!(int("fn f(): Int { 41 }\nf() + 1"), 42);
+        assert_eq!(float("fn f(x: Float): Float { x / 2 }\nf(3) * 2"), 3.0);
+        assert!(boolean("fn f(x: Int): Bool { x > 1 }\nnot f(1)"));
+        assert_eq!(
+            string("fn f(s: String): String { s + s }\nf(\"ab\") + \"!\""),
+            "abab!"
+        );
+        assert_eq!(int("fn f(): {x: Int} { x = 1 }\nf().x"), 1);
+        assert!(boolean("fn f(): {x: Int} { x = 1 }\nf() == { x = 1 }"));
+        assert_eq!(run("fn f() -> {} {}\nf()").unwrap(), Value::Empty);
+        assert_eq!(int("fn f(): fn(): Int { fn(): Int { 7 } }\nf()()"), 7);
+        // And through the general walker.
+        assert_eq!(
+            string("fn f(n: Int): Int { n * 2 }\n\"{f(2)} {f(3)}\""),
+            "4 6"
+        );
+        assert_eq!(
+            run("fn f(n: Int): {n: Int} { n = n }\n{ a = f(1); b = f(2) }")
+                .unwrap()
+                .to_string(),
+            "{a = {n = 1}; b = {n = 2}}"
+        );
+        // A call in a condition, an operand, and an argument.
+        assert_eq!(
+            int(
+                "fn even(n: Int): Bool { n % 2 == 0 }\nfn half(n: Int): Int { n // 2 }\n\
+                 if even(4) { half(half(8)) } else { 0 }"
+            ),
+            2
+        );
+        // Captured values of each kind, read by each walker.
+        let text = "let i = 1\nlet x = 1.5\nlet b = true\nlet s = \"s\"\nlet r = { v = 2 }\n\
+                    let g = fn(): Int { 3 }\n\
+                    let f = fn(): String { \"{i + 1} {x * 2} {not b} {s + s} {r.v} {g()} {r}\" }\n\
+                    f()";
+        assert_eq!(string(text), "2 3.0 false ss 2 3 {v = 2}");
+    }
+
+    #[test]
+    fn recursion() {
+        assert_eq!(
+            int("fn fact(n: Int): Int { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(20)"),
+            2_432_902_008_176_640_000
+        );
+        assert_eq!(
+            int(
+                "let fib = fn(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
+                 fib(20)"
+            ),
+            6765
+        );
+        // Through a field, and through a callee captured by a closure.
+        assert_eq!(
+            int(
+                "let m = { sum = fn(n: Int): Int { if n == 0 { 0 } else { n + sum(n - 1) } } }\n\
+                 m.sum(10)"
+            ),
+            55
+        );
+        assert_eq!(
+            int(
+                "fn down(n: Int): fn(): Int { fn(): Int { if n == 0 { 0 } else { down(n - 1)() + 1 } } }\n\
+                 down(5)()"
+            ),
+            5
+        );
+        // An overflow deep in a recursion is reported where it happens.
+        let diagnostic = run(
+            "fn fact(n: Int): Int { if n <= 1 { 1 } else { n * fact(n - 1) } }\n\
+                              fact(21)",
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.message, "integer overflow");
+        // The `*` of the outermost multiplication, `21 * fact(20)`.
+        assert_eq!(diagnostic.span, Span::new(48, 49));
+        assert_eq!(diagnostic.labels[0].text, "21");
+        assert_eq!(diagnostic.input, None);
+    }
+
+    #[test]
+    fn closures_capture_by_value() {
+        assert_eq!(int("let x = 1\nlet f = fn(): Int { x }\nx := 2\nf()"), 1);
+        assert_eq!(
+            int("let x = 1\nlet f = fn(): Int { x }\nlet x = 5\nf() + x"),
+            6
+        );
+        // Each closure holds what was in scope when it was made.
+        assert_eq!(
+            string(
+                "fn make(n: Int): fn(): Int { fn(): Int { n } }\n\
+                    let a = make(1)\nlet b = make(2)\n\"{a()} {b()} {a()}\""
+            ),
+            "1 2 1"
+        );
+        // A record captured is the record as it was.
+        assert_eq!(
+            string("let r = { x = 1 }\nlet f = fn(): {x: Int} { r }\nlet r.x = 2\n\"{f()} {r}\""),
+            "{x = 1} {x = 2}"
+        );
+        // A dotted `let` of a captured record inside the function updates
+        // the captured value into a new local, leaving the capture and the
+        // outer variable as they were.
+        assert_eq!(
+            string(
+                "let r = { a = 1 }\n\
+                 let f = fn(): {a: Int, b: Int} { let r.b = 2\nr }\n\
+                 \"{f()} {f()} {r}\""
+            ),
+            "{a = 1; b = 2} {a = 1; b = 2} {a = 1}"
+        );
+    }
+
+    #[test]
+    fn nested_closures_and_closures_called_later() {
+        assert_eq!(
+            int("fn adder(a: Int): fn(Int): fn(Int): Int {\n\
+                   fn(b: Int): fn(Int): Int { fn(c: Int): Int { a * 100 + b * 10 + c } }\n\
+                 }\n\
+                 adder(1)(2)(3)"),
+            123
+        );
+        assert_eq!(
+            int(
+                "fn counter(start: Int): fn(): Int { fn(): Int { start + 1 } }\n\
+                 let c = counter(41)\nlet unrelated = counter(0)()\nc()"
+            ),
+            42
+        );
+        // A function-valued field, called through `.`.
+        assert_eq!(
+            int("let math = { square = fn(v: Int): Int { v * v }; k = 3 }\nmath.square(math.k)"),
+            9
+        );
+        assert_eq!(
+            int(
+                "fn tools(): {twice: fn(Int): Int} { twice = fn(v: Int): Int { v * 2 } }\n\
+                 tools().twice(21)"
+            ),
+            42
+        );
+        // Passed as an argument, and chosen by an `if`.
+        assert_eq!(
+            int("fn apply(f: fn(Int): Int, v: Int): Int { f(v) }\n\
+                 apply(if true { fn(n: Int): Int { n + 1 } } else { fn(n: Int): Int { n } }, 1)"),
+            2
+        );
+    }
+
+    #[test]
+    fn arguments_are_evaluated_in_source_order() {
+        let f = "fn f(a: Int, b: Int): Int { a + b }\n";
+        assert_eq!(int(&format!("{f}f(b = 1, a = 2)")), 3);
+        // The first-written argument fails first, whatever it fills.
+        assert_eq!(
+            error(&format!("{f}f(b = 1 // 0, a = 9223372036854775807 + 1)")).0,
+            "division by zero"
+        );
+        assert_eq!(
+            error(&format!("{f}f(b = 9223372036854775807 + 1, a = 1 // 0)")).0,
+            "integer overflow"
+        );
+        // The trailing block comes last.
+        let g = "fn g(a: Int, r: {x: Int}): Int { a + r.x }\n";
+        assert_eq!(int(&format!("{g}g(1) {{ x = 2 }}")), 3);
+        assert_eq!(int(&format!("{g}g(a = 1) {{ x = 2 }}")), 3);
+        assert_eq!(
+            error(&format!("{g}g(1 // 0) {{ x = 9223372036854775807 + 1 }}")).0,
+            "division by zero"
+        );
+        assert_eq!(
+            error(&format!("{g}g(9223372036854775807 + 1) {{ x = 1 // 0 }}")).0,
+            "integer overflow"
+        );
+        // The callee is evaluated before the arguments.
+        assert_eq!(
+            error("fn f(x: Int): fn(Int): Int { fn(y: Int): Int { y } }\nf(1 // 0)(9223372036854775807 + 1)").0,
+            "division by zero"
+        );
+    }
+
+    /// Evaluates `ir` without `eval_in`'s truncation, returning the result
+    /// and the stack's length afterwards.
+    fn run_on(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> (Result<Value, Diagnostic>, usize) {
+        let result = Evaluator {
+            ir,
+            stack,
+            base: 0,
+            captures: &[],
+            callee: None,
+            depth: 0,
+        }
+        .value(ir.root());
+        (result, stack.len())
+    }
+
+    #[test]
+    fn a_call_truncates_the_stack_whether_it_succeeds_or_fails() {
+        let ir = compile(
+            "fn f(n: Int): Int { let m = n + 1\nlet k = m * 2\nk }\n\
+             fn g(n: Int): Int { let p = f(n)\nf(p) }\nlet a = g(1)\n= g(a)",
+        );
+        let frame = ir.frame_size() as usize;
+        let mut stack = vec![Value::Empty; frame];
+        let (result, len) = run_on(&ir, &mut stack);
+        // g(1) = f(f(1)) = 10, and g(10) = f(f(10)) = 46.
+        assert_eq!(result.unwrap(), Value::Int(46));
+        assert_eq!(len, frame);
+        // A failure inside a nested call leaves the stack at the frame too.
+        let ir = compile(
+            "fn f(n: Int): Int { let m = n // 0\nm }\n\
+             fn g(n: Int): Int { let p = n\nf(p) }\nlet a = 1\n= g(a)",
+        );
+        let frame = ir.frame_size() as usize;
+        let mut stack = vec![Value::Empty; frame];
+        let (result, len) = run_on(&ir, &mut stack);
+        assert_eq!(result.unwrap_err().message, "division by zero");
+        assert_eq!(len, frame);
+        // So does a failure in an argument, after the frame has grown.
+        let ir = compile("fn f(a: Int, b: Int): Int { a }\nf(1, 1 // 0)");
+        let mut stack = vec![Value::Empty; ir.frame_size() as usize];
+        let (result, len) = run_on(&ir, &mut stack);
+        assert_eq!(result.unwrap_err().message, "division by zero");
+        assert_eq!(len, ir.frame_size() as usize);
+    }
+
+    #[test]
+    fn a_warm_stack_does_not_grow_again() {
+        let ir = compile(
+            "let fib = fn(n: Int): Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
+             fib(15)",
+        );
+        let frame = ir.frame_size() as usize;
+        let mut stack = vec![Value::Empty; frame];
+        assert_eq!(eval_in(&ir, &mut stack).unwrap(), Value::Int(610));
+        let capacity = stack.capacity();
+        // Calls grew it: one slot per call in progress at the deepest.
+        assert!(capacity >= frame + 15, "{capacity}");
+        assert_eq!(stack.len(), frame);
+        assert_eq!(eval_in(&ir, &mut stack).unwrap(), Value::Int(610));
+        assert_eq!(stack.capacity(), capacity);
+        assert_eq!(stack.len(), frame);
+    }
+
+    #[test]
+    fn calls_nest_up_to_the_limit() {
+        on_big_stack(|| {
+            let recurse = "fn f(n: Int): Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n";
+            // `f(n)` makes n + 1 calls: exactly the limit is allowed.
+            let depth = i64::try_from(MAX_CALL_DEPTH).unwrap();
+            assert_eq!(
+                run(&format!("{recurse}f({})", depth - 1)).unwrap(),
+                Value::Int(depth - 1)
+            );
+            let text = format!("{recurse}f({depth})");
+            let diagnostic = run(&text).unwrap_err();
+            assert_eq!(
+                diagnostic.message,
+                format!("too many nested calls: the limit is {MAX_CALL_DEPTH}")
+            );
+            assert_eq!(
+                diagnostic.message,
+                "too many nested calls: the limit is 1000"
+            );
+            // The innermost call, which would have exceeded it.
+            assert_eq!(diagnostic.span, Span::new(43, 51));
+            assert_eq!(
+                diagnostic.notes,
+                vec!["GCSL does not eliminate tail calls, so recursion this deep is not supported"]
+            );
+            // Nothing is left on the stack by the failure.
+            let ir = compile(&text);
+            let mut stack = vec![Value::Empty; ir.frame_size() as usize];
+            let (result, len) = run_on(&ir, &mut stack);
+            assert!(result.is_err());
+            assert_eq!(len, ir.frame_size() as usize);
+        });
+    }
+
+    #[test]
+    fn function_values_and_their_internal_errors() {
+        // A closure shows as its type.
+        let value = run("fn(x: Int, s: String) -> {x: Int} { x = x }").unwrap();
+        assert_eq!(value.kind(), ValueKind::Fn);
+        assert_eq!(value.to_string(), "fn(x: Int, s: String) -> {x: Int}");
+        assert_eq!(
+            value.repr().to_string(),
+            "fn(x: Int, s: String) -> {x: Int}"
+        );
+        assert_eq!(
+            string("let f = fn(): Int { 1 }\n\"f is {f}\""),
+            "f is fn(): Int"
+        );
+        // The callee outside a function, and an argument outside a call.
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let callee = builder.alloc(IrKind::LoadCallee, Span::new(0, 1));
+        let ir = Rc::new(builder.finish(callee, 0, Vec::new()));
+        assert_eq!(
+            eval(&ir).unwrap_err().message,
+            "internal error: load of the callee outside a function"
+        );
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
+        let arg = builder.alloc(
+            IrKind::Arg {
+                param: 0,
+                value: one,
+            },
+            Span::new(0, 1),
+        );
+        let ir = Rc::new(builder.finish(arg, 0, Vec::new()));
+        assert_eq!(
+            eval(&ir).unwrap_err().message,
+            "internal error: an argument outside a call"
+        );
+        // A closure of a function its IR does not have.
+        let mut builder = crate::ir::IrBuilder::with_capacity(3);
+        let empty = builder.push_item_list(&[]);
+        let closure = builder.alloc(
+            IrKind::MakeClosure {
+                function: FnId::new(3),
+                captures: empty,
+            },
+            Span::new(0, 1),
+        );
+        let call = builder.alloc(
+            IrKind::Call {
+                callee: closure,
+                args: empty,
+                kind: ValueKind::Int,
+            },
+            Span::new(0, 3),
+        );
+        let ir = Rc::new(builder.finish(call, 0, Vec::new()));
+        assert_eq!(
+            eval(&ir).unwrap_err().message,
+            "internal error: a closure of a function its IR lacks"
+        );
     }
 }

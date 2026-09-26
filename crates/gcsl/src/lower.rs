@@ -4,11 +4,23 @@
 //! `Paren` and `Ascribe` nodes (the checker has already coerced whatever an
 //! ascription affects), turns integer literals typed `Float` into
 //! `FloatConst` directly, and inserts `IntToFloat` for concrete `Int`
-//! operands of `/`. Variables become `Load` and `Store` nodes on the slots
-//! the checker assigned. Every block, including the file's body, becomes a
-//! `Block` whose items are its declarations and non-final expression
-//! statements, and whose result is its `= EXPR` or final expression
-//! statement, or an explicit `Empty` node if it has neither.
+//! operands of `/`. Variables become `Store` nodes on the slots the checker
+//! assigned, and each use becomes what its [`VarRef`] says: a `Load` of a
+//! slot, a `LoadCapture` of a captured value, or a `LoadCallee`. Every
+//! block, including the file's body, becomes a `Block` whose items are its
+//! declarations and non-final expression statements, and whose result is
+//! its `= EXPR` or final expression statement, or an explicit `Empty` node
+//! if it has neither.
+//!
+//! A function expression's body is lowered into the IR's function table at
+//! its [`crate::ast::FnId`], with its frame and capture counts from the
+//! checker's [`crate::check::FnResolution`] and its type as text, computed
+//! once here, for its closures to display as. The expression itself becomes
+//! a `MakeClosure` whose captures are the reads, in the frame creating the
+//! closure, of each value the function captures. Function bodies nest, and
+//! so does their lowering. A call lowers to a `Call` whose `Arg` nodes are
+//! its arguments in source order, each with the parameter the checker bound
+//! it to.
 //!
 //! A record block's fields become `Store`s to their slots, as `let`s do, so
 //! that later items can read them, and its result is a `MakeRecord` whose
@@ -62,13 +74,14 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Ast, BinaryOp, ExprId, ExprKind, ItemId, ItemKind, ItemRange, PartRange, PathRange,
-    PathSegment, StrPart, UnaryOp, path_span,
+    ArgRange, Ast, BinaryOp, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange, PartRange,
+    PathRange, PathSegment, StrPart, UnaryOp, path_span,
 };
-use crate::check::{Checked, Resolution, Slot, Types};
+use crate::check::{Checked, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
 use crate::ir::{
-    Cmp, Ir, IrBuilder, IrId, IrKind, LayoutId, Operands, Shape, ShapeId, ShapedOperands,
+    Cmp, FnCode, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, Operands, Shape, ShapeId,
+    ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -76,14 +89,20 @@ use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, ValueKind, int_to_float};
 
 /// Lowers `ast`, whose types and resolution are `checked`, with its types
-/// interned into `types`, to IR.
+/// interned into `types`, to IR, recording that it is session input number
+/// `input` (0 for a file; see [`Ir::input`]).
 ///
 /// # Errors
 ///
 /// Returns an [`InternalError`] if `checked` was not produced by checking
 /// `ast` against `types`, or is otherwise inconsistent with it: a bug in
 /// the caller or the checker, never an error in the user's program.
-pub fn lower(ast: &Ast, checked: &Checked, types: &TypeTable) -> Result<Ir, InternalError> {
+pub fn lower(
+    ast: &Ast,
+    checked: &Checked,
+    types: &TypeTable,
+    input: u32,
+) -> Result<Ir, InternalError> {
     let Checked {
         types: expr_types,
         resolution,
@@ -95,7 +114,11 @@ pub fn lower(ast: &Ast, checked: &Checked, types: &TypeTable) -> Result<Ir, Inte
             span: root_span,
         });
     }
-    if resolution.expr_len() != ast.len() || resolution.item_len() != ast.item_count() {
+    if resolution.expr_len() != ast.len()
+        || resolution.item_len() != ast.item_count()
+        || resolution.function_len() != ast.fn_count()
+        || resolution.arg_len() != ast.arg_count()
+    {
         return Err(InternalError {
             message: "resolution does not belong to this AST",
             span: root_span,
@@ -114,15 +137,27 @@ pub fn lower(ast: &Ast, checked: &Checked, types: &TypeTable) -> Result<Ir, Inte
         layout_names: Vec::new(),
         shapes: HashMap::new(),
         shape_pending: Vec::new(),
+        functions: vec![None; ast.fn_count()],
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
     let kind = lowerer.lower_body(root, root_span, kind)?;
     let root = lowerer.builder.alloc(kind, root_span);
-    Ok(lowerer.builder.finish(
+    // Every function expression is reachable from the root, so each has
+    // been lowered.
+    let functions = lowerer
+        .functions
+        .into_iter()
+        .collect::<Option<Vec<FnCode>>>()
+        .ok_or(InternalError {
+            message: "a function expression was never lowered",
+            span: root_span,
+        })?;
+    Ok(lowerer.builder.finish_program(
         root,
-        resolution.frame_size(),
-        resolution.slot_names().to_vec(),
+        (resolution.frame_size(), resolution.slot_names().to_vec()),
+        functions,
+        input,
     ))
 }
 
@@ -145,6 +180,8 @@ struct Lowerer<'a> {
     /// Reused as the work list of record types whose shapes have ids but no
     /// fields yet.
     shape_pending: Vec<TyId>,
+    /// Each function lowered so far, indexed by [`FnId`].
+    functions: Vec<Option<FnCode>>,
 }
 
 impl Lowerer<'_> {
@@ -294,13 +331,10 @@ impl Lowerer<'_> {
             let kind = if end >= existing {
                 IrKind::Empty
             } else if end == 0 {
-                if resolution.source == Slot::NONE {
-                    return Err(InternalError {
-                        message: "an update of an existing record has no source slot",
-                        span,
-                    });
-                }
-                IrKind::Load(resolution.source, ValueKind::Record)
+                read(resolution.source, ValueKind::Record).ok_or(InternalError {
+                    message: "an update of an existing record has no source",
+                    span,
+                })?
             } else {
                 let Some(&record) = self.item_stack.get(base + end - 1) else {
                     return Err(InternalError {
@@ -358,7 +392,7 @@ impl Lowerer<'_> {
             let (kind, field) = match self.ast.path(path) {
                 [field] => (self.kind(value)?, field),
                 // A later definition of an open field extends it.
-                [field, ..] if self.resolution.item_path(id).source == Slot::NONE => {
+                [field, ..] if self.resolution.item_path(id).source == VarRef::None => {
                     (ValueKind::Record, field)
                 }
                 _ => continue,
@@ -433,15 +467,8 @@ impl Lowerer<'_> {
                 },
                 _,
             ) => self.lower_binary(op, op_start, (lhs, rhs), kind, id)?,
-            (ExprKind::Name(_), _) => {
-                let slot = self.resolution.expr_slot(id);
-                if slot == Slot::NONE {
-                    return Err(InternalError {
-                        message: "a variable use has no slot",
-                        span,
-                    });
-                }
-                IrKind::Load(slot, kind)
+            (ExprKind::Name(_) | ExprKind::Fn(_) | ExprKind::Call { .. }, _) => {
+                self.lower_use_or_function(id, kind)?
             }
             (ExprKind::Block(body), _) => self.lower_body(body, span, kind)?,
             (ExprKind::Field { expr: record, name }, _) => IrKind::Field {
@@ -457,7 +484,7 @@ impl Lowerer<'_> {
             }
             (
                 ExprKind::Int(_) | ExprKind::Float(_),
-                ValueKind::Bool | ValueKind::String | ValueKind::Record,
+                ValueKind::Bool | ValueKind::String | ValueKind::Record | ValueKind::Fn,
             ) => {
                 return Err(InternalError {
                     message: "numeric literal typed as a non-numeric type",
@@ -472,6 +499,113 @@ impl Lowerer<'_> {
             }
         };
         Ok(self.builder.alloc(lowered, span))
+    }
+
+    /// Lowers `id`, of kind `kind`, which is a variable use, a function
+    /// expression or a call. Apart from `lower_expr`, which is on the
+    /// recursion path of every expression, so that its frame does not hold
+    /// the temporaries of these cases.
+    fn lower_use_or_function(
+        &mut self,
+        id: ExprId,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let expr = *self.ast.get(id);
+        match (expr.kind, kind) {
+            (ExprKind::Name(_), _) => {
+                read(self.resolution.expr_var(id), kind).ok_or(InternalError {
+                    message: "a variable use has no slot",
+                    span: expr.span,
+                })
+            }
+            (ExprKind::Fn(function), ValueKind::Fn) => self.lower_fn(id, function),
+            (ExprKind::Call { callee, args }, _) => Ok(IrKind::Call {
+                callee: self.lower_operand(callee, ValueKind::Fn)?,
+                args: self.lower_args(args, expr.span)?,
+                kind,
+            }),
+            (ExprKind::Fn(_), _) => Err(InternalError {
+                message: "a function expression typed as a non-function type",
+                span: expr.span,
+            }),
+            _ => Err(InternalError {
+                message: "an expression lowered as a variable, function or call is none",
+                span: expr.span,
+            }),
+        }
+    }
+
+    /// Lowers the function expression `id`, whose details are `function`:
+    /// its body into the function table, and the expression to the
+    /// `MakeClosure` that captures, in the current frame, what the checker
+    /// found the function captures.
+    fn lower_fn(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
+        let (ast, resolution) = (self.ast, self.resolution);
+        let span = ast.get(id).span;
+        let resolution = resolution.function(function);
+        let body = self.lower_expr(ast.fn_decl(function).body)?;
+        let display = self
+            .table
+            .display(self.expr_types.get(id), self.ast.names())
+            .to_string()
+            .into_boxed_str();
+        let code = FnCode {
+            body,
+            frame_size: resolution.frame_size,
+            param_count: resolution.param_count,
+            capture_count: u32::try_from(resolution.captures.len()).unwrap_or(u32::MAX),
+            name: resolution.callee,
+            display,
+            slot_names: resolution.slot_names.clone().into_boxed_slice(),
+        };
+        let Some(entry) = self.functions.get_mut(function.index()) else {
+            return Err(InternalError {
+                message: "a function expression has no entry in the function table",
+                span,
+            });
+        };
+        *entry = Some(code);
+        let base = self.item_stack.len();
+        for &(var, ty) in &resolution.captures {
+            let kind = self.table.value_kind(ty).ok_or(InternalError {
+                message: "a captured value has a type with no values",
+                span,
+            })?;
+            let read = read(var, kind).ok_or(InternalError {
+                message: "a captured value is not a variable",
+                span,
+            })?;
+            let load = self.builder.alloc(read, span);
+            self.item_stack.push(load);
+        }
+        let captures = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(IrKind::MakeClosure { function, captures })
+    }
+
+    /// Lowers the arguments `args` of the call spanning `span` to `Arg`
+    /// nodes in source order, each with the parameter the checker bound it
+    /// to, and returns their list.
+    fn lower_args(&mut self, args: ArgRange, span: Span) -> Result<IrRange, InternalError> {
+        let (ast, resolution) = (self.ast, self.resolution);
+        let params = resolution.arg_params(args);
+        let base = self.item_stack.len();
+        for (arg, &param) in ast.args(args).iter().zip(params) {
+            if param == u32::MAX {
+                return Err(InternalError {
+                    message: "an argument of a call is bound to no parameter",
+                    span,
+                });
+            }
+            let value = self.lower_expr(arg.value)?;
+            let node = self
+                .builder
+                .alloc(IrKind::Arg { param, value }, arg.span(ast));
+            self.item_stack.push(node);
+        }
+        let list = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(list)
     }
 
     /// Lowers the prefix operator `op`, of kind `kind` and spanning `span`,
@@ -613,7 +747,7 @@ impl Lowerer<'_> {
             }
             (ValueKind::Record, BinaryOp::Same, _) => IrKind::RecordSame(operands),
             (ValueKind::Record, BinaryOp::NotSame, _) => IrKind::RecordNotSame(operands),
-            (ValueKind::Bool | ValueKind::Record, ..) => {
+            (ValueKind::Bool | ValueKind::Record | ValueKind::Fn, ..) => {
                 return Err(InternalError {
                     message: "comparison of a type it cannot compare",
                     span,
@@ -713,6 +847,17 @@ impl Lowerer<'_> {
     }
 }
 
+/// The node reading a value of kind `kind` from `var`, or `None` if it is
+/// not a variable.
+const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
+    match var {
+        VarRef::Local(slot) if slot.get() != Slot::NONE.get() => Some(IrKind::Load(slot, kind)),
+        VarRef::Capture(index) => Some(IrKind::LoadCapture(index, kind)),
+        VarRef::Callee => Some(IrKind::LoadCallee),
+        VarRef::Local(_) | VarRef::None => None,
+    }
+}
+
 /// The relation a comparison operator tests on values other than records,
 /// where `===` and `!==` are `==` and `!=`, or `None` for any other
 /// operator.
@@ -756,14 +901,14 @@ mod tests {
         let ast = parse_text(text);
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        lower(&ast, &checked, &types).unwrap()
+        lower(&ast, &checked, &types, 0).unwrap()
     }
 
     fn dump(text: &str) -> String {
         let ast = parse_text(text);
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        let ir = lower(&ast, &checked, &types).unwrap();
+        let ir = lower(&ast, &checked, &types, 0).unwrap();
         ir.pretty(ast.names()).to_string()
     }
 
@@ -829,7 +974,7 @@ mod tests {
     #[test]
     fn concrete_int_division_operands_are_converted() {
         let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::INT, TyId::FLOAT]);
-        let ir = lower(&ast, &checked, &TypeTable::new()).unwrap();
+        let ir = lower(&ast, &checked, &TypeTable::new(), 0).unwrap();
         assert_eq!(
             ir.pretty(ast.names()).to_string(),
             "(block @0..5\n  (float-div @0..5\n    (int-to-float @0..1\n      (int 7 @0..1))\n    (int-to-float @4..5\n      (int 2 @4..5))))"
@@ -930,7 +1075,7 @@ mod tests {
     #[test]
     fn untyped_entry_is_an_internal_error() {
         let (ast, checked) = concrete_int_division(vec![TyId::UNTYPED_INT, TyId::INT, TyId::FLOAT]);
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "an untyped integer survived type checking");
         assert_eq!(error.span, Span::new(0, 1));
     }
@@ -938,7 +1083,7 @@ mod tests {
     #[test]
     fn error_entry_is_an_internal_error() {
         let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::ERROR, TyId::FLOAT]);
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "a type error survived type checking");
         assert_eq!(error.span, Span::new(4, 5));
     }
@@ -948,7 +1093,7 @@ mod tests {
         let ast = parse_text("{ x = 1 }");
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(
             error.message,
             "a type with no values survived type checking"
@@ -958,7 +1103,7 @@ mod tests {
     #[test]
     fn impossible_result_type_is_an_internal_error() {
         let (ast, checked) = concrete_int_division(vec![TyId::INT, TyId::INT, TyId::INT]);
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "operator has a result type it cannot have");
         assert_eq!(error.span, Span::new(0, 5));
     }
@@ -970,7 +1115,7 @@ mod tests {
             types: Types::new(vec![TyId::INT, TyId::FLOAT, TyId::INT]),
             resolution: Resolution::without_variables(3, 1),
         };
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "operand type does not match its operator");
         assert_eq!(error.span, Span::new(4, 5));
     }
@@ -984,7 +1129,7 @@ mod tests {
             types: checked.types.clone(),
             resolution: Resolution::without_variables(2, 2),
         };
-        let error = lower(&ast, &unresolved, &types).unwrap_err();
+        let error = lower(&ast, &unresolved, &types, 0).unwrap_err();
         assert_eq!(error.message, "a declaration has no slot");
         assert_eq!(error.span, Span::new(0, 9));
     }
@@ -1099,13 +1244,13 @@ mod tests {
             types: Types::new(vec![TyId::INT]),
             resolution: Resolution::without_variables(3, 1),
         };
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "type table does not belong to this AST");
         let checked = Checked {
             types: Types::new(vec![TyId::INT, TyId::INT, TyId::FLOAT]),
             resolution: Resolution::without_variables(3, 2),
         };
-        let error = lower(&ast, &checked, &TypeTable::new()).unwrap_err();
+        let error = lower(&ast, &checked, &TypeTable::new(), 0).unwrap_err();
         assert_eq!(error.message, "resolution does not belong to this AST");
     }
 
@@ -1257,7 +1402,7 @@ mod tests {
         let ast = parse_text("a.x = 1\na.\"y z\".w = 2");
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        let ir = lower(&ast, &checked, &types).unwrap();
+        let ir = lower(&ast, &checked, &types, 0).unwrap();
         let text = |text: &str| ir.name_text(ast.names().lookup(text).unwrap());
         assert_eq!(text("x"), Some("x"));
         assert_eq!(text("y z"), Some("y z"));
@@ -1417,5 +1562,197 @@ mod tests {
             "(block @0..14\n  (bool-eq != @0..14\n    (bool true @0..4)\n    (bool false @9..14)))"
         );
         assert_eq!(lower_text("{ x = 1 } === { x = 2 }").shape_count(), 0);
+    }
+
+    #[test]
+    fn a_closure_captures_in_the_creating_frame() {
+        assert_eq!(
+            dump("let x = 1\nlet f = fn(y: Int): Int { x + y }"),
+            "(block @0..43\n\
+             \x20 (store x#0 @0..9\n\
+             \x20   (int 1 @8..9))\n\
+             \x20 (store f#1 @10..43\n\
+             \x20   (make-closure #0 @18..43\n\
+             \x20     (load x#0 @18..43)))\n\
+             \x20 (empty @0..43))\n\
+             fn #0 f (frame 1, params 1, captures 1)\n\
+             \x20 (block @34..43\n\
+             \x20   (int-add @36..41\n\
+             \x20     (load-capture 0 @36..37)\n\
+             \x20     (load y#0 @40..41)))"
+        );
+    }
+
+    #[test]
+    fn a_call_passes_its_arguments_in_source_order() {
+        let text = "fn f(a: Int, b: String): Int { a }\nf(b = \"s\", a = 1)";
+        assert_eq!(
+            dump(text),
+            "(block @0..52\n\
+             \x20 (store f#0 @0..34\n\
+             \x20   (make-closure #0 @0..34))\n\
+             \x20 (call @35..52\n\
+             \x20   (load f#0 @35..36)\n\
+             \x20   (arg 1 @37..44\n\
+             \x20     (str \"s\" @41..44))\n\
+             \x20   (arg 0 @46..51\n\
+             \x20     (int 1 @50..51))))\n\
+             fn #0 f (frame 2, params 2, captures 0)\n\
+             \x20 (block @29..34\n\
+             \x20   (load a#0 @31..32))"
+        );
+        // The root's result, after the function's declaration.
+        let call = |ir: &Ir| match ir.get(ir.root()).kind {
+            IrKind::Block { result, .. } => result,
+            other => panic!("the root is not a block: {other:?}"),
+        };
+        let ir = lower_text(text);
+        assert_eq!(ir.kind_of(call(&ir)), ValueKind::Int);
+        let IrKind::Call { args, kind, .. } = ir.get(call(&ir)).kind else {
+            panic!("expected a call");
+        };
+        assert_eq!(kind, ValueKind::Int);
+        let arg = ir.items(args)[0];
+        assert_eq!(ir.kind_of(arg), ValueKind::String);
+        // A trailing block is the last argument.
+        let ir = lower_text("fn f(a: Int, r: {x: Int}): Int { a }\nf(1) { x = 2 }");
+        let IrKind::Call { args, .. } = ir.get(call(&ir)).kind else {
+            panic!("expected a call");
+        };
+        let params: Vec<u32> = ir
+            .items(args)
+            .iter()
+            .map(|&arg| match ir.get(arg).kind {
+                IrKind::Arg { param, .. } => param,
+                other => panic!("expected an argument, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(params, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_recursive_function_loads_its_callee() {
+        assert_eq!(
+            dump("fn fact(n: Int): Int { if n <= 1 { 1 } else { n * fact(n - 1) } }"),
+            "(block @0..65\n\
+             \x20 (store fact#0 @0..65\n\
+             \x20   (make-closure #0 @0..65))\n\
+             \x20 (empty @0..65))\n\
+             fn #0 fact (frame 1, params 1, captures 0)\n\
+             \x20 (block @21..65\n\
+             \x20   (if @23..63\n\
+             \x20     (int-cmp <= @26..32\n\
+             \x20       (load n#0 @26..27)\n\
+             \x20       (int 1 @31..32))\n\
+             \x20     (block @33..38\n\
+             \x20       (int 1 @35..36))\n\
+             \x20     (block @44..63\n\
+             \x20       (int-mul @46..61\n\
+             \x20         (load n#0 @46..47)\n\
+             \x20         (call @50..61\n\
+             \x20           (load-callee @50..54)\n\
+             \x20           (arg 0 @55..60\n\
+             \x20             (int-sub @55..60\n\
+             \x20               (load n#0 @55..56)\n\
+             \x20               (int 1 @59..60))))))))"
+        );
+    }
+
+    #[test]
+    fn nested_functions_chain_their_captures() {
+        let text = "fn outer(a: Int): fn(): fn(): Int { fn(): fn(): Int { fn(): Int { a } } }";
+        assert_eq!(
+            dump(text),
+            "(block @0..73\n\
+             \x20 (store outer#0 @0..73\n\
+             \x20   (make-closure #2 @0..73))\n\
+             \x20 (empty @0..73))\n\
+             fn #0 (frame 0, params 0, captures 1)\n\
+             \x20 (block @64..69\n\
+             \x20   (load-capture 0 @66..67))\n\
+             fn #1 (frame 0, params 0, captures 1)\n\
+             \x20 (block @52..71\n\
+             \x20   (make-closure #0 @54..69\n\
+             \x20     (load-capture 0 @54..69)))\n\
+             fn #2 outer (frame 1, params 1, captures 0)\n\
+             \x20 (block @34..73\n\
+             \x20   (make-closure #1 @36..71\n\
+             \x20     (load a#0 @36..71)))"
+        );
+        // A captured callee is loaded as the callee in the creating frame.
+        let ir = lower_text("fn f(): fn(): Int { fn(): Int { f()() } }");
+        let outer = ir.function(FnId::new(1));
+        let IrKind::Block { result, .. } = ir.get(outer.body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::MakeClosure { function, captures } = ir.get(result).kind else {
+            panic!("expected a closure");
+        };
+        assert_eq!(function, FnId::new(0));
+        let captures: Vec<IrKind> = ir
+            .items(captures)
+            .iter()
+            .map(|&id| ir.get(id).kind)
+            .collect();
+        assert_eq!(captures, vec![IrKind::LoadCallee]);
+    }
+
+    #[test]
+    fn the_function_table_describes_each_function() {
+        let ast = parse_text(
+            "let k = 2\n\
+             fn scale(x: Int, by: {f: Float}) -> Float { let y = x * k\ny / by.f }\n\
+             let anon = fn(): {} {}",
+        );
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let ir = lower(&ast, &checked, &types, 7).unwrap();
+        assert_eq!(ir.input(), 7);
+        assert_eq!(ir.function_count(), 2);
+        let scale = ir.function(FnId::new(0));
+        assert_eq!(&*scale.display, "fn(x: Int, by: {f: Float}) -> Float");
+        assert_eq!(scale.frame_size, 3);
+        assert_eq!(scale.param_count, 2);
+        assert_eq!(scale.capture_count, 1);
+        assert_eq!(scale.name, ast.names().lookup("scale"));
+        let slot_names: Vec<&str> = scale
+            .slot_names
+            .iter()
+            .map(|&name| ast.names().get(name))
+            .collect();
+        assert_eq!(slot_names, vec!["x", "by", "y"]);
+        assert_eq!(ir.kind_of(scale.body), ValueKind::Float);
+        let anon = ir.find_function(FnId::new(1)).unwrap();
+        assert_eq!(&*anon.display, "fn(): {}");
+        assert_eq!(anon.name, ast.names().lookup("anon"));
+        assert_eq!(
+            (anon.frame_size, anon.param_count, anon.capture_count),
+            (0, 0, 0)
+        );
+        assert!(ir.find_function(FnId::new(2)).is_none());
+        assert_eq!(lower_text("1").input(), 0);
+        // A closure is a function.
+        let ir = lower_text("fn f(): fn(): Int { fn(): Int { 1 } }");
+        assert_eq!(ir.kind_of(ir.function(FnId::new(1)).body), ValueKind::Fn);
+    }
+
+    #[test]
+    fn an_argument_bound_to_no_parameter_is_an_internal_error() {
+        let ast = parse_text("fn f(a: Int): Int { a }\nf(1)");
+        let mut types = TypeTable::new();
+        let (mut checked, _) = check(&ast, &mut types).unwrap();
+        checked.resolution.unbind_arguments();
+        let error = lower(&ast, &checked, &types, 0).unwrap_err();
+        assert_eq!(
+            error.message,
+            "an argument of a call is bound to no parameter"
+        );
+        // A resolution without the tree's functions does not belong to it.
+        let unresolved = Checked {
+            types: checked.types.clone(),
+            resolution: Resolution::without_variables(ast.len(), ast.item_count()),
+        };
+        let error = lower(&ast, &unresolved, &types, 0).unwrap_err();
+        assert_eq!(error.message, "resolution does not belong to this AST");
     }
 }

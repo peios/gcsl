@@ -6,9 +6,14 @@
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
 //! `let PATH (: TYPE)? = EXPR`, `PATH := EXPR`, a field `PATH = EXPR`,
-//! `= EXPR` or an expression. After an item the next token must be a
-//! separator or the end of the body; anything else is "expected end of
-//! item".
+//! `= EXPR`, a named function `fn NAME(...) ...`, or an expression. After
+//! an item the next token must be a separator or the end of the body;
+//! anything else is "expected end of item".
+//!
+//! A named function is recognised by `fn` followed by an identifier at the
+//! start of an item, and is parsed as `let NAME = <the function expression
+//! from its '(' on>`, both spanning `fn` through the body's `}`. `fn`
+//! followed by anything else starts an ordinary expression item.
 //!
 //! # Paths
 //!
@@ -31,10 +36,13 @@
 //! value (see [`MAX_DEPTH`]).
 //!
 //! A newline ends an item except where the item cannot be complete: after
-//! a binary operator, after `:` (in an annotation or an ascription), and
-//! after `=`, `:=` and `let`. There the parser skips newlines before going
-//! on. Inside parentheses and interpolations the lexer emits no newlines at
-//! all, so an expression there may span lines freely.
+//! a binary operator, after `:` (in an annotation or an ascription, or as a
+//! function's return marker) and `->`, and after `=`, `:=` and `let`. There
+//! the parser skips newlines before going on. Directly inside parentheses
+//! and interpolations the lexer emits no newlines at all, so an expression,
+//! a parameter list or an argument list there may span lines freely; a
+//! block inside them is newline-sensitive again, so a multi-line block or
+//! function body may be passed as an argument.
 //!
 //! # Names
 //!
@@ -42,16 +50,48 @@
 //! type, may be an identifier or a plain string literal: one without the
 //! `r` prefix or interpolations, whose text the parser interns into the
 //! [`Names`] like an identifier, so `"x"` and `x` are the same name. A raw
-//! or interpolated literal there is an error. A variable's name must be an
-//! identifier.
+//! or interpolated literal there is an error. A variable's name, and so a
+//! parameter's, must be an identifier.
 //!
 //! # Types
 //!
-//! A type is a name, such as `Int`, or a record type: `{` then `}`, or
-//! `NAME: TYPE` entries separated by `,`, with an optional trailing `,`,
-//! then `}`. The lexer does not know it is in a type, so it emits the
-//! newlines inside the braces, and the parser skips them all: a record type
-//! may span lines freely. Repeated field names are left to the checker.
+//! A type is a name, such as `Int`, a record type or a function type. A
+//! record type is `{` then `}`, or `NAME: TYPE` entries separated by `,`,
+//! with an optional trailing `,`, then `}`. The lexer does not know it is
+//! in a type, so it emits the newlines inside the braces, and the parser
+//! skips them all: a record type may span lines freely. Repeated field names
+//! are left to the checker. A function type is `fn`, `(`, parameter types
+//! separated by `,` with an optional trailing `,`, `)`, the marker `:` or
+//! `->`, and the return type; a parameter type is `NAME: TYPE`, recognised
+//! by an identifier followed by `:`, or just `TYPE`.
+//!
+//! # Functions and calls
+//!
+//! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
+//! `,` with an optional trailing `,`, `)`, the return marker (`:` for a pure
+//! function, `->` for an impure one), the return type, and the body, a
+//! block whose `{` must follow the return type directly, as an `if`'s block
+//! follows its condition. Every parameter is annotated.
+//!
+//! A call is a postfix operator: after an operand, `(` starts an argument
+//! list, whose arguments are separated by `,` with an optional trailing
+//! `,`, each an expression or `NAME = EXPR` (recognised by an identifier
+//! followed by `=`). After the `)`, or instead of the list, a `{` on the
+//! same line starts a trailing block: an ordinary block, passed as the
+//! call's last argument. The parser accepts arguments in any order; binding
+//! them to parameters is the checker's business.
+//!
+//! A trailing block would make `if x { ... }` a call of `x`, so while the
+//! parser is in the condition of an `if` (or `else if`) a `{` after an
+//! expression never starts one: the parser keeps a flag,
+//! `Parser::no_trailing_block`, that `Parser::parse_if` sets around its
+//! condition. The flag applies to the whole condition at every operator, so
+//! `if a and b { }` is an `if` with condition `a and b`. It is lifted, and
+//! restored afterwards, inside parentheses, argument lists, blocks and
+//! interpolations, so `if (f { }) { }` calls `f`. A newline before a `{`
+//! ends the item as always, so it never starts a trailing block either.
+//!
+//! # Newlines after an `if`
 //!
 //! The one place a newline does not end an item even though the expression
 //! before it could be complete is after the block of an `if`: an `else` may
@@ -65,8 +105,9 @@
 //! function, [`Parser::parse_expr`], parses any expression whose operators
 //! bind at least as tightly as a given *minimum binding power*. It first
 //! parses a *prefix* expression (a literal, a name, a string, a
-//! parenthesised expression, a block, an `if`, or a prefix operator applied
-//! to an operand), which becomes the left-hand side. Then it loops: if the
+//! parenthesised expression, a block, an `if`, a function expression, or a
+//! prefix operator applied to an operand), which becomes the left-hand
+//! side. Then it loops: if the
 //! next token is a binary operator whose left binding power is at least the
 //! minimum, it consumes the operator, parses the right-hand side by calling
 //! itself with the operator's right binding power as the new minimum, and
@@ -87,6 +128,7 @@
 //! | postfix `:` TYPE            | 11      | (none: parses a type)      |
 //! | prefix `-`                  | (none)  | operand parsed with min 13 |
 //! | postfix `.` NAME            | 15      | (none: takes a name)       |
+//! | postfix call `(`...`)` `{`  | 15      | (none: arguments at min 0) |
 //!
 //! A tighter operator has higher powers, so in `1 + 2 * 3` the recursive
 //! call for the right-hand side of `+` (minimum 8) still accepts `*` (left
@@ -118,6 +160,10 @@
 //! `(a.b) : Int`, and `a.b.c` is `(a.b).c`. The parser does not skip
 //! newlines around `.`, so a `.` starting a line is not a continuation.
 //!
+//! A call binds exactly as tightly as field access, in the same loop, so
+//! `a.b(1).c` is `((a.b)(1)).c`, `-f(1)` is `-(f(1))` and `f(1)(2)` calls
+//! the result of `f(1)`. Each argument is parsed at minimum 0.
+//!
 //! Negation is its own token, [`TokenKind::Neg`], distinct from subtraction's
 //! [`TokenKind::Minus`]; the lexer tells them apart by spacing. `Neg` is only
 //! accepted in prefix position and `Minus` only as a binary operator.
@@ -145,18 +191,23 @@
 //! diagnostics.
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
-//! two ways. Parentheses, prefix operators, blocks, `if`s, interpolations
-//! and record types nest by recursion, so [`Parser::parse_expr`], the body
-//! of every nested block, every `else if` and every record type count their
-//! own depth and stop before the recursion itself could overflow.
+//! two ways. Parentheses, prefix operators, blocks, `if`s, interpolations,
+//! function expressions, argument lists, and record and function types nest
+//! by recursion, so [`Parser::parse_expr`], the body of every nested block,
+//! every `else if` and every record and function type count their own depth
+//! and stop before the recursion itself could overflow; a function
+//! expression and an argument list recurse only through those.
 //! Left-associative chains such as `1 + 1 + 1` or `a.b.c` nest without
 //! recursion, since the loop folds each operator into the left-hand side, so
 //! the parser also tracks the height of every node it allocates, a block
 //! being one above the tallest of its items' expressions and types, an `if`
 //! or an interpolation one above its tallest child, a field access one above
-//! its record, and an ascription one above the taller of its expression and
-//! its type (a record type being one above its tallest field type), and
-//! rejects a node that would exceed the limit. An item's height is its
+//! its record, an ascription one above the taller of its expression and its
+//! type (a record type being one above its tallest field type, and a
+//! function type one above the tallest of its parameter and return types),
+//! a function expression one above the tallest of its parameter types, its
+//! return type and its body, and a call one above the tallest of its callee
+//! and arguments, and rejects a node that would exceed the limit. An item's height is its
 //! value's, plus two levels for each segment of its path after the first,
 //! or its annotation's if that is taller; an item taller than the limit is
 //! rejected too, at the item. Together these guarantee that no tree handed
@@ -164,8 +215,9 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, FieldTy, Item, ItemId, ItemKind, ItemRange,
-    PathRange, PathSegment, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, FieldTy, FnDecl, Item, ItemId,
+    ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart, TypeExpr, TypeExprId,
+    TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -198,6 +250,13 @@ const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
 
 /// The error for a string literal where a variable's name is expected.
 const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
+
+/// The error for a function, or a function type, without a return marker.
+const MISSING_RETURN_TYPE: &str = "expected `:` or `->` and a return type after the parameters";
+
+/// The note on [`MISSING_RETURN_TYPE`].
+const RETURN_TYPE_NOTE: &str =
+    "a function declares its return type: `: T` for a pure function, `-> T` for an impure one";
 
 /// Parses `tokens`, lexed from `source` with its names interned into
 /// `names` and its string literals' text stored in `strings`, as a file: a
@@ -240,15 +299,22 @@ pub(crate) fn parse_parts(
         // There are never more nodes than tokens, so these never
         // reallocate: every node consumes a token of its own except the
         // empty else block of an `if` without `else`, and that `if`'s own
-        // block consumes two tokens, `{` and `}`, for one node. (A field
-        // access consumes two, `.` and the name.)
+        // block consumes two tokens, `{` and `}`, for one node; and a call
+        // with only a trailing block, whose block likewise consumes two.
+        // (A field access consumes two, `.` and the name, a call with an
+        // argument list its `(` and `)`, and a function expression at least
+        // `fn`, `(`, `)`, a marker and a type besides its body.)
         builder: AstBuilder::with_capacity(tokens.len()),
         heights: Vec::with_capacity(tokens.len()),
         depth: 0,
         item_stack: Vec::new(),
         part_stack: Vec::new(),
         field_ty_stack: Vec::new(),
+        param_stack: Vec::new(),
+        param_ty_stack: Vec::new(),
+        arg_stack: Vec::new(),
         path: Vec::new(),
+        no_trailing_block: false,
         diagnostics: Vec::new(),
     };
     match parser.parse_body(None) {
@@ -298,10 +364,26 @@ struct Parser<'a> {
     /// to the builder's field-type pool as each type ends, as for
     /// `item_stack`.
     field_ty_stack: Vec<FieldTy>,
+    /// The parameters of the function expressions being parsed, moved to
+    /// the builder's parameter pool as each parameter list ends, as for
+    /// `item_stack`.
+    param_stack: Vec<Param>,
+    /// The parameters of the function types being parsed, innermost last,
+    /// moved to the builder's parameter-type pool as each type ends, as for
+    /// `item_stack`.
+    param_ty_stack: Vec<ParamTy>,
+    /// The arguments of the calls being parsed, innermost last, moved to
+    /// the builder's argument pool as each call ends, as for `item_stack`.
+    arg_stack: Vec<Arg>,
     /// The segments of the path being read, moved to the builder's path
     /// pool once it is complete. Reading a path never starts another, so
     /// one buffer serves them all.
     path: Vec<PathSegment>,
+    /// Whether a `{` after an expression is kept from starting a trailing
+    /// block: set while parsing the condition of an `if`, so that its block
+    /// is not taken for one, and lifted inside parentheses, argument lists,
+    /// blocks and interpolations.
+    no_trailing_block: bool,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -347,6 +429,12 @@ impl Parser<'_> {
     /// annotation's if that is taller.
     fn parse_item(&mut self) -> ParseResult<(ItemId, u32)> {
         let token = self.peek();
+        let name_token = self.peek_at(1);
+        if token.kind == TokenKind::Fn
+            && let TokenKind::Ident(name) = name_token.kind
+        {
+            return self.parse_named_fn(token, (name, name_token.span));
+        }
         let mut ty_height = 0;
         // The number of segments of the item's path, if it has one.
         let mut segments = 1;
@@ -408,6 +496,32 @@ impl Parser<'_> {
             }
         };
         self.finish_item(token, (kind, value), ty_height, segments)
+    }
+
+    /// Parses a named function item, `fn NAME(...) ...`, starting at its
+    /// `fn` keyword, `keyword`, followed by `name` and its span: a `let` of
+    /// the name whose value is the function expression from `(` on, both
+    /// spanning `fn` through the body's `}`.
+    fn parse_named_fn(
+        &mut self,
+        keyword: Token,
+        (name, name_span): (Name, Span),
+    ) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        self.advance();
+        let value = self.parse_fn(keyword)?;
+        self.path.clear();
+        self.path.push(PathSegment {
+            name,
+            span: name_span,
+        });
+        let (path, segments) = self.finish_path();
+        let kind = ItemKind::Let {
+            path,
+            ty: None,
+            value,
+        };
+        self.finish_item(keyword, (kind, value), 0, segments)
     }
 
     /// Allocates the item of `kind`, starting at `token` and ending with its
@@ -597,9 +711,10 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses a type expression: a name or a record type. Returns it and
-    /// its height: 1 for a name, and one more than its tallest field's type
-    /// for a record type.
+    /// Parses a type expression: a name, a record type or a function type.
+    /// Returns it and its height: 1 for a name, one more than its tallest
+    /// field's type for a record type, and one more than the tallest of its
+    /// parameter and return types for a function type.
     fn parse_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let token = self.peek();
         match token.kind {
@@ -611,15 +726,125 @@ impl Parser<'_> {
                 });
                 Ok((id, LEAF_HEIGHT))
             }
-            // Record types nest by recursion, so they count their depth.
+            // Record and function types nest by recursion, so they count
+            // their depth.
             TokenKind::LBrace => {
                 self.enter()?;
                 let record = self.parse_record_type();
                 self.depth -= 1;
                 record
             }
+            TokenKind::Fn => {
+                self.enter()?;
+                let function = self.parse_fn_type();
+                self.depth -= 1;
+                function
+            }
             _ => Err(self.error("expected a type", error_span(token))),
         }
+    }
+
+    /// Parses a function type, starting at its `fn`: `(`, parameter types
+    /// separated by `,` with an optional trailing `,`, each `NAME: TYPE` or
+    /// `TYPE`, `)`, the marker `:` or `->`, and the return type.
+    fn parse_fn_type(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let keyword = self.peek();
+        self.advance();
+        let open = self.expect_fn_paren()?;
+        let base = self.param_ty_stack.len();
+        let mut tallest = 0;
+        loop {
+            let token = self.peek();
+            if token.kind == TokenKind::RParen {
+                self.advance();
+                break;
+            }
+            let name = match (token.kind, self.peek_at(1).kind) {
+                (TokenKind::Ident(name), TokenKind::Colon) => {
+                    self.advance();
+                    self.advance();
+                    Some(name)
+                }
+                _ => None,
+            };
+            let (ty, height) = self.parse_type()?;
+            tallest = tallest.max(height);
+            self.param_ty_stack.push(ParamTy { name, ty });
+            if self.list_separator(open)? {
+                break;
+            }
+        }
+        let params = self.builder.push_param_tys(&self.param_ty_stack[base..]);
+        self.param_ty_stack.truncate(base);
+        let (pure, _) = self.return_marker()?;
+        let (ret, ret_height) = self.parse_type()?;
+        let id = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Fn { params, ret, pure },
+            span: Span::join(keyword.span, self.type_span(ret)),
+        });
+        Ok((id, tallest.max(ret_height) + 1))
+    }
+
+    /// Consumes the `(` after `fn`, returning it, or reports what is there
+    /// instead.
+    fn expect_fn_paren(&mut self) -> ParseResult<Token> {
+        let open = self.peek();
+        if open.kind != TokenKind::LParen {
+            let found = self.describe(open);
+            return Err(self.error(
+                format!("expected `(` after `fn`, found {found}"),
+                error_span(open),
+            ));
+        }
+        self.advance();
+        Ok(open)
+    }
+
+    /// After an entry of a parenthesised list opened by `open`, consumes a
+    /// `,` or the closing `)`, returning whether it was the `)`; anything
+    /// else is an error.
+    fn list_separator(&mut self, open: Token) -> ParseResult<bool> {
+        let separator = self.peek();
+        match separator.kind {
+            TokenKind::Comma => {
+                self.advance();
+                Ok(false)
+            }
+            TokenKind::RParen => {
+                self.advance();
+                Ok(true)
+            }
+            _ => {
+                let found = self.describe(separator);
+                Err(self.report(
+                    Diagnostic::error(
+                        format!("expected `,` or `)`, found {found}"),
+                        error_span(separator),
+                    )
+                    .with_context(open.span, "unclosed `(`"),
+                ))
+            }
+        }
+    }
+
+    /// Consumes the return marker of a function or function type, `:` for a
+    /// pure one and `->` for an impure one, and the newlines after it.
+    /// Returns whether it is pure, and the marker's span.
+    fn return_marker(&mut self) -> ParseResult<(bool, Span)> {
+        let marker = self.peek();
+        let pure = match marker.kind {
+            TokenKind::Colon => true,
+            TokenKind::Arrow => false,
+            _ => {
+                return Err(self.report(
+                    Diagnostic::error(MISSING_RETURN_TYPE, error_span(marker))
+                        .with_note(RETURN_TYPE_NOTE),
+                ));
+            }
+        };
+        self.advance();
+        self.skip_newlines();
+        Ok((pure, marker.span))
     }
 
     /// Parses a record type, starting at its `{`. Newlines anywhere inside
@@ -699,6 +924,18 @@ impl Parser<'_> {
         let mut lhs = self.parse_prefix()?;
         loop {
             let token = self.peek();
+            let starts_call = match token.kind {
+                TokenKind::LParen => true,
+                TokenKind::LBrace => !self.no_trailing_block,
+                _ => false,
+            };
+            if starts_call {
+                if FIELD_BP < min_bp {
+                    break;
+                }
+                lhs = self.parse_call(lhs)?;
+                continue;
+            }
             if token.kind == TokenKind::Dot {
                 if FIELD_BP < min_bp {
                     break;
@@ -767,8 +1004,9 @@ impl Parser<'_> {
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
-    /// block, an `if` or a prefix operator application. Postfix operators,
-    /// `.` included, are applied by the caller's loop.
+    /// block, an `if`, a function expression or a prefix operator
+    /// application. Postfix operators, `.` and calls included, are applied
+    /// by the caller's loop.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
         let token = self.peek();
         let kind = match token.kind {
@@ -780,11 +1018,15 @@ impl Parser<'_> {
             TokenKind::Ident(name) => ExprKind::Name(name),
             TokenKind::StrStart(first) => return self.parse_interpolation(first),
             TokenKind::If => return self.parse_if(),
+            TokenKind::Fn => return self.parse_fn_expr(),
             TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
             TokenKind::Not => return self.parse_unary(UnaryOp::Not, NOT_BP),
             TokenKind::LParen => {
                 self.advance();
-                let inner = self.parse_expr(0)?;
+                let outer = std::mem::replace(&mut self.no_trailing_block, false);
+                let inner = self.parse_expr(0);
+                self.no_trailing_block = outer;
+                let inner = inner?;
                 let close = self.peek();
                 if close.kind != TokenKind::RParen {
                     let found = self.describe(close);
@@ -825,6 +1067,7 @@ impl Parser<'_> {
             | TokenKind::Let
             | TokenKind::Colon
             | TokenKind::ColonEq
+            | TokenKind::Arrow
             | TokenKind::Eq
             | TokenKind::RParen
             | TokenKind::RBrace
@@ -846,6 +1089,169 @@ impl Parser<'_> {
         self.alloc(kind, token.span, LEAF_HEIGHT)
     }
 
+    /// Parses a function expression in expression position, starting at
+    /// its `fn`. A name after the `fn` is an error here: a named function
+    /// is an item.
+    fn parse_fn_expr(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let next = self.peek();
+        if let TokenKind::Ident(_) = next.kind {
+            let found = self.source.slice(next.span);
+            return Err(self.report(
+                Diagnostic::error(
+                    format!("expected `(` after `fn`, found identifier `{found}`"),
+                    next.span,
+                )
+                .with_note(
+                    "a named function `fn NAME(...)` is an item; write it on a line of its own, \
+                     or drop the name",
+                ),
+            ));
+        }
+        self.parse_fn(keyword)
+    }
+
+    /// Parses the rest of a function expression whose `fn` keyword,
+    /// `keyword`, has been consumed, from its `(`: the parameters, the
+    /// return marker and type, and the body, which must start directly
+    /// after the return type. The expression spans `keyword` through the
+    /// body.
+    fn parse_fn(&mut self, keyword: Token) -> ParseResult<ExprId> {
+        let open = self.expect_fn_paren()?;
+        let base = self.param_stack.len();
+        let mut tallest = 0;
+        loop {
+            let token = self.peek();
+            let name = match token.kind {
+                TokenKind::RParen => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Ident(name) => name,
+                TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
+                TokenKind::StrStart(first) => {
+                    let literal = self.parse_interpolation(first)?;
+                    let span = self.span_of(literal);
+                    return Err(self.error(PLAIN_VARIABLE_NAME, span));
+                }
+                _ => {
+                    let found = self.describe(token);
+                    return Err(self.error(
+                        format!("expected a parameter name, found {found}"),
+                        error_span(token),
+                    ));
+                }
+            };
+            self.advance();
+            let colon = self.peek();
+            if colon.kind != TokenKind::Colon {
+                let message = format!(
+                    "expected `:` and a type after parameter `{}`",
+                    self.names.get(name)
+                );
+                return Err(self.report(
+                    Diagnostic::error(message, error_span(colon))
+                        .with_note("parameters must be annotated"),
+                ));
+            }
+            self.advance();
+            let (ty, height) = self.parse_type()?;
+            tallest = tallest.max(height);
+            self.param_stack.push(Param {
+                name,
+                span: Span::join(token.span, self.type_span(ty)),
+                ty,
+            });
+            if self.list_separator(open)? {
+                break;
+            }
+        }
+        let params = self.builder.push_params(&self.param_stack[base..]);
+        self.param_stack.truncate(base);
+        let (pure, marker) = self.return_marker()?;
+        let (ret, ret_height) = self.parse_type()?;
+        let brace = self.peek();
+        if brace.kind != TokenKind::LBrace {
+            return Err(self.error("expected `{` to start the function body", error_span(brace)));
+        }
+        let body = self.parse_block()?;
+        let height = tallest.max(ret_height).max(self.height_of(body)) + 1;
+        let span = Span::join(keyword.span, self.span_of(body));
+        let id = self.builder.push_fn(FnDecl {
+            params,
+            ret,
+            pure,
+            marker,
+            body,
+        });
+        self.alloc(ExprKind::Fn(id), span, height)
+    }
+
+    /// Parses the call of `callee`, starting at its `(` or, for a call with
+    /// only a trailing block, its `{`: the arguments and any trailing
+    /// block. The trailing block must start on the line the argument list
+    /// ends on, which the lexer's newline tokens ensure.
+    fn parse_call(&mut self, callee: ExprId) -> ParseResult<ExprId> {
+        let base = self.arg_stack.len();
+        let mut tallest = self.height_of(callee);
+        let open = self.peek();
+        let mut end = open.span;
+        if open.kind == TokenKind::LParen {
+            self.advance();
+            // An argument list is inside parentheses.
+            let outer = std::mem::replace(&mut self.no_trailing_block, false);
+            let close = self.parse_arguments(open, &mut tallest);
+            self.no_trailing_block = outer;
+            end = close?;
+        }
+        if self.peek().kind == TokenKind::LBrace && !self.no_trailing_block {
+            let block = self.parse_block()?;
+            tallest = tallest.max(self.height_of(block));
+            end = self.span_of(block);
+            self.arg_stack.push(Arg {
+                kind: ArgKind::Trailing,
+                value: block,
+            });
+        }
+        let args = self.builder.push_args(&self.arg_stack[base..]);
+        self.arg_stack.truncate(base);
+        let span = Span::join(self.span_of(callee), end);
+        self.alloc(ExprKind::Call { callee, args }, span, tallest + 1)
+    }
+
+    /// Parses the arguments of a call after its `(`, `open`, through its
+    /// `)`, whose span it returns, pushing each on `arg_stack` and raising
+    /// `tallest` to the tallest's height. An identifier directly followed
+    /// by `=` names its argument.
+    fn parse_arguments(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Span> {
+        loop {
+            let token = self.peek();
+            if token.kind == TokenKind::RParen {
+                self.advance();
+                return Ok(token.span);
+            }
+            let kind = match (token.kind, self.peek_at(1).kind) {
+                (TokenKind::Ident(name), TokenKind::Eq) => {
+                    self.advance();
+                    self.advance();
+                    ArgKind::Named {
+                        name,
+                        span: token.span,
+                    }
+                }
+                _ => ArgKind::Positional,
+            };
+            let value = self.parse_expr(0)?;
+            *tallest = (*tallest).max(self.height_of(value));
+            self.arg_stack.push(Arg { kind, value });
+            let close = self.peek();
+            if self.list_separator(open)? {
+                return Ok(close.span);
+            }
+        }
+    }
+
     /// Parses a prefix operator `op`, the current token, and its operand,
     /// parsed with minimum binding power `operand_bp`.
     fn parse_unary(&mut self, op: UnaryOp, operand_bp: u8) -> ParseResult<ExprId> {
@@ -862,7 +1268,9 @@ impl Parser<'_> {
         let open = self.peek();
         self.advance();
         self.enter()?;
+        let outer = std::mem::replace(&mut self.no_trailing_block, false);
         let body = self.parse_body(Some(open.span));
+        self.no_trailing_block = outer;
         self.depth -= 1;
         let (items, tallest) = body?;
         // `parse_body` only returns successfully at the matching `}`.
@@ -879,7 +1287,12 @@ impl Parser<'_> {
     fn parse_if(&mut self) -> ParseResult<ExprId> {
         let keyword = self.peek();
         self.advance();
-        let cond = self.parse_expr(0)?;
+        // A `{` after the condition is the `if`'s block, not a trailing
+        // block of a call.
+        let outer = std::mem::replace(&mut self.no_trailing_block, true);
+        let cond = self.parse_expr(0);
+        self.no_trailing_block = outer;
+        let cond = cond?;
         let open = self.peek();
         if open.kind != TokenKind::LBrace {
             return Err(self.error("expected `{` after `if` condition", error_span(open)));
@@ -944,7 +1357,10 @@ impl Parser<'_> {
         // the token before it.
         let mut open = start.span;
         let end = loop {
-            let expr = self.parse_expr(0)?;
+            let outer = std::mem::replace(&mut self.no_trailing_block, false);
+            let expr = self.parse_expr(0);
+            self.no_trailing_block = outer;
+            let expr = expr?;
             tallest = tallest.max(self.height_of(expr));
             self.part_stack.push(StrPart::Expr(expr));
             let token = self.peek();
@@ -1111,9 +1527,11 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::True
         | TokenKind::False
         | TokenKind::Not
+        | TokenKind::Fn
         | TokenKind::Neg
         | TokenKind::Colon
         | TokenKind::ColonEq
+        | TokenKind::Arrow
         | TokenKind::Eq
         | TokenKind::LParen
         | TokenKind::RParen
@@ -1236,6 +1654,21 @@ mod tests {
                 }
                 out.push('}');
             }
+            TypeExprKind::Fn { params, ret, pure } => {
+                out.push_str("fn(");
+                for (index, param) in ast.param_tys(params).iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    if let Some(name) = param.name {
+                        out.push_str(ast.names().get(name));
+                        out.push_str(": ");
+                    }
+                    type_name(ast, param.ty, out);
+                }
+                out.push_str(if pure { "): " } else { ") -> " });
+                type_name(ast, ret, out);
+            }
         }
     }
 
@@ -1327,6 +1760,56 @@ mod tests {
                 out.push_str(&FieldName(ast.names().get(name)).to_string());
                 out.push(')');
             }
+            ExprKind::Fn(function) => fn_shape(ast, function, out),
+            ExprKind::Call { callee, args } => call_shape(ast, callee, args, out),
+        }
+    }
+
+    /// A function expression as `fn(x: Int): Int {..}`, `-> Int` if impure.
+    fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
+        let decl = ast.fn_decl(function);
+        out.push_str("fn(");
+        for (index, param) in ast.params(decl.params).iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(ast.names().get(param.name));
+            out.push_str(": ");
+            type_name(ast, param.ty, out);
+        }
+        out.push_str(if decl.pure { "): " } else { ") -> " });
+        type_name(ast, decl.ret, out);
+        out.push(' ');
+        expr(ast, decl.body, out);
+    }
+
+    /// A call as `callee(1, y = 2)`, followed by its trailing block if it
+    /// has one: `callee(1){..}`. A call with only a trailing block, however
+    /// written, is `callee(){..}`.
+    fn call_shape(ast: &Ast, callee: ExprId, args: crate::ast::ArgRange, out: &mut String) {
+        expr(ast, callee, out);
+        out.push('(');
+        let mut trailing = None;
+        for (index, arg) in ast.args(args).iter().enumerate() {
+            match arg.kind {
+                ArgKind::Trailing => {
+                    trailing = Some(arg.value);
+                    continue;
+                }
+                ArgKind::Positional | ArgKind::Named { .. } if index > 0 => {
+                    out.push_str(", ");
+                }
+                ArgKind::Positional | ArgKind::Named { .. } => {}
+            }
+            if let ArgKind::Named { name, .. } = arg.kind {
+                out.push_str(ast.names().get(name));
+                out.push_str(" = ");
+            }
+            expr(ast, arg.value, out);
+        }
+        out.push(')');
+        if let Some(block) = trailing {
+            expr(ast, block, out);
         }
     }
 
@@ -1862,11 +2345,12 @@ mod tests {
                 Span::new(3, 4)
             )
         );
+        // (`2 (3)` is a call of `2`, which the checker rejects.)
         assert_eq!(
-            error("2 (3)"),
+            error("f(3) x"),
             (
-                "expected end of item, found `(`".to_owned(),
-                Span::new(2, 3)
+                "expected end of item, found `x`".to_owned(),
+                Span::new(5, 6)
             )
         );
         assert_eq!(
@@ -2800,5 +3284,533 @@ mod tests {
             "expected expression, found end of input"
         );
         assert_eq!(diagnostic.span, Span::new(3, 3));
+    }
+
+    // ----- Functions and calls -----
+
+    /// The expression of the file's only item, which must be an expression
+    /// or a `let`.
+    fn only_value(ast: &Ast) -> ExprId {
+        match ast.item(ast.items(ast.root())[0]).kind {
+            ItemKind::Expr(value) | ItemKind::Let { value, .. } => value,
+            other => panic!("expected an expression or a let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_expressions() {
+        assert_eq!(shape("fn(): Int { 1 }"), "fn(): Int {1}");
+        assert_eq!(shape("fn(x: Int): Int { x }"), "fn(x: Int): Int {x}");
+        assert_eq!(
+            shape("fn(name: String, times: Int) -> String { name }"),
+            "fn(name: String, times: Int) -> String {name}"
+        );
+        // A trailing comma, and a parameter list over several lines.
+        assert_eq!(shape("fn(x: Int,): Int { x }"), "fn(x: Int): Int {x}");
+        assert_eq!(
+            shape("let f = fn(\n  x: Int,\n  y: Int,\n): Int { x + y }"),
+            "let f = fn(x: Int, y: Int): Int {(x + y)}"
+        );
+        // Newlines after the marker, and a body over several lines.
+        assert_eq!(
+            shape("fn(n: Int) ->\n  {} {\n  let m = n\n  m\n}"),
+            "fn(n: Int) -> {} {let m = n; m}"
+        );
+        assert_eq!(shape("fn():\nInt { 1 }"), "fn(): Int {1}");
+        // A record return type followed by the body, and function types as
+        // parameter and return types.
+        assert_eq!(shape("fn(): {x: Int} { x = 1 }"), "fn(): {x: Int} {x = 1}");
+        assert_eq!(
+            shape("fn(f: fn(Int): Int): fn() -> Int { f }"),
+            "fn(f: fn(Int): Int): fn() -> Int {f}"
+        );
+        // An operand like any other.
+        assert_eq!(shape("fn(): Int { 1 } == g"), "(fn(): Int {1} == g)");
+        // The details: parameters with their spans, the marker and purity.
+        let ast = parse_text("fn(x: Int, yy: {a: Int}) -> Int { x }").unwrap();
+        let expr = ast.get(only_value(&ast));
+        assert_eq!(expr.span, Span::new(0, 37));
+        let ExprKind::Fn(function) = expr.kind else {
+            panic!("expected a function, got {expr:?}");
+        };
+        assert_eq!(ast.fn_count(), 1);
+        let decl = ast.fn_decl(function);
+        assert!(!decl.pure);
+        assert_eq!(decl.marker, Span::new(25, 27));
+        assert_eq!(ast.type_expr(decl.ret).span, Span::new(28, 31));
+        assert_eq!(ast.get(decl.body).span, Span::new(32, 37));
+        let spans: Vec<Span> = ast.params(decl.params).iter().map(|p| p.span).collect();
+        assert_eq!(spans, vec![Span::new(3, 9), Span::new(11, 23)]);
+        assert_eq!(decl.params.len(), 2);
+        assert!(!decl.params.is_empty());
+        let ast = parse_text("fn(): Int { 1 }").unwrap();
+        let ExprKind::Fn(function) = ast.get(only_value(&ast)).kind else {
+            panic!("expected a function");
+        };
+        assert!(ast.fn_decl(function).pure);
+        assert!(ast.fn_decl(function).params.is_empty());
+    }
+
+    #[test]
+    fn function_expression_errors() {
+        let diagnostic = parse_text("fn(x): Int { x }").unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "expected `:` and a type after parameter `x`"
+        );
+        assert_eq!(diagnostic.span, Span::new(4, 5));
+        assert_eq!(diagnostic.notes, vec!["parameters must be annotated"]);
+        assert_eq!(
+            error("fn(x, y: Int): Int { x }"),
+            (
+                "expected `:` and a type after parameter `x`".to_owned(),
+                Span::new(4, 5)
+            )
+        );
+        let diagnostic = parse_text("fn(x: Int) { x }").unwrap_err();
+        assert_eq!(diagnostic.message, MISSING_RETURN_TYPE);
+        assert_eq!(diagnostic.span, Span::new(11, 12));
+        assert_eq!(diagnostic.notes, vec![RETURN_TYPE_NOTE]);
+        assert_eq!(
+            MISSING_RETURN_TYPE,
+            "expected `:` or `->` and a return type after the parameters"
+        );
+        assert_eq!(
+            RETURN_TYPE_NOTE,
+            "a function declares its return type: `: T` for a pure function, `-> T` for an \
+             impure one"
+        );
+        assert_eq!(
+            error("fn() = 1"),
+            (MISSING_RETURN_TYPE.to_owned(), Span::new(5, 6))
+        );
+        // The body's `{` must follow the return type directly.
+        assert_eq!(
+            error("fn(): Int\n{ 1 }"),
+            (
+                "expected `{` to start the function body".to_owned(),
+                Span::new(9, 10)
+            )
+        );
+        assert_eq!(
+            error("fn(): Int 1"),
+            (
+                "expected `{` to start the function body".to_owned(),
+                Span::new(10, 11)
+            )
+        );
+        assert_eq!(
+            error("fn(): { 1 }").0,
+            "expected a field name in record type"
+        );
+        // Parameters need plain names.
+        assert_eq!(
+            error("fn(\"x\": Int): Int { 1 }"),
+            (PLAIN_VARIABLE_NAME.to_owned(), Span::new(3, 6))
+        );
+        assert_eq!(
+            error("fn(\"{y}\": Int): Int { 1 }"),
+            (PLAIN_VARIABLE_NAME.to_owned(), Span::new(3, 8))
+        );
+        assert_eq!(
+            error("fn(1: Int): Int { 1 }"),
+            (
+                "expected a parameter name, found `1`".to_owned(),
+                Span::new(3, 4)
+            )
+        );
+        let diagnostic = parse_text("fn(x: Int y: Int): Int { x }").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `,` or `)`, found `y`");
+        assert_eq!(diagnostic.span, Span::new(10, 11));
+        assert_eq!(labels(&diagnostic), vec![(Span::new(2, 3), "unclosed `(`")]);
+        assert_eq!(
+            error("fn(x: Int"),
+            (
+                "expected `,` or `)`, found end of input".to_owned(),
+                Span::new(9, 9)
+            )
+        );
+        assert_eq!(
+            error("fn { 1 }"),
+            (
+                "expected `(` after `fn`, found `{`".to_owned(),
+                Span::new(3, 4)
+            )
+        );
+        assert_eq!(error("fn(x: 1): Int { 1 }").0, "expected a type");
+    }
+
+    /// The labels of a diagnostic as `(span, text)` pairs.
+    fn labels(diagnostic: &Diagnostic) -> Vec<(Span, &str)> {
+        diagnostic
+            .labels
+            .iter()
+            .map(|label| (label.span, label.text.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn named_functions_are_lets_of_function_expressions() {
+        assert_eq!(
+            shape("fn greet(name: String): String { \"hello {name}\" }"),
+            "let greet = fn(name: String): String {\"hello <name>\"}"
+        );
+        assert_eq!(shape("fn f() -> {} {}\nf()"), "let f = fn() -> {} {}; f()");
+        // The item and its value both span `fn` through the body; the path
+        // is the name.
+        let ast = parse_text("  fn add(a: Int, b: Int): Int { a + b }").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(2, 39));
+        let ItemKind::Let { path, ty, value } = item.kind else {
+            panic!("expected a let, got {item:?}");
+        };
+        assert!(ty.is_none());
+        assert_eq!(ast.get(value).span, Span::new(2, 39));
+        let segments = ast.path(path);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].span, Span::new(5, 8));
+        assert_eq!(ast.names().get(segments[0].name), "add");
+        assert!(matches!(ast.get(value).kind, ExprKind::Fn(_)));
+        // In a block, and as the pretty printer shows it.
+        assert_eq!(
+            shape("{ fn f(): Int { 1 }; = f }"),
+            "{let f = fn(): Int {1}; = f}"
+        );
+        assert_eq!(
+            parse_text("fn f(): Int { 1 }")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n\
+             \x20 (let f @0..17\n\
+             \x20   (fn @0..17\n\
+             \x20     (params)\n\
+             \x20     (ret pure Int)\n\
+             \x20     (block @12..17\n\
+             \x20       (expr @14..15\n\
+             \x20         (int 1 @14..15))))))"
+        );
+        // Without a name, `fn` starts an expression item, and an item is
+        // never a field or a rebind of a function expression.
+        assert_eq!(shape("fn(): Int { 1 }"), "fn(): Int {1}");
+        assert_eq!(
+            error("fn(): Int { 1 } = 2"),
+            (
+                "expected end of item, found `=`".to_owned(),
+                Span::new(16, 17)
+            )
+        );
+    }
+
+    #[test]
+    fn a_named_function_is_an_item_not_an_expression() {
+        let diagnostic = parse_text("let f = fn greet(): Int { 1 }").unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "expected `(` after `fn`, found identifier `greet`"
+        );
+        assert_eq!(diagnostic.span, Span::new(11, 16));
+        assert_eq!(
+            diagnostic.notes,
+            vec![
+                "a named function `fn NAME(...)` is an item; write it on a line of its own, or \
+                 drop the name"
+            ]
+        );
+        assert_eq!(
+            error("1 + fn f(): Int { 1 }").0,
+            "expected `(` after `fn`, found identifier `f`"
+        );
+        assert_eq!(
+            error("fn 1"),
+            (
+                "expected `(` after `fn`, found `1`".to_owned(),
+                Span::new(3, 4)
+            )
+        );
+    }
+
+    #[test]
+    fn calls() {
+        assert_eq!(shape("f()"), "f()");
+        assert_eq!(shape("f(1)"), "f(1)");
+        assert_eq!(shape("f(1, 2,)"), "f(1, 2)");
+        assert_eq!(shape("f(y = 2)"), "f(y = 2)");
+        assert_eq!(shape("f(1, y = 2)"), "f(1, y = 2)");
+        assert_eq!(shape("f(y = 2, 1)"), "f(y = 2, 1)");
+        assert_eq!(shape("f(x == 1, y = x + 1)"), "f((x == 1), y = (x + 1))");
+        // Arguments may span lines inside the parentheses, and a block or a
+        // function body among them keeps its newlines.
+        assert_eq!(shape("f(\n  1,\n  y = 2,\n)"), "f(1, y = 2)");
+        assert_eq!(
+            shape("f(fn(n: Int): Int {\n  let m = n\n  m\n}, {\n  x = 1\n  y = 2\n})"),
+            "f(fn(n: Int): Int {let m = n; m}, {x = 1; y = 2})"
+        );
+        // Trailing blocks, with and without an argument list.
+        assert_eq!(shape("f {}"), "f(){}");
+        assert_eq!(shape("f() {}"), "f(){}");
+        assert_eq!(shape("f(1) {}"), "f(1){}");
+        assert_eq!(
+            shape("service(\"web\") { port = 80; image = \"nginx\" }"),
+            "service(\"web\"){port = 80; image = \"nginx\"}"
+        );
+        assert_eq!(shape("run {\n  1\n}"), "run(){1}");
+        // A call binds as tightly as field access.
+        assert_eq!(shape("math.square(4)"), "(math . square)(4)");
+        assert_eq!(shape("a.b(1).c"), "((a . b)(1) . c)");
+        assert_eq!(shape("-f(1)"), "(-f(1))");
+        assert_eq!(shape("not f(1)"), "(not f(1))");
+        assert_eq!(shape("f(1)(2)"), "f(1)(2)");
+        assert_eq!(shape("f(1) + g(2) * 3"), "(f(1) + (g(2) * 3))");
+        assert_eq!(shape("f(1) : Int"), "(f(1) : Int)");
+        assert_eq!(shape("(f)(1)"), "[f](1)");
+        assert_eq!(shape("{ x }(1)"), "{x}(1)");
+        // Any operand followed by `(` is a call; the checker rejects calling
+        // what is not a function.
+        assert_eq!(shape("2 (3)"), "2(3)");
+        // A newline ends the item before a `{` or `(`.
+        assert_eq!(shape("f\n{ 1 }"), "f; {1}");
+        assert_eq!(shape("f(1)\n{ 1 }"), "f(1); {1}");
+        assert_eq!(shape("f\n(1)"), "f; [1]");
+        // The trailing block is the last argument.
+        let ast = parse_text("f(1, y = 2) { 3 }").unwrap();
+        let call = ast.get(only_value(&ast));
+        assert_eq!(call.span, Span::new(0, 17));
+        assert_eq!(call.close_span(), Some(Span::new(16, 17)));
+        let ExprKind::Call { callee, args } = call.kind else {
+            panic!("expected a call, got {call:?}");
+        };
+        assert_eq!(ast.get(callee).span, Span::new(0, 1));
+        let args = ast.args(args);
+        let y = ast.names().lookup("y").unwrap();
+        assert_eq!(args[0].kind, ArgKind::Positional);
+        assert_eq!(
+            args[1].kind,
+            ArgKind::Named {
+                name: y,
+                span: Span::new(5, 6)
+            }
+        );
+        assert_eq!(args[2].kind, ArgKind::Trailing);
+        assert_eq!(args[1].span(&ast), Span::new(5, 10));
+        assert_eq!(args[2].span(&ast), Span::new(12, 17));
+        let ast = parse_text("f(1)").unwrap();
+        let call = ast.get(only_value(&ast));
+        assert_eq!(call.span, Span::new(0, 4));
+        assert_eq!(call.close_span(), Some(Span::new(3, 4)));
+        assert_eq!(ast.get(callee).close_span(), None);
+    }
+
+    #[test]
+    fn call_errors() {
+        let diagnostic = parse_text("f(1 2)").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `,` or `)`, found `2`");
+        assert_eq!(diagnostic.span, Span::new(4, 5));
+        assert_eq!(labels(&diagnostic), vec![(Span::new(1, 2), "unclosed `(`")]);
+        assert_eq!(
+            error("f(1"),
+            (
+                "expected `,` or `)`, found end of input".to_owned(),
+                Span::new(3, 3)
+            )
+        );
+        assert_eq!(
+            error("f(,)"),
+            ("expected expression, found `,`".to_owned(), Span::new(2, 3))
+        );
+        assert_eq!(
+            error("f(y = )"),
+            ("expected expression, found `)`".to_owned(), Span::new(6, 7))
+        );
+        // Only an expression may be an argument.
+        assert_eq!(error("f(let x = 1)").0, "expected expression, found `let`");
+        // A call has one trailing block at most; a second is a call of the
+        // first call's result, as `f(1)(2)` is.
+        assert_eq!(shape("f {} {}"), "f(){}(){}");
+    }
+
+    #[test]
+    fn an_if_condition_takes_no_trailing_block() {
+        assert_eq!(shape("if x { 1 }"), "(if x {1})");
+        assert_eq!(shape("if a and b { 1 }"), "(if (a and b) {1})");
+        assert_eq!(shape("if not a.b { 1 }"), "(if (not (a . b)) {1})");
+        assert_eq!(shape("if f(1) { 2 }"), "(if f(1) {2})");
+        assert_eq!(
+            shape("if a { 1 } else if x { 2 }"),
+            "(if a {1} else (if x {2}))"
+        );
+        assert_eq!(
+            shape("if a { 1 } else if b and c { 2 } else { 3 }"),
+            "(if a {1} else (if (b and c) {2} else {3}))"
+        );
+        // Lifted inside parentheses, argument lists, blocks and
+        // interpolations, and restored after them.
+        assert_eq!(shape("if (f { }) { 1 }"), "(if [f(){}] {1})");
+        assert_eq!(shape("if g(f { }) { 1 }"), "(if g(f(){}) {1})");
+        assert_eq!(shape("if { f { } } { 1 }"), "(if {f(){}} {1})");
+        assert_eq!(shape("if \"{f { }}\" { 1 }"), "(if \"<f(){}>\" {1})");
+        assert_eq!(shape("if (a) and b { 1 }"), "(if ([a] and b) {1})");
+        // After the condition, blocks are trailing blocks again.
+        assert_eq!(shape("if a { f { } }"), "(if a {f(){}})");
+        assert_eq!(
+            shape("if a { 1 } else { 2 }\nf { }"),
+            "(if a {1} else {2}); f(){}"
+        );
+        // A function expression in a condition has its body, since the
+        // body is not a trailing block.
+        assert_eq!(
+            shape("if fn(): Bool { true }() { 1 }"),
+            "(if fn(): Bool {true}() {1})"
+        );
+    }
+
+    #[test]
+    fn function_types() {
+        assert_eq!(
+            shape("let f: fn(Int, String): Bool = g"),
+            "let f: fn(Int, String): Bool = g"
+        );
+        assert_eq!(
+            shape("let f: fn(name: String, times: Int) -> String = g"),
+            "let f: fn(name: String, times: Int) -> String = g"
+        );
+        assert_eq!(
+            shape("let f: fn(): {x: Int} = g"),
+            "let f: fn(): {x: Int} = g"
+        );
+        assert_eq!(
+            shape("let f: fn(fn(Int): Int): Int = g"),
+            "let f: fn(fn(Int): Int): Int = g"
+        );
+        assert_eq!(
+            shape("let r: {f: fn(Int): Int, g: fn() -> {}} = h"),
+            "let r: {f: fn(Int): Int, g: fn() -> {}} = h"
+        );
+        assert_eq!(shape("g : fn(Int): Int"), "(g : fn(Int): Int)");
+        assert_eq!(
+            shape("let f: fn(x: Int, Int,): fn() -> Int = g"),
+            "let f: fn(x: Int, Int): fn() -> Int = g"
+        );
+        // Newlines inside the parentheses and after the marker.
+        assert_eq!(
+            shape("let f: fn(\n  Int,\n  x: Int\n) ->\n  Int = g"),
+            "let f: fn(Int, x: Int) -> Int = g"
+        );
+        // A name followed by `:` names the parameter; a name alone is a type.
+        let ast = parse_text("g : fn(x: Int, Int): Int").unwrap();
+        let ExprKind::Ascribe { ty, .. } = ast.get(only_value(&ast)).kind else {
+            panic!("expected an ascription");
+        };
+        let ty = ast.type_expr(ty);
+        assert_eq!(ty.span, Span::new(4, 24));
+        let TypeExprKind::Fn { params, ret, pure } = ty.kind else {
+            panic!("expected a function type, got {ty:?}");
+        };
+        assert!(pure);
+        assert_eq!(ast.type_expr(ret).span, Span::new(21, 24));
+        let params = ast.param_tys(params);
+        assert_eq!(params[0].name, ast.names().lookup("x"));
+        assert_eq!(params[1].name, None);
+        assert_eq!(ast.type_expr(params[1].ty).span, Span::new(15, 18));
+        // Errors.
+        let diagnostic = parse_text("let f: fn(Int) Int = g").unwrap_err();
+        assert_eq!(diagnostic.message, MISSING_RETURN_TYPE);
+        assert_eq!(diagnostic.span, Span::new(15, 18));
+        assert_eq!(diagnostic.notes, vec![RETURN_TYPE_NOTE]);
+        assert_eq!(
+            error("let f: fn Int = g"),
+            (
+                "expected `(` after `fn`, found `Int`".to_owned(),
+                Span::new(10, 13)
+            )
+        );
+        assert_eq!(
+            error("let f: fn(Int Int): Int = g").0,
+            "expected `,` or `)`, found `Int`"
+        );
+        assert_eq!(error("let f: fn(x:): Int = g").0, "expected a type");
+    }
+
+    #[test]
+    fn pretty_output_for_functions_and_calls() {
+        let text = "fn f(x: Int, y: fn(Int) -> String) -> {} {}\nf(1, y = g) { 2 }";
+        let ast = parse_text(text).unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let f @0..43\n\
+             \x20   (fn @0..43\n\
+             \x20     (params (x Int) (y fn(Int) -> String))\n\
+             \x20     (ret impure {})\n\
+             \x20     (block @41..43)))\n\
+             \x20 (expr @44..61\n\
+             \x20   (call @44..61\n\
+             \x20     (name f @44..45)\n\
+             \x20     (int 1 @46..47)\n\
+             \x20     (named y\n\
+             \x20       (name g @53..54))\n\
+             \x20     (trailing\n\
+             \x20       (block @56..61\n\
+             \x20         (expr @58..59\n\
+             \x20           (int 2 @58..59)))))))"
+        );
+    }
+
+    #[test]
+    fn nested_calls_and_functions_count_towards_depth() {
+        // N nested calls around a literal are N + 1 levels: each call is one
+        // above its argument.
+        let calls = |depth: usize| format!("{}1{}", "f(".repeat(depth), ")".repeat(depth));
+        let deepest = calls(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(calls(MAX_DEPTH));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        assert_eq!(
+            too_deep(calls(10_000)).message,
+            "expression nested too deeply"
+        );
+        // Far beyond the limit, stopped by the recursion count.
+        assert_eq!(
+            too_deep(calls(200_000)).message,
+            "expression nested too deeply"
+        );
+        // Each nested function expression is two levels, itself and its
+        // body; with the innermost body's literal, N of them are 2N + 1.
+        let functions =
+            |depth: usize| format!("{}1{}", "fn(): Int { ".repeat(depth), " }".repeat(depth));
+        let deepest = functions((MAX_DEPTH - 1) / 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(functions((MAX_DEPTH - 1) / 2 + 1)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(functions(10_000)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(functions(200_000)).message,
+            "expression nested too deeply"
+        );
+        // Function types nest by recursion too.
+        let types = |depth: usize| format!("let f: {}Int = g", "fn(): ".repeat(depth));
+        let deepest = types(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(types(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(types(200_000)).message,
+            "expression nested too deeply"
+        );
+        // Trailing blocks nest as blocks do.
+        let trailing = |depth: usize| format!("{}1{}", "f { ".repeat(depth), " }".repeat(depth));
+        let deepest = trailing((MAX_DEPTH - 1) / 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(trailing(200_000)).message,
+            "expression nested too deeply"
+        );
     }
 }
