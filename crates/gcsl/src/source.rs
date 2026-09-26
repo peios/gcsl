@@ -149,11 +149,7 @@ impl SourceFile {
     #[must_use]
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let offset = offset.min(self.len());
-        // `line_starts[0] == 0 <= offset`, so the partition point is >= 1.
-        let index = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
+        let index = self.line_index(offset);
         let line_start = self.line_starts.get(index).copied().unwrap_or(0);
         let before = self
             .text
@@ -164,6 +160,37 @@ impl SourceFile {
             offset_to_u32(index + 1),
             offset_to_u32(char_count(before) + 1),
         )
+    }
+
+    /// The 0-based index into the line table of the line containing byte
+    /// `offset`, which is clamped to the end of the text.
+    fn line_index(&self, offset: u32) -> usize {
+        let offset = offset.min(self.len());
+        // `line_starts[0] == 0 <= offset`, so the partition point is >= 1.
+        self.line_starts
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1)
+    }
+
+    /// The whole lines that `span` touches: from the start of the line
+    /// containing `span.start` to the end of the line containing `span.end`,
+    /// without that line's terminator.
+    #[must_use]
+    pub fn excerpt(&self, span: Span) -> Excerpt {
+        let first = self.line_index(span.start);
+        let last = self.line_index(span.end.max(span.start));
+        let start = self.line_starts.get(first).copied().unwrap_or(0);
+        let end = self.line_starts.get(last + 1).map_or(self.len(), |&next| {
+            // Step back over the terminator that starts the next line.
+            let line = self.text.get(..next as usize).unwrap_or("");
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            offset_to_u32(line.len())
+        });
+        Excerpt {
+            first_line: offset_to_u32(first + 1),
+            span: Span::new(start, end.max(start)),
+        }
     }
 
     /// Returns the text of 1-based line `line`, without its line terminator
@@ -184,6 +211,17 @@ impl SourceFile {
         let text = text.strip_suffix('\n').unwrap_or(text);
         text.strip_suffix('\r').unwrap_or(text)
     }
+}
+
+/// A run of whole lines from a [`SourceFile`], as [`SourceFile::excerpt`]
+/// returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Excerpt {
+    /// The 1-based number of the first line.
+    pub first_line: u32,
+    /// The bytes covered, from the start of the first line to the end of the
+    /// last line's content.
+    pub span: Span,
 }
 
 /// Converts a byte offset already known to lie within a [`SourceFile`] to
@@ -261,6 +299,37 @@ mod tests {
         let source = file("");
         assert_eq!(source.line_col(0), (1, 1));
         assert_eq!(source.line_text(1), "");
+    }
+
+    #[test]
+    fn excerpt_covers_whole_lines() {
+        let source = file("one\r\ntwo\nthree\nfour");
+        let lines = |span| {
+            let excerpt = source.excerpt(span);
+            (excerpt.first_line, source.slice(excerpt.span))
+        };
+        assert_eq!(lines(Span::new(1, 2)), (1, "one"));
+        assert_eq!(lines(Span::new(6, 7)), (2, "two"));
+        assert_eq!(lines(Span::new(1, 7)), (1, "one\r\ntwo"));
+        assert_eq!(lines(Span::new(9, 16)), (3, "three\nfour"));
+        // An empty span at the very end.
+        assert_eq!(lines(Span::new(19, 19)), (4, "four"));
+        // The end offset on a terminator belongs to the line it ends.
+        assert_eq!(lines(Span::new(0, 4)), (1, "one"));
+        assert_eq!(
+            source.excerpt(Span::new(0, 0)),
+            Excerpt {
+                first_line: 1,
+                span: Span::new(0, 3)
+            }
+        );
+        assert_eq!(
+            file("").excerpt(Span::new(0, 0)),
+            Excerpt {
+                first_line: 1,
+                span: Span::new(0, 0)
+            }
+        );
     }
 
     #[test]

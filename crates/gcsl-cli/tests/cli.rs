@@ -36,10 +36,12 @@ fn type_error_is_rendered_to_stderr_with_exit_code_1() {
     assert_eq!(
         stderr(&output),
         "error: cannot floor-divide Float\n\
-         \x20 --> tests/fixtures/type_error.gcsl:2:4\n\
-         \x20  |\n\
-         \x202 |   (7.0 // 2)\n\
-         \x20  |    ^^^^^^^^\n"
+         \x20--> tests/fixtures/type_error.gcsl:2:8\n\
+         \x20 |\n\
+         2 |   (7.0 // 2)\n\
+         \x20 |    --- ^^ - Int\n\
+         \x20 |    |\n\
+         \x20 |    Float\n"
     );
     assert_eq!(output.status.code(), Some(1));
 }
@@ -51,11 +53,29 @@ fn runtime_error_is_rendered_to_stderr_with_exit_code_1() {
     assert_eq!(
         stderr(&output),
         "error: division by zero\n\
-         \x20 --> tests/fixtures/runtime_error.gcsl:1:2\n\
-         \x20  |\n\
-         \x201 | (1 // 0) + (9223372036854775807 + 1)\n\
-         \x20  |  ^^^^^^\n"
+         \x20--> tests/fixtures/runtime_error.gcsl:1:4\n\
+         \x20 |\n\
+         1 | (1 // 0) + (9223372036854775807 + 1)\n\
+         \x20 |  - ^^ - 0\n\
+         \x20 |  |\n\
+         \x20 |  1\n"
     );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// Colour is only used on a terminal, and tests run through pipes, so this
+/// is the plain path; `NO_COLOR` set is the other way to get it.
+#[test]
+fn piped_stderr_has_no_escape_codes() {
+    let output = gcsl(&["run", "tests/fixtures/type_error.gcsl"]);
+    assert!(!stderr(&output).contains("\x1b["));
+    let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        .args(["run", "tests/fixtures/type_error.gcsl"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!stderr(&output).contains("\x1b["));
     assert_eq!(output.status.code(), Some(1));
 }
 
@@ -195,10 +215,10 @@ fn repl_evaluates_each_line() {
     assert_eq!(
         stderr(&output),
         "error: expected expression, found end of input\n\
-         \x20 --> <repl>:1:4\n\
-         \x20  |\n\
-         \x201 | 1 +\n\
-         \x20  |    ^\n"
+         \x20--> <repl>:1:4\n\
+         \x20 |\n\
+         1 | 1 +\n\
+         \x20 |    ^\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

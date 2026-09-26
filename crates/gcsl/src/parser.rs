@@ -143,11 +143,21 @@ impl Parser<'_> {
             if left_bp < min_bp {
                 break;
             }
+            let op_start = self.peek().span.start;
             self.advance();
             let rhs = self.parse_expr(right_bp)?;
             let span = Span::join(self.span_of(lhs), self.span_of(rhs));
             let height = self.height_of(lhs).max(self.height_of(rhs)) + 1;
-            lhs = self.alloc(ExprKind::Binary { op, lhs, rhs }, span, height)?;
+            lhs = self.alloc(
+                ExprKind::Binary {
+                    op,
+                    op_start,
+                    lhs,
+                    rhs,
+                },
+                span,
+                height,
+            )?;
         }
         Ok(lhs)
     }
@@ -184,7 +194,11 @@ impl Parser<'_> {
                 let inner = self.parse_expr(0)?;
                 let close = self.peek();
                 if close.kind != TokenKind::RParen {
-                    return Err(self.error("expected `)`", close.span));
+                    let found = self.describe(close);
+                    return Err(self.report(
+                        Diagnostic::error(format!("expected `)`, found {found}"), close.span)
+                            .with_context(token.span, "unclosed `(`"),
+                    ));
                 }
                 self.advance();
                 let height = self.height_of(inner) + 1;
@@ -325,7 +339,7 @@ mod tests {
                     go(ast, operand, out);
                     out.push(')');
                 }
-                ExprKind::Binary { op, lhs, rhs } => {
+                ExprKind::Binary { op, lhs, rhs, .. } => {
                     out.push('(');
                     go(ast, lhs, out);
                     out.push(' ');
@@ -461,9 +475,28 @@ mod tests {
     fn expected_close_paren() {
         assert_eq!(
             error("(1 + 2"),
-            ("expected `)`".to_owned(), Span::new(6, 6))
+            (
+                "expected `)`, found end of input".to_owned(),
+                Span::new(6, 6)
+            )
         );
-        assert_eq!(error("(1 2)"), ("expected `)`".to_owned(), Span::new(3, 4)));
+        let diagnostic = parse_text("(1 2)").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `)`, found `2`");
+        assert_eq!(diagnostic.span, Span::new(3, 4));
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].span, Span::new(0, 1));
+        assert_eq!(diagnostic.labels[0].text, "unclosed `(`");
+    }
+
+    #[test]
+    fn binary_nodes_record_their_operator() {
+        let ast = parse_text("1 + 2 // 3").unwrap();
+        let root = ast.get(ast.root());
+        assert_eq!(root.operator_span(), Some(Span::new(2, 3)));
+        let ExprKind::Binary { rhs, .. } = root.kind else {
+            panic!("expected binary, got {root:?}");
+        };
+        assert_eq!(ast.get(rhs).operator_span(), Some(Span::new(6, 8)));
     }
 
     #[test]

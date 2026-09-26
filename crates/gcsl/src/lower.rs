@@ -11,7 +11,7 @@
 use crate::ast::{Ast, BinaryOp, ExprId, ExprKind, UnaryOp};
 use crate::check::Types;
 use crate::diagnostic::InternalError;
-use crate::ir::{Ir, IrBuilder, IrId, IrKind};
+use crate::ir::{Ir, IrBuilder, IrId, IrKind, Operands};
 use crate::types::Ty;
 use crate::value::int_to_float;
 
@@ -81,7 +81,15 @@ impl Lowerer<'_> {
                 },
                 Ty::Float,
             ) => IrKind::FloatNeg(self.lower_operand(operand, Ty::Float)?),
-            (ExprKind::Binary { op, lhs, rhs }, _) => self.lower_binary(op, lhs, rhs, ty, id)?,
+            (
+                ExprKind::Binary {
+                    op,
+                    op_start,
+                    lhs,
+                    rhs,
+                },
+                _,
+            ) => self.lower_binary(op, op_start, lhs, rhs, ty, id)?,
             (ExprKind::Float(_), Ty::Int) => {
                 return Err(InternalError {
                     message: "float literal typed as Int",
@@ -95,12 +103,13 @@ impl Lowerer<'_> {
     fn lower_binary(
         &mut self,
         op: BinaryOp,
+        op_start: u32,
         lhs: ExprId,
         rhs: ExprId,
         ty: Ty,
         id: ExprId,
     ) -> Result<IrKind, InternalError> {
-        let (make, operand_ty): (fn(IrId, IrId) -> IrKind, Ty) = match (op, ty) {
+        let (make, operand_ty): (fn(Operands) -> IrKind, Ty) = match (op, ty) {
             (BinaryOp::Add, Ty::Int) => (IrKind::IntAdd, Ty::Int),
             (BinaryOp::Sub, Ty::Int) => (IrKind::IntSub, Ty::Int),
             (BinaryOp::Mul, Ty::Int) => (IrKind::IntMul, Ty::Int),
@@ -112,7 +121,7 @@ impl Lowerer<'_> {
             (BinaryOp::Div, Ty::Float) => {
                 let lhs = self.lower_as_float(lhs)?;
                 let rhs = self.lower_as_float(rhs)?;
-                return Ok(IrKind::FloatDiv(lhs, rhs));
+                return Ok(IrKind::FloatDiv(Operands { lhs, rhs, op_start }));
             }
             _ => {
                 return Err(InternalError {
@@ -123,7 +132,7 @@ impl Lowerer<'_> {
         };
         let lhs = self.lower_operand(lhs, operand_ty)?;
         let rhs = self.lower_operand(rhs, operand_ty)?;
-        Ok(make(lhs, rhs))
+        Ok(make(Operands { lhs, rhs, op_start }))
     }
 
     /// Lowers an operand that must already have type `expected`.
@@ -195,6 +204,7 @@ mod tests {
         let div = builder.alloc(Expr {
             kind: ExprKind::Binary {
                 op: BinaryOp::Div,
+                op_start: 2,
                 lhs,
                 rhs,
             },
@@ -207,11 +217,12 @@ mod tests {
     fn untyped_division_operands_become_float_constants() {
         let ir = lower_text("7 / 2");
         let root = ir.get(ir.root());
-        let IrKind::FloatDiv(lhs, rhs) = root.kind else {
+        let IrKind::FloatDiv(operands) = root.kind else {
             panic!("expected FloatDiv, got {root:?}");
         };
-        assert_eq!(ir.get(lhs).kind, IrKind::FloatConst(7.0));
-        assert_eq!(ir.get(rhs).kind, IrKind::FloatConst(2.0));
+        assert_eq!(ir.get(operands.lhs).kind, IrKind::FloatConst(7.0));
+        assert_eq!(ir.get(operands.rhs).kind, IrKind::FloatConst(2.0));
+        assert_eq!(operands.op_start, 2);
         assert_eq!(
             ir.pretty().to_string(),
             "(float-div @0..5\n  (float 7.0 @0..1)\n  (float 2.0 @4..5))"
@@ -256,11 +267,11 @@ mod tests {
     #[test]
     fn large_untyped_literal_rounds_to_nearest_float() {
         let ir = lower_text("9007199254740993 / 1");
-        let IrKind::FloatDiv(lhs, _) = ir.get(ir.root()).kind else {
+        let IrKind::FloatDiv(operands) = ir.get(ir.root()).kind else {
             panic!("expected FloatDiv");
         };
         assert_eq!(
-            ir.get(lhs).kind,
+            ir.get(operands.lhs).kind,
             IrKind::FloatConst(9_007_199_254_740_992.0)
         );
     }

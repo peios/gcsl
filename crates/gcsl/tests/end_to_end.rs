@@ -81,10 +81,12 @@ fn static_error_renders_exactly() {
     assert_eq!(
         rendered("# first line\n1 + (7.0 // 2)\n"),
         "error: cannot floor-divide Float\n\
-         \x20 --> calc.gcsl:2:6\n\
-         \x20  |\n\
-         \x202 | 1 + (7.0 // 2)\n\
-         \x20  |      ^^^^^^^^\n"
+         \x20--> calc.gcsl:2:10\n\
+         \x20 |\n\
+         2 | 1 + (7.0 // 2)\n\
+         \x20 |      --- ^^ - Int\n\
+         \x20 |      |\n\
+         \x20 |      Float\n"
     );
 }
 
@@ -93,16 +95,20 @@ fn every_type_error_is_reported() {
     assert_eq!(
         rendered("(7.0 // 2) +\n(3 % 2.5)"),
         "error: cannot floor-divide Float\n\
-         \x20 --> calc.gcsl:1:2\n\
-         \x20  |\n\
-         \x201 | (7.0 // 2) +\n\
-         \x20  |  ^^^^^^^^\n\
+         \x20--> calc.gcsl:1:6\n\
+         \x20 |\n\
+         1 | (7.0 // 2) +\n\
+         \x20 |  --- ^^ - Int\n\
+         \x20 |  |\n\
+         \x20 |  Float\n\
          \n\
          error: cannot take modulo of Float\n\
-         \x20 --> calc.gcsl:2:2\n\
-         \x20  |\n\
-         \x202 | (3 % 2.5)\n\
-         \x20  |  ^^^^^^^\n"
+         \x20--> calc.gcsl:2:4\n\
+         \x20 |\n\
+         2 | (3 % 2.5)\n\
+         \x20 |  - ^ --- Float\n\
+         \x20 |  |\n\
+         \x20 |  Int\n"
     );
 }
 
@@ -112,22 +118,28 @@ fn runtime_error_on_a_two_digit_line_renders_exactly() {
     assert_eq!(
         rendered(&text),
         "error: integer overflow\n\
-         \x20  --> calc.gcsl:11:4\n\
-         \x20   |\n\
-         \x2011 |   (9223372036854775807 + 1)\n\
-         \x20   |    ^^^^^^^^^^^^^^^^^^^^^^^\n"
+         \x20 --> calc.gcsl:11:24\n\
+         \x20  |\n\
+         11 |   (9223372036854775807 + 1)\n\
+         \x20  |    ------------------- ^ - 1\n\
+         \x20  |    |\n\
+         \x20  |    9223372036854775807\n"
     );
 }
 
 #[test]
-fn multi_line_operator_span_is_underlined_to_end_of_line() {
+fn operands_on_different_lines_are_each_labelled() {
     assert_eq!(
         rendered("1 //\n0"),
         "error: division by zero\n\
-         \x20 --> calc.gcsl:1:1\n\
-         \x20  |\n\
-         \x201 | 1 //\n\
-         \x20  | ^^^^\n"
+         \x20--> calc.gcsl:1:3\n\
+         \x20 |\n\
+         1 | 1 //\n\
+         \x20 | - ^^\n\
+         \x20 | |\n\
+         \x20 | 1\n\
+         2 | 0\n\
+         \x20 | - 0\n"
     );
 }
 
@@ -136,28 +148,30 @@ fn lex_and_parse_errors_render_through_run() {
     assert_eq!(
         rendered("1 + 2_"),
         "error: trailing `_` in number literal\n\
-         \x20 --> calc.gcsl:1:6\n\
-         \x20  |\n\
-         \x201 | 1 + 2_\n\
-         \x20  |      ^\n"
+         \x20--> calc.gcsl:1:6\n\
+         \x20 |\n\
+         1 | 1 + 2_\n\
+         \x20 |      ^\n"
     );
     assert_eq!(
         rendered("(1 + 2\n"),
-        "error: expected `)`\n\
-         \x20 --> calc.gcsl:1:7\n\
-         \x20  |\n\
-         \x201 | (1 + 2\n\
-         \x20  |       ^\n"
+        "error: expected `)`, found end of input\n\
+         \x20--> calc.gcsl:1:7\n\
+         \x20 |\n\
+         1 | (1 + 2\n\
+         \x20 | -     ^\n\
+         \x20 | |\n\
+         \x20 | unclosed `(`\n"
     );
     assert_eq!(
         rendered("99999999999999999999"),
         "error: integer literal out of range for Int\n\
-         \x20 --> calc.gcsl:1:1\n\
-         \x20  |\n\
-         \x201 | 99999999999999999999\n\
-         \x20  | ^^^^^^^^^^^^^^^^^^^^\n\
-         \x20  |\n\
-         \x20  = note: the largest Int literal is 9223372036854775807\n"
+         \x20--> calc.gcsl:1:1\n\
+         \x20 |\n\
+         1 | 99999999999999999999\n\
+         \x20 | ^^^^^^^^^^^^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: the largest Int literal is 9223372036854775807\n"
     );
 }
 

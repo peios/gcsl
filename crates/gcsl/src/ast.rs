@@ -52,6 +52,21 @@ impl UnaryOp {
             UnaryOp::Neg => "-",
         }
     }
+
+    /// The span of this operator's symbol when it starts at byte `start`.
+    #[must_use]
+    pub const fn span_at(self, start: u32) -> Span {
+        symbol_span(self.symbol(), start)
+    }
+}
+
+/// The span of an operator `symbol` starting at byte `start`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "operator symbols are a few bytes long"
+)]
+pub(crate) const fn symbol_span(symbol: &str, start: u32) -> Span {
+    Span::new(start, start + symbol.len() as u32)
 }
 
 /// An infix operator.
@@ -98,6 +113,12 @@ impl BinaryOp {
             BinaryOp::Rem => "%",
         }
     }
+
+    /// The span of this operator's symbol when it starts at byte `start`.
+    #[must_use]
+    pub const fn span_at(self, start: u32) -> Span {
+        symbol_span(self.symbol(), start)
+    }
 }
 
 /// What an [`Expr`] is.
@@ -118,6 +139,11 @@ pub enum ExprKind {
     Binary {
         /// The operator.
         op: BinaryOp,
+        /// Byte offset of the operator's symbol, so diagnostics can point at
+        /// it: its span is `op.span_at(op_start)`. Only the start is stored
+        /// because the symbol's length is known from `op`, which keeps
+        /// [`Expr`] small.
+        op_start: u32,
         /// The left operand.
         lhs: ExprId,
         /// The right operand.
@@ -137,6 +163,18 @@ pub struct Expr {
     /// left operand through its right operand, a `Unary` its operator through
     /// its operand.
     pub span: Span,
+}
+
+impl Expr {
+    /// The span of the operator's symbol, for operator nodes.
+    #[must_use]
+    pub const fn operator_span(&self) -> Option<Span> {
+        match self.kind {
+            ExprKind::Unary { op, .. } => Some(op.span_at(self.span.start)),
+            ExprKind::Binary { op, op_start, .. } => Some(op.span_at(op_start)),
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Paren(_) => None,
+        }
+    }
 }
 
 /// An arena under construction. Allocate children before their parents, then
@@ -353,11 +391,13 @@ mod tests {
         let sum = builder.alloc(Expr {
             kind: ExprKind::Binary {
                 op: BinaryOp::Add,
+                op_start: 3,
                 lhs: one,
                 rhs: two,
             },
             span: Span::new(1, 8),
         });
+        assert_eq!(builder.get(sum).operator_span(), Some(Span::new(3, 4)));
         let paren = builder.alloc(Expr {
             kind: ExprKind::Paren(sum),
             span: Span::new(0, 9),
@@ -369,6 +409,8 @@ mod tests {
             },
             span: Span::new(0, 9),
         });
+        assert_eq!(builder.get(neg).operator_span(), Some(Span::new(0, 1)));
+        assert_eq!(builder.get(paren).operator_span(), None);
         let ast = builder.finish(neg);
         assert_eq!(
             ast.pretty().to_string(),
@@ -388,5 +430,7 @@ mod tests {
         assert_eq!(BinaryOp::FloorDiv.symbol(), "//");
         assert_eq!(BinaryOp::Rem.symbol(), "%");
         assert_eq!(UnaryOp::Neg.symbol(), "-");
+        assert_eq!(BinaryOp::FloorDiv.span_at(4), Span::new(4, 6));
+        assert_eq!(UnaryOp::Neg.span_at(4), Span::new(4, 5));
     }
 }

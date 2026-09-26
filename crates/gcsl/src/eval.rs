@@ -8,12 +8,14 @@
 //!
 //! Operands are evaluated left to right, so when both would fail, the left
 //! one's error is reported. Evaluation holds no per-node state and allocates
-//! nothing, except the message of the diagnostic when it fails.
+//! nothing, except the diagnostic when it fails. A runtime error points at
+//! the operator and labels each operand with the value it had, so the
+//! user sees what actually overflowed or divided by zero.
 
 use std::num::NonZeroI64;
 
 use crate::diagnostic::Diagnostic;
-use crate::ir::{Ir, IrId, IrKind};
+use crate::ir::{Ir, IrId, IrKind, IrNode, Operands};
 use crate::source::Span;
 use crate::types::Ty;
 use crate::value::{Value, int_to_float};
@@ -44,43 +46,59 @@ impl Evaluator<'_> {
     /// Evaluates an `Int`-typed node.
     fn int(&self, id: IrId) -> Result<i64, Diagnostic> {
         let node = self.ir.get(id);
-        let span = node.span;
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
-            IrKind::IntNeg(operand) => self
-                .int(operand)?
-                .checked_neg()
-                .ok_or_else(|| overflow(span)),
-            IrKind::IntAdd(lhs, rhs) => {
-                let (lhs, rhs) = (self.int(lhs)?, self.int(rhs)?);
-                lhs.checked_add(rhs).ok_or_else(|| overflow(span))
+            IrKind::IntNeg(operand) => {
+                let value = self.int(operand)?;
+                value
+                    .checked_neg()
+                    .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value))
             }
-            IrKind::IntSub(lhs, rhs) => {
-                let (lhs, rhs) = (self.int(lhs)?, self.int(rhs)?);
-                lhs.checked_sub(rhs).ok_or_else(|| overflow(span))
+            IrKind::IntAdd(operands) => {
+                let (lhs, rhs) = self.ints(operands)?;
+                lhs.checked_add(rhs)
+                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
             }
-            IrKind::IntMul(lhs, rhs) => {
-                let (lhs, rhs) = (self.int(lhs)?, self.int(rhs)?);
-                lhs.checked_mul(rhs).ok_or_else(|| overflow(span))
+            IrKind::IntSub(operands) => {
+                let (lhs, rhs) = self.ints(operands)?;
+                lhs.checked_sub(rhs)
+                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
             }
-            IrKind::IntFloorDiv(lhs, rhs) => {
-                let (lhs, rhs) = (self.int(lhs)?, self.int(rhs)?);
-                let rhs = NonZeroI64::new(rhs).ok_or_else(|| division_by_zero(span))?;
-                floor_div(lhs, rhs).ok_or_else(|| overflow(span))
+            IrKind::IntMul(operands) => {
+                let (lhs, rhs) = self.ints(operands)?;
+                lhs.checked_mul(rhs)
+                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
             }
-            IrKind::IntRem(lhs, rhs) => {
-                let (lhs, rhs) = (self.int(lhs)?, self.int(rhs)?);
-                let rhs = NonZeroI64::new(rhs).ok_or_else(|| division_by_zero(span))?;
-                Ok(floor_mod(lhs, rhs))
+            IrKind::IntFloorDiv(operands) => {
+                let (lhs, rhs) = self.ints(operands)?;
+                let divisor = NonZeroI64::new(rhs)
+                    .ok_or_else(|| self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs))?;
+                floor_div(lhs, divisor)
+                    .ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
+            }
+            IrKind::IntRem(operands) => {
+                let (lhs, rhs) = self.ints(operands)?;
+                let divisor = NonZeroI64::new(rhs)
+                    .ok_or_else(|| self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs))?;
+                Ok(floor_mod(lhs, divisor))
             }
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
-            | IrKind::FloatAdd(..)
-            | IrKind::FloatSub(..)
-            | IrKind::FloatMul(..)
-            | IrKind::FloatDiv(..)
-            | IrKind::IntToFloat(_) => Err(internal("Float node where an Int was expected", span)),
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
+            | IrKind::IntToFloat(_) => {
+                Err(internal("Float node where an Int was expected", node.span))
+            }
         }
+    }
+
+    /// Evaluates both `Int` operands, left to right.
+    fn ints(&self, operands: Operands) -> Result<(i64, i64), Diagnostic> {
+        let lhs = self.int(operands.lhs)?;
+        let rhs = self.int(operands.rhs)?;
+        Ok((lhs, rhs))
     }
 
     /// Evaluates a `Float`-typed node. IEEE 754 semantics; never fails except
@@ -90,21 +108,52 @@ impl Evaluator<'_> {
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
             IrKind::FloatNeg(operand) => Ok(-self.float(operand)?),
-            IrKind::FloatAdd(lhs, rhs) => Ok(self.float(lhs)? + self.float(rhs)?),
-            IrKind::FloatSub(lhs, rhs) => Ok(self.float(lhs)? - self.float(rhs)?),
-            IrKind::FloatMul(lhs, rhs) => Ok(self.float(lhs)? * self.float(rhs)?),
-            IrKind::FloatDiv(lhs, rhs) => Ok(self.float(lhs)? / self.float(rhs)?),
+            IrKind::FloatAdd(o) => Ok(self.float(o.lhs)? + self.float(o.rhs)?),
+            IrKind::FloatSub(o) => Ok(self.float(o.lhs)? - self.float(o.rhs)?),
+            IrKind::FloatMul(o) => Ok(self.float(o.lhs)? * self.float(o.rhs)?),
+            IrKind::FloatDiv(o) => Ok(self.float(o.lhs)? / self.float(o.rhs)?),
             IrKind::IntToFloat(operand) => Ok(int_to_float(self.int(operand)?)),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
-            | IrKind::IntAdd(..)
-            | IrKind::IntSub(..)
-            | IrKind::IntMul(..)
-            | IrKind::IntFloorDiv(..)
-            | IrKind::IntRem(..) => Err(internal("Int node where a Float was expected", node.span)),
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_) => Err(internal("Int node where a Float was expected", node.span)),
         }
     }
+
+    /// A runtime error in a binary operator: the message points at the
+    /// operator, and each operand is labelled with its value.
+    fn binary_error(
+        &self,
+        node: &IrNode,
+        operands: Operands,
+        message: &'static str,
+        lhs: i64,
+        rhs: i64,
+    ) -> Diagnostic {
+        Diagnostic::error(message, node.operator_span().unwrap_or(node.span))
+            .with_context(self.ir.get(operands.lhs).span, lhs.to_string())
+            .with_context(self.ir.get(operands.rhs).span, rhs.to_string())
+    }
+
+    /// A runtime error in a unary operator, labelling the operand with its
+    /// value.
+    fn unary_error(
+        &self,
+        node: &IrNode,
+        operand: IrId,
+        message: &'static str,
+        value: i64,
+    ) -> Diagnostic {
+        Diagnostic::error(message, node.operator_span().unwrap_or(node.span))
+            .with_context(self.ir.get(operand).span, value.to_string())
+    }
 }
+
+const OVERFLOW: &str = "integer overflow";
+const DIVISION_BY_ZERO: &str = "division by zero";
 
 /// Floor division: the quotient rounded toward negative infinity. Returns
 /// `None` on overflow, which only `i64::MIN // -1` causes.
@@ -157,14 +206,6 @@ fn floor_mod(a: i64, b: NonZeroI64) -> i64 {
     } else {
         r
     }
-}
-
-fn overflow(span: Span) -> Diagnostic {
-    Diagnostic::error("integer overflow", span)
-}
-
-fn division_by_zero(span: Span) -> Diagnostic {
-    Diagnostic::error("division by zero", span)
 }
 
 fn internal(message: &'static str, span: Span) -> Diagnostic {
@@ -278,18 +319,44 @@ mod tests {
     #[test]
     fn overflow_on_each_operator() {
         let overflow = "integer overflow".to_owned();
+        // The error points at the operator.
         assert_eq!(
             error(&format!("{MAX} + 1")),
-            (overflow.clone(), Span::new(0, 23))
+            (overflow.clone(), Span::new(20, 21))
         );
         assert_eq!(error(&format!("{MIN} - 1")).0, overflow);
         assert_eq!(error(&format!("{MAX} * 2")).0, overflow);
         assert_eq!(
             error(&format!("-{MIN}")),
-            (overflow.clone(), Span::new(0, 27))
+            (overflow.clone(), Span::new(0, 1))
         );
         assert_eq!(error(&format!("{MIN} // -1")).0, overflow);
         assert_eq!(error(&format!("{MIN} * -1")).0, overflow);
+    }
+
+    #[test]
+    fn runtime_errors_label_operands_with_their_values() {
+        let diagnostic = run("2 * (9223372036854775807 - -1)").unwrap_err();
+        assert_eq!(diagnostic.message, "integer overflow");
+        assert_eq!(diagnostic.span, Span::new(25, 26));
+        let labels: Vec<(Span, &str)> = diagnostic
+            .labels
+            .iter()
+            .map(|label| (label.span, label.text.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (Span::new(5, 24), "9223372036854775807"),
+                (Span::new(27, 29), "-1")
+            ]
+        );
+        let diagnostic = run("-(-9223372036854775807 - 1)").unwrap_err();
+        assert_eq!(diagnostic.span, Span::new(0, 1));
+        assert_eq!(diagnostic.labels.len(), 1);
+        assert_eq!(diagnostic.labels[0].text, "-9223372036854775808");
+        // The parenthesised operand is labelled without its parentheses.
+        assert_eq!(diagnostic.labels[0].span, Span::new(2, 26));
     }
 
     #[test]
@@ -308,9 +375,12 @@ mod tests {
     #[test]
     fn division_by_zero() {
         let message = "division by zero".to_owned();
-        assert_eq!(error("7 // 0"), (message.clone(), Span::new(0, 6)));
-        assert_eq!(error("7 % 0"), (message.clone(), Span::new(0, 5)));
-        assert_eq!(error("1 + 7 % (2 - 2)"), (message, Span::new(4, 15)));
+        assert_eq!(error("7 // 0"), (message.clone(), Span::new(2, 4)));
+        assert_eq!(error("7 % 0"), (message.clone(), Span::new(2, 3)));
+        assert_eq!(error("1 + 7 % (2 - 2)"), (message, Span::new(6, 7)));
+        let diagnostic = run("1 + 7 % (2 - 2)").unwrap_err();
+        assert_eq!(diagnostic.labels[1].text, "0");
+        assert_eq!(diagnostic.labels[1].span, Span::new(9, 14));
     }
 
     #[test]
@@ -327,11 +397,11 @@ mod tests {
     fn errors_are_reported_left_to_right() {
         assert_eq!(
             error("(1 // 0) + (9223372036854775807 + 1)"),
-            ("division by zero".to_owned(), Span::new(1, 7))
+            ("division by zero".to_owned(), Span::new(3, 5))
         );
         assert_eq!(
             error("(9223372036854775807 + 1) + (1 // 0)"),
-            ("integer overflow".to_owned(), Span::new(1, 24))
+            ("integer overflow".to_owned(), Span::new(21, 22))
         );
     }
 

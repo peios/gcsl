@@ -24,6 +24,19 @@ impl IrId {
     }
 }
 
+/// The operands of a binary node, with the position of its operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Operands {
+    /// The left operand.
+    pub lhs: IrId,
+    /// The right operand.
+    pub rhs: IrId,
+    /// Byte offset of the operator's symbol, for runtime diagnostics. The
+    /// symbol's length is known from the node's kind (see
+    /// [`IrKind::operator_span`]), which keeps [`IrNode`] small.
+    pub op_start: u32,
+}
+
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, and of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes; see [`IrKind::ty`].
@@ -38,29 +51,46 @@ pub enum IrKind {
     /// `Float` negation.
     FloatNeg(IrId),
     /// Checked `Int` addition.
-    IntAdd(IrId, IrId),
+    IntAdd(Operands),
     /// Checked `Int` subtraction.
-    IntSub(IrId, IrId),
+    IntSub(Operands),
     /// Checked `Int` multiplication.
-    IntMul(IrId, IrId),
+    IntMul(Operands),
     /// Checked `Int` division rounding toward negative infinity.
-    IntFloorDiv(IrId, IrId),
+    IntFloorDiv(Operands),
     /// `Int` remainder with the sign of the divisor, matching `IntFloorDiv`.
-    IntRem(IrId, IrId),
+    IntRem(Operands),
     /// `Float` addition.
-    FloatAdd(IrId, IrId),
+    FloatAdd(Operands),
     /// `Float` subtraction.
-    FloatSub(IrId, IrId),
+    FloatSub(Operands),
     /// `Float` multiplication.
-    FloatMul(IrId, IrId),
+    FloatMul(Operands),
     /// `Float` division.
-    FloatDiv(IrId, IrId),
+    FloatDiv(Operands),
     /// Converts an `Int` operand to the nearest `Float`. Inserted by lowering
     /// for concrete `Int` operands of `/`.
     IntToFloat(IrId),
 }
 
 impl IrKind {
+    /// The source symbol of an operator node, or `None` for constants and
+    /// the implicit [`IrKind::IntToFloat`].
+    #[must_use]
+    pub const fn symbol(self) -> Option<&'static str> {
+        match self {
+            IrKind::IntNeg(_) | IrKind::FloatNeg(_) | IrKind::IntSub(_) | IrKind::FloatSub(_) => {
+                Some("-")
+            }
+            IrKind::IntAdd(_) | IrKind::FloatAdd(_) => Some("+"),
+            IrKind::IntMul(_) | IrKind::FloatMul(_) => Some("*"),
+            IrKind::FloatDiv(_) => Some("/"),
+            IrKind::IntFloorDiv(_) => Some("//"),
+            IrKind::IntRem(_) => Some("%"),
+            IrKind::IntConst(_) | IrKind::FloatConst(_) | IrKind::IntToFloat(_) => None,
+        }
+    }
+
     /// The type of the value this node produces. Never
     /// [`Ty::UntypedInt`].
     #[must_use]
@@ -68,17 +98,17 @@ impl IrKind {
         match self {
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
-            | IrKind::IntAdd(..)
-            | IrKind::IntSub(..)
-            | IrKind::IntMul(..)
-            | IrKind::IntFloorDiv(..)
-            | IrKind::IntRem(..) => Ty::Int,
+            | IrKind::IntAdd(_)
+            | IrKind::IntSub(_)
+            | IrKind::IntMul(_)
+            | IrKind::IntFloorDiv(_)
+            | IrKind::IntRem(_) => Ty::Int,
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
-            | IrKind::FloatAdd(..)
-            | IrKind::FloatSub(..)
-            | IrKind::FloatMul(..)
-            | IrKind::FloatDiv(..)
+            | IrKind::FloatAdd(_)
+            | IrKind::FloatSub(_)
+            | IrKind::FloatMul(_)
+            | IrKind::FloatDiv(_)
             | IrKind::IntToFloat(_) => Ty::Float,
         }
     }
@@ -90,15 +120,15 @@ impl IrKind {
             IrKind::FloatConst(_) => "float",
             IrKind::IntNeg(_) => "int-neg",
             IrKind::FloatNeg(_) => "float-neg",
-            IrKind::IntAdd(..) => "int-add",
-            IrKind::IntSub(..) => "int-sub",
-            IrKind::IntMul(..) => "int-mul",
-            IrKind::IntFloorDiv(..) => "int-floor-div",
-            IrKind::IntRem(..) => "int-rem",
-            IrKind::FloatAdd(..) => "float-add",
-            IrKind::FloatSub(..) => "float-sub",
-            IrKind::FloatMul(..) => "float-mul",
-            IrKind::FloatDiv(..) => "float-div",
+            IrKind::IntAdd(_) => "int-add",
+            IrKind::IntSub(_) => "int-sub",
+            IrKind::IntMul(_) => "int-mul",
+            IrKind::IntFloorDiv(_) => "int-floor-div",
+            IrKind::IntRem(_) => "int-rem",
+            IrKind::FloatAdd(_) => "float-add",
+            IrKind::FloatSub(_) => "float-sub",
+            IrKind::FloatMul(_) => "float-mul",
+            IrKind::FloatDiv(_) => "float-div",
             IrKind::IntToFloat(_) => "int-to-float",
         }
     }
@@ -109,8 +139,32 @@ impl IrKind {
 pub struct IrNode {
     /// What the node computes.
     pub kind: IrKind,
-    /// The source it was lowered from. Runtime errors are reported here.
+    /// The source expression it was lowered from, parentheses excluded.
     pub span: Span,
+}
+
+impl IrNode {
+    /// The span of the operator's symbol, for operator nodes: where a
+    /// runtime error in this node is reported.
+    #[must_use]
+    pub fn operator_span(&self) -> Option<Span> {
+        let symbol = self.kind.symbol()?;
+        let start = match self.kind {
+            IrKind::IntAdd(operands)
+            | IrKind::IntSub(operands)
+            | IrKind::IntMul(operands)
+            | IrKind::IntFloorDiv(operands)
+            | IrKind::IntRem(operands)
+            | IrKind::FloatAdd(operands)
+            | IrKind::FloatSub(operands)
+            | IrKind::FloatMul(operands)
+            | IrKind::FloatDiv(operands) => operands.op_start,
+            // A prefix operator starts its expression.
+            IrKind::IntNeg(_) | IrKind::FloatNeg(_) => self.span.start,
+            IrKind::IntConst(_) | IrKind::FloatConst(_) | IrKind::IntToFloat(_) => return None,
+        };
+        Some(crate::ast::symbol_span(symbol, start))
+    }
 }
 
 /// A lowered program: an arena of [`IrNode`]s and its root.
@@ -195,19 +249,19 @@ impl Pretty<'_> {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
             }
-            IrKind::IntAdd(lhs, rhs)
-            | IrKind::IntSub(lhs, rhs)
-            | IrKind::IntMul(lhs, rhs)
-            | IrKind::IntFloorDiv(lhs, rhs)
-            | IrKind::IntRem(lhs, rhs)
-            | IrKind::FloatAdd(lhs, rhs)
-            | IrKind::FloatSub(lhs, rhs)
-            | IrKind::FloatMul(lhs, rhs)
-            | IrKind::FloatDiv(lhs, rhs) => {
+            IrKind::IntAdd(operands)
+            | IrKind::IntSub(operands)
+            | IrKind::IntMul(operands)
+            | IrKind::IntFloorDiv(operands)
+            | IrKind::IntRem(operands)
+            | IrKind::FloatAdd(operands)
+            | IrKind::FloatSub(operands)
+            | IrKind::FloatMul(operands)
+            | IrKind::FloatDiv(operands) => {
                 f.write_str("\n")?;
-                self.node(f, lhs, depth + 1)?;
+                self.node(f, operands.lhs, depth + 1)?;
                 f.write_str("\n")?;
-                self.node(f, rhs, depth + 1)?;
+                self.node(f, operands.rhs, depth + 1)?;
             }
         }
         f.write_str(")")
@@ -236,7 +290,14 @@ mod tests {
         let seven = builder.alloc(IrKind::IntConst(7), Span::new(0, 1));
         let widened = builder.alloc(IrKind::IntToFloat(seven), Span::new(0, 1));
         let two = builder.alloc(IrKind::FloatConst(2.0), Span::new(4, 5));
-        let div = builder.alloc(IrKind::FloatDiv(widened, two), Span::new(0, 5));
+        let div = builder.alloc(
+            IrKind::FloatDiv(Operands {
+                lhs: widened,
+                rhs: two,
+                op_start: 2,
+            }),
+            Span::new(0, 5),
+        );
         let ir = builder.finish(div);
         assert_eq!(ir.root(), div);
         assert_eq!(ir.get(two).kind, IrKind::FloatConst(2.0));
@@ -247,11 +308,43 @@ mod tests {
     }
 
     #[test]
+    fn operator_spans() {
+        let operands = Operands {
+            lhs: IrId(0),
+            rhs: IrId(1),
+            op_start: 4,
+        };
+        let node = |kind| IrNode {
+            kind,
+            span: Span::new(2, 9),
+        };
+        assert_eq!(
+            node(IrKind::IntFloorDiv(operands)).operator_span(),
+            Some(Span::new(4, 6))
+        );
+        assert_eq!(
+            node(IrKind::FloatAdd(operands)).operator_span(),
+            Some(Span::new(4, 5))
+        );
+        assert_eq!(
+            node(IrKind::IntNeg(IrId(0))).operator_span(),
+            Some(Span::new(2, 3))
+        );
+        assert_eq!(node(IrKind::IntConst(1)).operator_span(), None);
+        assert_eq!(node(IrKind::IntToFloat(IrId(0))).operator_span(), None);
+    }
+
+    #[test]
     fn node_types() {
         let id = IrId(0);
+        let operands = Operands {
+            lhs: id,
+            rhs: id,
+            op_start: 0,
+        };
         assert_eq!(IrKind::IntConst(1).ty(), Ty::Int);
-        assert_eq!(IrKind::IntRem(id, id).ty(), Ty::Int);
-        assert_eq!(IrKind::FloatDiv(id, id).ty(), Ty::Float);
+        assert_eq!(IrKind::IntRem(operands).ty(), Ty::Int);
+        assert_eq!(IrKind::FloatDiv(operands).ty(), Ty::Float);
         assert_eq!(IrKind::IntToFloat(id).ty(), Ty::Float);
     }
 }

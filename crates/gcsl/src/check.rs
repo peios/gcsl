@@ -116,7 +116,7 @@ impl Checker<'_> {
                 op: UnaryOp::Neg,
                 operand,
             } => self.check_expr(operand),
-            ExprKind::Binary { op, lhs, rhs } => {
+            ExprKind::Binary { op, lhs, rhs, .. } => {
                 let lhs_ty = self.check_expr(lhs);
                 let rhs_ty = self.check_expr(rhs);
                 match op {
@@ -177,13 +177,33 @@ impl Checker<'_> {
             (Ty::Int, Ty::Int) => Ty::Int,
             (Ty::Float, Ty::Float) => Ty::Float,
             (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => {
-                self.errors.push(Diagnostic::error(
+                self.operand_error(
+                    id,
                     format!("cannot {} {lhs_ty} and {rhs_ty}", op.verb()),
-                    self.ast.get(id).span,
-                ));
+                    (lhs, lhs_ty),
+                    (rhs, rhs_ty),
+                );
                 Ty::Error
             }
         }
+    }
+
+    /// Reports an operator rejecting its operands: the message points at the
+    /// operator, and each operand is labelled with its type.
+    fn operand_error(
+        &mut self,
+        id: ExprId,
+        message: String,
+        (lhs, lhs_ty): (ExprId, Ty),
+        (rhs, rhs_ty): (ExprId, Ty),
+    ) {
+        let expr = self.ast.get(id);
+        let span = expr.operator_span().unwrap_or(expr.span);
+        self.errors.push(
+            Diagnostic::error(message, span)
+                .with_context(self.ast.get(lhs).span, lhs_ty.to_string())
+                .with_context(self.ast.get(rhs).span, rhs_ty.to_string()),
+        );
     }
 
     /// Types `//` and `%`: both operands must be integers, and the result is
@@ -204,10 +224,12 @@ impl Checker<'_> {
             return Ty::Error;
         }
         if lhs_ty == Ty::Float || rhs_ty == Ty::Float {
-            self.errors.push(Diagnostic::error(
+            self.operand_error(
+                id,
                 format!("cannot {} {}", op.verb(), Ty::Float),
-                self.ast.get(id).span,
-            ));
+                (lhs, lhs_ty),
+                (rhs, rhs_ty),
+            );
             return Ty::Error;
         }
         Ty::Int
@@ -318,7 +340,7 @@ mod tests {
     fn int_and_float_do_not_mix() {
         assert_eq!(
             errors("(7 // 2) + 1.5"),
-            vec![("cannot add Int and Float".to_owned(), Span::new(0, 14))]
+            vec![("cannot add Int and Float".to_owned(), Span::new(9, 10))]
         );
         assert_eq!(
             messages("1.5 - (7 // 2)"),
@@ -367,7 +389,7 @@ mod tests {
         assert_eq!(root_type("(7 // 2) // 2"), Ty::Int);
         assert_eq!(
             errors("7.0 // 2"),
-            vec![("cannot floor-divide Float".to_owned(), Span::new(0, 8))]
+            vec![("cannot floor-divide Float".to_owned(), Span::new(4, 6))]
         );
         assert_eq!(messages("7 // 2.0"), vec!["cannot floor-divide Float"]);
         assert_eq!(messages("7.0 % 2"), vec!["cannot take modulo of Float"]);
@@ -403,10 +425,32 @@ mod tests {
         assert_eq!(
             errors("(7.0 // 2) + (1 % 2.5)"),
             vec![
-                ("cannot floor-divide Float".to_owned(), Span::new(1, 9)),
-                ("cannot take modulo of Float".to_owned(), Span::new(14, 21)),
+                ("cannot floor-divide Float".to_owned(), Span::new(5, 7)),
+                ("cannot take modulo of Float".to_owned(), Span::new(16, 17)),
             ]
         );
+    }
+
+    #[test]
+    fn operands_are_labelled_with_their_types() {
+        let diagnostics = check(&parse_text("(7 // 2) + 1.5")).unwrap_err();
+        let labels: Vec<(Span, &str)> = diagnostics[0]
+            .labels
+            .iter()
+            .map(|label| (label.span, label.text.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![(Span::new(0, 8), "Int"), (Span::new(11, 14), "Float")]
+        );
+        // An untyped literal is labelled as the Int it would default to.
+        let diagnostics = check(&parse_text("1 % 2.5")).unwrap_err();
+        let labels: Vec<&str> = diagnostics[0]
+            .labels
+            .iter()
+            .map(|label| label.text.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Int", "Float"]);
     }
 
     #[test]
