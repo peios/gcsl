@@ -225,11 +225,13 @@
 //! the body is checked as a block whose scope starts with the parameters,
 //! against the return type as an annotated initialiser is checked against
 //! its annotation. The parameters are bindings like any other, so a `let`
-//! may shadow one and a `:=` rebind one. (The two things the body decides
-//! are whether a pure function's bare parameters may be futures, and
-//! whether an impure function's bare result is: see [Inferred
-//! parameters](#inferred-parameters) and [Inferred
-//! results](#inferred-results).)
+//! may shadow one and a `:=` rebind one. (The three things the body decides
+//! are whether a pure function's bare parameters may be futures, whether
+//! an impure function's bare result is, and whether an impure function's
+//! callback parameter may be given futures: see [Inferred
+//! parameters](#inferred-parameters), [Inferred
+//! results](#inferred-results) and [Narrowed
+//! callbacks](#narrowed-callbacks).)
 //!
 //! **Frames.** Each function runs in a frame of its own. The checker keeps a
 //! stack of the functions it is inside (`Function`); entering one saves the
@@ -348,7 +350,10 @@
 //! contravariant), though it is of `fn(Present<Int>) -> Int`, and neither
 //! is a memoised `fn(Int) ->> Int`, though it too is a subtype of
 //! `fn(Present<Int>) -> Int` (see [`crate::types`] for the effect
-//! lattice).
+//! lattice). An impure or memoised function's parameter written `fn(Int)
+//! -> Int` is narrowed to `fn(Present<Int>) -> Int` if its body only ever
+//! passes it present values: see [Narrowed
+//! callbacks](#narrowed-callbacks).
 //!
 //! **Awaits.** Every place a value is used as its bits decides whether it
 //! is awaited there, and records it in [`Resolution::await_of`] (or, for a
@@ -538,7 +543,9 @@
 //! what is written, with everything inside it: `Present<...>`,
 //! `Future<...>`, a union and a function type say what they are. A
 //! parenthesised type is what is inside it. The parameters are never
-//! inferred, nor is anything of a pure function's. A memoised function's
+//! inferred, nor is anything of a pure function's, though a callback
+//! parameter may be narrowed, in the same step (see [Narrowed
+//! callbacks](#narrowed-callbacks)). A memoised function's
 //! result is inferred in the same way, and its parameters are present:
 //! `fn fetch(x: Int) ->> Int { x }` is `fn(x: Int) ->> Int`, and `fn
 //! later(x: Int) ->> Int { lazy x }` is `fn(x: Int) ->> Future<Int>`.
@@ -589,6 +596,91 @@
 //! function in what the body returns counts as the either shape, so the
 //! inferred type holds no provisional type, and the enclosing function's
 //! settling leaves it as it is.
+//!
+//! # Narrowed callbacks
+//!
+//! In an impure or memoised function expression, a *callback parameter* is
+//! one whose type is written directly as an impure function type, `fn(...)
+//! -> T` (not inside `Future<...>`, a union, a record type or another
+//! function type), and each parameter position of that type written bare,
+//! as a name or a record type, is *narrowable*. As written, such a position
+//! is the either shape: the function says it may pass the callback a
+//! future there, so a pure callback that measures its parameter does not
+//! fit. A body that only ever passes present values there is narrowed to
+//! say so, and then it does:
+//!
+//! ```text
+//! fn double(x: Int): Int { x * 2 }
+//! fn run(f: fn(Int) -> Int) -> Int { f(1) }
+//! # run is fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>
+//! run(double)      # 2
+//! ```
+//!
+//! Once the body is checked, each narrowable position becomes its *present
+//! type*, the type written there with every bare type in it present (`Int`
+//! for `Int`, `{a: Int}` for `{a: Int}`, and `{a: Future<Int>}` for `{a:
+//! Future<Int>}`), if the body never uses the callback as a value, and
+//! every call of it gives the position an argument that fits the present
+//! type; otherwise it stays as written. A use as a value is any appearance
+//! of the name other than as exactly the callee of a call: `let g = f`,
+//! `other(f)`, `(f)(1)`, returning it, interpolating it. Each position is
+//! decided on its own, all or nothing, and a callback that is never called
+//! nor used has every narrowable position narrowed. An argument fits if
+//! what it is where it is passed, found as an inferred result's value is
+//! and inferred against the position as a bare result position is (see
+//! [Inferred results](#inferred-results): once the awaits marked on it have
+//! run, a record block by what its fields are, an untyped literal
+//! coerced), is a subtype of the present type. So `f({ a = 1 })` fits `{a:
+//! Int}`, while `f(j)`, `j` being a parameter of the function, which may be
+//! a future, does not fit `Int`, and nor does a parameter of an enclosing
+//! pure function, whose type is provisional. Positions not written bare,
+//! `Present<T>`, `Future<T>`, `T | Future<T>` and function types, are never
+//! narrowed, nor is the callback's result; a parameter written as a
+//! memoised or pure function type is not a callback parameter, its bare
+//! parameters being present already; and nothing of a pure function's is
+//! narrowed, since it cannot call an impure callback.
+//!
+//! Calls count wherever they are in the body, in a nested function or
+//! `lazy` too, as long as the name resolves to the parameter, not to
+//! something shadowing it. While the body is checked, the parameter's
+//! binding holds the index of its entry in the stack of the callback
+//! parameters of the functions being checked (`Callback`, with one
+//! `CallbackPosition` for each of its positions), which records the first
+//! use as a value (`Checker::check_name`) and, for each position, the first
+//! argument that does not fit (`Checker::check_callee`,
+//! `Checker::record_argument`), each in constant time but for finding what
+//! the argument is and the subtype test. When the body ends, the positions
+//! are decided (`Checker::narrow_callbacks`), and the function's type is
+//! interned again with the narrowed parameter types, in the same step as
+//! its inferred result and on the same conditions: no error was reported
+//! while the body was checked, and the declared parameter and result types
+//! have none. Everything that sees the function's value sees that type.
+//! Nothing inside the body changes: the callback has its written type
+//! there, every expression keeps its type, and no await is added or
+//! removed; the function's own name in its body has the declared type.
+//!
+//! Narrowing a position makes the callback's type a supertype of the
+//! written one, since parameters are contravariant, so the function accepts
+//! more callbacks. It is sound because the only code that can call the
+//! callback is the body, which was checked against the written type and is
+//! known to pass nothing at a narrowed position that does not fit its
+//! present type: the value can leave the body only through a use of its
+//! name as a value, which keeps every position as written.
+//!
+//! **The call-site label.** When an argument does not fit a callback
+//! parameter of a known callee of this input (see "The call-site error"
+//! under [Inferred parameters](#inferred-parameters)) that was not narrowed
+//! at some position, the mismatch has a label at what kept a position the
+//! argument needs as written, the first in source order: "`f` is given a
+//! value that may be a future here" at the argument of a call, and "`f` is
+//! used as a value here, so it may be given a future" at a use as a value.
+//! A position is needed if the argument's function type does not take the
+//! type the position is written as. The label is added only if the
+//! argument would have fitted, as it is or once awaited, had every
+//! narrowable position been narrowed, so that it never misleads about a
+//! mismatch with another cause ([`FnResolution::unnarrowed`] records what
+//! it needs). A callee of an earlier session input has no label, its
+//! source being gone.
 //!
 //! # Scopes
 //!
@@ -801,6 +893,48 @@ pub struct FnResolution {
     /// body measures, which makes it present; `None` for every other
     /// parameter. Empty for a `lazy`. See the module documentation.
     pub param_demands: Vec<Option<Span>>,
+    /// For each parameter, in order, if it is a callback parameter of an
+    /// impure or memoised function whose body was checked without an
+    /// error, and was not narrowed at some narrowable position, what kept
+    /// it from being narrowed; `None` for every other parameter. Empty if
+    /// no parameter has an entry, as for a `lazy`. See the module
+    /// documentation.
+    pub unnarrowed: Vec<Option<Unnarrowed>>,
+}
+
+/// A callback parameter that was not narrowed at some of its narrowable
+/// positions, in [`FnResolution::unnarrowed`]: what the call-site label on
+/// a mismatched argument needs. See the module documentation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unnarrowed {
+    /// The parameter's type had every narrowable position been narrowed.
+    pub narrowed: TyId,
+    /// For each parameter of the parameter's function type, in order, what
+    /// first kept it from being narrowed, in source order; `None` for one
+    /// that was narrowed or is not narrowable.
+    pub blocks: Box<[Option<NarrowingBlock>]>,
+}
+
+/// What kept a narrowable position of a callback parameter from being
+/// narrowed. See the module documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NarrowingBlock {
+    /// A call of the callback gives the position a value that may be a
+    /// future: the argument.
+    Given(Span),
+    /// The callback is used as a value, other than as the callee of a
+    /// call: the use of its name.
+    Used(Span),
+}
+
+impl NarrowingBlock {
+    /// Where it is.
+    #[must_use]
+    pub const fn span(self) -> Span {
+        match self {
+            NarrowingBlock::Given(span) | NarrowingBlock::Used(span) => span,
+        }
+    }
 }
 
 /// How the path of a dotted `let`, field or `:=` resolves: the record it
@@ -1087,6 +1221,11 @@ struct Binding {
     /// for every other binding, and for one declared by an earlier input of
     /// a session, whose [`FnId`]s belong to another tree.
     function: Option<FnId>,
+    /// For a callback parameter of an impure or memoised function being
+    /// checked, its index in `Checker::callbacks`, where its calls and uses
+    /// are recorded (see `Checker::narrow_callbacks`); `None` for every
+    /// other binding.
+    callback: Option<usize>,
 }
 
 /// What a [`Binding`] is.
@@ -1206,6 +1345,36 @@ struct Capture {
     source: VarRef,
     /// Its type.
     ty: TyId,
+}
+
+/// A callback parameter of an impure or memoised function being checked,
+/// in `Checker::callbacks`: what its body does with it so far, from which
+/// its type is narrowed when the body ends. See the module documentation.
+#[derive(Clone, Copy, Debug)]
+struct Callback {
+    /// The index of the parameter among its function's parameters.
+    param: usize,
+    /// Where the body first uses it as a value, other than as the callee of
+    /// a call, in source order, so far.
+    used: Option<Span>,
+    /// The index in `Checker::callback_positions` of the first of its
+    /// positions, one for each parameter of its function type, in order.
+    positions: usize,
+    /// The number of its positions.
+    count: usize,
+}
+
+/// One parameter position of a callback parameter's function type, in
+/// `Checker::callback_positions`.
+#[derive(Clone, Copy, Debug)]
+struct CallbackPosition {
+    /// For a narrowable position, one written bare, the type expression it
+    /// is written as and its present type, what it is narrowed to; `None`
+    /// for any other.
+    narrowable: Option<(TypeExprId, TyId)>,
+    /// Where a call of the callback first gives the position an argument
+    /// that does not fit its present type, in source order, so far.
+    given: Option<Span>,
 }
 
 /// A field declared in the record block being checked.
@@ -1470,6 +1639,13 @@ pub struct Checker<'a> {
     /// Reused as the work list of open nodes still to check against their
     /// expected types when a record block ends.
     pending: Vec<(u32, TyId)>,
+    /// The callback parameters of every impure or memoised function being
+    /// checked, outermost function first; each function truncates it back
+    /// when it ends.
+    callbacks: Vec<Callback>,
+    /// The parameter positions of the function types of `callbacks`, each
+    /// callback's together, in the same order.
+    callback_positions: Vec<CallbackPosition>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -1532,6 +1708,8 @@ impl<'a> Checker<'a> {
             built: Vec::new(),
             path_types: Vec::new(),
             pending: Vec::new(),
+            callbacks: Vec::new(),
+            callback_positions: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -1600,6 +1778,7 @@ impl<'a> Checker<'a> {
             .map(|binding| Binding {
                 declared: None,
                 function: None,
+                callback: None,
                 ..binding
             })
             .collect();
@@ -2770,6 +2949,7 @@ impl<'a> Checker<'a> {
             declared,
             kind,
             function: None,
+            callback: None,
         });
         slot
     }
@@ -3014,18 +3194,22 @@ impl<'a> Checker<'a> {
     /// here, and the test is retried with every provisional type of the
     /// function in `found` made present.
     fn expect(&mut self, expr: ExprId, found: TyId, expected: TyId, context: Span, why: &str) {
-        self.expect_at(expr, found, expected, (context, why), AwaitSite::Implicit);
+        let site = (AwaitSite::Implicit, None);
+        self.expect_at(expr, found, expected, (context, why), site);
     }
 
     /// As [`Checker::expect`], with `site` saying how an await at the top is
-    /// reported in a pure function (see [`Checker::await_here`]).
+    /// reported in a pure function (see [`Checker::await_here`]), and
+    /// `filling`, for an argument of a known callee of this input, the
+    /// callee's function and the parameter the argument fills, for the
+    /// label on a mismatch (see [`Checker::narrowing_label`]).
     fn expect_at(
         &mut self,
         expr: ExprId,
         found: TyId,
         expected: TyId,
         (context, why): (Span, &str),
-        site: AwaitSite,
+        (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) {
         match (found, expected) {
             (TyId::ERROR, _) => {}
@@ -3062,7 +3246,7 @@ impl<'a> Checker<'a> {
                         };
                         self.await_here(expr, found, kind, site);
                     }
-                    None => self.mismatch(expr, found, expected, (context, why)),
+                    None => self.mismatch(expr, (found, expected), (context, why), filling),
                 }
             }
         }
@@ -3184,15 +3368,20 @@ impl<'a> Checker<'a> {
     }
 
     /// Reports that `expr`, of type `found`, does not fit the type
-    /// `expected` stated at `context`, labelled `why`; with a note when a
-    /// future is expected and what is found is not one.
+    /// `expected` stated at `context`, labelled `why`; for an argument of a
+    /// known callee of this input, `filling` being the callee's function
+    /// and the parameter the argument fills, with a label at what kept the
+    /// parameter from being narrowed, if that is the cause (see
+    /// [`Checker::narrowing_label`]); and with a note when a future is
+    /// expected and what is found is not one.
     fn mismatch(
         &mut self,
         expr: ExprId,
-        found: TyId,
-        expected: TyId,
+        (found, expected): (TyId, TyId),
         (context, why): (Span, &str),
+        filling: Option<(FnId, usize)>,
     ) {
+        let narrowing = filling.and_then(|filling| self.narrowing_label(filling, found, expected));
         let found = self.settle(expr, found);
         let label = format!(
             "expected {}, found {}",
@@ -3202,6 +3391,9 @@ impl<'a> Checker<'a> {
         let mut error = Diagnostic::error("mismatched types", self.ast.get(expr).span)
             .with_label(label)
             .with_context(context, why);
+        if let Some((span, label)) = narrowing {
+            error = error.with_context(span, label);
+        }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);
             let found = self.shown(found);
@@ -3223,6 +3415,62 @@ impl<'a> Checker<'a> {
             }
         }
         self.errors.push(error);
+    }
+
+    /// The context label on the mismatch of an argument of type `found`
+    /// with `expected`, the type of the parameter number `param` of the
+    /// function expression `function` of this input, which the argument
+    /// fills, if that parameter is a callback parameter that was not
+    /// narrowed at some position and the argument would have fitted had
+    /// every narrowable position been narrowed, as it is or once awaited:
+    /// the label is at what first kept one of the positions the argument
+    /// needs narrowed as written, in source order, a position being needed
+    /// if the argument's function type does not take what the position is
+    /// written as (see the module documentation). `None` otherwise, when
+    /// the mismatch has another cause.
+    fn narrowing_label(
+        &mut self,
+        (function, param): (FnId, usize),
+        found: TyId,
+        expected: TyId,
+    ) -> Option<(Span, String)> {
+        let unnarrowed = self
+            .fn_resolutions
+            .get(function.index())?
+            .unnarrowed
+            .get(param)?
+            .clone()?;
+        if !self.types.is_subtype(found, unnarrowed.narrowed)
+            && self.types.needs_await(found, unnarrowed.narrowed).is_none()
+        {
+            return None;
+        }
+        let offered = self.types.fn_sig(self.types.strip(found))?;
+        let written = self.types.fn_sig(expected)?;
+        let block = unnarrowed
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(at, &block)| {
+                let (&(_, written), &(_, accepted)) =
+                    (written.params.get(at)?, offered.params.get(at)?);
+                block.filter(|_| !self.types.is_subtype(written, accepted))
+            })
+            .min_by_key(|block| block.span().start)?;
+        let decl = self.ast.fn_decl(function);
+        let name = self
+            .ast
+            .names()
+            .get(self.ast.params(decl.params).get(param)?.name);
+        let label = match block {
+            NarrowingBlock::Given(_) => {
+                format!("`{name}` is given a value that may be a future here")
+            }
+            NarrowingBlock::Used(_) => {
+                format!("`{name}` is used as a value here, so it may be given a future")
+            }
+        };
+        Some((block.span(), label))
     }
 
     /// Where `expr`, of type `ty`, is used as its bits at the top, by a
@@ -3532,18 +3780,21 @@ impl<'a> Checker<'a> {
         context: Span,
         why: &str,
     ) -> TyId {
-        self.check_expr_expecting_at(id, expected, (context, why), AwaitSite::Implicit)
+        self.check_expr_expecting_at(id, expected, (context, why), (AwaitSite::Implicit, None))
     }
 
     /// As [`Checker::check_expr_expecting`], with `site` saying how an
     /// await of `id` at the top is reported in a pure function (see
-    /// [`Checker::await_here`]).
+    /// [`Checker::await_here`]), and `filling`, for an argument of a known
+    /// callee of this input, the callee's function and the parameter the
+    /// argument fills, for the label on a mismatch (see
+    /// [`Checker::narrowing_label`]).
     fn check_expr_expecting_at(
         &mut self,
         id: ExprId,
         expected: TyId,
         (context, why): (Span, &str),
-        site: AwaitSite,
+        (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) -> TyId {
         // A record block is present, so it is checked against the present
         // member of an either shape (or of a provisional type).
@@ -3571,7 +3822,7 @@ impl<'a> Checker<'a> {
             return ty;
         }
         let found = self.check_expr(id);
-        self.expect_at(id, found, expected, (context, why), site);
+        self.expect_at(id, found, expected, (context, why), (site, filling));
         found
     }
 
@@ -3790,6 +4041,8 @@ impl<'a> Checker<'a> {
             callee,
             slot_names,
             param_demands: finished.demanded.clone(),
+            // Recorded by `check_fn`, for a function that has any.
+            unnarrowed: Vec::new(),
         };
         (self.next_slot, self.frame_size) = (finished.outer_next_slot, finished.outer_frame_size);
         finished.demanded
@@ -3809,8 +4062,10 @@ impl<'a> Checker<'a> {
     /// of every expression in the function is settled accordingly, and so
     /// is the function's type. An impure or memoised function whose body
     /// was checked without an error then has its result inferred from what
-    /// the body returns (see [`Checker::inferred`]), and its type, recorded
-    /// again, is the function type of its parameters and that result.
+    /// the body returns (see [`Checker::inferred`]) and its callback
+    /// parameters narrowed by what the body gives them (see
+    /// [`Checker::narrow_callbacks`]), and its type, recorded again, is the
+    /// function type of those parameters and that result.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
@@ -3856,29 +4111,156 @@ impl<'a> Checker<'a> {
         (self.next_slot, self.frame_size) = (0, 0);
         let span = self.ast.get(id).span;
         let errors = self.errors.len();
+        let callbacks = (self.callbacks.len(), self.callback_positions.len());
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
         // An impure or memoised function's bare result takes its laziness
-        // from the body, unless something is wrong with the function.
-        if let Some(ret_expr) = decl.ret
-            && !pure
-            && ty != TyId::ERROR
-            && self.errors.len() == errors
-        {
-            let value = self.value_of(decl.body, ret);
-            let inferred = self.inferred(ret_expr, ret, value);
-            if inferred != ret {
-                ty = self.intern_fn_type(base, inferred, decl.effect);
+        // from the body, and its callback parameters are narrowed, unless
+        // something is wrong with the function.
+        let mut unnarrowed = Vec::new();
+        if !pure && ty != TyId::ERROR && self.errors.len() == errors {
+            let mut result = ret;
+            if let Some(ret_expr) = decl.ret {
+                let value = self.value_of(decl.body, ret);
+                result = self.inferred(ret_expr, ret, value);
+            }
+            let narrowed = self.narrow_callbacks(base, callbacks.0, &mut unnarrowed);
+            if result != ret || narrowed {
+                ty = self.intern_fn_type(base, result, decl.effect);
                 self.expr_types[id.index()] = ty;
             }
         }
+        self.callbacks.truncate(callbacks.0);
+        self.callback_positions.truncate(callbacks.1);
         self.fn_params.truncate(base);
         let demanded = self.finish_function(decl.params.len(), callee);
+        if let Some(resolution) = self.fn_resolutions.get_mut(function.index()) {
+            resolution.unnarrowed = unnarrowed;
+        }
         if !provisional {
             return ty;
         }
         let decisions: Vec<bool> = demanded.iter().map(Option::is_some).collect();
         self.settle_function(id, function, &decisions);
         self.expr_types[id.index()]
+    }
+
+    /// Narrows the callback parameters `callbacks[start..]` of the impure or
+    /// memoised function whose parameters' types are `fn_params[base..]`,
+    /// whose body has just been checked without an error (see the module
+    /// documentation): each narrowable position of a callback parameter
+    /// that the body never uses as a value, and to which every call of it
+    /// gives an argument that fits the position's present type, becomes
+    /// that present type, in `fn_params`. Returns whether any did. For each
+    /// callback parameter left unnarrowed at some narrowable position, what
+    /// kept it so is recorded in `unnarrowed`, at the parameter's index,
+    /// the vector being filled with `None` first.
+    fn narrow_callbacks(
+        &mut self,
+        base: usize,
+        start: usize,
+        unnarrowed: &mut Vec<Option<Unnarrowed>>,
+    ) -> bool {
+        let count = self.fn_params.len().saturating_sub(base);
+        let mut narrowed = false;
+        for index in start..self.callbacks.len() {
+            let Some(callback) = self.callbacks.get(index).copied() else {
+                continue;
+            };
+            let Some(&(_, declared)) = self.fn_params.get(base + callback.param) else {
+                continue;
+            };
+            let Some(sig) = self.types.fn_sig(declared).cloned() else {
+                continue;
+            };
+            let positions = self
+                .callback_positions
+                .get(callback.positions..callback.positions + callback.count)
+                .unwrap_or_default();
+            // The parameters as narrowed, and as they would be had every
+            // narrowable position been narrowed.
+            let mut params = Vec::with_capacity(sig.params.len());
+            let mut every = Vec::with_capacity(sig.params.len());
+            let mut blocks = Vec::with_capacity(sig.params.len());
+            for (at, &(name, written)) in sig.params.iter().enumerate() {
+                let Some((present, given)) = positions.get(at).and_then(|position| {
+                    position
+                        .narrowable
+                        .map(|(_, present)| (present, position.given))
+                }) else {
+                    params.push((name, written));
+                    every.push((name, written));
+                    blocks.push(None);
+                    continue;
+                };
+                // The first in source order of what keeps it as written.
+                let block = [
+                    given.map(NarrowingBlock::Given),
+                    callback.used.map(NarrowingBlock::Used),
+                ]
+                .into_iter()
+                .flatten()
+                .min_by_key(|block| block.span().start);
+                params.push((name, if block.is_none() { present } else { written }));
+                every.push((name, present));
+                blocks.push(block);
+            }
+            let ty = self.types.fn_type(params, sig.ret, sig.effect);
+            if ty != declared {
+                if let Some(entry) = self.fn_params.get_mut(base + callback.param) {
+                    entry.1 = ty;
+                }
+                narrowed = true;
+            }
+            if blocks.iter().any(Option::is_some) {
+                let every = self.types.fn_type(every, sig.ret, sig.effect);
+                if unnarrowed.is_empty() {
+                    unnarrowed.resize(count, None);
+                }
+                if let Some(entry) = unnarrowed.get_mut(callback.param) {
+                    *entry = Some(Unnarrowed {
+                        narrowed: every,
+                        blocks: blocks.into(),
+                    });
+                }
+            }
+        }
+        narrowed
+    }
+
+    /// Records that the argument `arg`, checked against `param_ty`, fills
+    /// the parameter number `param` of the callback parameter
+    /// `callbacks[callback]` in a call of it: if the position is
+    /// narrowable and what the argument is once every await marked on it
+    /// has run (see [`Checker::value_of`], [`Checker::inferred`]) does not
+    /// fit its present type, the argument keeps the position as written.
+    fn record_argument(&mut self, callback: usize, param: usize, arg: ExprId, param_ty: TyId) {
+        let Some(at) = self
+            .callbacks
+            .get(callback)
+            .filter(|callback| param < callback.count)
+            .map(|callback| callback.positions + param)
+        else {
+            return;
+        };
+        let Some(&CallbackPosition {
+            narrowable: Some((written, present)),
+            given,
+        }) = self.callback_positions.get(at)
+        else {
+            return;
+        };
+        let span = self.ast.get(arg).span;
+        // An earlier argument keeps it as written already.
+        if given.is_some_and(|given| given.start <= span.start) {
+            return;
+        }
+        let value = self.value_of(arg, param_ty);
+        let found = self.inferred(written, param_ty, value);
+        if !self.types.is_subtype(found, present)
+            && let Some(position) = self.callback_positions.get_mut(at)
+        {
+            position.given = Some(span);
+        }
     }
 
     /// Whether a pure function's parameter whose type is written as `ty` is
@@ -4233,9 +4615,11 @@ impl<'a> Checker<'a> {
     /// module documentation): the callee's return type, or `Error` if the
     /// callee is not a function or the arguments do not fit its parameters.
     /// Every argument is checked whatever goes wrong. A callee that may be
-    /// a future is awaited.
+    /// a future is awaited. A call of a callback parameter through its name
+    /// records what it gives each position (see
+    /// [`Checker::record_argument`]), and is not a use of it as a value.
     fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
-        let callee_ty = self.check_expr(callee);
+        let (callee_ty, callback) = self.check_callee(callee);
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
             if callee_ty != TyId::ERROR {
@@ -4253,7 +4637,7 @@ impl<'a> Checker<'a> {
             }
             return TyId::ERROR;
         };
-        let erroneous = self.bind_arguments(id, (callee, callee_ty), args, &sig);
+        let erroneous = self.bind_arguments(id, (callee, callee_ty, callback), args, &sig);
         if let Some(function) = self.functions.last()
             && function.effect == Effect::Pure
             && sig.effect != Effect::Pure
@@ -4290,11 +4674,17 @@ impl<'a> Checker<'a> {
     /// a pure caller in the call-site form (see
     /// [`Checker::argument_await_error`]). In a recursive call through the
     /// function's own name, an argument whose type is a provisional type of
-    /// the function is measured.
+    /// the function is measured. In a call of the callback parameter
+    /// `callbacks[callback]`, if `callback` is `Some`, what each argument
+    /// gives the position it fills is recorded (see
+    /// [`Checker::record_argument`]). A mismatched argument filling a
+    /// callback parameter of a known callee of this input that was not
+    /// narrowed is labelled with what kept it so (see
+    /// [`Checker::narrowing_label`]).
     fn bind_arguments(
         &mut self,
         id: ExprId,
-        (callee, callee_ty): (ExprId, TyId),
+        (callee, callee_ty, callback): (ExprId, TyId, Option<usize>),
         args: ArgRange,
         sig: &FnTy,
     ) -> bool {
@@ -4360,20 +4750,20 @@ impl<'a> Checker<'a> {
                 *entry = position(index);
             }
             let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
-            let site = match known {
-                Some(known) => self.argument_site(known, param, (id, callee)),
-                None => AwaitSite::Implicit,
-            };
+            let context = self.argument_context(known, param, (id, callee));
             let found = self.check_expr_expecting_at(
                 arg.value,
                 param_ty,
                 (callee_span, &function_label),
-                site,
+                context,
             );
             // A recursive call measures every argument that is a parameter
             // of the function, conservatively.
             if recursive && self.types.laziness(found) == Laziness::Provisional {
                 self.claim_top(ast.get(arg.value).span, found);
+            }
+            if let Some(callback) = callback {
+                self.record_argument(callback, param, arg.value, param_ty);
             }
         }
         erroneous |= self.report_unfilled(
@@ -4412,6 +4802,30 @@ impl<'a> Checker<'a> {
             Some(function) => Some(KnownCallee::Current(function)),
             None if index < self.scope_measured.len() => Some(KnownCallee::Earlier(index)),
             None => None,
+        }
+    }
+
+    /// How an argument of the call `call` of `callee`, whose function is
+    /// `known` if it is known, that fills its parameter number `param` is
+    /// checked: how an await of it is reported in a pure caller (see
+    /// [`Checker::argument_site`]), and, for a callee of this input, the
+    /// callee's function and the parameter, for the label on a mismatch
+    /// (see [`Checker::narrowing_label`]).
+    fn argument_context(
+        &self,
+        known: Option<KnownCallee>,
+        param: usize,
+        (call, callee): (ExprId, ExprId),
+    ) -> (AwaitSite, Option<(FnId, usize)>) {
+        match known {
+            Some(known @ KnownCallee::Current(function)) => (
+                self.argument_site(known, param, (call, callee)),
+                Some((function, param)),
+            ),
+            Some(known @ KnownCallee::Earlier(_)) => {
+                (self.argument_site(known, param, (call, callee)), None)
+            }
+            None => (AwaitSite::Implicit, None),
         }
     }
 
@@ -4595,11 +5009,60 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// If the parameter number `param` of an impure or memoised function,
+    /// whose type is written as `ty` and is not erroneous, is a callback
+    /// parameter, one written directly as an impure function type, adds it
+    /// to `callbacks`, with its positions, and returns its index there;
+    /// `None` otherwise. A position written bare, as a name or a record
+    /// type, is narrowable, to its present type: the type it is written as
+    /// with every bare type in it present. See the module documentation.
+    fn callback_parameter(&mut self, param: usize, ty: TypeExprId) -> Option<usize> {
+        let ast = self.ast;
+        let TypeExprKind::Fn {
+            params,
+            effect: Effect::Impure,
+            ..
+        } = ast.type_expr(ty).kind
+        else {
+            return None;
+        };
+        let positions = self.callback_positions.len();
+        for position in ast.param_tys(params) {
+            // The type resolved without an error in its own mode, so it
+            // resolves without one in this one too.
+            let bare = matches!(
+                ast.type_expr(position.ty).kind,
+                TypeExprKind::Named(_) | TypeExprKind::Record(_)
+            );
+            let narrowable = bare
+                .then(|| {
+                    (
+                        position.ty,
+                        self.resolve_type(position.ty, Bareness::Present),
+                    )
+                })
+                .filter(|&(_, present)| present != TyId::ERROR);
+            self.callback_positions.push(CallbackPosition {
+                narrowable,
+                given: None,
+            });
+        }
+        self.callbacks.push(Callback {
+            param,
+            used: None,
+            positions,
+            count: self.callback_positions.len() - positions,
+        });
+        Some(self.callbacks.len() - 1)
+    }
+
     /// Checks the body of the function expression `decl`, whose parameters'
     /// types are `fn_params[base..]`, against its return type `ret`, in a
     /// scope of its own. The scope starts with the callee binding, if the
     /// function has a `callee` name (with the function's type and span),
-    /// then the parameters, each in the next slot; then the items are
+    /// then the parameters, each in the next slot, a callback parameter of
+    /// an impure or memoised function recording its calls and uses (see
+    /// [`Checker::callback_parameter`]); then the items are
     /// checked, and the body's value against `ret` as an annotated
     /// initialiser's is against its annotation, a record block against a
     /// record return type field by field.
@@ -4622,6 +5085,7 @@ impl<'a> Checker<'a> {
                 declared: Some(fn_span),
                 kind: BindingKind::Callee,
                 function: None,
+                callback: None,
             });
         }
         let params = self.ast.params(decl.params);
@@ -4641,6 +5105,12 @@ impl<'a> Checker<'a> {
                 .get(base + index)
                 .map_or(TyId::ERROR, |&(_, ty)| ty);
             self.declare_binding(param.name, ty, Some(param.span), BindingKind::Variable);
+            if decl.effect != Effect::Pure && ty != TyId::ERROR {
+                let callback = self.callback_parameter(index, param.ty);
+                if let Some(binding) = self.bindings.last_mut() {
+                    binding.callback = callback;
+                }
+            }
         }
         let body = decl.body;
         let block = *self.ast.get(body);
@@ -4835,11 +5305,44 @@ impl<'a> Checker<'a> {
 
     /// Resolves a use of the variable `name` at expression `id`, recording
     /// where it reads from, capturing it if it belongs to an enclosing
-    /// function, and returns its type.
+    /// function, and returns its type. A use of a callback parameter is
+    /// recorded as a use of it as a value, which keeps it as written (see
+    /// the module documentation); a call through its name is checked by
+    /// [`Checker::check_callee`] instead.
     fn check_name(&mut self, id: ExprId, name: Name, span: Span) -> TyId {
+        let (ty, callback) = self.use_name(id, name, span);
+        if let Some(callback) = callback.and_then(|callback| self.callbacks.get_mut(callback)) {
+            // The first use in source order.
+            if callback.used.is_none_or(|first| span.start < first.start) {
+                callback.used = Some(span);
+            }
+        }
+        ty
+    }
+
+    /// Checks the callee `callee` of a call, returning its type and, if it
+    /// is exactly a name, not in parentheses, whose binding is a callback
+    /// parameter, the parameter's index in `callbacks`: a call through the
+    /// name is recorded by what it gives each position of the callback's
+    /// type (see [`Checker::record_argument`]), not as a use of it as a
+    /// value.
+    fn check_callee(&mut self, callee: ExprId) -> (TyId, Option<usize>) {
+        let expr = self.ast.get(callee);
+        let ExprKind::Name(name) = expr.kind else {
+            return (self.check_expr(callee), None);
+        };
+        let (ty, callback) = self.use_name(callee, name, expr.span);
+        self.expr_types[callee.index()] = ty;
+        (ty, callback)
+    }
+
+    /// As [`Checker::check_name`], but recording nothing of a callback
+    /// parameter: returns the type, and the index in `callbacks` of the
+    /// callback parameter the name's binding is, if it is one.
+    fn use_name(&mut self, id: ExprId, name: Name, span: Span) -> (TyId, Option<usize>) {
         if let Some((index, binding)) = self.lookup(name) {
             self.expr_vars[id.index()] = self.resolve(index, binding);
-            return binding.ty;
+            return (binding.ty, binding.callback);
         }
         let text = self.ast.names().get(name);
         let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span);
@@ -4849,7 +5352,7 @@ impl<'a> Checker<'a> {
             );
         }
         self.errors.push(error);
-        TyId::ERROR
+        (TyId::ERROR, None)
     }
 
     /// Types `+`, `-` and `*`: both operands must end up the same numeric
@@ -9769,8 +10272,18 @@ mod tests {
     #[test]
     fn callbacks_must_accept_what_they_are_promised() {
         let double = "fn double(x: Int): Int { x * 2 }\n";
-        // `run` promises to pass its callback values that may be futures.
-        let text = format!("{double}fn run(f: fn(Int) -> Int) -> Int {{ f(1) }}\nrun(double)");
+        // `run` only ever passes its callback present values, so its
+        // callback parameter is narrowed, and takes `double` (see
+        // `callback_parameters_are_narrowed`).
+        assert_eq!(
+            shown_result(&format!(
+                "{double}fn run(f: fn(Int) -> Int) -> Int {{ f(1) }}\nrun(double)"
+            )),
+            "Int | Future<Int>"
+        );
+        // This `run` passes its callback a value that may be a future.
+        let text =
+            format!("{double}fn run(f: fn(Int) -> Int, j: Int) -> Int {{ f(j) }}\nrun(double, 1)");
         let found = diagnostics(&text);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].message, "mismatched types");
@@ -11216,10 +11729,12 @@ mod tests {
             ),
             "fn(x: Future<Int>, y: Int | Future<Int>, z: Int) ->> Int"
         );
-        // A function type parameter follows its own marker.
+        // A function type parameter follows its own marker, and a callback
+        // parameter the body never calls is narrowed (see
+        // `callback_parameters_are_narrowed`).
         assert_eq!(
             shown_result("fn k(f: fn(Int) -> Int) ->> Int { 1 }\nk"),
-            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) ->> Int"
+            "fn(f: fn(Int) -> Int | Future<Int>) ->> Int"
         );
         // Its own name in its body has the declared type.
         let text = "fn f(n: Int) ->> Int { if n < 2 { n } else { f(n - 1) + 1 } }\nf";
@@ -11389,6 +11904,458 @@ mod tests {
                 "fn outer(n: Int): fn(): fn(): Int { fn(): fn(): Int { fn(): Int { n + 1 } } }\nouter"
             ),
             "fn(n: Int): fn(): fn(): Int"
+        );
+    }
+
+    // ----- Narrowed callbacks -----
+
+    /// The type of the function named `run` in `text`, which must check, as
+    /// shown.
+    fn type_of_run(text: &str) -> String {
+        shown_result(&format!("{text}\nrun"))
+    }
+
+    /// The type of the function expression written first in `text` at the
+    /// first occurrence of `needle`, which starts with its `fn`, as shown,
+    /// whether the check succeeds or not.
+    fn type_of_fn_at(text: &str, needle: &str) -> String {
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let mut checker = Checker::new(&ast, &mut types);
+        checker.check_body(ast.root(), None);
+        let start = at(text, needle).start;
+        let id = ast
+            .expr_ids()
+            .find(|&id| {
+                matches!(ast.get(id).kind, ExprKind::Fn(_)) && ast.get(id).span.start == start
+            })
+            .unwrap_or_else(|| panic!("no function at {needle:?} in {text:?}"));
+        let ty = checker.expr_types[id.index()];
+        types.display(ty, ast.names()).to_string()
+    }
+
+    /// The span of the `n`th (from 0) occurrence of `needle` in `text`,
+    /// from `offset` bytes into it, `len` bytes long.
+    fn within(text: &str, needle: &str, n: usize, (offset, len): (u32, u32)) -> Span {
+        let found = nth(text, needle, n);
+        Span::new(found.start + offset, found.start + offset + len)
+    }
+
+    #[test]
+    fn callback_parameters_are_narrowed() {
+        // The rows of the specification.
+        for (text, shown) in [
+            (
+                "fn run(f: fn(Int) -> Int) -> Int { f(1) }",
+                "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // `j` may be a future.
+            (
+                "fn run(f: fn(Int) -> Int, j: Int) -> Int { f(j) }",
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int | Future<Int>) -> Int \
+                 | Future<Int>",
+            ),
+            (
+                "fn run(f: fn(Int) -> Int, j: Int) -> Int { f(await j) }",
+                "fn(f: fn(Int) -> Int | Future<Int>, j: Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // Every call must fit.
+            (
+                "fn run(f: fn(Int) -> Int, j: Int) -> Int { f(1) + f(j) }",
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int | Future<Int>) -> Int",
+            ),
+            // Each position on its own.
+            (
+                "fn run(f: fn(Int, Int) -> Int, j: Int) -> Int { f(1, j) }",
+                "fn(f: fn(Int, Int | Future<Int>) -> Int | Future<Int>, j: Int | Future<Int>) -> \
+                 Int | Future<Int>",
+            ),
+            (
+                "fn run(f: fn(Int) -> Int) -> Future<Int> { lazy f(1) }",
+                "fn(f: fn(Int) -> Int | Future<Int>) -> Future<Int>",
+            ),
+            // Used as a value.
+            (
+                "fn run(f: fn(Int) -> Int) -> Int { let g = f\n g(1) }",
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            (
+                "fn other(g: fn(Int) -> Int) -> Int { g(1) }\n\
+                 fn run(f: fn(Int) -> Int) -> Int { other(f) }",
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // Explicit positions.
+            (
+                "fn run(f: fn(Present<Int>) -> Int) -> Int { f(1) }",
+                "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            (
+                "fn run(f: fn(Int | Future<Int>) -> Int) -> Int { f(1) }",
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // A record type, narrowed to its present type.
+            (
+                "fn run(f: fn({a: Int}) -> Int) -> Int { f({ a = 1 }) }",
+                "fn(f: fn({a: Int}) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            (
+                "fn run(f: fn({a: Int}) -> Int, j: Int) -> Int { f({ a = j }) }",
+                "fn(f: fn({a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>) -> Int | \
+                 Future<Int>, j: Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // Vacuously: the call is of the shadowing `f`.
+            (
+                "fn run(f: fn(Int) -> Int) -> Int { let f = fn(x: Int) -> Int { x }\n f(1) }",
+                "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // Not a callback parameter.
+            (
+                "fn run(f: fn(Int) ->> Int) -> Int { f(1) }",
+                "fn(f: fn(Int) ->> Int | Future<Int>) -> Int | Future<Int>",
+            ),
+            // A memoised function's.
+            (
+                "fn run(f: fn(Int) -> Int) ->> Int { f(1) }",
+                "fn(f: fn(Int) -> Int | Future<Int>) ->> Int | Future<Int>",
+            ),
+        ] {
+            assert_eq!(type_of_run(text), shown, "{text}");
+        }
+        // Explicit parts of a record type are kept, and its bare fields
+        // are present.
+        assert_eq!(
+            type_of_run("fn run(f: fn({a: Future<Int>, b: Int}) -> Int) -> Int { 1 }"),
+            "fn(f: fn({a: Future<Int>, b: Int}) -> Int | Future<Int>) -> Int"
+        );
+        // Neither is a function type's position, nor the callback's
+        // result.
+        assert_eq!(
+            type_of_run("fn run(f: fn(fn(Int) -> Int) -> {a: Int}) -> Int { 1 }"),
+            "fn(f: fn(fn(Int | Future<Int>) -> Int | Future<Int>) -> {a: Int | Future<Int>} | \
+             Future<{a: Int | Future<Int>}>) -> Int"
+        );
+        // Nor anything of a pure function's, nor a parameter whose function
+        // type is not written directly.
+        assert_eq!(
+            type_of_run("fn run(f: fn(Int) -> Int): Int { 1 }"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>): Int"
+        );
+        assert_eq!(
+            type_of_run("fn run(r: {f: fn(Int) -> Int}) -> Int { r.f(1) }"),
+            "fn(r: {f: fn(Int | Future<Int>) -> Int | Future<Int>} | Future<{f: fn(Int | \
+             Future<Int>) -> Int | Future<Int>}>) -> Int | Future<Int>"
+        );
+        // Other uses as a value.
+        for body in ["(f)(1)", "\"{f}\"", "f"] {
+            let text = format!("fn run(f: fn(Int) -> Int) -> {{}} {{ let x = {body}\n{{}} }}");
+            assert_eq!(
+                type_of_run(&text),
+                "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> {}",
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrowed_callback_takes_a_pure_function_that_measures() {
+        let double = "fn double(x: Int): Int { x * 2 }\n";
+        let run = "fn run(f: fn(Int) -> Int) -> Int { f(1) }\n";
+        assert_eq!(
+            shown_result(&format!("{double}{run}run(double)")),
+            "Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result(&format!("{run}run(fn(x: Int): Int {{ x * 2 }})")),
+            "Int | Future<Int>"
+        );
+        // A written function type with the narrowed type's shape takes the
+        // host.
+        assert!(
+            check(
+                &parse_text(&format!(
+                    "{run}let r: fn(fn(Present<Int>) -> Int) -> Int = run"
+                )),
+                &mut TypeTable::new()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_callback_given_a_future_labels_the_mismatch() {
+        let double = "fn double(x: Int): Int { x * 2 }\n";
+        let function = "the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int \
+                        | Future<Int>) -> Int";
+        let given = "`f` is given a value that may be a future here";
+        let used = "`f` is used as a value here, so it may be given a future";
+        // A call that gives the position a value that may be a future.
+        let text = format!(
+            "{double}fn run(f: fn(Int) -> Int, j: Int) -> Int {{ f(1) + f(j) }}\nrun(double, 1)"
+        );
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, last(&text, "double"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected fn(Int | Future<Int>) -> Int | Future<Int>, found fn(x: Int): Int")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (last(&text, "run"), function),
+                (within(&text, "f(j)", 0, (2, 1)), given)
+            ]
+        );
+        // A use as a value.
+        let text = format!(
+            "{double}fn run(f: fn(Int) -> Int) -> Int {{\n  let g = f\n  g(1)\n}}\nrun(double)"
+        );
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (
+                    last(&text, "run"),
+                    "the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | \
+                     Future<Int>"
+                ),
+                (within(&text, "= f", 0, (2, 1)), used)
+            ]
+        );
+        // The first in source order.
+        for (body, needle, label) in [
+            ("let n = f(j)\n  let g = f\n  n", "f(j)", given),
+            ("let g = f\n  f(j)", "= f", used),
+        ] {
+            let text = format!(
+                "{double}fn run(f: fn(Int) -> Int, j: Int) -> Int {{\n  {body}\n}}\nrun(double, 1)"
+            );
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            let span = within(&text, needle, 0, (2, 1));
+            assert_eq!(labels(&found[0]).get(1), Some(&(span, label)), "{text}");
+        }
+        // At a position the argument needs: the second's, where only it
+        // measures its parameter.
+        let text = "fn run(f: fn(Int, Int) -> Int, j: Int) -> Int { f(j, 1) + f(1, j) }\n\
+                    run(fn(a: Int | Future<Int>, b: Int): Int { b }, 1)";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            labels(&found[0]).get(1),
+            Some(&(within(text, "1, j)", 0, (3, 1)), given))
+        );
+        // No label where the mismatch has another cause: the argument would
+        // not fit had the position been narrowed.
+        for arg in [
+            "fn(x: String): Int { 1 }",
+            "fn(x: Int): String { \"a\" }",
+            "1",
+        ] {
+            let text =
+                format!("fn run(f: fn(Int) -> Int, j: Int) -> Int {{ f(j) }}\nrun({arg}, 1)");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(found[0].message, "mismatched types", "{text}");
+            assert_eq!(labels(&found[0]).len(), 1, "{text}: {found:?}");
+        }
+        // Nor for a callee that is not known.
+        let text = format!(
+            "{double}let r = {{ run = fn(f: fn(Int) -> Int, j: Int) -> Int {{ f(j) }} }}\n\
+             r.run(double, 1)"
+        );
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(labels(&found[0]).len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_callbacks_position_is_the_parameter_its_argument_fills() {
+        // Named arguments, in any order.
+        assert_eq!(
+            type_of_run("fn run(f: fn(x: Int, y: Int) -> Int, j: Int) -> Int { f(y = 1, x = j) }"),
+            "fn(f: fn(x: Int | Future<Int>, y: Int) -> Int | Future<Int>, j: Int | Future<Int>) \
+             -> Int | Future<Int>"
+        );
+        // A trailing block fills the last.
+        assert_eq!(
+            type_of_run(
+                "fn run(f: fn(n: Int, body: {a: Int}) -> Int, j: Int) -> Int { f(j) { a = 1 } }"
+            ),
+            "fn(f: fn(n: Int | Future<Int>, body: {a: Int}) -> Int | Future<Int>, j: Int | \
+             Future<Int>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            type_of_run(
+                "fn run(f: fn(n: Int, body: {a: Int}) -> Int, j: Int) -> Int { f(1) { a = j } }"
+            ),
+            "fn(f: fn(n: Int, body: {a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>) -> \
+             Int | Future<Int>, j: Int | Future<Int>) -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn calls_of_a_callback_count_in_nested_functions_and_lazies() {
+        let narrowed = "fn(f: fn(Int) -> Int | Future<Int>)";
+        let written = "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>)";
+        for (body, shown) in [
+            ("let g = fn(x: Int) -> Int { f(1) }\n lazy g(2)", narrowed),
+            ("let g = fn(x: Int) -> Int { f(x) }\n lazy g(2)", written),
+            (
+                "let g = fn(x: Int) -> Future<Int> { lazy f(1) }\n g(2)",
+                narrowed,
+            ),
+            (
+                "let g = fn(x: Int) -> Future<Int> { lazy f(x) }\n g(2)",
+                written,
+            ),
+            // Awaited in the nested function first.
+            (
+                "let g = fn(x: Int) -> Future<Int> { let y = await x\n lazy f(y) }\n g(2)",
+                narrowed,
+            ),
+        ] {
+            let text = format!("fn run(f: fn(Int) -> Int) -> Future<Int> {{ {body} }}");
+            assert_eq!(
+                type_of_run(&text),
+                format!("{shown} -> Future<Int>"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_parameters_are_narrowed_independently() {
+        assert_eq!(
+            type_of_run(
+                "fn run(f: fn(Int) -> Int, g: fn(Int) -> Int, j: Int) -> Int { f(1) + g(j) }"
+            ),
+            "fn(f: fn(Int) -> Int | Future<Int>, g: fn(Int | Future<Int>) -> Int | Future<Int>, \
+             j: Int | Future<Int>) -> Int"
+        );
+        // A host nested in another, each with a callback, the inner calling
+        // the outer's.
+        let text = "fn run(f: fn(Int) -> Int, j: Int) -> Int {\n\
+                    \x20 let inner = fn(g: fn(Int) -> Int) -> Int { f(j) + g(1) }\n\
+                    \x20 inner(fn(x: Int) -> Int { x })\n\
+                    }";
+        assert_eq!(
+            type_of_run(text),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int | Future<Int>) -> Int"
+        );
+        assert_eq!(
+            type_of_fn_at(text, "fn(g"),
+            "fn(g: fn(Int) -> Int | Future<Int>) -> Int"
+        );
+        let text = "fn run(f: fn(Int) -> Int, j: Int) -> Int {\n\
+                    \x20 let inner = fn(g: fn(Int) -> Int) -> Int { f(1) + g(j) }\n\
+                    \x20 inner(fn(x: Int) -> Int { x })\n\
+                    }";
+        assert_eq!(
+            type_of_run(text),
+            "fn(f: fn(Int) -> Int | Future<Int>, j: Int | Future<Int>) -> Int"
+        );
+        assert_eq!(
+            type_of_fn_at(text, "fn(g"),
+            "fn(g: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int"
+        );
+        // An inner parameter of the same name shadows the outer one.
+        let text = "fn run(f: fn(Int) -> Int, j: Int) -> Int {\n\
+                    \x20 let inner = fn(f: fn(Int) -> Int) -> Int { f(j) }\n\
+                    \x20 inner(fn(x: Int) -> Int { x })\n\
+                    }";
+        assert_eq!(
+            type_of_run(text),
+            "fn(f: fn(Int) -> Int | Future<Int>, j: Int | Future<Int>) -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_host_with_an_error_keeps_its_declared_type() {
+        let declared = "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>";
+        for text in [
+            "fn run(f: fn(Int) -> Int) -> Int { f(1) + \"a\" }",
+            "fn run(f: fn(Int) -> Int) -> Int { let x: String = f(1)\n1 }",
+            "fn run(f: fn(Int) -> Int) -> Int { f(\"a\") }",
+        ] {
+            assert_eq!(messages(text).len(), 1, "{text}");
+            assert_eq!(type_of_fn_at(text, "fn run"), declared, "{text}");
+        }
+        // And with an erroneous parameter type, erroneous itself.
+        assert_eq!(
+            type_of_fn_at("fn run(f: fn(Nope) -> Int) -> Int { f(1) }", "fn run"),
+            "<error>"
+        );
+        // Its own name in its body has the declared type.
+        let text = "fn run(f: fn(Int) -> Int, n: Int) -> Int {\n\
+                    \x20 if n == 0 { f(1) } else { run(f, n - 1) }\n\
+                    }";
+        assert_eq!(
+            type_of_run(text),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, n: Int | Future<Int>) -> Int | \
+             Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_host_is_narrowed_and_has_its_result_inferred() {
+        assert_eq!(
+            type_of_run("fn run(f: fn(Int) -> Int) -> Int { f(1) + 1 }"),
+            "fn(f: fn(Int) -> Int | Future<Int>) -> Int"
+        );
+        assert_eq!(
+            type_of_run("fn run(f: fn(Int) -> Int) -> {v: Int, w: Int} { v = f(2); w = 3 }"),
+            "fn(f: fn(Int) -> Int | Future<Int>) -> {v: Int | Future<Int>, w: Int}"
+        );
+    }
+
+    #[test]
+    fn an_untyped_literal_fits_a_callbacks_position_once_coerced() {
+        for arg in ["1", "1 + 2", "(3)"] {
+            let text = format!("fn run(f: fn(Float) -> Int) -> Int {{ f({arg}) }}");
+            assert_eq!(
+                type_of_run(&text),
+                "fn(f: fn(Float) -> Int | Future<Int>) -> Int | Future<Int>",
+                "{text}"
+            );
+        }
+        assert_eq!(
+            type_of_run("fn run(f: fn({a: Float}) -> Int) -> Int { f({ a = 1 }) }"),
+            "fn(f: fn({a: Float}) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_provisional_parameter_given_to_a_callback_may_be_a_future() {
+        // The enclosing pure function's parameter may be a future for all
+        // the nested impure host knows.
+        let text = "fn outer(n: Int): fn(fn(Int) -> Int) -> Int {\n\
+                    \x20 fn(f: fn(Int) -> Int) -> Int { f(n) }\n\
+                    }";
+        assert!(check(&parse_text(text), &mut TypeTable::new()).is_ok());
+        assert_eq!(
+            type_of_fn_at(text, "fn(f:"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        // Even where the pure function measures it elsewhere.
+        let text = "fn outer(n: Int): fn(fn(Int) -> Int) -> Int {\n\
+                    \x20 let m = n + 1\n\
+                    \x20 fn(f: fn(Int) -> Int) -> Int { f(n) }\n\
+                    }";
+        assert_eq!(
+            type_of_fn_at(text, "fn(f:"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        // Awaited in the host first, it is present.
+        let text = "fn outer(n: Int): fn(fn(Int) -> Int) -> Int {\n\
+                    \x20 fn(f: fn(Int) -> Int) -> Int { f(await n) }\n\
+                    }";
+        assert_eq!(
+            type_of_fn_at(text, "fn(f:"),
+            "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>"
         );
     }
 }

@@ -1323,16 +1323,126 @@ fn a_record_that_may_be_a_future_can_be_updated() {
 fn a_callback_that_cannot_take_futures_renders_exactly() {
     assert_eq!(
         rendered(
-            "fn double(x: Int): Int { x * 2 }\nfn run(f: fn(Int) -> Int) -> Int { f(1) }\nrun(double)\n"
+            "fn double(x: Int): Int { x * 2 }\nfn run(f: fn(Int) -> Int, j: Int) -> Int { f(j) }\nrun(double, 1)\n"
         ),
         "error: mismatched types\n\
          \x20--> calc.gcsl:3:5\n\
          \x20 |\n\
-         3 | run(double)\n\
+         2 | fn run(f: fn(Int) -> Int, j: Int) -> Int { f(j) }\n\
+         \x20 |                                              - `f` is given a value that may be a \
+         future here\n\
+         3 | run(double, 1)\n\
+         \x20 | --- ^^^^^^ expected fn(Int | Future<Int>) -> Int | Future<Int>, found fn(x: Int): Int\n\
+         \x20 | |\n\
+         \x20 | the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int | \
+         Future<Int>) -> Int | Future<Int>\n"
+    );
+    // Used as a value.
+    assert_eq!(
+        rendered(
+            "fn double(x: Int): Int { x * 2 }\nfn run(f: fn(Int) -> Int) -> Int {\n  let g = f\n  g(1)\n}\nrun(double)\n"
+        ),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:6:5\n\
+         \x20 |\n\
+         3 |   let g = f\n\
+         \x20 |           - `f` is used as a value here, so it may be given a future\n\
+         ...\n\
+         6 | run(double)\n\
          \x20 | --- ^^^^^^ expected fn(Int | Future<Int>) -> Int | Future<Int>, found fn(x: Int): Int\n\
          \x20 | |\n\
          \x20 | the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | \
          Future<Int>\n"
+    );
+}
+
+#[test]
+fn a_callback_given_only_present_values_takes_a_pure_function() {
+    let double = "fn double(x: Int): Int { x * 2 }\n";
+    let run_fn = "fn run(f: fn(Int) -> Int) -> Int { f(1) }\n";
+    assert_eq!(
+        run(&format!("{double}{run_fn}run(double)")).unwrap(),
+        Value::Int(2)
+    );
+    assert_eq!(
+        show(&format!("{double}{run_fn}run")),
+        "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int> : fn(f: fn(Int) -> Int | \
+         Future<Int>) -> Int | Future<Int>"
+    );
+    // An argument awaited before the call, a record, and a call in a
+    // `lazy` awaited after.
+    let text = "fn sum(r: {a: Int, b: Int}): Int { r.a + r.b }\n\
+                fn run(f: fn({a: Int, b: Int}) -> Int, j: Int) -> Future<Int> {\n\
+                \x20 let k = await j\n\
+                \x20 lazy f({ a = k; b = 2 })\n\
+                }\n\
+                await run(sum, lazy 40)";
+    assert_eq!(run(text).unwrap(), Value::Int(42));
+}
+
+/// A build script in the style of `BUILD_SCRIPT`, whose impure wrapper
+/// takes a pure step function and gives it only present values.
+const STEP_SCRIPT: &str = "\
+fn compile(target: String): String { \"compiled {target}\" }
+fn build(step: fn(String) -> String, name: String) -> {name: String, log: String} {
+  let ready = await name
+  name = ready
+  log = step(ready)
+}
+let built = build(compile, lazy \"gcsl\")
+name = built.name
+log = built.log
+";
+
+#[test]
+fn a_wrapper_takes_a_pure_step_function() {
+    assert_eq!(
+        show(STEP_SCRIPT),
+        "{name = \"gcsl\"; log = \"compiled gcsl\"} : {log: String | Future<String>, name: \
+         String}"
+    );
+    let mut session = Session::new();
+    session.eval(&source(STEP_SCRIPT)).unwrap();
+    assert_eq!(
+        session.eval(&source("build")).unwrap().value.to_string(),
+        "fn(step: fn(String) -> String | Future<String>, name: String | Future<String>) -> \
+         {log: String | Future<String>, name: String}"
+    );
+    // Giving the step the name as it was given, which may be a future, it
+    // takes only a step that can take one.
+    let text = STEP_SCRIPT.replace("step(ready)", "step(name)");
+    let diagnostics = run(&text).unwrap_err();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "mismatched types");
+    assert_eq!(
+        diagnostics[0].labels[1].text,
+        "`step` is given a value that may be a future here"
+    );
+}
+
+#[test]
+fn a_narrowed_callback_is_kept_by_a_session() {
+    let mut session = Session::new();
+    session
+        .eval(&source(
+            "fn double(x: Int): Int { x * 2 }\n\
+             fn run(f: fn(Int) -> Int) -> Int { f(1) }\n\
+             fn loose(f: fn(Int) -> Int, j: Int) -> Int { f(j) }",
+        ))
+        .unwrap();
+    assert_eq!(
+        session.eval(&source("run(double)")).unwrap().value,
+        Value::Int(2)
+    );
+    // The callee is of an earlier input, whose source is gone: no label.
+    let diagnostics = session.eval(&source("loose(double, 1)")).unwrap_err();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "mismatched types");
+    assert_eq!(diagnostics[0].labels.len(), 1, "{:?}", diagnostics[0]);
+    assert_eq!(
+        diagnostics[0].labels[0].text,
+        "the function is fn(f: fn(Int | Future<Int>) -> Int | Future<Int>, j: Int | \
+         Future<Int>) -> Int | Future<Int>"
     );
 }
 
