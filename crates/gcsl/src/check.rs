@@ -347,7 +347,8 @@
 //! top or deeply (see [`TypeTable::needs_await`]); otherwise the mismatch is
 //! reported, with a note when a future is expected and a value that is not
 //! one is found. `await e` awaits `e` fully and has its type stripped; on a
-//! present value it does nothing, which is a warning. A bare `await e` item
+//! present value it does nothing, silently, since whether a value is
+//! present may be inferred from code elsewhere. A bare `await e` item
 //! is never an unused value. A statement is a position expecting `{}`: a
 //! statement whose value is `{}` once awaited (a `Future<{}>`, or the
 //! `{}` an impure function returns, which may be one) is awaited there,
@@ -4501,7 +4502,7 @@ impl<'a> Checker<'a> {
     /// preserves it; `not` needs a `Bool`; both await an operand that may be
     /// a future first. `await` awaits its operand fully, and its type is
     /// the operand's stripped of every future layer at its top; on an
-    /// operand that is present it does nothing, which is a warning.
+    /// operand that is present it does nothing.
     fn unary(&mut self, op: UnaryOp, op_span: Span, (operand, operand_ty): (ExprId, TyId)) -> TyId {
         if operand_ty == TyId::ERROR {
             return TyId::ERROR;
@@ -4533,15 +4534,9 @@ impl<'a> Checker<'a> {
     /// Types `await OPERAND`, whose keyword is at `keyword`, `operand` being
     /// of type `ty`, which is not erroneous (see [`Checker::unary`]).
     fn explicit_await(&mut self, keyword: Span, operand: ExprId, ty: TyId) -> TyId {
+        // Whether a value is present may be inferred, as a call's result is
+        // from its callee's body, so awaiting one is not worth a warning.
         if self.types.laziness(ty) == Laziness::Present {
-            let label = format!("this is {}", self.in_label(ty));
-            self.warnings.push(
-                Diagnostic::warning(
-                    "this value is already present; `await` does nothing",
-                    keyword,
-                )
-                .with_context(self.ast.get(operand).span, label),
-            );
             return ty;
         }
         let claimed = self.claim_top(self.ast.get(operand).span, ty);
@@ -9120,25 +9115,20 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_a_present_value_is_a_warning() {
+    fn awaiting_a_present_value_does_nothing() {
         let text = "let x = 1\nawait x";
-        let found = warnings(text);
-        assert_eq!(found.len(), 1);
-        assert_eq!(
-            found[0].message,
-            "this value is already present; `await` does nothing"
-        );
-        assert_eq!(found[0].severity, Severity::Warning);
-        assert_eq!(found[0].span, at(text, "await"));
-        assert_eq!(labels(&found[0]), vec![(last(text, "x"), "this is Int")]);
+        assert!(warnings(text).is_empty());
         assert_eq!(shown_result(text), "Int");
         assert!(marks(text).is_empty());
+        // A call's result that is inferred to be present.
+        let text = "fn tick() -> Int { 1 }\nawait tick()";
+        assert!(warnings(text).is_empty());
+        assert!(marks(text).is_empty());
+        // In a pure function too: nothing is awaited.
+        assert!(warnings("fn f(): Int { let x = 1\nawait x }").is_empty());
         // An untyped operand stays untyped, and adapts.
         assert_eq!(shown_result("await 5 + 1.5"), "Float");
-        assert_eq!(
-            labels(&warnings("await 5")[0]),
-            vec![(Span::new(6, 7), "this is Int")]
-        );
+        assert!(warnings("await 5").is_empty());
     }
 
     #[test]
