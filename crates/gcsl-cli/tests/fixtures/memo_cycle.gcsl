@@ -1,0 +1,2 @@
+fn size(name: String) ->> Int { size(name) + 1 }
+size("core")

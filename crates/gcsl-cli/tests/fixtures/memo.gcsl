@@ -1,0 +1,16 @@
+# A package index: each manifest is fetched once, however often it is asked for.
+fn fetch(name: String) ->> {name: String, deps: Int} {
+  name = name
+  deps = if name == "core" { 0 } else { 1 }
+}
+# Memoised, the recursion runs its body once per distinct argument.
+fn weight(n: Int) ->> Int { if n < 2 { n } else { weight(n - 1) + weight(n - 2) } }
+# A memoised function may return a future, which runs once when awaited.
+fn later(n: Int) ->> Int { lazy n * 2 }
+let first = fetch("core")
+let again = fetch("core")
+core = first.name
+deps = again.deps + fetch("gcsl").deps
+weight = weight(80)
+step = later(21)
+doubled = await later(21)

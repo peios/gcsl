@@ -25,7 +25,7 @@
 //! A function expression, `fn(x: Int): Int { ... }`, has more to it than
 //! fits in an [`Expr`], so its node, [`ExprKind::Fn`], holds only a
 //! [`FnId`] into an arena of [`FnDecl`]s, [`Ast::fn_decl`]: its parameters,
-//! return type, purity and body. Every function expression of a tree has
+//! return type, [`Effect`] and body. Every function expression of a tree has
 //! an id, from 0 to [`Ast::fn_count`], which later stages use to index
 //! their own per-function tables. A named function item, `fn f(...) ...`,
 //! is a `let` whose value is a function expression; the tree does not
@@ -227,20 +227,67 @@ pub struct Param {
     pub ty: TypeExprId,
 }
 
-/// A function expression, `fn (PARAMS) : RET BODY` or `fn (PARAMS) -> RET
-/// BODY`, or the body of a `lazy`. Held in the [`Ast`]'s function arena; the
-/// expression node is an [`ExprKind::Fn`] or an [`ExprKind::Lazy`] with its
-/// [`FnId`].
+/// What a function may do, as the marker before its return type declares
+/// it, in a function expression and a function type alike: `:` for pure,
+/// `->>` for impure and memoised, `->` for impure.
+///
+/// Ordered `Pure < Memo < Impure`, from the function that promises most to
+/// the one that promises least, which is the order in which one can stand
+/// in for another (see [`crate::types`]). Only `Pure` is pure: a memoised
+/// function may do everything an impure one may, and runs its body at most
+/// once per distinct arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Effect {
+    /// Pure, declared with `:`: it may neither call an impure function nor
+    /// await.
+    Pure,
+    /// Impure and memoised, declared with `->>`: each closure runs its body
+    /// at most once per distinct list of arguments.
+    Memo,
+    /// Impure, declared with `->`, run on every call.
+    Impure,
+}
+
+impl Effect {
+    /// The text between a function's parameters and its return type, as a
+    /// type is shown: `"): "`, `") ->> "` or `") -> "`, the `)` closing the
+    /// parameters included.
+    #[must_use]
+    pub const fn params_end(self) -> &'static str {
+        match self {
+            Effect::Pure => "): ",
+            Effect::Memo => ") ->> ",
+            Effect::Impure => ") -> ",
+        }
+    }
+
+    /// The effect's name, as the tree's and the IR's debug forms show it:
+    /// `pure`, `memo` or `impure`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Effect::Pure => "pure",
+            Effect::Memo => "memo",
+            Effect::Impure => "impure",
+        }
+    }
+}
+
+/// A function expression, `fn (PARAMS) : RET BODY`, `fn (PARAMS) ->> RET
+/// BODY` or `fn (PARAMS) -> RET BODY`, or the body of a `lazy`. Held in the
+/// [`Ast`]'s function arena; the expression node is an [`ExprKind::Fn`] or
+/// an [`ExprKind::Lazy`] with its [`FnId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FnDecl {
     /// The parameters, in order; none for a `lazy`.
     pub params: ParamRange,
     /// The declared return type; `None` for a `lazy`, which declares none.
     pub ret: Option<TypeExprId>,
-    /// Whether the function is pure, declared with `:`, rather than impure,
-    /// declared with `->`. A `lazy` is always impure.
-    pub pure: bool,
-    /// The `:` or `->` before the return type, or a `lazy`'s keyword.
+    /// What the function may do, as its marker declares: pure (`:`),
+    /// memoised (`->>`) or impure (`->`). A `lazy` is always
+    /// [`Effect::Impure`].
+    pub effect: Effect,
+    /// The `:`, `->>` or `->` before the return type, or a `lazy`'s keyword.
     pub marker: Span,
     /// The body: an [`ExprKind::Block`] for a function expression, and any
     /// expression, the operand, for a `lazy`.
@@ -760,14 +807,15 @@ pub enum TypeExprKind {
     /// A record type, `{x: Int, "a b": String}`: its fields in source
     /// order. Repeated names are allowed here and reported by the checker.
     Record(FieldTyRange),
-    /// A function type, `fn(Int, name: String): Bool` or `fn() -> Int`.
+    /// A function type, `fn(Int, name: String): Bool`, `fn(Int) ->> Int` or
+    /// `fn() -> Int`.
     Fn {
         /// The parameters, each with its name if it has one.
         params: ParamTyRange,
         /// The return type.
         ret: TypeExprId,
-        /// Whether it is pure, written with `:`, rather than `->`.
-        pure: bool,
+        /// What it may do, as its marker says: `:`, `->>` or `->`.
+        effect: Effect,
     },
     /// A name applied to a type argument, `NAME<TYPE>`, as in
     /// `Future<Int>`. The parser accepts any name; the checker knows which
@@ -1368,7 +1416,8 @@ impl Annotate for NoAnnotation {
 /// as in `(field "a b" ...)`. Types print as written, a record type's fields
 /// in source order: `{x: Int, "a b": {}}`, `fn(x: Int) -> String`. A function
 /// expression prints as `(fn ...)` followed by `(params (x Int) (y String))`,
-/// `(ret pure Int)` or `(ret impure Int)`, and its body; a call as
+/// `(ret pure Int)`, `(ret memo Int)` or `(ret impure Int)`, and its body; a
+/// call as
 /// `(call ...)` followed by its callee and its arguments in source order, a
 /// named one as `(named x EXPR)` and the trailing block as
 /// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
@@ -1452,7 +1501,11 @@ impl<A: Annotate> Pretty<'_, A> {
                 }
                 f.write_str("}")
             }
-            TypeExprKind::Fn { params, ret, pure } => {
+            TypeExprKind::Fn {
+                params,
+                ret,
+                effect,
+            } => {
                 f.write_str("fn(")?;
                 for (index, param) in self.ast.param_tys(params).iter().enumerate() {
                     if index > 0 {
@@ -1463,7 +1516,7 @@ impl<A: Annotate> Pretty<'_, A> {
                     }
                     self.type_expr(f, param.ty)?;
                 }
-                f.write_str(if pure { "): " } else { ") -> " })?;
+                f.write_str(effect.params_end())?;
                 self.type_expr(f, ret)
             }
             TypeExprKind::Applied { name, arg, .. } => {
@@ -1503,8 +1556,8 @@ impl<A: Annotate> Pretty<'_, A> {
             f.write_str(")")?;
         }
         f.write_str(")")?;
-        let purity = if decl.pure { "pure" } else { "impure" };
-        write!(f, "\n{:indent$}(ret {purity}", "", indent = depth * 2)?;
+        let effect = decl.effect.name();
+        write!(f, "\n{:indent$}(ret {effect}", "", indent = depth * 2)?;
         // A function expression always has a return type; only a `lazy`,
         // which is not printed through here, has none.
         if let Some(ret) = decl.ret {

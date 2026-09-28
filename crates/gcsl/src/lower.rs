@@ -13,7 +13,10 @@
 //! if it has neither.
 //!
 //! A function expression's body is lowered into the IR's function table at
-//! its [`crate::ast::FnId`], with its frame and capture counts from the
+//! its [`crate::ast::FnId`], as code of [`FnKind::Memo`] if it is declared
+//! with `->>` and of [`FnKind::Function`] otherwise (the IR does not tell
+//! a pure function from an impure one, since only the checker cares), with
+//! its frame and capture counts from the
 //! checker's [`crate::check::FnResolution`] and its type as text, computed
 //! once here, for its closures to display as. The expression itself becomes
 //! a `MakeClosure` whose captures are the reads, in the frame creating the
@@ -124,8 +127,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgRange, Ast, BinaryOp, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange, PartRange,
-    PathRange, PathSegment, StrPart, UnaryOp, path_span,
+    ArgRange, Ast, BinaryOp, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange,
+    PartRange, PathRange, PathSegment, StrPart, UnaryOp, path_span,
 };
 use crate::check::{AwaitMark, Checked, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
@@ -730,11 +733,16 @@ impl Lowerer<'_> {
     }
 
     /// Lowers the function expression `id`, whose details are `function`:
-    /// its body into the function table, and the expression to the
-    /// `MakeClosure` that captures, in the current frame, what the checker
-    /// found the function captures.
+    /// its body into the function table, as code of [`FnKind::Memo`] if it
+    /// is declared with `->>` and of [`FnKind::Function`] otherwise, and the
+    /// expression to the `MakeClosure` that captures, in the current frame,
+    /// what the checker found the function captures.
     fn lower_fn(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
-        let captures = self.lower_function(id, function, FnKind::Function)?;
+        let kind = match self.ast.fn_decl(function).effect {
+            Effect::Memo => FnKind::Memo,
+            Effect::Pure | Effect::Impure => FnKind::Function,
+        };
+        let captures = self.lower_function(id, function, kind)?;
         Ok(IrKind::MakeClosure { function, captures })
     }
 
@@ -1995,6 +2003,38 @@ mod tests {
             .map(|&id| ir.get(id).kind)
             .collect();
         assert_eq!(captures, vec![IrKind::LoadCallee]);
+    }
+
+    #[test]
+    fn a_memoised_function_is_code_of_its_own_kind() {
+        let ir = lower_text(
+            "fn f(x: Int) ->> Int { x }\n\
+             fn g(x: Int) -> Int { x }\n\
+             fn h(x: Int): Int { x }\n\
+             let l = lazy f(1)",
+        );
+        let kinds: Vec<FnKind> = (0..4).map(|id| ir.function(FnId::new(id)).kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                FnKind::Memo,
+                FnKind::Function,
+                FnKind::Function,
+                FnKind::Future
+            ]
+        );
+        assert_eq!(&*ir.function(FnId::new(0)).display, "fn(x: Int) ->> Int");
+        // The IR's dump shows it.
+        assert_eq!(
+            dump("fn f(x: Int) ->> Int { x }"),
+            "(block @0..26\n\
+             \x20 (store f#0 @0..26\n\
+             \x20   (make-closure #0 @0..26))\n\
+             \x20 (empty @0..26))\n\
+             memo fn #0 f (frame 1, params 1, captures 0, height 2)\n\
+             \x20 (block @21..26\n\
+             \x20   (load x#0 @23..24))"
+        );
     }
 
     #[test]

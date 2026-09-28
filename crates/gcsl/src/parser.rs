@@ -37,7 +37,8 @@
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
-//! function's return marker) and `->`, and after `=`, `:=` and `let`. There
+//! function's return marker), `->>` and `->`, and after `=`, `:=` and
+//! `let`. There
 //! the parser skips newlines before going on. Directly inside parentheses
 //! and interpolations the lexer emits no newlines at all, so an expression,
 //! a parameter list or an argument list there may span lines freely; a
@@ -63,8 +64,9 @@
 //! in a type, so it emits the newlines inside the braces, and the parser
 //! skips them all: a record type may span lines freely. Repeated field names
 //! are left to the checker. A function type is `fn`, `(`, parameter types
-//! separated by `,` with an optional trailing `,`, `)`, the marker `:` or
-//! `->`, and the return type; a parameter type is `NAME: TYPE`, recognised
+//! separated by `,` with an optional trailing `,`, `)`, the marker `:`,
+//! `->>` or `->`, and the return type; a parameter type is `NAME: TYPE`,
+//! recognised
 //! by an identifier followed by `:`, or just `TYPE`.
 //!
 //! An applied type is any identifier directly followed by `<`, a type, and
@@ -85,10 +87,13 @@
 //! # Functions and calls
 //!
 //! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
-//! `,` with an optional trailing `,`, `)`, the return marker (`:` for a pure
-//! function, `->` for an impure one), the return type, and the body, a
-//! block whose `{` must follow the return type directly, as an `if`'s block
-//! follows its condition. Every parameter is annotated.
+//! `,` with an optional trailing `,`, `)`, the return marker, the return
+//! type, and the body, a block whose `{` must follow the return type
+//! directly, as an `if`'s block follows its condition. Every parameter is
+//! annotated. The marker is one of three, each an [`Effect`] of the
+//! [`FnDecl`] and of a function type alike: `:` for a pure function, `->>`
+//! for an impure one that is memoised, run at most once per distinct
+//! arguments, and `->` for an impure one run on every call.
 //!
 //! A call is a postfix operator: after an operand, `(` starts an argument
 //! list, whose arguments are separated by `,` with an optional trailing
@@ -250,9 +255,9 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Expr, ExprId, ExprKind, FieldTy, FnDecl, Item, ItemId,
-    ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart, TypeExpr, TypeExprId,
-    TypeExprKind, UnaryOp,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTy, FnDecl, Item,
+    ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart, TypeExpr,
+    TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -287,11 +292,12 @@ const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
 const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 
 /// The error for a function, or a function type, without a return marker.
-const MISSING_RETURN_TYPE: &str = "expected `:` or `->` and a return type after the parameters";
+const MISSING_RETURN_TYPE: &str =
+    "expected `:`, `->` or `->>` and a return type after the parameters";
 
 /// The note on [`MISSING_RETURN_TYPE`].
-const RETURN_TYPE_NOTE: &str =
-    "a function declares its return type: `: T` for a pure function, `-> T` for an impure one";
+const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
+     `->> T` for a memoised one";
 
 /// Parses `tokens`, lexed from `source` with its names interned into
 /// `names` and its string literals' text stored in `strings`, as a file: a
@@ -916,10 +922,14 @@ impl Parser<'_> {
         }
         let params = self.builder.push_param_tys(&self.param_ty_stack[base..]);
         self.param_ty_stack.truncate(base);
-        let (pure, _) = self.return_marker()?;
+        let (effect, _) = self.return_marker()?;
         let (ret, ret_height) = self.parse_type()?;
         let id = self.builder.alloc_type(TypeExpr {
-            kind: TypeExprKind::Fn { params, ret, pure },
+            kind: TypeExprKind::Fn {
+                params,
+                ret,
+                effect,
+            },
             span: Span::join(keyword.span, self.type_span(ret)),
         });
         Ok((id, tallest.max(ret_height) + 1))
@@ -968,13 +978,15 @@ impl Parser<'_> {
     }
 
     /// Consumes the return marker of a function or function type, `:` for a
-    /// pure one and `->` for an impure one, and the newlines after it.
-    /// Returns whether it is pure, and the marker's span.
-    fn return_marker(&mut self) -> ParseResult<(bool, Span)> {
+    /// pure one, `->>` for a memoised one and `->` for an impure one, and
+    /// the newlines after it. Returns the effect it declares, and the
+    /// marker's span.
+    fn return_marker(&mut self) -> ParseResult<(Effect, Span)> {
         let marker = self.peek();
-        let pure = match marker.kind {
-            TokenKind::Colon => true,
-            TokenKind::Arrow => false,
+        let effect = match marker.kind {
+            TokenKind::Colon => Effect::Pure,
+            TokenKind::MemoArrow => Effect::Memo,
+            TokenKind::Arrow => Effect::Impure,
             _ => {
                 return Err(self.report(
                     Diagnostic::error(MISSING_RETURN_TYPE, error_span(marker))
@@ -984,7 +996,7 @@ impl Parser<'_> {
         };
         self.advance();
         self.skip_newlines();
-        Ok((pure, marker.span))
+        Ok((effect, marker.span))
     }
 
     /// Parses a record type, starting at its `{`. Newlines anywhere inside
@@ -1210,6 +1222,7 @@ impl Parser<'_> {
             | TokenKind::Colon
             | TokenKind::ColonEq
             | TokenKind::Arrow
+            | TokenKind::MemoArrow
             | TokenKind::Eq
             | TokenKind::RParen
             | TokenKind::RBrace
@@ -1312,7 +1325,7 @@ impl Parser<'_> {
         }
         let params = self.builder.push_params(&self.param_stack[base..]);
         self.param_stack.truncate(base);
-        let (pure, marker) = self.return_marker()?;
+        let (effect, marker) = self.return_marker()?;
         let (ret, ret_height) = self.parse_type()?;
         let brace = self.peek();
         if brace.kind != TokenKind::LBrace {
@@ -1324,7 +1337,7 @@ impl Parser<'_> {
         let id = self.builder.push_fn(FnDecl {
             params,
             ret: Some(ret),
-            pure,
+            effect,
             marker,
             body,
         });
@@ -1345,7 +1358,7 @@ impl Parser<'_> {
         let id = self.builder.push_fn(FnDecl {
             params,
             ret: None,
-            pure: false,
+            effect: Effect::Impure,
             marker: keyword.span,
             body,
         });
@@ -1699,6 +1712,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Colon
         | TokenKind::ColonEq
         | TokenKind::Arrow
+        | TokenKind::MemoArrow
         | TokenKind::Eq
         | TokenKind::LParen
         | TokenKind::RParen
@@ -1821,7 +1835,11 @@ mod tests {
                 }
                 out.push('}');
             }
-            TypeExprKind::Fn { params, ret, pure } => {
+            TypeExprKind::Fn {
+                params,
+                ret,
+                effect,
+            } => {
                 out.push_str("fn(");
                 for (index, param) in ast.param_tys(params).iter().enumerate() {
                     if index > 0 {
@@ -1833,7 +1851,7 @@ mod tests {
                     }
                     type_name(ast, param.ty, out);
                 }
-                out.push_str(if pure { "): " } else { ") -> " });
+                out.push_str(effect.params_end());
                 type_name(ast, ret, out);
             }
             TypeExprKind::Applied { name, arg, .. } => {
@@ -1950,7 +1968,8 @@ mod tests {
         }
     }
 
-    /// A function expression as `fn(x: Int): Int {..}`, `-> Int` if impure.
+    /// A function expression as `fn(x: Int): Int {..}`, `->> Int` if
+    /// memoised and `-> Int` if impure.
     fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
         let decl = ast.fn_decl(function);
         out.push_str("fn(");
@@ -1962,7 +1981,7 @@ mod tests {
             out.push_str(": ");
             type_name(ast, param.ty, out);
         }
-        out.push_str(if decl.pure { "): " } else { ") -> " });
+        out.push_str(decl.effect.params_end());
         type_name(ast, decl.ret.unwrap(), out);
         out.push(' ');
         expr(ast, decl.body, out);
@@ -3522,7 +3541,7 @@ mod tests {
         };
         assert_eq!(ast.fn_count(), 1);
         let decl = ast.fn_decl(function);
-        assert!(!decl.pure);
+        assert_eq!(decl.effect, Effect::Impure);
         assert_eq!(decl.marker, Span::new(25, 27));
         assert_eq!(ast.type_expr(decl.ret.unwrap()).span, Span::new(28, 31));
         assert_eq!(ast.get(decl.body).span, Span::new(32, 37));
@@ -3534,8 +3553,79 @@ mod tests {
         let ExprKind::Fn(function) = ast.get(only_value(&ast)).kind else {
             panic!("expected a function");
         };
-        assert!(ast.fn_decl(function).pure);
+        assert_eq!(ast.fn_decl(function).effect, Effect::Pure);
         assert!(ast.fn_decl(function).params.is_empty());
+    }
+
+    #[test]
+    fn memoised_functions() {
+        // A function expression, a named item, function types and nested
+        // function types, each with `->>`, which newlines may follow.
+        assert_eq!(
+            shape("fn(url: String) ->> String { url }"),
+            "fn(url: String) ->> String {url}"
+        );
+        assert_eq!(
+            shape("fn(n: Int) ->>\n  Int {\n  n\n}"),
+            "fn(n: Int) ->> Int {n}"
+        );
+        assert_eq!(
+            shape("fn(f: fn(Int) ->> Int): fn() ->> fn(x: Int) ->> Int { f }"),
+            "fn(f: fn(Int) ->> Int): fn() ->> fn(x: Int) ->> Int {f}"
+        );
+        assert_eq!(
+            shape("fn(f: fn(fn(Int) ->> Int) -> Int) ->> Int { 1 }"),
+            "fn(f: fn(fn(Int) ->> Int) -> Int) ->> Int {1}"
+        );
+        let text = "fn fetch(url: String) ->> String { url }";
+        let ast = parse_text(text).unwrap();
+        let ItemKind::Let { value, .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected a let");
+        };
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            panic!("expected a function");
+        };
+        let decl = ast.fn_decl(function);
+        assert_eq!(decl.effect, Effect::Memo);
+        // The marker spans the whole `->>`.
+        assert_eq!(decl.marker, Span::new(22, 25));
+        assert_eq!(&text[22..25], "->>");
+        // A type annotation with a memoised function type.
+        let ast = parse_text("let f: fn(Int) ->> Int = g").unwrap();
+        let ItemKind::Let { ty: Some(ty), .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an annotated let");
+        };
+        assert!(matches!(
+            ast.type_expr(ty).kind,
+            TypeExprKind::Fn {
+                effect: Effect::Memo,
+                ..
+            }
+        ));
+        // Printed, it reads back as itself.
+        let shown = shape("fn(f: fn(Int) ->> Int) ->> fn() ->> Int { f }");
+        assert_eq!(shown, "fn(f: fn(Int) ->> Int) ->> fn() ->> Int {f}");
+        assert_eq!(shape(&shown), shown);
+        // The tree's debug form shows the effect, and the types as written.
+        assert_eq!(
+            parse_text("fn f(g: fn(Int) ->> Int) ->> Int { 1 }")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n\
+             \x20 (let f @0..38\n\
+             \x20   (fn @0..38\n\
+             \x20     (params (g fn(Int) ->> Int))\n\
+             \x20     (ret memo Int)\n\
+             \x20     (block @33..38\n\
+             \x20       (expr @35..36\n\
+             \x20         (int 1 @35..36))))))"
+        );
+        // `->>>` is the memo arrow and a `>`, which cannot start a type.
+        assert_eq!(
+            error("fn(x: Int) ->>> Int { x }"),
+            ("expected a type".to_owned(), Span::new(14, 15))
+        );
     }
 
     #[test]
@@ -3560,12 +3650,12 @@ mod tests {
         assert_eq!(diagnostic.notes, vec![RETURN_TYPE_NOTE]);
         assert_eq!(
             MISSING_RETURN_TYPE,
-            "expected `:` or `->` and a return type after the parameters"
+            "expected `:`, `->` or `->>` and a return type after the parameters"
         );
         assert_eq!(
             RETURN_TYPE_NOTE,
             "a function declares its return type: `: T` for a pure function, `-> T` for an \
-             impure one"
+             impure one, `->> T` for a memoised one"
         );
         assert_eq!(
             error("fn() = 1"),
@@ -3890,10 +3980,15 @@ mod tests {
         };
         let ty = ast.type_expr(ty);
         assert_eq!(ty.span, Span::new(4, 24));
-        let TypeExprKind::Fn { params, ret, pure } = ty.kind else {
+        let TypeExprKind::Fn {
+            params,
+            ret,
+            effect,
+        } = ty.kind
+        else {
             panic!("expected a function type, got {ty:?}");
         };
-        assert!(pure);
+        assert_eq!(effect, Effect::Pure);
         assert_eq!(ast.type_expr(ret).span, Span::new(21, 24));
         let params = ast.param_tys(params);
         assert_eq!(params[0].name, ast.names().lookup("x"));
@@ -4040,7 +4135,7 @@ mod tests {
         let decl = ast.fn_decl(function);
         assert!(decl.params.is_empty());
         assert_eq!(decl.ret, None);
-        assert!(!decl.pure);
+        assert_eq!(decl.effect, Effect::Impure);
         assert_eq!(decl.marker, Span::new(2, 6));
         assert_eq!(ast.get(decl.body).span, Span::new(7, 12));
         assert!(matches!(ast.get(decl.body).kind, ExprKind::Binary { .. }));
@@ -4187,7 +4282,10 @@ mod tests {
         };
         assert!(matches!(
             ast.type_expr(lhs).kind,
-            TypeExprKind::Fn { pure: true, .. }
+            TypeExprKind::Fn {
+                effect: Effect::Pure,
+                ..
+            }
         ));
         assert!(matches!(
             ast.type_expr(rhs).kind,

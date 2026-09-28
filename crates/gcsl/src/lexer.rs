@@ -41,9 +41,13 @@
 //! record type, the parameters of a function and the arguments of a call.
 //!
 //! A `-` that is not inside an identifier is classified from the bytes
-//! either side of it (see `Lexer::minus`). Directly followed by `>` it is
-//! always the arrow `->` ([`TokenKind::Arrow`]), whatever is around it.
-//! Otherwise it is subtraction ([`TokenKind::Minus`]) when followed by
+//! either side of it (see `Lexer::minus`). Directly followed by `>>` it is
+//! always the memo arrow `->>` ([`TokenKind::MemoArrow`]), and otherwise
+//! directly followed by `>` always the arrow `->` ([`TokenKind::Arrow`]),
+//! whatever is around it: these are the markers of a memoised impure and of
+//! an impure function, the third, `:`, marking a pure one. So `->>>` is the
+//! memo arrow and a `>`, and `- >>` a `-` and two `>`s. Otherwise it is
+//! subtraction ([`TokenKind::Minus`]) when followed by
 //! whitespace, negation ([`TokenKind::Neg`]) when directly followed by an
 //! operand, and an error when it directly follows an operand, where `a-b`
 //! and `a - b` would be too easily confused.
@@ -227,6 +231,8 @@ pub enum TokenKind {
     ColonEq,
     /// `->`, which marks an impure function's return type.
     Arrow,
+    /// `->>`, which marks a memoised impure function's return type.
+    MemoArrow,
     /// `=`
     Eq,
     /// `(`
@@ -288,6 +294,7 @@ impl TokenKind {
             TokenKind::Colon => Some(":"),
             TokenKind::ColonEq => Some(":="),
             TokenKind::Arrow => Some("->"),
+            TokenKind::MemoArrow => Some("->>"),
             TokenKind::Eq => Some("="),
             TokenKind::LParen => Some("("),
             TokenKind::RParen => Some(")"),
@@ -756,8 +763,10 @@ impl<'a> Lexer<'a> {
     /// Classifies a `-` at `start` that is not part of an identifier or a
     /// number literal, from the bytes on either side of it:
     ///
-    /// 1. Directly followed by `>`: the arrow, [`TokenKind::Arrow`],
-    ///    whatever precedes it, so `a->b`, `x -> y` and `)->{` all have one.
+    /// 1. Directly followed by `>>`: the memo arrow,
+    ///    [`TokenKind::MemoArrow`]; otherwise directly followed by `>`: the
+    ///    arrow, [`TokenKind::Arrow`]; whatever precedes it, so `a->b`,
+    ///    `x -> y` and `)->{` all have an arrow, and `)->>{` a memo arrow.
     /// 2. Directly after an operand end (an identifier character or `)`):
     ///    an error, since `a-b` would be a single name and `a -b` a
     ///    negation.
@@ -768,6 +777,10 @@ impl<'a> Lexer<'a> {
     /// 5. Otherwise, as in `--x`: an unexpected character.
     fn minus(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         if self.peek_at(1) == Some(b'>') {
+            if self.peek_at(2) == Some(b'>') {
+                self.pos += 3;
+                return Ok(TokenKind::MemoArrow);
+            }
             self.pos += 2;
             return Ok(TokenKind::Arrow);
         }
@@ -1564,7 +1577,7 @@ mod tests {
             &SourceFile::new(
                 "test.gcsl",
                 "1 2.5 + - -x * / // % ( ) x let : := = { } ; . ,\n\
-                 if else true false and or not == != < <= > >= === !== fn -> lazy await |",
+                 if else true false and or not == != < <= > >= === !== fn -> ->> lazy await |",
             )
             .unwrap(),
         )
@@ -1614,6 +1627,7 @@ mod tests {
                 BangEqEq,
                 Fn,
                 Arrow,
+                MemoArrow,
                 Lazy,
                 Await,
                 Pipe,
@@ -1622,6 +1636,7 @@ mod tests {
         );
         assert_eq!(Fn.symbol(), Some("fn"));
         assert_eq!(Arrow.symbol(), Some("->"));
+        assert_eq!(MemoArrow.symbol(), Some("->>"));
         assert_eq!(Lazy.symbol(), Some("lazy"));
         assert_eq!(Await.symbol(), Some("await"));
         assert_eq!(Pipe.symbol(), Some("|"));
@@ -1722,8 +1737,20 @@ mod tests {
         assert_eq!(show("- ->")[..2], ["Minus", "Arrow"]);
         assert_eq!(spans("a -> b"), vec![(0, 1), (2, 4), (5, 6), (6, 6)]);
         assert_eq!(spans("a->b"), vec![(0, 1), (1, 3), (3, 4), (4, 4)]);
-        // `->` then `>` is the arrow and a greater-than.
-        assert_eq!(show("->>"), vec!["Arrow", "Gt", "Eof"]);
+        // `->>` is the memo arrow, one token, in every spacing, and a
+        // further `>` is a greater-than.
+        assert_eq!(show("->>"), vec!["MemoArrow", "Eof"]);
+        assert_eq!(show("->>>"), vec!["MemoArrow", "Gt", "Eof"]);
+        assert_eq!(
+            show("a->>b"),
+            vec!["Ident(a)", "MemoArrow", "Ident(b)", "Eof"]
+        );
+        assert_eq!(show(")->>{"), vec!["RParen", "MemoArrow", "LBrace", "Eof"]);
+        assert_eq!(show("-> ->>"), vec!["Arrow", "MemoArrow", "Eof"]);
+        assert_eq!(spans("a ->> b"), vec![(0, 1), (2, 5), (6, 7), (7, 7)]);
+        // Only a `-` directly before `>>` makes one.
+        assert_eq!(show("- >>"), vec!["Minus", "Gt", "Gt", "Eof"]);
+        assert_eq!(show("-> >"), vec!["Arrow", "Gt", "Eof"]);
         // A `-` not directly followed by `>` follows the usual rules.
         assert_eq!(show("a - > b")[1..3], ["Minus", "Gt"]);
         assert_eq!(

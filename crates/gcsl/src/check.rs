@@ -278,12 +278,18 @@
 //! initialised directly with a function expression remembers which, so
 //! that a call through its name knows the function's [`FnResolution`].
 //!
-//! **Purity.** A function declared with `:` is pure, and one declared with
-//! `->` impure; the top level is impure, and a block has the purity of the
-//! function it is in. Calling an impure function from a pure one is an
-//! error, and so is awaiting (see [Futures](#futures)). Those are the only
-//! gated operations: a pure function may create, pass, store and return
-//! impure functions and futures.
+//! **Purity.** A function declared with `:` is pure, one declared with `->`
+//! impure, and one declared with `->>` impure and memoised: its [`Effect`]
+//! is one of `Pure < Memo < Impure`, and only `Pure` is pure. A memoised
+//! function's body is an impure context exactly as an impure function's
+//! is; memoisation is the evaluator's business (see [`crate::eval`]), and
+//! what the checker does differently for it is only what its bare types
+//! mean (see [Futures](#futures)). The top level is impure, and a block has
+//! the purity of the function it is in. Calling a function that is not
+//! pure, an impure or a memoised one, from a pure one is an error, and so
+//! is awaiting (see [Futures](#futures)). Those are the only gated
+//! operations: a pure function may create, pass, store and return impure
+//! and memoised functions and futures.
 //!
 //! # Futures
 //!
@@ -301,16 +307,25 @@
 //! record type means what the position it is written in says (`Bareness`):
 //! the either shape, `T | Future<T>`, in the parameters and the return type
 //! of an impure function expression and of a written impure function type,
-//! at that position and at every bare position inside it, through record
-//! types (so `{a: Int}` there is `{a: Int | Future<Int>} | Future<{a: Int |
-//! Future<Int>}>`) but not into a nested function type, which has its own
-//! rule; and a present `T` everywhere else: annotations, ascriptions, the
-//! return types of pure functions, and the parameters and return types of
-//! written pure function types. (A pure function expression's bare
-//! parameters are inferred: see [Inferred
-//! parameters](#inferred-parameters); and so are an impure function
-//! expression's bare result positions, from what its body returns, once its
-//! body is checked against the either shapes written: see [Inferred
+//! and in the return type of a memoised one, at that position and at every
+//! bare position inside it, through record types (so `{a: Int}` there is
+//! `{a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>`) but not into a
+//! nested function type, which has its own rule; and a present `T`
+//! everywhere else: annotations, ascriptions, the return types of pure
+//! functions, the parameters and return types of written pure function
+//! types, and the parameters of memoised function expressions and written
+//! memoised function types (see `bareness_of`). A memoised function is
+//! strict: its arguments are the key its results are memoised by, so each
+//! is present, at its position and at every position inside it, and none is
+//! inferred; `Future<T>`, `T | Future<T>` and `Present<T>` may still be
+//! written there and mean what they say. A caller passing a value that may
+//! be a future to such a parameter awaits it at the call, deeply where the
+//! parameter's type needs it, as for any present parameter. (A pure
+//! function expression's bare parameters are inferred: see [Inferred
+//! parameters](#inferred-parameters); and so are an impure or memoised
+//! function expression's bare result positions, from what its body
+//! returns, once its body is checked against the either shapes written:
+//! see [Inferred
 //! results](#inferred-results).) A function type is the one bare type
 //! that is never the
 //! either shape at its own position: its interior follows its own purity
@@ -325,9 +340,13 @@
 //! errors. So an impure function takes, and says it returns, values that
 //! may be futures, since its body awaits them on demand, while a pure function
 //! takes present values where its body needs them, since its body cannot
-//! await; and a pure `fn(Int): Int` is not a subtype of the impure
-//! `fn(Int) -> Int`, which promises to pass futures (parameters are
-//! contravariant), though it is of `fn(Present<Int>) -> Int`.
+//! await, and a memoised function takes present values, the key it looks
+//! its results up by; and a pure `fn(Int): Int` is not a subtype of the
+//! impure `fn(Int) -> Int`, which promises to pass futures (parameters are
+//! contravariant), though it is of `fn(Present<Int>) -> Int`, and neither
+//! is a memoised `fn(Int) ->> Int`, though it too is a subtype of
+//! `fn(Present<Int>) -> Int` (see [`crate::types`] for the effect
+//! lattice).
 //!
 //! **Awaits.** Every place a value is used as its bits decides whether it
 //! is awaited there, and records it in [`Resolution::await_of`] (or, for a
@@ -378,10 +397,10 @@
 //! (`Checker::awaitable_capture`): a variable of the top level, which is
 //! impure, or one whose home function (the function whose body declares
 //! it) or a function between that one and the pure function is impure, as
-//! a `lazy` is. A capture whose home and every function between are pure
-//! could be awaited there no more than in the pure function, and keeps the
-//! usual note, as does a record read by a dotted `let` or `:=`, which is
-//! not an expression.
+//! a `lazy` and a memoised function are. A capture whose home and every
+//! function between are pure could be awaited there no more than in the
+//! pure function, and keeps the usual note, as does a record read by a
+//! dotted `let` or `:=`, which is not an expression.
 //!
 //! # Inferred parameters
 //!
@@ -465,15 +484,15 @@
 //! present, and the caller awaits it before the enclosing function runs, as
 //! for a measurement in the enclosing body itself; `fn make(n: Int): fn():
 //! Int { fn(): Int { n } }` therefore takes a present `n`. Through an impure
-//! function or a `lazy`, which may await, the provisional type is instead
-//! treated as the either shape it may become: measuring it there is an
-//! await, which measures nothing for the function it belongs to, and inside
-//! a pure function nested in that impure one it is the purity error. This is
-//! conservative and correct: the enclosing function's decision is not known
-//! while the nested body is checked, and if nothing measures the parameter
-//! a future may indeed arrive, which the `lazy` or impure function awaits
-//! when it runs. (An await of a parameter that turns out present finds a
-//! present value, and does nothing.)
+//! or memoised function or a `lazy`, which may await, the provisional type
+//! is instead treated as the either shape it may become: measuring it there
+//! is an await, which measures nothing for the function it belongs to, and
+//! inside a pure function nested in that impure one it is the purity
+//! error. This is conservative and correct: the enclosing function's
+//! decision is not known while the nested body is checked, and if nothing
+//! measures the parameter a future may indeed arrive, which the `lazy` or
+//! impure function awaits when it runs. (An await of a parameter that turns
+//! out present finds a present value, and does nothing.)
 //!
 //! **Where a provisional type is shown.** A diagnostic shows a provisional
 //! type as what it stands for at that point (`Checker::shown`): one of a
@@ -498,12 +517,12 @@
 //!
 //! # Inferred results
 //!
-//! An impure function's bare result position, one written as a name or a
-//! record type, is the either shape while the body is checked, as the bare
-//! type rule says, and then takes the laziness of what the body returns
-//! there: `T` if it is present, `Future<T>` if it is a future, and the
-//! either shape, as written, if it may be either or has a provisional type
-//! (see below), `T` being the type written there, with its own bare
+//! An impure or memoised function's bare result position, one written as a
+//! name or a record type, is the either shape while the body is checked,
+//! as the bare type rule says, and then takes the laziness of what the body
+//! returns there: `T` if it is present, `Future<T>` if it is a future, and
+//! the either shape, as written, if it may be either or has a provisional
+//! type (see below), `T` being the type written there, with its own bare
 //! positions inferred in the same way if it is a record type, each field
 //! against the field of the same name of what the body returns there once
 //! stripped (the body's other fields play no part). So `fn get() -> {a: Int,
@@ -515,7 +534,10 @@
 //! what is written, with everything inside it: `Present<...>`,
 //! `Future<...>`, a union and a function type say what they are. A
 //! parenthesised type is what is inside it. The parameters are never
-//! inferred, nor is anything of a pure function's.
+//! inferred, nor is anything of a pure function's. A memoised function's
+//! result is inferred in the same way, and its parameters are present:
+//! `fn fetch(x: Int) ->> Int { x }` is `fn(x: Int) ->> Int`, and `fn
+//! later(x: Int) ->> Int { lazy x }` is `fn(x: Int) ->> Future<Int>`.
 //!
 //! What the body returns is the value it has once every await the checker
 //! marked for fitting it to the declared result has run, since the typed
@@ -595,9 +617,9 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Expr, ExprId, ExprKind, FieldTyRange, FnDecl, FnId,
-    ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart, TypeExprId,
-    TypeExprKind, UnaryOp, path_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTyRange,
+    FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart,
+    TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1076,6 +1098,22 @@ enum Bareness {
     Either,
 }
 
+/// What bare types mean in the parameters and in the return type of a
+/// function of effect `effect`, as written in a function type or a function
+/// expression's signature: present in both for a pure function; present in
+/// the parameters, which are the key its results are memoised by, and the
+/// either shape in the return type for a memoised one; the either shape in
+/// both for an impure one. (A function expression then infers what its
+/// pure parameters and its impure or memoised results are: see
+/// `Checker::check_fn`.)
+const fn bareness_of(effect: Effect) -> (Bareness, Bareness) {
+    match effect {
+        Effect::Pure => (Bareness::Present, Bareness::Present),
+        Effect::Memo => (Bareness::Present, Bareness::Either),
+        Effect::Impure => (Bareness::Either, Bareness::Either),
+    }
+}
+
 /// A function expression or a `lazy` being checked: one entry of the
 /// checker's stack of the functions it is inside, innermost last.
 #[derive(Debug)]
@@ -1091,10 +1129,11 @@ struct Function {
     outer_slot_names: Vec<Name>,
     /// What the function captures, in capture order.
     captures: Vec<Capture>,
-    /// Whether the function is pure, declared with `:`; never for a
-    /// `lazy`.
-    pure: bool,
-    /// Its `:` or `->`, or a `lazy`'s keyword.
+    /// What the function may do, as declared: pure (`:`), memoised (`->>`)
+    /// or impure (`->`); always impure for a `lazy`. Only
+    /// [`Effect::Pure`] is pure.
+    effect: Effect,
+    /// Its `:`, `->>` or `->`, or a `lazy`'s keyword.
     marker: Span,
     /// For each parameter, where the body first measures it, in source
     /// order, so far; only a pure function's bare parameters, whose types
@@ -2793,22 +2832,22 @@ impl<'a> Checker<'a> {
                 self.sorted_fields.truncate(base);
                 resolved
             }
-            TypeExprKind::Fn { params, ret, pure } => {
+            TypeExprKind::Fn {
+                params,
+                ret,
+                effect,
+            } => {
                 // A function type has its own rule, whatever surrounds it.
-                let inner = if pure {
-                    Bareness::Present
-                } else {
-                    Bareness::Either
-                };
+                let (params_mode, ret_mode) = bareness_of(effect);
                 let base = self.fn_params.len();
                 for param in self.ast.param_tys(params) {
                     // Resolving a nested function type uses `fn_params`
                     // above this one's entries and truncates back.
-                    let param_ty = self.resolve_type(param.ty, inner);
+                    let param_ty = self.resolve_type(param.ty, params_mode);
                     self.fn_params.push((param.name, param_ty));
                 }
-                let ret = self.resolve_type(ret, inner);
-                let resolved = self.intern_fn_type(base, ret, pure);
+                let ret = self.resolve_type(ret, ret_mode);
+                let resolved = self.intern_fn_type(base, ret, effect);
                 self.fn_params.truncate(base);
                 resolved
             }
@@ -2863,14 +2902,14 @@ impl<'a> Checker<'a> {
     }
 
     /// Interns the function type whose parameters are `fn_params[base..]`
-    /// and whose return type is `ret`, or returns `Error` if any of them is
-    /// erroneous, having been reported.
-    fn intern_fn_type(&mut self, base: usize, ret: TyId, pure: bool) -> TyId {
+    /// and whose return type is `ret`, of effect `effect`, or returns
+    /// `Error` if any of them is erroneous, having been reported.
+    fn intern_fn_type(&mut self, base: usize, ret: TyId, effect: Effect) -> TyId {
         let params = self.fn_params.get(base..).unwrap_or_default();
         if ret == TyId::ERROR || params.iter().any(|&(_, ty)| ty == TyId::ERROR) {
             return TyId::ERROR;
         }
-        self.types.fn_type(params.iter().copied(), ret, pure)
+        self.types.fn_type(params.iter().copied(), ret, effect)
     }
 
     /// Checks that `expr`, of type `found`, can have type `expected`: an
@@ -2944,7 +2983,8 @@ impl<'a> Checker<'a> {
     /// The functions, as indices into the stack of functions being checked,
     /// whose parameters a use in the innermost body may measure: the
     /// innermost function, and each function enclosing it that is reached
-    /// through pure functions only (see the module documentation). Empty at
+    /// through pure functions only (see the module documentation), a
+    /// memoised function counting as the impure function it is. Empty at
     /// the top level.
     fn claimable(&self) -> std::ops::Range<usize> {
         let end = self.functions.len();
@@ -2953,7 +2993,7 @@ impl<'a> Checker<'a> {
             && self
                 .functions
                 .get(start)
-                .is_some_and(|function| function.pure)
+                .is_some_and(|function| function.effect == Effect::Pure)
         {
             start -= 1;
         }
@@ -3217,9 +3257,9 @@ impl<'a> Checker<'a> {
     /// function is created: if it comes from the top level, which is
     /// impure, or its home function (the function whose body declares it)
     /// or a function between that one and the innermost is impure, as a
-    /// `lazy` is. `None` for any other expression, including a capture
-    /// whose home and every function between are pure, which can await it
-    /// no more than the innermost function can.
+    /// `lazy` and a memoised function are. `None` for any other expression,
+    /// including a capture whose home and every function between are pure,
+    /// which can await it no more than the innermost function can.
     fn awaitable_capture(&self, expr: ExprId) -> Option<Name> {
         let mut node = expr;
         let name = loop {
@@ -3253,19 +3293,23 @@ impl<'a> Checker<'a> {
             .position(|function| function.bindings_start > binding)?;
         let awaitable = match outside.checked_sub(1) {
             None => true,
-            Some(home) => enclosing
-                .get(home..)
-                .is_some_and(|between| between.iter().any(|function| !function.pure)),
+            Some(home) => enclosing.get(home..).is_some_and(|between| {
+                // A memoised function may await, as an impure one may.
+                between
+                    .iter()
+                    .any(|function| function.effect != Effect::Pure)
+            }),
         };
         awaitable.then_some(name)
     }
 
-    /// The marker of the innermost function, if it is pure: where the
-    /// purity rule's errors say the function is pure.
+    /// The marker of the innermost function, if it is pure (a memoised
+    /// function is not): where the purity rule's errors say the function is
+    /// pure.
     fn pure_marker(&self) -> Option<Span> {
         self.functions
             .last()
-            .filter(|function| function.pure)
+            .filter(|function| function.effect == Effect::Pure)
             .map(|function| function.marker)
     }
 
@@ -3602,7 +3646,7 @@ impl<'a> Checker<'a> {
             outer_frame_size: self.frame_size,
             outer_slot_names: std::mem::take(&mut self.slot_names),
             captures: Vec::new(),
-            pure: false,
+            effect: Effect::Impure,
             marker: decl.marker,
             demanded: Vec::new(),
         });
@@ -3648,37 +3692,35 @@ impl<'a> Checker<'a> {
     /// documentation). Its type is known, and recorded, before the body is
     /// checked: the function type of its declared parameter and return
     /// types, or `Error` if any of them is. A bare type in them is present
-    /// for a pure function and the either shape for an impure one, except
-    /// that a pure function's parameter whose type is written as a name or
-    /// a record type has a provisional type while the body is checked, and
-    /// is present if the body measures it and the either shape otherwise:
-    /// once the body is checked, the type of every expression in the
-    /// function is settled accordingly, and so is the function's type. An
-    /// impure function whose body was checked without an error then has
-    /// its result inferred from what the body returns (see
-    /// [`Checker::inferred`]), and its type, recorded again, is the
-    /// function type of its parameters and that result.
+    /// for a pure function, the either shape for an impure one, and for a
+    /// memoised one present in the parameters and the either shape in the
+    /// result (see `bareness_of`), except that a pure function's parameter
+    /// whose type is written as a name or a record type has a provisional
+    /// type while the body is checked, and is present if the body measures
+    /// it and the either shape otherwise: once the body is checked, the type
+    /// of every expression in the function is settled accordingly, and so
+    /// is the function's type. An impure or memoised function whose body
+    /// was checked without an error then has its result inferred from what
+    /// the body returns (see [`Checker::inferred`]), and its type, recorded
+    /// again, is the function type of its parameters and that result.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
-        let mode = if decl.pure {
-            Bareness::Present
-        } else {
-            Bareness::Either
-        };
+        let pure = decl.effect == Effect::Pure;
+        let (params_mode, ret_mode) = bareness_of(decl.effect);
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
         let mut provisional = false;
         for (index, param) in params.iter().enumerate() {
-            let mut ty = self.resolve_type(param.ty, mode);
-            if decl.pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
+            let mut ty = self.resolve_type(param.ty, params_mode);
+            if pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
                 ty = self.types.provisional(function, position(index), ty);
                 provisional = true;
             }
             self.fn_params.push((Some(param.name), ty));
         }
         let ret = if let Some(ret) = decl.ret {
-            self.resolve_type(ret, mode)
+            self.resolve_type(ret, ret_mode)
         } else {
             // The parser gives every function expression a return type.
             self.errors.push(
@@ -3690,7 +3732,7 @@ impl<'a> Checker<'a> {
             );
             TyId::ERROR
         };
-        let mut ty = self.intern_fn_type(base, ret, decl.pure);
+        let mut ty = self.intern_fn_type(base, ret, decl.effect);
         self.expr_types[id.index()] = ty;
         self.functions.push(Function {
             fn_id: function,
@@ -3699,7 +3741,7 @@ impl<'a> Checker<'a> {
             outer_frame_size: self.frame_size,
             outer_slot_names: std::mem::take(&mut self.slot_names),
             captures: Vec::new(),
-            pure: decl.pure,
+            effect: decl.effect,
             marker: decl.marker,
             demanded: vec![None; params.len()],
         });
@@ -3707,17 +3749,17 @@ impl<'a> Checker<'a> {
         let span = self.ast.get(id).span;
         let errors = self.errors.len();
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
-        // An impure function's bare result takes its laziness from the body,
-        // unless something is wrong with the function.
+        // An impure or memoised function's bare result takes its laziness
+        // from the body, unless something is wrong with the function.
         if let Some(ret_expr) = decl.ret
-            && !decl.pure
+            && !pure
             && ty != TyId::ERROR
             && self.errors.len() == errors
         {
             let value = self.value_of(decl.body, ret);
             let inferred = self.inferred(ret_expr, ret, value);
             if inferred != ret {
-                ty = self.intern_fn_type(base, inferred, false);
+                ty = self.intern_fn_type(base, inferred, decl.effect);
                 self.expr_types[id.index()] = ty;
             }
         }
@@ -3975,8 +4017,8 @@ impl<'a> Checker<'a> {
         };
         let erroneous = self.bind_arguments(id, (callee, callee_ty), args, &sig);
         if let Some(function) = self.functions.last()
-            && function.pure
-            && !sig.pure
+            && function.effect == Effect::Pure
+            && sig.effect != Effect::Pure
         {
             let marker = function.marker;
             let label = format!("this is {}", self.in_label(callee_ty));
@@ -10768,5 +10810,202 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    // ----- Memoised functions -----
+
+    #[test]
+    fn a_memoised_functions_bare_parameters_are_present() {
+        assert_eq!(
+            shown_result("fn f(x: Int) ->> Int { x }\nf"),
+            "fn(x: Int) ->> Int"
+        );
+        // At every position inside, and whether the body measures them or
+        // not: they are not inferred.
+        assert_eq!(
+            shown_result("fn g(p: {a: Int, b: {c: String}}) ->> Int { 1 }\ng"),
+            "fn(p: {a: Int, b: {c: String}}) ->> Int"
+        );
+        // What is written explicitly means what it says.
+        assert_eq!(
+            shown_result(
+                "fn h(x: Future<Int>, y: Int | Future<Int>, z: Present<Int>) ->> Int { 1 }\nh"
+            ),
+            "fn(x: Future<Int>, y: Int | Future<Int>, z: Int) ->> Int"
+        );
+        // A function type parameter follows its own marker.
+        assert_eq!(
+            shown_result("fn k(f: fn(Int) -> Int) ->> Int { 1 }\nk"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) ->> Int"
+        );
+        // Its own name in its body has the declared type.
+        let text = "fn f(n: Int) ->> Int { if n < 2 { n } else { f(n - 1) + 1 } }\nf";
+        assert_eq!(shown_result(text), "fn(n: Int) ->> Int");
+    }
+
+    #[test]
+    fn a_memoised_functions_bare_result_is_inferred() {
+        assert_eq!(
+            shown_result("fn l(x: Int) ->> Int { lazy x }\nl"),
+            "fn(x: Int) ->> Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn j(c: Bool) ->> Int { if c { 1 } else { lazy 2 } }\nj"),
+            "fn(c: Bool) ->> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn r() ->> {a: Int, b: Int} { a = 1; b = lazy 2 }\nr"),
+            "fn() ->> {a: Int, b: Future<Int>}"
+        );
+        // A call's result is the inferred one.
+        assert_eq!(
+            shown_result("fn l(x: Int) ->> Int { lazy x }\nl(1)"),
+            "Future<Int>"
+        );
+        // A future passed through, as written.
+        assert_eq!(
+            shown_result("fn p(x: Future<Int>) ->> Int { x }\np"),
+            "fn(x: Future<Int>) ->> Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_written_memoised_function_type() {
+        // Parameters present, result the either shape.
+        assert_eq!(
+            shown_result(
+                "let f: fn(Int, {a: Int}) ->> Int = fn(x: Int, r: {a: Int}) ->> Int { x }\nf"
+            ),
+            "fn(Int, {a: Int}) ->> Int | Future<Int>"
+        );
+        // Nested in another function type, with its own rule.
+        assert_eq!(
+            shown_result(
+                "let f: fn(fn(Int) ->> Int) -> Int = fn(g: fn(Int) ->> Int) -> Int { g(1) }\nf"
+            ),
+            "fn(fn(Int) ->> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        // A memoised function stands in for an impure one whose caller
+        // passes present arguments, and a pure one for a memoised one.
+        let memo = "let m = fn(x: Int) ->> Int { x }\n";
+        assert!(diagnostics_of(&format!("{memo}let g: fn(Present<Int>) -> Int = m")).is_empty());
+        assert!(diagnostics_of("let g: fn(Int) ->> Int = fn(x: Int): Int { x }").is_empty());
+        // Not for one whose caller may pass a future, nor for a pure one.
+        for target in ["fn(Int) -> Int", "fn(Present<Int>): Int"] {
+            assert_eq!(
+                messages(&format!("{memo}let g: {target} = m")),
+                vec!["mismatched types"],
+                "{target}"
+            );
+        }
+    }
+
+    /// The diagnostics of `text`, none if it checks.
+    fn diagnostics_of(text: &str) -> Vec<Diagnostic> {
+        check(&parse_text(text), &mut TypeTable::new())
+            .err()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn an_argument_that_may_be_a_future_is_awaited_at_a_memoised_call() {
+        let f = "fn f(x: Int) ->> Int { x }\n";
+        assert_eq!(
+            marks(&format!("{f}let v = lazy 1\nf(v)")),
+            vec![("v", AwaitMark::Top)]
+        );
+        // Deeply, where the parameter's type needs it.
+        let g = "fn g(p: {a: Int}) ->> Int { p.a }\n";
+        assert_eq!(
+            marks(&format!("{g}let r = {{ a = lazy 1 }}\ng(r)")),
+            vec![("r", AwaitMark::Deep)]
+        );
+        // Not where the parameter is written lazy.
+        assert!(marks("fn h(x: Future<Int>) ->> Int { 1 }\nh(lazy 1)").is_empty());
+    }
+
+    #[test]
+    fn a_pure_function_cannot_call_a_memoised_one() {
+        let text = "fn m(x: Int) ->> Int { x }\nfn p(): Int { m(1) }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot call an impure function from a pure function"
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (last(text, "m"), "this is fn(x: Int) ->> Int"),
+                (last(text, ":"), "this function is pure, declared with `:`")
+            ]
+        );
+        // Nor can it await, whatever it calls.
+        assert_eq!(
+            messages("fn p(v: Future<Int>): Int { await v }"),
+            vec!["cannot await in a pure function"]
+        );
+        // But it may make, hold and return one.
+        assert_eq!(
+            shown_result("fn make(): fn(Int) ->> Int { fn(x: Int) ->> Int { x } }\nmake"),
+            "fn(): fn(Int) ->> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_memoised_functions_body_is_impure() {
+        // It may call impure functions and await, explicitly or not.
+        let text = "fn tick() -> Int { 1 }\n\
+                    fn m(x: Int) ->> Int {\n\
+                    \x20 let f = lazy x + 1\n\
+                    \x20 tick() + await f + f\n\
+                    }\nm";
+        assert_eq!(shown_result(text), "fn(x: Int) ->> Int");
+        // And call memoised ones, itself included.
+        let text = "fn m(x: Int) ->> Int { if x == 0 { 0 } else { m(x - 1) } }\n\
+                    fn n(x: Int) ->> Int { m(x) + 1 }\nn";
+        assert_eq!(shown_result(text), "fn(x: Int) ->> Int");
+    }
+
+    #[test]
+    fn a_pure_closure_in_a_memoised_function() {
+        // A memoised function's parameters are present, so a pure closure
+        // may use them.
+        assert_eq!(
+            shown_result("fn m(n: Int) ->> fn(): Int { fn(): Int { n + 1 } }\nm"),
+            "fn(n: Int) ->> fn(): Int"
+        );
+        // A variable of its body that may be a future cannot be awaited by
+        // the pure closure, and the memoised function, being impure, could
+        // await it first: the hint says so.
+        let text = "fn m(n: Int) ->> Int {\n\
+                    \x20 let v = lazy n\n\
+                    \x20 let g = fn(): Int { v + 1 }\n\
+                    \x20 g()\n\
+                    }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("v")]);
+        // A pure enclosing function's bare parameter, seen through the
+        // memoised function, is not claimable: measuring it there awaits it
+        // in the memoised function, and it stays the either shape.
+        assert_eq!(
+            shown_result(
+                "fn outer(n: Int): fn(Int) ->> Int { fn(x: Int) ->> Int { n + x } }\nouter"
+            ),
+            "fn(n: Int | Future<Int>): fn(Int) ->> Int | Future<Int>"
+        );
+        // Through the memoised function into a pure closure it is the
+        // purity error, with the hint, the memoised function being able to
+        // await it.
+        let text = "fn outer(n: Int): fn() ->> fn(): Int {\n\
+                    \x20 fn() ->> fn(): Int { fn(): Int { n + 1 } }\n\
+                    }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("n")]);
+        // With a pure function in its place, the parameter is claimed.
+        assert_eq!(
+            shown_result(
+                "fn outer(n: Int): fn(): fn(): Int { fn(): fn(): Int { fn(): Int { n + 1 } } }\nouter"
+            ),
+            "fn(n: Int): fn(): fn(): Int"
+        );
     }
 }

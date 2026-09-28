@@ -25,7 +25,14 @@
 //!   its code alive, and when one made by an earlier input fails, its
 //!   diagnostic names that input (see [`crate::Diagnostic::input`]), whose
 //!   source [`Session::source`] returns for rendering it. A future that
-//!   fails is left unrun, so a later input that awaits it runs it again.
+//!   fails is left unrun, so a later input that awaits it runs it again;
+//! - the [`MemoTables`] of every memoised (`->>`) closure any input has
+//!   called, from lists of arguments to what the closure returned, so that
+//!   a later input calling the closure with equal arguments gets the
+//!   earlier result without running the body again (see
+//!   [`crate::eval`]). A table lives as long as its closure: the session
+//!   holds the closure weakly and drops the tables of dead closures from
+//!   time to time; an entry of a live closure is never evicted.
 //!
 //! A failed input, whether it fails to compile or fails at runtime, leaves
 //! the session as it was: the scope is only replaced after evaluation
@@ -36,7 +43,12 @@
 //! they are read. Types the failed input interned are
 //! kept: a type is a fact about structure, not about the input, so a stale
 //! entry is harmless (see [`crate::types`]); forgetting them would mean
-//! rebuilding the table's lookup map.
+//! rebuilding the table's lookup map. The memo entries the failed input made
+//! are forgotten with it (see [`MemoTables::rollback`]): their keys and
+//! results may be records with names it interned, or closures of its code,
+//! which would mean something else, or nothing, to a later input. So a
+//! memoised call the failed input made runs again when a later input makes
+//! it, although its effects have happened.
 
 use std::mem;
 use std::rc::Rc;
@@ -45,7 +57,7 @@ use crate::Outcome;
 use crate::ast::Ast;
 use crate::check::{CheckOutput, Checker, Scope};
 use crate::diagnostic::{self, Diagnostic};
-use crate::eval;
+use crate::eval::{self, MemoTables};
 use crate::ir::Ir;
 use crate::lexer;
 use crate::lower;
@@ -67,6 +79,8 @@ pub struct Session {
     value_type: TyId,
     /// The source of each committed input, indexed by its number.
     sources: Vec<SourceFile>,
+    /// The memo tables of every memoised closure called by any input.
+    memo: MemoTables,
 }
 
 impl Default for Session {
@@ -86,6 +100,7 @@ impl Session {
             frame: Vec::new(),
             value_type: TyId::EMPTY,
             sources: Vec::new(),
+            memo: MemoTables::new(),
         }
     }
 
@@ -108,8 +123,12 @@ impl Session {
     /// order. The session is then unchanged.
     pub fn eval(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
         let names_before = self.names.len();
+        let memo_before = self.memo.checkpoint();
         let result = self.eval_uncommitted(source);
         if result.is_err() {
+            // What the input memoised may hold its names and closures of
+            // its code, which mean nothing once it is forgotten.
+            self.memo.rollback(memo_before);
             self.names.truncate(names_before);
         }
         result
@@ -156,7 +175,7 @@ impl Session {
         if self.frame.len() < frame_size {
             self.frame.resize(frame_size, Value::Empty);
         }
-        match eval::eval_in(&ir, &mut self.frame) {
+        match eval::eval_with(&ir, &mut self.frame, &mut self.memo) {
             Ok(value) => {
                 self.scope = output.scope;
                 self.value_type = output.ty;
@@ -574,6 +593,91 @@ mod tests {
                 .iter()
                 .any(|label| label.text == "awaited here")
         );
+    }
+
+    #[test]
+    fn a_memo_entry_of_one_input_is_found_by_a_later_one() {
+        let mut session = Session::new();
+        value(&mut session, "fn f(x: Int) ->> {v: Int} { v = x }");
+        let Value::Record(first) = value(&mut session, "f(1)") else {
+            panic!("expected a record");
+        };
+        value(&mut session, "let unrelated = 1");
+        let Value::Record(again) = value(&mut session, "f(1)") else {
+            panic!("expected a record");
+        };
+        assert!(Rc::ptr_eq(&first, &again));
+        let Value::Record(other) = value(&mut session, "f(2)") else {
+            panic!("expected a record");
+        };
+        assert!(!Rc::ptr_eq(&first, &other));
+        assert_eq!(session.memo.table_count(), 1);
+    }
+
+    #[test]
+    fn a_failed_input_forgets_what_it_memoised() {
+        let mut session = Session::new();
+        value(&mut session, "fn f(r: {x: Int}) ->> {v: Int} { v = r.x }");
+        let Value::Record(first) = value(&mut session, "f({ x = 1 })") else {
+            panic!("expected a record");
+        };
+        // The failed input's entries go, with the table it made for `g`;
+        // those of earlier inputs stay.
+        assert_eq!(
+            messages(
+                &mut session,
+                "fn g(x: Int) ->> Int { x }\nlet a = g(1)\nlet r = { x = 2; zzz = 3 }\n\
+                 let b = f(r)\nlet h = 1 // 0"
+            ),
+            vec!["division by zero"]
+        );
+        assert_eq!(session.memo.table_count(), 1);
+        let Value::Record(again) = value(&mut session, "f({ x = 1 })") else {
+            panic!("expected a record");
+        };
+        assert!(Rc::ptr_eq(&first, &again));
+        // A name the failed input interned is another input's now: a key
+        // holding it would be found by arguments it does not equal.
+        let Value::Record(other) = value(&mut session, "let q = { x = 2; qqq = 3 }\nf(q)") else {
+            panic!("expected a record");
+        };
+        assert_eq!(Rc::strong_count(&other), 2);
+        let Value::Record(third) = value(&mut session, "let z = { x = 2; zzz = 3 }\nf(z)") else {
+            panic!("expected a record");
+        };
+        assert!(!Rc::ptr_eq(&other, &third));
+    }
+
+    #[test]
+    fn a_memoised_call_that_fails_runs_again_in_a_later_input() {
+        let mut session = Session::new();
+        let first = "fn d(x: Int) ->> Int { 10 // x }";
+        value(&mut session, first);
+        for _ in 0..2 {
+            let diagnostics = eval(&mut session, "d(0)").unwrap_err();
+            assert_eq!(diagnostics[0].message, "division by zero");
+            // In the body, which ran again.
+            assert_eq!(session.source(0).unwrap().slice(diagnostics[0].span), "//");
+            assert_eq!(session.memo.running_count(), 0);
+        }
+        assert_eq!(value(&mut session, "d(5)"), Value::Int(2));
+        // A call that depends on its own result, likewise: no running mark
+        // is left, so the next input runs the body again, and fails in it,
+        // at the inner call, with the outer one labelled.
+        let text = "fn r(n: Int) ->> Int { if n == 0 { r(0) } else { n } }";
+        value(&mut session, text);
+        for _ in 0..2 {
+            let diagnostics = eval(&mut session, "r(0)").unwrap_err();
+            let diagnostic = &diagnostics[0];
+            assert_eq!(diagnostic.message, "this call depends on its own result");
+            assert_eq!(diagnostic.input, Some(2));
+            assert_eq!(session.source(2).unwrap().slice(diagnostic.span), "r(0)");
+            // The call running it is of the input being run, and the
+            // error's spans are of the function's: it is not labelled.
+            assert!(diagnostic.labels.is_empty());
+            assert_eq!(session.memo.running_count(), 0);
+        }
+        assert_eq!(value(&mut session, "r(4)"), Value::Int(4));
     }
 
     #[test]

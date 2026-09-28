@@ -435,6 +435,79 @@ fn dumps_show_futures() {
 }
 
 #[test]
+fn run_memoises_fetches() {
+    let output = gcsl(&["run", "tests/fixtures/memo.gcsl"]);
+    // `weight(80)` finishes only because each argument runs once.
+    assert_eq!(
+        stdout(&output),
+        "{core = \"core\"; deps = 1; weight = 23416728348467685; step = Future<Int>; \
+         doubled = 42}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_memoised_functions() {
+    let output = gcsl(&["run", "tests/fixtures/memo.gcsl", "--dump-tokens"]);
+    assert!(stdout(&output).contains("\nMemoArrow @104..107\n"));
+    let output = gcsl(&["run", "tests/fixtures/memo.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n      (ret memo {name: String, deps: Int})\n",
+        "\n      (params (n Int))\n      (ret memo Int)\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/memo.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        // Its parameter is present; its result is inferred from its body.
+        "(name fetch : fn(name: String) ->> {deps: Int, name: String} @473..478)",
+        "(name weight : fn(n: Int) ->> Int @579..585)",
+        "(name later : fn(n: Int) ->> Future<Int> @597..602)",
+        // Inside its body, its own name has the declared type.
+        "(name weight : fn(n: Int) ->> Int | Future<Int> @314..320)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/memo.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        "\nmemo fn #0 fetch (frame 3, params 1, captures 0, height 6)\n",
+        "\nmemo fn #1 weight (frame 1, params 1, captures 0, height 9)\n",
+        "\nfuture #2 (frame 0, params 0, captures 1, height 2)\n",
+        "\nmemo fn #3 later (frame 1, params 1, captures 0, height 3)\n",
+        "\n          (await @314..327\n\
+         \x20           (call @314..327\n\
+         \x20             (load-callee @314..320)\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_memoised_call_depending_on_its_own_result_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/memo_cycle.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: this call depends on its own result\n\
+         \x20--> tests/fixtures/memo_cycle.gcsl:1:33\n\
+         \x20 |\n\
+         1 | fn size(name: String) ->> Int { size(name) + 1 }\n\
+         \x20 |                                 ^^^^^^^^^^\n\
+         2 | size(\"core\")\n\
+         \x20 | ------------ called here with the same arguments\n\
+         \x20 |\n\
+         \x20 = note: a `->>` function called again with the same arguments while it is running \
+         would never finish\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn repl_shows_futures_as_their_types() {
     let output = repl(
         "let x = lazy 20 + 1\n\

@@ -33,21 +33,33 @@
 //! # Functions
 //!
 //! A function type, [`FnTy`], lists its parameters' types, each with the
-//! parameter's name if the type gives one, its return type, and whether it
-//! is pure. Names are part of the type as interned and displayed, so
-//! `fn(x: Int): Int` and `fn(Int): Int` are different ids, and they are
-//! what named arguments match, but subtyping ignores them, so each of those
-//! is a subtype of the other.
+//! parameter's name if the type gives one, its return type, and its
+//! [`Effect`]: pure (`:`), memoised (`->>`) or impure (`->`). Names are
+//! part of the type as interned and displayed, so `fn(x: Int): Int` and
+//! `fn(Int): Int` are different ids, and they are what named arguments
+//! match, but subtyping ignores them, so each of those is a subtype of the
+//! other.
 //!
-//! `fn(P1, ..., Pn) m R` is a subtype of `fn(Q1, ..., Qn) m' R'` when the
-//! arities are equal, each `Qi` is a subtype of `Pi` (parameters are
-//! contravariant: a function that accepts more can stand in for one that
-//! accepts less), `R` is a subtype of `R'` (the return type is covariant),
-//! and `m` is pure or `m'` impure (a pure function can stand in for an
-//! impure one, not the reverse). Two function types have a join when their
+//! The effects form a lattice, a chain: `Pure < Memo < Impure`. A pure
+//! function can stand in for a memoised or an impure one, and a memoised
+//! one for an impure one, but not the reverse: the caller of a pure
+//! function may itself be pure, and call nothing that is not. `fn(P1, ...,
+//! Pn) m R` is a subtype of `fn(Q1, ..., Qn) m' R'` when the arities are
+//! equal, each `Qi` is a subtype of `Pi` (parameters are contravariant: a
+//! function that accepts more can stand in for one that accepts less), `R`
+//! is a subtype of `R'` (the return type is covariant), and `m <= m'`. Two
+//! function types have a join when their
 //! arities are equal, their parameter types are identical pairwise and
 //! their return types have a join: its parameters keep the names both sides
-//! agree on, its return type is that join, and it is pure only if both are.
+//! agree on, its return type is that join, and its effect is the greater of
+//! the two.
+//!
+//! What a memoised function's bare parameter types mean is the checker's
+//! business (see [`crate::check`]): they are present, since its arguments
+//! are the key its results are memoised by, so the checker interns `fn(x:
+//! Int) ->> Int` with a present `Int` parameter, which is not a subtype of
+//! `fn(Int) -> Int`, whose bare parameter is the either shape, but is one of
+//! `fn(Present<Int>) -> Int`. That is the contravariance above, nothing new.
 //!
 //! # Futures
 //!
@@ -130,7 +142,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::ast::FnId;
+use crate::ast::{Effect, FnId};
 use crate::names::{Name, Names};
 use crate::strings::FieldName;
 use crate::value::ValueKind;
@@ -229,9 +241,9 @@ pub struct FnTy {
     pub params: Box<[(Option<Name>, TyId)]>,
     /// The return type.
     pub ret: TyId,
-    /// Whether the function is pure, declared with `:`, rather than impure,
-    /// declared with `->`.
-    pub pure: bool,
+    /// What the function may do: pure, declared with `:`, memoised,
+    /// declared with `->>`, or impure, declared with `->`.
+    pub effect: Effect,
 }
 
 /// What the top of a type says about whether its values are futures. See
@@ -378,18 +390,18 @@ impl TypeTable {
     }
 
     /// Returns the id of the function type with `params`, each a parameter's
-    /// name, if it has one, and type, returning `ret`, pure if `pure`,
+    /// name, if it has one, and type, returning `ret`, of effect `effect`,
     /// adding it to the table if it is new.
     pub fn fn_type(
         &mut self,
         params: impl IntoIterator<Item = (Option<Name>, TyId)>,
         ret: TyId,
-        pure: bool,
+        effect: Effect,
     ) -> TyId {
         self.intern(TyKind::Fn(FnTy {
             params: params.into_iter().collect(),
             ret,
-            pure,
+            effect,
         }))
     }
 
@@ -540,7 +552,7 @@ impl TypeTable {
                     .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
                     .collect();
                 let ret = self.settle(sig.ret, function, decisions);
-                self.fn_type(params, ret, sig.pure)
+                self.fn_type(params, ret, sig.effect)
             }
             TyKind::Future(inner) => {
                 let inner = self.settle(inner, function, decisions);
@@ -932,7 +944,7 @@ impl TypeTable {
         }
         if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
             return offered.params.len() == required.params.len()
-                && (offered.pure || !required.pure)
+                && offered.effect <= required.effect
                 && self.is_subtype(offered.ret, required.ret)
                 && offered
                     .params
@@ -1005,9 +1017,9 @@ impl TypeTable {
                 .zip(&b_sig.params)
                 .map(|(&(a_name, ty), &(b_name, _))| (a_name.filter(|_| a_name == b_name), ty))
                 .collect();
-            let (a_ret, b_ret, pure) = (a_sig.ret, b_sig.ret, a_sig.pure && b_sig.pure);
+            let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
             let ret = self.join(a_ret, b_ret)?;
-            return Some(self.fn_type(params, ret, pure));
+            return Some(self.fn_type(params, ret, effect));
         }
         let (TyKind::Record(a_record), TyKind::Record(b_record)) = (self.kind(a), self.kind(b))
         else {
@@ -1066,7 +1078,8 @@ impl TypeTable {
     /// a plain identifier quoted as a string literal (`{"a b": Int}`), and a
     /// nested record nested. The empty record is `{}`. A function shows its
     /// parameters in order, each with its name if it has one, then `: ` and
-    /// its return type if it is pure, or ` -> ` and its return type if not.
+    /// its return type if it is pure, ` ->> ` and its return type if it is
+    /// memoised, or ` -> ` and its return type if it is impure.
     /// A future shows as `Future<Int>`, and the either shape as `Int |
     /// Future<Int>`, present member first, in parentheses if it is a
     /// function type, `(fn(): Int) | Future<fn(): Int>`, since a function
@@ -1172,7 +1185,7 @@ impl fmt::Display for Display<'_> {
                     }
                     self.nested(ty).fmt(f)?;
                 }
-                f.write_str(if sig.pure { "): " } else { ") -> " })?;
+                f.write_str(sig.effect.params_end())?;
                 self.nested(sig.ret).fmt(f)
             }
         }
@@ -1406,35 +1419,35 @@ mod tests {
     #[test]
     fn function_types_intern_with_their_names() {
         let (mut table, _, [a, b, _]) = setup();
-        let named = table.fn_type([(Some(a), TyId::INT)], TyId::INT, true);
-        let unnamed = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        let named = table.fn_type([(Some(a), TyId::INT)], TyId::INT, Effect::Pure);
+        let unnamed = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
         assert_ne!(named, unnamed);
         assert_eq!(
-            table.fn_type([(Some(a), TyId::INT)], TyId::INT, true),
+            table.fn_type([(Some(a), TyId::INT)], TyId::INT, Effect::Pure),
             named
         );
         // Names, types, arity, return type and purity all distinguish.
         assert_ne!(
-            table.fn_type([(Some(b), TyId::INT)], TyId::INT, true),
+            table.fn_type([(Some(b), TyId::INT)], TyId::INT, Effect::Pure),
             named
         );
         assert_ne!(
-            table.fn_type([(Some(a), TyId::FLOAT)], TyId::INT, true),
+            table.fn_type([(Some(a), TyId::FLOAT)], TyId::INT, Effect::Pure),
             named
         );
-        assert_ne!(table.fn_type([], TyId::INT, true), named);
+        assert_ne!(table.fn_type([], TyId::INT, Effect::Pure), named);
         assert_ne!(
-            table.fn_type([(Some(a), TyId::INT)], TyId::BOOL, true),
+            table.fn_type([(Some(a), TyId::INT)], TyId::BOOL, Effect::Pure),
             named
         );
         assert_ne!(
-            table.fn_type([(Some(a), TyId::INT)], TyId::INT, false),
+            table.fn_type([(Some(a), TyId::INT)], TyId::INT, Effect::Impure),
             named
         );
         let sig = table.fn_sig(named).unwrap();
         assert_eq!(&*sig.params, &[(Some(a), TyId::INT)]);
         assert_eq!(sig.ret, TyId::INT);
-        assert!(sig.pure);
+        assert_eq!(sig.effect, Effect::Pure);
         assert!(table.fn_sig(TyId::INT).is_none());
         assert!(table.fn_sig(TyId::EMPTY).is_none());
         assert!(!table.is_record(named));
@@ -1450,31 +1463,42 @@ mod tests {
         );
         let mut table = TypeTable::new();
         let show = |table: &TypeTable, id| table.display(id, &names).to_string();
-        let plain = table.fn_type([(None, TyId::INT), (None, TyId::STRING)], TyId::BOOL, true);
+        let plain = table.fn_type(
+            [(None, TyId::INT), (None, TyId::STRING)],
+            TyId::BOOL,
+            Effect::Pure,
+        );
         assert_eq!(show(&table, plain), "fn(Int, String): Bool");
         let with_names = table.fn_type(
             [(Some(name), TyId::STRING), (Some(times), TyId::INT)],
             TyId::STRING,
-            false,
+            Effect::Impure,
         );
         assert_eq!(
             show(&table, with_names),
             "fn(name: String, times: Int) -> String"
         );
+        let memo = table.fn_type([(Some(x), TyId::STRING)], TyId::STRING, Effect::Memo);
+        assert_eq!(show(&table, memo), "fn(x: String) ->> String");
+        let returns_memo = table.fn_type([(None, memo)], memo, Effect::Memo);
+        assert_eq!(
+            show(&table, returns_memo),
+            "fn(fn(x: String) ->> String) ->> fn(x: String) ->> String"
+        );
         let record = table.record([(x, TyId::INT)]);
-        let returns_record = table.fn_type([], record, true);
+        let returns_record = table.fn_type([], record, Effect::Pure);
         assert_eq!(show(&table, returns_record), "fn(): {x: Int}");
-        let int_to_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
-        let higher = table.fn_type([(None, int_to_int)], TyId::INT, true);
+        let int_to_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
+        let higher = table.fn_type([(None, int_to_int)], TyId::INT, Effect::Pure);
         assert_eq!(show(&table, higher), "fn(fn(Int): Int): Int");
-        let returns_fn = table.fn_type([], int_to_int, false);
+        let returns_fn = table.fn_type([], int_to_int, Effect::Impure);
         assert_eq!(show(&table, returns_fn), "fn() -> fn(Int): Int");
         let in_record = table.record([(x, int_to_int)]);
         assert_eq!(show(&table, in_record), "{x: fn(Int): Int}");
         let mixed = table.fn_type(
             [(Some(x), TyId::INT), (None, TyId::EMPTY)],
             TyId::EMPTY,
-            true,
+            Effect::Pure,
         );
         assert_eq!(show(&table, mixed), "fn(x: Int, {}): {}");
     }
@@ -1484,42 +1508,42 @@ mod tests {
         let (mut table, _, [a, b, c]) = setup();
         let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
         let a_only = table.record([(a, TyId::INT)]);
-        let f = |table: &mut TypeTable, params: &[TyId], ret, pure| {
-            table.fn_type(params.iter().map(|&ty| (None, ty)), ret, pure)
+        let f = |table: &mut TypeTable, params: &[TyId], ret, effect| {
+            table.fn_type(params.iter().map(|&ty| (None, ty)), ret, effect)
         };
         // Arity must match.
-        let unary = f(&mut table, &[TyId::INT], TyId::INT, true);
-        let binary = f(&mut table, &[TyId::INT, TyId::INT], TyId::INT, true);
+        let unary = f(&mut table, &[TyId::INT], TyId::INT, Effect::Pure);
+        let binary = f(&mut table, &[TyId::INT, TyId::INT], TyId::INT, Effect::Pure);
         assert!(!table.is_subtype(unary, binary));
         assert!(!table.is_subtype(binary, unary));
         // Parameters are contravariant: accepting `{a}` is more than
         // accepting `{a, b}`.
-        let takes_a = f(&mut table, &[a_only], TyId::INT, true);
-        let takes_ab = f(&mut table, &[ab], TyId::INT, true);
+        let takes_a = f(&mut table, &[a_only], TyId::INT, Effect::Pure);
+        let takes_ab = f(&mut table, &[ab], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(takes_a, takes_ab));
         assert!(!table.is_subtype(takes_ab, takes_a));
         // The return type is covariant.
-        let gives_ab = f(&mut table, &[], ab, true);
-        let gives_a = f(&mut table, &[], a_only, true);
+        let gives_ab = f(&mut table, &[], ab, Effect::Pure);
+        let gives_a = f(&mut table, &[], a_only, Effect::Pure);
         assert!(table.is_subtype(gives_ab, gives_a));
         assert!(!table.is_subtype(gives_a, gives_ab));
         // Pure may stand in for impure, not the reverse.
-        let impure = f(&mut table, &[TyId::INT], TyId::INT, false);
+        let impure = f(&mut table, &[TyId::INT], TyId::INT, Effect::Impure);
         assert!(table.is_subtype(unary, impure));
         assert!(!table.is_subtype(impure, unary));
         // Names are ignored.
-        let named = table.fn_type([(Some(c), TyId::INT)], TyId::INT, true);
+        let named = table.fn_type([(Some(c), TyId::INT)], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(named, unary));
         assert!(table.is_subtype(unary, named));
         // Different parameter types, or a function and anything else.
-        let takes_float = f(&mut table, &[TyId::FLOAT], TyId::INT, true);
+        let takes_float = f(&mut table, &[TyId::FLOAT], TyId::INT, Effect::Pure);
         assert!(!table.is_subtype(unary, takes_float));
         assert!(!table.is_subtype(unary, TyId::INT));
         assert!(!table.is_subtype(unary, TyId::EMPTY));
         assert!(!table.is_subtype(TyId::EMPTY, unary));
         // Nested: a function of functions, and a record of functions.
-        let takes_takes_a = f(&mut table, &[takes_a], TyId::INT, true);
-        let takes_takes_ab = f(&mut table, &[takes_ab], TyId::INT, true);
+        let takes_takes_a = f(&mut table, &[takes_a], TyId::INT, Effect::Pure);
+        let takes_takes_ab = f(&mut table, &[takes_ab], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(takes_takes_ab, takes_takes_a));
         assert!(!table.is_subtype(takes_takes_a, takes_takes_ab));
         let record_pure = table.record([(a, unary), (b, TyId::INT)]);
@@ -1529,37 +1553,103 @@ mod tests {
     }
 
     #[test]
+    fn the_effect_lattice() {
+        let (mut table, _, _) = setup();
+        let effects = [Effect::Pure, Effect::Memo, Effect::Impure];
+        let of =
+            |table: &mut TypeTable, effect| table.fn_type([(None, TyId::INT)], TyId::INT, effect);
+        // All nine pairs: the offered effect must be at most the required.
+        for offered in effects {
+            for required in effects {
+                let (sub, sup) = (of(&mut table, offered), of(&mut table, required));
+                assert_eq!(
+                    table.is_subtype(sub, sup),
+                    offered <= required,
+                    "{offered:?} against {required:?}"
+                );
+            }
+        }
+        assert!(Effect::Pure < Effect::Memo && Effect::Memo < Effect::Impure);
+        // Joins take the greater effect, each way round.
+        for a in effects {
+            for b in effects {
+                let (left, right) = (of(&mut table, a), of(&mut table, b));
+                let joined = table.join(left, right);
+                assert_eq!(joined, Some(of(&mut table, a.max(b))), "{a:?} and {b:?}");
+            }
+        }
+        // A memoised function's bare parameter is present, which the
+        // checker decides; with one, it is not a subtype of an impure
+        // function type whose caller may pass a future, but is one of a
+        // function type that promises a present argument.
+        let either = table.deferrable(TyId::INT);
+        let memo = table.fn_type([(None, TyId::INT)], either, Effect::Memo);
+        let impure_either = table.fn_type([(None, either)], either, Effect::Impure);
+        let impure_present = table.fn_type([(None, TyId::INT)], either, Effect::Impure);
+        assert!(!table.is_subtype(memo, impure_either));
+        assert!(table.is_subtype(memo, impure_present));
+        // And a memoised function type never stands in for a pure one.
+        let pure = table.fn_type([(None, TyId::INT)], either, Effect::Pure);
+        assert!(!table.is_subtype(memo, pure));
+        assert!(table.is_subtype(pure, memo));
+    }
+
+    #[test]
     fn function_joins() {
         let (mut table, _, [a, b, _]) = setup();
         let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
         let a_only = table.record([(a, TyId::INT)]);
         let b_only = table.record([(b, TyId::INT)]);
         // Names kept where both sides agree, dropped otherwise; the return
-        // types' join; pure only if both are.
-        let left = table.fn_type([(Some(a), TyId::INT), (Some(a), TyId::BOOL)], ab, true);
-        let right = table.fn_type([(Some(a), TyId::INT), (Some(b), TyId::BOOL)], a_only, false);
-        let joined = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], a_only, false);
+        // types' join; the greater effect, so pure only if both are.
+        let left = table.fn_type(
+            [(Some(a), TyId::INT), (Some(a), TyId::BOOL)],
+            ab,
+            Effect::Pure,
+        );
+        let right = table.fn_type(
+            [(Some(a), TyId::INT), (Some(b), TyId::BOOL)],
+            a_only,
+            Effect::Impure,
+        );
+        let joined = table.fn_type(
+            [(Some(a), TyId::INT), (None, TyId::BOOL)],
+            a_only,
+            Effect::Impure,
+        );
         assert_eq!(table.join(left, right), Some(joined));
         assert_eq!(table.join(right, left), Some(joined));
-        let pure_right = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], b_only, true);
-        let pure_join = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], b_only, true);
+        let pure_right = table.fn_type(
+            [(Some(a), TyId::INT), (None, TyId::BOOL)],
+            b_only,
+            Effect::Pure,
+        );
+        let pure_join = table.fn_type(
+            [(Some(a), TyId::INT), (None, TyId::BOOL)],
+            b_only,
+            Effect::Pure,
+        );
         assert_eq!(table.join(left, pure_right), Some(pure_join));
-        let gives_a = table.fn_type([(Some(a), TyId::INT), (None, TyId::BOOL)], a_only, true);
+        let gives_a = table.fn_type(
+            [(Some(a), TyId::INT), (None, TyId::BOOL)],
+            a_only,
+            Effect::Pure,
+        );
         let gives_empty = table.fn_type(
             [(Some(a), TyId::INT), (None, TyId::BOOL)],
             TyId::EMPTY,
-            true,
+            Effect::Pure,
         );
         assert_eq!(table.join(pure_right, gives_a), Some(gives_empty));
         // Parameter types must be identical, not merely related.
-        let takes_a = table.fn_type([(None, a_only)], TyId::INT, true);
-        let takes_ab = table.fn_type([(None, ab)], TyId::INT, true);
+        let takes_a = table.fn_type([(None, a_only)], TyId::INT, Effect::Pure);
+        let takes_ab = table.fn_type([(None, ab)], TyId::INT, Effect::Pure);
         assert_eq!(table.join(takes_a, takes_ab), None);
         // Arities must match, and the return types must have a join.
-        let nullary = table.fn_type([], TyId::INT, true);
-        let unary = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        let nullary = table.fn_type([], TyId::INT, Effect::Pure);
+        let unary = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
         assert_eq!(table.join(nullary, unary), None);
-        let gives_float = table.fn_type([], TyId::FLOAT, true);
+        let gives_float = table.fn_type([], TyId::FLOAT, Effect::Pure);
         assert_eq!(table.join(nullary, gives_float), None);
         // A function and anything else have none; a function and itself is
         // itself.
@@ -1576,7 +1666,7 @@ mod tests {
     #[test]
     fn containing_a_function() {
         let (mut table, _, [a, b, c]) = setup();
-        let function = table.fn_type([], TyId::INT, true);
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
         assert!(table.contains_fn(function));
         for id in [
             TyId::INT,
@@ -1596,7 +1686,7 @@ mod tests {
         let deeper = table.record([(a, deep), (b, flat)]);
         assert!(table.contains_fn(deeper));
         // A function taking or returning records is a function.
-        let takes_flat = table.fn_type([(None, flat)], flat, true);
+        let takes_flat = table.fn_type([(None, flat)], flat, Effect::Pure);
         assert!(table.contains_fn(takes_flat));
         // An id from a bigger table contains nothing.
         assert!(!TypeTable::new().contains_fn(deep));
@@ -1616,7 +1706,7 @@ mod tests {
         assert_eq!(table.value_kind(TyId::ERROR), None);
         let union = table.intern(TyKind::Union(Box::new([TyId::INT, TyId::BOOL])));
         assert_eq!(table.value_kind(union), None);
-        let function = table.fn_type([(None, record)], TyId::INT, false);
+        let function = table.fn_type([(None, record)], TyId::INT, Effect::Impure);
         assert_eq!(table.value_kind(function), Some(ValueKind::Fn));
         // An id from a bigger table.
         assert_eq!(TypeTable::new().value_kind(record), None);
@@ -1708,7 +1798,7 @@ mod tests {
         let holder_present = table.record([(a, inner_present)]);
         assert_eq!(table.present(holder), holder_present);
         // Not into functions.
-        let function = table.fn_type([(None, either)], future, false);
+        let function = table.fn_type([(None, either)], future, Effect::Impure);
         let with_fn = table.record([(a, function), (b, future)]);
         let with_fn_present = table.record([(a, function), (b, TyId::INT)]);
         assert_eq!(table.present(with_fn), with_fn_present);
@@ -1816,12 +1906,12 @@ mod tests {
         assert!(!table.is_subtype(with_int, with_future));
         // Through function parameters, contravariant, and results,
         // covariant.
-        let takes_either = table.fn_type([(None, either)], TyId::INT, false);
-        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, false);
+        let takes_either = table.fn_type([(None, either)], TyId::INT, Effect::Impure);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Impure);
         assert!(table.is_subtype(takes_either, takes_int));
         assert!(!table.is_subtype(takes_int, takes_either));
-        let gives_future = table.fn_type([], future, false);
-        let gives_either = table.fn_type([], either, false);
+        let gives_future = table.fn_type([], future, Effect::Impure);
+        let gives_either = table.fn_type([], either, Effect::Impure);
         assert!(table.is_subtype(gives_future, gives_either));
         assert!(!table.is_subtype(gives_either, gives_future));
         // The two callback cases: a pure function whose parameter is
@@ -1829,12 +1919,12 @@ mod tests {
         // present and result either, and not `fn(Int) -> Int`, whose
         // parameter is the either too; one whose parameter is the either
         // fits both.
-        let double = table.fn_type([(Some(a), TyId::INT)], TyId::INT, true);
-        let present_callback = table.fn_type([(None, TyId::INT)], either, false);
-        let either_callback = table.fn_type([(None, either)], either, false);
+        let double = table.fn_type([(Some(a), TyId::INT)], TyId::INT, Effect::Pure);
+        let present_callback = table.fn_type([(None, TyId::INT)], either, Effect::Impure);
+        let either_callback = table.fn_type([(None, either)], either, Effect::Impure);
         assert!(table.is_subtype(double, present_callback));
         assert!(!table.is_subtype(double, either_callback));
-        let passes = table.fn_type([(Some(a), either)], TyId::INT, true);
+        let passes = table.fn_type([(Some(a), either)], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(passes, present_callback));
         assert!(table.is_subtype(passes, either_callback));
     }
@@ -1891,7 +1981,7 @@ mod tests {
         let holder = table.record([(a, either_deep)]);
         assert!(table.contains_future(holder));
         // Functions are not looked into.
-        let function = table.fn_type([(None, future)], future, true);
+        let function = table.fn_type([(None, future)], future, Effect::Pure);
         assert!(!table.contains_future(function));
         // But `contains_fn` looks through futures and unions.
         let future_fn = table.future(function);
@@ -1919,12 +2009,12 @@ mod tests {
         let future_empty = table.future(TyId::EMPTY);
         let record = table.record([(build, future_empty)]);
         assert_eq!(show(&table, record), "{build: Future<{}>}");
-        let takes_step = table.fn_type([(Some(step), future_empty)], TyId::EMPTY, true);
+        let takes_step = table.fn_type([(Some(step), future_empty)], TyId::EMPTY, Effect::Pure);
         assert_eq!(show(&table, takes_step), "fn(step: Future<{}>): {}");
         // A future of a future is interned, and so shown, as a future.
         let nested = table.future(future);
         assert_eq!(show(&table, nested), "Future<Int>");
-        let function = table.fn_type([], TyId::INT, true);
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
         let future_fn = table.future(function);
         assert_eq!(show(&table, future_fn), "Future<fn(): Int>");
         // The either of a function type parenthesises the function type,
@@ -1932,19 +2022,19 @@ mod tests {
         // `Future<...>`.
         let either_fn = table.deferrable(function);
         assert_eq!(show(&table, either_fn), "(fn(): Int) | Future<fn(): Int>");
-        let impure = table.fn_type([], either, false);
+        let impure = table.fn_type([], either, Effect::Impure);
         let either_impure = table.deferrable(impure);
         assert_eq!(
             show(&table, either_impure),
             "(fn() -> Int | Future<Int>) | Future<fn() -> Int | Future<Int>>"
         );
         // A function returning an either shows it unparenthesised.
-        let callback = table.fn_type([(None, either)], either, false);
+        let callback = table.fn_type([(None, either)], either, Effect::Impure);
         assert_eq!(
             show(&table, callback),
             "fn(Int | Future<Int>) -> Int | Future<Int>"
         );
-        let gives_either_fn = table.fn_type([], either_fn, false);
+        let gives_either_fn = table.fn_type([], either_fn, Effect::Impure);
         assert_eq!(
             show(&table, gives_either_fn),
             "fn() -> (fn(): Int) | Future<fn(): Int>"
@@ -2008,7 +2098,7 @@ mod tests {
         assert_eq!(table.deferrable(int), table.deferrable(TyId::INT));
         // Looked through as a union is by `contains_fn`, `contains_future`
         // and `needs_await`.
-        let function = table.fn_type([], TyId::INT, true);
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
         let with_fn = table.record([(a, function)]);
         let of_fn_record = table.provisional(F, 2, with_fn);
         assert!(table.contains_fn(of_fn_record));
@@ -2053,14 +2143,14 @@ mod tests {
         let holds_int = table.record([(a, TyId::INT)]);
         assert!(table.is_subtype(holder, holds_either));
         assert!(!table.is_subtype(holder, holds_int));
-        let takes_x = table.fn_type([(None, x)], TyId::INT, true);
-        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
-        let takes_either = table.fn_type([(None, either)], TyId::INT, true);
+        let takes_x = table.fn_type([(None, x)], TyId::INT, Effect::Pure);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
+        let takes_either = table.fn_type([(None, either)], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(takes_x, takes_int));
         assert!(!table.is_subtype(takes_x, takes_either));
-        let gives_x = table.fn_type([], x, true);
-        let gives_either = table.fn_type([], either, true);
-        let gives_int = table.fn_type([], TyId::INT, true);
+        let gives_x = table.fn_type([], x, Effect::Pure);
+        let gives_either = table.fn_type([], either, Effect::Pure);
+        let gives_int = table.fn_type([], TyId::INT, Effect::Pure);
         assert!(table.is_subtype(gives_x, gives_either));
         assert!(!table.is_subtype(gives_x, gives_int));
     }
@@ -2123,13 +2213,13 @@ mod tests {
         let either = table.deferrable(holder);
         let settled_either = table.deferrable(settled);
         assert_eq!(table.settle(either, F, &[true, true]), settled_either);
-        let function = table.fn_type([(Some(a), x), (Some(b), y)], holder, true);
+        let function = table.fn_type([(Some(a), x), (Some(b), y)], holder, Effect::Pure);
         let settled_function = {
             let lazy_holder = table.record([(a, int_either), (b, other)]);
             table.fn_type(
                 [(Some(a), int_either), (Some(b), TyId::STRING)],
                 lazy_holder,
-                true,
+                Effect::Pure,
             )
         };
         assert_eq!(table.settle(function, F, &[false, true]), settled_function);
@@ -2158,8 +2248,8 @@ mod tests {
         let holder = table.record([(a, first)]);
         let in_future = table.future(holder);
         let in_either = table.deferrable(holder);
-        let in_param = table.fn_type([(None, first)], TyId::INT, true);
-        let in_result = table.fn_type([], holder, true);
+        let in_param = table.fn_type([(None, first)], TyId::INT, Effect::Pure);
+        let in_result = table.fn_type([], holder, Effect::Pure);
         for id in [holder, in_future, in_either, in_param, in_result] {
             assert!(table.contains_provisional(id, Some(F)), "{id:?}");
             assert!(!table.contains_provisional(id, Some(G)), "{id:?}");
@@ -2202,10 +2292,10 @@ mod tests {
             Vec::<u32>::new()
         );
         // A function's result, not its parameters.
-        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, true);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
         assert_eq!(at_present(&table, in_param, takes_int), Vec::<u32>::new());
-        let gives_first = table.fn_type([], first, true);
-        let gives_int = table.fn_type([], TyId::INT, true);
+        let gives_first = table.fn_type([], first, Effect::Pure);
+        let gives_int = table.fn_type([], TyId::INT, Effect::Pure);
         assert_eq!(at_present(&table, gives_first, gives_int), vec![0]);
     }
 
@@ -2222,10 +2312,10 @@ mod tests {
         assert_eq!(show(&table, r), "{x: Int}?");
         let holder = table.record([(x, int)]);
         assert_eq!(show(&table, holder), "{x: Int?}");
-        let function = table.fn_type([], TyId::INT, true);
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
         let f = table.provisional(F, 2, function);
         assert_eq!(show(&table, f), "(fn(): Int)?");
-        let takes = table.fn_type([(Some(x), int)], int, true);
+        let takes = table.fn_type([(Some(x), int)], int, Effect::Pure);
         assert_eq!(show(&table, takes), "fn(x: Int?): Int?");
     }
 }

@@ -140,25 +140,116 @@
 //! so that an await of it from inside its own body, which the checker never
 //! lets through, is an error rather than an endless loop.
 //!
+//! # Memoised functions
+//!
+//! A function declared with `->>` is lowered to code of [`FnKind::Memo`],
+//! and each of its closures runs its body at most once per distinct list of
+//! arguments. Memoisation belongs to the closure, not to the call site: a
+//! call decides by the callee's code, one branch per call, whatever the
+//! static type of the callee (a memoised closure held as a `fn(Present<Int>)
+//! -> Int`, or passed to another function as a callback, is still
+//! memoised), so a call of any other function costs that one comparison
+//! more and nothing else. Two closures of one function expression are two
+//! functions, with a table each; a recursive call through the function's
+//! own name is a call of the running closure, memoised in its table.
+//!
+//! **The key.** A call's key is its arguments, in parameter order: the
+//! parameters' slots of the callee's frame, once the arguments have been
+//! evaluated into them, in source order, as for any call. Keys compare by
+//! *key equality*, which is [`Value`]'s equality, total equality: a
+//! function and a future by identity, the same `Rc`, and every other value
+//! as `===` compares it, records deeply, by field name, whatever the order
+//! of their fields, and every field, those the static type hides included;
+//! floats as IEEE 754 does, so `0.0` and `-0.0` are equal, and NaN is equal
+//! to nothing, itself included: a call with a NaN among its arguments never
+//! finds an entry, and always runs its body, and makes no entry, which no
+//! call could find. Its hash is consistent with
+//! it: the zeros hash alike, a function and a future by address, and a
+//! record as the sum of its fields' hashes, which does not depend on their
+//! order, down to a few levels of record nesting, below which a record
+//! contributes only its field count (equal keys still hash equally, and
+//! hashing never recurses as deeply as a record may be nested).
+//!
+//! **The tables.** The tables belong to the execution context, not to the
+//! closures: [`MemoTables`], which a [`crate::session::Session`] owns for
+//! its lifetime, and [`eval`] for its run, and which every frame of an
+//! evaluation borrows. Held outside the closure, a table that holds the
+//! closure itself, in a key or a result, makes no reference cycle. There
+//! is one table per closure, found by the closure's address, and the table
+//! holds its closure weakly, which keeps the allocation, and so the
+//! address, from being reused by another closure while the table exists,
+//! without keeping the closure alive. A table maps the hash of each key to
+//! its entries, nearly always one, held without an allocation of its own;
+//! each entry holds its key, the arguments copied into a boxed slice, and
+//! either the value the body returned or a mark that the body is running.
+//! Keys and results are held strongly, and an entry of a live closure is
+//! never evicted, however many there are: that memory is the cost of
+//! `->>`. A table of a dead closure can never be hit again, and is dropped
+//! by a *sweep*, which runs when a table is about to be added for another
+//! closure and the number of tables has reached a threshold; afterwards
+//! the threshold is twice the number of tables that survived, and at least
+//! `MIN_SWEEP_THRESHOLD`, so sweeping costs amortised constant time per
+//! closure called. Dropping a table may drop the last reference to other
+//! memoised closures, whose tables go at a later sweep; a closure held by
+//! its own table's keys or results lives as long as the context. A sweep
+//! never drops the table of a running call: the caller holds its closure.
+//! The one other way an entry goes is with the evaluation that made it, if
+//! its context says that evaluation never happened: a session takes a
+//! [`MemoTables::checkpoint`] before each input and rolls back to it if
+//! the input fails, since the names and the input number that the failed
+//! input's records and closures hold are given to later inputs.
+//!
+//! **A call.** The call grows the stack by the callee's frame, evaluates
+//! the arguments into it, and looks them up where they are, which
+//! allocates nothing: it hashes them in place and compares them with the
+//! keys of the entries of that hash. What it finds decides:
+//!
+//! - an entry with a value: the call's value is a copy of it, which for a
+//!   record, a closure or a future shares it, so a future a memoised
+//!   function returned is one future, run at most once, whoever awaits it.
+//!   The body does not run, and the call charges nothing to the nesting
+//!   budget;
+//! - a running entry: the function is running with equal arguments further
+//!   up the stack, and waiting for itself would never finish. The call
+//!   fails with "this call depends on its own result", and the call that is
+//!   running the function is labelled "called here with the same
+//!   arguments" when the error reaches it, as the await running a future
+//!   that awaits itself is labelled "awaited here", under the same
+//!   condition: that it is of the same session input as the error;
+//! - no entry: the call checks the nesting budget as any call does, copies
+//!   the arguments into a new entry marked running, the one allocation the
+//!   memoisation makes, runs the body as any call does, and then finds the
+//!   entry again, by the address of its key, which it compares equal to or
+//!   not, and records the value. If the body fails, the entry is removed
+//!   before the error goes on, so that a later call, in a later input of a
+//!   session, runs the body again.
+//!
+//! The lookup and the recording are helpers of `Evaluator::memo_call`, so
+//! that its frame, on the recursion path of a memoised recursion, holds
+//! little across the body.
+//!
 //! Operands are evaluated left to right, so when both would fail, the left
 //! one's error is reported. Items are evaluated in order, and so are a
 //! call's arguments, whatever parameters they fill. Evaluation holds no
 //! per-node state and allocates nothing beyond the stack, except the
-//! strings, records and closures the program builds and the diagnostic
-//! when it fails. A runtime error points at the operator and labels each
-//! operand with the value it had, so the user sees what actually
-//! overflowed or divided by zero.
+//! strings, records and closures the program builds, the memo tables and
+//! their entries, and the diagnostic when it fails. A runtime error points
+//! at the operator and labels each operand with the value it had, so the
+//! user sees what actually overflowed or divided by zero.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
+use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
 use std::num::NonZeroI64;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::ast::FnId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    Cmp, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId, Operands, ShapeId,
-    ShapedOperands,
+    Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId,
+    Operands, ShapeId, ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -182,26 +273,46 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 /// future, that would take the program's nesting, calls included, past
 /// [`MAX_DEPTH`] levels (see the module documentation). An error inside a
 /// future's body is reported where it happens, as one inside a function
-/// is. `Float` arithmetic never fails.
+/// is. A call of a memoised function that is running with the same
+/// arguments further up the stack is "this call depends on its own result",
+/// at the call. `Float` arithmetic never fails.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
     // The top level's frame; calls grow the stack beyond it.
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
     eval_in(ir, &mut stack)
 }
 
+/// Evaluates `ir` to a value with an existing `stack`, as [`eval_with`]
+/// does, with memo tables of its own, dropped when it returns.
+///
+/// # Errors
+///
+/// As [`eval_with`].
+pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
+    eval_with(ir, stack, &mut MemoTables::new())
+}
+
 /// Evaluates `ir` to a value with an existing `stack`, which must hold at
-/// least [`Ir::frame_size`] values: the top level's frame, at its bottom.
-/// Slots the program does not write keep their values, which is how a
-/// [`crate::session::Session`] keeps its variables from one input to the
-/// next. On return, whether evaluation succeeded or failed, the stack is
-/// truncated to the frame size, dropping whatever calls left above it; its
-/// capacity is kept, so a later evaluation's calls need not allocate it
-/// again.
+/// least [`Ir::frame_size`] values: the top level's frame, at its bottom,
+/// and existing memo tables, `memo`, in which every call of a memoised
+/// function is looked up and recorded (see [Memoised
+/// functions](#memoised-functions)). Slots the program does not write keep
+/// their values, and the tables keep their entries, which is how a
+/// [`crate::session::Session`] keeps its variables, and what its memoised
+/// functions have returned, from one input to the next. On return, whether
+/// evaluation succeeded or failed, the stack is truncated to the frame
+/// size, dropping whatever calls left above it; its capacity is kept, so a
+/// later evaluation's calls need not allocate it again. The tables hold no
+/// running call on return.
 ///
 /// # Errors
 ///
 /// As [`eval`]; and an internal error if `stack` is too small.
-pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
+pub fn eval_with(
+    ir: &Rc<Ir>,
+    stack: &mut Vec<Value>,
+    memo: &mut MemoTables,
+) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
     if stack.len() < frame_size {
@@ -216,6 +327,7 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
         base: 0,
         captures: &[],
         callee: None,
+        memo,
         levels: 0,
     }
     .value(root);
@@ -235,6 +347,8 @@ struct Evaluator<'a> {
     captures: &'a [Value],
     /// The running closure; `None` at the top level.
     callee: Option<&'a Rc<Closure>>,
+    /// The execution context's memo tables, shared by every frame.
+    memo: &'a mut MemoTables,
     /// The levels of nesting the enclosing frames have consumed where this
     /// frame's body starts: 0 at the top level. See the module
     /// documentation.
@@ -610,6 +724,7 @@ impl Evaluator<'_> {
             base,
             captures: &captures,
             callee: None,
+            memo: self.memo,
             levels: entering,
         }
         .value(code.body);
@@ -654,7 +769,8 @@ impl Evaluator<'_> {
 
     /// Evaluates the `Call` `node` of `callee` with the arguments `args`,
     /// at depth `depth` in this frame's body (see the module documentation),
-    /// and returns the body's value.
+    /// and returns the body's value; or, if the callee is a closure of a
+    /// memoised function, hands the call to [`Evaluator::memo_call`].
     fn call(
         &mut self,
         (callee, args, depth): (IrId, IrRange, u16),
@@ -664,6 +780,9 @@ impl Evaluator<'_> {
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
         };
+        if code.kind == FnKind::Memo {
+            return self.memo_call((&closure, code), (args, depth), node);
+        }
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
             return Err(nested_too_deeply(node));
@@ -681,6 +800,7 @@ impl Evaluator<'_> {
             base,
             captures: &closure.captures,
             callee: Some(&closure),
+            memo: self.memo,
             levels: entering,
         }
         .value(code.body);
@@ -691,6 +811,155 @@ impl Evaluator<'_> {
                 Err(error)
             }
             result => result,
+        }
+    }
+
+    /// Evaluates the `Call` `node` of `closure`, whose code `code` is
+    /// memoised, with the arguments `args`, at depth `depth` in this frame's
+    /// body (see [Memoised functions](#memoised-functions)): returns what
+    /// the closure returned for equal arguments before, if it has; fails if
+    /// it is running with equal arguments; and otherwise runs the body as
+    /// [`Evaluator::call`] does and records what it returns. The lookup and
+    /// the recording are in helpers, so that this frame, on the recursion
+    /// path of memoised recursion, keeps only what the body's evaluation
+    /// needs across it.
+    fn memo_call(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let base = self.stack.len();
+        let (mark, entering) = match self.memo_begin((closure, code), (args, depth), node)? {
+            MemoBegin::Found(value) => return Ok(value),
+            MemoBegin::Started(mark) => (Some(mark), mark.entering),
+            MemoBegin::Unkeyed(entering) => (None, entering),
+        };
+        let result = Evaluator {
+            ir: &closure.code,
+            stack: self.stack,
+            base,
+            captures: &closure.captures,
+            callee: Some(closure),
+            memo: self.memo,
+            levels: entering,
+        }
+        .value(code.body);
+        self.stack.truncate(base);
+        match mark {
+            Some(mark) => self.memo_end(closure, mark, result, node),
+            None => result.map_err(|error| self.memo_error(error, closure, false, node)),
+        }
+    }
+
+    /// Begins the memoised call `node` of `closure`, whose code is `code`,
+    /// at depth `depth` in this frame's body: grows the stack by the
+    /// callee's frame, evaluates the arguments `args` into it, and looks
+    /// them up in the closure's memo table, allocating nothing. If the
+    /// closure has returned for equal arguments, the stack is truncated
+    /// back and that value found. Otherwise, if it is running with equal
+    /// arguments, or its body would take the nesting past the budget, the
+    /// stack is truncated back and the error returned; and if neither, the
+    /// arguments are recorded as running, the one allocation of the call's
+    /// memoisation, and the frame is left for the body.
+    fn memo_begin(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        (args, depth): (IrRange, u16),
+        node: &IrNode,
+    ) -> Result<MemoBegin, Diagnostic> {
+        let base = self.stack.len();
+        self.stack
+            .resize(base + code.frame_size as usize, Value::Empty);
+        if let Err(error) = self.arguments(args, base) {
+            self.stack.truncate(base);
+            return Err(error);
+        }
+        let params = base..base + code.param_count as usize;
+        let Some(key) = self.stack.get(params.clone()) else {
+            self.stack.truncate(base);
+            return mistyped(node, "a call's parameters lie outside its frame");
+        };
+        let hash = match self.memo.lookup(closure, key) {
+            Lookup::Missing(hash) => hash,
+            Lookup::Done(value) => {
+                self.stack.truncate(base);
+                return Ok(MemoBegin::Found(value));
+            }
+            Lookup::Running => {
+                self.stack.truncate(base);
+                return Err(depends_on_own_result(node));
+            }
+        };
+        let entering = self.levels + usize::from(depth) + CALL_LEVELS;
+        if entering + code.height as usize > MAX_DEPTH {
+            self.stack.truncate(base);
+            return Err(nested_too_deeply(node));
+        }
+        let key = self.stack.get(params).unwrap_or_default();
+        // Arguments that equal nothing, themselves included, as those
+        // holding NaN, would make an entry no call could find.
+        if !key_eq(key, key) {
+            return Ok(MemoBegin::Unkeyed(entering));
+        }
+        let key = self.memo.start(closure, hash, key);
+        Ok(MemoBegin::Started(Mark {
+            hash,
+            key,
+            entering,
+        }))
+    }
+
+    /// Ends the memoised call `node` of `closure` that
+    /// [`Evaluator::memo_begin`] started as `mark`, whose body gave
+    /// `result`: records the value it returned, or, if it failed, removes
+    /// the running mark, so that a later call runs the body again, and
+    /// returns the error as [`Evaluator::memo_error`] reports it.
+    fn memo_end(
+        &mut self,
+        closure: &Rc<Closure>,
+        mark: Mark,
+        result: Result<Value, Diagnostic>,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        match result {
+            Ok(value) => match self.memo.finish(closure, &mark, Some(&value)) {
+                Some(_) => Ok(value),
+                None => mistyped(node, "a memoised call's entry is missing"),
+            },
+            Err(error) => match self.memo.finish(closure, &mark, None) {
+                Some(reentered) => Err(self.memo_error(error, closure, reentered, node)),
+                None => mistyped(node, "a memoised call's entry is missing"),
+            },
+        }
+    }
+
+    /// `error`, raised while `closure` ran for the memoised call `node`, as
+    /// it is reported: stamped with the closure's input when its code is of
+    /// another session input than this frame's, as [`Evaluator::call`]
+    /// stamps one, unless an inner frame has stamped an input on it
+    /// already; and otherwise, if the error is that a call inside the body
+    /// called the closure again with the same arguments (`reentered`),
+    /// labelled "called here with the same arguments" at this call, as the
+    /// await that ran a future that awaits itself is labelled.
+    fn memo_error(
+        &self,
+        mut error: Diagnostic,
+        closure: &Closure,
+        reentered: bool,
+        node: &IrNode,
+    ) -> Diagnostic {
+        if error.input.is_some() {
+            return error;
+        }
+        if closure.code.input() != self.ir.input() {
+            error.input = Some(closure.code.input());
+            return error;
+        }
+        if reentered {
+            error.with_context(node.span, "called here with the same arguments")
+        } else {
+            error
         }
     }
 
@@ -1624,6 +1893,431 @@ fn record_eq_shaped(ir: &Ir, shape: ShapeId, a: &Value, b: &Value) -> Option<boo
     }
 }
 
+/// The number of tables below which [`MemoTables`] never sweeps: the
+/// threshold's minimum (see [Memoised functions](#memoised-functions)).
+const MIN_SWEEP_THRESHOLD: usize = 32;
+
+/// How many levels of record nesting a memo key's hash descends into; a
+/// record nested deeper contributes only its field count. Equal keys still
+/// hash equally, and the bound keeps hashing from recursing as deeply as a
+/// record may be nested, which is as deeply as a program runs.
+const KEY_HASH_DEPTH: usize = 4;
+
+/// The memo tables of an execution context: one table per closure of a
+/// memoised function that has been called, from lists of arguments to what
+/// the closure returned for them. A [`crate::session::Session`] owns one
+/// for its lifetime, and [`eval`] and [`eval_in`] one for their run. See
+/// [Memoised functions](#memoised-functions).
+#[derive(Clone, Debug)]
+pub struct MemoTables {
+    /// Each closure's table, found by the closure's address, which the
+    /// table's weak reference to it keeps from being reused.
+    tables: HashMap<*const Closure, MemoTable>,
+    /// The number of tables at which adding one for another closure first
+    /// sweeps away the tables of dead closures.
+    threshold: usize,
+    /// The number of checkpoints taken: every entry records the one it was
+    /// made after (see [`MemoTables::checkpoint`]).
+    generation: u64,
+}
+
+/// A point in the life of [`MemoTables`], to which
+/// [`MemoTables::rollback`] returns them. See [`MemoTables::checkpoint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoCheckpoint(u64);
+
+impl Default for MemoTables {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoTables {
+    /// Tables holding nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tables: HashMap::new(),
+            threshold: MIN_SWEEP_THRESHOLD,
+            generation: 0,
+        }
+    }
+
+    /// Marks this point, before an evaluation whose values may not outlive
+    /// it: a session input, whose names and number are forgotten if it
+    /// fails, and with them the meaning of every record and closure it
+    /// made. Costs nothing until it is rolled back to.
+    pub fn checkpoint(&mut self) -> MemoCheckpoint {
+        self.generation += 1;
+        MemoCheckpoint(self.generation)
+    }
+
+    /// Forgets every entry made since `checkpoint` was taken, so that the
+    /// calls they recorded run again, and every table left with none. Only
+    /// between evaluations: no call is running. Visits every entry, which
+    /// only a failed evaluation pays for.
+    pub fn rollback(&mut self, checkpoint: MemoCheckpoint) {
+        self.tables.retain(|_, table| {
+            table
+                .buckets
+                .retain(|_, bucket| bucket.retain(|entry| entry.generation < checkpoint.0));
+            !table.buckets.is_empty()
+        });
+    }
+
+    /// The number of tables held: one for each closure called since the
+    /// last sweep, and one for each that survived it.
+    #[must_use]
+    pub fn table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// The number of entries recorded as running, for tests: none once an
+    /// evaluation has returned.
+    #[cfg(test)]
+    pub(crate) fn running_count(&self) -> usize {
+        self.tables
+            .values()
+            .flat_map(|table| table.buckets.values())
+            .flat_map(Bucket::entries)
+            .filter(|entry| matches!(entry.state, EntryState::Running { .. }))
+            .count()
+    }
+
+    /// Looks `key`, a call's arguments in parameter order, up in
+    /// `closure`'s table, by key equality (see [Memoised
+    /// functions](#memoised-functions)), without allocating. Marks a running
+    /// entry found as re-entered, for the error's label.
+    fn lookup(&mut self, closure: &Rc<Closure>, key: &[Value]) -> Lookup {
+        let hash = key_hash(key);
+        let Some(bucket) = self
+            .tables
+            .get_mut(&Rc::as_ptr(closure))
+            .and_then(|table| table.buckets.get_mut(&hash))
+        else {
+            return Lookup::Missing(hash);
+        };
+        let Some(entry) = bucket
+            .entries_mut()
+            .iter_mut()
+            .find(|entry| key_eq(&entry.key, key))
+        else {
+            return Lookup::Missing(hash);
+        };
+        match &mut entry.state {
+            EntryState::Done(value) => Lookup::Done(value.clone()),
+            EntryState::Running { reentered } => {
+                *reentered = true;
+                Lookup::Running
+            }
+        }
+    }
+
+    /// Records `key`, whose hash is `hash`, as running in `closure`'s
+    /// table, which is made if the closure has none, after sweeping if the
+    /// number of tables has reached the threshold. Returns the address of
+    /// the stored key, by which [`MemoTables::finish`] finds the entry
+    /// again, whatever its key compares equal to.
+    fn start(&mut self, closure: &Rc<Closure>, hash: u64, key: &[Value]) -> *const Value {
+        let address = Rc::as_ptr(closure);
+        if self.tables.len() >= self.threshold && !self.tables.contains_key(&address) {
+            self.sweep();
+        }
+        let table = self.tables.entry(address).or_insert_with(|| MemoTable {
+            closure: Rc::downgrade(closure),
+            buckets: HashMap::default(),
+        });
+        let key: Box<[Value]> = Box::from(key);
+        let stored = key.as_ptr();
+        let entry = Entry {
+            key,
+            state: EntryState::Running { reentered: false },
+            generation: self.generation,
+        };
+        match table.buckets.entry(hash) {
+            MapEntry::Occupied(mut bucket) => bucket.get_mut().push(entry),
+            MapEntry::Vacant(vacant) => {
+                vacant.insert(Bucket::One(entry));
+            }
+        }
+        stored
+    }
+
+    /// Ends the call of `closure` that [`MemoTables::start`] recorded as
+    /// `mark`: records `value` as what it returned, or, if it failed
+    /// (`None`), removes its entry. Returns whether the running entry was
+    /// found re-entered, or `None` if there is no such entry, which never
+    /// happens: the closure is alive while it runs, so no sweep removes its
+    /// table.
+    fn finish(
+        &mut self,
+        closure: &Rc<Closure>,
+        mark: &Mark,
+        value: Option<&Value>,
+    ) -> Option<bool> {
+        let table = self.tables.get_mut(&Rc::as_ptr(closure))?;
+        let Some(value) = value else {
+            return match table.remove(mark)? {
+                EntryState::Running { reentered } => Some(reentered),
+                EntryState::Done(_) => Some(false),
+            };
+        };
+        let entry = table
+            .buckets
+            .get_mut(&mark.hash)?
+            .entries_mut()
+            .iter_mut()
+            .find(|entry| entry.key.as_ptr() == mark.key)?;
+        entry.state = EntryState::Done(value.clone());
+        Some(false)
+    }
+
+    /// Drops the tables of dead closures, which no call can reach again,
+    /// and sets the threshold of the next sweep to twice the number of
+    /// tables that survive, or [`MIN_SWEEP_THRESHOLD`] if that is more.
+    /// Dropping a table may drop the last reference to other memoised
+    /// closures; their tables go at a later sweep.
+    fn sweep(&mut self) {
+        self.tables
+            .retain(|_, table| table.closure.strong_count() > 0);
+        self.threshold = (self.tables.len() * 2).max(MIN_SWEEP_THRESHOLD);
+    }
+}
+
+/// One closure's memo table.
+#[derive(Clone, Debug)]
+struct MemoTable {
+    /// The closure, held weakly: the table neither keeps it alive nor lets
+    /// its address be reused while the table exists.
+    closure: Weak<Closure>,
+    /// The entries, grouped by the hash of their keys.
+    buckets: HashMap<u64, Bucket, BuildHasherDefault<Prehashed>>,
+}
+
+impl MemoTable {
+    /// Removes the entry `mark` recorded, found by the address of its key,
+    /// and returns its state; `None` if there is none.
+    fn remove(&mut self, mark: &Mark) -> Option<EntryState> {
+        let bucket = self.buckets.get_mut(&mark.hash)?;
+        let index = bucket
+            .entries()
+            .iter()
+            .position(|entry| entry.key.as_ptr() == mark.key)?;
+        if let Bucket::Many(entries) = bucket
+            && entries.len() > 1
+        {
+            return Some(entries.swap_remove(index).state);
+        }
+        // The bucket's only entry: the bucket goes with it.
+        match self.buckets.remove(&mark.hash)? {
+            Bucket::One(entry) => Some(entry.state),
+            Bucket::Many(mut entries) => entries.pop().map(|entry| entry.state),
+        }
+    }
+}
+
+/// The entries of a memo table whose keys have one hash: nearly always
+/// one, held without an allocation of its own.
+#[derive(Clone, Debug)]
+enum Bucket {
+    /// The one entry.
+    One(Entry),
+    /// Several entries, after a collision of hashes, or of keys that are
+    /// never equal to anything, such as those holding NaN.
+    Many(Vec<Entry>),
+}
+
+impl Bucket {
+    /// The entries.
+    fn entries(&self) -> &[Entry] {
+        match self {
+            Bucket::One(entry) => std::slice::from_ref(entry),
+            Bucket::Many(entries) => entries,
+        }
+    }
+
+    /// The entries, to change their states.
+    fn entries_mut(&mut self) -> &mut [Entry] {
+        match self {
+            Bucket::One(entry) => std::slice::from_mut(entry),
+            Bucket::Many(entries) => entries,
+        }
+    }
+
+    /// Keeps only the entries `keep` accepts, and returns whether any is
+    /// left.
+    fn retain(&mut self, keep: impl Fn(&Entry) -> bool) -> bool {
+        match self {
+            Bucket::One(entry) => keep(entry),
+            Bucket::Many(entries) => {
+                entries.retain(keep);
+                !entries.is_empty()
+            }
+        }
+    }
+
+    /// Adds `entry`.
+    fn push(&mut self, entry: Entry) {
+        let previous = std::mem::replace(self, Bucket::Many(Vec::new()));
+        *self = Bucket::Many(match previous {
+            Bucket::One(first) => vec![first, entry],
+            Bucket::Many(mut entries) => {
+                entries.push(entry);
+                entries
+            }
+        });
+    }
+}
+
+/// A memoised call: the arguments it was made with, and what it returned
+/// or that it is running.
+#[derive(Clone, Debug)]
+struct Entry {
+    /// The arguments, in parameter order.
+    key: Box<[Value]>,
+    /// Whether the call is running or has returned, and what.
+    state: EntryState,
+    /// The checkpoint the entry was made after (see
+    /// [`MemoTables::checkpoint`]).
+    generation: u64,
+}
+
+/// Where a memoised call is.
+#[derive(Clone, Debug)]
+enum EntryState {
+    /// The body is running further up the stack; `reentered` once a call
+    /// inside it has found it so.
+    Running {
+        /// Whether a call inside the body has found this entry running.
+        reentered: bool,
+    },
+    /// The body returned this value.
+    Done(Value),
+}
+
+/// What looking a call's arguments up in a memo table finds.
+enum Lookup {
+    /// The closure returned this value for equal arguments.
+    Done(Value),
+    /// The closure is running with equal arguments.
+    Running,
+    /// No entry: the arguments' hash, for recording them.
+    Missing(u64),
+}
+
+/// How a memoised call begins, from [`Evaluator::memo_begin`].
+enum MemoBegin {
+    /// The closure returned this value for equal arguments before.
+    Found(Value),
+    /// The call is recorded as running and its frame is on the stack.
+    Started(Mark),
+    /// The arguments equal nothing, so the call is not recorded: its frame
+    /// is on the stack, and its body runs at this nesting.
+    Unkeyed(usize),
+}
+
+/// A running memoised call, as [`MemoTables::start`] recorded it.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    /// The hash of the arguments.
+    hash: u64,
+    /// The address of the stored key, which finds the entry again.
+    key: *const Value,
+    /// The nesting at which the body runs (see the module documentation).
+    entering: usize,
+}
+
+/// The hasher of a memo table's buckets, whose keys are hashes already: it
+/// takes a `u64` as its hash.
+#[derive(Clone, Copy, Debug, Default)]
+struct Prehashed(u64);
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    /// Only a `u64` is ever hashed; any other bytes are folded in.
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// Whether the memo keys `a` and `b` are equal, by key equality (see
+/// [Memoised functions](#memoised-functions)).
+fn key_eq(a: &[Value], b: &[Value]) -> bool {
+    a == b
+}
+
+/// The hash of the memo key `key`, consistent with key equality: equal keys
+/// hash equally. The standard library's [`DefaultHasher`], `SipHash` with
+/// fixed keys: it needs no dependency, and its output is spread well
+/// enough for the buckets to use as it is (see [`Prehashed`]).
+fn key_hash(key: &[Value]) -> u64 {
+    let mut state = DefaultHasher::new();
+    state.write_usize(key.len());
+    for value in key {
+        hash_value(value, &mut state, KEY_HASH_DEPTH);
+    }
+    state.finish()
+}
+
+/// Feeds `value` to `state`, consistently with key equality: a float's
+/// zeros alike, a function and a future by address, and a record, `depth`
+/// levels deep, as the sum of its fields' hashes, which does not depend on
+/// their order, since total equality compares fields by name.
+fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
+    match value {
+        Value::Int(value) => {
+            state.write_u8(0);
+            state.write_i64(*value);
+        }
+        Value::Float(value) => {
+            state.write_u8(1);
+            let bits = value.to_bits();
+            // `0.0` and `-0.0` are equal, and differ only in the sign bit.
+            state.write_u64(if bits << 1 == 0 { 0 } else { bits });
+        }
+        Value::Bool(value) => {
+            state.write_u8(2);
+            state.write_u8(u8::from(*value));
+        }
+        Value::Str(text) => {
+            state.write_u8(3);
+            text.hash(state);
+        }
+        Value::Empty => state.write_u8(4),
+        Value::Record(record) => {
+            state.write_u8(5);
+            state.write_usize(record.values.len());
+            if let Some(depth) = depth.checked_sub(1) {
+                let mut sum: u64 = 0;
+                for (name, value) in record.layout.names.iter().zip(&record.values) {
+                    let mut field = DefaultHasher::new();
+                    name.hash(&mut field);
+                    hash_value(value, &mut field, depth);
+                    sum = sum.wrapping_add(field.finish());
+                }
+                state.write_u64(sum);
+            }
+        }
+        Value::Fn(closure) => {
+            state.write_u8(6);
+            Rc::as_ptr(closure).hash(state);
+        }
+        Value::Future(future) => {
+            state.write_u8(7);
+            Rc::as_ptr(future).hash(state);
+        }
+    }
+}
+
 fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
@@ -1650,6 +2344,15 @@ fn depends_on_itself(node: &IrNode) -> Diagnostic {
     Diagnostic::error(
         "this deferred expression depends on its own value",
         node.span,
+    )
+}
+
+/// The error for the call `node` of a memoised function's closure that is
+/// running with equal arguments further up the stack.
+fn depends_on_own_result(node: &IrNode) -> Diagnostic {
+    Diagnostic::error("this call depends on its own result", node.span).with_note(
+        "a `->>` function called again with the same arguments while it is running would never \
+         finish",
     )
 }
 
@@ -3002,6 +3705,7 @@ mod tests {
             base: 0,
             captures: &[],
             callee: None,
+            memo: &mut MemoTables::new(),
             levels: 0,
         }
         .value(ir.root());
@@ -3879,5 +4583,468 @@ mod tests {
         );
         // The empty record has no fields to await.
         assert_eq!(eval_in(&ir, &mut vec![Value::Empty]).unwrap(), Value::Empty);
+    }
+
+    // ----- Memoised functions -----
+
+    /// Runs `text` on a fresh stack with `memo` as its memo tables.
+    fn run_with(text: &str, memo: &mut MemoTables) -> Result<Value, Diagnostic> {
+        let ir = compile(text);
+        let mut stack = vec![Value::Empty; ir.frame_size() as usize];
+        eval_with(&ir, &mut stack, memo)
+    }
+
+    /// The values of the fields of the record that `text` evaluates to, in
+    /// definition order.
+    fn fields(text: &str) -> Vec<Value> {
+        match run(text) {
+            Ok(Value::Record(record)) => record.values.to_vec(),
+            other => panic!("{text}: expected a record, got {other:?}"),
+        }
+    }
+
+    /// Whether `a` and `b` are one record, closure or future.
+    fn same(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Record(a), Value::Record(b)) => Rc::ptr_eq(a, b),
+            (Value::Fn(a), Value::Fn(b)) => Rc::ptr_eq(a, b),
+            (Value::Future(a), Value::Future(b)) => Rc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Whether a memoised function of a parameter of type `ty`, whose body
+    /// builds a fresh record, runs its body once when called with `first`
+    /// and then `second`, after `setup`: whether its results are one
+    /// record.
+    fn hits(setup: &str, ty: &str, first: &str, second: &str) -> bool {
+        let text = format!(
+            "fn f(x: {ty}) ->> {{v: Int}} {{ v = 1 }}\n{setup}\na = f({first})\nb = f({second})"
+        );
+        let values = fields(&text);
+        same(&values[0], &values[1])
+    }
+
+    #[test]
+    fn a_memoised_function_runs_once_per_distinct_arguments() {
+        let text = "fn f(x: Int) ->> {v: Int} { v = x }\na = f(1)\nb = f(1)\nc = f(2)\nd = f(2)";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]));
+        assert!(same(&values[2], &values[3]));
+        assert!(!same(&values[0], &values[2]));
+        assert_eq!(values[0].to_string(), "{v = 1}");
+        assert_eq!(values[2].to_string(), "{v = 2}");
+        // An impure function runs every time.
+        let values = fields(&text.replace("->>", "->"));
+        assert!(!same(&values[0], &values[1]));
+        // The key is the arguments in parameter order, however passed.
+        let text = "fn g(x: Int, y: Int) ->> {v: Int} { v = x }\n\
+                    a = g(1, 2)\nb = g(y = 2, x = 1)\nc = g(2, 1)";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]));
+        assert!(!same(&values[0], &values[2]));
+        // No parameters: one key.
+        let values = fields("fn h() ->> {v: Int} { v = 1 }\na = h()\nb = h()");
+        assert!(same(&values[0], &values[1]));
+    }
+
+    #[test]
+    fn memo_keys_compare_by_key_equality() {
+        let deep = |leaf: i64| format!("{}{leaf}{}", "{ a = ".repeat(6), " }".repeat(6));
+        let deep_type = format!("{}Int{}", "{a: ".repeat(6), "}".repeat(6));
+        let cases = [
+            ("", "Int", "1", "1", true),
+            ("", "Int", "1", "2", false),
+            // IEEE equality: the zeros are equal, and NaN is equal to
+            // nothing, itself included.
+            ("", "Float", "0.0", "-0.0", true),
+            ("", "Float", "1.5", "1.5", true),
+            ("", "Float", "1.5", "2.5", false),
+            ("", "Float", "0.0 / 0.0", "0.0 / 0.0", false),
+            ("let n = 0.0 / 0.0", "Float", "n", "n", false),
+            // By content, not by allocation.
+            ("", "String", "\"ab\"", "\"a\" + \"b\"", true),
+            ("", "String", "\"ab\"", "\"ba\"", false),
+            ("", "Bool", "true", "true", true),
+            ("", "Bool", "true", "false", false),
+            ("", "{}", "{}", "{}", true),
+            // Records by total equality: by field name, whatever the
+            // order, and every field, those the static type hides included.
+            (
+                "",
+                "{x: Int, y: Int}",
+                "{ x = 1; y = 2 }",
+                "{ y = 2; x = 1 }",
+                true,
+            ),
+            (
+                "",
+                "{x: Int, y: Int}",
+                "{ x = 1; y = 2 }",
+                "{ x = 1; y = 3 }",
+                false,
+            ),
+            ("", "{x: Int}", "{ x = 1; y = 2 }", "{ y = 2; x = 1 }", true),
+            (
+                "",
+                "{x: Int}",
+                "{ x = 1; y = 2 }",
+                "{ x = 1; y = 3 }",
+                false,
+            ),
+            ("", "{x: Int}", "{ x = 1 }", "{ x = 1; y = 2 }", false),
+            (
+                "",
+                "{a: {b: Int}}",
+                "{ a = { b = 1 } }",
+                "{ a = { b = 1 } }",
+                true,
+            ),
+            (
+                "",
+                "{a: {b: Int}}",
+                "{ a = { b = 1 } }",
+                "{ a = { b = 2 } }",
+                false,
+            ),
+            (
+                "",
+                "{a: {b: Float}}",
+                "{ a = { b = 0.0 } }",
+                "{ a = { b = -0.0 } }",
+                true,
+            ),
+            // Nested deeper than the hash looks.
+            ("", &deep_type, &deep(1), &deep(1), true),
+            ("", &deep_type, &deep(1), &deep(2), false),
+            // Functions and futures by identity.
+            ("let g = fn(): Int { 1 }", "fn(): Int", "g", "g", true),
+            ("", "fn(): Int", "fn(): Int { 1 }", "fn(): Int { 1 }", false),
+            ("let v = lazy 1", "Future<Int>", "v", "v", true),
+            ("", "Future<Int>", "lazy 1", "lazy 1", false),
+            (
+                "let g = fn(): Int { 1 }",
+                "{f: fn(): Int}",
+                "{ f = g }",
+                "{ f = g }",
+                true,
+            ),
+            (
+                "",
+                "{f: fn(): Int}",
+                "{ f = fn(): Int { 1 } }",
+                "{ f = fn(): Int { 1 } }",
+                false,
+            ),
+        ];
+        for (setup, ty, first, second, expected) in cases {
+            assert_eq!(
+                hits(setup, ty, first, second),
+                expected,
+                "{ty}: {first} then {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_memoised_recursion_runs_its_body_once_per_argument() {
+        // Unmemoised, this would make about 10^19 calls.
+        assert_eq!(
+            int(
+                "fn fib(n: Int) ->> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }\n\
+                 fib(90)"
+            ),
+            2_880_067_194_370_816_120
+        );
+    }
+
+    #[test]
+    fn a_memoised_recursion_has_the_nesting_budget_of_any_other() {
+        on_big_stack(|| {
+            let recurse = "fn f(n: Int) ->> Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n";
+            let ir = compile(&format!("{recurse}f(0)"));
+            let [(outer, _)] = ir.calls_in(ir.root())[..] else {
+                panic!("expected one call at the top level");
+            };
+            let code = ir.function(FnId::new(0));
+            let [(inner, inner_span)] = ir.calls_in(code.body)[..] else {
+                panic!("expected one call in the body");
+            };
+            let (outer, inner) = (usize::from(outer), usize::from(inner));
+            let height = code.height as usize;
+            let allowed = 1 + (MAX_DEPTH - height - outer - CALL_LEVELS) / (inner + CALL_LEVELS);
+            // A first call with the most calls the budget allows succeeds,
+            // using all of it, on the stack the pipeline is run with.
+            let last = i64::try_from(allowed - 1).unwrap();
+            assert_eq!(
+                run(&format!("{recurse}f({last})")).unwrap(),
+                Value::Int(last)
+            );
+            // One more fails as any recursion does, and leaves nothing
+            // running.
+            let text = format!("{recurse}f({})", last + 1);
+            let diagnostic = run(&text).unwrap_err();
+            assert_eq!(diagnostic.message, BUDGET_ERROR);
+            assert_eq!(diagnostic.notes, vec![BUDGET_NOTE]);
+            assert_eq!(diagnostic.span, inner_span);
+            assert!(diagnostic.labels.is_empty());
+            let mut memo = MemoTables::new();
+            assert_eq!(
+                run_with(&text, &mut memo).unwrap_err().message,
+                BUDGET_ERROR
+            );
+            assert_eq!(memo.running_count(), 0);
+            // A call that finds its result charges nothing for the body: in
+            // steps, each within the budget, the recursion goes past it.
+            let steps = i64::try_from(allowed / 100 + 2).unwrap();
+            let warm = format!(
+                "{recurse}fn warm(n: Int) -> Int {{ if n <= 0 {{ 0 }} else {{ warm(n - 100) + f(n) }} }}\n\
+                 warm({})",
+                100 * steps
+            );
+            assert_eq!(
+                run(&warm).unwrap(),
+                Value::Int(100 * steps * (steps + 1) / 2)
+            );
+        });
+    }
+
+    /// `STACK_SIZE` covers the nesting budget when it is spent on memoised
+    /// calls, whose recursion takes a frame more than any other call's,
+    /// unoptimised, whatever kind of nesting they are made from: for each
+    /// costly kind, a memoised recursion whose recursive call is wrapped in
+    /// that nesting makes as many calls as the budget allows, which takes
+    /// its deepest frame's body to exactly `MAX_DEPTH` levels, and one more
+    /// call fails.
+    #[test]
+    fn the_nesting_budget_fits_the_stack_for_memoised_calls() {
+        on_big_stack(|| {
+            for (kind, ret, wrap_in, value) in await_nesting_kinds() {
+                // `f(n)` makes n + 1 calls, none finding its result.
+                let program = |calls: usize, padding: usize| {
+                    format!(
+                        "fn f(n: Int) ->> {ret} {{ if n == 0 {{ {} }} else {{ {} }} }}\n{}f({}){}",
+                        wrap_in("-(-(n - 1))"),
+                        wrap_in("f(n - 1)"),
+                        "{ ".repeat(padding),
+                        calls - 1,
+                        " }".repeat(padding)
+                    )
+                };
+                let ir = compile(&program(1, 0));
+                let [(outer, _)] = ir.calls_in(ir.root())[..] else {
+                    panic!("{kind}: expected one call at the top level");
+                };
+                let code = ir.function(FnId::new(0));
+                assert_eq!(code.kind, FnKind::Memo, "{kind}");
+                let [(inner, _)] = ir.calls_in(code.body)[..] else {
+                    panic!("{kind}: expected one call in the body");
+                };
+                let (outer, inner) = (usize::from(outer), usize::from(inner));
+                assert!(inner > AWAIT_WRAP, "{kind}: {inner}");
+                let height = code.height as usize;
+                // The first call enters its frame at `outer + CALL_LEVELS`
+                // levels, each nested one `inner + CALL_LEVELS` further in;
+                // with the padding making up the remainder, the deepest
+                // frame's body reaches exactly `MAX_DEPTH`.
+                let step = inner + CALL_LEVELS;
+                let room = MAX_DEPTH - height - outer - CALL_LEVELS;
+                let (calls, padding) = (1 + room / step, room % step);
+                assert!(calls > 100, "{kind}: {calls}");
+                let expected = value(i64::try_from(calls).unwrap());
+                assert_eq!(run(&program(calls, padding)), Ok(expected), "{kind}");
+                for past in [program(calls + 1, padding), program(calls, padding + 1)] {
+                    let diagnostic = run(&past).unwrap_err();
+                    assert_eq!(diagnostic.message, BUDGET_ERROR, "{kind}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_memoised_call_depending_on_its_own_result_fails() {
+        let text = "fn f(n: Int) ->> Int { if n == 0 { f(0) } else { f(n - 1) + 1 } }\nf(3)";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "this call depends on its own result");
+        // At the call that found the function running with its arguments,
+        // labelled at the call that is running it.
+        let inner = text.find("f(0)").unwrap();
+        let running = text.find("f(n - 1)").unwrap();
+        let span = |start: usize, len: usize| {
+            Span::new(
+                u32::try_from(start).unwrap(),
+                u32::try_from(start + len).unwrap(),
+            )
+        };
+        assert_eq!(diagnostic.span, span(inner, 4));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![(span(running, 8), "called here with the same arguments")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            vec![
+                "a `->>` function called again with the same arguments while it is running \
+                 would never finish"
+            ]
+        );
+        // Every running call's mark is removed as the error passes.
+        let mut memo = MemoTables::new();
+        run_with(text, &mut memo).unwrap_err();
+        assert_eq!(memo.running_count(), 0);
+        assert_eq!(memo.table_count(), 1);
+        // With other arguments, the same function runs.
+        assert_eq!(
+            int("fn f(n: Int) ->> Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\nf(3)"),
+            3
+        );
+    }
+
+    #[test]
+    fn a_memoised_closure_is_memoised_however_it_is_called() {
+        // Through a variable of a supertype, and passed as a callback to an
+        // impure function: memoisation belongs to the closure.
+        let text = "fn f(x: Int) ->> {v: Int} { v = x }\n\
+                    let g: fn(Present<Int>) -> {v: Int} = f\n\
+                    fn apply(h: fn(Present<Int>) -> {v: Int}, x: Int) -> {v: Int} { h(x) }\n\
+                    a = f(1)\nb = g(1)\nc = apply(f, 1)\nd = apply(g, 1)";
+        let values = fields(text);
+        for value in &values[1..] {
+            assert!(same(&values[0], value), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn two_closures_of_one_function_expression_have_separate_tables() {
+        let text = "fn make() -> fn(Int) ->> {v: Int} { fn(x: Int) ->> {v: Int} { v = x } }\n\
+                    let p = make()\nlet q = make()\n\
+                    a = p(1)\nb = q(1)\nc = p(1)\nd = q(1)";
+        let values = fields(text);
+        assert!(same(&values[0], &values[2]));
+        assert!(same(&values[1], &values[3]));
+        assert!(!same(&values[0], &values[1]));
+    }
+
+    #[test]
+    fn a_memoised_future_is_one_future_run_once() {
+        let text = "fn f(x: Int) ->> Int { lazy x * 2 }\na = f(1)\nb = f(1)\nc = await a";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]));
+        // Awaiting one ran the other.
+        let Value::Future(future) = &values[1] else {
+            panic!("expected a future");
+        };
+        assert!(future.is_done());
+        assert_eq!(values[2], Value::Int(2));
+    }
+
+    /// Makes `n` short-lived memoised closures, one at a time, each called
+    /// once and dead once `once` returns.
+    const SPIN: &str = "fn once(n: Int) -> Int { let g = fn(x: Int) ->> Int { x + n }\ng(1) }\n\
+                        fn spin(n: Int) -> Int { if n == 0 { 0 } else { once(n) + spin(n - 1) } }\n";
+
+    #[test]
+    fn arguments_that_equal_nothing_make_no_entry() {
+        // A NaN argument never finds an entry, so none is made for it: the
+        // body runs each time, and the table does not grow.
+        let text = "let nan = 0.0 / 0.0\n\
+                    fn f(x: Float, r: {a: Float}) ->> {v: Float} { v = x }\n";
+        for args in ["nan, { a = 1.0 }", "1.0, { a = nan }"] {
+            let mut memo = MemoTables::new();
+            let both = format!("{text}{{ a = f({args}); b = f({args}) }}");
+            let Ok(Value::Record(record)) = run_with(&both, &mut memo) else {
+                panic!("{both}: expected a record");
+            };
+            assert!(!same(&record.values[0], &record.values[1]), "{args}");
+            assert_eq!(memo.table_count(), 0, "{args}");
+        }
+        // An error in such a call is reported as in any other.
+        let diagnostic =
+            run("let nan = 0.0 / 0.0\nfn d(x: Float) ->> Int { 1 // 0 }\nd(nan)").unwrap_err();
+        assert_eq!(diagnostic.message, "division by zero");
+    }
+
+    #[test]
+    fn a_rollback_forgets_the_entries_made_since_its_checkpoint() {
+        let text = "fn f(x: Int) ->> {v: Int} { v = x }\n";
+        let mut memo = MemoTables::new();
+        run_with(&format!("{text}f(1)"), &mut memo).unwrap();
+        assert_eq!(memo.table_count(), 1);
+        let checkpoint = memo.checkpoint();
+        run_with(&format!("{text}f(1)"), &mut memo).unwrap();
+        assert_eq!(memo.table_count(), 2);
+        memo.rollback(checkpoint);
+        assert_eq!(memo.table_count(), 1);
+        memo.rollback(MemoCheckpoint(0));
+        assert_eq!(memo.table_count(), 0);
+    }
+
+    #[test]
+    fn the_tables_of_dead_closures_are_swept() {
+        let mut memo = MemoTables::new();
+        assert_eq!(
+            run_with(&format!("{SPIN}spin(100)"), &mut memo).unwrap(),
+            Value::Int(100 + 5050)
+        );
+        // Swept each time the count reached the threshold, all dead: 100
+        // tables made, 32 at a time.
+        assert_eq!(memo.table_count(), 100 % MIN_SWEEP_THRESHOLD);
+        // Closures alive while more are made keep their tables, and the
+        // threshold grows with them.
+        let live = "fn live(n: Int) -> Int {\n\
+                    \x20 let g = fn(x: Int) ->> Int { x + n }\n\
+                    \x20 if n == 0 { g(1) } else { g(1) + live(n - 1) }\n\
+                    }\n";
+        let mut memo = MemoTables::new();
+        assert_eq!(
+            run_with(&format!("{live}live(99)"), &mut memo).unwrap(),
+            Value::Int(100 + 4950)
+        );
+        assert_eq!(memo.table_count(), 100);
+        // Once they are dead, a later sweep drops their tables.
+        run_with(&format!("{SPIN}spin(40)"), &mut memo).unwrap();
+        assert!(memo.table_count() < 40, "{}", memo.table_count());
+    }
+
+    #[test]
+    fn sweeping_frees_what_a_dead_closure_held() {
+        let text = "let r = { a = 1 }\n\
+                    fn make(n: Int) -> Int { let g = fn(x: Int) ->> {a: Int} { r }\ng(n).a }\n\
+                    let s = make(1)";
+        let ir = compile(text);
+        let mut frame = vec![Value::Empty; ir.frame_size() as usize];
+        let mut memo = MemoTables::new();
+        eval_with(&ir, &mut frame, &mut memo).unwrap();
+        let Value::Record(record) = frame[0].clone() else {
+            panic!("expected a record");
+        };
+        // Held here, by the frame, by `make`'s captures and by `g`'s table,
+        // as its result; `g` is dead, and what it captured is freed.
+        assert_eq!(Rc::strong_count(&record), 4);
+        drop(frame);
+        assert_eq!(Rc::strong_count(&record), 2);
+        assert_eq!(memo.table_count(), 1);
+        // A sweep drops the dead closure's table, and what it held.
+        run_with(&format!("{SPIN}spin(40)"), &mut memo).unwrap();
+        assert_eq!(Rc::strong_count(&record), 1);
+    }
+
+    #[test]
+    fn a_sweep_during_a_memoised_call_is_harmless() {
+        let mut memo = MemoTables::new();
+        let text = format!(
+            "{SPIN}fn outer(n: Int) ->> {{v: Int}} {{ v = spin(n) }}\na = outer(100)\nb = outer(100)"
+        );
+        let ir = compile(&text);
+        let mut stack = vec![Value::Empty; ir.frame_size() as usize];
+        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo).unwrap() else {
+            panic!("expected a record");
+        };
+        // The running call's table survived the sweeps its body caused, and
+        // the second call found its result.
+        assert!(same(&record.values[0], &record.values[1]));
+        assert_eq!(record.values[0].to_string(), "{v = 5150}");
+        assert_eq!(memo.running_count(), 0);
+        assert!(memo.table_count() < MIN_SWEEP_THRESHOLD);
     }
 }

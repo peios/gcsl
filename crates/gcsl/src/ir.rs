@@ -47,7 +47,9 @@
 //! Every function expression of the program has an entry in the function
 //! table, [`Ir::function`], indexed by the [`FnId`] the parser gave it: its
 //! body, a [`IrKind::Block`] in the same node arena as the rest of the
-//! program, and the sizes of its frame, parameters and captures. Each
+//! program, the sizes of its frame, parameters and captures, and its
+//! [`FnKind`], which says whether calls of its closures are memoised
+//! (declared with `->>`) or not (declared with `:` or `->`). Each
 //! function runs in a frame of its own, so a [`IrKind::Load`] or
 //! [`IrKind::Store`] in a body is of a slot of that function's frame, whose
 //! first slots are its parameters. A [`IrKind::LoadCapture`] reads one of
@@ -221,11 +223,17 @@ pub enum LazyField {
     Within(LazyShapeId),
 }
 
-/// Whether a function of the table is a function expression or a `lazy`.
+/// Whether a function of the table is a function expression, memoised or
+/// not, or a `lazy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FnKind {
-    /// A function expression, made into closures by `MakeClosure`.
+    /// A function expression declared with `:` or `->`, made into closures
+    /// by `MakeClosure`, whose body runs on every call.
     Function,
+    /// A function expression declared with `->>`, made into closures by
+    /// `MakeClosure`, each of whose closures runs its body at most once per
+    /// distinct list of arguments: see [`crate::eval`].
+    Memo,
     /// The body of a `lazy`, made into futures by `MakeFuture`.
     Future,
 }
@@ -779,7 +787,8 @@ pub struct FnCode {
     /// where its value is awaited to fit its return type), and any node
     /// for a `lazy`.
     pub body: IrId,
-    /// Whether this is a function expression's code or a `lazy`'s.
+    /// Whether this is a function expression's code, memoised or not, or a
+    /// `lazy`'s.
     pub kind: FnKind,
     /// The number of slots the body's frame needs, its parameters included.
     pub frame_size: u32,
@@ -1109,8 +1118,9 @@ impl Ir {
     /// depths of calls and awaits are not shown. After the root, each
     /// function is shown on a line of its own as
     /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
-    /// `fn #1 (frame ...)` if it has no name, and each `lazy`'s body as
-    /// `future #2 (frame ...)`, followed by its body, whose slots are named
+    /// `fn #1 (frame ...)` if it has no name, a memoised function as
+    /// `memo fn #2 name (frame ...)`, and each `lazy`'s body as
+    /// `future #3 (frame ...)`, followed by its body, whose slots are named
     /// by its own frame's variables. There is no trailing newline.
     #[must_use]
     pub fn pretty<'a>(&'a self, names: &'a Names) -> impl fmt::Display + 'a {
@@ -1480,6 +1490,7 @@ impl fmt::Display for Pretty<'_> {
         for (index, code) in self.ir.functions.iter().enumerate() {
             let head = match code.kind {
                 FnKind::Function => "fn",
+                FnKind::Memo => "memo fn",
                 FnKind::Future => "future",
             };
             write!(f, "\n{head} #{index}")?;
