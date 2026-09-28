@@ -3152,12 +3152,12 @@ mod tests {
             value.repr().to_string(),
             "fn(x: Int, s: String | Future<String>): {x: Int}"
         );
-        // An impure function's bare types are the either shape.
+        // An impure function's bare types are the either shape, but for
+        // what its result's take from its body.
         let value = run("fn(x: Int, s: String) -> {x: Int} { x = x }").unwrap();
         assert_eq!(
             value.to_string(),
-            "fn(x: Int | Future<Int>, s: String | Future<String>) -> {x: Int | Future<Int>} | \
-             Future<{x: Int | Future<Int>}>"
+            "fn(x: Int | Future<Int>, s: String | Future<String>) -> {x: Int | Future<Int>}"
         );
         assert_eq!(
             string("let f = fn(): Int { 1 }\n\"f is {f}\""),

@@ -223,9 +223,11 @@
 //! the body is checked as a block whose scope starts with the parameters,
 //! against the return type as an annotated initialiser is checked against
 //! its annotation. The parameters are bindings like any other, so a `let`
-//! may shadow one and a `:=` rebind one. (The one thing the body decides is
-//! whether a pure function's bare parameters may be futures: see [Inferred
-//! parameters](#inferred-parameters).)
+//! may shadow one and a `:=` rebind one. (The two things the body decides
+//! are whether a pure function's bare parameters may be futures, and
+//! whether an impure function's bare result is: see [Inferred
+//! parameters](#inferred-parameters) and [Inferred
+//! results](#inferred-results).)
 //!
 //! **Frames.** Each function runs in a frame of its own. The checker keeps a
 //! stack of the functions it is inside (`Function`); entering one saves the
@@ -306,7 +308,10 @@
 //! return types of pure functions, and the parameters and return types of
 //! written pure function types. (A pure function expression's bare
 //! parameters are inferred: see [Inferred
-//! parameters](#inferred-parameters).) A function type is the one bare type
+//! parameters](#inferred-parameters); and so are an impure function
+//! expression's bare result positions, from what its body returns, once its
+//! body is checked against the either shapes written: see [Inferred
+//! results](#inferred-results).) A function type is the one bare type
 //! that is never the
 //! either shape at its own position: its interior follows its own purity
 //! marker, and a function value that may be a future must be written so,
@@ -317,8 +322,8 @@
 //! position, their own interiors being present, and `T | Future<T>` may be
 //! written, with the same `T` either side; any other union, any other name
 //! applied to a type, and `Future` or `Present` without a type argument are
-//! errors. So an impure function takes and returns values that may be
-//! futures, since its body awaits them on demand, while a pure function
+//! errors. So an impure function takes, and says it returns, values that
+//! may be futures, since its body awaits them on demand, while a pure function
 //! takes present values where its body needs them, since its body cannot
 //! await; and a pure `fn(Int): Int` is not a subtype of the impure
 //! `fn(Int) -> Int`, which promises to pass futures (parameters are
@@ -387,7 +392,9 @@
 //! Int): Int { x * 2 }` is `fn(x: Int): Int`, and `fn keep(x: Int): {v: Int
 //! | Future<Int>} { v = x }` is `fn(x: Int | Future<Int>): {v: Int |
 //! Future<Int>}`. The result is not inferred: a pure function's bare result
-//! is present, so `fn id(x: Int): Int { x }` measures `x` through it.
+//! is present, so `fn id(x: Int): Int { x }` measures `x` through it. (An
+//! impure function's is inferred, and its parameters are not: see [Inferred
+//! results](#inferred-results).)
 //!
 //! While the body is checked, such a parameter has a provisional type,
 //! `provisional(function, index, T)` (see [`TypeTable::provisional`]), in
@@ -488,6 +495,62 @@
 //! on the measuring use. A parameter written present, or of a callee that is
 //! not known, gives the generic implicit-await error.
 //!
+//! # Inferred results
+//!
+//! An impure function's bare result position, one written as a name or a
+//! record type, is the either shape while the body is checked, as the bare
+//! type rule says, and then takes the laziness of what the body returns
+//! there: `T` if it is present, `Future<T>` if it is a future, and the
+//! either shape, as written, if it may be either or has a provisional type
+//! (see below), `T` being the type written there, with its own bare
+//! positions inferred in the same way if it is a record type, each field
+//! against the field of the same name of what the body returns there once
+//! stripped (the body's other fields play no part). So `fn get() -> {a: Int,
+//! b: String} { a = 1; b = "x" }` is `fn() -> {a: Int, b: String}`, `fn
+//! later() -> Int { lazy 5 }` is `fn() -> Future<Int>`, and `fn pass(x: Int)
+//! -> Int { x }` is `fn(x: Int | Future<Int>) -> Int | Future<Int>`, its
+//! parameter being the either shape, while `fn add(x: Int) -> Int { x + 1 }`
+//! is `fn(x: Int | Future<Int>) -> Int`. A position that is not bare keeps
+//! what is written, with everything inside it: `Present<...>`,
+//! `Future<...>`, a union and a function type say what they are. A
+//! parenthesised type is what is inside it. The parameters are never
+//! inferred, nor is anything of a pure function's.
+//!
+//! What the body returns is the value it has once every await the checker
+//! marked for fitting it to the declared result has run, since the typed
+//! walkers of the evaluator trust the inferred type (`Checker::value_of`):
+//! a body, or a field's value, awaited at the top has its type stripped, and
+//! one awaited deeply its type made present (see [`TypeTable::present`]),
+//! which is exactly what the deep await's lazy shape resolves; a record block
+//! checked field by field against the declared record type, whose type is
+//! the record of the declared fields' types, is instead the record of what
+//! its fields' values are, each found in the same way (an open field, one
+//! built by dotted paths, keeps its declared type); an untyped
+//! literal has been coerced. A position whose value's type is not a subtype
+//! of what would be inferred keeps its declared type. The inferred result
+//! is a subtype of the declared one, so the function's type is one too, by
+//! ordinary result covariance; a written function type is not inferred, so
+//! `fn() -> Int` written means the either shape as before, and accepts
+//! `fn() -> Int { 5 }`, as `fn() -> Present<Int>` now does too.
+//!
+//! The result is inferred once, when the body's check ends
+//! (`Checker::inferred`), and only if no error was reported while the body
+//! was checked, and the declared parameter and result types have none: an
+//! erroneous function keeps its declared type, so that its calls do not
+//! cascade. While the body is checked, the function's own name has the
+//! declared type, so a recursive call's result is the either shape at the
+//! bare positions, and nothing is iterated: `fn count(n: Int) -> Int { if n
+//! == 0 { 0 } else { count(n - 1) } }` is `fn(n: Int | Future<Int>) -> Int |
+//! Future<Int>`, but with `sum(n - 1) + n` in the `else` branch, which
+//! measures the recursive call, the result is present. Everything that sees
+//! the function's value sees the inferred type (the function expression's
+//! type, the binding it initialises, a session's [`Scope`], a closure's
+//! display, and captures); a use of its own name in its body keeps the
+//! declared type, a supertype. A provisional type of an enclosing pure
+//! function in what the body returns counts as the either shape, so the
+//! inferred type holds no provisional type, and the enclosing function's
+//! settling leaves it as it is.
+//!
 //! # Scopes
 //!
 //! Every block, including the file's own body, is a scope. A `let` declares
@@ -531,9 +594,9 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Expr, ExprId, ExprKind, FnDecl, FnId, ItemId,
-    ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart, TypeExprId, TypeExprKind,
-    UnaryOp, path_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Expr, ExprId, ExprKind, FieldTyRange, FnDecl, FnId,
+    ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart, TypeExprId,
+    TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1159,6 +1222,20 @@ struct Expecting<'w> {
     why: &'w str,
     /// The block's closing brace, where a missing field is reported.
     close: Span,
+}
+
+/// What an impure function's body is known to return at one position of
+/// its result type, once every await the checker marked for fitting it to
+/// the declared result has run, for [`Checker::inferred`]. See the module
+/// documentation.
+#[derive(Clone, Copy, Debug)]
+enum BodyValue {
+    /// A value that certainly has this type.
+    Typed(TyId),
+    /// The present record that a record block checked field by field
+    /// against the declared record type builds: the block's items, whose
+    /// fields' values say what the record holds.
+    Fields(ItemRange),
 }
 
 /// The variables of an outermost scope, with their slots and types: what a
@@ -1903,6 +1980,9 @@ impl<'a> Checker<'a> {
     ) -> Option<TyId> {
         let mut expected = expecting.ty;
         for (index, segment) in segments.iter().enumerate() {
+            // The record the path builds is present, which the either shape
+            // of a record type accepts.
+            expected = self.present_member(expected);
             // Not a record: reported when the block ends.
             self.types.record_fields(expected)?;
             let Some(ty) = self.types.field(expected, segment.name) else {
@@ -1923,6 +2003,18 @@ impl<'a> Checker<'a> {
             expected = ty;
         }
         Some(expected)
+    }
+
+    /// The type a present value is checked against where `expected` is
+    /// expected: the present member of an either shape, which a present
+    /// value satisfies by satisfying that, and `expected` itself otherwise,
+    /// a `Future` included, which no present value satisfies.
+    fn present_member(&self, expected: TyId) -> TyId {
+        if self.types.laziness(expected) == Laziness::Either {
+            self.types.strip(expected)
+        } else {
+            expected
+        }
     }
 
     /// Adds a node named `name`, at `span`, as the newest child of `parent`
@@ -2126,7 +2218,10 @@ impl<'a> Checker<'a> {
         if expected == TyId::ERROR || entry.ty == TyId::ERROR {
             return false;
         }
-        let Some(fields) = self.types.record_fields(expected) else {
+        // An open node is a present record, which the either shape of a
+        // record type accepts.
+        let record = self.present_member(expected);
+        let Some(fields) = self.types.record_fields(record) else {
             let label = format!(
                 "expected {}, found {}",
                 self.in_label(expected),
@@ -2155,7 +2250,7 @@ impl<'a> Checker<'a> {
         }
         missing.sort_unstable();
         let path = self.node_path(node);
-        let record = self.in_message(expected);
+        let record = self.in_message(record);
         for text in missing {
             self.errors.push(
                 Diagnostic::error(
@@ -3557,7 +3652,11 @@ impl<'a> Checker<'a> {
     /// a record type has a provisional type while the body is checked, and
     /// is present if the body measures it and the either shape otherwise:
     /// once the body is checked, the type of every expression in the
-    /// function is settled accordingly, and so is the function's type.
+    /// function is settled accordingly, and so is the function's type. An
+    /// impure function whose body was checked without an error then has
+    /// its result inferred from what the body returns (see
+    /// [`Checker::inferred`]), and its type, recorded again, is the
+    /// function type of its parameters and that result.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
@@ -3590,7 +3689,7 @@ impl<'a> Checker<'a> {
             );
             TyId::ERROR
         };
-        let ty = self.intern_fn_type(base, ret, decl.pure);
+        let mut ty = self.intern_fn_type(base, ret, decl.pure);
         self.expr_types[id.index()] = ty;
         self.functions.push(Function {
             fn_id: function,
@@ -3605,7 +3704,22 @@ impl<'a> Checker<'a> {
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let span = self.ast.get(id).span;
+        let errors = self.errors.len();
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
+        // An impure function's bare result takes its laziness from the body,
+        // unless something is wrong with the function.
+        if let Some(ret_expr) = decl.ret
+            && !decl.pure
+            && ty != TyId::ERROR
+            && self.errors.len() == errors
+        {
+            let value = self.value_of(decl.body, ret);
+            let inferred = self.inferred(ret_expr, ret, value);
+            if inferred != ret {
+                ty = self.intern_fn_type(base, inferred, false);
+                self.expr_types[id.index()] = ty;
+            }
+        }
         self.fn_params.truncate(base);
         let demanded = self.finish_function(decl.params.len(), callee);
         if !provisional {
@@ -3627,6 +3741,184 @@ impl<'a> Checker<'a> {
             self.ast.type_expr(ty).kind,
             TypeExprKind::Named(_) | TypeExprKind::Record(_)
         )
+    }
+
+    /// The inferred result of an impure function at the position of its
+    /// result type written as `ty`, whose declared type is `declared`, where
+    /// the body returns `value` (see the module documentation). A position
+    /// written bare, as a name or a record type, whose declared type is
+    /// therefore the either shape of a `T`, is `T` if the value is present,
+    /// `Future<T>` if it is a future, and the either shape, as declared, if
+    /// it may be either or is a provisional type; for a record type, `T` is
+    /// the record of its declared fields, each inferred in turn against the
+    /// field of the same name of the value once stripped. Every other
+    /// position keeps its declared type, and so does a bare one whose value
+    /// is not known well enough: a record block where a name is declared,
+    /// or a value whose type is not a subtype of what would be inferred.
+    ///
+    /// Recurses once per level of record type nesting in `ty`.
+    fn inferred(&mut self, ty: TypeExprId, declared: TyId, value: BodyValue) -> TyId {
+        let fields = match self.ast.type_expr(ty).kind {
+            TypeExprKind::Named(_) => None,
+            TypeExprKind::Record(fields) => Some(fields),
+            // They say what they are, a function type at its own position
+            // included.
+            TypeExprKind::Applied { .. } | TypeExprKind::Union { .. } | TypeExprKind::Fn { .. } => {
+                return declared;
+            }
+        };
+        if self.types.laziness(declared) != Laziness::Either {
+            return declared;
+        }
+        let present = self.types.strip(declared);
+        let (laziness, stripped) = match value {
+            // A record block is present.
+            BodyValue::Fields(_) => (Laziness::Present, value),
+            BodyValue::Typed(found) => (
+                self.types.laziness(found),
+                BodyValue::Typed(self.types.strip(found)),
+            ),
+        };
+        let shape = match (fields, stripped) {
+            (Some(fields), stripped) => match self.inferred_record(fields, present, stripped) {
+                Some(record) => record,
+                None => return declared,
+            },
+            (None, BodyValue::Typed(_)) => present,
+            (None, BodyValue::Fields(_)) => return declared,
+        };
+        let inferred = match laziness {
+            Laziness::Present => shape,
+            Laziness::Future => self.types.future(shape),
+            Laziness::Either | Laziness::Provisional => self.types.deferrable(shape),
+        };
+        match value {
+            BodyValue::Typed(found) if !self.types.is_subtype(found, inferred) => declared,
+            _ => inferred,
+        }
+    }
+
+    /// The present member of the inferred result at a record type written
+    /// with the fields `fields`, whose declared present member is the record
+    /// type `present`, where the body returns `value`, stripped: the record
+    /// of the declared fields, each inferred against the value's field of
+    /// the same name (see [`Checker::inferred`]), or keeping its declared
+    /// type if the value has no such field, or has it as an open field,
+    /// which is not known that well. The value's other fields play no part.
+    /// `None` if `present` lacks a field written, which a record type
+    /// resolved from `fields` never does.
+    ///
+    /// The declared fields are kept in `sorted_fields`, by name, each with
+    /// its position in `fields` and its type so far, so that a record
+    /// block's fields are found by binary search, in one pass over its
+    /// items.
+    fn inferred_record(
+        &mut self,
+        fields: FieldTyRange,
+        present: TyId,
+        value: BodyValue,
+    ) -> Option<TyId> {
+        let ast = self.ast;
+        let written = ast.field_tys(fields);
+        let base = self.sorted_fields.len();
+        for (index, field) in written.iter().enumerate() {
+            let Some(declared) = self.types.field(present, field.name) else {
+                self.sorted_fields.truncate(base);
+                return None;
+            };
+            self.sorted_fields
+                .push((field.name, position(index), declared));
+        }
+        // Inferring a nested record type uses `sorted_fields` above `end` and
+        // truncates back.
+        let end = self.sorted_fields.len();
+        self.sorted_fields
+            .get_mut(base..end)
+            .unwrap_or_default()
+            .sort_unstable_by_key(|&(name, _, _)| name);
+        match value {
+            BodyValue::Typed(found) => {
+                for at in base..end {
+                    let Some(&(name, index, declared)) = self.sorted_fields.get(at) else {
+                        continue;
+                    };
+                    let (Some(field), Some(found)) =
+                        (written.get(index as usize), self.types.field(found, name))
+                    else {
+                        continue;
+                    };
+                    let ty = self.inferred(field.ty, declared, BodyValue::Typed(found));
+                    if let Some(entry) = self.sorted_fields.get_mut(at) {
+                        entry.2 = ty;
+                    }
+                }
+            }
+            BodyValue::Fields(items) => {
+                for &item in ast.items(items) {
+                    // A field defined whole; one defined by dotted paths is
+                    // open.
+                    let ItemKind::Field { path, value } = ast.item(item).kind else {
+                        continue;
+                    };
+                    let [segment] = ast.path(path) else {
+                        continue;
+                    };
+                    let Ok(offset) = self
+                        .sorted_fields
+                        .get(base..end)
+                        .unwrap_or_default()
+                        .binary_search_by_key(&segment.name, |&(name, _, _)| name)
+                    else {
+                        continue;
+                    };
+                    let at = base + offset;
+                    let Some(&(_, index, declared)) = self.sorted_fields.get(at) else {
+                        continue;
+                    };
+                    let Some(field) = written.get(index as usize) else {
+                        continue;
+                    };
+                    let found = self.value_of(value, declared);
+                    let ty = self.inferred(field.ty, declared, found);
+                    if let Some(entry) = self.sorted_fields.get_mut(at) {
+                        entry.2 = ty;
+                    }
+                }
+            }
+        }
+        let sorted = self.sorted_fields.get(base..end).unwrap_or_default();
+        // Sorted by name, so interning does not sort it again.
+        let record = self
+            .types
+            .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
+        self.sorted_fields.truncate(base);
+        Some(record)
+    }
+
+    /// What the expression `expr`, checked where a value of type `expected`
+    /// was expected, is known to yield where it is used: the record of its
+    /// fields if it is a record block that was checked field by field
+    /// against `expected` (on the condition [`Checker::check_expr_expecting`]
+    /// and [`Checker::check_fn_body`] have), whose type is then the record
+    /// of the expected fields' types rather than of what its fields hold;
+    /// and otherwise its type once the await marked on it has run: as it
+    /// is if none is, stripped for an await at the top, and made present
+    /// for a deep one, which awaits every field of its type's record whose
+    /// type is lazy, at any depth, as its lazy shape lists them (see
+    /// [`TypeTable::present`]).
+    fn value_of(&mut self, expr: ExprId, expected: TyId) -> BodyValue {
+        if self.types.laziness(expected) != Laziness::Future
+            && self.types.is_record(self.types.strip(expected))
+            && let Some((_, items)) = self.record_block_within(expr)
+        {
+            return BodyValue::Fields(items);
+        }
+        let ty = self.expr_types[expr.index()];
+        BodyValue::Typed(match self.awaits[expr.index()] {
+            AwaitMark::None => ty,
+            AwaitMark::Top => self.types.strip(ty),
+            AwaitMark::Deep => self.types.present(ty),
+        })
     }
 
     /// Settles every provisional type of function `function`, the function
@@ -7487,7 +7779,7 @@ mod tests {
             shown_result("fn(x: Present<Int>, y: Present<String>): Bool { true }"),
             "fn(x: Int, y: String): Bool"
         );
-        assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {} | Future<{}>");
+        assert_eq!(shown_result("fn() -> {} {}"), "fn() -> {}");
         assert_eq!(
             shown_result("fn(f: fn(Int): Int): {r: fn() -> Int} { r = fn() -> Int { f(1) } }"),
             "fn(f: fn(Int): Int): {r: fn() -> Int | Future<Int>}"
@@ -7578,10 +7870,7 @@ mod tests {
             messages("fn(): Int { let x = 1 }"),
             vec!["mismatched types"]
         );
-        assert_eq!(
-            shown_result("fn() -> {} { let x = 1 }"),
-            "fn() -> {} | Future<{}>"
-        );
+        assert_eq!(shown_result("fn() -> {} { let x = 1 }"), "fn() -> {}");
     }
 
     #[test]
@@ -8228,21 +8517,22 @@ mod tests {
             result_type("fn tick() -> Present<{}> {}\ntick()\n1"),
             TyId::INT
         );
-        // An impure function's bare `{}` result may be a future: a statement
+        // An impure function's `{}` result that may be a future: a statement
         // expects `{}`, so it is awaited there, and its effects are not lost.
+        let tick = "fn tick() -> {} | Future<{}> {}\n";
         assert_eq!(
-            marks("fn tick() -> {} {}\ntick()\n1"),
+            marks(&format!("{tick}tick()\n1")),
             vec![("tick()", AwaitMark::Top)]
         );
+        assert_eq!(result_type(&format!("{tick}tick()\n1")), TyId::INT);
+        assert_eq!(result_type(&format!("{tick}await tick()\n1")), TyId::INT);
+        // One inferred to be present is not awaited.
+        assert!(marks("fn tick() -> {} {}\ntick()\n1").is_empty());
         assert_eq!(result_type("fn tick() -> {} {}\ntick()\n1"), TyId::INT);
-        assert_eq!(
-            result_type("fn tick() -> {} {}\nawait tick()\n1"),
-            TyId::INT
-        );
         // Which a pure function cannot do (the call is reported first: it
         // is checked before the statement's value is used).
         assert_eq!(
-            messages("fn tick() -> {} {}\nfn p(): Int { tick()\n1 }"),
+            messages(&format!("{tick}fn p(): Int {{ tick()\n1 }}")),
             vec![
                 "cannot call an impure function from a pure function",
                 "cannot use a value that may be a future in a pure function"
@@ -8365,10 +8655,7 @@ mod tests {
             let text = format!("let r = {{ a = {{ b = {{ f = fn() -> {{}} {{}} }} }} }}\nr {op} r");
             assert_eq!(
                 messages(&text),
-                vec![
-                    "cannot compare `{a: {b: {f: fn() -> {} | Future<{}>}}}`: it contains a \
-                     function"
-                ]
+                vec!["cannot compare `{a: {b: {f: fn() -> {}}}}`: it contains a function"]
             );
         }
         // The operands must first have one identical type.
@@ -8409,7 +8696,7 @@ mod tests {
                 "let f = if true { fn(a: Int): Int { a } } \
                  else { fn(b: Present<Int>) -> Int { b } }\nf"
             ),
-            "fn(Int) -> Int | Future<Int>"
+            "fn(Int) -> Int"
         );
         // An impure function's bare parameter is not a pure one's.
         assert_eq!(
@@ -8491,27 +8778,29 @@ mod tests {
     #[test]
     fn bare_types_are_either_in_impure_signatures_and_present_elsewhere() {
         // An impure function's parameters and result, a record type being
-        // the either shape at its own position and through its fields.
+        // the either shape at its own position and through its fields; the
+        // result's bare positions then take their laziness from the body
+        // (see `an_impure_functions_bare_result_is_inferred`).
         assert_eq!(
             shown_result("fn(x: Int, r: {a: String}) -> {v: Int} { v = x }"),
             "fn(x: Int | Future<Int>, r: {a: String | Future<String>} | Future<{a: String | \
-             Future<String>}>) -> {v: Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+             Future<String>}>) -> {v: Int | Future<Int>}"
         );
         assert_eq!(
             shown_result("fn f(r: {a: String}) -> {v: Int} { v = 1 }\nf"),
             "fn(r: {a: String | Future<String>} | Future<{a: String | Future<String>}>) -> {v: \
-             Int | Future<Int>} | Future<{v: Int | Future<Int>}>"
+             Int}"
         );
         assert_eq!(
             shown_result("fn(r: {a: {b: Int}}) -> Int { 1 }"),
             "fn(r: {a: {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>} | Future<{a: \
-             {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>}>) -> Int | Future<Int>"
+             {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>}>) -> Int"
         );
         // But not a function type, at its own position: it has its own rule
         // inside, and a function that may be a future is written so.
         assert_eq!(
             shown_result("fn(f: fn(): Int, r: {g: fn(): Int}) -> Int { 1 }"),
-            "fn(f: fn(): Int, r: {g: fn(): Int} | Future<{g: fn(): Int}>) -> Int | Future<Int>"
+            "fn(f: fn(): Int, r: {g: fn(): Int} | Future<{g: fn(): Int}>) -> Int"
         );
         // A pure function's result is present, and so are its parameters
         // that its body measures; those it does not are inferred to be the
@@ -8536,7 +8825,7 @@ mod tests {
         );
         assert_eq!(
             shown_result("fn(f: fn(Int): Int) -> Int { 1 }"),
-            "fn(f: fn(Int): Int) -> Int | Future<Int>"
+            "fn(f: fn(Int): Int) -> Int"
         );
         assert_eq!(
             shown_result("fn(f: fn(Int) -> Int): Int { 1 }"),
@@ -8552,7 +8841,7 @@ mod tests {
         );
         assert_eq!(
             shown_result("fn(r: Future<{a: Int}>) -> Int { 1 }"),
-            "fn(r: Future<{a: Int}>) -> Int | Future<Int>"
+            "fn(r: Future<{a: Int}>) -> Int"
         );
         assert_eq!(
             shown_result("fn(r: Future<{a: Int}>): Future<{a: Int}> { r }"),
@@ -8589,11 +8878,11 @@ mod tests {
         let run = "fn run(step: {}) -> {} { }\n";
         assert_eq!(
             shown_result(&format!("{run}run")),
-            "fn(step: {} | Future<{}>) -> {} | Future<{}>"
+            "fn(step: {} | Future<{}>) -> {}"
         );
         // A future of a record is passed as it is, unawaited.
         let text = format!("{run}run(lazy {{}})");
-        assert_eq!(shown_result(&text), "{} | Future<{}>");
+        assert_eq!(shown_result(&text), "{}");
         assert!(marks(&text).is_empty());
         let text = format!("{run}run({{}})");
         assert!(marks(&text).is_empty());
@@ -9324,7 +9613,7 @@ mod tests {
         // A field of the either shape is awaited deeply and compared.
         assert_eq!(
             shown_result("fn f(r: {a: Int}) -> Bool { r == { a = 1 } }\nf({ a = 1 })"),
-            "Bool | Future<Bool>"
+            "Bool"
         );
         // A future at the top is awaited as for any operator.
         assert_eq!(shown_result("(lazy 1) === 1"), "Bool");
@@ -9423,7 +9712,7 @@ mod tests {
         // Nor an impure function's, which is always the either shape.
         assert_eq!(
             type_of_f("fn f(x: Int) -> Int { 1 }"),
-            "fn(x: Int | Future<Int>) -> Int | Future<Int>"
+            "fn(x: Int | Future<Int>) -> Int"
         );
     }
 
@@ -9854,6 +10143,314 @@ mod tests {
         );
     }
 
+    // ----- Inferred results -----
+
+    /// The type of function expression number `n` of `text`, as shown,
+    /// whether the check succeeds or not.
+    fn fn_type(text: &str, n: u32) -> String {
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let mut checker = Checker::new(&ast, &mut types);
+        checker.check_body(ast.root(), None);
+        let id = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).kind == ExprKind::Fn(FnId::new(n)))
+            .unwrap_or_else(|| panic!("no function {n} in {text:?}"));
+        let ty = checker.expr_types[id.index()];
+        types.display(ty, ast.names()).to_string()
+    }
+
+    #[test]
+    fn an_impure_functions_bare_result_is_inferred() {
+        // Present where the body's value is, and so is a call's.
+        let get = "fn get() -> {a: Int, b: String} { a = 1; b = \"x\" }\n";
+        assert_eq!(
+            shown_result(&format!("{get}get")),
+            "fn() -> {a: Int, b: String}"
+        );
+        assert_eq!(shown_result(&format!("{get}get()")), "{a: Int, b: String}");
+        assert!(marks(&format!("{get}get().a + 1")).is_empty());
+        // A future where it is one.
+        assert_eq!(
+            shown_result("fn plan() -> {build: Int} { build = lazy 5 }\nplan"),
+            "fn() -> {build: Future<Int>}"
+        );
+        assert_eq!(
+            shown_result("fn g() -> {b: Int, a: String} { a = \"x\"; b = lazy 1 }\ng"),
+            "fn() -> {a: String, b: Future<Int>}"
+        );
+        assert_eq!(
+            shown_result("fn later() -> Int { lazy 5 }\nlater"),
+            "fn() -> Future<Int>"
+        );
+        // The either shape where it may be either: a parameter, which may
+        // be a future, but not once measured.
+        assert_eq!(
+            shown_result("fn pass(x: Int) -> Int { x }\npass"),
+            "fn(x: Int | Future<Int>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn add(x: Int) -> Int { x + 1 }\nadd"),
+            "fn(x: Int | Future<Int>) -> Int"
+        );
+        // An `if` joining a present value and a future.
+        assert_eq!(
+            shown_result("fn j(c: Bool) -> Int { if c { 1 } else { lazy 2 } }\nj"),
+            "fn(c: Bool | Future<Bool>) -> Int | Future<Int>"
+        );
+        // A field the declared type lacks plays no part, and is warned about
+        // as before.
+        let text = "fn wide() -> {a: Int} { a = 1; b = 2 }\nwide";
+        assert_eq!(shown_result(text), "fn() -> {a: Int}");
+        assert_eq!(
+            warnings(text)[0].message,
+            "field `b` is not in `{a: Int | Future<Int>}`"
+        );
+        // Nested records, inferred at every bare position.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: Int}} { a = { b = 1 } }\nn"),
+            "fn() -> {a: {b: Int}}"
+        );
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: Int}} { a = lazy { b = 1 } }\nn"),
+            "fn() -> {a: Future<{b: Int}>}"
+        );
+        assert_eq!(
+            shown_result("fn n(x: Int) -> {a: {b: Int, c: Int}} { a = { b = x; c = 1 } }\nn"),
+            "fn(x: Int | Future<Int>) -> {a: {b: Int | Future<Int>, c: Int}}"
+        );
+        // A record that is not a record block, whose fields are its type's.
+        assert_eq!(
+            shown_result("fn f() -> {a: Int} { = { a = lazy 1 } }\nf"),
+            "fn() -> {a: Future<Int>}"
+        );
+        // The empty record.
+        assert_eq!(shown_result("fn tick() -> {} { }\ntick"), "fn() -> {}");
+        assert_eq!(
+            shown_result("fn tock() -> {} { lazy {} }\ntock"),
+            "fn() -> Future<{}>"
+        );
+    }
+
+    #[test]
+    fn an_inferred_result_is_what_the_body_returns_once_awaited() {
+        // A body awaited deeply to fit a field written present is present at
+        // every bare position too, since the deep await resolves them all.
+        let text = "fn f() -> {a: Present<Int>, b: Int} { = { a = lazy 1; b = lazy 2 } }\nf";
+        assert_eq!(shown_result(text), "fn() -> {a: Int, b: Int}");
+        assert_eq!(
+            marks(text),
+            vec![("{ = { a = lazy 1; b = lazy 2 } }", AwaitMark::Deep)]
+        );
+        // A field's value awaited to fit its field is present; one that is
+        // not keeps its laziness.
+        let text = "fn m(x: Future<Int>) -> {a: Present<Int>, b: Int} { a = x; b = x }\nm";
+        assert_eq!(
+            shown_result(text),
+            "fn(x: Future<Int>) -> {a: Int, b: Future<Int>}"
+        );
+        assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+        // An untyped literal has been coerced.
+        assert_eq!(
+            shown_result("fn f() -> Float { 1 + 2 }\nf"),
+            "fn() -> Float"
+        );
+    }
+
+    #[test]
+    fn an_inferred_result_keeps_what_is_written_explicitly() {
+        assert_eq!(
+            shown_result("fn e() -> Int | Future<Int> { 5 }\ne"),
+            "fn() -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn p() -> Present<Int> { 5 }\np"),
+            "fn() -> Int"
+        );
+        assert_eq!(
+            shown_result("fn f() -> Future<Int> { lazy 5 }\nf"),
+            "fn() -> Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn u() -> {a: Int} | Future<{a: Int}> { a = 1 }\nu"),
+            "fn() -> {a: Int} | Future<{a: Int}>"
+        );
+        // A function type at its own position, whatever the function the
+        // body returns is inferred to be.
+        assert_eq!(
+            shown_result("fn mk() -> fn() -> Int { fn() -> Int { 5 } }\nmk"),
+            "fn() -> fn() -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn mk() -> {g: fn() -> Int} { g = fn() -> Int { 5 } }\nmk"),
+            "fn() -> {g: fn() -> Int | Future<Int>}"
+        );
+        // A pure function's result is present, as written.
+        assert_eq!(shown_result("fn p(): Int { 5 }\np"), "fn(): Int");
+    }
+
+    #[test]
+    fn a_recursive_call_has_the_declared_result() {
+        // Inferred once, when the body ends, from the declared type of the
+        // recursive call's result.
+        assert_eq!(
+            shown_result(
+                "fn count(n: Int) -> Int { if n == 0 { 0 } else { count(n - 1) } }\ncount"
+            ),
+            "fn(n: Int | Future<Int>) -> Int | Future<Int>"
+        );
+        let text = "fn sum(n: Int) -> Int { if n == 0 { 0 } else { sum(n - 1) + n } }";
+        assert_eq!(
+            shown_result(&format!("{text}\nsum")),
+            "fn(n: Int | Future<Int>) -> Int"
+        );
+        // Inside the body, the name has the declared type.
+        let (ast, types, output) = check_text(text);
+        let output = output.unwrap();
+        let recursive = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).span == last(text, "sum"))
+            .unwrap();
+        assert_eq!(
+            types
+                .display(output.checked.types.get(recursive), ast.names())
+                .to_string(),
+            "fn(n: Int | Future<Int>) -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_statement_awaits_an_inferred_result_only_if_it_may_be_a_future() {
+        assert!(marks("fn tick() -> {} { }\ntick()\n1").is_empty());
+        assert_eq!(
+            marks("fn tock() -> {} { lazy {} }\ntock()\n1"),
+            vec![("tock()", AwaitMark::Top)]
+        );
+    }
+
+    #[test]
+    fn dotted_fields_build_a_record_that_may_be_a_future() {
+        // The record a dotted field builds is present, which the either
+        // shape of a record type, as an impure function's bare result is at
+        // every level, accepts. An open field's type is not inferred.
+        let text = "fn n(c: Int) -> {a: {b: Int, d: Int}} { a.b = c; a.d = 2 }\nn(lazy 4).a.d";
+        assert!(warnings(text).is_empty());
+        assert_eq!(shown_result(text), "Int | Future<Int>");
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: {c: Int}}} { a.b.c = 1 }\nn().a.b.c"),
+            "Int | Future<Int>"
+        );
+        // Written as the either shape, in an annotation too.
+        assert_eq!(
+            shown_result("let r: {a: {b: Int} | Future<{b: Int}>} = { a.b = 1 }\nr.a.b"),
+            "Int"
+        );
+        // A missing field is reported against the record type.
+        let found = diagnostics("fn n() -> {a: {b: Int, c: Int}} { a.b = 1 }");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "missing field `a.c` in record");
+        assert_eq!(
+            found[0].notes,
+            vec!["the type `{b: Int | Future<Int>, c: Int | Future<Int>}` needs it"]
+        );
+        // A future is not what a dotted field builds.
+        assert_eq!(
+            messages("fn n() -> {a: Future<{b: Int}>} { a.b = 1 }"),
+            vec!["mismatched types"]
+        );
+        // A leaf written present is awaited.
+        let text = "fn n() -> {a: {b: Present<Int>}} { let x = lazy 1\na.b = x }";
+        assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn a_function_with_an_error_keeps_its_declared_result() {
+        // In the body, or where the body does not fit: one error, and the
+        // declared type, so that its calls do not cascade.
+        for (text, message, shown) in [
+            (
+                "fn f() -> Int { 1 + \"a\" }\nf() + 1",
+                "cannot add Int and String",
+                "fn() -> Int | Future<Int>",
+            ),
+            (
+                "fn f() -> Int { \"a\" }\nf() + 1",
+                "mismatched types",
+                "fn() -> Int | Future<Int>",
+            ),
+            (
+                "fn f() -> {a: Int, b: Int} { b = 1 }\nf().a + 1",
+                "missing field `a` in record",
+                "fn() -> {a: Int | Future<Int>, b: Int | Future<Int>} | Future<{a: Int | \
+                 Future<Int>, b: Int | Future<Int>}>",
+            ),
+            // An error elsewhere in the body.
+            (
+                "fn f() -> Int { let x: Int = \"a\"\n1 }\nf() + 1",
+                "mismatched types",
+                "fn() -> Int | Future<Int>",
+            ),
+        ] {
+            assert_eq!(messages(text), vec![message], "{text}");
+            assert_eq!(fn_type(text, 0), shown, "{text}");
+        }
+        // And with an erroneous parameter or result type, erroneous itself.
+        assert_eq!(fn_type("fn f(x: Nope) -> Int { 1 }", 0), "<error>");
+    }
+
+    #[test]
+    fn an_impure_function_nested_in_a_pure_one_is_settled() {
+        // A parameter of the pure function, returned unmeasured, may be a
+        // future for all the nested body knows, whether or not the pure
+        // function measures it elsewhere.
+        for text in [
+            "fn outer(n: Int): fn() -> Int { fn() -> Int { n } }",
+            "fn outer(n: Int): fn() -> Int { let m = n + 1\nfn() -> Int { n } }",
+        ] {
+            assert_eq!(fn_type(text, 0), "fn() -> Int | Future<Int>", "{text}");
+            assert!(check(&parse_text(text), &mut TypeTable::new()).is_ok());
+        }
+        assert_eq!(
+            type_of_f("fn f(n: Int): fn() -> Int { fn() -> Int { n } }"),
+            "fn(n: Int | Future<Int>): fn() -> Int | Future<Int>"
+        );
+        // Measured in the nested body, it is awaited there, and present.
+        let text = "fn outer(n: Int): fn() -> Int { fn() -> Int { n + 1 } }";
+        assert_eq!(fn_type(text, 0), "fn() -> Int");
+        assert_eq!(marks(text), vec![("n", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn an_inferred_result_is_a_subtype_of_the_declared_one() {
+        // A looser written type is satisfied as before, and a tighter one
+        // now too.
+        assert!(
+            check(
+                &parse_text(
+                    "let f: fn() -> Int = fn(): Int { 5 }\nlet g: fn() -> Int = fn() -> Int { 5 }"
+                ),
+                &mut TypeTable::new()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            shown_result("let g: fn() -> Present<Int> = fn() -> Int { 5 }\ng()"),
+            "Int"
+        );
+        assert_eq!(
+            messages("let g: fn() -> Present<Int> = fn() -> Int { lazy 5 }"),
+            vec!["mismatched types"]
+        );
+        // A future of the call's present record satisfies a written future.
+        let get = "fn get() -> {a: Int, b: String} { a = 1; b = \"x\" }\n";
+        assert_eq!(
+            shown_result(&format!(
+                "{get}let f: Future<{{a: Int}}> = lazy get()\n(await f).a"
+            )),
+            "Int"
+        );
+    }
+
     // ----- Dotted updates of records that may be futures -----
 
     /// The type of the expression of `text`, which must check, that spans
@@ -9909,10 +10506,11 @@ mod tests {
 
     #[test]
     fn a_dotted_update_awaits_a_record_that_may_be_a_future() {
-        // An impure function's result is the either shape: its record is
-        // awaited at the top, and the updated variable is present. `:=`
-        // keeps the field's type, and `let` replaces it.
-        let get = "fn get() -> {a: Int} { a = 1 }\nlet r = get()\n";
+        // A result written as the either shape: its record is awaited at
+        // the top, and the updated variable is present. `:=` keeps the
+        // field's type, and `let` replaces it.
+        let get = "fn get() -> {a: Int | Future<Int>} | Future<{a: Int | Future<Int>}> { a = 1 }\n\
+                   let r = get()\n";
         let text = format!("{get}r.a := 2\nr");
         assert_eq!(shown_result(&text), "{a: Int | Future<Int>}");
         assert_eq!(awaited_paths(&text, None), vec![(1, vec![true])]);

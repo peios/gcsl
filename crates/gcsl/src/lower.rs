@@ -2013,7 +2013,7 @@ mod tests {
         assert_eq!(
             &*scale.display,
             "fn(x: Int | Future<Int>, by: {f: Float | Future<Float>} | Future<{f: Float | \
-             Future<Float>}>) -> Float | Future<Float>"
+             Future<Float>}>) -> Float"
         );
         assert_eq!(scale.kind, FnKind::Function);
         assert_eq!(scale.frame_size, 3);
@@ -2259,6 +2259,50 @@ mod tests {
             dump("let x = lazy 1\n(x) + 1").lines().nth(4),
             Some("    (await @15..18")
         );
+    }
+
+    #[test]
+    fn a_call_of_an_inferred_present_result_is_not_awaited() {
+        // An impure function whose body returns a present record of present
+        // fields returns one: its call is of a concrete kind, and neither it
+        // nor its field is awaited.
+        let body = "{ a = 1; b = \"x\" }\n";
+        let text = format!("fn get() -> {{a: Int, b: String}} {body}get().a + 1");
+        let ir = lower_text(&text);
+        let IrKind::IntAdd(operands) = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected an addition");
+        };
+        let IrKind::Field { record, kind, .. } = ir.get(operands.lhs).kind else {
+            panic!("expected a field access");
+        };
+        assert_eq!(kind, ValueKind::Int);
+        let IrKind::Call { kind, .. } = ir.get(record).kind else {
+            panic!("expected a call");
+        };
+        assert_eq!(kind, ValueKind::Record);
+        assert!(!dump(&text).contains("(await"));
+        // Written as the either shape, the call may be a future, and so may
+        // its field: both are awaited.
+        let either = "{a: Int | Future<Int>, b: String | Future<String>}";
+        let text = format!("fn get() -> {either} | Future<{either}> {body}get().a + 1");
+        let ir = lower_text(&text);
+        let IrKind::IntAdd(operands) = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected an addition");
+        };
+        let IrKind::Await { value, .. } = ir.get(operands.lhs).kind else {
+            panic!("expected an await of the field");
+        };
+        let IrKind::Field { record, .. } = ir.get(value).kind else {
+            panic!("expected a field access");
+        };
+        let IrKind::Await { value, .. } = ir.get(record).kind else {
+            panic!("expected an await of the call");
+        };
+        let IrKind::Call { kind, .. } = ir.get(value).kind else {
+            panic!("expected a call");
+        };
+        assert_eq!(kind, ValueKind::Deferred);
+        assert_eq!(dump(&text).matches("(await").count(), 2);
     }
 
     #[test]

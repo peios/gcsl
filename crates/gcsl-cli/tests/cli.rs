@@ -401,16 +401,16 @@ fn dumps_show_futures() {
     let output = gcsl(&["run", "tests/fixtures/futures.gcsl", "--dump-types"]);
     let types = stdout(&output);
     for node in [
-        // A future of the call's either result is a future of a string.
+        // A future of the call's result is a future of a string.
         "(lazy : Future<String> @221..239\n",
-        "(name compile : fn(target: String | Future<String>) -> String | Future<String> @",
+        "(name compile : fn(target: String | Future<String>) -> String @",
         "(await : String @397..413\n",
         // Written bare, passed through unmeasured: inferred to be either.
         "(name keep : fn(step: String | Future<String>): {step: String | Future<String>} @",
         "(name step : String | Future<String> @564..568)",
-        // An impure function's bare record result may be a future too.
-        "(name built : {build: Future<String>, name: String | Future<String>} | \
-         Future<{build: Future<String>, name: String | Future<String>}> @610..615)",
+        // An impure function's bare record result takes its laziness from
+        // its body, which returns a present record of a present name.
+        "(name built : {build: Future<String>, name: String} @610..615)",
     ] {
         assert!(types.contains(node), "{node}: {types}");
     }

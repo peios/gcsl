@@ -1157,8 +1157,7 @@ fn a_build_script_plans_purely_and_builds_on_await() {
     assert_eq!(
         show(BUILD_SCRIPT),
         "{name = \"gcsl\"; log = \"compiled gcsl\"; later = Future<String>} : \
-         {later: String | Future<String>, log: String | Future<String>, \
-         name: String | Future<String>}"
+         {later: String | Future<String>, log: String, name: String}"
     );
     // The planned step, passed through, runs where it is awaited.
     assert_eq!(
@@ -1286,7 +1285,9 @@ fn a_captured_value_that_may_be_a_future_renders_exactly() {
 
 #[test]
 fn a_record_that_may_be_a_future_can_be_updated() {
-    let get = "fn get() -> {a: Int} { a = 1 }\nlet r = get()\n";
+    // A result written as the either shape, which is not inferred.
+    let get = "fn get() -> {a: Int | Future<Int>} | Future<{a: Int | Future<Int>}> { a = 1 }\n\
+               let r = get()\n";
     assert_eq!(
         run(&format!("{get}r.a := 2\nr")).unwrap().to_string(),
         "{a = 2}"
@@ -1302,15 +1303,16 @@ fn a_record_that_may_be_a_future_can_be_updated() {
         "{a = 5; b = 2} : {a: Int, b: Int}"
     );
     let f = "fn f(conf: {a: {b: Int}}) -> {a: {b: Int}} {\n  let conf.a.b = 2\n  conf\n}\n";
+    // The updated record is present, so the result is inferred to be.
     assert_eq!(
-        run(&format!("{f}await f(lazy {{ a = lazy {{ b = 1 }} }})"))
+        run(&format!("{f}f(lazy {{ a = lazy {{ b = 1 }} }})"))
             .unwrap()
             .to_string(),
         "{a = {b = 2}}"
     );
     let f = "fn f(conf: {a: {b: Int}}) -> {a: {b: Int}} {\n  conf.a.b := 2\n  conf\n}\n";
     assert_eq!(
-        run(&format!("{f}await f(lazy {{ a = lazy {{ b = 1 }} }})"))
+        run(&format!("{f}f(lazy {{ a = lazy {{ b = 1 }} }})"))
             .unwrap()
             .to_string(),
         "{a = {b = 2}}"
@@ -1347,5 +1349,91 @@ fn a_runtime_error_in_a_future_renders_where_it_happens() {
          \x20 |              1\n\
          2 | await x\n\
          \x20 | ------- awaited here\n"
+    );
+}
+
+/// An impure function whose body returns a present record of present
+/// fields.
+const GET: &str = "fn get() -> {a: Int, b: String} { a = 1; b = \"x\" }\n";
+
+#[test]
+fn an_impure_functions_inferred_result_is_what_it_returns() {
+    assert_eq!(
+        show(&format!("{GET}get()")),
+        "{a = 1; b = \"x\"} : {a: Int, b: String}"
+    );
+    // A future of it satisfies a written future of a present record.
+    assert_eq!(
+        run(&format!(
+            "{GET}let f: Future<{{a: Int}}> = lazy get()\n(await f).a"
+        ))
+        .unwrap(),
+        Value::Int(1)
+    );
+    // A field written present is awaited, and one written bare keeps the
+    // future; both read back give the value.
+    let m =
+        "fn m(x: Future<Int>) -> {a: Present<Int>, b: Int} { a = x; b = x }\nlet r = m(lazy 7)\n";
+    assert_eq!(run(&format!("{m}r.a")).unwrap(), Value::Int(7));
+    assert_eq!(run(&format!("{m}await r.b")).unwrap(), Value::Int(7));
+    assert_eq!(run(&format!("{m}r.a + r.b")).unwrap(), Value::Int(14));
+    // A body awaited deeply is present at every position.
+    assert_eq!(
+        show("fn f() -> {a: Present<Int>, b: Int} { = { a = lazy 1; b = lazy 2 } }\nf()"),
+        "{a = 1; b = 2} : {a: Int, b: Int}"
+    );
+    // Nested records, and recursion.
+    assert_eq!(
+        run("fn n() -> {a: {b: Int}} { a = { b = 1 } }\nn().a.b + 1").unwrap(),
+        Value::Int(2)
+    );
+    assert_eq!(
+        show("fn sum(n: Int) -> Int { if n == 0 { 0 } else { sum(n - 1) + n } }\nsum(4)"),
+        "10 : Int"
+    );
+    assert_eq!(
+        show("fn count(n: Int) -> Int { if n == 0 { 0 } else { count(n - 1) } }\ncount(4)"),
+        "0 : Int | Future<Int>"
+    );
+    // A statement whose value is a future of `{}` is still awaited, and
+    // its effects are not lost.
+    assert_eq!(
+        run("fn tock() -> {} { lazy { let x = 1 // 0 } }\ntock()\n1").unwrap_err()[0].message,
+        "division by zero"
+    );
+    assert_eq!(
+        run("fn tick() -> {} { }\ntick()\n1").unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn an_inferred_result_is_kept_by_a_session() {
+    let mut session = Session::new();
+    session.eval(&source(GET)).unwrap();
+    assert_eq!(
+        session.eval(&source("get")).unwrap().value.to_string(),
+        "fn() -> {a: Int, b: String}"
+    );
+    // The scope holds the inferred type, which a tighter written type
+    // accepts.
+    assert!(
+        session
+            .eval(&source("let g: fn() -> Present<{a: Int}> = get"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_mismatch_shows_an_inferred_result() {
+    assert_eq!(
+        rendered(&format!("{GET}let r = get()\nr : Int\n")),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:3:1\n\
+         \x20 |\n\
+         3 | r : Int\n\
+         \x20 | ^   --- ascribed here\n\
+         \x20 | |\n\
+         \x20 | expected Int, found {a: Int, b: String}\n"
     );
 }
