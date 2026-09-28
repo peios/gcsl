@@ -29,6 +29,10 @@
 //! tree keeps as written, [`TypeExprKind::List`], for printing; the checker
 //! gives both the same meaning.
 //!
+//! A spread is also an item of a block, `...EXPR`, [`ItemKind::Spread`],
+//! which defines the fields of the record `EXPR` is in the block's record
+//! (see [`crate::check`]).
+//!
 //! # Functions
 //!
 //! A function expression, `fn(x: Int): Int { ... }`, has more to it than
@@ -679,8 +683,8 @@ pub enum ExprKind {
     /// that declares it).
     Name(Name),
     /// A block `{ ... }`: a body of items in a scope of its own. With at
-    /// least one [`ItemKind::Field`] it is a record block, whose value is
-    /// the record of its fields.
+    /// least one [`ItemKind::Field`] or [`ItemKind::Spread`] it is a record
+    /// block, whose value is the record of its fields.
     Block(ItemRange),
     /// Field access, `EXPR.NAME` or `EXPR."quoted name"`. The span of the
     /// `.NAME` part is not stored; see [`Expr::member_span`].
@@ -841,6 +845,11 @@ pub enum ItemKind {
         /// The field's value, or the value at the end of the path.
         value: ExprId,
     },
+    /// `...EXPR`, a spread: defines each field of the record `EXPR` is, by
+    /// its static type, as a *soft* field of the record its block evaluates
+    /// to, and as a name in scope for the block's later items, which a later
+    /// item may define again.
+    Spread(ExprId),
     /// `PATH := EXPR`: rebinds a variable declared in the same block, named
     /// by the path's first segment, which is always an identifier; a dotted
     /// path rebinds it to an update of its value.
@@ -861,8 +870,8 @@ pub enum ItemKind {
 pub struct Item {
     /// What the item is.
     pub kind: ItemKind,
-    /// The source it covers: from `let`, the path, `=` or the start of the
-    /// expression, through the end of the expression.
+    /// The source it covers: from `let`, the path, `=`, `...` or the start
+    /// of the expression, through the end of the expression.
     pub span: Span,
 }
 
@@ -1437,6 +1446,7 @@ impl Ast {
                         ItemKind::Let { value, .. }
                         | ItemKind::Field { value, .. }
                         | ItemKind::Rebind { value, .. }
+                        | ItemKind::Spread(value)
                         | ItemKind::Result(value)
                         | ItemKind::Expr(value) => value,
                     },
@@ -1510,8 +1520,9 @@ impl Annotate for NoAnnotation {
 /// ```
 ///
 /// Items print as `(let x ...)`, `(let x : Type ...)`, `(field x ...)`,
-/// `(rebind x ...)`, `(result ...)` and `(expr ...)`, followed by their
-/// expression, a dotted path in full, as in `(let a.b.c ...)`; blocks as
+/// `(rebind x ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`,
+/// followed by their span and their expression, a dotted path in full, as
+/// in `(let a.b.c ...)`; blocks as
 /// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
 /// field accesses as `(. x ...)` followed by their record expression. A
 /// field name, or a path segment, that is not a plain identifier is quoted,
@@ -1576,6 +1587,10 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ItemKind::Rebind { path, value } => {
                 write!(f, "rebind {}", ast.show_path(ast.path(path)))?;
+                value
+            }
+            ItemKind::Spread(value) => {
+                f.write_str("spread")?;
                 value
             }
             ItemKind::Result(value) => {

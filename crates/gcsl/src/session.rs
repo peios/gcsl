@@ -741,4 +741,34 @@ mod tests {
         // No warnings, none returned.
         assert!(eval(&mut session, "p.x").unwrap().warnings.is_empty());
     }
+
+    #[test]
+    fn a_spread_at_the_top_level_defines_names_for_later_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let defaults = { host = \"h\"; port = 80 }");
+        assert_eq!(
+            value(&mut session, "...defaults\nport = 8080").to_string(),
+            "{host = \"h\"; port = 8080}"
+        );
+        assert_eq!(value_type(&session), "{host: String, port: Int}");
+        // Its fields are in scope for later inputs, as fields, the
+        // overridden one as it was overridden.
+        assert_eq!(
+            value(&mut session, "\"{host}:{port}\""),
+            Value::Str("h:8080".into())
+        );
+        assert_eq!(
+            messages(&mut session, "host := \"x\""),
+            vec!["cannot rebind `host`: it is a field, not a variable"]
+        );
+        // The two definitions of `port` share its slot, and the variables
+        // of later inputs take slots of their own after it.
+        value(&mut session, "let a = 1");
+        value(&mut session, "...{ b = 2; c = 3 }\nb = \"s\"\nlet d = 4");
+        value(&mut session, "let e = 5");
+        assert_eq!(
+            value(&mut session, "\"{host} {port} {a} {b} {c} {d} {e}\""),
+            Value::Str("h 8080 1 s 3 4 5".into())
+        );
+    }
 }

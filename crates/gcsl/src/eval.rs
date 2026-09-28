@@ -28,6 +28,14 @@
 //! so the statements that produce it allocate nothing. Reading a field finds
 //! it by comparing interned names against the layout's.
 //!
+//! A spread item needs nothing of its own: lowering makes it a store of its
+//! operand into a slot and, for each field of the operand's static type, a
+//! store of a field access into that slot's record (see [`crate::lower`]),
+//! so the operand is evaluated, and awaited, once, each field is found by
+//! name whatever the record's layout, a field the static type hides is
+//! never read, and a field's value is shared with the operand's record,
+//! not copied.
+//!
 //! # Lists
 //!
 //! A list node, of [`crate::value::ValueKind::List`], has no typed walker
@@ -5676,6 +5684,101 @@ mod tests {
         assert_eq!(
             int("let n = 3\nlet f = fn(): Int[] { [n, n] }\nlen(f()) + f()[0]"),
             5
+        );
+    }
+
+    // ----- Spreads -----
+
+    /// The value of `text`, as it would be written.
+    fn shown(text: &str) -> String {
+        run(text)
+            .unwrap_or_else(|error| panic!("{text}: {error:?}"))
+            .to_string()
+    }
+
+    #[test]
+    fn a_spread_copies_the_fields_of_its_static_type() {
+        assert_eq!(
+            shown(
+                "let defaults = { host = \"localhost\"; port = 80 }\n\
+                 let conf = {\n  ...defaults\n  port = 8080\n  url = \"{host}:{port}\"\n}\n\
+                 conf"
+            ),
+            "{host = \"localhost\"; port = 8080; url = \"localhost:8080\"}"
+        );
+        // The spread's fields take their places in the order of their
+        // names' text, whatever order the names were first met in, and an
+        // overridden field keeps its place.
+        assert_eq!(
+            shown("{ b = 0; ...{ a = 1; c = 2 }; a = \"s\" }"),
+            "{b = 0; a = \"s\"; c = 2}"
+        );
+        assert_eq!(
+            shown(
+                "let zed = 1\nlet beta = 2\nlet alpha = 3\n{ ...{ zed = 1; beta = 2; alpha = 3 } }"
+            ),
+            "{alpha = 3; beta = 2; zed = 1}"
+        );
+        assert_eq!(
+            shown("{ ...{ a = 1; b = 2 }; ...{ b = \"s\"; c = 3 } }"),
+            "{a = 1; b = \"s\"; c = 3}"
+        );
+        // A field the static type hides is not copied, and an ascription
+        // selects.
+        assert_eq!(
+            shown("let q = { x = 1; y = 2 }\nlet p: {x: Int} = q\n{ ...p }"),
+            "{x = 1}"
+        );
+        assert_eq!(
+            shown("let r = { a = 2; b = 1 }\n{ ...r : {b: Int} }"),
+            "{b = 1}"
+        );
+        assert_eq!(
+            shown("let r = { a = 1; b = lazy 2 }\n{ ...r : {b: Int} }"),
+            "{b = 2}"
+        );
+        // Between a spread and an override the name is the spread's.
+        assert_eq!(
+            shown("{ ...{ a = 1 }; b = a; a = 2; c = a }"),
+            "{a = 2; b = 1; c = 2}"
+        );
+        // `{}` spreads nothing.
+        assert_eq!(shown("{ ...{}; a = 1 }"), "{a = 1}");
+        assert_eq!(shown("{ ...{} }"), "{}");
+    }
+
+    #[test]
+    fn a_spread_evaluates_its_operand_once() {
+        // Its fields are read from one value: a future the operand makes is
+        // one future in both fields.
+        let frame = frame_after("let s = { ...{ let p = lazy 1\na = p; b = p } }");
+        let [Value::Record(s), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(same(&s.values[0], &s.values[1]));
+        // A field is shared with the operand's record, not copied.
+        let frame = frame_after("let r = { a = { x = 1 }; b = 2 }\nlet s = { ...r }");
+        let [Value::Record(r), Value::Record(s), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(same(&r.values[0], &s.values[0]));
+        // A future operand runs once: a later await of it finds the record
+        // the spread read its field from.
+        let frame =
+            frame_after("let f = lazy { a = { n = 1 } }\nlet s = { ...f }\nlet t = await f");
+        let [Value::Future(f), Value::Record(s), Value::Record(t)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(f.is_done());
+        assert!(same(&s.values[0], &t.values[0]));
+        // One that fails fails where the spread awaits it.
+        let text = "let f = lazy { a = 1 // 0 }\n{ ...f }";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "division by zero");
+        assert_eq!(diagnostic.span, Span::new(21, 23));
+        assert_eq!(
+            labels(&diagnostic).last(),
+            Some(&(Span::new(33, 34), "awaited here"))
         );
     }
 }

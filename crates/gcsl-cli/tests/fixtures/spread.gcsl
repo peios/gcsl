@@ -1,0 +1,9 @@
+# A configuration built on defaults: the spread defines their fields, which
+# later items may override and use.
+let defaults = { host = "localhost"; port = 80 }
+let conf = {
+  ...defaults
+  port = 8080
+  url = "{host}:{port}"
+}
+conf

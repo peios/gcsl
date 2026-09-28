@@ -1749,6 +1749,74 @@ fn an_index_out_of_range_renders_exactly() {
 }
 
 #[test]
+fn programs_with_spreads() {
+    let cases = [
+        (
+            "let defaults = { host = \"localhost\"; port = 80 }\n\
+             let conf = {\n  ...defaults\n  port = 8080\n  url = \"{host}:{port}\"\n}\nconf",
+            "{host = \"localhost\"; port = 8080; url = \"localhost:8080\"} : {host: String, port: \
+             Int, url: String}",
+        ),
+        (
+            "let r = { a = 2; b = 1 }\n{ ...r : {b: Int} }",
+            "{b = 1} : {b: Int}",
+        ),
+        (
+            "let f = lazy { a = 1; b = 2 }\n{ ...f; c = a + b }",
+            "{a = 1; b = 2; c = 3} : {a: Int, b: Int, c: Int}",
+        ),
+        (
+            "fn with_port(base: {name: String, port: Int}, p: Int) -> {name: String, port: Int} \
+             {\n  ...base\n  port = p\n}\nwith_port({ name = \"web\"; port = 80 }, 8080)",
+            "{name = \"web\"; port = 8080} : {name: String | Future<String>, port: Int | \
+             Future<Int>}",
+        ),
+        (
+            "fn keep(r: Present<{a: Int}>) -> {a: Int} { ...r }\nkeep({ a = 1 }).a + 1",
+            "2 : Int",
+        ),
+        (
+            "...{ x = 1; y = 2 }\nz = x + y",
+            "{x = 1; y = 2; z = 3} : {x: Int, y: Int, z: Int}",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn a_spread_of_a_field_defined_before_it_renders_exactly() {
+    assert_eq!(
+        rendered(
+            "let base = { name = \"web\"; port = 80 }\nlet web = {\n  port = 8080\n  ...base\n}\n"
+        ),
+        "error: field `port` is defined twice\n\
+         \x20--> calc.gcsl:4:6\n\
+         \x20 |\n\
+         3 |   port = 8080\n\
+         \x20 |   ---- first defined here\n\
+         4 |   ...base\n\
+         \x20 |      ^^^^ `port` is a field of this, of type Int\n\
+         \x20 |\n\
+         \x20 = note: a spread cannot replace a field defined before it; put the spread first\n"
+    );
+    assert_eq!(
+        rendered("let r = { a = lazy 1 }\nlet x: {a: Int} = { ...r }\n"),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:2:24\n\
+         \x20 |\n\
+         2 | let x: {a: Int} = { ...r }\n\
+         \x20 |        --------        ^ expected Int, found Future<Int> for field `a`\n\
+         \x20 |        |\n\
+         \x20 |        expected because of this annotation\n\
+         \x20 |\n\
+         \x20 = note: a spread's field cannot be awaited; define the field with its value, as in \
+         `a = r.a`\n"
+    );
+}
+
+#[test]
 fn list_elements_without_a_join_render_exactly() {
     assert_eq!(
         rendered("let ports = [8080, 8443,\n  \"9000\"]\n"),

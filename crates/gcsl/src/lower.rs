@@ -33,6 +33,19 @@
 //! record the block builds; blocks with the same names in the same order
 //! share one layout, found through a map from the names to the layout.
 //!
+//! A spread item is what its soft assignments say: a `Store` of its
+//! operand, awaited first if the checker marked it to be, into the item's
+//! own slot, so that it is evaluated once, and then, for each field of the
+//! operand's static type once awaited, in the type's order, a `Store` into
+//! the field's slot (see [`crate::check::Resolution::spread_slots`]) of a
+//! `Field` of a `Load` of the item's slot, which reads the field by name, of
+//! the kind of the field's type, as it is. So `...r`, with `r: {a: Int, b:
+//! String}`, lowers to `Store(t, Load(r))`, `Store(a, Field(Load(t), a))`
+//! and `Store(b, Field(Load(t), b))`. A field that overrides a soft one
+//! stores into its slot, and the record loads each field once, from its one
+//! slot, in the place where it was first defined, as the kind of the
+//! definition that stands. The layout is static, as for any record block.
+//!
 //! Only the kind of each node's value matters to the IR (see
 //! [`crate::ir::Ir::kind_of`]), so lowering reads each expression's type
 //! from the checker's tables and keeps only its [`ValueKind`]. A value of a
@@ -197,6 +210,7 @@ pub fn lower(
         item_stack: Vec::new(),
         layouts: HashMap::new(),
         layout_names: Vec::new(),
+        record_loads: Vec::new(),
         shapes: HashMap::new(),
         shape_pending: Vec::new(),
         lazy_shapes: HashMap::new(),
@@ -240,6 +254,10 @@ struct Lowerer<'a> {
     layouts: HashMap<Box<[Name]>, LayoutId>,
     /// Reused for collecting the field names of each record block.
     layout_names: Vec<Name>,
+    /// Reused for collecting how each field of each record block is
+    /// loaded, beside its name in `layout_names`: its slot, the kind of its
+    /// value and the span of its definition.
+    record_loads: Vec<(Slot, ValueKind, Span)>,
     /// The shape already made for each record and list type.
     shapes: HashMap<TyId, ShapeId>,
     /// Reused as the work list of record and list types whose shapes have
@@ -313,7 +331,12 @@ impl Lowerer<'_> {
             .map(|&id| self.ast.item(id).kind)
         {
             Some(ItemKind::Result(value) | ItemKind::Expr(value)) => self.kind(value),
-            Some(ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. })
+            Some(
+                ItemKind::Let { .. }
+                | ItemKind::Rebind { .. }
+                | ItemKind::Field { .. }
+                | ItemKind::Spread(_),
+            )
             | None => Ok(ValueKind::Record),
         }
     }
@@ -329,12 +352,15 @@ impl Lowerer<'_> {
         )
     }
 
-    /// Whether `body` has a field item, which makes it a record block.
+    /// Whether `body` has a field or spread item, which makes it a record
+    /// block.
     fn is_record_body(&self, body: ItemRange) -> bool {
-        self.ast
-            .items(body)
-            .iter()
-            .any(|&id| matches!(self.ast.item(id).kind, ItemKind::Field { .. }))
+        self.ast.items(body).iter().any(|&id| {
+            matches!(
+                self.ast.item(id).kind,
+                ItemKind::Field { .. } | ItemKind::Spread(_)
+            )
+        })
     }
 
     /// Lowers a body whose value is of kind `kind` to a `Block`, which the
@@ -368,6 +394,7 @@ impl Lowerer<'_> {
                     let store = self.builder.alloc(IrKind::Store(slot, value), item.span);
                     self.item_stack.push(store);
                 }
+                ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
                 ItemKind::Result(value) | ItemKind::Expr(value) if is_result => {
                     result = Some(self.lower_operand(value, kind)?);
                 }
@@ -517,30 +544,118 @@ impl Lowerer<'_> {
         Ok(update)
     }
 
+    /// Lowers the spread item `id`, whose operand is `value`, spanning
+    /// `span`, onto the item stack: a `Store` of the operand, awaited if the
+    /// checker marked it to be, into the item's own slot, so that it is
+    /// evaluated once, and then, for each field of the operand's static
+    /// type once awaited, in the type's order, a `Store` into the field's
+    /// slot (see [`Resolution::spread_slots`]) of a `Field` of a `Load` of
+    /// the item's slot, which reads the field by name. A field the runtime
+    /// value holds but the static type hides is not read.
+    fn lower_spread(&mut self, id: ItemId, value: ExprId, span: Span) -> Result<(), InternalError> {
+        let (table, resolution) = (self.table, self.resolution);
+        let held = resolution.item_slot(id);
+        if held == Slot::NONE {
+            return Err(InternalError {
+                message: "a spread has no slot",
+                span,
+            });
+        }
+        let operand = self.lower_expr(value)?;
+        let store = self.builder.alloc(IrKind::Store(held, operand), span);
+        self.item_stack.push(store);
+        let operand_span = self.ast.get(value).span;
+        let fields = table
+            .record_fields(table.strip(self.used_type(value)))
+            .ok_or(InternalError {
+                message: "a spread of a value that is not a record survived checking",
+                span: operand_span,
+            })?;
+        let slots = resolution.spread_slots(id);
+        if slots.len() != fields.len() || slots.contains(&Slot::NONE) {
+            return Err(InternalError {
+                message: "a spread's fields have no slots",
+                span,
+            });
+        }
+        for (&(name, ty), &slot) in fields.iter().zip(slots) {
+            let kind = table.value_kind(ty).ok_or(InternalError {
+                message: "a type with no values survived type checking",
+                span: operand_span,
+            })?;
+            let record = self
+                .builder
+                .alloc(IrKind::Load(held, ValueKind::Record), operand_span);
+            let field = self
+                .builder
+                .alloc(IrKind::Field { record, name, kind }, operand_span);
+            let store = self.builder.alloc(IrKind::Store(slot, field), span);
+            self.item_stack.push(store);
+        }
+        Ok(())
+    }
+
     /// Builds the `MakeRecord` of the record block of `items`, spanning
     /// `span`, whose fields have been stored: a `Load` of each field's slot,
-    /// at its name, in the order the fields were declared. An open field is
-    /// loaded once, from the slot its first definition declared, as a
-    /// record.
+    /// at its name, in the order the fields were first defined, of the kind
+    /// of its definition that stands. An open field is loaded once, from
+    /// the slot its first definition declared, as a record. A soft field,
+    /// one a spread defines, is loaded as the type its spread's operand
+    /// gives it, unless a later item overrides it; since only a spread
+    /// makes a field that may be defined again, the names defined so far
+    /// are searched for the one being defined only from the block's first
+    /// spread on.
     fn make_record(&mut self, items: &[ItemId], span: Span) -> Result<IrId, InternalError> {
+        let (table, resolution) = (self.table, self.resolution);
         self.layout_names.clear();
-        let base = self.item_stack.len();
+        self.record_loads.clear();
+        let mut spread = false;
         for &id in items {
-            let ItemKind::Field { path, value } = self.ast.item(id).kind else {
-                continue;
+            let (path, value) = match self.ast.item(id).kind {
+                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Spread(operand) => {
+                    spread = true;
+                    let operand_span = self.ast.get(operand).span;
+                    let fields = table
+                        .record_fields(table.strip(self.used_type(operand)))
+                        .unwrap_or_default();
+                    // A type holds its fields in the order their names
+                    // were interned, which is no order a reader knows: the
+                    // fields take their places in the order of their names'
+                    // text.
+                    let names = self.ast.names();
+                    let mut defined: Vec<_> = fields
+                        .iter()
+                        .zip(resolution.spread_slots(id))
+                        .map(|(&(name, ty), &slot)| (name, ty, slot))
+                        .collect();
+                    defined.sort_unstable_by_key(|&(name, _, _)| names.get(name));
+                    for (name, ty, slot) in defined {
+                        let kind = table.value_kind(ty).ok_or(InternalError {
+                            message: "a type with no values survived type checking",
+                            span: operand_span,
+                        })?;
+                        self.define_field(name, (slot, kind, operand_span), spread);
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             let (kind, field) = match self.ast.path(path) {
                 [field] => (self.kind(value)?, field),
                 // A later definition of an open field extends it.
-                [field, ..] if self.resolution.item_path(id).source == VarRef::None => {
+                [field, ..] if resolution.item_path(id).source == VarRef::None => {
                     (ValueKind::Record, field)
                 }
                 _ => continue,
             };
-            let slot = self.resolution.item_slot(id);
-            let load = self.builder.alloc(IrKind::Load(slot, kind), field.span);
+            let slot = resolution.item_slot(id);
+            self.define_field(field.name, (slot, kind, field.span), spread);
+        }
+        let base = self.item_stack.len();
+        for &(slot, kind, field_span) in &self.record_loads {
+            let load = self.builder.alloc(IrKind::Load(slot, kind), field_span);
             self.item_stack.push(load);
-            self.layout_names.push(field.name);
         }
         let layout = self.layout();
         let values = self.builder.push_item_list(&self.item_stack[base..]);
@@ -548,6 +663,22 @@ impl Lowerer<'_> {
         Ok(self
             .builder
             .alloc(IrKind::MakeRecord { layout, values }, span))
+    }
+
+    /// Adds the field `name` to the record being built by
+    /// [`Lowerer::make_record`], to be loaded as `load` says: its slot, the
+    /// kind of its value and the span of its definition. If `redefinable`,
+    /// the block has had a spread, and a field of the name already there is
+    /// overridden instead, keeping its place.
+    fn define_field(&mut self, name: Name, load: (Slot, ValueKind, Span), redefinable: bool) {
+        if redefinable && let Some(at) = self.layout_names.iter().position(|&known| known == name) {
+            if let Some(entry) = self.record_loads.get_mut(at) {
+                *entry = load;
+            }
+            return;
+        }
+        self.layout_names.push(name);
+        self.record_loads.push(load);
     }
 
     /// The layout for the names in `layout_names`, made if this is the
@@ -2957,5 +3088,111 @@ mod tests {
         }
         // A list with nothing lazy inside is not awaited.
         assert!(!dump("let xs = [[1]]\n\"{xs}\"").contains("await"));
+    }
+
+    // ----- Spreads -----
+
+    #[test]
+    fn a_spread_stores_its_operand_once_and_each_field_by_name() {
+        // The operand is held in the item's own slot, which no variable
+        // owns, and each field of its static type, in the type's order, is
+        // read from it into the field's slot. An override stores into the
+        // same slot, and the field keeps its place in the record, loaded as
+        // the definition that stands.
+        let text = "let r = { a = 1; b = 2 }\n...r\na = \"s\"";
+        assert_eq!(
+            dump(text),
+            "(block @0..37\n\
+             \x20 (store r#0 @0..24\n\
+             \x20   (block @8..24\n\
+             \x20     (store r#0 @10..15\n\
+             \x20       (int 1 @14..15))\n\
+             \x20     (store a#1 @17..22\n\
+             \x20       (int 2 @21..22))\n\
+             \x20     (make-record [a b] @8..24\n\
+             \x20       (load r#0 @10..11)\n\
+             \x20       (load a#1 @17..18))))\n\
+             \x20 (store ?#3 @25..29\n\
+             \x20   (load r#0 @28..29))\n\
+             \x20 (store a#1 @25..29\n\
+             \x20   (field a @28..29\n\
+             \x20     (load ?#3 @28..29)))\n\
+             \x20 (store b#2 @25..29\n\
+             \x20   (field b @28..29\n\
+             \x20     (load ?#3 @28..29)))\n\
+             \x20 (store a#1 @30..37\n\
+             \x20   (str \"s\" @34..37))\n\
+             \x20 (make-record [a b] @0..37\n\
+             \x20   (load a#1 @30..31)\n\
+             \x20   (load b#2 @28..29)))"
+        );
+        let ir = lower_text(text);
+        let IrKind::MakeRecord { values, .. } = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected a record");
+        };
+        let loads: Vec<IrKind> = ir.items(values).iter().map(|&id| ir.get(id).kind).collect();
+        assert_eq!(
+            loads,
+            vec![
+                IrKind::Load(Slot::new(1), ValueKind::String),
+                IrKind::Load(Slot::new(2), ValueKind::Int)
+            ]
+        );
+        // A later spread overrides a soft field in its slot too.
+        let ir = lower_text("{ ...{ a = 1; b = 2 }; ...{ b = \"s\"; c = 3 } }");
+        let IrKind::Block { result, .. } = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::MakeRecord { layout, values } = ir.get(result).kind else {
+            panic!("expected a record");
+        };
+        let names: Vec<&str> = ir.layout(layout).texts.iter().map(AsRef::as_ref).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        let loads: Vec<IrKind> = ir.items(values).iter().map(|&id| ir.get(id).kind).collect();
+        assert_eq!(
+            loads,
+            vec![
+                IrKind::Load(Slot::new(0), ValueKind::Int),
+                IrKind::Load(Slot::new(1), ValueKind::String),
+                IrKind::Load(Slot::new(2), ValueKind::Int)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spreads_operand_that_may_be_a_future_is_awaited_once() {
+        assert_eq!(
+            dump("let f = lazy { a = 1 }\n...f")
+                .lines()
+                .collect::<Vec<_>>()[..11],
+            [
+                "(block @0..27",
+                "  (store f#0 @0..22",
+                "    (make-future #0 @8..22))",
+                "  (store ?#2 @23..27",
+                "    (await @26..27",
+                "      (load f#0 @26..27)))",
+                "  (store a#1 @23..27",
+                "    (field a @26..27",
+                "      (load ?#2 @26..27)))",
+                "  (make-record [a] @0..27",
+                "    (load a#1 @26..27)))",
+            ]
+        );
+        // A field that may be a future is read as it is, not awaited.
+        let ir = lower_text("...{ a = lazy 1 }");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        let IrKind::Store(_, field) = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected a store");
+        };
+        assert!(matches!(
+            ir.get(field).kind,
+            IrKind::Field {
+                kind: ValueKind::Deferred,
+                ..
+            }
+        ));
     }
 }

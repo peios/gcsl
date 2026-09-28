@@ -61,15 +61,19 @@
 //!
 //! # Records
 //!
-//! A block with at least one field item is a *record block*. Its value is
-//! the record of its fields, so it has no result: a `= EXPR` in it is an
-//! error, and a final expression statement is a statement like any other.
-//! A field is declared like a variable: it takes a slot, is visible from the
-//! next item to the end of its block, shadows and is shadowed like one, and
-//! is a binding marked as a field so that `:=` on it can be rejected. Each
+//! A block with at least one field or spread item is a *record block*. Its
+//! value is the record of its fields, so it has no result: a `= EXPR` in it
+//! is an error, and a final expression statement is a statement like any
+//! other. A field is declared like a variable: it takes a slot, is visible
+//! from the next item to the end of its block, shadows and is shadowed like
+//! one, and is a binding marked as a field so that `:=` on it can be
+//! rejected. A field item defines a *hard* field, which is defined once; a
+//! spread defines *soft* ones, which later items may define again (see
+//! [Spreads and soft assignment](#spreads-and-soft-assignment)). Each
 //! block also records its fields in order in one flat vector of field
-//! declarations, as it does its bindings, and at the end of a record block
-//! the block's type is the record of those fields.
+//! declarations, as it does its bindings, each where it was first defined,
+//! and at the end of a record block the block's type is the record of those
+//! fields.
 //!
 //! Where a type is *expected* (an annotation or an ascription), a subtype is
 //! accepted (see [`TypeTable::is_subtype`]). A record block written where a
@@ -77,9 +81,9 @@
 //! directly by `Checker::check_expr_expecting`: each field's initialiser
 //! is checked against the expected field's type, so literals adapt and
 //! nested record blocks are checked the same way; a missing field is an
-//! error, and a field the type lacks is a *warning*, since nothing with the
-//! expected type can see it. Warnings are collected apart from errors and
-//! returned with a successful check.
+//! error, and a field item the type lacks is a *warning*, since nothing with
+//! the expected type can see it. Warnings are collected apart from errors
+//! and returned with a successful check.
 //!
 //! # Dotted fields
 //!
@@ -135,6 +139,92 @@
 //! checked against the expected type at every level of nesting: a missing
 //! field is an error, "missing field `a.x` in record", and a segment that
 //! the expected type has as something other than a record is a mismatch.
+//!
+//! # Spreads and soft assignment
+//!
+//! A spread item, `...EXPR`, is a sequence of *soft assignments*, one for
+//! each field of the record it spreads: `...{ x = 5; y = 2 }` is `x = 5; y =
+//! 2`, except that what it defines may be defined again.
+//!
+//! ```text
+//! let defaults = { host = "localhost"; port = 80 }
+//! let conf = {
+//!   ...defaults
+//!   port = 8080
+//!   url = "{host}:{port}"
+//! }
+//! # {host = "localhost"; port = 8080; url = "localhost:8080"}
+//! ```
+//!
+//! The operand is checked on its own, then measured at the top, as the
+//! record of a field access is (`Checker::measure`): awaited if it may be a
+//! future, subject to the purity rule, and a pure function's bare parameter
+//! measured; the await is marked on the operand, an expression, in
+//! [`Resolution::await_of`], as for a list's spread. It must then be a
+//! record: "cannot spread a value of type T: it is not a record". The fields
+//! it defines are exactly those of its type once measured, whatever else the
+//! runtime value holds, since the static type is the truth: a field hidden
+//! by width subtyping is not copied. So an ascription selects fields,
+//! `...conf : {b: Int}` defining only `b`, the ascription belonging to the
+//! operand, which is parsed as a field's value is; a bare type there is
+//! present, so it awaits a field that may be a future, and `{b: Int |
+//! Future<Int>}` keeps it lazy. `{}` spreads nothing. A type has no
+//! definition order, so the fields are taken in the order the type table
+//! holds them, by [`Name`], which is the order of the soft assignments and
+//! of the places the fields take in the record.
+//!
+//! Each field is then softly assigned: it becomes a field of the block's
+//! record and a name in scope for the block's later items, exactly as a
+//! field item makes it, with the type the operand's type gives it, which
+//! may be the either shape or a future, since nothing inside the operand is
+//! awaited. A field so defined is *soft* (its `FieldDecl` records the
+//! operand of the spread whose definition stands); one a field item defines
+//! is *hard*, as a dotted field is.
+//!
+//! - A later field item of a soft field's name overrides it: the field is
+//!   hard from then on, with the new value and type, which may differ.
+//! - A later spread with a field of a soft field's name overrides it too,
+//!   and the field stays soft.
+//! - A spread with a field of a hard field's name is "field `x` is defined
+//!   twice", at the operand, labelled "`x` is a field of this, of type T",
+//!   with "first defined here" on the hard field's name and the note "a
+//!   spread cannot replace a field defined before it; put the spread
+//!   first": once for the spread, naming the first such field and counting
+//!   the others in the note. The hard field stands; the spread's other
+//!   fields are still defined, so that their uses do not cascade, and the
+//!   block's record is erroneous.
+//! - A field item after a field item is "defined twice", as ever.
+//!
+//! An overridden field keeps its place in the record, where it was first
+//! defined, and its one slot, which every definition of it writes, as every
+//! definition of an open field does; the name, as a variable, is bound
+//! anew by each definition, as a `let` shadows, in that slot, so the items
+//! between a spread and an override see the spread's value and those after
+//! it the override's. Only a block that has had a spread looks for a soft
+//! field when a field item defines a name (`BlockSpreads`), so a block
+//! without one does no more work than before. A spread holds its operand's
+//! value in a slot of its own while its fields are read, the next free slot
+//! once they are declared, which it leaves free and no binding owns; where
+//! each field is stored is recorded in [`Resolution::spread_slots`]. A
+//! dotted path whose first segment is a soft field is "field `a` is already
+//! defined", as for a field defined whole; a dotted `let` of the name is an
+//! ordinary update of the variable. `:=` of a soft field's name is the
+//! error for any field.
+//!
+//! In a record block checked against an expected record type, each soft
+//! field that stands when the block ends, one no later item overrode, is
+//! checked against the expected field's type, if the type has the field,
+//! as a field's value is, except that it cannot be awaited to fit, there
+//! being no expression to await (`Checker::check_soft_fields`): a
+//! provisional type in it where the expected type is present is measured,
+//! at the operand; one that still does not fit is "mismatched types" at the
+//! operand, "expected E, found F for field `a`", with the note "a spread's
+//! field cannot be awaited; define the field with its value, as in `a =
+//! conf.a`" when awaiting would have made it fit (the example written with
+//! the operand when it is a name or a dotted path, and left out otherwise);
+//! and one that fits takes the expected type, as a field item's does. A
+//! soft field the expected type lacks is not warned about, since spreading
+//! a wider record is normal. Missing fields are reported as ever.
 //!
 //! # Dotted `let` and `:=`
 //!
@@ -365,11 +455,11 @@
 //! is awaited there, and records it in [`Resolution::await_of`] (or, for a
 //! record an update reads, [`Resolution::path_awaits`]) for lowering, which
 //! inserts the await; nothing is decided at runtime. A measuring operator
-//! (arithmetic, ordering, `and`, `or`, `not`, negation), a call of a value
-//! and a field access into one await it at the top if its type is a
-//! `Future` or an either (`Checker::measure`), and type the operation on
-//! the type it has once awaited, stripped of every future layer at its top
-//! (see [`TypeTable::strip`]); so does a dotted `let` or `:=` each record
+//! (arithmetic, ordering, `and`, `or`, `not`, negation), a call of a value,
+//! a field access into one and a spread of one await it at the top if its
+//! type is a `Future` or an either (`Checker::measure`), and type the
+//! operation on the type it has once awaited, stripped of every future
+//! layer at its top (see [`TypeTable::strip`]); so does a dotted `let` or `:=` each record
 //! along its path that exists (see "Dotted `let` and `:=`" above). An
 //! interpolated expression and an operand of an equality are awaited deeply
 //! (`Checker::measure_deep`): at the top and in every lazy field of the
@@ -580,7 +670,14 @@
 //! field's type, and lowering stores exactly `e`, with any await marked on
 //! it, into the record (see [Dotted fields](#dotted-fields)). So `fn n() ->
 //! {a: {b: Int}} { a.b = 1 }` is `fn() -> {a: {b: Int}}`, as with `a = { b
-//! = 1 }`. The block's items are passed over once, rebuilding the segments
+//! = 1 }`. A soft field, one a spread defines (see [Spreads and soft
+//! assignment](#spreads-and-soft-assignment)), is what the type its
+//! spread's operand gives it says, as it is: the spread stores exactly the
+//! value it reads from the operand, once awaited if marked, at that field,
+//! never awaiting it, and the static type is the truth, so the record
+//! really holds a value of that type there. Only the definition of a field
+//! that stands is inferred, a soft one overridden later playing no part.
+//! The block's items are passed over once, rebuilding the segments
 //! of its open fields as a tree (`Built`), which is then inferred against
 //! the declared type level by level; a segment the declared type lacks
 //! plays no part, and a declared field the block does not define, which a
@@ -814,7 +911,11 @@
 //! reused by whatever comes after it. The highest slot count reached is the
 //! frame size. A variable's slot is therefore known statically and never
 //! changes, and evaluation needs no environment lookups and no allocation
-//! per block.
+//! per block. Some items share a slot: each definition of a field after its
+//! first, a dotted path extending an open field or an item overriding a
+//! soft one, writes the field's one slot. A spread's operand is held in the next free slot,
+//! which counts towards the frame size but stays free (see [Spreads and
+//! soft assignment](#spreads-and-soft-assignment)).
 //!
 //! # Sessions
 //!
@@ -1149,9 +1250,19 @@ pub struct Resolution {
     /// indexed by [`ExprId`].
     awaits: Vec<AwaitMark>,
     /// The slot each `Let`, `Field` and `Rebind` item writes, indexed by
-    /// [`ItemId`]; [`Slot::NONE`] for every other item. Every definition of
-    /// an open field writes the field's one slot.
+    /// [`ItemId`], and for a `Spread` item the slot its operand's value is
+    /// held in while its fields are read; [`Slot::NONE`] for every other
+    /// item. Every definition of an open field writes the field's one slot,
+    /// and so does every definition of a field that overrides a soft one.
     item_slots: Vec<Slot>,
+    /// Where the slots of each `Spread` item's fields are in
+    /// `spread_slots`, indexed by [`ItemId`]: their start and their number;
+    /// `(0, 0)` for every other item.
+    item_spreads: Vec<(u32, u32)>,
+    /// The slot each field of each spread's operand is stored in, in the
+    /// order of the fields of the operand's static type, each spread's
+    /// together.
+    spread_slots: Vec<Slot>,
     /// How the path of each dotted `Let`, `Field` and `Rebind` item
     /// resolves, indexed by [`ItemId`]; [`PathResolution::NONE`] for every
     /// other item, and for one that builds its record from nothing.
@@ -1226,7 +1337,9 @@ impl Resolution {
     }
 
     /// The slot written by item `id`, or [`Slot::NONE`] if it is not a
-    /// declaration.
+    /// declaration. For a spread item, the slot its operand's value is held
+    /// in while its fields are read, which no binding owns (see
+    /// [`Resolution::spread_slots`] for its fields').
     ///
     /// # Panics
     ///
@@ -1235,6 +1348,25 @@ impl Resolution {
     #[must_use]
     pub fn item_slot(&self, id: ItemId) -> Slot {
         self.item_slots[id.index()]
+    }
+
+    /// The slot each field of the spread item `id`'s operand is stored in,
+    /// in the order of the fields of the operand's static type once
+    /// awaited: a new slot for a name that is not yet a field of its block,
+    /// and the field's one slot for a soft field it overrides (see the
+    /// module documentation). Empty for every other item.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn spread_slots(&self, id: ItemId) -> &[Slot] {
+        let (start, count) = self.item_spreads[id.index()];
+        let (start, count) = (start as usize, count as usize);
+        self.spread_slots
+            .get(start..start.saturating_add(count))
+            .unwrap_or_default()
     }
 
     /// How the path of item `id` resolves: [`PathResolution::NONE`] if it
@@ -1288,6 +1420,8 @@ impl Resolution {
             expr_vars: vec![VarRef::None; exprs],
             awaits: vec![AwaitMark::None; exprs],
             item_slots: vec![Slot::NONE; items],
+            item_spreads: vec![(0, 0); items],
+            spread_slots: Vec::new(),
             item_paths: vec![PathResolution::NONE; items],
             path_awaits: Vec::new(),
             frame_size: 0,
@@ -1322,10 +1456,13 @@ impl Resolution {
         self.arg_params.len()
     }
 
-    /// Number of item entries in both item tables, equal to the number of
+    /// Number of item entries in every item table, equal to the number of
     /// items in the [`Ast`].
     pub(crate) fn item_len(&self) -> usize {
-        self.item_slots.len().min(self.item_paths.len())
+        self.item_slots
+            .len()
+            .min(self.item_paths.len())
+            .min(self.item_spreads.len())
     }
 }
 
@@ -1528,19 +1665,44 @@ struct CallbackPosition {
     given: Option<Span>,
 }
 
-/// A field declared in the record block being checked.
+/// A field declared in the record block being checked. Its place in the
+/// block's fields is where it was first defined, which an override keeps.
 #[derive(Clone, Copy, Debug)]
 struct FieldDecl {
     name: Name,
-    /// Where the name is written in the field's first definition.
+    /// Where the name is written in the field's first definition, or in
+    /// the field item that overrode it, if one did; for a soft field, the
+    /// operand of the spread whose definition stands.
     name_span: Span,
     ty: TyId,
+    /// Its one slot, which every definition of it writes.
+    slot: Slot,
     /// For an open field, one first defined by a dotted path, where its
     /// segments are tracked; `None` for a field defined whole.
     open: Option<OpenField>,
+    /// For a soft field, one a spread defines, which a later item may
+    /// define again, the operand of the spread whose definition stands so
+    /// far; `None` for a hard field, one a field item defines.
+    spread: Option<ExprId>,
     /// Whether a dotted path under it was rejected, which makes its block's
     /// record erroneous, so that the rejection does not cascade.
     rejected: bool,
+}
+
+/// What the spread items of the innermost block checked so far have done,
+/// in `Checker::spreads`. See the module documentation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BlockSpreads {
+    /// The block has none yet, so every field of it is hard, and a field
+    /// item need not look for a soft field of its name.
+    #[default]
+    None,
+    /// It has some, and none was rejected.
+    Some,
+    /// It has some, and one was rejected: its operand is erroneous or not a
+    /// record, or it defines a field defined before it. The block's record
+    /// is erroneous, so that the rejection does not cascade.
+    Rejected,
 }
 
 /// An open field: a record built by dotted paths.
@@ -1654,6 +1816,10 @@ struct Built {
 enum Definition {
     /// Whole, with this value: a field, or the end of a dotted path.
     Whole(ExprId),
+    /// Softly, by a spread, whose operand gives the field this type: the
+    /// type of the value the spread reads from the operand and stores, as
+    /// it is.
+    Soft(TyId),
     /// By dotted paths: an open field or a segment of one, the index of
     /// its node in `Checker::built`.
     Dotted(u32),
@@ -1664,7 +1830,9 @@ enum Definition {
 ///
 /// Only a [`Checker`] produces a non-empty scope. Its bindings occupy slots
 /// `0..n` in declaration order, since the outermost block's declarations are
-/// the first to take slots and no block is left open around them.
+/// the first to take slots and no block is left open around them; the
+/// definitions of a field that overrides a soft one share the field's slot,
+/// so `n` may be less than the number of bindings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scope {
     bindings: Vec<Binding>,
@@ -1683,8 +1851,8 @@ impl Scope {
         Self::default()
     }
 
-    /// The number of variables declared, counting shadowed ones, which is
-    /// also the number of slots they occupy.
+    /// The number of variables declared, counting shadowed ones and every
+    /// definition of a field.
     #[must_use]
     pub fn len(&self) -> usize {
         self.bindings.len()
@@ -1731,6 +1899,9 @@ pub struct Checker<'a> {
     /// Whether and how each expression is awaited, indexed by [`ExprId`].
     awaits: Vec<AwaitMark>,
     item_slots: Vec<Slot>,
+    /// See [`Resolution::spread_slots`].
+    item_spreads: Vec<(u32, u32)>,
+    spread_slots: Vec<Slot>,
     item_paths: Vec<PathResolution>,
     /// Whether each existing record along the path of each dotted `let` or
     /// `:=` with an awaited one is awaited: see [`Resolution::path_awaits`].
@@ -1768,6 +1939,8 @@ pub struct Checker<'a> {
     fields: Vec<FieldDecl>,
     /// Index in `fields` of the innermost block's first field.
     fields_start: usize,
+    /// What the innermost block's spread items have done so far.
+    spreads: BlockSpreads,
     /// The next free slot.
     next_slot: u32,
     /// The highest `next_slot` reached.
@@ -1804,6 +1977,11 @@ pub struct Checker<'a> {
     /// their dotted paths: a stack, as `sorted_fields` is, each block's
     /// segments above those of the block enclosing it.
     built: Vec<Built>,
+    /// For each declared field of every record block with a spread whose
+    /// value an impure function's result is being inferred from, the
+    /// definition of it that stands so far, from the block's first spread
+    /// on: a stack, as `built` is (see [`Checker::infer_block_fields`]).
+    standing: Vec<Option<Definition>>,
     /// Reused for the records along the path of a dotted `let` or `:=` that
     /// exist: each one's type once measured, and whether it is awaited. A
     /// `:=` walks its path before its value is checked and declares its
@@ -1840,8 +2018,15 @@ impl<'a> Checker<'a> {
     #[must_use]
     pub fn with_scope(ast: &'a Ast, scope: Scope, types: &'a mut TypeTable) -> Self {
         let names = ast.names();
-        let slot_names: Vec<Name> = scope.bindings.iter().map(|binding| binding.name).collect();
-        // The scope's bindings occupy exactly slots `0..len`.
+        // The scope's bindings occupy exactly slots `0..n`, in declaration
+        // order, each slot named by the last binding in it.
+        let mut slot_names: Vec<Name> = Vec::with_capacity(scope.bindings.len());
+        for binding in &scope.bindings {
+            match slot_names.get_mut(binding.slot.index()) {
+                Some(entry) => *entry = binding.name,
+                None => slot_names.push(binding.name),
+            }
+        }
         let next_slot = u32::try_from(slot_names.len()).unwrap_or(u32::MAX);
         Self {
             ast,
@@ -1853,6 +2038,8 @@ impl<'a> Checker<'a> {
             expr_vars: vec![VarRef::None; ast.len()],
             awaits: vec![AwaitMark::None; ast.len()],
             item_slots: vec![Slot::NONE; ast.item_count()],
+            item_spreads: vec![(0, 0); ast.item_count()],
+            spread_slots: Vec::new(),
             item_paths: vec![PathResolution::NONE; ast.item_count()],
             path_awaits: Vec::new(),
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
@@ -1867,6 +2054,7 @@ impl<'a> Checker<'a> {
             block_start: 0,
             fields: Vec::new(),
             fields_start: 0,
+            spreads: BlockSpreads::None,
             next_slot,
             frame_size: next_slot,
             slot_names,
@@ -1884,6 +2072,7 @@ impl<'a> Checker<'a> {
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
             built: Vec::new(),
+            standing: Vec::new(),
             path_types: Vec::new(),
             pending: Vec::new(),
             callbacks: Vec::new(),
@@ -1966,6 +2155,8 @@ impl<'a> Checker<'a> {
                 expr_vars: self.expr_vars,
                 awaits: self.awaits,
                 item_slots: self.item_slots,
+                item_spreads: self.item_spreads,
+                spread_slots: self.spread_slots,
                 item_paths: self.item_paths,
                 path_awaits: self.path_awaits,
                 frame_size: self.frame_size,
@@ -1989,6 +2180,7 @@ impl<'a> Checker<'a> {
     /// an expected record type.
     fn check_block(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let outer = (self.block_start, self.fields_start, self.next_slot);
+        let outer_spreads = std::mem::take(&mut self.spreads);
         let nodes_start = self.nodes.len();
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
@@ -1997,6 +2189,7 @@ impl<'a> Checker<'a> {
         self.fields.truncate(self.fields_start);
         self.nodes.truncate(nodes_start);
         (self.block_start, self.fields_start, self.next_slot) = outer;
+        self.spreads = outer_spreads;
         ty
     }
 
@@ -2011,10 +2204,12 @@ impl<'a> Checker<'a> {
     /// [`Checker::fit`]).
     fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let items = self.ast.items(body);
-        let first_field = items
-            .iter()
-            .copied()
-            .find(|&id| matches!(self.ast.item(id).kind, ItemKind::Field { .. }));
+        let first_field = items.iter().copied().find(|&id| {
+            matches!(
+                self.ast.item(id).kind,
+                ItemKind::Field { .. } | ItemKind::Spread(_)
+            )
+        });
         let mut result = TyId::EMPTY;
         for (index, &id) in items.iter().enumerate() {
             let next = items.get(index + 1).copied();
@@ -2026,6 +2221,7 @@ impl<'a> Checker<'a> {
                 ItemKind::Let { path, ty, value } => self.check_let(id, path, ty, value),
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
                 ItemKind::Field { path, value } => self.check_field(id, path, value, expecting),
+                ItemKind::Spread(value) => self.check_spread_item(id, value),
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -2202,6 +2398,9 @@ impl<'a> Checker<'a> {
     /// the field. With `expecting`, its block is checked against an
     /// expected record type: a field the type has is checked against that
     /// field's type and then has it, and one the type lacks is a warning.
+    /// A single name that is a soft field of the block overrides it (see
+    /// the module documentation): the field keeps its place and its slot,
+    /// is hard from then on, and the name is bound anew.
     fn check_field(
         &mut self,
         id: ItemId,
@@ -2215,6 +2414,14 @@ impl<'a> Checker<'a> {
             return;
         };
         let (name, name_span) = (field.name, field.span);
+        // The soft field of the name that this overrides, if any; only a
+        // block with a spread can have one.
+        let soft = match self.spreads {
+            BlockSpreads::None => None,
+            BlockSpreads::Some | BlockSpreads::Rejected => self
+                .block_field(name)
+                .filter(|&index| self.fields[index].spread.is_some()),
+        };
         let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
         self.name_callee(segments, value);
         let ty = match expected {
@@ -2249,14 +2456,183 @@ impl<'a> Checker<'a> {
         };
         self.callee_name = None;
         let function = self.direct_function(segments, value);
-        self.declare_initialised(name, ty, id, (BindingKind::Field, function));
-        self.fields.push(FieldDecl {
+        let Some(index) = soft else {
+            self.declare_initialised(name, ty, id, (BindingKind::Field, function));
+            self.fields.push(FieldDecl {
+                name,
+                name_span,
+                ty,
+                slot: self.item_slots[id.index()],
+                open: None,
+                spread: None,
+                rejected: false,
+            });
+            return;
+        };
+        // The field keeps its place and its slot, and is hard from now on;
+        // the name is bound anew, as a `let` shadows.
+        let slot = self.fields[index].slot;
+        self.bind(Binding {
             name,
-            name_span,
+            slot,
             ty,
-            open: None,
-            rejected: false,
+            declared: Some(self.ast.item(id).span),
+            kind: BindingKind::Field,
+            function,
+            callback: None,
         });
+        self.item_slots[id.index()] = slot;
+        let field = &mut self.fields[index];
+        field.ty = ty;
+        field.name_span = name_span;
+        field.spread = None;
+    }
+
+    /// The index in `fields` of the innermost block's field named `name`,
+    /// by its first declaration, if it has one.
+    fn block_field(&self, name: Name) -> Option<usize> {
+        self.fields[self.fields_start..]
+            .iter()
+            .position(|field| field.name == name)
+            .map(|index| index + self.fields_start)
+    }
+
+    /// Checks the spread item `id`, `...VALUE` (see the module
+    /// documentation). Its operand is checked on its own and measured at
+    /// the top (see [`Checker::measure`]), and must then be a record:
+    /// "cannot spread a value of type T: it is not a record" otherwise.
+    /// Each field of the record's type, in the order the type table holds
+    /// them, by name, is then softly assigned: declared as a soft field of
+    /// the block, with the type the record's type gives it, and bound anew
+    /// as a name in scope, in the field's one slot if it is a soft field
+    /// already, which this overrides, keeping its place, and in the next
+    /// free slot otherwise. A hard field of one of the names is not
+    /// replaced, but reported: "field `x` is defined twice", at the
+    /// operand, once for the spread, naming the first such field and
+    /// counting the others. A spread rejected either way makes its block's
+    /// record erroneous. The item's own slot, which holds the operand's
+    /// value while its fields are read, is the next free slot once its
+    /// fields are declared, and is left free.
+    fn check_spread_item(&mut self, id: ItemId, value: ExprId) {
+        let found = self.check_expr(value);
+        let found = self.settle(value, found);
+        let ty = self.measure(value, found);
+        if self.spreads == BlockSpreads::None {
+            self.spreads = BlockSpreads::Some;
+        }
+        let item_span = self.ast.item(id).span;
+        let operand = self.ast.get(value).span;
+        // An erroneous operand has been reported already.
+        if ty == TyId::ERROR {
+            self.spreads = BlockSpreads::Rejected;
+            return;
+        }
+        let Some(fields) = self.types.record_fields(ty) else {
+            let shown = self.in_message(ty);
+            let label = format!("this is {}", self.in_label(ty));
+            self.errors.push(
+                Diagnostic::error(
+                    format!("cannot spread a value of type {shown}: it is not a record"),
+                    item_span,
+                )
+                .with_context(operand, label),
+            );
+            self.spreads = BlockSpreads::Rejected;
+            return;
+        };
+        let base = self.sorted_fields.len();
+        self.sorted_fields
+            .extend(fields.iter().map(|&(name, ty)| (name, 0, ty)));
+        let end = self.sorted_fields.len();
+        let start = self.spread_slots.len();
+        // The first field defined before the spread, hard, with its type in
+        // the operand and its declaration, and the number of others.
+        let mut conflict: Option<(Name, TyId, FieldDecl)> = None;
+        let mut others = 0_usize;
+        for at in base..end {
+            let Some(&(name, _, ty)) = self.sorted_fields.get(at) else {
+                continue;
+            };
+            let slot = match self.block_field(name) {
+                None => {
+                    let slot = self.declare_binding(name, ty, Some(item_span), BindingKind::Field);
+                    self.fields.push(FieldDecl {
+                        name,
+                        name_span: operand,
+                        ty,
+                        slot,
+                        open: None,
+                        spread: Some(value),
+                        rejected: false,
+                    });
+                    slot
+                }
+                Some(index) if self.fields[index].spread.is_some() => {
+                    let slot = self.fields[index].slot;
+                    self.bind(Binding {
+                        name,
+                        slot,
+                        ty,
+                        declared: Some(item_span),
+                        kind: BindingKind::Field,
+                        function: None,
+                        callback: None,
+                    });
+                    let field = &mut self.fields[index];
+                    field.ty = ty;
+                    field.name_span = operand;
+                    field.spread = Some(value);
+                    slot
+                }
+                Some(index) => {
+                    match conflict {
+                        None => conflict = Some((name, ty, self.fields[index])),
+                        Some(_) => others += 1,
+                    }
+                    Slot::NONE
+                }
+            };
+            self.spread_slots.push(slot);
+        }
+        self.sorted_fields.truncate(base);
+        self.item_spreads[id.index()] = (
+            position(start),
+            position(self.spread_slots.len().saturating_sub(start)),
+        );
+        self.item_slots[id.index()] = Slot(self.next_slot);
+        self.frame_size = self.frame_size.max(self.next_slot.saturating_add(1));
+        if let Some(conflict) = conflict {
+            self.report_spread_conflict(operand, conflict, others);
+            self.spreads = BlockSpreads::Rejected;
+        }
+    }
+
+    /// Reports that the spread whose operand is at `operand` has a field
+    /// named `name`, of type `ty`, that the hard field `hard` was defined as
+    /// before it, and `others` more such fields: "field `x` is defined
+    /// twice", once for the spread (see the module documentation).
+    fn report_spread_conflict(
+        &mut self,
+        operand: Span,
+        (name, ty, hard): (Name, TyId, FieldDecl),
+        others: usize,
+    ) {
+        let text = FieldName(self.ast.names().get(name)).to_string();
+        let also = match others {
+            0 => String::new(),
+            1 => " (it also has 1 other field defined before it)".to_owned(),
+            others => format!(" (it also has {others} other fields defined before it)"),
+        };
+        let note = format!(
+            "a spread cannot replace a field defined before it; put the spread first{also}"
+        );
+        let label = format!("`{text}` is a field of this, of type {}", self.in_label(ty));
+        self.errors.push(
+            Diagnostic::error(format!("field `{text}` is defined twice"), operand)
+                .with_label(label)
+                .with_context(hard.name_span, "first defined here")
+                .with_note(note),
+        );
     }
 
     /// Checks the dotted field item `id`, `a.b.c = VALUE`, whose path is
@@ -2276,10 +2652,7 @@ impl<'a> Checker<'a> {
         // Where the path attaches to what the block already has: the field's
         // declaration and the deepest existing node along the path, with the
         // number of segments that exist.
-        let declared = self.fields[self.fields_start..]
-            .iter()
-            .position(|field| field.name == first.name)
-            .map(|index| index + self.fields_start);
+        let declared = self.block_field(first.name);
         let attach = match declared {
             None => None,
             Some(index) => {
@@ -2358,10 +2731,12 @@ impl<'a> Checker<'a> {
                     name: first.name,
                     name_span: first.span,
                     ty,
+                    slot: self.item_slots[id.index()],
                     open: Some(OpenField {
                         node: root,
                         binding: self.bindings.len() - 1,
                     }),
+                    spread: None,
                     rejected: false,
                 });
             }
@@ -2554,12 +2929,20 @@ impl<'a> Checker<'a> {
     /// The type of the record block whose fields are the innermost block's,
     /// once they are all declared: the record of the fields, or `Error` if
     /// a field is defined twice, has an erroneous type or had a dotted path
-    /// under it rejected. With `expecting`,
-    /// also reports each field of the expected type that the block lacks,
+    /// under it rejected, or a spread was rejected. With `expecting`,
+    /// also checks each soft field that stands against the expected type
+    /// (see [`Checker::check_soft_fields`]), and reports each field of the
+    /// expected type that the block lacks,
     /// at any level of an open field, and each open field or segment of one
     /// that the expected type has as something other than a record, which
     /// make the type `Error` too.
     fn record_type(&mut self, expecting: Option<Expecting<'_>>) -> TyId {
+        let mut erroneous = self.spreads == BlockSpreads::Rejected;
+        if self.spreads != BlockSpreads::None
+            && let Some(expecting) = expecting
+        {
+            erroneous |= self.check_soft_fields(expecting);
+        }
         let fields = self.fields.get(self.fields_start..).unwrap_or_default();
         let base = self.sorted_fields.len();
         self.sorted_fields.extend(
@@ -2568,7 +2951,7 @@ impl<'a> Checker<'a> {
                 .enumerate()
                 .map(|(index, field)| (field.name, position(index), field.ty)),
         );
-        let mut erroneous = fields
+        erroneous |= fields
             .iter()
             .any(|field| field.ty == TyId::ERROR || field.rejected);
         let sorted = self.sorted_fields.get_mut(base..).unwrap_or_default();
@@ -2608,6 +2991,70 @@ impl<'a> Checker<'a> {
         };
         self.sorted_fields.truncate(base);
         ty
+    }
+
+    /// Checks each soft field of the innermost block that stands, one that
+    /// no later item overrode, and that `expecting`'s record type has,
+    /// against the type it has there, as a field's value is (see the module
+    /// documentation), except that it cannot be awaited to fit, since there
+    /// is no expression to await: a provisional type in it where the
+    /// expected type is present is measured, at the spread's operand, and a
+    /// field that still does not fit is "mismatched types" at the operand,
+    /// "expected E, found F for field `a`", with a note if awaiting it would
+    /// have made it fit. A field that fits takes the expected type, as a
+    /// field item's does. A soft field the type lacks is not warned about:
+    /// spreading a wider record is normal. Returns whether anything was
+    /// reported.
+    fn check_soft_fields(&mut self, expecting: Expecting<'_>) -> bool {
+        let mut reported = false;
+        for index in self.fields_start..self.fields.len() {
+            let field = self.fields[index];
+            let Some(operand) = field.spread else {
+                continue;
+            };
+            let Some(expected) = self.types.field(expecting.ty, field.name) else {
+                continue;
+            };
+            // An unknown type has been reported.
+            if expected == TyId::ERROR || field.ty == TyId::ERROR {
+                continue;
+            }
+            let span = self.ast.get(operand).span;
+            let found = if self.types.is_subtype(field.ty, expected) {
+                None
+            } else {
+                match self.claim_against_at(span, field.ty, expected) {
+                    Some(claimed) if self.types.is_subtype(claimed, expected) => None,
+                    Some(claimed) => Some(claimed),
+                    None => Some(field.ty),
+                }
+            };
+            let Some(found) = found else {
+                self.fields[index].ty = expected;
+                continue;
+            };
+            let text = FieldName(self.ast.names().get(field.name)).to_string();
+            let label = format!(
+                "expected {}, found {} for field `{text}`",
+                self.in_label(expected),
+                self.in_label(found)
+            );
+            let mut error = Diagnostic::error("mismatched types", span)
+                .with_label(label)
+                .with_context(expecting.context, expecting.why);
+            if self.types.needs_await(found, expected).is_some() {
+                let example = self
+                    .path_text(operand)
+                    .map(|path| format!(", as in `{text} = {path}.{text}`"))
+                    .unwrap_or_default();
+                error = error.with_note(format!(
+                    "a spread's field cannot be awaited; define the field with its value{example}"
+                ));
+            }
+            self.errors.push(error);
+            reported = true;
+        }
+        reported
     }
 
     /// Reports each field of `expecting`'s record type that is not among the
@@ -3132,13 +3579,7 @@ impl<'a> Checker<'a> {
         let slot = Slot(self.next_slot);
         self.next_slot = self.next_slot.saturating_add(1);
         self.frame_size = self.frame_size.max(self.next_slot);
-        match self.slot_names.get_mut(slot.index()) {
-            Some(entry) => *entry = name,
-            // Slots are taken in order, so a slot beyond the table is the
-            // next one.
-            None => self.slot_names.push(name),
-        }
-        self.bindings.push(Binding {
+        self.bind(Binding {
             name,
             slot,
             ty,
@@ -3148,6 +3589,19 @@ impl<'a> Checker<'a> {
             callback: None,
         });
         slot
+    }
+
+    /// Adds `binding` to the innermost block, in its slot, which is taken
+    /// already: the next free slot [`Checker::declare_binding`] has just
+    /// taken, or the one slot of the field it defines again.
+    fn bind(&mut self, binding: Binding) {
+        match self.slot_names.get_mut(binding.slot.index()) {
+            Some(entry) => *entry = binding.name,
+            // Slots are taken in order, so a slot beyond the table is the
+            // next one.
+            None => self.slot_names.push(binding.name),
+        }
+        self.bindings.push(binding);
     }
 
     /// The innermost, latest binding of `name`, with its index in
@@ -3517,6 +3971,13 @@ impl<'a> Checker<'a> {
     /// every provisional type of those functions made present; or `None` if
     /// there is no such parameter.
     fn claim_against(&mut self, expr: ExprId, found: TyId, expected: TyId) -> Option<TyId> {
+        self.claim_against_at(self.ast.get(expr).span, found, expected)
+    }
+
+    /// As [`Checker::claim_against`], for a value at `span`, which is where
+    /// each parameter is measured: a spread's operand, for a soft field,
+    /// which is not an expression of its own.
+    fn claim_against_at(&mut self, span: Span, found: TyId, expected: TyId) -> Option<TyId> {
         let mut found = found;
         let mut claimed = false;
         for index in self.claimable().rev() {
@@ -3531,7 +3992,6 @@ impl<'a> Checker<'a> {
             self.types
                 .provisionals_at_present(found, expected, function, &mut params);
             if !params.is_empty() {
-                let span = self.ast.get(expr).span;
                 found = self.make_present(index, span, &params, found);
                 claimed = true;
             }
@@ -4198,16 +4658,22 @@ impl<'a> Checker<'a> {
     /// the record of what each field's value is, found as
     /// [`Checker::value_of`] finds it, a record block in turn as this finds
     /// it, and a field that `record` lacks as its type says. A block with a
-    /// dotted field keeps `found`, the record of the expected fields' types,
-    /// a supertype of what it holds.
+    /// dotted field or a spread keeps `found`, the record of the expected
+    /// fields' types, and of what the soft fields the expected type lacks
+    /// hold, a supertype of what it holds.
     ///
     /// Recurses once per level of record blocks nested in each other.
     fn held_record(&mut self, items: ItemRange, record: TyId, found: TyId) -> TyId {
         let ast = self.ast;
         let base = self.sorted_fields.len();
         for &item in ast.items(items) {
-            let ItemKind::Field { path, value } = ast.item(item).kind else {
-                continue;
+            let (path, value) = match ast.item(item).kind {
+                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Spread(_) => {
+                    self.sorted_fields.truncate(base);
+                    return found;
+                }
+                _ => continue,
             };
             let [field] = ast.path(path) else {
                 self.sorted_fields.truncate(base);
@@ -4248,12 +4714,15 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Whether `body` has a field item, which makes it a record block.
+    /// Whether `body` has a field or spread item, which makes it a record
+    /// block.
     fn is_record_body(&self, body: ItemRange) -> bool {
-        self.ast
-            .items(body)
-            .iter()
-            .any(|&id| matches!(self.ast.item(id).kind, ItemKind::Field { .. }))
+        self.ast.items(body).iter().any(|&id| {
+            matches!(
+                self.ast.item(id).kind,
+                ItemKind::Field { .. } | ItemKind::Spread(_)
+            )
+        })
     }
 
     /// Computes, records and returns the type of `id`, bottom-up.
@@ -4846,11 +5315,19 @@ impl<'a> Checker<'a> {
 
     /// Infers each of the declared fields `sorted_fields[base..end]`,
     /// written as `written`, that the record block of `items` defines, in
-    /// one pass over its items: a field defined whole from its value, and
-    /// an open field from the leaves of the dotted paths that build it,
-    /// which the pass rebuilds in `built`, as a tree of segments under one
-    /// root for each declared field, to be inferred once it ends. A field,
-    /// or a segment, that the declared type lacks plays no part.
+    /// one pass over its items: a field defined whole from its value, a
+    /// soft field from the type its spread's operand gives it, and an open
+    /// field from the leaves of the dotted paths that build it, which the
+    /// pass rebuilds in `built`, as a tree of segments under one root for
+    /// each declared field, to be inferred once it ends. A field, or a
+    /// segment, that the declared type lacks plays no part.
+    ///
+    /// Only the definition of a field that stands is inferred: a soft one
+    /// may be overridden by a later spread or field item. So from the
+    /// block's first spread on, each definition is recorded in `standing`,
+    /// a later one replacing an earlier one, and inferred once the pass
+    /// ends; before it, a field item cannot be overridden, the block having
+    /// checked without an error, and is inferred at once.
     fn infer_block_fields(
         &mut self,
         written: &[FieldTy],
@@ -4874,9 +5351,22 @@ impl<'a> Checker<'a> {
                     next_sibling: NO_NODE,
                 }),
         );
+        // The definition that stands for `sorted_fields[at]` is at
+        // `standing + (at - base)`, once the block has had a spread.
+        let standing = self.standing.len();
+        let mut spread = false;
         for &item in ast.items(items) {
-            let ItemKind::Field { path, value } = ast.item(item).kind else {
-                continue;
+            let (path, value) = match ast.item(item).kind {
+                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Spread(operand) => {
+                    if !spread {
+                        spread = true;
+                        self.standing.resize(standing + (end - base), None);
+                    }
+                    self.stand_spread(operand, (base, end), standing);
+                    continue;
+                }
+                _ => continue,
             };
             let Some((first, rest)) = ast.path(path).split_first() else {
                 continue;
@@ -4884,11 +5374,23 @@ impl<'a> Checker<'a> {
             let Some(at) = self.sorted_at((base, end), first.name) else {
                 continue;
             };
-            if rest.is_empty() {
-                self.infer_field(written, at, Definition::Whole(value));
-            } else {
+            if !rest.is_empty() {
                 self.build_path(position(roots + (at - base)), rest, value);
+            } else if spread {
+                if let Some(entry) = self.standing.get_mut(standing + (at - base)) {
+                    *entry = Some(Definition::Whole(value));
+                }
+            } else {
+                self.infer_field(written, at, Definition::Whole(value));
             }
+        }
+        if spread {
+            for at in base..end {
+                if let Some(Some(definition)) = self.standing.get(standing + (at - base)).copied() {
+                    self.infer_field(written, at, definition);
+                }
+            }
+            self.standing.truncate(standing);
         }
         for at in base..end {
             let root = position(roots + (at - base));
@@ -4903,6 +5405,30 @@ impl<'a> Checker<'a> {
             self.infer_field(written, at, Definition::Dotted(root));
         }
         self.built.truncate(roots);
+    }
+
+    /// Records, in `standing` from `standing` on, that the spread whose
+    /// operand is `operand` defines each of the declared fields
+    /// `sorted_fields[base..end]` that its operand's type has, once awaited,
+    /// with the type it gives the field, which is what the spread reads
+    /// from the operand and stores, never awaited.
+    fn stand_spread(&mut self, operand: ExprId, (base, end): (usize, usize), standing: usize) {
+        let awaited = self.awaited(operand);
+        let record = self.types.strip(awaited);
+        for &(name, ty) in self.types.record_fields(record).unwrap_or_default() {
+            let Some(offset) = self
+                .sorted_fields
+                .get(base..end)
+                .unwrap_or_default()
+                .binary_search_by_key(&name, |&(name, _, _)| name)
+                .ok()
+            else {
+                continue;
+            };
+            if let Some(entry) = self.standing.get_mut(standing + offset) {
+                *entry = Some(Definition::Soft(ty));
+            }
+        }
     }
 
     /// Adds the dotted path whose segments after the first are `rest`,
@@ -4966,8 +5492,9 @@ impl<'a> Checker<'a> {
     /// await marked for fitting it to the field's declared type has run
     /// (see [`Checker::value_of`]), whether it is a field's or the leaf's
     /// of a dotted path, which is checked against the declared type at its
-    /// path as a field's value is against its field's; and a record dotted
-    /// paths build as present, its fields inferred in turn.
+    /// path as a field's value is against its field's; a soft field as the
+    /// type its spread's operand gives it; and a record dotted paths build
+    /// as present, its fields inferred in turn.
     fn infer_field(&mut self, written: &[FieldTy], at: usize, definition: Definition) {
         let Some(&(_, index, declared)) = self.sorted_fields.get(at) else {
             return;
@@ -4977,6 +5504,7 @@ impl<'a> Checker<'a> {
         };
         let found = match definition {
             Definition::Whole(value) => self.value_of(value, declared),
+            Definition::Soft(ty) => BodyValue::Typed(ty),
             Definition::Dotted(node) => BodyValue::Open(node),
         };
         let ty = self.inferred(field.ty, declared, found);
@@ -5003,12 +5531,20 @@ impl<'a> Checker<'a> {
         {
             return BodyValue::Fields(items);
         }
+        BodyValue::Typed(self.awaited(expr))
+    }
+
+    /// The type of what `expr` yields where it is used, once the await
+    /// marked on it has run: its type as it is if none is, stripped for an
+    /// await at the top, and made present for a deep one (see
+    /// [`Checker::value_of`]).
+    fn awaited(&mut self, expr: ExprId) -> TyId {
         let ty = self.expr_types[expr.index()];
-        BodyValue::Typed(match self.awaits[expr.index()] {
+        match self.awaits[expr.index()] {
             AwaitMark::None => ty,
             AwaitMark::Top => self.types.strip(ty),
             AwaitMark::Deep => self.types.present(ty),
-        })
+        }
     }
 
     /// Settles every provisional type of function `function`, the function
@@ -5742,6 +6278,7 @@ impl<'a> Checker<'a> {
         ret: TyId,
     ) {
         let outer = (self.block_start, self.fields_start, self.next_slot);
+        let outer_spreads = std::mem::take(&mut self.spreads);
         let nodes_start = self.nodes.len();
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
@@ -5797,6 +6334,7 @@ impl<'a> Checker<'a> {
             );
             self.bindings.truncate(self.block_start);
             (self.block_start, self.fields_start, self.next_slot) = outer;
+            self.spreads = outer_spreads;
             return;
         };
         // As for any record block, against the present member of the
@@ -5827,6 +6365,7 @@ impl<'a> Checker<'a> {
         self.fields.truncate(self.fields_start);
         self.nodes.truncate(nodes_start);
         (self.block_start, self.fields_start, self.next_slot) = outer;
+        self.spreads = outer_spreads;
     }
 
     /// Types the field access `id`, reading field `name` of `record`, of
@@ -6810,7 +7349,10 @@ impl<'a> Checker<'a> {
         };
         match self.ast.item(last).kind {
             ItemKind::Result(value) | ItemKind::Expr(value) => self.coerce(value, ty),
-            ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. } => {}
+            ItemKind::Let { .. }
+            | ItemKind::Rebind { .. }
+            | ItemKind::Field { .. }
+            | ItemKind::Spread(_) => {}
         }
     }
 
@@ -7732,6 +8274,7 @@ mod tests {
                 }
                 ItemKind::Rebind { value, .. }
                 | ItemKind::Field { value, .. }
+                | ItemKind::Spread(value)
                 | ItemKind::Result(value)
                 | ItemKind::Expr(value) => {
                     visit(ast, value, out);
@@ -14024,5 +14567,475 @@ mod tests {
         assert_eq!(shown_result(text), "String");
         let text = "let xs = [1]\n\"{xs}\"";
         assert_eq!(marks(text), vec![]);
+    }
+
+    // ----- Spreads -----
+
+    /// The span of the operand of the first spread `spread`, written with
+    /// its `...`, in `text`.
+    fn operand(text: &str, spread: &str) -> Span {
+        let spread = at(text, spread);
+        Span::new(spread.start + 3, spread.end)
+    }
+
+    /// The note on a spread that defines a field defined before it.
+    const SPREAD_TWICE_NOTE: &str =
+        "a spread cannot replace a field defined before it; put the spread first";
+
+    #[test]
+    fn a_spread_defines_the_fields_of_its_record() {
+        let text = "let defaults = { host = \"localhost\"; port = 80 }\n\
+                    let conf = {\n  ...defaults\n  port = 8080\n  url = \"{host}:{port}\"\n}\n\
+                    conf";
+        assert_eq!(shown_result(text), "{host: String, port: Int, url: String}");
+        // A block whose only item is a spread is a record block, and so is a
+        // file's body.
+        assert_eq!(shown_result("let r = { a = 1 }\n{ ...r }"), "{a: Int}");
+        assert_eq!(file_type("...{ a = 1; b = \"s\" }"), "{a: Int, b: String}");
+        // So it cannot have a result, with the existing error.
+        let text = "let r = { a = 1 }\n{ ...r; = 2 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "a block with fields cannot have a result");
+        assert_eq!(found[0].span, first_bytes(at(text, "= 2"), 1));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "...r"), "first field declared here")]
+        );
+        // Its final expression is a statement.
+        assert_eq!(
+            messages("...{ a = 1 }\na + 1"),
+            vec!["unused value of type Int"]
+        );
+    }
+
+    #[test]
+    fn a_spread_defines_exactly_the_fields_of_the_static_type() {
+        // `y` is hidden by width subtyping, so it is neither a field nor a
+        // name, and a field item may define it with another type.
+        let hidden = "let q = { x = 1; y = 2 }\nlet p: {x: Int} = q\n";
+        assert_eq!(shown_result(&format!("{hidden}{{ ...p }}")), "{x: Int}");
+        assert_eq!(
+            messages(&format!("{hidden}{{ ...p; z = y }}")),
+            vec!["undefined variable `y`"]
+        );
+        assert_eq!(
+            shown_result(&format!("{hidden}{{ ...p; y = \"s\"; x = true }}")),
+            "{x: Bool, y: String}"
+        );
+    }
+
+    #[test]
+    fn an_ascribed_spread_selects_fields() {
+        let r = "let r = { a = 2; b = 1 }\n";
+        assert_eq!(
+            shown_result(&format!("{r}{{ ...r : {{b: Int}} }}")),
+            "{b: Int}"
+        );
+        assert_eq!(
+            messages(&format!("{r}{{ ...r : {{b: Int}}; c = a }}")),
+            vec!["undefined variable `a`"]
+        );
+        // A bare type in an ascription is present, so a field that may be a
+        // future is awaited by it; the either shape keeps it lazy.
+        let r = "let r: {a: Int, b: Int | Future<Int>} = { a = 1; b = lazy 2 }\n";
+        let text = format!("{r}{{ ...r : {{b: Int}} }}");
+        assert_eq!(shown_result(&text), "{b: Int}");
+        assert_eq!(marks(&text), vec![("r", AwaitMark::Deep)]);
+        let text = format!("{r}{{ ...r : {{b: Int | Future<Int>}} }}");
+        assert_eq!(shown_result(&text), "{b: Int | Future<Int>}");
+        assert_eq!(marks(&text), vec![]);
+        // An ascribed literal warns about the field its type lacks, as any
+        // ascribed literal does.
+        let text = "{ ...{ a = 1; b = 2 } : {b: Int} }";
+        assert_eq!(shown_result(text), "{b: Int}");
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `a` is not in `{b: Int}`");
+        assert_eq!(found[0].span, at(text, "a"));
+    }
+
+    #[test]
+    fn a_soft_field_may_be_overridden() {
+        // By a field item, with another type: the field is then hard.
+        assert_eq!(
+            shown_result("let r = { a = 1; b = 2 }\n{ ...r; a = \"s\" }"),
+            "{a: String, b: Int}"
+        );
+        // By a later spread, and then still soft.
+        assert_eq!(
+            shown_result("{ ...{ a = 1 }; ...{ a = \"s\"; b = 2 } }"),
+            "{a: String, b: Int}"
+        );
+        assert_eq!(
+            shown_result("{ ...{ a = 1 }; ...{ a = \"s\" }; a = true }"),
+            "{a: Bool}"
+        );
+        // Every definition of the field writes its one slot; the spread's
+        // operand is held in the next free slot, which it leaves free.
+        let text = "let r = { a = 1; b = 2 }\n...r\na = \"s\"\nlet c = 3";
+        let (ast, resolution) = resolved(text);
+        let items = ast.items(ast.root());
+        assert_eq!(resolution.item_slot(items[1]), Slot(3));
+        assert_eq!(resolution.spread_slots(items[1]), &[Slot(1), Slot(2)]);
+        assert_eq!(resolution.item_slot(items[2]), Slot(1));
+        assert!(resolution.spread_slots(items[2]).is_empty());
+        assert_eq!(resolution.item_slot(items[3]), Slot(3));
+        assert_eq!(resolution.frame_size(), 4);
+        let (ast, resolution) = resolved("...{ a = 1 }\n...{ a = 2; b = 3 }");
+        let items = ast.items(ast.root());
+        assert_eq!(resolution.spread_slots(items[0]), &[Slot(0)]);
+        assert_eq!(resolution.item_slot(items[0]), Slot(1));
+        assert_eq!(resolution.spread_slots(items[1]), &[Slot(0), Slot(1)]);
+        assert_eq!(resolution.item_slot(items[1]), Slot(2));
+    }
+
+    #[test]
+    fn a_spread_cannot_replace_a_hard_field() {
+        let text = "let r = { a = 1 }\n{ a = 2; ...r }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `a` is defined twice");
+        assert_eq!(found[0].span, operand(text, "...r"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("`a` is a field of this, of type Int")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "a = 2"), 1), "first defined here")]
+        );
+        assert_eq!(found[0].notes, vec![SPREAD_TWICE_NOTE]);
+        // One error per spread, for the first such field in the type's
+        // order, counting the others.
+        let r = "let r = { a = 1; b = 2; c = 3 }\n";
+        let text = format!("{r}{{ c = 0; a = 0; ...r }}");
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `a` is defined twice");
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(&text, "a = 0"), 1), "first defined here")]
+        );
+        assert_eq!(
+            found[0].notes,
+            vec![format!(
+                "{SPREAD_TWICE_NOTE} (it also has 1 other field defined before it)"
+            )]
+        );
+        let found = diagnostics(&format!("{r}{{ a = 0; b = 0; c = 0; ...r }}"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].notes,
+            vec![format!(
+                "{SPREAD_TWICE_NOTE} (it also has 2 other fields defined before it)"
+            )]
+        );
+        // A dotted field is hard, and so is one a field item overrode.
+        let text = "{ a.x = 1; ...{ a = 2 } }";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "field `a` is defined twice");
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "a.x"), 1), "first defined here")]
+        );
+        let text = "{ ...{ a = 1 }; a = 2; ...{ a = 3 } }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span, at(text, "{ a = 3 }"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "a = 2"), 1), "first defined here")]
+        );
+        // The spread's other fields are still defined, and the block's
+        // record is erroneous, so neither cascades.
+        assert_eq!(
+            messages("{ a = 1; ...{ a = 2; b = 3 }; c = b + 1 }"),
+            vec!["field `a` is defined twice"]
+        );
+        assert_eq!(
+            messages("let q = { a = 1; ...{ a = 2 } }\nq.z"),
+            vec!["field `a` is defined twice"]
+        );
+        // A field item after a field item is defined twice as before; after
+        // one that overrode a soft field, against that one.
+        let text = "{ ...{ a = 1 }; a = 2; a = 3 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `a` is defined twice");
+        assert_eq!(found[0].span, first_bytes(at(text, "a = 3"), 1));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "a = 2"), 1), "first defined here")]
+        );
+    }
+
+    #[test]
+    fn a_spreads_fields_are_names_in_scope() {
+        // From the next item on, shadowing an outer variable of the name.
+        assert_eq!(
+            shown_result("let x = \"s\"\n{ ...{ x = 1 }; y = x + 1 }"),
+            "{x: Int, y: Int}"
+        );
+        // Between a spread and an override the name is the spread's, and
+        // after it the override's.
+        assert_eq!(
+            shown_result("{ ...{ a = 1 }; b = a; a = \"s\"; c = a }"),
+            "{a: String, b: Int, c: String}"
+        );
+        assert_eq!(
+            shown_result("{ ...{ a = 1 }; b = a; ...{ a = \"s\" }; c = a }"),
+            "{a: String, b: Int, c: String}"
+        );
+        // A later `let` shadows the field without changing it.
+        assert_eq!(
+            shown_result("{ ...{ a = 1 }; let a = \"s\"; b = a }"),
+            "{a: Int, b: String}"
+        );
+        // Not visible before its spread, nor after its block.
+        assert_eq!(
+            messages("{ b = a; ...{ a = 1 } }"),
+            vec!["undefined variable `a`"]
+        );
+        assert_eq!(
+            messages("let r = { ...{ a = 1 } }\na"),
+            vec!["undefined variable `a`"]
+        );
+        // `:=` on one is the error for a field.
+        let text = "let r = { a = 1 }\n{ ...r; a := 2 }";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `a`: it is a field, not a variable"
+        );
+        assert_eq!(found[0].span, last(text, "a"));
+        assert_eq!(labels(&found[0]), vec![(at(text, "...r"), "declared here")]);
+    }
+
+    #[test]
+    fn a_dotted_path_under_a_soft_field_is_an_error() {
+        let text = "let r = { server = { port = 1 } }\n{ ...r; server.port = 2 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `server` is already defined");
+        assert_eq!(found[0].span, at(text, "server.port"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(operand(text, "...r"), "defined whole here")]
+        );
+        assert_eq!(found[0].notes, vec![WHOLE_FIELD_NOTE]);
+        // A dotted `let` of the name updates the variable as ever.
+        assert_eq!(
+            shown_result(
+                "let r = { server = { port = 1 } }\n\
+                 { ...r; let server.port = \"s\"; p = server.port }"
+            ),
+            "{p: String, server: {port: Int}}"
+        );
+    }
+
+    #[test]
+    fn a_soft_field_is_checked_against_the_expected_type() {
+        let text = "let r = { a = 1 }\nlet x: {a: String} = { ...r }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, operand(text, "...r"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected String, found Int for field `a`")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                at(text, "{a: String}"),
+                "expected because of this annotation"
+            )]
+        );
+        assert!(found[0].notes.is_empty());
+        // It cannot be awaited to fit.
+        let text = "let r = { a = lazy 1 }\nlet x: {a: Int} = { ...r }";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found Future<Int> for field `a`")
+        );
+        assert_eq!(
+            found[0].notes,
+            vec![
+                "a spread's field cannot be awaited; define the field with its value, as in \
+                 `a = r.a`"
+            ]
+        );
+        assert_eq!(
+            diagnostics("let x: {a: Int} = { ...{ a = lazy 1 } }")[0].notes,
+            vec!["a spread's field cannot be awaited; define the field with its value"]
+        );
+        // Only the definition that stands is checked.
+        assert_eq!(
+            shown_result("let r = { a = 1 }\nlet x: {a: String} = { ...r; a = \"s\" }\nx"),
+            "{a: String}"
+        );
+        assert_eq!(
+            messages("let r = { a = \"s\" }\nlet x: {a: String} = { ...r; a = 1 }"),
+            vec!["mismatched types"]
+        );
+        // A subtype fits.
+        assert_eq!(
+            shown_result("let r = { a = { b = 1; c = 2 } }\nlet x: {a: {b: Int}} = { ...r }\nx"),
+            "{a: {b: Int}}"
+        );
+        // A soft field the type lacks is not warned about; a field item is.
+        assert!(warnings("let r = { a = 1; z = 2 }\nlet x: {a: Int} = { ...r }").is_empty());
+        let found = warnings("let x: {a: Int} = { ...{ a = 1 }; z = 2 }");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "field `z` is not in `{a: Int}`");
+        // A missing field is reported as ever.
+        let text = "let r = { a = 1 }\nlet x: {a: Int, b: Int} = { ...r }";
+        assert_eq!(
+            errors(text),
+            vec![("missing field `b` in record".to_owned(), last(text, "}"))]
+        );
+    }
+
+    #[test]
+    fn a_spreads_operand_is_measured_and_must_be_a_record() {
+        // A future is awaited at the top, once.
+        let text = "let f = lazy { a = 1; b = 2 }\n{ ...f; c = a + b }";
+        assert_eq!(shown_result(text), "{a: Int, b: Int, c: Int}");
+        assert_eq!(marks(text), vec![("f", AwaitMark::Top)]);
+        // So is the either shape; nothing inside it is awaited.
+        let text = "fn f(r: {a: Int}) -> {a: Int} { ...r }\nf";
+        assert_eq!(marks(text), vec![("r", AwaitMark::Top)]);
+        // A pure function's bare parameter is measured, which makes it
+        // present.
+        let text = "fn f(r: {a: Int}): {a: Int} { ...r }";
+        assert_eq!(type_of_f(text), "fn(r: {a: Int}): {a: Int}");
+        assert_eq!(demands(text, 0), vec![Some("r")]);
+        // One in a field of the operand is measured where the expected type
+        // is present, at the operand.
+        let text = "fn f(x: Int): {a: Int} { ...{ a = x } }";
+        assert_eq!(type_of_f(text), "fn(x: Int): {a: Int}");
+        assert_eq!(demands(text, 0), vec![Some("{ a = x }")]);
+        let text = "fn f(x: Int): {a: Int | Future<Int>} { ...{ a = x } }";
+        assert_eq!(
+            type_of_f(text),
+            "fn(x: Int | Future<Int>): {a: Int | Future<Int>}"
+        );
+        assert_eq!(demands(text, 0), vec![None]);
+        // In a pure function, one that may be a future is the purity error.
+        let text = "fn f(r: Future<{a: Int}>): {a: Int} { ...r }";
+        assert_implicit_await_error(text, last(text, "r"), "Future<{a: Int}>");
+        // Anything else is not a record.
+        let text = "{ ...5 }";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "cannot spread a value of type Int: it is not a record"
+        );
+        assert_eq!(found[0].span, at(text, "...5"));
+        assert_eq!(labels(&found[0]), vec![(at(text, "5"), "this is Int")]);
+        assert_eq!(
+            messages("{ ...[1] }"),
+            vec!["cannot spread a value of type `List<Int>`: it is not a record"]
+        );
+        assert_eq!(
+            messages("let f = lazy 1\n{ ...f }"),
+            vec!["cannot spread a value of type Int: it is not a record"]
+        );
+        // Neither that nor an erroneous operand cascades.
+        assert_eq!(
+            messages("let q = { ...5 }\nq.a + 1"),
+            vec!["cannot spread a value of type Int: it is not a record"]
+        );
+        assert_eq!(
+            messages("let q = { ...z; b = 1 }\nq.a"),
+            vec!["undefined variable `z`"]
+        );
+        // `{}` spreads nothing.
+        assert_eq!(shown_result("{ ...{} }"), "{}");
+        assert_eq!(shown_result("let e = {}\n{ ...e; a = 1 }"), "{a: Int}");
+    }
+
+    #[test]
+    fn a_soft_field_in_an_inferred_result() {
+        for (text, expected) in [
+            // From the type the operand gives it, as it is.
+            (
+                "fn f() -> {a: Int, b: Int} { ...{ a = 1; b = lazy 2 } }",
+                "fn() -> {a: Int, b: Future<Int>}",
+            ),
+            (
+                "fn f(r: Present<{a: Int, b: Int}>) -> {a: Int, b: Int} { ...r }",
+                "fn(r: {a: Int, b: Int}) -> {a: Int, b: Int}",
+            ),
+            (
+                "fn f(r: {a: Int}) -> {a: Int} { ...r }",
+                "fn(r: {a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>) -> {a: Int | \
+                 Future<Int>}",
+            ),
+            (
+                "fn f(r: {a: Int}) ->> {a: Int} { ...r }",
+                "fn(r: {a: Int}) ->> {a: Int}",
+            ),
+            // An overridden one from the definition that stands.
+            (
+                "fn f() -> {a: Int, b: Int} { ...{ a = 1; b = lazy 2 }; b = 3 }",
+                "fn() -> {a: Int, b: Int}",
+            ),
+            (
+                "fn f() -> {a: Int, b: Int} { ...{ a = 1; b = 3 }; ...{ b = lazy 2 } }",
+                "fn() -> {a: Int, b: Future<Int>}",
+            ),
+            // A field item before the spread, and a record block nested in
+            // the result.
+            (
+                "fn f() -> {a: Int, b: Int} { a = lazy 1; ...{ b = 2 } }",
+                "fn() -> {a: Future<Int>, b: Int}",
+            ),
+            (
+                "fn f() -> {x: {a: Int}} { x = { ...{ a = lazy 1 } } }",
+                "fn() -> {x: {a: Future<Int>}}",
+            ),
+            // The operand's other fields play no part.
+            (
+                "fn f() -> {a: Int} { ...{ a = 1; z = lazy 2 } }",
+                "fn() -> {a: Int}",
+            ),
+        ] {
+            assert_eq!(type_of_f(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_soft_field_of_an_earlier_input_shares_its_slot() {
+        let mut names = Names::new();
+        let mut types = TypeTable::new();
+        let parse_with = |text: &str, names: &mut Names| {
+            let source = SourceFile::new("test.gcsl", text).unwrap();
+            let (tokens, strings) = tokenize_with(&source, names).unwrap();
+            parse(&tokens, names.clone(), strings, &source).unwrap()
+        };
+        let first = parse_with("...{ a = 1; b = 2 }\na = \"s\"", &mut names);
+        let scope = Checker::new(&first, &mut types).check().unwrap().scope;
+        // Three bindings, in two slots.
+        assert_eq!(scope.len(), 3);
+        let second = parse_with("let c = a", &mut names);
+        let output = Checker::with_scope(&second, scope, &mut types)
+            .check()
+            .unwrap();
+        let resolution = &output.checked.resolution;
+        let items = second.items(second.root());
+        assert_eq!(resolution.item_slot(items[0]), Slot(2));
+        let slot_names: Vec<&str> = resolution
+            .slot_names()
+            .iter()
+            .map(|&name| second.names().get(name))
+            .collect();
+        assert_eq!(slot_names, vec!["a", "b", "c"]);
+        let ItemKind::Let { value, .. } = second.item(items[0]).kind else {
+            panic!("expected a let");
+        };
+        assert_eq!(output.checked.types.get(value), TyId::STRING);
     }
 }

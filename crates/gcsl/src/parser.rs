@@ -6,9 +6,14 @@
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
 //! `let PATH (: TYPE)? = EXPR`, `PATH := EXPR`, a field `PATH = EXPR`,
-//! `= EXPR`, a named function `fn NAME(...) ...`, or an expression. After
-//! an item the next token must be a separator or the end of the body;
-//! anything else is "expected end of item".
+//! `= EXPR`, a spread `...EXPR`, a named function `fn NAME(...) ...`, or an
+//! expression. After an item the next token must be a separator or the end
+//! of the body; anything else is "expected end of item".
+//!
+//! A spread item is recognised by `...` at the start of an item, and its
+//! expression is parsed as a field's value is, at minimum binding power 0,
+//! so `...conf : {b: Int}` spreads `conf : {b: Int}`. Whether the block it
+//! is in may have a result is the checker's business, as for a field.
 //!
 //! A named function is recognised by `fn` followed by an identifier at the
 //! start of an item, and is parsed as `let NAME = <the function expression
@@ -37,8 +42,8 @@
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
-//! function's return marker), `->>` and `->`, and after `=`, `:=` and
-//! `let`. There
+//! function's return marker), `->>` and `->`, and after `=`, `:=`, `let`
+//! and a spread item's `...`. There
 //! the parser skips newlines before going on. Directly inside parentheses,
 //! brackets and interpolations the lexer emits no newlines at all, so an
 //! expression, a parameter list, an argument list, a list literal or an
@@ -118,7 +123,9 @@
 //! trailing `,`, and `]`; `[]` is the empty list. An element is an
 //! expression, or `...` and an expression, a spread, parsed at minimum
 //! binding power 0 as any element is, so `...a + b` spreads `a + b`. A
-//! `...` anywhere else is an error, "`...` is only allowed in a list".
+//! `...` anywhere else that an expression starts, but at the start of an
+//! item (see [Items and bodies](#items-and-bodies)), is an error, "`...` is
+//! only allowed in a list or at the start of an item".
 //! Directly inside `[ ]` the lexer emits no newlines, as inside `( )`, so a
 //! literal may span lines.
 //!
@@ -330,10 +337,11 @@ const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 const MISSING_RETURN_TYPE: &str =
     "expected `:`, `->` or `->>` and a return type after the parameters";
 
-/// The error for a `...` that does not start an element of a list literal.
-/// (Where else a spread is allowed, as in a record once record spreads
-/// exist, is added here.)
-const MISPLACED_SPREAD: &str = "`...` is only allowed in a list";
+/// The error for a `...` that starts neither an element of a list literal
+/// nor an item, where an expression starts. (A spread item is recognised
+/// by `Parser::parse_item` before any expression is parsed, so it never
+/// reaches this.)
+const MISPLACED_SPREAD: &str = "`...` is only allowed in a list or at the start of an item";
 
 /// The note on [`MISSING_RETURN_TYPE`].
 const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
@@ -553,6 +561,12 @@ impl Parser<'_> {
                 self.skip_newlines();
                 let value = self.parse_expr(0)?;
                 (ItemKind::Result(value), value)
+            }
+            TokenKind::DotDotDot => {
+                self.advance();
+                self.skip_newlines();
+                let value = self.parse_expr(0)?;
+                (ItemKind::Spread(value), value)
             }
             _ => {
                 let start = self.pos;
@@ -1984,6 +1998,10 @@ mod tests {
                 ItemKind::Field { path, value } => {
                     out.push_str(&ast.show_path(ast.path(path)).to_string());
                     out.push_str(" = ");
+                    expr(ast, value, out);
+                }
+                ItemKind::Spread(value) => {
+                    out.push_str("...");
                     expr(ast, value, out);
                 }
                 ItemKind::Result(value) => {
@@ -4839,19 +4857,12 @@ mod tests {
 
     #[test]
     fn list_errors() {
-        // A spread anywhere an expression starts, but in a list.
-        for (text, at) in [
-            ("...xs", 0),
-            ("f(...xs)", 2),
-            ("let x = ...xs", 8),
-            ("[(...xs)]", 2),
-        ] {
+        // A spread anywhere an expression starts, but in a list or at the
+        // start of an item.
+        for (text, at) in [("f(...xs)", 2), ("let x = ...xs", 8), ("[(...xs)]", 2)] {
             assert_eq!(
                 error(text),
-                (
-                    "`...` is only allowed in a list".to_owned(),
-                    Span::new(at, at + 3)
-                ),
+                (MISPLACED_SPREAD.to_owned(), Span::new(at, at + 3)),
                 "{text}"
             );
         }
@@ -4884,6 +4895,87 @@ mod tests {
         assert_eq!(
             error("xs[0, 1]"),
             ("expected `]`, found `,`".to_owned(), Span::new(4, 5))
+        );
+    }
+
+    #[test]
+    fn spread_items() {
+        // A spread item in a block, first, last and alone.
+        assert_eq!(shape("{ ...a; b = 1 }"), "{...a; b = 1}");
+        assert_eq!(shape("{ b = 1; ...a }"), "{b = 1; ...a}");
+        assert_eq!(shape("{ ...a }"), "{...a}");
+        assert_eq!(shape("{\n  ...a\n  ...{ c = 2 }\n}"), "{...a; ...{c = 2}}");
+        // At the top level, and in a function body.
+        assert_eq!(shape("...a\nb = 1"), "...a; b = 1");
+        assert_eq!(shape("...a"), "...a");
+        assert_eq!(shape("fn(): {} { ...a }"), "fn(): {} {...a}");
+        // Its expression is parsed as a field's value is, at minimum 0, so
+        // an ascription belongs to it.
+        assert_eq!(shape("{ ...a : {b: Int} }"), "{...(a : {b: Int})}");
+        assert_eq!(shape("{ ...a.b + c }"), "{...((a . b) + c)}");
+        assert_eq!(shape("{ ...f(x) }"), "{...f(x)}");
+        // A newline after `...` does not end the item.
+        assert_eq!(shape("{ ...\n  a }"), "{...a}");
+        // A block with a result parses; that is the checker's error.
+        assert_eq!(shape("{ ...a; = 1 }"), "{...a; = 1}");
+        // What is printed parses back to itself.
+        for text in [
+            "{...a; b = 1}",
+            "...a; ...{c = 2}",
+            "fn(): {} {x = 1; ...a}",
+        ] {
+            assert_eq!(shape(text), text);
+        }
+        // The item spans `...` through its expression.
+        let ast = parse_text("{ ...ab : T }").unwrap();
+        let ExprKind::Block(items) = ast.get(only_value(&ast)).kind else {
+            panic!("expected a block");
+        };
+        let item = ast.item(ast.items(items)[0]);
+        assert_eq!(item.span, Span::new(2, 11));
+        let ItemKind::Spread(value) = item.kind else {
+            panic!("expected a spread, got {item:?}");
+        };
+        assert_eq!(ast.get(value).span, Span::new(5, 11));
+        // A `...` inside an item's expression is still misplaced.
+        for (text, at) in [
+            ("x = ...xs", 4),
+            ("{ (...xs) }", 3),
+            ("{ ...xs + ...ys }", 10),
+        ] {
+            assert_eq!(
+                error(text),
+                (MISPLACED_SPREAD.to_owned(), Span::new(at, at + 3)),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            error("{ ... }"),
+            ("expected expression, found `}`".to_owned(), Span::new(6, 7))
+        );
+        // A spread item nests as a field item does: each block is two
+        // levels of recursion, as `nesting_blocks_is_limited` counts them.
+        let spreads = |depth: usize| format!("{}1{}", "{...".repeat(depth), "}".repeat(depth));
+        let deepest = spreads((MAX_DEPTH - 1) / 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(spreads((MAX_DEPTH - 1) / 2 + 1)).message,
+            "expression nested too deeply"
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_spread_items() {
+        let ast = parse_text("...a\n{ ...b }").unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (spread @0..4\n\
+             \x20   (name a @3..4))\n\
+             \x20 (expr @5..13\n\
+             \x20   (block @5..13\n\
+             \x20     (spread @7..11\n\
+             \x20       (name b @10..11)))))"
         );
     }
 

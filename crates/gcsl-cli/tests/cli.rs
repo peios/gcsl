@@ -598,6 +598,87 @@ fn an_index_out_of_range_is_rendered() {
 }
 
 #[test]
+fn run_spreads_defaults_into_a_configuration() {
+    let output = gcsl(&["run", "tests/fixtures/spread.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{host = \"localhost\"; port = 8080; url = \"localhost:8080\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_spreads() {
+    let output = gcsl(&["run", "tests/fixtures/spread.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    assert!(
+        tokens.contains("\nDotDotDot @176..179\nIdent(defaults) @179..187\n"),
+        "{tokens}"
+    );
+    let output = gcsl(&["run", "tests/fixtures/spread.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    let node = "\n    (block @172..227\n\
+                \x20     (spread @176..187\n\
+                \x20       (name defaults @179..187))\n\
+                \x20     (field port @190..201\n";
+    assert!(ast.contains(node), "{node}: {ast}");
+    let output = gcsl(&["run", "tests/fixtures/spread.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "\n    (block : {host: String, port: Int, url: String} @172..227\n\
+         \x20     (spread @176..187\n\
+         \x20       (name defaults : {host: String, port: Int} @179..187))\n",
+        // The names the spread defines, one of them overridden.
+        "(name host : String @212..216)",
+        "(name port : Int @219..223)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/spread.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    // The operand is stored once, in a slot of its own, and each field is
+    // read from it by name into the field's slot; the override stores into
+    // the same slot, and the field keeps its place.
+    let node = "\n      (store url#3 @176..187\n\
+                \x20       (load defaults#0 @179..187))\n\
+                \x20     (store conf#1 @176..187\n\
+                \x20       (field host @179..187\n\
+                \x20         (load url#3 @179..187)))\n\
+                \x20     (store port#2 @176..187\n\
+                \x20       (field port @179..187\n\
+                \x20         (load url#3 @179..187)))\n\
+                \x20     (store port#2 @190..201\n\
+                \x20       (int 8080 @197..201))\n";
+    assert!(ir.contains(node), "{node}: {ir}");
+    let node = "\n      (make-record [host port url] @172..227\n\
+                \x20       (load conf#1 @179..187)\n\
+                \x20       (load port#2 @190..194)\n\
+                \x20       (load url#3 @204..207))))\n";
+    assert!(ir.contains(node), "{node}: {ir}");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_spread_of_a_field_defined_before_it_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/spread_twice.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: field `port` is defined twice\n\
+         \x20--> tests/fixtures/spread_twice.gcsl:4:6\n\
+         \x20 |\n\
+         3 |   port = 8080\n\
+         \x20 |   ---- first defined here\n\
+         4 |   ...base\n\
+         \x20 |      ^^^^ `port` is a field of this, of type Int\n\
+         \x20 |\n\
+         \x20 = note: a spread cannot replace a field defined before it; put the spread first\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn repl_shows_lists_and_their_types() {
     let output = repl(
         "let xs = [1, lazy 2]\n\
