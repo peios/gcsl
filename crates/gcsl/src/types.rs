@@ -30,6 +30,19 @@
 //! they share whose types have a join, so it always exists; see
 //! [`TypeTable::join`].
 //!
+//! # Lists
+//!
+//! `List<T>`, [`TyKind::List`], is the type of every list whose elements
+//! are all `T`s; the source may write it `T[]`. A list type is a container,
+//! as a record type is: its values are never futures themselves, but its
+//! element type may be `Future<T>` or the either shape, and everything that
+//! looks through a record's fields for futures and provisional types looks
+//! through a list's element type the same way ([`TypeTable::present`],
+//! [`TypeTable::contains_future`], [`TypeTable::settle`] and the others).
+//! Subtyping is covariant, `List<S> <: List<T>` iff `S <: T`, and the join
+//! of two list types is the list of the join of their element types, if
+//! that exists.
+//!
 //! # Functions
 //!
 //! A function type, [`FnTy`], lists its parameters' types, each with the
@@ -86,17 +99,18 @@
 //!
 //! [`TypeTable::strip`] removes every `Future` and either layer at the top of
 //! a type, which is what awaiting a value fully does to its type, and
-//! [`TypeTable::present`] also strips the fields of a record type,
-//! recursively (but not the parameters or results of function types), which
-//! is what awaiting it deeply does.
+//! [`TypeTable::present`] also strips the fields of a record type and the
+//! element type of a list type, recursively (but not the parameters or
+//! results of function types), which is what awaiting it deeply does.
 //!
 //! Subtyping extends to them: `Future<S> <: Future<T>` iff `S <: T`; `S <: T
 //! | Future<T>` iff `strip(S) <: T`, whatever shape `S` has (a present value
 //! satisfies the either shape, and so do a future and an either whose
 //! awaited value would); and nothing lazy is a subtype of a present type,
 //! nor is a present type a subtype of `Future<T>`, so a written `Future<T>`
-//! demands a deferred value. The rules apply through record fields and
-//! function types as the others do. Joins: two futures join to the future
+//! demands a deferred value. The rules apply through record fields, list
+//! element types and function types as the others do. Joins: two futures
+//! join to the future
 //! of the join of what they yield, and a future or an either with anything
 //! else to the either of the join of both sides stripped.
 //!
@@ -198,6 +212,9 @@ pub enum TyKind {
     String,
     /// A record type: its fields, sorted by [`Name`], with no duplicates.
     Record(RecordTy),
+    /// A list type, `List<T>`: the type of its elements. See the module
+    /// documentation.
+    List(TyId),
     /// A function type. See the module documentation.
     Fn(FnTy),
     /// A future whose await yields the type given, which is neither a
@@ -332,9 +349,10 @@ impl TypeTable {
     /// [`TyKind::Future`], [`TyKind::Union`] and [`TyKind::Provisional`].
     ///
     /// A table holds at most `u32::MAX` types. Every type but the
-    /// pre-interned ones is built from source (a record block, a record or
-    /// function type expression, a function expression or a parameter, each
-    /// at least two bytes of it, the join of two types already in the table,
+    /// pre-interned ones is built from source (a record block, a list
+    /// literal, a record, list or function type expression, a function
+    /// expression or a parameter, each at least two bytes of it, the join of
+    /// two types already in the table,
     /// which is no larger than either, or a type already in the table with
     /// its provisionals settled, which is no larger than it), so the limit is
     /// far beyond any table; past it, ids would saturate.
@@ -362,7 +380,7 @@ impl TypeTable {
                 self.has_provisional(sig.ret)
                     || sig.params.iter().any(|&(_, ty)| self.has_provisional(ty))
             }
-            TyKind::Future(inner) => self.has_provisional(*inner),
+            TyKind::Future(inner) | TyKind::List(inner) => self.has_provisional(*inner),
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -407,6 +425,22 @@ impl TypeTable {
         }))
     }
 
+    /// Returns the id of the list type whose elements are of type `element`,
+    /// `List<T>`, adding it to the table if it is new.
+    pub fn list(&mut self, element: TyId) -> TyId {
+        self.intern(TyKind::List(element))
+    }
+
+    /// The element type of list type `id`, or `None` if it is not a list
+    /// type.
+    #[must_use]
+    pub fn list_element(&self, id: TyId) -> Option<TyId> {
+        match self.kinds.get(id.index())? {
+            TyKind::List(element) => Some(*element),
+            _ => None,
+        }
+    }
+
     /// The signature of function type `id`, or `None` if it is not a
     /// function type.
     #[must_use]
@@ -418,12 +452,13 @@ impl TypeTable {
     }
 
     /// Whether `id` is a function type, or a record type with a field of a
-    /// type that is or contains one, at any depth, looking through futures,
-    /// unions and provisional types: a type whose values cannot be compared,
-    /// since functions have no equality.
+    /// type that is or contains one, or a list type whose element type is or
+    /// contains one, at any depth, looking through futures, unions and
+    /// provisional types: a type whose values cannot be compared, since
+    /// functions have no equality.
     ///
-    /// Recurses once per level of record, future, union or provisional
-    /// nesting.
+    /// Recurses once per level of record, list, future, union or
+    /// provisional nesting.
     #[must_use]
     pub fn contains_fn(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
@@ -432,9 +467,9 @@ impl TypeTable {
                 .fields
                 .iter()
                 .any(|&(_, field)| self.contains_fn(field)),
-            Some(TyKind::Future(inner) | TyKind::Provisional { inner, .. }) => {
-                self.contains_fn(*inner)
-            }
+            Some(
+                TyKind::Future(inner) | TyKind::List(inner) | TyKind::Provisional { inner, .. },
+            ) => self.contains_fn(*inner),
             Some(TyKind::Union(members)) => members.iter().any(|&member| self.contains_fn(member)),
             _ => false,
         }
@@ -510,7 +545,8 @@ impl TypeTable {
     }
 
     /// Type `id` with every provisional type of function `function` in it,
-    /// at any depth, through records, futures, unions and function types,
+    /// at any depth, through records, lists, futures, unions and function
+    /// types,
     /// replaced by what was decided for its parameter: its present type if
     /// `decisions[param]` is `true`, the parameter being measured, and the
     /// either shape of it otherwise. Provisional types of other functions
@@ -560,6 +596,10 @@ impl TypeTable {
                 let inner = self.settle(inner, function, decisions);
                 self.future(inner)
             }
+            TyKind::List(element) => {
+                let element = self.settle(element, function, decisions);
+                self.list(element)
+            }
             TyKind::Union(members) => {
                 if let Some(present) = self.either_member(id) {
                     let present = self.settle(present, function, decisions);
@@ -584,7 +624,7 @@ impl TypeTable {
     }
 
     /// Whether type `id` is or contains, at any depth, through records,
-    /// futures, unions and function types, a provisional type: one of
+    /// lists, futures, unions and function types, a provisional type: one of
     /// function `function`'s parameters, or of any function's for `None`.
     /// Constant time for `None`, and for a type with no provisional type at
     /// all.
@@ -611,7 +651,9 @@ impl TypeTable {
                         .iter()
                         .any(|&(_, ty)| self.contains_provisional(ty, Some(function)))
             }
-            Some(TyKind::Future(inner)) => self.contains_provisional(*inner, Some(function)),
+            Some(TyKind::Future(inner) | TyKind::List(inner)) => {
+                self.contains_provisional(*inner, Some(function))
+            }
             Some(TyKind::Union(members)) => members
                 .iter()
                 .any(|&member| self.contains_provisional(member, Some(function))),
@@ -620,9 +662,9 @@ impl TypeTable {
     }
 
     /// Adds to `out` the parameter of each provisional type of function
-    /// `function` in type `id`, at any depth, through records, futures,
-    /// unions and function types, in no particular order and possibly more
-    /// than once.
+    /// `function` in type `id`, at any depth, through records, lists,
+    /// futures, unions and function types, in no particular order and
+    /// possibly more than once.
     ///
     /// Recurses once per level of nesting in the type.
     pub fn provisional_params(&self, id: TyId, function: FnId, out: &mut Vec<u32>) {
@@ -646,7 +688,9 @@ impl TypeTable {
                 }
                 self.provisional_params(sig.ret, function, out);
             }
-            Some(TyKind::Future(inner)) => self.provisional_params(*inner, function, out),
+            Some(TyKind::Future(inner) | TyKind::List(inner)) => {
+                self.provisional_params(*inner, function, out);
+            }
             Some(TyKind::Union(members)) => {
                 for &member in members {
                     self.provisional_params(member, function, out);
@@ -662,7 +706,8 @@ impl TypeTable {
     /// supertype): the parameters that a value of type `found` would need
     /// to be present to fit `expected`, in no particular order and possibly
     /// more than once. The two types are walked together, through record
-    /// fields that both have, through future and either layers (with
+    /// fields that both have, through the element types of list types,
+    /// through future and either layers (with
     /// `expected` stripped to match), and through the return types of
     /// function types, but not their parameters: a parameter is
     /// contravariant, so a provisional one fits no worse for being left
@@ -706,6 +751,14 @@ impl TypeTable {
                     }
                 }
             }
+            Some(TyKind::List(element)) => {
+                if self.laziness(expected) == Laziness::Future {
+                    return;
+                }
+                if let Some(expected) = self.list_element(self.strip(expected)) {
+                    self.provisionals_at_present(*element, expected, function, out);
+                }
+            }
             Some(TyKind::Future(inner)) => {
                 self.provisionals_at_present(*inner, self.strip(expected), function, out);
             }
@@ -728,7 +781,7 @@ impl TypeTable {
     /// [`Laziness::Future`] for a `Future<T>`, [`Laziness::Either`] for a
     /// `T | Future<T>`, [`Laziness::Provisional`] for a provisional type,
     /// and [`Laziness::Present`] for everything else, a record with futures
-    /// in its fields included.
+    /// in its fields and a list of futures included.
     #[must_use]
     pub fn laziness(&self, id: TyId) -> Laziness {
         match self.kinds.get(id.index()) {
@@ -742,7 +795,7 @@ impl TypeTable {
     /// Type `id` with every `Future`, either and provisional layer at its
     /// top removed: the type of its value once awaited fully. `Future<Int>`,
     /// `Int | Future<Int>`, `Int?` and `Int` all strip to `Int`; a record's
-    /// fields are left as they are.
+    /// fields and a list's element type are left as they are.
     #[must_use]
     pub fn strip(&self, id: TyId) -> TyId {
         let mut id = id;
@@ -760,14 +813,23 @@ impl TypeTable {
 
     /// Type `id` stripped (see [`TypeTable::strip`]) and then, if it is a
     /// record type, with each field's type made present in the same way,
+    /// and if it is a list type, with its element type made present,
     /// recursively: the type of its value once awaited deeply. Provisional
     /// types are stripped like the either shapes they may become. Function
     /// types are left as they are, parameters and results alike. Interns the
-    /// record types it makes.
+    /// record and list types it makes.
     ///
-    /// Recurses once per level of record nesting.
+    /// Recurses once per level of record or list nesting.
     pub fn present(&mut self, id: TyId) -> TyId {
         let top = self.strip(id);
+        if let Some(element) = self.list_element(top) {
+            let presented = self.present(element);
+            return if presented == element {
+                top
+            } else {
+                self.list(presented)
+            };
+        }
         let Some(fields) = self.record_fields(top) else {
             return top;
         };
@@ -811,17 +873,20 @@ impl TypeTable {
     }
 
     /// Whether type `id` is a `Future`, or a record type with a field of a
-    /// type that is or contains one, at any depth of record nesting. An
-    /// either shape counts only through its present member, so `Int |
-    /// Future<Int>` contains none, a provisional type likewise through its
-    /// present type, and function types are not looked into.
+    /// type that is or contains one, or a list type whose element type is or
+    /// contains one, at any depth of record and list nesting. An either
+    /// shape counts only through its present member, so `Int | Future<Int>`
+    /// contains none, a provisional type likewise through its present type,
+    /// and function types are not looked into.
     ///
-    /// Recurses once per level of record nesting.
+    /// Recurses once per level of record or list nesting.
     #[must_use]
     pub fn contains_future(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
             Some(TyKind::Future(_)) => true,
-            Some(TyKind::Provisional { inner, .. }) => self.contains_future(*inner),
+            Some(TyKind::Provisional { inner, .. } | TyKind::List(inner)) => {
+                self.contains_future(*inner)
+            }
             Some(TyKind::Union(_)) => self
                 .either_member(id)
                 .is_some_and(|present| self.contains_future(present)),
@@ -911,7 +976,8 @@ impl TypeTable {
     /// Whether a value of type `sub` may be used where `sup` is expected:
     /// `sub` is `sup`; or both are record types and `sub` has every field
     /// of `sup`, each of a subtype of that field's type in `sup`; or both
-    /// are function types and `sub`'s signature fits `sup`'s; or `sup` is
+    /// are list types and `sub`'s element type is a subtype of `sup`'s; or
+    /// both are function types and `sub`'s signature fits `sup`'s; or `sup` is
     /// `Future<T>` and `sub` is `Future<S>` with `S <: T`; or `sup` is `T |
     /// Future<T>` and `sub` stripped is a subtype of `T` (see the module
     /// documentation). Nothing lazy is a subtype of a present type. A
@@ -919,8 +985,8 @@ impl TypeTable {
     /// subtype of exactly what `T | Future<T>` is) and its present type `T`
     /// as `sup`, unless the two are the same provisional type.
     ///
-    /// Recurses once per level of record, function type or future nesting
-    /// in the two types.
+    /// Recurses once per level of record, list, function type or future
+    /// nesting in the two types.
     #[must_use]
     pub fn is_subtype(&self, sub: TyId, sup: TyId) -> bool {
         if sub == sup {
@@ -943,6 +1009,9 @@ impl TypeTable {
         }
         if self.laziness(sub) != Laziness::Present {
             return false;
+        }
+        if let (Some(offered), Some(required)) = (self.list_element(sub), self.list_element(sup)) {
+            return self.is_subtype(offered, required);
         }
         if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
             return offered.params.len() == required.params.len()
@@ -974,7 +1043,9 @@ impl TypeTable {
     /// The least common supertype of `a` and `b`, for the branches of an
     /// `if`: `a` itself if the two are the same type; for two record types,
     /// the record of the fields they share whose types have a join, each
-    /// with that join (the empty record if there are none); for two
+    /// with that join (the empty record if there are none); for two list
+    /// types, the list of the join of their element types, if they have
+    /// one; for two
     /// function types, the join described in the module documentation, if
     /// they have one; for two futures, the future of the join of what they
     /// yield; for a future, an either or a provisional type (which joins as
@@ -984,8 +1055,8 @@ impl TypeTable {
     /// integers is the checker's business, not the table's, so `Int` and an
     /// untyped integer have no join here.
     ///
-    /// Recurses once per level of record, return type or future nesting
-    /// shared by `a` and `b`.
+    /// Recurses once per level of record, list, return type or future
+    /// nesting shared by `a` and `b`.
     pub fn join(&mut self, a: TyId, b: TyId) -> Option<TyId> {
         if a == b {
             return Some(a);
@@ -1000,6 +1071,10 @@ impl TypeTable {
             let (a_present, b_present) = (self.strip(a), self.strip(b));
             let joined = self.join(a_present, b_present)?;
             return Some(self.deferrable(joined));
+        }
+        if let (Some(a_element), Some(b_element)) = (self.list_element(a), self.list_element(b)) {
+            let joined = self.join(a_element, b_element)?;
+            return Some(self.list(joined));
         }
         if let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) {
             if a_sig.params.len() != b_sig.params.len() {
@@ -1069,6 +1144,7 @@ impl TypeTable {
             TyKind::Bool => Some(ValueKind::Bool),
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) => Some(ValueKind::Record),
+            TyKind::List(_) => Some(ValueKind::List),
             TyKind::Fn(_) => Some(ValueKind::Fn),
             TyKind::Future(_) => Some(ValueKind::Deferred),
             TyKind::Union(_) if self.is_deferrable(id) => Some(ValueKind::Deferred),
@@ -1083,7 +1159,8 @@ impl TypeTable {
     /// `fn(Int, name: String): Bool`, `fn() -> Int`. A record shows its
     /// fields in alphabetical order of their text, a field whose name is not
     /// a plain identifier quoted as a string literal (`{"a b": Int}`), and a
-    /// nested record nested. The empty record is `{}`. A function shows its
+    /// nested record nested. The empty record is `{}`. A list type shows as
+    /// `List<Int>`, however the source wrote it. A function shows its
     /// parameters in order, each with its name if it has one, then `: ` and
     /// its return type if it is pure, ` ->> ` and its return type if it is
     /// memoised, or ` -> ` and its return type if it is impure.
@@ -1137,6 +1214,7 @@ impl fmt::Display for Display<'_> {
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
+            TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
             TyKind::Provisional { inner, .. } => {
                 let shown = self.nested(*inner);
                 // A function type's return type would take the `?`.
@@ -2341,5 +2419,200 @@ mod tests {
         assert_eq!(show(&table, f), "(fn(): Int)?");
         let takes = table.fn_type([(Some(x), int)], int, Effect::Pure);
         assert_eq!(show(&table, takes), "fn(x: Int?): Int?");
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn list_types_intern_by_element_type() {
+        let (mut table, _, [a, ..]) = setup();
+        let ints = table.list(TyId::INT);
+        assert_eq!(table.list(TyId::INT), ints);
+        assert_ne!(table.list(TyId::FLOAT), ints);
+        assert_eq!(table.list_element(ints), Some(TyId::INT));
+        assert_eq!(table.list_element(TyId::INT), None);
+        let nested = table.list(ints);
+        assert_eq!(table.list_element(nested), Some(ints));
+        let record = table.record([(a, TyId::INT)]);
+        let records = table.list(record);
+        assert_eq!(table.record([(a, TyId::INT)]), record);
+        assert_eq!(table.list(record), records);
+        assert_eq!(table.value_kind(ints), Some(ValueKind::List));
+        let either = table.deferrable(ints);
+        assert_eq!(table.value_kind(either), Some(ValueKind::Deferred));
+        assert_eq!(table.laziness(ints), Laziness::Present);
+        assert!(!table.contains_fn(ints));
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
+        let functions = table.list(function);
+        assert!(table.contains_fn(functions));
+        let in_record = table.record([(a, functions)]);
+        assert!(table.contains_fn(in_record));
+    }
+
+    #[test]
+    fn display_list_types() {
+        let (mut table, names, [a, ..]) = setup();
+        let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+        let ints = table.list(TyId::INT);
+        assert_eq!(show(&table, ints), "List<Int>");
+        let nested = table.list(ints);
+        assert_eq!(show(&table, nested), "List<List<Int>>");
+        let either = table.deferrable(TyId::INT);
+        let eithers = table.list(either);
+        assert_eq!(show(&table, eithers), "List<Int | Future<Int>>");
+        let outer = table.deferrable(eithers);
+        assert_eq!(
+            show(&table, outer),
+            "List<Int | Future<Int>> | Future<List<Int | Future<Int>>>"
+        );
+        let record = table.record([(a, ints)]);
+        let records = table.list(record);
+        assert_eq!(show(&table, records), "List<{a: List<Int>}>");
+        let function = table.fn_type([], TyId::INT, Effect::Impure);
+        let functions = table.list(function);
+        assert_eq!(show(&table, functions), "List<fn() -> Int>");
+        let provisional = table.provisional(F, 0, ints);
+        assert_eq!(show(&table, provisional), "List<Int>?");
+    }
+
+    #[test]
+    fn list_subtyping_is_covariant() {
+        let (mut table, _, [a, b, _]) = setup();
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let just_a = table.record([(a, TyId::INT)]);
+        let abs = table.list(ab);
+        let just_as = table.list(just_a);
+        assert!(table.is_subtype(abs, just_as));
+        assert!(!table.is_subtype(just_as, abs));
+        let ints = table.list(TyId::INT);
+        let floats = table.list(TyId::FLOAT);
+        assert!(!table.is_subtype(ints, floats));
+        assert!(!table.is_subtype(ints, TyId::EMPTY));
+        assert!(!table.is_subtype(TyId::EMPTY, ints));
+        // With futures inside: a present element satisfies the either
+        // shape, and nothing but a future a future.
+        let either = table.deferrable(TyId::INT);
+        let future = table.future(TyId::INT);
+        let eithers = table.list(either);
+        let futures = table.list(future);
+        assert!(table.is_subtype(ints, eithers));
+        assert!(table.is_subtype(futures, eithers));
+        assert!(!table.is_subtype(eithers, ints));
+        assert!(!table.is_subtype(ints, futures));
+        // A list, or its future, satisfies the either shape of a list type.
+        let outer = table.deferrable(eithers);
+        let future_ints = table.future(ints);
+        assert!(table.is_subtype(ints, outer));
+        assert!(table.is_subtype(future_ints, outer));
+        assert!(!table.is_subtype(outer, eithers));
+        let nested = table.list(ints);
+        let nested_eithers = table.list(eithers);
+        assert!(table.is_subtype(nested, nested_eithers));
+    }
+
+    #[test]
+    fn list_joins() {
+        let (mut table, _, [a, b, _]) = setup();
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_string = table.record([(a, TyId::INT), (b, TyId::STRING)]);
+        let just_a = table.record([(a, TyId::INT)]);
+        let abs = table.list(ab);
+        let a_strings = table.list(a_string);
+        let just_as = table.list(just_a);
+        assert_eq!(table.join(abs, a_strings), Some(just_as));
+        let ints = table.list(TyId::INT);
+        let floats = table.list(TyId::FLOAT);
+        assert_eq!(table.join(ints, floats), None);
+        assert_eq!(table.join(ints, TyId::INT), None);
+        assert_eq!(table.join(ints, TyId::EMPTY), None);
+        let future = table.future(TyId::INT);
+        let futures = table.list(future);
+        let either = table.deferrable(TyId::INT);
+        let eithers = table.list(either);
+        assert_eq!(table.join(ints, futures), Some(eithers));
+        // A list and a future of one join to the either shape.
+        let future_ints = table.future(ints);
+        let outer = table.deferrable(ints);
+        assert_eq!(table.join(ints, future_ints), Some(outer));
+    }
+
+    #[test]
+    fn strip_present_and_futures_through_lists() {
+        let (mut table, _, [a, ..]) = setup();
+        let either = table.deferrable(TyId::INT);
+        let future = table.future(TyId::INT);
+        let eithers = table.list(either);
+        let futures = table.list(future);
+        let ints = table.list(TyId::INT);
+        // A list is present: stripping leaves its element type, and
+        // presenting makes it present too.
+        let outer = table.deferrable(eithers);
+        assert_eq!(table.strip(outer), eithers);
+        assert_eq!(table.present(outer), ints);
+        assert_eq!(table.present(futures), ints);
+        assert_eq!(table.present(ints), ints);
+        let nested = table.list(eithers);
+        let nested_ints = table.list(ints);
+        assert_eq!(table.present(nested), nested_ints);
+        let record = table.record([(a, eithers)]);
+        let present_record = table.record([(a, ints)]);
+        let records = table.list(record);
+        let present_records = table.list(present_record);
+        assert_eq!(table.present(records), present_records);
+        // Awaits: at the top for a future of a list with present elements,
+        // deeply for one with lazy elements.
+        let future_ints = table.future(ints);
+        assert_eq!(table.needs_await(future_ints, ints), Some(AwaitKind::Top));
+        assert_eq!(table.needs_await(eithers, ints), Some(AwaitKind::Deep));
+        assert_eq!(table.needs_await(outer, ints), Some(AwaitKind::Deep));
+        assert_eq!(table.needs_await(ints, eithers), None);
+        assert_eq!(table.needs_await(futures, TyId::INT), None);
+        // A `Future` element is a future inside; the either shape is not.
+        assert!(table.contains_future(futures));
+        assert!(!table.contains_future(eithers));
+        let nested_futures = table.list(futures);
+        assert!(table.contains_future(nested_futures));
+        let holder = table.record([(a, futures)]);
+        assert!(table.contains_future(holder));
+        assert!(!table.contains_future(ints));
+    }
+
+    #[test]
+    fn provisional_types_through_lists() {
+        let (mut table, _, _) = setup();
+        let first = table.provisional(F, 0, TyId::INT);
+        let firsts = table.list(first);
+        assert!(table.contains_provisional(firsts, Some(F)));
+        assert!(!table.contains_provisional(firsts, Some(G)));
+        let mut found = Vec::new();
+        table.provisional_params(firsts, F, &mut found);
+        assert_eq!(found, vec![0]);
+        // Settled, element and all.
+        let ints = table.list(TyId::INT);
+        let either = table.deferrable(TyId::INT);
+        let eithers = table.list(either);
+        assert_eq!(table.settle(firsts, F, &[true]), ints);
+        assert_eq!(table.settle(firsts, F, &[false]), eithers);
+        // Stripped and presented as the either shape it may become.
+        assert_eq!(table.present(firsts), ints);
+        // Those where a present element is expected.
+        let at_present = |table: &TypeTable, found: TyId, expected: TyId| {
+            let mut out = Vec::new();
+            table.provisionals_at_present(found, expected, F, &mut out);
+            out
+        };
+        assert_eq!(at_present(&table, firsts, ints), vec![0]);
+        assert_eq!(at_present(&table, firsts, eithers), Vec::<u32>::new());
+        let outer = table.deferrable(ints);
+        assert_eq!(at_present(&table, firsts, outer), vec![0]);
+        let future_ints = table.future(ints);
+        assert_eq!(at_present(&table, firsts, future_ints), Vec::<u32>::new());
+        // A provisional list is present as a supertype, its either shape as
+        // a subtype.
+        let list_param = table.provisional(F, 1, ints);
+        assert!(table.is_subtype(ints, list_param));
+        assert!(!table.is_subtype(list_param, ints));
+        let outer_eithers = table.deferrable(ints);
+        assert!(table.is_subtype(list_param, outer_eithers));
     }
 }

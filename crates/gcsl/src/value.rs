@@ -1,13 +1,18 @@
 //! Runtime values.
 //!
-//! Scalars are unboxed; strings, records, closures and futures are
-//! reference-counted, so copying a value, into a variable, a record or a
-//! closure's captures, is at most a reference-count increment. Records,
-//! closures and futures can nest as deeply as a program runs (a record
-//! holding a record, a closure capturing a closure, a future capturing a
-//! future), so dropping one frees what it uniquely owns iteratively, through
-//! a work list, rather than recursively (see [`Record`], [`Closure`] and
-//! [`Future`]).
+//! Scalars are unboxed; strings, records, lists, closures and futures are
+//! reference-counted, so copying a value, into a variable, a record, a list
+//! or a closure's captures, is at most a reference-count increment. Records,
+//! lists, closures and futures can nest as deeply as a program runs (a
+//! record holding a record, a list holding a list, a closure capturing a
+//! closure, a future capturing a future), so dropping one frees what it
+//! uniquely owns iteratively, through a work list, rather than recursively
+//! (see [`Record`], [`List`], [`Closure`] and [`Future`]), and comparing two
+//! compares nested records and lists through a work list too.
+//!
+//! A [`List`] is its elements in one reference-counted slice, allocated
+//! once; the empty list is no allocation at all, so every empty list is the
+//! same value, made for nothing.
 //!
 //! A [`Future`] is a memoised thunk: the function of a `lazy` with the
 //! values it captured, run by its first await, after which it holds the
@@ -41,6 +46,8 @@ pub enum ValueKind {
     String,
     /// A record: [`Value::Empty`] or [`Value::Record`].
     Record,
+    /// A list, [`Value::List`].
+    List,
     /// A function, [`Value::Fn`].
     Fn,
     /// A value whose static type is a `Future` or `T | Future<T>`, so which
@@ -106,21 +113,116 @@ impl Drop for Record {
     }
 }
 
+/// A list: its elements, in order, in one reference-counted slice, or
+/// nothing for the empty list, which therefore needs no allocation. Cloning
+/// a list shares its elements. See the module documentation.
+#[derive(Clone, Debug, Default)]
+pub struct List(Option<Rc<[Value]>>);
+
+impl List {
+    /// The empty list.
+    pub const EMPTY: List = List(None);
+
+    /// The list of `values`, in order: one allocation, which copies them
+    /// out of the vector, or none if there are none.
+    #[must_use]
+    pub fn from_vec(values: Vec<Value>) -> Self {
+        if values.is_empty() {
+            List::EMPTY
+        } else {
+            List(Some(Rc::from(values)))
+        }
+    }
+
+    /// The list of the values `values` yields, in order, which must be an
+    /// iterator of exactly known length, such as a map over a range, so
+    /// that the slice is allocated once, at its size, and filled in place;
+    /// no allocation if it yields none.
+    #[must_use]
+    pub fn from_exact(values: impl ExactSizeIterator<Item = Value>) -> Self {
+        if values.len() == 0 {
+            List::EMPTY
+        } else {
+            List(Some(values.collect()))
+        }
+    }
+
+    /// The elements, in order.
+    #[must_use]
+    pub fn values(&self) -> &[Value] {
+        self.0.as_deref().unwrap_or_default()
+    }
+
+    /// The number of elements.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values().len()
+    }
+
+    /// Whether the list has no elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    /// Whether this list and `other` are the same list, sharing their
+    /// elements, as a clone does: two empty lists always are.
+    #[must_use]
+    pub fn shares(&self, other: &List) -> bool {
+        match (&self.0, &other.0) {
+            (Some(mine), Some(theirs)) => Rc::ptr_eq(mine, theirs),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// The elements, if nothing else holds them, for dropping them.
+    fn unique_mut(&mut self) -> Option<&mut [Value]> {
+        self.0.as_mut().and_then(Rc::get_mut)
+    }
+}
+
+/// Dropping a list frees its nested records, lists, closures and futures
+/// iteratively, as dropping a record does, so a list nested in a list as
+/// deeply as a program runs is freed without recursion. A list whose
+/// elements are shared elsewhere is merely released.
+impl Drop for List {
+    fn drop(&mut self) {
+        if let Some(values) = self.unique_mut() {
+            drop_nested(values);
+        }
+    }
+}
+
+/// Lists compare element by element, in order, deeply, as [`Value`]'s
+/// equality compares each: two lists are equal when they have the same
+/// length and equal elements at every index. Nested records and lists are
+/// compared through a work list, as a record's fields are (see [`Record`]'s
+/// equality).
+impl PartialEq for List {
+    fn eq(&self, other: &Self) -> bool {
+        deep_equal(Pair::Lists(self.values(), other.values()))
+    }
+}
+
 /// A uniquely owned value that holds other values: what the iterative drop
-/// of records, closures and futures frees level by level.
+/// of records, lists, closures and futures frees level by level.
 enum Nested {
     /// A record, holding its fields.
     Record(Rc<Record>),
+    /// A list, holding its elements.
+    List(List),
     /// A closure, holding its captured values.
     Closure(Rc<Closure>),
     /// A future, holding its captured values or the value it yielded.
     Future(Rc<Future>),
 }
 
-/// Frees the records, closures and futures among `values` that nothing else
-/// holds, and all those they hold in turn, through a work list rather than
-/// recursion: each is emptied of the records, closures and futures it
-/// holds, which go on the list, before it is dropped, so no drop recurses.
+/// Frees the records, lists, closures and futures among `values` that
+/// nothing else holds, and all those they hold in turn, through a work list
+/// rather than recursion: each is emptied of the records, lists, closures
+/// and futures it holds, which go on the list, before it is dropped, so no
+/// drop recurses.
 fn drop_nested(values: &mut [Value]) {
     let mut pending = Vec::new();
     take_nested(values, &mut pending);
@@ -131,6 +233,12 @@ fn drop_nested(values: &mut [Value]) {
                     // Emptied, it drops without adding to the list or
                     // recursing.
                     take_nested(&mut record.values, &mut pending);
+                }
+            }
+            Nested::List(mut list) => {
+                // Emptied, its own drop finds nothing left to free.
+                if let Some(values) = list.unique_mut() {
+                    take_nested(values, &mut pending);
                 }
             }
             Nested::Closure(closure) => {
@@ -147,15 +255,22 @@ fn drop_nested(values: &mut [Value]) {
     }
 }
 
-/// Moves the records, closures and futures among `values` onto `pending`,
-/// leaving `{}` in their places.
+/// Moves the records, lists, closures and futures among `values` onto
+/// `pending`, leaving `{}` in their places. An empty list holds nothing, and
+/// stays.
 fn take_nested(values: &mut [Value], pending: &mut Vec<Nested>) {
     for value in values {
-        if !matches!(value, Value::Record(_) | Value::Fn(_) | Value::Future(_)) {
+        let holds = match value {
+            Value::Record(_) | Value::Fn(_) | Value::Future(_) => true,
+            Value::List(list) => !list.is_empty(),
+            _ => false,
+        };
+        if !holds {
             continue;
         }
         match std::mem::replace(value, Value::Empty) {
             Value::Record(record) => pending.push(Nested::Record(record)),
+            Value::List(list) => pending.push(Nested::List(list)),
             Value::Fn(closure) => pending.push(Nested::Closure(closure)),
             Value::Future(future) => pending.push(Nested::Future(future)),
             _ => {}
@@ -377,33 +492,71 @@ impl Drop for Future {
 /// equal value. Field order does not matter, and `Float` fields compare as
 /// IEEE 754 does, so a record holding NaN is not equal to itself.
 ///
-/// Nested records are compared iteratively through a work list, for the
-/// same reason [`Record`]'s drop is iterative: nesting is bounded only by
-/// the program's length. The list only grows when both records have a
-/// nested record in the same field, so comparing flat records allocates
-/// nothing.
+/// Nested records and lists are compared iteratively through a work list,
+/// for the same reason [`Record`]'s drop is iterative: nesting is bounded
+/// only by the program's length. The list only grows when both records
+/// have a nested record or list in the same field, so comparing flat
+/// records allocates nothing.
 impl PartialEq for Record {
     fn eq(&self, other: &Self) -> bool {
-        let mut pending = Vec::new();
-        if !fields_equal(self, other, &mut pending) {
+        deep_equal(Pair::Records(self, other))
+    }
+}
+
+/// Two records or two lists being compared by [`deep_equal`].
+enum Pair<'a> {
+    /// Two records, compared by field name.
+    Records(&'a Record, &'a Record),
+    /// The elements of two lists, compared in order.
+    Lists(&'a [Value], &'a [Value]),
+}
+
+/// Whether the two records or lists of `first` are equal, deeply, comparing
+/// the records and lists nested in them through a work list rather than
+/// recursion.
+fn deep_equal(first: Pair<'_>) -> bool {
+    let mut pending = Vec::new();
+    let mut next = Some(first);
+    while let Some(pair) = next {
+        let equal = match pair {
+            Pair::Records(mine, theirs) => fields_equal(mine, theirs, &mut pending),
+            Pair::Lists(mine, theirs) => {
+                mine.len() == theirs.len()
+                    && mine
+                        .iter()
+                        .zip(theirs)
+                        .all(|(mine, theirs)| values_equal(mine, theirs, &mut pending))
+            }
+        };
+        if !equal {
             return false;
         }
-        while let Some((mine, theirs)) = pending.pop() {
-            if !fields_equal(mine, theirs, &mut pending) {
-                return false;
-            }
+        next = pending.pop();
+    }
+    true
+}
+
+/// Whether `mine` and `theirs` are equal, as far as can be told without
+/// looking inside nested records and lists: a pair of those is deferred to
+/// `pending` and counts as equal here, and every other pair of values is
+/// compared with `==`.
+fn values_equal<'a>(mine: &'a Value, theirs: &'a Value, pending: &mut Vec<Pair<'a>>) -> bool {
+    match (mine, theirs) {
+        (Value::Record(a), Value::Record(b)) => {
+            pending.push(Pair::Records(a, b));
+            true
         }
-        true
+        (Value::List(a), Value::List(b)) => {
+            pending.push(Pair::Lists(a.values(), b.values()));
+            true
+        }
+        _ => mine == theirs,
     }
 }
 
 /// Compares the fields of `mine` and `theirs`, deferring pairs of nested
-/// records to `pending` instead of recursing into them.
-fn fields_equal<'a>(
-    mine: &'a Record,
-    theirs: &'a Record,
-    pending: &mut Vec<(&'a Record, &'a Record)>,
-) -> bool {
+/// records and lists to `pending` instead of recursing into them.
+fn fields_equal<'a>(mine: &'a Record, theirs: &'a Record, pending: &mut Vec<Pair<'a>>) -> bool {
     if mine.values.len() != theirs.values.len() {
         return false;
     }
@@ -418,10 +571,8 @@ fn fields_equal<'a>(
         let Some(other) = other else {
             return false;
         };
-        match (value, other) {
-            (Value::Record(a), Value::Record(b)) => pending.push((a, b)),
-            _ if value == other => {}
-            _ => return false,
+        if !values_equal(value, other, pending) {
+            return false;
         }
     }
     true
@@ -429,9 +580,10 @@ fn fields_equal<'a>(
 
 /// The result of evaluating an expression.
 ///
-/// Strings and records have value semantics but are shared: cloning a
-/// `Value::Str` or a `Value::Record` increments a reference count and never
-/// copies the text or the fields. So does cloning a `Value::Fn`, whose
+/// Strings, records and lists have value semantics but are shared: cloning
+/// a `Value::Str`, a `Value::Record` or a `Value::List` increments a
+/// reference count, if any, and never copies the text, the fields or the
+/// elements. So does cloning a `Value::Fn`, whose
 /// closure is immutable, and a `Value::Future`, which is shared by
 /// reference: every copy is the same future, run at most once.
 #[derive(Clone, Debug, PartialEq)]
@@ -450,6 +602,8 @@ pub enum Value {
     /// A record with at least one field; the empty record is always
     /// [`Value::Empty`].
     Record(Rc<Record>),
+    /// A list, the empty one included.
+    List(List),
     /// A function: a closure over the values it captured.
     Fn(Rc<Closure>),
     /// A future: a deferred computation, run by its first await.
@@ -466,6 +620,7 @@ impl Value {
             Value::Bool(_) => ValueKind::Bool,
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
+            Value::List(_) => ValueKind::List,
             Value::Fn(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
         }
@@ -493,6 +648,8 @@ impl Value {
 /// `repr` form, so strings are quoted, as in
 /// `{x = 1; y = "a"; inner = {n = 2}}`; a field name that is not a plain
 /// identifier is quoted too (see [`FieldName`]). The empty record is `{}`.
+/// A list shows as its elements in order, in brackets, separated by `, `,
+/// each in `repr` form, as in `[1, "a", {n = 2}]`; the empty list is `[]`.
 ///
 /// A function shows as its type, `fn(x: Int): Int`, in both forms, since it
 /// has no source form of its own to show, and so does a future, as
@@ -517,6 +674,16 @@ impl fmt::Display for Value {
                     write!(f, "{} = {}", FieldName(text), value.repr())?;
                 }
                 f.write_str("}")
+            }
+            Value::List(list) => {
+                f.write_str("[")?;
+                for (index, value) in list.values().iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    value.repr().fmt(f)?;
+                }
+                f.write_str("]")
             }
             // `{:?}` would show NaN as `NaN`.
             Value::Float(value) if value.is_nan() => f.write_str("nan"),
@@ -894,6 +1061,109 @@ mod tests {
         assert_eq!(int_to_float(3), 3.0);
         assert_eq!(int_to_float(9_007_199_254_740_993), 9_007_199_254_740_992.0);
         assert_eq!(int_to_float(i64::MIN), -9_223_372_036_854_775_808.0);
+    }
+
+    // ----- Lists -----
+
+    fn list(values: Vec<Value>) -> Value {
+        Value::List(List::from_vec(values))
+    }
+
+    #[test]
+    fn lists_are_small_and_the_empty_list_allocates_nothing() {
+        assert_eq!(size_of::<List>(), 2 * size_of::<usize>());
+        assert_eq!(size_of::<Value>(), 24);
+        let empty = List::from_vec(Vec::new());
+        assert!(empty.is_empty());
+        assert!(empty.shares(&List::EMPTY));
+        assert_eq!(empty, List::EMPTY);
+        assert!(List::from_exact(std::iter::empty()).is_empty());
+        let one = List::from_exact([Value::Int(1)].into_iter());
+        assert_eq!(one.len(), 1);
+        assert_eq!(one.values(), &[Value::Int(1)]);
+        assert!(one.shares(&one.clone()));
+        assert!(!one.shares(&List::from_vec(vec![Value::Int(1)])));
+        assert_eq!(list(Vec::new()).kind(), ValueKind::List);
+    }
+
+    #[test]
+    fn lists_display_their_elements_in_repr_form() {
+        let mut names = Names::new();
+        let record = record(&layout(&mut names, &["n"]), vec![Value::Int(2)]);
+        let value = list(vec![
+            Value::Int(1),
+            string("a\n"),
+            record,
+            list(vec![Value::Float(1.0), list(Vec::new())]),
+            Value::Empty,
+        ]);
+        let shown = "[1, \"a\\n\", {n = 2}, [1.0, []], {}]";
+        assert_eq!(value.to_string(), shown);
+        assert_eq!(value.repr().to_string(), shown);
+        assert_eq!(list(Vec::new()).to_string(), "[]");
+        let inside = record_of_list(&mut names);
+        assert_eq!(inside.to_string(), "{xs = [\"b\"]}");
+    }
+
+    /// A record whose field `xs` is a list of one string.
+    fn record_of_list(names: &mut Names) -> Value {
+        record(&layout(names, &["xs"]), vec![list(vec![string("b")])])
+    }
+
+    #[test]
+    fn lists_compare_element_by_element_in_order() {
+        let mut names = Names::new();
+        let xs = |values: &[i64]| list(values.iter().map(|&value| Value::Int(value)).collect());
+        assert_eq!(xs(&[1, 2]), xs(&[1, 2]));
+        assert_ne!(xs(&[1, 2]), xs(&[2, 1]));
+        assert_ne!(xs(&[1, 2]), xs(&[1, 2, 3]));
+        assert_ne!(xs(&[1, 2, 3]), xs(&[1, 2]));
+        assert_eq!(xs(&[]), xs(&[]));
+        assert_ne!(xs(&[]), Value::Empty);
+        // Nested, and in records, deeply.
+        assert_eq!(list(vec![xs(&[1])]), list(vec![xs(&[1])]));
+        assert_ne!(list(vec![xs(&[1])]), list(vec![xs(&[2])]));
+        assert_eq!(record_of_list(&mut names), record_of_list(&mut names));
+        let floats = |value: f64| list(vec![Value::Float(value)]);
+        assert_eq!(floats(0.0), floats(-0.0));
+        assert_ne!(floats(f64::NAN), floats(f64::NAN));
+    }
+
+    /// A list nested `depth` deep, alternately in records through the
+    /// field `inner` if `records` says so, ending in `leaf`.
+    fn nested_list(names: &mut Names, depth: usize, records: bool, leaf: Value) -> Value {
+        let layout = layout(names, &["inner"]);
+        let mut value = leaf;
+        for index in 0..depth {
+            value = if records && index % 2 == 1 {
+                record(&layout, vec![value])
+            } else {
+                list(vec![Value::Int(0), value])
+            };
+        }
+        value
+    }
+
+    #[test]
+    fn comparing_and_dropping_deeply_nested_lists_does_not_recurse() {
+        // Far deeper than a test thread's stack could take recursively,
+        // lists in lists and lists and records alternately.
+        let mut names = Names::new();
+        for records in [false, true] {
+            let a = nested_list(&mut names, 1_000_000, records, Value::Int(0));
+            let b = nested_list(&mut names, 1_000_000, records, Value::Int(0));
+            let c = nested_list(&mut names, 1_000_000, records, Value::Int(1));
+            assert_eq!(a, b);
+            assert_ne!(a, c);
+            drop(a);
+            drop(b);
+            drop(c);
+        }
+        // A list still held elsewhere is released, not freed.
+        let inner = List::from_vec(vec![Value::Int(1)]);
+        let outer = list(vec![Value::List(inner.clone())]);
+        drop(outer);
+        assert_eq!(inner.values(), &[Value::Int(1)]);
     }
 
     // ----- Futures -----

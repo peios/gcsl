@@ -1,0 +1,13 @@
+# A deployment: its services, the ports they listen on, and a report.
+fn port(name: String) -> Int { if name == "web" { 8080 } else { 5432 } }
+# Each port is looked up lazily, so the list it returns holds futures.
+fn ports(names: String[]) -> Int[] { [lazy port(names[0]), lazy port(names[1])] }
+let names = ["web", "db"]
+let found = ports(names)
+# Elements expected present are awaited, each where it is written.
+let open: List<Present<Int>> = [22, found[0], found[1]]
+count = len(open)
+first = open[0]
+report = "{names}: {found}"
+same = open == [22, 8080, 5432]
+services = [...[{ name = "web"; replicas = 2 }], { name = "db"; replicas = 1 }]

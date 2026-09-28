@@ -614,6 +614,75 @@ fn every_stage_handles_maximum_record_depth() {
     });
 }
 
+/// Lists nest as deeply as the parser allows, through every stage: as
+/// literals, read back by chains of indexes, spread into each other,
+/// checked against list types as deep, compared and shown.
+#[test]
+fn every_stage_handles_maximum_list_depth() {
+    on_recommended_stack(|| {
+        let depth = gcsl::MAX_DEPTH - 1;
+        let nested =
+            |depth: usize, leaf: &str| format!("{}{leaf}{}", "[".repeat(depth), "]".repeat(depth));
+        let literal = nested(depth, "1");
+        let indexes = source(&format!("let xs = {literal}\nxs{}", "[0]".repeat(depth)));
+        let spreads = source(&format!(
+            "{}[1]{}",
+            "[...".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        ));
+        // Checked against the type level by level, each literal against
+        // its element type.
+        let ty = format!("Int{}", "[]".repeat(depth));
+        let annotated = source(&format!("let xs: {ty} = {literal}\nxs == xs"));
+        let lengths = source(&format!("len({})", nested(depth - 1, "1")));
+        // A deep await descends every level to the one future inside, far
+        // enough from the budget for its body to run.
+        let lazy_depth = gcsl::MAX_DEPTH / 2;
+        let awaited = source(&format!(
+            "let xs = {}\n\"{{xs}}\"",
+            nested(lazy_depth, "1, lazy 2")
+        ));
+        // Each program, and whether its value, shown, is what it should be.
+        let deep = |shown: &str| {
+            // The future, awaited, shows as its value.
+            shown.starts_with("[[[") && shown.trim_end_matches(']').ends_with("[1, 2")
+        };
+        for (file, expected, print) in [
+            (
+                &indexes,
+                (|shown: &str| shown == "1") as fn(&str) -> bool,
+                true,
+            ),
+            (&spreads, |shown| shown == "[1]", false),
+            (&annotated, |shown| shown == "true", false),
+            (&lengths, |shown| shown == "1", false),
+            (&awaited, deep, false),
+        ] {
+            let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+            let shown = gcsl::eval::eval(&ir).unwrap().to_string();
+            assert!(expected(&shown), "{}", shown.get(..50).unwrap_or(&shown));
+            // (Annotating every node with its type would show types of
+            // every depth, in time quadratic in the depth, as for records.)
+            if print {
+                assert!(!ast.pretty().to_string().is_empty());
+                assert!(!ir.pretty(ast.names()).to_string().is_empty());
+            }
+        }
+        // Showing the deepest list's type.
+        let mut session = Session::new();
+        session.eval(&source(&literal)).unwrap();
+        let ty = session
+            .types()
+            .display(session.value_type(), session.names())
+            .to_string();
+        assert!(ty.starts_with("List<List<") && ty.trim_end_matches('>').ends_with("<Int"));
+    });
+}
+
 #[test]
 fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
     on_recommended_stack(|| {
@@ -674,6 +743,12 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
                 ">".repeat(200_000)
             ),
             format!("let x: Int{} = 1", " | Int".repeat(200_000)),
+            // Lists, indexes and list types.
+            format!("{}1{}", "[".repeat(200_000), "]".repeat(200_000)),
+            format!("{}1{}", "[...".repeat(200_000), "]".repeat(200_000)),
+            format!("x{}", "[0]".repeat(200_000)),
+            format!("{}0{}", "x[".repeat(200_000), "]".repeat(200_000)),
+            format!("let x: Int{} = 1", "[]".repeat(200_000)),
         ] {
             let diagnostics = run(&text).unwrap_err();
             assert_eq!(diagnostics[0].message, "expression nested too deeply");
@@ -728,6 +803,17 @@ struct Nesting {
 /// recursive call in.
 const WRAP: usize = 60;
 
+/// `inner` wrapped in `WRAP` levels of lists: half of them literals, each
+/// the only element of the one around it, and half indexes reading it back.
+fn wrap_in_lists(inner: &str) -> String {
+    format!(
+        "{}{inner}{}{}",
+        "[".repeat(WRAP / 2),
+        "]".repeat(WRAP / 2),
+        "[0]".repeat(WRAP / 2)
+    )
+}
+
 /// `STACK_SIZE` covers the nesting budget, unoptimised, whatever kind of
 /// nesting the calls are made from: for each costly kind, a recursion whose
 /// recursive call is wrapped in that nesting, and whose deepest frame is as
@@ -777,6 +863,12 @@ fn the_nesting_budget_fits_the_stack_for_every_kind_of_nesting() {
                     )
                 },
                 value: |calls| Value::Int(calls * i64::try_from(WRAP / 2).unwrap() - 1),
+            },
+            Nesting {
+                name: "list literals and indexes",
+                ret: "Int",
+                wrap: wrap_in_lists,
+                value: |_| Value::Int(-1),
             },
         ];
         // In the function's body, the block (0), the `if` (1) and the
@@ -1595,5 +1687,77 @@ fn a_mismatch_shows_an_inferred_result() {
          \x20 | ^   --- ascribed here\n\
          \x20 | |\n\
          \x20 | expected Int, found {a: Int, b: String}\n"
+    );
+}
+
+#[test]
+fn programs_with_lists() {
+    let cases = [
+        ("let xs: List<Int> = [1, 2, 3]\nxs[0]", "1 : Int"),
+        (
+            "let xs = [1, 2]\nlet ys: Int[] = [...xs, 3]\nys",
+            "[1, 2, 3] : List<Int>",
+        ),
+        ("len([1, 2, 3, 4])", "4 : Int"),
+        ("[1, 2, 3] == [1, 2, 3]", "true : Bool"),
+        ("\"{[1, 2]}\"", "\"[1, 2]\" : String"),
+        ("[\"a\", \"b\"]", "[\"a\", \"b\"] : List<String>"),
+        ("[1, 2.5]", "[1.0, 2.5] : List<Float>"),
+        ("[1, lazy 2]", "[1, Future<Int>] : List<Int | Future<Int>>"),
+        ("let e: Int[] = []\ne", "[] : List<Int>"),
+        (
+            "[{ name = \"a\"; port = 1 }, { name = \"b\" }]",
+            "[{name = \"a\"; port = 1}, {name = \"b\"}] : List<{name: String}>",
+        ),
+        (
+            "fn ports() -> Int[] { [80, lazy 443] }\nlet ps = ports()\n\"{ps}\"",
+            "\"[80, 443]\" : String",
+        ),
+        (
+            "fn first(xs: Int[]): Int { xs[0] }\nfirst([7, 8])",
+            "7 : Int",
+        ),
+        (
+            "fn total(xs: Int[]) -> Int {\n  if len(xs) == 0 { 0 } else { xs[0] + xs[len(xs) - 1] }\n}\n\
+             total([1, lazy 2, 3])",
+            "4 : Int",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn an_index_out_of_range_renders_exactly() {
+    assert_eq!(
+        rendered("let xs = [1, 2, 3]\nxs[5]\n"),
+        "error: index out of range\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         2 | xs[5]\n\
+         \x20 | ^^^^^ the index is 5, and the list has 3 elements\n"
+    );
+    assert_eq!(
+        rendered("[1][-1]\n"),
+        "error: index out of range\n\
+         \x20--> calc.gcsl:1:1\n\
+         \x20 |\n\
+         1 | [1][-1]\n\
+         \x20 | ^^^^^^^ the index is -1\n"
+    );
+}
+
+#[test]
+fn list_elements_without_a_join_render_exactly() {
+    assert_eq!(
+        rendered("let ports = [8080, 8443,\n  \"9000\"]\n"),
+        "error: list elements have different types\n\
+         \x20--> calc.gcsl:2:3\n\
+         \x20 |\n\
+         1 | let ports = [8080, 8443,\n\
+         \x20 |              ---- the elements so far are Int\n\
+         2 |   \"9000\"]\n\
+         \x20 |   ^^^^^^ this is String\n"
     );
 }

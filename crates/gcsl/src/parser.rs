@@ -39,9 +39,10 @@
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
 //! function's return marker), `->>` and `->`, and after `=`, `:=` and
 //! `let`. There
-//! the parser skips newlines before going on. Directly inside parentheses
-//! and interpolations the lexer emits no newlines at all, so an expression,
-//! a parameter list or an argument list there may span lines freely; a
+//! the parser skips newlines before going on. Directly inside parentheses,
+//! brackets and interpolations the lexer emits no newlines at all, so an
+//! expression, a parameter list, an argument list, a list literal or an
+//! index there may span lines freely; a
 //! block inside them is newline-sensitive again, so a multi-line block or
 //! function body may be passed as an argument.
 //!
@@ -57,8 +58,8 @@
 //! # Types
 //!
 //! A type is a name, such as `Int`, a name applied to a type argument, such
-//! as `Future<Int>`, a record type, a function type, a type in parentheses,
-//! or a union of types. A
+//! as `Future<Int>` or `List<Int>`, a record type, a function type, a type
+//! in parentheses, a list type written `T[]`, or a union of types. A
 //! record type is `{` then `}`, or `NAME: TYPE` entries separated by `,`,
 //! with an optional trailing `,`, then `}`. The lexer does not know it is
 //! in a type, so it emits the newlines inside the braces, and the parser
@@ -84,6 +85,14 @@
 //! are skipped after `<`, `|` and `(`, as after `:`. In expression position
 //! `|` is not an operator, so it is "expected expression".
 //!
+//! `T[]` is a postfix on any type that is not a union (a *member*, as
+//! `Parser::parse_type_member` parses it), repeatable, so `Int[][]` is a
+//! list of lists, `{a: Int}[]` and `(fn(): Int)[]` are lists, and `Int |
+//! Future<Int>[]` is the union of `Int` and a future of a list, which the
+//! checker rejects. A `[` after a type is this postfix only if a `]`
+//! follows it directly; in `fn(): Int[]` it belongs to the return type,
+//! which is parsed first.
+//!
 //! # Functions and calls
 //!
 //! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
@@ -102,6 +111,23 @@
 //! same line starts a trailing block: an ordinary block, passed as the
 //! call's last argument. The parser accepts arguments in any order; binding
 //! them to parameters is the checker's business.
+//!
+//! # Lists
+//!
+//! A list literal is `[`, elements separated by `,` with an optional
+//! trailing `,`, and `]`; `[]` is the empty list. An element is an
+//! expression, or `...` and an expression, a spread, parsed at minimum
+//! binding power 0 as any element is, so `...a + b` spreads `a + b`. A
+//! `...` anywhere else is an error, "`...` is only allowed in a list".
+//! Directly inside `[ ]` the lexer emits no newlines, as inside `( )`, so a
+//! literal may span lines.
+//!
+//! An index, `EXPR[INDEX]`, is a postfix operator, binding as tightly as a
+//! call and a field access and chaining with them: `f(x)[0].name[1]`. Like a
+//! trailing block, it must start on the line its operand ends on: after a
+//! newline the item has ended, so a `[` starting a line begins a list
+//! literal, the next item. Inside brackets, where there are no newline
+//! tokens, a `[` on the next line is still an index.
 //!
 //! # Futures
 //!
@@ -139,8 +165,9 @@
 //! function, [`Parser::parse_expr`], parses any expression whose operators
 //! bind at least as tightly as a given *minimum binding power*. It first
 //! parses a *prefix* expression (a literal, a name, a string, a
-//! parenthesised expression, a block, an `if`, a function expression, a
-//! `lazy`, or a prefix operator applied to an operand), which becomes the
+//! parenthesised expression, a block, a list literal, an `if`, a function
+//! expression, a `lazy`, or a prefix operator applied to an operand), which
+//! becomes the
 //! left-hand side. Then it loops: if the
 //! next token is a binary operator whose left binding power is at least the
 //! minimum, it consumes the operator, parses the right-hand side by calling
@@ -163,6 +190,7 @@
 //! | prefix `-` and `await`      | (none)  | operand parsed with min 13 |
 //! | postfix `.` NAME            | 15      | (none: takes a name)       |
 //! | postfix call `(`...`)` `{`  | 15      | (none: arguments at min 0) |
+//! | postfix index `[`...`]`     | 15      | (none: position at min 0)  |
 //!
 //! A tighter operator has higher powers, so in `1 + 2 * 3` the recursive
 //! call for the right-hand side of `+` (minimum 8) still accepts `*` (left
@@ -196,7 +224,8 @@
 //!
 //! A call binds exactly as tightly as field access, in the same loop, so
 //! `a.b(1).c` is `((a.b)(1)).c`, `-f(1)` is `-(f(1))` and `f(1)(2)` calls
-//! the result of `f(1)`. Each argument is parsed at minimum 0.
+//! the result of `f(1)`. Each argument is parsed at minimum 0. So does an
+//! index, whose position is parsed at minimum 0 too.
 //!
 //! Negation is its own token, [`TokenKind::Neg`], distinct from subtraction's
 //! [`TokenKind::Minus`]; the lexer tells them apart by spacing. `Neg` is only
@@ -226,22 +255,28 @@
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
 //! two ways. Parentheses, prefix operators (`await` included), blocks, `if`s,
-//! interpolations, function expressions, `lazy`s, argument lists, and
+//! interpolations, function expressions, `lazy`s, argument lists, list
+//! literals, indexes, and
 //! record, function, applied and parenthesised types nest by recursion, so
 //! [`Parser::parse_expr`], the body of every nested block, every `else if`
 //! and every record, function, applied and parenthesised type count their
 //! own depth and stop before the recursion itself could overflow; a
-//! function expression, a `lazy` and an argument list recurse only through
-//! those.
-//! Left-associative chains such as `1 + 1 + 1`, `a.b.c` or a union of many
-//! types nest without recursion, since the loop folds each operator into the
+//! function expression, a `lazy`, an argument list, a list literal and an
+//! index recurse only through those.
+//! Left-associative chains such as `1 + 1 + 1`, `a.b.c`, `xs[0][0]`, a
+//! union of many types or `Int[][]` nest without recursion, since the loop
+//! folds each operator into the
 //! left-hand side, so the parser also tracks the height of every node it
 //! allocates, a block being one above the tallest of its items' expressions
 //! and types, an `if` or an interpolation one above its tallest child, a
+//! list literal one above its tallest element (a spread's being its
+//! expression's), an index one above the taller of its list and its
+//! position, a
 //! field access one above its record, an ascription one above the taller of
 //! its expression and its type (a record type being one above its tallest
 //! field type, a function type one above the tallest of its parameter and
-//! return types, an applied type one above its argument, a parenthesised
+//! return types, an applied type one above its argument, a `T[]` one above
+//! `T`, a parenthesised
 //! type one above the type inside, though it leaves no node of its own, and
 //! a union one above the taller of its two sides), a function expression
 //! one above the tallest of its parameter types, its return type and its
@@ -255,9 +290,9 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTy, FnDecl, Item,
-    ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart, TypeExpr,
-    TypeExprId, TypeExprKind, UnaryOp,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
+    FnDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart,
+    TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -294,6 +329,11 @@ const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 /// The error for a function, or a function type, without a return marker.
 const MISSING_RETURN_TYPE: &str =
     "expected `:`, `->` or `->>` and a return type after the parameters";
+
+/// The error for a `...` that does not start an element of a list literal.
+/// (Where else a spread is allowed, as in a record once record spreads
+/// exist, is added here.)
+const MISPLACED_SPREAD: &str = "`...` is only allowed in a list";
 
 /// The note on [`MISSING_RETURN_TYPE`].
 const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
@@ -354,6 +394,7 @@ pub(crate) fn parse_parts(
         param_stack: Vec::new(),
         param_ty_stack: Vec::new(),
         arg_stack: Vec::new(),
+        element_stack: Vec::new(),
         path: Vec::new(),
         no_trailing_block: false,
         diagnostics: Vec::new(),
@@ -416,6 +457,10 @@ struct Parser<'a> {
     /// The arguments of the calls being parsed, innermost last, moved to
     /// the builder's argument pool as each call ends, as for `item_stack`.
     arg_stack: Vec<Arg>,
+    /// The elements of the list literals being parsed, innermost last,
+    /// moved to the builder's element pool as each literal ends, as for
+    /// `item_stack`.
+    element_stack: Vec<Element>,
     /// The segments of the path being read, moved to the builder's path
     /// pool once it is complete. Reading a path never starts another, so
     /// one buffer serves them all.
@@ -784,8 +829,36 @@ impl Parser<'_> {
 
     /// Parses a type that is not a union, unless in parentheses: a name, an
     /// applied type, a record type, a function type or a parenthesised
-    /// type. Returns it and its height, as [`Parser::parse_type`] does.
+    /// type, followed by any number of `[]`, each making a list type of the
+    /// type before it. Returns it and its height, as [`Parser::parse_type`]
+    /// does, one more for each `[]`.
     fn parse_type_member(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let (mut ty, mut height) = self.parse_type_atom()?;
+        // Repeated `[]`s are built by this loop, not by recursion, so their
+        // height is checked here.
+        while self.peek().kind == TokenKind::LBracket && self.peek_at(1).kind == TokenKind::RBracket
+        {
+            let close = self.peek_at(1);
+            self.advance();
+            self.advance();
+            let span = Span::join(self.type_span(ty), close.span);
+            height = height.saturating_add(1);
+            if height as usize > MAX_DEPTH {
+                return Err(self.too_deep(span));
+            }
+            ty = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::List(ty),
+                span,
+            });
+        }
+        Ok((ty, height))
+    }
+
+    /// Parses a type that is neither a union nor a list type written `T[]`,
+    /// unless in parentheses: a name, an applied type, a record type, a
+    /// function type or a parenthesised type. Returns it and its height, as
+    /// [`Parser::parse_type`] does.
+    fn parse_type_atom(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let token = self.peek();
         match token.kind {
             TokenKind::Ident(name) if self.peek_at(1).kind == TokenKind::Lt => {
@@ -1088,6 +1161,13 @@ impl Parser<'_> {
                 lhs = self.parse_call(lhs)?;
                 continue;
             }
+            if token.kind == TokenKind::LBracket {
+                if FIELD_BP < min_bp {
+                    break;
+                }
+                lhs = self.parse_index(lhs)?;
+                continue;
+            }
             if token.kind == TokenKind::Dot {
                 if FIELD_BP < min_bp {
                     break;
@@ -1156,9 +1236,10 @@ impl Parser<'_> {
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
-    /// block, an `if`, a function expression, a `lazy` or a prefix operator
-    /// application. Postfix operators, `.` and calls included, are applied
-    /// by the caller's loop.
+    /// block, a list literal, an `if`, a function expression, a `lazy` or a
+    /// prefix operator application. Postfix operators, `.`, calls and
+    /// indexes included, are applied by the caller's loop. A `...` here is
+    /// not the start of a list's element, and so an error.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
         let token = self.peek();
         let kind = match token.kind {
@@ -1201,6 +1282,8 @@ impl Parser<'_> {
                 );
             }
             TokenKind::LBrace => return self.parse_block(),
+            TokenKind::LBracket => return self.parse_list(),
+            TokenKind::DotDotDot => return Err(self.error(MISPLACED_SPREAD, token.span)),
             TokenKind::Minus
             | TokenKind::Plus
             | TokenKind::Star
@@ -1226,6 +1309,7 @@ impl Parser<'_> {
             | TokenKind::Eq
             | TokenKind::RParen
             | TokenKind::RBrace
+            | TokenKind::RBracket
             | TokenKind::StrMid(_)
             | TokenKind::StrEnd(_)
             | TokenKind::Semi
@@ -1427,6 +1511,94 @@ impl Parser<'_> {
                 return Ok(close.span);
             }
         }
+    }
+
+    /// Parses a list literal, starting at its `[`: its elements, each an
+    /// expression or `...` and one, separated by `,` with an optional
+    /// trailing `,`, through its `]`.
+    fn parse_list(&mut self) -> ParseResult<ExprId> {
+        let open = self.peek();
+        self.advance();
+        let base = self.element_stack.len();
+        let mut tallest = 0;
+        // Elements are inside brackets.
+        let outer = std::mem::replace(&mut self.no_trailing_block, false);
+        let close = self.parse_elements(open, &mut tallest);
+        self.no_trailing_block = outer;
+        let close = close?;
+        let elements = self.builder.push_elements(&self.element_stack[base..]);
+        self.element_stack.truncate(base);
+        self.alloc(
+            ExprKind::List(elements),
+            Span::join(open.span, close),
+            tallest + 1,
+        )
+    }
+
+    /// Parses the elements of a list literal after its `[`, `open`, through
+    /// its `]`, whose span it returns, pushing each on `element_stack` and
+    /// raising `tallest` to the tallest's height, a spread's being its
+    /// expression's.
+    fn parse_elements(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Span> {
+        loop {
+            let token = self.peek();
+            if token.kind == TokenKind::RBracket {
+                self.advance();
+                return Ok(token.span);
+            }
+            let spread = if token.kind == TokenKind::DotDotDot {
+                self.advance();
+                Some(token.span)
+            } else {
+                None
+            };
+            let value = self.parse_expr(0)?;
+            *tallest = (*tallest).max(self.height_of(value));
+            self.element_stack.push(Element { value, spread });
+            let separator = self.peek();
+            match separator.kind {
+                TokenKind::Comma => self.advance(),
+                TokenKind::RBracket => {
+                    self.advance();
+                    return Ok(separator.span);
+                }
+                _ => {
+                    let found = self.describe(separator);
+                    return Err(self.report(
+                        Diagnostic::error(
+                            format!("expected `,` or `]`, found {found}"),
+                            error_span(separator),
+                        )
+                        .with_context(open.span, "unclosed `[`"),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Parses the index of `list`, starting at its `[`: the position,
+    /// parsed at minimum binding power 0, and the `]`. The index spans
+    /// `list` through the `]`.
+    fn parse_index(&mut self, list: ExprId) -> ParseResult<ExprId> {
+        let open = self.peek();
+        self.advance();
+        // The position is inside brackets.
+        let outer = std::mem::replace(&mut self.no_trailing_block, false);
+        let index = self.parse_expr(0);
+        self.no_trailing_block = outer;
+        let index = index?;
+        let close = self.peek();
+        if close.kind != TokenKind::RBracket {
+            let found = self.describe(close);
+            return Err(self.report(
+                Diagnostic::error(format!("expected `]`, found {found}"), error_span(close))
+                    .with_context(open.span, "unclosed `[`"),
+            ));
+        }
+        self.advance();
+        let height = self.height_of(list).max(self.height_of(index)) + 1;
+        let span = Span::join(self.span_of(list), close.span);
+        self.alloc(ExprKind::Index { expr: list, index }, span, height)
     }
 
     /// Parses a prefix operator `op`, the current token, and its operand,
@@ -1718,8 +1890,11 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::RParen
         | TokenKind::LBrace
         | TokenKind::RBrace
+        | TokenKind::LBracket
+        | TokenKind::RBracket
         | TokenKind::Semi
         | TokenKind::Dot
+        | TokenKind::DotDotDot
         | TokenKind::Comma
         | TokenKind::Newline
         | TokenKind::Eof => None,
@@ -1867,6 +2042,11 @@ mod tests {
                 type_name(ast, rhs, out);
                 out.push(')');
             }
+            TypeExprKind::List(element) => {
+                out.push('(');
+                type_name(ast, element, out);
+                out.push_str(")[]");
+            }
         }
     }
 
@@ -1965,7 +2145,33 @@ mod tests {
             }
             ExprKind::Fn(function) => fn_shape(ast, function, out),
             ExprKind::Call { callee, args } => call_shape(ast, callee, args, out),
+            ExprKind::List(elements) => list_shape(ast, elements, out),
+            ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
         }
+    }
+
+    /// An index as `(xs at 0)`.
+    fn index_shape(ast: &Ast, (list, index): (ExprId, ExprId), out: &mut String) {
+        out.push('(');
+        expr(ast, list, out);
+        out.push_str(" at ");
+        expr(ast, index, out);
+        out.push(')');
+    }
+
+    /// A list literal as `list(1, ...xs)`.
+    fn list_shape(ast: &Ast, elements: crate::ast::ElementRange, out: &mut String) {
+        out.push_str("list(");
+        for (index, element) in ast.elements(elements).iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            if element.spread.is_some() {
+                out.push_str("...");
+            }
+            expr(ast, element.value, out);
+        }
+        out.push(')');
     }
 
     /// A function expression as `fn(x: Int): Int {..}`, `->> Int` if
@@ -4474,6 +4680,265 @@ mod tests {
         );
         assert_eq!(
             too_deep(union(200_000)).message,
+            "expression nested too deeply"
+        );
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn list_literals() {
+        assert_eq!(shape("[]"), "list()");
+        assert_eq!(shape("[1]"), "list(1)");
+        assert_eq!(shape("[1, 2,]"), "list(1, 2)");
+        assert_eq!(
+            shape("[[1], [], [[2]]]"),
+            "list(list(1), list(), list(list(2)))"
+        );
+        // A spread takes a whole element, parsed as any element is.
+        assert_eq!(
+            shape("[...xs, 1 + 2, ...a + b]"),
+            "list(...xs, (1 + 2), ...(a + b))"
+        );
+        assert_eq!(shape("[...[...xs]]"), "list(...list(...xs))");
+        // Across lines, with blocks and records inside.
+        assert_eq!(shape("[\n  1,\n  2\n]"), "list(1, 2)");
+        assert_eq!(
+            shape("[\n  { a = 1\n    b = 2 },\n  {}\n]"),
+            "list({a = 1; b = 2}, {})"
+        );
+        // An `if` condition may hold a list.
+        assert_eq!(shape("if xs == [] { 1 }"), "(if (xs == list()) {1})");
+        let ast = parse_text("[1, ...xs]").unwrap();
+        let list = ast.get(only_value(&ast));
+        assert_eq!(list.span, Span::new(0, 10));
+        let ExprKind::List(elements) = list.kind else {
+            panic!("expected a list, got {list:?}");
+        };
+        let [first, second] = ast.elements(elements) else {
+            panic!("expected two elements");
+        };
+        assert_eq!(first.spread, None);
+        assert_eq!(first.span(&ast), Span::new(1, 2));
+        assert_eq!(second.spread, Some(Span::new(4, 7)));
+        assert_eq!(second.span(&ast), Span::new(4, 9));
+        assert_eq!(ast.get(second.value).span, Span::new(7, 9));
+    }
+
+    #[test]
+    fn indexes_chain_with_calls_and_field_access() {
+        assert_eq!(shape("xs[0]"), "(xs at 0)");
+        assert_eq!(shape("xs[0][1]"), "((xs at 0) at 1)");
+        assert_eq!(shape("f(x)[0].name[1]"), "(((f(x) at 0) . name) at 1)");
+        assert_eq!(shape("xs[i + 1]"), "(xs at (i + 1))");
+        assert_eq!(shape("[1, 2][0]"), "(list(1, 2) at 0)");
+        assert_eq!(shape("-xs[0] * 2"), "((-(xs at 0)) * 2)");
+        assert_eq!(shape("xs[0](1)"), "(xs at 0)(1)");
+        assert_eq!(shape("a : Int[0]"), "((a : Int) at 0)");
+        // A position may span lines, as inside any brackets.
+        assert_eq!(shape("xs[\n  0\n]"), "(xs at 0)");
+        let ast = parse_text("xs [ 1 ]").unwrap();
+        let index = ast.get(only_value(&ast));
+        assert_eq!(index.span, Span::new(0, 8));
+        assert_eq!(index.bracket_span(&ast), Some(Span::new(2, 8)));
+        let ExprKind::Index { expr, index } = index.kind else {
+            panic!("expected an index, got {index:?}");
+        };
+        assert_eq!(ast.get(expr).span, Span::new(0, 2));
+        assert_eq!(ast.get(index).span, Span::new(5, 6));
+    }
+
+    #[test]
+    fn a_bracket_after_a_newline_starts_a_list() {
+        // The item has ended, so the `[` starts the next one.
+        assert_eq!(shape("xs\n[0]"), "xs; list(0)");
+        assert_eq!(shape("let x = f(1)\n[1, 2]"), "let x = f(1); list(1, 2)");
+        // Inside parentheses and brackets there are no newline tokens, so
+        // it is still an index.
+        assert_eq!(shape("(xs\n[0])"), "[(xs at 0)]");
+        assert_eq!(shape("[xs\n[0]]"), "list((xs at 0))");
+    }
+
+    #[test]
+    fn list_types() {
+        assert_eq!(shape("let x: List<Int> = y"), "let x: List<Int> = y");
+        assert_eq!(shape("let x: Int[] = y"), "let x: (Int)[] = y");
+        assert_eq!(shape("let x: Int[][] = y"), "let x: ((Int)[])[] = y");
+        assert_eq!(shape("let x: {a: Int}[] = y"), "let x: ({a: Int})[] = y");
+        assert_eq!(
+            shape("let x: Future<Int>[] = y"),
+            "let x: (Future<Int>)[] = y"
+        );
+        assert_eq!(shape("let x: List<Int>[] = y"), "let x: (List<Int>)[] = y");
+        assert_eq!(
+            shape("let x: (fn(): Int)[] = y"),
+            "let x: (fn(): Int)[] = y"
+        );
+        assert_eq!(
+            shape("let x: (Int | Future<Int>)[] = y"),
+            "let x: ((Int | Future<Int>))[] = y"
+        );
+        // The postfix binds tighter than `|`, and belongs to a function
+        // type's return type.
+        assert_eq!(
+            shape("let x: Int | Future<Int>[] = y"),
+            "let x: (Int | (Future<Int>)[]) = y"
+        );
+        assert_eq!(shape("let x: fn(): Int[] = y"), "let x: fn(): (Int)[] = y");
+        assert_eq!(
+            shape("fn(xs: Int[]): Int[] { xs }"),
+            "fn(xs: (Int)[]): (Int)[] {xs}"
+        );
+        let ast = parse_text("let x: Int[][] = y").unwrap();
+        let ItemKind::Let { ty: Some(ty), .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an annotated let");
+        };
+        let outer = ast.type_expr(ty);
+        assert_eq!(outer.span, Span::new(7, 14));
+        let TypeExprKind::List(inner) = outer.kind else {
+            panic!("expected a list type, got {outer:?}");
+        };
+        assert_eq!(ast.type_expr(inner).span, Span::new(7, 12));
+        // A `[` not directly followed by `]` is not part of the type.
+        assert_eq!(
+            error("let x: Int[3] = y"),
+            (
+                "expected `=` after variable name".to_owned(),
+                Span::new(10, 11)
+            )
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_lists() {
+        let ast = parse_text(
+            "let x: Int[] = [1, ...ys]\nx[0]\nlet f: (fn(): Int)[] = g\nlet u: (Int | \
+             Future<Int>)[][] = v\nlet r: fn(): List<Int>[] = h",
+        )
+        .unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (let x : Int[] @0..25\n\
+             \x20   (list @15..25\n\
+             \x20     (int 1 @16..17)\n\
+             \x20     (spread\n\
+             \x20       (name ys @22..24))))\n\
+             \x20 (expr @26..30\n\
+             \x20   (index @26..30\n\
+             \x20     (name x @26..27)\n\
+             \x20     (int 0 @28..29)))\n\
+             \x20 (let f : (fn(): Int)[] @31..55\n\
+             \x20   (name g @54..55))\n\
+             \x20 (let u : (Int | Future<Int>)[][] @56..90\n\
+             \x20   (name v @89..90))\n\
+             \x20 (let r : fn(): List<Int>[] @91..119\n\
+             \x20   (name h @118..119)))"
+        );
+    }
+
+    #[test]
+    fn list_errors() {
+        // A spread anywhere an expression starts, but in a list.
+        for (text, at) in [
+            ("...xs", 0),
+            ("f(...xs)", 2),
+            ("let x = ...xs", 8),
+            ("[(...xs)]", 2),
+        ] {
+            assert_eq!(
+                error(text),
+                (
+                    "`...` is only allowed in a list".to_owned(),
+                    Span::new(at, at + 3)
+                ),
+                "{text}"
+            );
+        }
+        let diagnostic = parse_text("[1 2]").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `,` or `]`, found `2`");
+        assert_eq!(diagnostic.span, Span::new(3, 4));
+        assert_eq!(labels(&diagnostic), vec![(Span::new(0, 1), "unclosed `[`")]);
+        assert_eq!(
+            error("[1, 2"),
+            (
+                "expected `,` or `]`, found end of input".to_owned(),
+                Span::new(5, 5)
+            )
+        );
+        assert_eq!(
+            error("[,]"),
+            ("expected expression, found `,`".to_owned(), Span::new(1, 2))
+        );
+        assert_eq!(
+            error("]"),
+            ("expected expression, found `]`".to_owned(), Span::new(0, 1))
+        );
+        let diagnostic = parse_text("xs[0").unwrap_err();
+        assert_eq!(diagnostic.message, "expected `]`, found end of input");
+        assert_eq!(labels(&diagnostic), vec![(Span::new(2, 3), "unclosed `[`")]);
+        assert_eq!(
+            error("xs[]"),
+            ("expected expression, found `]`".to_owned(), Span::new(3, 4))
+        );
+        assert_eq!(
+            error("xs[0, 1]"),
+            ("expected `]`, found `,`".to_owned(), Span::new(4, 5))
+        );
+    }
+
+    #[test]
+    fn lists_and_indexes_count_towards_depth() {
+        // N nested literals around a literal are N + 1 levels.
+        let nested = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let deepest = nested(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(nested(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(nested(200_000)).message,
+            "expression nested too deeply"
+        );
+        // A spread is as tall as its expression.
+        let spreads = |depth: usize| format!("{}1{}", "[...".repeat(depth), "]".repeat(depth));
+        let deepest = spreads(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(spreads(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        // A chain of N indexes on a name is N + 1 levels, built without
+        // recursion; so is N nested in each other's positions.
+        let chain = |depth: usize| format!("x{}", "[0]".repeat(depth));
+        let deepest = chain(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(chain(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(chain(200_000)).message,
+            "expression nested too deeply"
+        );
+        let positions = |depth: usize| format!("{}0{}", "x[".repeat(depth), "]".repeat(depth));
+        let deepest = positions(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(positions(200_000)).message,
+            "expression nested too deeply"
+        );
+        // N `[]`s on a name are N + 1 levels of type.
+        let ty = |depth: usize| format!("let x: Int{} = y", "[]".repeat(depth));
+        let deepest = ty(MAX_DEPTH - 1);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(ty(MAX_DEPTH)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(ty(200_000)).message,
             "expression nested too deeply"
         );
     }

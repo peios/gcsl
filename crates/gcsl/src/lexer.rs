@@ -3,19 +3,21 @@
 //! A hand-written pass over the source bytes. Spaces, tabs, `\r` and
 //! comments (`#` to end of line) are skipped. Each `\n` becomes a
 //! [`TokenKind::Newline`] token, because newlines separate items, except
-//! where the innermost open bracket is a `(`, or an interpolation's `{`: the
-//! lexer keeps a stack of the open brackets, and emits no `Newline` while a
-//! `(` is on top, so an expression, a parameter list or an argument list in
-//! parentheses may span lines freely, nor directly inside an interpolation
-//! (see [String literals](#string-literals)). A `{` on top makes newlines
-//! significant again, since a block body is newline-sensitive wherever it
-//! is written: a block or a function body passed as an argument inside a
-//! call's parentheses, `f({ ... })` or `f(fn(): Int { ... })`, may span
-//! lines, and so may one inside an interpolation. The stack is one byte per
-//! open bracket, and a program with no bracket allocates nothing for it. An
-//! unmatched closing bracket, which the parser reports, closes nothing: a
-//! `)` closes only a `(` on top of the stack, and a `}` closes the nearest
-//! `{`, together with any `(` left open inside it.
+//! where the innermost open bracket is a `(` or a `[`, or an
+//! interpolation's `{`: the lexer keeps a stack of the open brackets, and
+//! emits no `Newline` while a `(` or a `[` is on top, so an expression, a
+//! parameter list, an argument list or a list literal in brackets may span
+//! lines freely, nor directly inside an interpolation (see [String
+//! literals](#string-literals)). A `{` on top makes newlines significant
+//! again, since a block body is newline-sensitive wherever it is written: a
+//! block or a function body passed as an argument inside a call's
+//! parentheses, `f({ ... })` or `f(fn(): Int { ... })`, or written as an
+//! element of a list, may span lines, and so may one inside an
+//! interpolation. The stack is one byte per open bracket, and a program
+//! with no bracket allocates nothing for it. An unmatched closing bracket,
+//! which the parser reports, closes nothing: a `)` closes only a `(` on top
+//! of the stack, a `]` only a `[` on top, and a `}` closes the nearest `{`,
+//! together with any `(` or `[` left open inside it.
 //!
 //! Identifiers are interned into a [`Names`] table as they are lexed, so a
 //! [`TokenKind::Ident`] carries a [`Name`], not text. An identifier starts
@@ -36,9 +38,14 @@
 //! `|` is a [`TokenKind::Pipe`], used only in union types. `!` is only
 //! accepted as part of `!=` or `!==`; negation is `not`. A `.` is part of a
 //! number literal only between two digits, as in
-//! `1.5`; anywhere else it is a [`TokenKind::Dot`], so `1.x` is `1`, `.`,
-//! `x`. A `,` is a [`TokenKind::Comma`], which separates the fields of a
-//! record type, the parameters of a function and the arguments of a call.
+//! `1.5`; three dots in a row are one [`TokenKind::DotDotDot`], the spread
+//! of a list element; anywhere else a `.` is a [`TokenKind::Dot`], so `1.x`
+//! is `1`, `.`, `x`, and `..` is two `Dot`s. A `,` is a
+//! [`TokenKind::Comma`], which separates the fields of a record type, the
+//! parameters of a function, the arguments of a call and the elements of a
+//! list. `[` and `]` are [`TokenKind::LBracket`] and
+//! [`TokenKind::RBracket`], which delimit list literals and indexes and end
+//! the list type sugar `T[]`.
 //!
 //! A `-` that is not inside an identifier is classified from the bytes
 //! either side of it (see `Lexer::minus`). Directly followed by `>>` it is
@@ -50,7 +57,8 @@
 //! subtraction ([`TokenKind::Minus`]) when followed by
 //! whitespace, negation ([`TokenKind::Neg`]) when directly followed by an
 //! operand, and an error when it directly follows an operand, where `a-b`
-//! and `a - b` would be too easily confused.
+//! and `a - b` would be too easily confused. A `]` ends an operand, as a `)`
+//! does, and a `[` starts one, as a `(` does.
 //!
 //! # String literals
 //!
@@ -243,17 +251,24 @@ pub enum TokenKind {
     LBrace,
     /// `}`
     RBrace,
+    /// `[`
+    LBracket,
+    /// `]`
+    RBracket,
     /// `;`
     Semi,
-    /// `.` not inside a number literal: field access.
+    /// `.` not inside a number literal nor among three: field access.
     Dot,
+    /// `...`, which spreads a list into the list literal it is an element
+    /// of.
+    DotDotDot,
     /// `,`, which separates the fields of a record type, the parameters of
-    /// a function and the arguments of a call.
+    /// a function, the arguments of a call and the elements of a list.
     Comma,
     /// `|`, which separates the members of a union type.
     Pipe,
-    /// A `\n` outside parentheses and interpolations. Each newline is its
-    /// own token.
+    /// A `\n` outside parentheses, brackets and interpolations. Each newline
+    /// is its own token.
     Newline,
     /// End of input. Always the last token.
     Eof,
@@ -300,8 +315,11 @@ impl TokenKind {
             TokenKind::RParen => Some(")"),
             TokenKind::LBrace => Some("{"),
             TokenKind::RBrace => Some("}"),
+            TokenKind::LBracket => Some("["),
+            TokenKind::RBracket => Some("]"),
             TokenKind::Semi => Some(";"),
             TokenKind::Dot => Some("."),
+            TokenKind::DotDotDot => Some("..."),
             TokenKind::Comma => Some(","),
             TokenKind::Pipe => Some("|"),
             TokenKind::Int(_)
@@ -460,11 +478,13 @@ struct Interpolation {
 }
 
 /// An open bracket on the lexer's stack, which decides whether newlines
-/// are significant: they are trivia while a `(` is on top.
+/// are significant: they are trivia while a `(` or a `[` is on top.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bracket {
     /// `(`
     Paren,
+    /// `[` of a list literal or an index.
+    Square,
     /// `{` of a block or a record type; not an interpolation's `{`, which
     /// is a context of its own.
     Brace,
@@ -625,6 +645,17 @@ impl<'a> Lexer<'a> {
                 }
                 self.single(TokenKind::RParen)
             }
+            b'[' => {
+                self.brackets.push(Bracket::Square);
+                self.single(TokenKind::LBracket)
+            }
+            b']' => {
+                // As for `)`.
+                if self.context_brackets().last() == Some(&Bracket::Square) {
+                    self.brackets.pop();
+                }
+                self.single(TokenKind::RBracket)
+            }
             b'0'..=b'9' => self.number(start)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.identifier(start),
             _ => self.operator(start)?,
@@ -656,6 +687,9 @@ impl<'a> Lexer<'a> {
             b'%' => (TokenKind::Percent, 1),
             b';' => (TokenKind::Semi, 1),
             // A `.` inside a number literal has been consumed by `number`.
+            b'.' if self.peek_at(1) == Some(b'.') && self.peek_at(2) == Some(b'.') => {
+                (TokenKind::DotDotDot, 3)
+            }
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
             b'|' => (TokenKind::Pipe, 1),
@@ -687,8 +721,8 @@ impl<'a> Lexer<'a> {
     /// Lexes a `}` at `start`: the end of the innermost interpolation if it
     /// matches that interpolation's `{`, and a [`TokenKind::RBrace`]
     /// otherwise, closing the nearest open `{` on the bracket stack with
-    /// any `(` left open inside it. An unmatched `}` closes nothing; the
-    /// parser reports it.
+    /// any `(` or `[` left open inside it. An unmatched `}` closes nothing;
+    /// the parser reports it.
     fn close_brace(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         if let Some(interpolation) = self.interpolations.last_mut() {
             if interpolation.brace_depth > 0 {
@@ -727,12 +761,12 @@ impl<'a> Lexer<'a> {
     }
 
     /// Skips whitespace and comments, stopping at a `\n` that must become a
-    /// [`TokenKind::Newline`] token: one not directly inside a `(` or an
-    /// interpolation, which is decided by the innermost open bracket of the
-    /// current context, or by the context itself if it has none open.
+    /// [`TokenKind::Newline`] token: one not directly inside a `(`, a `[`
+    /// or an interpolation, which is decided by the innermost open bracket
+    /// of the current context, or by the context itself if it has none open.
     fn skip_trivia(&mut self) {
         let newlines_are_trivia = match self.context_brackets().last() {
-            Some(Bracket::Paren) => true,
+            Some(Bracket::Paren | Bracket::Square) => true,
             Some(Bracket::Brace) => false,
             None => !self.interpolations.is_empty(),
         };
@@ -767,13 +801,13 @@ impl<'a> Lexer<'a> {
     ///    [`TokenKind::MemoArrow`]; otherwise directly followed by `>`: the
     ///    arrow, [`TokenKind::Arrow`]; whatever precedes it, so `a->b`,
     ///    `x -> y` and `)->{` all have an arrow, and `)->>{` a memo arrow.
-    /// 2. Directly after an operand end (an identifier character or `)`):
-    ///    an error, since `a-b` would be a single name and `a -b` a
+    /// 2. Directly after an operand end (an identifier character, `)` or
+    ///    `]`): an error, since `a-b` would be a single name and `a -b` a
     ///    negation.
     /// 3. Otherwise, followed by whitespace or the end of input:
     ///    subtraction, [`TokenKind::Minus`].
     /// 4. Otherwise, directly followed by an operand start (a letter, digit,
-    ///    `_`, `(`, `{` or `"`): negation, [`TokenKind::Neg`].
+    ///    `_`, `(`, `[`, `{` or `"`): negation, [`TokenKind::Neg`].
     /// 5. Otherwise, as in `--x`: an unexpected character.
     fn minus(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         if self.peek_at(1) == Some(b'>') {
@@ -785,7 +819,7 @@ impl<'a> Lexer<'a> {
             return Ok(TokenKind::Arrow);
         }
         let previous = start.checked_sub(1).and_then(|at| self.bytes.get(at));
-        if previous.is_some_and(|&byte| is_identifier_byte(byte) || byte == b')') {
+        if previous.is_some_and(|&byte| is_identifier_byte(byte) || matches!(byte, b')' | b']')) {
             return Err(
                 Diagnostic::error("`-` here is ambiguous", span(start, start + 1)).with_note(
                     "write `a - b` with spaces for subtraction, or `a-b` for a single name",
@@ -794,7 +828,7 @@ impl<'a> Lexer<'a> {
         }
         match self.peek_at(1) {
             None | Some(b' ' | b'\t' | b'\r' | b'\n') => Ok(self.single(TokenKind::Minus)),
-            Some(byte) if is_identifier_byte(byte) || matches!(byte, b'(' | b'{' | b'"') => {
+            Some(byte) if is_identifier_byte(byte) || matches!(byte, b'(' | b'[' | b'{' | b'"') => {
                 Ok(self.single(TokenKind::Neg))
             }
             Some(_) => Err(self.unexpected_character()),
@@ -2441,6 +2475,105 @@ mod tests {
         assert_eq!(TokenKind::Eof.symbol(), None);
         let (tokens, _, _) = tokenize(&SourceFile::new("t", "\"a\"").unwrap()).unwrap();
         assert_eq!(tokens[0].kind.symbol(), None);
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn brackets_and_spreads_are_tokens() {
+        assert_eq!(
+            show("[1, ...xs][0]"),
+            [
+                "LBracket",
+                "Int(1)",
+                "Comma",
+                "DotDotDot",
+                "Ident(xs)",
+                "RBracket",
+                "LBracket",
+                "Int(0)",
+                "RBracket",
+                "Eof",
+            ]
+        );
+        assert_eq!(spans("[...a]"), [(0, 1), (1, 4), (4, 5), (5, 6), (6, 6)]);
+        assert_eq!(TokenKind::LBracket.symbol(), Some("["));
+        assert_eq!(TokenKind::RBracket.symbol(), Some("]"));
+        assert_eq!(TokenKind::DotDotDot.symbol(), Some("..."));
+    }
+
+    #[test]
+    fn three_dots_are_one_token_and_fewer_are_field_access() {
+        use TokenKind::{Dot, DotDotDot, Eof};
+        assert_eq!(kinds("..."), [DotDotDot, Eof]);
+        assert_eq!(kinds(".."), [Dot, Dot, Eof]);
+        assert_eq!(kinds("."), [Dot, Eof]);
+        assert_eq!(kinds("...."), [DotDotDot, Dot, Eof]);
+        assert_eq!(kinds("......"), [DotDotDot, DotDotDot, Eof]);
+        assert_eq!(kinds(". .."), [Dot, Dot, Dot, Eof]);
+        // A number literal takes a `.` only between two digits.
+        assert_eq!(show("1...x"), ["Int(1)", "DotDotDot", "Ident(x)", "Eof"]);
+        assert_eq!(show("1.5..."), ["Float(1.5)", "DotDotDot", "Eof"]);
+    }
+
+    #[test]
+    fn newlines_are_suppressed_inside_brackets() {
+        assert_eq!(
+            show("[1,\n2\n]\nx"),
+            [
+                "LBracket", "Int(1)", "Comma", "Int(2)", "RBracket", "Newline", "Ident(x)", "Eof"
+            ]
+        );
+        // Inside an index too.
+        assert_eq!(
+            show("xs[\n0\n]"),
+            ["Ident(xs)", "LBracket", "Int(0)", "RBracket", "Eof"]
+        );
+        // A `]` closes only a `[` on top: an unmatched one closes nothing.
+        assert_eq!(
+            show("(]\n)\nx"),
+            ["LParen", "RBracket", "RParen", "Newline", "Ident(x)", "Eof"]
+        );
+    }
+
+    #[test]
+    fn a_block_inside_brackets_is_newline_sensitive() {
+        assert_eq!(
+            show("[{\na = 1\n}\n, 2]\nx"),
+            [
+                "LBracket", "LBrace", "Newline", "Ident(a)", "Eq", "Int(1)", "Newline", "RBrace",
+                "Comma", "Int(2)", "RBracket", "Newline", "Ident(x)", "Eof"
+            ]
+        );
+        // A `}` closes a `[` left open inside its block.
+        assert_eq!(
+            show("{[\n}\nx"),
+            ["LBrace", "LBracket", "RBrace", "Newline", "Ident(x)", "Eof"]
+        );
+    }
+
+    #[test]
+    fn a_minus_next_to_brackets_is_classified_as_next_to_parentheses() {
+        assert_eq!(
+            error("xs[0]-1"),
+            ("`-` here is ambiguous".to_owned(), Span::new(5, 6))
+        );
+        assert_eq!(
+            show("-[1]"),
+            ["Neg", "LBracket", "Int(1)", "RBracket", "Eof"]
+        );
+        assert_eq!(
+            show("xs[0] - 1"),
+            [
+                "Ident(xs)",
+                "LBracket",
+                "Int(0)",
+                "RBracket",
+                "Minus",
+                "Int(1)",
+                "Eof"
+            ]
+        );
     }
 
     // ----- String literals -----

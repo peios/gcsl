@@ -681,6 +681,39 @@ mod tests {
     }
 
     #[test]
+    fn lists_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let xs = [1, 2, 3]");
+        assert_eq!(value(&mut session, "xs[2]"), Value::Int(3));
+        assert_eq!(value_type(&session), "Int");
+        value(&mut session, "let ys: Int[] = [...xs, 4]");
+        assert_eq!(value(&mut session, "len(ys)"), Value::Int(4));
+        assert_eq!(value(&mut session, "ys").to_string(), "[1, 2, 3, 4]");
+        assert_eq!(value_type(&session), "List<Int>");
+        // A function of one input takes a list of a later one.
+        value(
+            &mut session,
+            "fn total(xs: Int[]): Int { xs[0] + xs[len(xs) - 1] }",
+        );
+        assert_eq!(value(&mut session, "total(ys)"), Value::Int(5));
+        // An index out of range in a function of an earlier input names
+        // that input.
+        let diagnostics = eval(&mut session, "total([])").unwrap_err();
+        assert_eq!(diagnostics[0].message, "index out of range");
+        assert_eq!(diagnostics[0].input, Some(5));
+        // `len` is in every input's scope, and shadowed as any name.
+        value(&mut session, "let len = 5");
+        assert_eq!(value(&mut session, "len"), Value::Int(5));
+        assert_eq!(
+            messages(&mut session, "let n = [1]\nn := [\"a\"]"),
+            vec!["mismatched types"]
+        );
+        // An element that may be a future is awaited deeply when shown.
+        value(&mut session, "let zs = [lazy 1, 2]");
+        assert_eq!(value(&mut session, "\"{zs}\""), Value::Str("[1, 2]".into()));
+    }
+
+    #[test]
     fn warnings_come_back_with_the_value() {
         let mut session = Session::new();
         let outcome = eval(&mut session, "let p: {x: Int} = { x = 1; y = 2 }\np").unwrap();

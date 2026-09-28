@@ -39,8 +39,20 @@
 //! Typed equality, `==` and `!=` on records, compares only the fields of the
 //! operands' static type, so its node carries that type's [`Shape`]: the
 //! names of its fields, with a shape of its own for each field that is a
-//! record, in [`Ir::shape`]'s table. Total equality, `===` and `!==`,
-//! compares whole values and needs none.
+//! record or a list, in [`Ir::shape`]'s table. On lists, it compares the
+//! elements through the shape of their static type, which a list's shape,
+//! a [`ListShape`] ([`Ir::list_shape`]) in the same table, gives. Total
+//! equality, `===` and `!==`, compares whole values and needs none.
+//!
+//! # Lists
+//!
+//! A list literal lowers to an [`IrKind::MakeList`] of its elements in
+//! source order, each a node of any kind, or an [`IrKind::Spread`] of a
+//! list node for a spread element; the node says whether it has any spread,
+//! so that one without is built at its known length. An index is an
+//! [`IrKind::Index`], of the kind of the element read, like a field access.
+//! A built-in function's call lowers to a node of its own, specialised as
+//! any operator is: `len` to [`IrKind::ListLen`].
 //!
 //! # Functions
 //!
@@ -91,7 +103,9 @@
 //! kind; so nothing else ever inspects a runtime value to see whether it is
 //! a future. An await is *deep* when it also awaits the lazy fields of a
 //! record, as the [`LazyShape`] it carries lists them, from
-//! [`Ir::lazy_shape`]'s table. An await runs a future's body in a frame of
+//! [`Ir::lazy_shape`]'s table, or the elements of a list, as a list's lazy
+//! shape says to await each ([`Ir::lazy_list`]), in the same table. An
+//! await runs a future's body in a frame of
 //! its own, so, like a call, it records its depth in its frame's body for
 //! the nesting budget.
 //!
@@ -180,12 +194,23 @@ impl ShapeId {
 
 /// The static shape of a record type, which typed equality compares over:
 /// the name of each of its fields, sorted by [`Name`], with `Some` shape for
-/// each field that is itself a record, which is compared through that
-/// shape, and `None` for each field compared as a value.
+/// each field that is itself a record or a list, which is compared through
+/// that shape, and `None` for each field compared as a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shape {
-    /// Each field's name and, for a record field, its own shape.
+    /// Each field's name and, for a record or list field, its own shape.
     pub fields: Box<[(Name, Option<ShapeId>)]>,
+}
+
+/// The static shape of a list type, which typed equality compares over:
+/// how its elements compare. A list's shape is in the same table as the
+/// records', so that a record's field can name it; see [`Ir::list_shape`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ListShape {
+    /// The shape of the element type, if it is a record or a list type,
+    /// through which each element is compared; `None` if each is compared
+    /// as a value.
+    pub element: Option<ShapeId>,
 }
 
 /// Index of a lazy shape in its [`Ir`]'s table, or [`LazyShapeId::NONE`].
@@ -203,23 +228,26 @@ impl LazyShapeId {
 }
 
 /// What a deep [`IrKind::Await`] awaits in a record: each field, by name,
-/// that is lazy itself or holds a record with lazy fields somewhere inside.
-/// The fields are sorted by [`Name`], as a record type's are.
+/// that is lazy itself or holds a record or list with lazy values somewhere
+/// inside. The fields are sorted by [`Name`], as a record type's are. A
+/// list's lazy shape is in the same table, with no fields, and says what is
+/// done with each element instead: see [`Ir::lazy_list`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LazyShape {
     /// Each such field's name and what is done with its value.
     pub fields: Box<[(Name, LazyField)]>,
 }
 
-/// What a deep await does with one field of a record (see [`LazyShape`]).
+/// What a deep await does with one field of a record, or with each element
+/// of a list (see [`LazyShape`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LazyField {
-    /// The field is a future or an either: its value is awaited fully and
-    /// then, unless the shape is [`LazyShapeId::NONE`], its own lazy fields
-    /// are awaited as the shape says.
+    /// The field or element is a future or an either: its value is awaited
+    /// fully and then, unless the shape is [`LazyShapeId::NONE`], what is
+    /// lazy inside it is awaited as the shape says.
     Await(LazyShapeId),
-    /// The field is a present record with lazy fields somewhere inside:
-    /// they are awaited as the shape says.
+    /// The field or element is a present record or list with lazy values
+    /// somewhere inside: they are awaited as the shape says.
     Within(LazyShapeId),
 }
 
@@ -317,7 +345,9 @@ pub struct ShapedOperands {
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
 /// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
 /// and of `Record*`, `Field` and `UpdateField` nodes to record nodes (an
-/// `UpdateField`'s value excepted, which may be of any kind), and a `Call`'s
+/// `UpdateField`'s value excepted, which may be of any kind), of `List*`
+/// and `Spread` nodes and an `Index`'s list to list nodes, an `Index`'s
+/// position is an Int node, and a `Call`'s
 /// callee is a function node; see [`Ir::kind_of`]. No typed operand is ever
 /// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
 /// [`IrKind::Await`] of it.
@@ -355,6 +385,19 @@ pub enum IrKind {
     /// `!==` on two records of the same type: the negation of
     /// [`IrKind::RecordSame`].
     RecordNotSame(Operands),
+    /// `==` on two lists of the same type: typed equality, comparing their
+    /// lengths and their elements in order, each through the shape of the
+    /// element type, as the list's shape (see [`ListShape`]) says.
+    ListEq(ShapedOperands),
+    /// `!=` on two lists of the same type: the negation of
+    /// [`IrKind::ListEq`].
+    ListNe(ShapedOperands),
+    /// `===` on two lists of the same type: total equality, comparing whole
+    /// values deeply (see [`crate::value::List`]'s equality).
+    ListSame(Operands),
+    /// `!==` on two lists of the same type: the negation of
+    /// [`IrKind::ListSame`].
+    ListNotSame(Operands),
     /// `Bool` conjunction, evaluating the right operand only if the left is
     /// `true`.
     And(Operands),
@@ -452,6 +495,33 @@ pub enum IrKind {
         /// Its new value, of any kind.
         value: IrId,
     },
+    /// Builds a list of the values of `items`, in order: each item is a
+    /// node of any kind, whose value is the next element, or an
+    /// [`IrKind::Spread`], whose list's elements are the next ones.
+    MakeList {
+        /// The elements and spreads, in source order.
+        items: IrRange,
+        /// Whether any item is a spread; if none is, the list's length is
+        /// the number of items.
+        spreads: bool,
+    },
+    /// One spread element of an [`IrKind::MakeList`], and only ever among
+    /// its items: the list node whose elements it puts in its place.
+    Spread(IrId),
+    /// Reads the element of the list `list` evaluates to at the position
+    /// `index` evaluates to, counting from 0; a position outside the list
+    /// is a runtime error.
+    Index {
+        /// The list.
+        list: IrId,
+        /// The position, an `Int`.
+        index: IrId,
+        /// The kind of the element, which is the node's kind.
+        kind: ValueKind,
+    },
+    /// The number of elements of the list its operand evaluates to, an
+    /// `Int`: a call of the built-in function `len`.
+    ListLen(IrId),
     /// Builds a closure of function `function` of the IR, capturing the
     /// values of `captures`: loads in the frame creating it, one for each
     /// value the function captures, in capture order.
@@ -534,8 +604,10 @@ impl IrKind {
     /// an `if`'s condition and branches, a block's items and then its
     /// result, a call's callee and then its arguments, an argument's value,
     /// a store's value, a field access's record, an update's record and
-    /// value, an interpolation's pieces, a record's values, a closure's and
-    /// a future's captures, and an await's value. A closure's or a future's
+    /// value, an interpolation's pieces, a record's values, a list's items,
+    /// a spread's list, an index's list and position, a length's list, a
+    /// closure's and a future's captures, and an await's value. A closure's
+    /// or a future's
     /// function is not a child: its body is evaluated in a frame of its own.
     /// This is the one list of every node's children, and its match is
     /// exhaustive, so a new kind of node cannot be missed: [`Ir::pretty`]
@@ -567,6 +639,8 @@ impl IrKind {
             }
             | IrKind::Store(_, operand)
             | IrKind::Arg { value: operand, .. }
+            | IrKind::Spread(operand)
+            | IrKind::ListLen(operand)
             | IrKind::Await { value: operand, .. } => (None, &[], [Some(operand), None, None]),
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
@@ -584,18 +658,28 @@ impl IrKind {
             | IrKind::BoolEq(_, Operands { lhs, rhs, .. })
             | IrKind::RecordSame(Operands { lhs, rhs, .. })
             | IrKind::RecordNotSame(Operands { lhs, rhs, .. })
+            | IrKind::ListSame(Operands { lhs, rhs, .. })
+            | IrKind::ListNotSame(Operands { lhs, rhs, .. })
             | IrKind::And(Operands { lhs, rhs, .. })
             | IrKind::Or(Operands { lhs, rhs, .. })
             | IrKind::RecordEq(ShapedOperands { lhs, rhs, .. })
             | IrKind::RecordNe(ShapedOperands { lhs, rhs, .. })
+            | IrKind::ListEq(ShapedOperands { lhs, rhs, .. })
+            | IrKind::ListNe(ShapedOperands { lhs, rhs, .. })
             | IrKind::UpdateField {
                 record: lhs,
                 value: rhs,
+                ..
+            }
+            | IrKind::Index {
+                list: lhs,
+                index: rhs,
                 ..
             } => (None, &[], [Some(lhs), Some(rhs), None]),
             IrKind::If { cond, then, else_ } => (None, &[], [Some(cond), Some(then), Some(else_)]),
             IrKind::Interp(items)
             | IrKind::MakeRecord { values: items, .. }
+            | IrKind::MakeList { items, .. }
             | IrKind::MakeClosure {
                 captures: items, ..
             }
@@ -628,10 +712,10 @@ impl IrKind {
             IrKind::IntCmp(cmp, _) | IrKind::FloatCmp(cmp, _) | IrKind::StrCmp(cmp, _) => {
                 Some(cmp.symbol())
             }
-            IrKind::BoolEq(true, _) | IrKind::RecordEq(_) => Some("=="),
-            IrKind::BoolEq(false, _) | IrKind::RecordNe(_) => Some("!="),
-            IrKind::RecordSame(_) => Some("==="),
-            IrKind::RecordNotSame(_) => Some("!=="),
+            IrKind::BoolEq(true, _) | IrKind::RecordEq(_) | IrKind::ListEq(_) => Some("=="),
+            IrKind::BoolEq(false, _) | IrKind::RecordNe(_) | IrKind::ListNe(_) => Some("!="),
+            IrKind::RecordSame(_) | IrKind::ListSame(_) => Some("==="),
+            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) => Some("!=="),
             IrKind::And(_) => Some("and"),
             IrKind::Or(_) => Some("or"),
             IrKind::Not(_) => Some("not"),
@@ -655,7 +739,11 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::LoadCallee
             | IrKind::MakeFuture { .. }
-            | IrKind::Await { .. } => None,
+            | IrKind::Await { .. }
+            | IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Index { .. }
+            | IrKind::ListLen(_) => None,
         }
     }
 
@@ -673,6 +761,12 @@ impl IrKind {
             IrKind::BoolEq(..) => "bool-eq",
             IrKind::RecordEq(_) | IrKind::RecordNe(_) => "record-eq",
             IrKind::RecordSame(_) | IrKind::RecordNotSame(_) => "record-same",
+            IrKind::ListEq(_) | IrKind::ListNe(_) => "list-eq",
+            IrKind::ListSame(_) | IrKind::ListNotSame(_) => "list-same",
+            IrKind::MakeList { .. } => "make-list",
+            IrKind::Spread(_) => "spread",
+            IrKind::Index { .. } => "index",
+            IrKind::ListLen(_) => "list-len",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -723,8 +817,8 @@ pub struct IrNode {
 
 impl IrNode {
     /// The span of the operator's symbol, for operator nodes: where a
-    /// runtime error in this node is reported. `None` for typed record
-    /// comparisons, which cannot fail and do not keep it (see
+    /// runtime error in this node is reported. `None` for typed record and
+    /// list comparisons, which cannot fail and do not keep it (see
     /// [`ShapedOperands`]).
     #[must_use]
     pub fn operator_span(&self) -> Option<Span> {
@@ -746,12 +840,20 @@ impl IrNode {
             | IrKind::BoolEq(_, operands)
             | IrKind::RecordSame(operands)
             | IrKind::RecordNotSame(operands)
+            | IrKind::ListSame(operands)
+            | IrKind::ListNotSame(operands)
             | IrKind::And(operands)
             | IrKind::Or(operands) => operands.op_start,
             // A prefix operator starts its expression.
             IrKind::IntNeg(_) | IrKind::FloatNeg(_) | IrKind::Not(_) => self.span.start,
             IrKind::RecordEq(_)
             | IrKind::RecordNe(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Index { .. }
+            | IrKind::ListLen(_)
             | IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -824,7 +926,13 @@ pub struct Ir {
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
     shapes: Vec<Shape>,
+    /// For each shape of `shapes`, a list's shape if it is one, whose entry
+    /// in `shapes` then has no fields.
+    list_shapes: Vec<Option<ListShape>>,
     lazy_shapes: Vec<LazyShape>,
+    /// For each lazy shape of `lazy_shapes`, if it is a list's, what is done
+    /// with each element; its entry in `lazy_shapes` then has no fields.
+    lazy_lists: Vec<Option<LazyField>>,
     /// The text of the name of every [`IrKind::UpdateField`], which may
     /// add it to a record's layout at runtime.
     name_texts: HashMap<Name, Box<str>>,
@@ -930,7 +1038,8 @@ impl Ir {
         self.layouts.len()
     }
 
-    /// Returns the record shape `id`.
+    /// Returns the record shape `id`: one with no fields if it is a list's
+    /// shape (see [`Ir::list_shape`]).
     ///
     /// # Panics
     ///
@@ -940,13 +1049,21 @@ impl Ir {
         &self.shapes[id.index()]
     }
 
-    /// The number of distinct record shapes.
+    /// The list shape `id`, or `None` if it is a record's shape, or an id
+    /// this IR does not have.
+    #[must_use]
+    pub fn list_shape(&self, id: ShapeId) -> Option<ListShape> {
+        self.list_shapes.get(id.index()).copied().flatten()
+    }
+
+    /// The number of distinct record and list shapes.
     #[must_use]
     pub fn shape_count(&self) -> usize {
         self.shapes.len()
     }
 
-    /// Returns the lazy shape `id`.
+    /// Returns the lazy shape `id`: one with no fields if it is a list's
+    /// lazy shape (see [`Ir::lazy_list`]).
     ///
     /// # Panics
     ///
@@ -964,7 +1081,15 @@ impl Ir {
         self.lazy_shapes.get(id.index())
     }
 
-    /// The number of distinct lazy shapes.
+    /// What a deep await does with each element of a list whose lazy shape
+    /// is `id`, or `None` if `id` is a record's lazy shape,
+    /// [`LazyShapeId::NONE`], or an id this IR does not have.
+    #[must_use]
+    pub fn lazy_list(&self, id: LazyShapeId) -> Option<LazyField> {
+        self.lazy_lists.get(id.index()).copied().flatten()
+    }
+
+    /// The number of distinct lazy shapes, of records and lists.
     #[must_use]
     pub fn lazy_shape_count(&self) -> usize {
         self.lazy_shapes.len()
@@ -1021,8 +1146,8 @@ impl Ir {
     }
 
     /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
-    /// `MakeFuture` and for a load, capture, field access or call of a
-    /// value that may be a future, and never for an `Await`.
+    /// `MakeFuture` and for a load, capture, field access, index or call of
+    /// a value that may be a future, and never for an `Await`.
     ///
     /// # Panics
     ///
@@ -1055,6 +1180,10 @@ impl Ir {
                 | IrKind::RecordNe(_)
                 | IrKind::RecordSame(_)
                 | IrKind::RecordNotSame(_)
+                | IrKind::ListEq(_)
+                | IrKind::ListNe(_)
+                | IrKind::ListSame(_)
+                | IrKind::ListNotSame(_)
                 | IrKind::And(_)
                 | IrKind::Or(_)
                 | IrKind::Not(_) => ValueKind::Bool,
@@ -1065,7 +1194,9 @@ impl Ir {
                 | IrKind::IntSub(_)
                 | IrKind::IntMul(_)
                 | IrKind::IntFloorDiv(_)
-                | IrKind::IntRem(_) => ValueKind::Int,
+                | IrKind::IntRem(_)
+                | IrKind::ListLen(_) => ValueKind::Int,
+                IrKind::MakeList { .. } | IrKind::Spread(_) => ValueKind::List,
                 IrKind::FloatConst(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::FloatAdd(_)
@@ -1079,6 +1210,7 @@ impl Ir {
                 | IrKind::UpdateField { .. } => ValueKind::Record,
                 IrKind::Load(_, kind)
                 | IrKind::Field { kind, .. }
+                | IrKind::Index { kind, .. }
                 | IrKind::Call { kind, .. }
                 | IrKind::LoadCapture(_, kind)
                 | IrKind::Await { kind, .. } => kind,
@@ -1104,7 +1236,14 @@ impl Ir {
     /// operator and its shape's field names in the shape's order, each
     /// record field's own shape after its name, as in
     /// `(record-eq == [x inner[n]] @0..9 ...)`; a total one its operator,
-    /// as in `(record-same === @0..9 ...)`. A closure shows its function's
+    /// as in `(record-same === @0..9 ...)`. A list comparison shows the
+    /// same, a list's shape being `*` and its element type's shape, as in
+    /// `(list-eq == *[x] @0..9 ...)`, `(list-eq == * @0..9 ...)` and
+    /// `(list-same === @0..9 ...)`. A list shows as `(make-list @0..9 ...)`
+    /// and then its items, a spread as `(spread @0..5 ...)` and its list, an
+    /// index as `(index @0..5 ...)`, its list and its position, and a
+    /// length as `(list-len @0..7 ...)` and its list. A closure shows its
+    /// function's
     /// number and then what it captures, as in `(make-closure #0 @0..9
     /// ...)`, a call its callee and then its arguments, each as
     /// `(arg 0 @4..5 ...)` with the parameter it fills, and the reads of a
@@ -1114,7 +1253,9 @@ impl Ir {
     /// its value, as in `(await @0..9 ...)`, or, for a deep await, its
     /// shape first: the names of the fields it awaits, each followed by `!`
     /// if its value is awaited and by its own shape in brackets if the
-    /// await descends into it, as in `(await [a! b[c!]] @0..9 ...)`. The
+    /// await descends into it, as in `(await [a! b[c!]] @0..9 ...)`, or for
+    /// a list, `*`, `!` if each element is awaited, and the element's shape
+    /// if the await descends into it, as in `(await *! @0..9 ...)`. The
     /// depths of calls and awaits are not shown. After the root, each
     /// function is shown on a line of its own as
     /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
@@ -1140,7 +1281,9 @@ pub(crate) struct IrBuilder {
     strings: Vec<Rc<str>>,
     layouts: Vec<Rc<Layout>>,
     shapes: Vec<Shape>,
+    list_shapes: Vec<Option<ListShape>>,
     lazy_shapes: Vec<LazyShape>,
+    lazy_lists: Vec<Option<LazyField>>,
     name_texts: HashMap<Name, Box<str>>,
 }
 
@@ -1152,13 +1295,16 @@ impl IrBuilder {
             strings: Vec::new(),
             layouts: Vec::new(),
             shapes: Vec::new(),
+            list_shapes: Vec::new(),
             lazy_shapes: Vec::new(),
+            lazy_lists: Vec::new(),
             name_texts: HashMap::new(),
         }
     }
 
     /// Adds a node and returns its id. The builder holds at most one node
-    /// per AST node or item, plus one conversion per `/` operand, one
+    /// per AST node or item, plus one `Spread` per spread element of a list,
+    /// one conversion per `/` operand, one
     /// `Empty` or `MakeRecord` per block, one `Load` per field, one
     /// constant per literal piece of an interpolation, for each segment of
     /// a dotted path after the first an update and a record to update, one
@@ -1191,29 +1337,60 @@ impl IrBuilder {
     }
 
     /// Adds a record shape and returns its id. There is at most one per
-    /// record type, and fewer record types than bytes of source, so ids
-    /// never saturate either. Deduplicating is the caller's business.
+    /// record or list type, and fewer such types than bytes of source, so
+    /// ids never saturate either. Deduplicating is the caller's business.
     pub(crate) fn push_shape(&mut self, shape: Shape) -> ShapeId {
         let id = ShapeId(u32::try_from(self.shapes.len()).unwrap_or(u32::MAX));
         self.shapes.push(shape);
+        self.list_shapes.push(None);
         id
     }
 
     /// Replaces the fields of shape `id`, which [`IrBuilder::push_shape`]
     /// returned, so that a shape can be given its id before its fields are
-    /// known. Does nothing for an id it did not return.
+    /// known, and makes it a record's shape. Does nothing for an id it did
+    /// not return.
     pub(crate) fn set_shape(&mut self, id: ShapeId, shape: Shape) {
         if let Some(entry) = self.shapes.get_mut(id.index()) {
             *entry = shape;
         }
+        if let Some(entry) = self.list_shapes.get_mut(id.index()) {
+            *entry = None;
+        }
     }
 
-    /// Adds a lazy shape and returns its id. There is at most one per record
-    /// type, so ids never saturate, nor reach [`LazyShapeId::NONE`].
-    /// Deduplicating is the caller's business.
+    /// Makes shape `id`, which [`IrBuilder::push_shape`] returned, the list
+    /// shape `shape`, with no fields, so that a list's shape too can be
+    /// given its id before what it holds is known. Does nothing for an id
+    /// it did not return.
+    pub(crate) fn set_list_shape(&mut self, id: ShapeId, shape: ListShape) {
+        if let Some(entry) = self.shapes.get_mut(id.index()) {
+            entry.fields = Box::default();
+        }
+        if let Some(entry) = self.list_shapes.get_mut(id.index()) {
+            *entry = Some(shape);
+        }
+    }
+
+    /// Adds a record's lazy shape and returns its id. There is at most one
+    /// per record or list type, so ids never saturate, nor reach
+    /// [`LazyShapeId::NONE`]. Deduplicating is the caller's business.
     pub(crate) fn push_lazy_shape(&mut self, shape: LazyShape) -> LazyShapeId {
         let id = LazyShapeId(u32::try_from(self.lazy_shapes.len()).unwrap_or(u32::MAX));
         self.lazy_shapes.push(shape);
+        self.lazy_lists.push(None);
+        id
+    }
+
+    /// Adds a list's lazy shape, which awaits each element as `element`
+    /// says, and returns its id, as [`IrBuilder::push_lazy_shape`] does.
+    pub(crate) fn push_lazy_list(&mut self, element: LazyField) -> LazyShapeId {
+        let id = self.push_lazy_shape(LazyShape {
+            fields: Box::default(),
+        });
+        if let Some(entry) = self.lazy_lists.get_mut(id.index()) {
+            *entry = Some(element);
+        }
         id
     }
 
@@ -1331,7 +1508,9 @@ impl IrBuilder {
             strings: self.strings,
             layouts: self.layouts,
             shapes: self.shapes,
+            list_shapes: self.list_shapes,
             lazy_shapes: self.lazy_shapes,
+            lazy_lists: self.lazy_lists,
             name_texts: self.name_texts,
             functions,
             root,
@@ -1351,14 +1530,16 @@ struct Pretty<'a> {
 }
 
 impl Pretty<'_> {
-    /// Writes shape `id` as its field names in brackets, each record
-    /// field's shape after its name: `[x inner[n]]`. Nested shapes are
-    /// written through a work list, not recursion, since a record type can
-    /// be nested as deeply as a program is long.
+    /// Writes shape `id` as its field names in brackets, each record or
+    /// list field's shape after its name: `[x inner[n]]`; a list's shape is
+    /// `*` followed by its element type's shape, if it has one: `*[x]`,
+    /// `**[x]` or `*`. Nested shapes are written through a work list, not
+    /// recursion, since a record or list type can be nested as deeply as a
+    /// program is long.
     fn shape(&self, f: &mut fmt::Formatter<'_>, id: ShapeId) -> fmt::Result {
-        // Each shape being written, with the index of its next field.
-        let mut pending = vec![(id, 0_usize)];
-        f.write_str("[")?;
+        // Each record shape being written, with the index of its next field.
+        let mut pending = Vec::new();
+        self.open_shape(f, id, &mut pending)?;
         while let Some((shape, index)) = pending.pop() {
             let fields = self.ir.shapes.get(shape.index()).map(|s| &*s.fields);
             let Some(&(name, nested)) = fields.unwrap_or_default().get(index) else {
@@ -1371,22 +1552,47 @@ impl Pretty<'_> {
             write!(f, "{}", FieldName(self.names.get(name)))?;
             pending.push((shape, index + 1));
             if let Some(nested) = nested {
-                f.write_str("[")?;
-                pending.push((nested, 0));
+                self.open_shape(f, nested, &mut pending)?;
             }
         }
         Ok(())
     }
 
+    /// Starts writing shape `id` (see `Pretty::shape`): a `*` for each list
+    /// shape down to the first shape that is not a list's, and if that is a
+    /// record's, its `[`, queueing it on `pending` to have its fields
+    /// written.
+    fn open_shape(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        id: ShapeId,
+        pending: &mut Vec<(ShapeId, usize)>,
+    ) -> fmt::Result {
+        let mut current = id;
+        while let Some(list) = self.ir.list_shape(current) {
+            f.write_str("*")?;
+            match list.element {
+                Some(element) => current = element,
+                None => return Ok(()),
+            }
+        }
+        f.write_str("[")?;
+        pending.push((current, 0));
+        Ok(())
+    }
+
     /// Writes lazy shape `id` as the names of the fields it awaits in
     /// brackets, each followed by `!` if its value is awaited and by its own
-    /// shape if the await descends into it: `[a! b[c!]]`. Nested shapes are
-    /// written through a work list, not recursion, as `Pretty::shape`
-    /// writes record shapes.
+    /// shape if the await descends into it: `[a! b[c!]]`; a list's lazy
+    /// shape is `*`, followed by `!` if each element is awaited and by the
+    /// element's own shape if the await descends into it: `*!`, `*[a!]`.
+    /// Nested shapes are written through a work list, not recursion, as
+    /// `Pretty::shape` writes record shapes.
     fn lazy_shape(&self, f: &mut fmt::Formatter<'_>, id: LazyShapeId) -> fmt::Result {
-        // Each shape being written, with the index of its next field.
-        let mut pending = vec![(id, 0_usize)];
-        f.write_str("[")?;
+        // Each record's shape being written, with the index of its next
+        // field.
+        let mut pending = Vec::new();
+        self.open_lazy_shape(f, id, &mut pending)?;
         while let Some((shape, index)) = pending.pop() {
             let fields = self.ir.find_lazy_shape(shape).map(|s| &*s.fields);
             let Some(&(name, field)) = fields.unwrap_or_default().get(index) else {
@@ -1406,10 +1612,38 @@ impl Pretty<'_> {
                 LazyField::Within(nested) => nested,
             };
             if nested != LazyShapeId::NONE {
-                f.write_str("[")?;
-                pending.push((nested, 0));
+                self.open_lazy_shape(f, nested, &mut pending)?;
             }
         }
+        Ok(())
+    }
+
+    /// Starts writing lazy shape `id` (see `Pretty::lazy_shape`): a `*`,
+    /// and a `!` for an awaited element, for each list's lazy shape down to
+    /// the first that is not a list's, and if that is a record's, its `[`,
+    /// queueing it on `pending` to have its fields written.
+    fn open_lazy_shape(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        id: LazyShapeId,
+        pending: &mut Vec<(LazyShapeId, usize)>,
+    ) -> fmt::Result {
+        let mut current = id;
+        while let Some(element) = self.ir.lazy_list(current) {
+            f.write_str("*")?;
+            current = match element {
+                LazyField::Await(nested) => {
+                    f.write_str("!")?;
+                    nested
+                }
+                LazyField::Within(nested) => nested,
+            };
+            if current == LazyShapeId::NONE {
+                return Ok(());
+            }
+        }
+        f.write_str("[")?;
+        pending.push((current, 0));
         Ok(())
     }
 
@@ -1436,13 +1670,16 @@ impl Pretty<'_> {
                 write!(f, " {}", cmp.symbol())?;
             }
             IrKind::BoolEq(eq, _) => f.write_str(if eq { " ==" } else { " !=" })?,
-            IrKind::RecordEq(operands) | IrKind::RecordNe(operands) => {
-                let eq = matches!(node.kind, IrKind::RecordEq(_));
+            IrKind::RecordEq(operands)
+            | IrKind::RecordNe(operands)
+            | IrKind::ListEq(operands)
+            | IrKind::ListNe(operands) => {
+                let eq = matches!(node.kind, IrKind::RecordEq(_) | IrKind::ListEq(_));
                 f.write_str(if eq { " == " } else { " != " })?;
                 self.shape(f, operands.shape)?;
             }
-            IrKind::RecordSame(_) => f.write_str(" ===")?,
-            IrKind::RecordNotSame(_) => f.write_str(" !==")?,
+            IrKind::RecordSame(_) | IrKind::ListSame(_) => f.write_str(" ===")?,
+            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) => f.write_str(" !==")?,
             IrKind::MakeRecord { layout, .. } => {
                 f.write_str(" [")?;
                 for (index, text) in self.ir.layout(layout).texts.iter().enumerate() {
@@ -1965,6 +2202,178 @@ mod tests {
              \x20   (empty @0..2)\n\
              \x20   (empty @0..2)))"
         );
+    }
+
+    /// A program of every list node, all of one list, `[1, ...[1]]`, with
+    /// `x` interned into `names`: the IR, and the list, the spread, an
+    /// index, a length, the four comparisons (over a list of records
+    /// compared over `[x]`, a list of values, and whole) and the root, a
+    /// block whose result is a deep await of a list of lists.
+    fn list_program(names: &mut Names) -> (Ir, [IrId; 9]) {
+        let x = names.intern("x");
+        let mut builder = IrBuilder::with_capacity(12);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(1, 2));
+        let inner_items = builder.push_item_list(&[one]);
+        let inner = builder.alloc(
+            IrKind::MakeList {
+                items: inner_items,
+                spreads: false,
+            },
+            Span::new(7, 10),
+        );
+        let spread = builder.alloc(IrKind::Spread(inner), Span::new(4, 10));
+        let items = builder.push_item_list(&[one, spread]);
+        let list = builder.alloc(
+            IrKind::MakeList {
+                items,
+                spreads: true,
+            },
+            Span::new(0, 11),
+        );
+        let index = builder.alloc(
+            IrKind::Index {
+                list,
+                index: one,
+                kind: ValueKind::Int,
+            },
+            Span::new(0, 14),
+        );
+        let len = builder.alloc(IrKind::ListLen(list), Span::new(0, 16));
+        // A list of records compared over `[x]`, and one of values.
+        let record = builder.push_shape(Shape {
+            fields: Box::new([(x, None)]),
+        });
+        let records = builder.push_shape(Shape {
+            fields: Box::default(),
+        });
+        builder.set_list_shape(
+            records,
+            ListShape {
+                element: Some(record),
+            },
+        );
+        let values = builder.push_shape(Shape {
+            fields: Box::default(),
+        });
+        builder.set_list_shape(values, ListShape { element: None });
+        let shaped = |shape| ShapedOperands {
+            shape,
+            lhs: list,
+            rhs: list,
+        };
+        let eq = builder.alloc(IrKind::ListEq(shaped(records)), Span::new(0, 8));
+        let ne = builder.alloc(IrKind::ListNe(shaped(values)), Span::new(0, 8));
+        let operands = Operands {
+            lhs: list,
+            rhs: list,
+            op_start: 3,
+        };
+        let same = builder.alloc(IrKind::ListSame(operands), Span::new(0, 9));
+        let not_same = builder.alloc(IrKind::ListNotSame(operands), Span::new(0, 9));
+        // A deep await of a list of lists whose elements are awaited.
+        let each = builder.push_lazy_list(LazyField::Await(LazyShapeId::NONE));
+        let lists = builder.push_lazy_list(LazyField::Within(each));
+        let await_ = builder.alloc(
+            IrKind::Await {
+                value: list,
+                kind: ValueKind::List,
+                shape: lists,
+                depth: 0,
+            },
+            Span::new(0, 11),
+        );
+        let block_items = builder.push_item_list(&[index, len, eq, ne, same, not_same]);
+        let root = builder.alloc(
+            IrKind::Block {
+                items: block_items,
+                result: await_,
+            },
+            Span::new(0, 16),
+        );
+        let ir = builder.finish(root, 0, Vec::new());
+        (ir, [list, spread, index, len, eq, ne, same, not_same, root])
+    }
+
+    #[test]
+    fn list_nodes_have_kinds_symbols_and_shapes() {
+        let (ir, [list, spread, index, len, eq, ne, same, not_same, root]) =
+            list_program(&mut Names::new());
+        for (id, kind) in [
+            (list, ValueKind::List),
+            (spread, ValueKind::List),
+            (index, ValueKind::Int),
+            (len, ValueKind::Int),
+            (eq, ValueKind::Bool),
+            (ne, ValueKind::Bool),
+            (same, ValueKind::Bool),
+            (not_same, ValueKind::Bool),
+            (root, ValueKind::List),
+        ] {
+            assert_eq!(ir.kind_of(id), kind, "{:?}", ir.get(id));
+        }
+        let symbols = [eq, ne, same, not_same, index, len].map(|id| ir.get(id).kind.symbol());
+        assert_eq!(
+            symbols,
+            [Some("=="), Some("!="), Some("==="), Some("!=="), None, None]
+        );
+        assert_eq!(ir.get(eq).operator_span(), None);
+        assert_eq!(ir.get(same).operator_span(), Some(Span::new(3, 6)));
+        let IrKind::ListEq(ShapedOperands { shape: records, .. }) = ir.get(eq).kind else {
+            panic!("expected a list comparison");
+        };
+        let Some(ListShape {
+            element: Some(record),
+        }) = ir.list_shape(records)
+        else {
+            panic!("expected a list's shape");
+        };
+        assert_eq!(ir.list_shape(record), None);
+        assert_eq!(ir.shape(record).fields.len(), 1);
+        assert_eq!(ir.shape_count(), 3);
+        let IrKind::Await { shape: lists, .. } = ir.get(root_result(&ir, root)).kind else {
+            panic!("expected an await");
+        };
+        let Some(LazyField::Within(each)) = ir.lazy_list(lists) else {
+            panic!("expected a list's lazy shape");
+        };
+        assert_eq!(
+            ir.lazy_list(each),
+            Some(LazyField::Await(LazyShapeId::NONE))
+        );
+        assert_eq!(ir.lazy_shape_count(), 2);
+    }
+
+    /// The result of the block `root` of `ir`.
+    fn root_result(ir: &Ir, root: IrId) -> IrId {
+        match ir.get(root).kind {
+            IrKind::Block { result, .. } => result,
+            other => panic!("expected a block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_nodes_print() {
+        let mut names = Names::new();
+        let (ir, _) = list_program(&mut names);
+        // Each node shows its details and its children; the list, shared by
+        // every node here, the same each time.
+        let shown = ir.pretty(&names).to_string();
+        let list = "(make-list @0..11\n\
+                    \x20     (int 1 @1..2)\n\
+                    \x20     (spread @4..10\n\
+                    \x20       (make-list @7..10\n\
+                    \x20         (int 1 @1..2))))";
+        for node in [
+            format!("\n  (index @0..14\n    {list}\n    (int 1 @1..2))\n"),
+            format!("\n  (list-len @0..16\n    {list})\n"),
+            format!("\n  (list-eq == *[x] @0..8\n    {list}\n    {list})\n"),
+            format!("\n  (list-eq != * @0..8\n    {list}\n"),
+            format!("\n  (list-same === @0..9\n    {list}\n"),
+            format!("\n  (list-same !== @0..9\n    {list}\n"),
+            format!("\n  (await **! @0..11\n    {list}))"),
+        ] {
+            assert!(shown.contains(&node), "{node}: {shown}");
+        }
     }
 
     #[test]

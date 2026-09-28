@@ -54,8 +54,8 @@
 //! real error.
 //!
 //! In a diagnostic's message and notes, a type written as a name, such as
-//! `Int`, is shown plainly, and a structural type (a record, function,
-//! future or union type) in backticks, since it contains spaces and
+//! `Int`, is shown plainly, and a structural type (a record, list,
+//! function, future or union type) in backticks, since it contains spaces and
 //! punctuation: "cannot add Int and `{}`". Labels show every type plainly:
 //! "expected {x: Int}, found Int".
 //!
@@ -213,9 +213,10 @@
 //! either: lowering reads the operands' type from the type table.
 //!
 //! Functions have no equality: once the operands are found to have one
-//! identical type, a type that is a function type, or a record type
+//! identical type, a type that is a function type, or a record or list type
 //! containing one at any depth (see [`TypeTable::contains_fn`]), is an
-//! error. Nor do they have an order.
+//! error. Nor do they have an order. Lists compare as records do, element by
+//! element (see [Lists](#lists)).
 //!
 //! # Functions
 //!
@@ -280,7 +281,9 @@
 //! unknown or unusable name, a parameter filled twice and parameters left
 //! unfilled are each reported, and make the call erroneous. A binding
 //! initialised directly with a function expression remembers which, so
-//! that a call through its name knows the function's [`FnResolution`].
+//! that a call through its name knows the function's [`FnResolution`]. A
+//! call of a built-in function is typed apart (see [Built-in
+//! functions](#built-in-functions)).
 //!
 //! **Purity.** A function declared with `:` is pure, one declared with `->`
 //! impure, and one declared with `->>` impure and memoised: its [`Effect`]
@@ -307,13 +310,16 @@
 //! [`TypeTable::future`]). The name a `let` or a field binds is not in scope in
 //! its own `lazy` initialiser, as for any initialiser.
 //!
-//! **Bare types.** In a type expression, a type written as a name or a
-//! record type means what the position it is written in says (`Bareness`):
+//! **Bare types.** In a type expression, a type written as a name, a
+//! record type or a list type (`List<T>` or `T[]`) means what the position
+//! it is written in says (`Bareness`):
 //! the either shape, `T | Future<T>`, in the parameters and the return type
 //! of an impure function expression and of a written impure function type,
 //! and in the return type of a memoised one, at that position and at every
-//! bare position inside it, through record types (so `{a: Int}` there is
-//! `{a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>`) but not into a
+//! bare position inside it, through record and list types (so `{a: Int}`
+//! there is `{a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>`, and
+//! `List<Int>` is `List<Int | Future<Int>> | Future<List<Int | Future<Int>>>`)
+//! but not into a
 //! nested function type, which has its own rule; and a present `T`
 //! everywhere else: annotations, ascriptions, the return types of pure
 //! functions, the parameters and return types of written pure function
@@ -367,7 +373,8 @@
 //! along its path that exists (see "Dotted `let` and `:=`" above). An
 //! interpolated expression and an operand of an equality are awaited deeply
 //! (`Checker::measure_deep`): at the top and in every lazy field of the
-//! record it is, at any depth (see [`TypeTable::present`]). Where a type is
+//! record it is, or element of the list it is, at any depth (see
+//! [`TypeTable::present`]). Where a type is
 //! expected, as for an argument, an annotated initialiser, a function's body or an `if` condition, a value
 //! that is not a subtype of it is awaited if it is one once awaited, at the
 //! top or deeply (see [`TypeTable::needs_await`]); otherwise the mismatch is
@@ -382,9 +389,9 @@
 //! is an unused value.
 //!
 //! Futures have no equality: an operand of `==`, `!=`, `===` or `!==` whose
-//! type, once awaited at the top, has a `Future` in a field at any depth is
-//! an error (a field of the either shape is not: the deep await resolves
-//! it). Two `if` branches of which either may be a future have their join
+//! type, once awaited at the top, has a `Future` in a field or as a list's
+//! element type at any depth is an error (a field or an element of the
+//! either shape is not: the deep await resolves it). Two `if` branches of which either may be a future have their join
 //! (see [`TypeTable::join`]).
 //!
 //! **Purity.** Awaiting runs a deferred expression, which may have effects,
@@ -413,9 +420,10 @@
 //!
 //! # Inferred parameters
 //!
-//! A pure function's bare parameter, one whose type is written as a name or
-//! a record type (not `Present<...>`, `Future<...>`, a union or a function
-//! type, which say what they are), is present if the function's body
+//! A pure function's bare parameter, one whose type is written as a name, a
+//! record type or a list type (not `Present<...>`, `Future<...>`, a union
+//! or a function type, which say what they are), is present if the
+//! function's body
 //! *measures* it, and the either shape if it never does, so that a pure
 //! function can pass a future through without declaring it: `fn double(x:
 //! Int): Int { x * 2 }` is `fn(x: Int): Int`, and `fn keep(x: Int): {v: Int
@@ -527,19 +535,24 @@
 //! # Inferred results
 //!
 //! An impure or memoised function's bare result position, one written as a
-//! name or a record type, is the either shape while the body is checked,
+//! name, a record type or a list type, is the either shape while the body
+//! is checked,
 //! as the bare type rule says, and then takes the laziness of what the body
 //! returns there: `T` if it is present, `Future<T>` if it is a future, and
 //! the either shape, as written, if it may be either or has a provisional
 //! type (see below), `T` being the type written there, with its own bare
 //! positions inferred in the same way if it is a record type, each field
 //! against the field of the same name of what the body returns there once
-//! stripped (the body's other fields play no part). So `fn get() -> {a: Int,
+//! stripped (the body's other fields play no part), and if it is a list
+//! type, its element type against the element type of what the body
+//! returns there once stripped. So `fn get() -> {a: Int,
 //! b: String} { a = 1; b = "x" }` is `fn() -> {a: Int, b: String}`, `fn
 //! later() -> Int { lazy 5 }` is `fn() -> Future<Int>`, and `fn pass(x: Int)
 //! -> Int { x }` is `fn(x: Int | Future<Int>) -> Int | Future<Int>`, its
 //! parameter being the either shape, while `fn add(x: Int) -> Int { x + 1 }`
-//! is `fn(x: Int | Future<Int>) -> Int`. A position that is not bare keeps
+//! is `fn(x: Int | Future<Int>) -> Int`, and `fn l() -> List<Int> { [1,
+//! lazy 2] }` is `fn() -> List<Int | Future<Int>>` (see
+//! [Lists](#lists)). A position that is not bare keeps
 //! what is written, with everything inside it: `Present<...>`,
 //! `Future<...>`, a union and a function type say what they are. A
 //! parenthesised type is what is inside it. The parameters are never
@@ -603,7 +616,8 @@
 //! one whose type is written directly as an impure function type, `fn(...)
 //! -> T` (not inside `Future<...>`, a union, a record type or another
 //! function type), and each parameter position of that type written bare,
-//! as a name or a record type, is *narrowable*. As written, such a position
+//! as a name, a record type or a list type, is *narrowable*. As written,
+//! such a position
 //! is the either shape: the function says it may pass the callback a
 //! future there, so a pure callback that measures its parameter does not
 //! fit. A body that only ever passes present values there is narrowed to
@@ -682,6 +696,94 @@
 //! it needs). A callee of an earlier session input has no label, its
 //! source being gone.
 //!
+//! # Lists
+//!
+//! `List<T>`, also written `T[]`, is a container, like a record type (see
+//! [`crate::types`]): every rule above that names a record type names a
+//! list type too, with its element type a position inside it. So in an
+//! impure function's signature `List<Int>` is `List<Int | Future<Int>> |
+//! Future<List<Int | Future<Int>>>`; a pure function's parameter written as
+//! a list type is inferred, a bare list result position is inferred from
+//! the body, its element type from the element type of what the body
+//! returns, and a callback's parameter position written as a list type is
+//! narrowable; and a memoised function's list parameter is present
+//! throughout, so an argument whose elements may be futures is awaited
+//! deeply at the call. What looks through a record's fields for futures
+//! and provisional types looks through a list's element type, so an
+//! interpolated list and an operand of an equality are awaited deeply,
+//! element by element.
+//!
+//! **Literals.** A list literal with no expected type is the list of the
+//! join of its elements' types (see [`TypeTable::join`]), in order, a
+//! spread contributing its list's element type; untyped integers adapt as
+//! an `if`'s branches do, so `[1, 2.5]` is `List<Float>` and `[1, 2]`
+//! `List<Int>`, and two element types that differ measure the provisional
+//! parameters in them, as an `if`'s branches do (see [Inferred
+//! parameters](#inferred-parameters)). Two elements with no join are "list
+//! elements have different types", reported at the first that does not
+//! join with those before it; `[]` has nothing to join, and is "cannot
+//! infer the element type of `[]`". Nothing is awaited: `[1, lazy 2]` is
+//! `List<Int | Future<Int>>`.
+//!
+//! A literal where a list type `List<X>` (or its either shape) is expected
+//! has each element checked against `X` as an argument is against its
+//! parameter: an untyped integer adapts, an element that fits `X` once
+//! awaited is awaited, subject to the purity rule, and anything else is a
+//! mismatch. The literal's type is then the list of the join of what its
+//! elements are once those awaits have run (`Checker::fit`: what the
+//! evaluator's typed walkers will find in it), a subtype of `List<X>`, so
+//! that an inferred result sees what the list really holds; `[]` there is
+//! the list of `X` made present, where that fits `X`, since no element of it
+//! is a future. The expected type reaches a literal where it reaches a
+//! record block (an annotation, an argument, a function's body, a field of
+//! an expected record type, a `:=`, an ascription) through parentheses, and,
+//! for a list type only, also through a block's result and the branches of
+//! an `if` with `else`, so that a function's body, a block, reaches its
+//! literal; such a block or `if` has the type of what its result, or the
+//! join of what its branches, are once awaited. It never flows from one
+//! branch of an `if` to the other.
+//!
+//! A spread's operand is used as its bits at the top (`Checker::measure`),
+//! and must be a list: "cannot spread a value of type T: it is not a list".
+//! Its elements are not measured: where an element type is expected, they
+//! must fit it as they are, since there is no expression to await for each;
+//! a list whose elements would fit only once awaited is a mismatch, with a
+//! note saying why.
+//!
+//! **Indexes.** `e[i]` measures `e` at the top, which must be a list
+//! ("cannot index a value of type T: it is not a list"), and `i`, which
+//! must be an `Int` ("a list index must be an Int, found T"). Its type is
+//! the element type as it is, so the element, not the index, is awaited
+//! where it is used as its bits. A position outside the list is a runtime
+//! error (see [`crate::eval`]).
+//!
+//! **Equality.** Lists compare as records do (see [Equality](#equality)),
+//! when their types are identical, contain no function and no `Future`:
+//! element by element, typed equality comparing records inside by their
+//! static type. They have no order, and no arithmetic: `+` does not
+//! concatenate them, a spread does.
+//!
+//! # Built-in functions
+//!
+//! A [`Builtin`] is a name of a scope outside the outermost one, present in
+//! every program and session: a `let`, a parameter or a field of the same
+//! name shadows it as any outer binding is shadowed, and `:=` never finds
+//! it. The table of built-ins gives each its name, its parameters' names
+//! and its [`Effect`]; `len(list)`, the number of elements of a list, is the
+//! only one yet. A call of one, whose callee is exactly the name, binds its
+//! arguments by position or by the table's names, with the errors of any
+//! call's arguments (`Checker::bind_builtin_arguments`), and is then typed
+//! by the checker, since a built-in is generic: `len`'s argument is
+//! measured at the top, its elements not at all, and must be a list ("`len`
+//! takes a list, found T"), and the call is an `Int`. The callee resolves
+//! to [`VarRef::Builtin`] and has the function type of this call, and
+//! lowering makes the call the built-in's own node. Calling a built-in that
+//! is not pure from a pure function is an error, as for any function; `len`
+//! is pure. A built-in is not a value, for now: any other use of its name,
+//! `(len)(xs)` included, is "`len` is a built-in function and cannot be used
+//! as a value yet" (`Checker::builtin_value_error`, the one place that says
+//! so).
+//!
 //! # Scopes
 //!
 //! Every block, including the file's own body, is a scope. A `let` declares
@@ -725,9 +827,9 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTy,
-    FieldTyRange, FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment,
-    StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
+    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange,
+    PathRange, PathSegment, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -845,8 +947,57 @@ pub enum VarRef {
     Capture(u32),
     /// The closure being called: a function's reference to itself.
     Callee,
+    /// A built-in function, which is not a value: only the callee of a call
+    /// of it resolves to one, and lowering makes the call the built-in's
+    /// own node.
+    Builtin(Builtin),
     /// Nothing: the expression or item is not a variable use.
     None,
+}
+
+/// A built-in function: a name of a scope outside the outermost one,
+/// present in every program and session, which a call types afresh each
+/// time. See the module documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Builtin {
+    /// `len(list)`: the number of elements of a list, an `Int`.
+    Len,
+}
+
+impl Builtin {
+    /// Every built-in function, in the order a scope lists them.
+    pub const ALL: [Builtin; 1] = [Builtin::Len];
+
+    /// The name it is called by.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Builtin::Len => "len",
+        }
+    }
+
+    /// The names of its parameters, in order, which named arguments match.
+    #[must_use]
+    pub const fn params(self) -> &'static [&'static str] {
+        match self {
+            Builtin::Len => &["list"],
+        }
+    }
+
+    /// What it may do: only a pure one may be called from a pure function.
+    #[must_use]
+    pub const fn effect(self) -> Effect {
+        match self {
+            Builtin::Len => Effect::Pure,
+        }
+    }
+
+    /// A call of it, as the note on a use of it as a value shows one.
+    const fn example(self) -> &'static str {
+        match self {
+            Builtin::Len => "len(xs)",
+        }
+    }
 }
 
 /// Whether and how an expression's value is awaited where it is used, in
@@ -1435,11 +1586,13 @@ struct Node {
     next_sibling: u32,
 }
 
-/// The record type a record block is checked against, and where the
+/// The record type a record block is checked against, or the list type the
+/// result of a block that is not one is checked against, and where the
 /// expectation comes from, for [`Checker::check_expr_expecting`].
 #[derive(Clone, Copy, Debug)]
 struct Expecting<'w> {
-    /// The expected record type.
+    /// The expected record type, present; or the expected list type, as it
+    /// is expected, which may be its either shape.
     ty: TyId,
     /// The annotation, ascription, return type or callee stating it.
     context: Span,
@@ -1447,6 +1600,19 @@ struct Expecting<'w> {
     why: &'w str,
     /// The block's closing brace, where a missing field is reported.
     close: Span,
+}
+
+impl<'w> Expecting<'w> {
+    /// The expectation of a value of type `ty`, stated at `context`,
+    /// labelled `why`, of the block spanning `block`.
+    const fn new(ty: TyId, (context, why): (Span, &'w str), block: Span) -> Self {
+        Self {
+            ty,
+            context,
+            why,
+            close: Span::new(block.end.saturating_sub(1), block.end),
+        }
+    }
 }
 
 /// What an impure function's body is known to return at one position of
@@ -1614,6 +1780,15 @@ pub struct Checker<'a> {
     /// The name `Present`, which applied to a type is it with every bare
     /// type in it present, if the program mentions it.
     present_name: Option<Name>,
+    /// The name `List`, which applied to a type is a list of it, if the
+    /// program mentions it.
+    list_name: Option<Name>,
+    /// The built-in functions, each with its name, if the program mentions
+    /// it.
+    builtins: [(Option<Name>, Builtin); Builtin::ALL.len()],
+    /// Reused for the types of the elements of the list literals being
+    /// checked, innermost literal's last: a stack, as `sorted_fields` is.
+    element_types: Vec<TyId>,
     /// Reused for sorting the fields of a record block or a record type by
     /// name: each field's name, its position in source order and its type.
     /// Nested uses push above the entries of the use enclosing them and
@@ -1703,6 +1878,9 @@ impl<'a> Checker<'a> {
             ],
             future_name: names.lookup("Future"),
             present_name: names.lookup("Present"),
+            list_name: names.lookup("List"),
+            builtins: Builtin::ALL.map(|builtin| (names.lookup(builtin.name()), builtin)),
+            element_types: Vec::new(),
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
             built: Vec::new(),
@@ -1825,7 +2003,12 @@ impl<'a> Checker<'a> {
     /// Checks the items of a body in the current scope, returning its type:
     /// for a record block, the record of its fields; otherwise the type of
     /// its result, the `= EXPR` or final expression statement, or `{}` if
-    /// it has none.
+    /// it has none. With `expecting`, a record block is checked against the
+    /// expected record type, and a block that is not one has its result
+    /// checked against the expected type, which it does only for a list
+    /// type (see [`Checker::check_list_expected`]), and has the type its
+    /// result has once any await marked on it has run (see
+    /// [`Checker::fit`]).
     fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let items = self.ast.items(body);
         let first_field = items
@@ -1836,12 +2019,20 @@ impl<'a> Checker<'a> {
         for (index, &id) in items.iter().enumerate() {
             let next = items.get(index + 1).copied();
             let item = *self.ast.item(id);
+            // The result of a block that is not a record block, checked
+            // against what is expected of the block.
+            let result_expected = expecting.filter(|_| next.is_none() && first_field.is_none());
             match item.kind {
                 ItemKind::Let { path, ty, value } => self.check_let(id, path, ty, value),
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
                 ItemKind::Field { path, value } => self.check_field(id, path, value, expecting),
                 ItemKind::Result(value) => {
-                    let ty = self.check_expr(value);
+                    let ty = match result_expected {
+                        Some(expected) => {
+                            self.fit(value, expected.ty, (expected.context, expected.why))
+                        }
+                        None => self.check_expr(value),
+                    };
                     let eq = Span::new(item.span.start, item.span.start + 1);
                     if let Some(first_field) = first_field {
                         self.settle(value, ty);
@@ -1873,7 +2064,12 @@ impl<'a> Checker<'a> {
                     }
                 }
                 ItemKind::Expr(value) => {
-                    let ty = self.check_expr(value);
+                    let ty = match result_expected {
+                        Some(expected) => {
+                            self.fit(value, expected.ty, (expected.context, expected.why))
+                        }
+                        None => self.check_expr(value),
+                    };
                     // In a record block, even the final expression is a
                     // statement.
                     if next.is_none() && first_field.is_none() {
@@ -3005,8 +3201,9 @@ impl<'a> Checker<'a> {
 
     /// The type a type expression denotes, with a bare type meaning what
     /// `mode` says (see the module documentation): in `Either` mode, a type
-    /// written as a name or a record type is the either shape, a record
-    /// type's fields being resolved in `Either` mode too. A function type
+    /// written as a name, a record type or a list type (`List<T>` or `T[]`)
+    /// is the either shape, a record type's fields and a list type's
+    /// element type being resolved in `Either` mode too. A function type
     /// is never made the either shape at its own position, whatever the
     /// mode: its interior follows its own purity marker, and a function
     /// value that may be a future is written `Future<fn...>` or `fn... |
@@ -3036,7 +3233,10 @@ impl<'a> Checker<'a> {
                 self.errors.push(Diagnostic::error(message, ty.span));
                 TyId::ERROR
             }
-            TypeExprKind::Applied { name, span, arg } => self.resolve_applied(name, span, arg),
+            TypeExprKind::List(element) => self.resolve_list(element, mode),
+            TypeExprKind::Applied { name, span, arg } => {
+                self.resolve_applied((name, span), arg, mode)
+            }
             TypeExprKind::Union { lhs, rhs, bar } => {
                 let lhs = self.resolve_type(lhs, Bareness::Present);
                 let rhs = self.resolve_type(rhs, Bareness::Present);
@@ -3131,19 +3331,56 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Whether `name` is `Future` or `Present`, which take a type argument.
+    /// The list type whose element type is written as `element`, written
+    /// bare in `mode`, as a record type is: the element type is a position
+    /// inside it, resolved in `mode` too. `Error` if the element type is
+    /// erroneous.
+    fn resolve_list(&mut self, element: TypeExprId, mode: Bareness) -> TyId {
+        let element = self.resolve_type(element, mode);
+        if element == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        let list = self.types.list(element);
+        self.bare(list, mode)
+    }
+
+    /// Whether `name` is `Future`, `Present` or `List`, which take a type
+    /// argument.
     fn is_type_constructor(&self, name: Name) -> bool {
-        Some(name) == self.future_name || Some(name) == self.present_name
+        Some(name) == self.future_name
+            || Some(name) == self.present_name
+            || Some(name) == self.list_name
+    }
+
+    /// Whether a type written as `ty` is *bare*, so that the bare type rule
+    /// applies to it: a name, a record type or a list type, written
+    /// `List<T>` or `T[]`. Not `Present<...>`, `Future<...>`, a union or a
+    /// function type, which say what they are.
+    fn is_bare(&self, ty: TypeExprId) -> bool {
+        match self.ast.type_expr(ty).kind {
+            TypeExprKind::Named(_) | TypeExprKind::Record(_) | TypeExprKind::List(_) => true,
+            TypeExprKind::Applied { name, .. } => Some(name) == self.list_name,
+            TypeExprKind::Fn { .. } | TypeExprKind::Union { .. } => false,
+        }
     }
 
     /// The type the applied type `NAME<ARG>` denotes, the name `name`
-    /// written at `span`: `Future<T>` for `Future` (`T` stripped, as
-    /// [`TypeTable::future`] does, so `Future<Future<Int>>` is
+    /// written at `span`, in `mode`: `Future<T>` for `Future` (`T` stripped,
+    /// as [`TypeTable::future`] does, so `Future<Future<Int>>` is
     /// `Future<Int>`), and `T` for `Present`, where `T` is the argument
-    /// resolved with every bare type present; or
-    /// `Error` (reported) for any other name, or an erroneous argument. The
-    /// argument is resolved, and its errors reported, whatever the name.
-    fn resolve_applied(&mut self, name: Name, span: Span, arg: TypeExprId) -> TyId {
+    /// resolved with every bare type present; the list type of the argument
+    /// for `List`, written bare in `mode` (see [`Checker::resolve_list`]);
+    /// or `Error` (reported) for any other name, or an erroneous argument.
+    /// The argument is resolved, and its errors reported, whatever the name.
+    fn resolve_applied(
+        &mut self,
+        (name, span): (Name, Span),
+        arg: TypeExprId,
+        mode: Bareness,
+    ) -> TyId {
+        if Some(name) == self.list_name {
+            return self.resolve_list(arg, mode);
+        }
         let arg = self.resolve_type(arg, Bareness::Present);
         let text = self.ast.names().get(name);
         if Some(name) == self.future_name {
@@ -3771,8 +4008,12 @@ impl<'a> Checker<'a> {
     /// against the record type field by field (see the module
     /// documentation) and its type, and that of each parenthesis around it,
     /// is the record of its fields, a subtype of `expected`, or `Error` if a
-    /// field is missing. Otherwise `id` is checked bottom-up and then must
-    /// be a subtype of `expected`, as [`Checker::expect`] says.
+    /// field is missing. If `expected` is a list type, or the either shape
+    /// of one, and `id` is, through any parentheses, a list literal, a block
+    /// with a result or an `if` with `else`, it is checked against the list
+    /// type as [`Checker::check_list_expected`] says. Otherwise `id` is
+    /// checked bottom-up and then must be a subtype of `expected`, as
+    /// [`Checker::expect`] says.
     fn check_expr_expecting(
         &mut self,
         id: ExprId,
@@ -3821,9 +4062,177 @@ impl<'a> Checker<'a> {
             }
             return ty;
         }
+        if self.expects_list(expected)
+            && let Some(ty) = self.check_list_expected(id, expected, (context, why))
+        {
+            return ty;
+        }
         let found = self.check_expr(id);
         self.expect_at(id, found, expected, (context, why), (site, filling));
         found
+    }
+
+    /// Whether a value where `expected` is expected is checked against a
+    /// list type (see [`Checker::check_list_expected`]): whether `expected`
+    /// is a list type, or its either shape (or a provisional one), but not
+    /// a future, which no list literal is.
+    fn expects_list(&self, expected: TyId) -> bool {
+        self.types.laziness(expected) != Laziness::Future
+            && self
+                .types
+                .list_element(self.types.strip(expected))
+                .is_some()
+    }
+
+    /// Whether `body`, a block's, has a result: whether it is not a record
+    /// block and its last item is a `= EXPR` or an expression statement.
+    fn has_result(&self, body: ItemRange) -> bool {
+        !self.is_record_body(body)
+            && self.ast.items(body).last().is_some_and(|&last| {
+                matches!(
+                    self.ast.item(last).kind,
+                    ItemKind::Result(_) | ItemKind::Expr(_)
+                )
+            })
+    }
+
+    /// Where a value of type `expected`, a list type or its either shape,
+    /// is expected, as stated at `context`, labelled `why`: checks `id`
+    /// against it and returns the type it has, if `id` is, through any
+    /// parentheses, a list literal, a block with a result or an `if` with
+    /// `else`, and `None`, having checked nothing, otherwise. The type of a
+    /// list literal is found as [`Checker::check_list_expecting`] says, and
+    /// that of a block or an `if` is what its result, or each branch,
+    /// checked against `expected` in turn, is once any await marked on it
+    /// has run (see [`Checker::fit`]); it is recorded for `id` and every
+    /// parenthesis around it. So the expected type reaches a list literal
+    /// that is a function's body's result, a branch's, or either nested in
+    /// the other.
+    fn check_list_expected(
+        &mut self,
+        id: ExprId,
+        expected: TyId,
+        (context, why): (Span, &str),
+    ) -> Option<TyId> {
+        let mut node = id;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        let expr = *self.ast.get(node);
+        let ty = match expr.kind {
+            ExprKind::List(elements) => {
+                self.check_list_expecting(elements, expected, (context, why))
+            }
+            ExprKind::Block(body) if self.has_result(body) => {
+                let expecting = Expecting::new(expected, (context, why), expr.span);
+                self.check_block(body, Some(expecting))
+            }
+            ExprKind::If {
+                cond,
+                then,
+                else_,
+                has_else: true,
+            } => {
+                let keyword = expr.keyword_span().unwrap_or(expr.span);
+                let cond_ty = self.check_expr(cond);
+                self.expect(
+                    cond,
+                    cond_ty,
+                    TyId::BOOL,
+                    keyword,
+                    "`if` conditions are Bool",
+                );
+                let then_ty = self.fit(then, expected, (context, why));
+                let else_ty = self.fit(else_, expected, (context, why));
+                if then_ty == TyId::ERROR || else_ty == TyId::ERROR {
+                    TyId::ERROR
+                } else {
+                    // What the branches hold has a join that fits, or the
+                    // expected type describes both.
+                    self.types
+                        .join(then_ty, else_ty)
+                        .filter(|&joined| self.types.is_subtype(joined, expected))
+                        .unwrap_or(expected)
+                }
+            }
+            _ => return None,
+        };
+        let mut node = id;
+        loop {
+            self.expr_types[node.index()] = ty;
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                _ => break,
+            }
+        }
+        Some(ty)
+    }
+
+    /// Checks `id` where a value of type `expected` is expected, as stated
+    /// at `context`, labelled `why` (see [`Checker::check_expr_expecting`]),
+    /// and returns what it is once any await marked on it has run (see
+    /// [`Checker::value_of`]), or `Error` if checking it reported an error,
+    /// a mismatch included. A record block checked field by field against a
+    /// record type is the record of what its fields are (see
+    /// [`Checker::held_record`]).
+    fn fit(&mut self, id: ExprId, expected: TyId, (context, why): (Span, &str)) -> TyId {
+        let errors = self.errors.len();
+        let found =
+            self.check_expr_expecting_at(id, expected, (context, why), (AwaitSite::Implicit, None));
+        if found == TyId::ERROR || self.errors.len() > errors {
+            return TyId::ERROR;
+        }
+        match self.value_of(id, expected) {
+            BodyValue::Typed(ty) => ty,
+            BodyValue::Fields(items) => {
+                let record = self.types.strip(expected);
+                self.held_record(items, record, found)
+            }
+            BodyValue::Open(_) => found,
+        }
+    }
+
+    /// What the record block of `items`, checked without an error field by
+    /// field against the record type `record`, which gave it the type
+    /// `found`, holds once the awaits marked on its fields' values have run:
+    /// the record of what each field's value is, found as
+    /// [`Checker::value_of`] finds it, a record block in turn as this finds
+    /// it, and a field that `record` lacks as its type says. A block with a
+    /// dotted field keeps `found`, the record of the expected fields' types,
+    /// a supertype of what it holds.
+    ///
+    /// Recurses once per level of record blocks nested in each other.
+    fn held_record(&mut self, items: ItemRange, record: TyId, found: TyId) -> TyId {
+        let ast = self.ast;
+        let base = self.sorted_fields.len();
+        for &item in ast.items(items) {
+            let ItemKind::Field { path, value } = ast.item(item).kind else {
+                continue;
+            };
+            let [field] = ast.path(path) else {
+                self.sorted_fields.truncate(base);
+                return found;
+            };
+            let ty = match self.types.field(record, field.name) {
+                Some(expected) => match self.value_of(value, expected) {
+                    BodyValue::Typed(ty) => ty,
+                    BodyValue::Fields(inner) => {
+                        let (inner_record, inner_found) =
+                            (self.types.strip(expected), self.expr_types[value.index()]);
+                        self.held_record(inner, inner_record, inner_found)
+                    }
+                    BodyValue::Open(_) => self.expr_types[value.index()],
+                },
+                None => self.expr_types[value.index()],
+            };
+            self.sorted_fields.push((field.name, 0, ty));
+        }
+        let fields = self.sorted_fields.get(base..).unwrap_or_default();
+        let held = self
+            .types
+            .record(fields.iter().map(|&(name, _, ty)| (name, ty)));
+        self.sorted_fields.truncate(base);
+        held
     }
 
     /// The record block that `id` is, through any parentheses, with its
@@ -3895,6 +4304,8 @@ impl<'a> Checker<'a> {
             ExprKind::Fn(function) => self.check_fn(id, function),
             ExprKind::Call { callee, args } => self.check_call(id, callee, args),
             ExprKind::Lazy(function) => self.check_lazy(function),
+            ExprKind::List(elements) => self.check_list(id, elements),
+            ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
         };
         self.expr_types[id.index()] = ty;
         ty
@@ -4265,36 +4676,41 @@ impl<'a> Checker<'a> {
 
     /// Whether a pure function's parameter whose type is written as `ty` is
     /// inferred: present if the body measures it, the either shape if not.
-    /// So is one written as a name or a record type; not one written as
-    /// `Present<...>` or `Future<...>` or a union, which says what it is,
-    /// nor as a function type, which is never made the either shape at its
-    /// own position (see the module documentation).
+    /// So is one written bare, as a name, a record type or a list type (see
+    /// [`Checker::is_bare`]); not one written as `Present<...>` or
+    /// `Future<...>` or a union, which says what it is, nor as a function
+    /// type, which is never made the either shape at its own position (see
+    /// the module documentation).
     fn is_inferred(&self, ty: TypeExprId) -> bool {
-        matches!(
-            self.ast.type_expr(ty).kind,
-            TypeExprKind::Named(_) | TypeExprKind::Record(_)
-        )
+        self.is_bare(ty)
     }
 
     /// The inferred result of an impure function at the position of its
     /// result type written as `ty`, whose declared type is `declared`, where
     /// the body returns `value` (see the module documentation). A position
-    /// written bare, as a name or a record type, whose declared type is
-    /// therefore the either shape of a `T`, is `T` if the value is present,
-    /// `Future<T>` if it is a future, and the either shape, as declared, if
-    /// it may be either or is a provisional type; for a record type, `T` is
-    /// the record of its declared fields, each inferred in turn against the
-    /// field of the same name of the value once stripped. Every other
+    /// written bare, as a name, a record type or a list type, whose declared
+    /// type is therefore the either shape of a `T`, is `T` if the value is
+    /// present, `Future<T>` if it is a future, and the either shape, as
+    /// declared, if it may be either or is a provisional type; for a record
+    /// type, `T` is the record of its declared fields, each inferred in turn
+    /// against the field of the same name of the value once stripped, and
+    /// for a list type, the list of its declared element type inferred in
+    /// turn against the element type of the value once stripped. Every other
     /// position keeps its declared type, and so does a bare one whose value
     /// is not known well enough: a record block, or a record its dotted
-    /// paths build, where a name is declared, or a value whose type is not
-    /// a subtype of what would be inferred.
+    /// paths build, where a name or a list type is declared, or a value
+    /// whose type is not a subtype of what would be inferred.
     ///
-    /// Recurses once per level of record type nesting in `ty`.
+    /// Recurses once per level of record or list type nesting in `ty`.
     fn inferred(&mut self, ty: TypeExprId, declared: TyId, value: BodyValue) -> TyId {
-        let fields = match self.ast.type_expr(ty).kind {
-            TypeExprKind::Named(_) => None,
-            TypeExprKind::Record(fields) => Some(fields),
+        // The fields of a record type, or the element type of a list type.
+        let (fields, element) = match self.ast.type_expr(ty).kind {
+            TypeExprKind::Named(_) => (None, None),
+            TypeExprKind::Record(fields) => (Some(fields), None),
+            TypeExprKind::List(element) => (None, Some(element)),
+            TypeExprKind::Applied { name, arg, .. } if Some(name) == self.list_name => {
+                (None, Some(arg))
+            }
             // They say what they are, a function type at its own position
             // included.
             TypeExprKind::Applied { .. } | TypeExprKind::Union { .. } | TypeExprKind::Fn { .. } => {
@@ -4314,13 +4730,24 @@ impl<'a> Checker<'a> {
                 BodyValue::Typed(self.types.strip(found)),
             ),
         };
-        let shape = match (fields, stripped) {
-            (Some(fields), stripped) => match self.inferred_record(fields, present, stripped) {
+        let shape = match (fields, element, stripped) {
+            (Some(fields), _, stripped) => match self.inferred_record(fields, present, stripped) {
                 Some(record) => record,
                 None => return declared,
             },
-            (None, BodyValue::Typed(_)) => present,
-            (None, BodyValue::Fields(_) | BodyValue::Open(_)) => return declared,
+            (None, Some(element), BodyValue::Typed(found)) => {
+                let (Some(declared_element), Some(found_element)) = (
+                    self.types.list_element(present),
+                    self.types.list_element(found),
+                ) else {
+                    return declared;
+                };
+                let element =
+                    self.inferred(element, declared_element, BodyValue::Typed(found_element));
+                self.types.list(element)
+            }
+            (None, None, BodyValue::Typed(_)) => present,
+            (None, _, BodyValue::Fields(_) | BodyValue::Open(_)) => return declared,
         };
         let inferred = match laziness {
             Laziness::Present => shape,
@@ -4619,6 +5046,9 @@ impl<'a> Checker<'a> {
     /// records what it gives each position (see
     /// [`Checker::record_argument`]), and is not a use of it as a value.
     fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
+        if let Some(builtin) = self.builtin_callee(callee) {
+            return self.check_builtin_call(id, (callee, builtin), args);
+        }
         let (callee_ty, callback) = self.check_callee(callee);
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
@@ -4658,6 +5088,246 @@ impl<'a> Checker<'a> {
             );
         }
         if erroneous { TyId::ERROR } else { sig.ret }
+    }
+
+    /// The built-in function that `callee`, the callee of a call, names, if
+    /// it is exactly a name, not in parentheses, that no binding in scope
+    /// has and a built-in has.
+    fn builtin_callee(&self, callee: ExprId) -> Option<Builtin> {
+        let ExprKind::Name(name) = self.ast.get(callee).kind else {
+            return None;
+        };
+        // The name first, so that a call of anything else searches its
+        // scope only once, as it does without built-ins.
+        let builtin = self.builtin(name)?;
+        self.lookup(name).is_none().then_some(builtin)
+    }
+
+    /// The built-in function named `name`, if there is one.
+    fn builtin(&self, name: Name) -> Option<Builtin> {
+        self.builtins
+            .iter()
+            .find(|&&(builtin, _)| builtin == Some(name))
+            .map(|&(_, builtin)| builtin)
+    }
+
+    /// Types the call `id` of the built-in function `builtin`, the callee
+    /// `callee`, with the arguments `args` (see the module documentation):
+    /// the arguments are bound to the built-in's parameters as a function's
+    /// are (see [`Checker::bind_builtin_arguments`]), and then typed as the
+    /// built-in says, each built-in its own way. The callee's type is the
+    /// function type the built-in has at this call. Calling a built-in that
+    /// is not pure from a pure function is an error, as for any function.
+    fn check_builtin_call(
+        &mut self,
+        id: ExprId,
+        (callee, builtin): (ExprId, Builtin),
+        args: ArgRange,
+    ) -> TyId {
+        self.expr_vars[callee.index()] = VarRef::Builtin(builtin);
+        let base = self.filled.len();
+        let erroneous = self.bind_builtin_arguments(id, (callee, builtin), args);
+        // Each parameter's argument, as bound.
+        let bound: Vec<ExprId> = {
+            let arg_list = self.ast.args(args);
+            self.filled
+                .get(base..)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|&arg| arg_list.get(arg as usize).map(|arg| arg.value))
+                .collect()
+        };
+        self.filled.truncate(base);
+        let ty = match (builtin, bound.as_slice()) {
+            (Builtin::Len, &[list]) if !erroneous => self.check_len(callee, list),
+            _ => {
+                // Every argument is checked, whatever goes wrong.
+                for &arg in &bound {
+                    self.check_alone(arg);
+                }
+                TyId::ERROR
+            }
+        };
+        if let Some(function) = self.functions.last()
+            && function.effect == Effect::Pure
+            && builtin.effect() != Effect::Pure
+        {
+            let marker = function.marker;
+            self.errors.push(
+                Diagnostic::error(
+                    "cannot call an impure function from a pure function",
+                    self.ast.get(id).span,
+                )
+                .with_context(
+                    self.ast.get(callee).span,
+                    format!("`{}` is an impure built-in function", builtin.name()),
+                )
+                .with_context(marker, PURE_CONTEXT),
+            );
+        }
+        ty
+    }
+
+    /// Types the call of `len`, the callee `callee`, whose argument is
+    /// `list`: the argument is used as its bits at the top (see
+    /// [`Checker::measure`]), its elements not at all, and must be a list,
+    /// "`len` takes a list, found T". The call is an `Int`, and the callee
+    /// a pure function from that list type to `Int`; `Error` if the
+    /// argument is not a list or is erroneous.
+    fn check_len(&mut self, callee: ExprId, list: ExprId) -> TyId {
+        let found = self.check_expr(list);
+        let found = self.settle(list, found);
+        let ty = self.measure(list, found);
+        if ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        if self.types.list_element(ty).is_none() {
+            let shown = self.in_message(ty);
+            let label = format!("this is {}", self.in_label(ty));
+            self.errors.push(
+                Diagnostic::error(
+                    format!("`{}` takes a list, found {shown}", Builtin::Len.name()),
+                    self.ast.get(list).span,
+                )
+                .with_label(label),
+            );
+            return TyId::ERROR;
+        }
+        self.expr_types[callee.index()] =
+            self.types
+                .fn_type([(None, ty)], TyId::INT, Builtin::Len.effect());
+        TyId::INT
+    }
+
+    /// Binds the arguments `args` of the call `id` of the built-in function
+    /// `builtin`, the callee `callee`, to its parameters, as
+    /// [`Checker::bind_arguments`] binds a function's, by position or by
+    /// the names its table gives, and records the argument filling each
+    /// parameter above `filled`'s length on entry, which the caller
+    /// truncates back. An argument that fills no parameter is checked alone
+    /// here; the others are left to the caller. Reports every argument that
+    /// cannot be bound and every parameter left unfilled with the errors a
+    /// function's call reports, and returns whether there was any.
+    fn bind_builtin_arguments(
+        &mut self,
+        id: ExprId,
+        (callee, builtin): (ExprId, Builtin),
+        args: ArgRange,
+    ) -> bool {
+        let ast = self.ast;
+        let call = ast.get(id);
+        let callee_span = ast.get(callee).span;
+        let label = format!("`{}` is a built-in function", builtin.name());
+        let params = builtin.params();
+        let arg_list = ast.args(args);
+        let count = params.len();
+        let positional = arg_list
+            .iter()
+            .filter(|arg| arg.kind == ArgKind::Positional)
+            .count();
+        let trailing = arg_list.iter().any(|arg| arg.kind == ArgKind::Trailing);
+        let named = arg_list
+            .iter()
+            .any(|arg| matches!(arg.kind, ArgKind::Named { .. }));
+        let found = positional + usize::from(trailing);
+        let mut erroneous = false;
+        if found > count {
+            self.report_extra_arguments((call, callee_span, &label), args, count);
+            erroneous = true;
+        }
+        let base = self.filled.len();
+        self.filled.resize(base + count, u32::MAX);
+        let mut next_positional = 0;
+        for (index, arg) in arg_list.iter().enumerate() {
+            let target = match arg.kind {
+                ArgKind::Positional => {
+                    next_positional += 1;
+                    Some(next_positional - 1).filter(|&param| param < count)
+                }
+                ArgKind::Trailing => (positional < count).then(|| count - 1),
+                ArgKind::Named { name, span } => {
+                    let text = ast.names().get(name);
+                    let param = params.iter().position(|&param| param == text);
+                    if param.is_none() {
+                        self.errors.push(
+                            Diagnostic::error(format!("unknown argument `{text}`"), span)
+                                .with_context(callee_span, label.as_str()),
+                        );
+                        erroneous = true;
+                    }
+                    param
+                }
+            };
+            let Some(param) = target else {
+                self.check_alone(arg.value);
+                continue;
+            };
+            let first = self.filled.get(base + param).copied().unwrap_or(u32::MAX);
+            if let Some(first) = arg_list.get(first as usize) {
+                let name = params.get(param).and_then(|&text| ast.names().lookup(text));
+                self.report_given_twice((param, name), first.span(ast), arg.span(ast));
+                erroneous = true;
+                self.check_alone(arg.value);
+                continue;
+            }
+            if let Some(entry) = self.filled.get_mut(base + param) {
+                *entry = position(index);
+            }
+        }
+        let unfilled: Vec<&str> = params
+            .iter()
+            .zip(self.filled.get(base..).unwrap_or_default())
+            .filter(|&(_, &arg)| arg == u32::MAX)
+            .map(|(&text, _)| text)
+            .collect();
+        if !unfilled.is_empty() {
+            erroneous = true;
+            if !named && !trailing {
+                let noun = if count == 1 { "argument" } else { "arguments" };
+                self.errors.push(
+                    Diagnostic::error(format!("expected {count} {noun}, found {found}"), call.span)
+                        .with_context(callee_span, label.as_str()),
+                );
+            } else {
+                let close = call.close_span().unwrap_or(call.span);
+                for text in unfilled {
+                    self.errors.push(
+                        Diagnostic::error(format!("missing argument `{text}`"), close)
+                            .with_context(callee_span, label.as_str()),
+                    );
+                }
+            }
+        }
+        if !erroneous {
+            for (param, &arg) in self
+                .filled
+                .get(base..)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                if let Some(entry) = self.arg_params.get_mut(args.start() + arg as usize) {
+                    *entry = position(param);
+                }
+            }
+        }
+        erroneous
+    }
+
+    /// Reports a use of the built-in function `builtin`, at `span`, other
+    /// than as the callee of a call, and returns `Error`: a built-in is not
+    /// a value, for now. (The one place this restriction is made, so that
+    /// lifting it is one change.)
+    fn builtin_value_error(&mut self, builtin: Builtin, span: Span) -> TyId {
+        let name = builtin.name();
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{name}` is a built-in function and cannot be used as a value yet"),
+                span,
+            )
+            .with_note(format!("call it, as in `{}`", builtin.example())),
+        );
+        TyId::ERROR
     }
 
     /// Binds the arguments `args` of the call `id` to the parameters of
@@ -5013,9 +5683,10 @@ impl<'a> Checker<'a> {
     /// whose type is written as `ty` and is not erroneous, is a callback
     /// parameter, one written directly as an impure function type, adds it
     /// to `callbacks`, with its positions, and returns its index there;
-    /// `None` otherwise. A position written bare, as a name or a record
-    /// type, is narrowable, to its present type: the type it is written as
-    /// with every bare type in it present. See the module documentation.
+    /// `None` otherwise. A position written bare, as a name, a record type
+    /// or a list type (see [`Checker::is_bare`]), is narrowable, to its
+    /// present type: the type it is written as with every bare type in it
+    /// present. See the module documentation.
     fn callback_parameter(&mut self, param: usize, ty: TypeExprId) -> Option<usize> {
         let ast = self.ast;
         let TypeExprKind::Fn {
@@ -5030,11 +5701,8 @@ impl<'a> Checker<'a> {
         for position in ast.param_tys(params) {
             // The type resolved without an error in its own mode, so it
             // resolves without one in this one too.
-            let bare = matches!(
-                ast.type_expr(position.ty).kind,
-                TypeExprKind::Named(_) | TypeExprKind::Record(_)
-            );
-            let narrowable = bare
+            let narrowable = self
+                .is_bare(position.ty)
                 .then(|| {
                     (
                         position.ty,
@@ -5147,7 +5815,11 @@ impl<'a> Checker<'a> {
             let found = self.check_body(items, Some(expecting));
             self.expr_types[body.index()] = found;
         } else {
-            let found = self.check_body(items, None);
+            // A list literal the body results in is checked against a list
+            // return type, as a record block is against a record one.
+            let expecting = (self.expects_list(ret) && self.has_result(items))
+                .then(|| Expecting::new(ret, (context, why), block.span));
+            let found = self.check_body(items, expecting);
             self.expr_types[body.index()] = found;
             self.expect(body, found, ret, context, why);
         }
@@ -5344,6 +6016,10 @@ impl<'a> Checker<'a> {
             self.expr_vars[id.index()] = self.resolve(index, binding);
             return (binding.ty, binding.callback);
         }
+        // The callee of a call of a built-in is checked apart.
+        if let Some(builtin) = self.builtin(name) {
+            return (self.builtin_value_error(builtin, span), None);
+        }
         let text = self.ast.names().get(name);
         let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span);
         if text.contains('-') {
@@ -5425,8 +6101,9 @@ impl<'a> Checker<'a> {
     /// Types a comparison. Both operands must be the same type, untyped
     /// operands adapting as for arithmetic and two untyped operands
     /// settling to `Int`: any type without functions in it for `==`, `!=`,
-    /// `===` and `!==` (two records must be exactly the same type), and
-    /// `Int`, `Float` or `String` for ordering. The result is `Bool`.
+    /// `===` and `!==` (two records, or two lists, must be exactly the same
+    /// type), and `Int`, `Float` or `String` for ordering. The result is
+    /// `Bool`.
     fn comparison(
         &mut self,
         id: ExprId,
@@ -5439,7 +6116,10 @@ impl<'a> Checker<'a> {
             // An operand of a type with no order is reported as such, before
             // any mismatch.
             let unordered = [lhs_ty, rhs_ty].into_iter().find(|&ty| {
-                ty == TyId::BOOL || self.types.is_record(ty) || self.types.fn_sig(ty).is_some()
+                ty == TyId::BOOL
+                    || self.types.is_record(ty)
+                    || self.types.list_element(ty).is_some()
+                    || self.types.fn_sig(ty).is_some()
             });
             if let Some(unordered) = unordered {
                 self.coerce(lhs, TyId::INT);
@@ -5492,7 +6172,7 @@ impl<'a> Checker<'a> {
     }
 
     /// Decides the common type of two expressions that must have the same
-    /// type: `Bool`, `String`, record and function types must match
+    /// type: `Bool`, `String`, record, list and function types must match
     /// exactly, and numeric types agree as for [`Checker::numeric`], whose
     /// results this returns.
     fn agree(
@@ -5504,6 +6184,7 @@ impl<'a> Checker<'a> {
             && (lhs_ty == TyId::BOOL
                 || lhs_ty == TyId::STRING
                 || self.types.is_record(lhs_ty)
+                || self.types.list_element(lhs_ty).is_some()
                 || self.types.fn_sig(lhs_ty).is_some())
         {
             Some(lhs_ty)
@@ -5654,6 +6335,339 @@ impl<'a> Checker<'a> {
         ty
     }
 
+    /// Types the list literal `id`, whose elements are `elements`, with no
+    /// expected type (see the module documentation): each element is
+    /// checked, a spread's operand being measured and having to be a list,
+    /// and the literal is the list of the join of the elements' types, in
+    /// order, a spread contributing its list's element type, untyped
+    /// integers adapting as an `if`'s branches do. Two elements with no join
+    /// are "list elements have different types", at the first element that
+    /// does not join with those before it; and an empty literal has nothing
+    /// to join, "cannot infer the element type of `[]`". `Error` for either,
+    /// and for a literal with an erroneous element.
+    fn check_list(&mut self, id: ExprId, elements: ElementRange) -> TyId {
+        let ast = self.ast;
+        let list = ast.elements(elements);
+        if list.is_empty() {
+            self.errors.push(
+                Diagnostic::error("cannot infer the element type of `[]`", ast.get(id).span)
+                    .with_note("annotate it, as in `let xs: List<Int> = []`"),
+            );
+            return TyId::ERROR;
+        }
+        // Every element is checked, in order, before any is joined.
+        let base = self.element_types.len();
+        for element in list {
+            let ty = match element.spread {
+                Some(spread) => self
+                    .check_spread(element.value, spread)
+                    .and_then(|list| self.types.list_element(list))
+                    .unwrap_or(TyId::ERROR),
+                None => self.check_expr(element.value),
+            };
+            self.element_types.push(ty);
+        }
+        let mut joined = None;
+        let mut failed = false;
+        for (index, element) in list.iter().enumerate() {
+            let ty = self
+                .element_types
+                .get(base + index)
+                .copied()
+                .unwrap_or(TyId::ERROR);
+            if ty == TyId::ERROR {
+                failed = true;
+            }
+            if failed {
+                continue;
+            }
+            let Some(so_far) = joined else {
+                joined = Some(ty);
+                continue;
+            };
+            let earlier = list.get(..index).unwrap_or_default();
+            match self.join_element((earlier, element.value), so_far, ty) {
+                Ok(ty) => joined = Some(ty),
+                Err((so_far, ty)) => {
+                    self.report_element_mismatch(list, index, so_far, ty);
+                    failed = true;
+                }
+            }
+        }
+        self.element_types.truncate(base);
+        // Whatever has not adapted to a concrete type is an `Int`.
+        for element in list.iter().filter(|element| element.spread.is_none()) {
+            let ty = self.expr_types[element.value.index()];
+            self.settle(element.value, ty);
+        }
+        match joined {
+            _ if failed => TyId::ERROR,
+            Some(TyId::UNTYPED_INT) => self.types.list(TyId::INT),
+            Some(element) => self.types.list(element),
+            None => TyId::ERROR,
+        }
+    }
+
+    /// The join of `so_far`, the join of the types of the elements
+    /// `earlier` of a list literal, with `ty`, the type of the element after
+    /// them, whose expression is `value`, a spread's being its list's
+    /// element type: `Ok` with the join, or `Err` with the two types as they
+    /// were joined if they have none. As for an `if`'s branches, an untyped
+    /// integer, or the untyped elements so far, adapt to the other side's
+    /// `Int` or `Float` once stripped, or to `Int`; and if the two types
+    /// differ, each parameter of a claimable function (see
+    /// [`Checker::claimable`]) whose provisional type is in either is
+    /// measured, conservatively, at the element.
+    fn join_element(
+        &mut self,
+        (earlier, value): (&[Element], ExprId),
+        so_far: TyId,
+        ty: TyId,
+    ) -> Result<TyId, (TyId, TyId)> {
+        let (mut so_far, mut ty) = (so_far, ty);
+        if so_far == TyId::UNTYPED_INT && ty == TyId::UNTYPED_INT {
+            return Ok(so_far);
+        }
+        if so_far == TyId::UNTYPED_INT {
+            so_far = self.numeric_target(ty);
+            for earlier in earlier {
+                if earlier.spread.is_none() {
+                    self.coerce(earlier.value, so_far);
+                }
+            }
+        }
+        if ty == TyId::UNTYPED_INT {
+            ty = self.numeric_target(so_far);
+            self.coerce(value, ty);
+        }
+        if so_far == ty {
+            return Ok(ty);
+        }
+        let so_far = self.claim(value, so_far);
+        let ty = self.claim(value, ty);
+        self.types.join(so_far, ty).ok_or((so_far, ty))
+    }
+
+    /// The type an untyped integer adapts to where it must agree with a
+    /// value of type `other`: `other`'s `Int` or `Float`, once stripped, or
+    /// `Int`.
+    fn numeric_target(&self, other: TyId) -> TyId {
+        match self.types.strip(other) {
+            concrete @ (TyId::INT | TyId::FLOAT) => concrete,
+            _ => TyId::INT,
+        }
+    }
+
+    /// Reports that element number `index` of `list`, whose type (or, for a
+    /// spread, whose list's element type) is `ty`, has no join with the
+    /// type `so_far` of the elements before it.
+    fn report_element_mismatch(&mut self, list: &[Element], index: usize, so_far: TyId, ty: TyId) {
+        let (Some(first), Some(element)) = (list.first(), list.get(index)) else {
+            return;
+        };
+        let label = match element.spread {
+            Some(_) => format!("its elements are {}", self.in_label(ty)),
+            None => format!("this is {}", self.in_label(ty)),
+        };
+        let context = format!("the elements so far are {}", self.in_label(so_far));
+        self.errors.push(
+            Diagnostic::error("list elements have different types", element.span(self.ast))
+                .with_label(label)
+                .with_context(first.span(self.ast), context),
+        );
+    }
+
+    /// Checks the operand `value` of the spread whose `...` is at `spread`,
+    /// which is used as its bits at the top (see [`Checker::measure`]):
+    /// returns the list type it has once measured, or `None`, having
+    /// reported "cannot spread a value of type T: it is not a list" for
+    /// anything else, or if it is erroneous.
+    fn check_spread(&mut self, value: ExprId, spread: Span) -> Option<TyId> {
+        let found = self.check_expr(value);
+        let found = self.settle(value, found);
+        let ty = self.measure(value, found);
+        if ty == TyId::ERROR {
+            return None;
+        }
+        if self.types.list_element(ty).is_some() {
+            return Some(ty);
+        }
+        let shown = self.in_message(ty);
+        let label = format!("this is {}", self.in_label(ty));
+        let span = self.ast.get(value).span;
+        self.errors.push(
+            Diagnostic::error(
+                format!("cannot spread a value of type {shown}: it is not a list"),
+                Span::join(spread, span),
+            )
+            .with_context(span, label),
+        );
+        None
+    }
+
+    /// Types a list literal whose elements are `elements` where a value of
+    /// type `expected` is expected, a list type `List<X>` once stripped of
+    /// its either shape, as stated at `context`, labelled `why` (see the
+    /// module documentation): each element is checked against `X` as an
+    /// argument is against its parameter, and a spread's list's elements
+    /// must fit `X` as they are. The literal is the list of the join of what
+    /// its elements are once the awaits marked on them have run (see
+    /// [`Checker::fit`]), a subtype of `List<X>`; `List<X>` itself should
+    /// they have no join that is one. An empty literal is the list of `X`
+    /// made present, where that fits `X`, since it has no element to be a
+    /// future, and of `X` otherwise. `Error` if an element does not fit.
+    fn check_list_expecting(
+        &mut self,
+        elements: ElementRange,
+        expected: TyId,
+        (context, why): (Span, &str),
+    ) -> TyId {
+        let stripped = self.types.strip(expected);
+        let Some(element) = self.types.list_element(stripped) else {
+            return TyId::ERROR;
+        };
+        let list = self.ast.elements(elements);
+        if list.is_empty() {
+            let present = self.types.present(element);
+            let element = if self.types.is_subtype(present, element) {
+                present
+            } else {
+                element
+            };
+            return self.types.list(element);
+        }
+        let base = self.element_types.len();
+        for item in list {
+            let ty = match item.spread {
+                Some(spread) => self.fit_spread(item.value, spread, element, (context, why)),
+                None => self.fit(item.value, element, (context, why)),
+            };
+            self.element_types.push(ty);
+        }
+        let end = self.element_types.len();
+        let mut joined = self.element_types.get(base).copied();
+        for at in base + 1..end {
+            let value = self.element_types.get(at).copied().unwrap_or(TyId::ERROR);
+            joined = joined.and_then(|so_far| self.types.join(so_far, value));
+        }
+        let failed = self
+            .element_types
+            .get(base..)
+            .unwrap_or_default()
+            .contains(&TyId::ERROR);
+        self.element_types.truncate(base);
+        if failed {
+            return TyId::ERROR;
+        }
+        let joined = joined
+            .filter(|&joined| self.types.is_subtype(joined, element))
+            .unwrap_or(element);
+        self.types.list(joined)
+    }
+
+    /// Checks the operand `value` of the spread whose `...` is at `spread`
+    /// in a list literal whose elements are expected to be of type
+    /// `element`, as stated at `context`, labelled `why`: the operand is
+    /// measured at the top and must be a list (see [`Checker::check_spread`])
+    /// whose element type fits `element` as it is, once a provisional type
+    /// in it where `element` is present is measured. There is no expression
+    /// to await for each element, so a list whose elements would fit only
+    /// once awaited is a mismatch, whose note says so. Returns the list's
+    /// element type, or `Error` if it does not fit.
+    fn fit_spread(
+        &mut self,
+        value: ExprId,
+        spread: Span,
+        element: TyId,
+        (context, why): (Span, &str),
+    ) -> TyId {
+        let Some(list) = self.check_spread(value, spread) else {
+            return TyId::ERROR;
+        };
+        let expected = self.types.list(element);
+        let list = if self.types.is_subtype(list, expected) {
+            list
+        } else {
+            match self.claim_against(value, list, expected) {
+                Some(claimed) if self.types.is_subtype(claimed, expected) => claimed,
+                _ => {
+                    let found = self.types.list_element(list).unwrap_or(TyId::ERROR);
+                    let label = format!(
+                        "expected {}, found {}",
+                        self.in_label(expected),
+                        self.in_label(list)
+                    );
+                    let mut error = Diagnostic::error("mismatched types", self.ast.get(value).span)
+                        .with_label(label)
+                        .with_context(context, why);
+                    if self.types.needs_await(found, element).is_some() {
+                        error = error.with_note(
+                            "its elements would fit once awaited, but a spread cannot await them: \
+                             there is no expression to await; spread a list of their awaited \
+                             values instead",
+                        );
+                    }
+                    self.errors.push(error);
+                    return TyId::ERROR;
+                }
+            }
+        };
+        self.types.list_element(list).unwrap_or(TyId::ERROR)
+    }
+
+    /// Types the index `id`, reading the element of `list` at `index` (see
+    /// the module documentation): the list is measured at the top, and must
+    /// be a list, "cannot index a value of type T: it is not a list",
+    /// reported at the `[INDEX]`; the position is measured, and must be an
+    /// `Int`, an untyped integer being one, "a list index must be an Int,
+    /// found T". The index's type is the list's element type as it is, which
+    /// may be a future or the either shape; `Error` if either is wrong.
+    fn check_index(&mut self, id: ExprId, list: ExprId, index: ExprId) -> TyId {
+        let list_ty = self.check_expr(list);
+        let list_ty = self.settle(list, list_ty);
+        let list_ty = self.measure(list, list_ty);
+        let index_ty = self.check_expr(index);
+        let index_ty = self.measure(index, index_ty);
+        let index_fits = match index_ty {
+            TyId::UNTYPED_INT => {
+                self.coerce(index, TyId::INT);
+                true
+            }
+            TyId::INT => true,
+            TyId::ERROR => false,
+            _ => {
+                let shown = self.in_message(index_ty);
+                let label = format!("this is {}", self.in_label(index_ty));
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("a list index must be an Int, found {shown}"),
+                        self.ast.get(index).span,
+                    )
+                    .with_label(label),
+                );
+                false
+            }
+        };
+        if list_ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        let Some(element) = self.types.list_element(list_ty) else {
+            let expr = self.ast.get(id);
+            let brackets = expr.bracket_span(self.ast).unwrap_or(expr.span);
+            let shown = self.in_message(list_ty);
+            let label = format!("this is {}", self.in_label(list_ty));
+            self.errors.push(
+                Diagnostic::error(
+                    format!("cannot index a value of type {shown}: it is not a list"),
+                    brackets,
+                )
+                .with_context(self.ast.get(list).span, label),
+            );
+            return TyId::ERROR;
+        };
+        if index_fits { element } else { TyId::ERROR }
+    }
+
     /// Types `/`: it accepts any mix of numeric operands and always yields
     /// `Float`. Untyped operands become `Float` literals; concrete `Int`
     /// operands are converted by lowering.
@@ -5767,7 +6781,9 @@ impl<'a> Checker<'a> {
             | ExprKind::Ascribe { .. }
             | ExprKind::Fn(_)
             | ExprKind::Call { .. }
-            | ExprKind::Lazy(_) => {}
+            | ExprKind::Lazy(_)
+            | ExprKind::List(_)
+            | ExprKind::Index { .. } => {}
             // An `await` of an untyped operand is one of a present value,
             // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
@@ -5800,13 +6816,14 @@ impl<'a> Checker<'a> {
 
     /// Type `ty` as a diagnostic's message or notes show it (see
     /// [`Checker::shown`]): plainly if it is written as a name, and in
-    /// backticks if it is structural, as a record, function, future or
-    /// union type is.
+    /// backticks if it is structural, as a record, list, function, future
+    /// or union type is.
     fn in_message(&mut self, ty: TyId) -> String {
         let ty = self.shown(ty);
         let shown = self.types.display(ty, self.ast.names());
         match self.types.kind(ty) {
             TyKind::Record(_)
+            | TyKind::List(_)
             | TyKind::Fn(_)
             | TyKind::Future(_)
             | TyKind::Union(_)
@@ -6690,6 +7707,15 @@ mod tests {
                     for arg in ast.args(args) {
                         visit(ast, arg.value, out);
                     }
+                }
+                ExprKind::List(elements) => {
+                    for element in ast.elements(elements) {
+                        visit(ast, element.value, out);
+                    }
+                }
+                ExprKind::Index { expr, index } => {
+                    visit(ast, expr, out);
+                    visit(ast, index, out);
                 }
                 ExprKind::Int(_)
                 | ExprKind::Float(_)
@@ -12380,5 +13406,623 @@ mod tests {
             type_of_fn_at(text, "fn(f:"),
             "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>"
         );
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn list_types_resolve_either_way() {
+        for (ty, shown) in [
+            ("List<Int>", "List<Int>"),
+            ("Int[]", "List<Int>"),
+            ("Int[][]", "List<List<Int>>"),
+            ("List<Int>[]", "List<List<Int>>"),
+            ("{a: Int}[]", "List<{a: Int}>"),
+            ("Future<Int>[]", "List<Future<Int>>"),
+            ("(fn(): Int)[]", "List<fn(): Int>"),
+            ("(Int | Future<Int>)[]", "List<Int | Future<Int>>"),
+            ("fn(): Int[]", "fn(): List<Int>"),
+            (
+                "List<Int> | Future<List<Int>>",
+                "List<Int> | Future<List<Int>>",
+            ),
+        ] {
+            let text = format!("let f = fn(x: Present<{ty}>): {{}} {{ }}\nf");
+            assert_eq!(shown_result(&text), format!("fn(x: {shown}): {{}}"), "{ty}");
+        }
+        // `List` takes an argument, as `Future` does.
+        let text = "let x: List = y";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "type `List` needs a type argument, as in `List<Int>`"
+        );
+        assert_eq!(found[0].span, at(text, "List"));
+        assert_eq!(
+            messages("let x: Lust<Int> = 1"),
+            vec!["unknown type `Lust`"]
+        );
+        // `[]` binds tighter than `|`: a future of a list, not an either.
+        let text = "let x: Int | Future<Int>[] = 1";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "unions other than `T | Future<T>` are not supported yet".to_owned(),
+                at(text, "|")
+            )]
+        );
+    }
+
+    #[test]
+    fn the_bare_type_rule_passes_through_list_types() {
+        // Impure: the either shape at the list and at its element.
+        for (ty, shown) in [
+            (
+                "List<Int>",
+                "List<Int | Future<Int>> | Future<List<Int | Future<Int>>>",
+            ),
+            (
+                "Int[]",
+                "List<Int | Future<Int>> | Future<List<Int | Future<Int>>>",
+            ),
+            (
+                "{a: Int}[]",
+                "List<{a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>> | \
+                 Future<List<{a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>>>",
+            ),
+            // Explicit parts are kept.
+            ("List<Present<Int>>", "List<Int> | Future<List<Int>>"),
+            (
+                "List<Future<Int>>",
+                "List<Future<Int>> | Future<List<Future<Int>>>",
+            ),
+            ("Present<List<Int>>", "List<Int>"),
+            ("Future<List<Int>>", "Future<List<Int>>"),
+        ] {
+            let text = format!("let f = fn(x: {ty}) -> {{}} {{ }}\nf");
+            assert_eq!(
+                shown_result(&text),
+                format!("fn(x: {shown}) -> {{}}"),
+                "{ty}"
+            );
+        }
+        // A written impure function type's positions too, and a memoised
+        // function's result; not a pure or memoised one's parameters.
+        assert_eq!(
+            shown_result("let f = fn(g: fn(Int[]) ->> Int[]) -> {} { }\nf"),
+            "fn(g: fn(List<Int>) ->> List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) \
+             -> {}"
+        );
+        assert_eq!(
+            shown_result("let f = fn(g: Future<fn(Int[]) -> Int>) -> {} { }\nf"),
+            "fn(g: Future<fn(List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> Int \
+             | Future<Int>>) -> {}"
+        );
+    }
+
+    #[test]
+    fn list_parameters_and_results_are_inferred() {
+        // Slice 9: a pure function's list parameter, measured or not.
+        assert_eq!(
+            type_of_f("fn f(xs: List<Int>): Int { len(xs) }"),
+            "fn(xs: List<Int>): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): Int { xs[0] }"),
+            "fn(xs: List<Int>): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): List<Int> { [...xs] }"),
+            "fn(xs: List<Int>): List<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): {v: Int[] | Future<Int[]>} { v = xs }"),
+            "fn(xs: List<Int> | Future<List<Int>>): {v: List<Int> | Future<List<Int>>}"
+        );
+        // Slices 11 and 13: a list result position, and its element
+        // position, from what the body returns.
+        for (text, shown) in [
+            ("fn f() -> List<Int> { [1, 2] }", "fn() -> List<Int>"),
+            (
+                "fn f() -> List<Int> { [1, lazy 2] }",
+                "fn() -> List<Int | Future<Int>>",
+            ),
+            (
+                "fn f() -> List<Int> { [lazy 1] }",
+                "fn() -> List<Future<Int>>",
+            ),
+            ("fn f() -> List<Int> { [] }", "fn() -> List<Int>"),
+            ("fn f() -> Int[] { lazy [1] }", "fn() -> Future<List<Int>>"),
+            (
+                "fn f(xs: Int[]) -> Int[] { xs }",
+                "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> \
+                 List<Int | Future<Int>> | Future<List<Int | Future<Int>>>",
+            ),
+            (
+                "fn f() -> List<{a: Int, b: Int}> { [{ a = 1; b = lazy 2 }] }",
+                "fn() -> List<{a: Int, b: Future<Int>}>",
+            ),
+            (
+                "fn f() -> {xs: Int[]} { xs = [1] }",
+                "fn() -> {xs: List<Int>}",
+            ),
+            (
+                "fn f() -> List<Int[]> { [[1], [lazy 2]] }",
+                "fn() -> List<List<Int | Future<Int>>>",
+            ),
+            // Explicit parts keep what they say.
+            ("fn f() -> List<Present<Int>> { [1] }", "fn() -> List<Int>"),
+            ("fn f() -> Present<List<Int>> { [1] }", "fn() -> List<Int>"),
+            ("fn f() ->> Int[] { [1] }", "fn() ->> List<Int>"),
+        ] {
+            assert_eq!(type_of_f(text), shown, "{text}");
+        }
+        // A `->>` function's list parameter is present throughout, so an
+        // argument whose elements may be futures is awaited deeply.
+        let text = "fn m(xs: Int[]) ->> Int { len(xs) }\nlet ys = [1, lazy 2]\nlet n = m(ys)";
+        assert_eq!(
+            shown_result(&format!("{text}\nm")),
+            "fn(xs: List<Int>) ->> Int"
+        );
+        assert_eq!(marks(text), vec![("ys", AwaitMark::Deep)]);
+    }
+
+    #[test]
+    fn list_callback_positions_are_narrowable() {
+        assert_eq!(
+            type_of_run("fn run(f: fn(List<Int>) -> Int) -> Int { f([1]) }"),
+            "fn(f: fn(List<Int>) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            type_of_run("fn run(f: fn(Int[]) -> Int, xs: Present<Int[]>) -> Int { f(xs) }"),
+            "fn(f: fn(List<Int>) -> Int | Future<Int>, xs: List<Int>) -> Int | Future<Int>"
+        );
+        // An element that may be a future keeps the position as written.
+        assert_eq!(
+            type_of_run("fn run(f: fn(Int[]) -> Int, j: Int) -> Int { f([j]) }"),
+            "fn(f: fn(List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> Int | \
+             Future<Int>, j: Int | Future<Int>) -> Int | Future<Int>"
+        );
+        // So a pure function measuring its list is accepted once narrowed.
+        let text = "fn sum(xs: List<Int>): Int { xs[0] + xs[1] }\n\
+                    fn run(f: fn(List<Int>) -> Int) -> Int { f([1, 2]) }\n\
+                    run(sum)";
+        assert!(check(&parse_text(text), &mut TypeTable::new()).is_ok());
+    }
+
+    #[test]
+    fn list_literals_join_their_elements() {
+        for (text, shown) in [
+            ("[1, 2]", "List<Int>"),
+            ("[1, 2.5]", "List<Float>"),
+            ("[2.5, 1]", "List<Float>"),
+            ("[1, 2, 2.5]", "List<Float>"),
+            ("[\"a\"]", "List<String>"),
+            ("[1, lazy 2]", "List<Int | Future<Int>>"),
+            ("[lazy 1, lazy 2]", "List<Future<Int>>"),
+            ("[1, lazy 2.5]", "List<Float | Future<Float>>"),
+            ("[{ a = 1; b = 2 }, { a = 3 }]", "List<{a: Int}>"),
+            ("[{ a = 1 }, { b = 3 }]", "List<{}>"),
+            ("[[1], [2, 3]]", "List<List<Int>>"),
+            ("[...[1], 2]", "List<Int>"),
+            ("[1, ...[2.5]]", "List<Float>"),
+            ("[...[1], ...[lazy 2]]", "List<Int | Future<Int>>"),
+            ("[fn(x: Int): Int { x }]", "List<fn(x: Int): Int>"),
+            ("[{}]", "List<{}>"),
+        ] {
+            assert_eq!(shown_result(text), text_type(shown), "{text}");
+        }
+        // Elements are checked, and nothing is awaited.
+        assert_eq!(marks("[1, lazy 2]"), vec![]);
+    }
+
+    /// `shown` as it is: for the table of `list_literals_join_their_elements`.
+    fn text_type(shown: &str) -> String {
+        shown.to_owned()
+    }
+
+    #[test]
+    fn list_elements_without_a_join_are_reported() {
+        let text = "[1, 2, \"a\", 3]";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let error = &found[0];
+        assert_eq!(error.message, "list elements have different types");
+        assert_eq!(error.span, at(text, "\"a\""));
+        assert_eq!(error.label.as_deref(), Some("this is String"));
+        assert_eq!(
+            labels(error),
+            vec![(at(text, "1"), "the elements so far are Int")]
+        );
+        // A spread is labelled with its elements' type.
+        let text = "[1.5, ...[\"a\"]]";
+        let error = &diagnostics(text)[0];
+        assert_eq!(error.message, "list elements have different types");
+        assert_eq!(error.span, at(text, "...[\"a\"]"));
+        assert_eq!(error.label.as_deref(), Some("its elements are String"));
+        assert_eq!(
+            labels(error),
+            vec![(at(text, "1.5"), "the elements so far are Float")]
+        );
+        // Records of any width join; functions whose parameters do not
+        // compare do not.
+        assert_eq!(
+            messages("[fn(x: {a: Int}): Int { 1 }, fn(x: {b: Int}): Int { 1 }]"),
+            vec!["list elements have different types"]
+        );
+        // An erroneous element is not reported again.
+        assert_eq!(messages("[1, y, \"a\"]"), vec!["undefined variable `y`"]);
+    }
+
+    #[test]
+    fn an_empty_literal_needs_an_expected_type() {
+        for text in [
+            "[]",
+            "let xs = []",
+            "[...[]]",
+            "if true { [] } else { [1] }",
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(found[0].message, "cannot infer the element type of `[]`");
+            assert_eq!(found[0].span, at(text, "[]"), "{text}");
+            assert_eq!(
+                found[0].notes,
+                vec!["annotate it, as in `let xs: List<Int> = []`"]
+            );
+        }
+        // With one, anywhere a record block gets one, and through the
+        // results of blocks and the branches of an `if`.
+        for text in [
+            "let xs: List<Int> = []\nxs",
+            "[] : Int[]",
+            "let xs: Int[][] = [[1], []]\nxs[1]",
+            "fn f(xs: Int[]): Int { len(xs) }\nf([])",
+            "fn f(): Int[] { [] }\nf()",
+            "fn f(c: Bool): Int[] { if c { [] } else { [1] } }\nf(true)",
+            "let r: {xs: Int[]} = { xs = [] }\nr.xs",
+            "let xs: Int[] = [1]\nxs := []\nxs",
+            "let xs: Int[] = { let n = 1\n [] }\nxs",
+            "let xs: Int[] = ([])\nxs",
+        ] {
+            assert!(
+                check(&parse_text(text), &mut TypeTable::new()).is_ok(),
+                "{text}: {:?}",
+                diagnostics(text)
+            );
+        }
+        // Its elements count as present, where that fits.
+        let text = "[] : List<Int | Future<Int>>";
+        assert_eq!(type_at(text, at(text, "[]")), "List<Int>");
+        let text = "[] : List<{a: Int | Future<Int>}>";
+        assert_eq!(type_at(text, at(text, "[]")), "List<{a: Int}>");
+        let text = "[] : List<Future<Int>>";
+        assert_eq!(type_at(text, at(text, "[]")), "List<Future<Int>>");
+    }
+
+    #[test]
+    fn a_literal_against_an_expected_type_fits_each_element() {
+        // An element that fits once awaited is awaited, at the top level.
+        let text = "let xs: List<Present<Int>> = [1, lazy 2]\nxs";
+        assert_eq!(marks(text), vec![("lazy 2", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "List<Int>");
+        // A literal of records and of lists, deeply.
+        let text = "let xs: List<Present<{a: Int}>> = [{ a = 1 }, lazy { a = 2 }]\nxs";
+        assert_eq!(marks(text), vec![("lazy { a = 2 }", AwaitMark::Top)]);
+        let text = "let ys = [lazy 1]\nlet xs: List<Present<Int[]>> = [ys]\nxs";
+        assert_eq!(marks(text), vec![("ys", AwaitMark::Deep)]);
+        // Untyped integers adapt to the element type.
+        assert_eq!(shown_result("[1, 2] : Float[]"), "List<Float>");
+        // Anything else is a mismatch at the element.
+        let text = "let xs: List<Int> = [1, \"a\"]";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "\"a\""));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "List<Int>"), "expected because of this annotation")]
+        );
+        // In a pure function, an await of an element is the purity error.
+        let text = "fn f(): List<Present<Int>> { [1, lazy 2] }";
+        assert_implicit_await_error(text, at(text, "lazy 2"), "Future<Int>");
+        // The literal's type is what its elements are once awaited.
+        let text = "fn f() -> List<Int> { [1, lazy 2, await lazy 3] }\nf";
+        assert_eq!(shown_result(text), "fn() -> List<Int | Future<Int>>");
+    }
+
+    #[test]
+    fn spreads_are_measured_and_must_be_lists() {
+        // Present, future and provisional lists.
+        assert_eq!(shown_result("let xs = [1]\n[...xs, 2]"), "List<Int>");
+        let text = "let xs = lazy [1]\n[...xs, 2]";
+        assert_eq!(shown_result(text), "List<Int>");
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Top)]);
+        let text = "fn f(xs: Future<Int[]>): Int[] { [...xs] }";
+        assert_implicit_await_error(text, last(text, "xs"), "Future<List<Int>>");
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): Int { len([...xs]) }"),
+            "fn(xs: List<Int>): Int"
+        );
+        // Anything else is not a list.
+        let text = "[...1]";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "cannot spread a value of type Int: it is not a list"
+        );
+        assert_eq!(found[0].span, at(text, "...1"));
+        assert_eq!(labels(&found[0]), vec![(at(text, "1"), "this is Int")]);
+        assert_eq!(
+            messages("[...{ a = 1 }]"),
+            vec!["cannot spread a value of type `{a: Int}`: it is not a list"]
+        );
+        // Against an expected element type, its elements must fit as they
+        // are: there is nothing to await for each.
+        let text = "let xs: List<Present<Int>> = [1, ...[lazy 2]]";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "[lazy 2]"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected List<Int>, found List<Future<Int>>")
+        );
+        assert_eq!(found[0].notes.len(), 1);
+        assert!(found[0].notes[0].contains("no expression to await"));
+        // A mismatch for another reason has no note.
+        let found = diagnostics("let xs: List<Int> = [...[\"a\"]]");
+        assert_eq!(found[0].message, "mismatched types");
+        assert!(found[0].notes.is_empty());
+        // Elements that fit, and a provisional list's elements where a
+        // present element is expected, which are measured.
+        assert_eq!(
+            shown_result("let xs: List<Int | Future<Int>> = [...[lazy 1], 2]\nxs"),
+            "List<Int | Future<Int>>"
+        );
+        assert_eq!(
+            type_of_f("fn f(x: Int): Int[] {\n let ys = [x]\n [...ys] : Int[] }"),
+            "fn(x: Int): List<Int>"
+        );
+    }
+
+    #[test]
+    fn indexes_read_an_element_as_it_is() {
+        assert_eq!(shown_result("[1, 2][0]"), "Int");
+        assert_eq!(shown_result("let xs = [lazy 1]\nxs[0]"), "Future<Int>");
+        // Using the element awaits it, not the list or the index.
+        let text = "let xs = [1, lazy 2]\nxs[1] + 1";
+        assert_eq!(marks(text), vec![("xs[1]", AwaitMark::Top)]);
+        // A list or an index that may be a future is awaited.
+        let text = "let xs = lazy [1]\nlet i = lazy 0\nxs[i]";
+        assert_eq!(
+            marks(text),
+            vec![("xs", AwaitMark::Top), ("i", AwaitMark::Top)]
+        );
+        // In a pure function that is the purity error.
+        let text = "fn f(xs: Future<Int[]>): Int { xs[0] }";
+        assert_implicit_await_error(text, last(text, "xs"), "Future<List<Int>>");
+        // A pure function's parameter is measured.
+        assert_eq!(
+            type_of_f("fn f(xs: Int[], i: Int): Int { xs[i] }"),
+            "fn(xs: List<Int>, i: Int): Int"
+        );
+    }
+
+    #[test]
+    fn index_errors() {
+        let text = "let x = 1\nx[0]";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot index a value of type Int: it is not a list"
+        );
+        assert_eq!(found[0].span, at(text, "[0]"));
+        assert_eq!(labels(&found[0]), vec![(last(text, "x"), "this is Int")]);
+        assert_eq!(
+            messages("{ a = 1 }[0]"),
+            vec!["cannot index a value of type `{a: Int}`: it is not a list"]
+        );
+        let text = "[1][\"a\"]";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "a list index must be an Int, found String"
+        );
+        assert_eq!(found[0].span, at(text, "\"a\""));
+        assert_eq!(found[0].label.as_deref(), Some("this is String"));
+        assert_eq!(
+            messages("[1][1.5]"),
+            vec!["a list index must be an Int, found Float"]
+        );
+        // Both are reported.
+        assert_eq!(
+            messages("1[2.5]"),
+            vec![
+                "cannot index a value of type Int: it is not a list",
+                "a list index must be an Int, found Float"
+            ]
+        );
+    }
+
+    #[test]
+    fn len_is_a_built_in_function() {
+        assert_eq!(shown_result("len([1, 2])"), "Int");
+        assert_eq!(shown_result("len(list = [1, 2])"), "Int");
+        assert_eq!(shown_result("len([lazy 1])"), "Int");
+        // Its argument is measured at the top, its elements not at all.
+        let text = "let xs = lazy [lazy 1]\nlen(xs)";
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Top)]);
+        // It is pure, so a pure function may call it.
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): Int { len(xs) + 1 }"),
+            "fn(xs: List<Int>): Int"
+        );
+        // Its callee has the function type of the call.
+        let text = "len([1])";
+        assert_eq!(type_at(text, at(text, "len")), "fn(List<Int>): Int");
+        let (ast, resolution) = resolved(text);
+        let callee = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).span == at(text, "len"))
+            .unwrap();
+        assert_eq!(resolution.expr_var(callee), VarRef::Builtin(Builtin::Len));
+        // A future list in a pure function is the purity error.
+        let text = "fn f(xs: Future<Int[]>): Int { len(xs) }";
+        assert_implicit_await_error(text, last(text, "xs"), "Future<List<Int>>");
+    }
+
+    #[test]
+    fn a_built_in_is_shadowed_as_any_outer_name() {
+        assert_eq!(shown_result("let len = 5\nlen"), "Int");
+        assert_eq!(
+            shown_result("let len = fn(x: String): String { x }\nlen(\"a\")"),
+            "String"
+        );
+        assert_eq!(
+            type_of_f("fn f(len: Int): Int { len + 1 }"),
+            "fn(len: Int): Int"
+        );
+        assert_eq!(file_type("len = 1\nn = len"), "{len: Int, n: Int}");
+        // `:=` never finds it.
+        assert_eq!(
+            messages("len := 1"),
+            vec!["cannot rebind `len`: no variable named `len` is declared"]
+        );
+    }
+
+    #[test]
+    fn a_built_in_is_not_a_value_yet() {
+        for (text, span) in [
+            ("len", Span::new(0, 3)),
+            ("let f = len", Span::new(8, 11)),
+            ("(len)([1])", Span::new(1, 4)),
+            ("\"{len}\"", Span::new(2, 5)),
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(
+                found[0].message,
+                "`len` is a built-in function and cannot be used as a value yet"
+            );
+            assert_eq!(found[0].span, span, "{text}");
+            assert_eq!(found[0].notes, vec!["call it, as in `len(xs)`"]);
+        }
+    }
+
+    #[test]
+    fn a_built_in_s_arguments_are_bound_as_a_function_s() {
+        let text = "len(1)";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "`len` takes a list, found Int");
+        assert_eq!(found[0].span, at(text, "1"));
+        assert_eq!(found[0].label.as_deref(), Some("this is Int"));
+        assert_eq!(
+            messages("len({ a = 1 })"),
+            vec!["`len` takes a list, found `{a: Int}`"]
+        );
+        let text = "len([1], [2])";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "expected 1 argument, found 2");
+        assert_eq!(found[0].span, Span::new(0, 13));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (at(text, "len"), "`len` is a built-in function"),
+                (at(text, "[2]"), "unexpected argument")
+            ]
+        );
+        let text = "len()";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "expected 1 argument, found 0");
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "len"), "`len` is a built-in function")]
+        );
+        let text = "len(lst = [1])";
+        assert_eq!(
+            errors(text),
+            vec![
+                ("unknown argument `lst`".to_owned(), at(text, "lst")),
+                ("missing argument `list`".to_owned(), at(text, ")"))
+            ]
+        );
+        let text = "len([1], list = [2])";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "argument `list` is given twice".to_owned(),
+                at(text, "list = [2]")
+            )]
+        );
+        // Every argument is checked whatever goes wrong.
+        assert_eq!(
+            messages("len(y, z)"),
+            vec![
+                "expected 1 argument, found 2",
+                "undefined variable `y`",
+                "undefined variable `z`"
+            ]
+        );
+    }
+
+    #[test]
+    fn lists_compare_as_records_do() {
+        assert_eq!(shown_result("[1] == [1]"), "Bool");
+        assert_eq!(shown_result("[[1]] !== [[2]]"), "Bool");
+        assert_eq!(shown_result("[{ a = 1 }] == [{ a = 2 }]"), "Bool");
+        // Either elements are awaited deeply first.
+        let text = "let xs = [1, lazy 2]\nxs == xs";
+        assert_eq!(
+            marks(text),
+            vec![("xs", AwaitMark::Deep), ("xs", AwaitMark::Deep)]
+        );
+        // Their types must be identical, without a future or a function.
+        assert_eq!(
+            messages("[1] == [1.5]"),
+            vec!["cannot compare `List<Int>` and `List<Float>`"]
+        );
+        let text = "let xs: List<Future<Int>> = [lazy 1]\nxs == xs";
+        assert_eq!(
+            messages(text),
+            vec!["cannot compare `List<Future<Int>>`: it contains a future"]
+        );
+        let text = "let fs = [fn(): Int { 1 }]\nfs == fs";
+        assert_eq!(
+            messages(text),
+            vec!["cannot compare `List<fn(): Int>`: it contains a function"]
+        );
+        // They have no order, and no arithmetic.
+        let text = "[1] < [2]";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "cannot order `List<Int>`");
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (at(text, "[1]"), "List<Int>"),
+                (at(text, "[2]"), "List<Int>")
+            ]
+        );
+        assert_eq!(
+            messages("[1] + [2]"),
+            vec!["cannot add `List<Int>` and `List<Int>`"]
+        );
+        assert_eq!(messages("-[1]"), vec!["cannot negate `List<Int>`"]);
+        assert_eq!(messages("[true] and true"), vec!["mismatched types"]);
+    }
+
+    #[test]
+    fn interpolating_a_list_awaits_it_deeply() {
+        let text = "let xs = [lazy 1]\n\"{xs}\"";
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Deep)]);
+        assert_eq!(shown_result(text), "String");
+        let text = "let xs = [1]\n\"{xs}\"";
+        assert_eq!(marks(text), vec![]);
     }
 }

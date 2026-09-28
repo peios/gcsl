@@ -508,6 +508,116 @@ fn a_memoised_call_depending_on_its_own_result_is_rendered() {
 }
 
 #[test]
+fn run_builds_a_deployment_of_lists() {
+    let output = gcsl(&["run", "tests/fixtures/lists.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{count = 3; first = 22; report = \"[\\\"web\\\", \\\"db\\\"]: [8080, 5432]\"; \
+         same = true; services = [{name = \"web\"; replicas = 2}, {name = \"db\"; replicas = \
+         1}]}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_lists() {
+    let output = gcsl(&["run", "tests/fixtures/lists.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in [
+        "\nIdent(String) @230..236\nLBracket @236..237\nRBracket @237..238\n",
+        "\nDotDotDot @576..579\n",
+    ] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/lists.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n      (params (names String[]))\n      (ret impure Int[])\n",
+        "\n    (list @445..469\n\
+         \x20     (int 22 @446..448)\n\
+         \x20     (index @450..458\n\
+         \x20       (name found @450..455)\n\
+         \x20       (int 0 @456..457))\n",
+        "\n    (list @575..643\n\
+         \x20     (spread\n\
+         \x20       (list @579..611\n",
+        "(let open : List<Present<Int>> @414..469\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/lists.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        // A bare list parameter of an impure function is the either shape,
+        // element and all; its result is inferred from its body's list.
+        "(name ports : fn(names: List<String | Future<String>> | Future<List<String | \
+         Future<String>>>) -> List<Future<Int>> @334..339)",
+        "(list : List<String> @308..321\n",
+        // An element is read as it is.
+        "(index : Future<Int> @450..458\n",
+        "(name len : fn(List<Int>): Int @478..481)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/lists.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        "\n    (make-list @445..469\n\
+         \x20     (int 22 @446..448)\n\
+         \x20     (await @450..458\n\
+         \x20       (index @450..458\n\
+         \x20         (load found#3 @450..455)\n\
+         \x20         (int 0 @456..457)))\n",
+        "\n    (list-len @478..487\n\
+         \x20     (load open#4 @482..486)))\n",
+        "\n      (await *! @524..529\n\
+         \x20       (load found#3 @524..529))\n",
+        "\n    (list-eq == * @539..563\n",
+        "\n    (make-list @575..643\n\
+         \x20     (spread @576..611\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn an_index_out_of_range_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/index_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: index out of range\n\
+         \x20--> tests/fixtures/index_error.gcsl:2:1\n\
+         \x20 |\n\
+         2 | ports[2]\n\
+         \x20 | ^^^^^^^^ the index is 2, and the list has 2 elements\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn repl_shows_lists_and_their_types() {
+    let output = repl(
+        "let xs = [1, lazy 2]\n\
+         xs\n\
+         \"{xs}\"\n\
+         xs[1] + len(xs)\n\
+         [...xs, 3][0]\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "[1, Future<Int>] : List<Int | Future<Int>>\n\
+         \"[1, 2]\" : String\n\
+         4 : Int\n\
+         1 : Int | Future<Int>\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn repl_shows_futures_as_their_types() {
     let output = repl(
         "let x = lazy 20 + 1\n\

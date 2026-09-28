@@ -1,7 +1,7 @@
 //! The evaluator: a recursive walk over [`Ir`].
 //!
-//! There is one walker per kind of value (see [`crate::value::ValueKind`]):
-//! `Evaluator::int`, `Evaluator::float`, `Evaluator::bool` and
+//! There is one walker per kind of value (see [`crate::value::ValueKind`])
+//! but lists: `Evaluator::int`, `Evaluator::float`, `Evaluator::bool` and
 //! `Evaluator::string`, returning an `i64`, an `f64`, a `bool` and an
 //! `Rc<str>`, and `Evaluator::record`, returning a [`Value`] that is
 //! [`Value::Empty`] or [`Value::Record`], since both are records. Every IR
@@ -9,16 +9,17 @@
 //! parent and no runtime value is ever inspected to choose an operation.
 //! `Evaluator::function` returns the closure of a function value. Each
 //! typed walker handles the nodes of its kind and also loads, captures,
-//! blocks, `if`s, field accesses, calls and awaits, which can be of any
-//! kind: an `if` evaluates its condition through `bool` and then exactly
-//! one branch through the walker it was called with, and a field access, a
-//! call or an await produces a [`Value`] from which the walker extracts its
-//! kind's. A general walker, `Evaluator::value`, handles every node, and
-//! hands the typed nodes to the typed walkers, building a [`Value`] only
-//! where a value of statically unknown kind is needed: at the root, in a
-//! slot, in a record, in a closure's or a future's captures, as an
-//! interpolated value, as a block's or a function body's result evaluated
-//! through `value`, or where the value may be a future (see
+//! blocks, `if`s, field accesses, indexes, calls and awaits, which can be of
+//! any kind: an `if` evaluates its condition through `bool` and then exactly
+//! one branch through the walker it was called with, and a field access, an
+//! index, a call or an await produces a [`Value`] from which the walker
+//! extracts its kind's. A general walker, `Evaluator::value`, handles every
+//! node, and hands the typed nodes to the typed walkers, building a
+//! [`Value`] only where a value of statically unknown kind is needed: at the
+//! root, in a slot, in a record, in a list, in a closure's or a future's
+//! captures, as an interpolated value, as a block's or a function body's
+//! result evaluated through `value`, where a list is needed (see
+//! [Lists](#lists)), or where the value may be a future (see
 //! [Futures](#futures)).
 //!
 //! A record is built from its record block's shared [`crate::value::Layout`]
@@ -26,6 +27,29 @@
 //! and one for the reference-counted record. The empty record is unboxed,
 //! so the statements that produce it allocate nothing. Reading a field finds
 //! it by comparing interned names against the layout's.
+//!
+//! # Lists
+//!
+//! A list node, of [`crate::value::ValueKind::List`], has no typed walker
+//! of its own: `Evaluator::list` evaluates it through the general walker
+//! and takes the [`List`] out of the value, which is one match on its tag,
+//! as a load extracts a slot's value. A list is only ever read whole, by an
+//! index, a spread, `len` or a comparison, each of which is a helper and
+//! not on the recursion path of anything but its own operands, so a walker
+//! of its own would save nothing measurable, and would add another large
+//! match to keep in step with every kind of node; the list nodes that can
+//! be of any kind, indexes, are handled by every typed walker, as field
+//! accesses are.
+//!
+//! A `MakeList` without spreads evaluates its items in order straight into
+//! the list's one allocation, sized to the number of items; the empty list
+//! allocates nothing. One with spreads collects its elements in a vector,
+//! each spread's list's elements cloned in its place (reference-count
+//! increments), in time linear in the result's length, and then copies
+//! them into the list's allocation. An `Index` evaluates its list, then its
+//! position, and fails with "index out of range" at the index, labelled
+//! with the position and the list's length, for a position outside the
+//! list, a negative one included; nothing wraps around from the end.
 //!
 //! An `UpdateField` builds a new record and never changes the old one. It
 //! clones the old record's values into a new boxed slice, one allocation,
@@ -47,7 +71,11 @@
 //! a work list, as total equality compares them (see
 //! [`crate::value::Record`]), so nesting does not recurse and comparing flat
 //! records allocates nothing. Total equality, `RecordSame` and
-//! `RecordNotSame`, is [`Value`]'s `PartialEq`.
+//! `RecordNotSame`, is [`Value`]'s `PartialEq`. `ListEq` and `ListNe`
+//! compare two lists' lengths and then their elements in order, each
+//! through the shape of the element type, if it is a record or a list, as
+//! the list's [`crate::ir::ListShape`] says, and with `==` otherwise, in the
+//! same work list; `ListSame` and `ListNotSame` are [`Value`]'s `PartialEq`.
 //!
 //! `and` and `or` short-circuit: the right operand is evaluated only when
 //! the left does not decide the result. A string constant is a reference
@@ -126,13 +154,18 @@
 //! call, `run_future`, charged to the nesting budget as a call of a
 //! parameterless function would be, the await's depth in its frame's body
 //! plus [`CALL_LEVELS`] plus the body's height, and one more level for each
-//! level of record nesting a deep await has descended to reach it. Its first
-//! await runs the body in a frame of its own, on the value stack above the
+//! level of record or list nesting a deep await has descended to reach it.
+//! Its first await runs the body in a frame of its own, on the value stack
+//! above the
 //! awaiting frame's, and records the value, dropping the captures; every
 //! later await is a borrow and a clone of that value. A deep await then
 //! awaits the lazy fields its shape lists, recursively, building a new
 //! record, sharing the layout and the untouched values, only if a field
-//! changed. An error inside a body leaves the future unrun, with its
+//! changed; and the elements of a list, each as a list's lazy shape says,
+//! in order, building a new list, sharing the untouched elements, only if an
+//! element changed. Each element's future runs at most once, however many
+//! lists hold it, since a future is shared. An error inside a body leaves
+//! the future unrun, with its
 //! captures, so a later await runs it again, and gets the context label
 //! "awaited here" on the await that ran it, when both are of the same
 //! session input; otherwise the future's input is stamped on it, as a call
@@ -159,16 +192,19 @@
 //! *key equality*, which is [`Value`]'s equality, total equality: a
 //! function and a future by identity, the same `Rc`, and every other value
 //! as `===` compares it, records deeply, by field name, whatever the order
-//! of their fields, and every field, those the static type hides included;
+//! of their fields, and every field, those the static type hides included,
+//! and lists deeply, element by element, in order;
 //! floats as IEEE 754 does, so `0.0` and `-0.0` are equal, and NaN is equal
 //! to nothing, itself included: a call with a NaN among its arguments never
 //! finds an entry, and always runs its body, and makes no entry, which no
 //! call could find. Its hash is consistent with
-//! it: the zeros hash alike, a function and a future by address, and a
-//! record as the sum of its fields' hashes, which does not depend on their
-//! order, down to a few levels of record nesting, below which a record
-//! contributes only its field count (equal keys still hash equally, and
-//! hashing never recurses as deeply as a record may be nested).
+//! it: the zeros hash alike, a function and a future by address, a record
+//! as the sum of its fields' hashes, which does not depend on their order,
+//! and a list as its length and its elements' hashes in order, down to a
+//! few levels of record and list nesting, below which a record contributes
+//! only its field count and a list its length (equal keys still hash
+//! equally, and hashing never recurses as deeply as a record or a list may
+//! be nested).
 //!
 //! **The tables.** The tables belong to the execution context, not to the
 //! closures: [`MemoTables`], which a [`crate::session::Session`] owns for
@@ -232,8 +268,8 @@
 //! one's error is reported. Items are evaluated in order, and so are a
 //! call's arguments, whatever parameters they fill. Evaluation holds no
 //! per-node state and allocates nothing beyond the stack, except the
-//! strings, records and closures the program builds, the memo tables and
-//! their entries, and the diagnostic when it fails. A runtime error points
+//! strings, records, lists and closures the program builds, the memo tables
+//! and their entries, and the diagnostic when it fails. A runtime error points
 //! at the operator and labels each operand with the value it had, so the
 //! user sees what actually overflowed or divided by zero.
 
@@ -249,12 +285,12 @@ use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
     Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId,
-    Operands, ShapeId, ShapedOperands,
+    ListShape, Operands, ShapeId, ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
 use crate::value::{
-    Begin, Closure, Future, FutureState, Layout, Record, Value, ValueKind, int_to_float,
+    Begin, Closure, Future, FutureState, Layout, List, Record, Value, ValueKind, int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
@@ -268,7 +304,8 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 ///
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
-/// "division by zero" for `//` or `%` by zero; and at a call's or an
+/// "division by zero" for `//` or `%` by zero; at an index's span, "index
+/// out of range" for a position outside its list; and at a call's or an
 /// await's span, "call nested too deeply" for a call, or an await running a
 /// future, that would take the program's nesting, calls included, past
 /// [`MAX_DEPTH`] levels (see the module documentation). An error inside a
@@ -356,7 +393,9 @@ struct Evaluator<'a> {
 }
 
 // The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
-// the recursion of evaluation: an expression nested N deep puts about N of
+// the recursion of evaluation (a list is evaluated through `value`, and
+// `make_list`, `index` and `list` are helpers on its recursion path, which
+// is why they hold little): an expression nested N deep puts about N of
 // their frames on the stack. Each is therefore only a dispatcher. The work
 // of each operator is in a helper of its own, and every error is returned
 // by a call in tail position, so a walker's frame does not hold the
@@ -397,13 +436,17 @@ impl Evaluator<'_> {
             IrKind::MakeFuture { function, captures } => self.make_future(function, captures),
             IrKind::Await { .. } => self.await_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
+            IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
+            IrKind::Index { list, index, .. } => self.index((list, index), node),
+            IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => self.int(id).map(Value::Int),
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => self.int(id).map(Value::Int),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -420,6 +463,10 @@ impl Evaluator<'_> {
             | IrKind::RecordNe(_)
             | IrKind::RecordSame(_)
             | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
@@ -624,13 +671,14 @@ impl Evaluator<'_> {
 
     /// Awaits the lazy fields of `value`, a record, as lazy shape `shape`
     /// lists them, for the await `node` at depth `depth` in this frame's
-    /// body, the record being `level` levels of record nesting below the
-    /// value the await awaits: each field that is lazy is awaited fully and
-    /// then, if its shape says so, deeply, and each present record field
-    /// with lazy fields inside is awaited deeply. If any field changed, the
-    /// result is a new record sharing the layout and the values that did
-    /// not; otherwise it is the record as it was. The empty record has no
-    /// fields to await.
+    /// body, the record's fields being `level` levels of record and list
+    /// nesting below the value the await awaits: each field that is lazy is
+    /// awaited fully and then, if its shape says so, deeply, and each
+    /// present record or list field with lazy values inside is awaited
+    /// deeply. If any field changed, the result is a new record sharing the
+    /// layout and the values that did not; otherwise it is the record as it
+    /// was. The empty record has no fields to await. A list's elements are
+    /// awaited by [`Evaluator::await_elements`] instead.
     fn await_deep(
         &mut self,
         value: Value,
@@ -639,6 +687,9 @@ impl Evaluator<'_> {
         level: usize,
         node: &IrNode,
     ) -> Result<Value, Diagnostic> {
+        if matches!(value, Value::List(_)) {
+            return self.await_elements(value, shape, depth, level, node);
+        }
         let Value::Record(record) = &value else {
             return Ok(value);
         };
@@ -667,12 +718,7 @@ impl Evaluator<'_> {
                     self.await_deep(old.clone(), inner, depth, level + 1, node)?
                 }
             };
-            let differs = match (old, &new) {
-                (Value::Future(_), _) => true,
-                (Value::Record(old), Value::Record(new)) => !Rc::ptr_eq(old, new),
-                _ => false,
-            };
-            if differs {
+            if replaced(old, &new) {
                 let values = changed.get_or_insert_with(|| record.values.to_vec());
                 if let Some(slot) = values.get_mut(index) {
                     *slot = new;
@@ -684,6 +730,57 @@ impl Evaluator<'_> {
                 layout: Rc::clone(&record.layout),
                 values: values.into_boxed_slice(),
             }))),
+            None => Ok(value),
+        }
+    }
+
+    /// Awaits the elements of `value`, a list, as the list's lazy shape
+    /// `shape` says to await each, for the await `node` at depth `depth` in
+    /// this frame's body, the elements being `level` levels of record and
+    /// list nesting below the value the await awaits, as
+    /// [`Evaluator::await_deep`] awaits a record's fields: each element is
+    /// awaited fully and then, if the shape says so, deeply, or, if it is
+    /// present, deeply. If any element changed, the result is a new list,
+    /// sharing the elements that did not; otherwise it is the list as it
+    /// was.
+    fn await_elements(
+        &mut self,
+        value: Value,
+        shape: LazyShapeId,
+        depth: u16,
+        level: usize,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let Value::List(list) = &value else {
+            return Ok(value);
+        };
+        let Some(each) = self.ir.lazy_list(shape) else {
+            return mistyped(node, "an await of a list's lazy shape its IR lacks");
+        };
+        let mut changed: Option<Vec<Value>> = None;
+        for (index, old) in list.values().iter().enumerate() {
+            let new = match each {
+                LazyField::Await(inner) => {
+                    let awaited = self.await_fully(old.clone(), depth, level, node)?;
+                    if inner == LazyShapeId::NONE {
+                        awaited
+                    } else {
+                        self.await_deep(awaited, inner, depth, level + 1, node)?
+                    }
+                }
+                LazyField::Within(inner) => {
+                    self.await_deep(old.clone(), inner, depth, level + 1, node)?
+                }
+            };
+            if replaced(old, &new) {
+                let values = changed.get_or_insert_with(|| list.values().to_vec());
+                if let Some(slot) = values.get_mut(index) {
+                    *slot = new;
+                }
+            }
+        }
+        match changed {
+            Some(values) => Ok(Value::List(List::from_vec(values))),
             None => Ok(value),
         }
     }
@@ -1013,11 +1110,21 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FUNCTION),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Fn(closure) => Some(closure),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => {
+                self.index_as((list, index), node, |value| match value {
+                    Value::Fn(closure) => Some(closure),
+                    _ => None,
+                })
+            }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node),
@@ -1091,6 +1198,132 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Evaluates a list node, through the general walker, to its list (see
+    /// the module documentation).
+    fn list(&mut self, id: IrId) -> Result<List, Diagnostic> {
+        match self.value(id)? {
+            Value::List(list) => Ok(list),
+            _ => mistyped(
+                self.ir.get(id),
+                "a node of another kind where a list was expected",
+            ),
+        }
+    }
+
+    /// Builds a list of the values of `items`, in order, spreading the
+    /// list of each `Spread` among them if `spreads` says there is one: one
+    /// allocation, sized exactly and filled in place, if there is none,
+    /// and none at all for the empty list.
+    fn make_list(&mut self, items: IrRange, spreads: bool) -> Result<Value, Diagnostic> {
+        let ir = self.ir;
+        let items = ir.items(items);
+        if spreads {
+            return self.make_spread_list(items);
+        }
+        // The slice is built at its known length as the items are
+        // evaluated, in order; once one fails, the rest are not evaluated,
+        // and the slice, filled with `{}`, is dropped.
+        let mut failed = None;
+        let list = List::from_exact((0..items.len()).map(|at| {
+            if failed.is_some() {
+                return Value::Empty;
+            }
+            let value = items
+                .get(at)
+                .map_or(Ok(Value::Empty), |&item| self.value(item));
+            value.unwrap_or_else(|error| {
+                failed = Some(error);
+                Value::Empty
+            })
+        }));
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(Value::List(list)),
+        }
+    }
+
+    /// Builds a list of the values of `items`, in order, of which some are
+    /// `Spread`s, whose lists' elements are put in their places: collected
+    /// in a vector, which grows by amortised doubling, so that the whole
+    /// takes time linear in the list's length, and then copied into the
+    /// list's one allocation.
+    fn make_spread_list(&mut self, items: &[IrId]) -> Result<Value, Diagnostic> {
+        let mut values = Vec::with_capacity(items.len());
+        for &item in items {
+            if let IrKind::Spread(list) = self.ir.get(item).kind {
+                values.extend_from_slice(self.list(list)?.values());
+            } else {
+                values.push(self.value(item)?);
+            }
+        }
+        Ok(Value::List(List::from_vec(values)))
+    }
+
+    /// Evaluates `list` and then `index`, and returns the element at the
+    /// position, counting from 0, for the `Index` `node`; a position
+    /// outside the list, a negative one included, is "index out of range".
+    fn index(&mut self, (list, index): (IrId, IrId), node: &IrNode) -> Result<Value, Diagnostic> {
+        let list = self.list(list)?;
+        let at = self.int(index)?;
+        match usize::try_from(at)
+            .ok()
+            .and_then(|position| list.values().get(position))
+        {
+            Some(value) => Ok(value.clone()),
+            None => Err(out_of_range(node, at, list.len())),
+        }
+    }
+
+    /// Evaluates the `Index` `node`, reading the element of `list` at
+    /// `index`, as a value that `extract` accepts: an element of the kind
+    /// the node states.
+    fn index_as<T>(
+        &mut self,
+        operands: (IrId, IrId),
+        node: &IrNode,
+        extract: fn(Value) -> Option<T>,
+    ) -> Result<T, Diagnostic> {
+        match extract(self.index(operands, node)?) {
+            Some(value) => Ok(value),
+            None => mistyped(
+                node,
+                "a list holds an element of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates a `ListLen` of `list`: the number of its elements.
+    fn list_len(&mut self, list: IrId) -> Result<i64, Diagnostic> {
+        // A list has far fewer elements than `i64::MAX`.
+        Ok(i64::try_from(self.list(list)?.len()).unwrap_or(i64::MAX))
+    }
+
+    /// Evaluates the typed list comparison `node`, a `ListEq` if `equal` and
+    /// a `ListNe` otherwise: the operands compare element by element over
+    /// the list's shape (see [`record_eq_shaped`]).
+    fn list_eq(
+        &mut self,
+        operands: ShapedOperands,
+        equal: bool,
+        node: &IrNode,
+    ) -> Result<bool, Diagnostic> {
+        let lhs = Value::List(self.list(operands.lhs)?);
+        let rhs = Value::List(self.list(operands.rhs)?);
+        match record_eq_shaped(self.ir, operands.shape, &lhs, &rhs) {
+            Some(same) => Ok(same == equal),
+            None => mistyped(node, "a list does not have its shape"),
+        }
+    }
+
+    /// Evaluates a total list comparison, a `ListSame` if `equal` and a
+    /// `ListNotSame` otherwise: lists compare whole, element by element,
+    /// deeply.
+    fn list_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
+        let lhs = self.list(operands.lhs)?;
+        let rhs = self.list(operands.rhs)?;
+        Ok((lhs == rhs) == equal)
+    }
+
     /// The value in `slot` of this frame.
     fn load(&self, slot: Slot, node: &IrNode) -> Result<&Value, Diagnostic> {
         self.stack
@@ -1113,11 +1346,22 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Int(value) => Some(value),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => {
+                self.index_as((list, index), node, |value| match value {
+                    Value::Int(value) => Some(value),
+                    _ => None,
+                })
+            }
+            IrKind::ListLen(list) => self.list_len(list),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
             IrKind::Call {
@@ -1167,6 +1411,10 @@ impl Evaluator<'_> {
             | IrKind::RecordNe(_)
             | IrKind::RecordSame(_)
             | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
@@ -1177,6 +1425,9 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
+            IrKind::MakeList { .. } | IrKind::Spread(_) => {
+                mistyped(node, "list node where an Int was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where an Int was expected")
             }
@@ -1246,11 +1497,21 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FLOAT),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Float(value) => Some(value),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => {
+                self.index_as((list, index), node, |value| match value {
+                    Value::Float(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
             IrKind::Call {
@@ -1288,7 +1549,8 @@ impl Evaluator<'_> {
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => mistyped(node, "Int node where a Float was expected"),
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => mistyped(node, "Int node where a Float was expected"),
             IrKind::BoolConst(_)
             | IrKind::IntCmp(..)
             | IrKind::FloatCmp(..)
@@ -1298,6 +1560,10 @@ impl Evaluator<'_> {
             | IrKind::RecordNe(_)
             | IrKind::RecordSame(_)
             | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
@@ -1309,6 +1575,9 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a Float was expected")
+            }
+            IrKind::MakeList { .. } | IrKind::Spread(_) => {
+                mistyped(node, "list node where a Float was expected")
             }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Float was expected")
@@ -1348,11 +1617,21 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_BOOL),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Bool(value) => Some(value),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => {
+                self.index_as((list, index), node, |value| match value {
+                    Value::Bool(value) => Some(value),
+                    _ => None,
+                })
+            }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
             IrKind::Call {
@@ -1380,6 +1659,10 @@ impl Evaluator<'_> {
             IrKind::RecordNe(o) => self.record_eq(o, false, node),
             IrKind::RecordSame(o) => self.record_same(o, true),
             IrKind::RecordNotSame(o) => self.record_same(o, false),
+            IrKind::ListEq(o) => self.list_eq(o, true, node),
+            IrKind::ListNe(o) => self.list_eq(o, false, node),
+            IrKind::ListSame(o) => self.list_same(o, true),
+            IrKind::ListNotSame(o) => self.list_same(o, false),
             IrKind::And(o) => self.logic(o, false),
             IrKind::Or(o) => self.logic(o, true),
             IrKind::Not(operand) => self.not(operand),
@@ -1395,7 +1678,8 @@ impl Evaluator<'_> {
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => mistyped(node, "Int node where a Bool was expected"),
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => mistyped(node, "Int node where a Bool was expected"),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -1410,6 +1694,9 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
+            IrKind::MakeList { .. } | IrKind::Spread(_) => {
+                mistyped(node, "list node where a Bool was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Bool was expected")
             }
@@ -1501,11 +1788,21 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_STRING),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Str(text) => Some(text),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => {
+                self.index_as((list, index), node, |value| match value {
+                    Value::Str(text) => Some(text),
+                    _ => None,
+                })
+            }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
             IrKind::Call {
@@ -1539,7 +1836,8 @@ impl Evaluator<'_> {
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => mistyped(node, "Int node where a String was expected"),
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => mistyped(node, "Int node where a String was expected"),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -1556,6 +1854,10 @@ impl Evaluator<'_> {
             | IrKind::RecordNe(_)
             | IrKind::RecordSame(_)
             | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a String was expected"),
@@ -1564,6 +1866,9 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a String was expected")
+            }
+            IrKind::MakeList { .. } | IrKind::Spread(_) => {
+                mistyped(node, "list node where a String was expected")
             }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a String was expected")
@@ -1586,11 +1891,16 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_RECORD),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
                 Value::Empty | Value::Record(_) => Some(value),
                 _ => None,
             }),
+            IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_record),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
             IrKind::Call {
@@ -1629,7 +1939,8 @@ impl Evaluator<'_> {
             | IrKind::IntSub(_)
             | IrKind::IntMul(_)
             | IrKind::IntFloorDiv(_)
-            | IrKind::IntRem(_) => mistyped(node, "Int node where a record was expected"),
+            | IrKind::IntRem(_)
+            | IrKind::ListLen(_) => mistyped(node, "Int node where a record was expected"),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -1646,11 +1957,18 @@ impl Evaluator<'_> {
             | IrKind::RecordNe(_)
             | IrKind::RecordSame(_)
             | IrKind::RecordNotSame(_)
+            | IrKind::ListEq(_)
+            | IrKind::ListNe(_)
+            | IrKind::ListSame(_)
+            | IrKind::ListNotSame(_)
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a record was expected")
+            }
+            IrKind::MakeList { .. } | IrKind::Spread(_) => {
+                mistyped(node, "list node where a record was expected")
             }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a record was expected")
@@ -1686,6 +2004,7 @@ impl Evaluator<'_> {
             | Value::Float(_)
             | Value::Bool(_)
             | Value::Str(_)
+            | Value::List(_)
             | Value::Fn(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
@@ -1802,6 +2121,19 @@ const DEFERRED_STRING: &str = "a node that may be a future where a String was ex
 const DEFERRED_RECORD: &str = "a node that may be a future where a record was expected";
 const DEFERRED_FUNCTION: &str = "a node that may be a future where a function was expected";
 
+/// Whether a deep await replaced `old`, a record's field or a list's
+/// element, with `new`: a future by what it yielded, or a record or list by
+/// a new one with values inside it awaited. Awaiting anything else, or a
+/// record or list with nothing to await inside, leaves it as it was.
+fn replaced(old: &Value, new: &Value) -> bool {
+    match (old, new) {
+        (Value::Future(_), _) => true,
+        (Value::Record(old), Value::Record(new)) => !Rc::ptr_eq(old, new),
+        (Value::List(old), Value::List(new)) => !old.shares(new),
+        _ => false,
+    }
+}
+
 /// Floor division: the quotient rounded toward negative infinity. Returns
 /// `None` on overflow, which only `i64::MIN // -1` causes.
 ///
@@ -1855,25 +2187,43 @@ fn floor_mod(a: i64, b: NonZeroI64) -> i64 {
     }
 }
 
-/// Typed equality: whether records `a` and `b` are equal over shape
-/// `shape`, comparing, for each field of the shape, the two records' fields
-/// of that name, a record field through its own shape and any other with
-/// `==` on [`Value`]. Fields the shape lacks are ignored, so a record with
-/// no fields in its shape is equal to any other.
+/// Typed equality: whether records or lists `a` and `b` are equal over
+/// shape `shape`. For a record's shape, that compares, for each field of
+/// the shape, the two records' fields of that name, a record or list field
+/// through its own shape and any other with `==` on [`Value`]; fields the
+/// shape lacks are ignored, so a record with no fields in its shape is
+/// equal to any other. For a list's shape, the two lists must have the same
+/// length, and each pair of elements is compared through the element's
+/// shape, or with `==` if it has none.
 ///
-/// Nested records are compared through a work list rather than recursion,
-/// as [`Record`]'s total equality does, and the list only grows when a
-/// shape has a record field, so comparing flat records allocates nothing.
+/// Nested records and lists are compared through a work list rather than
+/// recursion, as [`Record`]'s total equality does, and the list only grows
+/// when a shape has a record or list field or element, so comparing flat
+/// records and lists allocates nothing.
 ///
 /// `None` if a record lacks a field of its shape, or holds something other
-/// than a record in a field the shape has as a record: the checker
-/// guarantees neither happens, so either is an internal error.
+/// than a record or a list where the shape has one: the checker guarantees
+/// neither happens, so either is an internal error.
 fn record_eq_shaped(ir: &Ir, shape: ShapeId, a: &Value, b: &Value) -> Option<bool> {
     let mut pending: Vec<(ShapeId, &Value, &Value)> = Vec::new();
     let (mut shape, mut a, mut b) = (shape, a, b);
     loop {
         let fields = &ir.shape(shape).fields;
-        if !fields.is_empty() {
+        if let Some(ListShape { element }) = ir.list_shape(shape) {
+            let (Value::List(a), Value::List(b)) = (a, b) else {
+                return None;
+            };
+            if a.len() != b.len() {
+                return Some(false);
+            }
+            for (mine, theirs) in a.values().iter().zip(b.values()) {
+                match element {
+                    Some(nested) => pending.push((nested, mine, theirs)),
+                    None if mine == theirs => {}
+                    None => return Some(false),
+                }
+            }
+        } else if !fields.is_empty() {
             let (Value::Record(a), Value::Record(b)) = (a, b) else {
                 return None;
             };
@@ -1897,10 +2247,11 @@ fn record_eq_shaped(ir: &Ir, shape: ShapeId, a: &Value, b: &Value) -> Option<boo
 /// threshold's minimum (see [Memoised functions](#memoised-functions)).
 const MIN_SWEEP_THRESHOLD: usize = 32;
 
-/// How many levels of record nesting a memo key's hash descends into; a
-/// record nested deeper contributes only its field count. Equal keys still
-/// hash equally, and the bound keeps hashing from recursing as deeply as a
-/// record may be nested, which is as deeply as a program runs.
+/// How many levels of record and list nesting a memo key's hash descends
+/// into; a record nested deeper contributes only its field count, and a
+/// list only its length. Equal keys still hash equally, and the bound keeps
+/// hashing from recursing as deeply as a record or list may be nested,
+/// which is as deeply as a program runs.
 const KEY_HASH_DEPTH: usize = 4;
 
 /// The memo tables of an execution context: one table per closure of a
@@ -2269,9 +2620,11 @@ fn key_hash(key: &[Value]) -> u64 {
 }
 
 /// Feeds `value` to `state`, consistently with key equality: a float's
-/// zeros alike, a function and a future by address, and a record, `depth`
+/// zeros alike, a function and a future by address, a record, `depth`
 /// levels deep, as the sum of its fields' hashes, which does not depend on
-/// their order, since total equality compares fields by name.
+/// their order, since total equality compares fields by name, and a list,
+/// `depth` levels deep, as its elements in order, since total equality
+/// compares elements by position.
 fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
     match value {
         Value::Int(value) => {
@@ -2307,6 +2660,15 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
                 state.write_u64(sum);
             }
         }
+        Value::List(list) => {
+            state.write_u8(8);
+            state.write_usize(list.len());
+            if let Some(depth) = depth.checked_sub(1) {
+                for value in list.values() {
+                    hash_value(value, state, depth);
+                }
+            }
+        }
         Value::Fn(closure) => {
             state.write_u8(6);
             Rc::as_ptr(closure).hash(state);
@@ -2336,6 +2698,19 @@ fn nested_too_deeply(node: &IrNode) -> Diagnostic {
          function called; GCSL does not eliminate tail calls, so recursion this deep is not \
          supported",
     )
+}
+
+/// The error for the `Index` `node` reading position `at` of a list of
+/// `len` elements, which it lies outside: "index out of range", labelled
+/// with the index and, if it is not negative, the list's length.
+fn out_of_range(node: &IrNode, at: i64, len: usize) -> Diagnostic {
+    let facts = if at < 0 {
+        format!("the index is {at}")
+    } else {
+        let noun = if len == 1 { "element" } else { "elements" };
+        format!("the index is {at}, and the list has {len} {noun}")
+    };
+    Diagnostic::error("index out of range", node.span).with_label(facts)
 }
 
 /// The error for the await `node` of a future whose body is running: an
@@ -2399,6 +2774,15 @@ fn as_record(value: &Value, node: &IrNode) -> Result<Value, Diagnostic> {
     match value {
         Value::Empty | Value::Record(_) => Ok(value.clone()),
         _ => mistyped(node, "record load from a slot holding another type"),
+    }
+}
+
+/// `value` if it is a record: what the record walker extracts from an
+/// element read by an index.
+fn into_record(value: Value) -> Option<Value> {
+    match value {
+        Value::Empty | Value::Record(_) => Some(value),
+        _ => None,
     }
 }
 
@@ -5046,5 +5430,252 @@ mod tests {
         assert_eq!(record.values[0].to_string(), "{v = 5150}");
         assert_eq!(memo.running_count(), 0);
         assert!(memo.table_count() < MIN_SWEEP_THRESHOLD);
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn lists_are_built_indexed_and_measured() {
+        let text = "let xs: List<Int> = [1, 2, 3]\n\
+                    let ys: Int[] = [...xs, 4]\n\
+                    a = xs[0]\n\
+                    b = len(ys)\n\
+                    c = xs == [1, 2, 3]\n\
+                    d = \"{ys}\"";
+        assert_eq!(
+            run(text).unwrap().to_string(),
+            "{a = 1; b = 4; c = true; d = \"[1, 2, 3, 4]\"}"
+        );
+        assert_eq!(run("[]: Int[]").unwrap(), Value::List(List::EMPTY));
+        assert_eq!(int("len([]: Int[])"), 0);
+        assert_eq!(int("[[1, 2], [3]][1][0]"), 3);
+        assert_eq!(float("[1, 2.5][0]"), 1.0);
+        assert_eq!(string("[\"a\", \"b\"][1]"), "b");
+        assert!(boolean("[true][0]"));
+        assert_eq!(int("[{ a = 7 }][0].a"), 7);
+        assert_eq!(int("[fn(x: Int): Int { x * 2 }][0](21)"), 42);
+        assert_eq!(int("[lazy 5][0] + 1"), 6);
+        assert_eq!(run("[{}][0]").unwrap(), Value::Empty);
+        assert_eq!(run("[[1]][0]").unwrap().to_string(), "[1]");
+        // Spreads, nested and empty.
+        assert_eq!(
+            run("let e: Int[] = []\n[...e, 1, ...[2, 3], ...e, ...[...[4]]]")
+                .unwrap()
+                .to_string(),
+            "[1, 2, 3, 4]"
+        );
+        assert_eq!(
+            run("let e: Int[] = []\n[...e]").unwrap(),
+            Value::List(List::EMPTY)
+        );
+    }
+
+    #[test]
+    fn a_list_evaluates_its_elements_in_order() {
+        // The first element that fails is reported, and nothing after it
+        // is evaluated.
+        assert_eq!(
+            error("[1, 1 // 0, 2 // 0]"),
+            ("division by zero".to_owned(), Span::new(6, 8))
+        );
+        assert_eq!(
+            error("[1, ...[1 // 0], 2 // 0]"),
+            ("division by zero".to_owned(), Span::new(10, 12))
+        );
+        assert_eq!(
+            error("[...[1 // 0], ...[2 // 0]]"),
+            ("division by zero".to_owned(), Span::new(7, 9))
+        );
+        // The list, then the position.
+        assert_eq!(
+            error("[1 // 0][2 // 0]"),
+            ("division by zero".to_owned(), Span::new(3, 5))
+        );
+        assert_eq!(
+            error("[1][2 // 0]"),
+            ("division by zero".to_owned(), Span::new(6, 8))
+        );
+    }
+
+    #[test]
+    fn an_index_out_of_range_is_a_runtime_error() {
+        for (text, label) in [
+            (
+                "[1, 2, 3][5]",
+                "the index is 5, and the list has 3 elements",
+            ),
+            (
+                "[1, 2, 3][3]",
+                "the index is 3, and the list has 3 elements",
+            ),
+            ("[1][1]", "the index is 1, and the list has 1 element"),
+            ("[1, 2, 3][-1]", "the index is -1"),
+            (
+                "([]: Int[])[0]",
+                "the index is 0, and the list has 0 elements",
+            ),
+        ] {
+            let diagnostic = run(text).unwrap_err();
+            assert_eq!(diagnostic.message, "index out of range", "{text}");
+            // At the whole index.
+            let whole = Span::new(0, u32::try_from(text.len()).unwrap());
+            assert_eq!(diagnostic.span, whole, "{text}");
+            assert_eq!(diagnostic.label.as_deref(), Some(label), "{text}");
+            assert!(diagnostic.labels.is_empty(), "{text}");
+        }
+        // Inside a function, and inside a future, where it happens.
+        let text = "fn f(xs: Int[]): Int { xs[3] }\nf([1])";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.span, Span::new(23, 28));
+        let text = "let x = lazy [1][9]\nawait x";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.span, Span::new(13, 19));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![(Span::new(20, 27), "awaited here")]
+        );
+    }
+
+    #[test]
+    fn a_spread_shares_the_elements_of_its_list() {
+        let frame = frame_after("let xs = [{ a = 1 }, { a = 2 }]\nlet ys = [...xs, ...xs]");
+        let [Value::List(xs), Value::List(ys)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert_eq!(ys.len(), 4);
+        assert!(same(&xs.values()[0], &ys.values()[0]));
+        assert!(same(&xs.values()[1], &ys.values()[1]));
+        assert!(same(&xs.values()[0], &ys.values()[2]));
+        // An element read by an index is the element, not a copy.
+        let frame = frame_after("let xs = [{ a = 1 }]\nlet r = xs[0]");
+        let [Value::List(xs), r] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(same(&xs.values()[0], r));
+    }
+
+    #[test]
+    fn a_deep_await_of_a_list_runs_each_future_once() {
+        let frame = frame_after(
+            "let a = lazy { n = 1 }\n\
+             let xs = [a, a, lazy { n = 2 }, { n = 3 }]\n\
+             let s = \"{xs}\"\n\
+             let t = \"{xs}\"",
+        );
+        let [Value::Future(a), Value::List(xs), s, t] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert_eq!(s.to_string(), "[{n = 1}, {n = 1}, {n = 2}, {n = 3}]");
+        assert_eq!(s, t);
+        // The list holds the futures, each run by the first await and found
+        // done by every later one; the one future `a` is both elements.
+        assert!(a.is_done());
+        let [
+            Value::Future(first),
+            Value::Future(second),
+            Value::Future(third),
+            Value::Record(_),
+        ] = xs.values()
+        else {
+            panic!("unexpected list {xs:?}");
+        };
+        assert!(Rc::ptr_eq(a, first) && Rc::ptr_eq(a, second));
+        assert!(third.is_done());
+        // A deep await of a record's list and a list's records.
+        assert_eq!(
+            string("let r = { xs = [lazy 1, 2] }\n\"{r}\""),
+            "{xs = [1, 2]}"
+        );
+        assert_eq!(
+            string("let xs = [{ a = lazy [lazy 1] }]\n\"{xs}\""),
+            "[{a = [1]}]"
+        );
+        // An awaited list with nothing lazy is the list as it was.
+        let frame = frame_after("let xs = [1, lazy 2]\nlet ys = [...xs]: List<Int | Future<Int>>");
+        assert_eq!(frame[1].to_string(), "[1, Future<Int>]");
+    }
+
+    #[test]
+    fn list_equality_of_both_kinds() {
+        booleans(&[
+            ("[1, 2] == [1, 2]", true),
+            ("[1, 2] == [1, 3]", false),
+            ("[1, 2] == [1, 2, 3]", false),
+            ("[1, 2] != [2, 1]", true),
+            ("[1, 2] === [1, 2]", true),
+            ("[1, 2] !== [1, 2, 3]", true),
+            ("[[1], [2, 3]] == [[1], [2, 3]]", true),
+            ("[[1], [2, 3]] == [[1], [2]]", false),
+            ("[[1], [2, 3]] === [[1], [3, 2]]", false),
+            ("[0.0] == [-0.0]", true),
+            ("[0.0 / 0.0] == [0.0 / 0.0]", false),
+            ("let e: Int[] = []\ne == e", true),
+            (
+                "let xs = [1, lazy 2]\nxs == [1, 2]: List<Int | Future<Int>>",
+                true,
+            ),
+            ("[{ a = [1] }] == [{ a = [1] }]", true),
+            ("[{ a = [1] }] == [{ a = [2] }]", false),
+        ]);
+        // Typed equality compares records inside by their static type;
+        // total equality compares whole values.
+        let hidden = "let p: {x: Int} = { x = 1; y = 2 }\n\
+                      let q: {x: Int} = { x = 1; y = 3 }\n";
+        booleans(&[
+            (&format!("{hidden}[p] == [q]"), true),
+            (&format!("{hidden}[p] === [q]"), false),
+            (&format!("{hidden}[[p]] == [[q]]"), true),
+            (&format!("{hidden}{{ xs = [p] }} == {{ xs = [q] }}"), true),
+            (&format!("{hidden}{{ xs = [p] }} === {{ xs = [q] }}"), false),
+        ]);
+    }
+
+    #[test]
+    fn lists_display_their_elements() {
+        assert_eq!(
+            string("\"{[1, 2]} {[\"a\"]} {[[1.5], []: Float[]]} {[{ n = 1 }]}\""),
+            "[1, 2] [\"a\"] [[1.5], []] [{n = 1}]"
+        );
+        assert_eq!(
+            string("\"{[fn(): Int { 1 }]} {[lazy 1]}\""),
+            "[fn(): Int] [1]"
+        );
+    }
+
+    #[test]
+    fn lists_are_memo_keys() {
+        assert!(hits("", "Int[]", "[1, 2]", "[1, 2]"));
+        assert!(hits("", "Int[]", "[1, 2]", "[...[1], 2]"));
+        assert!(hits("", "Int[]", "[]", "[]"));
+        assert!(!hits("", "Int[]", "[1, 2]", "[1, 2, 3]"));
+        assert!(!hits("", "Int[]", "[1, 2]", "[2, 1]"));
+        assert!(!hits("", "Int[]", "[]", "[1]"));
+        assert!(hits("", "Float[]", "[0.0]", "[-0.0]"));
+        assert!(!hits("", "Float[]", "[0.0 / 0.0]", "[0.0 / 0.0]"));
+        // Deeply, deeper than the hash looks, and by total equality.
+        let deep = |leaf: i64| format!("{}{leaf}{}", "[".repeat(6), "]".repeat(6));
+        let deep_type = format!("Int{}", "[]".repeat(6));
+        assert!(hits("", &deep_type, &deep(1), &deep(1)));
+        assert!(!hits("", &deep_type, &deep(1), &deep(2)));
+        assert!(hits("", "{a: Int}[]", "[{ a = 1 }]", "[{ a = 1 }]"));
+        assert!(!hits("", "{a: Int}[]", "[{ a = 1 }]", "[{ a = 1; b = 2 }]"));
+        // Elements that may be futures are awaited at the call first.
+        assert!(hits("let x = lazy 1", "Int[]", "[x]", "[1]"));
+    }
+
+    #[test]
+    fn a_list_is_captured_by_a_closure_and_a_lazy() {
+        assert_eq!(
+            int("let xs = [1, 2]\nlet f = fn(): Int { xs[1] }\nlet xs = [5]\nf()"),
+            2
+        );
+        assert_eq!(
+            int("let xs = [1, 2]\nlet f = lazy len(xs)\nxs := [5]\nawait f"),
+            2
+        );
+        assert_eq!(
+            int("let n = 3\nlet f = fn(): Int[] { [n, n] }\nlen(f()) + f()[0]"),
+            5
+        );
     }
 }

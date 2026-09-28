@@ -17,8 +17,17 @@
 //! type expressions, [`Ast::field_tys`], the segments of the paths that
 //! name what a `let`, a field or a `:=` declares, [`Ast::path`], the
 //! parameters of function expressions, [`Ast::params`], the arguments of
-//! calls, [`Ast::args`], and the parameters of function types,
-//! [`Ast::param_tys`].
+//! calls, [`Ast::args`], the parameters of function types,
+//! [`Ast::param_tys`], and the elements of list literals, [`Ast::elements`].
+//!
+//! # Lists
+//!
+//! A list literal, `[1, ...xs, 3]`, [`ExprKind::List`], lists its elements
+//! in source order, each an expression or a spread of one ([`Element`]). An
+//! index, `xs[0]`, is [`ExprKind::Index`]. A list type is written
+//! `List<Int>`, an applied type like `Future<Int>`, or `Int[]`, which the
+//! tree keeps as written, [`TypeExprKind::List`], for printing; the checker
+//! gives both the same meaning.
 //!
 //! # Functions
 //!
@@ -214,6 +223,39 @@ impl ArgRange {
 pub struct ParamTyRange {
     start: u32,
     len: u32,
+}
+
+/// The elements of a list literal: a contiguous range of the element pool
+/// of the [`Ast`] that allocated it. Resolve it with [`Ast::elements`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ElementRange {
+    start: u32,
+    len: u32,
+}
+
+/// One element of a list literal: an expression, whose value is the
+/// element, or `...` and an expression, whose value is a list whose
+/// elements are spread into the literal in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Element {
+    /// The expression.
+    pub value: ExprId,
+    /// For a spread, where its `...` is written; `None` for an element
+    /// that is not one.
+    pub spread: Option<Span>,
+}
+
+impl Element {
+    /// The span of the whole element in `ast`: its `...` through its
+    /// expression for a spread, and its expression otherwise.
+    #[must_use]
+    pub fn span(&self, ast: &Ast) -> Span {
+        let value = ast.get(self.value).span;
+        match self.spread {
+            Some(spread) => Span::join(spread, value),
+            None => value,
+        }
+    }
 }
 
 /// One parameter of a function expression, `NAME: TYPE`.
@@ -669,6 +711,17 @@ pub enum ExprKind {
     /// written. Its details are in the function arena (see
     /// [`Ast::fn_decl`]), the operand being the body.
     Lazy(FnId),
+    /// A list literal, `[a, ...b, c]`: its elements, in source order (see
+    /// [`Element`]).
+    List(ElementRange),
+    /// An index, `EXPR[INDEX]`: the element of a list at a position. The
+    /// span of the `[INDEX]` part is not stored; see [`Expr::bracket_span`].
+    Index {
+        /// The list.
+        expr: ExprId,
+        /// The position.
+        index: ExprId,
+    },
 }
 
 /// One node of the tree.
@@ -684,7 +737,8 @@ pub struct Expr {
     /// `Field` its record expression through its name. A `Fn` covers its
     /// `fn` keyword through its body's `}`, a `Call` its callee through
     /// its `)` or its trailing block's `}`, and a `Lazy` its `lazy` keyword
-    /// through its operand.
+    /// through its operand. A `List` covers its brackets, and an `Index` its
+    /// list expression through its `]`.
     pub span: Span,
 }
 
@@ -708,7 +762,20 @@ impl Expr {
             | ExprKind::Ascribe { .. }
             | ExprKind::Fn(_)
             | ExprKind::Call { .. }
-            | ExprKind::Lazy(_) => None,
+            | ExprKind::Lazy(_)
+            | ExprKind::List(_)
+            | ExprKind::Index { .. } => None,
+        }
+    }
+
+    /// The span of the `[INDEX]` part of an `Index` node, for diagnostics
+    /// about the indexing: from the end of its list expression, found in
+    /// `ast`, to its `]`. `None` for every other node.
+    #[must_use]
+    pub fn bracket_span(&self, ast: &Ast) -> Option<Span> {
+        match self.kind {
+            ExprKind::Index { expr, .. } => Some(Span::new(ast.get(expr).span.end, self.span.end)),
+            _ => None,
         }
     }
 
@@ -828,6 +895,9 @@ pub enum TypeExprKind {
         /// The type argument.
         arg: TypeExprId,
     },
+    /// `TYPE[]`, the sugar for the list type `List<TYPE>`: its element
+    /// type. `List<TYPE>` written out is an [`TypeExprKind::Applied`].
+    List(TypeExprId),
     /// A union, `TYPE | TYPE`. `|` binds looser than everything else in a
     /// type, and a union of three is the union of a union and the third.
     Union {
@@ -873,6 +943,7 @@ pub struct AstBuilder {
     params: Vec<Param>,
     args: Vec<Arg>,
     param_tys: Vec<ParamTy>,
+    elements: Vec<Element>,
 }
 
 impl AstBuilder {
@@ -1016,6 +1087,17 @@ impl AstBuilder {
         }
     }
 
+    /// Appends `elements` to the element pool as one list literal's
+    /// elements and returns their range.
+    pub fn push_elements(&mut self, elements: &[Element]) -> ElementRange {
+        let start = next_id(self.elements.len());
+        self.elements.extend_from_slice(elements);
+        ElementRange {
+            start,
+            len: next_id(elements.len()),
+        }
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -1063,6 +1145,7 @@ impl AstBuilder {
             params: self.params,
             args: self.args,
             param_tys: self.param_tys,
+            elements: self.elements,
             root,
             names,
             strings,
@@ -1085,6 +1168,7 @@ pub struct Ast {
     params: Vec<Param>,
     args: Vec<Arg>,
     param_tys: Vec<ParamTy>,
+    elements: Vec<Element>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -1227,6 +1311,18 @@ impl Ast {
         &self.param_tys[start..start + range.len as usize]
     }
 
+    /// Returns the elements of the list literal whose elements are `range`,
+    /// in source order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn elements(&self, range: ElementRange) -> &[Element] {
+        let start = range.start as usize;
+        &self.elements[start..start + range.len as usize]
+    }
+
     /// Shows `segments`, a path of this tree or a prefix of one, as it is
     /// written (see [`PathDisplay`]).
     #[must_use]
@@ -1299,7 +1395,8 @@ impl Ast {
     /// parses first down to a leaf: a block's first item's value, an `if`'s
     /// condition, a call's callee, a binary operator's left operand, a
     /// function's or `lazy`'s body, an interpolated string's first
-    /// expression. Debug builds check that every node of the range lies
+    /// expression, a list literal's first element's, an index's list.
+    /// Debug builds check that every node of the range lies
     /// within `id`'s span and the node before it starts before `id`.
     pub(crate) fn subtree(&self, id: ExprId) -> impl Iterator<Item = ExprId> + use<> {
         let first = self.first_node(id);
@@ -1348,8 +1445,13 @@ impl Ast {
                 ExprKind::If { cond, .. } => cond,
                 ExprKind::Unary { operand, .. } => operand,
                 ExprKind::Binary { lhs, .. } => lhs,
+                ExprKind::List(elements) => match self.elements(elements).first() {
+                    Some(element) => element.value,
+                    None => return node,
+                },
                 ExprKind::Paren(inner)
                 | ExprKind::Field { expr: inner, .. }
+                | ExprKind::Index { expr: inner, .. }
                 | ExprKind::Ascribe { expr: inner, .. } => inner,
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::Call { callee, .. } => callee,
@@ -1422,11 +1524,16 @@ impl Annotate for NoAnnotation {
 /// named one as `(named x EXPR)` and the trailing block as
 /// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
 /// `(let f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its body,
-/// and an `await` as `(await ...)` followed by its operand. Applied and
+/// and an `await` as `(await ...)` followed by its operand. A list literal
+/// prints as `(list ...)` followed by its elements in source order, a
+/// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by
+/// its list and its position. Applied and
 /// union types print as written, `Future<Int>`, `Present<Int>` and
 /// `Int | Future<Int>`, a function type that is a member of a union in
 /// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
-/// would otherwise take the rest of the union; other parentheses in a type
+/// would otherwise take the rest of the union; a list type written `T[]`
+/// prints so, its element type in parentheses if it is a function type or
+/// a union, `(fn(): Int)[]`; other parentheses in a type
 /// leave no trace in the tree and are not printed.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
@@ -1529,6 +1636,21 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str(" | ")?;
                 self.union_member(f, rhs)
             }
+            TypeExprKind::List(element) => {
+                // The `[]` would belong to a function type's return type,
+                // and bind tighter than a union's `|`.
+                if matches!(
+                    self.ast.type_expr(element).kind,
+                    TypeExprKind::Fn { .. } | TypeExprKind::Union { .. }
+                ) {
+                    f.write_str("(")?;
+                    self.type_expr(f, element)?;
+                    f.write_str(")[]")
+                } else {
+                    self.type_expr(f, element)?;
+                    f.write_str("[]")
+                }
+            }
         }
     }
 
@@ -1590,6 +1712,27 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// Writes the elements `range` of a list literal, each on a line of its
+    /// own at `depth`, with a leading newline.
+    fn elements(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        range: ElementRange,
+        depth: usize,
+    ) -> fmt::Result {
+        for element in self.ast.elements(range) {
+            f.write_str("\n")?;
+            if element.spread.is_some() {
+                writeln!(f, "{:indent$}(spread", "", indent = depth * 2)?;
+                self.node(f, element.value, depth + 1)?;
+                f.write_str(")")?;
+            } else {
+                self.node(f, element.value, depth)?;
+            }
+        }
+        Ok(())
+    }
+
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
         let expr = self.ast.get(id);
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
@@ -1619,6 +1762,8 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Fn(_) => f.write_str("fn")?,
             ExprKind::Call { .. } => f.write_str("call")?,
             ExprKind::Lazy(_) => f.write_str("lazy")?,
+            ExprKind::List(_) => f.write_str("list")?,
+            ExprKind::Index { .. } => f.write_str("index")?,
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
@@ -1649,12 +1794,17 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
             }
-            ExprKind::Binary { lhs, rhs, .. } => {
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Index {
+                expr: lhs,
+                index: rhs,
+            } => {
                 f.write_str("\n")?;
                 self.node(f, lhs, depth + 1)?;
                 f.write_str("\n")?;
                 self.node(f, rhs, depth + 1)?;
             }
+            ExprKind::List(elements) => self.elements(f, elements, depth + 1)?,
             ExprKind::If {
                 cond, then, else_, ..
             } => {
@@ -2129,6 +2279,87 @@ mod tests {
              \x20 (expr @29..37\n\
              \x20   (not @29..37\n\
              \x20     (bool true @33..37))))"
+        );
+    }
+
+    #[test]
+    fn lists_and_indexes_are_subtrees_of_the_pool() {
+        // `[1, ...xs][0]`, built children first as the parser does.
+        let mut names = Names::new();
+        let xs = names.intern("xs");
+        let mut builder = AstBuilder::new();
+        let one = leaf(&mut builder, 1, 1);
+        let xs_use = builder.alloc(Expr {
+            kind: ExprKind::Name(xs),
+            span: Span::new(7, 9),
+        });
+        let elements = builder.push_elements(&[
+            Element {
+                value: one,
+                spread: None,
+            },
+            Element {
+                value: xs_use,
+                spread: Some(Span::new(4, 7)),
+            },
+        ]);
+        let list = builder.alloc(Expr {
+            kind: ExprKind::List(elements),
+            span: Span::new(0, 10),
+        });
+        let zero = leaf(&mut builder, 0, 11);
+        let index = builder.alloc(Expr {
+            kind: ExprKind::Index {
+                expr: list,
+                index: zero,
+            },
+            span: Span::new(0, 13),
+        });
+        let empty_elements = builder.push_elements(&[]);
+        let empty = builder.alloc(Expr {
+            kind: ExprKind::List(empty_elements),
+            span: Span::new(14, 16),
+        });
+        let items: Vec<ItemId> = [index, empty]
+            .into_iter()
+            .map(|value| {
+                builder.alloc_item(Item {
+                    kind: ItemKind::Expr(value),
+                    span: builder.get(value).span,
+                })
+            })
+            .collect();
+        let root = builder.push_item_list(&items);
+        let ast = builder.finish(root, names, Strings::new());
+        assert_eq!(ast.elements(elements).len(), 2);
+        assert!(ast.elements(empty_elements).is_empty());
+        assert_eq!(ast.elements(elements)[1].span(&ast), Span::new(4, 9));
+        // A literal's subtree starts at its first element's, an index's at
+        // its list's; an empty literal's is itself.
+        assert_eq!(
+            ast.subtree(index).collect::<Vec<_>>(),
+            vec![one, xs_use, list, zero, index]
+        );
+        assert_eq!(
+            ast.subtree(list).collect::<Vec<_>>(),
+            vec![one, xs_use, list]
+        );
+        assert_eq!(ast.subtree(empty).collect::<Vec<_>>(), vec![empty]);
+        assert_eq!(ast.get(index).operator_span(), None);
+        assert_eq!(ast.get(index).bracket_span(&ast), Some(Span::new(10, 13)));
+        assert_eq!(ast.get(list).bracket_span(&ast), None);
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..13\n\
+             \x20   (index @0..13\n\
+             \x20     (list @0..10\n\
+             \x20       (int 1 @1..2)\n\
+             \x20       (spread\n\
+             \x20         (name xs @7..9)))\n\
+             \x20     (int 0 @11..12)))\n\
+             \x20 (expr @14..16\n\
+             \x20   (list @14..16)))"
         );
     }
 }

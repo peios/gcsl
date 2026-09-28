@@ -67,11 +67,19 @@
 //!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. `===`
-//! and `!==` lower exactly as `==` and `!=` on every kind but records. `==`
-//! and `!=` on records compare over the [`Shape`] of the operands' static
-//! type, read from the type table: one shape per distinct record type met
-//! in such a comparison, nested record types included, memoised by type
-//! and built through a work list rather than recursion. Each
+//! and `!==` lower exactly as `==` and `!=` on every kind but records and
+//! lists. `==` and `!=` on records and lists compare over the [`Shape`] (a
+//! [`ListShape`] for a list) of the operands' static type, read from the
+//! type table: one shape per distinct record or list type met in such a
+//! comparison, nested record and list types included, memoised by type and
+//! built through a work list rather than recursion.
+//!
+//! A list literal lowers to a `MakeList` of its elements' expressions, in
+//! source order, a spread's operand wrapped in a `Spread`, and an index to
+//! an `Index` of the element's kind. A call of a built-in function, whose
+//! callee the checker resolved to [`VarRef::Builtin`], lowers to the
+//! built-in's own node, of its arguments as the checker bound them: `len`
+//! to a `ListLen` of its list. Each
 //! string literal, and each literal piece of an interpolated string,
 //! becomes a `StrConst` whose text is copied from the AST's string table
 //! into the IR's own, so the AST's table is not needed after lowering. A
@@ -89,7 +97,8 @@
 //! `Await` whose kind is that of its type once awaited: its type stripped of
 //! every future layer at its top, whose kind is the same as its type's once
 //! awaited deeply. A deep await carries a [`LazyShape`] of that type, listing
-//! the record fields to await, made once per type, as record shapes are,
+//! the record fields to await, or for a list what to do with each element,
+//! made once per type, as record shapes are,
 //! and built from the leaves up through a work list. An explicit `await e`
 //! is that `Await` itself, spanning the `await` expression, rather than an
 //! `Await` of `e`; one of a present value is just its operand. Everywhere a
@@ -127,14 +136,14 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgRange, Ast, BinaryOp, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, ItemRange,
-    PartRange, PathRange, PathSegment, StrPart, UnaryOp, path_span,
+    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ItemId, ItemKind,
+    ItemRange, PartRange, PathRange, PathSegment, StrPart, UnaryOp, path_span,
 };
-use crate::check::{AwaitMark, Checked, Resolution, Slot, Types, VarRef};
+use crate::check::{AwaitMark, Builtin, Checked, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
 use crate::ir::{
     Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField, LazyShape,
-    LazyShapeId, Operands, Shape, ShapeId, ShapedOperands,
+    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -231,16 +240,17 @@ struct Lowerer<'a> {
     layouts: HashMap<Box<[Name]>, LayoutId>,
     /// Reused for collecting the field names of each record block.
     layout_names: Vec<Name>,
-    /// The shape already made for each record type.
+    /// The shape already made for each record and list type.
     shapes: HashMap<TyId, ShapeId>,
-    /// Reused as the work list of record types whose shapes have ids but no
-    /// fields yet.
+    /// Reused as the work list of record and list types whose shapes have
+    /// ids but no fields, or element's shape, yet.
     shape_pending: Vec<TyId>,
-    /// The lazy shape already made for each record type, or
-    /// [`LazyShapeId::NONE`] if it has no lazy fields at any depth.
+    /// The lazy shape already made for each record and list type, or
+    /// [`LazyShapeId::NONE`] if it has no lazy values at any depth.
     lazy_shapes: HashMap<TyId, LazyShapeId>,
-    /// Reused as the work list of record types whose lazy shapes are being
-    /// made, each with whether its fields' types have been queued.
+    /// Reused as the work list of record and list types whose lazy shapes
+    /// are being made, each with whether the types inside it have been
+    /// queued.
     lazy_pending: Vec<(TyId, bool)>,
     /// Each function lowered so far, indexed by [`FnId`].
     functions: Vec<Option<FnCode>>,
@@ -662,6 +672,18 @@ impl Lowerer<'_> {
                 name,
                 kind,
             },
+            (ExprKind::Index { expr: list, index }, _) => IrKind::Index {
+                list: self.lower_operand(list, ValueKind::List)?,
+                index: self.lower_operand(index, ValueKind::Int)?,
+                kind,
+            },
+            (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements)?,
+            (ExprKind::List(_), _) => {
+                return Err(InternalError {
+                    message: "a list literal typed as something other than a list",
+                    span,
+                });
+            }
             (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
                     message: "float literal typed as Int",
@@ -673,6 +695,7 @@ impl Lowerer<'_> {
                 ValueKind::Bool
                 | ValueKind::String
                 | ValueKind::Record
+                | ValueKind::List
                 | ValueKind::Fn
                 | ValueKind::Deferred,
             ) => {
@@ -714,13 +737,16 @@ impl Lowerer<'_> {
                 message: "a `lazy` typed as something other than a future",
                 span: expr.span,
             }),
-            (ExprKind::Call { callee, args }, _) => Ok(IrKind::Call {
-                callee: self.lower_operand(callee, ValueKind::Fn)?,
-                args: self.lower_args(args, expr.span)?,
-                kind,
-                // Set by `IrBuilder::measure` once every node is built.
-                depth: 0,
-            }),
+            (ExprKind::Call { callee, args }, _) => match self.resolution.expr_var(callee) {
+                VarRef::Builtin(builtin) => self.lower_builtin(builtin, args, kind, expr.span),
+                _ => Ok(IrKind::Call {
+                    callee: self.lower_operand(callee, ValueKind::Fn)?,
+                    args: self.lower_args(args, expr.span)?,
+                    kind,
+                    // Set by `IrBuilder::measure` once every node is built.
+                    depth: 0,
+                }),
+            },
             (ExprKind::Fn(_), _) => Err(InternalError {
                 message: "a function expression typed as a non-function type",
                 span: expr.span,
@@ -821,6 +847,71 @@ impl Lowerer<'_> {
         let captures = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(captures)
+    }
+
+    /// Lowers the call spanning `span` of the built-in function `builtin`
+    /// with the arguments `args`, of kind `kind`, to the built-in's own
+    /// node: `len` to a `ListLen` of its list.
+    fn lower_builtin(
+        &mut self,
+        builtin: Builtin,
+        args: ArgRange,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        match builtin {
+            Builtin::Len if kind == ValueKind::Int => {
+                let list = self.builtin_argument(args, 0, span)?;
+                Ok(IrKind::ListLen(self.lower_operand(list, ValueKind::List)?))
+            }
+            Builtin::Len => Err(InternalError {
+                message: "a call of `len` typed as something other than an Int",
+                span,
+            }),
+        }
+    }
+
+    /// The argument, among `args`, of the call spanning `span` of a
+    /// built-in function, that the checker bound to its parameter number
+    /// `param`.
+    fn builtin_argument(
+        &self,
+        args: ArgRange,
+        param: u32,
+        span: Span,
+    ) -> Result<ExprId, InternalError> {
+        self.ast
+            .args(args)
+            .iter()
+            .zip(self.resolution.arg_params(args))
+            .find(|&(_, &bound)| bound == param)
+            .map(|(arg, _)| arg.value)
+            .ok_or(InternalError {
+                message: "a parameter of a built-in function is bound to no argument",
+                span,
+            })
+    }
+
+    /// Lowers the elements `elements` of a list literal to the items of a
+    /// `MakeList`, in source order: each element's expression, as it is
+    /// used, and a `Spread` of each spread's list.
+    fn lower_list(&mut self, elements: ElementRange) -> Result<IrKind, InternalError> {
+        let ast = self.ast;
+        let base = self.item_stack.len();
+        let mut spreads = false;
+        for element in ast.elements(elements) {
+            let item = if element.spread.is_some() {
+                spreads = true;
+                let list = self.lower_operand(element.value, ValueKind::List)?;
+                self.builder.alloc(IrKind::Spread(list), element.span(ast))
+            } else {
+                self.lower_expr(element.value)?
+            };
+            self.item_stack.push(item);
+        }
+        let items = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(IrKind::MakeList { items, spreads })
     }
 
     /// Lowers the arguments `args` of the call spanning `span` to `Arg`
@@ -961,10 +1052,10 @@ impl Lowerer<'_> {
             });
         }
         let operand_kind = self.kind(lhs)?;
-        // Typed equality on records compares over the operands' type, once
-        // awaited.
+        // Typed equality on records and lists compares over the operands'
+        // type, once awaited.
         let shape = match (operand_kind, op) {
-            (ValueKind::Record, BinaryOp::Eq | BinaryOp::Ne) => {
+            (ValueKind::Record | ValueKind::List, BinaryOp::Eq | BinaryOp::Ne) => {
                 Some(self.shape(self.used_type(lhs), span)?)
             }
             _ => None,
@@ -988,7 +1079,22 @@ impl Lowerer<'_> {
             }
             (ValueKind::Record, BinaryOp::Same, _) => IrKind::RecordSame(operands),
             (ValueKind::Record, BinaryOp::NotSame, _) => IrKind::RecordNotSame(operands),
-            (ValueKind::Bool | ValueKind::Record | ValueKind::Fn | ValueKind::Deferred, ..) => {
+            (ValueKind::List, BinaryOp::Eq, Some(shape)) => {
+                IrKind::ListEq(ShapedOperands { shape, lhs, rhs })
+            }
+            (ValueKind::List, BinaryOp::Ne, Some(shape)) => {
+                IrKind::ListNe(ShapedOperands { shape, lhs, rhs })
+            }
+            (ValueKind::List, BinaryOp::Same, _) => IrKind::ListSame(operands),
+            (ValueKind::List, BinaryOp::NotSame, _) => IrKind::ListNotSame(operands),
+            (
+                ValueKind::Bool
+                | ValueKind::Record
+                | ValueKind::List
+                | ValueKind::Fn
+                | ValueKind::Deferred,
+                ..,
+            ) => {
                 return Err(InternalError {
                     message: "comparison of a type it cannot compare",
                     span,
@@ -997,13 +1103,14 @@ impl Lowerer<'_> {
         })
     }
 
-    /// The shape of the record type `ty`, made, with the shapes of the
-    /// record types nested in it, if this is the first comparison of it.
-    /// Each shape is given its id when it is first met and its fields when
-    /// it is taken off the work list, so that nesting does not recurse. A
-    /// field that may be a future is compared as its value once awaited,
-    /// which the deep await of the operands has done, so the shape follows
-    /// its type stripped.
+    /// The shape of the record or list type `ty`, made, with the shapes of
+    /// the record and list types nested in it, if this is the first
+    /// comparison of it. Each shape is given its id when it is first met
+    /// and its fields, or its element's shape, when it is taken off the work
+    /// list, so that nesting does not recurse. A field or an element that
+    /// may be a future is compared as its value once awaited, which the
+    /// deep await of the operands has done, so the shape follows its type
+    /// stripped.
     fn shape(&mut self, ty: TyId, span: Span) -> Result<ShapeId, InternalError> {
         if let Some(&id) = self.shapes.get(&ty) {
             return Ok(id);
@@ -1011,24 +1118,23 @@ impl Lowerer<'_> {
         let table = self.table;
         let id = self.new_shape(ty);
         while let Some(ty) = self.shape_pending.pop() {
+            if let Some(element) = table.list_element(ty) {
+                let element = self.nested_shape(table.strip(element));
+                if let Some(&shape) = self.shapes.get(&ty) {
+                    self.builder.set_list_shape(shape, ListShape { element });
+                }
+                continue;
+            }
             let Some(fields) = table.record_fields(ty) else {
                 self.shape_pending.clear();
                 return Err(InternalError {
-                    message: "a record comparison of a type that is not a record",
+                    message: "a record or list comparison of a type that is neither",
                     span,
                 });
             };
             let mut shaped = Vec::with_capacity(fields.len());
             for &(name, field_ty) in fields {
-                let field_ty = table.strip(field_ty);
-                let nested = if table.is_record(field_ty) {
-                    Some(match self.shapes.get(&field_ty) {
-                        Some(&nested) => nested,
-                        None => self.new_shape(field_ty),
-                    })
-                } else {
-                    None
-                };
+                let nested = self.nested_shape(table.strip(field_ty));
                 shaped.push((name, nested));
             }
             let Some(&shape) = self.shapes.get(&ty) else {
@@ -1044,8 +1150,27 @@ impl Lowerer<'_> {
         Ok(id)
     }
 
-    /// Gives the record type `ty` a shape with no fields yet, and queues it
-    /// to be given them.
+    /// The shape a record's field or a list's element of type `ty`, stripped,
+    /// is compared through: its own if it is a record or a list type, made
+    /// and queued if it has none yet, and none otherwise.
+    fn nested_shape(&mut self, ty: TyId) -> Option<ShapeId> {
+        if !self.is_container(ty) {
+            return None;
+        }
+        Some(match self.shapes.get(&ty) {
+            Some(&nested) => nested,
+            None => self.new_shape(ty),
+        })
+    }
+
+    /// Whether `ty` is a record or a list type, which can hold values of
+    /// other types.
+    fn is_container(&self, ty: TyId) -> bool {
+        self.table.is_record(ty) || self.table.list_element(ty).is_some()
+    }
+
+    /// Gives the record or list type `ty` a shape with no fields yet, and
+    /// queues it to be given its fields or its element's shape.
     fn new_shape(&mut self, ty: TyId) -> ShapeId {
         let id = self.builder.push_shape(Shape {
             fields: Box::default(),
@@ -1057,11 +1182,13 @@ impl Lowerer<'_> {
 
     /// The lazy shape of `ty`, a type present at its top: for a record type,
     /// each field whose type is a future or an either, with the lazy shape
-    /// of its type stripped, and each present record field with lazy fields
-    /// somewhere inside, with its own; [`LazyShapeId::NONE`] if it has no
-    /// such field, or is not a record type. Made once per type, and the
-    /// shapes of the record types inside it first, through a work list
-    /// rather than recursion, since record types can nest as deeply as a
+    /// of its type stripped, and each present record or list field with
+    /// lazy values somewhere inside, with its own; for a list type, what is
+    /// done with each element, in the same way, if its type is lazy or has
+    /// lazy values inside; [`LazyShapeId::NONE`] if it has no such field or
+    /// element, or is neither. Made once per type, and the shapes of the
+    /// record and list types inside it first, through a work list rather
+    /// than recursion, since record and list types can nest as deeply as a
     /// program is long.
     fn lazy_shape(&mut self, ty: TyId) -> LazyShapeId {
         let table = self.table;
@@ -1069,43 +1196,59 @@ impl Lowerer<'_> {
             return id;
         }
         self.lazy_pending.push((ty, false));
-        while let Some((record, queued)) = self.lazy_pending.pop() {
-            if self.lazy_shapes.contains_key(&record) {
+        while let Some((container, queued)) = self.lazy_pending.pop() {
+            if self.lazy_shapes.contains_key(&container) {
                 continue;
             }
-            let fields = table.record_fields(record).unwrap_or_default();
+            let element = table.list_element(container);
+            let fields = table.record_fields(container).unwrap_or_default();
             if !queued {
-                // Its fields' record types first, then it again.
-                self.lazy_pending.push((record, true));
-                for &(_, field_ty) in fields {
-                    let field_ty = table.strip(field_ty);
-                    if table.is_record(field_ty) && !self.lazy_shapes.contains_key(&field_ty) {
-                        self.lazy_pending.push((field_ty, false));
+                // The record and list types inside it first, then it again.
+                self.lazy_pending.push((container, true));
+                let inside = fields.iter().map(|&(_, field_ty)| field_ty).chain(element);
+                for inner in inside {
+                    let inner = table.strip(inner);
+                    if self.is_container(inner) && !self.lazy_shapes.contains_key(&inner) {
+                        self.lazy_pending.push((inner, false));
                     }
                 }
                 continue;
             }
-            let mut lazy = Vec::new();
-            for &(name, field_ty) in fields {
-                let inner = self
-                    .lazy_shapes
-                    .get(&table.strip(field_ty))
+            // What a deep await does with a value of type `ty` inside it.
+            let action = |lazy_shapes: &HashMap<TyId, LazyShapeId>, ty: TyId| {
+                let inner = lazy_shapes
+                    .get(&table.strip(ty))
                     .copied()
                     .unwrap_or(LazyShapeId::NONE);
-                if table.laziness(field_ty) != Laziness::Present {
-                    lazy.push((name, LazyField::Await(inner)));
+                if table.laziness(ty) != Laziness::Present {
+                    Some(LazyField::Await(inner))
                 } else if inner != LazyShapeId::NONE {
-                    lazy.push((name, LazyField::Within(inner)));
+                    Some(LazyField::Within(inner))
+                } else {
+                    None
                 }
-            }
-            let id = if lazy.is_empty() {
-                LazyShapeId::NONE
-            } else {
-                self.builder.push_lazy_shape(LazyShape {
-                    fields: lazy.into_boxed_slice(),
-                })
             };
-            self.lazy_shapes.insert(record, id);
+            let id = if let Some(element) = element {
+                match action(&self.lazy_shapes, element) {
+                    Some(each) => self.builder.push_lazy_list(each),
+                    None => LazyShapeId::NONE,
+                }
+            } else {
+                let lazy: Vec<(Name, LazyField)> = fields
+                    .iter()
+                    .filter_map(|&(name, field_ty)| {
+                        action(&self.lazy_shapes, field_ty).map(|field| (name, field))
+                    })
+                    .collect();
+                if lazy.is_empty() {
+                    LazyShapeId::NONE
+                } else {
+                    self.builder.push_lazy_shape(LazyShape {
+                        fields: lazy.into_boxed_slice(),
+                    })
+                }
+            };
+            self.lazy_shapes.insert(container, id);
         }
         self.lazy_shapes
             .get(&ty)
@@ -1154,13 +1297,13 @@ impl Lowerer<'_> {
 }
 
 /// The node reading a value of kind `kind` from `var`, or `None` if it is
-/// not a variable.
+/// not a variable, a built-in function being none.
 const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
     match var {
         VarRef::Local(slot) if slot.get() != Slot::NONE.get() => Some(IrKind::Load(slot, kind)),
         VarRef::Capture(index) => Some(IrKind::LoadCapture(index, kind)),
         VarRef::Callee => Some(IrKind::LoadCallee),
-        VarRef::Local(_) | VarRef::None => None,
+        VarRef::Local(_) | VarRef::Builtin(_) | VarRef::None => None,
     }
 }
 
@@ -2627,5 +2770,192 @@ mod tests {
             IrKind::Block { result, .. } => result,
             other => panic!("the root is not a block: {other:?}"),
         }
+    }
+
+    // ----- Lists -----
+
+    #[test]
+    fn a_list_literal_makes_a_list_of_its_elements() {
+        assert_eq!(
+            dump("[1, lazy 2, ...[3]]"),
+            "(block @0..19\n\
+             \x20 (make-list @0..19\n\
+             \x20   (int 1 @1..2)\n\
+             \x20   (make-future #0 @4..10)\n\
+             \x20   (spread @12..18\n\
+             \x20     (make-list @15..18\n\
+             \x20       (int 3 @16..17)))))\n\
+             future #0 (frame 0, params 0, captures 0, height 1)\n\
+             \x20 (int 2 @9..10)"
+        );
+        let ir = lower_text("[1, 2]");
+        assert!(matches!(
+            ir.get(result_of(&ir)).kind,
+            IrKind::MakeList { spreads: false, .. }
+        ));
+        assert_eq!(ir.kind_of(result_of(&ir)), ValueKind::List);
+        let ir = lower_text("[...[1]]");
+        assert!(matches!(
+            ir.get(result_of(&ir)).kind,
+            IrKind::MakeList { spreads: true, .. }
+        ));
+        // An element awaited to fit its expected type is wrapped in its
+        // await, and a spread's list that may be a future too.
+        let shown = dump("let xs: List<Present<Int>> = [lazy 1]\nlet ys = lazy [2]\n[...ys]");
+        assert!(
+            shown.contains(
+                "(make-list @29..37\n\
+                 \x20     (await @30..36\n\
+                 \x20       (make-future #0 @30..36)))"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "(spread @57..62\n\
+                 \x20     (await @60..62\n\
+                 \x20       (load ys#1 @60..62)))"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn an_index_reads_an_element_of_its_kind() {
+        assert_eq!(
+            dump("let xs = [1.5]\nxs[0] + 1.0"),
+            "(block @0..26\n\
+             \x20 (store xs#0 @0..14\n\
+             \x20   (make-list @9..14\n\
+             \x20     (float 1.5 @10..13)))\n\
+             \x20 (float-add @15..26\n\
+             \x20   (index @15..20\n\
+             \x20     (load xs#0 @15..17)\n\
+             \x20     (int 0 @18..19))\n\
+             \x20   (float 1.0 @23..26)))"
+        );
+        // An element that may be a future is read as one and awaited where
+        // it is used.
+        let ir = lower_text("let xs = [lazy 1]\nxs[0]");
+        let index = result_after_items(&ir);
+        assert!(matches!(
+            ir.get(index).kind,
+            IrKind::Index {
+                kind: ValueKind::Deferred,
+                ..
+            }
+        ));
+        let shown = dump("let xs = [1, lazy 2]\nxs[1] * 2");
+        assert!(
+            shown.contains(
+                "(int-mul @21..30\n\
+                 \x20   (await @21..26\n\
+                 \x20     (index @21..26\n"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn len_lowers_to_the_length_of_its_list() {
+        assert_eq!(
+            dump("len(list = [1])"),
+            "(block @0..15\n\
+             \x20 (list-len @0..15\n\
+             \x20   (make-list @11..14\n\
+             \x20     (int 1 @12..13))))"
+        );
+        let ir = lower_text("len([1])");
+        assert_eq!(ir.kind_of(result_of(&ir)), ValueKind::Int);
+        // Its list is awaited if it may be a future.
+        let shown = dump("let xs = lazy [1]\nlen(xs)");
+        assert!(
+            shown.contains("(list-len @18..25\n    (await @22..24\n"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn list_equality_compares_over_a_list_shape() {
+        assert_eq!(
+            dump("[1] == [2]"),
+            "(block @0..10\n\
+             \x20 (list-eq == * @0..10\n\
+             \x20   (make-list @0..3\n\
+             \x20     (int 1 @1..2))\n\
+             \x20   (make-list @7..10\n\
+             \x20     (int 2 @8..9))))"
+        );
+        assert!(dump("[1] !== [2]").contains("(list-same !== @0..11\n"));
+        assert!(dump("[1] === [2]").contains("(list-same === @0..11\n"));
+        assert!(dump("[1] != [2]").contains("(list-eq != * @0..10\n"));
+        // Through records' shapes, and records' fields through lists'.
+        let text = "let q: {x: Int} = { x = 1; y = 2 }\n[q] == [q]";
+        assert!(dump(text).contains("(list-eq == *[x] @"), "{}", dump(text));
+        let text = "let q = { xs = [[{ a = 1 }]]; n = 1 }\nq == q";
+        assert!(
+            dump(text).contains("(record-eq == [xs**[a] n] @"),
+            "{}",
+            dump(text)
+        );
+        // One shape per type, nested ones included.
+        let ir = lower_text("let q = [[{ a = 1 }]]\nlet a = q == q\n= q[0] == q[0]");
+        assert_eq!(ir.shape_count(), 3);
+        let ir = lower_text("[{ a = 1 }] == [{ a = 1 }]");
+        let IrKind::ListEq(ShapedOperands { shape, .. }) = ir.get(result_of(&ir)).kind else {
+            panic!("expected a list comparison");
+        };
+        let Some(ListShape {
+            element: Some(element),
+        }) = ir.list_shape(shape)
+        else {
+            panic!("expected a list's shape");
+        };
+        assert_eq!(ir.list_shape(element), None);
+        assert_eq!(ir.shape(element).fields.len(), 1);
+        assert!(ir.shape(shape).fields.is_empty());
+    }
+
+    #[test]
+    fn a_deep_await_of_a_list_awaits_each_element() {
+        let text = "let xs = [1, lazy 2]\n\"{xs}\"";
+        let shown = dump(text);
+        assert!(
+            shown.contains("(await *! @23..25\n      (load xs#0 @23..25))"),
+            "{shown}"
+        );
+        let ir = lower_text(text);
+        let IrKind::Interp(items) = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected an interpolation");
+        };
+        let IrKind::Await { shape, kind, .. } = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected an await");
+        };
+        assert_eq!(kind, ValueKind::List);
+        assert_eq!(
+            ir.lazy_list(shape),
+            Some(LazyField::Await(LazyShapeId::NONE))
+        );
+        assert!(ir.lazy_shape(shape).fields.is_empty());
+        assert_eq!(ir.lazy_list(LazyShapeId::NONE), None);
+        // Each element's lazy values, and a record's lazy list.
+        for (text, shape) in [
+            ("let xs = [{ a = lazy 1 }]\n\"{xs}\"", "*[a!]"),
+            ("let xs = [[1, lazy 2]]\n\"{xs}\"", "**!"),
+            ("let xs = [lazy [1, lazy 2]]\n\"{xs}\"", "*!*!"),
+            ("let r = { xs = [lazy 1]; n = 2 }\n\"{r}\"", "[xs*!]"),
+            (
+                "let xs = [{ a = lazy [{ b = lazy 1 }] }]\n\"{xs}\"",
+                "*[a!*[b!]]",
+            ),
+        ] {
+            let shown = dump(text);
+            assert!(
+                shown.contains(&format!("(await {shape} @")),
+                "{text}: {shown}"
+            );
+        }
+        // A list with nothing lazy inside is not awaited.
+        assert!(!dump("let xs = [[1]]\n\"{xs}\"").contains("await"));
     }
 }

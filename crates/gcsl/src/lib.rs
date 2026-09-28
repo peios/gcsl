@@ -66,14 +66,17 @@ pub use value::{Value, ValueKind};
 /// The deepest nesting accepted, measured as the height of the syntax tree:
 /// a leaf is one level, and every operator (`await` included), parenthesis,
 /// ascription, field access, block, `if`, interpolated string, function
-/// expression, `lazy` and call adds one to its tallest child (a block's
-/// children being its items' expressions and annotated types, an
-/// ascription's its expression and type, a function's its parameter types,
-/// return type and body, a `lazy`'s its operand, and a call's its callee
-/// and arguments). A type written as a name is one level, a record type one
+/// expression, `lazy`, call, list literal and index adds one to its tallest
+/// child (a block's children being its items' expressions and annotated
+/// types, an ascription's its expression and type, a function's its
+/// parameter types, return type and body, a `lazy`'s its operand, a call's
+/// its callee and arguments, a list literal's its elements' expressions,
+/// spread or not, and an index's its list and its position). A type written
+/// as a name is one level, a record type one
 /// more than its tallest field's type, a function type one more than the
 /// tallest of its parameter and return types, an applied type such as
-/// `Future<Int>` one more than its argument, and a union one more than the
+/// `Future<Int>` one more than its argument, `T[]` one more than `T`, and a
+/// union one more than the
 /// taller of its sides. A `let`, field or `:=` with a dotted path is two levels taller than
 /// its value for each segment of the path after the first, since later
 /// stages build a record for each segment and read the old one's field
@@ -101,7 +104,7 @@ pub use value::{Value, ValueKind};
 /// within this budget; otherwise it fails with "call nested too deeply".
 /// An await that runs a future's body is charged as a call of a
 /// parameterless function is, and a deep await one more level for each
-/// level of record nesting it has descended. Nesting built by calls and
+/// level of record or list nesting it has descended. Nesting built by calls and
 /// awaits therefore never exceeds `MAX_DEPTH` levels, whatever shape the
 /// recursion has. (The top level's own nesting is not checked: it is
 /// bounded by the parser's limit alone.)
