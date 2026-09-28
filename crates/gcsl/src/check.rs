@@ -9468,7 +9468,7 @@ mod tests {
         );
         // A function can be shown as text.
         assert_eq!(result_type("\"{fn(): Int { 1 }}\""), TyId::STRING);
-        // `if` branches of function types join, their parameters identical.
+        // `if` branches of function types join.
         assert_eq!(
             shown_result(
                 "let f = if true { fn(a: Int): Int { a } } \
@@ -9476,9 +9476,32 @@ mod tests {
             ),
             "fn(Int) -> Int"
         );
-        // An impure function's bare parameter is not a pure one's.
+        // A parameter is the narrower of the two: an impure function's bare
+        // one may be a future, which a pure one that measures its own
+        // cannot take.
         assert_eq!(
-            messages("if true { fn(a: Int): Int { a } } else { fn(b: Int) -> Int { b } }"),
+            shown_result(
+                "let f = if true { fn(a: Int): Int { a } } else { fn(b: Int) -> Int { b } }\nf"
+            ),
+            "fn(Int) -> Int | Future<Int>"
+        );
+        // Two functions written alike and inferred differently.
+        assert_eq!(
+            shown_result(
+                "let f = if true { fn(x: Int): Int { x * 2 } } else { fn(x: Int): Int { 5 } }\nf"
+            ),
+            "fn(x: Int): Int"
+        );
+        assert_eq!(
+            shown_result(
+                "let h = if true { fn(f: fn(Int) -> Int) -> Int { f(1) } } \
+                 else { fn(f: fn(Int) -> Int) -> Int { let g = f\ng(1) } }\nh"
+            ),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        // Unrelated parameter types have no join.
+        assert_eq!(
+            messages("if true { fn(a: Int): Int { a } } else { fn(a: String): Int { 1 } }"),
             vec!["`if` branches have different types"]
         );
         assert_eq!(

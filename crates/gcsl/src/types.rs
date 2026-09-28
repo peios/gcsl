@@ -48,11 +48,13 @@
 //! equal, each `Qi` is a subtype of `Pi` (parameters are contravariant: a
 //! function that accepts more can stand in for one that accepts less), `R`
 //! is a subtype of `R'` (the return type is covariant), and `m <= m'`. Two
-//! function types have a join when their
-//! arities are equal, their parameter types are identical pairwise and
-//! their return types have a join: its parameters keep the names both sides
-//! agree on, its return type is that join, and its effect is the greater of
-//! the two.
+//! function types have a join when their arities are equal, of each pair
+//! of parameter types one is a subtype of the other, and their return types
+//! have a join: each parameter is the narrower of its pair, which both
+//! functions accept (their types need not be identical, since two functions
+//! written with one signature may be inferred different ones), and keeps
+//! its name if both sides agree on it; its return type is that join, and
+//! its effect is the greater of the two.
 //!
 //! What a memoised function's bare parameter types mean is the checker's
 //! business (see [`crate::check`]): they are present, since its arguments
@@ -1000,23 +1002,28 @@ impl TypeTable {
             return Some(self.deferrable(joined));
         }
         if let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) {
-            let same_params = a_sig.params.len() == b_sig.params.len()
-                && a_sig
-                    .params
-                    .iter()
-                    .zip(&b_sig.params)
-                    .all(|(&(_, a_param), &(_, b_param))| a_param == b_param);
-            if !same_params {
+            if a_sig.params.len() != b_sig.params.len() {
                 return None;
             }
-            // A copy of the parameters, since joining the return types may
-            // intern new types and so needs the table mutably.
+            // Parameters are contravariant, so each is the narrower of the
+            // two, which both functions accept: one of them, if it is a
+            // subtype of the other. A copy, since joining the return types
+            // may intern new types and so needs the table mutably.
             let params: Vec<(Option<Name>, TyId)> = a_sig
                 .params
                 .iter()
                 .zip(&b_sig.params)
-                .map(|(&(a_name, ty), &(b_name, _))| (a_name.filter(|_| a_name == b_name), ty))
-                .collect();
+                .map(|(&(a_name, a_param), &(b_name, b_param))| {
+                    let param = if self.is_subtype(a_param, b_param) {
+                        a_param
+                    } else if self.is_subtype(b_param, a_param) {
+                        b_param
+                    } else {
+                        return None;
+                    };
+                    Some((a_name.filter(|_| a_name == b_name), param))
+                })
+                .collect::<Option<_>>()?;
             let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
             let ret = self.join(a_ret, b_ret)?;
             return Some(self.fn_type(params, ret, effect));
@@ -1641,10 +1648,27 @@ mod tests {
             Effect::Pure,
         );
         assert_eq!(table.join(pure_right, gives_a), Some(gives_empty));
-        // Parameter types must be identical, not merely related.
+        // A parameter is the narrower of the two types, which both
+        // functions accept, if one is a subtype of the other.
         let takes_a = table.fn_type([(None, a_only)], TyId::INT, Effect::Pure);
         let takes_ab = table.fn_type([(None, ab)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(takes_a, takes_ab), None);
+        assert_eq!(table.join(takes_a, takes_ab), Some(takes_ab));
+        assert_eq!(table.join(takes_ab, takes_a), Some(takes_ab));
+        let either = table.deferrable(TyId::INT);
+        let takes_either = table.fn_type([(None, either)], TyId::INT, Effect::Pure);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
+        assert_eq!(table.join(takes_either, takes_int), Some(takes_int));
+        assert_eq!(table.join(takes_int, takes_either), Some(takes_int));
+        // Each parameter on its own.
+        let mixed = table.fn_type([(None, either), (None, ab)], TyId::INT, Effect::Pure);
+        let other = table.fn_type([(None, TyId::INT), (None, a_only)], TyId::INT, Effect::Pure);
+        let narrow = table.fn_type([(None, TyId::INT), (None, ab)], TyId::INT, Effect::Pure);
+        assert_eq!(table.join(mixed, other), Some(narrow));
+        // Unrelated parameter types have none.
+        let unrelated = table.fn_type([(None, b_only)], TyId::INT, Effect::Pure);
+        assert_eq!(table.join(takes_a, unrelated), None);
+        let takes_bool = table.fn_type([(None, TyId::BOOL)], TyId::INT, Effect::Pure);
+        assert_eq!(table.join(takes_int, takes_bool), None);
         // Arities must match, and the return types must have a join.
         let nullary = table.fn_type([], TyId::INT, Effect::Pure);
         let unary = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
