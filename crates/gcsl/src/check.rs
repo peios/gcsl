@@ -174,9 +174,30 @@
 //! `let p: {x: Int} = { x = 1; y = 2 }` followed by `let p.y.z = 3`, whose
 //! `y` becomes `{z = 3}`.
 //!
-//! How a dotted item resolves (the slot of the record it updates, and how
-//! many of its path's segments name records that already exist) is
-//! recorded for lowering as a [`PathResolution`].
+//! Updating a record reads it. Every record along the path that exists
+//! (the variable's, and each following segment's, short of the last, that
+//! the record before it has) is measured at the top, as the record of a
+//! field access is (see [Futures](#futures)): a pure function's bare
+//! parameter is measured, which makes it present, and a record that may be
+//! a future is awaited, subject to the purity rule, whose error is reported
+//! at the path up to that segment. The rules above then apply to its type
+//! once awaited, stripped of its future layers, so that a record that is
+//! not one once awaited is "not a record", shown as the type it had before,
+//! and the new binding is built from the stripped types: the updated
+//! variable is present, as is every record along the path, and the fields
+//! off the path keep their types. After `let r = lazy { a = 1 }`, `let r.a
+//! = 2` makes `r` a `{a: Int}`. The last segment is never measured: it is
+//! replaced, not read, so for `:=` it keeps the field's type, which may be
+//! the either shape. Dotted fields are not affected: they only extend
+//! records their own block is building.
+//!
+//! How a dotted item resolves (the slot of the record it updates, how many
+//! of its path's segments name records that already exist, and which of
+//! those are awaited) is recorded for lowering as a [`PathResolution`].
+//! A path segment is not an expression, which [`Resolution::await_of`]
+//! could mark, so the awaited records are listed in a table of their own,
+//! [`Resolution::path_awaits`], in which only an item that awaits one has
+//! entries.
 //!
 //! # Equality
 //!
@@ -304,17 +325,19 @@
 //! contravariant), though it is of `fn(Present<Int>) -> Int`.
 //!
 //! **Awaits.** Every place a value is used as its bits decides whether it
-//! is awaited there, and records it in [`Resolution::await_of`] for
-//! lowering, which inserts the await; nothing is decided at runtime. A
-//! measuring operator (arithmetic, ordering, `and`, `or`, `not`, negation),
-//! a call of a value and a field access into one await it at the top if its
-//! type is a `Future` or an either (`Checker::measure`), and type the
-//! operation on the type it has once awaited, stripped of every future
-//! layer at its top (see [`TypeTable::strip`]). An interpolated expression
-//! and an operand of an equality are awaited deeply (`Checker::measure_deep`):
-//! at the top and in every lazy field of the record it is, at any depth (see
-//! [`TypeTable::present`]). Where a type is expected, as for an argument,
-//! an annotated initialiser, a function's body or an `if` condition, a value
+//! is awaited there, and records it in [`Resolution::await_of`] (or, for a
+//! record an update reads, [`Resolution::path_awaits`]) for lowering, which
+//! inserts the await; nothing is decided at runtime. A measuring operator
+//! (arithmetic, ordering, `and`, `or`, `not`, negation), a call of a value
+//! and a field access into one await it at the top if its type is a
+//! `Future` or an either (`Checker::measure`), and type the operation on
+//! the type it has once awaited, stripped of every future layer at its top
+//! (see [`TypeTable::strip`]); so does a dotted `let` or `:=` each record
+//! along its path that exists (see "Dotted `let` and `:=`" above). An
+//! interpolated expression and an operand of an equality are awaited deeply
+//! (`Checker::measure_deep`): at the top and in every lazy field of the
+//! record it is, at any depth (see [`TypeTable::present`]). Where a type is
+//! expected, as for an argument, an annotated initialiser, a function's body or an `if` condition, a value
 //! that is not a subtype of it is awaited if it is one once awaited, at the
 //! top or deeply (see [`TypeTable::needs_await`]); otherwise the mismatch is
 //! reported, with a note when a future is expected and a value that is not
@@ -340,6 +363,19 @@
 //! pure function measuring its own bare parameter is never an error: it
 //! makes the parameter present (see below), so the await happens in the
 //! caller, where an argument that may be a future is awaited at the call.
+//!
+//! The implicit-await error's note suggests declaring the function with
+//! `->`. Where the value is a variable, through any parentheses and as the
+//! result of any block (as in the body `{ n }`), that the pure function
+//! captures, and that code outside it could await before
+//! creating it, the note instead says to do that, as `let n = await n`
+//! (`Checker::awaitable_capture`): a variable of the top level, which is
+//! impure, or one whose home function (the function whose body declares
+//! it) or a function between that one and the pure function is impure, as
+//! a `lazy` is. A capture whose home and every function between are pure
+//! could be awaited there no more than in the pure function, and keeps the
+//! usual note, as does a record read by a dotted `let` or `:=`, which is
+//! not an expression.
 //!
 //! # Inferred parameters
 //!
@@ -381,7 +417,9 @@
 //!   it to an either parameter, storing it in an either field and returning
 //!   it against an either return type measure nothing;
 //! - an explicit `await` of it (an error in any case, the function being
-//!   pure) and an update of the record it is (`let p.x = ...`) measure it;
+//!   pure) and an update of the record it is, whether it is the updated
+//!   variable or a record further along the path (`let p.x = ...`, or
+//!   `let q.p.x = ...` where `q` holds it in its field `p`), measure it;
 //! - a recursive call through the function's own name measures every
 //!   argument whose type is a provisional type of the function,
 //!   conservatively;
@@ -664,8 +702,9 @@ pub struct FnResolution {
 }
 
 /// How the path of a dotted `let`, field or `:=` resolves: the record it
-/// updates, and how far into its path that record's static type reaches.
-/// See the module documentation.
+/// updates, how far into its path that record's static type reaches, and
+/// which of the records along the way are awaited. See the module
+/// documentation.
 ///
 /// For `let a.b.c = e`, with `a` in scope as `{b: {c: Int}}`, the source is
 /// where `a` is read from and all of `a` and `a.b` exist, so `existing` is
@@ -684,15 +723,32 @@ pub struct PathResolution {
     /// segment, short of the last, that the type has as a record. Every
     /// segment after them, the last excepted, is created as a record.
     pub existing: u32,
+    /// Where the item's `existing` entries start in the resolution's table
+    /// of awaited records (see [`Resolution::path_awaits`]), or
+    /// [`PathResolution::NOT_AWAITED`] if none of its records is awaited,
+    /// which is the case of every item but a dotted `let` or `:=` of a
+    /// record that may be a future.
+    pub awaits: u32,
 }
 
 impl PathResolution {
+    /// The `awaits` of an item none of whose records is awaited.
+    pub const NOT_AWAITED: u32 = u32::MAX;
+
     /// The resolution of an item that is not a dotted declaration, and of
     /// one that builds its record from nothing.
-    pub const NONE: PathResolution = PathResolution {
-        source: VarRef::None,
-        existing: 0,
-    };
+    pub const NONE: PathResolution = PathResolution::unawaited(VarRef::None, 0);
+
+    /// The resolution of an item that updates the record read from
+    /// `source`, `existing` of whose path's segments exist, none of them
+    /// awaited.
+    const fn unawaited(source: VarRef, existing: u32) -> Self {
+        Self {
+            source,
+            existing,
+            awaits: PathResolution::NOT_AWAITED,
+        }
+    }
 }
 
 /// Where every variable of an [`Ast`] is stored, what every function's
@@ -713,6 +769,11 @@ pub struct Resolution {
     /// resolves, indexed by [`ItemId`]; [`PathResolution::NONE`] for every
     /// other item, and for one that builds its record from nothing.
     item_paths: Vec<PathResolution>,
+    /// For each dotted `let` and `:=` item of which some record along its
+    /// path is awaited, whether each of its existing records is, from its
+    /// source down, where its [`PathResolution::awaits`] says. Items with no
+    /// awaited record have no entries.
+    path_awaits: Vec<bool>,
     /// The number of slots the top level's frame needs.
     frame_size: u32,
     /// For each slot of the top level's frame, the name of the last
@@ -801,6 +862,21 @@ impl Resolution {
         self.item_paths[id.index()]
     }
 
+    /// For each of the `path.existing` records along the path that `path`
+    /// resolves, from its source down, whether it is awaited before it is
+    /// updated, being a value that may be a future: empty if none is (see
+    /// the module documentation). `None` if `path` names entries this
+    /// resolution does not have.
+    #[must_use]
+    pub fn path_awaits(&self, path: PathResolution) -> Option<&[bool]> {
+        if path.awaits == PathResolution::NOT_AWAITED {
+            return Some(&[]);
+        }
+        let start = path.awaits as usize;
+        self.path_awaits
+            .get(start..start.checked_add(path.existing as usize)?)
+    }
+
     /// The number of slots the top level's frame needs: one more than the
     /// highest slot used.
     #[must_use]
@@ -826,6 +902,7 @@ impl Resolution {
             awaits: vec![AwaitMark::None; exprs],
             item_slots: vec![Slot::NONE; items],
             item_paths: vec![PathResolution::NONE; items],
+            path_awaits: Vec::new(),
             frame_size: 0,
             slot_names: Vec::new(),
             functions: Vec::new(),
@@ -1157,6 +1234,9 @@ pub struct Checker<'a> {
     awaits: Vec<AwaitMark>,
     item_slots: Vec<Slot>,
     item_paths: Vec<PathResolution>,
+    /// Whether each existing record along the path of each dotted `let` or
+    /// `:=` with an awaited one is awaited: see [`Resolution::path_awaits`].
+    path_awaits: Vec<bool>,
     /// What has been found for each function expression, indexed by
     /// [`FnId`].
     fn_resolutions: Vec<FnResolution>,
@@ -1212,9 +1292,13 @@ pub struct Checker<'a> {
     /// The segments of the open fields of every block being checked,
     /// outermost block first; each block truncates it back when it ends.
     nodes: Vec<Node>,
-    /// Reused for the types of the records along the path of a dotted
-    /// `let` or `:=`.
-    path_types: Vec<TyId>,
+    /// Reused for the records along the path of a dotted `let` or `:=` that
+    /// exist: each one's type once measured, and whether it is awaited. A
+    /// `:=` walks its path before its value is checked and declares its
+    /// variable after, so an update nested in the value pushes above the
+    /// entries of the one enclosing it and truncates back, as with
+    /// `sorted_fields`.
+    path_types: Vec<(TyId, bool)>,
     /// Reused as the work list of open nodes still to check against their
     /// expected types when a record block ends.
     pending: Vec<(u32, TyId)>,
@@ -1251,6 +1335,7 @@ impl<'a> Checker<'a> {
             awaits: vec![AwaitMark::None; ast.len()],
             item_slots: vec![Slot::NONE; ast.item_count()],
             item_paths: vec![PathResolution::NONE; ast.item_count()],
+            path_awaits: Vec::new(),
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
             arg_params: vec![u32::MAX; ast.arg_count()],
             bindings: scope.bindings,
@@ -1356,6 +1441,7 @@ impl<'a> Checker<'a> {
                 awaits: self.awaits,
                 item_slots: self.item_slots,
                 item_paths: self.item_paths,
+                path_awaits: self.path_awaits,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
                 functions: self.fn_resolutions,
@@ -1740,11 +1826,11 @@ impl<'a> Checker<'a> {
                 let binding = &mut self.bindings[open.binding];
                 binding.ty = ty;
                 self.item_slots[id.index()] = binding.slot;
-                // The field is in this block, so in the current frame.
-                self.item_paths[id.index()] = PathResolution {
-                    source: VarRef::Local(binding.slot),
-                    existing: position(existing),
-                };
+                // The field is in this block, so in the current frame. The
+                // record a dotted field extends is one its block is building,
+                // never a future.
+                let source = VarRef::Local(binding.slot);
+                self.item_paths[id.index()] = PathResolution::unawaited(source, position(existing));
             }
         }
     }
@@ -2111,7 +2197,8 @@ impl<'a> Checker<'a> {
             return;
         };
         let text = self.ast.names().get(name);
-        // The binding being rebound, once the `:=` rules pass.
+        // The binding being rebound, with its index in `bindings`, once the
+        // `:=` rules pass.
         let target = match self.lookup(name) {
             Some((_, binding)) if binding.kind == BindingKind::Field => {
                 let mut error = Diagnostic::error(
@@ -2138,7 +2225,7 @@ impl<'a> Checker<'a> {
                 );
                 None
             }
-            Some((index, binding)) if index >= self.block_start => Some(binding),
+            Some((index, binding)) if index >= self.block_start => Some((index, binding)),
             Some((_, binding)) => {
                 let mut error = Diagnostic::error(
                     format!("cannot rebind `{text}` here: it is declared in an enclosing block"),
@@ -2164,7 +2251,7 @@ impl<'a> Checker<'a> {
                 None
             }
         };
-        let Some(target) = target.filter(|target| target.ty != TyId::ERROR) else {
+        let Some((index, target)) = target.filter(|(_, target)| target.ty != TyId::ERROR) else {
             // The rebind was rejected (or the variable is already erroneous):
             // check the value on its own and declare the name with what it
             // has, so later uses do not cascade.
@@ -2184,6 +2271,10 @@ impl<'a> Checker<'a> {
             self.declare(name, target.ty, id, BindingKind::Variable);
             return;
         }
+        // The path is walked, measuring its records, before the value is
+        // checked, since the value is checked against its leaf's type; its
+        // records stay on `path_types` until the variable is declared.
+        let base = self.path_types.len();
         if let Some(leaf) = self.rebind_leaf(segments, target.ty) {
             self.check_expr_expecting(
                 value,
@@ -2191,7 +2282,7 @@ impl<'a> Checker<'a> {
                 path_span(segments),
                 "`:=` keeps the field's type",
             );
-            self.declare_update(id, segments, leaf);
+            self.finish_update(id, segments, (Some((index, target)), base), leaf);
         } else {
             self.check_alone(value);
             self.declare(name, TyId::ERROR, id, BindingKind::Variable);
@@ -2199,24 +2290,77 @@ impl<'a> Checker<'a> {
     }
 
     /// The type of the leaf of the dotted `:=` path `segments`, whose first
-    /// segment has record type `root`. Every segment must already exist,
-    /// since `:=` never adds a field: a missing one, or a segment along the
-    /// way that is not a record, is reported and `None` returned.
+    /// segment has type `root`, once its path is walked (see
+    /// [`Checker::walk_path`]), which leaves the records along it on
+    /// `path_types` for [`Checker::finish_update`]. Every segment must
+    /// already exist, since `:=` never adds a field: a missing one, or a
+    /// segment along the way that is not a record, is reported and `None`
+    /// returned, with `path_types` as it was.
     fn rebind_leaf(&mut self, segments: &[PathSegment], root: TyId) -> Option<TyId> {
-        // Updating a record reads it: a parameter of this function is
-        // measured.
-        let root = match segments.first() {
-            Some(first) => self.claim_top(first.span, root),
-            None => root,
+        let base = self.path_types.len();
+        let root = self.walk_path(segments, root)?;
+        let records = self.path_types.get(base..)?;
+        let (walked, &(record, _), last) = (records.len(), records.last()?, segments.last()?);
+        // The first segment that the record before it lacks: one the walk
+        // stopped at, or the leaf.
+        let missing = if walked + 1 < segments.len() {
+            walked
+        } else {
+            match self.types.field(record, last.name) {
+                Some(leaf) => return Some(leaf),
+                None => walked,
+            }
         };
-        let mut current = root;
-        for (index, segment) in segments.iter().enumerate().skip(1) {
-            if !self.types.is_record(current) {
+        self.path_types.truncate(base);
+        let path = self.ast.show_path(segments);
+        let prefix = self.ast.show_path(&segments[..missing]);
+        let field = FieldName(self.ast.names().get(segments[missing].name));
+        let label = format!("this is {}", self.in_label(root));
+        self.errors.push(
+            Diagnostic::error(
+                format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
+                path_span(segments),
+            )
+            .with_context(segments[0].span, label)
+            .with_note(format!(
+                "`:=` cannot add a field; add it with `let {path} = ...`"
+            )),
+        );
+        None
+    }
+
+    /// Walks the path `segments` of a dotted `let` or `:=` whose first
+    /// segment's variable has type `old`, which is not erroneous. Updating a
+    /// record reads it, so each record along the path that exists is
+    /// measured at the top (see [`Checker::measure_path_record`]): the
+    /// variable's, and each following segment's, short of the last, that the
+    /// record before it has. Each is pushed onto `path_types`, stripped, with
+    /// whether it is awaited; the walk stops at the first segment the record
+    /// before it lacks, and before the last, which is replaced, not read.
+    ///
+    /// Returns `old` as measured, for labelling a later error. A record that
+    /// is not one once stripped is reported instead, "cannot update `a.b.c`:
+    /// `a.b` is Int, not a record", showing its type before stripping, and
+    /// `None` returned, with `path_types` as it was.
+    fn walk_path(&mut self, segments: &[PathSegment], old: TyId) -> Option<TyId> {
+        let base = self.path_types.len();
+        let mut root = old;
+        // The type of `segments[..index]`, which exists.
+        let mut current = old;
+        for (index, next) in segments.iter().enumerate().skip(1) {
+            let prefix = &segments[..index];
+            let (measured, awaited) = self.measure_path_record(prefix, current);
+            if index == 1 {
+                root = measured;
+            }
+            let record = self.types.strip(measured);
+            if !self.types.is_record(record) {
+                self.path_types.truncate(base);
                 let message = format!(
                     "cannot update `{}`: `{}` is {}, not a record",
                     self.ast.show_path(segments),
-                    self.ast.show_path(&segments[..index]),
-                    self.in_message(current)
+                    self.ast.show_path(prefix),
+                    self.in_message(measured)
                 );
                 let label = format!("this is {}", self.in_label(root));
                 self.errors.push(
@@ -2225,110 +2369,103 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            let Some(ty) = self.types.field(current, segment.name) else {
-                let path = self.ast.show_path(segments);
-                let prefix = self.ast.show_path(&segments[..index]);
-                let field = FieldName(self.ast.names().get(segment.name));
-                let label = format!("this is {}", self.in_label(root));
-                self.errors.push(
-                    Diagnostic::error(
-                        format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
-                        path_span(segments),
-                    )
-                    .with_context(segments[0].span, label)
-                    .with_note(format!(
-                        "`:=` cannot add a field; add it with `let {path} = ...`"
-                    )),
-                );
-                return None;
-            };
-            current = ty;
+            self.path_types.push((record, awaited));
+            // After the last record comes the leaf, which is never measured.
+            match self.types.field(record, next.name) {
+                Some(ty) if index + 1 < segments.len() => current = ty,
+                _ => break,
+            }
         }
-        Some(current)
+        Some(root)
+    }
+
+    /// Where the record at `prefix`, a proper prefix of the path of a dotted
+    /// `let` or `:=`, of type `ty`, is read by the update, as
+    /// [`Checker::measure`] measures the record of a field access: if it is
+    /// a parameter of a claimable function (see [`Checker::claimable`])
+    /// whose type is provisional, the parameter is measured, which makes it
+    /// present, and its present type returned; if it may be a future, it is
+    /// to be awaited at the top, subject to the purity rule, reported at
+    /// `prefix` (see [`Checker::implicit_await_error`]), and `ty` is
+    /// returned with `true`; otherwise, or if it is erroneous, `ty` is
+    /// returned with `false`.
+    fn measure_path_record(&mut self, prefix: &[PathSegment], ty: TyId) -> (TyId, bool) {
+        if ty == TyId::ERROR || self.types.laziness(ty) == Laziness::Present {
+            return (ty, false);
+        }
+        let span = path_span(prefix);
+        let claimed = self.claim_top(span, ty);
+        if claimed != ty {
+            return (claimed, false);
+        }
+        // A future, an either, or a provisional type of an enclosing
+        // function, which may be a future for all this body knows. A path
+        // is not an expression, so the await is recorded with the item's
+        // path, by `finish_update`.
+        if let Some(marker) = self.pure_marker() {
+            let error = self.implicit_await_error(span, ty, marker, None);
+            self.errors.push(error);
+        }
+        (ty, true)
     }
 
     /// Declares the variable of the dotted `let` or `:=` item `id`, whose
     /// path is `segments` and whose value has type `leaf_ty`: a new binding
     /// of the path's first segment, `a`, whose type is that of `a` in scope,
     /// or of `{}` if there is none, with the rest of the path set to
-    /// `leaf_ty` (see the module documentation). If `a` or a segment along
-    /// the way is not a record, that is reported and the binding is
-    /// `Error`.
+    /// `leaf_ty` (see the module documentation). Walks the path first (see
+    /// [`Checker::walk_path`]). If `a` or a segment along the way is not a
+    /// record, that is reported and the binding is `Error`.
     fn declare_update(&mut self, id: ItemId, segments: &[PathSegment], leaf_ty: TyId) {
+        let Some(first) = segments.first() else {
+            return;
+        };
+        let base = self.path_types.len();
+        let found = self.lookup(first.name);
+        let mut failed = leaf_ty == TyId::ERROR;
+        if let Some((_, old)) = found {
+            // An erroneous variable has been reported already.
+            failed |= old.ty == TyId::ERROR || self.walk_path(segments, old.ty).is_none();
+        }
+        let leaf_ty = if failed { TyId::ERROR } else { leaf_ty };
+        self.finish_update(id, segments, (found, base), leaf_ty);
+    }
+
+    /// Declares the variable of the dotted `let` or `:=` item `id`, whose
+    /// path is `segments`, whose leaf is set to a value of type `leaf_ty`,
+    /// `Error` if the update was rejected, and whose path has been walked
+    /// (see [`Checker::walk_path`]): the records along it that exist are
+    /// the entries of `path_types` from `base` on, which this truncates
+    /// back. `found` is the binding of the path's first segment in scope,
+    /// with its index in `bindings`, if there is one. The new binding's type
+    /// is built from the leaf outwards: each record along the path, as it
+    /// was once measured or created empty, with its segment set. Records for
+    /// lowering where the old record is read from, how many records along
+    /// the path exist, and which of them are awaited, as a
+    /// [`PathResolution`].
+    fn finish_update(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        (found, base): (Option<(usize, Binding)>, usize),
+        leaf_ty: TyId,
+    ) {
         let Some((first, rest)) = segments.split_first() else {
             return;
         };
-        self.path_types.clear();
-        let found = self.lookup(first.name);
-        // Updating a record reads it: a parameter of this function is
-        // measured.
-        let old = found.map(|(_, binding)| Binding {
-            ty: self.claim_top(first.span, binding.ty),
-            ..binding
-        });
-        let mut failed = leaf_ty == TyId::ERROR;
-        if let Some(old) = old {
-            if old.ty == TyId::ERROR {
-                // Reported already.
-                failed = true;
-            } else if self.types.is_record(old.ty) {
-                // The type of each record along the path that exists, from
-                // `a` down; the last segment is never one of them.
-                let mut current = old.ty;
-                self.path_types.push(current);
-                for (index, segment) in rest.iter().enumerate() {
-                    if index + 1 == rest.len() {
-                        break;
-                    }
-                    match self.types.field(current, segment.name) {
-                        None => break,
-                        Some(ty) if self.types.is_record(ty) => {
-                            current = ty;
-                            self.path_types.push(current);
-                        }
-                        Some(ty) => {
-                            let prefix = self.ast.show_path(&segments[..index + 2]);
-                            let message = format!(
-                                "cannot update `{}`: `{prefix}` is {}, not a record",
-                                self.ast.show_path(segments),
-                                self.in_message(ty)
-                            );
-                            let label = format!("this is {}", self.in_label(old.ty));
-                            self.errors.push(
-                                Diagnostic::error(message, path_span(segments))
-                                    .with_context(first.span, label),
-                            );
-                            failed = true;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                let message = format!(
-                    "cannot update `{}`: `{}` is {}, not a record",
-                    self.ast.show_path(segments),
-                    self.ast.show_path(&segments[..1]),
-                    self.in_message(old.ty)
-                );
-                let label = format!("this is {}", self.in_label(old.ty));
-                self.errors.push(
-                    Diagnostic::error(message, path_span(segments)).with_context(first.span, label),
-                );
-                failed = true;
-            }
-        }
-        let existing = self.path_types.len();
-        let ty = if failed {
+        let existing = self.path_types.len().saturating_sub(base);
+        let ty = if leaf_ty == TyId::ERROR {
             TyId::ERROR
         } else {
-            // From the leaf outwards: each record along the path, as it was
-            // or created empty, with its segment set.
             let mut ty = leaf_ty;
             for (level, segment) in rest.iter().enumerate().rev() {
-                let base = self.path_types.get(level).copied().unwrap_or(TyId::EMPTY);
+                let record = self
+                    .path_types
+                    .get(base + level)
+                    .map_or(TyId::EMPTY, |&(record, _)| record);
                 ty = self
                     .types
-                    .with_field(base, segment.name, ty)
+                    .with_field(record, segment.name, ty)
                     .unwrap_or(TyId::ERROR);
             }
             ty
@@ -2339,11 +2476,23 @@ impl<'a> Checker<'a> {
             // The old record may belong to an enclosing function, and is
             // then read from the closure's captures.
             let source = self.resolve(index, old);
+            let records = self.path_types.get(base..).unwrap_or_default();
+            // Most updates await nothing, and add no entries.
+            let awaits = if records.iter().any(|&(_, awaited)| awaited) {
+                let start = position(self.path_awaits.len());
+                self.path_awaits
+                    .extend(records.iter().map(|&(_, awaited)| awaited));
+                start
+            } else {
+                PathResolution::NOT_AWAITED
+            };
             self.item_paths[id.index()] = PathResolution {
                 source,
                 existing: position(existing),
+                awaits,
             };
         }
+        self.path_types.truncate(base);
         self.declare(first.name, ty, id, BindingKind::Variable);
     }
 
@@ -2904,8 +3053,9 @@ impl<'a> Checker<'a> {
     /// an error, "cannot await in a pure function" at the `await` keyword
     /// for an explicit await ([`AwaitSite::Explicit`]), and "cannot use a
     /// value that may be a future in a pure function" at `expr` for an
-    /// implicit one, or its call-site form for an argument that fills a
-    /// parameter the callee's body measures ([`AwaitSite::Argument`]; see
+    /// implicit one (see [`Checker::implicit_await_error`]), or its
+    /// call-site form for an argument that fills a parameter the callee's
+    /// body measures ([`AwaitSite::Argument`]; see
     /// [`Checker::argument_await_error`]). The mark is recorded regardless,
     /// so that the error does not cascade. The body of a `lazy` is impure,
     /// wherever it is written.
@@ -2919,19 +3069,99 @@ impl<'a> Checker<'a> {
             AwaitSite::Argument(call_site) => {
                 self.argument_await_error(expr, ty, marker, call_site)
             }
-            AwaitSite::Implicit => Diagnostic::error(
-                "cannot use a value that may be a future in a pure function",
-                self.ast.get(expr).span,
-            )
-            .with_label(format!("this is {}", self.in_label(ty)))
-            .with_context(marker, PURE_CONTEXT)
-            .with_note(
-                "using the value here would await it, which may run effects; a pure function \
-                 may hold and pass on a future but not await it. Declare the function with `->` \
-                 to make it impure",
-            ),
+            AwaitSite::Implicit => {
+                let capture = self.awaitable_capture(expr);
+                self.implicit_await_error(self.ast.get(expr).span, ty, marker, capture)
+            }
         };
         self.errors.push(error);
+    }
+
+    /// The implicit-await error, "cannot use a value that may be a future
+    /// in a pure function", at `span`, where a value of type `ty` is used
+    /// as its bits in a pure function whose marker is at `marker`: labelled
+    /// with the type and the marker. Its note says how to await `capture`
+    /// before the function is created, if it is a variable the function
+    /// captures that can be awaited there (see
+    /// [`Checker::awaitable_capture`]), and otherwise that the function
+    /// could be made impure. For a use of a value by an expression and for
+    /// a record read by a dotted `let` or `:=` alike.
+    fn implicit_await_error(
+        &mut self,
+        span: Span,
+        ty: TyId,
+        marker: Span,
+        capture: Option<Name>,
+    ) -> Diagnostic {
+        let note = match capture {
+            Some(name) => {
+                let text = self.ast.names().get(name);
+                format!(
+                    "a pure function cannot await, and `{text}` may be a future; await it before \
+                     the function is created, in the enclosing impure code: `let {text} = await \
+                     {text}`"
+                )
+            }
+            None => "using the value here would await it, which may run effects; a pure \
+                     function may hold and pass on a future but not await it. Declare the \
+                     function with `->` to make it impure"
+                .to_owned(),
+        };
+        Diagnostic::error(
+            "cannot use a value that may be a future in a pure function",
+            span,
+        )
+        .with_label(format!("this is {}", self.in_label(ty)))
+        .with_context(marker, PURE_CONTEXT)
+        .with_note(note)
+    }
+
+    /// The name of the variable that `expr` is, through any parentheses and
+    /// as the result of any block, if the innermost function captures it and it can be awaited before that
+    /// function is created: if it comes from the top level, which is
+    /// impure, or its home function (the function whose body declares it)
+    /// or a function between that one and the innermost is impure, as a
+    /// `lazy` is. `None` for any other expression, including a capture
+    /// whose home and every function between are pure, which can await it
+    /// no more than the innermost function can.
+    fn awaitable_capture(&self, expr: ExprId) -> Option<Name> {
+        let mut node = expr;
+        let name = loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                // A block is awaited for its result, as a function's body
+                // `{ n }` is against the result type.
+                ExprKind::Block(items) => {
+                    let last = self.ast.items(items).last()?;
+                    let (ItemKind::Result(result) | ItemKind::Expr(result)) =
+                        self.ast.item(*last).kind
+                    else {
+                        return None;
+                    };
+                    node = result;
+                }
+                ExprKind::Name(name) => break name,
+                _ => return None,
+            }
+        };
+        let VarRef::Capture(capture) = self.expr_vars[node.index()] else {
+            return None;
+        };
+        let (innermost, enclosing) = self.functions.split_last()?;
+        let binding = innermost.captures.get(capture as usize)?.binding;
+        // The outermost function the binding is not in; its home is the
+        // function before it, or the top level if there is none.
+        let outside = self
+            .functions
+            .iter()
+            .position(|function| function.bindings_start > binding)?;
+        let awaitable = match outside.checked_sub(1) {
+            None => true,
+            Some(home) => enclosing
+                .get(home..)
+                .is_some_and(|between| between.iter().any(|function| !function.pure)),
+        };
+        awaitable.then_some(name)
     }
 
     /// The marker of the innermost function, if it is pure: where the
@@ -6619,11 +6849,13 @@ mod tests {
                 PathResolution::NONE,
                 PathResolution {
                     source: VarRef::Local(Slot(0)),
-                    existing: 1
+                    existing: 1,
+                    awaits: PathResolution::NOT_AWAITED
                 },
                 PathResolution {
                     source: VarRef::Local(Slot(0)),
-                    existing: 1
+                    existing: 1,
+                    awaits: PathResolution::NOT_AWAITED
                 },
             ]
         );
@@ -6633,7 +6865,8 @@ mod tests {
             resolution.item_path(ast.items(ast.root())[1]),
             PathResolution {
                 source: VarRef::Local(Slot(0)),
-                existing: 2
+                existing: 2,
+                awaits: PathResolution::NOT_AWAITED
             }
         );
     }
@@ -6975,14 +7208,16 @@ mod tests {
             resolution.item_path(items[1]),
             PathResolution {
                 source: VarRef::Local(Slot(0)),
-                existing: 2
+                existing: 2,
+                awaits: PathResolution::NOT_AWAITED
             }
         );
         assert_eq!(
             resolution.item_path(items[2]),
             PathResolution {
                 source: VarRef::Local(Slot(1)),
-                existing: 1
+                existing: 1,
+                awaits: PathResolution::NOT_AWAITED
             }
         );
         // The update is a new binding in a new slot.
@@ -7066,7 +7301,8 @@ mod tests {
             resolution.item_path(items[1]),
             PathResolution {
                 source: VarRef::Local(Slot(0)),
-                existing: 1
+                existing: 1,
+                awaits: PathResolution::NOT_AWAITED
             }
         );
         let text = "let a = { x = 1 }\nlet old = a\na.x := 2\nold";
@@ -7602,7 +7838,8 @@ mod tests {
             resolution.item_path(update),
             PathResolution {
                 source: VarRef::Capture(0),
-                existing: 1
+                existing: 1,
+                awaits: PathResolution::NOT_AWAITED
             }
         );
         // `:=` on a captured variable is rebinding one of an enclosing
@@ -9615,5 +9852,333 @@ mod tests {
             found[0].message,
             "cannot use a value that may be a future in a pure function"
         );
+    }
+
+    // ----- Dotted updates of records that may be futures -----
+
+    /// The type of the expression of `text`, which must check, that spans
+    /// `span`, as shown.
+    fn type_at(text: &str, span: Span) -> String {
+        let (ast, types, output) = check_text(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        let id = ast
+            .expr_ids()
+            .find(|&id| ast.get(id).span == span)
+            .unwrap_or_else(|| panic!("no expression at {span:?} in {text:?}"));
+        types
+            .display(output.checked.types.get(id), ast.names())
+            .to_string()
+    }
+
+    /// For each dotted `let` and `:=` in the body of function number `n` of
+    /// `text`, which must check, or in the file's body if `n` is `None`, in
+    /// order: how many records along its path exist, and whether each of
+    /// them is awaited.
+    fn awaited_paths(text: &str, n: Option<u32>) -> Vec<(u32, Vec<bool>)> {
+        let (ast, resolution) = resolved(text);
+        let body = match n {
+            None => ast.root(),
+            Some(n) => match ast.get(ast.fn_decl(FnId::new(n)).body).kind {
+                ExprKind::Block(body) => body,
+                other => panic!("the body is not a block: {other:?}"),
+            },
+        };
+        ast.items(body)
+            .iter()
+            .filter(|&&id| {
+                matches!(
+                    ast.item(id).kind,
+                    ItemKind::Let { path, .. } | ItemKind::Rebind { path, .. }
+                        if ast.path(path).len() > 1
+                )
+            })
+            .map(|&id| {
+                let path = resolution.item_path(id);
+                (
+                    path.existing,
+                    resolution.path_awaits(path).unwrap().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// The first `n` bytes of `span`.
+    fn first_bytes(span: Span, n: u32) -> Span {
+        Span::new(span.start, span.start + n)
+    }
+
+    #[test]
+    fn a_dotted_update_awaits_a_record_that_may_be_a_future() {
+        // An impure function's result is the either shape: its record is
+        // awaited at the top, and the updated variable is present. `:=`
+        // keeps the field's type, and `let` replaces it.
+        let get = "fn get() -> {a: Int} { a = 1 }\nlet r = get()\n";
+        let text = format!("{get}r.a := 2\nr");
+        assert_eq!(shown_result(&text), "{a: Int | Future<Int>}");
+        assert_eq!(awaited_paths(&text, None), vec![(1, vec![true])]);
+        // The await is recorded with the path, not on any expression.
+        assert!(marks(&text).is_empty());
+        let text = format!("{get}let r.a = 2\nr");
+        assert_eq!(shown_result(&text), "{a: Int}");
+        assert_eq!(awaited_paths(&text, None), vec![(1, vec![true])]);
+        // An either-typed leaf accepts a future as well as a present value.
+        let text = format!("{get}r.a := lazy 2\nr");
+        assert_eq!(shown_result(&text), "{a: Int | Future<Int>}");
+        // A future of a record, whose fields are present.
+        let lazy = "let r = lazy { a = 1 }\n";
+        for update in ["r.a := 2", "let r.a = 2"] {
+            let text = format!("{lazy}{update}\nr");
+            assert_eq!(shown_result(&text), "{a: Int}", "{text}");
+            assert_eq!(awaited_paths(&text, None), vec![(1, vec![true])], "{text}");
+        }
+        // A field added to it, and one added under a field it lacks.
+        assert_eq!(
+            shown_result(&format!("{lazy}let r.b = \"s\"\nr")),
+            "{a: Int, b: String}"
+        );
+        let text = format!("{lazy}let r.b.c = 1\nr");
+        assert_eq!(shown_result(&text), "{a: Int, b: {c: Int}}");
+        assert_eq!(awaited_paths(&text, None), vec![(1, vec![true])]);
+        // A present record awaits nothing, and has no entries.
+        let text = "let r = { a = { b = 1 } }\nlet r.a.b = 2\nr.a.b := 3";
+        assert_eq!(
+            awaited_paths(text, None),
+            vec![(2, Vec::new()), (2, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn a_dotted_update_awaits_every_record_along_its_path() {
+        // An impure function's parameter, the either shape at every level:
+        // both `conf` and `conf.a` are awaited, and every record along the
+        // path is present afterwards.
+        for (update, shown) in [
+            ("let conf.a.b = 2", "{a: {b: Int}}"),
+            ("conf.a.b := 2", "{a: {b: Int | Future<Int>}}"),
+        ] {
+            let text =
+                format!("fn f(conf: {{a: {{b: Int}}}}) -> Int {{\n  {update}\n  conf.a.b\n}}");
+            assert_eq!(
+                awaited_paths(&text, Some(0)),
+                vec![(2, vec![true, true])],
+                "{text}"
+            );
+            let conf = last(&text, "conf");
+            assert_eq!(type_at(&text, conf), shown, "{text}");
+            // The access after the update awaits nothing but, for `:=`, the
+            // field it returns, which is passed on as the result.
+            assert!(marks(&text).is_empty(), "{text}");
+        }
+        // Only the records that may be futures are awaited.
+        let text = "let r = { a = lazy { b = 1 }; c = 2 }\nlet r.a.b = 3\nr";
+        assert_eq!(shown_result(text), "{a: {b: Int}, c: Int}");
+        assert_eq!(awaited_paths(text, None), vec![(2, vec![false, true])]);
+        // Through a future of a future.
+        let text = "let r = lazy { a = lazy { b = 1; c = 2 } }\nr.a.b := 5\nr";
+        assert_eq!(shown_result(text), "{a: {b: Int, c: Int}}");
+        assert_eq!(awaited_paths(text, None), vec![(2, vec![true, true])]);
+    }
+
+    #[test]
+    fn a_pure_function_cannot_update_a_record_that_may_be_a_future() {
+        // Reported once, at the path up to the record, for `let` and `:=`.
+        for update in ["let r.a = 2", "r.a := 2"] {
+            let text = format!("fn f(r: Future<{{a: Int}}>): {{a: Int}} {{ {update}\nr }}");
+            assert_implicit_await_error(
+                &text,
+                first_bytes(at(&text, "r.a"), 1),
+                "Future<{a: Int}>",
+            );
+        }
+        // A record further along the path: the parameter itself is measured,
+        // which makes it present, and its field may be a future.
+        let text = "fn f(r: {a: Future<{b: Int}>}): Int { let r.a.b = 2\nr.a.b }";
+        assert_implicit_await_error(text, at(text, "r.a"), "Future<{b: Int}>");
+        assert_eq!(demands(text, 0), vec![Some("r")]);
+        // A record a pure closure captures, with the usual note: a path is
+        // not an expression.
+        let text = "let r = lazy { a = 1 }\nlet g = fn(): {a: Int} { let r.a = 2\nr }";
+        assert_implicit_await_error(text, first_bytes(last(text, "r.a"), 1), "Future<{a: Int}>");
+    }
+
+    #[test]
+    fn a_dotted_update_measures_every_parameter_along_its_path() {
+        // The updated variable, by `:=` as by `let`.
+        let text = "fn f(r: {a: Int}): {a: Int} { r.a := 2\nr }";
+        assert_eq!(demands(text, 0), vec![Some("r")]);
+        assert_eq!(type_of_f(text), "fn(r: {a: Int}): {a: Int}");
+        assert!(marks(text).is_empty());
+        // A parameter held in a field of another variable, measured where
+        // the update reads it, and nowhere else.
+        for update in ["let q.inner.x = 2", "q.inner.x := 2"] {
+            let text =
+                format!("fn f(p: {{x: Int}}): Int {{ let q = {{ inner = p }}\n{update}\n1 }}");
+            assert_eq!(demands(&text, 0), vec![Some("q.inner")], "{text}");
+            assert_eq!(type_of_f(&text), "fn(p: {x: Int}): Int", "{text}");
+            assert!(marks(&text).is_empty(), "{text}");
+            assert_eq!(
+                awaited_paths(&text, Some(0)),
+                vec![(2, Vec::new())],
+                "{text}"
+            );
+        }
+        // Not the leaf, which is replaced, not read.
+        let text = "fn f(p: {x: Int}): Int { let q = { inner = p }\nlet q.inner = 2\n1 }";
+        assert_eq!(demands(text, 0), vec![None]);
+        assert_eq!(type_of_f(text), "fn(p: {x: Int} | Future<{x: Int}>): Int");
+    }
+
+    #[test]
+    fn a_record_that_is_not_one_once_awaited_cannot_be_updated() {
+        // Shown as it was before the await.
+        for update in ["let r.a.b = 1", "r.a.b := 1"] {
+            let text = format!("let r = {{ a = lazy 1 }}\n{update}");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(
+                found[0].message,
+                "cannot update `r.a.b`: `r.a` is `Future<Int>`, not a record"
+            );
+            assert_eq!(found[0].span, at(&text, "r.a.b"));
+            assert_eq!(
+                labels(&found[0]),
+                vec![(
+                    first_bytes(at(&text, "r.a.b"), 1),
+                    "this is {a: Future<Int>}"
+                )]
+            );
+        }
+        assert_eq!(
+            messages("let r = lazy 1\nlet r.a = 2"),
+            vec!["cannot update `r.a`: `r` is `Future<Int>`, not a record"]
+        );
+        // In a pure function, the await is an error too, before the rule
+        // that the record must be one applies.
+        assert_eq!(
+            messages("fn f(r: {a: Future<Int>}): Int { let r.a.b = 1\n1 }"),
+            vec![
+                "cannot use a value that may be a future in a pure function",
+                "cannot update `r.a.b`: `r.a` is `Future<Int>`, not a record"
+            ]
+        );
+        // `:=` still adds no field to a record that may be a future.
+        let text = "let r = lazy { a = 1 }\nr.b := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `r.b`: `r` has no field `b`"
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "r.b"), 1), "this is Future<{a: Int}>")]
+        );
+        assert_eq!(
+            messages("let r = lazy { a = 1 }\nr.b.c := 2"),
+            vec!["cannot rebind `r.b.c`: `r` has no field `b`"]
+        );
+    }
+
+    // ----- Awaiting a captured value before a pure function is created -----
+
+    /// The note of the implicit-await error for a variable `name` that a
+    /// pure function captures and that can be awaited before it is created.
+    fn capture_note(name: &str) -> String {
+        format!(
+            "a pure function cannot await, and `{name}` may be a future; await it before the \
+             function is created, in the enclosing impure code: `let {name} = await {name}`"
+        )
+    }
+
+    /// The notes of the one error of `text`, which must be the implicit-await
+    /// error.
+    fn implicit_await_notes(text: &str) -> Vec<String> {
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{text}: {found:?}");
+        assert_eq!(
+            found[0].message, "cannot use a value that may be a future in a pure function",
+            "{text}"
+        );
+        found[0].notes.clone()
+    }
+
+    #[test]
+    fn a_captured_value_that_can_be_awaited_outside_gets_a_hint() {
+        // Through a `lazy`, which is impure, from the pure function whose
+        // parameter it is.
+        let text = "fn outer(n: Int): Future<Int> {\n\
+                    \x20 lazy {\n\
+                    \x20   let g = fn(): Int { n + 1 }\n\
+                    \x20   = g()\n\
+                    \x20 }\n\
+                    }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("n")]);
+        let found = diagnostics(text);
+        assert_eq!(found[0].span, first_bytes(last(text, "n + 1"), 1));
+        // From the top level, which is impure; through parentheses; as the
+        // record of a field access.
+        for text in [
+            "let n = lazy 1\nlet g = fn(): Int { n + 1 }",
+            "let n = lazy 1\nlet g = fn(): Int { (n) + 1 }",
+            "let n = lazy { a = 1 }\nlet g = fn(): Int { n.a + 1 }",
+        ] {
+            assert_eq!(
+                implicit_await_notes(text),
+                vec![capture_note("n")],
+                "{text}"
+            );
+        }
+        // From an impure function, with nothing between.
+        let text = "fn f(n: Int) -> fn(): Int { fn(): Int { n + 1 } }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("n")]);
+        // As the result of the pure function's body: the body, a block, is
+        // what is awaited against the result type.
+        for text in [
+            "let n = lazy 1\nlet g = fn(): Int { n }",
+            "let n = lazy 1\nlet g = fn(): Int { = (n) }",
+        ] {
+            assert_eq!(
+                implicit_await_notes(text),
+                vec![capture_note("n")],
+                "{text}"
+            );
+        }
+        // As an argument against a parameter written present.
+        let text = "fn h(x: Present<Int>): Int { x }\nlet n = lazy 1\nlet g = fn(): Int { h(n) }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("n")]);
+        // The suggested fix checks.
+        let text = "fn outer(n: Int): Future<Int> {\n\
+                    \x20 lazy {\n\
+                    \x20   let n = await n\n\
+                    \x20   let g = fn(): Int { n + 1 }\n\
+                    \x20   = g()\n\
+                    \x20 }\n\
+                    }\nouter";
+        assert_eq!(shown_result(text), "fn(n: Int | Future<Int>): Future<Int>");
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_awaited_outside_gets_the_usual_note() {
+        for text in [
+            // A pure function's own parameter.
+            "fn f(n: Future<Int>): Int { n + 1 }",
+            // A capture through pure functions only.
+            "fn f(n: Future<Int>): fn(): Int { fn(): Int { n + 1 } }",
+            // A capture whose home is pure, though an impure function
+            // encloses that: the home cannot await it either.
+            "fn g() -> Int {\n  let h = fn(n: Future<Int>): fn(): Int { fn(): Int { n + 1 } }\n  1\n}",
+            // A field of a captured record, which is not a plain name.
+            "let r = { a = lazy 1 }\nlet g = fn(): Int { r.a + 1 }",
+            // A variable of the pure function's own body.
+            "fn f(): Int { let n = lazy 1\nn + 1 }",
+            // A block whose result is a variable of its own.
+            "fn f(): Int { let n = lazy 1\n= n }",
+        ] {
+            assert_eq!(
+                implicit_await_notes(text),
+                vec![IMPLICIT_AWAIT_NOTE],
+                "{text}"
+            );
+        }
     }
 }

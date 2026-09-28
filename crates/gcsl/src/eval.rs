@@ -3290,6 +3290,58 @@ mod tests {
     }
 
     #[test]
+    fn an_update_of_a_future_record_runs_it_once() {
+        // The update awaits the future, and a later await of the same future
+        // finds the record that one run built: the update shares its
+        // untouched field with it.
+        let frame = frame_after(
+            "let r = lazy { a = 1; b = { c = 2 } }\n\
+             let old = r\n\
+             let r.a = 5\n\
+             let s = await old",
+        );
+        let [
+            Value::Future(future),
+            Value::Future(old),
+            Value::Record(updated),
+            Value::Record(read),
+        ] = &frame[..]
+        else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(Rc::ptr_eq(future, old));
+        assert!(future.is_done());
+        assert_eq!(frame[2].to_string(), "{a = 5; b = {c = 2}}");
+        assert_eq!(frame[3].to_string(), "{a = 1; b = {c = 2}}");
+        let (Value::Record(updated), Value::Record(read)) = (&updated.values[1], &read.values[1])
+        else {
+            panic!("expected records");
+        };
+        assert!(Rc::ptr_eq(updated, read));
+        // Every record along the path, by `let` and `:=`.
+        assert_eq!(
+            string("let r = lazy { a = lazy { b = 1; c = 2 } }\nr.a.b := 5\n\"{r}\""),
+            "{a = {b = 5; c = 2}}"
+        );
+        assert_eq!(
+            string(
+                "fn f(conf: {a: {b: Int}}) -> {a: {b: Int}} { let conf.a.b = conf.a.b + 1\nconf }\n\
+                 let x = f(lazy { a = lazy { b = 1 } })\n\
+                 let y = f({ a = { b = 10 } })\n\
+                 \"{await x} {await y}\""
+            ),
+            "{a = {b = 2}} {a = {b = 11}}"
+        );
+        // A failing future fails where the update awaits it.
+        let diagnostic = run("let r = lazy { a = 1 // 0 }\nlet r.a = 2").unwrap_err();
+        assert_eq!(diagnostic.message, "division by zero");
+        assert_eq!(
+            labels(&diagnostic).last(),
+            Some(&(Span::new(32, 33), "awaited here"))
+        );
+    }
+
+    #[test]
     fn awaits_through_every_walker() {
         let text = "let i = lazy 20\n\
                     let x = lazy 1.5\n\

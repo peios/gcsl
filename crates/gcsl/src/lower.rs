@@ -48,11 +48,19 @@
 //! `Store(a', UpdateField(Load(a), b, UpdateField(Field(Load(a), b), c,
 //! e)))`, where each record node is shared by the update that builds on it
 //! and the access into it, and with `a: {x: Int}` to
-//! `Store(a', UpdateField(Load(a), b, UpdateField(Empty, c, e)))`. A dotted
-//! field stores back into its field's one slot. Each record block's field
-//! is loaded for its record once, from the slot its first definition
-//! declared. The text of each name an update sets is recorded in the IR,
-//! for the evaluator to show a field it adds.
+//! `Store(a', UpdateField(Load(a), b, UpdateField(Empty, c, e)))`. A record
+//! along the path that the checker marked to be awaited (see
+//! [`crate::check::Resolution::path_awaits`]) is read as it would be
+//! otherwise, but of kind [`ValueKind::Deferred`], and wrapped in an `Await`
+//! of kind `Record`, spanning the path up to its segment, as the record of a
+//! field access is; that `Await` is the record node the update and the
+//! access into it share. So with `a: Future<{b: {c: Int}}>`, the first
+//! record is `Await(Load(a))`, and the second `Field(Await(Load(a)), b)`.
+//! So the record walker that evaluates an update never sees a value that
+//! may be a future. A dotted field stores back into its field's one slot.
+//! Each record block's field is loaded for its record once, from the slot
+//! its first definition declared. The text of each name an update sets is
+//! recorded in the IR, for the evaluator to show a field it adds.
 //!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. `===`
@@ -99,9 +107,15 @@
 //! another frame, walked on its own. The nodes of a frame form a tree,
 //! except the record nodes an update chain shares between the update that
 //! builds on a record and the access into it: such a node's depth is
-//! counted from the first path the walk reaches it by. That does not
-//! matter, because the shared nodes are loads, captures, the callee, field
-//! accesses and `Empty`, never calls or awaits.
+//! counted from the first path the walk reaches it by. The shared nodes are
+//! loads, captures, the callee, field accesses, `Empty` and the `Await`s of
+//! records that may be futures, never calls. An `Await`'s depth matters
+//! only when it runs a future, and a shared one runs it, if at all, where it
+//! is first evaluated: as the record of the update that builds on it, which
+//! the evaluator evaluates before the update's value, where the access into
+//! it is, and which is also the first parent the walk reaches it by, since
+//! it visits a node's children in order. Every later evaluation, through
+//! the access, finds the future already run, and only copies its value.
 //!
 //! Lowering cannot fail on tables produced by [`crate::check::check`]. Any
 //! combination the checker should have ruled out is reported as an
@@ -399,6 +413,7 @@ impl Lowerer<'_> {
     /// chain of `UpdateField`s setting the path to `value`, from the leaf
     /// outwards, each on the record at the path before its segment: the
     /// updated slot or a `Field` of the record before it where they exist,
+    /// each wrapped in an `Await` if the checker marked it to be awaited,
     /// and `Empty` where the path creates a record.
     fn lower_update(
         &mut self,
@@ -406,18 +421,31 @@ impl Lowerer<'_> {
         segments: &[PathSegment],
         value: ExprId,
     ) -> Result<IrId, InternalError> {
-        let resolution = self.resolution.item_path(id);
+        let table = self.resolution;
+        let resolution = table.item_path(id);
         let existing = resolution.existing as usize;
+        let awaits = table.path_awaits(resolution).ok_or(InternalError {
+            message: "an update's awaited records are missing",
+            span: path_span(segments),
+        })?;
         let base = self.item_stack.len();
         // The record at each proper prefix of the path, `segments[..=end]`,
         // on the item stack: the record that setting `segments[end + 1]`
         // builds on.
         for end in 0..segments.len().saturating_sub(1) {
             let span = path_span(&segments[..=end]);
+            // A record that may be a future is read as it is and awaited, as
+            // the record of a field access is.
+            let awaited = awaits.get(end).copied().unwrap_or(false);
+            let read_kind = if awaited {
+                ValueKind::Deferred
+            } else {
+                ValueKind::Record
+            };
             let kind = if end >= existing {
                 IrKind::Empty
             } else if end == 0 {
-                read(resolution.source, ValueKind::Record).ok_or(InternalError {
+                read(resolution.source, read_kind).ok_or(InternalError {
                     message: "an update of an existing record has no source",
                     span,
                 })?
@@ -431,10 +459,23 @@ impl Lowerer<'_> {
                 IrKind::Field {
                     record,
                     name: segments[end].name,
-                    kind: ValueKind::Record,
+                    kind: read_kind,
                 }
             };
-            let record = self.builder.alloc(kind, span);
+            let mut record = self.builder.alloc(kind, span);
+            if awaited {
+                record = self.builder.alloc(
+                    IrKind::Await {
+                        value: record,
+                        kind: ValueKind::Record,
+                        shape: LazyShapeId::NONE,
+                        // Set by `IrBuilder::measure` once every node is
+                        // built.
+                        depth: 0,
+                    },
+                    span,
+                );
+            }
             self.item_stack.push(record);
         }
         // The evaluator shows a field it adds by this text.
@@ -2392,6 +2433,108 @@ mod tests {
             vec![1]
         );
         assert_eq!(code.height, 3);
+    }
+
+    #[test]
+    fn an_update_awaits_each_record_along_its_path_that_may_be_a_future() {
+        // An impure function's parameter, the either shape at every level:
+        // each record is awaited, spanning the path up to it, and the await
+        // is the record node the update and the access into it share.
+        let text = "fn f(r: {a: {b: Int}}) -> {} { let r.a.b = 2 }";
+        assert_eq!(
+            dump(text),
+            "(block @0..46\n\
+             \x20 (store f#0 @0..46\n\
+             \x20   (make-closure #0 @0..46))\n\
+             \x20 (empty @0..46))\n\
+             fn #0 f (frame 2, params 1, captures 0, height 8)\n\
+             \x20 (block @29..46\n\
+             \x20   (store r#1 @31..44\n\
+             \x20     (update-field a @35..38\n\
+             \x20       (await @35..36\n\
+             \x20         (load r#0 @35..36))\n\
+             \x20       (update-field b @35..40\n\
+             \x20         (await @35..38\n\
+             \x20           (field a @35..38\n\
+             \x20             (await @35..36\n\
+             \x20               (load r#0 @35..36))))\n\
+             \x20         (int 2 @43..44))))\n\
+             \x20   (empty @29..46))"
+        );
+        let ir = lower_text(text);
+        let code = ir.function(FnId::new(0));
+        let IrKind::Block { items, .. } = ir.get(code.body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::Store(_, outer) = ir.get(ir.items(items)[0]).kind else {
+            panic!("expected a store");
+        };
+        let IrKind::UpdateField {
+            record: first,
+            value: inner,
+            ..
+        } = ir.get(outer).kind
+        else {
+            panic!("expected an update");
+        };
+        let IrKind::UpdateField { record: second, .. } = ir.get(inner).kind else {
+            panic!("expected an update");
+        };
+        // Each read is of kind `Deferred`, and each await of a record.
+        let IrKind::Await {
+            value: load,
+            kind: ValueKind::Record,
+            shape: LazyShapeId::NONE,
+            ..
+        } = ir.get(first).kind
+        else {
+            panic!("expected an await of a record");
+        };
+        assert_eq!(
+            ir.get(load).kind,
+            IrKind::Load(Slot::new(0), ValueKind::Deferred)
+        );
+        let IrKind::Await {
+            value: field,
+            kind: ValueKind::Record,
+            ..
+        } = ir.get(second).kind
+        else {
+            panic!("expected an await of a record");
+        };
+        let IrKind::Field { record, kind, .. } = ir.get(field).kind else {
+            panic!("expected a field access");
+        };
+        assert_eq!(kind, ValueKind::Deferred);
+        assert_eq!(record, first);
+        // The block (0), the store (1), the update of `a` (2), its record's
+        // await (3); the update of `b` (3), its record's await (4). The
+        // shared await, met again under the access, keeps the depth of the
+        // path the walk first reaches it by, where it is first evaluated.
+        assert_eq!(
+            ir.awaits_in(code.body)
+                .into_iter()
+                .map(|(depth, _)| depth)
+                .collect::<Vec<_>>(),
+            vec![3, 4, 3]
+        );
+        // A record that is present is read as before, beside one that is
+        // not.
+        let text = "let r = { a = lazy { b = 1 } }\nlet r.a.b = 2";
+        let shown = dump(text);
+        assert!(
+            shown.contains(
+                "  (store r#1 @31..44\n\
+                 \x20   (update-field a @35..38\n\
+                 \x20     (load r#0 @35..36)\n\
+                 \x20     (update-field b @35..40\n\
+                 \x20       (await @35..38\n\
+                 \x20         (field a @35..38\n\
+                 \x20           (load r#0 @35..36)))\n\
+                 \x20       (int 2 @43..44))))"
+            ),
+            "{shown}"
+        );
     }
 
     /// The result of the root block of `ir`, whatever items come before it.

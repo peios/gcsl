@@ -1257,6 +1257,67 @@ fn an_await_in_a_pure_function_renders_exactly() {
 }
 
 #[test]
+fn a_captured_value_that_may_be_a_future_renders_exactly() {
+    let outer = "fn outer(n: Int): Future<Int> {\n  lazy {\n    let g = fn(): Int { n + 1 }\n    = g()\n  }\n}\n";
+    assert_eq!(
+        rendered(outer),
+        "error: cannot use a value that may be a future in a pure function\n\
+         \x20--> calc.gcsl:3:25\n\
+         \x20 |\n\
+         3 |     let g = fn(): Int { n + 1 }\n\
+         \x20 |                 -       ^ this is Int | Future<Int>\n\
+         \x20 |                 |\n\
+         \x20 |                 this function is pure, declared with `:`\n\
+         \x20 |\n\
+         \x20 = note: a pure function cannot await, and `n` may be a future; await it before \
+         the function is created, in the enclosing impure code: `let n = await n`\n"
+    );
+    // The suggested fix, applied.
+    let fixed = "fn outer(n: Int): Future<Int> {\n  lazy {\n    let n = await n\n    let g = fn(): Int { n + 1 }\n    = g()\n  }\n}\n";
+    assert_eq!(
+        run(&format!("{fixed}await outer(41)")).unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(
+        run(&format!("{fixed}await outer(lazy 41)")).unwrap(),
+        Value::Int(42)
+    );
+}
+
+#[test]
+fn a_record_that_may_be_a_future_can_be_updated() {
+    let get = "fn get() -> {a: Int} { a = 1 }\nlet r = get()\n";
+    assert_eq!(
+        run(&format!("{get}r.a := 2\nr")).unwrap().to_string(),
+        "{a = 2}"
+    );
+    assert_eq!(
+        show(&format!("{get}r.a := 2\nr")),
+        "{a = 2} : {a: Int | Future<Int>}"
+    );
+    assert_eq!(show(&format!("{get}let r.a = 2\nr")), "{a = 2} : {a: Int}");
+    // Through a `lazy`, and along a path of records that may be futures.
+    assert_eq!(
+        show("let r = lazy { a = 1; b = 2 }\nlet r.a = 5\nr"),
+        "{a = 5; b = 2} : {a: Int, b: Int}"
+    );
+    let f = "fn f(conf: {a: {b: Int}}) -> {a: {b: Int}} {\n  let conf.a.b = 2\n  conf\n}\n";
+    assert_eq!(
+        run(&format!("{f}await f(lazy {{ a = lazy {{ b = 1 }} }})"))
+            .unwrap()
+            .to_string(),
+        "{a = {b = 2}}"
+    );
+    let f = "fn f(conf: {a: {b: Int}}) -> {a: {b: Int}} {\n  conf.a.b := 2\n  conf\n}\n";
+    assert_eq!(
+        run(&format!("{f}await f(lazy {{ a = lazy {{ b = 1 }} }})"))
+            .unwrap()
+            .to_string(),
+        "{a = {b = 2}}"
+    );
+}
+
+#[test]
 fn a_callback_that_cannot_take_futures_renders_exactly() {
     assert_eq!(
         rendered(
