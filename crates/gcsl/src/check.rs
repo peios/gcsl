@@ -183,7 +183,9 @@
 //! at the path up to that segment. The rules above then apply to its type
 //! once awaited, stripped of its future layers, so that a record that is
 //! not one once awaited is "not a record", shown as the type it had before,
-//! and the new binding is built from the stripped types: the updated
+//! and then alone: the update cannot work whether or not it is awaited, so
+//! the purity error is reported only for a value that is a record once
+//! awaited. The new binding is built from the stripped types: the updated
 //! variable is present, as is every record along the path, and the fields
 //! off the path keep their types. After `let r = lazy { a = 1 }`, `let r.a
 //! = 2` makes `r` a `{a: Int}`. The last segment is never measured: it is
@@ -391,16 +393,18 @@
 //!
 //! The implicit-await error's note suggests declaring the function with
 //! `->`. Where the value is a variable, through any parentheses and as the
-//! result of any block (as in the body `{ n }`), that the pure function
-//! captures, and that code outside it could await before
+//! result of any block (as in the body `{ n }`), or the variable a dotted
+//! `let` or `:=` updates, the record at its path's first segment, that the
+//! pure function captures, and that code outside it could await before
 //! creating it, the note instead says to do that, as `let n = await n`
-//! (`Checker::awaitable_capture`): a variable of the top level, which is
-//! impure, or one whose home function (the function whose body declares
-//! it) or a function between that one and the pure function is impure, as
-//! a `lazy` and a memoised function are. A capture whose home and every
-//! function between are pure could be awaited there no more than in the
-//! pure function, and keeps the usual note, as does a record read by a
-//! dotted `let` or `:=`, which is not an expression.
+//! (`Checker::awaitable_capture`, `Checker::awaitable_outside`): a variable
+//! of the top level, which is impure, or one whose home function (the
+//! function whose body declares it) or a function between that one and the
+//! pure function is impure, as a `lazy` and a memoised function are. A
+//! capture whose home and every function between are pure could be awaited
+//! there no more than in the pure function, and keeps the usual note, as
+//! does a record further along a dotted `let`'s or `:=`'s path, which is
+//! not a variable.
 //!
 //! # Inferred parameters
 //!
@@ -547,10 +551,22 @@
 //! which is exactly what the deep await's lazy shape resolves; a record block
 //! checked field by field against the declared record type, whose type is
 //! the record of the declared fields' types, is instead the record of what
-//! its fields' values are, each found in the same way (an open field, one
-//! built by dotted paths, keeps its declared type); an untyped
-//! literal has been coerced. A position whose value's type is not a subtype
-//! of what would be inferred keeps its declared type. The inferred result
+//! its fields' values are, each found in the same way; an untyped literal
+//! has been coerced. An open field, one built by dotted paths, is a present
+//! record, built by the block, of what its segments are: a segment that
+//! further paths extend is such a record in turn, and a leaf, `a.b.c = e`,
+//! is what `e` is, found as a field's value is, since it was checked
+//! against the declared type at its path as a field's value is against its
+//! field's type, and lowering stores exactly `e`, with any await marked on
+//! it, into the record (see [Dotted fields](#dotted-fields)). So `fn n() ->
+//! {a: {b: Int}} { a.b = 1 }` is `fn() -> {a: {b: Int}}`, as with `a = { b
+//! = 1 }`. The block's items are passed over once, rebuilding the segments
+//! of its open fields as a tree (`Built`), which is then inferred against
+//! the declared type level by level; a segment the declared type lacks
+//! plays no part, and a declared field the block does not define, which a
+//! successful check rules out, keeps its declared type. A position whose
+//! value's type is not a subtype of what would be inferred keeps its
+//! declared type. The inferred result
 //! is a subtype of the declared one, so the function's type is one too, by
 //! ordinary result covariance; a written function type is not inferred, so
 //! `fn() -> Int` written means the either shape as before, and accepts
@@ -617,9 +633,9 @@
 use std::fmt;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTyRange,
-    FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment, StrPart,
-    TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Expr, ExprId, ExprKind, FieldTy,
+    FieldTyRange, FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange, PathRange, PathSegment,
+    StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1276,6 +1292,36 @@ enum BodyValue {
     /// against the declared record type builds: the block's items, whose
     /// fields' values say what the record holds.
     Fields(ItemRange),
+    /// The present record that the dotted paths of such a block build at
+    /// an open field or a segment of one: the index of its node in
+    /// `Checker::built`, whose leaves' values say what the record holds.
+    Open(u32),
+}
+
+/// One segment of an open field of a record block that an impure
+/// function's body returns, rebuilt from the block's dotted paths for
+/// [`Checker::inferred`], since the block's own [`Node`]s are gone once it
+/// ends. Its children are a linked list through `first_child` and
+/// `next_sibling`, most recent first, as a [`Node`]'s are.
+#[derive(Clone, Copy, Debug)]
+struct Built {
+    name: Name,
+    /// For the end of a dotted path, the value it is defined whole with;
+    /// `None` for a record the paths build.
+    leaf: Option<ExprId>,
+    first_child: u32,
+    next_sibling: u32,
+}
+
+/// How a field of a record block that an impure function's body returns
+/// is defined, for [`Checker::infer_field`].
+#[derive(Clone, Copy, Debug)]
+enum Definition {
+    /// Whole, with this value: a field, or the end of a dotted path.
+    Whole(ExprId),
+    /// By dotted paths: an open field or a segment of one, the index of
+    /// its node in `Checker::built`.
+    Dotted(u32),
 }
 
 /// The variables of an outermost scope, with their slots and types: what a
@@ -1409,6 +1455,11 @@ pub struct Checker<'a> {
     /// The segments of the open fields of every block being checked,
     /// outermost block first; each block truncates it back when it ends.
     nodes: Vec<Node>,
+    /// The segments of the open fields of every record block whose value
+    /// an impure function's result is being inferred from, rebuilt from
+    /// their dotted paths: a stack, as `sorted_fields` is, each block's
+    /// segments above those of the block enclosing it.
+    built: Vec<Built>,
     /// Reused for the records along the path of a dotted `let` or `:=` that
     /// exist: each one's type once measured, and whether it is awaited. A
     /// `:=` walks its path before its value is checked and declares its
@@ -1478,6 +1529,7 @@ impl<'a> Checker<'a> {
             present_name: names.lookup("Present"),
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
+            built: Vec::new(),
             path_types: Vec::new(),
             pending: Vec::new(),
             errors: Vec::new(),
@@ -1979,7 +2031,9 @@ impl<'a> Checker<'a> {
                 NodeKind::Open => node = child,
                 // Reported already.
                 NodeKind::Leaf if found.ty == TyId::ERROR => return None,
-                NodeKind::Leaf if self.types.is_record(found.ty) => {
+                // A record, or one that may be or is a future, as one
+                // defined whole where an either shape is expected is.
+                NodeKind::Leaf if self.types.is_record(self.types.strip(found.ty)) => {
                     self.errors.push(
                         Diagnostic::error(format!("field `{prefix}` is already defined"), path)
                             .with_context(found.span, "defined whole here")
@@ -2389,10 +2443,17 @@ impl<'a> Checker<'a> {
         let Some((index, target)) = target.filter(|(_, target)| target.ty != TyId::ERROR) else {
             // The rebind was rejected (or the variable is already erroneous):
             // check the value on its own and declare the name with what it
-            // has, so later uses do not cascade.
+            // has, so later uses do not cascade. The path of a variable that
+            // may be a future is not walked: awaiting it would be reported
+            // of a variable that cannot be rebound anyway.
             let ty = self.check_alone(value);
+            let lazy = self.lookup(name).is_some_and(|(_, binding)| {
+                binding.ty != TyId::ERROR && self.types.laziness(binding.ty) != Laziness::Present
+            });
             if segments.len() == 1 {
                 self.declare(name, ty, id, BindingKind::Variable);
+            } else if lazy {
+                self.declare(name, TyId::ERROR, id, BindingKind::Variable);
             } else {
                 self.declare_update(id, segments, ty);
             }
@@ -2410,7 +2471,7 @@ impl<'a> Checker<'a> {
         // checked, since the value is checked against its leaf's type; its
         // records stay on `path_types` until the variable is declared.
         let base = self.path_types.len();
-        if let Some(leaf) = self.rebind_leaf(segments, target.ty) {
+        if let Some(leaf) = self.rebind_leaf(segments, (target.ty, index)) {
             self.check_expr_expecting(
                 value,
                 leaf,
@@ -2425,15 +2486,19 @@ impl<'a> Checker<'a> {
     }
 
     /// The type of the leaf of the dotted `:=` path `segments`, whose first
-    /// segment has type `root`, once its path is walked (see
-    /// [`Checker::walk_path`]), which leaves the records along it on
-    /// `path_types` for [`Checker::finish_update`]. Every segment must
-    /// already exist, since `:=` never adds a field: a missing one, or a
-    /// segment along the way that is not a record, is reported and `None`
-    /// returned, with `path_types` as it was.
-    fn rebind_leaf(&mut self, segments: &[PathSegment], root: TyId) -> Option<TyId> {
+    /// segment's variable, at `binding` in `bindings`, has type `root`, once
+    /// its path is walked (see [`Checker::walk_path`]), which leaves the
+    /// records along it on `path_types` for [`Checker::finish_update`].
+    /// Every segment must already exist, since `:=` never adds a field: a
+    /// missing one, or a segment along the way that is not a record, is
+    /// reported and `None` returned, with `path_types` as it was.
+    fn rebind_leaf(
+        &mut self,
+        segments: &[PathSegment],
+        (root, binding): (TyId, usize),
+    ) -> Option<TyId> {
         let base = self.path_types.len();
-        let root = self.walk_path(segments, root)?;
+        let root = self.walk_path(segments, (root, binding))?;
         let records = self.path_types.get(base..)?;
         let (walked, &(record, _), last) = (records.len(), records.last()?, segments.last()?);
         // The first segment that the record before it lacks: one the walk
@@ -2465,26 +2530,32 @@ impl<'a> Checker<'a> {
     }
 
     /// Walks the path `segments` of a dotted `let` or `:=` whose first
-    /// segment's variable has type `old`, which is not erroneous. Updating a
-    /// record reads it, so each record along the path that exists is
-    /// measured at the top (see [`Checker::measure_path_record`]): the
-    /// variable's, and each following segment's, short of the last, that the
-    /// record before it has. Each is pushed onto `path_types`, stripped, with
-    /// whether it is awaited; the walk stops at the first segment the record
-    /// before it lacks, and before the last, which is replaced, not read.
+    /// segment's variable, at `binding` in `bindings`, has type `old`, which
+    /// is not erroneous. Updating a record reads it, so each record along
+    /// the path that exists is measured at the top (see
+    /// [`Checker::measure_path_record`]): the variable's, and each following
+    /// segment's, short of the last, that the record before it has. Each is
+    /// pushed onto `path_types`, stripped, with whether it is awaited; the
+    /// walk stops at the first segment the record before it lacks, and
+    /// before the last, which is replaced, not read.
     ///
     /// Returns `old` as measured, for labelling a later error. A record that
     /// is not one once stripped is reported instead, "cannot update `a.b.c`:
     /// `a.b` is Int, not a record", showing its type before stripping, and
     /// `None` returned, with `path_types` as it was.
-    fn walk_path(&mut self, segments: &[PathSegment], old: TyId) -> Option<TyId> {
+    fn walk_path(
+        &mut self,
+        segments: &[PathSegment],
+        (old, binding): (TyId, usize),
+    ) -> Option<TyId> {
         let base = self.path_types.len();
         let mut root = old;
         // The type of `segments[..index]`, which exists.
         let mut current = old;
         for (index, next) in segments.iter().enumerate().skip(1) {
             let prefix = &segments[..index];
-            let (measured, awaited) = self.measure_path_record(prefix, current);
+            let variable = (index == 1).then_some(binding);
+            let (measured, awaited) = self.measure_path_record(prefix, current, variable);
             if index == 1 {
                 root = measured;
             }
@@ -2521,10 +2592,19 @@ impl<'a> Checker<'a> {
     /// whose type is provisional, the parameter is measured, which makes it
     /// present, and its present type returned; if it may be a future, it is
     /// to be awaited at the top, subject to the purity rule, reported at
-    /// `prefix` (see [`Checker::implicit_await_error`]), and `ty` is
-    /// returned with `true`; otherwise, or if it is erroneous, `ty` is
-    /// returned with `false`.
-    fn measure_path_record(&mut self, prefix: &[PathSegment], ty: TyId) -> (TyId, bool) {
+    /// `prefix` (see [`Checker::implicit_await_error`]) if it is a record
+    /// once stripped, and `ty` is returned with `true`; otherwise, or if it
+    /// is erroneous, `ty` is returned with `false`. `variable` is where the
+    /// record is in `bindings` if it is the variable the path updates, the
+    /// path's first segment, whose name the purity error's note suggests
+    /// awaiting before the pure function is created if it can be (see
+    /// [`Checker::awaitable_outside`]).
+    fn measure_path_record(
+        &mut self,
+        prefix: &[PathSegment],
+        ty: TyId,
+        variable: Option<usize>,
+    ) -> (TyId, bool) {
         if ty == TyId::ERROR || self.types.laziness(ty) == Laziness::Present {
             return (ty, false);
         }
@@ -2536,9 +2616,17 @@ impl<'a> Checker<'a> {
         // A future, an either, or a provisional type of an enclosing
         // function, which may be a future for all this body knows. A path
         // is not an expression, so the await is recorded with the item's
-        // path, by `finish_update`.
-        if let Some(marker) = self.pure_marker() {
-            let error = self.implicit_await_error(span, ty, marker, None);
+        // path, by `finish_update`. A value that is not a record once
+        // awaited cannot be updated, awaited or not, which `walk_path`
+        // reports instead.
+        if let Some(marker) = self.pure_marker()
+            && self.types.is_record(self.types.strip(ty))
+        {
+            let capture = match (variable, prefix) {
+                (Some(binding), [first]) if self.awaitable_outside(binding) => Some(first.name),
+                _ => None,
+            };
+            let error = self.implicit_await_error(span, ty, marker, capture);
             self.errors.push(error);
         }
         (ty, true)
@@ -2558,9 +2646,9 @@ impl<'a> Checker<'a> {
         let base = self.path_types.len();
         let found = self.lookup(first.name);
         let mut failed = leaf_ty == TyId::ERROR;
-        if let Some((_, old)) = found {
+        if let Some((index, old)) = found {
             // An erroneous variable has been reported already.
-            failed |= old.ty == TyId::ERROR || self.walk_path(segments, old.ty).is_none();
+            failed |= old.ty == TyId::ERROR || self.walk_path(segments, (old.ty, index)).is_none();
         }
         let leaf_ty = if failed { TyId::ERROR } else { leaf_ty };
         self.finish_update(id, segments, (found, base), leaf_ty);
@@ -3253,11 +3341,9 @@ impl<'a> Checker<'a> {
     }
 
     /// The name of the variable that `expr` is, through any parentheses and
-    /// as the result of any block, if the innermost function captures it and it can be awaited before that
-    /// function is created: if it comes from the top level, which is
-    /// impure, or its home function (the function whose body declares it)
-    /// or a function between that one and the innermost is impure, as a
-    /// `lazy` and a memoised function are. `None` for any other expression,
+    /// as the result of any block, if the innermost function captures it and
+    /// it can be awaited before that function is created (see
+    /// [`Checker::awaitable_outside`]). `None` for any other expression,
     /// including a capture whose home and every function between are pure,
     /// which can await it no more than the innermost function can.
     fn awaitable_capture(&self, expr: ExprId) -> Option<Name> {
@@ -3283,15 +3369,38 @@ impl<'a> Checker<'a> {
         let VarRef::Capture(capture) = self.expr_vars[node.index()] else {
             return None;
         };
-        let (innermost, enclosing) = self.functions.split_last()?;
-        let binding = innermost.captures.get(capture as usize)?.binding;
+        let binding = self
+            .functions
+            .last()?
+            .captures
+            .get(capture as usize)?
+            .binding;
+        self.awaitable_outside(binding).then_some(name)
+    }
+
+    /// Whether the binding at `binding` in `bindings` is one the innermost
+    /// function captures, lying below its first binding, that can be awaited
+    /// before that function is created: one of the top level, which is
+    /// impure, or whose home function (the function whose body declares it)
+    /// or a function between that one and the innermost is impure, as a
+    /// `lazy` and a memoised function are. Not a binding of the innermost
+    /// function itself, nor a capture whose home and every function between
+    /// are pure. The condition of [`Checker::awaitable_capture`], and of the
+    /// same hint for the variable a dotted `let` or `:=` updates.
+    fn awaitable_outside(&self, binding: usize) -> bool {
+        let Some((_, enclosing)) = self.functions.split_last() else {
+            return false;
+        };
         // The outermost function the binding is not in; its home is the
         // function before it, or the top level if there is none.
-        let outside = self
+        let Some(outside) = self
             .functions
             .iter()
-            .position(|function| function.bindings_start > binding)?;
-        let awaitable = match outside.checked_sub(1) {
+            .position(|function| function.bindings_start > binding)
+        else {
+            return false;
+        };
+        match outside.checked_sub(1) {
             None => true,
             Some(home) => enclosing.get(home..).is_some_and(|between| {
                 // A memoised function may await, as an impure one may.
@@ -3299,8 +3408,7 @@ impl<'a> Checker<'a> {
                     .iter()
                     .any(|function| function.effect != Effect::Pure)
             }),
-        };
-        awaitable.then_some(name)
+        }
     }
 
     /// The marker of the innermost function, if it is pure (a memoised
@@ -3796,8 +3904,9 @@ impl<'a> Checker<'a> {
     /// the record of its declared fields, each inferred in turn against the
     /// field of the same name of the value once stripped. Every other
     /// position keeps its declared type, and so does a bare one whose value
-    /// is not known well enough: a record block where a name is declared,
-    /// or a value whose type is not a subtype of what would be inferred.
+    /// is not known well enough: a record block, or a record its dotted
+    /// paths build, where a name is declared, or a value whose type is not
+    /// a subtype of what would be inferred.
     ///
     /// Recurses once per level of record type nesting in `ty`.
     fn inferred(&mut self, ty: TypeExprId, declared: TyId, value: BodyValue) -> TyId {
@@ -3815,8 +3924,9 @@ impl<'a> Checker<'a> {
         }
         let present = self.types.strip(declared);
         let (laziness, stripped) = match value {
-            // A record block is present.
-            BodyValue::Fields(_) => (Laziness::Present, value),
+            // A record block is present, and so is a record its dotted
+            // paths build.
+            BodyValue::Fields(_) | BodyValue::Open(_) => (Laziness::Present, value),
             BodyValue::Typed(found) => (
                 self.types.laziness(found),
                 BodyValue::Typed(self.types.strip(found)),
@@ -3828,7 +3938,7 @@ impl<'a> Checker<'a> {
                 None => return declared,
             },
             (None, BodyValue::Typed(_)) => present,
-            (None, BodyValue::Fields(_)) => return declared,
+            (None, BodyValue::Fields(_) | BodyValue::Open(_)) => return declared,
         };
         let inferred = match laziness {
             Laziness::Present => shape,
@@ -3846,15 +3956,17 @@ impl<'a> Checker<'a> {
     /// type `present`, where the body returns `value`, stripped: the record
     /// of the declared fields, each inferred against the value's field of
     /// the same name (see [`Checker::inferred`]), or keeping its declared
-    /// type if the value has no such field, or has it as an open field,
-    /// which is not known that well. The value's other fields play no part.
-    /// `None` if `present` lacks a field written, which a record type
+    /// type if the value has no such field. A field of a record block, or
+    /// of a record its dotted paths build, that dotted paths build is
+    /// inferred as such a record in turn. The value's other fields play no
+    /// part. `None` if `present` lacks a field written, which a record type
     /// resolved from `fields` never does.
     ///
     /// The declared fields are kept in `sorted_fields`, by name, each with
     /// its position in `fields` and its type so far, so that a record
-    /// block's fields are found by binary search, in one pass over its
-    /// items.
+    /// block's fields, and the children of a segment its dotted paths
+    /// build, are found by binary search, in one pass over its items (see
+    /// [`Checker::infer_block_fields`]) or over the segment's children.
     fn inferred_record(
         &mut self,
         fields: FieldTyRange,
@@ -3896,36 +4008,21 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            BodyValue::Fields(items) => {
-                for &item in ast.items(items) {
-                    // A field defined whole; one defined by dotted paths is
-                    // open.
-                    let ItemKind::Field { path, value } = ast.item(item).kind else {
-                        continue;
+            BodyValue::Fields(items) => self.infer_block_fields(written, (base, end), items),
+            BodyValue::Open(node) => {
+                let mut child = self
+                    .built
+                    .get(node as usize)
+                    .map_or(NO_NODE, |entry| entry.first_child);
+                while let Some(&entry) = self.built.get(child as usize) {
+                    let definition = match entry.leaf {
+                        Some(value) => Definition::Whole(value),
+                        None => Definition::Dotted(child),
                     };
-                    let [segment] = ast.path(path) else {
-                        continue;
-                    };
-                    let Ok(offset) = self
-                        .sorted_fields
-                        .get(base..end)
-                        .unwrap_or_default()
-                        .binary_search_by_key(&segment.name, |&(name, _, _)| name)
-                    else {
-                        continue;
-                    };
-                    let at = base + offset;
-                    let Some(&(_, index, declared)) = self.sorted_fields.get(at) else {
-                        continue;
-                    };
-                    let Some(field) = written.get(index as usize) else {
-                        continue;
-                    };
-                    let found = self.value_of(value, declared);
-                    let ty = self.inferred(field.ty, declared, found);
-                    if let Some(entry) = self.sorted_fields.get_mut(at) {
-                        entry.2 = ty;
+                    if let Some(at) = self.sorted_at((base, end), entry.name) {
+                        self.infer_field(written, at, definition);
                     }
+                    child = entry.next_sibling;
                 }
             }
         }
@@ -3936,6 +4033,147 @@ impl<'a> Checker<'a> {
             .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
         self.sorted_fields.truncate(base);
         Some(record)
+    }
+
+    /// Infers each of the declared fields `sorted_fields[base..end]`,
+    /// written as `written`, that the record block of `items` defines, in
+    /// one pass over its items: a field defined whole from its value, and
+    /// an open field from the leaves of the dotted paths that build it,
+    /// which the pass rebuilds in `built`, as a tree of segments under one
+    /// root for each declared field, to be inferred once it ends. A field,
+    /// or a segment, that the declared type lacks plays no part.
+    fn infer_block_fields(
+        &mut self,
+        written: &[FieldTy],
+        (base, end): (usize, usize),
+        items: ItemRange,
+    ) {
+        let ast = self.ast;
+        // The root for `sorted_fields[at]` is at `roots + (at - base)`.
+        // Inferring a value pushes onto `built` above what is there and
+        // truncates back.
+        let roots = self.built.len();
+        self.built.extend(
+            self.sorted_fields
+                .get(base..end)
+                .unwrap_or_default()
+                .iter()
+                .map(|&(name, _, _)| Built {
+                    name,
+                    leaf: None,
+                    first_child: NO_NODE,
+                    next_sibling: NO_NODE,
+                }),
+        );
+        for &item in ast.items(items) {
+            let ItemKind::Field { path, value } = ast.item(item).kind else {
+                continue;
+            };
+            let Some((first, rest)) = ast.path(path).split_first() else {
+                continue;
+            };
+            let Some(at) = self.sorted_at((base, end), first.name) else {
+                continue;
+            };
+            if rest.is_empty() {
+                self.infer_field(written, at, Definition::Whole(value));
+            } else {
+                self.build_path(position(roots + (at - base)), rest, value);
+            }
+        }
+        for at in base..end {
+            let root = position(roots + (at - base));
+            // A field no dotted path builds.
+            if self
+                .built
+                .get(root as usize)
+                .is_none_or(|entry| entry.first_child == NO_NODE)
+            {
+                continue;
+            }
+            self.infer_field(written, at, Definition::Dotted(root));
+        }
+        self.built.truncate(roots);
+    }
+
+    /// Adds the dotted path whose segments after the first are `rest`,
+    /// ending in `value`, to the tree of segments in `built` whose root, the
+    /// path's first segment, is `root`: each segment that is not yet a child
+    /// of the one before it is added as its newest child, and the last is
+    /// the leaf holding `value`.
+    fn build_path(&mut self, root: u32, rest: &[PathSegment], value: ExprId) {
+        let mut node = root;
+        for segment in rest {
+            if let Some(child) = self.built_child(node, segment.name) {
+                node = child;
+                continue;
+            }
+            let index = position(self.built.len());
+            let next_sibling = match self.built.get_mut(node as usize) {
+                Some(parent) => std::mem::replace(&mut parent.first_child, index),
+                None => NO_NODE,
+            };
+            self.built.push(Built {
+                name: segment.name,
+                leaf: None,
+                first_child: NO_NODE,
+                next_sibling,
+            });
+            node = index;
+        }
+        if let Some(leaf) = self.built.get_mut(node as usize) {
+            leaf.leaf = Some(value);
+        }
+    }
+
+    /// The child of the segment `node` of `built` named `name`, if it has
+    /// one.
+    fn built_child(&self, node: u32, name: Name) -> Option<u32> {
+        let mut child = self.built.get(node as usize)?.first_child;
+        while let Some(entry) = self.built.get(child as usize) {
+            if entry.name == name {
+                return Some(child);
+            }
+            child = entry.next_sibling;
+        }
+        None
+    }
+
+    /// The index in `sorted_fields` of the entry named `name` among those
+    /// in `base..end`, which are sorted by name, if there is one.
+    fn sorted_at(&self, (base, end): (usize, usize), name: Name) -> Option<usize> {
+        self.sorted_fields
+            .get(base..end)
+            .unwrap_or_default()
+            .binary_search_by_key(&name, |&(name, _, _)| name)
+            .ok()
+            .map(|offset| base + offset)
+    }
+
+    /// Infers the declared field `sorted_fields[at]`, written as one of
+    /// `written`, which the record the body returns defines as
+    /// `definition`, and records its inferred type there (see
+    /// [`Checker::inferred`]): a value defined whole as it is once every
+    /// await marked for fitting it to the field's declared type has run
+    /// (see [`Checker::value_of`]), whether it is a field's or the leaf's
+    /// of a dotted path, which is checked against the declared type at its
+    /// path as a field's value is against its field's; and a record dotted
+    /// paths build as present, its fields inferred in turn.
+    fn infer_field(&mut self, written: &[FieldTy], at: usize, definition: Definition) {
+        let Some(&(_, index, declared)) = self.sorted_fields.get(at) else {
+            return;
+        };
+        let Some(field) = written.get(index as usize) else {
+            return;
+        };
+        let found = match definition {
+            Definition::Whole(value) => self.value_of(value, declared),
+            Definition::Dotted(node) => BodyValue::Open(node),
+        };
+        let ty = self.inferred(field.ty, declared, found);
+        if let Some(entry) = self.sorted_fields.get_mut(at) {
+            entry.2 = ty;
+        }
     }
 
     /// What the expression `expr`, checked where a value of type `expected`
@@ -10364,13 +10602,28 @@ mod tests {
     fn dotted_fields_build_a_record_that_may_be_a_future() {
         // The record a dotted field builds is present, which the either
         // shape of a record type, as an impure function's bare result is at
-        // every level, accepts. An open field's type is not inferred.
+        // every level, accepts. An open field's type is inferred (see
+        // `dotted_fields_in_an_inferred_result`).
         let text = "fn n(c: Int) -> {a: {b: Int, d: Int}} { a.b = c; a.d = 2 }\nn(lazy 4).a.d";
         assert!(warnings(text).is_empty());
-        assert_eq!(shown_result(text), "Int | Future<Int>");
+        assert_eq!(shown_result(text), "Int");
         assert_eq!(
             shown_result("fn n() -> {a: {b: {c: Int}}} { a.b.c = 1 }\nn().a.b.c"),
-            "Int | Future<Int>"
+            "Int"
+        );
+        // A segment defined whole there cannot be extended, as anywhere.
+        for whole in ["{ c = 1 }", "lazy { c = 1 }"] {
+            let text = format!("fn n() -> {{a: {{b: {{c: Int}}}}}} {{ a.b = {whole}; a.b.d = 2 }}");
+            assert_eq!(
+                messages(&text),
+                vec!["field `a.b` is already defined"],
+                "{text}"
+            );
+        }
+        // A rebind that is rejected does not go on to report its path.
+        assert_eq!(
+            messages("let r = lazy { a = 1 }\nlet g = fn(): Int { r.a := 2\n1 }"),
+            vec!["cannot rebind `r` here: it is declared in an enclosing block"]
         );
         // Written as the either shape, in an annotation too.
         assert_eq!(
@@ -10393,6 +10646,82 @@ mod tests {
         // A leaf written present is awaited.
         let text = "fn n() -> {a: {b: Present<Int>}} { let x = lazy 1\na.b = x }";
         assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn dotted_fields_in_an_inferred_result() {
+        // A field built by dotted paths is a present record, inferred as a
+        // field defined whole is.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: Int}} { a.b = 1 }\nn()"),
+            "{a: {b: Int}}"
+        );
+        assert_eq!(
+            shown_result("fn w() -> {a: {b: Int}} { a = { b = 1 } }\nw()"),
+            "{a: {b: Int}}"
+        );
+        assert_eq!(
+            shown_result("fn m(c: Int) -> {a: {b: Int, d: Int}} { a.b = c; a.d = 2 }\nm"),
+            "fn(c: Int | Future<Int>) -> {a: {b: Int | Future<Int>, d: Int}}"
+        );
+        // Three levels, and a segment extended by several paths.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: {c: Int}}} { a.b.c = 1 }\nn"),
+            "fn() -> {a: {b: {c: Int}}}"
+        );
+        assert_eq!(
+            shown_result(
+                "fn n() -> {a: {b: {c: Int, d: Int}, e: Int}} { a.b.c = lazy 1; a.e = 2; a.b.d = 3 }\nn"
+            ),
+            "fn() -> {a: {b: {c: Future<Int>, d: Int}, e: Int}}"
+        );
+        // Whole and dotted fields in one block.
+        assert_eq!(
+            shown_result(
+                "fn n() -> {x: Int, a: {b: Int, c: {d: Int}}, y: {z: Int}} {\n\
+                 \x20 x = 1; a.b = 2; y = { z = lazy 3 }; a.c.d = lazy 4\n\
+                 }\nn"
+            ),
+            "fn() -> {a: {b: Int, c: {d: Future<Int>}}, x: Int, y: {z: Future<Int>}}"
+        );
+        // A leaf that is a future.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: Int}} { a.b = lazy 1 }\nn"),
+            "fn() -> {a: {b: Future<Int>}}"
+        );
+        // A leaf that is a record block, checked field by field.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: {c: Int}}} { a.b = { c = lazy 1 } }\nn"),
+            "fn() -> {a: {b: {c: Future<Int>}}}"
+        );
+        // A leaf written present, given a future, is awaited, and stays as
+        // written.
+        let text = "fn n() -> {a: {b: Present<Int>}} { let x = lazy 1\na.b = x }\nn";
+        assert_eq!(shown_result(text), "fn() -> {a: {b: Int}}");
+        assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+        // A dotted field under an explicit either record type is kept as
+        // written.
+        assert_eq!(
+            shown_result("fn n() -> {a: {b: Int} | Future<{b: Int}>} { a.b = 1 }\nn"),
+            "fn() -> {a: {b: Int} | Future<{b: Int}>}"
+        );
+        // A dotted field, or a segment of one, the declared type lacks plays
+        // no part, and is warned about as before.
+        let text = "fn n() -> {a: {b: Int}} { a.b = 1; a.c = lazy 2; q.r = lazy 3 }\nn";
+        assert_eq!(shown_result(text), "fn() -> {a: {b: Int}}");
+        let found: Vec<String> = warnings(text).into_iter().map(|w| w.message).collect();
+        assert_eq!(
+            found,
+            vec![
+                "field `c` is not in `{b: Int | Future<Int>}`",
+                "field `q` is not in `{a: {b: Int | Future<Int>} | Future<{b: Int | Future<Int>}>}`"
+            ]
+        );
+        // A memoised function's result, in the same way.
+        assert_eq!(
+            shown_result("fn n(x: Int) ->> {a: {b: Int, c: Int}} { a.b = x; a.c = lazy x }\nn"),
+            "fn(x: Int) ->> {a: {b: Int, c: Future<Int>}}"
+        );
     }
 
     #[test]
@@ -10625,10 +10954,14 @@ mod tests {
         let text = "fn f(r: {a: Future<{b: Int}>}): Int { let r.a.b = 2\nr.a.b }";
         assert_implicit_await_error(text, at(text, "r.a"), "Future<{b: Int}>");
         assert_eq!(demands(text, 0), vec![Some("r")]);
-        // A record a pure closure captures, with the usual note: a path is
-        // not an expression.
+        // A record a pure closure captures, that can be awaited before the
+        // closure is created: see
+        // `the_variable_a_dotted_update_reads_gets_the_capture_hint`.
         let text = "let r = lazy { a = 1 }\nlet g = fn(): {a: Int} { let r.a = 2\nr }";
-        assert_implicit_await_error(text, first_bytes(last(text, "r.a"), 1), "Future<{a: Int}>");
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].span, first_bytes(last(text, "r.a"), 1));
+        assert_eq!(found[0].notes, vec![capture_note("r")]);
     }
 
     #[test]
@@ -10682,15 +11015,35 @@ mod tests {
             messages("let r = lazy 1\nlet r.a = 2"),
             vec!["cannot update `r.a`: `r` is `Future<Int>`, not a record"]
         );
-        // In a pure function, the await is an error too, before the rule
-        // that the record must be one applies.
-        assert_eq!(
-            messages("fn f(r: {a: Future<Int>}): Int { let r.a.b = 1\n1 }"),
-            vec![
-                "cannot use a value that may be a future in a pure function",
+        // In a pure function too, alone: the update cannot work whether or
+        // not the value is awaited, so the await is not reported.
+        for update in ["let r.a.b = 1", "r.a.b := 1"] {
+            let text = format!("fn f(r: {{a: Future<Int>}}): Int {{ {update}\n1 }}");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(
+                found[0].message,
                 "cannot update `r.a.b`: `r.a` is `Future<Int>`, not a record"
-            ]
+            );
+            assert_eq!(found[0].span, at(&text, "r.a.b"));
+            assert_eq!(
+                labels(&found[0]),
+                vec![(
+                    first_bytes(at(&text, "r.a.b"), 1),
+                    "this is {a: Future<Int>}"
+                )]
+            );
+        }
+        // The variable itself, too.
+        assert_eq!(
+            messages("fn f(r: Future<Int>): Int { let r.a = 1\n1 }"),
+            vec!["cannot update `r.a`: `r` is `Future<Int>`, not a record"]
         );
+        // A record that may be a future is still reported, once.
+        for update in ["let r.a.b = 1", "r.a.b := 1"] {
+            let text = format!("fn f(r: {{a: Future<{{b: Int}}>}}): Int {{ {update}\n1 }}");
+            assert_implicit_await_error(&text, at(&text, "r.a"), "Future<{b: Int}>");
+        }
         // `:=` still adds no field to a record that may be a future.
         let text = "let r = lazy { a = 1 }\nr.b := 2";
         let found = diagnostics(text);
@@ -10803,6 +11156,36 @@ mod tests {
             "fn f(): Int { let n = lazy 1\nn + 1 }",
             // A block whose result is a variable of its own.
             "fn f(): Int { let n = lazy 1\n= n }",
+        ] {
+            assert_eq!(
+                implicit_await_notes(text),
+                vec![IMPLICIT_AWAIT_NOTE],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_variable_a_dotted_update_reads_gets_the_capture_hint() {
+        // The variable itself, a capture that can be awaited outside, by the
+        // same conditions as for an expression.
+        let text = "let r = lazy { a = 1 }\nlet g = fn(): {a: Int} { let r.a = 2\nr }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("r")]);
+        let found = diagnostics(text);
+        assert_eq!(found[0].span, first_bytes(last(text, "r.a"), 1));
+        assert_eq!(found[0].label.as_deref(), Some("this is Future<{a: Int}>"));
+        // From an impure function, with nothing between.
+        let text = "fn f(r: Future<{a: Int}>) -> fn(): Int { fn(): Int { let r.a = 2\n1 } }";
+        assert_eq!(implicit_await_notes(text), vec![capture_note("r")]);
+        for text in [
+            // A record further along the path.
+            "let r = { a = lazy { b = 1 } }\nlet g = fn(): Int { let r.a.b = 2\n1 }",
+            // A capture whose home is pure, reached through pure functions
+            // only.
+            "fn f(r: Future<{a: Int}>): fn(): Int { fn(): Int { let r.a = 2\n1 } }",
+            // The function's own parameter.
+            "fn f(r: Future<{a: Int}>): Int { let r.a = 2\n1 }",
+            "fn f(r: Future<{a: Int}>): Int { r.a := 2\n1 }",
         ] {
             assert_eq!(
                 implicit_await_notes(text),

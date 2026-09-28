@@ -1408,6 +1408,56 @@ fn an_impure_functions_inferred_result_is_what_it_returns() {
 }
 
 #[test]
+fn dotted_fields_are_read_back_through_an_inferred_result() {
+    let n = "fn n() -> {a: {b: Int}} { a.b = 1 }\n";
+    assert_eq!(show(&format!("{n}n()")), "{a = {b = 1}} : {a: {b: Int}}");
+    // Present, so reading it awaits nothing; a leaf that is a future is
+    // awaited.
+    let f = "fn f() -> {a: {b: Int, c: Int}} { a.b = lazy 5; a.c = 1 }\n";
+    for (text, awaits, expected) in [
+        (format!("{n}n().a.b + 1"), false, 2),
+        (format!("{f}f().a.b + 1"), true, 6),
+    ] {
+        let file = source(&text);
+        let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
+        let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
+        let mut types = TypeTable::new();
+        let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+        let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+        let printed = ir.pretty(ast.names()).to_string();
+        assert_eq!(printed.contains("await"), awaits, "{text}: {printed}");
+        assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Int(expected));
+    }
+    // A leaf that may be a future, and one that is present.
+    let m = "fn m(c: Int) -> {a: {b: Int, d: Int}} { a.b = c; a.d = 2 }\n";
+    assert_eq!(
+        run(&format!("{m}m(lazy 4).a.b + m(3).a.d")).unwrap(),
+        Value::Int(6)
+    );
+    // A leaf that is a future, read with and without `await`.
+    let f = format!("{f}let r = f()\n");
+    assert_eq!(run(&format!("{f}await r.a.b")).unwrap(), Value::Int(5));
+    assert_eq!(run(&format!("{f}r.a.b + r.a.c")).unwrap(), Value::Int(6));
+    assert_eq!(
+        run(&format!("{f}let x: Int = r.a.b\nx")).unwrap(),
+        Value::Int(5)
+    );
+    // A leaf written present, given a future, is awaited where it is set.
+    assert_eq!(
+        run("fn p() -> {a: {b: Present<Int>}} { let x = lazy 7\na.b = x }\np().a.b + 1").unwrap(),
+        Value::Int(8)
+    );
+    // Three levels, whole and dotted fields together, in a memoised
+    // function.
+    let g = "fn g(x: Int) ->> {a: {b: {c: Int}, d: Int}, e: Int} { a.b.c = x + 1; e = 3; a.d = lazy x }\n";
+    assert_eq!(show(&format!("{g}g(1).a.b")), "{c = 2} : {c: Int}");
+    assert_eq!(
+        run(&format!("{g}g(1).a.b.c * g(1).e + g(1).a.d")).unwrap(),
+        Value::Int(7)
+    );
+}
+
+#[test]
 fn an_inferred_result_is_kept_by_a_session() {
     let mut session = Session::new();
     session.eval(&source(GET)).unwrap();
