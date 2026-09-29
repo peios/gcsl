@@ -65,13 +65,14 @@ pub use value::{Value, ValueKind};
 
 /// The deepest nesting accepted, measured as the height of the syntax tree:
 /// a leaf is one level, and every operator (`await` included), parenthesis,
-/// ascription, field access, block, `if`, interpolated string, function
-/// expression, `lazy`, call, list literal and index adds one to its tallest
-/// child (a block's children being its items' expressions and annotated
-/// types, an ascription's its expression and type, a function's its
-/// parameter types, return type and body, a `lazy`'s its operand, a call's
-/// its callee and arguments, a list literal's its elements' expressions,
-/// spread or not, and an index's its list and its position). A type written
+/// ascription, field access, block, `if`, `for`, interpolated string,
+/// function expression, `lazy`, call, list literal and index adds one to
+/// its tallest child (a block's children being its items' expressions and
+/// annotated types, an ascription's its expression and type, a function's
+/// its parameter types, return type and body, a `lazy`'s its operand, a
+/// call's its callee and arguments, a list literal's its elements'
+/// expressions, spread or not, an index's its list and its position, and a
+/// `for`'s its iterable, its guard and its body). A type written
 /// as a name is one level, a record type one
 /// more than its tallest field's type, a function type one more than the
 /// tallest of its parameter and return types, an applied type such as
@@ -99,7 +100,9 @@ pub use value::{Value, ValueKind};
 /// GCSL does not eliminate tail calls. There, a level is a node of the IR:
 /// every node on the path from a frame's body to the node being evaluated
 /// is one level, and each call in progress costs [`CALL_LEVELS`] more on
-/// top of the nesting around it. A call is made only if the nesting it
+/// top of the nesting around it. The iterations of a `for` do not nest:
+/// its body is one level below it, as an `if`'s branch is, however many
+/// times it runs. A call is made only if the nesting it
 /// would reach, the whole height of its callee's body included, stays
 /// within this budget; otherwise it fails with "call nested too deeply".
 /// An await that runs a future's body is charged as a call of a

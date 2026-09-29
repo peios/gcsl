@@ -573,6 +573,49 @@ fn every_stage_handles_maximum_depth() {
     });
 }
 
+/// `for`s nest as deeply as the parser allows, through every stage, the
+/// printers included: in each other's bodies, two levels each, as blocks
+/// are, where evaluation recurses through each one's loop into its body;
+/// and in each other's iterables, one level each.
+#[test]
+fn every_stage_handles_maximum_for_depth() {
+    on_recommended_stack(|| {
+        let depth = gcsl::MAX_DEPTH;
+        let bodies = (depth - 1) / 2;
+        let in_bodies = source(&format!(
+            "{}1{}",
+            "for x in [1] { ".repeat(bodies),
+            " }".repeat(bodies)
+        ));
+        let in_bodies_value = (0..bodies).fold(Value::Int(1), |inner, _| {
+            Value::List(gcsl::value::List::from_vec(vec![inner]))
+        });
+        // N `for`s nested in each other's iterables are N + 2 levels, the
+        // innermost being one above its body.
+        let in_iterables = source(&format!(
+            "{}[1]{}",
+            "for x in ".repeat(depth - 2),
+            " { x }".repeat(depth - 2)
+        ));
+        let in_iterables_value = Value::List(gcsl::value::List::from_vec(vec![Value::Int(1)]));
+        for (file, expected) in [
+            (&in_bodies, in_bodies_value),
+            (&in_iterables, in_iterables_value),
+        ] {
+            let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+            assert_eq!(gcsl::eval::eval(&ir).unwrap(), expected);
+            let annotation = checked.types.annotation(&types, ast.names());
+            assert!(!ast.pretty().to_string().is_empty());
+            assert!(!ast.pretty_with(&annotation).to_string().is_empty());
+            assert!(!ir.pretty(ast.names()).to_string().is_empty());
+        }
+    });
+}
+
 /// Records nest as deeply as the parser allows, through every stage: as
 /// record blocks, as chains of field accesses on them, and as record types.
 #[test]
@@ -749,6 +792,19 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
             format!("x{}", "[0]".repeat(200_000)),
             format!("{}0{}", "x[".repeat(200_000), "]".repeat(200_000)),
             format!("let x: Int{} = 1", "[]".repeat(200_000)),
+            // `for`s, in their bodies, iterables and guards, and ranges.
+            format!(
+                "{}1{}",
+                "for x in xs { ".repeat(200_000),
+                " }".repeat(200_000)
+            ),
+            format!("{}xs{}", "for x in ".repeat(200_000), " {}".repeat(200_000)),
+            format!(
+                "{}g{}",
+                "for x in xs if ".repeat(200_000),
+                " {}".repeat(200_000)
+            ),
+            format!("{}0{}", "(0..".repeat(200_000), ")".repeat(200_000)),
         ] {
             let diagnostics = run(&text).unwrap_err();
             assert_eq!(diagnostics[0].message, "expression nested too deeply");
@@ -814,6 +870,78 @@ fn wrap_in_lists(inner: &str) -> String {
     )
 }
 
+/// `inner` wrapped in `WRAP` levels of `for`s: each `for` over a list of
+/// one element, its body and the index reading its one value back are
+/// three levels.
+fn wrap_in_fors(inner: &str) -> String {
+    format!(
+        "{}{inner}{}",
+        "for v in [1] { ".repeat(WRAP / 3),
+        " }[0]".repeat(WRAP / 3)
+    )
+}
+
+/// The costly kinds of nesting that
+/// `the_nesting_budget_fits_the_stack_for_every_kind_of_nesting` wraps each
+/// recursive call in.
+fn nesting_kinds() -> [Nesting; 7] {
+    [
+        Nesting {
+            name: "additions",
+            ret: "Int",
+            wrap: |inner| format!("{inner}{}", " + 1".repeat(WRAP)),
+            // `f(0)` is `-1 + WRAP`, and each call adds `WRAP`.
+            value: |calls| Value::Int(calls * i64::try_from(WRAP).unwrap() - 1),
+        },
+        Nesting {
+            name: "negations",
+            ret: "Int",
+            wrap: |inner| format!("{}{inner}{}", "-(".repeat(WRAP), ")".repeat(WRAP)),
+            // An even number of negations.
+            value: |_| Value::Int(-1),
+        },
+        Nesting {
+            name: "interpolated strings",
+            ret: "String",
+            wrap: |inner| format!("{}{inner}{}", "\"{".repeat(WRAP), "}\"".repeat(WRAP)),
+            value: |_| Value::Str("-1".into()),
+        },
+        Nesting {
+            name: "nested blocks",
+            ret: "Int",
+            wrap: |inner| format!("{}{inner}{}", "{ ".repeat(WRAP), " }".repeat(WRAP)),
+            value: |_| Value::Int(-1),
+        },
+        Nesting {
+            name: "blocks with a declaration each",
+            ret: "Int",
+            // Half the levels are blocks, and half additions of the
+            // variables they declare.
+            wrap: |inner| {
+                format!(
+                    "{}{inner}{}{}",
+                    "{ let v = 1\n".repeat(WRAP / 2),
+                    " + v".repeat(WRAP / 2),
+                    "\n}".repeat(WRAP / 2)
+                )
+            },
+            value: |calls| Value::Int(calls * i64::try_from(WRAP / 2).unwrap() - 1),
+        },
+        Nesting {
+            name: "list literals and indexes",
+            ret: "Int",
+            wrap: wrap_in_lists,
+            value: |_| Value::Int(-1),
+        },
+        Nesting {
+            name: "fors",
+            ret: "Int",
+            wrap: wrap_in_fors,
+            value: |_| Value::Int(-1),
+        },
+    ]
+}
+
 /// `STACK_SIZE` covers the nesting budget, unoptimised, whatever kind of
 /// nesting the calls are made from: for each costly kind, a recursion whose
 /// recursive call is wrapped in that nesting, and whose deepest frame is as
@@ -822,55 +950,7 @@ fn wrap_in_lists(inner: &str) -> String {
 #[test]
 fn the_nesting_budget_fits_the_stack_for_every_kind_of_nesting() {
     on_recommended_stack(|| {
-        let kinds = [
-            Nesting {
-                name: "additions",
-                ret: "Int",
-                wrap: |inner| format!("{inner}{}", " + 1".repeat(WRAP)),
-                // `f(0)` is `-1 + WRAP`, and each call adds `WRAP`.
-                value: |calls| Value::Int(calls * i64::try_from(WRAP).unwrap() - 1),
-            },
-            Nesting {
-                name: "negations",
-                ret: "Int",
-                wrap: |inner| format!("{}{inner}{}", "-(".repeat(WRAP), ")".repeat(WRAP)),
-                // An even number of negations.
-                value: |_| Value::Int(-1),
-            },
-            Nesting {
-                name: "interpolated strings",
-                ret: "String",
-                wrap: |inner| format!("{}{inner}{}", "\"{".repeat(WRAP), "}\"".repeat(WRAP)),
-                value: |_| Value::Str("-1".into()),
-            },
-            Nesting {
-                name: "nested blocks",
-                ret: "Int",
-                wrap: |inner| format!("{}{inner}{}", "{ ".repeat(WRAP), " }".repeat(WRAP)),
-                value: |_| Value::Int(-1),
-            },
-            Nesting {
-                name: "blocks with a declaration each",
-                ret: "Int",
-                // Half the levels are blocks, and half additions of the
-                // variables they declare.
-                wrap: |inner| {
-                    format!(
-                        "{}{inner}{}{}",
-                        "{ let v = 1\n".repeat(WRAP / 2),
-                        " + v".repeat(WRAP / 2),
-                        "\n}".repeat(WRAP / 2)
-                    )
-                },
-                value: |calls| Value::Int(calls * i64::try_from(WRAP / 2).unwrap() - 1),
-            },
-            Nesting {
-                name: "list literals and indexes",
-                ret: "Int",
-                wrap: wrap_in_lists,
-                value: |_| Value::Int(-1),
-            },
-        ];
+        let kinds = nesting_kinds();
         // In the function's body, the block (0), the `if` (1) and the
         // branch's block (2) are around the wrapping, so the recursive call
         // is at depth `WRAP + 3`, and it is as tall as its argument, its
@@ -1745,6 +1825,109 @@ fn an_index_out_of_range_renders_exactly() {
          \x20 |\n\
          1 | [1][-1]\n\
          \x20 | ^^^^^^^ the index is -1\n"
+    );
+}
+
+#[test]
+fn programs_with_fors_and_ranges() {
+    let cases = [
+        ("0..5", "[0, 1, 2, 3, 4] : List<Int>"),
+        ("0..=2", "[0, 1, 2] : List<Int>"),
+        (
+            "let xs = [1, 2, 3]\nfor x in xs { x * 2 }",
+            "[2, 4, 6] : List<Int>",
+        ),
+        (
+            "let xs = [1, 2, 3, 4]\nfor x in xs if x % 2 == 0 { x }",
+            "[2, 4] : List<Int>",
+        ),
+        (
+            "for i in 0..10 if i > 6 { i * i }",
+            "[49, 64, 81] : List<Int>",
+        ),
+        (
+            "for x in [1, 2] { name = \"s{x}\"; port = 8000 + x }",
+            "[{name = \"s1\"; port = 8001}, {name = \"s2\"; port = 8002}] : List<{name: String, \
+             port: Int}>",
+        ),
+        (
+            "let ys: Float[] = for x in [1, 2] { 1 }\nys",
+            "[1.0, 1.0] : List<Float>",
+        ),
+        (
+            "for x in [1, 2] { lazy x }",
+            "[Future<Int>, Future<Int>] : List<Future<Int>>",
+        ),
+        (
+            "let fs = for x in 1..=3 { fn(y: Int): Int { x * y } }\nfor f in fs { f(10) }",
+            "[10, 20, 30] : List<Int>",
+        ),
+        (
+            "fn evens(n: Int): Int[] { for i in 0..n if i % 2 == 0 { i } }\nevens(7)",
+            "[0, 2, 4, 6] : List<Int>",
+        ),
+        (
+            "fn run(n: Int) -> {} { }\nlet steps = [1, 2]\n\
+             for s in steps { lazy run(s) }\nlen(steps)",
+            "2 : Int",
+        ),
+        (
+            "let grid = for y in 0..2 { for x in 0..3 { x + y * 3 } }\ngrid[1]",
+            "[3, 4, 5] : List<Int>",
+        ),
+        ("len(for i in 0..20000000 if i == 0 { i })", "1 : Int"),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn range_and_for_errors_render_exactly() {
+    assert_eq!(
+        rendered("let big = 0..=20000000\n"),
+        "error: range too large\n\
+         \x20--> calc.gcsl:1:11\n\
+         \x20 |\n\
+         1 | let big = 0..=20000000\n\
+         \x20 |           ^^^^^^^^^^^^ this range has 20000001 elements\n\
+         \x20 |\n\
+         \x20 = note: a range used as a list holds every element; the limit is 16777216. A \
+         `for` over a range directly has no limit\n"
+    );
+    assert_eq!(
+        rendered("let n = 5\nfor x in n { x }\n"),
+        "error: cannot iterate over a value of type Int: it is not a list\n\
+         \x20--> calc.gcsl:2:10\n\
+         \x20 |\n\
+         2 | for x in n { x }\n\
+         \x20 |          ^ this is Int\n"
+    );
+    assert_eq!(
+        rendered("let xs = [1]\nlet r = xs..3\n"),
+        "error: a range's bounds must be Int, found `List<Int>`\n\
+         \x20--> calc.gcsl:2:9\n\
+         \x20 |\n\
+         2 | let r = xs..3\n\
+         \x20 |         ^^ this is List<Int>\n"
+    );
+    assert_eq!(
+        rendered("0..1..2\n"),
+        "error: `..` cannot be chained\n\
+         \x20--> calc.gcsl:1:5\n\
+         \x20 |\n\
+         1 | 0..1..2\n\
+         \x20 |     ^^\n"
+    );
+    assert_eq!(
+        rendered("[1]\n2\n"),
+        "error: unused value of type `List<Int>`\n\
+         \x20--> calc.gcsl:1:1\n\
+         \x20 |\n\
+         1 | [1]\n\
+         \x20 | ^^^\n\
+         \x20 |\n\
+         \x20 = note: make it the block's result with `= ...`, bind it with `let`, or remove it\n"
     );
 }
 

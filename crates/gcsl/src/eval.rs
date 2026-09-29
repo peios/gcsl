@@ -59,6 +59,36 @@
 //! with the position and the list's length, for a position outside the
 //! list, a negative one included; nothing wraps around from the end.
 //!
+//! A `Range`, inclusive or not, used as a value evaluates its bounds,
+//! left to right, and builds the list of its integers in one allocation,
+//! sized exactly and filled in place; the empty range, one whose left bound
+//! is not below its right one (or, inclusive, is above it), allocates
+//! nothing. Its length is computed in 128 bits, so that no pair of bounds
+//! overflows it, `i64::MIN..=i64::MAX` included, and a range of more than
+//! [`MAX_RANGE_LEN`] integers fails with "range too large" at the range,
+//! labelled with its length, rather than allocate its list.
+//!
+//! A `For` is evaluated by a helper, `Evaluator::for_loop`, which the
+//! walkers only call: it evaluates the iterable once, and for each element
+//! in order writes it to the variable's slot of the current frame, then
+//! evaluates the guard, if there is one, and if that is true or absent the
+//! body, each through its walker, so an error stops the loop and is
+//! reported as any error in the body is. Every iteration evaluates the body
+//! from the `for`, at the same depth, so iterations do not nest, and the
+//! nesting budget, charged statically by the body's height, is charged for
+//! one. A closure or a `lazy` the body makes reads the slot when it is
+//! made, so it captures that iteration's element. A collecting `for`
+//! gathers the body's values in a vector, sized up front to the number of
+//! elements when there is no guard to skip some (at most
+//! [`MAX_RANGE_LEN`]), and copies them into the list's allocation, in time
+//! linear in its length; one that discards them, a statement whose value
+//! nothing would hold, drops each as it comes and is `{}`. A `for` whose
+//! iterable is directly a range (the parentheses around it are gone by
+//! then) does not build the range's list: it evaluates the bounds and
+//! counts from one to the other, the last included for `..=`, stopping at
+//! the last rather than stepping past it, so that counting up to
+//! `i64::MAX` never overflows; so it has no limit on the range's length.
+//!
 //! An `UpdateField` builds a new record and never changes the old one. It
 //! clones the old record's values into a new boxed slice, one allocation,
 //! with the updated field's value replaced or appended. A replacement
@@ -306,6 +336,12 @@ use crate::{CALL_LEVELS, MAX_DEPTH};
 /// on top of its literal pieces' lengths.
 const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 
+/// The most integers a range used as a value may have: a range of more is
+/// the runtime error "range too large", since its list would hold every one
+/// of them. A `for` directly over a range counts its integers without
+/// building the list, and has no limit.
+pub const MAX_RANGE_LEN: usize = 16_777_216;
+
 /// Evaluates `ir` to a value, on a fresh stack.
 ///
 /// # Errors
@@ -313,7 +349,9 @@ const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
 /// "division by zero" for `//` or `%` by zero; at an index's span, "index
-/// out of range" for a position outside its list; and at a call's or an
+/// out of range" for a position outside its list; at a range's span,
+/// "range too large" for a range used as a value of more than
+/// [`MAX_RANGE_LEN`] integers; and at a call's or an
 /// await's span, "call nested too deeply" for a call, or an await running a
 /// future, that would take the program's nesting, calls included, past
 /// [`MAX_DEPTH`] levels (see the module documentation). An error inside a
@@ -402,9 +440,10 @@ struct Evaluator<'a> {
 
 // The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
 // the recursion of evaluation (a list is evaluated through `value`, and
-// `make_list`, `index` and `list` are helpers on its recursion path, which
-// is why they hold little): an expression nested N deep puts about N of
-// their frames on the stack. Each is therefore only a dispatcher. The work
+// `make_list`, `index`, `list` and `for_loop` are helpers on its recursion
+// path, which is why they hold little): an expression nested N deep puts
+// about N of their frames on the stack. Each is therefore only a
+// dispatcher. The work
 // of each operator is in a helper of its own, and every error is returned
 // by a call in tail position, so a walker's frame does not hold the
 // temporaries of every operator; an unoptimised build gives each of those
@@ -445,6 +484,12 @@ impl Evaluator<'_> {
             IrKind::Await { .. } => self.await_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
+            IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
+            IrKind::For {
+                slot,
+                parts,
+                collect,
+            } => self.for_loop((slot, parts, collect), node),
             IrKind::Index { list, index, .. } => self.index((list, index), node),
             IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
             IrKind::IntConst(_)
@@ -1250,6 +1295,102 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Evaluates the range `node` of `operands`, its bounds, left to right,
+    /// to the list of its integers, in order, up to the right bound,
+    /// included if `inclusive`: one allocation, sized exactly and filled in
+    /// place, and none for an empty range. A range of more than
+    /// [`MAX_RANGE_LEN`] integers is "range too large".
+    fn range(
+        &mut self,
+        operands: Operands,
+        inclusive: bool,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let (start, end) = self.ints(operands)?;
+        let len = range_len(start, end, inclusive);
+        let Some(len) = usize::try_from(len)
+            .ok()
+            .filter(|&len| len <= MAX_RANGE_LEN)
+        else {
+            return Err(range_too_large(node, len));
+        };
+        // No integer of the range passes its end, so none overflows.
+        let list = List::from_exact((0..len).map(|offset| {
+            Value::Int(i64::try_from(offset).map_or(end, |offset| start.saturating_add(offset)))
+        }));
+        Ok(Value::List(list))
+    }
+
+    /// Evaluates the `For` `node`, whose variable is in `slot` and whose
+    /// parts are `parts` (see [`IrKind::For`]): its iterable once, and then,
+    /// for each element in order, the element written to the slot, the
+    /// guard, if it has one, and if that is true or absent, the body. If
+    /// `collect`, the body's values are collected, in a vector sized up
+    /// front to the number of elements when there is no guard to skip
+    /// some, and then copied into the list's allocation, so that the whole
+    /// takes time linear in the list's length; otherwise they are dropped
+    /// as they come, and the `for` is `{}`. The first error stops the loop.
+    /// Each iteration evaluates the body afresh at the same depth, so none
+    /// nests in another.
+    fn for_loop(
+        &mut self,
+        (slot, parts, collect): (Slot, IrRange, bool),
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let (iterable, guard, body) = match *self.ir.items(parts) {
+            [iterable, body] => (iterable, None, body),
+            [iterable, guard, body] => (iterable, Some(guard), body),
+            _ => return mistyped(node, "a `for` without its iterable and body"),
+        };
+        let elements = self.elements(iterable)?;
+        let mut values = Vec::new();
+        if collect && guard.is_none() {
+            // A range of any length may be iterated over: no more than this
+            // is reserved up front, and the vector grows past it only as
+            // the body's values come.
+            values.reserve_exact(elements.remaining().min(MAX_RANGE_LEN));
+        }
+        let at = self.base + slot.index();
+        for element in elements {
+            let Some(variable) = self.stack.get_mut(at) else {
+                return Err(internal(
+                    "a `for`'s variable is outside the frame",
+                    node.span,
+                ));
+            };
+            *variable = element;
+            if let Some(guard) = guard
+                && !self.bool(guard)?
+            {
+                continue;
+            }
+            let value = self.value(body)?;
+            if collect {
+                values.push(value);
+            }
+        }
+        Ok(if collect {
+            Value::List(List::from_vec(values))
+        } else {
+            Value::Empty
+        })
+    }
+
+    /// What a `for` whose iterable is `iterable` iterates over: if the
+    /// iterable is directly a range, its integers, from its bounds,
+    /// evaluated left to right, without building its list, so that no
+    /// [`MAX_RANGE_LEN`] applies; otherwise the elements of the list it
+    /// evaluates to.
+    fn elements(&mut self, iterable: IrId) -> Result<Elements, Diagnostic> {
+        match self.ir.get(iterable).kind {
+            IrKind::Range(inclusive, operands) => {
+                let (start, end) = self.ints(operands)?;
+                Ok(Elements::range(start, end, inclusive))
+            }
+            _ => Ok(Elements::List(self.list(iterable)?, 0)),
+        }
+    }
+
     /// Builds a list of the values of `items`, in order, of which some are
     /// `Spread`s, whose lists' elements are put in their places: collected
     /// in a vector, which grows by amortised doubling, so that the whole
@@ -1433,9 +1574,12 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
-            IrKind::MakeList { .. } | IrKind::Spread(_) => {
-                mistyped(node, "list node where an Int was expected")
-            }
+            // A `for` that discards its values is `{}`, but only ever a
+            // statement.
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { .. } => mistyped(node, "list node where an Int was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where an Int was expected")
             }
@@ -1584,9 +1728,10 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a Float was expected")
             }
-            IrKind::MakeList { .. } | IrKind::Spread(_) => {
-                mistyped(node, "list node where a Float was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { .. } => mistyped(node, "list node where a Float was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Float was expected")
             }
@@ -1702,9 +1847,10 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
-            IrKind::MakeList { .. } | IrKind::Spread(_) => {
-                mistyped(node, "list node where a Bool was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { .. } => mistyped(node, "list node where a Bool was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Bool was expected")
             }
@@ -1875,9 +2021,10 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a String was expected")
             }
-            IrKind::MakeList { .. } | IrKind::Spread(_) => {
-                mistyped(node, "list node where a String was expected")
-            }
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { .. } => mistyped(node, "list node where a String was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a String was expected")
             }
@@ -1904,10 +2051,7 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_RECORD),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Empty | Value::Record(_) => Some(value),
-                _ => None,
-            }),
+            IrKind::Await { .. } => self.await_as(node, into_record),
             IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_record),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
@@ -1930,12 +2074,7 @@ impl Evaluator<'_> {
                 self.record(branch)
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Empty | Value::Record(_) => Some(value),
-                    _ => None,
-                })
-            }
+            IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_record),
             IrKind::UpdateField {
                 record,
                 name,
@@ -1975,9 +2114,15 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a record was expected")
             }
-            IrKind::MakeList { .. } | IrKind::Spread(_) => {
-                mistyped(node, "list node where a record was expected")
-            }
+            IrKind::For {
+                slot,
+                parts,
+                collect: false,
+            } => self.for_loop((slot, parts, false), node),
+            IrKind::MakeList { .. }
+            | IrKind::Spread(_)
+            | IrKind::Range(..)
+            | IrKind::For { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a record was expected")
             }
@@ -2721,6 +2866,102 @@ fn out_of_range(node: &IrNode, at: i64, len: usize) -> Diagnostic {
     Diagnostic::error("index out of range", node.span).with_label(facts)
 }
 
+/// The number of integers from `start` up to `end`, `end` included if
+/// `inclusive`: 0 if there are none, and computed without overflow, so
+/// that `i64::MIN..=i64::MAX` has its 2^64.
+fn range_len(start: i64, end: i64, inclusive: bool) -> u128 {
+    let len = i128::from(end) - i128::from(start) + i128::from(inclusive);
+    u128::try_from(len).unwrap_or(0)
+}
+
+/// The error for the range `node`, used as a value, of `len` integers,
+/// more than [`MAX_RANGE_LEN`].
+fn range_too_large(node: &IrNode, len: u128) -> Diagnostic {
+    Diagnostic::error("range too large", node.span)
+        .with_label(format!("this range has {len} elements"))
+        .with_note(format!(
+            "a range used as a list holds every element; the limit is {MAX_RANGE_LEN}. A `for` \
+             over a range directly has no limit"
+        ))
+}
+
+/// What a `for` iterates over, one element at a time.
+#[derive(Debug)]
+enum Elements {
+    /// The elements of a list, from the one at the index.
+    List(List, usize),
+    /// The integers of a range that is never built, from `next` to `last`,
+    /// both included, unless `done`: counted so that reaching
+    /// `i64::MAX` never overflows.
+    Range {
+        /// The next integer.
+        next: i64,
+        /// The last integer.
+        last: i64,
+        /// Whether every integer has been yielded, or there were none.
+        done: bool,
+    },
+}
+
+impl Elements {
+    /// The integers from `start` up to `end`, `end` included if
+    /// `inclusive`; none if there are none.
+    fn range(start: i64, end: i64, inclusive: bool) -> Self {
+        let last = if inclusive {
+            Some(end)
+        } else {
+            end.checked_sub(1)
+        };
+        match last {
+            Some(last) if start <= last => Elements::Range {
+                next: start,
+                last,
+                done: false,
+            },
+            _ => Elements::Range {
+                next: 0,
+                last: 0,
+                done: true,
+            },
+        }
+    }
+
+    /// How many elements are left, or `usize::MAX` if more than that.
+    fn remaining(&self) -> usize {
+        match self {
+            Elements::List(list, at) => list.len().saturating_sub(*at),
+            Elements::Range { done: true, .. } => 0,
+            &Elements::Range { next, last, .. } => {
+                usize::try_from(range_len(next, last, true)).unwrap_or(usize::MAX)
+            }
+        }
+    }
+}
+
+impl Iterator for Elements {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        match self {
+            Elements::List(list, at) => {
+                let value = list.values().get(*at)?.clone();
+                *at += 1;
+                Some(value)
+            }
+            Elements::Range { done: true, .. } => None,
+            Elements::Range { next, last, done } => {
+                let value = *next;
+                if value == *last {
+                    *done = true;
+                } else {
+                    *next = value + 1;
+                }
+                Some(Value::Int(value))
+            }
+        }
+    }
+}
+
 /// The error for the await `node` of a future whose body is running: an
 /// await of the future from inside its own body.
 fn depends_on_itself(node: &IrNode) -> Diagnostic {
@@ -2786,14 +3027,13 @@ fn as_record(value: &Value, node: &IrNode) -> Result<Value, Diagnostic> {
 }
 
 /// `value` if it is a record: what the record walker extracts from an
-/// element read by an index.
+/// element read by an index, an awaited value or a field.
 fn into_record(value: Value) -> Option<Value> {
     match value {
         Value::Empty | Value::Record(_) => Some(value),
         _ => None,
     }
 }
-
 /// A new reference to the closure in `value`, read by the load or capture
 /// read `node`.
 fn as_function(value: &Value, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> {
@@ -4729,7 +4969,7 @@ mod tests {
 
     /// The costly kinds of nesting, as the end-to-end tests list them for
     /// calls.
-    fn await_nesting_kinds() -> [AwaitNesting; 5] {
+    fn await_nesting_kinds() -> [AwaitNesting; 6] {
         [
             (
                 "additions",
@@ -4785,6 +5025,20 @@ mod tests {
                     )
                 },
                 |calls| Value::Int(calls * i64::try_from(AWAIT_WRAP / 2).unwrap() - 1),
+            ),
+            (
+                "fors",
+                "Int",
+                // Each `for`, its body and the index reading its one value
+                // back are three levels.
+                |inner| {
+                    format!(
+                        "{}{inner}{}",
+                        "for v in [1] { ".repeat(AWAIT_WRAP / 3),
+                        " }[0]".repeat(AWAIT_WRAP / 3)
+                    )
+                },
+                |_| Value::Int(-1),
             ),
         ]
     }
@@ -5780,5 +6034,285 @@ mod tests {
             labels(&diagnostic).last(),
             Some(&(Span::new(33, 34), "awaited here"))
         );
+    }
+
+    // ----- Ranges and `for` -----
+
+    /// The span of the first occurrence of `needle` in `text`.
+    fn at(text: &str, needle: &str) -> Span {
+        let start = u32::try_from(text.find(needle).unwrap()).unwrap();
+        Span::new(start, start + u32::try_from(needle.len()).unwrap())
+    }
+
+    #[test]
+    fn ranges_are_lists_of_their_integers() {
+        assert_eq!(shown("0..5"), "[0, 1, 2, 3, 4]");
+        assert_eq!(shown("0..=5"), "[0, 1, 2, 3, 4, 5]");
+        assert_eq!(shown("-3..=-1"), "[-3, -2, -1]");
+        assert_eq!(shown("-2..2"), "[-2, -1, 0, 1]");
+        assert_eq!(shown("4..=4"), "[4]");
+        assert_eq!(shown("0..=0"), "[0]");
+        // Empty, and reversed, which is empty too.
+        for text in ["3..3", "5..2", "5..=4", "0..-1"] {
+            assert_eq!(run(text), Ok(Value::List(List::EMPTY)), "{text}");
+        }
+        // At the ends of `Int`, without overflowing.
+        assert_eq!(
+            shown(&format!("{MAX} - 1..={MAX}")),
+            "[9223372036854775806, 9223372036854775807]"
+        );
+        assert_eq!(shown(&format!("{MAX} - 1..{MAX}")), "[9223372036854775806]");
+        assert_eq!(
+            shown(&format!("{MIN}..{MIN} + 2")),
+            "[-9223372036854775808, -9223372036854775807]"
+        );
+        assert_eq!(shown(&format!("{MIN}..={MIN}")), "[-9223372036854775808]");
+        assert_eq!(run(&format!("{MAX}..{MIN}")), Ok(Value::List(List::EMPTY)));
+        assert_eq!(run(&format!("{MIN}..{MIN}")), Ok(Value::List(List::EMPTY)));
+        // Read as any list is.
+        assert_eq!(int("len(0..100)"), 100);
+        assert_eq!(int("(10..20)[3]"), 13);
+        assert!(boolean("0..3 == [0, 1, 2]"));
+        assert_eq!(shown("[...0..2, ...5..=6]"), "[0, 1, 5, 6]");
+        // Its bounds are evaluated once, left to right.
+        let text = "(1 // 0)..(2 // 0)";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        let text = "let n = lazy 3\n0..n";
+        assert_eq!(shown(text), "[0, 1, 2]");
+    }
+
+    /// The note of the error for a range used as a list that is too long.
+    const RANGE_NOTE: &str = "a range used as a list holds every element; the limit is 16777216. \
+                              A `for` over a range directly has no limit";
+
+    #[test]
+    fn a_range_used_as_a_list_is_limited() {
+        assert_eq!(MAX_RANGE_LEN, 16_777_216);
+        for (text, len) in [
+            ("0..16777217".to_owned(), "16777217"),
+            ("0..=16777216".to_owned(), "16777217"),
+            ("-1..=16777215".to_owned(), "16777217"),
+            (format!("0..{MAX}"), "9223372036854775807"),
+            (format!("{MIN}..{MAX}"), "18446744073709551615"),
+            (format!("{MIN}..={MAX}"), "18446744073709551616"),
+        ] {
+            let diagnostic = run(&text).unwrap_err();
+            assert_eq!(diagnostic.message, "range too large", "{text}");
+            // At the whole range.
+            let whole = Span::new(0, u32::try_from(text.len()).unwrap());
+            assert_eq!(diagnostic.span, whole, "{text}");
+            assert_eq!(
+                diagnostic.label.as_deref(),
+                Some(format!("this range has {len} elements").as_str()),
+                "{text}"
+            );
+            assert!(diagnostic.labels.is_empty(), "{text}");
+            assert_eq!(diagnostic.notes, vec![RANGE_NOTE], "{text}");
+        }
+        // Wherever it is used as a value, in a function too.
+        let text = "fn f(n: Int): Int { len(0..n) }\nf(20000000)";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "range too large");
+        assert_eq!(diagnostic.span, at(text, "0..n"));
+        // A range in the iterable that is not directly it is built.
+        let text = "for i in [0..16777217][0] { i }";
+        assert_eq!(
+            error(text),
+            ("range too large".to_owned(), at(text, "0..16777217"))
+        );
+    }
+
+    #[test]
+    fn a_for_collects_its_bodys_values() {
+        for (text, expected) in [
+            ("for x in [1, 2, 3] { x * 2 }", "[2, 4, 6]"),
+            ("for x in [1, 2, 3, 4] if x % 2 == 0 { x }", "[2, 4]"),
+            ("for i in 0..5 { i * i }", "[0, 1, 4, 9, 16]"),
+            ("for i in 0..=4 if i != 2 { i }", "[0, 1, 3, 4]"),
+            ("for x in [\"a\", \"b\"] { \"{x}!\" }", "[\"a!\", \"b!\"]"),
+            ("for x in [1.5] { x * 2.0 }", "[3.0]"),
+            ("for x in [true, false] { not x }", "[false, true]"),
+            ("for x in [1] { a = x; b = x + 1 }", "[{a = 1; b = 2}]"),
+            ("for x in [1, 2] { }", "[{}, {}]"),
+            (
+                "for x in [[1, 2], [3]] { for y in x { y * 10 } }",
+                "[[10, 20], [30]]",
+            ),
+            ("for x in for y in [1, 2] { y + 1 } { x * 2 }", "[4, 6]"),
+            ("for f in [fn(x: Int): Int { x + 1 }] { f(1) }", "[2]"),
+            ("for x in [1, 2] { let y = x * 3\n= y + 1 }", "[4, 7]"),
+            // With lazy elements, the variable is the element as it is.
+            ("for x in [lazy 1, 2] { x + 1 }", "[2, 3]"),
+            // Checked against an expected element type, and awaited each
+            // iteration to fit it.
+            ("let ys: Float[] = for x in [1, 2] { 1 }\nys", "[1.0, 1.0]"),
+            (
+                "let xs = [lazy 1, lazy 2]\nlet ys: List<Present<Int>> = for x in xs { x }\nys",
+                "[1, 2]",
+            ),
+        ] {
+            assert_eq!(shown(text), expected, "{text}");
+        }
+        // Empty: an empty list, a guard that keeps nothing, an empty range.
+        for text in [
+            "for x in []: Int[] { x }",
+            "for x in [1, 2] if false { x }",
+            "for i in 3..0 { i }",
+        ] {
+            assert_eq!(run(text), Ok(Value::List(List::EMPTY)), "{text}");
+        }
+        // Read by every kind of use.
+        assert_eq!(
+            int("len(for x in [1, 2] { x }) + (for x in [5] { x })[0]"),
+            7
+        );
+        assert!(boolean("for x in [1, 2] { x } == [1, 2]"));
+        assert_eq!(string("let ys = for x in [lazy 1] { x }\n\"{ys}\""), "[1]");
+        assert_eq!(shown("[...for x in [1] { x }, 2]"), "[1, 2]");
+    }
+
+    #[test]
+    fn a_for_runs_in_order_and_stops_at_the_first_error() {
+        // The body, element by element: the first that fails is reported.
+        let text = "for f in [fn(): Int { 1 // 0 }, fn(): Int { 2 // 0 }] { f() }";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        let text = "for x in [3, 2, 1, 0] { 6 // (x - 1) }";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        // The iterable first, then each element's guard, then its body.
+        let text = "for x in [1 // 0] { 2 // 0 }";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        let text = "for x in [1, 0] if 1 // x > 0 { 2 // 0 }";
+        let body = at(text, "2 //").start + 2;
+        assert_eq!(
+            error(text),
+            ("division by zero".to_owned(), Span::new(body, body + 2))
+        );
+        // The body only where the guard holds.
+        assert_eq!(shown("for x in [0, 1] if x > 0 { 1 // x }"), "[1]");
+        // The iterable is evaluated once: both elements are the one future
+        // that its single evaluation made.
+        let frame = frame_after("let ys = for x in { let a = lazy 5\n= [a, a] } { x }");
+        let [Value::List(ys)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        let [Value::Future(first), Value::Future(second)] = ys.values() else {
+            panic!("unexpected list {ys:?}");
+        };
+        assert!(Rc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn a_closure_made_in_the_body_captures_that_iterations_element() {
+        assert_eq!(
+            int("let fs = for x in [1, 2, 3] { fn(): Int { x } }\n\
+                 fs[0]() + 10 * fs[1]() + 100 * fs[2]()"),
+            321
+        );
+        assert_eq!(
+            int("let ls = for i in 1..=3 { lazy i * i }\n\
+                 await ls[0] + 10 * await ls[1] + 100 * await ls[2]"),
+            941
+        );
+        assert_eq!(
+            shown(
+                "let fs = for x in [1, 2, 3, 4] if x % 2 == 1 { fn(y: Int): Int { x + y } }\n\
+                 for f in fs { f(10) }"
+            ),
+            "[11, 13]"
+        );
+    }
+
+    #[test]
+    fn a_for_over_a_range_does_not_build_it() {
+        // Past the limit of a range used as a list, directly and in
+        // parentheses.
+        assert_eq!(
+            shown("for i in 0..16777220 if i > 16777217 { i }"),
+            "[16777218, 16777219]"
+        );
+        assert_eq!(shown("for i in (0..=16777217) if i == 3 { i }"), "[3]");
+        // Up to the largest Int, included, without overflowing its count,
+        // and from the smallest.
+        assert_eq!(
+            shown(&format!("for i in {MAX} - 2..={MAX} {{ i - {MAX} }}")),
+            "[-2, -1, 0]"
+        );
+        assert_eq!(
+            shown(&format!("for i in {MAX} - 2..{MAX} {{ i - {MAX} }}")),
+            "[-2, -1]"
+        );
+        assert_eq!(
+            shown(&format!("for i in {MIN}..={MIN} + 1 {{ i - {MIN} }}")),
+            "[0, 1]"
+        );
+        assert_eq!(
+            run(&format!("for i in {MAX}..={MIN} {{ i }}")),
+            Ok(Value::List(List::EMPTY))
+        );
+        // Its bounds are evaluated once, before any element.
+        let text = "for i in 0..(1 // 0) { 2 // 0 }";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        // As a statement, it collects nothing.
+        assert_eq!(int("for i in 0..16777220 { }\n1"), 1);
+    }
+
+    #[test]
+    fn a_unit_like_statement_runs_for_its_effects() {
+        // A `for` whose values are `{}` runs its body, and drops them.
+        assert_eq!(int("for x in [1, 2] { }\n7"), 7);
+        let text = "for x in [1, 0] { let y = 1 // x }\n1";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        // A statement of futures awaits each deeply, once, in order.
+        let frame =
+            frame_after("let a = lazy {}\nlet steps = [a, a, lazy {}]\nfor s in steps { s }\n1");
+        let [Value::Future(a), Value::List(steps), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(a.is_done());
+        assert!(
+            steps
+                .values()
+                .iter()
+                .all(|step| matches!(step, Value::Future(future) if future.is_done()))
+        );
+        let frame =
+            frame_after("let steps = [lazy {}, lazy {}]\nfor s in steps { lazy await s }\n1");
+        let [Value::List(steps), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(
+            steps
+                .values()
+                .iter()
+                .all(|step| matches!(step, Value::Future(future) if future.is_done()))
+        );
+        let text =
+            "let steps = [lazy { let a = 1 }, lazy { let b = 1 // 0 }]\nfor s in steps { s }\n1";
+        assert_eq!(error(text), ("division by zero".to_owned(), at(text, "//")));
+        // Other unit-like lists.
+        assert_eq!(int("[]\n[{}]\n[[{}, {}]]\n3"), 3);
+    }
+
+    #[test]
+    fn iterations_do_not_consume_the_nesting_budget() {
+        on_big_stack(|| {
+            // Far more calls than the budget has levels, one an iteration,
+            // each at the same depth.
+            assert_eq!(
+                int("fn id(x: Int): Int { x }\nlen(for i in 0..20000 { id(i) })"),
+                20000
+            );
+            // A recursion through a `for` in each frame is charged for the
+            // `for`'s body once a call.
+            assert_eq!(
+                int("fn f(n: Int): Int {\n\
+                     \x20 if n == 0 { 0 } else {\n\
+                     \x20   len(for i in 0..3 if i == 0 { f(n - 1) }) + f(n - 1)\n\
+                     \x20 }\n\
+                     }\n\
+                     f(12)"),
+                12
+            );
+        });
     }
 }

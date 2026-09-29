@@ -92,7 +92,18 @@
 //! an `Index` of the element's kind. A call of a built-in function, whose
 //! callee the checker resolved to [`VarRef::Builtin`], lowers to the
 //! built-in's own node, of its arguments as the checker bound them: `len`
-//! to a `ListLen` of its list. Each
+//! to a `ListLen` of its list. A range lowers to a `Range` of its bounds,
+//! flagged if it is inclusive, and a `for` to a `For` on the slot the
+//! checker gave its variable (see [`crate::check::Resolution::for_slot`]),
+//! whose parts are its iterable, its guard, if it has one, and its body,
+//! each as it is used, the body wrapped in an `Await` where the checker
+//! marked it to fit the element type expected of the `for`. A statement,
+//! an expression item that is not its block's result, is `{}` or a
+//! unit-like list (see [`crate::check`]); a `for` statement whose type is
+//! unit-like as it is, through any parentheses, discards its body's values
+//! instead of collecting them, since its list would be dropped as soon as
+//! it was built, and any other list statement is evaluated and dropped.
+//! Each
 //! string literal, and each literal piece of an interpolated string,
 //! becomes a `StrConst` whose text is copied from the AST's string table
 //! into the IR's own, so the AST's table is not needed after lowering. A
@@ -149,7 +160,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ItemId, ItemKind,
+    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForId, ItemId, ItemKind,
     ItemRange, PartRange, PathRange, PathSegment, StrPart, UnaryOp, path_span,
 };
 use crate::check::{AwaitMark, Builtin, Checked, Resolution, Slot, Types, VarRef};
@@ -193,6 +204,7 @@ pub fn lower(
         || resolution.item_len() != ast.item_count()
         || resolution.function_len() != ast.fn_count()
         || resolution.arg_len() != ast.arg_count()
+        || resolution.for_len() != ast.for_count()
     {
         return Err(InternalError {
             message: "resolution does not belong to this AST",
@@ -406,10 +418,16 @@ impl Lowerer<'_> {
                     });
                 }
                 ItemKind::Expr(value) => {
-                    // Evaluated for effect only, so it must be `{}`, unless
-                    // it is a bare `await`, whose value is discarded
-                    // whatever it is.
+                    // Evaluated for effect only, so it must be `{}` or a
+                    // unit-like list, unless it is a bare `await`, whose
+                    // value is discarded whatever it is. A unit-like `for`
+                    // discards its body's values rather than build a list.
                     let statement = if self.is_await(value) {
+                        self.lower_expr(value)?
+                    } else if let Some((for_id, span)) = self.discarded_for(value) {
+                        let kind = self.lower_for(for_id, false)?;
+                        self.builder.alloc(kind, span)
+                    } else if self.kind(value)? == ValueKind::List {
                         self.lower_expr(value)?
                     } else {
                         self.lower_operand(value, ValueKind::Record)?
@@ -809,9 +827,10 @@ impl Lowerer<'_> {
                 kind,
             },
             (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements)?,
-            (ExprKind::List(_), _) => {
+            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true)?,
+            (ExprKind::List(_) | ExprKind::For(_), _) => {
                 return Err(InternalError {
-                    message: "a list literal typed as something other than a list",
+                    message: "a list literal or a `for` typed as something other than a list",
                     span,
                 });
             }
@@ -1045,6 +1064,60 @@ impl Lowerer<'_> {
         Ok(IrKind::MakeList { items, spreads })
     }
 
+    /// Lowers the `for` expression `for_id` to a `For` on its variable's
+    /// slot, whose parts are its iterable, a list, as it is used, its
+    /// guard, if it has one, a `Bool`, and its body, as it is used, which
+    /// may be awaited to fit the element type expected of the `for`. It
+    /// collects the body's values into a list if `collect`, and discards
+    /// them otherwise.
+    fn lower_for(&mut self, for_id: ForId, collect: bool) -> Result<IrKind, InternalError> {
+        let decl = *self.ast.for_decl(for_id);
+        let slot = self.resolution.for_slot(for_id);
+        if slot == Slot::NONE {
+            return Err(InternalError {
+                message: "a `for` has no slot for its variable",
+                span: self.ast.get(decl.body).span,
+            });
+        }
+        let base = self.item_stack.len();
+        let iterable = self.lower_operand(decl.iterable, ValueKind::List)?;
+        self.item_stack.push(iterable);
+        if let Some(guard) = decl.guard {
+            let guard = self.lower_operand(guard, ValueKind::Bool)?;
+            self.item_stack.push(guard);
+        }
+        let body = self.lower_expr(decl.body)?;
+        self.item_stack.push(body);
+        let parts = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(IrKind::For {
+            slot,
+            parts,
+            collect,
+        })
+    }
+
+    /// The `for` expression that the statement `value` is, through any
+    /// parentheses, with its span, if its type is unit-like as it is, so
+    /// that nothing awaits it: its list would be dropped as soon as it was
+    /// built, so it is not built.
+    fn discarded_for(&self, value: ExprId) -> Option<(ForId, Span)> {
+        if self.resolution.await_of(value) != AwaitMark::None
+            || !self.table.is_unit_like(self.expr_types.get(value))
+        {
+            return None;
+        }
+        let mut node = value;
+        loop {
+            let expr = self.ast.get(node);
+            match expr.kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::For(for_id) => return Some((for_id, expr.span)),
+                _ => return None,
+            }
+        }
+    }
+
     /// Lowers the arguments `args` of the call spanning `span` to `Arg`
     /// nodes in source order, each with the parameter the checker bound it
     /// to, and returns their list.
@@ -1144,6 +1217,12 @@ impl Lowerer<'_> {
             (BinaryOp::Mul, ValueKind::Int) => (IrKind::IntMul, ValueKind::Int),
             (BinaryOp::FloorDiv, ValueKind::Int) => (IrKind::IntFloorDiv, ValueKind::Int),
             (BinaryOp::Rem, ValueKind::Int) => (IrKind::IntRem, ValueKind::Int),
+            (BinaryOp::Range, ValueKind::List) => {
+                (|operands| IrKind::Range(false, operands), ValueKind::Int)
+            }
+            (BinaryOp::RangeInclusive, ValueKind::List) => {
+                (|operands| IrKind::Range(true, operands), ValueKind::Int)
+            }
             (BinaryOp::Add, ValueKind::Float) => (IrKind::FloatAdd, ValueKind::Float),
             (BinaryOp::Sub, ValueKind::Float) => (IrKind::FloatSub, ValueKind::Float),
             (BinaryOp::Mul, ValueKind::Float) => (IrKind::FloatMul, ValueKind::Float),
@@ -1456,7 +1535,9 @@ const fn comparison(op: BinaryOp) -> Option<Cmp> {
         | BinaryOp::FloorDiv
         | BinaryOp::Rem
         | BinaryOp::And
-        | BinaryOp::Or => None,
+        | BinaryOp::Or
+        | BinaryOp::Range
+        | BinaryOp::RangeInclusive => None,
     }
 }
 
@@ -3194,5 +3275,197 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ----- Ranges and `for` -----
+
+    #[test]
+    fn a_range_lowers_to_a_list_of_its_bounds() {
+        assert_eq!(
+            dump("-1..=2"),
+            "(block @0..6\n\
+             \x20 (range-inclusive @0..6\n\
+             \x20   (int-neg @0..2\n\
+             \x20     (int 1 @1..2))\n\
+             \x20   (int 2 @5..6)))"
+        );
+        let ir = lower_text("0..2");
+        let range = result_of(&ir);
+        assert_eq!(ir.kind_of(range), ValueKind::List);
+        assert_eq!(ir.get(range).operator_span(), Some(Span::new(1, 3)));
+        let ir = lower_text("0..=2");
+        assert_eq!(
+            ir.get(result_of(&ir)).operator_span(),
+            Some(Span::new(1, 4))
+        );
+        // A bound that may be a future is awaited.
+        let shown = dump("let n = lazy 2\n0..n");
+        assert!(
+            shown.contains(
+                "(range @15..19\n\
+                 \x20   (int 0 @15..16)\n\
+                 \x20   (await @18..19\n\
+                 \x20     (load n#0 @18..19)))"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_for_lowers_to_its_slot_and_parts() {
+        assert_eq!(
+            dump("let xs = [1]\nfor x in xs if x > 0 { x * 2 }"),
+            "(block @0..43\n\
+             \x20 (store xs#0 @0..12\n\
+             \x20   (make-list @9..12\n\
+             \x20     (int 1 @10..11)))\n\
+             \x20 (for x#1 if @13..43\n\
+             \x20   (load xs#0 @22..24)\n\
+             \x20   (int-cmp > @28..33\n\
+             \x20     (load x#1 @28..29)\n\
+             \x20     (int 0 @32..33))\n\
+             \x20   (block @34..43\n\
+             \x20     (int-mul @36..41\n\
+             \x20       (load x#1 @36..37)\n\
+             \x20       (int 2 @40..41)))))"
+        );
+        let ir = lower_text("for x in [1] { x }");
+        let for_node = result_of(&ir);
+        let IrKind::For {
+            slot,
+            parts,
+            collect,
+        } = ir.get(for_node).kind
+        else {
+            panic!("expected a for, got {:?}", ir.get(for_node));
+        };
+        assert_eq!(slot, Slot::new(0));
+        assert_eq!(ir.items(parts).len(), 2);
+        assert!(collect);
+        assert_eq!(ir.kind_of(for_node), ValueKind::List);
+        assert_eq!(ir.get(for_node).operator_span(), None);
+        // The iterable is a range node as it is, through parentheses.
+        let ir = lower_text("for i in (0..3) { i }");
+        let IrKind::For { parts, .. } = ir.get(result_of(&ir)).kind else {
+            panic!("expected a for");
+        };
+        assert!(matches!(
+            ir.get(ir.items(parts)[0]).kind,
+            IrKind::Range(false, _)
+        ));
+        // An iterable that may be a future is awaited once, and an element
+        // is read as it is and awaited where it is used.
+        let shown = dump("let xs = lazy [lazy 1]\nfor x in xs { x + 1 }");
+        assert!(
+            shown.contains(
+                "(for x#1 @23..44\n\
+                 \x20   (await @32..34\n\
+                 \x20     (load xs#0 @32..34))\n\
+                 \x20   (block @35..44\n\
+                 \x20     (int-add @37..42\n\
+                 \x20       (await @37..38\n\
+                 \x20         (load x#1 @37..38))"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_body_awaited_to_fit_is_awaited_in_the_for() {
+        // (The variable's slot is named by `ys`, the last variable stored
+        // in it, as the slot of any variable of a finished block is.)
+        let shown = dump("let xs = [lazy 1]\nlet ys: List<Present<Int>> = for x in xs { x }\nys");
+        assert!(
+            shown.contains(
+                "(for ys#1 @47..64\n\
+                 \x20     (load xs#0 @56..58)\n\
+                 \x20     (await @59..64\n\
+                 \x20       (block @59..64\n\
+                 \x20         (load ys#1 @61..62))))"
+            ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_unit_like_for_statement_builds_no_list() {
+        // As it is: a `for` that discards its body's values and is `{}`.
+        let ir = lower_text("for x in [1] { }\nfor y in [2] { for z in [3] { } }\n1");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        for &item in ir.items(items) {
+            assert!(
+                matches!(ir.get(item).kind, IrKind::For { collect: false, .. }),
+                "{:?}",
+                ir.get(item)
+            );
+            assert_eq!(ir.kind_of(item), ValueKind::Record);
+        }
+        assert_eq!(
+            dump("(for x in [1] { })\n1"),
+            "(block @0..20\n\
+             \x20 (for-each x#0 @1..17\n\
+             \x20   (make-list @10..13\n\
+             \x20     (int 1 @11..12))\n\
+             \x20   (block @14..17\n\
+             \x20     (empty @14..17)))\n\
+             \x20 (int 1 @19..20))"
+        );
+        // Unit-like only once awaited: the list is built and awaited
+        // deeply.
+        let shown = dump("let steps = [lazy {}]\nfor s in steps { s }\n1");
+        assert!(
+            shown.contains(
+                "(await *! @22..42\n\
+                 \x20   (for s#1 @22..42\n"
+            ),
+            "{shown}"
+        );
+        // Any other unit-like statement is evaluated and dropped, as it is.
+        let ir = lower_text("[]\n[{}]\n1");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        for &item in ir.items(items) {
+            assert!(matches!(ir.get(item).kind, IrKind::MakeList { .. }));
+        }
+        // A `for` that is its block's result builds its list.
+        let ir = lower_text("for x in [1] { }");
+        assert!(matches!(
+            ir.get(result_of(&ir)).kind,
+            IrKind::For { collect: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_for_is_one_level_above_its_parts() {
+        let g = "fn g(n: Int): Int { n }\n";
+        // In a function's body: the block (0), the `for` (1), its body (2),
+        // the call (3); and the body's height: the block, the `for`, its
+        // body, the call, its argument, the load.
+        let ir = lower_text(&format!(
+            "{g}fn f(xs: Int[]): Int[] {{ for x in xs {{ g(x) }} }}"
+        ));
+        let f = ir.function(FnId::new(1));
+        assert_eq!(depths(&ir, f.body), vec![3]);
+        assert_eq!(f.height, 6);
+        // In the iterable and the guard: the block (0), the `for` (1), the
+        // list (2) and the guard's call (2).
+        let ir = lower_text(&format!("{g}for x in [g(1)] if g(x) > 0 {{ }}"));
+        assert_eq!(depths(&ir, ir.root()), vec![3, 3]);
+        // Nested, each `for` and its body are a level each.
+        let ir = lower_text(&format!("{g}for x in [1] {{ for y in [2] {{ g(y) }} }}"));
+        assert_eq!(depths(&ir, ir.root()), vec![5]);
+    }
+
+    #[test]
+    fn a_for_without_its_slot_is_an_internal_error() {
+        let ast = parse_text("for x in [1] { x }");
+        let mut types = TypeTable::new();
+        let (mut checked, _) = check(&ast, &mut types).unwrap();
+        checked.resolution.forget_for_slots();
+        let error = lower(&ast, &checked, &types, 0).unwrap_err();
+        assert_eq!(error.message, "a `for` has no slot for its variable");
     }
 }

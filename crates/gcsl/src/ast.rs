@@ -18,7 +18,9 @@
 //! name what a `let`, a field or a `:=` declares, [`Ast::path`], the
 //! parameters of function expressions, [`Ast::params`], the arguments of
 //! calls, [`Ast::args`], the parameters of function types,
-//! [`Ast::param_tys`], and the elements of list literals, [`Ast::elements`].
+//! [`Ast::param_tys`], and the elements of list literals, [`Ast::elements`];
+//! and the details of function expressions and `for` expressions have
+//! arenas of their own (see [Functions](#functions) and [Lists](#lists)).
 //!
 //! # Lists
 //!
@@ -32,6 +34,13 @@
 //! A spread is also an item of a block, `...EXPR`, [`ItemKind::Spread`],
 //! which defines the fields of the record `EXPR` is in the block's record
 //! (see [`crate::check`]).
+//!
+//! A range, `a..b` or `a..=b`, is a binary operator, [`BinaryOp::Range`]
+//! or [`BinaryOp::RangeInclusive`]. A `for` expression, `for x in xs if
+//! GUARD { ... }`, has more to it than fits in an [`Expr`], so its node,
+//! [`ExprKind::For`], holds only a [`ForId`] into an arena of
+//! [`ForDecl`]s, [`Ast::for_decl`]: its variable's name and where it is
+//! written, its iterable, its guard, if any, and its body, a block.
 //!
 //! # Functions
 //!
@@ -173,6 +182,47 @@ impl fmt::Display for FnId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{}", self.0)
     }
+}
+
+/// Index of a `for` expression's [`ForDecl`] in the `for` arena of the
+/// [`Ast`] (or [`AstBuilder`]) that allocated it. Like [`ExprId`], only
+/// meaningful for that arena; later stages index their per-`for` tables by
+/// it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ForId(u32);
+
+impl ForId {
+    /// The `for` numbered `number`. Ids are normally assigned by the
+    /// parser; this is for tests.
+    #[cfg(test)]
+    pub(crate) const fn new(number: u32) -> Self {
+        Self(number)
+    }
+
+    /// The id as an index into the arena and into side tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A `for` expression, `for NAME in ITERABLE BLOCK` or `for NAME in
+/// ITERABLE if GUARD BLOCK`. Held in the [`Ast`]'s `for` arena; the
+/// expression node is an [`ExprKind::For`] with its [`ForId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ForDecl {
+    /// The element variable's name, always an identifier.
+    pub name: Name,
+    /// Where the name is written.
+    pub name_span: Span,
+    /// What is iterated over, a list.
+    pub iterable: ExprId,
+    /// The guard after `if`, if any, which decides whether an element
+    /// contributes.
+    pub guard: Option<ExprId>,
+    /// The body, an [`ExprKind::Block`], whose value each element that
+    /// passes the guard contributes.
+    pub body: ExprId,
 }
 
 /// The parameters of a function expression: a contiguous range of the
@@ -540,6 +590,11 @@ pub enum BinaryOp {
     And,
     /// `a or b`, short-circuiting.
     Or,
+    /// `a..b`, the list of the integers from `a` up to but not including
+    /// `b`.
+    Range,
+    /// `a..=b`, the list of the integers from `a` up to and including `b`.
+    RangeInclusive,
 }
 
 impl BinaryOp {
@@ -565,6 +620,7 @@ impl BinaryOp {
             | BinaryOp::Ge => "compare",
             BinaryOp::And => "and",
             BinaryOp::Or => "or",
+            BinaryOp::Range | BinaryOp::RangeInclusive => "make a range of",
         }
     }
 
@@ -588,7 +644,15 @@ impl BinaryOp {
             BinaryOp::Ge => ">=",
             BinaryOp::And => "and",
             BinaryOp::Or => "or",
+            BinaryOp::Range => "..",
+            BinaryOp::RangeInclusive => "..=",
         }
+    }
+
+    /// Whether this is one of the range operators, `..` and `..=`.
+    #[must_use]
+    pub const fn is_range(self) -> bool {
+        matches!(self, BinaryOp::Range | BinaryOp::RangeInclusive)
     }
 
     /// Whether this is one of the comparison operators, `==`, `!=`, `===`,
@@ -726,6 +790,10 @@ pub enum ExprKind {
         /// The position.
         index: ExprId,
     },
+    /// `for NAME in ITERABLE (if GUARD)? { ... }`: the list of the body's
+    /// values for the elements of the iterable that pass the guard. Its
+    /// details are in the `for` arena (see [`Ast::for_decl`]).
+    For(ForId),
 }
 
 /// One node of the tree.
@@ -741,8 +809,9 @@ pub struct Expr {
     /// `Field` its record expression through its name. A `Fn` covers its
     /// `fn` keyword through its body's `}`, a `Call` its callee through
     /// its `)` or its trailing block's `}`, and a `Lazy` its `lazy` keyword
-    /// through its operand. A `List` covers its brackets, and an `Index` its
-    /// list expression through its `]`.
+    /// through its operand. A `List` covers its brackets, an `Index` its
+    /// list expression through its `]`, and a `For` its `for` keyword
+    /// through its body's `}`.
     pub span: Span,
 }
 
@@ -768,7 +837,8 @@ impl Expr {
             | ExprKind::Call { .. }
             | ExprKind::Lazy(_)
             | ExprKind::List(_)
-            | ExprKind::Index { .. } => None,
+            | ExprKind::Index { .. }
+            | ExprKind::For(_) => None,
         }
     }
 
@@ -806,11 +876,13 @@ impl Expr {
         }
     }
 
-    /// The span of the `if` keyword, for `If` nodes.
+    /// The span of the `if` keyword, for `If` nodes, and of the `for`
+    /// keyword, for `For` nodes.
     #[must_use]
     pub const fn keyword_span(&self) -> Option<Span> {
         match self.kind {
             ExprKind::If { .. } => Some(symbol_span("if", self.span.start)),
+            ExprKind::For(_) => Some(symbol_span("for", self.span.start)),
             _ => None,
         }
     }
@@ -953,6 +1025,7 @@ pub struct AstBuilder {
     args: Vec<Arg>,
     param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
+    fors: Vec<ForDecl>,
 }
 
 impl AstBuilder {
@@ -1063,6 +1136,14 @@ impl AstBuilder {
         id
     }
 
+    /// Adds the `for` expression `decl` to the `for` arena and returns its
+    /// id, which its [`ExprKind::For`] node then carries.
+    pub fn push_for(&mut self, decl: ForDecl) -> ForId {
+        let id = ForId(next_id(self.fors.len()));
+        self.fors.push(decl);
+        id
+    }
+
     /// Appends `params` to the parameter pool as one function's parameters
     /// and returns their range.
     pub fn push_params(&mut self, params: &[Param]) -> ParamRange {
@@ -1155,6 +1236,7 @@ impl AstBuilder {
             args: self.args,
             param_tys: self.param_tys,
             elements: self.elements,
+            fors: self.fors,
             root,
             names,
             strings,
@@ -1178,6 +1260,7 @@ pub struct Ast {
     args: Vec<Arg>,
     param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
+    fors: Vec<ForDecl>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -1276,6 +1359,23 @@ impl Ast {
     #[must_use]
     pub fn fn_count(&self) -> usize {
         self.fns.len()
+    }
+
+    /// Returns the `for` expression `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn for_decl(&self, id: ForId) -> &ForDecl {
+        &self.fors[id.index()]
+    }
+
+    /// The number of `for` expressions in the tree, which bounds every
+    /// [`ForId`] in it: they are `0..for_count()`.
+    #[must_use]
+    pub fn for_count(&self) -> usize {
+        self.fors.len()
     }
 
     /// Returns the parameters of the function expression whose parameters
@@ -1404,7 +1504,8 @@ impl Ast {
     /// parses first down to a leaf: a block's first item's value, an `if`'s
     /// condition, a call's callee, a binary operator's left operand, a
     /// function's or `lazy`'s body, an interpolated string's first
-    /// expression, a list literal's first element's, an index's list.
+    /// expression, a list literal's first element's, an index's list, a
+    /// `for`'s iterable.
     /// Debug builds check that every node of the range lies
     /// within `id`'s span and the node before it starts before `id`.
     pub(crate) fn subtree(&self, id: ExprId) -> impl Iterator<Item = ExprId> + use<> {
@@ -1465,6 +1566,7 @@ impl Ast {
                 | ExprKind::Ascribe { expr: inner, .. } => inner,
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::Call { callee, .. } => callee,
+                ExprKind::For(id) => self.for_decl(id).iterable,
             };
         }
     }
@@ -1538,7 +1640,10 @@ impl Annotate for NoAnnotation {
 /// and an `await` as `(await ...)` followed by its operand. A list literal
 /// prints as `(list ...)` followed by its elements in source order, a
 /// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by
-/// its list and its position. Applied and
+/// its list and its position. A `for` prints as `(for x ...)`, `x` being
+/// its variable, followed by its iterable, its guard as `(guard EXPR)` if
+/// it has one, and its body; a range as its operator, `..` or `..=`, like
+/// any binary operator. Applied and
 /// union types print as written, `Future<Int>`, `Present<Int>` and
 /// `Int | Future<Int>`, a function type that is a member of a union in
 /// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
@@ -1748,6 +1853,27 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// The name of the variable of the `for` expression `id`.
+    fn for_name(&self, id: ForId) -> &str {
+        self.ast.names().get(self.ast.for_decl(id).name)
+    }
+
+    /// Writes the iterable, the guard, as `(guard EXPR)`, if there is one,
+    /// and the body of the `for` expression `id`, each on a line of its own
+    /// at `depth`, with a leading newline.
+    fn for_parts(&self, f: &mut fmt::Formatter<'_>, id: ForId, depth: usize) -> fmt::Result {
+        let decl = self.ast.for_decl(id);
+        f.write_str("\n")?;
+        self.node(f, decl.iterable, depth)?;
+        if let Some(guard) = decl.guard {
+            writeln!(f, "\n{:indent$}(guard", "", indent = depth * 2)?;
+            self.node(f, guard, depth + 1)?;
+            f.write_str(")")?;
+        }
+        f.write_str("\n")?;
+        self.node(f, decl.body, depth)
+    }
+
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
         let expr = self.ast.get(id);
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
@@ -1779,6 +1905,7 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Lazy(_) => f.write_str("lazy")?,
             ExprKind::List(_) => f.write_str("list")?,
             ExprKind::Index { .. } => f.write_str("index")?,
+            ExprKind::For(id) => write!(f, "for {}", self.for_name(id))?,
         }
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
@@ -1820,6 +1947,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.node(f, rhs, depth + 1)?;
             }
             ExprKind::List(elements) => self.elements(f, elements, depth + 1)?,
+            ExprKind::For(id) => self.for_parts(f, id, depth + 1)?,
             ExprKind::If {
                 cond, then, else_, ..
             } => {
@@ -2375,6 +2503,99 @@ mod tests {
              \x20     (int 0 @11..12)))\n\
              \x20 (expr @14..16\n\
              \x20   (list @14..16)))"
+        );
+    }
+
+    #[test]
+    fn ranges_are_binary_operators() {
+        for (op, symbol) in [(BinaryOp::Range, ".."), (BinaryOp::RangeInclusive, "..=")] {
+            assert_eq!(op.symbol(), symbol);
+            assert!(op.is_range());
+            assert!(!op.is_comparison());
+            assert!(!op.is_equality());
+        }
+        assert_eq!(BinaryOp::Range.span_at(4), Span::new(4, 6));
+        assert_eq!(BinaryOp::RangeInclusive.span_at(4), Span::new(4, 7));
+        assert!(!BinaryOp::Add.is_range());
+        assert!(!BinaryOp::Lt.is_range());
+    }
+
+    #[test]
+    fn a_for_is_a_subtree_of_the_pool() {
+        // `for x in 0..3 if g { x }`, built children first as the parser
+        // does.
+        let mut names = Names::new();
+        let (x, g) = (names.intern("x"), names.intern("g"));
+        let mut builder = AstBuilder::new();
+        let zero = leaf(&mut builder, 0, 9);
+        let three = leaf(&mut builder, 3, 12);
+        let range = builder.alloc(Expr {
+            kind: ExprKind::Binary {
+                op: BinaryOp::Range,
+                op_start: 10,
+                lhs: zero,
+                rhs: three,
+            },
+            span: Span::new(9, 13),
+        });
+        let guard = builder.alloc(Expr {
+            kind: ExprKind::Name(g),
+            span: Span::new(17, 18),
+        });
+        let x_use = builder.alloc(Expr {
+            kind: ExprKind::Name(x),
+            span: Span::new(21, 22),
+        });
+        let item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(x_use),
+            span: Span::new(21, 22),
+        });
+        let items = builder.push_item_list(&[item]);
+        let body = builder.alloc(Expr {
+            kind: ExprKind::Block(items),
+            span: Span::new(19, 24),
+        });
+        let id = builder.push_for(ForDecl {
+            name: x,
+            name_span: Span::new(4, 5),
+            iterable: range,
+            guard: Some(guard),
+            body,
+        });
+        let for_expr = builder.alloc(Expr {
+            kind: ExprKind::For(id),
+            span: Span::new(0, 24),
+        });
+        let item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(for_expr),
+            span: Span::new(0, 24),
+        });
+        let root = builder.push_item_list(&[item]);
+        let ast = builder.finish(root, names, Strings::new());
+        assert_eq!(ast.for_count(), 1);
+        assert_eq!(id.index(), 0);
+        assert_eq!(ast.for_decl(id).body, body);
+        // A `for`'s subtree starts at its iterable's.
+        assert_eq!(
+            ast.subtree(for_expr).collect::<Vec<_>>(),
+            vec![zero, three, range, guard, x_use, body, for_expr]
+        );
+        assert_eq!(ast.get(for_expr).operator_span(), None);
+        assert_eq!(ast.get(for_expr).keyword_span(), Some(Span::new(0, 3)));
+        assert_eq!(ast.get(range).operator_span(), Some(Span::new(10, 12)));
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..24\n\
+             \x20   (for x @0..24\n\
+             \x20     (.. @9..13\n\
+             \x20       (int 0 @9..10)\n\
+             \x20       (int 3 @12..13))\n\
+             \x20     (guard\n\
+             \x20       (name g @17..18))\n\
+             \x20     (block @19..24\n\
+             \x20       (expr @21..22\n\
+             \x20         (name x @21..22))))))"
         );
     }
 }

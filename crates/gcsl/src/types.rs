@@ -441,6 +441,26 @@ impl TypeTable {
         }
     }
 
+    /// Whether `id` is *unit-like*: `{}`, or a list type whose element type
+    /// is unit-like, as `List<{}>` and `List<List<{}>>` are. A value of such
+    /// a type holds nothing but empty records and lists of them, so a
+    /// statement of one is not an unused value (see [`crate::check`]). A
+    /// type that is unit-like only once awaited, as `List<Future<{}>>` is,
+    /// is not.
+    #[must_use]
+    pub fn is_unit_like(&self, id: TyId) -> bool {
+        let mut id = id;
+        loop {
+            if id == TyId::EMPTY {
+                return true;
+            }
+            match self.list_element(id) {
+                Some(element) => id = element,
+                None => return false,
+            }
+        }
+    }
+
     /// The signature of function type `id`, or `None` if it is not a
     /// function type.
     #[must_use]

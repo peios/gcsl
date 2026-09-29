@@ -472,11 +472,20 @@
 //! one is found. `await e` awaits `e` fully and has its type stripped; on a
 //! present value it does nothing, silently, since whether a value is
 //! present may be inferred from code elsewhere. A bare `await e` item
-//! is never an unused value. A statement is a position expecting `{}`: a
-//! statement whose value is `{}` once awaited (a `Future<{}>`, or the
-//! `{}` an impure function returns, which may be one) is awaited there,
-//! so that its effects are not lost; any other statement not of type `{}`
-//! is an unused value.
+//! is never an unused value. A statement, an expression item that is not
+//! its block's result, is a position expecting a *unit-like* value: `{}`,
+//! or a list whose element type is unit-like (see
+//! [`TypeTable::is_unit_like`]), which holds nothing a program could use.
+//! A statement that is unit-like as it is, as `{}` is, or the `List<{}>` of
+//! a `for` whose body is `{}`, is fine as it is; one whose value is
+//! unit-like once awaited, at the top (a `Future<{}>`, or the `{}` an
+//! impure function returns, which may be one) or deeply (a
+//! `List<Future<{}>>`, as `for s in steps { lazy run(s) }` is), is awaited
+//! there, at the top or deeply as its type needs (`Checker::measure`,
+//! `Checker::measure_deep`), subject to the purity rule, so that its
+//! effects are not lost; any other statement is an unused value. A
+//! statement that is directly the empty list literal, `[]`, is a
+//! `List<{}>`, whose element type needs no inferring.
 //!
 //! Futures have no equality: an operand of `==`, `!=`, `===` or `!==` whose
 //! type, once awaited at the top, has a `Future` in a field or as a list's
@@ -536,12 +545,14 @@
 //! which is exactly where a value that may be a future would be awaited:
 //!
 //! - `Checker::measure` (the operands of the measuring operators, the
-//!   callee of a call, the record of a field access, a statement that is
-//!   `{}` once awaited) measures a provisional type at the top, and gives
-//!   its present type, with no await and no purity error;
+//!   callee of a call, the record of a field access, the list of an index,
+//!   a spread or a `for`, a statement that is `{}` once awaited) measures
+//!   a provisional type at the top, and gives its present type, with no
+//!   await and no purity error;
 //! - `Checker::measure_deep` (an interpolated expression, an operand of an
-//!   equality) measures each provisional type in the value's type, at the
-//!   top or in a field, before deciding the await for the rest;
+//!   equality, a statement that is unit-like once awaited deeply) measures
+//!   each provisional type in the value's type, at the top or in a field,
+//!   before deciding the await for the rest;
 //! - `Checker::expect`, where the value is not a subtype of what is
 //!   expected as it is, measures each parameter whose provisional type sits
 //!   where the expected type is present (a present parameter, annotation,
@@ -836,8 +847,9 @@
 //! an expected record type, a `:=`, an ascription) through parentheses, and,
 //! for a list type only, also through a block's result and the branches of
 //! an `if` with `else`, so that a function's body, a block, reaches its
-//! literal; such a block or `if` has the type of what its result, or the
-//! join of what its branches, are once awaited. It never flows from one
+//! literal; it reaches a `for` in the same way (see [For](#for)); such a
+//! block or `if` has the type of what its result, or the join of what its
+//! branches, are once awaited. It never flows from one
 //! branch of an `if` to the other.
 //!
 //! A spread's operand is used as its bits at the top (`Checker::measure`),
@@ -859,6 +871,52 @@
 //! element by element, typed equality comparing records inside by their
 //! static type. They have no order, and no arithmetic: `+` does not
 //! concatenate them, a spread does.
+//!
+//! # Ranges
+//!
+//! `a..b` is the list of the integers from `a` up to but not including
+//! `b`, and `a..=b` up to and including `b`. Both bounds are measured, as
+//! the operands of any measuring operator are (`Checker::measure`), and
+//! must be `Int`, an untyped integer being one, which is coerced: "a
+//! range's bounds must be Int, found T", at the bound. The range is a
+//! present `List<Int>`, and pure. That a range used as a value may not be
+//! too long is a runtime matter (see [`crate::eval`]).
+//!
+//! # For
+//!
+//! `for x in xs if GUARD { BODY }` is the list of the body's values for the
+//! elements of `xs`, in order, that pass the guard (`Checker::check_for`).
+//! The iterable is checked and measured at the top, as the list of an
+//! index is: awaited if it may be a future, subject to the purity rule, and
+//! a pure function's bare parameter measured. It must then be a list:
+//! "cannot iterate over a value of type T: it is not a list", at the
+//! iterable. Its elements are not measured.
+//!
+//! The variable is declared in a scope of its own, which holds the guard and
+//! the body and nothing else, as a block's scope holds its items: it takes
+//! the next free slot of the enclosing function's frame (see
+//! [`Resolution::for_slot`]), which the `for` leaves when it ends, and has
+//! the element type as it is, which may be the either shape or a future. It
+//! shadows as a `let` does, and since the body is a block of its own, `:=`
+//! of it there is "declared in an enclosing block". A `for` is not a
+//! function: the guard and the body are checked in the enclosing function,
+//! whose purity governs their awaits and calls and whose captures they use,
+//! so a closure or a `lazy` made in the body captures the variable as it
+//! would any variable of the enclosing function, by value, which is its
+//! value in that iteration. The guard is checked as an `if`'s condition is:
+//! measured, and `Bool`.
+//!
+//! Where no list type is expected, the `for` is `List<B>`, `B` being the
+//! body's type, an untyped integer settled to `Int` as a list literal's
+//! element is. Where a list type `List<X>`, or its either shape, is
+//! expected, the expectation reaches the `for` as it reaches a list literal
+//! (see [Lists](#lists)), and the body is checked against `X` as a
+//! literal's element is (`Checker::fit`): an untyped integer adapts, a body
+//! that fits once awaited is awaited, and a record block is checked field
+//! by field. The `for` is then the list of what the body is once those
+//! awaits have run, the type of every value the evaluator collects, or
+//! `List<X>` if that is not a subtype of `X`, as for a literal. A body
+//! that is a record block makes a list of records.
 //!
 //! # Built-in functions
 //!
@@ -883,7 +941,8 @@
 //!
 //! # Scopes
 //!
-//! Every block, including the file's own body, is a scope. A `let` declares
+//! Every block, including the file's own body, is a scope, and so is the
+//! scope a `for` declares its variable in (see [For](#for)). A `let` declares
 //! a variable visible from the next item to the end of its block; a later
 //! `let` of the same name shadows it, in the same block or an inner one. A
 //! `:=` is a new declaration too, allowed only for a name already declared
@@ -904,11 +963,12 @@
 //!
 //! Every variable and field is stored in a [`Slot`] of its function's flat
 //! frame (the top level's, outside functions), assigned stack-fashion, as
-//! in Lua and clox: entering a block records the next free slot; each
-//! declaration (a parameter, a `let`, a field, and `:=`, which is a new
-//! binding) takes the next free slot; leaving the block restores the next
-//! free slot to what it was on entry, so the slots of a finished block are
-//! reused by whatever comes after it. The highest slot count reached is the
+//! in Lua and clox: entering a block, or a `for`'s scope, records the next
+//! free slot; each declaration (a parameter, a `let`, a field, a `for`'s
+//! variable, and `:=`, which is a new binding) takes the next free slot;
+//! leaving the block restores the next free slot to what it was on entry,
+//! so the slots of a finished block are reused by whatever comes after it.
+//! The highest slot count reached is the
 //! frame size. A variable's slot is therefore known statically and never
 //! changes, and evaluation needs no environment lookups and no allocation
 //! per block. Some items share a slot: each definition of a field after its
@@ -929,7 +989,7 @@ use std::fmt;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
-    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ItemId, ItemKind, ItemRange, PartRange,
+    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForId, ItemId, ItemKind, ItemRange, PartRange,
     PathRange, PathSegment, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
@@ -1284,6 +1344,9 @@ pub struct Resolution {
     /// [`Ast`]'s argument pool; `u32::MAX` for an argument of an erroneous
     /// call.
     arg_params: Vec<u32>,
+    /// The slot each `for` expression's variable is stored in, indexed by
+    /// [`ForId`].
+    for_slots: Vec<Slot>,
 }
 
 impl Resolution {
@@ -1369,6 +1432,18 @@ impl Resolution {
             .unwrap_or_default()
     }
 
+    /// The slot the variable of the `for` expression `id` is stored in,
+    /// which each element is written to before the guard and the body run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the [`Ast`] this table was built
+    /// for.
+    #[must_use]
+    pub fn for_slot(&self, id: ForId) -> Slot {
+        self.for_slots[id.index()]
+    }
+
     /// How the path of item `id` resolves: [`PathResolution::NONE`] if it
     /// is not a dotted declaration or builds its record from nothing.
     ///
@@ -1428,6 +1503,7 @@ impl Resolution {
             slot_names: Vec::new(),
             functions: Vec::new(),
             arg_params: Vec::new(),
+            for_slots: Vec::new(),
         }
     }
 
@@ -1436,6 +1512,13 @@ impl Resolution {
     #[cfg(test)]
     pub(crate) fn unbind_arguments(&mut self) {
         self.arg_params.fill(u32::MAX);
+    }
+
+    /// Forgets the slot of every `for`'s variable, for testing what
+    /// lowering makes of that.
+    #[cfg(test)]
+    pub(crate) fn forget_for_slots(&mut self) {
+        self.for_slots.fill(Slot::NONE);
     }
 
     /// Number of expression entries in both expression tables, equal to
@@ -1454,6 +1537,12 @@ impl Resolution {
     /// [`Ast`].
     pub(crate) fn arg_len(&self) -> usize {
         self.arg_params.len()
+    }
+
+    /// Number of `for` entries, equal to the number of `for` expressions
+    /// in the [`Ast`].
+    pub(crate) fn for_len(&self) -> usize {
+        self.for_slots.len()
     }
 
     /// Number of item entries in every item table, equal to the number of
@@ -1911,6 +2000,8 @@ pub struct Checker<'a> {
     fn_resolutions: Vec<FnResolution>,
     /// The parameter each argument fills, indexed like the argument pool.
     arg_params: Vec<u32>,
+    /// The slot of each `for` expression's variable, indexed by [`ForId`].
+    for_slots: Vec<Slot>,
     /// Every variable, field and callee in scope, outermost block first.
     bindings: Vec<Binding>,
     /// For each binding of the scope the check started from, its entry of
@@ -2044,6 +2135,7 @@ impl<'a> Checker<'a> {
             path_awaits: Vec::new(),
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
             arg_params: vec![u32::MAX; ast.arg_count()],
+            for_slots: vec![Slot::NONE; ast.for_count()],
             bindings: scope.bindings,
             scope_measured: scope.measured,
             functions: Vec::new(),
@@ -2163,6 +2255,7 @@ impl<'a> Checker<'a> {
                 slot_names: self.slot_names,
                 functions: self.fn_resolutions,
                 arg_params: self.arg_params,
+                for_slots: self.for_slots,
             },
         };
         let mut warnings = self.warnings;
@@ -2260,31 +2353,26 @@ impl<'a> Checker<'a> {
                     }
                 }
                 ItemKind::Expr(value) => {
+                    // In a record block, even the final expression is a
+                    // statement.
+                    let is_result = next.is_none() && first_field.is_none();
                     let ty = match result_expected {
                         Some(expected) => {
                             self.fit(value, expected.ty, (expected.context, expected.why))
                         }
+                        None if !is_result && self.is_empty_list(value) => {
+                            // A statement `[]` holds nothing, and is the
+                            // unit-like `List<{}>`.
+                            let ty = self.types.list(TyId::EMPTY);
+                            self.expr_types[value.index()] = ty;
+                            ty
+                        }
                         None => self.check_expr(value),
                     };
-                    // In a record block, even the final expression is a
-                    // statement.
-                    if next.is_none() && first_field.is_none() {
+                    if is_result {
                         result = ty;
-                    } else if self.is_await(value) {
-                        // A bare `await` is run for its effects, and its
-                        // value discarded, whatever it is.
-                        self.settle(value, ty);
-                    } else if ty != TyId::EMPTY
-                        && ty != TyId::ERROR
-                        && self.types.strip(ty) == TyId::EMPTY
-                    {
-                        // A statement is a position expecting `{}`: a value
-                        // that is `{}` once awaited is awaited here, so its
-                        // effects are not lost, subject to the purity rule;
-                        // a parameter of this function is measured.
-                        self.measure(value, ty);
-                    } else if ty != TyId::EMPTY && ty != TyId::ERROR {
-                        self.unused_value(value, ty);
+                    } else {
+                        self.check_statement(value, ty);
                     }
                 }
             }
@@ -2304,6 +2392,44 @@ impl<'a> Checker<'a> {
                 ..
             }
         )
+    }
+
+    /// Whether `value` is directly the empty list literal, `[]`.
+    fn is_empty_list(&self, value: ExprId) -> bool {
+        matches!(
+            self.ast.get(value).kind,
+            ExprKind::List(elements) if self.ast.elements(elements).is_empty()
+        )
+    }
+
+    /// Applies the statement rule to `value`, an expression item that is
+    /// not its block's result, of type `ty` (see the module documentation).
+    /// A bare `await` is run for its effects, and its value discarded,
+    /// whatever it is. Otherwise a statement is a position expecting a
+    /// unit-like value (see [`TypeTable::is_unit_like`]): one that is
+    /// unit-like as it is needs nothing; one that is unit-like once awaited,
+    /// at the top as a `Future<{}>` is or deeply as a `List<Future<{}>>`
+    /// is, is awaited here, so that its effects are not lost, subject to
+    /// the purity rule, a parameter of this function being measured; and
+    /// any other is an unused value.
+    fn check_statement(&mut self, value: ExprId, ty: TyId) {
+        if self.is_await(value) {
+            self.settle(value, ty);
+            return;
+        }
+        if ty == TyId::ERROR || self.types.is_unit_like(ty) {
+            return;
+        }
+        if self.types.strip(ty) == TyId::EMPTY {
+            self.measure(value, ty);
+            return;
+        }
+        let present = self.types.present(ty);
+        if self.types.is_unit_like(present) {
+            self.measure_deep(value, ty);
+        } else {
+            self.unused_value(value, ty);
+        }
     }
 
     /// Reports the statement `value`, of type `ty`, which is neither `{}`
@@ -4192,7 +4318,8 @@ impl<'a> Checker<'a> {
     }
 
     /// Where `expr`, of type `ty`, is used as its bits all the way down, as
-    /// an interpolated expression or an operand of an equality: every
+    /// an interpolated expression or an operand of an equality, or is
+    /// awaited as a statement unit-like once awaited deeply: every
     /// parameter of the innermost function whose provisional type is in it,
     /// at the top or in a field, is measured; then if it, or a field of the
     /// record it is at any depth, may be a future, it is marked to be
@@ -4559,10 +4686,11 @@ impl<'a> Checker<'a> {
     /// Where a value of type `expected`, a list type or its either shape,
     /// is expected, as stated at `context`, labelled `why`: checks `id`
     /// against it and returns the type it has, if `id` is, through any
-    /// parentheses, a list literal, a block with a result or an `if` with
-    /// `else`, and `None`, having checked nothing, otherwise. The type of a
-    /// list literal is found as [`Checker::check_list_expecting`] says, and
-    /// that of a block or an `if` is what its result, or each branch,
+    /// parentheses, a list literal, a block with a result, an `if` with
+    /// `else` or a `for`, and `None`, having checked nothing, otherwise. The
+    /// type of a list literal is found as [`Checker::check_list_expecting`]
+    /// says, that of a `for` as [`Checker::check_for`] says, and that of a
+    /// block or an `if` is what its result, or each branch,
     /// checked against `expected` in turn, is once any await marked on it
     /// has run (see [`Checker::fit`]); it is recorded for `id` and every
     /// parenthesis around it. So the expected type reaches a list literal
@@ -4614,6 +4742,13 @@ impl<'a> Checker<'a> {
                         .filter(|&joined| self.types.is_subtype(joined, expected))
                         .unwrap_or(expected)
                 }
+            }
+            ExprKind::For(for_id) => {
+                let element = self
+                    .types
+                    .list_element(self.types.strip(expected))
+                    .unwrap_or(TyId::ERROR);
+                self.check_for(node, for_id, Some((element, (context, why))))
             }
             _ => return None,
         };
@@ -4775,6 +4910,7 @@ impl<'a> Checker<'a> {
             ExprKind::Lazy(function) => self.check_lazy(function),
             ExprKind::List(elements) => self.check_list(id, elements),
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
+            ExprKind::For(for_id) => self.check_for(id, for_id, None),
         };
         self.expr_types[id.index()] = ty;
         ty
@@ -4823,6 +4959,41 @@ impl<'a> Checker<'a> {
             | BinaryOp::Le
             | BinaryOp::Gt
             | BinaryOp::Ge => self.comparison(id, op, (lhs, lhs_ty), (rhs, rhs_ty)),
+            BinaryOp::Range | BinaryOp::RangeInclusive => {
+                let fits =
+                    [(lhs, lhs_ty), (rhs, rhs_ty)].map(|(bound, ty)| self.range_bound(bound, ty));
+                if fits.contains(&false) {
+                    TyId::ERROR
+                } else {
+                    self.types.list(TyId::INT)
+                }
+            }
+        }
+    }
+
+    /// Checks `bound`, of type `ty` once measured, a bound of a range, which
+    /// must be an `Int`, an untyped integer being one: "a range's bounds
+    /// must be Int, found T" otherwise. Returns whether it is one.
+    fn range_bound(&mut self, bound: ExprId, ty: TyId) -> bool {
+        match ty {
+            TyId::UNTYPED_INT => {
+                self.coerce(bound, TyId::INT);
+                true
+            }
+            TyId::INT => true,
+            TyId::ERROR => false,
+            _ => {
+                let shown = self.in_message(ty);
+                let label = format!("this is {}", self.in_label(ty));
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("a range's bounds must be Int, found {shown}"),
+                        self.ast.get(bound).span,
+                    )
+                    .with_label(label),
+                );
+                false
+            }
         }
     }
 
@@ -7207,6 +7378,91 @@ impl<'a> Checker<'a> {
         if index_fits { element } else { TyId::ERROR }
     }
 
+    /// Types the `for` expression `id`, whose details are `for_id` (see the
+    /// module documentation). The iterable is measured at the top and must
+    /// be a list, "cannot iterate over a value of type T: it is not a list",
+    /// its elements not measured. The variable is declared, with the
+    /// element type as it is, in a scope of its own, holding the guard and
+    /// the body, in the next free slot of the current frame, which it
+    /// leaves when the `for` ends. The guard is checked as an `if`'s
+    /// condition is. With `element`, the element type of the list type
+    /// expected of the `for`, with where that is stated and its label, the
+    /// body is checked against it as a list literal's element is (see
+    /// [`Checker::fit`]), and the type is the list of what the body is once
+    /// any await marked on it has run, or of `element` should that not fit
+    /// it. Without, the type is the list of the body's type, an untyped
+    /// integer settled to `Int`. `Error` if the iterable or the body is
+    /// erroneous.
+    fn check_for(
+        &mut self,
+        id: ExprId,
+        for_id: ForId,
+        element: Option<(TyId, (Span, &str))>,
+    ) -> TyId {
+        let decl = *self.ast.for_decl(for_id);
+        let iterable = self.check_expr(decl.iterable);
+        let iterable = self.settle(decl.iterable, iterable);
+        let iterable = self.measure(decl.iterable, iterable);
+        let item = self.iterated(decl.iterable, iterable);
+        // The variable's scope, holding the guard and the body, as a block
+        // holds its items.
+        let outer = (self.block_start, self.fields_start, self.next_slot);
+        let outer_spreads = std::mem::take(&mut self.spreads);
+        self.block_start = self.bindings.len();
+        self.fields_start = self.fields.len();
+        let slot =
+            self.declare_binding(decl.name, item, Some(decl.name_span), BindingKind::Variable);
+        self.for_slots[for_id.index()] = slot;
+        if let Some(guard) = decl.guard {
+            let expr = self.ast.get(id);
+            let keyword = expr.keyword_span().unwrap_or(expr.span);
+            let ty = self.check_expr(guard);
+            self.expect(guard, ty, TyId::BOOL, keyword, "`for` guards are Bool");
+        }
+        let body = if let Some((element, (context, why))) = element {
+            let held = self.fit(decl.body, element, (context, why));
+            if held == TyId::ERROR || self.types.is_subtype(held, element) {
+                held
+            } else {
+                element
+            }
+        } else {
+            let ty = self.check_expr(decl.body);
+            self.settle(decl.body, ty)
+        };
+        self.bindings.truncate(self.block_start);
+        (self.block_start, self.fields_start, self.next_slot) = outer;
+        self.spreads = outer_spreads;
+        if item == TyId::ERROR || body == TyId::ERROR {
+            TyId::ERROR
+        } else {
+            self.types.list(body)
+        }
+    }
+
+    /// The element type of `ty`, the type of the iterable `iterable` of a
+    /// `for` once measured, or `Error`, having reported "cannot iterate over
+    /// a value of type T: it is not a list" if it is not a list, or if it is
+    /// erroneous.
+    fn iterated(&mut self, iterable: ExprId, ty: TyId) -> TyId {
+        if ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        if let Some(element) = self.types.list_element(ty) {
+            return element;
+        }
+        let shown = self.in_message(ty);
+        let label = format!("this is {}", self.in_label(ty));
+        self.errors.push(
+            Diagnostic::error(
+                format!("cannot iterate over a value of type {shown}: it is not a list"),
+                self.ast.get(iterable).span,
+            )
+            .with_label(label),
+        );
+        TyId::ERROR
+    }
+
     /// Types `/`: it accepts any mix of numeric operands and always yields
     /// `Float`. Untyped operands become `Float` literals; concrete `Int`
     /// operands are converted by lowering.
@@ -7322,7 +7578,8 @@ impl<'a> Checker<'a> {
             | ExprKind::Call { .. }
             | ExprKind::Lazy(_)
             | ExprKind::List(_)
-            | ExprKind::Index { .. } => {}
+            | ExprKind::Index { .. }
+            | ExprKind::For(_) => {}
             // An `await` of an untyped operand is one of a present value,
             // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
@@ -8258,6 +8515,14 @@ mod tests {
                 ExprKind::Index { expr, index } => {
                     visit(ast, expr, out);
                     visit(ast, index, out);
+                }
+                ExprKind::For(id) => {
+                    let decl = ast.for_decl(id);
+                    visit(ast, decl.iterable, out);
+                    if let Some(guard) = decl.guard {
+                        visit(ast, guard, out);
+                    }
+                    visit(ast, decl.body, out);
                 }
                 ExprKind::Int(_)
                 | ExprKind::Float(_)
@@ -15037,5 +15302,471 @@ mod tests {
             panic!("expected a let");
         };
         assert_eq!(output.checked.types.get(value), TyId::STRING);
+    }
+
+    // ----- Ranges and `for` -----
+
+    #[test]
+    fn ranges_are_present_lists_of_ints() {
+        for text in [
+            "0..10",
+            "0..=10",
+            "let n = 3\n0..n",
+            "let n = 3\n-n..=n + 1",
+            "(0..2)[1] .. 5",
+        ] {
+            assert_eq!(shown_result(text), "List<Int>", "{text}");
+        }
+        assert_eq!(shown_result("(0..2)[1]"), "Int");
+        // Untyped bounds become `Int`s.
+        assert!(!all_types("0..=10").contains(&TyId::UNTYPED_INT));
+        let text = "0..10";
+        assert_eq!(type_at(text, at(text, "0")), "Int");
+        // Both bounds are measured: awaited if they may be futures.
+        let text = "let a = lazy 1\nlet b = lazy 5\na..=b";
+        assert_eq!(
+            marks(text),
+            vec![("a", AwaitMark::Top), ("b", AwaitMark::Top)]
+        );
+        assert_eq!(shown_result(text), "List<Int>");
+        // A pure function's parameter is measured, and a range is pure.
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int[] { 0..n }"),
+            "fn(n: Int): List<Int>"
+        );
+        let text = "fn f(n: Future<Int>): Int[] { 0..n }";
+        assert_implicit_await_error(text, last(text, "n"), "Future<Int>");
+    }
+
+    #[test]
+    fn range_errors() {
+        let text = "0..1.5";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "a range's bounds must be Int, found Float"
+        );
+        assert_eq!(found[0].span, at(text, "1.5"));
+        assert_eq!(found[0].label.as_deref(), Some("this is Float"));
+        assert!(found[0].labels.is_empty());
+        let text = "\"a\"..=1";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "a range's bounds must be Int, found String".to_owned(),
+                at(text, "\"a\"")
+            )]
+        );
+        assert_eq!(
+            messages("{ a = 1 }..2"),
+            vec!["a range's bounds must be Int, found `{a: Int}`"]
+        );
+        // Both bounds are reported.
+        assert_eq!(
+            messages("1.5..true"),
+            vec![
+                "a range's bounds must be Int, found Float",
+                "a range's bounds must be Int, found Bool"
+            ]
+        );
+        // An erroneous bound is not reported again, nor a range of one.
+        assert_eq!(messages("0..y"), vec!["undefined variable `y`"]);
+        assert_eq!(messages("len(0..y) + 1"), vec!["undefined variable `y`"]);
+    }
+
+    #[test]
+    fn a_for_is_the_list_of_its_body() {
+        for (text, shown) in [
+            ("let xs = [1, 2]\nfor x in xs { x * 2 }", "List<Int>"),
+            ("for x in [1, 2] if x % 2 == 0 { x }", "List<Int>"),
+            ("for i in 0..10 { i * i }", "List<Int>"),
+            ("for i in 0..=10 if i > 2 { \"{i}\" }", "List<String>"),
+            // An untyped integer settles as a list literal's element does.
+            ("for x in [1] { 1 }", "List<Int>"),
+            ("for x in [1] { 2.5 }", "List<Float>"),
+            ("for x in [1.5] { x / 2 }", "List<Float>"),
+            // A record block makes a list of records.
+            (
+                "for x in [1] { a = x; b = \"b\" }",
+                "List<{a: Int, b: String}>",
+            ),
+            ("for x in [1] { }", "List<{}>"),
+            // The element may be a future, and so may the body.
+            ("for x in [lazy 1] { x }", "List<Future<Int>>"),
+            ("for x in [1, lazy 2] { x }", "List<Int | Future<Int>>"),
+            ("for x in [1] { lazy x }", "List<Future<Int>>"),
+            // Nested, in the body and in the iterable.
+            ("for x in [[1]] { for y in x { y } }", "List<List<Int>>"),
+            ("for x in for y in [1] { y } { x }", "List<Int>"),
+            ("[...for x in [1] { x }, 2]", "List<Int>"),
+            ("len(for x in [1] { x })", "Int"),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // Every node settles.
+        assert!(!all_types("for x in [1] { 1 }").contains(&TyId::UNTYPED_INT));
+    }
+
+    #[test]
+    fn the_variable_has_the_element_type_in_a_scope_of_its_own() {
+        // As it is, lazy or not.
+        let text = "for x in [lazy 1] { x }";
+        assert_eq!(type_at(text, last(text, "x")), "Future<Int>");
+        assert_eq!(marks(text), vec![]);
+        let text = "for x in [1, lazy 2] if true { x }";
+        assert_eq!(type_at(text, last(text, "x")), "Int | Future<Int>");
+        // Used as its bits, it is awaited there.
+        let text = "for x in [lazy 1] { x + 1 }";
+        assert_eq!(marks(text), vec![("x", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "List<Int>");
+        // It shadows as a `let` does, and is gone after the `for`.
+        let text = "let x = \"a\"\nlet ys = for x in [1] { x + 1 }\nx";
+        assert_eq!(shown_result(text), "String");
+        assert_eq!(
+            messages("let ys = for x in [1] { x }\nx"),
+            vec!["undefined variable `x`"]
+        );
+        // The guard sees it.
+        assert_eq!(shown_result("for x in [1, 2] if x > 1 { x }"), "List<Int>");
+        // It cannot be rebound from the body, whose block is its own.
+        let text = "for x in [1] {\n  x := 2\n  x\n}";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `x` here: it is declared in an enclosing block"
+        );
+        assert_eq!(labels(&found[0]), vec![(at(text, "x"), "declared here")]);
+        // It takes the next free slot, which the `for` leaves when it ends;
+        // the body's variables take those after it.
+        let text = "let a = 1\nlet ys = for x in [a] {\n  let y = x\n  y\n}\nlet b = 2";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(resolution.for_slot(ForId::new(0)), Slot(1));
+        assert_eq!(uses(&ast, &resolution, "x"), vec![VarRef::Local(Slot(1))]);
+        assert_eq!(uses(&ast, &resolution, "y"), vec![VarRef::Local(Slot(2))]);
+        let items = ast.items(ast.root());
+        assert_eq!(resolution.item_slot(items[1]), Slot(1));
+        assert_eq!(resolution.item_slot(items[2]), Slot(2));
+        assert_eq!(resolution.frame_size(), 3);
+        // A closure made in the body captures it as any variable of the
+        // enclosing function, from its slot.
+        let text = "let fs = for x in [1] { fn(): Int { x } }";
+        assert_eq!(
+            captures(text, 0),
+            vec![(VarRef::Local(Slot(0)), "Int".to_owned())]
+        );
+        // In a function, the slot is the function's.
+        let text = "fn f(n: Int): Int[] { for x in [n] { x } }";
+        let (_, resolution) = resolved(text);
+        assert_eq!(resolution.for_slot(ForId::new(0)), Slot(1));
+        assert_eq!(resolution.function(FnId::new(0)).frame_size, 2);
+    }
+
+    #[test]
+    fn for_errors() {
+        let text = "for x in 1 { x }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot iterate over a value of type Int: it is not a list"
+        );
+        assert_eq!(found[0].span, at(text, "1"));
+        assert_eq!(found[0].label.as_deref(), Some("this is Int"));
+        assert!(found[0].labels.is_empty());
+        assert_eq!(
+            messages("for x in { a = 1 } { x }"),
+            vec!["cannot iterate over a value of type `{a: Int}`: it is not a list"]
+        );
+        // Once awaited: a future of a list is one.
+        assert_eq!(
+            messages("let n = lazy 1\nfor x in n { x }"),
+            vec!["cannot iterate over a value of type Int: it is not a list"]
+        );
+        // The guard must be `Bool`.
+        let text = "for x in [1] if x { x }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, nth(text, "x", 1));
+        assert_eq!(found[0].label.as_deref(), Some("expected Bool, found Int"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "for"), "`for` guards are Bool")]
+        );
+        // Errors do not cascade: an erroneous iterable, whose variable is
+        // then erroneous, and an erroneous body.
+        assert_eq!(
+            messages("for x in y { x + 1 }"),
+            vec!["undefined variable `y`"]
+        );
+        assert_eq!(
+            messages("for x in 1 { x + 1 }\n2"),
+            vec!["cannot iterate over a value of type Int: it is not a list"]
+        );
+        assert_eq!(
+            messages("let ys = for x in [1] { z }\nlen(ys)"),
+            vec!["undefined variable `z`"]
+        );
+        // Every part is checked whatever goes wrong.
+        assert_eq!(
+            messages("for x in y if z { w }"),
+            vec![
+                "undefined variable `y`",
+                "undefined variable `z`",
+                "undefined variable `w`"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_iterable_is_measured_at_the_top() {
+        // A future, or an either, is awaited; its elements are not.
+        let text = "let xs = lazy [lazy 1]\nfor x in xs { x }";
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "List<Future<Int>>");
+        let text = "let xs: Int[] | Future<Int[]> = [1]\nfor x in xs { x }";
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Top)]);
+        // In an impure function, where a bare list parameter may be a
+        // future, and its elements too.
+        let text = "fn f(xs: Int[]) -> Int[] { for x in xs { x } }";
+        assert_eq!(marks(text), vec![("xs", AwaitMark::Top)]);
+        assert_eq!(
+            fn_type(text, 0),
+            "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> List<Int | \
+             Future<Int>>"
+        );
+        // In a pure function a future is the purity error, and a bare
+        // parameter is measured, which makes it present.
+        let text = "fn f(xs: Future<Int[]>): Int[] { for x in xs { x } }";
+        assert_implicit_await_error(text, last(text, "xs"), "Future<List<Int>>");
+        let text = "fn f(xs: Int[] | Future<Int[]>): Int[] { for x in xs { x } }";
+        assert_implicit_await_error(text, last(text, "xs"), "List<Int> | Future<List<Int>>");
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): Int { len(for x in xs { x }) }"),
+            "fn(xs: List<Int>): Int"
+        );
+        assert_eq!(
+            demands("fn f(xs: Int[]): Int { len(for x in xs { x }) }", 0),
+            vec![Some("xs")]
+        );
+        // So is one captured from an enclosing pure function.
+        assert_eq!(
+            type_of_f("fn f(xs: Int[]): fn(): Int[] { fn(): Int[] { for x in xs { x } } }"),
+            "fn(xs: List<Int>): fn(): List<Int>"
+        );
+    }
+
+    #[test]
+    fn the_body_is_checked_in_the_enclosing_function() {
+        // Its awaits are the enclosing function's: in a pure one, the purity
+        // error.
+        let text = "fn f(xs: List<Future<Int>>): Int[] { for x in xs { x + 1 } }";
+        assert_implicit_await_error(text, nth(text, "x", 3), "Future<Int>");
+        let text = "fn f(xs: List<Future<Int>>): Int[] { for x in xs if x > 0 { 1 } }";
+        assert_implicit_await_error(text, nth(text, "x", 3), "Future<Int>");
+        let text = "fn f(n: Future<Int>): Int[] { for x in [1] { await n } }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "cannot await in a pure function");
+        // And its calls: a pure function calls nothing impure there either.
+        let text = "fn g() -> Int { 1 }\nfn f(): Int[] { for x in [1] { g() } }";
+        assert_eq!(
+            messages(text),
+            vec!["cannot call an impure function from a pure function"]
+        );
+        // In an impure function, or at the top level, the same is fine.
+        let text = "fn f(xs: List<Future<Int>>) -> Int[] { for x in xs { x + 1 } }";
+        assert_eq!(
+            marks(text),
+            vec![("xs", AwaitMark::Top), ("x", AwaitMark::Top)]
+        );
+        // A parameter of the enclosing pure function used in the body is
+        // measured as anywhere in its body.
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int[] { for x in [1] { x + n } }"),
+            "fn(n: Int): List<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int): List<Int | Future<Int>> { for x in [1] { n } }"),
+            "fn(n: Int | Future<Int>): List<Int | Future<Int>>"
+        );
+    }
+
+    #[test]
+    fn an_expected_list_type_reaches_the_body() {
+        // An untyped integer adapts to the element type.
+        let text = "let ys: List<Float> = for x in [1, 2] { 1 }\nys";
+        assert_eq!(shown_result(text), "List<Float>");
+        assert_eq!(
+            type_at(text, at(text, "for x in [1, 2] { 1 }")),
+            "List<Float>"
+        );
+        assert_eq!(type_at(text, last(text, "1")), "Float");
+        // A body that fits once awaited is awaited, each iteration, and the
+        // `for` is the list of what it is then.
+        let text = "let xs = [lazy 1, lazy 2]\nlet ys: List<Present<Int>> = for x in xs { x }\nys";
+        assert_eq!(marks(text), vec![("{ x }", AwaitMark::Top)]);
+        assert_eq!(type_at(text, at(text, "for x in xs { x }")), "List<Int>");
+        // A list type expected of the body reaches its result, as it reaches
+        // a block's.
+        let text = "let xs = [[lazy 1]]\nlet ys: List<Present<Int[]>> = for x in xs { x }\nys";
+        assert_eq!(marks(text), vec![("x", AwaitMark::Deep)]);
+        assert_eq!(
+            type_at(text, at(text, "for x in xs { x }")),
+            "List<List<Int>>"
+        );
+        // An either element type takes what the body is.
+        let text = "let ys: List<Int | Future<Int>> = for x in [1] { lazy x }\nys";
+        assert_eq!(
+            type_at(text, at(text, "for x in [1] { lazy x }")),
+            "List<Future<Int>>"
+        );
+        // Through parentheses, the result of a block, an ascription and an
+        // argument.
+        for text in [
+            "let ys: List<Float> = (for x in [1] { 1 })\nys",
+            "let ys: List<Float> = { for x in [1] { 1 } }\nys",
+            "(for x in [1] { 1 }) : List<Float>",
+            "fn f(ys: Float[]): Float[] { ys }\nf(for x in [1] { 1 })",
+        ] {
+            assert_eq!(shown_result(text), "List<Float>", "{text}");
+        }
+        // A record block is checked against the expected record type.
+        let text = "let ys: List<{a: Float}> = for x in [1] { a = 1 }\nys";
+        assert_eq!(shown_result(text), "List<{a: Float}>");
+        let text = "let ys: List<{a: Int, b: Int}> = for x in [1] { a = 1 }";
+        assert_eq!(messages(text), vec!["missing field `b` in record"]);
+        // A body that does not fit is a mismatch at the body.
+        let text = "let ys: List<Int> = for x in [1] { \"a\" }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "{ \"a\" }"));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "List<Int>"), "expected because of this annotation")]
+        );
+        // In a pure function, an await of the body is the purity error.
+        let text = "fn f(xs: List<Future<Int>>): List<Int> { for x in xs { x } }";
+        assert_implicit_await_error(text, at(text, "{ x }"), "Future<Int>");
+    }
+
+    #[test]
+    fn a_function_returning_a_for_has_its_result_inferred() {
+        for (text, shown) in [
+            (
+                "fn f() -> Int[] { for x in [1, 2] { x } }\nf",
+                "fn() -> List<Int>",
+            ),
+            (
+                "fn f() -> Int[] { for x in [1, 2] { lazy x } }\nf",
+                "fn() -> List<Future<Int>>",
+            ),
+            (
+                "fn f(xs: Int[]) -> Int[] { for x in xs { x } }\nf",
+                "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> List<Int | \
+                 Future<Int>>",
+            ),
+            (
+                "fn f(xs: Int[]) -> Int[] { for x in xs { x + 1 } }\nf",
+                "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> List<Int>",
+            ),
+            (
+                "fn f() ->> {a: Int}[] { for x in [1] { a = lazy x } }\nf",
+                "fn() ->> List<{a: Future<Int>}>",
+            ),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_unit_like_statement_is_not_an_unused_value() {
+        // `{}`, a list of `{}`s, a list of those, and `[]` itself.
+        for text in [
+            "for x in [1] { }\n1",
+            "let steps = [1]\nfor s in steps { let t = s }\n1",
+            "for x in [1] { for y in [2] { } }\n1",
+            "[{}, {}]\n1",
+            "[[{}]]\n1",
+            "[]\n1",
+            "{ []\n= 1 }",
+            "{ a = 1; [] }",
+            "fn f(): Int { []\n1 }",
+            "fn f(xs: List<{}>): Int { xs\n1 }",
+        ] {
+            assert_eq!(
+                check(&parse_text(text), &mut TypeTable::new()).err(),
+                None,
+                "{text}"
+            );
+            assert_eq!(marks(text), vec![], "{text}");
+        }
+        // A statement `[]` is the unit-like `List<{}>`; one in parentheses,
+        // or in a literal, is an ordinary empty literal.
+        let text = "[]\n1";
+        assert_eq!(type_at(text, at(text, "[]")), "List<{}>");
+        for text in ["([])\n1", "[[]]\n1"] {
+            assert_eq!(
+                messages(text),
+                vec!["cannot infer the element type of `[]`"],
+                "{text}"
+            );
+        }
+        // A pure function's parameter is measured by a statement, as a
+        // `{}` one is.
+        assert_eq!(
+            type_of_f("fn f(xs: List<{}>): Int { xs\n1 }"),
+            "fn(xs: List<{}>): Int"
+        );
+    }
+
+    #[test]
+    fn a_statement_unit_like_once_awaited_is_awaited() {
+        // At the top, as before, and deeply.
+        let text = "let s = lazy [{}]\ns\n1";
+        assert_eq!(marks(text), vec![("s", AwaitMark::Top)]);
+        let text = "let s = lazy [lazy {}]\ns\n1";
+        assert_eq!(marks(text), vec![("s", AwaitMark::Deep)]);
+        let text = "let steps = [lazy {}, lazy {}]\nfor s in steps { s }\n1";
+        assert_eq!(marks(text), vec![("for s in steps { s }", AwaitMark::Deep)]);
+        let text = "fn run(n: Int) -> {} { }\nfor s in [1, 2] { lazy run(s) }\n1";
+        assert_eq!(
+            marks(text),
+            vec![("for s in [1, 2] { lazy run(s) }", AwaitMark::Deep)]
+        );
+        let text = "let s = [lazy [lazy {}]]\ns\n1";
+        assert_eq!(marks(text), vec![("s", AwaitMark::Deep)]);
+        // In a pure function, that is the purity error.
+        let text = "fn f(steps: List<Future<{}>>): Int { for s in steps { s }\n1 }";
+        assert_implicit_await_error(text, at(text, "for s in steps { s }"), "List<Future<{}>>");
+        let text = "fn f(steps: List<Future<{}>>): Int { steps\n1 }";
+        assert_implicit_await_error(text, last(text, "steps"), "List<Future<{}>>");
+    }
+
+    #[test]
+    fn any_other_statement_is_still_an_unused_value() {
+        for (text, shown) in [
+            ("[1]\n2", "`List<Int>`"),
+            ("for x in [1] { x }\n2", "`List<Int>`"),
+            ("[lazy 1]\n2", "`List<Future<Int>>`"),
+            ("[{ a = 1 }]\n2", "`List<{a: Int}>`"),
+            ("for x in [1] { lazy x }\n2", "`List<Future<Int>>`"),
+            ("let s = lazy [1]\ns\n2", "`Future<List<Int>>`"),
+        ] {
+            assert_eq!(
+                messages(text),
+                vec![format!("unused value of type {shown}")],
+                "{text}"
+            );
+        }
+        let text = "for x in [1] { x }\n2";
+        assert_eq!(diagnostics(text)[0].span, at(text, "for x in [1] { x }"));
     }
 }

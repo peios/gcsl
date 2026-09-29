@@ -598,6 +598,138 @@ fn an_index_out_of_range_is_rendered() {
 }
 
 #[test]
+fn run_rolls_out_a_fleet_with_fors() {
+    let output = gcsl(&["run", "tests/fixtures/fors.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{count = 3; plan = \"[\\\"web-1\\\", \\\"web-2\\\"] on [8000, 8001, 8002]\"; squares = \
+         [1, 4, 9]; same = true}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_fors_and_ranges() {
+    let output = gcsl(&["run", "tests/fixtures/fors.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in [
+        "\nFor @213..216\nIdent(i) @217..218\nIn @219..221\nInt(0) @222..223\nDotDot @223..225\n",
+        "\nInt(1) @687..688\nDotDotEq @688..691\nInt(3) @691..692\n",
+    ] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/fors.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n    (for host @310..354\n\
+         \x20     (name hosts @322..327)\n\
+         \x20     (guard\n\
+         \x20       (!= @331..345\n\
+         \x20         (name host @331..335)\n\
+         \x20         (str \"db-1\" @339..345)))\n\
+         \x20     (block @346..354\n",
+        "\n    (for i @678..702\n\
+         \x20     (..= @687..692\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/fors.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "(for i : List<Int> @213..248\n\
+         \x20     (.. : List<Int> @222..235\n",
+        "(for host : List<String> @310..354\n",
+        // A statement of `{}`s, and one of futures.
+        "(for host : List<{}> @426..459\n",
+        "(for host : List<Future<{}>> @524..562\n",
+        // The body is awaited to fit the expected element type, so the
+        // list holds what it is once awaited.
+        "(for p : List<Int> @596..621\n",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/fors.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // A `for` shows its variable's slot, named, as every slot is, by
+        // the last variable stored in it.
+        "\n    (for ports#2 @213..248\n\
+         \x20     (range @222..235\n\
+         \x20       (int 0 @222..223)\n\
+         \x20       (list-len @225..235\n",
+        "\n    (for webs#3 if @310..354\n\
+         \x20     (load hosts#1 @322..327)\n\
+         \x20     (str-cmp != @331..345\n",
+        // The statement of `{}`s discards its body's values; the statement
+        // of futures builds its list, and awaits it deeply.
+        "\n  (for-each checks#4 @426..459\n\
+         \x20   (load webs#3 @438..442)\n",
+        "\n  (await *! @524..562\n\
+         \x20   (for checks#4 @524..562\n",
+        "\n    (for checks#4 @596..621\n\
+         \x20     (load ports#2 @605..610)\n\
+         \x20     (await @611..621\n",
+        "\n    (for squares#7 @678..702\n\
+         \x20     (range-inclusive @687..692\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn a_range_too_large_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/range_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: range too large\n\
+         \x20--> tests/fixtures/range_error.gcsl:1:11\n\
+         \x20 |\n\
+         1 | let ids = 0..=20000000\n\
+         \x20 |           ^^^^^^^^^^^^ this range has 20000001 elements\n\
+         \x20 |\n\
+         \x20 = note: a range used as a list holds every element; the limit is 16777216. A \
+         `for` over a range directly has no limit\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn iterating_over_what_is_not_a_list_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/iterate_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot iterate over a value of type Int: it is not a list\n\
+         \x20--> tests/fixtures/iterate_error.gcsl:2:10\n\
+         \x20 |\n\
+         2 | for r in replicas { r }\n\
+         \x20 |          ^^^^^^^^ this is Int\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn repl_shows_fors_and_ranges() {
+    let output = repl(
+        "let xs = for i in 0..3 { i * 2 }\n\
+         xs\n\
+         for x in xs if x > 0 { lazy x }\n\
+         0..=2\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "[0, 2, 4] : List<Int>\n\
+         [Future<Int>, Future<Int>] : List<Future<Int>>\n\
+         [0, 1, 2] : List<Int>\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn run_spreads_defaults_into_a_configuration() {
     let output = gcsl(&["run", "tests/fixtures/spread.gcsl"]);
     assert_eq!(

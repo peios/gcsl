@@ -149,10 +149,11 @@
 //! # Trailing blocks
 //!
 //! A trailing block would make `if x { ... }` a call of `x`, so while the
-//! parser is in the condition of an `if` (or `else if`) a `{` after an
-//! expression never starts one: the parser keeps a flag,
-//! `Parser::no_trailing_block`, that `Parser::parse_if` sets around its
-//! condition. The flag applies to the whole condition at every operator, so
+//! parser is in the condition of an `if` (or `else if`), or the iterable or
+//! the guard of a `for`, a `{` after an expression never starts one: the
+//! parser keeps a flag, `Parser::no_trailing_block`, that `Parser::parse_if`
+//! sets around its condition and `Parser::parse_for` around its iterable
+//! and guard. The flag applies to the whole condition at every operator, so
 //! `if a and b { }` is an `if` with condition `a and b`. It is lifted, and
 //! restored afterwards, inside parentheses, argument lists, blocks and
 //! interpolations, so `if (f { }) { }` calls `f`. A newline before a `{`
@@ -172,8 +173,9 @@
 //! function, [`Parser::parse_expr`], parses any expression whose operators
 //! bind at least as tightly as a given *minimum binding power*. It first
 //! parses a *prefix* expression (a literal, a name, a string, a
-//! parenthesised expression, a block, a list literal, an `if`, a function
-//! expression, a `lazy`, or a prefix operator applied to an operand), which
+//! parenthesised expression, a block, a list literal, an `if`, a `for`, a
+//! function expression, a `lazy`, or a prefix operator applied to an
+//! operand), which
 //! becomes the
 //! left-hand side. Then it loops: if the
 //! next token is a binary operator whose left binding power is at least the
@@ -191,6 +193,7 @@
 //! | prefix `not`                | (none)  | operand parsed with min 5  |
 //! | `==` `!=` `===` `!==`       | 5       | 6 (non-associative)        |
 //! | `<` `<=` `>` `>=`           | 5       | 6 (non-associative)        |
+//! | `..` `..=`                  | 6       | 7 (non-associative)        |
 //! | `+` `-`                     | 7       | 8                          |
 //! | `*` `/` `//` `%`            | 9       | 10                         |
 //! | postfix `:` TYPE            | 11      | (none: parses a type)      |
@@ -210,6 +213,16 @@
 //! operand stops before another comparison as usual, and the parser then
 //! reports "comparison operators cannot be chained" if one follows, since
 //! `a < b < c` would otherwise mean `(a < b) < c`.
+//!
+//! The ranges, `..` and `..=`, bind tighter than comparison and looser than
+//! `+` and `-`: their left power is comparison's right power, so the right
+//! operand of `==` takes in a range, and their right power is the left
+//! power of `+` and `-`, so a range's right operand takes in a sum and
+//! `0..len(xs) - 1` is `0..(len(xs) - 1)`, while `a..b == c` is `(a..b) ==
+//! c`. They are non-associative as comparison is: a range directly
+//! followed by another, `a..b..c` or `a..b..=c`, is "`..` cannot be
+//! chained" (or "`..=` cannot be chained"), at the second operator.
+//! Negation binds tighter, so `-1..1` is `(-1)..1`.
 //!
 //! `not` is a prefix operator whose operand is parsed with minimum 5, the
 //! left power of comparison, so it takes in a comparison but not `and` or
@@ -243,6 +256,15 @@
 //! without `else` gets an empty block as its else branch, allocated by the
 //! parser with an empty span at the end of the `if`'s block.
 //!
+//! A `for` is a prefix expression too, usable wherever an `if` is: `for`,
+//! the variable's name, an identifier, `in`, the iterable, parsed at
+//! minimum 0 as an `if`'s condition is, optionally `if` and a guard, parsed
+//! the same way, and the body, a block that must follow on the same line.
+//! No operator starts with `if`, so an `if` after the complete iterable
+//! always begins the guard; an iterable that is itself an `if` expression
+//! starts with `if` and is parsed whole first. Its details are kept in the
+//! tree's `for` arena (see [`crate::ast::ForDecl`]).
+//!
 //! An interpolated string arrives from the lexer as a
 //! [`TokenKind::StrStart`], each expression's tokens, a
 //! [`TokenKind::StrMid`] between each two expressions, and a
@@ -262,20 +284,21 @@
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
 //! two ways. Parentheses, prefix operators (`await` included), blocks, `if`s,
-//! interpolations, function expressions, `lazy`s, argument lists, list
+//! `for`s, interpolations, function expressions, `lazy`s, argument lists, list
 //! literals, indexes, and
 //! record, function, applied and parenthesised types nest by recursion, so
 //! [`Parser::parse_expr`], the body of every nested block, every `else if`
 //! and every record, function, applied and parenthesised type count their
 //! own depth and stop before the recursion itself could overflow; a
-//! function expression, a `lazy`, an argument list, a list literal and an
-//! index recurse only through those.
+//! function expression, a `lazy`, a `for`, an argument list, a list literal
+//! and an index recurse only through those.
 //! Left-associative chains such as `1 + 1 + 1`, `a.b.c`, `xs[0][0]`, a
 //! union of many types or `Int[][]` nest without recursion, since the loop
 //! folds each operator into the
 //! left-hand side, so the parser also tracks the height of every node it
 //! allocates, a block being one above the tallest of its items' expressions
 //! and types, an `if` or an interpolation one above its tallest child, a
+//! `for` one above the tallest of its iterable, its guard and its body, a
 //! list literal one above its tallest element (a spread's being its
 //! expression's), an index one above the taller of its list and its
 //! position, a
@@ -298,8 +321,8 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
-    FnDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment, StrPart,
-    TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    FnDecl, ForDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment,
+    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -1245,13 +1268,22 @@ impl Parser<'_> {
                     ));
                 }
             }
+            // Likewise for a range, whose right operand stops before any
+            // further range.
+            if op.is_range() {
+                let next = self.peek();
+                if let Some(next_op) = binary_op(next.kind).filter(|next| next.is_range()) {
+                    let message = format!("`{}` cannot be chained", next_op.symbol());
+                    return Err(self.error(message, next.span));
+                }
+            }
         }
         Ok(lhs)
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
-    /// block, a list literal, an `if`, a function expression, a `lazy` or a
-    /// prefix operator application. Postfix operators, `.`, calls and
+    /// block, a list literal, an `if`, a `for`, a function expression, a
+    /// `lazy` or a prefix operator application. Postfix operators, `.`, calls and
     /// indexes included, are applied by the caller's loop. A `...` here is
     /// not the start of a list's element, and so an error.
     fn parse_prefix(&mut self) -> ParseResult<ExprId> {
@@ -1265,6 +1297,7 @@ impl Parser<'_> {
             TokenKind::Ident(name) => ExprKind::Name(name),
             TokenKind::StrStart(first) => return self.parse_interpolation(first),
             TokenKind::If => return self.parse_if(),
+            TokenKind::For => return self.parse_for(),
             TokenKind::Fn => return self.parse_fn_expr(),
             TokenKind::Lazy => return self.parse_lazy(),
             TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
@@ -1315,6 +1348,9 @@ impl Parser<'_> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Else
+            | TokenKind::In
+            | TokenKind::DotDot
+            | TokenKind::DotDotEq
             | TokenKind::Let
             | TokenKind::Colon
             | TokenKind::ColonEq
@@ -1708,6 +1744,82 @@ impl Parser<'_> {
         )
     }
 
+    /// Parses a `for` expression, starting at its `for`: the variable's
+    /// name, an identifier, `in`, the iterable, an optional guard, `if` and
+    /// an expression, and the body, a block. The iterable and the guard are
+    /// parsed as an `if`'s condition is, at minimum binding power 0 with no
+    /// trailing block, so a `{` after either is the body; an `if` after the
+    /// complete iterable, which no expression continues with, begins the
+    /// guard. The expression spans `for` through the body.
+    fn parse_for(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let name_token = self.peek();
+        let name = match name_token.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, name_token.span)),
+            TokenKind::StrStart(first) => {
+                let literal = self.parse_interpolation(first)?;
+                let span = self.span_of(literal);
+                return Err(self.error(PLAIN_VARIABLE_NAME, span));
+            }
+            _ => {
+                return Err(self.error("expected a name after `for`", error_span(name_token)));
+            }
+        };
+        self.advance();
+        let in_token = self.peek();
+        if in_token.kind != TokenKind::In {
+            let found = self.describe(in_token);
+            return Err(self.error(
+                format!("expected `in` after the `for` variable, found {found}"),
+                error_span(in_token),
+            ));
+        }
+        self.advance();
+        // A `{` after the iterable or the guard is the body, not a trailing
+        // block of a call.
+        let outer = std::mem::replace(&mut self.no_trailing_block, true);
+        let parts = self.parse_for_head();
+        self.no_trailing_block = outer;
+        let (iterable, guard) = parts?;
+        let open = self.peek();
+        if open.kind != TokenKind::LBrace {
+            let message = match guard {
+                Some(_) => "expected `{` after `for` guard",
+                None => "expected `{` or `if` after `for` iterable",
+            };
+            return Err(self.error(message, error_span(open)));
+        }
+        let body = self.parse_block()?;
+        let height = self
+            .height_of(iterable)
+            .max(guard.map_or(0, |guard| self.height_of(guard)))
+            .max(self.height_of(body))
+            + 1;
+        let span = Span::join(keyword.span, self.span_of(body));
+        let id = self.builder.push_for(ForDecl {
+            name,
+            name_span: name_token.span,
+            iterable,
+            guard,
+            body,
+        });
+        self.alloc(ExprKind::For(id), span, height)
+    }
+
+    /// Parses the iterable of a `for` and its guard, if an `if` follows the
+    /// iterable, each at minimum binding power 0.
+    fn parse_for_head(&mut self) -> ParseResult<(ExprId, Option<ExprId>)> {
+        let iterable = self.parse_expr(0)?;
+        if self.peek().kind != TokenKind::If {
+            return Ok((iterable, None));
+        }
+        self.advance();
+        let guard = self.parse_expr(0)?;
+        Ok((iterable, Some(guard)))
+    }
+
     /// Parses an interpolated string, starting at its
     /// [`TokenKind::StrStart`], whose text is `first`.
     fn parse_interpolation(&mut self, first: StrId) -> ParseResult<ExprId> {
@@ -1877,6 +1989,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         TokenKind::Ge => Some(BinaryOp::Ge),
         TokenKind::And => Some(BinaryOp::And),
         TokenKind::Or => Some(BinaryOp::Or),
+        TokenKind::DotDot => Some(BinaryOp::Range),
+        TokenKind::DotDotEq => Some(BinaryOp::RangeInclusive),
         TokenKind::Int(_)
         | TokenKind::Float(_)
         | TokenKind::Str(_)
@@ -1893,6 +2007,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Fn
         | TokenKind::Lazy
         | TokenKind::Await
+        | TokenKind::For
+        | TokenKind::In
         | TokenKind::Pipe
         | TokenKind::Neg
         | TokenKind::Colon
@@ -1916,8 +2032,10 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
 }
 
 /// `(left, right)` binding powers of a binary operator. Right is left + 1,
-/// which makes every level left-associative, except comparison, which
-/// [`Parser::parse_expr`] makes non-associative.
+/// which makes every level left-associative, except comparison and the
+/// ranges, which [`Parser::parse_expr`] makes non-associative. The ranges
+/// sit between comparison, whose right power is their left one, and `+`
+/// and `-`, whose left power is their right one.
 fn binding_power(op: BinaryOp) -> (u8, u8) {
     match op {
         BinaryOp::Or => (1, 2),
@@ -1930,6 +2048,7 @@ fn binding_power(op: BinaryOp) -> (u8, u8) {
         | BinaryOp::Le
         | BinaryOp::Gt
         | BinaryOp::Ge => (5, 6),
+        BinaryOp::Range | BinaryOp::RangeInclusive => (6, 7),
         BinaryOp::Add | BinaryOp::Sub => (7, 8),
         BinaryOp::Mul | BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Rem => (9, 10),
     }
@@ -1964,8 +2083,9 @@ mod tests {
     /// by `; `, binary operations and prefix operations are parenthesised,
     /// parens show as `[ ]`, blocks as `{ }`, ascriptions as `(e : T)`,
     /// field accesses as `(e . x)`, fields as `x = e`, strings as `"text"`
-    /// with interpolations as `<e>`, and an `if` as `(if c {..} else ..)`,
-    /// or `(if c {..})` without `else`. Record types show as
+    /// with interpolations as `<e>`, an `if` as `(if c {..} else ..)`, or
+    /// `(if c {..})` without `else`, and a `for` as it is written, `for x in
+    /// xs if g {..}`. Record types show as
     /// `{x: T, "a b": T}`.
     fn shape(text: &str) -> String {
         let ast = parse_text(text).unwrap();
@@ -2165,7 +2285,24 @@ mod tests {
             ExprKind::Call { callee, args } => call_shape(ast, callee, args, out),
             ExprKind::List(elements) => list_shape(ast, elements, out),
             ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
+            ExprKind::For(id) => for_shape(ast, id, out),
         }
+    }
+
+    /// A `for` as `for x in xs if g {..}`, without ` if g` if it has no
+    /// guard: as it is written, so that it parses back to itself.
+    fn for_shape(ast: &Ast, id: crate::ast::ForId, out: &mut String) {
+        let decl = ast.for_decl(id);
+        out.push_str("for ");
+        out.push_str(ast.names().get(decl.name));
+        out.push_str(" in ");
+        expr(ast, decl.iterable, out);
+        if let Some(guard) = decl.guard {
+            out.push_str(" if ");
+            expr(ast, guard, out);
+        }
+        out.push(' ');
+        expr(ast, decl.body, out);
     }
 
     /// An index as `(xs at 0)`.
@@ -5031,6 +5168,353 @@ mod tests {
         );
         assert_eq!(
             too_deep(ty(200_000)).message,
+            "expression nested too deeply"
+        );
+    }
+
+    // ----- Ranges and `for` -----
+
+    #[test]
+    fn ranges_bind_between_comparison_and_addition() {
+        assert_eq!(shape("0..10"), "(0 .. 10)");
+        assert_eq!(shape("0..=10"), "(0 ..= 10)");
+        assert_eq!(shape("a..b"), "(a .. b)");
+        assert_eq!(shape("0 .. 1"), "(0 .. 1)");
+        // Looser than `+` and `-`, on either side.
+        assert_eq!(shape("0..len(xs) - 1"), "(0 .. (len(xs) - 1))");
+        assert_eq!(shape("a + 1..=b * 2"), "((a + 1) ..= (b * 2))");
+        // Tighter than the comparisons, on either side.
+        assert_eq!(shape("a..b == c"), "((a .. b) == c)");
+        assert_eq!(shape("c == a..=b"), "(c == (a ..= b))");
+        assert_eq!(shape("a..b < c..d"), "((a .. b) < (c .. d))");
+        assert_eq!(shape("x and a..b != c"), "(x and ((a .. b) != c))");
+        assert_eq!(shape("not a..b"), "(not (a .. b))");
+        // Negation binds tighter still.
+        assert_eq!(shape("-1..1"), "((-1) .. 1)");
+        assert_eq!(shape("0..-1"), "(0 .. (-1))");
+        assert_eq!(shape("-a..=-b"), "((-a) ..= (-b))");
+        // Postfix operators apply to the bound, and an ascription too.
+        assert_eq!(shape("a.b..c[0]"), "((a . b) .. (c at 0))");
+        assert_eq!(shape("0..n : Int"), "(0 .. (n : Int))");
+        assert_eq!(shape("(0..n)[1]"), "([(0 .. n)] at 1)");
+        // Newlines after the operator are skipped, as after any binary
+        // operator, and not before it.
+        assert_eq!(shape("0..\n\n  10"), "(0 .. 10)");
+        assert_eq!(shape("0..=\n10"), "(0 ..= 10)");
+        assert_eq!(
+            error("0\n..10"),
+            (
+                "expected expression, found `..`".to_owned(),
+                Span::new(2, 4)
+            )
+        );
+        // A range is an operand like any other: in a list, as an argument,
+        // spread.
+        assert_eq!(shape("[0..2, ...1..=3]"), "list((0 .. 2), ...(1 ..= 3))");
+        assert_eq!(shape("f(0..n, m = 1..2)"), "f((0 .. n), m = (1 .. 2))");
+        // Neither dot of a range is part of a number.
+        assert_eq!(shape("1.5..2"), "(1.5 .. 2)");
+    }
+
+    #[test]
+    fn ranges_cannot_be_chained() {
+        let diagnostic = parse_text("a..b..c").unwrap_err();
+        assert_eq!(diagnostic.message, "`..` cannot be chained");
+        assert_eq!(diagnostic.span, Span::new(4, 6));
+        assert!(diagnostic.notes.is_empty());
+        assert_eq!(
+            error("a..=b..=c"),
+            ("`..=` cannot be chained".to_owned(), Span::new(5, 8))
+        );
+        // With each other, either way round.
+        assert_eq!(
+            error("a..b..=c"),
+            ("`..=` cannot be chained".to_owned(), Span::new(4, 7))
+        );
+        assert_eq!(
+            error("a..=b..c"),
+            ("`..` cannot be chained".to_owned(), Span::new(5, 7))
+        );
+        // After a right operand that is a sum, and on the right of a
+        // comparison.
+        assert_eq!(
+            error("0..n + 1..m"),
+            ("`..` cannot be chained".to_owned(), Span::new(8, 10))
+        );
+        assert_eq!(
+            error("x == 0..1..2"),
+            ("`..` cannot be chained".to_owned(), Span::new(9, 11))
+        );
+        // Parentheses separate them.
+        assert_eq!(shape("(a..b)..c"), "([(a .. b)] .. c)");
+        assert_eq!(shape("a..(b..c)"), "(a .. [(b .. c)])");
+    }
+
+    #[test]
+    fn for_shapes() {
+        assert_eq!(shape("for x in xs { x }"), "for x in xs {x}");
+        assert_eq!(shape("for x in xs {}"), "for x in xs {}");
+        // The guard.
+        assert_eq!(
+            shape("for x in xs if x > 1 { x }"),
+            "for x in xs if (x > 1) {x}"
+        );
+        assert_eq!(
+            shape("for x in xs if a and not b { x }"),
+            "for x in xs if (a and (not b)) {x}"
+        );
+        // An iterable that is a call, an index, a field, a range, an `if`,
+        // a block, a list.
+        assert_eq!(shape("for x in f(y) { x }"), "for x in f(y) {x}");
+        assert_eq!(shape("for x in xs[0] { x }"), "for x in (xs at 0) {x}");
+        assert_eq!(shape("for x in r.xs { x }"), "for x in (r . xs) {x}");
+        assert_eq!(shape("for i in 0..n { i }"), "for i in (0 .. n) {i}");
+        assert_eq!(
+            shape("for i in (0..=n) if i != 2 { i }"),
+            "for i in [(0 ..= n)] if (i != 2) {i}"
+        );
+        assert_eq!(
+            shape("for x in if a { xs } else { ys } { x }"),
+            "for x in (if a {xs} else {ys}) {x}"
+        );
+        assert_eq!(
+            shape("for x in if a { xs } else { ys } if x { x }"),
+            "for x in (if a {xs} else {ys}) if x {x}"
+        );
+        assert_eq!(shape("for x in { xs } { x }"), "for x in {xs} {x}");
+        assert_eq!(shape("for x in [1, 2] { x }"), "for x in list(1, 2) {x}");
+        // A `{` after the iterable or the guard is the body, never a
+        // trailing block; in parentheses it is one.
+        assert_eq!(shape("for x in f { x }"), "for x in f {x}");
+        assert_eq!(shape("for x in xs if g { x }"), "for x in xs if g {x}");
+        assert_eq!(shape("for x in (f { 1 }) { x }"), "for x in [f(){1}] {x}");
+        assert_eq!(shape("for x in f(g { 1 }) { x }"), "for x in f(g(){1}) {x}");
+        // Nested, and in the body.
+        assert_eq!(
+            shape("for x in xs { for y in x { y } }"),
+            "for x in xs {for y in x {y}}"
+        );
+        assert_eq!(
+            shape("for x in for y in ys { y } { x }"),
+            "for x in for y in ys {y} {x}"
+        );
+        assert_eq!(
+            shape("for x in xs {\n  let y = x * 2\n  y\n}"),
+            "for x in xs {let y = (x * 2); y}"
+        );
+        // A `for` is an operand like any other prefix expression: in a
+        // list, as an argument, spread, in a `let`, followed by an index.
+        assert_eq!(
+            shape("[for x in xs { x }, ...for y in ys { y }]"),
+            "list(for x in xs {x}, ...for y in ys {y})"
+        );
+        assert_eq!(
+            shape("f(for x in xs { x }, n = for y in ys { y })"),
+            "f(for x in xs {x}, n = for y in ys {y})"
+        );
+        assert_eq!(
+            shape("let ys = for x in xs { x }"),
+            "let ys = for x in xs {x}"
+        );
+        assert_eq!(shape("for x in xs { x }[0]"), "(for x in xs {x} at 0)");
+        assert_eq!(shape("1 + for x in xs { x }"), "(1 + for x in xs {x})");
+        assert_eq!(shape("{ ...for x in xs { x } }"), "{...for x in xs {x}}");
+        // What is printed parses back to itself.
+        for text in [
+            "for x in xs {x}",
+            "for x in xs if g {x}",
+            "let ys = for x in xs {for y in x {y}}",
+            "f(for x in xs {x}, n = for y in ys {y})",
+        ] {
+            assert_eq!(shape(text), text);
+        }
+    }
+
+    #[test]
+    fn a_for_spans_its_keyword_through_its_body() {
+        let ast = parse_text("for x in xs if g { x }").unwrap();
+        let root = only_value(&ast);
+        let expr = ast.get(root);
+        assert_eq!(expr.span, Span::new(0, 22));
+        assert_eq!(expr.keyword_span(), Some(Span::new(0, 3)));
+        let ExprKind::For(id) = expr.kind else {
+            panic!("expected a for, got {expr:?}");
+        };
+        let decl = ast.for_decl(id);
+        assert_eq!(ast.names().get(decl.name), "x");
+        assert_eq!(decl.name_span, Span::new(4, 5));
+        assert_eq!(ast.get(decl.iterable).span, Span::new(9, 11));
+        assert_eq!(
+            decl.guard.map(|guard| ast.get(guard).span),
+            Some(Span::new(15, 16))
+        );
+        assert_eq!(ast.get(decl.body).span, Span::new(17, 22));
+        assert_eq!(ast.for_count(), 1);
+        // Without a guard.
+        let ast = parse_text("for x in xs {}").unwrap();
+        let ExprKind::For(id) = ast.get(only_value(&ast)).kind else {
+            panic!("expected a for");
+        };
+        assert_eq!(ast.for_decl(id).guard, None);
+    }
+
+    #[test]
+    fn for_errors() {
+        // A body on the next line is the error an `if`'s is.
+        assert_eq!(
+            error("for x in xs\n{ x }"),
+            (
+                "expected `{` or `if` after `for` iterable".to_owned(),
+                Span::new(11, 12)
+            )
+        );
+        assert_eq!(
+            error("for x in xs if g\n{ x }"),
+            (
+                "expected `{` after `for` guard".to_owned(),
+                Span::new(16, 17)
+            )
+        );
+        assert_eq!(
+            error("for x in xs x"),
+            (
+                "expected `{` or `if` after `for` iterable".to_owned(),
+                Span::new(12, 13)
+            )
+        );
+        assert_eq!(
+            error("for x in xs"),
+            (
+                "expected `{` or `if` after `for` iterable".to_owned(),
+                Span::new(11, 11)
+            )
+        );
+        // The variable is a plain name.
+        assert_eq!(
+            error("for 1 in xs {}"),
+            ("expected a name after `for`".to_owned(), Span::new(4, 5))
+        );
+        assert_eq!(
+            error("for \"x\" in xs {}"),
+            (PLAIN_VARIABLE_NAME.to_owned(), Span::new(4, 7))
+        );
+        assert_eq!(
+            error("for a.b in xs {}"),
+            (
+                "expected `in` after the `for` variable, found `.`".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("for x xs {}"),
+            (
+                "expected `in` after the `for` variable, found `xs`".to_owned(),
+                Span::new(6, 8)
+            )
+        );
+        assert_eq!(
+            error("for x in {}"),
+            (
+                "expected `{` or `if` after `for` iterable".to_owned(),
+                Span::new(11, 11)
+            )
+        );
+        assert_eq!(
+            error("for x in xs if {}"),
+            (
+                "expected `{` after `for` guard".to_owned(),
+                Span::new(17, 17)
+            )
+        );
+        assert_eq!(
+            error("in"),
+            (
+                "expected expression, found `in`".to_owned(),
+                Span::new(0, 2)
+            )
+        );
+        assert_eq!(
+            error("for x in xs { x } 2"),
+            (
+                "expected end of item, found `2`".to_owned(),
+                Span::new(18, 19)
+            )
+        );
+        // `for` and `in` are keywords, not names.
+        assert_eq!(
+            error("let in = 1"),
+            ("expected a name after `let`".to_owned(), Span::new(4, 6))
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_ranges_and_fors() {
+        let ast = parse_text("for i in 0..=n if i != 1 { i }\nfor x in xs {}").unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..30\n\
+             \x20   (for i @0..30\n\
+             \x20     (..= @9..14\n\
+             \x20       (int 0 @9..10)\n\
+             \x20       (name n @13..14))\n\
+             \x20     (guard\n\
+             \x20       (!= @18..24\n\
+             \x20         (name i @18..19)\n\
+             \x20         (int 1 @23..24)))\n\
+             \x20     (block @25..30\n\
+             \x20       (expr @27..28\n\
+             \x20         (name i @27..28)))))\n\
+             \x20 (expr @31..45\n\
+             \x20   (for x @31..45\n\
+             \x20     (name xs @40..42)\n\
+             \x20     (block @43..45))))"
+        );
+    }
+
+    #[test]
+    fn fors_count_towards_depth() {
+        // A `for` is one above the tallest of its parts, as an `if` is:
+        // nested in each other's bodies, N `for`s around a literal are 2N +
+        // 1 levels, and two levels of parser recursion each.
+        let nested =
+            |depth: usize| format!("{}1{}", "for x in xs { ".repeat(depth), " }".repeat(depth));
+        let deepest = nested((MAX_DEPTH - 1) / 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(nested((MAX_DEPTH - 1) / 2 + 1)).message,
+            "expression nested too deeply"
+        );
+        assert_eq!(
+            too_deep(nested(200_000)).message,
+            "expression nested too deeply"
+        );
+        // Nested in each other's iterables, N `for`s are N + 2 levels, the
+        // innermost being one above its body, a block around a name; and in
+        // each other's guards.
+        let iterables =
+            |depth: usize| format!("{}xs{}", "for x in ".repeat(depth), " { x }".repeat(depth));
+        let deepest = iterables(MAX_DEPTH - 2);
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        assert_eq!(
+            too_deep(iterables(MAX_DEPTH - 1)).message,
+            "expression nested too deeply"
+        );
+        let guards = |depth: usize| {
+            format!(
+                "{}g{}",
+                "for x in xs if ".repeat(depth),
+                " {}".repeat(depth)
+            )
+        };
+        assert_eq!(
+            too_deep(guards(200_000)).message,
+            "expression nested too deeply"
+        );
+        // A chain of ranges is an error, but ranges nest in parentheses.
+        let ranges = |depth: usize| format!("{}0{}", "(0..".repeat(depth), ")".repeat(depth));
+        assert_eq!(
+            too_deep(ranges(200_000)).message,
             "expression nested too deeply"
         );
     }

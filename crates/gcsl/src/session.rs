@@ -714,6 +714,53 @@ mod tests {
     }
 
     #[test]
+    fn fors_and_ranges_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let xs = for i in 0..3 { i * 10 }");
+        assert_eq!(value(&mut session, "xs").to_string(), "[0, 10, 20]");
+        assert_eq!(value_type(&session), "List<Int>");
+        // A `for`'s variable is not a top-level variable, and its slot is
+        // free for the next declaration.
+        assert_eq!(messages(&mut session, "x"), vec!["undefined variable `x`"]);
+        value(
+            &mut session,
+            "let fs = for x in xs if x > 0 { fn(): Int { x } }",
+        );
+        value(&mut session, "let y = 7");
+        // A closure made in an earlier input keeps its iteration's value.
+        assert_eq!(value(&mut session, "fs[0]() + fs[1]() + y"), Value::Int(37));
+        // A range too large fails the input, which leaves the session as
+        // it was.
+        assert_eq!(
+            messages(&mut session, "let big = 0..20000000"),
+            vec!["range too large"]
+        );
+        assert_eq!(
+            messages(&mut session, "big"),
+            vec!["undefined variable `big`"]
+        );
+        assert_eq!(value(&mut session, "len(xs)"), Value::Int(3));
+        // An error in a `for` in a function of an earlier input names that
+        // input.
+        value(
+            &mut session,
+            "fn inverses(xs: Int[]): Int[] { for x in xs { 60 // x } }",
+        );
+        assert_eq!(
+            value(&mut session, "inverses([1, 2])").to_string(),
+            "[60, 30]"
+        );
+        let diagnostics = eval(&mut session, "inverses([1, 0])").unwrap_err();
+        assert_eq!(diagnostics[0].message, "division by zero");
+        assert_eq!(diagnostics[0].input, Some(6));
+        // A unit-like statement.
+        assert_eq!(
+            value(&mut session, "for x in xs { }\n[]\nlen(xs)"),
+            Value::Int(3)
+        );
+    }
+
+    #[test]
     fn warnings_come_back_with_the_value() {
         let mut session = Session::new();
         let outcome = eval(&mut session, "let p: {x: Int} = { x = 1; y = 2 }\np").unwrap();

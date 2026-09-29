@@ -1,0 +1,16 @@
+# A fleet: its hosts, the ports they listen on, and a rollout.
+fn deploy(host: String) -> {} { }
+let hosts = ["web-1", "web-2", "db-1"]
+# A range is the integers up to its end; `..=` includes the end.
+let ports = for i in 0..len(hosts) { 8000 + i }
+# A guard keeps only the elements it is true for.
+let webs = for host in hosts if host != "db-1" { host }
+# A statement of `{}`s builds no list: each body runs for its effects.
+for host in webs { deploy(host) }
+# A statement of futures is awaited deeply, so every step runs.
+for host in webs { lazy deploy(host) }
+let checks: List<Present<Int>> = for p in ports { lazy p }
+count = len(ports)
+plan = "{webs} on {ports}"
+squares = for i in 1..=3 { i * i }
+same = checks == ports

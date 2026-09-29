@@ -54,6 +54,16 @@
 //! A built-in function's call lowers to a node of its own, specialised as
 //! any operator is: `len` to [`IrKind::ListLen`].
 //!
+//! A range, `..` or `..=`, is an [`IrKind::Range`] of its two `Int`
+//! bounds, a list node. A `for` is an [`IrKind::For`]: the slot
+//! of its variable, in the current frame, and its parts, the iterable, the
+//! guard if it has one and the body, in the item pool, which are its
+//! children, so that its height is one above the tallest of them, as an
+//! `if`'s is, and the nesting budget is charged for its body once, however
+//! many times it runs. It either collects the body's values into a list or,
+//! as a statement whose value nothing would hold, discards them and is
+//! `{}`.
+//!
 //! # Functions
 //!
 //! Every function expression of the program has an entry in the function
@@ -343,11 +353,12 @@ pub struct ShapedOperands {
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
-/// `And`, `Or` and `Not` nodes and an `If`'s condition to Bool-typed nodes,
-/// and of `Record*`, `Field` and `UpdateField` nodes to record nodes (an
-/// `UpdateField`'s value excepted, which may be of any kind), of `List*`
-/// and `Spread` nodes and an `Index`'s list to list nodes, an `Index`'s
-/// position is an Int node, and a `Call`'s
+/// `And`, `Or` and `Not` nodes and an `If`'s condition and a `For`'s guard
+/// to Bool-typed nodes, and of `Record*`, `Field` and `UpdateField` nodes
+/// to record nodes (an `UpdateField`'s value excepted, which may be of any
+/// kind), of `List*` and `Spread` nodes, an `Index`'s list and a `For`'s
+/// iterable to list nodes, an `Index`'s position and a `Range`'s bounds
+/// are Int nodes, and a `Call`'s
 /// callee is a function node; see [`Ir::kind_of`]. No typed operand is ever
 /// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
 /// [`IrKind::Await`] of it.
@@ -522,6 +533,31 @@ pub enum IrKind {
     /// The number of elements of the list its operand evaluates to, an
     /// `Int`: a call of the built-in function `len`.
     ListLen(IrId),
+    /// A range: the list of the `Int`s from the left operand, an `Int`, up
+    /// to the right one, an `Int`, in order, the right one included if the
+    /// flag is `true` (`a..=b`) and not if it is `false` (`a..b`); empty if
+    /// there are none. A runtime error if it would have more than
+    /// [`crate::eval::MAX_RANGE_LEN`] elements, unless it is directly the
+    /// iterable of a [`IrKind::For`], which does not build it.
+    Range(bool, Operands),
+    /// A `for`: evaluates the iterable, the first of `parts`, a list node,
+    /// once, and then for each of its elements in order writes the element
+    /// to `slot`, evaluates the guard, the second of three parts, a `Bool`
+    /// node, if there are three, and if it is true or there is none, the
+    /// body, the last part, a node of any kind. An iterable that is
+    /// directly a [`IrKind::Range`] is not built: its bounds are evaluated
+    /// and its integers counted.
+    For {
+        /// The slot of the `for`'s variable, in the current frame.
+        slot: Slot,
+        /// The iterable, the guard if there is one, and the body.
+        parts: IrRange,
+        /// Whether the `for` yields the list of the body's values, in
+        /// order, and is of kind [`ValueKind::List`]; otherwise it discards
+        /// them and yields `{}`, a statement whose value nothing would
+        /// hold, and is of kind [`ValueKind::Record`].
+        collect: bool,
+    },
     /// Builds a closure of function `function` of the IR, capturing the
     /// values of `captures`: loads in the frame creating it, one for each
     /// value the function captures, in capture order.
@@ -606,7 +642,8 @@ impl IrKind {
     /// a store's value, a field access's record, an update's record and
     /// value, an interpolation's pieces, a record's values, a list's items,
     /// a spread's list, an index's list and position, a length's list, a
-    /// closure's and a future's captures, and an await's value. A closure's
+    /// range's bounds, a `for`'s iterable, guard and body, a closure's and
+    /// a future's captures, and an await's value. A closure's
     /// or a future's
     /// function is not a child: its body is evaluated in a frame of its own.
     /// This is the one list of every node's children, and its match is
@@ -662,6 +699,7 @@ impl IrKind {
             | IrKind::ListNotSame(Operands { lhs, rhs, .. })
             | IrKind::And(Operands { lhs, rhs, .. })
             | IrKind::Or(Operands { lhs, rhs, .. })
+            | IrKind::Range(_, Operands { lhs, rhs, .. })
             | IrKind::RecordEq(ShapedOperands { lhs, rhs, .. })
             | IrKind::RecordNe(ShapedOperands { lhs, rhs, .. })
             | IrKind::ListEq(ShapedOperands { lhs, rhs, .. })
@@ -680,6 +718,7 @@ impl IrKind {
             IrKind::Interp(items)
             | IrKind::MakeRecord { values: items, .. }
             | IrKind::MakeList { items, .. }
+            | IrKind::For { parts: items, .. }
             | IrKind::MakeClosure {
                 captures: items, ..
             }
@@ -719,6 +758,8 @@ impl IrKind {
             IrKind::And(_) => Some("and"),
             IrKind::Or(_) => Some("or"),
             IrKind::Not(_) => Some("not"),
+            IrKind::Range(false, _) => Some(".."),
+            IrKind::Range(true, _) => Some("..="),
             IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -743,7 +784,8 @@ impl IrKind {
             | IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Index { .. }
-            | IrKind::ListLen(_) => None,
+            | IrKind::ListLen(_)
+            | IrKind::For { .. } => None,
         }
     }
 
@@ -767,6 +809,10 @@ impl IrKind {
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
             IrKind::ListLen(_) => "list-len",
+            IrKind::Range(false, _) => "range",
+            IrKind::Range(true, _) => "range-inclusive",
+            IrKind::For { collect: true, .. } => "for",
+            IrKind::For { collect: false, .. } => "for-each",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -843,7 +889,8 @@ impl IrNode {
             | IrKind::ListSame(operands)
             | IrKind::ListNotSame(operands)
             | IrKind::And(operands)
-            | IrKind::Or(operands) => operands.op_start,
+            | IrKind::Or(operands)
+            | IrKind::Range(_, operands) => operands.op_start,
             // A prefix operator starts its expression.
             IrKind::IntNeg(_) | IrKind::FloatNeg(_) | IrKind::Not(_) => self.span.start,
             IrKind::RecordEq(_)
@@ -854,6 +901,7 @@ impl IrNode {
             | IrKind::Spread(_)
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
+            | IrKind::For { .. }
             | IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -1196,7 +1244,10 @@ impl Ir {
                 | IrKind::IntFloorDiv(_)
                 | IrKind::IntRem(_)
                 | IrKind::ListLen(_) => ValueKind::Int,
-                IrKind::MakeList { .. } | IrKind::Spread(_) => ValueKind::List,
+                IrKind::MakeList { .. }
+                | IrKind::Spread(_)
+                | IrKind::Range(..)
+                | IrKind::For { collect: true, .. } => ValueKind::List,
                 IrKind::FloatConst(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::FloatAdd(_)
@@ -1207,7 +1258,8 @@ impl Ir {
                 IrKind::Empty
                 | IrKind::Store(..)
                 | IrKind::MakeRecord { .. }
-                | IrKind::UpdateField { .. } => ValueKind::Record,
+                | IrKind::UpdateField { .. }
+                | IrKind::For { collect: false, .. } => ValueKind::Record,
                 IrKind::Load(_, kind)
                 | IrKind::Field { kind, .. }
                 | IrKind::Index { kind, .. }
@@ -1242,7 +1294,12 @@ impl Ir {
     /// `(list-same === @0..9 ...)`. A list shows as `(make-list @0..9 ...)`
     /// and then its items, a spread as `(spread @0..5 ...)` and its list, an
     /// index as `(index @0..5 ...)`, its list and its position, and a
-    /// length as `(list-len @0..7 ...)` and its list. A closure shows its
+    /// length as `(list-len @0..7 ...)` and its list. A range shows as
+    /// `(range @0..4 ...)` or `(range-inclusive @0..5 ...)` and its bounds,
+    /// and a `for` as `(for x#2 @0..20 ...)`, its variable's slot followed
+    /// by ` if` if it has a guard, and then its iterable, its guard and its
+    /// body; one that discards the body's values as `(for-each x#2 @0..20
+    /// ...)`. A closure shows its
     /// function's
     /// number and then what it captures, as in `(make-closure #0 @0..9
     /// ...)`, a call its callee and then its arguments, each as
@@ -1701,6 +1758,13 @@ impl Pretty<'_> {
                 self.lazy_shape(f, shape)?;
             }
             IrKind::Arg { param, .. } | IrKind::LoadCapture(param, _) => write!(f, " {param}")?,
+            IrKind::For { slot, parts, .. } => {
+                self.slot(f, slot)?;
+                // The iterable, the guard and the body.
+                if self.ir.items(parts).len() == 3 {
+                    f.write_str(" if")?;
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -2374,6 +2438,104 @@ mod tests {
         ] {
             assert!(shown.contains(&node), "{node}: {shown}");
         }
+    }
+
+    #[test]
+    fn ranges_and_fors_have_kinds_children_and_print() {
+        // `for i in 0..3 if b { i }` and `for-each` of it over `0..=3`, by
+        // hand, with `i` in slot 0 and `b` in slot 1.
+        let mut names = Names::new();
+        let slot_names = vec![names.intern("i"), names.intern("b")];
+        let mut builder = IrBuilder::with_capacity(12);
+        let zero = builder.alloc(IrKind::IntConst(0), Span::new(9, 10));
+        let three = builder.alloc(IrKind::IntConst(3), Span::new(12, 13));
+        let operands = |op_start| Operands {
+            lhs: zero,
+            rhs: three,
+            op_start,
+        };
+        let range = builder.alloc(IrKind::Range(false, operands(10)), Span::new(9, 13));
+        let inclusive = builder.alloc(IrKind::Range(true, operands(10)), Span::new(9, 14));
+        let guard = builder.alloc(
+            IrKind::Load(Slot::new(1), ValueKind::Bool),
+            Span::new(17, 18),
+        );
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Int),
+            Span::new(21, 22),
+        );
+        let no_items = builder.push_item_list(&[]);
+        let body = builder.alloc(
+            IrKind::Block {
+                items: no_items,
+                result: load,
+            },
+            Span::new(19, 24),
+        );
+        let parts = builder.push_item_list(&[range, guard, body]);
+        let collecting = builder.alloc(
+            IrKind::For {
+                slot: Slot::new(0),
+                parts,
+                collect: true,
+            },
+            Span::new(0, 24),
+        );
+        let parts = builder.push_item_list(&[inclusive, body]);
+        let discarding = builder.alloc(
+            IrKind::For {
+                slot: Slot::new(0),
+                parts,
+                collect: false,
+            },
+            Span::new(0, 25),
+        );
+        let block_items = builder.push_item_list(&[discarding]);
+        let root = builder.alloc(
+            IrKind::Block {
+                items: block_items,
+                result: collecting,
+            },
+            Span::new(0, 25),
+        );
+        let ir = builder.finish(root, 2, slot_names);
+        for (id, kind) in [
+            (range, ValueKind::List),
+            (inclusive, ValueKind::List),
+            (collecting, ValueKind::List),
+            (discarding, ValueKind::Record),
+            (root, ValueKind::List),
+        ] {
+            assert_eq!(ir.kind_of(id), kind, "{:?}", ir.get(id));
+        }
+        let symbols = [range, inclusive, collecting].map(|id| ir.get(id).kind.symbol());
+        assert_eq!(symbols, [Some(".."), Some("..="), None]);
+        assert_eq!(ir.get(range).operator_span(), Some(Span::new(10, 12)));
+        assert_eq!(ir.get(inclusive).operator_span(), Some(Span::new(10, 13)));
+        assert_eq!(ir.get(collecting).operator_span(), None);
+        // A `for`'s children are its parts, and a range's its bounds.
+        assert_eq!(
+            ir.children(collecting).collect::<Vec<_>>(),
+            vec![range, guard, body]
+        );
+        assert_eq!(ir.children(range).collect::<Vec<_>>(), vec![zero, three]);
+        assert_eq!(
+            ir.pretty(&names).to_string(),
+            "(block @0..25\n\
+             \x20 (for-each i#0 @0..25\n\
+             \x20   (range-inclusive @9..14\n\
+             \x20     (int 0 @9..10)\n\
+             \x20     (int 3 @12..13))\n\
+             \x20   (block @19..24\n\
+             \x20     (load i#0 @21..22)))\n\
+             \x20 (for i#0 if @0..24\n\
+             \x20   (range @9..13\n\
+             \x20     (int 0 @9..10)\n\
+             \x20     (int 3 @12..13))\n\
+             \x20   (load b#1 @17..18)\n\
+             \x20   (block @19..24\n\
+             \x20     (load i#0 @21..22))))"
+        );
     }
 
     #[test]

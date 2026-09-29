@@ -24,11 +24,12 @@
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `if`,
-//! `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy` and `await`;
-//! the whole identifier is scanned before it is compared with them, so
-//! `fn-x`, `lazy-x` and `await-x` are identifiers. An `r` directly followed
-//! by `"` begins a raw string literal; anywhere else it is an ordinary
-//! identifier. `Future` and `Present` are not keywords: they are ordinary
+//! `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`, `await`,
+//! `for` and `in`; the whole identifier is scanned before it is compared
+//! with them, so `fn-x`, `lazy-x`, `await-x` and `for-x` are identifiers.
+//! An `r` directly followed by `"` begins a raw string literal; anywhere
+//! else it is an ordinary identifier. `Future` and `Present` are not
+//! keywords: they are ordinary
 //! identifiers, which only the checker gives a meaning, in types.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
@@ -38,9 +39,13 @@
 //! `|` is a [`TokenKind::Pipe`], used only in union types. `!` is only
 //! accepted as part of `!=` or `!==`; negation is `not`. A `.` is part of a
 //! number literal only between two digits, as in
-//! `1.5`; three dots in a row are one [`TokenKind::DotDotDot`], the spread
-//! of a list element; anywhere else a `.` is a [`TokenKind::Dot`], so `1.x`
-//! is `1`, `.`, `x`, and `..` is two `Dot`s. A `,` is a
+//! `1.5`. Dots are lexed greedily too: three in a row are one
+//! [`TokenKind::DotDotDot`], the spread of a list element; otherwise two
+//! followed by `=` are one [`TokenKind::DotDotEq`], the inclusive range,
+//! and two alone one [`TokenKind::DotDot`], the range; anywhere else a `.`
+//! is a [`TokenKind::Dot`]. So `1.x` is `1`, `.`, `x`, `0..10` is `0`,
+//! `..`, `10`, `1.5..2` is `1.5`, `..`, `2`, `0...5` is `0`, `...`, `5`,
+//! and `....` is `...`, `.`. A `,` is a
 //! [`TokenKind::Comma`], which separates the fields of a record type, the
 //! parameters of a function, the arguments of a call and the elements of a
 //! list. `[` and `]` are [`TokenKind::LBracket`] and
@@ -201,6 +206,11 @@ pub enum TokenKind {
     Lazy,
     /// The keyword `await`, which awaits the value after it.
     Await,
+    /// The keyword `for`, which starts a `for` expression.
+    For,
+    /// The keyword `in`, between a `for`'s variable and what it iterates
+    /// over.
+    In,
     /// `+`
     Plus,
     /// `-` as subtraction: not directly after an operand, and followed by
@@ -257,11 +267,17 @@ pub enum TokenKind {
     RBracket,
     /// `;`
     Semi,
-    /// `.` not inside a number literal nor among three: field access.
+    /// `.` not inside a number literal nor among two or three: field access.
     Dot,
     /// `...`, which spreads a list into the list literal it is an element
     /// of.
     DotDotDot,
+    /// `..`, the range of the integers from its left operand up to but not
+    /// including its right one.
+    DotDot,
+    /// `..=`, the range of the integers from its left operand up to and
+    /// including its right one.
+    DotDotEq,
     /// `,`, which separates the fields of a record type, the parameters of
     /// a function, the arguments of a call and the elements of a list.
     Comma,
@@ -292,6 +308,8 @@ impl TokenKind {
             TokenKind::Fn => Some("fn"),
             TokenKind::Lazy => Some("lazy"),
             TokenKind::Await => Some("await"),
+            TokenKind::For => Some("for"),
+            TokenKind::In => Some("in"),
             TokenKind::Plus => Some("+"),
             TokenKind::Minus | TokenKind::Neg => Some("-"),
             TokenKind::Star => Some("*"),
@@ -320,6 +338,8 @@ impl TokenKind {
             TokenKind::Semi => Some(";"),
             TokenKind::Dot => Some("."),
             TokenKind::DotDotDot => Some("..."),
+            TokenKind::DotDot => Some(".."),
+            TokenKind::DotDotEq => Some("..="),
             TokenKind::Comma => Some(","),
             TokenKind::Pipe => Some("|"),
             TokenKind::Int(_)
@@ -349,6 +369,8 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "fn" => TokenKind::Fn,
         "lazy" => TokenKind::Lazy,
         "await" => TokenKind::Await,
+        "for" => TokenKind::For,
+        "in" => TokenKind::In,
         _ => return None,
     })
 }
@@ -687,9 +709,11 @@ impl<'a> Lexer<'a> {
             b'%' => (TokenKind::Percent, 1),
             b';' => (TokenKind::Semi, 1),
             // A `.` inside a number literal has been consumed by `number`.
-            b'.' if self.peek_at(1) == Some(b'.') && self.peek_at(2) == Some(b'.') => {
-                (TokenKind::DotDotDot, 3)
-            }
+            b'.' if self.peek_at(1) == Some(b'.') => match self.peek_at(2) {
+                Some(b'.') => (TokenKind::DotDotDot, 3),
+                Some(b'=') => (TokenKind::DotDotEq, 3),
+                _ => (TokenKind::DotDot, 2),
+            },
             b'.' => (TokenKind::Dot, 1),
             b',' => (TokenKind::Comma, 1),
             b'|' => (TokenKind::Pipe, 1),
@@ -2503,17 +2527,95 @@ mod tests {
     }
 
     #[test]
-    fn three_dots_are_one_token_and_fewer_are_field_access() {
-        use TokenKind::{Dot, DotDotDot, Eof};
+    fn three_dots_are_one_token_two_a_range_and_one_field_access() {
+        use TokenKind::{Dot, DotDot, DotDotDot, Eof};
         assert_eq!(kinds("..."), [DotDotDot, Eof]);
-        assert_eq!(kinds(".."), [Dot, Dot, Eof]);
+        assert_eq!(kinds(".."), [DotDot, Eof]);
         assert_eq!(kinds("."), [Dot, Eof]);
         assert_eq!(kinds("...."), [DotDotDot, Dot, Eof]);
         assert_eq!(kinds("......"), [DotDotDot, DotDotDot, Eof]);
-        assert_eq!(kinds(". .."), [Dot, Dot, Dot, Eof]);
+        assert_eq!(kinds(". .."), [Dot, DotDot, Eof]);
         // A number literal takes a `.` only between two digits.
         assert_eq!(show("1...x"), ["Int(1)", "DotDotDot", "Ident(x)", "Eof"]);
         assert_eq!(show("1.5..."), ["Float(1.5)", "DotDotDot", "Eof"]);
+    }
+
+    // ----- Ranges and `for` -----
+
+    #[test]
+    fn two_dots_are_a_range_and_two_and_an_equals_sign_an_inclusive_one() {
+        use TokenKind::{Dot, DotDot, DotDotDot, DotDotEq, Eof, Eq, EqEq};
+        assert_eq!(kinds(".."), [DotDot, Eof]);
+        assert_eq!(kinds("..="), [DotDotEq, Eof]);
+        assert_eq!(kinds("..=="), [DotDotEq, Eq, Eof]);
+        assert_eq!(kinds(".. ="), [DotDot, Eq, Eof]);
+        assert_eq!(kinds(". .="), [Dot, Dot, Eq, Eof]);
+        assert_eq!(kinds("...="), [DotDotDot, Eq, Eof]);
+        assert_eq!(kinds(".. =="), [DotDot, EqEq, Eof]);
+        // A number takes neither dot of a range after it: a `.` not followed
+        // by a digit is not part of a number.
+        assert_eq!(show("0..10"), ["Int(0)", "DotDot", "Int(10)", "Eof"]);
+        assert_eq!(show("0..=10"), ["Int(0)", "DotDotEq", "Int(10)", "Eof"]);
+        assert_eq!(show("1.5..2"), ["Float(1.5)", "DotDot", "Int(2)", "Eof"]);
+        assert_eq!(show("1.5..=2"), ["Float(1.5)", "DotDotEq", "Int(2)", "Eof"]);
+        assert_eq!(show("0...5"), ["Int(0)", "DotDotDot", "Int(5)", "Eof"]);
+        assert_eq!(show("a..b"), ["Ident(a)", "DotDot", "Ident(b)", "Eof"]);
+        assert_eq!(show("a..=b"), ["Ident(a)", "DotDotEq", "Ident(b)", "Eof"]);
+        assert_eq!(show("0 .. 1"), ["Int(0)", "DotDot", "Int(1)", "Eof"]);
+        assert_eq!(show("0 ..= 1"), ["Int(0)", "DotDotEq", "Int(1)", "Eof"]);
+        assert_eq!(
+            show("x.a..y.b"),
+            [
+                "Ident(x)", "Dot", "Ident(a)", "DotDot", "Ident(y)", "Dot", "Ident(b)", "Eof"
+            ]
+        );
+        // A `-` after a range is a negation.
+        assert_eq!(show("0..-1"), ["Int(0)", "DotDot", "Neg", "Int(1)", "Eof"]);
+        assert_eq!(
+            show("-1..=-1"),
+            ["Neg", "Int(1)", "DotDotEq", "Neg", "Int(1)", "Eof"]
+        );
+        assert_eq!(spans("0..10"), [(0, 1), (1, 3), (3, 5), (5, 5)]);
+        assert_eq!(spans("0..=10"), [(0, 1), (1, 4), (4, 6), (6, 6)]);
+        assert_eq!(TokenKind::DotDot.symbol(), Some(".."));
+        assert_eq!(TokenKind::DotDotEq.symbol(), Some("..="));
+    }
+
+    #[test]
+    fn for_and_in_are_keywords_only_as_whole_words() {
+        assert_eq!(
+            show("for in for-x in-x fore into For In"),
+            vec![
+                "For",
+                "In",
+                "Ident(for-x)",
+                "Ident(in-x)",
+                "Ident(fore)",
+                "Ident(into)",
+                "Ident(For)",
+                "Ident(In)",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("for x in xs { x }"),
+            [
+                "For",
+                "Ident(x)",
+                "In",
+                "Ident(xs)",
+                "LBrace",
+                "Ident(x)",
+                "RBrace",
+                "Eof"
+            ]
+        );
+        assert!(!is_identifier("for"));
+        assert!(!is_identifier("in"));
+        assert!(is_identifier("for-x"));
+        assert!(is_identifier("into"));
+        assert_eq!(TokenKind::For.symbol(), Some("for"));
+        assert_eq!(TokenKind::In.symbol(), Some("in"));
     }
 
     #[test]
