@@ -291,6 +291,96 @@
 //! [`Resolution::path_awaits`], in which only an item that awaits one has
 //! entries.
 //!
+//! # Mutable variables
+//!
+//! `let mut x = e` declares a *mutable variable*, checked exactly as `let x
+//! = e` is (and `let mut x: T = e` as `let x: T = e`), whose type is fixed
+//! there for its whole life. Its binding is of kind `BindingKind::Mutable`,
+//! and shadows and is shadowed as any variable's is: a later `let x`, `let
+//! mut x` or dotted `let x.a = ...` is a new variable in a new slot, which
+//! is mutable only if it is a `let mut`. A `let mut`'s path is a single
+//! name (the parser rejects a dotted one).
+//!
+//! ```text
+//! let mut total = 0
+//! for x in xs { total := total + x }
+//! let mut conf = { port = 80; host = "a" }
+//! if tls { conf.port := 443 }
+//! ```
+//!
+//! Values never change: a mutable variable is one that `:=` may give a new
+//! value from *any* block of the function that declares it (the top level,
+//! for one of the top level), an `if`'s branch, a `for`'s body or guard, a
+//! nested block or a record block, and not only from its declaring block.
+//! `x := e`, where the innermost binding of `x` (`lookup`) is a mutable
+//! variable, is checked by `Checker::check_mutable_rebind`:
+//!
+//! 1. If the variable is of the function being checked, the rebind is
+//!    allowed from any block, and `e` is checked against the variable's
+//!    type exactly as a `:=` in the declaring block of a variable that is
+//!    not mutable is: "the variable was declared here", literals adapting,
+//!    a value awaited to fit where an await is allowed. Nothing is
+//!    declared: the item writes the variable's own slot (see
+//!    [`Resolution::item_slot`]), and the variable keeps its type, its
+//!    declaration and its place in `bindings`. So in the declaring block
+//!    too, a mutable variable has one slot for its whole life, and a frame
+//!    does not grow with its rebinds.
+//! 2. If it is of an enclosing function or of the top level, and the `:=`
+//!    is in a function expression or a `lazy` nested in that, it is "cannot
+//!    rebind `x` here: it is declared outside this function" (or "this
+//!    `lazy`", for the innermost being one), labelled at the declaration,
+//!    with a note that the function holds its own copy of the variable. The
+//!    value is checked on its own and nothing is declared, so nothing
+//!    cascades.
+//!
+//! A rebind of a mutable variable that is erroneous already, whose error
+//! has been reported, checks its value on its own and declares nothing too.
+//!
+//! A dotted rebind, `x.a.b := e`, of a mutable variable of the function
+//! being checked, from any block, walks its path exactly as any dotted `:=`
+//! does (see "Dotted `let` and `:=`" above): each existing record measured,
+//! awaited where it may be a future, subject to the purity rule; every
+//! segment existing; `e` fitting the leaf's type. The updated record is
+//! written to the variable's own slot, and the variable keeps its declared
+//! type, which an assignment in an `if` must not change for the code after
+//! it, where a variable that is not mutable takes the updated type, the
+//! records along the path present. So the updated type must be a
+//! subtype of the declared one (`Checker::kept_type`), which it is whenever
+//! the variable and the records along the path are present or the either
+//! shape; otherwise, as for a variable declared exactly `Future<{a: Int}>`,
+//! it is "cannot rebind `r.a`: `r` is declared `Future<{a: Int}>`, and the
+//! update makes it `{a: Int}`", at the path, the value still being checked.
+//!
+//! A variable that is not mutable is rebound as before: a `:=` in its
+//! declaring block declares a new binding, and one from an inner block is
+//! "declared in an enclosing block", whose note says that only a `let mut`
+//! variable can be rebound there (a parameter and a `for`'s variable, which
+//! cannot be declared `mut`, included), unless the `:=` is in a function or
+//! a `lazy` nested in the variable's own, where `let mut` would not help
+//! either. Fields and the callee are rejected as ever.
+//!
+//! Nothing else is new. Rebinding a mutable variable is not an effect
+//! anything outside its function can see, so pure, memoised and impure
+//! functions alike may. A function expression or a `lazy` that reads a
+//! mutable variable of an enclosing function captures it, by value, when
+//! it is created, as any variable (see [Functions](#functions)), so later
+//! rebinds do not reach it, and no value is ever shared and changed. A `for`
+//! and an `if` are not functions, so their guards and bodies may rebind the
+//! enclosing function's mutable variables. There is no flow typing: a
+//! mutable variable has its declared type at every use, so one that may be
+//! a future is measured, and awaited, at each.
+//!
+//! Since the variable may come to hold another value, nothing is inferred
+//! from its initialiser beyond its type: a mutable variable initialised
+//! directly with a function expression does not remember the function
+//! (`Binding::function` is `None`, and so is its entry of a session's
+//! [`Scope`]), so a call through it is typed by its type alone (see "The
+//! call-site error" under [Inferred parameters](#inferred-parameters)).
+//! Inside `let mut f = fn ...`, the name `f` is still the function being
+//! called, whatever `f` holds later. Its type is its initialiser's, which
+//! for a function is the type inferred for it (see [Inferred
+//! results](#inferred-results)); an annotation gives it a wider one.
+//!
 //! # Equality
 //!
 //! `==` and `!=` are *typed* equality, and `===` and `!==` *total*
@@ -316,7 +406,8 @@
 //! the body is checked as a block whose scope starts with the parameters,
 //! against the return type as an annotated initialiser is checked against
 //! its annotation. The parameters are bindings like any other, so a `let`
-//! may shadow one and a `:=` rebind one. (The three things the body decides
+//! may shadow one and a `:=` rebind one, in the body's own block, since a
+//! parameter is not a mutable variable. (The three things the body decides
 //! are whether a pure function's bare parameters may be futures, whether
 //! an impure function's bare result is, and whether an impure function's
 //! callback parameter may be given futures: see [Inferred
@@ -344,11 +435,17 @@
 //! enclosing it, so the use reads its own function's capture. This is the
 //! upvalue chain of Lua and the free-variable cells of Python, except that
 //! there are no cells: each closure holds copies, made when its function
-//! expression is evaluated. Capturing by value is the only choice consistent
-//! with `:=`, which declares a new binding rather than assigning to the old
-//! one: after `let x = 1; let f = fn(): Int { x }; x := 2`, the `x` that `f`
-//! uses is the first binding, whose value is 1 whenever it is read, so `f()`
-//! is 1. A capture list is searched linearly, since it is short.
+//! expression is evaluated. For a variable that is not mutable, `:=`
+//! declares a new binding rather than assigning to the old one: after `let
+//! x = 1; let f = fn(): Int { x }; x := 2`, the `x` that `f` uses is the
+//! first binding, whose value is 1 whenever it is read, so `f()` is 1. A
+//! mutable variable is one binding, whose slot each `:=` writes (see
+//! [Mutable variables](#mutable-variables)), and capturing by value is what
+//! keeps it from being shared: after `let mut x = 1; let f = fn(): Int { x
+//! }; x := 2`, `f()` is 1 too, since `f` copied `x` when it was made, and
+//! no function can rebind the variable it copied, which `:=` from inside
+//! one is rejected for. So no value is ever shared and changed. A capture
+//! list is searched linearly, since it is short.
 //!
 //! **Self-reference.** A function expression that is the direct initialiser
 //! of a single-name `let`, field or named function item (not through
@@ -371,7 +468,8 @@
 //! unknown or unusable name, a parameter filled twice and parameters left
 //! unfilled are each reported, and make the call erroneous. A binding
 //! initialised directly with a function expression remembers which, so
-//! that a call through its name knows the function's [`FnResolution`]. A
+//! that a call through its name knows the function's [`FnResolution`],
+//! unless it is a mutable variable, which may come to hold another. A
 //! call of a built-in function is typed apart (see [Built-in
 //! functions](#built-in-functions)).
 //!
@@ -625,8 +723,9 @@
 //! the error "argument `x` would be awaited inside `f`, which is pure",
 //! labelled with where `f`'s body first measures the parameter when `f` is
 //! known (`Checker::argument_await_error`). A callee is known when it is a
-//! plain name whose binding was initialised directly with a function
-//! expression, of this input ([`FnResolution::param_demands`] says which
+//! plain name whose binding, not a mutable variable's, was initialised
+//! directly with a function expression, of this input
+//! ([`FnResolution::param_demands`] says which
 //! parameters were measured, and where) or of an earlier session input,
 //! whose [`Scope`] keeps which parameters its functions' bodies measure, but
 //! not where, since that input's source is gone: the error then has no label
@@ -904,7 +1003,10 @@
 //! so a closure or a `lazy` made in the body captures the variable as it
 //! would any variable of the enclosing function, by value, which is its
 //! value in that iteration. The guard is checked as an `if`'s condition is:
-//! measured, and `Bool`.
+//! measured, and `Bool`. Being blocks of the enclosing function, the guard
+//! and the body may rebind its mutable variables (see [Mutable
+//! variables](#mutable-variables)), and the guard for each element reads
+//! what the body wrote for the elements before it.
 //!
 //! Where no list type is expected, the `for` is `List<B>`, `B` being the
 //! body's type, an untyped integer settled to `Int` as a list literal's
@@ -949,7 +1051,10 @@
 //! in the same block, and not for a field; its value must fit the
 //! variable's type (a subtype, or an adapting literal), and the new binding
 //! keeps that type, so `:=` reads as assignment: a `let` is needed to
-//! change a variable's type.
+//! change a variable's type. A `:=` of a mutable variable, a `let mut`'s, is
+//! allowed from any block of the variable's function, and declares
+//! nothing: it is an assignment to the variable, which keeps its type (see
+//! [Mutable variables](#mutable-variables)).
 //!
 //! The scopes in effect form a stack, kept as one flat vector of bindings
 //! with the innermost block's bindings last: entering a block records where
@@ -965,10 +1070,14 @@
 //! frame (the top level's, outside functions), assigned stack-fashion, as
 //! in Lua and clox: entering a block, or a `for`'s scope, records the next
 //! free slot; each declaration (a parameter, a `let`, a field, a `for`'s
-//! variable, and `:=`, which is a new binding) takes the next free slot;
-//! leaving the block restores the next free slot to what it was on entry,
-//! so the slots of a finished block are reused by whatever comes after it.
-//! The highest slot count reached is the
+//! variable, and `:=` of a variable that is not mutable, which is a new
+//! binding) takes the next free slot; leaving the block restores the next
+//! free slot to what it was on entry, so the slots of a finished block are
+//! reused by whatever comes after it. A `:=` of a mutable variable takes
+//! none: it writes the variable's one slot, from whatever block it is in,
+//! all of which end before the variable's own block does, so the slot is
+//! never reused while the variable is in scope. The highest slot count
+//! reached is the
 //! frame size. A variable's slot is therefore known statically and never
 //! changes, and evaluation needs no environment lookups and no allocation
 //! per block. Some items share a slot: each definition of a field after its
@@ -983,7 +1092,11 @@
 //! returns extended by the new input's top-level declarations. This is what
 //! lets a [`crate::session::Session`] check each input in the context of the
 //! variables its earlier inputs declared, with the same code that checks a
-//! file.
+//! file. The scope keeps each binding's kind, so a later input may rebind an
+//! earlier input's mutable variable from any block of its top level, but
+//! not from a function or a `lazy`, as if it continued the same block; and
+//! it lists their slots ([`Scope::mutable_slots`]), the only ones of the
+//! scope a later input can write.
 
 use std::fmt;
 
@@ -1610,6 +1723,10 @@ struct Binding {
 enum BindingKind {
     /// A variable: declared by a `let`, a `:=` or a parameter.
     Variable,
+    /// A mutable variable, declared by a `let mut`, which `:=` rebinds in
+    /// its one slot, from any block of its function, keeping its type and
+    /// its binding.
+    Mutable,
     /// A field, which `:=` may not rebind.
     Field,
     /// A function's name for itself, inside its own body, which `:=` may
@@ -1951,6 +2068,18 @@ impl Scope {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
+    }
+
+    /// The slots of the scope's mutable variables, in declaration order. A
+    /// later input checked from the scope can write no other of its slots:
+    /// it may rebind a mutable variable from any block of its top level,
+    /// and every declaration it makes takes a slot of its own, after the
+    /// scope's.
+    pub fn mutable_slots(&self) -> impl Iterator<Item = Slot> + '_ {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.kind == BindingKind::Mutable)
+            .map(|binding| binding.slot)
     }
 }
 
@@ -2311,7 +2440,12 @@ impl<'a> Checker<'a> {
             // against what is expected of the block.
             let result_expected = expecting.filter(|_| next.is_none() && first_field.is_none());
             match item.kind {
-                ItemKind::Let { path, ty, value } => self.check_let(id, path, ty, value),
+                ItemKind::Let {
+                    path,
+                    ty,
+                    value,
+                    mutable,
+                } => self.check_let(id, path, ty, (value, mutable)),
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
                 ItemKind::Field { path, value } => self.check_field(id, path, value, expecting),
                 ItemKind::Spread(value) => self.check_spread_item(id, value),
@@ -2453,13 +2587,17 @@ impl<'a> Checker<'a> {
     }
 
     /// Checks `let PATH (: TYPE)? = VALUE` and declares the variable: with
-    /// the value's type, or for a dotted path the type of the update.
+    /// the value's type, or for a dotted path the type of the update. A
+    /// `let mut` (`mutable`), whose path is a single name, is checked in
+    /// the same way and declares a mutable variable, which remembers no
+    /// function expression, since it may come to hold another function (see
+    /// the module documentation).
     fn check_let(
         &mut self,
         id: ItemId,
         path: PathRange,
         annotation: Option<TypeExprId>,
-        value: ExprId,
+        (value, mutable): (ExprId, bool),
     ) {
         let expected = annotation.map(|annotation| {
             (
@@ -2490,6 +2628,9 @@ impl<'a> Checker<'a> {
         };
         self.callee_name = None;
         match segments {
+            [variable] if mutable => {
+                self.declare(variable.name, ty, id, BindingKind::Mutable);
+            }
             [variable] => {
                 let function = self.direct_function(segments, value);
                 self.declare_initialised(variable.name, ty, id, (BindingKind::Variable, function));
@@ -3323,7 +3464,9 @@ impl<'a> Checker<'a> {
     /// Checks `PATH := VALUE` and declares the new binding: with the value's
     /// type, or for a dotted path the type of the update. The binding is
     /// declared even when the rebind is rejected, so that later uses of the
-    /// name do not cascade into "undefined variable" errors.
+    /// name do not cascade into "undefined variable" errors. A rebind of a
+    /// mutable variable declares nothing: see
+    /// [`Checker::check_mutable_rebind`].
     fn check_rebind(&mut self, id: ItemId, path: PathRange, value: ExprId) {
         let segments = self.ast.path(path);
         let Some(&PathSegment {
@@ -3362,18 +3505,13 @@ impl<'a> Checker<'a> {
                 );
                 None
             }
+            Some((index, binding)) if binding.kind == BindingKind::Mutable => {
+                self.check_mutable_rebind(id, segments, (index, binding), value);
+                return;
+            }
             Some((index, binding)) if index >= self.block_start => Some((index, binding)),
-            Some((_, binding)) => {
-                let mut error = Diagnostic::error(
-                    format!("cannot rebind `{text}` here: it is declared in an enclosing block"),
-                    name_span,
-                );
-                // A binding from an earlier session input has no item here
-                // to point at.
-                if let Some(declared) = binding.declared {
-                    error = error.with_context(declared, "declared here");
-                }
-                let error = error.with_note(format!("shadow it with `let {text} = ...` instead"));
+            Some((index, binding)) => {
+                let error = self.enclosing_rebind_error(name_span, (index, binding));
                 self.errors.push(error);
                 None
             }
@@ -3431,6 +3569,171 @@ impl<'a> Checker<'a> {
             self.check_alone(value);
             self.declare(name, TyId::ERROR, id, BindingKind::Variable);
         }
+    }
+
+    /// Checks `PATH := VALUE`, the item `id` whose path is `segments`, of
+    /// the mutable variable `target`, at `index` in `bindings`, which is the
+    /// innermost binding of the path's first segment (see the module
+    /// documentation). From the variable's own function, or from the top
+    /// level for a variable of the top level, the rebind is allowed in any
+    /// block, and writes the variable's own slot: the value must fit the
+    /// variable's type as for a `:=` of a variable that is not mutable, in
+    /// its declaring block, and a dotted path is walked and its leaf
+    /// checked as for one too, but nothing is declared, and the variable
+    /// keeps its type, its declaration and its place in `bindings`. A
+    /// dotted rebind's record must therefore be of the variable's type (see
+    /// [`Checker::kept_type`]). From a function expression or a `lazy`
+    /// nested in that function, the rebind is rejected: the function holds
+    /// its own copy of the variable. A rejected rebind, and one of a
+    /// variable that is erroneous already, check the value on its own and
+    /// declare nothing, so nothing cascades.
+    fn check_mutable_rebind(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        (index, target): (usize, Binding),
+        value: ExprId,
+    ) {
+        let Some(first) = segments.first() else {
+            return;
+        };
+        if let Some(function) = self.functions.last()
+            && index < function.bindings_start
+        {
+            let error = self.outside_rebind_error(first, target, function.fn_id);
+            self.errors.push(error);
+            self.check_alone(value);
+            return;
+        }
+        if target.ty == TyId::ERROR {
+            self.check_alone(value);
+            return;
+        }
+        if segments.len() == 1 {
+            let context = target.declared.unwrap_or(first.span);
+            self.check_expr_expecting(value, target.ty, context, "the variable was declared here");
+            self.item_slots[id.index()] = target.slot;
+            return;
+        }
+        // As for any dotted `:=`, the path is walked before the value is
+        // checked against its leaf's type.
+        let base = self.path_types.len();
+        let Some(leaf) = self.rebind_leaf(segments, (target.ty, index)) else {
+            self.check_alone(value);
+            return;
+        };
+        self.check_expr_expecting(
+            value,
+            leaf,
+            path_span(segments),
+            "`:=` keeps the field's type",
+        );
+        let updated = self.record_update(id, segments, (Some((index, target)), base), leaf);
+        self.kept_type(segments, target, updated);
+        self.item_slots[id.index()] = target.slot;
+    }
+
+    /// The error for a `:=`, whose name is at `name_span`, of the variable
+    /// `binding`, at `index` in `bindings`, which is not mutable and is
+    /// declared in a block enclosing the `:=`'s own: "cannot rebind `x`
+    /// here: it is declared in an enclosing block", labelled at the
+    /// declaration when there is one. Its note says to shadow the variable,
+    /// and that a `let mut` variable can be rebound from an inner block,
+    /// unless the `:=` is in a function or a `lazy` nested in the
+    /// variable's own, where `let mut` would not help either.
+    fn enclosing_rebind_error(
+        &self,
+        name_span: Span,
+        (index, binding): (usize, Binding),
+    ) -> Diagnostic {
+        let text = self.ast.names().get(binding.name);
+        let mut error = Diagnostic::error(
+            format!("cannot rebind `{text}` here: it is declared in an enclosing block"),
+            name_span,
+        );
+        // A binding from an earlier session input has no item here to
+        // point at.
+        if let Some(declared) = binding.declared {
+            error = error.with_context(declared, "declared here");
+        }
+        let outside = self
+            .functions
+            .last()
+            .is_some_and(|function| index < function.bindings_start);
+        error.with_note(if outside {
+            format!("shadow it with `let {text} = ...` instead")
+        } else {
+            format!(
+                "shadow it with `let {text} = ...` instead; only a variable declared with `let \
+                 mut` can be rebound from an inner block"
+            )
+        })
+    }
+
+    /// The error for a `:=` of the mutable variable `target`, the first
+    /// segment of whose path is `first`, from inside the function
+    /// expression or `lazy` `function`, nested in the variable's own
+    /// function or in the top level: "cannot rebind `x` here: it is
+    /// declared outside this function" (or "this `lazy`"), labelled at the
+    /// declaration when there is one.
+    fn outside_rebind_error(
+        &self,
+        first: &PathSegment,
+        target: Binding,
+        function: FnId,
+    ) -> Diagnostic {
+        let text = self.ast.names().get(first.name);
+        // A `lazy` is the one function that declares no return type.
+        let kind = if self.ast.fn_decl(function).ret.is_none() {
+            "`lazy`"
+        } else {
+            "function"
+        };
+        let mut error = Diagnostic::error(
+            format!("cannot rebind `{text}` here: it is declared outside this {kind}"),
+            first.span,
+        );
+        // A variable from an earlier session input has no item here to
+        // point at.
+        if let Some(declared) = target.declared {
+            error = error.with_context(declared, "declared here");
+        }
+        error.with_note(format!(
+            "a {kind} holds its own copy of each variable it uses, made when the {kind} is \
+             created; rebinding the copy would not change `{text}`"
+        ))
+    }
+
+    /// Checks that `updated`, the record a dotted `:=` of the path
+    /// `segments` makes of the mutable variable `target`, is of the
+    /// variable's type, which a mutable variable keeps: it is whenever the
+    /// variable and the records along the path are present or the either
+    /// shape, since the update makes them present. Otherwise, as for a
+    /// variable declared exactly `Future<{a: Int}>`, reports "cannot rebind
+    /// `r.a`: `r` is declared `Future<{a: Int}>`, and the update makes it
+    /// `{a: Int}`" at the path.
+    fn kept_type(&mut self, segments: &[PathSegment], target: Binding, updated: TyId) {
+        if updated == TyId::ERROR || self.types.is_subtype(updated, target.ty) {
+            return;
+        }
+        let path = self.ast.show_path(segments).to_string();
+        let text = self.ast.names().get(target.name);
+        let declared = self.in_message(target.ty);
+        let made = self.in_message(updated);
+        let mut error = Diagnostic::error(
+            format!(
+                "cannot rebind `{path}`: `{text}` is declared {declared}, and the update makes \
+                 it {made}"
+            ),
+            path_span(segments),
+        );
+        if let Some(span) = target.declared {
+            error = error.with_context(span, "declared here");
+        }
+        self.errors.push(error.with_note(
+            "a mutable variable keeps its type; declare it with a type that allows both, or \
+             await it where it is declared",
+        ));
     }
 
     /// The type of the leaf of the dotted `:=` path `segments`, whose first
@@ -3621,8 +3924,28 @@ impl<'a> Checker<'a> {
         (found, base): (Option<(usize, Binding)>, usize),
         leaf_ty: TyId,
     ) {
-        let Some((first, rest)) = segments.split_first() else {
+        let Some(first) = segments.first() else {
             return;
+        };
+        let ty = self.record_update(id, segments, (found, base), leaf_ty);
+        self.declare(first.name, ty, id, BindingKind::Variable);
+    }
+
+    /// The type of the record that the dotted `let` or `:=` item `id`,
+    /// whose path is `segments`, makes, as [`Checker::finish_update`]
+    /// describes it, for whatever the item declares or rebinds; records
+    /// for lowering how its path resolves, and truncates `path_types` back
+    /// to `base`. `Error` if `leaf_ty` is, or if `segments` is empty.
+    fn record_update(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        (found, base): (Option<(usize, Binding)>, usize),
+        leaf_ty: TyId,
+    ) -> TyId {
+        let Some((_, rest)) = segments.split_first() else {
+            self.path_types.truncate(base);
+            return TyId::ERROR;
         };
         let existing = self.path_types.len().saturating_sub(base);
         let ty = if leaf_ty == TyId::ERROR {
@@ -3664,7 +3987,7 @@ impl<'a> Checker<'a> {
             };
         }
         self.path_types.truncate(base);
-        self.declare(first.name, ty, id, BindingKind::Variable);
+        ty
     }
 
     /// Declares a variable or field, as `kind` says, for the item `id`, in
@@ -3749,7 +4072,9 @@ impl<'a> Checker<'a> {
     fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
         let home = match binding.kind {
             BindingKind::Callee => VarRef::Callee,
-            BindingKind::Variable | BindingKind::Field => VarRef::Local(binding.slot),
+            BindingKind::Variable | BindingKind::Mutable | BindingKind::Field => {
+                VarRef::Local(binding.slot)
+            }
         };
         // The outermost function the binding is not in: every function from
         // there inwards must capture it.
@@ -8269,7 +8594,10 @@ mod tests {
         assert_eq!(labels(diagnostic), vec![(Span::new(0, 9), "declared here")]);
         assert_eq!(
             diagnostic.notes,
-            vec!["shadow it with `let x = ...` instead"]
+            vec![
+                "shadow it with `let x = ...` instead; only a variable declared with `let mut` \
+                 can be rebound from an inner block"
+            ]
         );
         // The label points at the latest declaration.
         let diagnostic = &diagnostics("let x = 1\nx := 2\n{ x := 3 }")[0];
@@ -8277,6 +8605,24 @@ mod tests {
             labels(diagnostic),
             vec![(Span::new(10, 16), "declared here")]
         );
+        // From a function or a `lazy`, `let mut` would not help, so the
+        // note does not suggest it.
+        for text in [
+            "let x = 1\nlet f = fn(): Int { x := 2; x }",
+            "let x = 1\nlet l = lazy { x := 2; x }",
+            "let x = 1\nlet f = fn(): Int { if true { x := 2 }; x }",
+        ] {
+            let diagnostic = &diagnostics(text)[0];
+            assert_eq!(
+                diagnostic.message, "cannot rebind `x` here: it is declared in an enclosing block",
+                "{text}"
+            );
+            assert_eq!(
+                diagnostic.notes,
+                vec!["shadow it with `let x = ...` instead"],
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -15768,5 +16114,620 @@ mod tests {
         }
         let text = "for x in [1] { x }\n2";
         assert_eq!(diagnostics(text)[0].span, at(text, "for x in [1] { x }"));
+    }
+
+    // ----- Mutable variables -----
+
+    /// The item of `ast`, parsed from `text`, written first at `needle`.
+    fn item_at(ast: &Ast, text: &str, needle: &str) -> ItemId {
+        let span = at(text, needle);
+        (0..u32::try_from(ast.item_count()).unwrap())
+            .map(ItemId::new)
+            .find(|&id| ast.item(id).span == span)
+            .unwrap_or_else(|| panic!("no item at {needle:?} in {text:?}"))
+    }
+
+    /// The first byte of `span`.
+    fn head(span: Span) -> Span {
+        Span::new(span.start, span.start + 1)
+    }
+
+    /// The expression of `ast` that spans `span`.
+    fn expr_at(ast: &Ast, span: Span) -> ExprId {
+        ast.expr_ids()
+            .find(|&id| ast.get(id).span == span)
+            .unwrap_or_else(|| panic!("no expression at {span:?}"))
+    }
+
+    /// The note on rebinding a variable that is not mutable from an inner
+    /// block, for a variable named `name`.
+    fn enclosing_note(name: &str) -> String {
+        format!(
+            "shadow it with `let {name} = ...` instead; only a variable declared with `let mut` \
+             can be rebound from an inner block"
+        )
+    }
+
+    #[test]
+    fn a_mutable_variable_is_rebound_from_any_block() {
+        for text in [
+            // The declaring block, and an `if`'s branches.
+            "let mut x = 1\nx := 2\nx",
+            "let mut x = 1\nif true { x := 2 }\nx",
+            "let mut x = 1\nif false { } else { x := 2 }\nx",
+            "let mut x = 1\nif false { } else if true { x := 2 }\nx",
+            // A `for`'s body, and a block in its guard.
+            "let mut x = 0\nfor i in [1, 2] { x := x + i }\nx",
+            "let mut x = 0\nlet ys = for i in [1, 2] if { x := x + i; x > 1 } { i }\nx",
+            // A nested block, several levels deep, and a record block.
+            "let mut x = 0\n{ { x := 1 } }\nx",
+            "let mut x = 0\nfor i in [1] { if true { { x := i } } }\nx",
+            "let mut x = 0\nlet r = { a = 1; x := 2; b = x }\nx",
+            // A block that is a value: an initialiser, an argument, an
+            // operand.
+            "let mut x = 0\nlet y = { x := 1; 2 }\nx + y",
+            "fn id(n: Int): Int { n }\nlet mut x = 0\nid({ x := 1; x }) + x",
+            // A function's own variable, from its blocks.
+            "fn f(): Int { let mut x = 0; if true { x := 1 }; x }\nf()",
+            "let f = fn(n: Int): Int { let mut x = n; for i in 0..n { x := x + i }; x }\nf(2)",
+            // A record block declaring and rebinding one of its own.
+            "let r = { let mut t = 1; { t := 2 }; a = t }\nr.a",
+        ] {
+            assert_eq!(shown_result(text), "Int", "{text}");
+        }
+    }
+
+    #[test]
+    fn a_mutable_variable_keeps_its_type() {
+        // Its type is fixed where it is declared, with or without an
+        // annotation, and literals adapt to it.
+        assert_eq!(shown_result("let mut x: Float = 0\n{ x := 1 }\nx"), "Float");
+        assert_eq!(shown_result("let mut x = 0.5\n{ x := 1 }\nx"), "Float");
+        assert_eq!(
+            shown_result("let mut r: {a: Int} = { a = 1; b = 2 }\n{ r := { a = 3; c = 4 } }\nr"),
+            "{a: Int}"
+        );
+        // A mismatch is reported against the declaration, however deep the
+        // rebind, and even after earlier rebinds.
+        let text = "let mut x = 0\nx := 1\nfor i in [1] { { x := 1.5 } }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "1.5"));
+        assert_eq!(found[0].label.as_deref(), Some("expected Int, found Float"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "let mut x = 0"), "the variable was declared here")]
+        );
+        // So a variable is not retyped by a rebind, as it is by a `let`.
+        assert_eq!(
+            messages("let mut x = 1\n{ x := \"s\" }\nx + 1"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn a_mutable_variable_has_one_slot() {
+        let text = "let mut x = 0\nx := 1\n{ x := 2 }\nfor i in [1] { x := i }\nx";
+        let (ast, resolution) = resolved(text);
+        let declared = item_at(&ast, text, "let mut x = 0");
+        assert_eq!(resolution.item_slot(declared), Slot(0));
+        for rebind in ["x := 1", "x := 2", "x := i"] {
+            let item = item_at(&ast, text, rebind);
+            assert_eq!(resolution.item_slot(item), Slot(0), "{rebind}");
+        }
+        // The `for`'s variable is the one other slot; the rebinds take none.
+        assert_eq!(resolution.frame_size(), 2);
+        assert_eq!(
+            resolution.expr_var(result_expr(&ast)),
+            VarRef::Local(Slot(0))
+        );
+        let names: Vec<&str> = resolution
+            .slot_names()
+            .iter()
+            .map(|&name| ast.names().get(name))
+            .collect();
+        assert_eq!(names, vec!["x", "i"]);
+        // However many rebinds there are, where a variable that is not
+        // mutable takes a slot for each.
+        let rebinds = "\nx := x + 1".repeat(10);
+        let (_, resolution) = resolved(&format!("let mut x = 0{rebinds}\nx"));
+        assert_eq!(resolution.frame_size(), 1);
+        let (_, resolution) = resolved(&format!("let x = 0{rebinds}\nx"));
+        assert_eq!(resolution.frame_size(), 11);
+        // In a function's frame too.
+        let text = "fn f(n: Int): Int { let mut x = n; { x := 1 }; x := 2; x }\nf(1)";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(resolution.function(FnId::new(0)).frame_size, 2);
+        for rebind in ["x := 1", "x := 2"] {
+            let item = item_at(&ast, text, rebind);
+            assert_eq!(resolution.item_slot(item), Slot(1), "{rebind}");
+        }
+    }
+
+    #[test]
+    fn a_variable_that_is_not_mutable_is_rebound_as_before() {
+        // In its declaring block, a rebind is a new binding in a new slot.
+        let text = "let x = 0\nx := 1\nx";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(resolution.item_slot(item_at(&ast, text, "x := 1")), Slot(1));
+        assert_eq!(resolution.frame_size(), 2);
+        // From an inner block it is an error, with the reworded note, for a
+        // `let`, a parameter and a `for`'s variable alike.
+        for (text, name, declaration) in [
+            ("let x = 1\n{ x := 2 }", "x", "let x = 1"),
+            ("fn f(n: Int): Int { if true { n := 1 }; n }", "n", "n: Int"),
+            ("let ys = for v in [1] { v := 2; v }", "v", "v"),
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(
+                found[0].message,
+                format!("cannot rebind `{name}` here: it is declared in an enclosing block"),
+                "{text}"
+            );
+            assert_eq!(found[0].span, head(last(text, &format!("{name} :="))));
+            assert_eq!(
+                labels(&found[0]),
+                vec![(at(text, declaration), "declared here")],
+                "{text}"
+            );
+            assert_eq!(found[0].notes, vec![enclosing_note(name)], "{text}");
+        }
+    }
+
+    #[test]
+    fn mutable_and_immutable_variables_shadow_each_other() {
+        // A `let` over a `let mut` is a new variable, which is not mutable.
+        let text = "let mut x = 1\nlet x = 2\n{ x := 3 }";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `x` here: it is declared in an enclosing block"
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "let x = 2"), "declared here")]
+        );
+        // So is a dotted `let` of a mutable variable.
+        assert_eq!(
+            messages("let mut r = { a = 1 }\nlet r.a = 2\n{ r.a := 3 }"),
+            vec!["cannot rebind `r` here: it is declared in an enclosing block"]
+        );
+        // A `let mut` over a `let` is a new variable, which is mutable, in a
+        // slot of its own.
+        let text = "let x = 1\nlet mut x = 2.5\n{ x := 3.5 }\nx";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            resolution.item_slot(item_at(&ast, text, "let mut x = 2.5")),
+            Slot(1)
+        );
+        assert_eq!(
+            resolution.item_slot(item_at(&ast, text, "x := 3.5")),
+            Slot(1)
+        );
+        assert_eq!(shown_result(text), "Float");
+        // An inner variable that is not mutable, over an outer mutable one,
+        // is rebound in its own block as any such variable is, with a new
+        // binding, leaving the outer one alone; from a block inside it, it
+        // is the error.
+        let text = "let mut x = 1\n{ let x = 2.5\nx := 3.5 }\nx := 4\nx";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            resolution.item_slot(item_at(&ast, text, "x := 3.5")),
+            Slot(2)
+        );
+        assert_eq!(resolution.item_slot(item_at(&ast, text, "x := 4")), Slot(0));
+        assert_eq!(shown_result(text), "Int");
+        assert_eq!(
+            messages("let mut x = 1\n{ let x = 2.5\n{ x := 3.5 } }"),
+            vec!["cannot rebind `x` here: it is declared in an enclosing block"]
+        );
+        // An inner mutable variable over an outer one is the one rebound.
+        let text = "let mut x = 1\n{ let mut x = 2.5\n{ x := 3.5 } }\nx";
+        assert_eq!(shown_result(text), "Int");
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            resolution.item_slot(item_at(&ast, text, "x := 3.5")),
+            Slot(1)
+        );
+    }
+
+    #[test]
+    fn a_mutable_variable_cannot_be_rebound_from_a_function_or_a_lazy() {
+        let function_note = "a function holds its own copy of each variable it uses, made when \
+                             the function is created; rebinding the copy would not change `x`";
+        let lazy_note = "a `lazy` holds its own copy of each variable it uses, made when the \
+                         `lazy` is created; rebinding the copy would not change `x`";
+        for (text, what, note) in [
+            // A top-level variable, one and two levels in.
+            (
+                "let mut x = 1\nlet f = fn(): Int { x := 2; x }",
+                "function",
+                function_note,
+            ),
+            (
+                "let mut x = 1\nlet l = lazy { x := 2; x }",
+                "`lazy`",
+                lazy_note,
+            ),
+            (
+                "let mut x = 1\nlet f = fn(): Int { let g = fn(): Int { x := 2; x }; 1 }",
+                "function",
+                function_note,
+            ),
+            (
+                "let mut x = 1\nlet f = fn(): Int { let l = lazy { x := 2; x }; 1 }",
+                "`lazy`",
+                lazy_note,
+            ),
+            (
+                "let mut x = 1\nlet l = lazy { let f = fn(): Int { x := 2; x }; 1 }",
+                "function",
+                function_note,
+            ),
+            // A function's variable, one and two levels in.
+            (
+                "fn f(): Int { let mut x = 1; let g = fn(): Int { x := 2; x }; x }",
+                "function",
+                function_note,
+            ),
+            (
+                "fn f() -> Int { let mut x = 1; let l = lazy { x := 2; x }; x }",
+                "`lazy`",
+                lazy_note,
+            ),
+            (
+                "fn f(): Int { let mut x = 1; let g = fn(): Int { let h = fn(): Int { x := 2; x \
+                 }; 1 }; x }",
+                "function",
+                function_note,
+            ),
+            // From a block of the function, and dotted.
+            (
+                "let mut x = 1\nlet f = fn(): Int { if true { x := 2 }; x }",
+                "function",
+                function_note,
+            ),
+            (
+                "let mut x = { a = 1 }\nlet f = fn(): Int { x.a := 2; 1 }",
+                "function",
+                function_note,
+            ),
+        ] {
+            let found = diagnostics(text);
+            // The value is checked on its own and nothing is declared, so
+            // nothing cascades.
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(
+                found[0].message,
+                format!("cannot rebind `x` here: it is declared outside this {what}"),
+                "{text}"
+            );
+            let rebind = text.rfind("x :=").or_else(|| text.rfind("x.a :=")).unwrap();
+            let rebind = u32::try_from(rebind).unwrap();
+            assert_eq!(found[0].span, Span::new(rebind, rebind + 1), "{text}");
+            let declaration = at(text, "let mut x = ");
+            let declaration = ast_item_span(text, declaration.start);
+            assert_eq!(
+                labels(&found[0]),
+                vec![(declaration, "declared here")],
+                "{text}"
+            );
+            assert_eq!(found[0].notes, vec![note], "{text}");
+        }
+        // The value is still checked.
+        assert_eq!(
+            messages("let mut x = 1\nlet f = fn(): Int { x := 1 + \"s\"; 1 }"),
+            vec![
+                "cannot rebind `x` here: it is declared outside this function",
+                "cannot add Int and String"
+            ]
+        );
+        // Reading the variable there captures it, by value, as any.
+        let text = "let mut x = 1\nlet f = fn(): Int { x }\nx := 2\nlet l = lazy x\nf()";
+        let (ast, resolution) = resolved(text);
+        for function in [0, 1] {
+            assert_eq!(
+                resolution.function(FnId::new(function)).captures,
+                vec![(VarRef::Local(Slot(0)), TyId::INT)]
+            );
+        }
+        let read = expr_at(&ast, head(last(text, "x }")));
+        assert_eq!(resolution.expr_var(read), VarRef::Capture(0));
+    }
+
+    /// The span of the item of `text` that starts at `start`.
+    fn ast_item_span(text: &str, start: u32) -> Span {
+        let ast = parse_text(text);
+        (0..u32::try_from(ast.item_count()).unwrap())
+            .map(|index| ast.item(ItemId::new(index)).span)
+            .find(|span| span.start == start)
+            .unwrap_or_else(|| panic!("no item at {start} in {text:?}"))
+    }
+
+    #[test]
+    fn rebinding_a_mutable_variable_is_allowed_in_any_function() {
+        // Nothing outside the function can see it, so a pure function may.
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int { let mut x = 0; for i in 0..n { x := x + i }; x }"),
+            "fn(n: Int): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int) ->> Int { let mut x = 0; if n > 1 { x := n }; x }"),
+            "fn(n: Int) ->> Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int) -> Int { let mut x = 0; { x := 1 }; x }"),
+            "fn(n: Int | Future<Int>) -> Int"
+        );
+        // A value awaited to fit is the usual purity error.
+        let text = "fn f(l: Future<Int>): Int { let mut x = 0; if true { x := l }; x }";
+        assert_implicit_await_error(text, last(text, "l"), "Future<Int>");
+    }
+
+    #[test]
+    fn a_mutable_variable_that_may_be_a_future() {
+        // It has its declared type at every use, so it is measured at each.
+        let text = "let mut r: Int | Future<Int> = lazy 1\nlet a = r + 1\nr := 2\n\
+                    { r := lazy 3 }\nlet b = r + 1\nb";
+        assert_eq!(
+            marks(text),
+            vec![("r", AwaitMark::Top), ("r", AwaitMark::Top)]
+        );
+        assert_eq!(
+            shown_result("let mut r: Int | Future<Int> = 1\n{ r := lazy 2 }\nr"),
+            "Int | Future<Int>"
+        );
+        // A future where the type does not allow one is awaited to fit.
+        let text = "let mut x = 1\nlet l = lazy 2\n{ x := l }\nx";
+        assert_eq!(marks(text), vec![("l", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "Int");
+        let text = "let mut x = { a = 1 }\nlet l = lazy { a = 2 }\n{ x := l }\nx";
+        assert_eq!(marks(text), vec![("l", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn dotted_rebinds_of_a_mutable_variable() {
+        // From an inner block, writing the variable's own slot.
+        let text = "let mut c = { port = 80; host = \"a\" }\nif true { c.port := 443 }\nc";
+        assert_eq!(shown_result(text), "{host: String, port: Int}");
+        let (ast, resolution) = resolved(text);
+        let item = item_at(&ast, text, "c.port := 443");
+        assert_eq!(resolution.item_slot(item), Slot(0));
+        assert_eq!(
+            resolution.item_path(item),
+            PathResolution {
+                source: VarRef::Local(Slot(0)),
+                existing: 1,
+                awaits: PathResolution::NOT_AWAITED,
+            }
+        );
+        // Deeper, and in a loop.
+        let text = "let mut c = { tls = { on = false; port = 1 } }\n\
+                    for p in [2, 3] { c.tls.port := c.tls.port + p }\nc.tls.port";
+        assert_eq!(shown_result(text), "Int");
+        // The variable keeps its declared type: one that may be a future is
+        // updated once awaited, and is still awaited where it is used
+        // after, as it is not once a variable that is not mutable is.
+        let text = "let mut r: {a: Int} | Future<{a: Int}> = lazy { a = 1 }\n\
+                    { r.a := 2 }\nr.a";
+        assert_eq!(marks(text), vec![("r", AwaitMark::Top)]);
+        assert_eq!(shown_result(text), "Int");
+        let (ast, resolution) = resolved(text);
+        let path = resolution.item_path(item_at(&ast, text, "r.a := 2"));
+        assert_eq!(resolution.path_awaits(path), Some(&[true][..]));
+        let text = "let r: {a: Int} | Future<{a: Int}> = lazy { a = 1 }\nr.a := 2\nr.a";
+        assert_eq!(marks(text), Vec::new());
+        // A record along the path that the type gives as a field of the
+        // either shape is updated as present.
+        let text = "let mut r: {b: {c: Int} | Future<{c: Int}>} = { b = { c = 1 } }\n\
+                    { r.b.c := 2 }\nr.b.c";
+        assert_eq!(shown_result(text), "Int");
+        assert_eq!(marks(text), vec![("r.b", AwaitMark::Top)]);
+        // A segment that does not exist, or a variable that is not a
+        // record, is an error as for any `:=`.
+        assert_eq!(
+            messages("let mut r = { a = 1 }\n{ r.b := 2 }"),
+            vec!["cannot rebind `r.b`: `r` has no field `b`"]
+        );
+        assert_eq!(
+            messages("let mut n = 1\n{ n.a := 2 }"),
+            vec!["cannot update `n.a`: `n` is Int, not a record"]
+        );
+        assert_eq!(
+            messages("let mut r = { a = 1 }\n{ r.a := 2.5 }"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_rebind_must_keep_the_variables_type() {
+        let note = "a mutable variable keeps its type; declare it with a type that allows both, \
+                    or await it where it is declared";
+        let text = "let mut r: Future<{a: Int}> = lazy { a = 1 }\nr.a := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `r.a`: `r` is declared `Future<{a: Int}>`, and the update makes it \
+             `{a: Int}`"
+        );
+        assert_eq!(found[0].span, at(text, "r.a"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                at(text, "let mut r: Future<{a: Int}> = lazy { a = 1 }"),
+                "declared here"
+            )]
+        );
+        assert_eq!(found[0].notes, vec![note]);
+        // A record along the path declared a future, likewise.
+        assert_eq!(
+            messages("let mut r: {b: Future<{c: Int}>} = { b = lazy { c = 1 } }\n{ r.b.c := 2 }"),
+            vec![
+                "cannot rebind `r.b.c`: `r` is declared `{b: Future<{c: Int}>}`, and the update \
+                 makes it `{b: {c: Int}}`"
+            ]
+        );
+        // The value is still checked.
+        let mut found = messages("let mut r: Future<{a: Int}> = lazy { a = 1 }\nr.a := 2.5");
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "cannot rebind `r.a`: `r` is declared `Future<{a: Int}>`, and the update makes \
+                 it `{a: Int}`",
+                "mismatched types"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mutable_variable_holding_a_function() {
+        // Recursion inside the first function is through its own name, the
+        // function being called, whatever the variable holds later.
+        let text = "let mut f = fn(n: Int): Int { if n == 0 { 0 } else { f(n - 1) } }\n\
+                    let g = fn(n: Int): Int { n * 2 }\nf := g\nf(1)";
+        assert_eq!(shown_result(text), "Int");
+        let (ast, resolution) = resolved(text);
+        let inner = expr_at(&ast, head(at(text, "f(n - 1)")));
+        assert_eq!(resolution.expr_var(inner), VarRef::Callee);
+        assert_eq!(
+            resolution.function(FnId::new(0)).callee,
+            ast.names().lookup("f")
+        );
+        // A call through the variable is typed by its type alone: the
+        // variable remembers no function expression, so the call-site form
+        // of the implicit-await error does not name the function's
+        // parameter, as it does for a variable that is not mutable.
+        let text = "let mut f = fn(n: Int): Int { n * 2 }\n\
+                    fn p(x: Int | Future<Int>): Int { f(x) }";
+        assert_implicit_await_error(text, last(text, "x"), "Int | Future<Int>");
+        let text = "let f = fn(n: Int): Int { n * 2 }\n\
+                    fn p(x: Int | Future<Int>): Int { f(x) }";
+        assert_eq!(
+            messages(text),
+            vec!["argument `x` would be awaited inside `f`, which is pure"]
+        );
+        // Its type is the type its initialiser has, an inferred result
+        // included; an annotation widens it.
+        assert_eq!(
+            messages("let mut f = fn() -> Int { 5 }\nf := fn() -> Int { lazy 5 }"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(
+            shown_result(
+                "let mut f: fn() -> Int = fn() -> Int { 5 }\nf := fn() -> Int { lazy 5 }\nf"
+            ),
+            "fn() -> Int | Future<Int>"
+        );
+    }
+
+    #[test]
+    fn a_pure_functions_parameter_copied_into_a_mutable_variable() {
+        // Measured where the variable is, through any rebind.
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int { let mut x = n; if true { x := x + 1 }; x }"),
+            "fn(n: Int): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int { let mut x = n; { x := 5 }; x }"),
+            "fn(n: Int): Int"
+        );
+        // Passed through unmeasured, rebound with the parameter or a
+        // present value, it is the either shape.
+        assert_eq!(
+            type_of_f("fn f(n: Int): {v: Int | Future<Int>} { let mut x = n; { x := n }; v = x }"),
+            "fn(n: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int): {v: Int | Future<Int>} { let mut x = n; { x := 5 }; v = x }"),
+            "fn(n: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+        // Updated along a path, it is measured, as a record that is updated
+        // is.
+        assert_eq!(
+            type_of_f("fn f(p: {a: Int}): {a: Int} { let mut r = p; { r.a := 2 }; r }"),
+            "fn(p: {a: Int}): {a: Int}"
+        );
+    }
+
+    #[test]
+    fn a_function_whose_result_is_a_mutable_variable() {
+        // An impure function's result is what the variable's type says,
+        // whatever it was last given.
+        assert_eq!(
+            type_of_f("fn f() -> Int { let mut r = 1; if true { r := 2 }; r }"),
+            "fn() -> Int"
+        );
+        assert_eq!(
+            type_of_f("fn f() -> Int { let mut r = lazy 1; { r := lazy 2 }; r }"),
+            "fn() -> Future<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f(e: Int) -> Int { let mut r = e; { r := 3 }; r }"),
+            "fn(e: Int | Future<Int>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f() -> {a: Int} { let mut r = { a = 1 }; { r.a := 2 }; r }"),
+            "fn() -> {a: Int}"
+        );
+    }
+
+    #[test]
+    fn mutable_variables_continue_from_an_existing_scope() {
+        let mut names = Names::new();
+        let mut types = TypeTable::new();
+        let parse_with = |text: &str, names: &mut Names| {
+            let source = SourceFile::new("test.gcsl", text).unwrap();
+            let (tokens, strings) = tokenize_with(&source, names).unwrap();
+            parse(&tokens, names.clone(), strings, &source).unwrap()
+        };
+        let first = parse_with(
+            "let a = 1\nlet mut b = 2\nlet mut c = 3\nlet c = 4",
+            &mut names,
+        );
+        let scope = Checker::new(&first, &mut types).check().unwrap().scope;
+        let slots: Vec<Slot> = scope.mutable_slots().collect();
+        assert_eq!(slots, vec![Slot(1), Slot(2)]);
+        // A later input rebinds an earlier mutable variable from an inner
+        // block, in its slot, taking none.
+        let text = "{ b := b + 1 }\nb";
+        let second = parse_with(text, &mut names);
+        let output = Checker::with_scope(&second, scope.clone(), &mut types)
+            .check()
+            .unwrap();
+        let resolution = &output.checked.resolution;
+        let block = second.items(second.root())[0];
+        let ItemKind::Expr(block) = second.item(block).kind else {
+            panic!("expected a block");
+        };
+        let ExprKind::Block(items) = second.get(block).kind else {
+            panic!("expected a block");
+        };
+        assert_eq!(resolution.item_slot(second.items(items)[0]), Slot(1));
+        assert_eq!(resolution.frame_size(), 4);
+        assert_eq!(output.scope.len(), scope.len());
+        // But not from a function, with no declaration to point at.
+        let third = parse_with("let f = fn(): Int { b := 1; b }", &mut names);
+        let found = Checker::with_scope(&third, scope.clone(), &mut types)
+            .check()
+            .unwrap_err();
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `b` here: it is declared outside this function"
+        );
+        assert!(found[0].labels.is_empty());
+        // A mutable variable shadowed by one that is not is not rebound.
+        let fourth = parse_with("{ c := 5 }", &mut names);
+        let found = Checker::with_scope(&fourth, scope, &mut types)
+            .check()
+            .unwrap_err();
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `c` here: it is declared in an enclosing block"
+        );
+        assert_eq!(found[0].notes, vec![enclosing_note("c")]);
     }
 }

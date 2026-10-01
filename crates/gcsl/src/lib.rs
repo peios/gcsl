@@ -1,8 +1,8 @@
 //! GCSL: a statically typed scripting language.
 //!
 //! A program is a block body: a sequence of items (`let` declarations,
-//! named functions, `:=` rebindings, fields, a `= EXPR` result and
-//! expression statements)
+//! `let mut` declarations of mutable variables, named functions, `:=`
+//! rebindings, fields, a `= EXPR` result and expression statements)
 //! whose value is its result, or the record of its fields. It passes
 //! through these stages, each exposed as its own module so that tools can
 //! stop after any of them:

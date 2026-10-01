@@ -1,0 +1,28 @@
+# A fleet's health checks, tallied in mutable variables.
+let checks = [{ host = "web-1"; ms = 120 }, { host = "web-2"; ms = 340 }, { host = "db-1"; ms = 90 }]
+let mut total = 0
+let mut slowest = { host = ""; ms = 0 }
+# `:=` rebinds a mutable variable from any block of its function.
+for c in checks {
+  total := total + c.ms
+  if c.ms > slowest.ms { slowest := c }
+}
+# A dotted rebind updates the record in the variable's one slot.
+let mut conf = { port = 80; tls = false }
+if total > 500 { conf.tls := true; conf.port := 443 }
+# A guard may read what the body rebinds.
+let mut budget = 300
+let fits = for c in checks if budget >= c.ms { budget := budget - c.ms; c.host }
+# A closure copies the variable when it is made.
+let report = fn(): Int { total }
+total := 0
+fn mean(xs: Int[]): Int {
+  let mut sum = 0
+  for x in xs { sum := sum + x }
+  sum // len(xs)
+}
+checked = report()
+slow = slowest.host
+port = conf.port
+hosts = fits
+average = mean(for c in checks { c.ms })

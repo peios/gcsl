@@ -132,6 +132,21 @@
 //! `Vec<f64>`) would avoid the tag check; that is a later optimisation for
 //! a bytecode VM, not something this tree walker needs.
 //!
+//! A slot may be written many times: a mutable variable's by each of its
+//! rebinds, from any block of its function, a `for`'s body included, as well
+//! as a `for`'s variable's by each iteration. A `Load` reads the slot when
+//! it is evaluated, and evaluation is in source order, so a read sees the
+//! last write before it: in `let mut x = 1; let y = x + { x := 5; x }`, `y`
+//! is 6. A `Load` copies the value, a reference-count increment, and never
+//! moves it out of the slot, and nothing caches a slot's value, so a `for`'s
+//! guard reads what its body last wrote, and a closure or a future copies
+//! the value a slot holds when it is made, which later writes do not
+//! change. A value already read is held, as any operand is, while what
+//! follows it is evaluated: `r.a := e` reads `r`, then evaluates `e`, which
+//! may rebind `r` itself, and stores the update of the record it read (see
+//! [`crate::lower`]); and a `for` iterates over the list its iterable was
+//! when it began, whatever its body rebinds.
+//!
 //! # Calls
 //!
 //! A closure is built by `MakeClosure` from its captured values, read in
@@ -6314,5 +6329,173 @@ mod tests {
                 12
             );
         });
+    }
+
+    #[test]
+    fn a_mutable_variable_is_rebound_from_inner_blocks() {
+        // A sum, a count and a maximum over a list.
+        let text = "let xs = [3, 1, 4, 1, 5]\n\
+                    let mut total = 0\n\
+                    let mut count = 0\n\
+                    let mut max = 0\n\
+                    for x in xs {\n\
+                    \x20 total := total + x\n\
+                    \x20 count := count + 1\n\
+                    \x20 if x > max { max := x }\n\
+                    }\n\
+                    \"{total} {count} {max}\"";
+        assert_eq!(string(text), "14 5 5");
+        // The examples of the summary.
+        let text = "let mut total = 0\n\
+                    for x in [1, 2, 3] { total := total + x }\n\
+                    if total > 5 { total := total * 2 }\n\
+                    let mut conf = { port = 80; host = \"a\" }\n\
+                    if true { conf.port := 443 }\n\
+                    \"{total} {conf}\"";
+        assert_eq!(string(text), "12 {port = 443; host = \"a\"}");
+        // In the declaring block, in every branch, and deep.
+        assert_eq!(int("let mut x = 1\nx := x + 1\nx := x * 10\nx"), 20);
+        assert_eq!(
+            int("let mut x = 0\nif false { x := 1 } else if true { x := 2 } else { x := 3 }\nx"),
+            2
+        );
+        assert_eq!(
+            int("let mut x = 0\nfor i in [1] { if true { { { x := 7 } } } }\nx"),
+            7
+        );
+        // A record block's own mutable variable.
+        assert_eq!(
+            string("let r = { let mut t = 1; { t := t + 1 }; a = t; t := 10; b = t }\n\"{r}\""),
+            "{a = 2; b = 10}"
+        );
+    }
+
+    #[test]
+    fn a_for_sees_its_rebinds_in_order() {
+        // A guard that reads what the body rebinds: an element stops
+        // contributing once it fails.
+        let text = "let mut acc = 0\n\
+                    let taken = for v in [3, 1, 4, 1, 5] if acc < 5 { acc := acc + v; v }\n\
+                    \"{taken} {acc}\"";
+        assert_eq!(string(text), "[3, 1, 4] 8");
+        // A guard that rebinds, in a block of its own.
+        let text = "let mut seen = 0\n\
+                    let odd = for v in 1..=5 if { seen := seen + 1; v % 2 == 1 } { v }\n\
+                    \"{odd} {seen}\"";
+        assert_eq!(string(text), "[1, 3, 5] 5");
+        // Nested loops.
+        assert_eq!(
+            int("let mut n = 0\nfor i in 0..4 { for j in 0..i { n := n + 1 } }\nn"),
+            6
+        );
+        let text = "let mut p = 0\n\
+                    for i in 1..=3 {\n\
+                    \x20 let mut row = 0\n\
+                    \x20 for j in 1..=3 { row := row + i * j }\n\
+                    \x20 p := p * 100 + row\n\
+                    }\n\
+                    p";
+        assert_eq!(int(text), 61218);
+        // The iterable is evaluated once, before the body rebinds it.
+        let text = "let mut xs = [1, 2, 3]\n\
+                    let ys = for x in xs { xs := [x]; x }\n\
+                    len(ys) * 10 + len(xs)";
+        assert_eq!(int(text), 31);
+    }
+
+    #[test]
+    fn closures_and_lazies_copy_a_mutable_variable_when_made() {
+        // Made before and after a rebind, each sees the value it had then.
+        let text = "let mut x = 1\n\
+                    let f = fn(): Int { x }\n\
+                    let a = lazy x\n\
+                    x := 2\n\
+                    let g = fn(): Int { x }\n\
+                    let b = lazy x\n\
+                    x := 3\n\
+                    f() * 10000 + g() * 1000 + (await a) * 100 + (await b) * 10 + x";
+        assert_eq!(int(text), 12_123);
+        // One closure for each iteration, each with that iteration's value.
+        let text = "let mut x = 0\n\
+                    let fs = for i in 0..3 { x := x + 10; fn(): Int { x } }\n\
+                    x := 1000\n\
+                    fs[0]() + fs[1]() * 100 + fs[2]() * 10000";
+        assert_eq!(int(text), 302_010);
+        // A `lazy` awaited after the variable changes still has its copy.
+        let text = "let mut x = 5\nlet l = lazy x * 2\nfor i in [1] { x := 0 }\nawait l";
+        assert_eq!(int(text), 10);
+    }
+
+    #[test]
+    fn a_read_of_a_mutable_variable_gives_its_value_when_evaluated() {
+        // Evaluation is in source order: the left operand is read before
+        // the right one rebinds it.
+        assert_eq!(int("let mut x = 1\nlet y = x + { x := 5; x }\ny"), 6);
+        assert_eq!(int("let mut x = 1\nlet y = { x := 5; x } + x\ny"), 10);
+        // An argument rebinding it, before the next is evaluated.
+        assert_eq!(
+            int("fn sub(a: Int, b: Int): Int { a - b }\nlet mut x = 1\nsub(x, { x := 10; x })"),
+            -9
+        );
+        // A dotted rebind reads the record, then the value, which may
+        // rebind the variable too; the update is what is stored.
+        assert_eq!(
+            string("let mut r = { a = 1; b = 2 }\nr.a := { r := { a = 7; b = 8 }; r.b }\n\"{r}\""),
+            "{a = 8; b = 2}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_rebind_of_a_mutable_variable() {
+        let text = "let mut c = { hits = 0; tags = { last = \"\" } }\n\
+                    for s in [\"a\", \"b\"] { c.hits := c.hits + 1; c.tags.last := s }\n\
+                    \"{c.hits} {c.tags.last}\"";
+        assert_eq!(string(text), "2 b");
+        // The old record is not changed.
+        assert_eq!(
+            int("let mut c = { a = 1 }\nlet old = c\n{ c.a := 2 }\nold.a * 10 + c.a"),
+            12
+        );
+        // A record that may be a future is awaited where it is updated, and
+        // where it is read after.
+        assert_eq!(
+            int("let mut r: {a: Int} | Future<{a: Int}> = lazy { a = 1 }\n{ r.a := r.a + 1 }\nr.a"),
+            2
+        );
+    }
+
+    #[test]
+    fn each_call_has_its_own_mutable_variables() {
+        // A function called many times starts from a fresh variable each
+        // time.
+        let text = "fn count(xs: Int[]): Int { let mut n = 0; for x in xs { n := n + 1 }; n }\n\
+                    count([1, 2]) * 100 + count([1, 2, 3]) * 10 + count([])";
+        assert_eq!(int(text), 230);
+        assert_eq!(
+            int("let f = fn(): Int { let mut n = 0; n := n + 1; n }\nf() + f() + f()"),
+            3
+        );
+        // Recursion with a mutable local, rebound before and after the
+        // recursive call: each frame has its own.
+        let text = "fn sum(n: Int): Int { let mut s = n; if n > 0 { s := s + sum(n - 1) }; s }\n\
+                    sum(4)";
+        assert_eq!(int(text), 10);
+        let text = "fn f(n: Int): Int {\n\
+                    \x20 let mut a = n\n\
+                    \x20 if n > 0 { let b = f(n - 1); a := a * 10 + b }\n\
+                    \x20 a\n\
+                    }\n\
+                    f(2)";
+        assert_eq!(int(text), 30);
+        // A memoised one too, which runs its body once per argument.
+        let text = "fn fact(n: Int) ->> Int { let mut p = 1; for i in 1..=n { p := p * i }; p }\n\
+                    fact(5) + fact(5) + fact(3)";
+        assert_eq!(int(text), 246);
+        // And one that rebinds a variable holding a function.
+        let text = "let mut f = fn(n: Int): Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n\
+                    let a = f(3)\n\
+                    f := fn(n: Int): Int { n * 2 }\n\
+                    a * 10 + f(3)";
+        assert_eq!(int(text), 36);
     }
 }

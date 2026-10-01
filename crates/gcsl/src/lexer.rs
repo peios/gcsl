@@ -23,10 +23,13 @@
 //! [`TokenKind::Ident`] carries a [`Name`], not text. An identifier starts
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
-//! `hello-world` and `x-1` are single names. The keywords are `let`, `if`,
-//! `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`, `await`,
-//! `for` and `in`; the whole identifier is scanned before it is compared
-//! with them, so `fn-x`, `lazy-x`, `await-x` and `for-x` are identifiers.
+//! `hello-world` and `x-1` are single names. The keywords are `let`, `mut`,
+//! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`,
+//! `await`, `for` and `in`; the whole identifier is scanned before it is
+//! compared with them, so `fn-x`, `lazy-x`, `await-x`, `for-x` and `mut-x`
+//! are identifiers. `mut` is only ever written after `let`, which it makes
+//! a mutable variable's declaration, but it is a keyword wherever it
+//! appears, so no variable or unquoted field can be named `mut`.
 //! An `r` directly followed by `"` begins a raw string literal; anywhere
 //! else it is an ordinary identifier. `Future` and `Present` are not
 //! keywords: they are ordinary
@@ -186,6 +189,8 @@ pub enum TokenKind {
     Ident(Name),
     /// The keyword `let`.
     Let,
+    /// The keyword `mut`, which after `let` declares a mutable variable.
+    Mut,
     /// The keyword `if`.
     If,
     /// The keyword `else`.
@@ -298,6 +303,7 @@ impl TokenKind {
     pub const fn symbol(self) -> Option<&'static str> {
         match self {
             TokenKind::Let => Some("let"),
+            TokenKind::Mut => Some("mut"),
             TokenKind::If => Some("if"),
             TokenKind::Else => Some("else"),
             TokenKind::True => Some("true"),
@@ -359,6 +365,7 @@ impl TokenKind {
 fn keyword(text: &str) -> Option<TokenKind> {
     Some(match text {
         "let" => TokenKind::Let,
+        "mut" => TokenKind::Mut,
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "true" => TokenKind::True,
@@ -2616,6 +2623,32 @@ mod tests {
         assert!(is_identifier("into"));
         assert_eq!(TokenKind::For.symbol(), Some("for"));
         assert_eq!(TokenKind::In.symbol(), Some("in"));
+    }
+
+    #[test]
+    fn mut_is_a_keyword_only_as_a_whole_word() {
+        assert_eq!(
+            show("mut mut-x mutable muts Mut _mut"),
+            vec![
+                "Mut",
+                "Ident(mut-x)",
+                "Ident(mutable)",
+                "Ident(muts)",
+                "Ident(Mut)",
+                "Ident(_mut)",
+                "Eof"
+            ]
+        );
+        assert_eq!(
+            show("let mut x = 1"),
+            ["Let", "Mut", "Ident(x)", "Eq", "Int(1)", "Eof"]
+        );
+        assert!(!is_identifier("mut"));
+        assert!(is_identifier("mut-x"));
+        assert!(is_identifier("mutable"));
+        assert_eq!(TokenKind::Mut.symbol(), Some("mut"));
+        // A keyword is a token of its own, at its own span.
+        assert_eq!(spans("let mut x"), vec![(0, 3), (4, 7), (8, 9), (9, 9)]);
     }
 
     #[test]

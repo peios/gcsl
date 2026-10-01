@@ -3,9 +3,10 @@
 //!
 //! Each input is a block body, like a file, run in the context of every
 //! earlier successful input: variables and fields declared at their top
-//! level are visible, `:=` at top level may rebind variables, and new
-//! top-level declarations persist for later inputs. The session keeps these
-//! things between inputs:
+//! level are visible, `:=` at top level may rebind variables, `:=` in any
+//! block of its top level (but not in a function or a `lazy`) may rebind
+//! mutable ones, and new top-level declarations persist for later inputs.
+//! The session keeps these things between inputs:
 //!
 //! - the [`Names`] table, lent to each stage in turn, so that the same name
 //!   in two inputs is the same [`crate::names::Name`];
@@ -13,8 +14,9 @@
 //!   input is the same [`TyId`] in the next, and the types of the variables
 //!   carried over stay meaningful;
 //! - the checker's outermost [`Scope`]: each top-level variable with its
-//!   slot and type, from which [`Checker::with_scope`] checks the next
-//!   input exactly as if it continued the same block;
+//!   slot, its type and whether it is mutable, from which
+//!   [`Checker::with_scope`] checks the next input exactly as if it
+//!   continued the same block;
 //! - the value stack, whose bottom is the top level's frame, holding each
 //!   top-level variable's value in its slot, and which calls grow and
 //!   shrink back while an input runs;
@@ -40,8 +42,14 @@
 //! source is not kept, so it takes no number. The frame may have grown, and
 //! slots above the last committed variable may hold values from the failed
 //! run, but those slots belong to no variable and are always written before
-//! they are read. Types the failed input interned are
-//! kept: a type is a fact about structure, not about the input, so a stale
+//! they are read. A run may also have rebound a committed mutable variable
+//! before it failed, which writes the variable's own slot: so before each
+//! input runs, the session copies the values of the committed mutable
+//! variables, the only committed slots an input can write (see
+//! [`Scope::mutable_slots`]), and writes them back if the input fails at
+//! runtime. The values are reference counted, so the copy is cheap, and
+//! with no mutable variable there is none. Types the failed input interned
+//! are kept: a type is a fact about structure, not about the input, so a stale
 //! entry is harmless (see [`crate::types`]); forgetting them would mean
 //! rebuilding the table's lookup map. The memo entries the failed input made
 //! are forgotten with it (see [`MemoTables::rollback`]): their keys and
@@ -175,6 +183,7 @@ impl Session {
         if self.frame.len() < frame_size {
             self.frame.resize(frame_size, Value::Empty);
         }
+        let committed = self.committed_mutables();
         match eval::eval_with(&ir, &mut self.frame, &mut self.memo) {
             Ok(value) => {
                 self.scope = output.scope;
@@ -186,6 +195,9 @@ impl Session {
                 })
             }
             Err(mut error) => {
+                // The run may have rebound committed mutable variables
+                // before it failed.
+                self.restore(committed);
                 // A closure of this input called from a closure of an
                 // earlier one stamps this input's number: that is the input
                 // being run, which is what no number means.
@@ -193,6 +205,28 @@ impl Session {
                     error.input = None;
                 }
                 Err(diagnostic::merge(vec![error], output.warnings))
+            }
+        }
+    }
+
+    /// A copy of the value of each committed mutable variable, with its
+    /// slot: all of the committed part of the frame that an input can
+    /// change (see [`Scope::mutable_slots`]). The values are reference
+    /// counted, so this copies no record, list or string; and without a
+    /// mutable variable it is empty, and allocates nothing.
+    fn committed_mutables(&self) -> Vec<(usize, Value)> {
+        self.scope
+            .mutable_slots()
+            .filter_map(|slot| Some((slot.index(), self.frame.get(slot.index())?.clone())))
+            .collect()
+    }
+
+    /// Writes back the values `committed_mutables` copied, after an input
+    /// that failed at runtime, which may have rebound them.
+    fn restore(&mut self, committed: Vec<(usize, Value)>) {
+        for (index, value) in committed {
+            if let Some(slot) = self.frame.get_mut(index) {
+                *slot = value;
             }
         }
     }
@@ -758,6 +792,98 @@ mod tests {
             value(&mut session, "for x in xs { }\n[]\nlen(xs)"),
             Value::Int(3)
         );
+    }
+
+    #[test]
+    fn mutable_variables_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let mut total = 0");
+        // Later inputs rebind it from inner blocks, in its slot.
+        value(&mut session, "for x in [1, 2, 3] { total := total + x }");
+        value(&mut session, "if total > 5 { total := total * 2 }");
+        value(&mut session, "{ { total := total + 1 } }");
+        assert_eq!(value(&mut session, "total"), Value::Int(13));
+        assert_eq!(value_type(&session), "Int");
+        assert_eq!(session.frame.len(), 1);
+        // A function or a `lazy` of a later input cannot rebind it, and
+        // there is no declaration to point at.
+        let diagnostics =
+            eval(&mut session, "let f = fn(): Int { total := 1; total }").unwrap_err();
+        assert_eq!(
+            diagnostics[0].message,
+            "cannot rebind `total` here: it is declared outside this function"
+        );
+        assert!(diagnostics[0].labels.is_empty());
+        assert_eq!(
+            messages(&mut session, "let l = lazy { total := 1; total }"),
+            vec!["cannot rebind `total` here: it is declared outside this `lazy`"]
+        );
+        // A function of a later input reads it as it was when the function
+        // was made.
+        value(&mut session, "let get = fn(): Int { total }");
+        value(&mut session, "{ total := 100 }");
+        assert_eq!(value(&mut session, "get()"), Value::Int(13));
+        assert_eq!(value(&mut session, "total"), Value::Int(100));
+    }
+
+    #[test]
+    fn a_failed_input_leaves_a_mutable_variable_as_it_was() {
+        let mut session = Session::new();
+        value(&mut session, "let mut n = 1");
+        value(&mut session, "let mut conf = { port = 80; host = \"h\" }");
+        // Rebound, plainly or along a path, and then failing at runtime.
+        for text in [
+            "n := 2\nlet z = 1 // 0",
+            "{ n := 3 }\n1 // 0",
+            "for x in [1, 0] { n := n + 10 // x }",
+            "conf.port := 443\nlet z = 1 // 0",
+            "if true { conf.port := 8080; conf.host := \"x\" }\n1 // 0",
+        ] {
+            assert_eq!(
+                messages(&mut session, text),
+                vec!["division by zero"],
+                "{text}"
+            );
+            assert_eq!(value(&mut session, "n"), Value::Int(1), "{text}");
+            assert_eq!(
+                value(&mut session, "conf").to_string(),
+                "{port = 80; host = \"h\"}",
+                "{text}"
+            );
+        }
+        // One that succeeds keeps what it rebound.
+        value(&mut session, "{ n := 5; conf.port := 443 }");
+        assert_eq!(value(&mut session, "n"), Value::Int(5));
+        assert_eq!(value(&mut session, "conf.port"), Value::Int(443));
+        // A variable declared after it is restored too, and one that is not
+        // mutable was never written.
+        value(&mut session, "let fixed = 7\nlet mut m = 8");
+        assert_eq!(
+            messages(&mut session, "m := 9\nn := 6\nlet q = fixed // 0"),
+            vec!["division by zero"]
+        );
+        assert_eq!(
+            value(&mut session, "\"{n} {conf.port} {fixed} {m}\""),
+            Value::Str("5 443 7 8".into())
+        );
+    }
+
+    #[test]
+    fn a_mutable_variable_keeps_its_declared_type_across_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "let mut r: Int | Future<Int> = lazy 1");
+        value(&mut session, "{ r := 2 }");
+        assert_eq!(value(&mut session, "r"), Value::Int(2));
+        assert_eq!(value_type(&session), "Int | Future<Int>");
+        assert_eq!(value(&mut session, "r + 1"), Value::Int(3));
+        value(
+            &mut session,
+            "let mut c: {a: Int} | Future<{a: Int}> = lazy { a = 1 }",
+        );
+        value(&mut session, "{ c.a := 2 }");
+        assert_eq!(value(&mut session, "c").to_string(), "{a = 2}");
+        assert_eq!(value_type(&session), "{a: Int} | Future<{a: Int}>");
+        assert_eq!(value(&mut session, "c.a"), Value::Int(2));
     }
 
     #[test]

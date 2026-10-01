@@ -5,10 +5,25 @@
 //! A file, like the inside of a block `{ ... }`, is a *body*: a sequence of
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
-//! `let PATH (: TYPE)? = EXPR`, `PATH := EXPR`, a field `PATH = EXPR`,
-//! `= EXPR`, a spread `...EXPR`, a named function `fn NAME(...) ...`, or an
-//! expression. After an item the next token must be a separator or the end
-//! of the body; anything else is "expected end of item".
+//! `let PATH (: TYPE)? = EXPR`, `let mut NAME (: TYPE)? = EXPR`, `PATH :=
+//! EXPR`, a field `PATH = EXPR`, `= EXPR`, a spread `...EXPR`, a named
+//! function `fn NAME(...) ...`, or an expression. After an item the next
+//! token must be a separator or the end of the body; anything else is
+//! "expected end of item".
+//!
+//! `let mut` declares a mutable variable: an ordinary `let` item, marked as
+//! mutable (see [`ItemKind::Let`]). Its path must be a single name: `let mut a.b = e` is "`let mut` needs a
+//! plain name", at the path, since a dotted `let` updates a variable rather
+//! than declaring one. `mut` is allowed nowhere else, and is "`mut` is only
+//! allowed after `let`" at the `mut` wherever an item, an expression, a
+//! name, a type or a function's parameter list would start, or an item
+//! would end: before a field (`mut x = 1`) and a parameter (`fn(mut n:
+//! Int)`) with a note saying what to write instead, and before a `for`'s
+//! variable, after `fn` and everywhere else of those without one. (Where a
+//! particular token is expected after a complete part of an item or an
+//! expression, a separator, a closing bracket, `=`, `in` or a block, as in
+//! `f(x mut)` or `let x mut = 1`, the usual "expected ..., found `mut`"
+//! stands.)
 //!
 //! A spread item is recognised by `...` at the start of an item, and its
 //! expression is parsed as a field's value is, at minimum binding power 0,
@@ -42,8 +57,8 @@
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
-//! function's return marker), `->>` and `->`, and after `=`, `:=`, `let`
-//! and a spread item's `...`. There
+//! function's return marker), `->>` and `->`, and after `=`, `:=`, `let`,
+//! the `mut` of a `let mut` and a spread item's `...`. There
 //! the parser skips newlines before going on. Directly inside parentheses,
 //! brackets and interpolations the lexer emits no newlines at all, so an
 //! expression, a parameter list, an argument list, a list literal or an
@@ -322,7 +337,7 @@ use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
     FnDecl, ForDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment,
-    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -365,6 +380,23 @@ const MISSING_RETURN_TYPE: &str =
 /// by `Parser::parse_item` before any expression is parsed, so it never
 /// reaches this.)
 const MISPLACED_SPREAD: &str = "`...` is only allowed in a list or at the start of an item";
+
+/// The error for a `mut` anywhere but directly after `let`.
+const MISPLACED_MUT: &str = "`mut` is only allowed after `let`";
+
+/// The error for a `let mut` whose path is dotted.
+const DOTTED_MUT: &str = "`let mut` needs a plain name";
+
+/// The note on [`DOTTED_MUT`].
+const DOTTED_MUT_NOTE: &str = "a dotted `let` updates a variable; declare the variable with `let \
+     mut a = ...` and update it with `a.b := ...`";
+
+/// The note on [`MISPLACED_MUT`] before a field.
+const MUT_FIELD_NOTE: &str = "a field is defined once; declare a variable with `let mut x = ...` \
+     and define the field from it";
+
+/// The note on [`MISPLACED_MUT`] before a parameter.
+const MUT_PARAM_NOTE: &str = "copy the parameter into a mutable variable, as in `let mut n = n`";
 
 /// The note on [`MISSING_RETURN_TYPE`].
 const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a pure function, `-> T` for an impure one, \
@@ -552,6 +584,10 @@ impl Parser<'_> {
         {
             return self.parse_named_fn(token, (name, name_token.span));
         }
+        if token.kind == TokenKind::Mut {
+            let note = self.starts_field(1).then_some(MUT_FIELD_NOTE);
+            return Err(self.misplaced_mut(token, note));
+        }
         let mut ty_height = 0;
         // The number of segments of the item's path, if it has one.
         let mut segments = 1;
@@ -559,7 +595,22 @@ impl Parser<'_> {
             TokenKind::Let => {
                 self.advance();
                 self.skip_newlines();
-                let (path, len) = self.parse_let_path()?;
+                let mutable = self.peek().kind == TokenKind::Mut;
+                let keyword = if mutable {
+                    let keyword = self.peek();
+                    self.advance();
+                    self.skip_newlines();
+                    keyword
+                } else {
+                    token
+                };
+                let (path, len) = self.parse_let_path(keyword)?;
+                if mutable && len > 1 {
+                    return Err(self.report(
+                        Diagnostic::error(DOTTED_MUT, path_span(&self.path))
+                            .with_note(DOTTED_MUT_NOTE),
+                    ));
+                }
                 segments = len;
                 let ty = if self.peek().kind == TokenKind::Colon {
                     self.advance();
@@ -577,7 +628,13 @@ impl Parser<'_> {
                 self.advance();
                 self.skip_newlines();
                 let value = self.parse_expr(0)?;
-                (ItemKind::Let { path, ty, value }, value)
+                let kind = ItemKind::Let {
+                    path,
+                    ty,
+                    value,
+                    mutable,
+                };
+                (kind, value)
             }
             TokenKind::Eq => {
                 self.advance();
@@ -621,6 +678,32 @@ impl Parser<'_> {
         self.finish_item(token, (kind, value), ty_height, segments)
     }
 
+    /// Whether the tokens from `ahead` places after the current one begin a
+    /// field item: a path, a name or a plain string literal and then `.`
+    /// and a name as many times as they follow, and then `=`.
+    fn starts_field(&self, ahead: usize) -> bool {
+        let is_name = |token: Token| matches!(token.kind, TokenKind::Ident(_) | TokenKind::Str(_));
+        let mut at = ahead;
+        if !is_name(self.peek_at(at)) {
+            return false;
+        }
+        at += 1;
+        while self.peek_at(at).kind == TokenKind::Dot && is_name(self.peek_at(at + 1)) {
+            at += 2;
+        }
+        self.peek_at(at).kind == TokenKind::Eq
+    }
+
+    /// Reports `token`, a `mut` where it is not allowed, with `note` if one
+    /// says what to write instead.
+    fn misplaced_mut(&mut self, token: Token, note: Option<&str>) -> Reported {
+        let error = Diagnostic::error(MISPLACED_MUT, token.span);
+        self.report(match note {
+            Some(note) => error.with_note(note),
+            None => error,
+        })
+    }
+
     /// Parses a named function item, `fn NAME(...) ...`, starting at its
     /// `fn` keyword, `keyword`, followed by `name` and its span: a `let` of
     /// the name whose value is the function expression from `(` on, both
@@ -643,6 +726,7 @@ impl Parser<'_> {
             path,
             ty: None,
             value,
+            mutable: false,
         };
         self.finish_item(keyword, (kind, value), 0, segments)
     }
@@ -671,10 +755,11 @@ impl Parser<'_> {
         Ok((item, height))
     }
 
-    /// Parses the path after `let`, starting at its first segment: an
-    /// identifier, then `.` and a name, plain or quoted, as many times as
-    /// they follow. Returns it and its number of segments.
-    fn parse_let_path(&mut self) -> ParseResult<(PathRange, u32)> {
+    /// Parses the path after `let`, or after the `mut` of a `let mut`,
+    /// `keyword`, starting at its first segment: an identifier, then `.`
+    /// and a name, plain or quoted, as many times as they follow. Returns
+    /// it and its number of segments.
+    fn parse_let_path(&mut self, keyword: Token) -> ParseResult<(PathRange, u32)> {
         let name_token = self.peek();
         let name = match name_token.kind {
             TokenKind::Ident(name) => name,
@@ -686,8 +771,10 @@ impl Parser<'_> {
                 let span = self.span_of(literal);
                 return Err(self.error(PLAIN_VARIABLE_NAME, span));
             }
+            TokenKind::Mut => return Err(self.misplaced_mut(name_token, None)),
             _ => {
-                return Err(self.error("expected a name after `let`", name_token.span));
+                let after = self.describe(keyword);
+                return Err(self.error(format!("expected a name after {after}"), name_token.span));
             }
         };
         self.advance();
@@ -793,7 +880,7 @@ impl Parser<'_> {
     /// Parses the name of a field after `.` or in a record type, the
     /// current token: an identifier or a plain string literal. Returns
     /// `None`, having consumed nothing, if the token is neither; a raw or
-    /// interpolated literal is an error.
+    /// interpolated literal is an error, and so is a `mut`.
     fn field_name(&mut self) -> ParseResult<Option<Name>> {
         let token = self.peek();
         let name = match token.kind {
@@ -804,6 +891,7 @@ impl Parser<'_> {
                 let span = self.span_of(literal);
                 return Err(self.error(PLAIN_FIELD_NAME, span));
             }
+            TokenKind::Mut => return Err(self.misplaced_mut(token, None)),
             _ => return Ok(None),
         };
         self.advance();
@@ -827,6 +915,7 @@ impl Parser<'_> {
                         .with_note("write `a - b` with spaces for subtraction"),
                 ))
             }
+            TokenKind::Mut => Err(self.misplaced_mut(token, None)),
             _ => {
                 let found = self.describe(token);
                 Err(self.error(format!("expected end of item, found {found}"), token.span))
@@ -935,6 +1024,7 @@ impl Parser<'_> {
                 self.depth -= 1;
                 inner
             }
+            TokenKind::Mut => Err(self.misplaced_mut(token, None)),
             _ => Err(self.error("expected a type", error_span(token))),
         }
     }
@@ -1049,6 +1139,9 @@ impl Parser<'_> {
     /// instead.
     fn expect_fn_paren(&mut self) -> ParseResult<Token> {
         let open = self.peek();
+        if open.kind == TokenKind::Mut {
+            return Err(self.misplaced_mut(open, None));
+        }
         if open.kind != TokenKind::LParen {
             let found = self.describe(open);
             return Err(self.error(
@@ -1331,6 +1424,7 @@ impl Parser<'_> {
             TokenKind::LBrace => return self.parse_block(),
             TokenKind::LBracket => return self.parse_list(),
             TokenKind::DotDotDot => return Err(self.error(MISPLACED_SPREAD, token.span)),
+            TokenKind::Mut => return Err(self.misplaced_mut(token, None)),
             TokenKind::Minus
             | TokenKind::Plus
             | TokenKind::Star
@@ -1424,6 +1518,9 @@ impl Parser<'_> {
                     let literal = self.parse_interpolation(first)?;
                     let span = self.span_of(literal);
                     return Err(self.error(PLAIN_VARIABLE_NAME, span));
+                }
+                TokenKind::Mut => {
+                    return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
                 }
                 _ => {
                     let found = self.describe(token);
@@ -1763,6 +1860,7 @@ impl Parser<'_> {
                 let span = self.span_of(literal);
                 return Err(self.error(PLAIN_VARIABLE_NAME, span));
             }
+            TokenKind::Mut => return Err(self.misplaced_mut(name_token, None)),
             _ => {
                 return Err(self.error("expected a name after `for`", error_span(name_token)));
             }
@@ -1999,6 +2097,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::StrEnd(_)
         | TokenKind::Ident(_)
         | TokenKind::Let
+        | TokenKind::Mut
         | TokenKind::If
         | TokenKind::Else
         | TokenKind::True
@@ -2100,7 +2199,9 @@ mod tests {
                 out.push_str("; ");
             }
             match ast.item(id).kind {
-                ItemKind::Let { path, ty, value } => {
+                ItemKind::Let {
+                    path, ty, value, ..
+                } => {
                     out.push_str("let ");
                     out.push_str(&ast.show_path(ast.path(path)).to_string());
                     if let Some(ty) = ty {
@@ -4099,7 +4200,10 @@ mod tests {
         let ast = parse_text("  fn add(a: Int, b: Int): Int { a + b }").unwrap();
         let item = ast.item(ast.items(ast.root())[0]);
         assert_eq!(item.span, Span::new(2, 39));
-        let ItemKind::Let { path, ty, value } = item.kind else {
+        let ItemKind::Let {
+            path, ty, value, ..
+        } = item.kind
+        else {
             panic!("expected a let, got {item:?}");
         };
         assert!(ty.is_none());
@@ -5516,6 +5620,196 @@ mod tests {
         assert_eq!(
             too_deep(ranges(200_000)).message,
             "expression nested too deeply"
+        );
+    }
+
+    /// Whether each item of the file's body is a `let mut`.
+    fn mutability(text: &str) -> Vec<bool> {
+        let ast = parse_text(text).unwrap();
+        ast.items(ast.root())
+            .iter()
+            .map(|&id| matches!(ast.item(id).kind, ItemKind::Let { mutable: true, .. }))
+            .collect()
+    }
+
+    /// The message, span and notes of the syntax error in `text`.
+    fn error_with_notes(text: &str) -> (String, Span, Vec<String>) {
+        let diagnostic = parse_text(text).unwrap_err();
+        (diagnostic.message, diagnostic.span, diagnostic.notes)
+    }
+
+    #[test]
+    fn mutable_lets() {
+        // Both forms, which are `let`s, marked as mutable.
+        assert_eq!(
+            mutability("let mut x = 1\nlet y = 2\nlet mut z: Float = 3\nz := 4\nfn f(): Int { 1 }"),
+            vec![true, false, true, false, false]
+        );
+        assert_eq!(shape("let mut x = 1"), "let x = 1");
+        assert_eq!(shape("let mut x: Int = 1"), "let x: Int = 1");
+        // A newline may follow `mut`, as it may follow `let`.
+        assert_eq!(mutability("let mut\n  x = 1"), vec![true]);
+        assert_eq!(mutability("let\nmut\nx =\n1"), vec![true]);
+        assert_eq!(mutability("let mut x:\n  Int = 1"), vec![true]);
+        // The item spans `let` through its value, and its name is its path.
+        let ast = parse_text("  let mut total = 0").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(2, 19));
+        let ItemKind::Let { path, ty, .. } = item.kind else {
+            panic!("expected a let");
+        };
+        assert!(ty.is_none());
+        let spans: Vec<Span> = ast.path(path).iter().map(|s| s.span).collect();
+        assert_eq!(spans, vec![Span::new(10, 15)]);
+        // In blocks and function bodies too, each marked on its own.
+        let ast =
+            parse_text("{ let a = 1; let mut b = 2; fn(): Int { let mut c = 3; c } }").unwrap();
+        let printed = ast.pretty().to_string();
+        for head in ["(let a @", "(let mut b @", "(let mut c @"] {
+            assert!(printed.contains(head), "{head}: {printed}");
+        }
+    }
+
+    #[test]
+    fn pretty_output_for_mutable_lets() {
+        let text = "let mut x = 1\nlet y = 2\nlet mut z: Float = 3";
+        let expected = "(file\n\
+                        \x20 (let mut x @0..13\n\
+                        \x20   (int 1 @12..13))\n\
+                        \x20 (let y @14..23\n\
+                        \x20   (int 2 @22..23))\n\
+                        \x20 (let mut z : Float @24..44\n\
+                        \x20   (int 3 @43..44)))";
+        assert_eq!(parse_text(text).unwrap().pretty().to_string(), expected);
+        // The printed tree says all the source does: laid out otherwise, the
+        // same items print the same but for their spans, and a `let` that is
+        // not mutable prints without `mut`.
+        let spread = "let\nmut\nx = 1\nlet y = 2\nlet mut\nz: Float = 3";
+        let printed = parse_text(spread).unwrap().pretty().to_string();
+        let heads = |printed: &str| -> Vec<String> {
+            printed
+                .lines()
+                .map(|line| line.split(" @").next().unwrap_or(line).to_owned())
+                .collect()
+        };
+        assert_eq!(heads(&printed), heads(expected));
+        let plain = parse_text("let x = 1").unwrap().pretty().to_string();
+        assert_eq!(plain, "(file\n  (let x @0..9\n    (int 1 @8..9)))");
+    }
+
+    #[test]
+    fn mut_is_only_allowed_after_let() {
+        let misplaced = |at: u32, note: Option<&str>| {
+            (
+                MISPLACED_MUT.to_owned(),
+                Span::new(at, at + 3),
+                note.map(str::to_owned).into_iter().collect::<Vec<_>>(),
+            )
+        };
+        // A field, with a note: dotted, quoted or plain.
+        assert_eq!(
+            error_with_notes("mut x = 1"),
+            misplaced(0, Some(MUT_FIELD_NOTE))
+        );
+        assert_eq!(
+            error_with_notes("{ mut a.\"b c\".d = 1 }"),
+            misplaced(2, Some(MUT_FIELD_NOTE))
+        );
+        assert_eq!(
+            error_with_notes("mut \"q\" = 1"),
+            misplaced(0, Some(MUT_FIELD_NOTE))
+        );
+        assert_eq!(
+            MUT_FIELD_NOTE,
+            "a field is defined once; declare a variable with `let mut x = ...` and define the \
+             field from it"
+        );
+        // A parameter, with a note.
+        assert_eq!(
+            error_with_notes("fn(mut n: Int): Int { n }"),
+            misplaced(3, Some(MUT_PARAM_NOTE))
+        );
+        assert_eq!(
+            error_with_notes("fn f(a: Int, mut b: Int): Int { a }"),
+            misplaced(13, Some(MUT_PARAM_NOTE))
+        );
+        assert_eq!(
+            MUT_PARAM_NOTE,
+            "copy the parameter into a mutable variable, as in `let mut n = n`"
+        );
+        // A `for`'s variable, a named function item and a function
+        // expression, without one.
+        for (text, at) in [
+            ("for mut x in xs { x }", 4),
+            ("fn mut f(): Int { 1 }", 3),
+            ("let g = fn mut(): Int { 1 }", 11),
+        ] {
+            assert_eq!(error_with_notes(text), misplaced(at, None), "{text}");
+        }
+        // Anywhere else an item, an expression, a name or a type starts, or
+        // an item ends.
+        for (text, at) in [
+            ("mut x := 1", 0),
+            ("mut x", 0),
+            ("mut", 0),
+            ("1 + mut", 4),
+            ("f(mut x)", 2),
+            ("f(mut = 1)", 2),
+            ("[mut]", 1),
+            ("x := mut", 5),
+            ("let x: mut = 1", 7),
+            ("let x: List<mut> = []", 12),
+            ("let f: fn(mut: Int): Int = g", 10),
+            ("a.mut", 2),
+            ("a.mut = 1", 2),
+            ("let r: {mut: Int} = r", 8),
+            ("let mut mut x = 1", 8),
+            ("let x = 1 mut", 10),
+            ("x mut", 2),
+            ("if mut { 1 }", 3),
+            ("\"{mut}\"", 2),
+        ] {
+            assert_eq!(error_with_notes(text), misplaced(at, None), "{text}");
+        }
+        // Where a separator or a closing bracket is expected inside an
+        // expression, the usual error stands.
+        assert_eq!(
+            error("f(x mut)"),
+            (
+                "expected `,` or `)`, found `mut`".to_owned(),
+                Span::new(4, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn a_mutable_let_needs_a_plain_name() {
+        let note = vec![DOTTED_MUT_NOTE.to_owned()];
+        assert_eq!(
+            error_with_notes("let mut a.b = 1"),
+            (DOTTED_MUT.to_owned(), Span::new(8, 11), note.clone())
+        );
+        assert_eq!(
+            error_with_notes("let mut a.\"b c\".d: Int = 1"),
+            (DOTTED_MUT.to_owned(), Span::new(8, 17), note)
+        );
+        assert_eq!(
+            DOTTED_MUT_NOTE,
+            "a dotted `let` updates a variable; declare the variable with `let mut a = ...` and \
+             update it with `a.b := ...`"
+        );
+        // A plain name, as after `let`.
+        assert_eq!(
+            error("let mut \"x\" = 1"),
+            (PLAIN_VARIABLE_NAME.to_owned(), Span::new(8, 11))
+        );
+        assert_eq!(
+            error("let mut = 1"),
+            ("expected a name after `mut`".to_owned(), Span::new(8, 9))
+        );
+        assert_eq!(
+            error("let = 1"),
+            ("expected a name after `let`".to_owned(), Span::new(4, 5))
         );
     }
 }

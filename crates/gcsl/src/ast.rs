@@ -72,6 +72,13 @@
 //! definition or update, whose meaning the checker gives (see
 //! [`crate::check`]).
 //!
+//! # Mutable variables
+//!
+//! `let mut NAME = EXPR` declares a *mutable* variable, which `:=` may
+//! rebind from any block of the function declaring it (see
+//! [`crate::check`]). It is an [`ItemKind::Let`] like any other, marked as
+//! mutable, whose path is always a single name.
+//!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
 //! `Ast` always has a valid root. The `Ast` also owns the [`Names`] table its
@@ -105,6 +112,13 @@ impl ExprId {
 pub struct ItemId(u32);
 
 impl ItemId {
+    /// The item numbered `number`. Ids are normally assigned by the parser;
+    /// this is for finding items by number in tests.
+    #[cfg(test)]
+    pub(crate) const fn new(number: u32) -> Self {
+        Self(number)
+    }
+
     /// The id as an index into the arena and into side tables.
     pub(crate) const fn index(self) -> usize {
         self.0 as usize
@@ -897,7 +911,8 @@ pub enum ItemKind {
     /// any, with the rest of the path set, and an annotation then applies to
     /// the path's last segment. A named function item, `fn NAME(...) ...`,
     /// is one of these too: a `let` of `NAME`, without an annotation, whose
-    /// value is the function expression.
+    /// value is the function expression. So is `let mut NAME = EXPR`, with
+    /// or without an annotation, whose path is a single name.
     Let {
         /// The variable's name, then any further segments.
         path: PathRange,
@@ -905,6 +920,8 @@ pub enum ItemKind {
         ty: Option<TypeExprId>,
         /// The initialiser.
         value: ExprId,
+        /// Whether it is a `let mut`, which declares a mutable variable.
+        mutable: bool,
     },
     /// `PATH = EXPR`, as in `x = 1`, `"quoted name" = 1` or `a.b = 1`:
     /// declares a field of the record its block evaluates to, named by the
@@ -922,9 +939,10 @@ pub enum ItemKind {
     /// to, and as a name in scope for the block's later items, which a later
     /// item may define again.
     Spread(ExprId),
-    /// `PATH := EXPR`: rebinds a variable declared in the same block, named
-    /// by the path's first segment, which is always an identifier; a dotted
-    /// path rebinds it to an update of its value.
+    /// `PATH := EXPR`: rebinds a variable declared in the same block, or a
+    /// mutable variable of the same function, named by the path's first
+    /// segment, which is always an identifier; a dotted path rebinds it to
+    /// an update of its value.
     Rebind {
         /// The variable's name, then any further segments.
         path: PathRange,
@@ -1621,7 +1639,8 @@ impl Annotate for NoAnnotation {
 ///     (name x @17..18)))
 /// ```
 ///
-/// Items print as `(let x ...)`, `(let x : Type ...)`, `(field x ...)`,
+/// Items print as `(let x ...)`, `(let x : Type ...)`, `(let mut x ...)`,
+/// `(let mut x : Type ...)`, `(field x ...)`,
 /// `(rebind x ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`,
 /// followed by their span and their expression, a dotted path in full, as
 /// in `(let a.b.c ...)`; blocks as
@@ -1678,8 +1697,14 @@ impl<A: Annotate> Pretty<'_, A> {
         let ast = self.ast;
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
         let value = match item.kind {
-            ItemKind::Let { path, ty, value } => {
-                write!(f, "let {}", ast.show_path(ast.path(path)))?;
+            ItemKind::Let {
+                path,
+                ty,
+                value,
+                mutable,
+            } => {
+                let keyword = if mutable { "let mut" } else { "let" };
+                write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?;
                 if let Some(ty) = ty {
                     f.write_str(" : ")?;
                     self.type_expr(f, ty)?;
@@ -2154,6 +2179,7 @@ mod tests {
                 path: x_path,
                 ty: Some(float_ty),
                 value: block,
+                mutable: false,
             },
             span: Span::new(0, 37),
         });
@@ -2171,6 +2197,7 @@ mod tests {
                 path: y_path,
                 ty: None,
                 value: empty,
+                mutable: false,
             },
             span: Span::new(38, 48),
         });
@@ -2284,6 +2311,7 @@ mod tests {
                 path: dotted,
                 ty: None,
                 value: one,
+                mutable: false,
             },
             ItemKind::Field {
                 path: dotted,

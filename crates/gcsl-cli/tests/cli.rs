@@ -730,6 +730,138 @@ fn repl_shows_fors_and_ranges() {
 }
 
 #[test]
+fn run_tallies_checks_in_mutable_variables() {
+    let output = gcsl(&["run", "tests/fixtures/mut.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{checked = 550; slow = \"web-2\"; port = 443; hosts = [\"web-1\", \"db-1\"]; average = \
+         183}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_mutable_variables() {
+    let output = gcsl(&["run", "tests/fixtures/mut.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    let token = "\nLet @159..162\nMut @163..166\nIdent(total) @167..172\nEq @173..174\n";
+    assert!(tokens.contains(token), "{token}: {tokens}");
+    let output = gcsl(&["run", "tests/fixtures/mut.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n  (let mut total @159..176\n\
+         \x20   (int 0 @175..176))\n",
+        "\n      (block @299..366\n\
+         \x20       (rebind total @303..324\n",
+        "\n        (rebind conf.tls @491..507\n",
+        "\n        (let mut sum @793..808\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/mut.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "(for c : List<{}> @283..366\n",
+        "(name slowest : {host: String, ms: Int} @337..344)",
+        // A dotted rebind leaves the variable's type as it was declared.
+        "(name conf : {port: Int, tls: Bool} @907..911)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/mut.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // A rebind in a `for`'s body, and in an `if` in it, stores into the
+        // variable's one slot.
+        "\n  (store total#1 @159..176\n\
+         \x20   (int 0 @175..176))\n",
+        "\n    (block @299..366\n\
+         \x20     (store total#1 @303..324\n\
+         \x20       (int-add @312..324\n\
+         \x20         (load total#1 @312..317)\n",
+        "\n        (block @348..364\n\
+         \x20         (store slowest#2 @350..362\n\
+         \x20           (load conf#3 @361..362))\n",
+        // The guard reads the slot the body writes.
+        "\n      (int-cmp >= @621..635\n\
+         \x20       (load budget#4 @621..627)\n",
+        "\n        (store budget#4 @638..661\n",
+        // The closure copies the variable when it is made.
+        "\n  (store report#6 @721..753\n\
+         \x20   (make-closure #0 @734..753\n\
+         \x20     (load total#1 @734..753)))\n\
+         \x20 (store total#1 @754..764\n",
+        // A function's own variable, in its own frame.
+        "\n      (block @823..841\n\
+         \x20       (store sum#1 @825..839\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn rebinding_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/rebind_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot rebind `total` here: it is declared in an enclosing block\n\
+         \x20--> tests/fixtures/rebind_error.gcsl:2:19\n\
+         \x20 |\n\
+         1 | let total = 0\n\
+         \x20 | ------------- declared here\n\
+         2 | for x in [1, 2] { total := total + x }\n\
+         \x20 |                   ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: shadow it with `let total = ...` instead; only a variable declared with \
+         `let mut` can be rebound from an inner block\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl(&["run", "tests/fixtures/mut_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot rebind `total` here: it is declared outside this function\n\
+         \x20--> tests/fixtures/mut_error.gcsl:2:29\n\
+         \x20 |\n\
+         1 | let mut total = 0\n\
+         \x20 | ----------------- declared here\n\
+         2 | let add = fn(x: Int): Int { total := total + x; total }\n\
+         \x20 |                             ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a function holds its own copy of each variable it uses, made when the \
+         function is created; rebinding the copy would not change `total`\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn repl_rebinds_mutable_variables_across_lines() {
+    let output = repl(
+        "let mut n = 0\n\
+         for i in 0..4 { n := n + i }\n\
+         n\n\
+         let f = fn(): Int { n := 1; n }\n\
+         { n := n * 2 }\n\
+         n\n",
+    );
+    // The `for` is its input's result, a list of its body's `{}`s.
+    assert_eq!(
+        stdout(&output),
+        "[{}, {}, {}, {}] : List<{}>\n6 : Int\n12 : Int\n"
+    );
+    assert!(
+        stderr(&output)
+            .starts_with("error: cannot rebind `n` here: it is declared outside this function\n"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn run_spreads_defaults_into_a_configuration() {
     let output = gcsl(&["run", "tests/fixtures/spread.gcsl"]);
     assert_eq!(

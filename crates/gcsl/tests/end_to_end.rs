@@ -1277,8 +1277,119 @@ fn rebind_in_an_enclosing_block_renders_exactly() {
          3 |   total := 1\n\
          \x20 |   ^^^^^\n\
          \x20 |\n\
-         \x20 = note: shadow it with `let total = ...` instead\n"
+         \x20 = note: shadow it with `let total = ...` instead; only a variable declared with \
+         `let mut` can be rebound from an inner block\n"
     );
+}
+
+#[test]
+fn rebinding_a_mutable_variable_from_a_function_renders_exactly() {
+    assert_eq!(
+        rendered(
+            "let mut total = 0\nlet add = fn(x: Int): Int {\n  total := total + x\n  total\n}\n"
+        ),
+        "error: cannot rebind `total` here: it is declared outside this function\n\
+         \x20--> calc.gcsl:3:3\n\
+         \x20 |\n\
+         1 | let mut total = 0\n\
+         \x20 | ----------------- declared here\n\
+         2 | let add = fn(x: Int): Int {\n\
+         3 |   total := total + x\n\
+         \x20 |   ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a function holds its own copy of each variable it uses, made when the \
+         function is created; rebinding the copy would not change `total`\n"
+    );
+    assert_eq!(
+        rendered("let mut n = 0\nlet later = lazy { n := 1 }\n"),
+        "error: cannot rebind `n` here: it is declared outside this `lazy`\n\
+         \x20--> calc.gcsl:2:20\n\
+         \x20 |\n\
+         1 | let mut n = 0\n\
+         \x20 | ------------- declared here\n\
+         2 | let later = lazy { n := 1 }\n\
+         \x20 |                    ^\n\
+         \x20 |\n\
+         \x20 = note: a `lazy` holds its own copy of each variable it uses, made when the `lazy` \
+         is created; rebinding the copy would not change `n`\n"
+    );
+}
+
+#[test]
+fn a_dotted_rebind_that_would_change_a_mutable_variables_type_renders_exactly() {
+    assert_eq!(
+        rendered("let mut r: Future<{a: Int}> = lazy { a = 1 }\nr.a := 2\n"),
+        "error: cannot rebind `r.a`: `r` is declared `Future<{a: Int}>`, and the update makes it \
+         `{a: Int}`\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         1 | let mut r: Future<{a: Int}> = lazy { a = 1 }\n\
+         \x20 | -------------------------------------------- declared here\n\
+         2 | r.a := 2\n\
+         \x20 | ^^^\n\
+         \x20 |\n\
+         \x20 = note: a mutable variable keeps its type; declare it with a type that allows both, \
+         or await it where it is declared\n"
+    );
+}
+
+#[test]
+fn a_misplaced_mut_renders_exactly() {
+    assert_eq!(
+        rendered("port = 80\nmut retries = 3\n"),
+        "error: `mut` is only allowed after `let`\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         2 | mut retries = 3\n\
+         \x20 | ^^^\n\
+         \x20 |\n\
+         \x20 = note: a field is defined once; declare a variable with `let mut x = ...` and \
+         define the field from it\n"
+    );
+}
+
+#[test]
+fn programs_with_mutable_variables() {
+    let cases = [
+        (
+            "let mut total = 0\nfor x in [1, 2, 3] { total := total + x }\ntotal",
+            "6 : Int",
+        ),
+        (
+            "let mut conf = { port = 80; host = \"a\" }\nif true { conf.port := 443 }\nconf",
+            "{port = 443; host = \"a\"} : {host: String, port: Int}",
+        ),
+        ("let mut x = 1\nlet y = x + { x := 5; x }\ny", "6 : Int"),
+        (
+            "let mut best = \"\"\nfor w in [\"a\", \"ccc\", \"bb\"] if len([w]) > 0 {\n  \
+             if w > best { best := w }\n}\nbest",
+            "\"ccc\" : String",
+        ),
+        (
+            "fn fib(n: Int): Int {\n  let mut a = 0\n  let mut b = 1\n  for i in 0..n {\n    \
+             let next = a + b\n    a := b\n    b := next\n  }\n  a\n}\nfib(10)",
+            "55 : Int",
+        ),
+        (
+            "let mut r: Int | Future<Int> = lazy 1\n{ r := lazy 2 }\nr * 10",
+            "20 : Int",
+        ),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(show(text), expected, "{text}");
+    }
+}
+
+#[test]
+fn a_session_restores_a_mutable_variable_an_input_rebound_before_failing() {
+    let mut session = Session::new();
+    session.eval(&source("let mut n = 1")).unwrap();
+    let diagnostics = session
+        .eval(&source("for d in [1, 0] { n := n + 10 // d }"))
+        .unwrap_err();
+    assert_eq!(diagnostics[0].message, "division by zero");
+    let outcome = session.eval(&source("n")).unwrap();
+    assert_eq!(outcome.value, Value::Int(1));
 }
 
 #[test]

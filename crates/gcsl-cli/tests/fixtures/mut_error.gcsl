@@ -1,0 +1,2 @@
+let mut total = 0
+let add = fn(x: Int): Int { total := total + x; total }

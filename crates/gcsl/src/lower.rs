@@ -12,6 +12,14 @@
 //! its `= EXPR` or final expression statement, or an explicit `Empty` node
 //! if it has neither.
 //!
+//! A rebind of a mutable variable, from whatever block, is a `Store` into
+//! the slot of the variable's declaration, which the checker gives the
+//! item, and a dotted one a `Store` there of the update of the record
+//! loaded from that slot (see below), so lowering does nothing of its own
+//! for them. Nothing here assumes that a slot is written once: every `Load`
+//! is a read of its slot where it is evaluated, never folded into another,
+//! cached or moved out of the slot, and every `Store` is kept.
+//!
 //! A function expression's body is lowered into the IR's function table at
 //! its [`crate::ast::FnId`], as code of [`FnKind::Memo`] if it is declared
 //! with `->>` and of [`FnKind::Function`] otherwise (the IR does not tell
@@ -2139,6 +2147,48 @@ mod tests {
              \x20       (make-record [d] @31..40\n\
              \x20         (load b#2 @33..34)))))\n\
              \x20 (empty @0..40))"
+        );
+    }
+
+    #[test]
+    fn a_rebind_of_a_mutable_variable_stores_into_its_slot() {
+        // From an inner block, plainly or along a path, the rebind is a
+        // store into the variable's one slot, the dotted one of an update
+        // of the record loaded from it.
+        assert_eq!(
+            dump("let mut x = 1\n{ x := 2 }\nlet mut r = { a = x }\nif true { r.a := x + 1 }\nr.a"),
+            "(block @0..75\n\
+             \x20 (store x#0 @0..13\n\
+             \x20   (int 1 @12..13))\n\
+             \x20 (block @14..24\n\
+             \x20   (store x#0 @16..22\n\
+             \x20     (int 2 @21..22))\n\
+             \x20   (empty @14..24))\n\
+             \x20 (store r#1 @25..46\n\
+             \x20   (block @37..46\n\
+             \x20     (store r#1 @39..44\n\
+             \x20       (load x#0 @43..44))\n\
+             \x20     (make-record [a] @37..46\n\
+             \x20       (load r#1 @39..40))))\n\
+             \x20 (if @47..71\n\
+             \x20   (bool true @50..54)\n\
+             \x20   (block @55..71\n\
+             \x20     (store r#1 @57..69\n\
+             \x20       (update-field a @57..60\n\
+             \x20         (load r#1 @57..58)\n\
+             \x20         (int-add @64..69\n\
+             \x20           (load x#0 @64..65)\n\
+             \x20           (int 1 @68..69))))\n\
+             \x20     (empty @55..71))\n\
+             \x20   (block @71..71\n\
+             \x20     (empty @71..71)))\n\
+             \x20 (field a @72..75\n\
+             \x20   (load r#1 @72..73)))"
+        );
+        // A frame does not grow with the rebinds.
+        assert_eq!(
+            lower_text("let mut x = 1\nx := 2\nx := 3\nx").frame_size(),
+            1
         );
     }
 
