@@ -65,9 +65,12 @@
 //! sized exactly and filled in place; the empty range, one whose left bound
 //! is not below its right one (or, inclusive, is above it), allocates
 //! nothing. Its length is computed in 128 bits, so that no pair of bounds
-//! overflows it, `i64::MIN..=i64::MAX` included, and a range of more than
-//! [`MAX_RANGE_LEN`] integers fails with "range too large" at the range,
-//! labelled with its length, rather than allocate its list.
+//! overflows it, `i64::MIN..=i64::MAX` included, and a range of more
+//! integers than a list can hold ([`MAX_LIST_LEN`]) fails with "range too
+//! large" at the range, labelled with its length, rather than ask for an
+//! allocation that cannot exist. There is no other limit on a list's
+//! length: how large a list a program builds is its own business, and one
+//! too large for the machine fails as any allocation does.
 //!
 //! A `For` is evaluated by a helper, `Evaluator::for_loop`, which the
 //! walkers only call: it evaluates the iterable once, and for each element
@@ -80,8 +83,8 @@
 //! one. A closure or a `lazy` the body makes reads the slot when it is
 //! made, so it captures that iteration's element. A collecting `for`
 //! gathers the body's values in a vector, sized up front to the number of
-//! elements when there is no guard to skip some (at most
-//! [`MAX_RANGE_LEN`]), and copies them into the list's allocation, in time
+//! elements when there is no guard to skip some (at most `FOR_RESERVE`
+//! up front), and copies them into the list's allocation, in time
 //! linear in its length; one that discards them, a statement whose value
 //! nothing would hold, drops each as it comes and is `{}`. A `for` whose
 //! iterable is directly a range (the parentheses around it are gone by
@@ -388,11 +391,20 @@ use crate::{CALL_LEVELS, MAX_DEPTH};
 /// on top of its literal pieces' lengths.
 const INTERPOLATED_VALUE_ESTIMATE: usize = 8;
 
-/// The most integers a range used as a value may have: a range of more is
-/// the runtime error "range too large", since its list would hold every one
-/// of them. A `for` directly over a range counts its integers without
-/// building the list, and has no limit.
-pub const MAX_RANGE_LEN: usize = 16_777_216;
+/// The most elements a list can hold: as many as fit an allocation of
+/// `isize::MAX` bytes, the most the allocator can be asked for. It is not a
+/// policy: how large a list a program builds is the program's business,
+/// and one too large for the machine fails as any allocation does. A range
+/// used as a value of more integers than this is the runtime error "range
+/// too large", since its list cannot exist; a `for` directly over a range
+/// counts its integers without building the list.
+pub const MAX_LIST_LEN: usize = (isize::MAX as usize) / std::mem::size_of::<Value>();
+
+/// The most elements a collecting `for` reserves up front for its values,
+/// before they come: enough that a loop of ordinary size allocates once,
+/// and few enough that one over a huge range grows as its values come
+/// rather than reserve for all of them first.
+const FOR_RESERVE: usize = 16_777_216;
 
 /// Evaluates `ir` to a value, on a fresh stack.
 ///
@@ -403,8 +415,8 @@ pub const MAX_RANGE_LEN: usize = 16_777_216;
 /// "division by zero" for `//` or `%` by zero; at an index's span, or at
 /// the path of an update up to its index segment, "index out of range" for
 /// a position outside its list; at a range's span,
-/// "range too large" for a range used as a value of more than
-/// [`MAX_RANGE_LEN`] integers; and at a call's or an
+/// "range too large" for a range used as a value of more integers than a
+/// list can hold ([`MAX_LIST_LEN`]); and at a call's or an
 /// await's span, "call nested too deeply" for a call, or an await running a
 /// future, that would take the program's nesting, calls included, past
 /// [`MAX_DEPTH`] levels (see the module documentation). An error inside a
@@ -1354,7 +1366,8 @@ impl Evaluator<'_> {
     /// to the list of its integers, in order, up to the right bound,
     /// included if `inclusive`: one allocation, sized exactly and filled in
     /// place, and none for an empty range. A range of more than
-    /// [`MAX_RANGE_LEN`] integers is "range too large".
+    /// [`MAX_LIST_LEN`] integers, whose list cannot exist, is "range too
+    /// large".
     fn range(
         &mut self,
         operands: Operands,
@@ -1363,10 +1376,7 @@ impl Evaluator<'_> {
     ) -> Result<Value, Diagnostic> {
         let (start, end) = self.ints(operands)?;
         let len = range_len(start, end, inclusive);
-        let Some(len) = usize::try_from(len)
-            .ok()
-            .filter(|&len| len <= MAX_RANGE_LEN)
-        else {
+        let Some(len) = usize::try_from(len).ok().filter(|&len| len <= MAX_LIST_LEN) else {
             return Err(range_too_large(node, len));
         };
         // No integer of the range passes its end, so none overflows.
@@ -1403,7 +1413,7 @@ impl Evaluator<'_> {
             // A range of any length may be iterated over: no more than this
             // is reserved up front, and the vector grows past it only as
             // the body's values come.
-            values.reserve_exact(elements.remaining().min(MAX_RANGE_LEN));
+            values.reserve_exact(elements.remaining().min(FOR_RESERVE));
         }
         let at = self.base + slot.index();
         for element in elements {
@@ -1433,9 +1443,9 @@ impl Evaluator<'_> {
 
     /// What a `for` whose iterable is `iterable` iterates over: if the
     /// iterable is directly a range, its integers, from its bounds,
-    /// evaluated left to right, without building its list, so that no
-    /// [`MAX_RANGE_LEN`] applies; otherwise the elements of the list it
-    /// evaluates to.
+    /// evaluated left to right, without building its list, so that
+    /// [`MAX_LIST_LEN`] does not apply; otherwise the elements of the list
+    /// it evaluates to.
     fn elements(&mut self, iterable: IrId) -> Result<Elements, Diagnostic> {
         match self.ir.get(iterable).kind {
             IrKind::Range(inclusive, operands) => {
@@ -3069,13 +3079,13 @@ fn range_len(start: i64, end: i64, inclusive: bool) -> u128 {
 }
 
 /// The error for the range `node`, used as a value, of `len` integers,
-/// more than [`MAX_RANGE_LEN`].
+/// more than [`MAX_LIST_LEN`].
 fn range_too_large(node: &IrNode, len: u128) -> Diagnostic {
     Diagnostic::error("range too large", node.span)
         .with_label(format!("this range has {len} elements"))
         .with_note(format!(
-            "a range used as a list holds every element; the limit is {MAX_RANGE_LEN}. A `for` \
-             over a range directly has no limit"
+            "a range used as a list holds every element, and a list cannot hold more than \
+             {MAX_LIST_LEN}. A `for` over a range directly builds no list"
         ))
 }
 
@@ -6276,17 +6286,17 @@ mod tests {
     }
 
     /// The note of the error for a range used as a list that is too long.
-    const RANGE_NOTE: &str = "a range used as a list holds every element; the limit is 16777216. \
-                              A `for` over a range directly has no limit";
+    const RANGE_NOTE: &str = "a range used as a list holds every element, and a list cannot hold \
+                              more than 384307168202282325. A `for` over a range directly builds \
+                              no list";
 
     #[test]
-    fn a_range_used_as_a_list_is_limited() {
-        assert_eq!(MAX_RANGE_LEN, 16_777_216);
+    fn a_range_used_as_a_list_is_limited_only_by_what_a_list_can_hold() {
+        // The most elements an allocation of `isize::MAX` bytes holds.
+        assert_eq!(MAX_LIST_LEN, 384_307_168_202_282_325);
         for (text, len) in [
-            ("0..16777217".to_owned(), "16777217"),
-            ("0..=16777216".to_owned(), "16777217"),
-            ("-1..=16777215".to_owned(), "16777217"),
             (format!("0..{MAX}"), "9223372036854775807"),
+            ("0..=384307168202282325".to_owned(), "384307168202282326"),
             (format!("{MIN}..{MAX}"), "18446744073709551615"),
             (format!("{MIN}..={MAX}"), "18446744073709551616"),
         ] {
@@ -6304,16 +6314,22 @@ mod tests {
             assert_eq!(diagnostic.notes, vec![RANGE_NOTE], "{text}");
         }
         // Wherever it is used as a value, in a function too.
-        let text = "fn f(n: Int): Int { len(0..n) }\nf(20000000)";
-        let diagnostic = run(text).unwrap_err();
+        let text = format!("fn f(n: Int): Int {{ len(0..n) }}\nf({MAX})");
+        let diagnostic = run(&text).unwrap_err();
         assert_eq!(diagnostic.message, "range too large");
-        assert_eq!(diagnostic.span, at(text, "0..n"));
+        assert_eq!(diagnostic.span, at(&text, "0..n"));
         // A range in the iterable that is not directly it is built.
-        let text = "for i in [0..16777217][0] { i }";
+        let text = format!("for i in [0..{MAX}][0] {{ i }}");
         assert_eq!(
-            error(text),
-            ("range too large".to_owned(), at(text, "0..16777217"))
+            error(&text),
+            (
+                "range too large".to_owned(),
+                at(&text, &format!("0..{MAX}"))
+            )
         );
+        // Below that there is no limit: a list of any size a program asks
+        // for is built.
+        assert_eq!(shown("len(0..1000000)"), "1000000");
     }
 
     #[test]

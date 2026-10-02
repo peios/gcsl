@@ -2048,15 +2048,15 @@ fn programs_with_fors_and_ranges() {
 #[test]
 fn range_and_for_errors_render_exactly() {
     assert_eq!(
-        rendered("let big = 0..=20000000\n"),
+        rendered("let big = 0..=9223372036854775807\n"),
         "error: range too large\n\
          \x20--> calc.gcsl:1:11\n\
          \x20 |\n\
-         1 | let big = 0..=20000000\n\
-         \x20 |           ^^^^^^^^^^^^ this range has 20000001 elements\n\
+         1 | let big = 0..=9223372036854775807\n\
+         \x20 |           ^^^^^^^^^^^^^^^^^^^^^^^ this range has 9223372036854775808 elements\n\
          \x20 |\n\
-         \x20 = note: a range used as a list holds every element; the limit is 16777216. A \
-         `for` over a range directly has no limit\n"
+         \x20 = note: a range used as a list holds every element, and a list cannot hold more \
+         than 384307168202282325. A `for` over a range directly builds no list\n"
     );
     assert_eq!(
         rendered("let n = 5\nfor x in n { x }\n"),

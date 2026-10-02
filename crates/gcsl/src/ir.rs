@@ -634,9 +634,9 @@ pub enum IrKind {
     /// A range: the list of the `Int`s from the left operand, an `Int`, up
     /// to the right one, an `Int`, in order, the right one included if the
     /// flag is `true` (`a..=b`) and not if it is `false` (`a..b`); empty if
-    /// there are none. A runtime error if it would have more than
-    /// [`crate::eval::MAX_RANGE_LEN`] elements, unless it is directly the
-    /// iterable of a [`IrKind::For`], which does not build it.
+    /// there are none. A runtime error if it would have more elements than
+    /// a list can hold ([`crate::eval::MAX_LIST_LEN`]), unless it is
+    /// directly the iterable of a [`IrKind::For`], which does not build it.
     Range(bool, Operands),
     /// A `for`: evaluates the iterable, the first of `parts`, a list node,
     /// once, and then for each of its elements in order writes the element

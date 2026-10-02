@@ -763,10 +763,10 @@ mod tests {
         value(&mut session, "let y = 7");
         // A closure made in an earlier input keeps its iteration's value.
         assert_eq!(value(&mut session, "fs[0]() + fs[1]() + y"), Value::Int(37));
-        // A range too large fails the input, which leaves the session as
-        // it was.
+        // A range too large for any list fails the input, which leaves the
+        // session as it was.
         assert_eq!(
-            messages(&mut session, "let big = 0..20000000"),
+            messages(&mut session, "let big = 0..9223372036854775807"),
             vec!["range too large"]
         );
         assert_eq!(
