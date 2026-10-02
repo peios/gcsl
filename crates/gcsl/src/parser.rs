@@ -37,23 +37,52 @@
 //!
 //! # Paths
 //!
-//! A path is one or more names separated by `.`: `x`, `server.port`,
-//! `"log level".format`. After `let` the parser reads the path directly:
-//! an identifier, then `.` and a name as many times as they follow. A field
-//! item or a rebind is recognised afterwards instead: the parser parses an
-//! expression and, when the next token is `=` or `:=`, converts that
-//! expression to a path and drops its nodes, which were the last allocated.
-//! The expression must be a name, a plain string literal, or a chain of
-//! field accesses on one of those, which is exactly how a path reads as an
-//! expression; anything else before the `=` or `:=` is "expected end of
-//! item". A variable's name must be an identifier, so
-//! the first segment of the path of a `let` or a `:=` cannot be a literal;
-//! later segments may be quoted.
+//! A path is a name followed by any number of segments, each `.` and a
+//! name or, in the path of a `:=`, an index, `[EXPR]`:
 //!
-//! A dotted path nests what its item declares: later stages build a record
-//! for each segment but the last, updating one record inside another, so a
-//! path of `N` segments makes its item `2(N - 1)` levels taller than its
-//! value (see [`MAX_DEPTH`]).
+//! ```text
+//! PATH    = NAME SEGMENT*
+//! SEGMENT = "." NAME | "[" EXPR "]"
+//! ```
+//!
+//! as in `x`, `server.port`, `"log level".format`, `xs[i]`,
+//! `conf.hosts[0].up` and `grid[y][x]`. An index segment's `[` follows the
+//! rule it follows in an expression (see [Lists](#lists)): it must start on
+//! the line the path is on, so a `[` after a newline begins the next item.
+//! Its position is any expression, parsed as an index's is and kept in the
+//! tree, and the source text it is written as is added to the string table,
+//! for showing the path as it is written (see [`crate::ast::PathSegment`]);
+//! a position written over several lines is shown on one, each line break,
+//! with the spaces around it, one space.
+//!
+//! After `let` the parser reads the path directly: an identifier, then its
+//! segments as they follow. A field item or a rebind has no keyword, so the
+//! parser looks ahead first (`Parser::starts_path_item`): if the item's
+//! tokens are a name or a plain string literal, then `.` and a name or a
+//! `[`, anything and its matching `]` as many times as they follow, and
+//! then `=` or `:=`, it reads the path directly in the same way, and its
+//! first name is then checked as it was when the path was read back from an
+//! expression: a variable's name must be an identifier, so the first
+//! segment of the path of a `let` or a `:=` cannot be a literal, and a
+//! field's may be a plain string literal; later segments may be quoted.
+//! Otherwise the item is parsed as an expression, and an `=` or `:=` after
+//! it means that it is not a path: "expected end of item", or, before a
+//! chain of field accesses on a literal that cannot be its name, the error
+//! for that literal. The lookahead only counts brackets, and the tokens
+//! between them are then parsed as the position, so an item starting with
+//! an index is looked through twice.
+//!
+//! Only a `:=` path may have index segments: a `let` path with one, `let
+//! xs[0] = 1`, is "a `let` path cannot index a list", and a field's, `xs[0]
+//! = 1`, "a field's path cannot index a list", each at the first index's
+//! brackets, with a note writing the path as a `:=`. (`let mut xs[0] = 1`
+//! is the first, not "`let mut` needs a plain name".)
+//!
+//! A dotted path nests what its item declares: later stages build a record,
+//! or a list, for each segment but the last, updating one inside another,
+//! so a path of `N` segments makes its item `2(N - 1)` levels taller than
+//! the taller of its value and its index segments' positions (see
+//! [`MAX_DEPTH`]).
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
@@ -327,17 +356,20 @@
 //! one above the tallest of its parameter types, its return type and its
 //! body, a `lazy`
 //! one above its operand, and a call one above the tallest of its callee and
-//! arguments, and rejects a node that would exceed the limit. An item's height is its
-//! value's, plus two levels for each segment of its path after the first,
-//! or its annotation's if that is taller; an item taller than the limit is
-//! rejected too, at the item. Together these guarantee that no tree handed
-//! to a later stage is deeper than `MAX_DEPTH`.
+//! arguments, and rejects a node that would exceed the limit. An item's
+//! height is the taller of its value's and its path's index positions',
+//! plus two levels for each segment of its path after the first, or its
+//! annotation's if that is taller; an item taller than the limit is
+//! rejected too, at the item. A position is parsed by
+//! `Parser::parse_expr`, so it counts its own depth as any expression
+//! does. Together these guarantee that no tree handed to a later stage is
+//! deeper than `MAX_DEPTH`.
 
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
     FnDecl, ForDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment,
-    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -391,6 +423,12 @@ const DOTTED_MUT: &str = "`let mut` needs a plain name";
 const DOTTED_MUT_NOTE: &str = "a dotted `let` updates a variable; declare the variable with `let \
      mut a = ...` and update it with `a.b := ...`";
 
+/// The error for an index segment in the path of a `let`.
+const LET_INDEX: &str = "a `let` path cannot index a list";
+
+/// The error for an index segment in the path of a field item.
+const FIELD_INDEX: &str = "a field's path cannot index a list";
+
 /// The note on [`MISPLACED_MUT`] before a field.
 const MUT_FIELD_NOTE: &str = "a field is defined once; declare a variable with `let mut x = ...` \
      and define the field from it";
@@ -416,10 +454,10 @@ const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a
 pub fn parse(
     tokens: &[Token],
     mut names: Names,
-    strings: Strings,
+    mut strings: Strings,
     source: &SourceFile,
 ) -> Result<Ast, Diagnostic> {
-    let (builder, root) = parse_parts(tokens, source, &mut names, &strings)?;
+    let (builder, root) = parse_parts(tokens, source, &mut names, &mut strings)?;
     Ok(builder.finish(root, names, strings))
 }
 
@@ -427,12 +465,14 @@ pub fn parse(
 /// instead of an [`Ast`], and borrowing the tables rather than taking them,
 /// so that a caller lending its [`Names`] only hands them over once parsing
 /// has succeeded. The text of every quoted field name is interned into
-/// `names`; on error, names met before the error remain interned.
+/// `names`; on error, names met before the error remain interned. The
+/// source text of the position of every index segment of a path is added
+/// to `strings` (see [`crate::ast::SegmentKind::Index`]).
 pub(crate) fn parse_parts(
     tokens: &[Token],
     source: &SourceFile,
     names: &mut Names,
-    strings: &Strings,
+    strings: &mut Strings,
 ) -> Result<(AstBuilder, ItemRange), Diagnostic> {
     let mut parser = Parser {
         tokens,
@@ -473,6 +513,25 @@ pub(crate) fn parse_parts(
     }
 }
 
+/// What an item's height needs to know of its path: its number of segments,
+/// each after the first adding two levels, and the height of its tallest
+/// index position, 0 if it has none.
+#[derive(Clone, Copy, Debug)]
+struct PathShape {
+    /// The number of segments.
+    segments: u32,
+    /// The height of the tallest position of an index segment, or 0.
+    positions: u32,
+}
+
+impl PathShape {
+    /// The shape of a single name, and of an item without a path.
+    const SINGLE: PathShape = PathShape {
+        segments: 1,
+        positions: 0,
+    };
+}
+
 /// Proof that a diagnostic has been pushed to the parser's sink. Only
 /// [`Parser::report`] creates one.
 #[derive(Debug)]
@@ -486,8 +545,9 @@ struct Parser<'a> {
     source: &'a SourceFile,
     /// Where quoted field names are interned.
     names: &'a mut Names,
-    /// The text of the string literals, for quoted field names.
-    strings: &'a Strings,
+    /// The text of the string literals, for quoted field names, to which the
+    /// source text of each index segment's position is added.
+    strings: &'a mut Strings,
     builder: AstBuilder,
     /// The height of each allocated expression node, indexed like the
     /// builder's arena: 1 for a leaf, one more than the tallest child
@@ -524,9 +584,10 @@ struct Parser<'a> {
     /// moved to the builder's element pool as each literal ends, as for
     /// `item_stack`.
     element_stack: Vec<Element>,
-    /// The segments of the path being read, moved to the builder's path
-    /// pool once it is complete. Reading a path never starts another, so
-    /// one buffer serves them all.
+    /// The segments of the paths being read, innermost last, moved to the
+    /// builder's path pool as each path is complete, as for `item_stack`:
+    /// the position of an index segment may hold a block, whose items read
+    /// paths of their own.
     path: Vec<PathSegment>,
     /// Whether a `{` after an expression is kept from starting a trailing
     /// block: set while parsing the condition of an `if`, so that its block
@@ -573,8 +634,9 @@ impl Parser<'_> {
         Ok((range, height))
     }
 
-    /// Parses one item. Returns it and its height: its expression's, plus
-    /// two levels for each segment of its path after the first, or its
+    /// Parses one item. Returns it and its height: the taller of its
+    /// expression and the positions of its path's index segments, plus two
+    /// levels for each segment of its path after the first, or its
     /// annotation's if that is taller.
     fn parse_item(&mut self) -> ParseResult<(ItemId, u32)> {
         let token = self.peek();
@@ -589,8 +651,8 @@ impl Parser<'_> {
             return Err(self.misplaced_mut(token, note));
         }
         let mut ty_height = 0;
-        // The number of segments of the item's path, if it has one.
-        let mut segments = 1;
+        // The shape of the item's path, if it has one.
+        let mut shape = PathShape::SINGLE;
         let (kind, value) = match token.kind {
             TokenKind::Let => {
                 self.advance();
@@ -604,14 +666,8 @@ impl Parser<'_> {
                 } else {
                     token
                 };
-                let (path, len) = self.parse_let_path(keyword)?;
-                if mutable && len > 1 {
-                    return Err(self.report(
-                        Diagnostic::error(DOTTED_MUT, path_span(&self.path))
-                            .with_note(DOTTED_MUT_NOTE),
-                    ));
-                }
-                segments = len;
+                let (path, path_shape) = self.parse_let_path(keyword, mutable)?;
+                shape = path_shape;
                 let ty = if self.peek().kind == TokenKind::Colon {
                     self.advance();
                     self.skip_newlines();
@@ -648,50 +704,91 @@ impl Parser<'_> {
                 let value = self.parse_expr(0)?;
                 (ItemKind::Spread(value), value)
             }
+            _ if self.starts_path_item() => {
+                let (kind, value, path) = self.parse_path_item()?;
+                shape = path;
+                (kind, value)
+            }
             _ => {
-                let start = self.pos;
-                let first_node = self.builder.expr_count();
                 let expr = self.parse_expr(0)?;
                 let operator = self.peek();
                 let rebind = match operator.kind {
                     TokenKind::Eq => false,
                     TokenKind::ColonEq => true,
-                    _ => return self.finish_item(token, (ItemKind::Expr(expr), expr), 0, 1),
+                    _ => {
+                        let kind = (ItemKind::Expr(expr), expr);
+                        return self.finish_item(token, kind, 0, PathShape::SINGLE);
+                    }
                 };
-                let (path, len) = self.expr_to_path(start, expr, operator, rebind)?;
-                segments = len;
-                // The path's nodes were the last allocated, and it replaces
-                // them.
-                self.builder.truncate_exprs(first_node);
-                self.heights.truncate(first_node);
-                self.advance();
-                self.skip_newlines();
-                let value = self.parse_expr(0)?;
-                let kind = if rebind {
-                    ItemKind::Rebind { path, value }
-                } else {
-                    ItemKind::Field { path, value }
-                };
-                (kind, value)
+                return Err(self.not_a_path(expr, operator, rebind));
             }
         };
-        self.finish_item(token, (kind, value), ty_height, segments)
+        self.finish_item(token, (kind, value), ty_height, shape)
     }
 
     /// Whether the tokens from `ahead` places after the current one begin a
     /// field item: a path, a name or a plain string literal and then `.`
     /// and a name as many times as they follow, and then `=`.
     fn starts_field(&self, ahead: usize) -> bool {
+        self.path_end(ahead, false)
+            .is_some_and(|end| self.peek_at(end).kind == TokenKind::Eq)
+    }
+
+    /// Whether the current token begins a field item or a rebind whose
+    /// path is written as one: a name or a plain string literal, then `.`
+    /// and a name or `[`, anything and the matching `]` as many times as
+    /// they follow, and then `=` or `:=`. Such an item is read by
+    /// [`Parser::parse_path_item`]; any other item that turns out to be
+    /// followed by `=` or `:=` is not a path (see [`Parser::not_a_path`]).
+    /// The tokens between brackets are only counted here, and parsed as
+    /// the position afterwards, so an item starting with an index is looked
+    /// through twice.
+    fn starts_path_item(&self) -> bool {
+        self.path_end(0, true)
+            .is_some_and(|end| matches!(self.peek_at(end).kind, TokenKind::Eq | TokenKind::ColonEq))
+    }
+
+    /// How many places after the current token the tokens from `ahead`
+    /// places after it stop spelling a path: a name or a plain string
+    /// literal, then `.` and a name and, if `indexes`, `[` and everything up
+    /// to the matching `]`, as many times as they follow. `None` if they do
+    /// not start with a name, or a `[` is never closed.
+    fn path_end(&self, ahead: usize, indexes: bool) -> Option<usize> {
         let is_name = |token: Token| matches!(token.kind, TokenKind::Ident(_) | TokenKind::Str(_));
         let mut at = ahead;
         if !is_name(self.peek_at(at)) {
-            return false;
+            return None;
         }
         at += 1;
-        while self.peek_at(at).kind == TokenKind::Dot && is_name(self.peek_at(at + 1)) {
-            at += 2;
+        loop {
+            match self.peek_at(at).kind {
+                TokenKind::Dot if is_name(self.peek_at(at + 1)) => at += 2,
+                TokenKind::LBracket if indexes => at = self.after_brackets(at)?,
+                _ => return Some(at),
+            }
         }
-        self.peek_at(at).kind == TokenKind::Eq
+    }
+
+    /// How many places after the current token the token after the `]`
+    /// matching the `[` `open` places after it is, counting brackets alone;
+    /// `None` if the input ends first.
+    fn after_brackets(&self, open: usize) -> Option<usize> {
+        let mut depth = 0_usize;
+        let mut at = open;
+        loop {
+            match self.peek_at(at).kind {
+                TokenKind::LBracket => depth += 1,
+                TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(at + 1);
+                    }
+                }
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+            at += 1;
+        }
     }
 
     /// Reports `token`, a `mut` where it is not allowed, with `note` if one
@@ -716,36 +813,37 @@ impl Parser<'_> {
         self.advance();
         self.advance();
         let value = self.parse_fn(keyword)?;
-        self.path.clear();
+        let base = self.path.len();
         self.path.push(PathSegment {
-            name,
+            kind: SegmentKind::Name(name),
             span: name_span,
         });
-        let (path, segments) = self.finish_path();
+        let (path, shape) = self.finish_path(base);
         let kind = ItemKind::Let {
             path,
             ty: None,
             value,
             mutable: false,
         };
-        self.finish_item(keyword, (kind, value), 0, segments)
+        self.finish_item(keyword, (kind, value), 0, shape)
     }
 
     /// Allocates the item of `kind`, starting at `token` and ending with its
     /// expression `value`, whose annotation, if any, is `ty_height` tall and
-    /// whose path has `segments` segments. Returns it and its height,
-    /// failing if that exceeds [`MAX_DEPTH`].
+    /// whose path has the shape `path`. Returns it and its height, failing
+    /// if that exceeds [`MAX_DEPTH`].
     fn finish_item(
         &mut self,
         token: Token,
         (kind, value): (ItemKind, ExprId),
         ty_height: u32,
-        segments: u32,
+        path: PathShape,
     ) -> ParseResult<(ItemId, u32)> {
         let span = Span::join(token.span, self.span_of(value));
-        let path_height = segments.saturating_sub(1).saturating_mul(2);
+        let path_height = path.segments.saturating_sub(1).saturating_mul(2);
         let height = self
             .height_of(value)
+            .max(path.positions)
             .saturating_add(path_height)
             .max(ty_height);
         if height as usize > MAX_DEPTH {
@@ -756,10 +854,19 @@ impl Parser<'_> {
     }
 
     /// Parses the path after `let`, or after the `mut` of a `let mut`,
-    /// `keyword`, starting at its first segment: an identifier, then `.`
-    /// and a name, plain or quoted, as many times as they follow. Returns
-    /// it and its number of segments.
-    fn parse_let_path(&mut self, keyword: Token) -> ParseResult<(PathRange, u32)> {
+    /// `keyword`, as `mutable` says, starting at its first segment: an
+    /// identifier, then `.` and a name, plain or quoted, as many times as
+    /// they follow. Returns it and its shape.
+    ///
+    /// An index segment is read as in any path, and then reported at its
+    /// brackets: "a `let` path cannot index a list", with a note writing the
+    /// path as a `:=`. A `let mut`'s path must be a single name: a dotted one
+    /// is "`let mut` needs a plain name", at the path.
+    fn parse_let_path(
+        &mut self,
+        keyword: Token,
+        mutable: bool,
+    ) -> ParseResult<(PathRange, PathShape)> {
         let name_token = self.peek();
         let name = match name_token.kind {
             TokenKind::Ident(name) => name,
@@ -778,94 +885,171 @@ impl Parser<'_> {
             }
         };
         self.advance();
-        self.path.clear();
+        let base = self.path.len();
         self.path.push(PathSegment {
-            name,
+            kind: SegmentKind::Name(name),
             span: name_token.span,
         });
-        while self.peek().kind == TokenKind::Dot {
-            self.advance();
-            let segment = self.peek();
-            let Some(name) = self.field_name()? else {
-                return Err(self.error("expected a field name after `.`", error_span(segment)));
-            };
-            self.path.push(PathSegment {
-                name,
-                span: segment.span,
-            });
+        self.parse_segments()?;
+        if let Some(error) = self.indexed_path(base, LET_INDEX) {
+            return Err(error);
         }
-        Ok(self.finish_path())
+        if mutable && self.path.len() - base > 1 {
+            return Err(self.report(
+                Diagnostic::error(DOTTED_MUT, path_span(&self.path[base..]))
+                    .with_note(DOTTED_MUT_NOTE),
+            ));
+        }
+        Ok(self.finish_path(base))
     }
 
-    /// Converts `expr`, parsed from the tokens starting at `start` and
-    /// followed by `operator`, the `=` of a field item or the `:=` of a
-    /// rebind as `rebind` says, to the path it spells: a name, a plain
-    /// string literal, or a chain of field accesses on one of those. Returns
-    /// it and its number of segments.
+    /// Parses a field item, `PATH = EXPR`, or a rebind, `PATH := EXPR`,
+    /// whose tokens [`Parser::starts_path_item`] has found to begin with a
+    /// path, starting at the path's first segment. Returns its kind, its
+    /// value and its path's shape.
     ///
-    /// Anything else is "expected end of item" at the operator. A raw or
-    /// interpolated literal is not a field name, and no literal is a
-    /// variable's name.
-    fn expr_to_path(
-        &mut self,
-        start: usize,
-        expr: ExprId,
-        operator: Token,
-        rebind: bool,
-    ) -> ParseResult<(PathRange, u32)> {
-        // Walk down to the base, collecting the accessed names from the last
-        // segment to the second.
-        self.path.clear();
-        let mut node = expr;
-        let base = loop {
-            let inner = *self.builder.get(node);
-            match inner.kind {
-                ExprKind::Field { expr, name } => {
-                    self.path.push(PathSegment {
-                        name,
-                        span: inner.span,
-                    });
-                    node = expr;
-                }
-                ExprKind::Name(name) => break name,
-                ExprKind::Str(_) | ExprKind::Interp(_) if rebind => {
-                    return Err(self.error(PLAIN_VARIABLE_NAME, inner.span));
-                }
-                ExprKind::Str(text) => {
-                    let literal = self.token_at(start);
-                    break self.quoted_name(literal, text)?;
-                }
-                ExprKind::Interp(_) => return Err(self.error(PLAIN_FIELD_NAME, inner.span)),
-                _ => {
-                    let found = self.describe(operator);
-                    return Err(self.error(
-                        format!("expected end of item, found {found}"),
-                        operator.span,
-                    ));
-                }
+    /// The path's first segment is checked after the rest of the path is
+    /// read, as when the path was read back from an expression: a field's
+    /// name may be a plain string literal but not a raw one, and a
+    /// variable's must be an identifier. Only a rebind's path may have index
+    /// segments: a field's is reported at the first, "a field's path cannot
+    /// index a list", with a note writing the path as a `:=`.
+    fn parse_path_item(&mut self) -> ParseResult<(ItemKind, ExprId, PathShape)> {
+        let first = self.peek();
+        self.advance();
+        let base = self.path.len();
+        let positions = self.parse_segments()?;
+        let operator = self.peek();
+        let rebind = operator.kind == TokenKind::ColonEq;
+        let name = match first.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(_) if rebind => return Err(self.error(PLAIN_VARIABLE_NAME, first.span)),
+            TokenKind::Str(text) => self.quoted_name(first, text)?,
+            _ => {
+                let found = self.describe(operator);
+                return Err(self.error(
+                    format!("expected end of item, found {found}"),
+                    operator.span,
+                ));
             }
         };
-        self.path.push(PathSegment {
-            name: base,
-            span: self.token_at(start).span,
-        });
-        self.path.reverse();
-        // A path's tokens are exactly its base and then `.` and a name for
-        // each access, since newlines are not skipped around `.`: the name
-        // of segment `i` is token `start + 2i`.
-        for (index, segment) in self.path.iter_mut().enumerate().skip(1) {
-            if let Some(token) = self.tokens.get(start + 2 * index) {
-                segment.span = token.span;
-            }
+        self.path.insert(
+            base,
+            PathSegment {
+                kind: SegmentKind::Name(name),
+                span: first.span,
+            },
+        );
+        if !rebind && let Some(error) = self.indexed_path(base, FIELD_INDEX) {
+            return Err(error);
         }
-        Ok(self.finish_path())
+        let (path, mut shape) = self.finish_path(base);
+        shape.positions = positions;
+        self.advance();
+        self.skip_newlines();
+        let value = self.parse_expr(0)?;
+        let kind = if rebind {
+            ItemKind::Rebind { path, value }
+        } else {
+            ItemKind::Field { path, value }
+        };
+        Ok((kind, value, shape))
     }
 
-    /// Moves the path being read to the builder's path pool, returning its
-    /// range and its number of segments.
-    fn finish_path(&mut self) -> (PathRange, u32) {
-        let len = u32::try_from(self.path.len()).unwrap_or(u32::MAX);
-        (self.builder.push_path(&self.path), len)
+    /// Parses the segments of a path after its first, onto `path`, while
+    /// they follow: `.` and a name, plain or quoted, or an index, `[`, a
+    /// position and `]`, which, as in an expression, must start on the line
+    /// the path is on, a newline ending the path. Returns the height of the
+    /// tallest position, 0 if there is none.
+    fn parse_segments(&mut self) -> ParseResult<u32> {
+        let mut tallest = 0;
+        loop {
+            match self.peek().kind {
+                TokenKind::Dot => {
+                    self.advance();
+                    let segment = self.peek();
+                    let Some(name) = self.field_name()? else {
+                        return Err(
+                            self.error("expected a field name after `.`", error_span(segment))
+                        );
+                    };
+                    self.path.push(PathSegment {
+                        kind: SegmentKind::Name(name),
+                        span: segment.span,
+                    });
+                }
+                TokenKind::LBracket => {
+                    let (position, span) = self.parse_position()?;
+                    tallest = tallest.max(self.height_of(position));
+                    let written = self.source.slice(self.span_of(position));
+                    let text = if written.contains('\n') {
+                        self.strings.push(&one_line(written))
+                    } else {
+                        self.strings.push(written)
+                    };
+                    self.path.push(PathSegment {
+                        kind: SegmentKind::Index { position, text },
+                        span,
+                    });
+                }
+                _ => return Ok(tallest),
+            }
+        }
+    }
+
+    /// The error `message` at the first index segment of the path being
+    /// read from `base` on, if it has one, which may not: "a `let` path
+    /// cannot index a list" or "a field's path cannot index a list", with a
+    /// note writing the path as it is written, as a `:=`.
+    fn indexed_path(&mut self, base: usize, message: &str) -> Option<Reported> {
+        let path = self.path.get(base..)?;
+        let index = path.iter().find(|segment| segment.position().is_some())?;
+        let error = Diagnostic::error(message, index.span).with_note(format!(
+            "update the element with `{} := ...`",
+            one_line(self.source.slice(path_span(path)))
+        ));
+        Some(self.report(error))
+    }
+
+    /// The error for `expr`, parsed at the start of an item and followed by
+    /// `operator`, the `=` of a field item or the `:=` of a rebind as
+    /// `rebind` says, which is not a path, since [`Parser::starts_path_item`]
+    /// found none: "expected end of item" at the operator, unless it is a
+    /// chain of field accesses on a literal that is not a name, a raw or
+    /// interpolated literal for a field and any literal for a variable.
+    fn not_a_path(&mut self, expr: ExprId, operator: Token, rebind: bool) -> Reported {
+        let mut node = expr;
+        loop {
+            let inner = *self.builder.get(node);
+            match inner.kind {
+                ExprKind::Field { expr, .. } => node = expr,
+                ExprKind::Str(_) | ExprKind::Interp(_) if rebind => {
+                    return self.error(PLAIN_VARIABLE_NAME, inner.span);
+                }
+                ExprKind::Interp(_) => return self.error(PLAIN_FIELD_NAME, inner.span),
+                _ => {
+                    let found = self.describe(operator);
+                    return self.error(
+                        format!("expected end of item, found {found}"),
+                        operator.span,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Moves the path being read, the segments of `path` from `base` on, to
+    /// the builder's path pool, returning its range and its shape, with no
+    /// positions: the caller knows how tall they are.
+    fn finish_path(&mut self, base: usize) -> (PathRange, PathShape) {
+        let segments = self.path.get(base..).unwrap_or_default();
+        let shape = PathShape {
+            segments: u32::try_from(segments.len()).unwrap_or(u32::MAX),
+            positions: 0,
+        };
+        let range = self.builder.push_path(segments);
+        self.path.truncate(base);
+        (range, shape)
     }
 
     /// The name a plain string literal `token`, of text `text`, gives a
@@ -1723,10 +1907,19 @@ impl Parser<'_> {
         }
     }
 
-    /// Parses the index of `list`, starting at its `[`: the position,
-    /// parsed at minimum binding power 0, and the `]`. The index spans
-    /// `list` through the `]`.
+    /// Parses the index of `list`, starting at its `[` (see
+    /// [`Parser::parse_position`]). The index spans `list` through the `]`.
     fn parse_index(&mut self, list: ExprId) -> ParseResult<ExprId> {
+        let (index, brackets) = self.parse_position()?;
+        let height = self.height_of(list).max(self.height_of(index)) + 1;
+        let span = Span::join(self.span_of(list), brackets);
+        self.alloc(ExprKind::Index { expr: list, index }, span, height)
+    }
+
+    /// Parses the brackets of an index, of an expression or of a path,
+    /// starting at the `[`: the position, parsed at minimum binding power
+    /// 0, and the `]`. Returns the position and the span of the brackets.
+    fn parse_position(&mut self) -> ParseResult<(ExprId, Span)> {
         let open = self.peek();
         self.advance();
         // The position is inside brackets.
@@ -1743,9 +1936,7 @@ impl Parser<'_> {
             ));
         }
         self.advance();
-        let height = self.height_of(list).max(self.height_of(index)) + 1;
-        let span = Span::join(self.span_of(list), close.span);
-        self.alloc(ExprKind::Index { expr: list, index }, span, height)
+        Ok((index, Span::join(open.span, close.span)))
     }
 
     /// Parses a prefix operator `op`, the current token, and its operand,
@@ -2153,6 +2344,17 @@ fn binding_power(op: BinaryOp) -> (u8, u8) {
     }
 }
 
+/// `text`, the source of a position or a path, on one line: each line break,
+/// with the spaces around it, is one space, so that a path shown in a
+/// diagnostic or a dump stays on its line.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Where to point an error about finding `token`: its span, except for the
 /// piece of a string after an interpolation, where it is the `}` ending the
 /// interpolation, not the text after it.
@@ -2203,7 +2405,7 @@ mod tests {
                     path, ty, value, ..
                 } => {
                     out.push_str("let ");
-                    out.push_str(&ast.show_path(ast.path(path)).to_string());
+                    path_shape(ast, path, out);
                     if let Some(ty) = ty {
                         out.push_str(": ");
                         type_name(ast, ty, out);
@@ -2212,12 +2414,12 @@ mod tests {
                     expr(ast, value, out);
                 }
                 ItemKind::Rebind { path, value } => {
-                    out.push_str(&ast.show_path(ast.path(path)).to_string());
+                    path_shape(ast, path, out);
                     out.push_str(" := ");
                     expr(ast, value, out);
                 }
                 ItemKind::Field { path, value } => {
-                    out.push_str(&ast.show_path(ast.path(path)).to_string());
+                    path_shape(ast, path, out);
                     out.push_str(" = ");
                     expr(ast, value, out);
                 }
@@ -2230,6 +2432,26 @@ mod tests {
                     expr(ast, value, out);
                 }
                 ItemKind::Expr(value) => expr(ast, value, out),
+            }
+        }
+    }
+
+    /// A path as written, each name as [`Ast::show_path`] shows it, and each
+    /// index segment's position in its shape: `xs[(i + 1)].name`.
+    fn path_shape(ast: &Ast, path: PathRange, out: &mut String) {
+        for (index, segment) in ast.path(path).iter().enumerate() {
+            match segment.kind {
+                SegmentKind::Name(_) => {
+                    if index > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&ast.show_path(std::slice::from_ref(segment)).to_string());
+                }
+                SegmentKind::Index { position, .. } => {
+                    out.push('[');
+                    expr(ast, position, out);
+                    out.push(']');
+                }
             }
         }
     }
@@ -3514,7 +3736,7 @@ mod tests {
             .items(ast.root())
             .iter()
             .map(|&id| match ast.item(id).kind {
-                ItemKind::Field { path, .. } => ast.path(path)[0].name,
+                ItemKind::Field { path, .. } => ast.path(path)[0].name().unwrap(),
                 other => panic!("expected a field, got {other:?}"),
             })
             .collect();
@@ -4211,7 +4433,7 @@ mod tests {
         let segments = ast.path(path);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].span, Span::new(5, 8));
-        assert_eq!(ast.names().get(segments[0].name), "add");
+        assert_eq!(ast.names().get(segments[0].name().unwrap()), "add");
         assert!(matches!(ast.get(value).kind, ExprKind::Fn(_)));
         // In a block, and as the pretty printer shows it.
         assert_eq!(
@@ -5811,5 +6033,241 @@ mod tests {
             error("let = 1"),
             ("expected a name after `let`".to_owned(), Span::new(4, 5))
         );
+    }
+
+    #[test]
+    fn index_segments_in_rebind_paths() {
+        for (text, expected) in [
+            // First, last, mixed with names, and two in a row.
+            ("xs[0] := 1", "xs[0] := 1"),
+            ("xs[0].a := 1", "xs[0].a := 1"),
+            ("a.b[0] := 1", "a.b[0] := 1"),
+            ("conf.hosts[0].up := true", "conf.hosts[0].up := true"),
+            ("grid[y][x] := 1", "grid[y][x] := 1"),
+            ("a.\"b c\"[0].d := 1", "a.\"b c\"[0].d := 1"),
+            // Any expression as the position: a call, arithmetic, another
+            // index, a block, even one holding a path of its own.
+            ("xs[f(1, y = 2)] := 1", "xs[f(1, y = 2)] := 1"),
+            ("xs[i + 1 * 2] := 1", "xs[(i + (1 * 2))] := 1"),
+            ("xs[ys[0]] := 1", "xs[(ys at 0)] := 1"),
+            ("xs[{ let i = 1; i }] := 2", "xs[{let i = 1; i}] := 2"),
+            (
+                "xs[{ ys[0] := 1; 0 }][a.b] := 2",
+                "xs[{ys[0] := 1; 0}][(a . b)] := 2",
+            ),
+            // Inside brackets, newlines do not end the item.
+            ("xs[\n  i\n] := 1", "xs[i] := 1"),
+            ("xs[0] :=\n  1", "xs[0] := 1"),
+            // In a block.
+            ("{ xs[0] := 1 }", "{xs[0] := 1}"),
+        ] {
+            assert_eq!(shape(text), expected, "{text}");
+        }
+        // An index read, compared or accessed is an expression, as ever.
+        assert_eq!(shape("xs[0]"), "(xs at 0)");
+        assert_eq!(shape("xs[0] == 1"), "((xs at 0) == 1)");
+        assert_eq!(shape("xs[0].a"), "((xs at 0) . a)");
+        // A path is read from its tokens: its positions are its only nodes.
+        assert_eq!(parse_text("xs[i].a[0] := 1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn index_segments_span_their_brackets() {
+        let text = "  xs[i + 1].name[ 0 ] := v";
+        let ast = parse_text(text).unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(2, 26));
+        let ItemKind::Rebind { path, .. } = item.kind else {
+            panic!("expected a rebind");
+        };
+        let segments = ast.path(path);
+        let spans: Vec<Span> = segments.iter().map(|segment| segment.span).collect();
+        assert_eq!(
+            spans,
+            vec![
+                Span::new(2, 4),
+                Span::new(4, 11),
+                Span::new(12, 16),
+                Span::new(16, 21)
+            ]
+        );
+        assert_eq!(path_span(segments), Span::new(2, 21));
+        // Each position is an expression of the tree, and the path shows it
+        // as it is written between the brackets.
+        let positions: Vec<Span> = segments
+            .iter()
+            .filter_map(PathSegment::position)
+            .map(|position| ast.get(position).span)
+            .collect();
+        assert_eq!(positions, vec![Span::new(5, 10), Span::new(18, 19)]);
+        assert_eq!(ast.show_path(segments).to_string(), "xs[i + 1].name[0]");
+        assert_eq!(ast.show_path(&segments[..2]).to_string(), "xs[i + 1]");
+        assert_eq!(segments[0].name(), ast.names().lookup("xs"));
+        assert_eq!(segments[1].name(), None);
+        // A block whose first item has a position starts with it.
+        let ast = parse_text("{ xs[i] := v }").unwrap();
+        let ItemKind::Expr(block) = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected a block");
+        };
+        let nodes: Vec<Span> = ast.subtree(block).map(|id| ast.get(id).span).collect();
+        assert_eq!(
+            nodes,
+            vec![Span::new(5, 6), Span::new(11, 12), Span::new(0, 14)]
+        );
+    }
+
+    #[test]
+    fn an_index_on_the_next_line_is_not_a_segment() {
+        // As in an expression, the `[` starts the next item, a list literal,
+        // which is not a path.
+        assert_eq!(shape("xs\n[0]"), "xs; list(0)");
+        assert_eq!(
+            error("xs\n[0] := 1"),
+            (
+                "expected end of item, found `:=`".to_owned(),
+                Span::new(7, 9)
+            )
+        );
+        assert_eq!(
+            error("{ a.b\n[0] = 1 }"),
+            (
+                "expected end of item, found `=`".to_owned(),
+                Span::new(10, 11)
+            )
+        );
+        assert_eq!(
+            error("let xs\n[0] = 1"),
+            (
+                "expected `=` after variable name".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn only_a_rebind_path_may_index_a_list() {
+        for (text, message, (start, end), path) in [
+            ("let xs[0] = 1", LET_INDEX, (6, 9), "xs[0]"),
+            (
+                "let a.b[i + 1].c: Int = 1",
+                LET_INDEX,
+                (7, 14),
+                "a.b[i + 1].c",
+            ),
+            ("let mut xs[0] = 1", LET_INDEX, (10, 13), "xs[0]"),
+            ("xs[0] = 1", FIELD_INDEX, (2, 5), "xs[0]"),
+            ("{ a.xs[0].b = 1 }", FIELD_INDEX, (6, 9), "a.xs[0].b"),
+            ("\"q\"[0] = 1", FIELD_INDEX, (3, 6), "\"q\"[0]"),
+            // A path written over several lines is shown on one.
+            (
+                "let xs[\n  i +\n  1\n] = 1",
+                LET_INDEX,
+                (6, 19),
+                "xs[ i + 1 ]",
+            ),
+        ] {
+            assert_eq!(
+                error_with_notes(text),
+                (
+                    message.to_owned(),
+                    Span::new(start, end),
+                    vec![format!("update the element with `{path} := ...`")]
+                ),
+                "{text}"
+            );
+        }
+        assert_eq!(LET_INDEX, "a `let` path cannot index a list");
+        assert_eq!(FIELD_INDEX, "a field's path cannot index a list");
+        // A rebind's first name is a variable's, as ever.
+        assert_eq!(
+            error("\"x\"[0] := 1"),
+            (PLAIN_VARIABLE_NAME.to_owned(), Span::new(0, 3))
+        );
+        // A mistake in a position is reported first.
+        assert_eq!(
+            error("let xs[) = 1"),
+            ("expected expression, found `)`".to_owned(), Span::new(7, 8))
+        );
+        // Anything else before `:=` is still not a path.
+        let found_colon_eq = |at: u32| {
+            (
+                "expected end of item, found `:=`".to_owned(),
+                Span::new(at, at + 2),
+            )
+        };
+        assert_eq!(error("xs[0] + 1 := 2"), found_colon_eq(10));
+        assert_eq!(error("(xs)[0] := 2"), found_colon_eq(8));
+        assert_eq!(error("f()[0] := 2"), found_colon_eq(7));
+    }
+
+    #[test]
+    fn pretty_output_for_index_paths() {
+        let text = "xs[i + 1].up := true\ngrid[y][0] := 1";
+        let expected = "(file\n\
+                        \x20 (rebind xs[i + 1].up @0..20\n\
+                        \x20   (at\n\
+                        \x20     (+ @3..8\n\
+                        \x20       (name i @3..4)\n\
+                        \x20       (int 1 @7..8)))\n\
+                        \x20   (bool true @16..20))\n\
+                        \x20 (rebind grid[y][0] @21..36\n\
+                        \x20   (at\n\
+                        \x20     (name y @26..27))\n\
+                        \x20   (at\n\
+                        \x20     (int 0 @29..30))\n\
+                        \x20   (int 1 @35..36)))";
+        assert_eq!(parse_text(text).unwrap().pretty().to_string(), expected);
+        // Laid out otherwise, the same items print the same but for their
+        // spans.
+        let spread = "xs[\n  i +\n  1\n].up :=\n  true\ngrid[ y ][0] := 1";
+        let heads = |printed: &str| -> Vec<String> {
+            printed
+                .lines()
+                .map(|line| line.split(" @").next().unwrap_or(line).to_owned())
+                .collect()
+        };
+        let printed = parse_text(spread).unwrap().pretty().to_string();
+        assert_eq!(heads(&printed), heads(expected));
+        // A path shown as it is written reads back as the same path.
+        for path in [
+            "conf.hosts[i + 1].up",
+            "grid[y][f(x, 2)]",
+            "a.\"b c\"[ys[0]].d",
+        ] {
+            let text = format!("{path} := 1");
+            let ast = parse_text(&text).unwrap();
+            let ItemKind::Rebind { path: range, .. } = ast.item(ast.items(ast.root())[0]).kind
+            else {
+                panic!("expected a rebind");
+            };
+            let shown = ast.show_path(ast.path(range)).to_string();
+            assert_eq!(shown, path);
+            assert_eq!(shape(&format!("{shown} := 1")), shape(&text));
+        }
+    }
+
+    #[test]
+    fn index_positions_count_towards_height() {
+        // A chain of N terms is N levels: as a position of a path of two
+        // segments, the item is two levels more, at the limit with one fewer
+        // than the limit allows a chain alone.
+        let chain = |terms: usize| format!("0{}", " + 0".repeat(terms - 1));
+        let deepest = format!("xs[{}] := 1", chain(MAX_DEPTH - 2));
+        on_big_stack(move || parse_text(&deepest).unwrap());
+        let diagnostic = too_deep(format!("xs[{}] := 1", chain(MAX_DEPTH - 1)));
+        assert_eq!(diagnostic.message, "expression nested too deeply");
+        assert_eq!(diagnostic.span.start, 0);
+        // Taller than the value, the position decides the height.
+        let deep = format!("{{ xs[{}] := 1 }}", chain(MAX_DEPTH - 3));
+        on_big_stack(move || parse_text(&deep).unwrap());
+        too_deep(format!("{{ xs[{}] := 1 }}", chain(MAX_DEPTH - 2)));
+        // Positions nested in each other recurse, and are stopped as any
+        // expression nested too deeply is.
+        let nested = format!(
+            "xs[{}0{}] := 1",
+            "ys[".repeat(MAX_DEPTH),
+            "]".repeat(MAX_DEPTH)
+        );
+        assert_eq!(too_deep(nested).message, "expression nested too deeply");
     }
 }

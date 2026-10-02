@@ -838,6 +838,112 @@ fn rebinding_errors_are_rendered() {
 }
 
 #[test]
+fn run_updates_elements_of_lists() {
+    let output = gcsl(&["run", "tests/fixtures/update.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{up = true; ports = [81, 5433]; cells = [[0, 1], [2, 3]]; counts = [0, 5, 0]; before = \
+         [0, 0, 0]; r = {a = 8; b = 7}}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_element_updates() {
+    let output = gcsl(&["run", "tests/fixtures/update.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    let token = "\nIdent(hosts) @247..252\nLBracket @252..253\nInt(0) @253..254\nRBracket \
+                 @254..255\nDot @255..256\nIdent(up) @256..258\nColonEq @259..261\n";
+    assert!(tokens.contains(token), "{token}: {tokens}");
+    let output = gcsl(&["run", "tests/fixtures/update.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        // A path shows as it is written, and each position before the
+        // value.
+        "\n  (rebind hosts[0].up @247..266\n\
+         \x20   (at\n\
+         \x20     (int 0 @253..254))\n\
+         \x20   (bool true @262..266))\n",
+        "\n        (rebind hosts[i].ports[0] @364..406\n\
+         \x20         (at\n\
+         \x20           (name i @370..371))\n\
+         \x20         (at\n\
+         \x20           (int 0 @379..380))\n",
+        "\n              (rebind grid[y][x] @497..520\n\
+         \x20               (at\n\
+         \x20                 (name y @502..503))\n\
+         \x20               (at\n\
+         \x20                 (name x @505..506))\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/update.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "\n  (rebind counts[1] @628..642\n\
+         \x20   (at\n\
+         \x20     (int 1 : Int @635..636))\n",
+        // The list another variable holds keeps its type, and so does the
+        // one updated.
+        "(name before : List<Int> @872..878)",
+        "(name counts : List<Int> @856..862)",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/update.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // One update for the whole path: its value, its list and its
+        // positions, and its steps.
+        "\n  (store hosts#0 @247..266\n\
+         \x20   (update [].up @247..258\n\
+         \x20     (bool true @262..266)\n\
+         \x20     (load hosts#0 @247..252)\n\
+         \x20     (int 0 @253..254)))\n",
+        "\n      (store hosts#0 @364..406\n\
+         \x20       (update [].ports[] @364..381\n\
+         \x20         (int-add @385..406\n",
+        "\n            (update [][] @497..507\n",
+        // The value, which rebinds `r`, comes before the read of `r`.
+        "\n  (store r#4 @735..778\n\
+         \x20   (update .a @735..738\n\
+         \x20     (block @742..778\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn update_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/update_range_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: index out of range\n\
+         \x20--> tests/fixtures/update_range_error.gcsl:2:1\n\
+         \x20 |\n\
+         2 | ports[2] := 8080\n\
+         \x20 | ^^^^^^^^ the index is 2, and the list has 2 elements\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl(&["run", "tests/fixtures/update_list_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot update `replicas[0]`: `replicas` is Int, not a list\n\
+         \x20--> tests/fixtures/update_list_error.gcsl:2:1\n\
+         \x20 |\n\
+         2 | replicas[0] := 4\n\
+         \x20 | --------^^^\n\
+         \x20 | |\n\
+         \x20 | this is Int\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn repl_rebinds_mutable_variables_across_lines() {
     let output = repl(
         "let mut n = 0\n\

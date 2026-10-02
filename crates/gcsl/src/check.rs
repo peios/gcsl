@@ -258,6 +258,22 @@
 //! let a.x = 2      # a is {x = 2}; old is still {x = 1}
 //! ```
 //!
+//! **Order.** Every dotted `let` and dotted `:=`, of a mutable variable or
+//! not, is evaluated in one order, Python's: first its value, once; then
+//! the variable is read, and the path walked from its first segment, each
+//! record (or list, see [Lists](#lists)) along it read once and awaited
+//! where it is marked to be, and each index segment's position evaluated
+//! once, where the walk reaches it, left to right; and then the new value
+//! is built from the leaf outwards and stored. So the update applies to the
+//! variable as it is when the assignment happens: `r.a := { r := { a = 100;
+//! b = 7 }; r.b + 1 }` makes `r` `{a = 8; b = 7}`, and a record along the
+//! path that is a future is awaited after the value's effects. The order
+//! changes nothing here: the checker walks the path before it checks the
+//! value, since the value is checked against the leaf's type, and its
+//! types, awaits, purity errors and their spans are the same whatever order
+//! the program runs in (see [`crate::lower`] and [`crate::eval`] for how
+//! the order is kept).
+//!
 //! The static type is the truth. An update that creates an intermediate
 //! record where the static type has no such field replaces whatever the
 //! runtime value holds there: a field hidden by subtyping, as in
@@ -283,9 +299,14 @@
 //! the either shape. Dotted fields are not affected: they only extend
 //! records their own block is building.
 //!
-//! How a dotted item resolves (the slot of the record it updates, how many
-//! of its path's segments name records that already exist, and which of
-//! those are awaited) is recorded for lowering as a [`PathResolution`].
+//! The path of a `:=`, and only of a `:=`, may index lists too, `xs[i] :=
+//! v` or `conf.hosts[0].up := true`, which replaces an element of a list:
+//! see "Updating an element" under [Lists](#lists).
+//!
+//! How a dotted item resolves (the slot of the record or list it updates,
+//! how many of its path's segments name records or lists that already
+//! exist, and which of those are awaited) is recorded for lowering as a
+//! [`PathResolution`].
 //! A path segment is not an expression, which [`Resolution::await_of`]
 //! could mark, so the awaited records are listed in a table of their own,
 //! [`Resolution::path_awaits`], in which only an item that awaits one has
@@ -336,20 +357,24 @@
 //! A rebind of a mutable variable that is erroneous already, whose error
 //! has been reported, checks its value on its own and declares nothing too.
 //!
-//! A dotted rebind, `x.a.b := e`, of a mutable variable of the function
-//! being checked, from any block, walks its path exactly as any dotted `:=`
-//! does (see "Dotted `let` and `:=`" above): each existing record measured,
-//! awaited where it may be a future, subject to the purity rule; every
-//! segment existing; `e` fitting the leaf's type. The updated record is
+//! A dotted rebind, `x.a.b := e` or `xs[i].a := e`, of a mutable variable
+//! of the function being checked, from any block, walks its path exactly
+//! as any dotted `:=` does (see "Dotted `let` and `:=`" above): each
+//! existing record or list measured, awaited where it may be a future,
+//! subject to the purity rule; every segment existing; each position
+//! checked; `e` fitting the leaf's type. The updated record or list is
 //! written to the variable's own slot, and the variable keeps its declared
 //! type, which an assignment in an `if` must not change for the code after
 //! it, where a variable that is not mutable takes the updated type, the
-//! records along the path present. So the updated type must be a
+//! records and lists along the path present. So the updated type must be a
 //! subtype of the declared one (`Checker::kept_type`), which it is whenever
 //! the variable and the records along the path are present or the either
 //! shape; otherwise, as for a variable declared exactly `Future<{a: Int}>`,
 //! it is "cannot rebind `r.a`: `r` is declared `Future<{a: Int}>`, and the
 //! update makes it `{a: Int}`", at the path, the value still being checked.
+//! It is evaluated as every dotted update is: its value first, then the
+//! variable read, so `r.a := { r := { a = 100; b = 7 }; r.b + 1 }` updates
+//! the record the value stored, and `r` is `{a = 8; b = 7}`.
 //!
 //! A variable that is not mutable is rebound as before: a `:=` in its
 //! declaring block declares a new binding, and one from an inner block is
@@ -557,8 +582,8 @@
 //! a field access into one and a spread of one await it at the top if its
 //! type is a `Future` or an either (`Checker::measure`), and type the
 //! operation on the type it has once awaited, stripped of every future
-//! layer at its top (see [`TypeTable::strip`]); so does a dotted `let` or `:=` each record
-//! along its path that exists (see "Dotted `let` and `:=`" above). An
+//! layer at its top (see [`TypeTable::strip`]); so does a dotted `let` or `:=` each record,
+//! or list, along its path that exists (see "Dotted `let` and `:=`" above). An
 //! interpolated expression and an operand of an equality are awaited deeply
 //! (`Checker::measure_deep`): at the top and in every lazy field of the
 //! record it is, or element of the list it is, at any depth (see
@@ -965,6 +990,63 @@
 //! where it is used as its bits. A position outside the list is a runtime
 //! error (see [`crate::eval`]).
 //!
+//! **Updating an element.** The path of a `:=` may have index segments,
+//! `[EXPR]`, among its names, in any number and order (see
+//! [`crate::ast::SegmentKind::Index`]):
+//!
+//! ```text
+//! let mut xs = [1, 2, 3]
+//! xs[0] := 10                         # [10, 2, 3]
+//! let mut conf = { hosts = [{ name = "a"; up = false }] }
+//! conf.hosts[0].up := true
+//! grid[y][x] := 1
+//! ```
+//!
+//! Which variable a `:=` may rebind is as for any `:=` (see [Mutable
+//! variables](#mutable-variables)). The walk along the path (see "Dotted
+//! `let` and `:=`" above, and `Checker::walk_path`) has one case more: at
+//! an index segment `P[EXPR]`, the value at `P` is measured at the top, as
+//! a record along a path is (awaited if it may be a future, subject to the
+//! purity rule, reported at `P`; a pure function's bare parameter
+//! measured), and must then be a list: otherwise "cannot update `xs[0]`:
+//! `xs` is Int, not a list", showing the type it had before stripping, the
+//! purity error being reported only for a value that is a list once
+//! awaited. `EXPR` is then checked and measured, as an index's position is
+//! (`Checker::check_position`), an expression of the enclosing function
+//! like any other, its purity, captures and awaits as usual: an `Int`, an
+//! untyped integer being one, or "a list index must be an Int, found T".
+//! The segment's type is the list's element type as it is; a segment after
+//! it walks into the element, which is measured in turn, as a record for a
+//! name or a list for another index. A name segment on a list, or an index
+//! segment on a record, is the matching "not a record" or "not a list"
+//! error. Each position is checked exactly once: where the walk reaches it,
+//! or on its own if the walk stops before, or the `:=` is rejected, so that
+//! its mistakes are still reported.
+//!
+//! If the last segment is an index, the value must fit the list's element
+//! type, as a field's leaf must fit the field's: a subtype, an adapting
+//! literal, or an await to fit where one is allowed, labelled "`:=` keeps
+//! the element's type" at the path. A `let` path cannot index a list, so a
+//! field missing after an index segment, "cannot rebind `xs[0].b`: `xs[0]`
+//! has no field `b`", has no note suggesting one.
+//!
+//! A list's type never changes. The updated type is built from the leaf
+//! outwards (`Checker::record_update`), each record along the path present
+//! with its segment set, and each list along it present, keeping its
+//! element type, which the updated element must be a subtype of
+//! (`Checker::updated_list`). It is whenever the element type is present or
+//! the either shape; otherwise, as for elements declared exactly
+//! `Future<{a: Int}>` of a path continuing through one, it is "cannot
+//! rebind `xs[0].a`: the elements of `xs` are `Future<{a: Int}>`, and the
+//! update makes one `{a: Int}`", at the path, with a note that a list keeps
+//! its element type. A mutable variable keeps its declared type, which the
+//! updated type must then fit (`Checker::kept_type`); a variable that is
+//! not mutable is rebound with the updated type. `:=` never adds: an index
+//! segment does not create an element, and its position is not checked
+//! statically. A rejected `:=` with an index segment declares its name as
+//! `Error`, rather than walking its path to find an updated type, which
+//! would check its positions again.
+//!
 //! **Equality.** Lists compare as records do (see [Equality](#equality)),
 //! when their types are identical, contain no function and no `Future`:
 //! element by element, typed equality comparing records inside by their
@@ -1103,7 +1185,7 @@ use std::fmt;
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
     ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForId, ItemId, ItemKind, ItemRange, PartRange,
-    PathRange, PathSegment, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    PathRange, PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1362,10 +1444,10 @@ impl NarrowingBlock {
     }
 }
 
-/// How the path of a dotted `let`, field or `:=` resolves: the record it
-/// updates, how far into its path that record's static type reaches, and
-/// which of the records along the way are awaited. See the module
-/// documentation.
+/// How the path of a dotted `let`, field or `:=` resolves: the record, or
+/// for a `:=` with an index segment the list, it updates, how far into its
+/// path that value's static type reaches, and which of the records and
+/// lists along the way are awaited. See the module documentation.
 ///
 /// For `let a.b.c = e`, with `a` in scope as `{b: {c: Int}}`, the source is
 /// where `a` is read from and all of `a` and `a.b` exist, so `existing` is
@@ -1378,11 +1460,12 @@ pub struct PathResolution {
     /// variable would read it (a slot, or a captured value), or
     /// [`VarRef::None`] if it builds its record from nothing.
     pub source: VarRef,
-    /// How many of the path's leading segments name records that exist in
-    /// the static type of the updated value: 0 without a source, and
-    /// otherwise 1 for the source itself and one more for each following
-    /// segment, short of the last, that the type has as a record. Every
-    /// segment after them, the last excepted, is created as a record.
+    /// How many of the path's leading segments name records, or lists, that
+    /// exist in the static type of the updated value: 0 without a source,
+    /// and otherwise 1 for the source itself and one more for each
+    /// following segment, short of the last, that the type has as a record
+    /// or a list (every one, for a `:=`). Every segment after them, the last
+    /// excepted, is created as a record.
     pub existing: u32,
     /// Where the item's `existing` entries start in the resolution's table
     /// of awaited records (see [`Resolution::path_awaits`]), or
@@ -2628,12 +2711,17 @@ impl<'a> Checker<'a> {
         };
         self.callee_name = None;
         match segments {
-            [variable] if mutable => {
-                self.declare(variable.name, ty, id, BindingKind::Mutable);
-            }
             [variable] => {
-                let function = self.direct_function(segments, value);
-                self.declare_initialised(variable.name, ty, id, (BindingKind::Variable, function));
+                // A `let` path's segments are all names.
+                let Some(name) = variable.name() else {
+                    return;
+                };
+                if mutable {
+                    self.declare(name, ty, id, BindingKind::Mutable);
+                } else {
+                    let function = self.direct_function(segments, value);
+                    self.declare_initialised(name, ty, id, (BindingKind::Variable, function));
+                }
             }
             segments => self.declare_update(id, segments, ty),
         }
@@ -2656,7 +2744,7 @@ impl<'a> Checker<'a> {
     /// afterwards, in case the function did not take it.
     fn name_callee(&mut self, segments: &[PathSegment], value: ExprId) {
         self.callee_name = match (segments, self.ast.get(value).kind) {
-            ([single], ExprKind::Fn(_)) => Some(single.name),
+            ([single], ExprKind::Fn(_)) => single.name(),
             _ => None,
         };
     }
@@ -2680,7 +2768,12 @@ impl<'a> Checker<'a> {
             self.check_dotted_field(id, segments, value, expecting);
             return;
         };
-        let (name, name_span) = (field.name, field.span);
+        // A field's path's segments are all names.
+        let Some(name) = field.name() else {
+            self.check_alone(value);
+            return;
+        };
+        let name_span = field.span;
         // The soft field of the name that this overrides, if any; only a
         // block with a spread can have one.
         let soft = match self.spreads {
@@ -2913,13 +3006,18 @@ impl<'a> Checker<'a> {
         value: ExprId,
         expecting: Option<Expecting<'_>>,
     ) {
-        let Some(first) = segments.first() else {
+        // A field's path's segments are all names.
+        let Some((first, first_name)) = segments
+            .first()
+            .and_then(|first| Some((first, first.name()?)))
+        else {
+            self.check_alone(value);
             return;
         };
         // Where the path attaches to what the block already has: the field's
         // declaration and the deepest existing node along the path, with the
         // number of segments that exist.
-        let declared = self.block_field(first.name);
+        let declared = self.block_field(first_name);
         let attach = match declared {
             None => None,
             Some(index) => {
@@ -2964,22 +3062,13 @@ impl<'a> Checker<'a> {
             None => self.check_alone(value),
         };
         // The new nodes, from the first segment that does not exist yet.
-        let (mut parent, root) = if let Some((_, open, node, _)) = attach {
+        let (parent, root) = if let Some((_, open, node, _)) = attach {
             (node, open.node)
         } else {
-            let root = self.add_node(NO_NODE, first.name, first.span, NodeKind::Open);
+            let root = self.add_node(NO_NODE, first_name, first.span, NodeKind::Open);
             (root, root)
         };
-        let last = segments.len() - 1;
-        for (index, segment) in segments.iter().enumerate().skip(existing.max(1)) {
-            let span = path_span(&segments[..=index]);
-            let kind = if index == last {
-                NodeKind::Leaf
-            } else {
-                NodeKind::Open
-            };
-            parent = self.add_node(parent, segment.name, span, kind);
-        }
+        let parent = self.add_path_nodes(parent, segments, existing.max(1));
         // `parent` is now the leaf. Its type is the value's, and the type of
         // each node above it changes.
         self.nodes[parent as usize].ty = leaf_ty;
@@ -2993,9 +3082,9 @@ impl<'a> Checker<'a> {
         let ty = self.nodes[root as usize].ty;
         match attach {
             None => {
-                self.declare(first.name, ty, id, BindingKind::Field);
+                self.declare(first_name, ty, id, BindingKind::Field);
                 self.fields.push(FieldDecl {
-                    name: first.name,
+                    name: first_name,
                     name_span: first.span,
                     ty,
                     slot: self.item_slots[id.index()],
@@ -3021,6 +3110,29 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Adds a node for each segment of the dotted field path `segments` from
+    /// the one at `from` on, each a child of the one before it and the first
+    /// of `parent`, the last a leaf and the others open, spanning the path up
+    /// to it. Returns the last, the leaf.
+    fn add_path_nodes(&mut self, parent: u32, segments: &[PathSegment], from: usize) -> u32 {
+        let last = segments.len() - 1;
+        let mut parent = parent;
+        for (index, segment) in segments.iter().enumerate().skip(from) {
+            // A field's path's segments are all names.
+            let Some(name) = segment.name() else {
+                continue;
+            };
+            let span = path_span(&segments[..=index]);
+            let kind = if index == last {
+                NodeKind::Leaf
+            } else {
+                NodeKind::Open
+            };
+            parent = self.add_node(parent, name, span, kind);
+        }
+        parent
+    }
+
     /// Finds where the path `segments`, whose first segment names the open
     /// field whose root node is `root`, attaches to that field: the deepest
     /// node along the path that exists, and the number of the path's
@@ -3031,7 +3143,7 @@ impl<'a> Checker<'a> {
         let mut node = root;
         let last = segments.len() - 1;
         for (index, segment) in segments.iter().enumerate().skip(1) {
-            let Some(child) = self.child(node, segment.name) else {
+            let Some(child) = segment.name().and_then(|name| self.child(node, name)) else {
                 return Some((node, index));
             };
             let found = self.nodes[child as usize];
@@ -3096,9 +3208,10 @@ impl<'a> Checker<'a> {
             expected = self.present_member(expected);
             // Not a record: reported when the block ends.
             self.types.record_fields(expected)?;
-            let Some(ty) = self.types.field(expected, segment.name) else {
+            let name = segment.name()?;
+            let Some(ty) = self.types.field(expected, name) else {
                 if index >= existing {
-                    let text = self.ast.names().get(segment.name);
+                    let text = self.ast.names().get(name);
                     let record = self.in_message(expected);
                     self.warnings.push(
                         Diagnostic::warning(
@@ -3466,13 +3579,15 @@ impl<'a> Checker<'a> {
     /// declared even when the rebind is rejected, so that later uses of the
     /// name do not cascade into "undefined variable" errors. A rebind of a
     /// mutable variable declares nothing: see
-    /// [`Checker::check_mutable_rebind`].
+    /// [`Checker::check_mutable_rebind`]. The positions of the path's index
+    /// segments are checked once each, before the value: as the path is
+    /// walked, or on their own if it is not.
     fn check_rebind(&mut self, id: ItemId, path: PathRange, value: ExprId) {
         let segments = self.ast.path(path);
-        let Some(&PathSegment {
-            name,
-            span: name_span,
-        }) = segments.first()
+        // A path's first segment is a name.
+        let Some((name, name_span)) = segments
+            .first()
+            .and_then(|first| Some((first.name()?, first.span)))
         else {
             return;
         };
@@ -3528,17 +3643,21 @@ impl<'a> Checker<'a> {
         };
         let Some((index, target)) = target.filter(|(_, target)| target.ty != TyId::ERROR) else {
             // The rebind was rejected (or the variable is already erroneous):
-            // check the value on its own and declare the name with what it
-            // has, so later uses do not cascade. The path of a variable that
-            // may be a future is not walked: awaiting it would be reported
-            // of a variable that cannot be rebound anyway.
+            // check the positions and the value on their own and declare the
+            // name with what it has, so later uses do not cascade. The path
+            // of a variable that may be a future is not walked: awaiting it
+            // would be reported of a variable that cannot be rebound anyway.
+            // Nor is one with an index segment, whose walk would check the
+            // positions again.
+            self.check_positions_alone(segments);
             let ty = self.check_alone(value);
             let lazy = self.lookup(name).is_some_and(|(_, binding)| {
                 binding.ty != TyId::ERROR && self.types.laziness(binding.ty) != Laziness::Present
             });
+            let indexed = segments.iter().any(|segment| segment.position().is_some());
             if segments.len() == 1 {
                 self.declare(name, ty, id, BindingKind::Variable);
-            } else if lazy {
+            } else if lazy || indexed {
                 self.declare(name, TyId::ERROR, id, BindingKind::Variable);
             } else {
                 self.declare_update(id, segments, ty);
@@ -3553,17 +3672,13 @@ impl<'a> Checker<'a> {
             self.declare(name, target.ty, id, BindingKind::Variable);
             return;
         }
-        // The path is walked, measuring its records, before the value is
-        // checked, since the value is checked against its leaf's type; its
-        // records stay on `path_types` until the variable is declared.
+        // The path is walked, measuring its records and lists and checking
+        // its positions, before the value is checked, since the value is
+        // checked against its leaf's type; its records and lists stay on
+        // `path_types` until the variable is declared.
         let base = self.path_types.len();
         if let Some(leaf) = self.rebind_leaf(segments, (target.ty, index)) {
-            self.check_expr_expecting(
-                value,
-                leaf,
-                path_span(segments),
-                "`:=` keeps the field's type",
-            );
+            self.check_expr_expecting(value, leaf, path_span(segments), leaf_label(segments));
             self.finish_update(id, segments, (Some((index, target)), base), leaf);
         } else {
             self.check_alone(value);
@@ -3585,8 +3700,9 @@ impl<'a> Checker<'a> {
     /// [`Checker::kept_type`]). From a function expression or a `lazy`
     /// nested in that function, the rebind is rejected: the function holds
     /// its own copy of the variable. A rejected rebind, and one of a
-    /// variable that is erroneous already, check the value on its own and
-    /// declare nothing, so nothing cascades.
+    /// variable that is erroneous already, check the positions of the path's
+    /// index segments and the value on their own and declare nothing, so
+    /// nothing cascades.
     fn check_mutable_rebind(
         &mut self,
         id: ItemId,
@@ -3600,12 +3716,15 @@ impl<'a> Checker<'a> {
         if let Some(function) = self.functions.last()
             && index < function.bindings_start
         {
-            let error = self.outside_rebind_error(first, target, function.fn_id);
+            let error =
+                self.outside_rebind_error((target.name, first.span), target, function.fn_id);
             self.errors.push(error);
+            self.check_positions_alone(segments);
             self.check_alone(value);
             return;
         }
         if target.ty == TyId::ERROR {
+            self.check_positions_alone(segments);
             self.check_alone(value);
             return;
         }
@@ -3622,12 +3741,7 @@ impl<'a> Checker<'a> {
             self.check_alone(value);
             return;
         };
-        self.check_expr_expecting(
-            value,
-            leaf,
-            path_span(segments),
-            "`:=` keeps the field's type",
-        );
+        self.check_expr_expecting(value, leaf, path_span(segments), leaf_label(segments));
         let updated = self.record_update(id, segments, (Some((index, target)), base), leaf);
         self.kept_type(segments, target, updated);
         self.item_slots[id.index()] = target.slot;
@@ -3671,18 +3785,18 @@ impl<'a> Checker<'a> {
     }
 
     /// The error for a `:=` of the mutable variable `target`, the first
-    /// segment of whose path is `first`, from inside the function
-    /// expression or `lazy` `function`, nested in the variable's own
-    /// function or in the top level: "cannot rebind `x` here: it is
+    /// segment of whose path is `name`, written at `span`, from inside the
+    /// function expression or `lazy` `function`, nested in the variable's
+    /// own function or in the top level: "cannot rebind `x` here: it is
     /// declared outside this function" (or "this `lazy`"), labelled at the
     /// declaration when there is one.
     fn outside_rebind_error(
         &self,
-        first: &PathSegment,
+        (name, span): (Name, Span),
         target: Binding,
         function: FnId,
     ) -> Diagnostic {
-        let text = self.ast.names().get(first.name);
+        let text = self.ast.names().get(name);
         // A `lazy` is the one function that declares no return type.
         let kind = if self.ast.fn_decl(function).ret.is_none() {
             "`lazy`"
@@ -3691,7 +3805,7 @@ impl<'a> Checker<'a> {
         };
         let mut error = Diagnostic::error(
             format!("cannot rebind `{text}` here: it is declared outside this {kind}"),
-            first.span,
+            span,
         );
         // A variable from an earlier session input has no item here to
         // point at.
@@ -3739,10 +3853,13 @@ impl<'a> Checker<'a> {
     /// The type of the leaf of the dotted `:=` path `segments`, whose first
     /// segment's variable, at `binding` in `bindings`, has type `root`, once
     /// its path is walked (see [`Checker::walk_path`]), which leaves the
-    /// records along it on `path_types` for [`Checker::finish_update`].
-    /// Every segment must already exist, since `:=` never adds a field: a
-    /// missing one, or a segment along the way that is not a record, is
-    /// reported and `None` returned, with `path_types` as it was.
+    /// records and lists along it on `path_types` for
+    /// [`Checker::finish_update`]: a field's type, or a list's element type
+    /// as it is for an index. Every segment must already exist, since `:=`
+    /// never adds a field: a missing one, or a segment along the way that is
+    /// not a record or a list as its segment needs, is reported and `None`
+    /// returned, with `path_types` as it was. An index segment always
+    /// exists: its position is a runtime matter.
     fn rebind_leaf(
         &mut self,
         segments: &[PathSegment],
@@ -3757,43 +3874,61 @@ impl<'a> Checker<'a> {
         let missing = if walked + 1 < segments.len() {
             walked
         } else {
-            match self.types.field(record, last.name) {
+            let leaf = match last.kind {
+                SegmentKind::Name(name) => self.types.field(record, name),
+                SegmentKind::Index { .. } => self.types.list_element(record),
+            };
+            match leaf {
                 Some(leaf) => return Some(leaf),
                 None => walked,
             }
         };
         self.path_types.truncate(base);
+        // Only a name can be missing.
+        let name = segments[missing].name()?;
         let path = self.ast.show_path(segments);
         let prefix = self.ast.show_path(&segments[..missing]);
-        let field = FieldName(self.ast.names().get(segments[missing].name));
+        let field = FieldName(self.ast.names().get(name));
         let label = format!("this is {}", self.in_label(root));
-        self.errors.push(
-            Diagnostic::error(
-                format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
-                path_span(segments),
-            )
-            .with_context(segments[0].span, label)
-            .with_note(format!(
+        let error = Diagnostic::error(
+            format!("cannot rebind `{path}`: `{prefix}` has no field `{field}`"),
+            path_span(segments),
+        )
+        .with_context(segments[0].span, label);
+        // A `let` path cannot index a list, so a path with an index segment
+        // has no `let` to suggest.
+        let indexed = segments.iter().any(|segment| segment.position().is_some());
+        self.errors.push(if indexed {
+            error
+        } else {
+            error.with_note(format!(
                 "`:=` cannot add a field; add it with `let {path} = ...`"
-            )),
-        );
+            ))
+        });
         None
     }
 
     /// Walks the path `segments` of a dotted `let` or `:=` whose first
     /// segment's variable, at `binding` in `bindings`, has type `old`, which
-    /// is not erroneous. Updating a record reads it, so each record along
-    /// the path that exists is measured at the top (see
+    /// is not erroneous. Updating a record or a list reads it, so each one
+    /// along the path that exists is measured at the top (see
     /// [`Checker::measure_path_record`]): the variable's, and each following
-    /// segment's, short of the last, that the record before it has. Each is
-    /// pushed onto `path_types`, stripped, with whether it is awaited; the
-    /// walk stops at the first segment the record before it lacks, and
-    /// before the last, which is replaced, not read.
+    /// segment's, short of the last, that the record before it has, or that
+    /// is an element of the list before it. Each is pushed onto
+    /// `path_types`, stripped, with whether it is awaited; the walk stops at
+    /// the first segment the record before it lacks, and before the last,
+    /// which is replaced, not read. The position of an index segment, which
+    /// only a `:=` path has, is checked where the walk reaches it, after its
+    /// list is measured (see [`Checker::check_position`]).
     ///
-    /// Returns `old` as measured, for labelling a later error. A record that
-    /// is not one once stripped is reported instead, "cannot update `a.b.c`:
-    /// `a.b` is Int, not a record", showing its type before stripping, and
-    /// `None` returned, with `path_types` as it was.
+    /// Returns `old` as measured, for labelling a later error. A value that
+    /// is not a record, before a name, or a list, before an index, once
+    /// stripped is reported instead, "cannot update `a.b.c`: `a.b` is Int,
+    /// not a record" or "cannot update `xs[0]`: `xs` is Int, not a list",
+    /// showing its type before stripping, and `None` returned, with
+    /// `path_types` as it was; so is an index whose position is not an
+    /// `Int`. Every position the walk does not reach is checked on its own,
+    /// so that each is checked exactly once whatever happens.
     fn walk_path(
         &mut self,
         segments: &[PathSegment],
@@ -3806,55 +3941,104 @@ impl<'a> Checker<'a> {
         for (index, next) in segments.iter().enumerate().skip(1) {
             let prefix = &segments[..index];
             let variable = (index == 1).then_some(binding);
-            let (measured, awaited) = self.measure_path_record(prefix, current, variable);
+            let position = next.position();
+            let (measured, awaited) =
+                self.measure_path_record(prefix, current, (variable, position.is_some()));
             if index == 1 {
                 root = measured;
             }
             let record = self.types.strip(measured);
-            if !self.types.is_record(record) {
+            let inner = match position {
+                None if self.types.is_record(record) => {
+                    next.name().map(|name| self.types.field(record, name))
+                }
+                Some(_) => self.types.list_element(record).map(Some),
+                None => None,
+            };
+            let Some(inner) = inner else {
                 self.path_types.truncate(base);
-                let message = format!(
-                    "cannot update `{}`: `{}` is {}, not a record",
-                    self.ast.show_path(segments),
-                    self.ast.show_path(prefix),
-                    self.in_message(measured)
-                );
-                let label = format!("this is {}", self.in_label(root));
-                self.errors.push(
-                    Diagnostic::error(message, path_span(segments))
-                        .with_context(segments[0].span, label),
-                );
+                self.not_updatable(segments, prefix, (measured, root));
+                self.check_positions_alone(&segments[index..]);
+                return None;
+            };
+            self.path_types.push((record, awaited));
+            if let Some(position) = position
+                && !self.check_position(position)
+            {
+                self.path_types.truncate(base);
+                self.check_positions_alone(&segments[index + 1..]);
                 return None;
             }
-            self.path_types.push((record, awaited));
-            // After the last record comes the leaf, which is never measured.
-            match self.types.field(record, next.name) {
+            // After the last record or list comes the leaf, which is never
+            // measured.
+            match inner {
                 Some(ty) if index + 1 < segments.len() => current = ty,
-                _ => break,
+                _ => {
+                    self.check_positions_alone(&segments[index + 1..]);
+                    break;
+                }
             }
         }
         Some(root)
     }
 
-    /// Where the record at `prefix`, a proper prefix of the path of a dotted
-    /// `let` or `:=`, of type `ty`, is read by the update, as
-    /// [`Checker::measure`] measures the record of a field access: if it is
-    /// a parameter of a claimable function (see [`Checker::claimable`])
-    /// whose type is provisional, the parameter is measured, which makes it
-    /// present, and its present type returned; if it may be a future, it is
-    /// to be awaited at the top, subject to the purity rule, reported at
-    /// `prefix` (see [`Checker::implicit_await_error`]) if it is a record
-    /// once stripped, and `ty` is returned with `true`; otherwise, or if it
-    /// is erroneous, `ty` is returned with `false`. `variable` is where the
-    /// record is in `bindings` if it is the variable the path updates, the
-    /// path's first segment, whose name the purity error's note suggests
-    /// awaiting before the pure function is created if it can be (see
+    /// Reports that the update whose path is `segments` cannot select its
+    /// next segment in the value at `prefix`, of type `measured`, the
+    /// variable's being `root` (see [`Checker::walk_path`]): "cannot update
+    /// `a.b.c`: `a.b` is Int, not a record" before a name, or "... not a
+    /// list" before an index, labelled at the variable with its type.
+    fn not_updatable(
+        &mut self,
+        segments: &[PathSegment],
+        prefix: &[PathSegment],
+        (measured, root): (TyId, TyId),
+    ) {
+        let needed = match segments.get(prefix.len()).and_then(PathSegment::position) {
+            Some(_) => "list",
+            None => "record",
+        };
+        let message = format!(
+            "cannot update `{}`: `{}` is {}, not a {needed}",
+            self.ast.show_path(segments),
+            self.ast.show_path(prefix),
+            self.in_message(measured)
+        );
+        let label = format!("this is {}", self.in_label(root));
+        self.errors.push(
+            Diagnostic::error(message, path_span(segments)).with_context(segments[0].span, label),
+        );
+    }
+
+    /// Checks the position of each index segment of `segments` on its own,
+    /// for a `:=` that is rejected, or whose walk stops before reaching
+    /// them, so that their mistakes are reported and nothing cascades.
+    fn check_positions_alone(&mut self, segments: &[PathSegment]) {
+        for position in segments.iter().filter_map(PathSegment::position) {
+            self.check_alone(position);
+        }
+    }
+
+    /// Where the record or list at `prefix`, a proper prefix of the path of
+    /// a dotted `let` or `:=`, of type `ty`, is read by the update, as
+    /// [`Checker::measure`] measures the record of a field access or the
+    /// list of an index: if it is a parameter of a claimable function (see
+    /// [`Checker::claimable`]) whose type is provisional, the parameter is
+    /// measured, which makes it present, and its present type returned; if
+    /// it may be a future, it is to be awaited at the top, subject to the
+    /// purity rule, reported at `prefix` (see
+    /// [`Checker::implicit_await_error`]) if it is what the next segment
+    /// needs once stripped, a list if `list` and a record otherwise, and
+    /// `ty` is returned with `true`; otherwise, or if it is erroneous, `ty`
+    /// is returned with `false`. `variable` is where the value is in
+    /// `bindings` if it is the variable the path updates, the path's first
+    /// segment, whose name the purity error's note suggests awaiting before
+    /// the pure function is created if it can be (see
     /// [`Checker::awaitable_outside`]).
     fn measure_path_record(
         &mut self,
         prefix: &[PathSegment],
         ty: TyId,
-        variable: Option<usize>,
+        (variable, list): (Option<usize>, bool),
     ) -> (TyId, bool) {
         if ty == TyId::ERROR || self.types.laziness(ty) == Laziness::Present {
             return (ty, false);
@@ -3867,14 +4051,20 @@ impl<'a> Checker<'a> {
         // A future, an either, or a provisional type of an enclosing
         // function, which may be a future for all this body knows. A path
         // is not an expression, so the await is recorded with the item's
-        // path, by `finish_update`. A value that is not a record once
-        // awaited cannot be updated, awaited or not, which `walk_path`
+        // path, by `finish_update`. A value that is not a record, or a list,
+        // once awaited cannot be updated, awaited or not, which `walk_path`
         // reports instead.
+        let stripped = self.types.strip(ty);
+        let updatable = if list {
+            self.types.list_element(stripped).is_some()
+        } else {
+            self.types.is_record(stripped)
+        };
         if let Some(marker) = self.pure_marker()
-            && self.types.is_record(self.types.strip(ty))
+            && updatable
         {
             let capture = match (variable, prefix) {
-                (Some(binding), [first]) if self.awaitable_outside(binding) => Some(first.name),
+                (Some(binding), [first]) if self.awaitable_outside(binding) => first.name(),
                 _ => None,
             };
             let error = self.implicit_await_error(span, ty, marker, capture);
@@ -3891,11 +4081,11 @@ impl<'a> Checker<'a> {
     /// [`Checker::walk_path`]). If `a` or a segment along the way is not a
     /// record, that is reported and the binding is `Error`.
     fn declare_update(&mut self, id: ItemId, segments: &[PathSegment], leaf_ty: TyId) {
-        let Some(first) = segments.first() else {
+        let Some(name) = segments.first().and_then(PathSegment::name) else {
             return;
         };
         let base = self.path_types.len();
-        let found = self.lookup(first.name);
+        let found = self.lookup(name);
         let mut failed = leaf_ty == TyId::ERROR;
         if let Some((index, old)) = found {
             // An erroneous variable has been reported already.
@@ -3908,15 +4098,16 @@ impl<'a> Checker<'a> {
     /// Declares the variable of the dotted `let` or `:=` item `id`, whose
     /// path is `segments`, whose leaf is set to a value of type `leaf_ty`,
     /// `Error` if the update was rejected, and whose path has been walked
-    /// (see [`Checker::walk_path`]): the records along it that exist are
-    /// the entries of `path_types` from `base` on, which this truncates
-    /// back. `found` is the binding of the path's first segment in scope,
-    /// with its index in `bindings`, if there is one. The new binding's type
-    /// is built from the leaf outwards: each record along the path, as it
-    /// was once measured or created empty, with its segment set. Records for
-    /// lowering where the old record is read from, how many records along
-    /// the path exist, and which of them are awaited, as a
-    /// [`PathResolution`].
+    /// (see [`Checker::walk_path`]): the records and lists along it that
+    /// exist are the entries of `path_types` from `base` on, which this
+    /// truncates back. `found` is the binding of the path's first segment in
+    /// scope, with its index in `bindings`, if there is one. The new
+    /// binding's type is built from the leaf outwards: each record along
+    /// the path, as it was once measured or created empty, with its segment
+    /// set, and each list as it was once measured, its element type kept
+    /// (see [`Checker::updated_list`]). Records for lowering where the old
+    /// record or list is read from, how many records and lists along the
+    /// path exist, and which of them are awaited, as a [`PathResolution`].
     fn finish_update(
         &mut self,
         id: ItemId,
@@ -3924,18 +4115,19 @@ impl<'a> Checker<'a> {
         (found, base): (Option<(usize, Binding)>, usize),
         leaf_ty: TyId,
     ) {
-        let Some(first) = segments.first() else {
+        let Some(name) = segments.first().and_then(PathSegment::name) else {
             return;
         };
         let ty = self.record_update(id, segments, (found, base), leaf_ty);
-        self.declare(first.name, ty, id, BindingKind::Variable);
+        self.declare(name, ty, id, BindingKind::Variable);
     }
 
-    /// The type of the record that the dotted `let` or `:=` item `id`,
-    /// whose path is `segments`, makes, as [`Checker::finish_update`]
+    /// The type of the record or list that the dotted `let` or `:=` item
+    /// `id`, whose path is `segments`, makes, as [`Checker::finish_update`]
     /// describes it, for whatever the item declares or rebinds; records
     /// for lowering how its path resolves, and truncates `path_types` back
-    /// to `base`. `Error` if `leaf_ty` is, or if `segments` is empty.
+    /// to `base`. `Error` if `leaf_ty` is, if an updated element does not
+    /// fit its list, or if `segments` is empty.
     fn record_update(
         &mut self,
         id: ItemId,
@@ -3948,22 +4140,26 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         };
         let existing = self.path_types.len().saturating_sub(base);
-        let ty = if leaf_ty == TyId::ERROR {
-            TyId::ERROR
-        } else {
-            let mut ty = leaf_ty;
-            for (level, segment) in rest.iter().enumerate().rev() {
-                let record = self
-                    .path_types
-                    .get(base + level)
-                    .map_or(TyId::EMPTY, |&(record, _)| record);
-                ty = self
-                    .types
-                    .with_field(record, segment.name, ty)
-                    .unwrap_or(TyId::ERROR);
+        let mut ty = leaf_ty;
+        for (level, segment) in rest.iter().enumerate().rev() {
+            if ty == TyId::ERROR {
+                break;
             }
-            ty
-        };
+            let record = self
+                .path_types
+                .get(base + level)
+                .map_or(TyId::EMPTY, |&(record, _)| record);
+            ty = match segment.kind {
+                SegmentKind::Name(name) => self
+                    .types
+                    .with_field(record, name, ty)
+                    .unwrap_or(TyId::ERROR),
+                // The list's prefix is the path up to it.
+                SegmentKind::Index { .. } => {
+                    self.updated_list(segments, &segments[..=level], (record, ty))
+                }
+            };
+        }
         if let Some((index, old)) = found
             && existing > 0
         {
@@ -3988,6 +4184,41 @@ impl<'a> Checker<'a> {
         }
         self.path_types.truncate(base);
         ty
+    }
+
+    /// The type of the list `list`, at `prefix` of the path `segments` of a
+    /// `:=`, once its element is replaced by one of type `element`: `list`
+    /// itself, present, since a list's type never changes, if the element
+    /// is a subtype of its element type, as it is whenever the element type
+    /// is present or the either shape. Otherwise, as for elements declared
+    /// exactly `Future<{a: Int}>` of a path continuing through one, reports
+    /// "cannot rebind `xs[0].a`: the elements of `xs` are `Future<{a:
+    /// Int}>`, and the update makes one `{a: Int}`", at the path, and
+    /// returns `Error`.
+    fn updated_list(
+        &mut self,
+        segments: &[PathSegment],
+        prefix: &[PathSegment],
+        (list, element): (TyId, TyId),
+    ) -> TyId {
+        let Some(declared) = self.types.list_element(list) else {
+            return TyId::ERROR;
+        };
+        if self.types.is_subtype(element, declared) {
+            return list;
+        }
+        let message = format!(
+            "cannot rebind `{}`: the elements of `{}` are {}, and the update makes one {}",
+            self.ast.show_path(segments),
+            self.ast.show_path(prefix),
+            self.in_message(declared),
+            self.in_message(element)
+        );
+        self.errors
+            .push(Diagnostic::error(message, path_span(segments)).with_note(
+                "a list keeps its element type; declare the elements with a type that allows both",
+            ));
+        TyId::ERROR
     }
 
     /// Declares a variable or field, as `kind` says, for the item `id`, in
@@ -5135,11 +5366,14 @@ impl<'a> Checker<'a> {
                 }
                 _ => continue,
             };
-            let [field] = ast.path(path) else {
+            let Some(name) = (match ast.path(path) {
+                [field] => field.name(),
+                _ => None,
+            }) else {
                 self.sorted_fields.truncate(base);
                 return found;
             };
-            let ty = match self.types.field(record, field.name) {
+            let ty = match self.types.field(record, name) {
                 Some(expected) => match self.value_of(value, expected) {
                     BodyValue::Typed(ty) => ty,
                     BodyValue::Fields(inner) => {
@@ -5151,7 +5385,7 @@ impl<'a> Checker<'a> {
                 },
                 None => self.expr_types[value.index()],
             };
-            self.sorted_fields.push((field.name, 0, ty));
+            self.sorted_fields.push((name, 0, ty));
         }
         let fields = self.sorted_fields.get(base..).unwrap_or_default();
         let held = self
@@ -5867,7 +6101,10 @@ impl<'a> Checker<'a> {
             let Some((first, rest)) = ast.path(path).split_first() else {
                 continue;
             };
-            let Some(at) = self.sorted_at((base, end), first.name) else {
+            let Some(at) = first
+                .name()
+                .and_then(|name| self.sorted_at((base, end), name))
+            else {
                 continue;
             };
             if !rest.is_empty() {
@@ -5934,8 +6171,9 @@ impl<'a> Checker<'a> {
     /// the leaf holding `value`.
     fn build_path(&mut self, root: u32, rest: &[PathSegment], value: ExprId) {
         let mut node = root;
-        for segment in rest {
-            if let Some(child) = self.built_child(node, segment.name) {
+        // A field's path's segments are all names.
+        for name in rest.iter().filter_map(PathSegment::name) {
+            if let Some(child) = self.built_child(node, name) {
                 node = child;
                 continue;
             }
@@ -5945,7 +6183,7 @@ impl<'a> Checker<'a> {
                 None => NO_NODE,
             };
             self.built.push(Built {
-                name: segment.name,
+                name,
                 leaf: None,
                 first_child: NO_NODE,
                 next_sibling,
@@ -7661,28 +7899,7 @@ impl<'a> Checker<'a> {
         let list_ty = self.check_expr(list);
         let list_ty = self.settle(list, list_ty);
         let list_ty = self.measure(list, list_ty);
-        let index_ty = self.check_expr(index);
-        let index_ty = self.measure(index, index_ty);
-        let index_fits = match index_ty {
-            TyId::UNTYPED_INT => {
-                self.coerce(index, TyId::INT);
-                true
-            }
-            TyId::INT => true,
-            TyId::ERROR => false,
-            _ => {
-                let shown = self.in_message(index_ty);
-                let label = format!("this is {}", self.in_label(index_ty));
-                self.errors.push(
-                    Diagnostic::error(
-                        format!("a list index must be an Int, found {shown}"),
-                        self.ast.get(index).span,
-                    )
-                    .with_label(label),
-                );
-                false
-            }
-        };
+        let index_fits = self.check_position(index);
         if list_ty == TyId::ERROR {
             return TyId::ERROR;
         }
@@ -7701,6 +7918,37 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         };
         if index_fits { element } else { TyId::ERROR }
+    }
+
+    /// Checks `index`, the position of an index or of an index segment of a
+    /// `:=` path, an expression of the enclosing function like any other,
+    /// and measures it at the top: it must be an `Int`, an untyped integer
+    /// being one, which is coerced, and is otherwise reported, "a list index
+    /// must be an Int, found T", at the position. Returns whether it is one;
+    /// an erroneous position has been reported already.
+    fn check_position(&mut self, index: ExprId) -> bool {
+        let index_ty = self.check_expr(index);
+        let index_ty = self.measure(index, index_ty);
+        match index_ty {
+            TyId::UNTYPED_INT => {
+                self.coerce(index, TyId::INT);
+                true
+            }
+            TyId::INT => true,
+            TyId::ERROR => false,
+            _ => {
+                let shown = self.in_message(index_ty);
+                let label = format!("this is {}", self.in_label(index_ty));
+                self.errors.push(
+                    Diagnostic::error(
+                        format!("a list index must be an Int, found {shown}"),
+                        self.ast.get(index).span,
+                    )
+                    .with_label(label),
+                );
+                false
+            }
+        }
     }
 
     /// Types the `for` expression `id`, whose details are `for_id` (see the
@@ -8009,6 +8257,16 @@ fn is_numeric(ty: TyId) -> bool {
 /// the conversion never saturates.
 fn position(index: usize) -> u32 {
     u32::try_from(index).unwrap_or(u32::MAX)
+}
+
+/// The label, at the path of the dotted `:=` whose path is `segments`, on
+/// the type its value must fit: the type of its last field, or of the
+/// elements of the list its last segment indexes.
+fn leaf_label(segments: &[PathSegment]) -> &'static str {
+    match segments.last().map(|segment| segment.kind) {
+        Some(SegmentKind::Index { .. }) => "`:=` keeps the element's type",
+        _ => "`:=` keeps the field's type",
+    }
 }
 
 /// The note on a dotted path under a field, or a segment, defined whole.
@@ -8910,7 +9168,7 @@ mod tests {
             all_lets
                 .iter()
                 .filter(|&&id| {
-                    matches!(ast.item(id).kind, ItemKind::Let { path, .. } if ast.path(path)[0].name == wanted)
+                    matches!(ast.item(id).kind, ItemKind::Let { path, .. } if ast.path(path)[0].name() == Some(wanted))
                 })
                 .map(|&id| resolution.item_slot(id).get())
                 .collect()
@@ -16729,5 +16987,402 @@ mod tests {
             "cannot rebind `c` here: it is declared in an enclosing block"
         );
         assert_eq!(found[0].notes, vec![enclosing_note("c")]);
+    }
+
+    // ----- Updating an element -----
+
+    #[test]
+    fn an_index_path_updates_an_element() {
+        // Every form of path, of a mutable variable and of one that is not:
+        // a list's type never changes, and a record's along the path does
+        // only as `:=` keeps it.
+        for (text, shown) in [
+            ("let mut xs = [1, 2, 3]\nxs[0] := 10\nxs", "List<Int>"),
+            ("let xs = [1, 2, 3]\nxs[0] := 10\nxs", "List<Int>"),
+            (
+                "let mut xs = [1, 2, 3]\nfor i in 0..len(xs) { xs[i] := xs[i] * 2 }\nxs",
+                "List<Int>",
+            ),
+            (
+                "let mut conf = { hosts = [{ name = \"a\"; up = false }] }\n\
+                 conf.hosts[0].up := true\nconf",
+                "{hosts: List<{name: String, up: Bool}>}",
+            ),
+            (
+                "let mut grid = [[0, 0], [0, 0]]\nlet y = 1\nlet x = 0\ngrid[y][x] := 1\ngrid",
+                "List<List<Int>>",
+            ),
+            (
+                "let xs = [{ a = [1, 2] }]\nxs[0].a[1] := 5\nxs",
+                "List<{a: List<Int>}>",
+            ),
+            // A literal adapts to the element type.
+            ("let mut xs = [1.5]\nxs[0] := 2\nxs", "List<Float>"),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // Every record and list along the path exists, and is read from
+        // the variable's slot.
+        let text = "let mut conf = { hosts = [{ up = false }] }\nconf.hosts[0].up := true";
+        let (ast, resolution) = resolved(text);
+        let item = item_at(&ast, text, "conf.hosts[0].up := true");
+        assert_eq!(resolution.item_slot(item), Slot(0));
+        assert_eq!(
+            resolution.item_path(item),
+            PathResolution {
+                source: VarRef::Local(Slot(0)),
+                existing: 3,
+                awaits: PathResolution::NOT_AWAITED,
+            }
+        );
+        // A variable that is not mutable takes the updated type: the
+        // records and lists along the path present, the list's element type
+        // as it was.
+        assert_eq!(
+            shown_result("let r = lazy { xs = [lazy 1, 2] }\nr.xs[0] := 5\nr"),
+            "{xs: List<Int | Future<Int>>}"
+        );
+        // A position is an `Int` once coerced, and so is the element it
+        // reads in the value.
+        let text = "let mut xs = [1, 2]\nxs[1] := xs[0]";
+        assert_eq!(type_at(text, last(text, "1")), "Int");
+    }
+
+    #[test]
+    fn an_index_path_needs_lists_and_int_positions() {
+        // A value that is not a list where an index selects in it, labelled
+        // at the variable with its type.
+        let text = "let mut x = 1\nx[0] := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot update `x[0]`: `x` is Int, not a list"
+        );
+        assert_eq!(found[0].span, at(text, "x[0]"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(first_bytes(at(text, "x[0]"), 1), "this is Int")]
+        );
+        assert!(found[0].notes.is_empty());
+        // An index on a record, a name on a list, and either further along.
+        for (text, path, message) in [
+            (
+                "let mut r = { a = 1 }\nr[0] := 2",
+                "r[0]",
+                "cannot update `r[0]`: `r` is `{a: Int}`, not a list",
+            ),
+            (
+                "let mut xs = [1]\nxs.a := 2",
+                "xs.a",
+                "cannot update `xs.a`: `xs` is `List<Int>`, not a record",
+            ),
+            (
+                "let mut xs = [1]\nxs[0].a := 2",
+                "xs[0].a",
+                "cannot update `xs[0].a`: `xs[0]` is Int, not a record",
+            ),
+            (
+                "let mut r = { a = [{ b = 1 }] }\nr.a[0].b[1] := 2",
+                "r.a[0].b[1]",
+                "cannot update `r.a[0].b[1]`: `r.a[0].b` is Int, not a list",
+            ),
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(found[0].message, message, "{text}");
+            assert_eq!(found[0].span, last(text, path), "{text}");
+        }
+        // A position that is not an `Int`, as for an index.
+        let text = "let mut xs = [1]\nxs[\"a\"] := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "a list index must be an Int, found String"
+        );
+        assert_eq!(found[0].span, at(text, "\"a\""));
+        assert_eq!(found[0].label.as_deref(), Some("this is String"));
+        assert!(found[0].labels.is_empty());
+        assert_eq!(
+            messages("let mut xs = [1]\nxs[1.5] := 2"),
+            vec!["a list index must be an Int, found Float"]
+        );
+        // A value that does not fit the element type.
+        let text = "let mut xs = [1]\nxs[0] := \"a\"";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "\"a\""));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found String")
+        );
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "xs[0]"), "`:=` keeps the element's type")]
+        );
+        // A field missing after an index: no `let` can add it.
+        let text = "let mut xs = [{ a = 1 }]\nxs[0].b := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `xs[0].b`: `xs[0]` has no field `b`"
+        );
+        assert_eq!(found[0].span, at(text, "xs[0].b"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(
+                first_bytes(at(text, "xs[0].b"), 2),
+                "this is List<{a: Int}>"
+            )]
+        );
+        assert!(found[0].notes.is_empty());
+        // A position is shown as it is written.
+        assert_eq!(
+            messages("let mut xs = [1]\nlet i = 0\nxs[i  +  1].a := 2"),
+            vec!["cannot update `xs[i  +  1].a`: `xs[i  +  1]` is Int, not a record"]
+        );
+    }
+
+    #[test]
+    fn every_position_is_checked_once() {
+        // Where the walk reaches it, or on its own where the walk stops
+        // before it, so that its mistakes are reported too.
+        for (text, expected) in [
+            (
+                "let mut x = 1\nx[y] := 2",
+                vec![
+                    "cannot update `x[y]`: `x` is Int, not a list",
+                    "undefined variable `y`",
+                ],
+            ),
+            (
+                "let mut xs = [1]\nxs[0].a[z] := 2",
+                vec![
+                    "cannot update `xs[0].a[z]`: `xs[0]` is Int, not a record",
+                    "undefined variable `z`",
+                ],
+            ),
+            (
+                "let mut r = { a = [1] }\nr.b[z] := 2",
+                vec![
+                    "cannot rebind `r.b[z]`: `r` has no field `b`",
+                    "undefined variable `z`",
+                ],
+            ),
+            (
+                "let mut xs = [[1]]\nxs[\"a\"][z] := 2",
+                vec![
+                    "a list index must be an Int, found String",
+                    "undefined variable `z`",
+                ],
+            ),
+            (
+                "let xs = [1]\n{ xs[y] := 2 }",
+                vec![
+                    "cannot rebind `xs` here: it is declared in an enclosing block",
+                    "undefined variable `y`",
+                ],
+            ),
+            (
+                "ys[y] := 2",
+                vec![
+                    "cannot rebind `ys`: no variable named `ys` is declared",
+                    "undefined variable `y`",
+                ],
+            ),
+        ] {
+            let mut found = messages(text);
+            found.sort();
+            let mut expected = expected;
+            expected.sort_unstable();
+            assert_eq!(found, expected, "{text}");
+        }
+        // Each position gets a type once, and the program lowers.
+        let text = "let mut xs = [[1, 2], [3]]\nlet i = 0\nxs[i][i + 1] := xs[1][0]\nxs";
+        assert_eq!(shown_result(text), "List<List<Int>>");
+    }
+
+    #[test]
+    fn an_updated_element_must_fit_its_list() {
+        let note = "a list keeps its element type; declare the elements with a type that allows \
+                    both";
+        // Elements declared exactly a future, which a path through one makes
+        // present.
+        let text = "let mut xs: Future<{a: Int}>[] = [lazy { a = 1 }]\nxs[0].a := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `xs[0].a`: the elements of `xs` are `Future<{a: Int}>`, and the update \
+             makes one `{a: Int}`"
+        );
+        assert_eq!(found[0].span, at(text, "xs[0].a"));
+        assert!(found[0].labels.is_empty());
+        assert_eq!(found[0].notes, vec![note]);
+        // For a variable that is not mutable too, and deeper.
+        assert_eq!(
+            messages("let r = { xs = [lazy { a = 1 }] }\nr.xs[0].a := 2"),
+            vec![
+                "cannot rebind `r.xs[0].a`: the elements of `r.xs` are `Future<{a: Int}>`, and \
+                 the update makes one `{a: Int}`"
+            ]
+        );
+        // Elements of the either shape take the present element.
+        let text = "let xs: List<{a: Int} | Future<{a: Int}>> = [lazy { a = 1 }]\n\
+                    xs[0].a := 2\nxs";
+        assert_eq!(shown_result(text), "List<{a: Int} | Future<{a: Int}>>");
+        assert_eq!(awaited_paths(text, None), vec![(2, vec![false, true])]);
+        // An element replaced at the leaf is not read, and keeps its type.
+        let text = "let xs = [lazy 1]\nxs[0] := lazy 2\nxs";
+        assert_eq!(shown_result(text), "List<Future<Int>>");
+        assert_eq!(awaited_paths(text, None), vec![(1, Vec::new())]);
+        assert_eq!(
+            messages("let xs = [lazy 1]\nxs[0] := 2"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn a_list_that_may_be_a_future_is_awaited_where_it_is_updated() {
+        // A variable that is not mutable becomes present.
+        let text = "let xs = lazy [1, 2]\nxs[0] := 5\nxs";
+        assert_eq!(shown_result(text), "List<Int>");
+        assert_eq!(awaited_paths(text, None), vec![(1, vec![true])]);
+        // A mutable one keeps its declared type, which must allow the update.
+        let text = "let mut xs: Int[] | Future<Int[]> = lazy [1]\n{ xs[0] := 2 }\nxs";
+        assert_eq!(shown_result(text), "List<Int> | Future<List<Int>>");
+        let text = "let mut xs: Future<Int[]> = lazy [1]\nxs[0] := 2";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `xs[0]`: `xs` is declared `Future<List<Int>>`, and the update makes \
+             it `List<Int>`"
+        );
+        assert_eq!(found[0].span, at(text, "xs[0]"));
+        // In an impure function, a list and its elements of the either
+        // shape are awaited, and so is a position.
+        let text = "fn f(xs: List<{a: Int}>, i: Int) -> Int { xs[i].a := 1\n0 }";
+        assert_eq!(awaited_paths(text, Some(0)), vec![(2, vec![true, true])]);
+        assert_eq!(marks(text), vec![("i", AwaitMark::Top)]);
+    }
+
+    #[test]
+    fn a_pure_function_and_an_index_path() {
+        // A bare parameter is measured by the update, and so present.
+        let text = "fn f(xs: Int[]): Int[] { xs[0] := 1\nxs }";
+        assert_eq!(demands(text, 0), vec![Some("xs")]);
+        assert_eq!(type_of_f(text), "fn(xs: List<Int>): List<Int>");
+        assert!(marks(text).is_empty());
+        // A parameter held in a record, and a position, measured where the
+        // update reads them.
+        let text = "fn f(xs: Int[], i: Int): Int { let r = { a = xs }\nr.a[i] := 1\n0 }";
+        assert_eq!(demands(text, 0), vec![Some("r.a"), Some("i")]);
+        assert_eq!(type_of_f(text), "fn(xs: List<Int>, i: Int): Int");
+        // A list that may be a future cannot be awaited.
+        let text = "fn f(xs: Future<Int[]>): Int { xs[0] := 1\n0 }";
+        assert_implicit_await_error(text, first_bytes(at(text, "xs[0]"), 2), "Future<List<Int>>");
+        // Nor can an element along the path.
+        let text = "fn f(xs: List<{a: Int} | Future<{a: Int}>>): Int { xs[0].a := 1\n0 }";
+        assert_implicit_await_error(text, at(text, "xs[0]"), "{a: Int} | Future<{a: Int}>");
+        // Nor a position, which is an expression of the function.
+        let text = "fn f(xs: Int[], i: Future<Int>): Int[] { xs[i] := 1\nxs }";
+        assert_implicit_await_error(text, first_bytes(at(text, "i]"), 1), "Future<Int>");
+        // Nor can a position call an impure function.
+        let text = "fn g() -> Int { 0 }\nfn f(xs: Int[]): Int[] { xs[g()] := 1\nxs }";
+        assert_eq!(
+            messages(text),
+            vec!["cannot call an impure function from a pure function"]
+        );
+        // A value that is not a list once awaited is reported alone.
+        assert_eq!(
+            messages("fn f(x: Future<Int>): Int { x[0] := 1\n0 }"),
+            vec!["cannot update `x[0]`: `x` is `Future<Int>`, not a list"]
+        );
+    }
+
+    #[test]
+    fn an_index_path_follows_the_rebind_rules() {
+        // A mutable variable, from an inner block, writing its slot.
+        let text = "let mut xs = [1]\nif true { xs[0] := 2 }\nxs";
+        assert_eq!(shown_result(text), "List<Int>");
+        let (ast, resolution) = resolved(text);
+        assert_eq!(
+            resolution.item_slot(item_at(&ast, text, "xs[0] := 2")),
+            Slot(0)
+        );
+        // One that is not, from an inner block, from a function or a `lazy`:
+        // rejected, with the positions and the value still checked.
+        let text = "let xs = [1]\n{ xs[0] := 2 }";
+        let found = diagnostics(text);
+        assert_eq!(
+            found[0].message,
+            "cannot rebind `xs` here: it is declared in an enclosing block"
+        );
+        assert_eq!(found[0].notes, vec![enclosing_note("xs")]);
+        for (text, kind) in [
+            (
+                "let mut xs = [1]\nlet f = fn(): Int { xs[q] := 2.5\n0 }",
+                "function",
+            ),
+            (
+                "let mut xs = [1]\nlet f = lazy { xs[q] := 2.5\n0 }",
+                "`lazy`",
+            ),
+        ] {
+            let mut found = messages(text);
+            found.sort();
+            assert_eq!(
+                found,
+                vec![
+                    format!("cannot rebind `xs` here: it is declared outside this {kind}"),
+                    "undefined variable `q`".to_owned()
+                ],
+                "{text}"
+            );
+        }
+        // A rejected rebind with an index segment declares its name as
+        // erroneous, so that later uses do not cascade.
+        assert_eq!(
+            messages("let xs = [1]\n{ xs[0] := 2\nxs[0] + \"s\" }"),
+            vec!["cannot rebind `xs` here: it is declared in an enclosing block"]
+        );
+        // A position reads and captures variables as any expression does.
+        let text = "let mut xs = [1, 2]\nlet i = 1\n\
+                    let f = fn(): List<Int> { let mut ys = xs\nys[i] := 5\nys }";
+        let (ast, resolution) = resolved(text);
+        assert_eq!(uses(&ast, &resolution, "i"), vec![VarRef::Capture(1)]);
+        assert_eq!(
+            captures(text, 0),
+            vec![
+                (VarRef::Local(Slot(0)), "List<Int>".to_owned()),
+                (VarRef::Local(Slot(1)), "Int".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_function_returning_an_updated_list() {
+        // An impure function's result is inferred from the updated
+        // variable: the list present, its elements of the either shape.
+        let text = "fn f(xs: Int[]) -> Int[] { xs[0] := 1\nxs }";
+        assert_eq!(
+            type_of_f(text),
+            "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> List<Int | \
+             Future<Int>>"
+        );
+        // A mutable copy keeps the parameter's type, which is the result.
+        let text = "fn f(xs: Int[]) -> Int[] { let mut ys = xs\nys[0] := 1\nys }";
+        assert_eq!(
+            type_of_f(text),
+            "fn(xs: List<Int | Future<Int>> | Future<List<Int | Future<Int>>>) -> List<Int | \
+             Future<Int>> | Future<List<Int | Future<Int>>>"
+        );
+        // A pure function's, present throughout.
+        let text = "fn f(xs: Int[], x: Int): Int[] { let mut ys = xs\nys[0] := x\nys }";
+        assert_eq!(type_of_f(text), "fn(xs: List<Int>, x: Int): List<Int>");
     }
 }

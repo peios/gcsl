@@ -1,0 +1,22 @@
+# A fleet's hosts, kept in mutable variables and updated element by element.
+let mut hosts = [{ name = "web-1"; up = false; ports = [80] }, { name = "db-1"; up = false; ports = [5432] }]
+# `:=` replaces one element of a list, here a field of one.
+hosts[0].up := true
+# Every element in a loop: the value is evaluated first, then the path.
+for i in 0..len(hosts) { hosts[i].ports[0] := hosts[i].ports[0] + 1 }
+# Two indexes in a row.
+let mut grid = [[0, 0], [0, 0]]
+for y in 0..2 { for x in 0..2 { grid[y][x] := y * 2 + x } }
+# The old list is unchanged for whatever else holds it.
+let mut counts = [0, 0, 0]
+let before = counts
+counts[1] := 5
+# The update applies to the variable as it is when it happens.
+let mut r = { a = 1; b = 2 }
+r.a := { r := { a = 100; b = 7 }; r.b + 1 }
+up = hosts[0].up
+ports = for h in hosts { h.ports[0] }
+cells = grid
+counts = counts
+before = before
+r = r

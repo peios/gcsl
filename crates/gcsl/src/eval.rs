@@ -42,7 +42,8 @@
 //! of its own: `Evaluator::list` evaluates it through the general walker
 //! and takes the [`List`] out of the value, which is one match on its tag,
 //! as a load extracts a slot's value. A list is only ever read whole, by an
-//! index, a spread, `len` or a comparison, each of which is a helper and
+//! index, a spread, `len`, a comparison or an update (see
+//! [Updates](#updates)), each of which is a helper and
 //! not on the recursion path of anything but its own operands, so a walker
 //! of its own would save nothing measurable, and would add another large
 //! match to keep in step with every kind of node; the list nodes that can
@@ -89,17 +90,18 @@
 //! the last rather than stepping past it, so that counting up to
 //! `i64::MAX` never overflows; so it has no limit on the range's length.
 //!
-//! An `UpdateField` builds a new record and never changes the old one. It
-//! clones the old record's values into a new boxed slice, one allocation,
-//! with the updated field's value replaced or appended. A replacement
-//! shares the old record's layout. An addition needs a new layout: the old
-//! one's names and texts with the added name after them, whose text the
-//! evaluator takes from [`Ir::name_text`], since it has no names table and
-//! must never need one. Every addition of a name to a record of a given
-//! layout makes an equal layout anew; caching the result per old layout and
-//! name is the optimisation for a bytecode VM, which will have a place to
-//! keep such a cache at each update site. Updating the empty record makes a
-//! record of the one field.
+//! An `UpdateField`, a dotted field's, builds a new record and never
+//! changes the old one, as a step of an `Update` that sets a field does
+//! (see [Updates](#updates)). It clones the old record's values into a new
+//! boxed slice, one allocation, with the updated field's value replaced or
+//! appended. A replacement shares the old record's layout. An addition
+//! needs a new layout: the old one's names and texts with the added name
+//! after them, whose text the evaluator takes from [`Ir::name_text`], since
+//! it has no names table and must never need one. Every addition of a name
+//! to a record of a given layout makes an equal layout anew; caching the
+//! result per old layout and name is the optimisation for a bytecode VM,
+//! which will have a place to keep such a cache at each update site.
+//! Updating the empty record makes a record of the one field.
 //!
 //! Typed equality, `RecordEq` and `RecordNe`, compares two records over the
 //! [`crate::ir::Shape`] of their static type: for each field of the shape,
@@ -142,10 +144,45 @@
 //! guard reads what its body last wrote, and a closure or a future copies
 //! the value a slot holds when it is made, which later writes do not
 //! change. A value already read is held, as any operand is, while what
-//! follows it is evaluated: `r.a := e` reads `r`, then evaluates `e`, which
-//! may rebind `r` itself, and stores the update of the record it read (see
-//! [`crate::lower`]); and a `for` iterates over the list its iterable was
-//! when it began, whatever its body rebinds.
+//! follows it is evaluated: `r.a := e` evaluates `e` first, which may
+//! rebind `r` itself, and then reads `r`, as it then is, and stores the
+//! update of that record (see [Updates](#updates)); and a `for` iterates
+//! over the list its iterable was when it began, whatever its body
+//! rebinds.
+//!
+//! # Updates
+//!
+//! An `Update`, a dotted `let` or `:=`, is evaluated by a helper,
+//! `Evaluator::update`, which the walkers only call, in the order every
+//! dotted update has: its value first, once, through `value`; then the
+//! record or list it updates, the variable's, read, and awaited if the
+//! checker marked it; and then `Evaluator::walk_update` walks the path down
+//! from it, once, without recursing: each step selects a field, or an
+//! element at the position its next `Int` child evaluates to, there and
+//! then, left to right, and reads it, awaits it, charged to the nesting
+//! budget as an await just below the update, or, where a `let`'s path goes
+//! beyond the static type, starts from `{}`, holding each record or list
+//! it passes through in a vector; the last step selects the leaf. A
+//! position outside its list, a negative one included, stops the walk with
+//! "index out of range", at the path up to and including its segment,
+//! labelled as an index's is, before anything is stored, so the variable is
+//! left as it was. Then the new value is built back up, from the leaf
+//! outwards: the leaf set to the value, then each record or list passed
+//! through with what its step selected replaced by the one built below it.
+//! The update's value is that; the `Store` around it writes it. A value
+//! already read is held while what follows it runs, so a position that
+//! rebinds the variable does not change what the walk updates, and the
+//! store then overwrites the rebind.
+//!
+//! Nothing read is changed: another variable or closure holding an old
+//! record or list still sees it as it was. A record is set as an
+//! `UpdateField` sets it. A list is copied, in one allocation sized to its
+//! length, sharing every element but the one replaced, so updating each
+//! element of a list in a loop takes time quadratic in its length, for now:
+//! updating in place, when the variable is the only holder of what it
+//! updates, is the optimisation that evaluating the value before the
+//! variable is read allows. A path of one step allocates nothing for the
+//! walk.
 //!
 //! # Calls
 //!
@@ -338,7 +375,7 @@ use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
     Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId,
-    ListShape, Operands, ShapeId, ShapedOperands,
+    ListShape, Operands, ShapeId, ShapedOperands, StepAt, StepMode, UpdatePathId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -363,8 +400,9 @@ pub const MAX_RANGE_LEN: usize = 16_777_216;
 ///
 /// Returns a runtime error at the failing operator's span: "integer
 /// overflow" for `Int` arithmetic that leaves the range of `i64`, and
-/// "division by zero" for `//` or `%` by zero; at an index's span, "index
-/// out of range" for a position outside its list; at a range's span,
+/// "division by zero" for `//` or `%` by zero; at an index's span, or at
+/// the path of an update up to its index segment, "index out of range" for
+/// a position outside its list; at a range's span,
 /// "range too large" for a range used as a value of more than
 /// [`MAX_RANGE_LEN`] integers; and at a call's or an
 /// await's span, "call nested too deeply" for a call, or an await running a
@@ -455,8 +493,9 @@ struct Evaluator<'a> {
 
 // The walkers `value`, `int`, `float`, `bool`, `string` and `record` are
 // the recursion of evaluation (a list is evaluated through `value`, and
-// `make_list`, `index`, `list` and `for_loop` are helpers on its recursion
-// path, which is why they hold little): an expression nested N deep puts
+// `make_list`, `index`, `list`, `for_loop`, `update` and `walk_update` are
+// helpers on its recursion path, which is why they hold little): an
+// expression nested N deep puts
 // about N of their frames on the stack. Each is therefore only a
 // dispatcher. The work
 // of each operator is in a helper of its own, and every error is returned
@@ -487,6 +526,7 @@ impl Evaluator<'_> {
                 name,
                 value,
             } => self.update_field((record, name, value), node),
+            IrKind::Update { .. } => self.update(node),
             IrKind::LoadCapture(index, _) => self.capture_value(index, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
             IrKind::Call {
@@ -1434,7 +1474,7 @@ impl Evaluator<'_> {
             .and_then(|position| list.values().get(position))
         {
             Some(value) => Ok(value.clone()),
-            None => Err(out_of_range(node, at, list.len())),
+            None => Err(out_of_range(node.span, at, list.len())),
         }
     }
 
@@ -1515,15 +1555,9 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Int(value) => Some(value),
-                _ => None,
-            }),
+            IrKind::Await { .. } => self.await_as(node, Value::into_int),
             IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, |value| match value {
-                    Value::Int(value) => Some(value),
-                    _ => None,
-                })
+                self.index_as((list, index), node, Value::into_int)
             }
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
@@ -1533,10 +1567,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Int(value) => Some(value),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, Value::into_int),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
@@ -1554,10 +1585,7 @@ impl Evaluator<'_> {
                 self.int_division(node, operands, |lhs, rhs| Some(floor_mod(lhs, rhs)))
             }
             IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Int(value) => Some(value),
-                    _ => None,
-                })
+                self.field_as((record, name), node, Value::into_int)
             }
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
@@ -1589,6 +1617,7 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
+            IrKind::Update { .. } => mistyped(node, "update node where an Int was expected"),
             // A `for` that discards its values is `{}`, but only ever a
             // statement.
             IrKind::MakeList { .. }
@@ -1669,15 +1698,9 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FLOAT),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Float(value) => Some(value),
-                _ => None,
-            }),
+            IrKind::Await { .. } => self.await_as(node, Value::into_float),
             IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, |value| match value {
-                    Value::Float(value) => Some(value),
-                    _ => None,
-                })
+                self.index_as((list, index), node, Value::into_float)
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
@@ -1686,10 +1709,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Float(value) => Some(value),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, Value::into_float),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.float(result)
@@ -1705,10 +1725,7 @@ impl Evaluator<'_> {
             IrKind::FloatDiv(o) => self.float_arithmetic(o, |lhs, rhs| lhs / rhs),
             IrKind::IntToFloat(operand) => self.int(operand).map(int_to_float),
             IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Float(value) => Some(value),
-                    _ => None,
-                })
+                self.field_as((record, name), node, Value::into_float)
             }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -1743,6 +1760,7 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a Float was expected")
             }
+            IrKind::Update { .. } => mistyped(node, "update node where a Float was expected"),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
@@ -1790,15 +1808,9 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_BOOL),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Bool(value) => Some(value),
-                _ => None,
-            }),
+            IrKind::Await { .. } => self.await_as(node, Value::into_bool),
             IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, |value| match value {
-                    Value::Bool(value) => Some(value),
-                    _ => None,
-                })
+                self.index_as((list, index), node, Value::into_bool)
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
@@ -1807,10 +1819,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Bool(value) => Some(value),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, Value::into_bool),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.bool(result)
@@ -1835,10 +1844,7 @@ impl Evaluator<'_> {
             IrKind::Or(o) => self.logic(o, true),
             IrKind::Not(operand) => self.not(operand),
             IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Bool(value) => Some(value),
-                    _ => None,
-                })
+                self.field_as((record, name), node, Value::into_bool)
             }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -1862,6 +1868,7 @@ impl Evaluator<'_> {
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
+            IrKind::Update { .. } => mistyped(node, "update node where a Bool was expected"),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
@@ -1962,15 +1969,9 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_STRING),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Str(text) => Some(text),
-                _ => None,
-            }),
+            IrKind::Await { .. } => self.await_as(node, Value::into_string),
             IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, |value| match value {
-                    Value::Str(text) => Some(text),
-                    _ => None,
-                })
+                self.index_as((list, index), node, Value::into_string)
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
@@ -1979,10 +1980,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Str(text) => Some(text),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, Value::into_string),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.string(result)
@@ -1994,10 +1992,7 @@ impl Evaluator<'_> {
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
             IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Str(text) => Some(text),
-                    _ => None,
-                })
+                self.field_as((record, name), node, Value::into_string)
             }
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
@@ -2036,6 +2031,7 @@ impl Evaluator<'_> {
             | IrKind::UpdateField { .. } => {
                 mistyped(node, "record node where a String was expected")
             }
+            IrKind::Update { .. } => mistyped(node, "update node where a String was expected"),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
@@ -2095,6 +2091,10 @@ impl Evaluator<'_> {
                 name,
                 value,
             } => self.update_field((record, name, value), node),
+            IrKind::Update {
+                kind: ValueKind::Record,
+                ..
+            } => self.update(node),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -2137,7 +2137,8 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. } => mistyped(node, "list node where a record was expected"),
+            | IrKind::For { .. }
+            | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a record was expected")
             }
@@ -2154,6 +2155,143 @@ impl Evaluator<'_> {
     ) -> Result<Value, Diagnostic> {
         let old = self.record(record)?;
         let value = self.value(value)?;
+        self.with_field(old, name, value, node)
+    }
+
+    /// Evaluates the `Update` `node` (see the module documentation): its
+    /// value, first, then the record or list it updates, and then the walk
+    /// of its path (see [`Evaluator::walk_update`]). Apart from the walk,
+    /// so that the recursion through the value holds nothing of it.
+    fn update(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        let IrKind::Update {
+            parts, path, depth, ..
+        } = node.kind
+        else {
+            return mistyped(node, "a node that is not an update updated");
+        };
+        let ir = self.ir;
+        let parts = ir.items(parts);
+        let (Some(&value), Some(&root)) = (parts.first(), parts.get(1)) else {
+            return mistyped(node, "an update without its value or its record");
+        };
+        let value = self.value(value)?;
+        let root = self.value(root)?;
+        let positions = parts.get(2..).unwrap_or_default();
+        self.walk_update((root, value), (positions, path, depth), node)
+    }
+
+    /// Walks the path `path` of the `Update` `node`, at depth `depth` in
+    /// this frame's body, down from `root`, the record or list it updates,
+    /// one step at a time: each step selects a field, or an element at the
+    /// position the next of `positions` evaluates to, there and then, and
+    /// reads it, awaits it, as an await at the step's path, or starts from
+    /// `{}`, holding each record or list it passes through. The last step
+    /// selects the leaf, and the new value is built back up from it: the
+    /// leaf set to `value`, then each record or list passed through with
+    /// what its step selected replaced by the one built below it. Nothing
+    /// read is changed. A position outside its list stops the walk with
+    /// "index out of range", at the path up to its segment.
+    fn walk_update(
+        &mut self,
+        (root, value): (Value, Value),
+        (positions, path, depth): (&[IrId], UpdatePathId, u16),
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        let ir = self.ir;
+        let Some((leaf, steps)) = ir.update_path(path).and_then(<[UpdateStep]>::split_last) else {
+            return mistyped(node, "an update of a path its IR lacks");
+        };
+        let mut positions = positions.iter().copied();
+        let mut passed = Vec::with_capacity(steps.len());
+        let mut current = root;
+        for step in steps {
+            let at = self.select(&current, step, &mut positions, node)?;
+            let inner = match step.mode {
+                StepMode::Read => selected(&current, at, node)?,
+                StepMode::Await => {
+                    // A failure of the await is reported at the step's path.
+                    let site = IrNode {
+                        kind: node.kind,
+                        span: step.span,
+                    };
+                    let read = selected(&current, at, node)?;
+                    self.await_fully(read, depth.saturating_add(1), 0, &site)?
+                }
+                StepMode::Create => Value::Empty,
+                StepMode::Set => return mistyped(node, "an update sets a value before its leaf"),
+            };
+            passed.push((current, at));
+            current = inner;
+        }
+        if leaf.mode != StepMode::Set {
+            return mistyped(node, "an update's last step does not set its leaf");
+        }
+        let at = self.select(&current, leaf, &mut positions, node)?;
+        let mut new = self.replace(current, at, value, node)?;
+        while let Some((container, at)) = passed.pop() {
+            new = self.replace(container, at, new, node)?;
+        }
+        Ok(new)
+    }
+
+    /// What `step` of the `Update` `node` selects in `container`, the
+    /// record or list its walk is at: a field by name, or, evaluating the
+    /// next of `positions`, an element, whose position must lie in the
+    /// list, a negative one never does, or the update fails with "index out
+    /// of range" at the step's path.
+    fn select(
+        &mut self,
+        container: &Value,
+        step: &UpdateStep,
+        positions: &mut impl Iterator<Item = IrId>,
+        node: &IrNode,
+    ) -> Result<Selected, Diagnostic> {
+        let StepAt::Field(name) = step.at else {
+            let Some(position) = positions.next() else {
+                return mistyped(node, "an update lacks the position of an element");
+            };
+            let at = self.int(position)?;
+            let Value::List(list) = container else {
+                return mistyped(node, "an update selects an element of what is not a list");
+            };
+            return match usize::try_from(at).ok().filter(|&index| index < list.len()) {
+                Some(index) => Ok(Selected::Element(index)),
+                None => Err(out_of_range(step.span, at, list.len())),
+            };
+        };
+        Ok(Selected::Field(name))
+    }
+
+    /// `container`, a record or list an update's walk passed through, with
+    /// what `at` selects in it replaced by `value`, or added for a field
+    /// the record lacks, for the `Update` `node`: a new record or list,
+    /// `container` unchanged.
+    fn replace(
+        &self,
+        container: Value,
+        at: Selected,
+        value: Value,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
+        match (container, at) {
+            (container, Selected::Field(name)) => self.with_field(container, name, value, node),
+            (Value::List(list), Selected::Element(index)) => {
+                Ok(Value::List(with_element(&list, index, value)))
+            }
+            _ => mistyped(node, "an update sets an element of what is not a list"),
+        }
+    }
+
+    /// `old`, a record, with field `name` set to `value`, for the update
+    /// `node`: a new record, the old one unchanged. See the module
+    /// documentation.
+    fn with_field(
+        &self,
+        old: Value,
+        name: Name,
+        value: Value,
+        node: &IrNode,
+    ) -> Result<Value, Diagnostic> {
         let old = match old {
             Value::Record(old) => old,
             Value::Empty => {
@@ -2868,17 +3006,58 @@ fn nested_too_deeply(node: &IrNode) -> Diagnostic {
     )
 }
 
-/// The error for the `Index` `node` reading position `at` of a list of
-/// `len` elements, which it lies outside: "index out of range", labelled
-/// with the index and, if it is not negative, the list's length.
-fn out_of_range(node: &IrNode, at: i64, len: usize) -> Diagnostic {
+/// The error for an index, or an update's index step, at `span`, of
+/// position `at` in a list of `len` elements, which it lies outside: "index
+/// out of range", labelled with the index and, if it is not negative, the
+/// list's length.
+fn out_of_range(span: Span, at: i64, len: usize) -> Diagnostic {
     let facts = if at < 0 {
         format!("the index is {at}")
     } else {
         let noun = if len == 1 { "element" } else { "elements" };
         format!("the index is {at}, and the list has {len} {noun}")
     };
-    Diagnostic::error("index out of range", node.span).with_label(facts)
+    Diagnostic::error("index out of range", span).with_label(facts)
+}
+
+/// What a step of an update selects in the record or list its walk is at:
+/// a field by name, or an element by an index that lies in the list.
+#[derive(Clone, Copy, Debug)]
+enum Selected {
+    /// The field of this name.
+    Field(Name),
+    /// The element at this index.
+    Element(usize),
+}
+
+/// The value `at` selects in `container`, read by the walk of the `Update`
+/// `node` to go down a level: a field the checker guarantees the record
+/// has, or an element at an index that `Evaluator::select` found in the
+/// list.
+fn selected(container: &Value, at: Selected, node: &IrNode) -> Result<Value, Diagnostic> {
+    let found = match (container, at) {
+        (Value::Record(record), Selected::Field(name)) => record.get(name),
+        (Value::List(list), Selected::Element(index)) => list.values().get(index),
+        _ => None,
+    };
+    match found {
+        Some(value) => Ok(value.clone()),
+        None => mistyped(node, "an update reads what its record or list lacks"),
+    }
+}
+
+/// `list` with its element at `index`, which lies in it, replaced by
+/// `value`: a new list, in one allocation, sharing every other element, and
+/// `list` unchanged, so that whatever else holds it still sees its old
+/// elements.
+fn with_element(list: &List, index: usize, value: Value) -> List {
+    let mut value = Some(value);
+    List::from_exact(list.values().iter().enumerate().map(|(at, element)| {
+        match value.take_if(|_| at == index) {
+            Some(value) => value,
+            None => element.clone(),
+        }
+    }))
 }
 
 /// The number of integers from `start` up to `end`, `end` included if
@@ -6437,11 +6616,12 @@ mod tests {
             int("fn sub(a: Int, b: Int): Int { a - b }\nlet mut x = 1\nsub(x, { x := 10; x })"),
             -9
         );
-        // A dotted rebind reads the record, then the value, which may
-        // rebind the variable too; the update is what is stored.
+        // A dotted rebind evaluates its value first, which may rebind the
+        // variable too, and then reads the record it updates: the update of
+        // the variable as it then is is what is stored.
         assert_eq!(
             string("let mut r = { a = 1; b = 2 }\nr.a := { r := { a = 7; b = 8 }; r.b }\n\"{r}\""),
-            "{a = 8; b = 2}"
+            "{a = 8; b = 8}"
         );
     }
 
@@ -6497,5 +6677,317 @@ mod tests {
                     f := fn(n: Int): Int { n * 2 }\n\
                     a * 10 + f(3)";
         assert_eq!(int(text), 36);
+    }
+
+    // ----- Updating an element -----
+
+    #[test]
+    fn an_index_path_replaces_one_element() {
+        for (text, expected) in [
+            ("let mut xs = [1, 2, 3]\nxs[0] := 10\nxs", "[10, 2, 3]"),
+            (
+                "let mut xs = [1, 2, 3]\nfor i in 0..len(xs) { xs[i] := xs[i] * 2 }\nxs",
+                "[2, 4, 6]",
+            ),
+            (
+                "let mut conf = { hosts = [{ name = \"a\"; up = false }] }\n\
+                 conf.hosts[0].up := true\nconf",
+                "{hosts = [{name = \"a\"; up = true}]}",
+            ),
+            (
+                "let mut grid = [[0, 0], [0, 0]]\nlet y = 1\nlet x = 0\ngrid[y][x] := 1\ngrid",
+                "[[0, 0], [1, 0]]",
+            ),
+            // First, middle and last; of a variable that is not mutable too.
+            ("let xs = [1, 2, 3]\nxs[0] := 9\nxs", "[9, 2, 3]"),
+            ("let xs = [1, 2, 3]\nxs[1] := 9\nxs", "[1, 9, 3]"),
+            ("let xs = [1, 2, 3]\nxs[2] := 9\nxs", "[1, 2, 9]"),
+            // Nested lists, lists of records and records of lists.
+            (
+                "let mut m = [[1, 2], [3, 4]]\nm[1][0] := 30\nm[0] := [5]\nm",
+                "[[5], [30, 4]]",
+            ),
+            (
+                "let mut rs = [{ a = 1; b = [1] }, { a = 2; b = [2] }]\n\
+                 rs[1].a := 20\nrs[0].b[0] := 10\nrs",
+                "[{a = 1; b = [10]}, {a = 20; b = [2]}]",
+            ),
+            (
+                "let mut r = { xs = [1, 2]; n = { ys = [[0]] } }\nr.xs[1] := 5\n\
+                 r.n.ys[0][0] := 7\nr",
+                "{xs = [1, 5]; n = {ys = [[7]]}}",
+            ),
+            // An element of another type, as the element type allows.
+            ("let mut xs = [1.5, 2.5]\nxs[1] := 3\nxs", "[1.5, 3.0]"),
+            (
+                "let mut xs = [\"a\"]\nxs[0] := xs[0] + \"b\"\nxs",
+                "[\"ab\"]",
+            ),
+        ] {
+            assert_eq!(shown(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn an_index_update_leaves_the_old_list_to_its_other_holders() {
+        // Another variable, a closure's capture, a record's field and a
+        // future's capture all still see the old elements.
+        let text = "let mut xs = [1, 2]\nlet old = xs\nlet f = fn(): List<Int> { xs }\n\
+                    let r = { held = xs }\nlet later = lazy xs\nxs[0] := 10\n\
+                    \"{xs} {old} {f()} {r.held} {await later}\"";
+        assert_eq!(string(text), "[10, 2] [1, 2] [1, 2] [1, 2] [1, 2]");
+        // The new list shares every element it did not replace, and the old
+        // list is the one the other variable holds.
+        let frame =
+            frame_after("let mut xs = [{ a = 1 }, { a = 2 }]\nlet old = xs\nxs[1] := { a = 3 }");
+        let [Value::List(xs), Value::List(old), ..] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(same(&xs.values()[0], &old.values()[0]));
+        assert!(!same(&xs.values()[1], &old.values()[1]));
+        assert_eq!(old.values()[1].to_string(), "{a = 2}");
+        // A record along the path shares its other fields.
+        let frame =
+            frame_after("let mut r = { xs = [1]; other = { n = 1 } }\nlet old = r\nr.xs[0] := 2");
+        let [Value::Record(r), Value::Record(old)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(same(&r.values[1], &old.values[1]));
+        assert_eq!(old.values[0].to_string(), "[1]");
+    }
+
+    #[test]
+    fn a_position_outside_the_list_fails_and_changes_nothing() {
+        for (text, label, path, before) in [
+            (
+                "let mut xs = [1, 2]\nxs[2] := 5",
+                "the index is 2, and the list has 2 elements",
+                "xs[2]",
+                "[1, 2]",
+            ),
+            (
+                "let mut xs = [1, 2]\nxs[-1] := 5",
+                "the index is -1",
+                "xs[-1]",
+                "[1, 2]",
+            ),
+            (
+                "let mut xs: Int[] = []\nxs[0] := 5",
+                "the index is 0, and the list has 0 elements",
+                "xs[0]",
+                "[]",
+            ),
+            (
+                "let mut xs = [{ a = [1] }]\nxs[1].a[0] := 5",
+                "the index is 1, and the list has 1 element",
+                "xs[1]",
+                "[{a = [1]}]",
+            ),
+            (
+                "let mut xs = [{ a = [1] }]\nxs[0].a[3] := 5",
+                "the index is 3, and the list has 1 element",
+                "xs[0].a[3]",
+                "[{a = [1]}]",
+            ),
+        ] {
+            let ir = compile(text);
+            let mut frame = vec![Value::Empty; ir.frame_size() as usize];
+            let diagnostic = eval_in(&ir, &mut frame).unwrap_err();
+            assert_eq!(diagnostic.message, "index out of range", "{text}");
+            assert_eq!(diagnostic.label.as_deref(), Some(label), "{text}");
+            assert_eq!(diagnostic.span, at(text, path), "{text}");
+            assert!(diagnostic.labels.is_empty(), "{text}");
+            // The variable is left as it was.
+            assert_eq!(frame[0].to_string(), before, "{text}");
+        }
+        // Appending is by spread, not by index.
+        assert_eq!(shown("let mut xs = [1]\nxs := [...xs, 2]\nxs"), "[1, 2]");
+    }
+
+    #[test]
+    fn an_update_evaluates_its_value_first_and_each_position_once_in_order() {
+        // Blocks that rebind a mutable variable of the top level as they
+        // run show the order: the value, once, and then each position, once,
+        // left to right.
+        let text = "let mut log = \"\"\nlet mut xs = [[0, 0], [0, 0]]\n\
+                    xs[{ log := log + \"i\"; 1 }][{ log := log + \"j\"; 0 }] := \
+                    { log := log + \"v\"; 5 }\n\"{log} {xs}\"";
+        assert_eq!(string(text), "vij [[0, 0], [5, 0]]");
+        // The variable is read after the value, so a value that rebinds it
+        // is updated as it then is, for `:=` and a dotted `let` alike.
+        assert_eq!(
+            shown("let mut r = { a = 1; b = 2 }\nr.a := { r := { a = 100; b = 7 }; r.b + 1 }\nr"),
+            "{a = 8; b = 7}"
+        );
+        assert_eq!(
+            shown(
+                "let mut r = { a = 1; b = 2 }\nlet r.a = { r := { a = 100; b = 7 }; r.b + 1 }\nr"
+            ),
+            "{a = 8; b = 7}"
+        );
+        // A position that rebinds it runs after it is read, and the store
+        // overwrites what it stored.
+        assert_eq!(
+            shown("let mut xs = [1, 2]\nxs[{ xs := [7, 8, 9]; 1 }] := 5\nxs"),
+            "[1, 5]"
+        );
+        // A value that fails leaves the variable as it was, before anything
+        // of the path is read.
+        for text in [
+            "let mut xs = [1]\nxs[0] := 1 // 0",
+            "let mut xs = [1]\nxs[1] := 1 // 0",
+        ] {
+            let ir = compile(text);
+            let mut frame = vec![Value::Empty; ir.frame_size() as usize];
+            let diagnostic = eval_in(&ir, &mut frame).unwrap_err();
+            assert_eq!(diagnostic.message, "division by zero", "{text}");
+            assert_eq!(frame[0].to_string(), "[1]", "{text}");
+        }
+    }
+
+    #[test]
+    fn a_future_along_the_path_is_awaited_after_the_value() {
+        // The value's effects come first: here it replaces the future that
+        // would fail with one that does not, which is the one awaited.
+        let text = "let mut r: {a: Int, b: Int} | Future<{a: Int, b: Int}> = \
+                    lazy { a = 1 // 0; b = 2 }\n\
+                    r.a := { r := lazy { a = 7; b = 8 }; 1 }\nr";
+        assert_eq!(shown(text), "{a = 1; b = 8}");
+        // A value that fails fails before the future is awaited, which stays
+        // unrun.
+        let text = "let mut r: {a: Int} | Future<{a: Int}> = lazy { a = 1 }\nr.a := 2 // 0";
+        let ir = compile(text);
+        let mut frame = vec![Value::Empty; ir.frame_size() as usize];
+        let diagnostic = eval_in(&ir, &mut frame).unwrap_err();
+        assert_eq!(diagnostic.span, at(text, "//"));
+        let Value::Future(future) = &frame[0] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(!future.is_done());
+        // An element along the path likewise, awaited by its step, at the
+        // path up to it.
+        let text = "let mut xs: List<{a: Int} | Future<{a: Int}>> = [lazy { a = 1 // 0 }]\n\
+                    xs[0].a := { xs := [{ a = 5 }]; 6 }\nxs";
+        assert_eq!(shown(text), "[{a = 6}]");
+        let text = "let xs: List<{a: Int} | Future<{a: Int}>> = [lazy { a = 1 // 0 }]\n\
+                    xs[0].a := 2";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "division by zero");
+        assert_eq!(
+            labels(&diagnostic).last(),
+            Some(&(at(text, "xs[0]"), "awaited here"))
+        );
+    }
+
+    #[test]
+    fn an_element_that_is_a_future_is_awaited_only_on_the_way() {
+        // Replaced at the leaf, it is not read, and never runs.
+        let frame = frame_after("let xs = [lazy 1 // 0]\nlet old = xs\nxs[0] := lazy 2");
+        let [Value::List(xs), Value::List(old), Value::List(new)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(xs.shares(old));
+        let (Value::Future(replaced), Value::Future(_)) = (&old.values()[0], &new.values()[0])
+        else {
+            panic!("expected futures");
+        };
+        assert!(!replaced.is_done());
+        assert_eq!(
+            int("let xs = [lazy 1 // 0]\nxs[0] := lazy 2\nawait xs[0]"),
+            2
+        );
+        // Gone through, it is awaited once: a later await of the same future
+        // finds the record that one run built, which the update shares its
+        // untouched field with.
+        let frame = frame_after(
+            "let xs: List<{a: Int, b: {c: Int}} | Future<{a: Int, b: {c: Int}}>> = \
+             [lazy { a = 1; b = { c = 2 } }]\nlet old = xs\nxs[0].a := 5\n\
+             let s = await old[0]",
+        );
+        let [
+            _,
+            Value::List(old),
+            Value::List(updated),
+            Value::Record(read),
+        ] = &frame[..]
+        else {
+            panic!("unexpected frame {frame:?}");
+        };
+        let Value::Future(future) = &old.values()[0] else {
+            panic!("expected a future");
+        };
+        assert!(future.is_done());
+        let Value::Record(element) = &updated.values()[0] else {
+            panic!("expected a record");
+        };
+        assert_eq!(element.values[0], Value::Int(5));
+        assert!(same(&element.values[1], &read.values[1]));
+    }
+
+    #[test]
+    fn a_long_path_and_a_deep_position_use_the_nesting_budget() {
+        on_big_stack(|| {
+            // A function whose body is as tall as `levels`, from a dotted
+            // `let` of a long path, a deep position, or a chain of the same
+            // height, called from the top level: each fails exactly where
+            // the others do.
+            let path =
+                |steps: usize| format!("fn f(): Int {{ let a{} = 1\n0 }}\nf()", ".b".repeat(steps));
+            let position = |terms: usize| {
+                format!(
+                    "fn f(): Int {{ let mut xs = [0]\nxs[0{}] := 1\n0 }}\nf()",
+                    " + 0".repeat(terms - 1)
+                )
+            };
+            let chain = |terms: usize| {
+                format!(
+                    "fn f(): Int {{ let mut xs = [0]\nlet x = 0{}\n0 }}\nf()",
+                    " + 0".repeat(terms - 1)
+                )
+            };
+            let height = |text: &str| compile(text).function(FnId::new(0)).height as usize;
+            // The update is two levels taller than its tallest part for each
+            // step, and its store and the body's block two more.
+            assert_eq!(height(&path(10)), 2 * 10 + 4);
+            assert_eq!(height(&position(10)), 10 + 5);
+            assert_eq!(height(&chain(13)), 13 + 2);
+            // The call enters `f`'s frame at 1 + CALL_LEVELS levels.
+            let room = MAX_DEPTH - 1 - CALL_LEVELS;
+            let steps = (room - 4) / 2;
+            let terms = room - 5;
+            for (within, past) in [
+                (path(steps), path(steps + 1)),
+                (position(terms), position(terms + 1)),
+                (chain(terms + 3), chain(terms + 4)),
+            ] {
+                assert_eq!(run(&within).unwrap(), Value::Int(0));
+                let diagnostic = run(&past).unwrap_err();
+                assert_eq!(diagnostic.message, BUDGET_ERROR);
+                let call = u32::try_from(past.len()).unwrap();
+                assert_eq!(diagnostic.span, Span::new(call - 3, call));
+            }
+        });
+    }
+
+    #[test]
+    fn a_loop_of_updates_uses_no_budget_per_iteration() {
+        // Many more iterations than the budget has levels, each updating an
+        // element and a record's field through a path.
+        let text = "fn f(n: Int): Int {\n\
+                    \x20 let mut xs = [0, 0]\n\
+                    \x20 let mut r = { counts = [0] }\n\
+                    \x20 for i in 0..n { xs[i % 2] := i; r.counts[0] := r.counts[0] + 1 }\n\
+                    \x20 xs[0] + xs[1] + r.counts[0]\n\
+                    }\n";
+        let n = 3 * MAX_DEPTH;
+        let expected = i64::try_from(n - 2 + n - 1 + n).unwrap();
+        assert_eq!(int(&format!("{text}f({n})")), expected);
+        // The function's height does not depend on the count.
+        let height = |count: usize| {
+            compile(&format!("{text}f({count})"))
+                .function(FnId::new(0))
+                .height
+        };
+        assert_eq!(height(1), height(n));
     }
 }

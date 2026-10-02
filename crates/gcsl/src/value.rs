@@ -633,6 +633,47 @@ impl Value {
     pub const fn repr(&self) -> Repr<'_> {
         Repr(self)
     }
+
+    /// The `Int` the value is, if it is one: what the evaluator's `Int`
+    /// walker takes from a value read as a whole, an element, a field, an
+    /// awaited value or a call's result.
+    #[must_use]
+    pub(crate) fn into_int(self) -> Option<i64> {
+        match self {
+            Value::Int(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The `Float` the value is, if it is one, as [`Value::into_int`] takes
+    /// an `Int`.
+    #[must_use]
+    pub(crate) fn into_float(self) -> Option<f64> {
+        match self {
+            Value::Float(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The `Bool` the value is, if it is one, as [`Value::into_int`] takes
+    /// an `Int`.
+    #[must_use]
+    pub(crate) fn into_bool(self) -> Option<bool> {
+        match self {
+            Value::Bool(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The `String` the value is, if it is one, as [`Value::into_int`]
+    /// takes an `Int`: the same text, not a copy.
+    #[must_use]
+    pub(crate) fn into_string(self) -> Option<Rc<str>> {
+        match self {
+            Value::Str(text) => Some(text),
+            _ => None,
+        }
+    }
 }
 
 /// Shows the value only, never its type.

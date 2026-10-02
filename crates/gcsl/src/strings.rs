@@ -5,7 +5,10 @@
 //! each piece (a whole literal, or the text before, between or after its
 //! interpolations) in a [`Strings`] table. A string token therefore carries
 //! a [`StrId`], not text, and no later stage looks at a literal's source
-//! again.
+//! again. The parser adds one entry more for each index segment of a path,
+//! `xs[i + 1] := ...`: the source text of its position, `i + 1`, by which
+//! diagnostics show the path as it is written (see
+//! [`crate::ast::PathSegment`]).
 //!
 //! Unlike [`crate::names::Names`], the table does not deduplicate: every
 //! piece gets its own entry, since equal pieces are rare and comparing them

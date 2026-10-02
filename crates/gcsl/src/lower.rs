@@ -14,9 +14,9 @@
 //!
 //! A rebind of a mutable variable, from whatever block, is a `Store` into
 //! the slot of the variable's declaration, which the checker gives the
-//! item, and a dotted one a `Store` there of the update of the record
-//! loaded from that slot (see below), so lowering does nothing of its own
-//! for them. Nothing here assumes that a slot is written once: every `Load`
+//! item, and a dotted one a `Store` there of the update of the record or
+//! list loaded from that slot (see below), so lowering does nothing of its
+//! own for them. Nothing here assumes that a slot is written once: every `Load`
 //! is a read of its slot where it is evaluated, never folded into another,
 //! cached or moved out of the slot, and every `Store` is kept.
 //!
@@ -60,31 +60,49 @@
 //! record subtype where a supertype is expected needs no conversion: a
 //! record is the same value whatever record type it is seen as.
 //!
-//! A dotted `let`, `:=` or field lowers to a `Store` of a chain of
+//! A dotted `let` or `:=` lowers to a `Store` of one `Update` node, whose
+//! children are, in the order they are evaluated, its value, the record or
+//! list it updates and the position of each index segment of its path, and
+//! whose path, one [`crate::ir::UpdateStep`] for each segment after the
+//! first, is in the IR's side table (`Lowerer::lower_update`). The record or
+//! list updated is the variable's slot, or capture, read as a use of it
+//! would read it (see [`crate::check::PathResolution`]), of kind `List` if
+//! the path's second segment indexes it and `Record` otherwise; or `Empty`
+//! for a `let` of a name not in scope. Each step selects a field by name or
+//! an element at the next position, and reads what it selects, creates it
+//! as the empty record where the static type lacks it, or, for the last,
+//! sets it. A record or list along the path that the checker marked to be
+//! awaited (see [`crate::check::Resolution::path_awaits`]) is awaited where
+//! it is read: the variable's by an `Await`, of kind `Record` or `List`, of
+//! its read, of kind [`ValueKind::Deferred`], spanning its name, as the
+//! record of a field access is, and any other by its step, which awaits
+//! what it reads, as an `Await` spanning the path up to its segment would.
+//! So `let a.b.c = e`, with `a: {b: {c: Int}}` in scope, lowers to
+//! `Store(a', Update[.b.c](e, Load(a)))`, with `a: {x: Int}` to
+//! `Store(a', Update[.b+.c](e, Load(a)))`, the `+` marking the record it
+//! creates, with `a: Future<{b: Future<{c: Int}>}>` to `Store(a',
+//! Update[.b!.c](e, Await(Load(a))))`, and `xs[i].up := e` to `Store(xs,
+//! Update[[].up](e, Load(xs), Load(i)))`. Every child is evaluated once,
+//! and the value first (see [`crate::eval`]). The text of each name a step
+//! selects is recorded in the IR, for the evaluator to show a field it
+//! adds.
+//!
+//! A dotted field, which extends a record its block is building and never
+//! awaits or indexes, lowers instead to a `Store` of a chain of
 //! `UpdateField` nodes, one for each segment of its path after the first,
 //! from the leaf outwards, each setting its segment in the record at the
-//! path before it. That record is the updated variable's or field's slot,
-//! loaded, for the first segment, and a `Field` of the record before it for
-//! each later one that the static type has (see
-//! [`crate::check::PathResolution`]); a record the path creates is `Empty`,
-//! as is the first record of a dotted field's first definition. So
-//! `let a.b.c = e`, with `a: {b: {c: Int}}` in scope, lowers to
-//! `Store(a', UpdateField(Load(a), b, UpdateField(Field(Load(a), b), c,
+//! path before it (`Lowerer::lower_field_update`). That record is the
+//! field's slot, loaded, for the first segment, and a `Field` of the record
+//! before it for each later one that the static type has; a record the
+//! path creates is `Empty`, as is the first record of a dotted field's
+//! first definition. So `a.b.c = e`, extending `a`, which has `b`, lowers
+//! to `Store(a, UpdateField(Load(a), b, UpdateField(Field(Load(a), b), c,
 //! e)))`, where each record node is shared by the update that builds on it
-//! and the access into it, and with `a: {x: Int}` to
-//! `Store(a', UpdateField(Load(a), b, UpdateField(Empty, c, e)))`. A record
-//! along the path that the checker marked to be awaited (see
-//! [`crate::check::Resolution::path_awaits`]) is read as it would be
-//! otherwise, but of kind [`ValueKind::Deferred`], and wrapped in an `Await`
-//! of kind `Record`, spanning the path up to its segment, as the record of a
-//! field access is; that `Await` is the record node the update and the
-//! access into it share. So with `a: Future<{b: {c: Int}}>`, the first
-//! record is `Await(Load(a))`, and the second `Field(Await(Load(a)), b)`.
-//! So the record walker that evaluates an update never sees a value that
-//! may be a future. A dotted field stores back into its field's one slot.
-//! Each record block's field is loaded for its record once, from the slot
-//! its first definition declared. The text of each name an update sets is
-//! recorded in the IR, for the evaluator to show a field it adds.
+//! and the access into it: the record is read before the value, which
+//! cannot change the field's slot, so the order cannot be observed. A
+//! dotted field stores back into its field's one slot. Each record block's
+//! field is loaded for its record once, from the slot its first definition
+//! declared.
 //!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. `===`
@@ -148,18 +166,14 @@
 //! its height, in one vector indexed by node, on the way up. A
 //! `MakeClosure`'s or a `MakeFuture`'s captures are its children, loads in
 //! the creating frame; the function it makes is not, since that body is
-//! another frame, walked on its own. The nodes of a frame form a tree,
-//! except the record nodes an update chain shares between the update that
-//! builds on a record and the access into it: such a node's depth is
-//! counted from the first path the walk reaches it by. The shared nodes are
-//! loads, captures, the callee, field accesses, `Empty` and the `Await`s of
-//! records that may be futures, never calls. An `Await`'s depth matters
-//! only when it runs a future, and a shared one runs it, if at all, where it
-//! is first evaluated: as the record of the update that builds on it, which
-//! the evaluator evaluates before the update's value, where the access into
-//! it is, and which is also the first parent the walk reaches it by, since
-//! it visits a node's children in order. Every later evaluation, through
-//! the access, finds the future already run, and only copies its value.
+//! another frame, walked on its own. An `Update` gets its depth too, for
+//! the awaits of its steps, and is two levels taller than its tallest child
+//! for each step of its path, as the parser counts a path's segments. The
+//! nodes of a frame form a tree, except the record nodes a dotted field's
+//! update chain shares between the update that builds on a record and the
+//! access into it: such a node's depth is counted from the first path the
+//! walk reaches it by. The shared nodes are loads, field accesses and
+//! `Empty`, never calls or awaits.
 //!
 //! Lowering cannot fail on tables produced by [`crate::check::check`]. Any
 //! combination the checker should have ruled out is reported as an
@@ -169,13 +183,13 @@ use std::collections::HashMap;
 
 use crate::ast::{
     ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForId, ItemId, ItemKind,
-    ItemRange, PartRange, PathRange, PathSegment, StrPart, UnaryOp, path_span,
+    ItemRange, PartRange, PathRange, PathSegment, SegmentKind, StrPart, UnaryOp, path_span,
 };
-use crate::check::{AwaitMark, Builtin, Checked, Resolution, Slot, Types, VarRef};
+use crate::check::{AwaitMark, Builtin, Checked, PathResolution, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
 use crate::ir::{
     Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField, LazyShape,
-    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands,
+    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -228,6 +242,7 @@ pub fn lower(
         // stores, empty records and field loads.
         builder: IrBuilder::with_capacity(ast.len()),
         item_stack: Vec::new(),
+        steps: Vec::new(),
         layouts: HashMap::new(),
         layout_names: Vec::new(),
         record_loads: Vec::new(),
@@ -268,8 +283,13 @@ struct Lowerer<'a> {
     builder: IrBuilder,
     /// The items of the blocks being lowered, innermost last, moved to the
     /// builder's pool as each block ends, as the parser does for the AST.
-    /// A record's values are collected here in the same way.
+    /// A record's values, and an update's parts, are collected here in the
+    /// same way.
     item_stack: Vec<IrId>,
+    /// The steps of the paths of the updates being lowered, innermost last,
+    /// moved to the builder's table as each update ends: a position may
+    /// hold a block with updates of its own.
+    steps: Vec<UpdateStep>,
     /// The layout already made for each sequence of field names.
     layouts: HashMap<Box<[Name]>, LayoutId>,
     /// Reused for collecting the field names of each record block.
@@ -461,26 +481,111 @@ impl Lowerer<'_> {
     }
 
     /// Lowers the value that the declaration `id`, whose path is `path`,
-    /// stores: its expression `value` for a plain path, and for a dotted
-    /// one the chain of updates that sets the path to it.
+    /// stores: its expression `value` for a plain path, for a dotted field
+    /// the chain of field updates that sets the path to it, and for a dotted
+    /// `let` or `:=` the update that does.
     fn lower_declaration(
         &mut self,
         id: ItemId,
         path: PathRange,
         value: ExprId,
     ) -> Result<IrId, InternalError> {
-        match self.ast.path(path) {
-            [_] => self.lower_expr(value),
-            segments => self.lower_update(id, segments, value),
+        match (self.ast.item(id).kind, self.ast.path(path)) {
+            (_, [_]) => self.lower_expr(value),
+            (ItemKind::Field { .. }, segments) => self.lower_field_update(id, segments, value),
+            (_, segments) => self.lower_update(id, segments, value),
         }
     }
 
-    /// Lowers the dotted declaration `id`, whose path is `segments`, to the
-    /// chain of `UpdateField`s setting the path to `value`, from the leaf
+    /// Lowers the dotted field `id`, whose path is `segments`, to the chain
+    /// of `UpdateField`s setting the path to `value`, from the leaf
     /// outwards, each on the record at the path before its segment: the
-    /// updated slot or a `Field` of the record before it where they exist,
-    /// each wrapped in an `Await` if the checker marked it to be awaited,
-    /// and `Empty` where the path creates a record.
+    /// field's slot or a `Field` of the record before it where they exist,
+    /// and `Empty` where the path creates a record. A dotted field extends a
+    /// record its block is building, which is never awaited.
+    fn lower_field_update(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        value: ExprId,
+    ) -> Result<IrId, InternalError> {
+        let table = self.resolution;
+        let resolution = table.item_path(id);
+        let existing = resolution.existing as usize;
+        if !table
+            .path_awaits(resolution)
+            .is_some_and(<[bool]>::is_empty)
+        {
+            return Err(InternalError {
+                message: "a dotted field's record is awaited",
+                span: path_span(segments),
+            });
+        }
+        let base = self.item_stack.len();
+        // The record at each proper prefix of the path, `segments[..=end]`,
+        // on the item stack: the record that setting `segments[end + 1]`
+        // builds on.
+        for end in 0..segments.len().saturating_sub(1) {
+            let span = path_span(&segments[..=end]);
+            let kind = if end >= existing {
+                IrKind::Empty
+            } else if end == 0 {
+                read(resolution.source, ValueKind::Record).ok_or(InternalError {
+                    message: "an update of an existing record has no source",
+                    span,
+                })?
+            } else {
+                let (Some(&record), Some(name)) =
+                    (self.item_stack.get(base + end - 1), segments[end].name())
+                else {
+                    return Err(InternalError {
+                        message: "an update's record is missing",
+                        span,
+                    });
+                };
+                IrKind::Field {
+                    record,
+                    name,
+                    kind: ValueKind::Record,
+                }
+            };
+            let record = self.builder.alloc(kind, span);
+            self.item_stack.push(record);
+        }
+        let mut update = self.lower_expr(value)?;
+        for (level, segment) in segments.iter().enumerate().skip(1).rev() {
+            let (Some(&record), Some(name)) =
+                (self.item_stack.get(base + level - 1), segment.name())
+            else {
+                return Err(InternalError {
+                    message: "an update's record is missing",
+                    span: path_span(segments),
+                });
+            };
+            // The evaluator shows a field it adds by this text.
+            self.builder.add_name_text(name, self.ast.names().get(name));
+            update = self.builder.alloc(
+                IrKind::UpdateField {
+                    record,
+                    name,
+                    value: update,
+                },
+                path_span(&segments[..=level]),
+            );
+        }
+        self.item_stack.truncate(base);
+        Ok(update)
+    }
+
+    /// Lowers the dotted `let` or `:=` `id`, whose path is `segments`, to
+    /// an `Update` setting the path to `value`, spanning the path: its
+    /// parts are `value`, then the record or list updated, the variable's
+    /// slot or capture read, wrapped in an `Await` if the checker marked it
+    /// to be awaited, or `Empty` for a `let` of a name not in scope, and
+    /// then the position of each index segment, in order; and its steps,
+    /// one for each segment after the first, select a field or an element
+    /// and read it, read and await it where the checker marked it, create
+    /// it where the static type lacks it, or, for the last, set it.
     fn lower_update(
         &mut self,
         id: ItemId,
@@ -490,84 +595,107 @@ impl Lowerer<'_> {
         let table = self.resolution;
         let resolution = table.item_path(id);
         let existing = resolution.existing as usize;
+        let span = path_span(segments);
         let awaits = table.path_awaits(resolution).ok_or(InternalError {
             message: "an update's awaited records are missing",
-            span: path_span(segments),
+            span,
         })?;
         let base = self.item_stack.len();
-        // The record at each proper prefix of the path, `segments[..=end]`,
-        // on the item stack: the record that setting `segments[end + 1]`
-        // builds on.
-        for end in 0..segments.len().saturating_sub(1) {
-            let span = path_span(&segments[..=end]);
-            // A record that may be a future is read as it is and awaited, as
-            // the record of a field access is.
-            let awaited = awaits.get(end).copied().unwrap_or(false);
-            let read_kind = if awaited {
-                ValueKind::Deferred
-            } else {
-                ValueKind::Record
-            };
-            let kind = if end >= existing {
-                IrKind::Empty
-            } else if end == 0 {
-                read(resolution.source, read_kind).ok_or(InternalError {
-                    message: "an update of an existing record has no source",
-                    span,
-                })?
-            } else {
-                let Some(&record) = self.item_stack.get(base + end - 1) else {
-                    return Err(InternalError {
-                        message: "an update's record is missing",
-                        span,
-                    });
-                };
-                IrKind::Field {
-                    record,
-                    name: segments[end].name,
-                    kind: read_kind,
+        // The value is evaluated first.
+        let value = self.lower_expr(value)?;
+        self.item_stack.push(value);
+        let root = self.update_root(segments, resolution, awaits)?;
+        self.item_stack.push(root);
+        let steps = self.steps.len();
+        for (level, segment) in segments.iter().enumerate().skip(1) {
+            let at = match segment.kind {
+                SegmentKind::Name(name) => {
+                    // The evaluator shows a field it adds by this text.
+                    self.builder.add_name_text(name, self.ast.names().get(name));
+                    StepAt::Field(name)
+                }
+                SegmentKind::Index { position, .. } => {
+                    let position = self.lower_operand(position, ValueKind::Int)?;
+                    self.item_stack.push(position);
+                    StepAt::Element
                 }
             };
-            let mut record = self.builder.alloc(kind, span);
-            if awaited {
-                record = self.builder.alloc(
-                    IrKind::Await {
-                        value: record,
-                        kind: ValueKind::Record,
-                        shape: LazyShapeId::NONE,
-                        // Set by `IrBuilder::measure` once every node is
-                        // built.
-                        depth: 0,
-                    },
-                    span,
-                );
-            }
-            self.item_stack.push(record);
-        }
-        // The evaluator shows a field it adds by this text.
-        for segment in segments.get(1..).unwrap_or_default() {
-            let text = self.ast.names().get(segment.name);
-            self.builder.add_name_text(segment.name, text);
-        }
-        let mut update = self.lower_expr(value)?;
-        for (level, segment) in segments.iter().enumerate().skip(1).rev() {
-            let Some(&record) = self.item_stack.get(base + level - 1) else {
-                return Err(InternalError {
-                    message: "an update's record is missing",
-                    span: path_span(segments),
-                });
+            // The record or list the step selects is the one at
+            // `segments[..=level]`.
+            let mode = if level + 1 == segments.len() {
+                StepMode::Set
+            } else if level >= existing {
+                StepMode::Create
+            } else if awaits.get(level).copied().unwrap_or(false) {
+                StepMode::Await
+            } else {
+                StepMode::Read
             };
-            update = self.builder.alloc(
-                IrKind::UpdateField {
-                    record,
-                    name: segment.name,
-                    value: update,
-                },
-                path_span(&segments[..=level]),
-            );
+            self.steps.push(UpdateStep {
+                at,
+                mode,
+                span: path_span(&segments[..=level]),
+            });
         }
+        let path = self
+            .builder
+            .push_update_path(self.steps.get(steps..).unwrap_or_default());
+        self.steps.truncate(steps);
+        let parts = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
-        Ok(update)
+        let kind = updated_kind(segments);
+        Ok(self.builder.alloc(
+            IrKind::Update {
+                parts,
+                path,
+                kind,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
+            },
+            span,
+        ))
+    }
+
+    /// The node reading the record or list that the dotted `let` or `:=`
+    /// whose path is `segments`, and which resolves as `resolution` says,
+    /// updates, spanning its first segment: a read of its variable's slot
+    /// or capture, as a use of the variable would read it, wrapped in an
+    /// `Await` if `awaits`, the checker's marks for the records and lists
+    /// along the path, says so for it, or `Empty` if no variable is
+    /// updated.
+    fn update_root(
+        &mut self,
+        segments: &[PathSegment],
+        resolution: PathResolution,
+        awaits: &[bool],
+    ) -> Result<IrId, InternalError> {
+        let span = segments.first().map_or(Span::new(0, 0), |first| first.span);
+        if resolution.existing == 0 {
+            return Ok(self.builder.alloc(IrKind::Empty, span));
+        }
+        let kind = updated_kind(segments);
+        // A record or list that may be a future is read as it is and
+        // awaited, as the record of a field access is.
+        let awaited = awaits.first().copied().unwrap_or(false);
+        let read_kind = if awaited { ValueKind::Deferred } else { kind };
+        let read = read(resolution.source, read_kind).ok_or(InternalError {
+            message: "an update of an existing record has no source",
+            span,
+        })?;
+        let read = self.builder.alloc(read, span);
+        if !awaited {
+            return Ok(read);
+        }
+        Ok(self.builder.alloc(
+            IrKind::Await {
+                value: read,
+                kind,
+                shape: LazyShapeId::NONE,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
+            },
+            span,
+        ))
     }
 
     /// Lowers the spread item `id`, whose operand is `value`, spanning
@@ -675,8 +803,12 @@ impl Lowerer<'_> {
                 }
                 _ => continue,
             };
+            // A field's path's segments are all names.
+            let Some(name) = field.name() else {
+                continue;
+            };
             let slot = resolution.item_slot(id);
-            self.define_field(field.name, (slot, kind, field.span), spread);
+            self.define_field(name, (slot, kind, field.span), spread);
         }
         let base = self.item_stack.len();
         for &(slot, kind, field_span) in &self.record_loads {
@@ -1514,6 +1646,16 @@ impl Lowerer<'_> {
     }
 }
 
+/// The kind of the record or list that a dotted `let` or `:=` whose path is
+/// `segments` updates: a list if its second segment is an index, and a
+/// record otherwise.
+fn updated_kind(segments: &[PathSegment]) -> ValueKind {
+    match segments.get(1).map(|segment| segment.kind) {
+        Some(SegmentKind::Index { .. }) => ValueKind::List,
+        _ => ValueKind::Record,
+    }
+}
+
 /// The node reading a value of kind `kind` from `var`, or `None` if it is
 /// not a variable, a built-in function being none.
 const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
@@ -2118,12 +2260,9 @@ mod tests {
              \x20     (make-record [b] @8..25\n\
              \x20       (load a#0 @10..11))))\n\
              \x20 (store a#1 @26..39\n\
-             \x20   (update-field b @30..33\n\
-             \x20     (load a#0 @30..31)\n\
-             \x20     (update-field c @30..35\n\
-             \x20       (field b @30..33\n\
-             \x20         (load a#0 @30..31))\n\
-             \x20       (int 2 @38..39))))\n\
+             \x20   (update .b.c @30..35\n\
+             \x20     (int 2 @38..39)\n\
+             \x20     (load a#0 @30..31)))\n\
              \x20 (empty @0..39))"
         );
         // Where the static type lacks a segment, its record is created.
@@ -2133,19 +2272,17 @@ mod tests {
              \x20 (store a#0 @0..9\n\
              \x20   (int 1 @8..9))\n\
              \x20 (store b#1 @10..23\n\
-             \x20   (update-field c @14..17\n\
-             \x20     (empty @14..15)\n\
-             \x20     (update-field d @14..19\n\
-             \x20       (empty @14..17)\n\
-             \x20       (load a#0 @22..23))))\n\
+             \x20   (update .c+.d @14..19\n\
+             \x20     (load a#0 @22..23)\n\
+             \x20     (empty @14..15)))\n\
              \x20 (store b#2 @24..40\n\
-             \x20   (update-field c @24..27\n\
-             \x20     (load b#1 @24..25)\n\
+             \x20   (update .c @24..27\n\
              \x20     (block @31..40\n\
              \x20       (store b#2 @33..38\n\
              \x20         (int 2 @37..38))\n\
              \x20       (make-record [d] @31..40\n\
-             \x20         (load b#2 @33..34)))))\n\
+             \x20         (load b#2 @33..34)))\n\
+             \x20     (load b#1 @24..25)))\n\
              \x20 (empty @0..40))"
         );
     }
@@ -2174,11 +2311,11 @@ mod tests {
              \x20   (bool true @50..54)\n\
              \x20   (block @55..71\n\
              \x20     (store r#1 @57..69\n\
-             \x20       (update-field a @57..60\n\
-             \x20         (load r#1 @57..58)\n\
+             \x20       (update .a @57..60\n\
              \x20         (int-add @64..69\n\
              \x20           (load x#0 @64..65)\n\
-             \x20           (int 1 @68..69))))\n\
+             \x20           (int 1 @68..69))\n\
+             \x20         (load r#1 @57..58)))\n\
              \x20     (empty @55..71))\n\
              \x20   (block @71..71\n\
              \x20     (empty @71..71)))\n\
@@ -2516,23 +2653,23 @@ mod tests {
     fn the_shared_nodes_of_an_update_chain_do_not_disturb_depths() {
         let g = "fn g(n: Int): Int { n }\n";
         // `let a.b.c = g(a.b.c)`: the block (0), the store (1), the update
-        // of `b` (2), the update of `c` (3), the call (4). The update of `b`
-        // shares its load of `a` with the access `a.b` that the update of
-        // `c` builds on, so the walk reaches that load twice; the call's
-        // depth is its own path's, and so is the later call's (1).
+        // (2), the call (3), the update's value, its first child, which no
+        // node of its path shares; the later call's depth is its own path's
+        // (1).
         let ir = lower_text(&format!(
             "{g}let a = {{ b = {{ c = 1 }} }}\nlet a.b.c = g(a.b.c)\n= g(a.b.c)"
         ));
-        assert_eq!(depths(&ir, ir.root()), vec![4, 1]);
-        // In a function's body, where the chain's longest path is through
-        // the call: the block (1), the store (2), the update of `b` (3), the
-        // update of `c` (4), the call (5), its argument (6), the literal (7).
+        assert_eq!(depths(&ir, ir.root()), vec![3, 1]);
+        // In a function's body, where the update's longest path is through
+        // the call: the block (1), the store (2), the update, two levels
+        // more for each of its path's two steps (7), the call (8), its
+        // argument (9), the literal (10).
         let ir = lower_text(&format!(
             "{g}fn u(r: {{b: {{c: Int}}}}): {{b: {{c: Int}}}} {{ let r.b.c = g(1)\nr }}"
         ));
         let u = ir.function(FnId::new(1));
-        assert_eq!(depths(&ir, u.body), vec![4]);
-        assert_eq!(u.height, 7);
+        assert_eq!(depths(&ir, u.body), vec![3]);
+        assert_eq!(u.height, 10);
     }
 
     #[test]
@@ -2927,8 +3064,9 @@ mod tests {
     #[test]
     fn an_update_awaits_each_record_along_its_path_that_may_be_a_future() {
         // An impure function's parameter, the either shape at every level:
-        // each record is awaited, spanning the path up to it, and the await
-        // is the record node the update and the access into it share.
+        // each record is awaited, the variable's by an await of its read,
+        // spanning its name, and the record at `r.a` by the step that reads
+        // it, spanning the path up to it.
         let text = "fn f(r: {a: {b: Int}}) -> {} { let r.a.b = 2 }";
         assert_eq!(
             dump(text),
@@ -2936,18 +3074,13 @@ mod tests {
              \x20 (store f#0 @0..46\n\
              \x20   (make-closure #0 @0..46))\n\
              \x20 (empty @0..46))\n\
-             fn #0 f (frame 2, params 1, captures 0, height 8)\n\
+             fn #0 f (frame 2, params 1, captures 0, height 9)\n\
              \x20 (block @29..46\n\
              \x20   (store r#1 @31..44\n\
-             \x20     (update-field a @35..38\n\
+             \x20     (update .a!.b @35..40\n\
+             \x20       (int 2 @43..44)\n\
              \x20       (await @35..36\n\
-             \x20         (load r#0 @35..36))\n\
-             \x20       (update-field b @35..40\n\
-             \x20         (await @35..38\n\
-             \x20           (field a @35..38\n\
-             \x20             (await @35..36\n\
-             \x20               (load r#0 @35..36))))\n\
-             \x20         (int 2 @43..44))))\n\
+             \x20         (load r#0 @35..36))))\n\
              \x20   (empty @29..46))"
         );
         let ir = lower_text(text);
@@ -2955,21 +3088,22 @@ mod tests {
         let IrKind::Block { items, .. } = ir.get(code.body).kind else {
             panic!("expected a block");
         };
-        let IrKind::Store(_, outer) = ir.get(ir.items(items)[0]).kind else {
+        let IrKind::Store(_, update) = ir.get(ir.items(items)[0]).kind else {
             panic!("expected a store");
         };
-        let IrKind::UpdateField {
-            record: first,
-            value: inner,
+        let IrKind::Update {
+            parts,
+            path,
+            kind: ValueKind::Record,
             ..
-        } = ir.get(outer).kind
+        } = ir.get(update).kind
         else {
-            panic!("expected an update");
+            panic!("expected an update of a record");
         };
-        let IrKind::UpdateField { record: second, .. } = ir.get(inner).kind else {
-            panic!("expected an update");
+        let &[_, first] = ir.items(parts) else {
+            panic!("expected a value and a record");
         };
-        // Each read is of kind `Deferred`, and each await of a record.
+        // The read is of kind `Deferred`, and the await of a record.
         let IrKind::Await {
             value: load,
             kind: ValueKind::Record,
@@ -2983,29 +3117,23 @@ mod tests {
             ir.get(load).kind,
             IrKind::Load(Slot::new(0), ValueKind::Deferred)
         );
-        let IrKind::Await {
-            value: field,
-            kind: ValueKind::Record,
-            ..
-        } = ir.get(second).kind
-        else {
-            panic!("expected an await of a record");
-        };
-        let IrKind::Field { record, kind, .. } = ir.get(field).kind else {
-            panic!("expected a field access");
-        };
-        assert_eq!(kind, ValueKind::Deferred);
-        assert_eq!(record, first);
-        // The block (0), the store (1), the update of `a` (2), its record's
-        // await (3); the update of `b` (3), its record's await (4). The
-        // shared await, met again under the access, keeps the depth of the
-        // path the walk first reaches it by, where it is first evaluated.
+        let steps = ir.update_path(path).unwrap();
+        let modes: Vec<_> = steps.iter().map(|step| (step.mode, step.span)).collect();
+        assert_eq!(
+            modes,
+            vec![
+                (StepMode::Await, Span::new(35, 38)),
+                (StepMode::Set, Span::new(35, 40))
+            ]
+        );
+        // The block (0), the store (1), the update (2), its record's await
+        // (3); the step's await is the update's own.
         assert_eq!(
             ir.awaits_in(code.body)
                 .into_iter()
                 .map(|(depth, _)| depth)
                 .collect::<Vec<_>>(),
-            vec![3, 4, 3]
+            vec![3]
         );
         // A record that is present is read as before, beside one that is
         // not.
@@ -3014,16 +3142,169 @@ mod tests {
         assert!(
             shown.contains(
                 "  (store r#1 @31..44\n\
-                 \x20   (update-field a @35..38\n\
-                 \x20     (load r#0 @35..36)\n\
-                 \x20     (update-field b @35..40\n\
-                 \x20       (await @35..38\n\
-                 \x20         (field a @35..38\n\
-                 \x20           (load r#0 @35..36)))\n\
-                 \x20       (int 2 @43..44))))"
+                 \x20   (update .a!.b @35..40\n\
+                 \x20     (int 2 @43..44)\n\
+                 \x20     (load r#0 @35..36)))"
             ),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn the_shared_nodes_of_a_dotted_fields_chain_do_not_disturb_depths() {
+        // `a.b.d = g(a.b.c)`, extending `a`: the block (0), its item's block
+        // (1), the store (2), the update of `b` (3), the update of `d` (4),
+        // the call (5). The update of `b` shares its load of `a` with the
+        // access `a.b` that the update of `d` builds on, so the walk
+        // reaches that load twice; the call's depth is its own path's.
+        let ir = lower_text("fn g(n: Int): Int { n }\n{ a.b.c = 1; a.b.d = g(a.b.c) }");
+        assert_eq!(depths(&ir, ir.root()), vec![5]);
+    }
+
+    #[test]
+    fn an_index_path_lowers_to_one_update_of_its_list() {
+        // The value, the list and each position, in the order they are
+        // evaluated, and a step for each segment after the first.
+        assert_eq!(
+            dump("let mut xs = [1, 2]\nlet i = 0\nxs[i + 1] := 5"),
+            "(block @0..44\n\
+             \x20 (store xs#0 @0..19\n\
+             \x20   (make-list @13..19\n\
+             \x20     (int 1 @14..15)\n\
+             \x20     (int 2 @17..18)))\n\
+             \x20 (store i#1 @20..29\n\
+             \x20   (int 0 @28..29))\n\
+             \x20 (store xs#0 @30..44\n\
+             \x20   (update [] @30..39\n\
+             \x20     (int 5 @43..44)\n\
+             \x20     (load xs#0 @30..32)\n\
+             \x20     (int-add @33..38\n\
+             \x20       (load i#1 @33..34)\n\
+             \x20       (int 1 @37..38))))\n\
+             \x20 (empty @0..44))"
+        );
+        // Names and indexes mixed, two in a row, and a record updated: the
+        // update is of the kind of what it updates.
+        let ir = lower_text(
+            "let mut conf = { hosts = [[{ up = false }]] }\nconf.hosts[0][1].up := true",
+        );
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::Store(_, update) = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected a store");
+        };
+        let IrKind::Update {
+            parts,
+            path,
+            kind: ValueKind::Record,
+            ..
+        } = ir.get(update).kind
+        else {
+            panic!("expected an update of a record");
+        };
+        let parts: Vec<_> = ir.items(parts).iter().map(|&id| ir.get(id).kind).collect();
+        assert_eq!(
+            parts,
+            vec![
+                IrKind::BoolConst(true),
+                IrKind::Load(Slot::new(0), ValueKind::Record),
+                IrKind::IntConst(0),
+                IrKind::IntConst(1)
+            ]
+        );
+        let steps: Vec<_> = ir
+            .update_path(path)
+            .unwrap()
+            .iter()
+            .map(|step| (matches!(step.at, StepAt::Element), step.mode, step.span))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                (false, StepMode::Read, Span::new(46, 56)),
+                (true, StepMode::Read, Span::new(46, 59)),
+                (true, StepMode::Read, Span::new(46, 62)),
+                (false, StepMode::Set, Span::new(46, 65))
+            ]
+        );
+        // A list updated is of kind `List`, and so is its read.
+        let shown = dump("let xs = [[1]]\nxs[0][0] := 2");
+        assert!(
+            shown.contains(
+                "  (store xs#1 @15..28\n\
+                 \x20   (update [][] @15..23\n\
+                 \x20     (int 2 @27..28)\n\
+                 \x20     (load xs#0 @15..17)\n\
+                 \x20     (int 0 @18..19)\n\
+                 \x20     (int 0 @21..22)))"
+            ),
+            "{shown}"
+        );
+        let ir = lower_text("let xs = [[1]]\nxs[0][0] := 2");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::Store(_, update) = ir.get(ir.items(items)[1]).kind else {
+            panic!("expected a store");
+        };
+        assert_eq!(ir.kind_of(update), ValueKind::List);
+    }
+
+    #[test]
+    fn an_index_path_awaits_the_lists_and_elements_that_may_be_futures() {
+        // An impure function's parameter and its elements, the either shape:
+        // the list read is awaited, as a list, and so is the element its
+        // step reads; the position too, where it is used.
+        let text = "fn f(xs: List<{a: Int}>, i: Int) -> {} { xs[i].a := 1 }";
+        let shown = dump(text);
+        assert!(
+            shown.contains(
+                "    (store xs#2 @41..53\n\
+                 \x20     (update []!.a @41..48\n\
+                 \x20       (int 1 @52..53)\n\
+                 \x20       (await @41..43\n\
+                 \x20         (load xs#0 @41..43))\n\
+                 \x20       (await @44..45\n\
+                 \x20         (load i#1 @44..45))))"
+            ),
+            "{shown}"
+        );
+        let ir = lower_text(text);
+        let code = ir.function(FnId::new(0));
+        let IrKind::Block { items, .. } = ir.get(code.body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::Store(_, update) = ir.get(ir.items(items)[0]).kind else {
+            panic!("expected a store");
+        };
+        let IrKind::Update { parts, .. } = ir.get(update).kind else {
+            panic!("expected an update");
+        };
+        let IrKind::Await { kind, value, .. } = ir.get(ir.items(parts)[1]).kind else {
+            panic!("expected an await");
+        };
+        assert_eq!(kind, ValueKind::List);
+        assert_eq!(
+            ir.get(value).kind,
+            IrKind::Load(Slot::new(0), ValueKind::Deferred)
+        );
+        // The update gets its depth, for its steps' awaits: the block (0),
+        // the store (1), the update (2); and the awaits below it (3).
+        let IrKind::Update { depth, .. } = ir.get(update).kind else {
+            panic!("expected an update");
+        };
+        assert_eq!(depth, 2);
+        assert_eq!(
+            ir.awaits_in(code.body)
+                .into_iter()
+                .map(|(depth, _)| depth)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+        // Two levels for each of its two steps: the update is 1 + 2 + 4
+        // tall, the store 8 and the block 9.
+        assert_eq!(code.height, 9);
     }
 
     /// The result of the root block of `ir`, whatever items come before it.

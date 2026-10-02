@@ -79,9 +79,10 @@ pub use value::{Value, ValueKind};
 /// `Future<Int>` one more than its argument, `T[]` one more than `T`, and a
 /// union one more than the
 /// taller of its sides. A `let`, field or `:=` with a dotted path is two levels taller than
-/// its value for each segment of the path after the first, since later
-/// stages build a record for each segment and read the old one's field
-/// through all those before it. Every stage recurses once per
+/// the taller of its value and the positions of its path's index segments
+/// for each segment of the path after the first, since later stages build
+/// a record, or a list, for each segment and read the old one's field or
+/// element through all those before it. Every stage recurses once per
 /// level, so the parser rejects anything deeper with an "expression nested
 /// too deeply" error rather than letting a later stage overflow the stack.
 /// The lexer, which recurses through string literals nested in each other's
@@ -99,8 +100,10 @@ pub use value::{Value, ValueKind};
 /// expressions, since calls nest on the Rust stack as expressions do and
 /// GCSL does not eliminate tail calls. There, a level is a node of the IR:
 /// every node on the path from a frame's body to the node being evaluated
-/// is one level, and each call in progress costs [`CALL_LEVELS`] more on
-/// top of the nesting around it. The iterations of a `for` do not nest:
+/// is one level, the update of a dotted `let` or `:=` counting two more for
+/// each segment of its path after the first, as the parser counts it,
+/// although it walks the path without recursing, and each call in progress
+/// costs [`CALL_LEVELS`] more on top of the nesting around it. The iterations of a `for` do not nest:
 /// its body is one level below it, as an `if`'s branch is, however many
 /// times it runs. A call is made only if the nesting it
 /// would reach, the whole height of its callee's body included, stays

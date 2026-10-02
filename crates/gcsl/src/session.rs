@@ -165,9 +165,9 @@ impl Session {
     /// Runs `source`, committing its scope only on success. On failure the
     /// caller must forget the names it interned.
     fn eval_uncommitted(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
-        let (tokens, strings) =
+        let (tokens, mut strings) =
             lexer::tokenize_with(source, &mut self.names).map_err(|error| vec![error])?;
-        let (builder, root) = parser::parse_parts(&tokens, source, &mut self.names, &strings)
+        let (builder, root) = parser::parse_parts(&tokens, source, &mut self.names, &mut strings)
             .map_err(|error| vec![error])?;
         // The tree owns the names while it lives; take them back before
         // anything can fail. The string table belongs to this input alone:
@@ -866,6 +866,64 @@ mod tests {
             value(&mut session, "\"{n} {conf.port} {fixed} {m}\""),
             Value::Str("5 443 7 8".into())
         );
+    }
+
+    #[test]
+    fn an_element_of_an_earlier_inputs_list_is_updated_by_a_later_one() {
+        let mut session = Session::new();
+        value(&mut session, "let mut xs = [1, 2, 3]");
+        value(
+            &mut session,
+            "let mut conf = { hosts = [{ up = false }, { up = false }] }",
+        );
+        value(&mut session, "let old = xs");
+        // From the top level, an inner block and a `for`, in its slot.
+        value(&mut session, "xs[0] := 10");
+        value(&mut session, "{ conf.hosts[1].up := true }");
+        value(&mut session, "for i in 1..3 { xs[i] := xs[i] * 2 }");
+        assert_eq!(value(&mut session, "xs").to_string(), "[10, 4, 6]");
+        assert_eq!(value_type(&session), "List<Int>");
+        assert_eq!(
+            value(&mut session, "conf").to_string(),
+            "{hosts = [{up = false}, {up = true}]}"
+        );
+        // The list an earlier variable holds is not changed.
+        assert_eq!(value(&mut session, "old").to_string(), "[1, 2, 3]");
+        // Nor by a later input's function, which cannot rebind it.
+        assert_eq!(
+            messages(&mut session, "let f = fn(): Int { xs[0] := 1; 0 }"),
+            vec!["cannot rebind `xs` here: it is declared outside this function"]
+        );
+    }
+
+    #[test]
+    fn a_failed_index_update_leaves_the_old_list() {
+        let mut session = Session::new();
+        value(&mut session, "let mut xs = [1, 2]");
+        value(&mut session, "let mut grid = [[0], [0]]");
+        // Out of range, at the first index or a later one, or failing
+        // later in the input, after the update was stored.
+        for (text, message) in [
+            ("xs[2] := 5", "index out of range"),
+            ("xs[-1] := 5", "index out of range"),
+            ("grid[0][1] := 5", "index out of range"),
+            (
+                "{ xs[0] := 5; grid[1][0] := 5 }\nlet z = 1 // 0",
+                "division by zero",
+            ),
+            ("for i in [0, 1, 2] { xs[i] := 9 }", "index out of range"),
+        ] {
+            assert_eq!(messages(&mut session, text), vec![message], "{text}");
+            assert_eq!(value(&mut session, "xs").to_string(), "[1, 2]", "{text}");
+            assert_eq!(
+                value(&mut session, "grid").to_string(),
+                "[[0], [0]]",
+                "{text}"
+            );
+        }
+        // One that succeeds keeps what it stored.
+        value(&mut session, "xs[1] := 20");
+        assert_eq!(value(&mut session, "xs").to_string(), "[1, 20]");
     }
 
     #[test]

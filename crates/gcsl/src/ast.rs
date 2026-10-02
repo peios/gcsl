@@ -65,12 +65,25 @@
 //!
 //! # Paths
 //!
-//! A `let`, a field item and a `:=` each declare a [path](PathRange): one or
-//! more names separated by `.`, each an identifier or a plain string
-//! literal, as in `x`, `server.port` or `"log level".format`. A path of one
-//! segment is the plain case, declaring that name; a longer one is a dotted
-//! definition or update, whose meaning the checker gives (see
-//! [`crate::check`]).
+//! A `let`, a field item and a `:=` each declare a [path](PathRange): a
+//! name, an identifier or a plain string literal, followed by any number of
+//! segments, each `.` and a name, as in `x`, `server.port` or `"log
+//! level".format`, or, in the path of a `:=` only, `[EXPR]`, the position of
+//! an element of a list, as in `xs[i]`, `conf.hosts[0].up` or
+//! `grid[y][x]`:
+//!
+//! ```text
+//! PATH    = NAME SEGMENT*
+//! SEGMENT = "." NAME | "[" EXPR "]"
+//! ```
+//!
+//! Each segment is a [`PathSegment`], of a [`SegmentKind`]. An index
+//! segment's position is an expression of the tree like any other, and the
+//! source text it is written as is kept in the [`Strings`] table, so that a
+//! path can be shown as it is written ([`Ast::show_path`]) without the
+//! source. A path of one segment is the plain case, declaring that name; a
+//! longer one is a dotted definition or update, whose meaning the checker
+//! gives (see [`crate::check`]).
 //!
 //! # Mutable variables
 //!
@@ -452,14 +465,54 @@ pub struct ParamTy {
     pub ty: TypeExprId,
 }
 
-/// One segment of a path: a name, written as an identifier or a plain
-/// string literal.
+/// One segment of a path (see [Paths](crate::ast#paths)): a name, or, in
+/// the path of a `:=` and never as its first segment, the position of an
+/// element of a list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PathSegment {
-    /// The name, interned whether it was written plain or quoted.
-    pub name: Name,
-    /// Where the name is written, quotes included for a quoted name.
+    /// What the segment selects.
+    pub kind: SegmentKind,
+    /// Where the segment is written: a name, quotes included for a quoted
+    /// one, or an index's brackets and what is between them.
     pub span: Span,
+}
+
+/// What a [`PathSegment`] selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SegmentKind {
+    /// A name, written as an identifier or a plain string literal: the
+    /// variable or field the path starts with, or a field of the record
+    /// before it.
+    Name(Name),
+    /// `[EXPR]`: the element of the list before it at a position.
+    Index {
+        /// The position, an expression of the tree.
+        position: ExprId,
+        /// The source text of the position, as it is written between the
+        /// brackets, for showing the path: from its first token to its
+        /// last, on one line (see [`crate::parser`]).
+        text: StrId,
+    },
+}
+
+impl PathSegment {
+    /// The segment's name, or `None` for an index segment.
+    #[must_use]
+    pub const fn name(&self) -> Option<Name> {
+        match self.kind {
+            SegmentKind::Name(name) => Some(name),
+            SegmentKind::Index { .. } => None,
+        }
+    }
+
+    /// The position of an index segment, or `None` for a name.
+    #[must_use]
+    pub const fn position(&self) -> Option<ExprId> {
+        match self.kind {
+            SegmentKind::Index { position, .. } => Some(position),
+            SegmentKind::Name(_) => None,
+        }
+    }
 }
 
 /// The span of the path, or the prefix of one, made of `segments`: from its
@@ -473,23 +526,33 @@ pub fn path_span(segments: &[PathSegment]) -> Span {
     }
 }
 
-/// A path, or the prefix of one, shown as it is written: its segments
-/// separated by `.`, each a plain identifier or a quoted string literal as
-/// [`FieldName`] shows it, as in `server.port` or `"log level".format`.
-/// Returned by [`Ast::show_path`].
+/// A path, or the prefix of one, shown as it is written: its first name,
+/// then `.` and a name for each name segment, each a plain identifier or a
+/// quoted string literal as [`FieldName`] shows it, and each index segment
+/// in brackets, with the source text of its position, as in `server.port`,
+/// `"log level".format` or `conf.hosts[i + 1].up`. Returned by
+/// [`Ast::show_path`].
 #[derive(Clone, Copy, Debug)]
 pub struct PathDisplay<'a> {
     names: &'a Names,
+    strings: &'a Strings,
     segments: &'a [PathSegment],
 }
 
 impl fmt::Display for PathDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, segment) in self.segments.iter().enumerate() {
-            if index > 0 {
-                f.write_str(".")?;
+            match segment.kind {
+                SegmentKind::Name(name) => {
+                    if index > 0 {
+                        f.write_str(".")?;
+                    }
+                    FieldName(self.names.get(name)).fmt(f)?;
+                }
+                SegmentKind::Index { text, .. } => {
+                    write!(f, "[{}]", self.strings.get(text))?;
+                }
             }
-            FieldName(self.names.get(segment.name)).fmt(f)?;
         }
         Ok(())
     }
@@ -942,7 +1005,8 @@ pub enum ItemKind {
     /// `PATH := EXPR`: rebinds a variable declared in the same block, or a
     /// mutable variable of the same function, named by the path's first
     /// segment, which is always an identifier; a dotted path rebinds it to
-    /// an update of its value.
+    /// an update of its value. Its path is the only one that may have index
+    /// segments, `xs[i] := v`, each of which replaces an element of a list.
     Rebind {
         /// The variable's name, then any further segments.
         path: PathRange,
@@ -1072,19 +1136,6 @@ impl AstBuilder {
         let id = ExprId(next_id(self.exprs.len()));
         self.exprs.push(expr);
         id
-    }
-
-    /// The number of expression nodes allocated so far: the id the next one
-    /// gets.
-    pub(crate) fn expr_count(&self) -> usize {
-        self.exprs.len()
-    }
-
-    /// Forgets every expression node allocated after the first `len`, which
-    /// nothing may refer to any more. The parser uses it to drop the nodes
-    /// of an expression it has read a path from.
-    pub(crate) fn truncate_exprs(&mut self, len: usize) {
-        self.exprs.truncate(len);
     }
 
     /// Adds `item` to the item arena and returns its id.
@@ -1456,6 +1507,7 @@ impl Ast {
     pub fn show_path<'a>(&'a self, segments: &'a [PathSegment]) -> PathDisplay<'a> {
         PathDisplay {
             names: &self.names,
+            strings: &self.strings,
             segments,
         }
     }
@@ -1516,12 +1568,14 @@ impl Ast {
     /// The ids of the nodes of expression `id`'s subtree, its descendants
     /// and itself, in allocation order. They are contiguous, ending at `id`:
     /// nodes are allocated children-first, and while the parser parses an
-    /// expression it allocates only that expression's nodes (the nodes of a
-    /// path it reads back are dropped before anything else is allocated).
+    /// expression it allocates only that expression's nodes (a path is read
+    /// from its tokens, allocating only the positions of its index
+    /// segments, which belong to its item).
     /// The first is found by following, from `id`, the child the parser
-    /// parses first down to a leaf: a block's first item's value, an `if`'s
-    /// condition, a call's callee, a binary operator's left operand, a
-    /// function's or `lazy`'s body, an interpolated string's first
+    /// parses first down to a leaf: a block's first item's value, or the
+    /// position of the first index segment of its path if it has one, an
+    /// `if`'s condition, a call's callee, a binary operator's left operand,
+    /// a function's or `lazy`'s body, an interpolated string's first
     /// expression, a list literal's first element's, an index's list, a
     /// `for`'s iterable.
     /// Debug builds check that every node of the range lies
@@ -1562,9 +1616,15 @@ impl Ast {
                 }
                 ExprKind::Block(items) => match self.items(items).first() {
                     Some(&item) => match self.item(item).kind {
+                        // The positions of a path are parsed before the
+                        // value.
+                        ItemKind::Rebind { path, value } => self
+                            .path(path)
+                            .iter()
+                            .find_map(PathSegment::position)
+                            .unwrap_or(value),
                         ItemKind::Let { value, .. }
                         | ItemKind::Field { value, .. }
-                        | ItemKind::Rebind { value, .. }
                         | ItemKind::Spread(value)
                         | ItemKind::Result(value)
                         | ItemKind::Expr(value) => value,
@@ -1643,7 +1703,9 @@ impl Annotate for NoAnnotation {
 /// `(let mut x : Type ...)`, `(field x ...)`,
 /// `(rebind x ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`,
 /// followed by their span and their expression, a dotted path in full, as
-/// in `(let a.b.c ...)`; blocks as
+/// in `(let a.b.c ...)`, and an index segment as it is written, as in
+/// `(rebind xs[i + 1].up ...)`, its position then shown before the value as
+/// `(at EXPR)`, one for each index segment, in order; blocks as
 /// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
 /// field accesses as `(. x ...)` followed by their record expression. A
 /// field name, or a path segment, that is not a plain identifier is quoted,
@@ -1733,6 +1795,15 @@ impl<A: Annotate> Pretty<'_, A> {
             }
         };
         writeln!(f, " @{}", item.span)?;
+        // The positions of a `:=` path's index segments, in order, before
+        // its value, as they are parsed.
+        if let ItemKind::Rebind { path, .. } = item.kind {
+            for position in ast.path(path).iter().filter_map(PathSegment::position) {
+                writeln!(f, "{:indent$}(at", "", indent = (depth + 1) * 2)?;
+                self.node(f, position, depth + 2)?;
+                f.write_str(")\n")?;
+            }
+        }
         self.node(f, value, depth + 1)?;
         f.write_str(")")
     }
@@ -2146,7 +2217,7 @@ mod tests {
             span: Span::new(23, 30),
         });
         let y_path = builder.push_path(&[PathSegment {
-            name: y,
+            kind: SegmentKind::Name(y),
             span: Span::new(18, 19),
         }]);
         let rebind = builder.alloc_item(Item {
@@ -2171,7 +2242,7 @@ mod tests {
             span: Span::new(7, 12),
         });
         let x_path = builder.push_path(&[PathSegment {
-            name: x,
+            kind: SegmentKind::Name(x),
             span: Span::new(4, 5),
         }]);
         let with_type = builder.alloc_item(Item {
@@ -2189,7 +2260,7 @@ mod tests {
             span: Span::new(46, 48),
         });
         let y_path = builder.push_path(&[PathSegment {
-            name: y,
+            kind: SegmentKind::Name(y),
             span: Span::new(42, 43),
         }]);
         let without_type = builder.alloc_item(Item {
@@ -2294,7 +2365,7 @@ mod tests {
         );
         let mut builder = AstBuilder::new();
         let segment = |name, start, end| PathSegment {
-            name,
+            kind: SegmentKind::Name(name),
             span: Span::new(start, end),
         };
         let segments = [

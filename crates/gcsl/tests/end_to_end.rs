@@ -573,6 +573,58 @@ fn every_stage_handles_maximum_depth() {
     });
 }
 
+/// Index paths are as tall as the parser allows, through every stage, the
+/// printers included: with a position as tall as an item may be, with
+/// positions nested in each other's, which every stage recurses through,
+/// and with as many index segments as a path may have, walked down and
+/// built back up without recursing.
+#[test]
+fn every_stage_handles_maximum_update_depth() {
+    on_recommended_stack(|| {
+        let depth = gcsl::MAX_DEPTH;
+        // A chain of N terms is N levels, and the item two more.
+        let terms = depth - 2;
+        let tall = source(&format!(
+            "let mut xs = [0]\nxs[0{}] := 1\nxs[0]",
+            " + 0".repeat(terms - 1)
+        ));
+        // N indexes around a literal are N + 1 levels, and the item two more.
+        let indexes = depth - 3;
+        let nested = source(&format!(
+            "let mut xs = [0]\nxs[{}0{}] := 1\nxs[0]",
+            "xs[".repeat(indexes),
+            "]".repeat(indexes)
+        ));
+        // Two levels for each segment after the first.
+        let steps = (depth - 1) / 2;
+        let long = source(&format!(
+            "let mut l = {}0{}\nl{} := 1\nl{}",
+            "[".repeat(steps),
+            "]".repeat(steps),
+            "[0]".repeat(steps),
+            "[0]".repeat(steps)
+        ));
+        // Printing a tree this deep takes seconds (see
+        // `every_stage_handles_maximum_depth`); the printers recurse through
+        // a position as through any expression, which the nested positions
+        // cover.
+        for (file, print) in [(&tall, false), (&nested, true), (&long, false)] {
+            let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, file).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+            assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Int(1));
+            if print {
+                let annotation = checked.types.annotation(&types, ast.names());
+                assert!(!ast.pretty().to_string().is_empty());
+                assert!(!ast.pretty_with(&annotation).to_string().is_empty());
+                assert!(!ir.pretty(ast.names()).to_string().is_empty());
+            }
+        }
+    });
+}
+
 /// `for`s nest as deeply as the parser allows, through every stage, the
 /// printers included: in each other's bodies, two levels each, as blocks
 /// are, where evaluation recurses through each one's loop into its body;

@@ -28,13 +28,25 @@
 //! order, live in [`Ir::layout`]'s table, shared by reference count with
 //! every record built from them.
 //!
-//! A functional update, `let a.b = e`, a dotted `:=` or a dotted field,
-//! lowers to a chain of [`IrKind::UpdateField`] nodes, one for each segment
-//! of its path after the first, from the leaf outwards: each builds a new
-//! record from an old one with one field set. When an update adds a field,
-//! the evaluator makes a layout for the new record at runtime, and takes the
-//! added name's text from [`Ir::name_text`], so that it never needs the
-//! names table.
+//! A functional update, `let a.b = e` or a dotted `:=`, lowers to one
+//! [`IrKind::Update`] node for the whole update: its children are its
+//! value, the record or list it updates (the variable's, read and awaited
+//! where the checker marked it, or the empty record a `let` builds from) and
+//! the positions of its path's index segments, in that order, which is the
+//! order they are evaluated in; the steps of its path, one for each segment
+//! after the first, are in a side table, [`Ir::update_path`], each an
+//! [`UpdateStep`]: a field by name or an element at the next position, and
+//! whether what it selects is read, read and awaited, created as the empty
+//! record, or, for the last, set. Evaluating it walks the path down once and
+//! builds the new value back up (see [`crate::eval`]), so every node of it
+//! is evaluated exactly once. A dotted field, which only extends a record
+//! its block is building and never awaits or indexes, lowers instead to a
+//! chain of [`IrKind::UpdateField`] nodes, one for each segment of its path
+//! after the first, from the leaf outwards: each builds a new record from
+//! an old one with one field set. When an update of either kind adds a
+//! field, the evaluator makes a layout for the new record at runtime, and
+//! takes the added name's text from [`Ir::name_text`], so that it never
+//! needs the names table.
 //!
 //! Typed equality, `==` and `!=` on records, compares only the fields of the
 //! operands' static type, so its node carries that type's [`Shape`]: the
@@ -88,12 +100,13 @@
 //! Calls nest on the Rust stack, so the evaluator keeps them within a
 //! budget of nesting levels, [`crate::MAX_DEPTH`], which they share with
 //! expressions (see [`crate::CALL_LEVELS`]). For it, every
-//! [`IrKind::Call`] and [`IrKind::Await`] records its depth in the body of
-//! the frame it is evaluated in, the body node being at depth 0, and every
-//! function the height of its body, [`FnCode::height`]: both counted in
-//! nodes, through the children that `IrKind::children` lists. Lowering
-//! computes them once, after building the nodes; the evaluator only adds
-//! and compares.
+//! [`IrKind::Call`], [`IrKind::Await`] and [`IrKind::Update`], whose steps
+//! may await, records its depth in the body of the frame it is evaluated
+//! in, the body node being at depth 0, and every function the height of
+//! its body, [`FnCode::height`]: both counted in nodes, through the
+//! children that `IrKind::children` lists, an update counting two levels
+//! more for each step of its path. Lowering computes them once, after
+//! building the nodes; the evaluator only adds and compares.
 //!
 //! # Futures
 //!
@@ -221,6 +234,68 @@ pub struct ListShape {
     /// through which each element is compared; `None` if each is compared
     /// as a value.
     pub element: Option<ShapeId>,
+}
+
+/// Index of the path of an [`IrKind::Update`] in its [`Ir`]'s table.
+/// Resolve it with [`Ir::update_path`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UpdatePathId(u32);
+
+impl UpdatePathId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The steps of one update's path: a contiguous range of the step pool of
+/// the [`Ir`] that holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StepRange {
+    start: u32,
+    len: u32,
+}
+
+/// One step of the path of an [`IrKind::Update`], one for each segment of
+/// the source path after the first: what it selects in the record or list
+/// the step before it reached, the variable's value for the first, and
+/// what it does with it. Every step but the last goes down a level; the
+/// last sets the leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UpdateStep {
+    /// What the step selects.
+    pub at: StepAt,
+    /// What it does with it.
+    pub mode: StepMode,
+    /// The path up to and including the step's segment, as written: where
+    /// an error at the step is reported.
+    pub span: Span,
+}
+
+/// What an [`UpdateStep`] selects in the record or list before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StepAt {
+    /// The field of this name, of a record.
+    Field(Name),
+    /// An element of a list, at the position that the next of the update's
+    /// positions evaluates to (see [`IrKind::Update`]).
+    Element,
+}
+
+/// What an [`UpdateStep`] does with what it selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StepMode {
+    /// Reads it, a present record or list, for the next step to update.
+    Read,
+    /// Reads it, a record or list that may be a future, and awaits it fully,
+    /// as an [`IrKind::Await`] does, for the next step to update.
+    Await,
+    /// Ignores it, being a field the static type of the record does not
+    /// have, and starts the next step from the empty record, as a dotted
+    /// `let` creates a record where its path goes beyond the static type.
+    Create,
+    /// Replaces it, or adds the field, with the update's value: the last
+    /// step, and only the last.
+    Set,
 }
 
 /// Index of a lazy shape in its [`Ir`]'s table, or [`LazyShapeId::NONE`].
@@ -357,8 +432,9 @@ pub struct ShapedOperands {
 /// to Bool-typed nodes, and of `Record*`, `Field` and `UpdateField` nodes
 /// to record nodes (an `UpdateField`'s value excepted, which may be of any
 /// kind), of `List*` and `Spread` nodes, an `Index`'s list and a `For`'s
-/// iterable to list nodes, an `Index`'s position and a `Range`'s bounds
-/// are Int nodes, and a `Call`'s
+/// iterable to list nodes, an `Index`'s position, an `Update`'s positions
+/// and a `Range`'s bounds are Int nodes, an `Update`'s record or list is
+/// of the update's kind, and a `Call`'s
 /// callee is a function node; see [`Ir::kind_of`]. No typed operand is ever
 /// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
 /// [`IrKind::Await`] of it.
@@ -506,6 +582,28 @@ pub enum IrKind {
         /// Its new value, of any kind.
         value: IrId,
     },
+    /// A dotted `let` or `:=`: evaluates its value, the first of `parts`, a
+    /// node of any kind; then the record or list it updates, the second, a
+    /// node of kind `kind`; then walks `path` down from it, one step at a
+    /// time, evaluating the position of each step that selects an element,
+    /// the rest of `parts`, in order, `Int` nodes, where it reaches it; and
+    /// finally builds the new record or list, of kind `kind`, from the leaf
+    /// outwards: each record or list along the path with what the step
+    /// after it selects replaced or, for a field, added. Nothing evaluated
+    /// is ever changed. A position outside its list is a runtime error.
+    Update {
+        /// The value, the record or list updated, and each position.
+        parts: IrRange,
+        /// The steps of the path after its first segment.
+        path: UpdatePathId,
+        /// The kind of the record or list updated, and so of the node:
+        /// [`ValueKind::Record`] or [`ValueKind::List`].
+        kind: ValueKind,
+        /// The update's depth in the body of the frame it is evaluated in,
+        /// for the nesting budget of the awaits of its steps, as an
+        /// [`IrKind::Await`]'s. Lowering sets it once every node is built.
+        depth: u16,
+    },
     /// Builds a list of the values of `items`, in order: each item is a
     /// node of any kind, whose value is the next element, or an
     /// [`IrKind::Spread`], whose list's elements are the next ones.
@@ -639,8 +737,9 @@ impl IrKind {
     /// in `pool`, the item pool, of any list it has: an operator's operands,
     /// an `if`'s condition and branches, a block's items and then its
     /// result, a call's callee and then its arguments, an argument's value,
-    /// a store's value, a field access's record, an update's record and
-    /// value, an interpolation's pieces, a record's values, a list's items,
+    /// a store's value, a field access's record, a field update's record
+    /// and value, a dotted update's value, record or list and positions, an
+    /// interpolation's pieces, a record's values, a list's items,
     /// a spread's list, an index's list and position, a length's list, a
     /// range's bounds, a `for`'s iterable, guard and body, a closure's and
     /// a future's captures, and an await's value. A closure's
@@ -719,6 +818,7 @@ impl IrKind {
             | IrKind::MakeRecord { values: items, .. }
             | IrKind::MakeList { items, .. }
             | IrKind::For { parts: items, .. }
+            | IrKind::Update { parts: items, .. }
             | IrKind::MakeClosure {
                 captures: items, ..
             }
@@ -774,6 +874,7 @@ impl IrKind {
             | IrKind::MakeRecord { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
+            | IrKind::Update { .. }
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
@@ -837,6 +938,7 @@ impl IrKind {
             IrKind::MakeRecord { .. } => "make-record",
             IrKind::Field { .. } => "field",
             IrKind::UpdateField { .. } => "update-field",
+            IrKind::Update { .. } => "update",
             IrKind::MakeClosure { .. } => "make-closure",
             IrKind::Call { .. } => "call",
             IrKind::Arg { .. } => "arg",
@@ -916,6 +1018,7 @@ impl IrNode {
             | IrKind::MakeRecord { .. }
             | IrKind::Field { .. }
             | IrKind::UpdateField { .. }
+            | IrKind::Update { .. }
             | IrKind::MakeClosure { .. }
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
@@ -981,9 +1084,15 @@ pub struct Ir {
     /// For each lazy shape of `lazy_shapes`, if it is a list's, what is done
     /// with each element; its entry in `lazy_shapes` then has no fields.
     lazy_lists: Vec<Option<LazyField>>,
-    /// The text of the name of every [`IrKind::UpdateField`], which may
-    /// add it to a record's layout at runtime.
+    /// The text of the name of every [`IrKind::UpdateField`], and of every
+    /// field an [`IrKind::Update`]'s path steps to, which may add it to a
+    /// record's layout at runtime.
     name_texts: HashMap<Name, Box<str>>,
+    /// The steps of every update's path, each path's together.
+    update_steps: Vec<UpdateStep>,
+    /// Where each update's path is in `update_steps`, indexed by
+    /// [`UpdatePathId`].
+    update_paths: Vec<StepRange>,
     /// Every function of the program, indexed by [`FnId`].
     functions: Vec<FnCode>,
     root: IrId,
@@ -1143,11 +1252,21 @@ impl Ir {
         self.lazy_shapes.len()
     }
 
-    /// The text of `name`, if it is the name of an [`IrKind::UpdateField`]:
-    /// what the evaluator shows a field it adds to a record as.
+    /// The text of `name`, if it is the name of an [`IrKind::UpdateField`]
+    /// or of a field an [`IrKind::Update`]'s path steps to: what the
+    /// evaluator shows a field it adds to a record as.
     #[must_use]
     pub fn name_text(&self, name: Name) -> Option<&str> {
         self.name_texts.get(&name).map(AsRef::as_ref)
+    }
+
+    /// The steps of the update path `id`, in order, the last setting the
+    /// leaf; `None` for an id this IR does not have.
+    #[must_use]
+    pub fn update_path(&self, id: UpdatePathId) -> Option<&[UpdateStep]> {
+        let range = self.update_paths.get(id.index())?;
+        let start = range.start as usize;
+        self.update_steps.get(start..start + range.len as usize)
     }
 
     /// The root node, the file's body, whose value is the program's result.
@@ -1262,6 +1381,7 @@ impl Ir {
                 | IrKind::For { collect: false, .. } => ValueKind::Record,
                 IrKind::Load(_, kind)
                 | IrKind::Field { kind, .. }
+                | IrKind::Update { kind, .. }
                 | IrKind::Index { kind, .. }
                 | IrKind::Call { kind, .. }
                 | IrKind::LoadCapture(_, kind)
@@ -1281,9 +1401,13 @@ impl Ir {
     /// their text quoted and escaped, as in `(str "a\n" @0..5)`, and
     /// comparisons their operator, as in `(int-cmp < @0..5 ...)`. A record
     /// shows its layout's names in brackets and then its values, as in
-    /// `(make-record [x y] @0..9 ...)`, and a field access or an update its
-    /// name, as in `(field x @0..3 ...)` and `(update-field x @0..3 ...)`,
-    /// then its record and, for an update, the value. A name that is not a
+    /// `(make-record [x y] @0..9 ...)`, and a field access or a field update
+    /// its name, as in `(field x @0..3 ...)` and `(update-field x @0..3
+    /// ...)`, then its record and, for an update, the value. A dotted `let`
+    /// or `:=` shows the steps of its path, as in `(update .hosts[].up
+    /// @0..16 ...)`, a step whose record or list is awaited followed by `!`
+    /// and one whose record is created by `+`, and then its value, the
+    /// record or list it updates and its positions. A name that is not a
     /// plain identifier is quoted. A typed record comparison shows its
     /// operator and its shape's field names in the shape's order, each
     /// record field's own shape after its name, as in
@@ -1342,6 +1466,8 @@ pub(crate) struct IrBuilder {
     lazy_shapes: Vec<LazyShape>,
     lazy_lists: Vec<Option<LazyField>>,
     name_texts: HashMap<Name, Box<str>>,
+    update_steps: Vec<UpdateStep>,
+    update_paths: Vec<StepRange>,
 }
 
 impl IrBuilder {
@@ -1356,6 +1482,8 @@ impl IrBuilder {
             lazy_shapes: Vec::new(),
             lazy_lists: Vec::new(),
             name_texts: HashMap::new(),
+            update_steps: Vec::new(),
+            update_paths: Vec::new(),
         }
     }
 
@@ -1364,7 +1492,9 @@ impl IrBuilder {
     /// one conversion per `/` operand, one
     /// `Empty` or `MakeRecord` per block, one `Load` per field, one
     /// constant per literal piece of an interpolation, for each segment of
-    /// a dotted path after the first an update and a record to update, one
+    /// a dotted field's path after the first an update and a record to
+    /// update, for each dotted `let` or `:=` an update and the record or
+    /// list it reads and awaits, one
     /// `Arg` per argument of a call, one `Await` per expression awaited
     /// where it is used, and one load per value a closure or a future
     /// captures (a variable used inside functions nested `n` deep in the
@@ -1452,11 +1582,25 @@ impl IrBuilder {
     }
 
     /// Records `text` as the text of `name`, the name of an
-    /// [`IrKind::UpdateField`], unless it is recorded already.
+    /// [`IrKind::UpdateField`] or of a field an [`IrKind::Update`]'s path
+    /// steps to, unless it is recorded already.
     pub(crate) fn add_name_text(&mut self, name: Name, text: &str) {
         self.name_texts
             .entry(name)
             .or_insert_with(|| Box::from(text));
+    }
+
+    /// Adds the steps of an update's path, `steps`, and returns its id.
+    /// There is at most one per dotted `let` or `:=`, and one step per
+    /// segment of its path, so ids never saturate either.
+    pub(crate) fn push_update_path(&mut self, steps: &[UpdateStep]) -> UpdatePathId {
+        let id = UpdatePathId(u32::try_from(self.update_paths.len()).unwrap_or(u32::MAX));
+        self.update_paths.push(StepRange {
+            start: u32::try_from(self.update_steps.len()).unwrap_or(u32::MAX),
+            len: u32::try_from(steps.len()).unwrap_or(u32::MAX),
+        });
+        self.update_steps.extend_from_slice(steps);
+        id
     }
 
     /// Appends `items` to the item pool as one list and returns its range.
@@ -1478,18 +1622,24 @@ impl IrBuilder {
         self.finish_program(root, (frame_size, slot_names), Vec::new(), 0)
     }
 
-    /// Gives every [`IrKind::Call`] and [`IrKind::Await`] of the program
-    /// whose root is `root` and whose functions are `functions` its depth
-    /// in its frame, and every function its body's height,
-    /// [`FnCode::height`]: one walk of the root and one of each function's
-    /// body, through [`IrKind::children`]. The heights of all the nodes are
-    /// kept in one vector, and the walks share one stack.
+    /// Gives every [`IrKind::Call`], [`IrKind::Await`] and
+    /// [`IrKind::Update`] of the program whose root is `root` and whose
+    /// functions are `functions` its depth in its frame, and every function
+    /// its body's height, [`FnCode::height`]: one walk of the root and one of
+    /// each function's body, through [`IrKind::children`]. The heights of all
+    /// the nodes are kept in one vector, and the walks share one stack.
     ///
-    /// The nodes of each frame form a tree, apart from the record nodes an
-    /// update chain shares between an update and the field access into the
-    /// record it updates (see [`crate::lower`]). The walk visits such a node
-    /// once, from the first parent it reaches it by, and every other parent
-    /// takes its height as computed then.
+    /// An update is two levels taller than its tallest child for each step
+    /// of its path, as the parser counts each segment of a path after the
+    /// first (see [`crate::MAX_DEPTH`]), although the evaluator walks the
+    /// path without recursing: so the nesting budget is charged for a long
+    /// path as it is for deep nesting.
+    ///
+    /// The nodes of each frame form a tree, apart from the record nodes a
+    /// dotted field's update chain shares between an update and the field
+    /// access into the record it updates (see [`crate::lower`]). The walk
+    /// visits such a node once, from the first parent it reaches it by, and
+    /// every other parent takes its height as computed then.
     pub(crate) fn measure(&mut self, root: IrId, functions: &mut [FnCode]) {
         // A node's height, or 0 while it is unvisited: a height is at
         // least 1.
@@ -1510,7 +1660,10 @@ impl IrBuilder {
     /// been walked when it is popped again.
     fn walk(&mut self, body: IrId, heights: &mut [u32], stack: &mut Vec<(IrId, u32, bool)>) -> u32 {
         let Self {
-            nodes, item_lists, ..
+            nodes,
+            item_lists,
+            update_paths,
+            ..
         } = self;
         stack.push((body, 0, false));
         while let Some((id, depth, entered)) = stack.pop() {
@@ -1525,14 +1678,24 @@ impl IrBuilder {
                     .filter_map(|child| heights.get(child.index()).copied())
                     .max()
                     .unwrap_or(0);
+                // Two levels for each step of an update's path.
+                let path = match node.kind {
+                    IrKind::Update { path, .. } => update_paths
+                        .get(path.index())
+                        .map_or(0, |steps| steps.len.saturating_mul(2)),
+                    _ => 0,
+                };
                 if let Some(entry) = heights.get_mut(id.index()) {
-                    *entry = tallest.saturating_add(1);
+                    *entry = tallest.saturating_add(1).saturating_add(path);
                 }
             } else if height == 0 {
                 if let IrKind::Call {
                     depth: node_depth, ..
                 }
                 | IrKind::Await {
+                    depth: node_depth, ..
+                }
+                | IrKind::Update {
                     depth: node_depth, ..
                 } = &mut node.kind
                 {
@@ -1569,6 +1732,8 @@ impl IrBuilder {
             lazy_shapes: self.lazy_shapes,
             lazy_lists: self.lazy_lists,
             name_texts: self.name_texts,
+            update_steps: self.update_steps,
+            update_paths: self.update_paths,
             functions,
             root,
             frame_size,
@@ -1704,6 +1869,25 @@ impl Pretty<'_> {
         Ok(())
     }
 
+    /// Writes the steps of the update path `id` as the path after its first
+    /// segment: `.` and the name for a field and `[]` for an element, each
+    /// followed by `!` if what it selects is awaited and by `+` if it is
+    /// created, as in `.hosts[].up`, `.a!.b` and `.c+.d`.
+    fn update_path(&self, f: &mut fmt::Formatter<'_>, id: UpdatePathId) -> fmt::Result {
+        for step in self.ir.update_path(id).unwrap_or_default() {
+            match step.at {
+                StepAt::Field(name) => write!(f, ".{}", FieldName(self.names.get(name)))?,
+                StepAt::Element => f.write_str("[]")?,
+            }
+            match step.mode {
+                StepMode::Await => f.write_str("!")?,
+                StepMode::Create => f.write_str("+")?,
+                StepMode::Read | StepMode::Set => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Writes a slot as `name#slot`, the name quoted if it is a field's
     /// that is not a plain identifier, or `?#slot` if the IR has no name
     /// for it.
@@ -1749,6 +1933,10 @@ impl Pretty<'_> {
             }
             IrKind::Field { name, .. } | IrKind::UpdateField { name, .. } => {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
+            }
+            IrKind::Update { path, .. } => {
+                f.write_str(" ")?;
+                self.update_path(f, path)?;
             }
             IrKind::MakeClosure { function, .. } | IrKind::MakeFuture { function, .. } => {
                 write!(f, " {function}")?;
@@ -2583,5 +2771,124 @@ mod tests {
              \x20   (empty @4..7)\n\
              \x20   (int 1 @16..17)))"
         );
+    }
+
+    #[test]
+    fn a_dotted_update_shows_its_path_and_its_parts() {
+        // `r.a[i]."c d".e := 1` by hand, its record and the element awaited
+        // and `"c d"` created, which no checked program does together.
+        let mut names = Names::new();
+        let (a, spaced, e) = (names.intern("a"), names.intern("c d"), names.intern("e"));
+        let mut builder = IrBuilder::with_capacity(6);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(23, 24));
+        let load = builder.alloc(
+            IrKind::Load(Slot::new(0), ValueKind::Deferred),
+            Span::new(0, 1),
+        );
+        let root = builder.alloc(
+            IrKind::Await {
+                value: load,
+                kind: ValueKind::Record,
+                shape: LazyShapeId::NONE,
+                depth: 0,
+            },
+            Span::new(0, 1),
+        );
+        let i = builder.alloc(IrKind::Load(Slot::new(1), ValueKind::Int), Span::new(4, 5));
+        let parts = builder.push_item_list(&[one, root, i]);
+        let step = |at, mode, end| UpdateStep {
+            at,
+            mode,
+            span: Span::new(0, end),
+        };
+        let path = builder.push_update_path(&[
+            step(StepAt::Field(a), StepMode::Read, 3),
+            step(StepAt::Element, StepMode::Await, 6),
+            step(StepAt::Field(spaced), StepMode::Create, 12),
+            step(StepAt::Field(e), StepMode::Set, 14),
+        ]);
+        let update = builder.alloc(
+            IrKind::Update {
+                parts,
+                path,
+                kind: ValueKind::Record,
+                depth: 0,
+            },
+            Span::new(0, 14),
+        );
+        let store = builder.alloc(IrKind::Store(Slot::new(0), update), Span::new(0, 24));
+        let items = builder.push_item_list(&[store]);
+        let empty = builder.alloc(IrKind::Empty, Span::new(0, 24));
+        let block = builder.alloc(
+            IrKind::Block {
+                items,
+                result: empty,
+            },
+            Span::new(0, 24),
+        );
+        let ir = builder.finish(block, 2, vec![names.intern("r"), names.intern("i")]);
+        assert_eq!(ir.kind_of(update), ValueKind::Record);
+        assert_eq!(ir.get(update).kind.symbol(), None);
+        assert_eq!(ir.get(update).operator_span(), None);
+        assert_eq!(ir.children(update).collect::<Vec<_>>(), vec![one, root, i]);
+        let steps = ir.update_path(path).unwrap();
+        assert_eq!(steps.len(), 4);
+        assert_eq!(steps[1].mode, StepMode::Await);
+        assert_eq!(ir.update_path(UpdatePathId(1)), None);
+        // Its depth is set as an await's: the block (0), the store (1), the
+        // update (2); and the await of its record is below it (3).
+        let IrKind::Update { depth, .. } = ir.get(update).kind else {
+            panic!("expected an update");
+        };
+        assert_eq!(depth, 2);
+        assert_eq!(ir.awaits_in(block), vec![(3, Span::new(0, 1))]);
+        assert_eq!(
+            ir.pretty(&names).to_string(),
+            "(block @0..24\n\
+             \x20 (store r#0 @0..24\n\
+             \x20   (update .a[]!.\"c d\"+.e @0..14\n\
+             \x20     (int 1 @23..24)\n\
+             \x20     (await @0..1\n\
+             \x20       (load r#0 @0..1))\n\
+             \x20     (load i#1 @4..5)))\n\
+             \x20 (empty @0..24))"
+        );
+    }
+
+    #[test]
+    fn a_dotted_update_is_two_levels_taller_for_each_step() {
+        // A function whose body is the update: its height is one above its
+        // tallest part, and two for each step.
+        let mut builder = IrBuilder::with_capacity(2);
+        let one = builder.alloc(IrKind::IntConst(1), Span::new(0, 1));
+        let parts = builder.push_item_list(&[one, one]);
+        let path = builder.push_update_path(&[UpdateStep {
+            at: StepAt::Element,
+            mode: StepMode::Set,
+            span: Span::new(0, 3),
+        }]);
+        let update = builder.alloc(
+            IrKind::Update {
+                parts,
+                path,
+                kind: ValueKind::List,
+                depth: 0,
+            },
+            Span::new(0, 3),
+        );
+        let code = FnCode {
+            body: update,
+            kind: FnKind::Function,
+            frame_size: 0,
+            param_count: 0,
+            capture_count: 0,
+            height: 0,
+            name: None,
+            display: Box::from("fn(): {}"),
+            slot_names: Box::default(),
+        };
+        let mut functions = vec![code];
+        builder.measure(update, &mut functions);
+        assert_eq!(functions[0].height, 4);
     }
 }
