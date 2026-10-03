@@ -149,6 +149,28 @@
 //! its iterable, guard, condition or header, and starts each function's
 //! body with an empty one, as the checker's frames are kept.
 //!
+//! A `return` lowers to a `Return` of its value, as it is used (awaited
+//! where the checker marked it to fit its target), naming what it leaves
+//! by a [`CatchId`]: [`CatchId::FUNCTION`] for the function or `lazy`
+//! around it, and otherwise the catch of the labelled block or loop the
+//! checker found it is for ([`Resolution::target`]). A labelled block that
+//! some `return` leaves ([`Resolution::is_returned_block`]) lowers to a
+//! `Catch` of its `Block`, the `Catch` of the block's whole kind, the
+//! join's, and the `Block` of its own result's; and a loop that some
+//! `return` leaves ([`Resolution::loop_of`]) to a `Catch` of its loop
+//! node, so that a block or loop no `return` leaves lowers as it always
+//! did. A `return` cannot name its catch by node, since a catch is built
+//! after what it holds: each catch is numbered as it starts, from 0, once
+//! in the program (`Lowerer::start_catch`), and the lowerer keeps the
+//! catches whose blocks or loops it is lowering, of the function it is
+//! lowering, on a stack, as it keeps the loops, with what each is for, on
+//! which a `return` finds its number; each function's body starts with an
+//! empty one. A loop that cannot end (see [`crate::check`]) is a loop
+//! node that collects nothing, whatever its type, and of any kind where
+//! it stands, `Never` or a `return`'s join; a statement of a union all of
+//! whose members are unit-like, of kind `Mixed`, is lowered as it is, as a
+//! unit-like list statement is.
+//!
 //! A node of type `Never` is of kind [`ValueKind::Never`], which may stand
 //! where a node of any kind is expected (`Lowerer::lower_operand`): a
 //! `break`, a `continue`, a block ending in one, an `if` both of whose
@@ -226,15 +248,17 @@ use std::collections::HashMap;
 
 use crate::ast::{
     ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead, ForId, ItemId,
-    ItemKind, ItemRange, Jump, PartRange, PathRange, PathSegment, SegmentKind, StrPart, UnaryOp,
-    path_span, symbol_span,
+    ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
+    UnaryOp, path_span, symbol_span,
 };
-use crate::check::{AwaitMark, Builtin, Checked, PathResolution, Resolution, Slot, Types, VarRef};
+use crate::check::{
+    AwaitMark, Builtin, Checked, JumpTarget, PathResolution, Resolution, Slot, Types, VarRef,
+};
 use crate::diagnostic::InternalError;
 use crate::ir::{
-    Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField, LazyShape,
-    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode, TestCode,
-    TestId, UpdateStep,
+    CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField,
+    LazyShape, LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode,
+    TestCode, TestId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -297,6 +321,8 @@ pub fn lower(
         lazy_pending: Vec::new(),
         functions: vec![None; ast.fn_count()],
         loops: Vec::new(),
+        catches: Vec::new(),
+        next_catch: 0,
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -362,6 +388,14 @@ struct Lowerer<'a> {
     /// lowered, outermost first: how many loops out a `break` or
     /// `continue` goes is counted on it.
     loops: Vec<ForId>,
+    /// The catches of the labelled blocks and loops that some `return`
+    /// leaves whose items or bodies are being lowered, of the function
+    /// being lowered, outermost first, each with what it catches for: a
+    /// `return`'s number is found on it.
+    catches: Vec<(JumpTarget, CatchId)>,
+    /// The number of the next catch: one more than the last given, so that
+    /// no two catches of the program share one.
+    next_catch: u32,
 }
 
 impl Lowerer<'_> {
@@ -421,7 +455,9 @@ impl Lowerer<'_> {
             .map(|&id| self.ast.item(id).kind)
         {
             Some(ItemKind::Result(value) | ItemKind::Expr(value)) => self.kind(value),
-            Some(ItemKind::Break(_) | ItemKind::Continue(_)) => Ok(ValueKind::Never),
+            Some(ItemKind::Break(_) | ItemKind::Continue(_) | ItemKind::Return(_)) => {
+                Ok(ValueKind::Never)
+            }
             Some(
                 ItemKind::Let { .. }
                 | ItemKind::Rebind { .. }
@@ -476,7 +512,7 @@ impl Lowerer<'_> {
                     self.item_stack.push(store);
                 }
                 ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
-                ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+                ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                     let node = self.lower_jump(id, jump)?;
                     if is_result {
                         result = Some(node);
@@ -502,9 +538,11 @@ impl Lowerer<'_> {
                     let statement = if self.is_await(value) {
                         self.lower_expr(value)?
                     } else if let Some((for_id, span)) = self.discarded_for(value) {
-                        let kind = self.lower_for(for_id, false, span)?;
+                        let kind = self.kind(value)?;
+                        let kind = self.lower_for(for_id, (kind, false), span)?;
                         self.builder.alloc(kind, span)
-                    } else if self.kind(value)? == ValueKind::List {
+                    } else if matches!(self.kind(value)?, ValueKind::List | ValueKind::Mixed) {
+                        // A unit-like list, or a union of unit-like members.
                         self.lower_expr(value)?
                     } else {
                         self.lower_operand(value, ValueKind::Record)?
@@ -561,6 +599,9 @@ impl Lowerer<'_> {
     /// bodies are being lowered.
     fn lower_jump(&mut self, id: ItemId, jump: Jump) -> Result<IrId, InternalError> {
         let item = self.ast.item(id);
+        if let ItemKind::Return(_) = item.kind {
+            return self.lower_return(id, jump);
+        }
         let target = self.resolution.jump_target(id);
         let Some(at) = self
             .loops
@@ -579,6 +620,59 @@ impl Lowerer<'_> {
             _ => IrKind::Continue { loops, value },
         };
         Ok(self.builder.alloc(kind, item.span))
+    }
+
+    /// Lowers the `return` item `id`, whose value, if any, is `jump`'s, to
+    /// a `Return` of its value as it is used (awaited where the checker
+    /// marked it, to fit its target), naming what the checker found it
+    /// leaves (see [`Resolution::target`]): [`CatchId::FUNCTION`] for the
+    /// function or `lazy` around it, or the number of the catch of the
+    /// labelled block or loop it names, which is among those being
+    /// lowered, on [`Lowerer::catches`].
+    fn lower_return(&mut self, id: ItemId, jump: Jump) -> Result<IrId, InternalError> {
+        let item = self.ast.item(id);
+        let to = match self.resolution.target(id) {
+            Some(JumpTarget::Function) => CatchId::FUNCTION,
+            Some(target) => self
+                .catches
+                .iter()
+                .rev()
+                .find(|&&(around, _)| around == target)
+                .map(|&(_, catch)| catch)
+                .ok_or(InternalError {
+                    message: "a `return` is not in the block or loop it leaves",
+                    span: item.span,
+                })?,
+            None => {
+                return Err(InternalError {
+                    message: "a `return` has nothing to leave",
+                    span: item.span,
+                });
+            }
+        };
+        let value = jump.value.map(|value| self.lower_expr(value)).transpose()?;
+        Ok(self.builder.alloc(IrKind::Return { to, value }, item.span))
+    }
+
+    /// Starts a catch for `target`, a labelled block or a loop that some
+    /// `return` leaves: numbers it, the next number of the program, and
+    /// puts it on [`Lowerer::catches`] for its block's items or its loop's
+    /// body, which the caller lowers and then ends it with
+    /// [`Lowerer::end_catch`].
+    fn start_catch(&mut self, target: JumpTarget) -> CatchId {
+        let id = CatchId::new(self.next_catch);
+        self.next_catch = self.next_catch.saturating_add(1);
+        self.catches.push((target, id));
+        id
+    }
+
+    /// Ends the catch `id`, started by [`Lowerer::start_catch`], whose
+    /// block or loop lowered to `body`, spanning `span`: an
+    /// [`IrKind::Catch`] of it, of kind `kind`, the whole's.
+    fn end_catch(&mut self, id: CatchId, (body, span): (IrKind, Span), kind: ValueKind) -> IrKind {
+        self.catches.pop();
+        let body = self.builder.alloc(body, span);
+        IrKind::Catch { body, id, kind }
     }
 
     /// Lowers the value that the declaration `id`, whose path is `path`,
@@ -1067,7 +1161,7 @@ impl Lowerer<'_> {
                 ExprKind::Name(_) | ExprKind::Fn(_) | ExprKind::Call { .. } | ExprKind::Lazy(_),
                 _,
             ) => self.lower_use_or_function(id, kind)?,
-            (ExprKind::Block(body), _) => self.lower_body(body, span, kind)?,
+            (ExprKind::Block { items, label }, _) => self.lower_block(id, (items, label), kind)?,
             (ExprKind::Field { expr: record, name }, _) => IrKind::Field {
                 record: self.lower_operand(record, ValueKind::Record)?,
                 name,
@@ -1114,10 +1208,33 @@ impl Lowerer<'_> {
         Ok(self.builder.alloc(lowered, span))
     }
 
+    /// Lowers the block `id`, whose items are `items` and whose label, if
+    /// it has one, is `label`, of kind `kind`, to a `Block`; or, if it is a
+    /// labelled block that some `return` leaves, to a `Catch` of kind
+    /// `kind` of the `Block`, which is of its result's own kind, its items
+    /// lowered with the catch on [`Lowerer::catches`]. Apart from
+    /// `lower_plain`, which is on the recursion path of every expression.
+    fn lower_block(
+        &mut self,
+        id: ExprId,
+        (items, label): (ItemRange, Option<LabelId>),
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let span = self.ast.get(id).span;
+        if label.is_none() || !self.resolution.is_returned_block(id) {
+            return self.lower_body(items, span, kind);
+        }
+        let catch = self.start_catch(JumpTarget::Block(id));
+        let own = self.body_kind(items)?;
+        let block = self.lower_body(items, span, own)?;
+        Ok(self.end_catch(catch, (block, span), kind))
+    }
+
     /// Lowers the list literal or `for`, as `expr` is, of kind `kind`,
-    /// spanning `span`: an internal error unless `kind` is a list's. Apart
-    /// from `lower_plain`, which is on the recursion path of every
-    /// expression.
+    /// spanning `span`: an internal error unless `kind` is a list's, but
+    /// for a loop that cannot end, or that a `return` leaves, which may be
+    /// of any kind (see [`Lowerer::lower_for`]). Apart from `lower_plain`,
+    /// which is on the recursion path of every expression.
     fn lower_listing(
         &mut self,
         expr: ExprKind,
@@ -1126,7 +1243,13 @@ impl Lowerer<'_> {
     ) -> Result<IrKind, InternalError> {
         match (expr, kind) {
             (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements),
-            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true, span),
+            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, (kind, true), span),
+            (ExprKind::For(for_id), _)
+                if self.resolution.loop_of(for_id).endless
+                    || self.resolution.loop_of(for_id).returned =>
+            {
+                self.lower_for(for_id, (kind, true), span)
+            }
             _ => Err(InternalError {
                 message: "a list literal or a `for` typed as something other than a list",
                 span,
@@ -1242,7 +1365,16 @@ impl Lowerer<'_> {
         for &item in after.map_or(&[][..], |after| ast.items(after)) {
             self.lower_store(item)?;
         }
+        // The `return`s for the loop need its catch, though it is never
+        // made.
+        let returned = self.resolution.loop_of(for_id).returned;
+        if returned {
+            self.start_catch(JumpTarget::Loop(for_id));
+        }
         self.lower_loop_body(for_id, decl.body)?;
+        if returned {
+            self.catches.pop();
+        }
         Ok(Some(IrKind::Block { items, result }))
     }
 
@@ -1351,11 +1483,14 @@ impl Lowerer<'_> {
         function: FnId,
         kind: FnKind,
     ) -> Result<IrRange, InternalError> {
-        // A function's body starts with no loop around it: no `break` leaves
-        // it.
-        let outer = std::mem::take(&mut self.loops);
+        // A function's body starts with no loop or labelled block around
+        // it: no `break` leaves it, and no labelled `return`.
+        let outer = (
+            std::mem::take(&mut self.loops),
+            std::mem::take(&mut self.catches),
+        );
         let body = self.lower_expr(self.ast.fn_decl(function).body);
-        self.loops = outer;
+        (self.loops, self.catches) = outer;
         self.enter_function(id, function, (kind, body?))
     }
 
@@ -1490,7 +1625,31 @@ impl Lowerer<'_> {
     /// those before it, if it has any; a `do` loop to a `Loop` of its
     /// condition and its body that does not test first. Each body is
     /// lowered with its loop on [`Lowerer::loops`].
+    ///
+    /// A loop that cannot end (see [`crate::check::LoopResolution`]) never
+    /// collects, whatever `collect` says: nothing could read its list. A
+    /// loop that a `return` leaves is wrapped in a `Catch` of kind `kind`,
+    /// the whole loop's, its body lowered with the catch on
+    /// [`Lowerer::catches`].
     fn lower_for(
+        &mut self,
+        for_id: ForId,
+        (kind, collect): (ValueKind, bool),
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        let found = self.resolution.loop_of(for_id);
+        let collect = collect && !found.endless;
+        if !found.returned {
+            return self.lower_loop_node(for_id, collect, span);
+        }
+        let catch = self.start_catch(JumpTarget::Loop(for_id));
+        let looped = self.lower_loop_node(for_id, collect, span)?;
+        Ok(self.end_catch(catch, (looped, span), kind))
+    }
+
+    /// Lowers the loop `for_id`, spanning `span`, as [`Lowerer::lower_for`]
+    /// says, without the catch around it.
+    fn lower_loop_node(
         &mut self,
         for_id: ForId,
         collect: bool,
@@ -4429,5 +4588,85 @@ mod tests {
         // A loop over a value of type Never is its iterable.
         let shown = dump("let v = for x in [1] { for y in { break } { y } }\nv");
         assert!(!shown.contains("(for y"), "{shown}");
+    }
+
+    #[test]
+    fn a_return_names_what_it_leaves() {
+        // A function's or a `lazy`'s, by `fn`.
+        let shown = dump("fn f(n: Int): Int { if n > 0 { return n }; 0 }\nf(1)");
+        assert!(shown.contains("(return fn @31..39\n"), "{shown}");
+        let shown = dump("let l = lazy { return 1 }\nawait l");
+        assert!(shown.contains("(return fn @15..23\n"), "{shown}");
+        // A labelled block's, by the number of its catch, around it; the
+        // block keeps its own kind, the catch takes the join's.
+        let ir = lower_text("let c = true\n{'b if c { return'b 1 }; \"s\" }");
+        let IrKind::Catch { body, id, kind } = ir.get(result_after_items(&ir)).kind else {
+            panic!("expected a catch: {:?}", ir.get(result_after_items(&ir)));
+        };
+        assert_eq!(id, CatchId::new(0));
+        assert_eq!(kind, ValueKind::Mixed);
+        assert_eq!(ir.kind_of(body), ValueKind::String);
+        let shown = dump("let c = true\n{'b if c { return'b 1 }; \"s\" }");
+        assert!(
+            shown.contains("(catch 0 @13..43\n    (block @13..43\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("(return 0 @24..34\n"), "{shown}");
+        // A labelled block no `return` leaves is its block, as any.
+        let shown = dump("{'b 1 }");
+        assert!(!shown.contains("catch"), "{shown}");
+        // Nested catches are numbered as they start, and a `return` finds
+        // its own.
+        let shown = dump("{'a {'b if true { return'a 1 }; return'b 2 } }");
+        assert!(shown.contains("(catch 0 @"), "{shown}");
+        assert!(shown.contains("(catch 1 @"), "{shown}");
+        assert!(shown.contains("(return 0 @"), "{shown}");
+        assert!(shown.contains("(return 1 @"), "{shown}");
+        // A loop's, around the loop, which keeps collecting.
+        let shown = dump("let xs = [1, 7]\nlet v = for'l x in xs { if x > 5 { return'l x }; x }");
+        // (`x`'s slot is named by `v`, the last variable stored in it.)
+        assert!(
+            shown.contains("(catch 0 @24..68\n      (for v#1 @24..68\n"),
+            "{shown}"
+        );
+        assert!(shown.contains("(return 0 @51..61\n"), "{shown}");
+    }
+
+    #[test]
+    fn a_loop_that_cannot_end_collects_nothing() {
+        // Whatever its body's type.
+        let shown = dump("let v: Int = for'spin { if true { return'spin 1 }; 5 }\nv");
+        assert!(shown.contains("(loop-each @13..54\n"), "{shown}");
+        assert!(shown.contains("(catch 0 @13..54\n"), "{shown}");
+        // As a statement, and of type Never where an `Int` is wanted.
+        let shown = dump("let v = for'o x in [1] { let y: Int = 1 + for { break'o }; y }\nv");
+        assert!(shown.contains("(loop-each @"), "{shown}");
+        assert!(!shown.contains("catch"), "{shown}");
+        // A loop that can end keeps its list.
+        let shown = dump("let v = for { break 1 }\nv");
+        assert!(shown.contains("(loop @"), "{shown}");
+    }
+
+    #[test]
+    fn a_statement_of_a_unit_like_union_is_lowered_as_it_is() {
+        let ir = lower_text("fn f() -> {} { for'l x in [1] { if x > 0 { return'l } }; {} }\nf()");
+        let Some(code) = ir.find_function(FnId::new(0)) else {
+            panic!("expected a function");
+        };
+        let IrKind::Block { items, .. } = ir.get(code.body).kind else {
+            panic!("expected a block");
+        };
+        let [statement] = ir.items(items) else {
+            panic!("expected one statement");
+        };
+        let IrKind::Catch { body, kind, .. } = ir.get(*statement).kind else {
+            panic!("expected a catch: {:?}", ir.get(*statement));
+        };
+        assert_eq!(kind, ValueKind::Mixed);
+        // The statement loop discards its values.
+        assert!(matches!(
+            ir.get(body).kind,
+            IrKind::For { collect: false, .. }
+        ));
     }
 }

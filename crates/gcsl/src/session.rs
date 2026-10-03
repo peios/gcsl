@@ -770,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn a_function_that_returns_serves_later_inputs() {
+        let mut session = Session::new();
+        value(
+            &mut session,
+            "fn find(xs: List<Int>, t: Int): Int { for x in xs { if x == t { return x * 10 } }; -1 }",
+        );
+        assert_eq!(value(&mut session, "find([1, 2, 3], 2)"), Value::Int(20));
+        assert_eq!(value(&mut session, "find([1], 5)"), Value::Int(-1));
+        // A memoised one that returns early keeps its entry across inputs,
+        // and across a failed one.
+        value(
+            &mut session,
+            "fn m(n: Int) ->> {v: Int} { if n > 0 { return { v = n } }; { v = 0 } }",
+        );
+        let Value::Record(first) = value(&mut session, "m(2)") else {
+            panic!("expected a record");
+        };
+        messages(&mut session, "let a = m(3)\nlet b = 1 // 0");
+        let Value::Record(again) = value(&mut session, "m(2)") else {
+            panic!("expected a record");
+        };
+        assert!(Rc::ptr_eq(&first, &again));
+        assert_eq!(session.memo.running_count(), 0);
+        // A failed input with a `return` and a labelled block leaves the
+        // session as it was.
+        value(&mut session, "let mut n = 0");
+        assert_eq!(
+            messages(
+                &mut session,
+                "let k = {'b n := 5; if n > 0 { return'b n // 0 }; 1 }"
+            ),
+            vec!["division by zero"]
+        );
+        assert_eq!(value(&mut session, "n"), Value::Int(0));
+        assert_eq!(messages(&mut session, "k"), vec!["undefined variable `k`"]);
+        // A `return` at the top of an input is an error, as in a file.
+        assert_eq!(
+            messages(&mut session, "return 1"),
+            vec!["`return` outside a function"]
+        );
+        assert_eq!(value(&mut session, "{'b return'b 4 }"), Value::Int(4));
+    }
+
+    #[test]
     fn lists_across_inputs() {
         let mut session = Session::new();
         value(&mut session, "let xs = [1, 2, 3]");

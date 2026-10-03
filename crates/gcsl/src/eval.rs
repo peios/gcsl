@@ -110,29 +110,61 @@
 //! of a node that does not yield one. An `Unwind` is an error, a
 //! [`Diagnostic`], which ends the evaluation, or a *stop*, a `Stop`: a
 //! `break` or a `continue` on its way to its loop, with the number of loops
-//! it is still to leave and the value it contributes, if any. A stop travels
+//! it is still to leave, or a `return` on its way to what it leaves, named
+//! by the number of its [`CatchId`] in the same `u32`, each with its value,
+//! if any, and what it does there (`StopKind`). So a stop is as small as it
+//! was before `return`, and a loop handles a `break` or `continue` as it
+//! did. A stop travels
 //! as an error does, through every `?`, so every node between a `break` and
 //! its loop is left at once, with nothing after the `break` evaluated: in
 //! `{ if c { break }; 1 } + g()`, `g` is not called. (A flag that the loop
-//! checks would let the `+` and its call run.) A `Break` or `Continue` node
-//! evaluates its value through the general walker and then unwinds
-//! (`Evaluator::leave`); every walker, typed or general, hands it such a
-//! node, since a node of kind [`ValueKind::Never`] may stand where one of
-//! any kind is expected, so the typed walkers grow by one arm each and pay
-//! nothing else.
+//! checks would let the `+` and its call run.) A `Break`, `Continue` or
+//! `Return` node evaluates its value through the general walker and then
+//! unwinds (`Evaluator::leave`); every walker, typed or general, hands it
+//! such a node, since a node of kind [`ValueKind::Never`] may stand where
+//! one of any kind is expected. A catch (see below) may stand under any
+//! walker too, and so may a loop that cannot end, whose node is of kind
+//! `Never` where it stands, which the walker runs. So each typed walker has
+//! one arm for all of them, handing them to one helper
+//! (`Evaluator::stopping`), and pays nothing else; the general walker has
+//! one more arm, for a catch (`Evaluator::catch`). These helpers, and the
+//! record walker's for its loops (`Evaluator::record_loop`), are kept out
+//! of line, so that no walker's frame, on the recursion path of every
+//! expression, grows: with an arm each in every typed walker, inlined, the
+//! new nodes cost a loop of a few million iterations two or three per
+//! cent. `leave` and `caught` are left to the compiler, as they were.
 //!
-//! Only a loop catches a stop, and only one that comes out of its body
-//! (`caught`): a stop out of its iterable, guard, condition or items after
-//! its condition is for a loop around it, and goes on with `?`. A stop with
-//! no loops left to leave is this loop's: its value, if any, is collected,
-//! and the loop ends, for a `break`, or goes on with its items after the
-//! condition and its next test, for a `continue`. Any other goes on, one
-//! loop nearer its own, and this loop's list is dropped with it. The
-//! checker lets no stop out of a function, a `lazy` or a memoised call, nor
-//! out of the top level, so one that reaches such a boundary is an internal
-//! error there (`Unwind::into_error`), never a diagnostic, and never caught
-//! by a loop of another frame. Slice 22's `return` is meant to be one more
-//! kind of stop, caught by a call.
+//! Only a loop catches a `break` or `continue`, and only one that comes out
+//! of its body (`caught`): a stop out of its iterable, guard, condition or
+//! items after its condition is for a loop around it, and goes on with
+//! `?`. A stop with no loops left to leave is this loop's: its value, if
+//! any, is collected, and the loop ends, for a `break`, or goes on with its
+//! items after the condition and its next test, for a `continue`. Any other
+//! goes on, one loop nearer its own, and this loop's list is dropped with
+//! it. A `return` goes through every loop as it is, the loop's list and
+//! after-items with it. Its target catches it, three ways:
+//!
+//! - a `Catch`, around a labelled block or a loop that a `return` leaves,
+//!   catches one that names its number, coming out of the block or loop, and
+//!   yields its value (`Evaluator::catch`); any other stop goes on;
+//! - a call, a memoised call and an await running a future catch one that
+//!   names [`CatchId::FUNCTION`] coming out of the body, the value being the
+//!   body's (`Unwind::returned`). The catch is on the error road only, a
+//!   [`Result::or_else`] of the body's result, so that a body that gives a
+//!   value takes exactly the road it took before `return` existed (written
+//!   as a function of the whole result, matched on every call, it cost a
+//!   call-heavy program a few per cent). It is inside the memoised call's
+//!   running entry and the future's running mark: the value returned is
+//!   then recorded by `Evaluator::memo_end`, and resolves the future, by
+//!   the road any value of a body takes, rather than reaching them as an
+//!   `Err`, which clears the entry or leaves the future unrun.
+//!
+//! The checker lets no other stop out of a function, a `lazy` or a memoised
+//! call, nor any out of the top level, so one that reaches such a boundary
+//! is an internal error there (`Unwind::into_error`), never a diagnostic,
+//! and never caught by a loop or catch of another frame. A catch's number
+//! is unique in its program, and no node holds itself within one frame, so
+//! a catch never takes another's `return`.
 //!
 //! Since evaluation goes on after a stop, nothing may assume that an `Err`
 //! ends it all and skip restoring what it changed. What was found, and done:
@@ -142,20 +174,30 @@
 //!   nothing is counted up and down around a node, so nothing can leak.
 //! - The value stack: a call grows it by the callee's frame before its
 //!   arguments are evaluated, and an argument may now stop, as in `f({
-//!   continue })`: `Evaluator::call` and `Evaluator::memo_begin` truncate it
-//!   back on any `Err` of an argument, as they did for an error, and the
-//!   stop goes on. A call, a memoised call and a future truncate it after
-//!   the body whatever the body gave, and `eval_with` at the top.
+//!   continue })`, or return from the function the call is in, as in
+//!   `f(g({ return 1 }))`: `Evaluator::call` and `Evaluator::memo_begin`
+//!   truncate it back on any `Err` of an argument, as they did for an
+//!   error, and the stop goes on. A call, a memoised call and a future
+//!   truncate it after the body whatever the body gave, a `return` for it
+//!   included, and `eval_with` at the top.
 //! - A future's running mark: `Evaluator::run_future` puts the future back
-//!   unrun on any `Err` of its body; a stop cannot come out of a body, and
-//!   is made an internal error first.
+//!   unrun on any `Err` of its body; a `return` for the `lazy` is its value,
+//!   caught before, and recorded as any value is; no other stop can come
+//!   out of a body, and is made an internal error first.
 //! - A memoised call's running entry: `Evaluator::memo_end` removes it on
-//!   any `Err` of the body, a stop again made an internal error first. The
-//!   memo tables' checkpoint is rolled back only by a
+//!   any `Err` of the body; a `return` for the function is its value,
+//!   caught before, and recorded as any value is, so that a function that
+//!   returns early is memoised; any other stop is made an internal error
+//!   first. The memo tables' checkpoint is rolled back only by a
 //!   [`crate::session::Session`], and only when a whole input fails: a stop
-//!   in the body of a `->>` function is caught by its loop, in the body, and
-//!   reaches neither the call nor the session, so the entries the body's
-//!   calls rightly recorded stay.
+//!   in the body of a `->>` function is caught by its loop or catch, or by
+//!   its call, in the body, and reaches neither the call's caller nor the
+//!   session, so the entries the body's calls rightly recorded stay.
+//! - A `return` out of the value of an update (`r.a := { return 1 }`) or
+//!   out of a position of its path leaves before anything is stored, the
+//!   records the walk read dropped with it; one out of an interpolation
+//!   drops the text built so far, one out of an `if`'s narrowed branch
+//!   leaves the slot the `is` wrote, which belongs to the `if`.
 //! - The input stamped on an error from another input's code, and the
 //!   "awaited here" and "called here with the same arguments" labels, are
 //!   added to errors only.
@@ -485,8 +527,9 @@ use crate::ast::FnId;
 use crate::check::Slot;
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
-    Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField, LazyShapeId,
-    ListShape, Operands, ShapeId, ShapedOperands, StepAt, StepMode, UpdatePathId, UpdateStep,
+    CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
+    LazyShapeId, ListShape, Operands, ShapeId, ShapedOperands, StepAt, StepMode, UpdatePathId,
+    UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -601,8 +644,8 @@ pub fn eval_with(
 enum Unwind {
     /// A runtime error, or an internal one, which ends the evaluation.
     Error(Diagnostic),
-    /// A `break` or a `continue` on its way to the loop it is for, which
-    /// catches it, after which evaluation goes on.
+    /// A `break`, a `continue` or a `return` on its way to what it is for,
+    /// which catches it, after which evaluation goes on.
     Stop(Stop),
 }
 
@@ -618,28 +661,57 @@ impl Unwind {
     fn into_error(self, span: Span) -> Diagnostic {
         match self {
             Unwind::Error(error) => error,
+            Unwind::Stop(Stop {
+                kind: StopKind::Return,
+                ..
+            }) => internal("a `return` left its function", span),
             Unwind::Stop(_) => internal("a `break` or `continue` left its function", span),
+        }
+    }
+
+    /// What this, which came out of a body that ran in a frame of its own,
+    /// is to its call, memoised call or await (see [Stops](#stops)): the
+    /// value of a `return` for the function or `lazy`, `{}` for one
+    /// without; and otherwise the error this is, a stop being an internal
+    /// error at `span`, the boundary it reached. The one place a
+    /// function-level `return` is caught, on the error road only, as
+    /// [`Result::or_else`] of a body's result, so that a body that gives a
+    /// value takes exactly the road it took before `return` existed.
+    fn returned(self, span: Span) -> Result<Value, Diagnostic> {
+        match self {
+            Unwind::Stop(Stop {
+                kind: StopKind::Return,
+                to,
+                value,
+            }) if to == CatchId::FUNCTION.number() => Ok(value.unwrap_or(Value::Empty)),
+            unwind => Err(unwind.into_error(span)),
         }
     }
 }
 
-/// A `break` or a `continue` unwinding to its loop: which loop, counted
-/// outwards from the innermost loop whose body it is unwinding out of, and
-/// what it contributes to that loop's list.
+/// A `break`, a `continue` or a `return` unwinding to what it is for, with
+/// its value, if it has one: for a `break` or a `continue`, its loop,
+/// counted outwards from the innermost loop whose body it is unwinding out
+/// of; for a `return`, the catch it is for, by number, or the function or
+/// `lazy` being run. Both are named by one `u32`, so that a stop is as
+/// small as it was before `return` existed, and a loop handles a `break` or
+/// `continue` exactly as it did.
 #[derive(Debug)]
 struct Stop {
-    /// How many loops the stop leaves before it reaches its own: 0 when the
-    /// loop whose body it comes out of is its target. Each loop it passes
-    /// through takes one off and drops its own list.
-    loops: u32,
+    /// For a `break` or a `continue`, how many loops it leaves before it
+    /// reaches its own: 0 when the loop whose body it comes out of is its
+    /// target, each loop it passes through taking one off and dropping its
+    /// own list. For a `return`, the [`CatchId`] it is for, which every loop
+    /// and catch it passes through leaves as it is.
+    to: u32,
     /// What it does when it gets there.
     kind: StopKind,
-    /// The value of its expression, which the target loop collects, if it
-    /// has one.
+    /// The value of its expression, which the target loop collects, or
+    /// which is returned, if it has one.
     value: Option<Value>,
 }
 
-/// What a [`Stop`] does at its loop.
+/// What a [`Stop`] does at what it is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopKind {
     /// `break`: ends the loop, after collecting the value, if any.
@@ -647,6 +719,10 @@ enum StopKind {
     /// `continue`: ends the iteration, after collecting the value, if any,
     /// and goes on with the after-items and the next test.
     Continue,
+    /// `return`: ends the labelled block or loop whose catch it is for, or
+    /// with [`CatchId::FUNCTION`] the body of the function or `lazy` being
+    /// run, which evaluates to the value, `{}` without one.
+    Return,
 }
 
 /// What evaluating a node gives: its value, or why there is none.
@@ -723,7 +799,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
             IrKind::For { .. } | IrKind::Loop { .. } => self.looped(node),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
+            IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {
+                self.leave(node)
+            }
+            IrKind::Catch { .. } => self.catch(node),
             IrKind::Index { list, index, .. } => self.index((list, index), node),
             IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
             IrKind::IntConst(_)
@@ -1213,8 +1292,10 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        // No stop leaves a `lazy`'s body: the checker sees to it.
-        match result.map_err(|unwind| unwind.into_error(node.span)) {
+        // A `return` for the `lazy` is its value, recorded as any is, here,
+        // inside the running mark; no other stop leaves its body: the
+        // checker sees to it.
+        match result.or_else(|unwind| unwind.returned(node.span)) {
             Ok(value) => {
                 // The captures are dropped on return: a future that has
                 // run holds only its value.
@@ -1288,8 +1369,9 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        // No stop leaves a function's body: the checker sees to it.
-        match result.map_err(|unwind| unwind.into_error(node.span)) {
+        // A `return` for the function is its value; no other stop leaves
+        // its body: the checker sees to it.
+        match result.or_else(|unwind| unwind.returned(node.span)) {
             Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
                 error.input = Some(closure.code.input());
                 Err(error.into())
@@ -1330,8 +1412,10 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        // No stop leaves a function's body: the checker sees to it.
-        let result = result.map_err(|unwind| unwind.into_error(node.span));
+        // A `return` for the function is its value, which `memo_end` then
+        // records as any, here, inside the running entry; no other stop
+        // leaves its body: the checker sees to it.
+        let result = result.or_else(|unwind| unwind.returned(node.span));
         match mark {
             Some(mark) => self.memo_end(closure, mark, result, node),
             None => result.map_err(|error| self.memo_error(error, closure, false, node).into()),
@@ -1551,7 +1635,15 @@ impl Evaluator<'_> {
                 Value::Fn(closure) => Some(closure),
                 _ => None,
             }),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
+            | IrKind::For { .. }
+            | IrKind::Loop { .. } => self.stopping(node, |value| match value {
+                Value::Fn(closure) => Some(closure),
+                _ => None,
+            }),
             _ => mistyped(node, "a node of another kind where a function was expected"),
         }
     }
@@ -1790,19 +1882,23 @@ impl Evaluator<'_> {
         })
     }
 
-    /// Evaluates the `Break` or `Continue` `node`: its value, if it has
-    /// one, through the general walker, and then the stop that carries it
-    /// to its loop, unwinding every node on the way, as an error does.
-    /// Every walker hands such a node here, since one of kind
-    /// [`ValueKind::Never`] may stand where a value of any kind is expected.
+    /// Evaluates the `Break`, `Continue` or `Return` `node`: its value, if
+    /// it has one, through the general walker, and then the stop that
+    /// carries it to its loop, or to what it returns from, unwinding every
+    /// node on the way, as an error does. Every walker hands such a node
+    /// here, the typed walkers through [`Evaluator::stopping`], since one
+    /// of kind [`ValueKind::Never`] may stand where a value of any kind is
+    /// expected. A `return` names its catch by number in the `u32` a
+    /// `break` counts its loops in (see [`Stop`]).
     fn leave<T>(&mut self, node: &IrNode) -> Flow<T> {
-        let (kind, loops, value) = match node.kind {
+        let (kind, to, value) = match node.kind {
             IrKind::Break { loops, value } => (StopKind::Break, loops, value),
             IrKind::Continue { loops, value } => (StopKind::Continue, loops, value),
+            IrKind::Return { to, value } => (StopKind::Return, to.number(), value),
             _ => {
                 return mistyped(
                     node,
-                    "a node that is not a `break` or `continue` left a loop",
+                    "a node that is not a `break`, `continue` or `return` left a loop",
                 );
             }
         };
@@ -1810,7 +1906,70 @@ impl Evaluator<'_> {
             Some(value) => Some(self.value(value)?),
             None => None,
         };
-        Err(Unwind::Stop(Stop { loops, kind, value }))
+        Err(Unwind::Stop(Stop { to, kind, value }))
+    }
+
+    /// Evaluates the `Catch` `node` (see [`IrKind::Catch`]): its block or
+    /// loop, through the general walker, whose value it yields, or the
+    /// value of a `return` for it that comes out of it, `{}` for one
+    /// without. Any other stop, and an error, go on as they are. Never
+    /// inlined into the general walker, whose frame, on the recursion path
+    /// of every expression, it would grow.
+    #[inline(never)]
+    fn catch(&mut self, node: &IrNode) -> Flow<Value> {
+        let IrKind::Catch { body, id, .. } = node.kind else {
+            return mistyped(node, "a node that is not a catch caught");
+        };
+        match self.value(body) {
+            Err(Unwind::Stop(Stop {
+                kind: StopKind::Return,
+                to,
+                value,
+            })) if to == id.number() => Ok(value.unwrap_or(Value::Empty)),
+            flow => flow,
+        }
+    }
+
+    /// Evaluates, for a typed walker, a node that stops or may, as a value
+    /// that `extract` accepts, of the kind the walker wants: a `break`,
+    /// `continue` or `return` unwinds as [`Evaluator::leave`] says; a
+    /// catch's value must be one `extract` accepts, of the kind the node
+    /// states; and a loop where a value of another kind than a loop's is
+    /// wanted is one that cannot end, of type `Never` (see [`crate::ir`]),
+    /// which runs until something leaves it, and is mistyped if it ends.
+    /// One arm of each typed walker hands them all here, out of line, so
+    /// that what a program without them never meets grows no walker.
+    #[inline(never)]
+    fn stopping<T>(&mut self, node: &IrNode, extract: fn(Value) -> Option<T>) -> Flow<T> {
+        match node.kind {
+            IrKind::Catch { .. } if mixed(node) => mistyped(node, MIXED),
+            IrKind::Catch { .. } => match extract(self.catch(node)?) {
+                Some(value) => Ok(value),
+                None => mistyped(
+                    node,
+                    "a catch yielded a value of another kind than its node",
+                ),
+            },
+            IrKind::For { .. } | IrKind::Loop { .. } => {
+                self.looped(node)?;
+                mistyped(node, "a loop ended where it cannot")
+            }
+            _ => self.leave(node),
+        }
+    }
+
+    /// Evaluates the loop `node` where a record is expected: one that
+    /// discards what its iterations contribute, which is `{}`, as a
+    /// statement or a loop that cannot end is; one that collects them is a
+    /// list, and mistyped here. Out of line, as [`Evaluator::stopping`] is.
+    #[inline(never)]
+    fn record_loop(&mut self, node: &IrNode) -> Flow<Value> {
+        match node.kind {
+            IrKind::For { collect: true, .. } | IrKind::Loop { collect: true, .. } => {
+                mistyped(node, "list node where a record was expected")
+            }
+            _ => self.looped(node),
+        }
     }
 
     /// What a `for` whose iterable is `iterable` iterates over: if the
@@ -2002,14 +2161,17 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where an Int was expected"),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             // A loop that discards its values is `{}`, but only ever a
-            // statement.
-            IrKind::MakeList { .. }
-            | IrKind::Spread(_)
-            | IrKind::Range(..)
+            // statement, or a loop that cannot end, which `stopping` runs.
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => mistyped(node, "list node where an Int was expected"),
+            | IrKind::Loop { .. } => self.stopping(node, Value::into_int),
+            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
+                mistyped(node, "list node where an Int was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where an Int was expected")
             }
@@ -2153,12 +2315,15 @@ impl Evaluator<'_> {
                 mistyped(node, "record node where a Float was expected")
             }
             IrKind::Update { .. } => mistyped(node, "update node where a Float was expected"),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
-            IrKind::MakeList { .. }
-            | IrKind::Spread(_)
-            | IrKind::Range(..)
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => mistyped(node, "list node where a Float was expected"),
+            | IrKind::Loop { .. } => self.stopping(node, Value::into_float),
+            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
+                mistyped(node, "list node where a Float was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Float was expected")
             }
@@ -2263,12 +2428,15 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Bool was expected"),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
-            IrKind::MakeList { .. }
-            | IrKind::Spread(_)
-            | IrKind::Range(..)
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => mistyped(node, "list node where a Bool was expected"),
+            | IrKind::Loop { .. } => self.stopping(node, Value::into_bool),
+            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
+                mistyped(node, "list node where a Bool was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Bool was expected")
             }
@@ -2427,12 +2595,15 @@ impl Evaluator<'_> {
                 mistyped(node, "record node where a String was expected")
             }
             IrKind::Update { .. } => mistyped(node, "update node where a String was expected"),
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
-            IrKind::MakeList { .. }
-            | IrKind::Spread(_)
-            | IrKind::Range(..)
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => mistyped(node, "list node where a String was expected"),
+            | IrKind::Loop { .. } => self.stopping(node, Value::into_string),
+            IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
+                mistyped(node, "list node where a String was expected")
+            }
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a String was expected")
             }
@@ -2527,15 +2698,14 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a record was expected")
             }
-            IrKind::For { collect: false, .. } | IrKind::Loop { collect: false, .. } => {
-                self.looped(node)
-            }
-            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
+            IrKind::For { .. } | IrKind::Loop { .. } => self.record_loop(node),
+            IrKind::Break { .. }
+            | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. } => self.stopping(node, into_record),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. }
-            | IrKind::Loop { .. }
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a record was expected")
@@ -2823,13 +2993,14 @@ const MIXED: &str = "a node of a union of kinds where one kind was expected";
 /// is collected into `values` when the loop `collect`s, and the result is
 /// whether the loop ends there, as after a `break`, or goes on, as after a
 /// `continue`. A stop for a loop further out goes on with one loop fewer to
-/// leave, and an error goes on as it is; this loop's list is dropped with
+/// leave, and a `return` and an error go on as they are, untouched, the
+/// `return` for a catch or a call outside; this loop's list is dropped with
 /// it.
 fn caught(unwind: Unwind, values: &mut Vec<Value>, collect: bool) -> Flow<bool> {
     match unwind {
         Unwind::Stop(Stop {
-            loops: 0,
-            kind,
+            to: 0,
+            kind: kind @ (StopKind::Break | StopKind::Continue),
             value,
         }) => {
             if collect && let Some(value) = value {
@@ -2837,12 +3008,16 @@ fn caught(unwind: Unwind, values: &mut Vec<Value>, collect: bool) -> Flow<bool> 
             }
             Ok(kind == StopKind::Break)
         }
-        Unwind::Stop(Stop { loops, kind, value }) => Err(Unwind::Stop(Stop {
-            loops: loops - 1,
+        Unwind::Stop(Stop {
+            to,
+            kind: kind @ (StopKind::Break | StopKind::Continue),
+            value,
+        }) => Err(Unwind::Stop(Stop {
+            to: to - 1,
             kind,
             value,
         })),
-        error @ Unwind::Error(_) => Err(error),
+        other => Err(other),
     }
 }
 
@@ -3624,6 +3799,10 @@ const fn mixed(node: &IrNode) -> bool {
                 ..
             }
             | IrKind::As {
+                kind: ValueKind::Mixed,
+                ..
+            }
+            | IrKind::Catch {
                 kind: ValueKind::Mixed,
                 ..
             }
@@ -8070,6 +8249,222 @@ mod tests {
         assert_eq!(
             diagnostic.message,
             "internal error: a `break` or `continue` left its function"
+        );
+    }
+
+    #[test]
+    fn a_return_at_the_top_is_an_internal_error() {
+        // No checked program lets a `return` out of the top level either.
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let span = Span::new(0, 6);
+        let stop = builder.alloc(
+            IrKind::Return {
+                to: CatchId::FUNCTION,
+                value: None,
+            },
+            span,
+        );
+        let ir = Rc::new(builder.finish(stop, 0, Vec::new()));
+        let diagnostic = eval(&ir).unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "internal error: a `return` left its function"
+        );
+    }
+
+    // ----- `return`, labelled blocks and loops that return -----
+
+    #[test]
+    fn the_values_of_every_target() {
+        assert_eq!(
+            shown(
+                "fn sign(n: Int): Int { if n < 0 { return -1 }; if n > 0 { return 1 }; 0 }\n\
+                 [sign(-5), sign(0), sign(8)]"
+            ),
+            "[-1, 0, 1]"
+        );
+        assert_eq!(
+            int(
+                "let cached = true\nlet old = 7\nfn compute() -> Int { 9 }\n\
+                 let job = lazy { if cached { return old }; compute() }\nawait job"
+            ),
+            7
+        );
+        assert_eq!(
+            int("let a = false\nlet b = true\n\
+                 let y = {'pick if a { return'pick 1 }; if b { return'pick 2 }; 3 }\ny"),
+            2
+        );
+        assert_eq!(
+            shown("let xs = [1, 7, 3]\nfor'scan x in xs { if x > 5 { return'scan x } }"),
+            "7"
+        );
+        assert_eq!(
+            shown("let xs = [1, 2]\nfor'scan x in xs { if x > 5 { return'scan x } }"),
+            "[{}, {}]"
+        );
+        assert_eq!(
+            int("let mut n = 0\nfn poll(k: Int) -> Int { k - 3 }\n\
+                 let v: Int = for'spin { n := n + 1; let r = poll(n); if r > 0 { return'spin r } }\nv"),
+            1
+        );
+        // A labelled loop body: what it returns, the iteration contributes.
+        assert_eq!(
+            shown("for x in [1, 6, 3] {'it if x < 5 { return'it 0 }; x }"),
+            "[0, 6, 0]"
+        );
+        // A bare `return` returns `{}`.
+        assert_eq!(shown("{'b if true { return'b }; {} }"), "{}");
+        assert_eq!(shown("fn f() -> {} { return }\nf()"), "{}");
+        // An untyped literal adapts to the block's type.
+        assert_eq!(
+            float("let f: Float = {'a if true { return'a 1 }; 2 }\nf"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_function_return_leaves_from_any_depth() {
+        for (body, value) in [
+            // Nested loops, a labelled block and a `do`.
+            (
+                "for x in [1, 2] { for y in [3, 4] { if y == 4 { return x * 10 + y } } }; 0",
+                "14",
+            ),
+            ("{'b for x in [5] { {'c return x } } }; 0", "5"),
+            ("do { return 6 } for true; 0", "6"),
+            // An argument list, a list literal, an `if` condition.
+            ("g({ return 7 }) + 1", "7"),
+            ("[1, { return 8 }][0]", "8"),
+            ("if { return 9 } { 1 } else { 2 }", "9"),
+            // An update's value and a position of its path.
+            ("let mut r = { a = 0 }; r.a := { return 10 }; r.a", "10"),
+            ("let mut l = [0]; l[{ return 11 }] := 1; l[0]", "11"),
+            // A narrowed branch, an interpolation.
+            (
+                "let u: Int | String = 12; if u is Int { return u }; 0",
+                "12",
+            ),
+            ("len(\"{ { return 13 } }\")", "13"),
+        ] {
+            let text = format!("fn g(n: Int): Int {{ n }}\nfn f(): Int {{ {body} }}\nf()");
+            assert_eq!(shown(&text), value, "{body}");
+        }
+    }
+
+    #[test]
+    fn nothing_after_a_return_runs() {
+        // `ran` counts what runs after the `return`: nothing does.
+        for body in [
+            "{ return 1 } + { ran := ran + 1; 0 }",
+            "g({ return 1 }, { ran := ran + 1; 0 })",
+            "[{ return 1 }, { ran := ran + 1; 0 }][0]",
+            "for x in [1, 2] { if x == 1 { return 1 }; ran := ran + 1 }; 0",
+            "let k = {'b return 1 }; ran := ran + 1; k",
+        ] {
+            let text = format!(
+                "let mut ran = 0\nfn g(a: Int, b: Int): Int {{ a + b }}\n\
+                 fn f() -> Int {{ let mut ran = 0\nlet v = {{ {body} }}\nv + ran }}\nf()"
+            );
+            assert_eq!(int(&text), 1, "{body}");
+        }
+        // A loop return drops the list and skips the after-items.
+        assert_eq!(
+            string(
+                "let mut trace = 0\n\
+                 let e = for'l let i = 0; i < 5; i := ({ trace := trace + 1; i + 1 }) { if i == 2 { return'l 99 }; i }\n\
+                 \"{e} {trace}\""
+            ),
+            "99 2"
+        );
+        // A labelled block's return inside a loop body leaves the loop
+        // running.
+        assert_eq!(
+            shown("for x in [1, 2, 3] { let k = {'b if x == 2 { return'b 20 }; x }; k + 1 }"),
+            "[2, 21, 4]"
+        );
+    }
+
+    #[test]
+    fn a_memoised_function_that_returns_early_is_memoised() {
+        // Its body runs once: both calls give the one record it built.
+        let text = "fn f(x: Int) ->> {v: Int} { if x > 0 { return { v = x } }; { v = 0 } }\n\
+                    a = f(1)\nb = f(1)";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]));
+        assert_eq!(values[0].to_string(), "{v = 1}");
+        // A `lazy` that returns early, awaited twice, runs once.
+        let text = "let l = lazy { if true { return { a = 1 } }; { a = 2 } }\n\
+                    p = await l\nq = await l";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]), "{values:?}");
+        assert_eq!(values[0].to_string(), "{a = 1}");
+        // In a function, the `lazy`'s return resolves the future, and
+        // the function goes on.
+        assert_eq!(
+            int("fn f() -> Int { let j = lazy { return 1 }; await j + 1 }\nf()"),
+            2
+        );
+    }
+
+    #[test]
+    fn recursion_with_early_returns() {
+        assert_eq!(
+            int("fn fact(n: Int): Int { if n <= 1 { return 1 }; n * fact(n - 1) }\nfact(10)"),
+            3_628_800
+        );
+        // To depth, as the pipeline is run; past the budget, its error.
+        let depth = on_big_stack(|| {
+            int("fn deep(n: Int): Int { if n == 0 { return 0 }; deep(n - 1) + 1 }\ndeep(1500)")
+        });
+        assert_eq!(depth, 1500);
+        let message = on_big_stack(|| {
+            error("fn deep(n: Int): Int { if n == 0 { return 0 }; deep(n - 1) + 1 }\ndeep(100000)")
+                .0
+        });
+        assert!(message.starts_with("call nested too deeply"), "{message}");
+        // A memoised recursion through early returns.
+        assert_eq!(
+            int(
+                "fn fib(n: Int) ->> Int { if n < 2 { return n }; fib(n - 1) + fib(n - 2) }\nfib(60)"
+            ),
+            1_548_008_755_920
+        );
+    }
+
+    #[test]
+    fn a_return_leaves_the_stack_as_it_found_it() {
+        for text in [
+            "fn f(): Int { for x in [1] { { {'b return 3 } } } ; 0 }\nf()",
+            "fn g(n: Int): Int { n }\nfn f(): Int { g(g({ return 3 })) }\nf()",
+            "fn f(n: Int) ->> Int { if n > 0 { return 3 }; 0 }\nf(1) + f(1) - 3",
+            "let l = lazy { for { return 3 } }\nawait l",
+            "for'l x in [1, 2] {'b let k = { if x == 1 { return'b 0 }; return'l 3 }; k }",
+        ] {
+            let ir = compile(text);
+            let frame = ir.frame_size() as usize;
+            let mut stack = vec![Value::Empty; frame];
+            let (result, len) = run_on(&ir, &mut stack);
+            assert_eq!(result.unwrap(), Value::Int(3), "{text}");
+            assert_eq!(len, frame, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_return_of_a_stop_is_the_stop() {
+        // A `break` in the value of a `return` leaves for its loop before
+        // anything is returned.
+        assert_eq!(
+            shown(
+                "fn f() -> List<Int> { for x in [1, 2] { if x > 1 { return { break x } }; x } }\nf()"
+            ),
+            "[1, 2]"
+        );
+        // A loop that cannot end, where an `Int` is wanted, runs until a
+        // stop leaves it.
+        assert_eq!(
+            shown("for'o x in [1, 2] { let y: Int = 1 + for { break'o x * 10 }; y }"),
+            "[10]"
         );
     }
 }

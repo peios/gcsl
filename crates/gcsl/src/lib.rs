@@ -68,7 +68,7 @@ pub use value::{Value, ValueKind};
 /// ascription, field access, block, `if`, loop, interpolated string,
 /// function expression, `lazy`, call, list literal and index adds one to
 /// its tallest child (a block's children being its items' expressions, a
-/// `break`'s or `continue`'s value among them, and annotated types, an
+/// `break`'s, `continue`'s or `return`'s value among them, and annotated types, an
 /// ascription's its expression and type, a function's
 /// its parameter types, return type and body, a `lazy`'s its operand, a
 /// call's its callee and arguments, a list literal's its elements'

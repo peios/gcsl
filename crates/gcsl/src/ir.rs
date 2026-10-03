@@ -89,14 +89,30 @@
 //! kind, which is its child, and the number of loops it leaves before the
 //! one it is for, counted from the innermost loop whose body holds it.
 //!
+//! A `return` is an [`IrKind::Return`], with its value, if it has one, its
+//! child, and the [`CatchId`] it leaves for: [`CatchId::FUNCTION`] for the
+//! function or `lazy` around it, and otherwise the number of an
+//! [`IrKind::Catch`] around it. A catch wraps a labelled block, or a loop,
+//! that some `return` leaves, and only those, so that a block or loop no
+//! `return` leaves is the node it always was. Its node is the block or the
+//! loop, and its kind that of the whole, which is the join of the block's
+//! or loop's own value and what is returned (a loop's list or a value
+//! returned to it may differ in kind, so the loop node keeps its own). A
+//! `return` cannot name its catch by node, since lowering builds children
+//! before their parents; it names it by a number lowering gives each catch
+//! as it starts it, once per program.
+//!
 //! Such a node is of kind [`ValueKind::Never`], and so is a block whose
 //! result is one, an `if` both of whose branches are, and a node lowered
 //! from an expression of type `Never`; a node of that kind may stand where
 //! a node of any kind is expected, and every walker of the evaluator hands
-//! a `Break` or `Continue` it meets to the one place that unwinds (see
-//! [`crate::eval`]). The other nodes of kind `Never`, a load of a variable
-//! or a field access of type `Never`, say, are only ever in code that does
-//! not run.
+//! a `Break`, `Continue` or `Return` it meets to the one place that unwinds
+//! (see [`crate::eval`]). The other nodes of kind `Never`, a load of a
+//! variable or a field access of type `Never`, say, are only ever in code
+//! that does not run, but for a loop that cannot end, a `for { ... }` no
+//! `break` is for, which runs and never yields: its node is a `Loop` that
+//! collects nothing, of kind [`ValueKind::Record`] as a node, though what
+//! stands where it is may be of any kind, and every walker runs it.
 //!
 //! # Functions
 //!
@@ -384,6 +400,41 @@ pub enum LazyField {
     /// The field or element is a present record or list with lazy values
     /// somewhere inside: they are awaited as the shape says.
     Within(LazyShapeId),
+}
+
+/// What a `return` leaves, named by number: a [`IrKind::Catch`] of the
+/// same number, around a labelled block or a loop, or for
+/// [`CatchId::FUNCTION`], the function or `lazy` being run. Lowering
+/// numbers the catches of a program from 0, each once, so no two catches
+/// of one IR share a number (see [`crate::lower`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CatchId(u32);
+
+impl CatchId {
+    /// The function or `lazy` whose body is being run: what an unlabelled
+    /// `return` leaves, caught by the call, the memoised call or the await
+    /// running it.
+    pub const FUNCTION: CatchId = CatchId(u32::MAX);
+
+    /// The catch numbered `number`.
+    pub(crate) const fn new(number: u32) -> Self {
+        Self(number)
+    }
+
+    /// The catch's number, as a stop carries it (see [`crate::eval`]).
+    pub(crate) const fn number(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for CatchId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if *self == CatchId::FUNCTION {
+            f.write_str("fn")
+        } else {
+            write!(f, "{}", self.0)
+        }
+    }
 }
 
 /// Index of a test of an `is` or an `as` in its [`Ir`]'s table. Resolve it
@@ -801,6 +852,31 @@ pub enum IrKind {
         /// What it contributes to its loop's list, if anything.
         value: Option<IrId>,
     },
+    /// `return`: evaluates `value`, if there is one, a node of any kind,
+    /// and unwinds to the [`IrKind::Catch`] numbered `to`, or for
+    /// [`CatchId::FUNCTION`] out of the body of the function or `lazy`
+    /// being run, which evaluates to the value, `{}` without one (see
+    /// [`crate::eval`]). Of kind [`ValueKind::Never`].
+    Return {
+        /// What it leaves.
+        to: CatchId,
+        /// The value it returns, if it has one.
+        value: Option<IrId>,
+    },
+    /// A labelled block, or a loop, that a `return` leaves: evaluates
+    /// `body`, the block or the loop, a node of any kind, and yields its
+    /// value, or the value of a `return` to `id` that comes out of it, of
+    /// kind `kind`. Only a labelled block or a loop that some `return`
+    /// leaves has one.
+    Catch {
+        /// The block or loop.
+        body: IrId,
+        /// The number the `return`s that leave it name.
+        id: CatchId,
+        /// The kind of the value: the block's or loop's type's, which is
+        /// the join of its own and what is returned.
+        kind: ValueKind,
+    },
     /// Builds a closure of function `function` of the IR, capturing the
     /// values of `captures`: loads in the frame creating it, one for each
     /// value the function captures, in capture order.
@@ -887,8 +963,9 @@ impl IrKind {
     /// interpolation's pieces, a record's values, a list's items,
     /// a spread's list, an index's list and position, a length's list, a
     /// range's bounds, a `for`'s iterable, guard and body, a condition
-    /// loop's condition, body and items after it, a `break`'s and a
-    /// `continue`'s value, a closure's and
+    /// loop's condition, body and items after it, a `break`'s, a
+    /// `continue`'s and a `return`'s value, a catch's block or loop, a
+    /// closure's and
     /// a future's captures, and an await's, an `is`'s and an `as`'s value.
     /// A closure's
     /// or a future's
@@ -927,10 +1004,11 @@ impl IrKind {
             | IrKind::ListLen(operand)
             | IrKind::Is { value: operand, .. }
             | IrKind::As { value: operand, .. }
-            | IrKind::Await { value: operand, .. } => (None, &[], [Some(operand), None, None]),
-            IrKind::Break { value, .. } | IrKind::Continue { value, .. } => {
-                (None, &[], [value, None, None])
-            }
+            | IrKind::Await { value: operand, .. }
+            | IrKind::Catch { body: operand, .. } => (None, &[], [Some(operand), None, None]),
+            IrKind::Break { value, .. }
+            | IrKind::Continue { value, .. }
+            | IrKind::Return { value, .. } => (None, &[], [value, None, None]),
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
             | IrKind::IntMul(Operands { lhs, rhs, .. })
@@ -1048,6 +1126,8 @@ impl IrKind {
             | IrKind::Loop { .. }
             | IrKind::Break { .. }
             | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. } => None,
         }
@@ -1102,6 +1182,8 @@ impl IrKind {
             } => "do-each",
             IrKind::Break { .. } => "break",
             IrKind::Continue { .. } => "continue",
+            IrKind::Return { .. } => "return",
+            IrKind::Catch { .. } => "catch",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -1197,6 +1279,8 @@ impl IrNode {
             | IrKind::Loop { .. }
             | IrKind::Break { .. }
             | IrKind::Continue { .. }
+            | IrKind::Return { .. }
+            | IrKind::Catch { .. }
             | IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -1231,9 +1315,12 @@ impl IrNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnCode {
     /// The body, in the same node arena as the rest of the program: a
-    /// [`IrKind::Block`] for a function (or an [`IrKind::Await`] of one,
-    /// where its value is awaited to fit its return type), and any node
-    /// for a `lazy`.
+    /// [`IrKind::Block`] for a function, or for a labelled body that a
+    /// `return` leaves an [`IrKind::Catch`] of one (or an
+    /// [`IrKind::Await`] of either, where its value is awaited to fit its
+    /// return type), and any node for a `lazy`. A `return` for the
+    /// function or `lazy` comes out of it as a stop, which the call, the
+    /// memoised call or the await running it catches.
     pub body: IrId,
     /// Whether this is a function expression's code, memoised or not, or a
     /// `lazy`'s.
@@ -1605,7 +1692,9 @@ impl Ir {
                 | IrKind::Range(..)
                 | IrKind::For { collect: true, .. }
                 | IrKind::Loop { collect: true, .. } => ValueKind::List,
-                IrKind::Break { .. } | IrKind::Continue { .. } => ValueKind::Never,
+                IrKind::Break { .. } | IrKind::Continue { .. } | IrKind::Return { .. } => {
+                    ValueKind::Never
+                }
                 IrKind::FloatConst(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::FloatAdd(_)
@@ -1626,7 +1715,8 @@ impl Ir {
                 | IrKind::Call { kind, .. }
                 | IrKind::LoadCapture(_, kind)
                 | IrKind::Await { kind, .. }
-                | IrKind::As { kind, .. } => kind,
+                | IrKind::As { kind, .. }
+                | IrKind::Catch { kind, .. } => kind,
                 IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
                 IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
@@ -1670,7 +1760,11 @@ impl Ir {
     /// condition, its body and the items after its condition; a `break` as
     /// `(break 1 @0..7 ...)` and a `continue` as `(continue 0 @0..8)`, with
     /// the number of loops it leaves before its own, and its value, if it
-    /// has one. A closure shows its
+    /// has one; a `return` as `(return 0 @0..9 ...)`, with the number of
+    /// the catch it leaves for, or as `(return fn @0..8 ...)` for one that
+    /// leaves its function or `lazy`, and its value, if it has one; and a
+    /// catch as `(catch 0 @0..30 ...)`, with its number, and its block or
+    /// loop. A closure shows its
     /// function's
     /// number and then what it captures, as in `(make-closure #0 @0..9
     /// ...)`, a call its callee and then its arguments, each as
@@ -2328,6 +2422,8 @@ impl Pretty<'_> {
             IrKind::Break { loops, .. } | IrKind::Continue { loops, .. } => {
                 write!(f, " {loops}")?;
             }
+            IrKind::Return { to, .. } => write!(f, " {to}")?,
+            IrKind::Catch { id, .. } => write!(f, " {id}")?,
             _ => {}
         }
         Ok(())

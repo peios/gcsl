@@ -153,7 +153,9 @@
 //!
 //! A union of members of one kind of value (lists, say) has that kind (see
 //! [`TypeTable::value_kind`]); any other has [`ValueKind::Mixed`], whose
-//! values only the evaluator's general walker handles.
+//! values only the evaluator's general walker handles. A union all of
+//! whose members are unit-like, as `List<{}> | {}` is, is unit-like (see
+//! [`TypeTable::is_unit_like`]).
 //!
 //! A *test* of a type (see [`ValueTest`]) is how the checker's `is` and
 //! `as` ask at runtime whether a value is of a type: by the structure of
@@ -567,18 +569,24 @@ impl TypeTable {
         }
     }
 
-    /// Whether `id` is *unit-like*: `{}`, `Never`, or a list type whose
-    /// element type is unit-like, as `List<{}>` and `List<List<{}>>` are. A
-    /// value of such a type holds nothing but empty records and lists of
-    /// them, and `Never` has no value at all, so a statement of one is not
-    /// an unused value (see [`crate::check`]). A type that is unit-like
-    /// only once awaited, as `List<Future<{}>>` is, is not.
+    /// Whether `id` is *unit-like*: `{}`, `Never`, a list type whose element
+    /// type is unit-like, as `List<{}>` and `List<List<{}>>` are, or a
+    /// union all of whose members are, as `List<{}> | {}` is. A value of
+    /// such a type holds nothing but empty records and lists of them, and
+    /// `Never` has no value at all, so a statement of one is not an unused
+    /// value (see [`crate::check`]). A type that is unit-like only once
+    /// awaited, as `List<Future<{}>>` is, is not.
+    ///
+    /// Recurses once per union met inside a list's element type.
     #[must_use]
     pub fn is_unit_like(&self, id: TyId) -> bool {
         let mut id = id;
         loop {
             if id == TyId::EMPTY || self.is_never(id) {
                 return true;
+            }
+            if let Some(members) = self.union_members(id) {
+                return members.iter().all(|&member| self.is_unit_like(member));
             }
             match self.list_element(id) {
                 Some(element) => id = element,

@@ -1,0 +1,22 @@
+# Leaving early: a function, a `lazy`, a labelled block and a loop.
+fn sign(n: Int): Int { if n < 0 { return -1 }; if n > 0 { return 1 }; 0 }
+let signs = [sign(-4), sign(0), sign(9)]
+# A `return` in a `lazy` leaves the `lazy`, and is the future's value.
+let cached = true
+let job = lazy { if cached { return 7 }; 9 }
+# A labelled block evaluates to what is returned to it.
+let pick = {'pick if cached { return'pick "cached" }; "fresh" }
+# Returned to a loop, the whole loop is the value, not a list.
+let costs = [3, 8, 5]
+let hit = for'scan c in costs { if c > 5 { return'scan c } }
+# A loop with no condition and no `break` never ends: no list, no union.
+let mut tries = 0
+let polled: Int = for'spin { tries := tries + 1; if tries > 2 { return'spin tries } }
+# A labelled body: what it returns is what the iteration contributes.
+let capped = for c in costs {'it if c > 5 { return'it 5 }; c }
+signs = signs
+job = await job
+pick = pick
+hit = hit
+polled = polled
+capped = capped

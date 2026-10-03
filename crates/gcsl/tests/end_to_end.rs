@@ -671,6 +671,37 @@ fn every_stage_handles_maximum_for_depth() {
     });
 }
 
+/// Labelled blocks that `return` nest as deeply as the parser allows,
+/// through every stage, the printers included: each a block whose one item
+/// returns the next to it, so that each lowers to a catch of a block of a
+/// `return`, three levels of IR for the one of height, and evaluation
+/// recurses through each one's catch, block and `return`.
+#[test]
+fn every_stage_handles_maximum_labelled_block_depth() {
+    on_recommended_stack(|| {
+        let levels = (gcsl::MAX_DEPTH - 1) / 2;
+        let mut opens = String::new();
+        for n in 0..levels {
+            opens.push_str("{'l");
+            opens.push_str(&n.to_string());
+            opens.push_str(" return'l");
+            opens.push_str(&n.to_string());
+            opens.push(' ');
+        }
+        let file = source(&format!("{opens}1{}", " }".repeat(levels)));
+        let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
+        let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
+        let mut types = TypeTable::new();
+        let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+        let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+        assert_eq!(gcsl::eval::eval(&ir).unwrap(), Value::Int(1));
+        let annotation = checked.types.annotation(&types, ast.names());
+        assert!(!ast.pretty().to_string().is_empty());
+        assert!(!ast.pretty_with(&annotation).to_string().is_empty());
+        assert!(!ir.pretty(ast.names()).to_string().is_empty());
+    });
+}
+
 /// Records nest as deeply as the parser allows, through every stage: as
 /// record blocks, as chains of field accesses on them, and as record types.
 #[test]
@@ -2379,6 +2410,96 @@ fn loop_warnings_render_exactly() {
          \x20 |                        ----- this always leaves the block\n\
          2 |   x }\n\
          \x20 |   ^\n"
+    );
+}
+
+/// Ten thousand `return`s for a function, a labelled block and a loop,
+/// each out of a nest of blocks and loops, leave the nesting budget as it
+/// was, as `stops_leave_the_nesting_budget_as_it_was` shows for `break`.
+#[test]
+fn returns_leave_the_nesting_budget_as_it_was() {
+    on_recommended_stack(|| {
+        let recursion = "fn f(n: Int): Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n";
+        let returns = "fn g(i: Int): Int { for j in [1] { { { if i >= 0 { return i } } } }; 0 }\n\
+                       let v = for i in 0..10000 { let a = g(i); let b = {'b { { return'b a } } }; \
+                       for'l { { return'l b } } }\n";
+        let fits = |calls: usize, before: &str| {
+            run(&format!("{recursion}{before}f({})", calls - 1)).is_ok()
+        };
+        let (mut low, mut high) = (1, gcsl::MAX_DEPTH);
+        while low + 1 < high {
+            let middle = usize::midpoint(low, high);
+            if fits(middle, "") {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        assert!(fits(low, "") && !fits(low + 1, ""));
+        assert!(fits(low, returns), "{low}");
+        assert!(!fits(low + 1, returns), "{low}");
+    });
+}
+
+/// `return`, labelled blocks and loops that return, through every stage.
+#[test]
+fn programs_with_returns() {
+    for (text, value) in [
+        (
+            "fn sign(n: Int): Int { if n < 0 { return -1 }; if n > 0 { return 1 }; 0 }\n\
+             [sign(-3), sign(0), sign(3)]",
+            "[-1, 0, 1]",
+        ),
+        ("let job = lazy { if true { return 5 }; 6 }\nawait job", "5"),
+        (
+            "let y = {'pick if false { return'pick 1 }; if true { return'pick 2 }; 3 }\ny",
+            "2",
+        ),
+        (
+            "let hit: Int | List<{}> = for'scan x in [1, 7] { if x > 5 { return'scan x } }\nhit",
+            "7",
+        ),
+        (
+            "let mut k = 0\nlet v: Int = for'spin { k := k + 1; if k > 2 { return'spin k } }\nv",
+            "3",
+        ),
+        (
+            "for x in [1, 6] {'it if x < 5 { return'it 0 }; x }",
+            "[0, 6]",
+        ),
+    ] {
+        assert_eq!(run(text).unwrap().repr().to_string(), value, "{text}");
+    }
+    assert_eq!(
+        show("fn f(c: Bool) -> Int { if c { return 1 }; lazy 2 }\nf"),
+        "fn(c: Bool | Future<Bool>) -> Int | Future<Int> : fn(c: Bool | Future<Bool>) -> Int | \
+         Future<Int>"
+    );
+}
+
+#[test]
+fn return_diagnostics_render_exactly() {
+    assert_eq!(
+        rendered_warnings("let hit = for'scan x in [1, 7] { if x > 5 { return'scan x } }\n"),
+        "warning: this loop is its list or a value returned to it, of different types\n\
+         \x20--> calc.gcsl:1:11\n\
+         \x20 |\n\
+         1 | let hit = for'scan x in [1, 7] { if x > 5 { return'scan x } }\n\
+         \x20 |           ^^^ its list is List<{}>                      - this is Int\n\
+         \x20 |\n\
+         \x20 = note: the loop is `Int | List<{}>`; annotate it with that type if all are meant, \
+         or tell them apart with `is`\n"
+    );
+    assert_eq!(
+        rendered("let x = 1\nreturn x\n"),
+        "error: `return` outside a function\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         2 | return x\n\
+         \x20 | ^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: only a function or a `lazy` can be returned from without a label; a block \
+         or a loop labelled `'L` is left with `return'L`\n"
     );
 }
 

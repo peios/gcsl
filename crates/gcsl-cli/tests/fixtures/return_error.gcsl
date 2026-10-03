@@ -1,0 +1,3 @@
+let limit = 3
+return limit
+let found = for'scan x in [1, 2] { let f = fn(): Int { return'scan x }; x }

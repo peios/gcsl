@@ -25,11 +25,12 @@
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `mut`,
 //! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`,
-//! `await`, `for`, `do`, `break`, `continue`, `in`, `is` and `as`; the
-//! whole identifier is scanned before it is compared with them, so `fn-x`,
-//! `lazy-x`, `await-x`, `for-x`, `do-x`, `break-x`, `mut-x` and `is-x` are
-//! identifiers. So no variable or unquoted field can be named `do`,
-//! `break` or `continue`. A *label*, [`TokenKind::Label`], is `'` directly
+//! `await`, `for`, `do`, `break`, `continue`, `return`, `in`, `is` and
+//! `as`; the whole identifier is scanned before it is compared with them,
+//! so `fn-x`, `lazy-x`, `await-x`, `for-x`, `do-x`, `break-x`, `return-x`,
+//! `mut-x` and `is-x` are identifiers. So no variable or unquoted field can
+//! be named `do`, `break`, `continue` or `return`. A *label*,
+//! [`TokenKind::Label`], is `'` directly
 //! followed by a name, scanned by the rule for identifiers, as in `'outer`,
 //! `'_` and `'a-b`, one token holding the name; its text is interned
 //! whatever it spells, so `'for` is a label named `for`. A `'` not directly
@@ -229,9 +230,12 @@ pub enum TokenKind {
     Break,
     /// The keyword `continue`, an item that ends an iteration of a loop.
     Continue,
-    /// A loop's label: `'` directly followed by a name, as in `'outer`,
-    /// holding the name, interned as an identifier is (a keyword's spelling
-    /// included, since the `'` makes it no keyword).
+    /// The keyword `return`, an item that leaves a function, a `lazy`, or
+    /// the block or loop its label names, with a value.
+    Return,
+    /// A loop's or a block's label: `'` directly followed by a name, as in
+    /// `'outer`, holding the name, interned as an identifier is (a
+    /// keyword's spelling included, since the `'` makes it no keyword).
     Label(Name),
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
@@ -344,6 +348,7 @@ impl TokenKind {
             TokenKind::Do => Some("do"),
             TokenKind::Break => Some("break"),
             TokenKind::Continue => Some("continue"),
+            TokenKind::Return => Some("return"),
             TokenKind::In => Some("in"),
             TokenKind::Is => Some("is"),
             TokenKind::As => Some("as"),
@@ -412,6 +417,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "do" => TokenKind::Do,
         "break" => TokenKind::Break,
         "continue" => TokenKind::Continue,
+        "return" => TokenKind::Return,
         "in" => TokenKind::In,
         "is" => TokenKind::Is,
         "as" => TokenKind::As,
@@ -2725,6 +2731,32 @@ mod tests {
         assert_eq!(TokenKind::Do.symbol(), Some("do"));
         assert_eq!(TokenKind::Break.symbol(), Some("break"));
         assert_eq!(TokenKind::Continue.symbol(), Some("continue"));
+    }
+
+    #[test]
+    fn return_is_a_keyword_only_as_a_whole_word() {
+        assert_eq!(
+            show("return return-x returns Return _return"),
+            vec![
+                "Return",
+                "Ident(return-x)",
+                "Ident(returns)",
+                "Ident(Return)",
+                "Ident(_return)",
+                "Eof"
+            ]
+        );
+        assert!(!is_identifier("return"));
+        assert!(is_identifier("return-x"));
+        assert_eq!(TokenKind::Return.symbol(), Some("return"));
+        // A label is written directly after it, and after a `{`.
+        assert_eq!(
+            with_labels("{'pick return'pick 1 }"),
+            [
+                "LBrace", "'pick", "Return", "'pick", "Int(1)", "RBrace", "Eof"
+            ]
+        );
+        assert_eq!(spans("{'a"), [(0, 1), (1, 3), (3, 3)]);
     }
 
     /// The tokens of `text`, a label shown as `'` and its name, and every

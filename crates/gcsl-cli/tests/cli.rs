@@ -1623,6 +1623,113 @@ fn repl_shows_functions_and_their_errors_against_their_own_line() {
 }
 
 #[test]
+fn run_leaves_functions_blocks_and_loops_early() {
+    let output = gcsl(&["run", "tests/fixtures/return.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{signs = [-1, 0, 1]; job = 7; pick = \"cached\"; hit = 8; polled = 3; capped = [3, 5, \
+         5]}\n"
+    );
+    // A loop that can end as its list, or be returned from: a union, and a
+    // warning. One that cannot end: neither.
+    assert_eq!(
+        stderr(&output),
+        "warning: this loop is its list or a value returned to it, of different types\n\
+         \x20 --> tests/fixtures/return.gcsl:11:11\n\
+         \x20  |\n\
+         11 | let hit = for'scan c in costs { if c > 5 { return'scan c } }\n\
+         \x20  |           ^^^ its list is List<{}>                     - this is Int\n\
+         \x20  |\n\
+         \x20  = note: the loop is `Int | List<{}>`; annotate it with that type if all are \
+         meant, or tell them apart with `is`\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_returns_and_their_catches() {
+    let output = gcsl(&["run", "tests/fixtures/return.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in [
+        "\nReturn @102..108\nNeg @109..110\n",
+        "\nLBrace @384..385\nLabel(pick) @385..390\n",
+        "\nFor @532..535\nLabel(scan) @535..540\n",
+    ] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/return.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "(return @102..111\n",
+        "(block'pick @384..436\n",
+        "(return'pick @403..423\n",
+        "(for'scan c @532..582\n",
+        "(block'it @858..892\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/return.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "(lazy : Future<Int> @282..316\n",
+        "(block'pick : String @384..436\n",
+        "(for'scan c : Int | List<{}> @532..582\n",
+        // A loop that cannot end is only what is returned to it.
+        "(for'spin : Int @692..759\n",
+        "(for c : List<Int> @843..892\n",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/return.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // A function's `return` names it by `fn`.
+        "(return fn @102..111\n",
+        // A labelled block's and a loop's by their catches' numbers.
+        "(catch 0 @384..436\n",
+        "(return 0 @403..423\n",
+        "\n    (catch 1 @532..582\n\
+         \x20     (for hit#6 @532..582\n",
+        // A loop that cannot end collects nothing.
+        "\n    (catch 2 @692..759\n\
+         \x20     (loop-each @692..759\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn return_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/return_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `return` outside a function\n\
+         \x20--> tests/fixtures/return_error.gcsl:2:1\n\
+         \x20 |\n\
+         2 | return limit\n\
+         \x20 | ^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: only a function or a `lazy` can be returned from without a label; a block \
+         or a loop labelled `'L` is left with `return'L`\n\
+         \n\
+         error: `return` cannot leave a function\n\
+         \x20--> tests/fixtures/return_error.gcsl:3:56\n\
+         \x20 |\n\
+         3 | let found = for'scan x in [1, 2] { let f = fn(): Int { return'scan x }; x }\n\
+         \x20 |                -----                       --          ^^^^^^^^^^^\n\
+         \x20 |                |                           |\n\
+         \x20 |                |                           inside a function here\n\
+         \x20 |                the loop it names is outside it\n\
+         \x20 |\n\
+         \x20 = note: the body of a function runs when it is called, which may be after the \
+         loop has ended\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn repl_evaluates_each_line() {
     let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");
     assert_eq!(stdout(&output), "3 : Int\n3.5 : Float\n-0.0 : Float\n");

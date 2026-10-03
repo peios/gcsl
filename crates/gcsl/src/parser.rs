@@ -7,7 +7,7 @@
 //! separators, and so blank and comment-only lines, are skipped. An item is
 //! `let PATH (: TYPE)? = EXPR`, `let mut NAME (: TYPE)? = EXPR`, `PATH :=
 //! EXPR`, a field `PATH = EXPR`, `= EXPR`, a spread `...EXPR`, a named
-//! function `fn NAME(...) ...`, a `break` or a `continue` (see
+//! function `fn NAME(...) ...`, a `break`, a `continue` or a `return` (see
 //! [Loops](#loops)), or an expression. After an item the next
 //! token must be a separator or the end of the body; anything else is
 //! "expected end of item".
@@ -269,21 +269,29 @@
 //! follow the `for`: a label, a `let` or a name followed by `in` there is
 //! "only a condition follows the `for` of a `do`".
 //!
-//! `break` and `continue` are items (`Parser::parse_jump`), allowed where
-//! any item of a block is, the keyword followed by its label, if any, and
-//! its value, if one begins on the same line: a newline, a `;`, a `}` or
-//! the end of input after the keyword and the label means there is none.
-//! Where an expression starts, they are "expected expression", as `let` is.
+//! `break`, `continue` and `return` are items (`Parser::parse_jump`),
+//! allowed where any item of a block is, the keyword followed by its label,
+//! if any, and its value, if one begins on the same line: a newline, a
+//! `;`, a `}` or the end of input after the keyword and the label means
+//! there is none. Where an expression starts, they are "expected
+//! expression", as `let` is, so `x or return 1` is an error. Where a
+//! `return` may go, and what it leaves, is the checker's business.
 //!
 //! # Labels
 //!
 //! A label, [`TokenKind::Label`], is written directly after the `for`,
-//! `do`, `break` or `continue` it belongs to: with anything between, it is
-//! "a label is written directly after `for`, with no space" (or `do`,
-//! `break`, `continue`), at the label. Anywhere else, where an item or an
-//! expression starts or ends, or the name of a `for`'s variable or of a
-//! `let` is expected, it is "a label names a loop: it follows `for`, `do`,
-//! `break` or `continue`", at the label.
+//! `do`, `break`, `continue` or `return` it belongs to, or directly after
+//! the `{` of a block, which it names (`Parser::parse_block`): any block,
+//! a block expression, a function's body, a branch of an `if`, a loop's
+//! body, a `lazy`'s block or a trailing block. With anything between, it
+//! is "a label is written directly after `for`, with no space" (or `do`,
+//! `break`, `continue`, `return`, `{`), at the label. A block with a field
+//! or a spread item, a record block, cannot be labelled: "a record block
+//! cannot be labelled", at the label, once the block is parsed. Anywhere
+//! else, where an item or an expression starts or ends, or the name of a
+//! `for`'s variable or of a `let` is expected, an interpolation's braces
+//! included, it is "a label names a loop or a block: it follows `for`,
+//! `do`, `break`, `continue`, `return` or `{`", at the label.
 //!
 //! # Expressions
 //!
@@ -423,7 +431,7 @@
 //! folds each operator into the
 //! left-hand side, so the parser also tracks the height of every node it
 //! allocates, a block being one above the tallest of its items' expressions
-//! and types (a `break`'s or `continue`'s value among them), an `if` or an
+//! and types (a `break`'s, `continue`'s or `return`'s value among them), an `if` or an
 //! interpolation one above its tallest child, a
 //! `for` one above the tallest of its iterable, its guard and its body, a
 //! condition loop one above the tallest of its header's items, its
@@ -523,7 +531,12 @@ const FIELD_INDEX: &str = "a field's path cannot index a list";
 
 /// The error for a label anywhere but directly after the keyword of what it
 /// belongs to.
-const MISPLACED_LABEL: &str = "a label names a loop: it follows `for`, `do`, `break` or `continue`";
+const MISPLACED_LABEL: &str = "a label names a loop or a block: it follows `for`, `do`, `break`, \
+     `continue`, `return` or `{`";
+
+/// The error for a label on a record block, which nothing can leave by
+/// it.
+const LABELLED_RECORD: &str = "a record block cannot be labelled";
 
 /// The error for a `do` loop whose body is not followed by `for`.
 const MISSING_DO_FOR: &str = "expected `for` and a condition after the body of a `do`";
@@ -784,7 +797,9 @@ impl Parser<'_> {
                 let (kind, value, ty_height, path_shape) = self.parse_let(token)?;
                 return self.finish_item(token, (kind, value), ty_height, path_shape);
             }
-            TokenKind::Break | TokenKind::Continue => return self.parse_jump(token),
+            TokenKind::Break | TokenKind::Continue | TokenKind::Return => {
+                return self.parse_jump(token);
+            }
             TokenKind::Label(_) => return Err(self.misplaced_label(token)),
             TokenKind::Eq => {
                 self.advance();
@@ -861,11 +876,12 @@ impl Parser<'_> {
         Ok((kind, value, ty_height, shape))
     }
 
-    /// Parses a `break` or `continue` item, starting at its keyword,
-    /// `keyword`: the keyword, its label, if one is written directly after
-    /// it, and its value, if one begins on the same line, since a newline,
-    /// a `;` or a `}` after the keyword and the label means there is none.
-    /// Returns it and its height: its value's, or 0 without one.
+    /// Parses a `break`, `continue` or `return` item, starting at its
+    /// keyword, `keyword`: the keyword, its label, if one is written
+    /// directly after it, and its value, if one begins on the same line,
+    /// since a newline, a `;` or a `}` after the keyword and the label means
+    /// there is none. Returns it and its height: its value's, or 0 without
+    /// one.
     fn parse_jump(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
         self.advance();
         let label = self.parse_label(keyword)?;
@@ -884,19 +900,20 @@ impl Parser<'_> {
             return Err(self.too_deep(span));
         }
         let jump = Jump { label, value };
-        let kind = if keyword.kind == TokenKind::Break {
-            ItemKind::Break(jump)
-        } else {
-            ItemKind::Continue(jump)
+        let kind = match keyword.kind {
+            TokenKind::Break => ItemKind::Break(jump),
+            TokenKind::Return => ItemKind::Return(jump),
+            _ => ItemKind::Continue(jump),
         };
         let item = self.builder.alloc_item(Item { kind, span });
         Ok((item, height))
     }
 
-    /// Parses the label of the `for`, `do`, `break` or `continue`
-    /// `keyword`, just consumed, if one follows it: one written directly
-    /// after it, with no space, or the error "a label is written directly
-    /// after `for`, with no space" at a label with space before it.
+    /// Parses the label of the `for`, `do`, `break`, `continue` or `return`
+    /// `keyword`, or of the block whose `{` it is, just consumed, if one
+    /// follows it: one written directly after it, with no space, or the
+    /// error "a label is written directly after `for`, with no space" (or
+    /// the keyword's, or `{`) at a label with space before it.
     fn parse_label(&mut self, keyword: Token) -> ParseResult<Option<Label>> {
         let token = self.peek();
         let TokenKind::Label(name) = token.kind else {
@@ -917,7 +934,7 @@ impl Parser<'_> {
     }
 
     /// Reports `token`, a label where none is allowed: anywhere but directly
-    /// after `for`, `do`, `break` or `continue`.
+    /// after `for`, `do`, `break`, `continue`, `return` or a block's `{`.
     fn misplaced_label(&mut self, token: Token) -> Reported {
         self.error(MISPLACED_LABEL, token.span)
     }
@@ -1829,31 +1846,7 @@ impl Parser<'_> {
             TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
             TokenKind::Await => return self.parse_unary(UnaryOp::Await, PREFIX_BP),
             TokenKind::Not => return self.parse_unary(UnaryOp::Not, NOT_BP),
-            TokenKind::LParen => {
-                self.advance();
-                let outer = std::mem::replace(&mut self.braces, Braces::Free);
-                let inner = self.parse_expr(0);
-                self.braces = outer;
-                let inner = inner?;
-                let close = self.peek();
-                if close.kind != TokenKind::RParen {
-                    let found = self.describe(close);
-                    return Err(self.report(
-                        Diagnostic::error(
-                            format!("expected `)`, found {found}"),
-                            error_span(close),
-                        )
-                        .with_context(token.span, "unclosed `(`"),
-                    ));
-                }
-                self.advance();
-                let height = self.height_of(inner) + 1;
-                return self.alloc(
-                    ExprKind::Paren(inner),
-                    Span::join(token.span, close.span),
-                    height,
-                );
-            }
+            TokenKind::LParen => return self.parse_paren(token),
             TokenKind::LBrace => return self.parse_block(),
             TokenKind::LBracket => return self.parse_list(),
             TokenKind::DotDotDot => return Err(self.error(MISPLACED_SPREAD, token.span)),
@@ -1880,6 +1873,7 @@ impl Parser<'_> {
             | TokenKind::As
             | TokenKind::Break
             | TokenKind::Continue
+            | TokenKind::Return
             | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::Let
@@ -2192,6 +2186,31 @@ impl Parser<'_> {
         Ok((index, Span::join(open.span, close.span)))
     }
 
+    /// Parses a parenthesised expression, starting at its `(`, `open`, the
+    /// current token.
+    fn parse_paren(&mut self, open: Token) -> ParseResult<ExprId> {
+        self.advance();
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
+        let inner = self.parse_expr(0);
+        self.braces = outer;
+        let inner = inner?;
+        let close = self.peek();
+        if close.kind != TokenKind::RParen {
+            let found = self.describe(close);
+            return Err(self.report(
+                Diagnostic::error(format!("expected `)`, found {found}"), error_span(close))
+                    .with_context(open.span, "unclosed `(`"),
+            ));
+        }
+        self.advance();
+        let height = self.height_of(inner) + 1;
+        self.alloc(
+            ExprKind::Paren(inner),
+            Span::join(open.span, close.span),
+            height,
+        )
+    }
+
     /// Parses a prefix operator `op`, the current token, and its operand,
     /// parsed with minimum binding power `operand_bp`.
     fn parse_unary(&mut self, op: UnaryOp, operand_bp: u8) -> ParseResult<ExprId> {
@@ -2203,24 +2222,46 @@ impl Parser<'_> {
         self.alloc(ExprKind::Unary { op, operand }, span, height)
     }
 
-    /// Parses a block `{ ... }`, starting at its `{`.
+    /// Parses a block `{ ... }`, starting at its `{`, with its label, if one
+    /// is written directly after the `{`. A record block, one with a field
+    /// or a spread item, cannot be labelled: "a record block cannot be
+    /// labelled", at the label.
     fn parse_block(&mut self) -> ParseResult<ExprId> {
         let open = self.peek();
         self.advance();
+        let label = self.parse_label(open)?;
         self.enter()?;
         let outer = std::mem::replace(&mut self.braces, Braces::Free);
         let body = self.parse_body(Some(open.span));
         self.braces = outer;
         self.depth -= 1;
         let (items, tallest) = body?;
+        let label = match label {
+            Some(label) if self.is_record_body(items) => {
+                return Err(self.error(LABELLED_RECORD, label.span));
+            }
+            Some(label) => Some(self.builder.push_label(label)),
+            None => None,
+        };
         // `parse_body` only returns successfully at the matching `}`.
         let close = self.peek();
         self.advance();
         self.alloc(
-            ExprKind::Block(items),
+            ExprKind::Block { items, label },
             Span::join(open.span, close.span),
             tallest + 1,
         )
+    }
+
+    /// Whether the body `items`, just parsed, has a field or a spread item,
+    /// which makes it a record block.
+    fn is_record_body(&self, items: ItemRange) -> bool {
+        self.builder.items(items).iter().any(|&id| {
+            matches!(
+                self.builder.item(id).kind,
+                ItemKind::Field { .. } | ItemKind::Spread(_)
+            )
+        })
     }
 
     /// Parses an `if` expression, starting at its `if`.
@@ -2264,7 +2305,11 @@ impl Parser<'_> {
             self.pos = after_then;
             let end = self.span_of(then).end;
             let empty = self.builder.push_item_list(&[]);
-            let else_ = self.alloc(ExprKind::Block(empty), Span::new(end, end), LEAF_HEIGHT)?;
+            let block = ExprKind::Block {
+                items: empty,
+                label: None,
+            };
+            let else_ = self.alloc(block, Span::new(end, end), LEAF_HEIGHT)?;
             (else_, false)
         };
         let span = Span::join(keyword.span, self.span_of(else_));
@@ -2772,6 +2817,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Do
         | TokenKind::Break
         | TokenKind::Continue
+        | TokenKind::Return
         | TokenKind::Label(_)
         | TokenKind::In
         | TokenKind::Is
@@ -2882,14 +2928,15 @@ mod tests {
         }
     }
 
-    /// One item of a body, as [`shape`] writes it: a `break` or `continue`
-    /// as it is written, its label after its keyword and its value after
-    /// a space.
+    /// One item of a body, as [`shape`] writes it: a `break`, `continue` or
+    /// `return` as it is written, its label after its keyword and its
+    /// value after a space.
     fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
         match ast.item(id).kind {
-            ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+            ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                 out.push_str(match ast.item(id).kind {
                     ItemKind::Break(_) => "break",
+                    ItemKind::Return(_) => "return",
                     _ => "continue",
                 });
                 if let Some(label) = jump.label {
@@ -3059,9 +3106,10 @@ mod tests {
                     // empty span.
                     let empty = ast.get(else_);
                     assert_eq!(empty.span.start, empty.span.end);
-                    assert!(
-                        matches!(empty.kind, ExprKind::Block(items) if ast.items(items).is_empty())
-                    );
+                    assert!(matches!(
+                        empty.kind,
+                        ExprKind::Block { items, label: None } if ast.items(items).is_empty()
+                    ));
                 }
                 out.push(')');
             }
@@ -3094,11 +3142,7 @@ mod tests {
                 expr(ast, inner, out);
                 out.push(']');
             }
-            ExprKind::Block(items) => {
-                out.push('{');
-                body(ast, items, out);
-                out.push('}');
-            }
+            ExprKind::Block { items, label } => block_shape(ast, (items, label), out),
             ExprKind::Ascribe { expr: inner, ty }
             | ExprKind::Is { expr: inner, ty }
             | ExprKind::As { expr: inner, ty } => {
@@ -3121,6 +3165,23 @@ mod tests {
             ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
             ExprKind::For(id) => for_shape(ast, id, out),
         }
+    }
+
+    /// A block as `{..}`, its label after its `{` and a space, as in `{'a
+    /// ..}`.
+    fn block_shape(
+        ast: &Ast,
+        (items, label): (ItemRange, Option<crate::ast::LabelId>),
+        out: &mut String,
+    ) {
+        out.push('{');
+        if let Some(label) = label {
+            out.push('\'');
+            out.push_str(ast.names().get(ast.label(label).name));
+            out.push(' ');
+        }
+        body(ast, items, out);
+        out.push('}');
     }
 
     /// A loop as it is written, so that it parses back to itself: `for x in
@@ -6023,7 +6084,7 @@ mod tests {
         }
         // The item spans `...` through its expression.
         let ast = parse_text("{ ...ab : T }").unwrap();
-        let ExprKind::Block(items) = ast.get(only_value(&ast)).kind else {
+        let ExprKind::Block { items, .. } = ast.get(only_value(&ast)).kind else {
             panic!("expected a block");
         };
         let item = ast.item(ast.items(items)[0]);
@@ -7168,6 +7229,7 @@ mod tests {
         let (keyword, jump) = match item.kind {
             ItemKind::Break(jump) => ("break", jump),
             ItemKind::Continue(jump) => ("continue", jump),
+            ItemKind::Return(jump) => ("return", jump),
             other => panic!("{text}: expected a jump, got {other:?}"),
         };
         (
@@ -7326,5 +7388,188 @@ mod tests {
              \x20   (for @71..77\n\
              \x20     (block @75..77))))"
         );
+    }
+
+    #[test]
+    fn return_with_and_without_a_value_and_a_label() {
+        assert_eq!(jump("return"), ("return", None, None, Span::new(0, 6)));
+        assert_eq!(
+            jump("return x + 1"),
+            ("return", None, Some(Span::new(7, 12)), Span::new(0, 12))
+        );
+        assert_eq!(
+            jump("return'pick"),
+            ("return", Some("pick".to_owned()), None, Span::new(0, 11))
+        );
+        assert_eq!(
+            jump("return'pick 2"),
+            (
+                "return",
+                Some("pick".to_owned()),
+                Some(Span::new(12, 13)),
+                Span::new(0, 13)
+            )
+        );
+        // A newline, a `;` or a `}` after the keyword means no value.
+        assert_eq!(shape("return\n1"), "return; 1");
+        assert_eq!(shape("return'a\nx"), "return'a; x");
+        assert_eq!(shape("return; 1"), "return; 1");
+        assert_eq!(shape("{ return }"), "{return}");
+        // An item of any plain block, an operand or not.
+        assert_eq!(
+            shape("let x = if c { return 1 } else { 2 }"),
+            "let x = (if c {return 1} else {2})"
+        );
+        assert_eq!(shape("f(g({ return 1 }))"), "f(g({return 1}))");
+    }
+
+    #[test]
+    fn every_return_and_labelled_block_form_prints_back_to_itself() {
+        for text in [
+            "return",
+            "return 1",
+            "return'a",
+            "return'a x",
+            "{'pick return'pick 1; 3}",
+            "{'a {'b return'a 1}}",
+            "for x in xs {'it return'it 0; x}",
+            "for'scan x in xs {return'scan x}",
+            "for'spin {return'spin r}",
+            "do'd {return'd 1} for c",
+            "f(){'t 1}",
+        ] {
+            assert_eq!(shape(text), text);
+        }
+        assert_eq!(
+            shape("if c {'t 1} else {'e return'e 2}"),
+            "(if c {'t 1} else {'e return'e 2})"
+        );
+        assert_eq!(shape("lazy {'l return 1}"), "(lazy {'l return 1})");
+        // A function's body may be labelled, as any block.
+        assert_eq!(
+            shape("fn f(): Int {'body return'body 1}"),
+            "let f = fn(): Int {'body return'body 1}"
+        );
+        // The summary's examples.
+        assert_eq!(
+            shape("let y = {'pick if a { return'pick 1 }; if b { return'pick 2 }; 3 }"),
+            "let y = {'pick (if a {return'pick 1}); (if b {return'pick 2}); 3}"
+        );
+        assert_eq!(
+            shape("fn sign(n: Int): Int { if n < 0 { return -1 }; 0 }"),
+            "let sign = fn(n: Int): Int {(if (n < 0) {return (-1)}); 0}"
+        );
+        assert_eq!(
+            shape("let v: Int = for'spin { let r = poll(); if r > 0 { return'spin r } }"),
+            "let v: Int = for'spin {let r = poll(); (if (r > 0) {return'spin r})}"
+        );
+    }
+
+    #[test]
+    fn return_is_never_an_expression() {
+        for (text, span) in [
+            ("x or return 1", Span::new(5, 11)),
+            ("1 + return", Span::new(4, 10)),
+            ("f(return)", Span::new(2, 8)),
+            ("[return 1]", Span::new(1, 7)),
+            ("let x = return", Span::new(8, 14)),
+            ("= return", Span::new(2, 8)),
+        ] {
+            assert_eq!(
+                error(text),
+                ("expected expression, found `return`".to_owned(), span),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_label_is_written_directly_after_its_brace() {
+        for (text, keyword, span) in [
+            ("{ 'a 1 }", "{", Span::new(2, 4)),
+            ("return 'a", "return", Span::new(7, 9)),
+            ("fn f(): Int { 'b 1 }", "{", Span::new(14, 16)),
+        ] {
+            assert_eq!(
+                error(text),
+                (
+                    format!("a label is written directly after `{keyword}`, with no space"),
+                    span
+                ),
+                "{text}"
+            );
+        }
+        // A label on the next line, or in an interpolation's braces, is
+        // misplaced.
+        for (text, span) in [
+            ("{\n'a 1 }", Span::new(2, 4)),
+            ("\"x{'a 1}\"", Span::new(3, 5)),
+            ("{'a'b 1}", Span::new(3, 5)),
+        ] {
+            assert_eq!(error(text), (MISPLACED_LABEL.to_owned(), span), "{text}");
+        }
+        // A block in an interpolation may be labelled.
+        assert_eq!(shape("\"x{ {'a return'a 1} }\""), "\"x<{'a return'a 1}>\"");
+        assert_eq!(
+            MISPLACED_LABEL,
+            "a label names a loop or a block: it follows `for`, `do`, `break`, `continue`, \
+             `return` or `{`"
+        );
+    }
+
+    #[test]
+    fn a_record_block_cannot_be_labelled() {
+        for (text, span) in [
+            ("{'a x = 1 }", Span::new(1, 3)),
+            ("{'a ...r }", Span::new(1, 3)),
+            ("let r = {'rec a.b = 1; c = 2 }", Span::new(9, 13)),
+        ] {
+            assert_eq!(
+                error(text),
+                ("a record block cannot be labelled".to_owned(), span),
+                "{text}"
+            );
+        }
+        // Without its label, or with only a `let`, it is fine.
+        assert_eq!(shape("{x = 1}"), "{x = 1}");
+        assert_eq!(shape("{'a let x = 1; x}"), "{'a let x = 1; x}");
+    }
+
+    #[test]
+    fn return_is_not_a_name() {
+        assert_eq!(
+            error("let return = 1"),
+            ("expected a name after `let`".to_owned(), Span::new(4, 10))
+        );
+        assert_eq!(
+            error("fn(return: Int): Int { 1 }").0,
+            "expected a parameter name, found `return`"
+        );
+        assert_eq!(error("x.return").0, "expected a field name after `.`");
+        assert_eq!(shape("\"return\" = 1"), "\"return\" = 1");
+    }
+
+    #[test]
+    fn pretty_output_for_returns_and_labelled_blocks() {
+        let ast = parse_text("{'pick return'pick 1 }\nreturn").unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..22\n\
+             \x20   (block'pick @0..22\n\
+             \x20     (return'pick @7..20\n\
+             \x20       (int 1 @19..20))))\n\
+             \x20 (return @23..29))"
+        );
+        // A label's height counts nothing; a value's counts as an item's.
+        let ast = parse_text("{'a return'a 1 + 2 }").unwrap();
+        let ExprKind::Block { items, label } = ast.get(only_value(&ast)).kind else {
+            panic!("expected a block");
+        };
+        assert_eq!(
+            label.map(|label| ast.label(label).span),
+            Some(Span::new(1, 3))
+        );
+        assert_eq!(ast.items(items).len(), 1);
     }
 }

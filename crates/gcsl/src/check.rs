@@ -616,8 +616,10 @@
 //! present may be inferred from code elsewhere. A bare `await e` item
 //! is never an unused value. A statement, an expression item that is not
 //! its block's result, is a position expecting a *unit-like* value: `{}`,
-//! or a list whose element type is unit-like (see
-//! [`TypeTable::is_unit_like`]), which holds nothing a program could use.
+//! a list whose element type is unit-like, or a union all of whose members
+//! are, as the `List<{}> | {}` of a statement loop a bare `return` may
+//! leave is (see [`TypeTable::is_unit_like`]), which holds nothing a
+//! program could use.
 //! A statement that is unit-like as it is, as `{}` is, or the `List<{}>` of
 //! a `for` whose body is `{}`, is fine as it is; one whose value is
 //! unit-like once awaited, at the top (a `Future<{}>`, or the `{}` an
@@ -847,6 +849,21 @@
 //! ordinary result covariance; a written function type is not inferred, so
 //! `fn() -> Int` written means the either shape as before, and accepts
 //! `fn() -> Int { 5 }`, as `fn() -> Present<Int>` now does too.
+//!
+//! What the body returns is decided from all its *result sites* (see
+//! [`return`](#return)): its own result and the value of every `return`
+//! for the function, as if they were the branches of one `if`
+//! (`Checker::inferred_result`). Each site is inferred as the body's
+//! result alone would be, and the result is the join of what they give,
+//! or the declared type should that join not be a subtype of it; a site
+//! of type `Never`, as a body ending in a `return` is, plays no part, and
+//! a function every site of which is `Never` is inferred from `Never`, a
+//! present type. Inferring each site and joining is never less precise
+//! than joining the sites' types first, which would see a record block
+//! checked field by field as the record of the declared fields, and is the
+//! same where the sites are names, futures or eithers: `fn f(c: Bool) ->
+//! Int { if c { return 1 }; 2 }` is `fn(...) -> Int`, with `lazy 2` there
+//! `-> Int | Future<Int>`, and with both lazy `-> Future<Int>`.
 //!
 //! The result is inferred once, when the body's check ends
 //! (`Checker::inferred`), and only if no error was reported while the body
@@ -1148,7 +1165,11 @@
 //! unit-like as a statement. A body that can fall off its end contributes
 //! its own value: `for x in xs { if x > 5 { break x } }` is `List<Int |
 //! {}>`, with the warning, which a final `continue` removes. A body that
-//! is a record block makes a list of records.
+//! is a record block makes a list of records. That list is the loop's
+//! *ordinary* type, what it is when it ends: a loop that cannot end is
+//! `Never` instead (see [Never-ending loops](#never-ending-loops)), and a
+//! loop a `return` leaves is the join of its ordinary type and the values
+//! returned (see [Loops that return](#loops-that-return)).
 //!
 //! # Loops
 //!
@@ -1194,10 +1215,12 @@
 //! function being checked whose *body* holds it, a loop's iterable, guard,
 //! condition and header items being outside its body; with one, the loop of
 //! that label whose body holds it. To find it, the checker keeps the loops
-//! whose bodies are being checked on a stack (`LoopFrame`), each with the
+//! whose bodies are being checked on a stack (`LoopFrame`), with the
+//! labelled blocks whose items are (see [Labels](#labels)), each with the
 //! number of functions being checked when its body began, so that a loop
-//! outside the innermost function or `lazy` is not a target. Errors, each at
-//! the keyword and its label:
+//! outside the innermost function or `lazy` is not a target. A `break` for
+//! a loop is recorded on its frame, for [Never-ending
+//! loops](#never-ending-loops). Errors, each at the keyword and its label:
 //!
 //! - no loop holds it: "`break` outside a loop" (or "`continue`");
 //! - only loops outside the innermost function or `lazy` hold it, or have
@@ -1217,20 +1240,155 @@
 //!
 //! # Labels
 //!
-//! A loop's label, `for'L` or `do'L`, names it for the `break'L` and
-//! `continue'L` in its body. A loop labelled `L` whose body is in that of a
-//! loop labelled `L` of the same function is "label `'L` is already in
-//! use", at the inner label, labelled "the loop around this one is labelled
-//! so" at the outer; a function nested in a loop starts with no labels, and
-//! an unused label is fine. A labelled `break` or `continue` leaves every
-//! loop between it and its target, and its value joins the target's
-//! element type only.
+//! A loop's label, `for'L` or `do'L`, names it for the `break'L`,
+//! `continue'L` and `return'L` in its body, and a block's, `{'L ... }`,
+//! names it for the `return'L` in it (see [Labelled
+//! blocks](#labelled-blocks)). Loop labels and block labels are one
+//! namespace, kept on one stack, [`Checker::loops`], of the loops whose
+//! bodies and the labelled blocks whose items are being checked
+//! (`LoopFrame`; an unlabelled block has none, and costs nothing). A loop
+//! or labelled block labelled `L` inside the body of one labelled `L` of the
+//! same function is "label `'L` is already in use", at the inner label,
+//! labelled "the loop around this one is labelled so" (or "the block") at
+//! the outer, with the note "give the inner loop another label" (or
+//! "block"); a function or `lazy` nested in a loop or block starts with no
+//! labels, and an unused label is fine. A labelled `break` or `continue`
+//! leaves every loop between it and its target, and its value joins the
+//! target's element type only. An unlabelled `break` or `continue` is for
+//! the innermost loop, whatever labelled blocks lie between; a labelled one
+//! whose label names a block is "`'L` labels a block, not a loop", at the
+//! keyword and its label, labelled "the block is labelled here" at the
+//! block's label, with the note "use `return'L` to leave a block".
+//!
+//! # `return`
+//!
+//! `return`, `return EXPR`, `return'L` and `return'L EXPR` are items, as
+//! `break` is (`Checker::check_return`). Each is for a *target*, recorded
+//! for lowering in [`Resolution::target`]:
+//!
+//! - unlabelled, the innermost function or `lazy` being checked, however
+//!   many blocks, labelled blocks and loops of it lie between; at the top
+//!   level, outside any, it is "`return` outside a function";
+//! - labelled `L`, the innermost loop or labelled block labelled `L`
+//!   holding it, of the same function or `lazy`, found as a `break`'s loop
+//!   is ([`Checker::jump_target`]): none at all is "no enclosing block or
+//!   loop is labelled `'L`", at the label, and one only outside the
+//!   innermost function or `lazy` is "`return` cannot leave a function" (or
+//!   "a `lazy`"), as for `break`, labelled "the block it names is outside
+//!   it" (or "the loop") at its label. A loop's iterable, guard, condition
+//!   and header items are not in its body, so a `return'L` there is not for
+//!   it.
+//!
+//! As an item of a record block it is "`return` cannot be an item of a
+//! record block". A block whose last item is a `return` is `Never`, and a
+//! `return` never completes, for the unreachable warning, unless it is in
+//! error. A `return` without a value returns `{}`.
+//!
+//! Each target has *result sites*: its own result, and the value of every
+//! `return` for it (a `Site`, gathered on its frame as it is checked). How
+//! they combine depends on the target:
+//!
+//! - **A function.** Every value returned is treated exactly as the body's
+//!   result is, at every place the checker treats that result specially:
+//!   it is checked against the declared result type, as the body's result
+//!   is, with [`Checker::check_expr_expecting`] (a mismatch is "mismatched
+//!   types" at the value, labelled "the return type is declared here" at
+//!   the type, and a `return` without a value that `{}` does not fit is the
+//!   same at the `return`, with a note that it returns `{}`), so that an
+//!   untyped literal adapts, a value that fits once awaited is awaited, a
+//!   record block is checked field by field and a list literal, a block
+//!   with a result or an `if` against a list type or a union, as the body
+//!   is; the pure function's parameters it holds are measured where the
+//!   declared type is present ([Inferred parameters](#inferred-parameters),
+//!   through `Checker::expect`); a callback parameter returned is used as a
+//!   value, and a call of one in it records its argument ([Narrowed
+//!   callbacks](#narrowed-callbacks)), as anywhere in the body; and an
+//!   impure or memoised function's bare result is inferred from every
+//!   site, each as the body's result alone would be, dotted fields
+//!   included (see [Inferred results](#inferred-results)).
+//! - **A `lazy`.** A `return` leaves the `lazy`, whatever lies between,
+//!   and its value is the future's: it does not leave the function around
+//!   the `lazy`, which may have finished, and is no result site of it. The
+//!   `lazy` is `Future<T>`, `T` the join of its operand's type and every
+//!   value returned, as an `if`'s branches are joined, untyped integers
+//!   adapting to each other and then settling to `Int`; a join that widens
+//!   is a warning, "the values this `lazy` returns have different types",
+//!   at its keyword, labelled at each site, with the union note. Nothing
+//!   is expected of a `lazy`'s operand, so nothing is of its `return`s: a
+//!   type expected of the `lazy` is fitted by the `Future` as a whole, as
+//!   before (`Checker::returned_lazy`).
+//! - **A labelled block or a loop**: see [Labelled
+//!   blocks](#labelled-blocks) and [Loops that return](#loops-that-return).
+//!
+//! # Labelled blocks
+//!
+//! A block labelled `L`, `{'L ... }`, any block that is not a record block
+//! (which the parser rejects), evaluates to the value of a `return'L` in
+//! it at once. It is checked as any block is, with a frame on
+//! [`Checker::loops`] around its items (`Checker::labelled_block`, and
+//! for a function's body, which is a block like any other,
+//! `Checker::check_fn_body`); its type is the join of its own result and
+//! every value returned to it (`Checker::leave_block`), as an `if`'s
+//! branches are joined: untyped integers adapt to each other and to the
+//! numeric types beside them, and stay untyped if all are, a later
+//! [`Checker::coerce`] reaching the values returned as it reaches the
+//! block's result. Where a list type or a union is expected of the block
+//! (as it reaches a block's result: see [Lists](#lists)), each value
+//! returned is checked against it, as the result is, and the join is no
+//! warning; otherwise a join that widens is a warning, "the values this
+//! block returns have different types", at its label, labelled at each
+//! site, with the union note. A block every way through which returns is
+//! of the values' type; a block that returns on no path is `Never` if its
+//! result is. A labelled loop body is a labelled block like any other: in
+//! `for x in xs {'it if x < 0 { return'it 0 }; x }`, `0` is what the
+//! iteration contributes, as `continue 0` would make it.
+//!
+//! # Loops that return
+//!
+//! A `return'L` whose `L` labels a loop makes the whole loop evaluate to
+//! its value at once, not to a list. The loop's type is the join of its
+//! ordinary type, its list or `Never` (see [Never-ending
+//! loops](#never-ending-loops)), and every value returned to it
+//! ([`Checker::returned_loop`]). Without an expected type, untyped values
+//! settle against the list, and a join that widens, as `List<Int> | Int`
+//! does, is a warning, "this loop is its list or a value returned to it, of
+//! different types", at the loop's keyword, labelled "its list is
+//! List<Int>" there and with its type at each `return`, with the union
+//! note. Where a type `T` is expected of it, which reaches a loop directly,
+//! through parentheses, wherever an expected type reaches an expression,
+//! and through a block's result or an `if`'s branches where a list type or
+//! a union is expected ([`Checker::check_loop_expecting`]): every value
+//! returned is checked against `T`; its body is checked against the
+//! element type of `T`'s list type, when `T` is one, or a union with
+//! exactly one, as before, and against nothing otherwise; and a loop that
+//! can end must fit `T` as a list too, or it is "this loop may end as a
+//! list, `List<{}>`, which is not Int", at its keyword, with the note
+//! "annotate it as `Int | List<{}>`, or return from every way the loop can
+//! end". A loop no `return` leaves keeps the generic mismatch where its
+//! list does not fit. Which loops a `return` leaves is recorded for
+//! lowering in [`Resolution::loop_of`].
+//!
+//! # Never-ending loops
+//!
+//! A `for BLOCK` loop, written with no condition (not `for true`, nor a
+//! `do` loop), that no `break` is for, its own or a labelled one from a
+//! loop inside it, can never end normally: its ordinary type is `Never`,
+//! not a list, whatever its body's type, and it builds no list
+//! ([`Resolution::loop_of`]). So `let v: Int = for'spin { ... return'spin
+//! r }` is an `Int` with no union and no warning, a bare `for { ... }`
+//! statement with no `break` is `Never`, and what follows it in its block
+//! gets the unreachable warning; a function whose only result site is
+//! such a loop has a body of type `Never`, from which its result is
+//! inferred (a present `T`, honestly: it never returns a future). Its body
+//! and its `continue`s still make an element type, as any loop's, with
+//! the same warning, though no list is ever built.
 //!
 //! # Never
 //!
 //! `Never` (see [`crate::types`]) is the type of what never completes: a
-//! block whose last item is a `break` or `continue`, and so anything whose
-//! value is such a block's. Everything else follows from the join, `Never`
+//! block whose last item is a `break`, `continue` or `return`, a loop that
+//! cannot end (see [Never-ending loops](#never-ending-loops)), and so
+//! anything whose value is such a block's. Everything else follows from the join, `Never`
 //! being its identity: an `if` both of whose branches are `Never` is
 //! `Never`, `if c { break } else { 5 }` is `Int`, and an `if` without
 //! `else` whose branch is `Never` is `{}`.
@@ -1255,8 +1413,8 @@
 //! its own and declares `Never`, quietly.
 //!
 //! **The unreachable warning.** In a block, the first item after one that
-//! never completes, a `break` or `continue` (not one that is an error, in
-//! a record block or with no loop to leave), or an expression, result,
+//! never completes, a `break`, `continue` or `return` (not one that is an
+//! error, in a record block or with nothing to leave), or an expression, result,
 //! `let` or `:=` item whose
 //! value is `Never`, is warned about once: "this is never run", labelled
 //! "this always leaves the block" at the earlier item. The block's type is
@@ -1508,14 +1666,14 @@
 //! it lists their slots ([`Scope::mutable_slots`]), the only ones of the
 //! scope a later input can write.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
     ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
-    ItemRange, Jump, Label, PartRange, PathRange, PathSegment, SegmentKind, StrPart, TypeExprId,
-    TypeExprKind, UnaryOp, path_span, symbol_span,
+    ItemRange, Jump, Label, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
+    TypeExprId, TypeExprKind, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1893,12 +2051,42 @@ pub struct Resolution {
     /// The slot each `for` expression's variable is stored in, indexed by
     /// [`ForId`].
     for_slots: Vec<Slot>,
-    /// The loop each `break` and `continue` item is for, indexed by
-    /// [`ItemId`]; `None` for every other item.
-    jumps: Vec<Option<ForId>>,
+    /// What each `break`, `continue` and `return` item is for, indexed by
+    /// [`ItemId`]; `None` for every other item, and for one that is in
+    /// error.
+    jumps: Vec<Option<JumpTarget>>,
+    /// What was found of each loop, indexed by [`ForId`].
+    loops: Vec<LoopResolution>,
+    /// The labelled blocks that some `return` leaves, by their ids.
+    returned_blocks: HashSet<ExprId>,
     /// What was decided for each `is` and `as` expression, by its id; only
     /// a program that has one has entries.
     tests: HashMap<ExprId, TestResolution>,
+}
+
+/// What a `break`, `continue` or `return` item is for (see
+/// [`Resolution::target`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JumpTarget {
+    /// A loop: the one a `break` or `continue` is for, or the one a
+    /// `return'L` names.
+    Loop(ForId),
+    /// The labelled block, by its expression, that a `return'L` names.
+    Block(ExprId),
+    /// The innermost function or `lazy` around an unlabelled `return`.
+    Function,
+}
+
+/// What the checker found of a loop, for lowering: see
+/// [`Resolution::loop_of`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LoopResolution {
+    /// Whether the loop cannot end: a `for BLOCK` that no `break` is for,
+    /// whose ordinary type is `Never`, and which builds no list.
+    pub endless: bool,
+    /// Whether some `return'L` leaves it, so that it evaluates to the
+    /// value returned.
+    pub returned: bool,
 }
 
 impl Resolution {
@@ -2002,7 +2190,34 @@ impl Resolution {
     /// does not have.
     #[must_use]
     pub fn jump_target(&self, id: ItemId) -> Option<ForId> {
+        match self.target(id)? {
+            JumpTarget::Loop(loop_id) => Some(loop_id),
+            JumpTarget::Block(_) | JumpTarget::Function => None,
+        }
+    }
+
+    /// What the `break`, `continue` or `return` item `id` is for: a loop,
+    /// a labelled block or, for an unlabelled `return`, the innermost
+    /// function or `lazy`. `None` for any other item, for one in error,
+    /// and for an id this table does not have.
+    #[must_use]
+    pub fn target(&self, id: ItemId) -> Option<JumpTarget> {
         self.jumps.get(id.index()).copied().flatten()
+    }
+
+    /// What was found of the loop `id`: whether it cannot end, and whether
+    /// a `return` leaves it. The default, a loop that can end and that no
+    /// `return` leaves, for an id this table does not have.
+    #[must_use]
+    pub fn loop_of(&self, id: ForId) -> LoopResolution {
+        self.loops.get(id.index()).copied().unwrap_or_default()
+    }
+
+    /// Whether some `return` leaves the labelled block `id`, so that it
+    /// evaluates to the value returned.
+    #[must_use]
+    pub fn is_returned_block(&self, id: ExprId) -> bool {
+        self.returned_blocks.contains(&id)
     }
 
     /// What was decided for the `is` or `as` expression `id`: its test's
@@ -2074,6 +2289,8 @@ impl Resolution {
             arg_params: Vec::new(),
             for_slots: Vec::new(),
             jumps: vec![None; items],
+            loops: Vec::new(),
+            returned_blocks: HashSet::new(),
             tests: HashMap::new(),
         }
     }
@@ -2260,6 +2477,28 @@ struct Function {
     /// order, so far; only a pure function's bare parameters, whose types
     /// are provisional, are ever measured. Empty for a `lazy`.
     demanded: Vec<Option<Span>>,
+    /// The declared result type, as resolved, and where it is written,
+    /// against which every `return` value is checked as the body's result
+    /// is; `None` for a `lazy`, which declares none.
+    result: Option<(TyId, Span)>,
+    /// The `return`s for it so far, in the order they are checked: its
+    /// result sites besides the body's own result (see
+    /// [`return`](#return)).
+    returns: Vec<Site>,
+}
+
+/// One value that a `return` gives its target: a result site of a
+/// function, a `lazy`, a labelled block or a loop (see
+/// [`return`](#return)).
+#[derive(Clone, Copy, Debug)]
+struct Site {
+    /// The value, or `None` for a `return` without one, which gives `{}`.
+    value: Option<ExprId>,
+    /// Where it is shown: the value, or the `return` and its label.
+    at: Span,
+    /// Its type: with an expected type, what it is once the awaits marked
+    /// on it have run (see [`Checker::fit`]), and its own type otherwise.
+    ty: TyId,
 }
 
 /// Where an await is decided, for the purity rule's error in a pure
@@ -2476,14 +2715,18 @@ struct Tested {
     unreached: bool,
 }
 
-/// A loop whose body is being checked, in `Checker::loops`, innermost last:
-/// what a `break` or `continue` in the body needs to find it, and what they
-/// contribute to its list (see [`break` and `continue`](#break-and-continue)).
+/// A loop whose body, or a labelled block whose items, are being checked,
+/// in `Checker::loops`, innermost last: what a `break`, `continue` or
+/// `return` in it needs to find it, and what they give it (see [`break`
+/// and `continue`](#break-and-continue), [Labels](#labels) and
+/// [`return`](#return)). An unlabelled block has none.
 #[derive(Clone, Debug)]
 struct LoopFrame {
-    /// The loop.
-    id: ForId,
-    /// Its label, if it has one.
+    /// The loop, or `None` for a labelled block.
+    id: Option<ForId>,
+    /// The loop or block expression.
+    expr: ExprId,
+    /// Its label, if it has one; a block's always has one.
     label: Option<Label>,
     /// The number of functions being checked when its body began: a
     /// `break` in a function or `lazy` nested in the body sees more, and
@@ -2497,6 +2740,57 @@ struct LoopFrame {
     /// are checked, with what it is: its type, or with an expected type,
     /// what it is once the awaits marked on it have run.
     values: Vec<(ExprId, TyId)>,
+    /// Whether a `break` is for it, which a loop with no condition needs
+    /// to end at all (see [Never-ending loops](#never-ending-loops)).
+    broken: bool,
+    /// The type expected of the whole loop or block, if one is, with where
+    /// that is stated and its label: the value of each `return` for it is
+    /// checked against it.
+    returns_expected: Option<(TyId, Span, String)>,
+    /// The `return`s for it so far, in the order they are checked.
+    returns: Vec<Site>,
+}
+
+impl LoopFrame {
+    /// The frame of the loop `id`, the expression `expr`, labelled `label`
+    /// if it has one, in the body of the function at `depth`, of which the
+    /// element type `expected` is expected, and the type `returns_expected`
+    /// as a whole, if they are.
+    fn new(
+        (id, expr): (Option<ForId>, ExprId),
+        label: Option<Label>,
+        depth: usize,
+        expected: Option<(TyId, Span, String)>,
+        returns_expected: Option<(TyId, Span, String)>,
+    ) -> Self {
+        Self {
+            id,
+            expr,
+            label,
+            depth,
+            expected,
+            values: Vec::new(),
+            broken: false,
+            returns_expected,
+            returns: Vec::new(),
+        }
+    }
+
+    /// The target that a `break`, `continue` or `return` for it has.
+    const fn target(&self) -> JumpTarget {
+        match self.id {
+            Some(id) => JumpTarget::Loop(id),
+            None => JumpTarget::Block(self.expr),
+        }
+    }
+
+    /// What it is, as diagnostics name it: "loop" or "block".
+    const fn noun(&self) -> &'static str {
+        match self.id {
+            Some(_) => "loop",
+            None => "block",
+        }
+    }
 }
 
 /// The bindings an `if` whose condition narrows a variable gives its
@@ -2661,11 +2955,23 @@ pub struct Checker<'a> {
     arg_params: Vec<u32>,
     /// The slot of each `for` expression's variable, indexed by [`ForId`].
     for_slots: Vec<Slot>,
-    /// The loop each `break` and `continue` item is for, indexed by
-    /// [`ItemId`]: see [`Resolution::jump_target`].
-    jumps: Vec<Option<ForId>>,
-    /// The loops whose bodies are being checked, outermost first.
+    /// What each `break`, `continue` and `return` item is for, indexed by
+    /// [`ItemId`]: see [`Resolution::target`].
+    jumps: Vec<Option<JumpTarget>>,
+    /// The loops whose bodies, and the labelled blocks whose items, are
+    /// being checked, outermost first.
     loops: Vec<LoopFrame>,
+    /// What was found of each loop, indexed by [`ForId`]: see
+    /// [`Resolution::loop_of`].
+    loop_resolutions: Vec<LoopResolution>,
+    /// The labelled blocks some `return` leaves: see
+    /// [`Resolution::is_returned_block`].
+    returned_blocks: HashSet<ExprId>,
+    /// The values of the `return`s for each labelled block that has any,
+    /// by the block's id, which an untyped integer pushed into the block
+    /// reaches as it reaches the block's result (see
+    /// [`Checker::coerce`]).
+    block_returns: HashMap<ExprId, Vec<ExprId>>,
     /// `Never`, interned into the table once, as the checker starts.
     never: TyId,
     /// Set by [`Checker::walk_path`] when it stops at a record or list of
@@ -2812,6 +3118,9 @@ impl<'a> Checker<'a> {
             for_slots: vec![Slot::NONE; ast.for_count()],
             jumps: vec![None; ast.item_count()],
             loops: Vec::new(),
+            loop_resolutions: vec![LoopResolution::default(); ast.for_count()],
+            returned_blocks: HashSet::new(),
+            block_returns: HashMap::new(),
             never,
             unreached_path: false,
             bindings: scope.bindings,
@@ -2931,6 +3240,8 @@ impl<'a> Checker<'a> {
                 arg_params: self.arg_params,
                 for_slots: self.for_slots,
                 jumps: self.jumps,
+                loops: self.loop_resolutions,
+                returned_blocks: self.returned_blocks,
                 tests: self.tests,
             },
         };
@@ -3033,7 +3344,13 @@ impl<'a> Checker<'a> {
                 ItemKind::Break(jump) | ItemKind::Continue(jump) => {
                     self.check_jump((id, item), jump, first_field);
                     if next.is_none() && first_field.is_none() {
-                        result = self.never;
+                        result = self.left_type(id);
+                    }
+                }
+                ItemKind::Return(jump) => {
+                    self.check_return((id, item), jump, first_field);
+                    if next.is_none() && first_field.is_none() {
+                        result = self.left_type(id);
                     }
                 }
             }
@@ -3105,14 +3422,28 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The type of a block whose last item is `id`, a `break`, a `continue`
+    /// or a `return`, checked: `Never`, or erroneous if the item is an
+    /// error and so has nothing to leave for, so that nothing more is
+    /// reported of the block.
+    fn left_type(&self, id: ItemId) -> TyId {
+        if self.jumps[id.index()].is_some() {
+            self.never
+        } else {
+            TyId::ERROR
+        }
+    }
+
     /// Whether the item `id`, of `kind`, checked, never completes, so that
-    /// no item after it in its block runs: a `break` or a `continue`, but
-    /// one that is an error and so has no loop to leave for, and an
-    /// expression item, a result, a `let` or a `:=` whose value is of type
-    /// `Never`.
+    /// no item after it in its block runs: a `break`, a `continue` or a
+    /// `return`, but one that is an error and so has nothing to leave for,
+    /// and an expression item, a result, a `let` or a `:=` whose value is
+    /// of type `Never`.
     fn never_completes(&self, id: ItemId, kind: ItemKind) -> bool {
         match kind {
-            ItemKind::Break(_) | ItemKind::Continue(_) => self.jumps[id.index()].is_some(),
+            ItemKind::Break(_) | ItemKind::Continue(_) | ItemKind::Return(_) => {
+                self.jumps[id.index()].is_some()
+            }
             ItemKind::Expr(value)
             | ItemKind::Result(value)
             | ItemKind::Let { value, .. }
@@ -5711,7 +6042,7 @@ impl<'a> Checker<'a> {
                 ExprKind::Paren(inner) => node = inner,
                 // A block is awaited for its result, as a function's body
                 // `{ n }` is against the result type.
-                ExprKind::Block(items) => {
+                ExprKind::Block { items, .. } => {
                     let last = self.ast.items(items).last()?;
                     let (ItemKind::Result(result) | ItemKind::Expr(result)) =
                         self.ast.item(*last).kind
@@ -5910,6 +6241,9 @@ impl<'a> Checker<'a> {
         (context, why): (Span, &str),
         (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) -> TyId {
+        if let Some(found) = self.loop_within(id) {
+            return self.check_loop_expecting(id, found, expected, (context, why), (site, filling));
+        }
         // A record block is present, so it is checked against the present
         // member of an either shape (or of a provisional type), or the one
         // record member of a union.
@@ -6002,13 +6336,13 @@ impl<'a> Checker<'a> {
     /// Where a value of type `expected`, a list type or a union, or the
     /// either shape of one, is expected, as stated at `context`, labelled
     /// `why`: checks `id` against it and returns the type it has, if `id`
-    /// is, through any parentheses, a list literal or a `for` and `expected`
-    /// has a list type to check it against (see
-    /// [`Checker::expected_member`]), a block with a result or an `if` with
-    /// `else`, and `None`, having checked nothing, otherwise. The type of a
-    /// list literal is found as [`Checker::check_list_expecting`] says,
-    /// that of a `for` as [`Checker::check_for`] says, and that of a block
-    /// or an `if` is what its result, or each branch, checked against
+    /// is, through any parentheses, a list literal and `expected` has a
+    /// list type to check it against (see [`Checker::expected_member`]), a
+    /// block with a result or an `if` with `else`, and `None`, having
+    /// checked nothing, otherwise. (A loop is checked against what is
+    /// expected of it by [`Checker::check_loop_expecting`].) The type of a
+    /// list literal is found as [`Checker::check_list_expecting`] says, and
+    /// that of a block or an `if` is what its result, or each branch, checked against
     /// `expected` in turn, is once any await marked on it has run (see
     /// [`Checker::fit`]); it is recorded for `id` and every parenthesis
     /// around it. So the expected type reaches a list literal that is a
@@ -6041,9 +6375,12 @@ impl<'a> Checker<'a> {
                     })?;
                 self.check_list_expecting(elements, list, (context, why))
             }
-            ExprKind::Block(body) if self.has_result(body) => {
+            ExprKind::Block { items, label } if self.has_result(items) => {
                 let expecting = Expecting::new(expected, (context, why), expr.span);
-                self.check_block(body, Some(expecting))
+                match label {
+                    Some(label) => self.labelled_block(node, label, items, Some(expecting)),
+                    None => self.check_block(items, Some(expecting)),
+                }
             }
             ExprKind::If {
                 cond,
@@ -6076,13 +6413,17 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            ExprKind::For(for_id) => {
-                let list = self.expected_member(expected, ValueKind::List)?;
-                let element = self.types.list_element(list).unwrap_or(TyId::ERROR);
-                self.check_for(node, for_id, Some((element, (context, why))))
-            }
+            // A loop is checked against whatever is expected of it, by
+            // `check_loop_expecting`, before this is asked.
             _ => return None,
         };
+        self.set_through_parens(id, ty);
+        Some(ty)
+    }
+
+    /// Records `ty` as the type of `id` and of every parenthesis inside it,
+    /// down to what they hold.
+    fn set_through_parens(&mut self, id: ExprId, ty: TyId) {
         let mut node = id;
         loop {
             self.expr_types[node.index()] = ty;
@@ -6091,7 +6432,46 @@ impl<'a> Checker<'a> {
                 _ => break,
             }
         }
-        Some(ty)
+    }
+
+    /// The loop that `id` is, through any parentheses, with its details,
+    /// or `None` if it is not one.
+    fn loop_within(&self, id: ExprId) -> Option<(ExprId, ForId)> {
+        let mut node = id;
+        loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::For(for_id) => return Some((node, for_id)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Checks `id`, which is, through any parentheses, the loop `node`,
+    /// whose details are `for_id`, where a value of type `expected` is
+    /// expected, as stated at `context`, labelled `why`, with `site` and
+    /// `filling` as for [`Checker::check_expr_expecting_at`] (see
+    /// [`Checker::check_for`]): every `return` for the loop is checked
+    /// against `expected`, and its body against the element type of
+    /// `expected`'s list type, if it has one, as a list literal is. A loop
+    /// that no `return` leaves, and whose list type is not checked so, must
+    /// then fit `expected` as any value must (see [`Checker::expect`]).
+    /// Returns its type, recorded for `id` and every parenthesis inside it.
+    fn check_loop_expecting(
+        &mut self,
+        id: ExprId,
+        (node, for_id): (ExprId, ForId),
+        expected: TyId,
+        (context, why): (Span, &str),
+        (site, filling): (AwaitSite, Option<(FnId, usize)>),
+    ) -> TyId {
+        let ty = self.check_for(node, for_id, Some((expected, (context, why))));
+        self.set_through_parens(id, ty);
+        let listed = self.expected_member(expected, ValueKind::List).is_some();
+        if !listed && !self.loop_resolutions[for_id.index()].returned {
+            self.expect_at(id, ty, expected, (context, why), (site, filling));
+        }
+        ty
     }
 
     /// Checks `id` where a value of type `expected` is expected, as stated
@@ -6177,7 +6557,9 @@ impl<'a> Checker<'a> {
         loop {
             match self.ast.get(node).kind {
                 ExprKind::Paren(inner) => node = inner,
-                ExprKind::Block(body) if self.is_record_body(body) => return Some((node, body)),
+                ExprKind::Block { items, .. } if self.is_record_body(items) => {
+                    return Some((node, items));
+                }
                 _ => return None,
             }
         }
@@ -6224,7 +6606,10 @@ impl<'a> Checker<'a> {
                 self.binary(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
             }
             ExprKind::Name(name) => self.check_name(id, name, expr.span),
-            ExprKind::Block(body) => self.check_block(body, None),
+            ExprKind::Block { items, label } => match label {
+                Some(label) => self.labelled_block(id, label, items, None),
+                None => self.check_block(items, None),
+            },
             ExprKind::Field { expr: record, name } => {
                 let record_ty = self.check_expr(record);
                 self.field_access(id, (record, record_ty), name)
@@ -6428,16 +6813,63 @@ impl<'a> Checker<'a> {
             marker: decl.marker,
             keyword,
             demanded: Vec::new(),
+            result: None,
+            returns: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let found = self.check_expr(decl.body);
-        let body_ty = self.settle(decl.body, found);
+        let returns = self
+            .functions
+            .last_mut()
+            .map(|function| std::mem::take(&mut function.returns))
+            .unwrap_or_default();
+        let body_ty = if returns.is_empty() {
+            self.settle(decl.body, found)
+        } else {
+            self.returned_lazy(keyword, (decl.body, found), &returns)
+        };
         self.finish_function(0, None);
         if body_ty == TyId::ERROR {
             TyId::ERROR
         } else {
             self.types.future(body_ty)
         }
+    }
+
+    /// What the `lazy` whose keyword is at `keyword`, whose operand is
+    /// `body`, of type `found`, and which the `return`s `returns` leave,
+    /// yields: the join of its operand's type and the values returned, as
+    /// an `if`'s branches are joined, untyped integers adapting to each
+    /// other and then settling to `Int`. A join that widens is a warning,
+    /// "the values this `lazy` returns have different types", at the
+    /// keyword, labelled at each. (Nothing reaches a `lazy` from a type
+    /// expected of it: the `Future` it is must fit that as a whole.)
+    fn returned_lazy(
+        &mut self,
+        keyword: Span,
+        (body, found): (ExprId, TyId),
+        returns: &[Site],
+    ) -> TyId {
+        let mut sites = Vec::with_capacity(returns.len() + 1);
+        sites.push(Site {
+            value: Some(body),
+            at: self.ast.get(self.branch_value(body)).span,
+            ty: found,
+        });
+        sites.extend_from_slice(returns);
+        let (joined, widened) = self.join_sites(body, &sites, true);
+        if widened {
+            let future = self.types.future(joined);
+            self.sites_widened(
+                (
+                    "the values this `lazy` returns have different types",
+                    keyword,
+                ),
+                &sites,
+                ("`lazy`", future),
+            );
+        }
+        joined
     }
 
     /// Pops the innermost function off the stack of functions being
@@ -6517,6 +6949,9 @@ impl<'a> Checker<'a> {
         };
         let mut ty = self.intern_fn_type(base, ret, decl.effect);
         self.expr_types[id.index()] = ty;
+        let ret_span = decl.ret.map_or(self.ast.get(decl.body).span, |ret| {
+            self.ast.type_expr(ret).span
+        });
         self.functions.push(Function {
             fn_id: function,
             bindings_start: self.bindings.len(),
@@ -6528,21 +6963,27 @@ impl<'a> Checker<'a> {
             marker: decl.marker,
             keyword: symbol_span("fn", self.ast.get(id).span.start),
             demanded: vec![None; params.len()],
+            result: Some((ret, ret_span)),
+            returns: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let span = self.ast.get(id).span;
         let errors = self.errors.len();
         let callbacks = (self.callbacks.len(), self.callback_positions.len());
         self.check_fn_body(&decl, base, (callee, ty, span), ret);
+        let returns = self
+            .functions
+            .last_mut()
+            .map(|function| std::mem::take(&mut function.returns))
+            .unwrap_or_default();
         // An impure or memoised function's bare result takes its laziness
-        // from the body, and its callback parameters are narrowed, unless
-        // something is wrong with the function.
+        // from the body and its `return`s, and its callback parameters are
+        // narrowed, unless something is wrong with the function.
         let mut unnarrowed = Vec::new();
         if !pure && ty != TyId::ERROR && self.errors.len() == errors {
             let mut result = ret;
             if let Some(ret_expr) = decl.ret {
-                let value = self.value_of(decl.body, ret);
-                result = self.inferred(ret_expr, ret, value);
+                result = self.inferred_result((ret_expr, ret), decl.body, &returns);
             }
             let narrowed = self.narrow_callbacks(base, callbacks.0, &mut unnarrowed);
             if result != ret || narrowed {
@@ -6681,6 +7122,53 @@ impl<'a> Checker<'a> {
             && let Some(position) = self.callback_positions.get_mut(at)
         {
             position.given = Some(span);
+        }
+    }
+
+    /// The inferred result of an impure or memoised function whose result
+    /// type is written as `ty`, declared `declared`, whose body is `body`
+    /// and whose `return`s are `returns` (see [Inferred
+    /// results](#inferred-results)): decided from all its result sites, the
+    /// body's own result and every value returned, as if they were the
+    /// branches of one `if`. Each site is inferred against the declared
+    /// type as the body alone would be (see [`Checker::inferred`]), a site
+    /// of type `Never` playing no part, and the result is the join of what
+    /// they give; the declared type if that is not a subtype of it. A
+    /// function every site of which is `Never` is inferred from `Never`.
+    fn inferred_result(
+        &mut self,
+        (ty, declared): (TypeExprId, TyId),
+        body: ExprId,
+        returns: &[Site],
+    ) -> TyId {
+        if returns.is_empty() {
+            let value = self.value_of(body, declared);
+            return self.inferred(ty, declared, value);
+        }
+        let mut joined = None;
+        let sites = std::iter::once(Some(body)).chain(returns.iter().map(|site| site.value));
+        for value in sites {
+            let found = match value {
+                Some(value) if self.awaited(value) == self.never => continue,
+                Some(value) => {
+                    let value = self.value_of(value, declared);
+                    self.inferred(ty, declared, value)
+                }
+                // A `return` without a value returns `{}`.
+                None => self.inferred(ty, declared, BodyValue::Typed(TyId::EMPTY)),
+            };
+            joined = Some(match joined {
+                None => found,
+                Some(so_far) => self.types.join(so_far, found).0,
+            });
+        }
+        match joined {
+            None => {
+                let never = self.never;
+                self.inferred(ty, declared, BodyValue::Typed(never))
+            }
+            Some(joined) if self.types.is_subtype(joined, declared) => joined,
+            Some(_) => declared,
         }
     }
 
@@ -7889,8 +8377,8 @@ impl<'a> Checker<'a> {
         let context = decl
             .ret
             .map_or(block.span, |ret| self.ast.type_expr(ret).span);
-        let why = "the return type is declared here";
-        let ExprKind::Block(items) = block.kind else {
+        let why = RESULT_WHY;
+        let ExprKind::Block { items, label } = block.kind else {
             // The parser only makes blocks bodies.
             self.errors.push(
                 InternalError {
@@ -7924,7 +8412,16 @@ impl<'a> Checker<'a> {
             // return type, as a record block is against a record one.
             let expecting = (self.expects_list(ret) && self.has_result(items))
                 .then(|| Expecting::new(ret, (context, why), block.span));
-            let found = self.check_body(items, expecting);
+            // A labelled body is a labelled block like any other, whose
+            // `return`s give it its value.
+            let label = label.map(|label| self.ast.label(label));
+            if let Some(label) = label {
+                self.enter_block(body, label, expecting);
+            }
+            let mut found = self.check_body(items, expecting);
+            if label.is_some() {
+                found = self.leave_block(body, found, expecting);
+            }
             self.expr_types[body.index()] = found;
             self.expect(body, found, ret, context, why);
         }
@@ -8744,7 +9241,7 @@ impl<'a> Checker<'a> {
         loop {
             match self.ast.get(node).kind {
                 ExprKind::Paren(inner) => node = inner,
-                ExprKind::Block(body) if self.has_result(body) => {
+                ExprKind::Block { items: body, .. } if self.has_result(body) => {
                     match self
                         .ast
                         .items(body)
@@ -9232,19 +9729,31 @@ impl<'a> Checker<'a> {
     /// is outside its body's block. The body is checked with the loop on
     /// [`Checker::loops`], so that the `break`s and `continue`s in it find
     /// it, and what they and the body contribute make the loop's element
-    /// type (see [`Checker::element_type`]). With `element`, the element
-    /// type of the list type expected of the loop, with where that is
-    /// stated and its label, the body and each value are checked against it
-    /// as a list literal's elements are (see [`Checker::fit`]). The loop is
-    /// the list of its element type, or `Never` if what always runs first,
-    /// an iterable or a condition before the first iteration, is; `Error`
-    /// if the iterable, the body or a value is erroneous.
+    /// type (see [`Checker::element_type`]). With `expected`, the type
+    /// expected of the whole loop, with where that is stated and its label,
+    /// every `return` for the loop is checked against it, and if it has a
+    /// list type (see [`Checker::expected_member`]), the body and each
+    /// value against that list's element type, as a list literal's elements
+    /// are (see [`Checker::fit`]). The loop's ordinary type is the list of
+    /// its element type, or `Never` if what always runs first, an iterable
+    /// or a condition before the first iteration, is, or if it cannot end
+    /// (see [Never-ending loops](#never-ending-loops)); `Error` if the
+    /// iterable, the body or a value is erroneous. A loop that a `return`
+    /// leaves is the join of that and the values returned (see
+    /// [`Checker::returned_loop`]).
     fn check_for(
         &mut self,
         id: ExprId,
         for_id: ForId,
-        element: Option<(TyId, (Span, &str))>,
+        expected: Option<(TyId, (Span, &str))>,
     ) -> TyId {
+        let element = expected.and_then(|(whole, context)| {
+            let list = self.expected_member(whole, ValueKind::List)?;
+            Some((
+                self.types.list_element(list).unwrap_or(TyId::ERROR),
+                context,
+            ))
+        });
         let decl = *self.ast.for_decl(for_id);
         let outer = (self.block_start, self.fields_start, self.next_slot);
         let outer_spreads = std::mem::take(&mut self.spreads);
@@ -9264,8 +9773,15 @@ impl<'a> Checker<'a> {
             } => self.while_head(id, before, cond, after),
             ForHead::Do { .. } => TyId::EMPTY,
         };
-        let expected = element.map(|(element, (context, why))| (element, context, why.to_owned()));
-        self.enter_loop(for_id, decl.label, expected);
+        let owned = |(ty, (context, why)): (TyId, (Span, &str))| (ty, context, why.to_owned());
+        let frame = LoopFrame::new(
+            (Some(for_id), id),
+            decl.label,
+            self.functions.len(),
+            element.map(owned),
+            expected.map(owned),
+        );
+        self.enter_target(frame);
         let body = match element {
             Some((element, context)) => self.fit(decl.body, element, context),
             None => self.check_expr(decl.body),
@@ -9279,14 +9795,101 @@ impl<'a> Checker<'a> {
         self.bindings.truncate(self.block_start);
         (self.block_start, self.fields_start, self.next_slot) = outer;
         self.spreads = outer_spreads;
-        let values = frame.map(|frame| frame.values).unwrap_or_default();
+        let (values, broken, returns) = frame
+            .map(|frame| (frame.values, frame.broken, frame.returns))
+            .unwrap_or_default();
         let collected = self.element_type(id, (decl.body, body), values, element);
-        if head == TyId::ERROR || collected == TyId::ERROR {
+        // A loop with no condition ends only by a `break`.
+        let endless = matches!(decl.head, ForHead::While { cond: None, .. }) && !broken;
+        if let Some(resolution) = self.loop_resolutions.get_mut(for_id.index()) {
+            resolution.endless = endless;
+        }
+        let ordinary = if head == TyId::ERROR || collected == TyId::ERROR {
             TyId::ERROR
-        } else if head == self.never {
+        } else if head == self.never || endless {
             self.never
         } else {
             self.types.list(collected)
+        };
+        if returns.is_empty() {
+            return ordinary;
+        }
+        self.returned_loop(id, ordinary, &returns, expected)
+    }
+
+    /// The type of the loop `id`, whose ordinary type, what it is when it
+    /// ends, is `ordinary`, and which the `return`s `returns` leave, with
+    /// `expected`, the type expected of the whole loop, if one is, with
+    /// where that is stated and its label: the join of its ordinary type
+    /// and the values returned (see [`return`](#return)). Under an expected
+    /// type each value fits it already, and a loop that can end must fit it
+    /// as a list too: otherwise it is "this loop may end as a list,
+    /// `List<{}>`, which is not Int", at its keyword, and `Error`. Without
+    /// one, a join that widens is a warning, "this loop is its list or a
+    /// value returned to it, of different types".
+    fn returned_loop(
+        &mut self,
+        id: ExprId,
+        ordinary: TyId,
+        returns: &[Site],
+        expected: Option<(TyId, (Span, &str))>,
+    ) -> TyId {
+        if ordinary == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        let keyword = self.ast.loop_keyword(id);
+        let mut sites = Vec::with_capacity(returns.len() + 1);
+        sites.push(Site {
+            value: None,
+            at: keyword,
+            ty: ordinary,
+        });
+        sites.extend_from_slice(returns);
+        let Some((whole, _)) = expected else {
+            let (joined, widened) = self.join_sites(id, &sites, true);
+            if widened {
+                let note = self.union_note_of("loop", joined);
+                let list = format!("its list is {}", self.in_label(ordinary));
+                let mut warning = Diagnostic::warning(
+                    "this loop is its list or a value returned to it, of different types",
+                    keyword,
+                )
+                .with_label(list);
+                let never = self.never;
+                for site in returns.iter().filter(|site| site.ty != never) {
+                    let label = format!("this is {}", self.in_label(self.site_type(site)));
+                    warning = warning.with_context(site.at, label);
+                }
+                self.warnings.push(warning.with_note(note));
+            }
+            return joined;
+        };
+        // An expected type in error has been reported.
+        if whole == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        if ordinary != self.never && !self.types.is_subtype(ordinary, whole) {
+            let (list, shown) = (self.in_message(ordinary), self.in_message(whole));
+            let (joined, _) = self.types.join(whole, ordinary);
+            let annotation = self.types.display(joined, self.ast.names()).to_string();
+            self.errors.push(
+                Diagnostic::error(
+                    format!("this loop may end as a list, {list}, which is not {shown}"),
+                    keyword,
+                )
+                .with_note(format!(
+                    "annotate it as `{annotation}`, or return from every way the loop can end"
+                )),
+            );
+            return TyId::ERROR;
+        }
+        // Each value fits what is expected, so the join is no warning; and
+        // what is expected describes them all should it not be a subtype.
+        let (joined, _) = self.join_sites(id, &sites, true);
+        if joined == TyId::ERROR || self.types.is_subtype(joined, whole) {
+            joined
+        } else {
+            whole
         }
     }
 
@@ -9396,45 +9999,212 @@ impl<'a> Checker<'a> {
             | ItemKind::Result(_)
             | ItemKind::Expr(_)
             | ItemKind::Break(_)
-            | ItemKind::Continue(_) => {}
+            | ItemKind::Continue(_)
+            | ItemKind::Return(_) => {}
         }
     }
 
-    /// Puts the loop `id`, labelled `label` if it has one, of which the
-    /// element type `expected`, with where that is stated and its label, is
-    /// expected if one is, on [`Checker::loops`], for its body. A label
-    /// that a loop of the same function whose body holds this one has
+    /// Puts `frame`, a loop's or a labelled block's, on [`Checker::loops`],
+    /// for its body. Loop and block labels are one namespace: a label that
+    /// a loop or labelled block of the same function holding this one has
     /// already is "label `'L` is already in use", at the label, labelled at
     /// the other; a function starts with no labels.
-    fn enter_loop(
-        &mut self,
-        id: ForId,
-        label: Option<Label>,
-        expected: Option<(TyId, Span, String)>,
-    ) {
-        let depth = self.functions.len();
-        if let Some(label) = label
-            && let Some(outer) = self
+    fn enter_target(&mut self, frame: LoopFrame) {
+        if let Some(label) = frame.label
+            && let Some((outer, noun)) = self
                 .loops
                 .iter()
                 .rev()
-                .take_while(|frame| frame.depth == depth)
-                .find_map(|frame| frame.label.filter(|outer| outer.name == label.name))
+                .take_while(|outer| outer.depth == frame.depth)
+                .find_map(|outer| {
+                    let found = outer.label.filter(|outer| outer.name == label.name)?;
+                    Some((found, outer.noun()))
+                })
         {
             let text = self.ast.names().get(label.name);
             self.errors.push(
                 Diagnostic::error(format!("label `'{text}` is already in use"), label.span)
-                    .with_context(outer.span, "the loop around this one is labelled so")
-                    .with_note("give the inner loop another label"),
+                    .with_context(
+                        outer.span,
+                        format!("the {noun} around this one is labelled so"),
+                    )
+                    .with_note(format!("give the inner {} another label", frame.noun())),
             );
         }
-        self.loops.push(LoopFrame {
-            id,
-            label,
-            depth,
+        self.loops.push(frame);
+    }
+
+    /// Checks the block `id`, labelled `label`, whose items are `items`, as
+    /// [`Checker::check_block`] does, with `expecting` as for it, and with
+    /// the block on [`Checker::loops`], so that the `return`s that name it
+    /// find it: its type is the join of its result and of the values they
+    /// return (see [`Checker::leave_block`]).
+    fn labelled_block(
+        &mut self,
+        id: ExprId,
+        label: LabelId,
+        items: ItemRange,
+        expecting: Option<Expecting<'_>>,
+    ) -> TyId {
+        self.enter_block(id, self.ast.label(label), expecting);
+        let ty = self.check_block(items, expecting);
+        self.leave_block(id, ty, expecting)
+    }
+
+    /// Puts the block `id`, labelled `label`, on [`Checker::loops`], for
+    /// its items: the `return`s that name it are checked against what
+    /// `expecting` says is expected of it, if anything is.
+    fn enter_block(&mut self, id: ExprId, label: Label, expecting: Option<Expecting<'_>>) {
+        let expected =
+            expecting.map(|expecting| (expecting.ty, expecting.context, expecting.why.to_owned()));
+        let frame = LoopFrame::new(
+            (None, id),
+            Some(label),
+            self.functions.len(),
+            None,
             expected,
-            values: Vec::new(),
+        );
+        self.enter_target(frame);
+    }
+
+    /// Takes the labelled block `id`, whose result is of type `result`, off
+    /// [`Checker::loops`], and returns its type: the join of its result and
+    /// of the values the `return`s that name it return, as an `if`'s
+    /// branches are joined, untyped integers adapting to each other and
+    /// staying untyped if all are (see [`Checker::join_sites`]). With
+    /// `expecting`, each fits what it expects already, and the join is no
+    /// warning, but is the type expected should it not be a subtype of it;
+    /// without, a join that widens is a warning, "the values this block
+    /// returns have different types", at its label, labelled at each.
+    fn leave_block(&mut self, id: ExprId, result: TyId, expecting: Option<Expecting<'_>>) -> TyId {
+        let Some(frame) = self.loops.pop() else {
+            return result;
+        };
+        if frame.returns.is_empty() {
+            return result;
+        }
+        let values: Vec<ExprId> = frame.returns.iter().filter_map(|site| site.value).collect();
+        if !values.is_empty() {
+            self.block_returns.insert(id, values);
+        }
+        // The result site is the block itself, which an untyped integer is
+        // pushed into as into its result.
+        self.expr_types[id.index()] = result;
+        let at = self.ast.get(self.branch_value(id)).span;
+        let mut sites = Vec::with_capacity(frame.returns.len() + 1);
+        sites.push(Site {
+            value: Some(id),
+            at,
+            ty: result,
         });
+        sites.extend_from_slice(&frame.returns);
+        let (joined, widened) = self.join_sites(id, &sites, false);
+        match expecting {
+            Some(expecting)
+                if joined == TyId::ERROR || self.types.is_subtype(joined, expecting.ty) =>
+            {
+                joined
+            }
+            Some(expecting) => expecting.ty,
+            None => {
+                if widened && let Some(label) = frame.label {
+                    self.sites_widened(
+                        (
+                            "the values this block returns have different types",
+                            label.span,
+                        ),
+                        &sites,
+                        ("block", joined),
+                    );
+                }
+                joined
+            }
+        }
+    }
+
+    /// The join of the types of `sites`, the result sites of the block,
+    /// loop or `lazy` `anchor`, in order, as the branches of an `if` are
+    /// joined (see [`Checker::join_element`]): a site of type `Never` adds
+    /// nothing, untyped integers adapt to each other and to the numeric
+    /// types beside them, and staying untyped if all are, unless `settle`,
+    /// when they settle to `Int`; and whether it widened. `Never` if every
+    /// site is, and `Error` if any is erroneous. A site without a value, a
+    /// `return` without one or a loop's list, is pushed nothing into; the
+    /// parameters measured where the types differ are measured at a site's
+    /// value, or at `anchor` for one without.
+    fn join_sites(&mut self, anchor: ExprId, sites: &[Site], settle: bool) -> (TyId, bool) {
+        let live: Vec<(ExprId, TyId)> = sites
+            .iter()
+            .filter(|site| site.ty != self.never)
+            .map(|site| (site.value.unwrap_or(anchor), site.ty))
+            .collect();
+        if live.iter().any(|&(_, ty)| ty == TyId::ERROR) {
+            return (TyId::ERROR, false);
+        }
+        let mut joined = None;
+        let mut widened = false;
+        for (index, &(value, ty)) in live.iter().enumerate() {
+            let Some(so_far) = joined else {
+                joined = Some(ty);
+                continue;
+            };
+            // A site without a value of its own is never untyped, so
+            // nothing is pushed into `anchor` for it.
+            let earlier: Vec<ExprId> = live.iter().take(index).map(|&(at, _)| at).collect();
+            let (ty, widens, _) = self.join_element((earlier.into_iter(), value), so_far, ty);
+            joined = Some(ty);
+            widened |= widens;
+        }
+        let joined = match joined {
+            Some(TyId::UNTYPED_INT) if settle => {
+                for &(value, _) in &live {
+                    let ty = self.expr_types[value.index()];
+                    self.settle(value, ty);
+                }
+                TyId::INT
+            }
+            Some(joined) => joined,
+            None => self.never,
+        };
+        (joined, widened)
+    }
+
+    /// The type of `site` as a warning about it shows it: that of its value
+    /// as it now is, an untyped integer having adapted, or the site's own.
+    fn site_type(&self, site: &Site) -> TyId {
+        site.value
+            .map_or(site.ty, |value| self.expr_types[value.index()])
+    }
+
+    /// Warns, `message` at `at`, that `sites`, the result sites of a
+    /// block, a loop or a `lazy`, have different types, which `joined`, the
+    /// type of `what`, widened to a union of: labelled at each site with its
+    /// type, with slice 20's note naming the union.
+    fn sites_widened(
+        &mut self,
+        (message, at): (&str, Span),
+        sites: &[Site],
+        (what, joined): (&str, TyId),
+    ) {
+        let note = self.union_note_of(what, joined);
+        let mut warning = Diagnostic::warning(message, at);
+        let never = self.never;
+        for site in sites.iter().filter(|site| site.ty != never) {
+            let label = format!("this is {}", self.in_label(self.site_type(site)));
+            warning = warning.with_context(site.at, label);
+        }
+        self.warnings.push(warning.with_note(note));
+    }
+
+    /// The note on a warning that the values a `what` may have widened to
+    /// the union `joined`: "the `what` is `Int | String`; annotate it with
+    /// that type if all are meant, or tell them apart with `is`".
+    fn union_note_of(&mut self, what: &str, joined: TyId) -> String {
+        format!(
+            "the {what} is {}; annotate it with that type if all are meant, or tell them apart \
+             with `is`",
+            self.in_message(joined)
+        )
     }
 
     /// The element type of the loop `id`, whose body, `body`, is of type
@@ -9546,21 +10316,9 @@ impl<'a> Checker<'a> {
             ItemKind::Break(_) => "break",
             _ => "continue",
         };
-        let written = symbol_span(keyword, item.span.start);
-        let at = jump
-            .label
-            .map_or(written, |label| Span::join(written, label.span));
+        let at = jump_span(keyword, item.span, jump.label);
         let target = if first_field.is_some() {
-            self.errors.push(
-                Diagnostic::error(
-                    format!("`{keyword}` cannot be an item of a record block"),
-                    at,
-                )
-                .with_note(
-                    "a record block's value is the record of its fields; leave the loop from \
-                         a block that is not one, such as a field's value",
-                ),
-            );
+            self.in_record_error(keyword, at);
             None
         } else {
             self.jump_target(keyword, at, jump.label)
@@ -9571,14 +10329,13 @@ impl<'a> Checker<'a> {
             }
             return;
         };
-        let Some((loop_id, expected)) = self
-            .loops
-            .get(frame)
-            .map(|frame| (frame.id, frame.expected.clone()))
-        else {
+        let Some((target, expected)) = self.loops.get_mut(frame).map(|frame| {
+            frame.broken |= keyword == "break";
+            (frame.target(), frame.expected.clone())
+        }) else {
             return;
         };
-        self.jumps[id.index()] = Some(loop_id);
+        self.jumps[id.index()] = Some(target);
         let Some(value) = jump.value else {
             return;
         };
@@ -9591,68 +10348,252 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Reports the `break`, `continue` or `return`, as `keyword` says,
+    /// written at `at`, as an item of a record block, which nothing can
+    /// leave.
+    fn in_record_error(&mut self, keyword: &str, at: Span) {
+        let leave = if keyword == "return" {
+            "return"
+        } else {
+            "leave the loop"
+        };
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{keyword}` cannot be an item of a record block"),
+                at,
+            )
+            .with_note(format!(
+                "a record block's value is the record of its fields; {leave} from a block that \
+                 is not one, such as a field's value"
+            )),
+        );
+    }
+
     /// The index in [`Checker::loops`] of the loop that the `break` or
     /// `continue`, as `keyword` says, written at `at`, with `label`, if it
     /// has one, is for: the innermost loop of the function being checked
-    /// whose body holds it, labelled `label` if it has one. Where there is
-    /// none, reports why and returns `None`: "`break` outside a loop", if
-    /// no loop holds it; "no enclosing loop is labelled `'L`", at the
-    /// label, if no loop it could be for is labelled so; and if the only
-    /// such loops are outside the function or `lazy` being checked, "`break`
-    /// cannot leave a function" (or "a `lazy`"), labelled at the function's
-    /// keyword, and at the loop's label for a label, with a note saying
-    /// when the body runs.
+    /// whose body holds it, labelled `label` if it has one; or for a
+    /// `return`, which always has a label, the innermost loop or labelled
+    /// block of that label holding it. Where there is none, reports why and
+    /// returns `None`: "`break` outside a loop", if no loop holds it; "no
+    /// enclosing loop is labelled `'L`" (for a `return`, "no enclosing
+    /// block or loop is labelled `'L`"), at the label, if nothing it could
+    /// be for is labelled so; "`'L` labels a block, not a loop" if a
+    /// `break` or `continue` names a block, labelled at the block's label;
+    /// and if the only such loops or blocks are outside the function or
+    /// `lazy` being checked, "`break` cannot leave a function" (or "a
+    /// `lazy`"), labelled at the function's keyword, and at the loop's or
+    /// block's label for a label, with a note saying when the body runs.
     fn jump_target(&mut self, keyword: &str, at: Span, label: Option<Label>) -> Option<usize> {
         let depth = self.functions.len();
-        let names = |frame: &LoopFrame| {
-            label.is_none_or(|label| frame.label.is_some_and(|own| own.name == label.name))
+        let returning = keyword == "return";
+        let names = |frame: &LoopFrame| match label {
+            Some(label) => frame.label.is_some_and(|own| own.name == label.name),
+            // An unlabelled `break` or `continue` is for a loop.
+            None => frame.id.is_some(),
         };
         let found = self.loops.iter().rposition(names);
-        let found = match found {
-            Some(index)
-                if self
-                    .loops
-                    .get(index)
-                    .is_some_and(|frame| frame.depth == depth) =>
-            {
-                return Some(index);
+        let found = match found.and_then(|index| Some((index, self.loops.get(index)?))) {
+            Some((index, frame)) if frame.depth == depth => {
+                if returning || frame.id.is_some() {
+                    return Some(index);
+                }
+                let error = self.not_a_loop(at, frame.label);
+                self.errors.push(error);
+                return None;
             }
-            found => found.and_then(|index| self.loops.get(index)),
+            found => found.map(|(_, frame)| frame),
         };
         let error = match (found, label) {
-            (Some(outer), _) => {
-                let outer_label = outer.label;
-                let function = self.functions.last();
-                let (kind, when) = match function.map(|function| self.ast.fn_decl(function.fn_id)) {
-                    Some(decl) if decl.ret.is_none() => ("a `lazy`", "awaited"),
-                    _ => ("a function", "called"),
-                };
-                let mut error = Diagnostic::error(format!("`{keyword}` cannot leave {kind}"), at)
-                    .with_note(format!(
-                        "the body of {kind} runs when it is {when}, which may be after the loop \
-                         has ended"
-                    ));
-                if let Some(function) = function {
-                    error = error.with_context(function.keyword, format!("inside {kind} here"));
-                }
-                match (label, outer_label) {
-                    (Some(_), Some(outer)) => {
-                        error.with_context(outer.span, "the loop it names is outside it")
-                    }
-                    _ => error,
-                }
-            }
+            (Some(outer), _) => self.leave_function_error(keyword, at, (label, outer)),
             (None, None) => Diagnostic::error(format!("`{keyword}` outside a loop"), at),
             (None, Some(label)) => {
                 let text = self.ast.names().get(label.name);
+                let what = if returning { "block or loop" } else { "loop" };
                 Diagnostic::error(
-                    format!("no enclosing loop is labelled `'{text}`"),
+                    format!("no enclosing {what} is labelled `'{text}`"),
                     label.span,
                 )
             }
         };
         self.errors.push(error);
         None
+    }
+
+    /// The error for a `break` or `continue` written at `at` whose label
+    /// names a block, labelled `label`: "`'L` labels a block, not a loop",
+    /// labelled at the block's label, with a note saying to `return`.
+    fn not_a_loop(&self, at: Span, label: Option<Label>) -> Diagnostic {
+        let Some(label) = label else {
+            return InternalError {
+                message: "a block without a label is a target",
+                span: at,
+            }
+            .into();
+        };
+        let text = self.ast.names().get(label.name);
+        Diagnostic::error(format!("`'{text}` labels a block, not a loop"), at)
+            .with_context(label.span, "the block is labelled here")
+            .with_note(format!("use `return'{text}` to leave a block"))
+    }
+
+    /// The error for the `break`, `continue` or `return`, as `keyword`
+    /// says, written at `at`, with `label`, if it has one, whose only
+    /// target, `outer`, is outside the function or `lazy` being checked:
+    /// "`break` cannot leave a function" (or "a `lazy`"), labelled at the
+    /// function's keyword, and at the target's label for a label, with a
+    /// note saying when the body runs.
+    fn leave_function_error(
+        &self,
+        keyword: &str,
+        at: Span,
+        (label, outer): (Option<Label>, &LoopFrame),
+    ) -> Diagnostic {
+        let noun = outer.noun();
+        let function = self.functions.last();
+        let (kind, when) = match function.map(|function| self.ast.fn_decl(function.fn_id)) {
+            Some(decl) if decl.ret.is_none() => ("a `lazy`", "awaited"),
+            _ => ("a function", "called"),
+        };
+        let mut error = Diagnostic::error(format!("`{keyword}` cannot leave {kind}"), at)
+            .with_note(format!(
+                "the body of {kind} runs when it is {when}, which may be after the {noun} has \
+                 ended"
+            ));
+        if let Some(function) = function {
+            error = error.with_context(function.keyword, format!("inside {kind} here"));
+        }
+        match (label, outer.label) {
+            (Some(_), Some(outer)) => {
+                error.with_context(outer.span, format!("the {noun} it names is outside it"))
+            }
+            _ => error,
+        }
+    }
+
+    /// Checks the `return` item `id`, `item`, whose label and value are
+    /// `jump`, in a block whose first field, if it has one, is
+    /// `first_field` (see [`return`](#return)): as an item of a record
+    /// block, it is "`return` cannot be an item of a record block";
+    /// without a label it is for the innermost function or `lazy`, and at
+    /// the top level, outside any, "`return` outside a function"; with
+    /// one, for the loop or labelled block [`Checker::jump_target`] finds.
+    /// What it is for is recorded for lowering, and its value, `{}` without
+    /// one, is one of that target's result sites (see
+    /// [`Checker::return_site`]). Where there is no target, its value is
+    /// checked on its own.
+    fn check_return(
+        &mut self,
+        (id, item): (ItemId, Item),
+        jump: Jump,
+        first_field: Option<ItemId>,
+    ) {
+        let at = jump_span("return", item.span, jump.label);
+        let target = if first_field.is_some() {
+            self.in_record_error("return", at);
+            None
+        } else {
+            match jump.label {
+                None if self.functions.is_empty() => {
+                    self.errors.push(
+                        Diagnostic::error("`return` outside a function", at).with_note(
+                            "only a function or a `lazy` can be returned from without a label; a \
+                         block or a loop labelled `'L` is left with `return'L`",
+                        ),
+                    );
+                    None
+                }
+                None => Some(None),
+                Some(label) => self.jump_target("return", at, Some(label)).map(Some),
+            }
+        };
+        let Some(frame) = target else {
+            if let Some(value) = jump.value {
+                self.check_alone(value);
+            }
+            return;
+        };
+        let target = match frame.and_then(|frame| self.loops.get(frame)) {
+            Some(frame) => frame.target(),
+            None => JumpTarget::Function,
+        };
+        self.jumps[id.index()] = Some(target);
+        match target {
+            JumpTarget::Loop(loop_id) => {
+                if let Some(resolution) = self.loop_resolutions.get_mut(loop_id.index()) {
+                    resolution.returned = true;
+                }
+            }
+            JumpTarget::Block(block) => {
+                self.returned_blocks.insert(block);
+            }
+            JumpTarget::Function => {}
+        }
+        let site = self.return_site(at, jump.value, frame);
+        let returns = match frame {
+            Some(frame) => self.loops.get_mut(frame).map(|frame| &mut frame.returns),
+            None => self
+                .functions
+                .last_mut()
+                .map(|function| &mut function.returns),
+        };
+        if let Some(returns) = returns {
+            returns.push(site);
+        }
+    }
+
+    /// Checks the value of the `return` written at `at`, if it has one, for
+    /// the loop or labelled block `loops[frame]`, or with no frame for the
+    /// innermost function or `lazy`, and returns it as one of the target's
+    /// result sites. For a function, it is checked against the declared
+    /// result type as the body's result is (see [`return`](#return)), and
+    /// for a loop or block, against the type expected of the whole, if one
+    /// is; otherwise on its own. A `return` without a value gives `{}`,
+    /// which must fit the same.
+    fn return_site(&mut self, at: Span, value: Option<ExprId>, frame: Option<usize>) -> Site {
+        let expected = match frame {
+            Some(frame) => self
+                .loops
+                .get(frame)
+                .and_then(|frame| frame.returns_expected.clone()),
+            None => self
+                .functions
+                .last()
+                .and_then(|function| function.result)
+                .map(|(ret, context)| (ret, context, RESULT_WHY.to_owned())),
+        };
+        let Some(value) = value else {
+            if let Some((expected, context, why)) = expected
+                && expected != TyId::ERROR
+                && !self.types.is_subtype(TyId::EMPTY, expected)
+            {
+                let label = format!("expected {}, found {{}}", self.in_label(expected));
+                self.errors.push(
+                    Diagnostic::error("mismatched types", at)
+                        .with_label(label)
+                        .with_context(context, why)
+                        .with_note("a `return` without a value returns `{}`"),
+                );
+            }
+            return Site {
+                value: None,
+                at,
+                ty: TyId::EMPTY,
+            };
+        };
+        let ty = match (expected, frame) {
+            // As the body's result is, whose type is its own.
+            (Some((ret, context, why)), None) => {
+                self.check_expr_expecting(value, ret, context, &why)
+            }
+            (Some((expected, context, why)), Some(_)) => self.fit(value, expected, (context, &why)),
+            (None, _) => self.check_expr(value),
+        };
+        Site {
+            value: Some(value),
+            at: self.ast.get(value).span,
+            ty,
+        }
     }
 
     /// The element type of `ty`, the type of the iterable `iterable` of a
@@ -9896,7 +10837,17 @@ impl<'a> Checker<'a> {
                 self.coerce(then, ty);
                 self.coerce(else_, ty);
             }
-            ExprKind::Block(body) => self.coerce_result(body, ty),
+            ExprKind::Block { items, label } => {
+                self.coerce_result(items, ty);
+                // A labelled block's `return`s are its result sites too.
+                if label.is_some()
+                    && let Some(values) = self.block_returns.get(&id).cloned()
+                {
+                    for value in values {
+                        self.coerce(value, ty);
+                    }
+                }
+            }
         }
     }
 
@@ -9914,7 +10865,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Field { .. }
             | ItemKind::Spread(_)
             | ItemKind::Break(_)
-            | ItemKind::Continue(_) => {}
+            | ItemKind::Continue(_)
+            | ItemKind::Return(_) => {}
         }
     }
 
@@ -9978,6 +10930,17 @@ impl<'a> Checker<'a> {
         }
         ty
     }
+}
+
+/// The label on a function's declared result type where a value does not
+/// fit it: the body's result, or a `return`'s value.
+const RESULT_WHY: &str = "the return type is declared here";
+
+/// The span of the keyword `keyword` of a `break`, `continue` or `return`
+/// item spanning `item`, which it starts, through its label, if it has one.
+fn jump_span(keyword: &str, item: Span, label: Option<Label>) -> Span {
+    let written = symbol_span(keyword, item.start);
+    label.map_or(written, |label| Span::join(written, label.span))
 }
 
 /// Whether `ty` is a numeric type, untyped integers included.
@@ -10834,7 +11797,7 @@ mod tests {
     fn lets(ast: &Ast, body: ItemRange, out: &mut Vec<ItemId>) {
         fn visit(ast: &Ast, id: ExprId, out: &mut Vec<ItemId>) {
             match ast.get(id).kind {
-                ExprKind::Block(body) => lets(ast, body, out),
+                ExprKind::Block { items: body, .. } => lets(ast, body, out),
                 ExprKind::Binary { lhs, rhs, .. } => {
                     visit(ast, lhs, out);
                     visit(ast, rhs, out);
@@ -10910,7 +11873,7 @@ mod tests {
                 | ItemKind::Expr(value) => {
                     visit(ast, value, out);
                 }
-                ItemKind::Break(_) | ItemKind::Continue(_) => {}
+                ItemKind::Break(_) | ItemKind::Continue(_) | ItemKind::Return(_) => {}
             }
         }
     }
@@ -13100,7 +14063,7 @@ mod tests {
         let update = ast
             .expr_ids()
             .filter_map(|id| match ast.get(id).kind {
-                ExprKind::Block(body) => Some(body),
+                ExprKind::Block { items, .. } => Some(items),
                 _ => None,
             })
             .flat_map(|body| ast.items(body).iter().copied())
@@ -15581,7 +16544,7 @@ mod tests {
         let body = match n {
             None => ast.root(),
             Some(n) => match ast.get(ast.fn_decl(FnId::new(n)).body).kind {
-                ExprKind::Block(body) => body,
+                ExprKind::Block { items, .. } => items,
                 other => panic!("the body is not a block: {other:?}"),
             },
         };
@@ -18734,7 +19697,7 @@ mod tests {
         let ItemKind::Expr(block) = second.item(block).kind else {
             panic!("expected a block");
         };
-        let ExprKind::Block(items) = second.get(block).kind else {
+        let ExprKind::Block { items, .. } = second.get(block).kind else {
             panic!("expected a block");
         };
         assert_eq!(resolution.item_slot(second.items(items)[0]), Slot(1));
@@ -20029,7 +20992,7 @@ mod tests {
             let ExprKind::For(id) = ast.get(result_expr_of_let(&ast)).kind else {
                 panic!("{body}: expected a loop");
             };
-            let ExprKind::Block(items) = ast.get(ast.for_decl(id).body).kind else {
+            let ExprKind::Block { items, .. } = ast.get(ast.for_decl(id).body).kind else {
                 panic!("{body}: expected a block");
             };
             let last = *ast.items(items).last().unwrap();
@@ -20198,5 +21161,584 @@ mod tests {
             let text = format!("fn f() -> List<Int> {{ {body} }}\nf");
             assert_eq!(shown_result(&text), ty, "{body}");
         }
+    }
+
+    // ----- `return`, labelled blocks and loops that return -----
+
+    #[test]
+    fn each_target_is_typed_by_its_result_sites() {
+        // A function: its declared type.
+        assert_eq!(
+            shown_result(
+                "fn sign(n: Int): Int { if n < 0 { return -1 }; if n > 0 { return 1 }; 0 }\nsign"
+            ),
+            "fn(n: Int): Int"
+        );
+        // A `lazy`: the join of its operand and what it returns.
+        assert_eq!(
+            loop_type("lazy { if flag { return 1.5 }; 2 }"),
+            "Future<Float>"
+        );
+        assert_eq!(loop_type("lazy { return 1 }"), "Future<Int>");
+        // A labelled block: the join of its result and what it returns.
+        assert_eq!(
+            loop_type("{'pick if flag { return'pick 1 }; if xs[0] > 1 { return'pick 2 }; 3 }"),
+            "Int"
+        );
+        assert_eq!(loop_type("{'b return'b 2.5 }"), "Float");
+        assert_eq!(loop_type("{'b if flag { return'b 1 }; 2.5 }"), "Float");
+        // A loop: the join of its list and what it returns.
+        assert_eq!(
+            loop_type("for'scan x in xs { if x > 5 { return'scan [x] }; x }"),
+            "List<Int>"
+        );
+        assert_eq!(
+            loop_type("for'scan x in xs { if x > 5 { return'scan x }; continue }"),
+            "Int | List<{}>"
+        );
+        // A bare `return` returns `{}`.
+        assert_eq!(loop_type("{'b if flag { return'b }; {} }"), "{}");
+        // A labelled loop body is a labelled block: what it returns is what
+        // the iteration contributes.
+        assert_eq!(
+            loop_type("for x in xs {'it if x < 5 { return'it 0 }; x }"),
+            "List<Int>"
+        );
+        // The summary's examples, end to end.
+        let text = "let a = true\nlet b = false\n\
+                    let y = {'pick if a { return'pick 1 }; if b { return'pick 2 }; 3 }\n\
+                    let v: Int = for'spin { let r = 4; if r > 0 { return'spin r } }\n= y + v";
+        assert_eq!(file_type(text), "Int");
+        assert!(warnings(text).is_empty());
+    }
+
+    #[test]
+    fn a_function_return_is_checked_against_the_result_type() {
+        for marker in [":", "->>", "->"] {
+            let text = format!("fn g(n: Int){marker} Int {{ if n > 0 {{ return \"a\" }}; 0 }}");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{marker}: {found:?}");
+            assert_eq!(found[0].message, "mismatched types");
+            assert_eq!(found[0].span, at(&text, "\"a\""));
+            let expected = if marker == ":" {
+                "expected Int, found String"
+            } else {
+                "expected Int | Future<Int>, found String"
+            };
+            assert_eq!(found[0].label.as_deref(), Some(expected), "{marker}");
+            assert_eq!(
+                labels(&found[0]),
+                vec![(last(&text, "Int"), "the return type is declared here")]
+            );
+        }
+        // An untyped literal adapts, a record block is checked field by
+        // field, and a list literal against a list type.
+        assert_eq!(
+            shown_result("fn f(c: Bool): Float { if c { return 1 }; 2.5 }\nf"),
+            "fn(c: Bool): Float"
+        );
+        assert!(
+            diagnostics_or_none(
+                "fn f(c: Bool): {a: Float} { if c { return { a = 1 } }; { a = 2.5 } }"
+            )
+            .is_empty()
+        );
+        assert!(
+            diagnostics_or_none("fn f(c: Bool): List<Float> { if c { return [1, 2] }; [] }")
+                .is_empty()
+        );
+        assert_eq!(
+            messages("fn f(c: Bool): {a: Int} { if c { return { b = 1 } }; { a = 1 } }"),
+            vec![
+                "field `b` is not in `{a: Int}`",
+                "missing field `a` in record"
+            ]
+        );
+        // A bare `return` returns `{}`, which an `Int` result is not.
+        let text = "fn f(): Int { return }";
+        let found = diagnostics(text);
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "return"));
+        assert_eq!(found[0].label.as_deref(), Some("expected Int, found {}"));
+        assert_eq!(found[0].notes, ["a `return` without a value returns `{}`"]);
+        // It is fine where `{}`, or its either shape, is the result.
+        assert_eq!(
+            shown_result("fn f(c: Bool) -> {} { if c { return }; {} }\nf"),
+            "fn(c: Bool | Future<Bool>) -> {}"
+        );
+        // A body that ends in `return` is `Never`, and fits any result.
+        assert_eq!(
+            shown_result("fn f(): String { return \"x\" }\nf"),
+            "fn(): String"
+        );
+        // A value that fits once awaited is awaited, where the function may
+        // await.
+        let (ast, resolution) = resolved("fn f(x: Future<Int>) -> Present<Int> { return x }");
+        let x = ast
+            .expr_ids()
+            .filter(|&id| matches!(ast.get(id).kind, ExprKind::Name(_)))
+            .last()
+            .unwrap();
+        assert_eq!(resolution.await_of(x), AwaitMark::Top);
+    }
+
+    #[test]
+    fn result_inference_decides_from_every_site() {
+        for (body, ty) in [
+            // Present, future and either, with the body's own result.
+            ("if c { return 1 }; 2", "-> Int"),
+            ("if c { return lazy 1 }; lazy 2", "-> Future<Int>"),
+            ("if c { return 1 }; lazy 2", "-> Int | Future<Int>"),
+            // With only `return`s.
+            ("if c { return 1 }; return 2", "-> Int"),
+            ("if c { return lazy 1 }; return lazy 2", "-> Future<Int>"),
+            ("if c { return lazy 1 }; return 2", "-> Int | Future<Int>"),
+        ] {
+            let text = format!("fn f(c: Bool) -> Int {{ {body} }}\nf");
+            assert_eq!(
+                shown_result(&text),
+                format!("fn(c: Bool | Future<Bool>) {ty}"),
+                "{body}"
+            );
+        }
+        // Memoised functions alike.
+        assert_eq!(
+            shown_result("fn f(c: Bool) ->> Int { if c { return lazy 1 }; lazy 2 }\nf"),
+            "fn(c: Bool) ->> Future<Int>"
+        );
+        // A record's fields are inferred site by site, dotted ones too.
+        assert_eq!(
+            shown_result(
+                "fn f(c: Bool) -> {a: {b: Int}} { if c { return { a.b = 1 } }; { a = { b = 2 } } }\nf"
+            ),
+            "fn(c: Bool | Future<Bool>) -> {a: {b: Int}}"
+        );
+        assert_eq!(
+            shown_result(
+                "fn f(c: Bool) -> {a: Int} { if c { return { a = lazy 1 } }; { a = 2 } }\nf"
+            ),
+            "fn(c: Bool | Future<Bool>) -> {a: Int | Future<Int>}"
+        );
+        // A `return` in a `lazy` is no site of the function around it.
+        assert_eq!(
+            shown_result("fn f() -> Int { let j = lazy { return 1 }; 2 }\nf"),
+            "fn() -> Int"
+        );
+    }
+
+    #[test]
+    fn a_pure_function_measures_what_it_returns_as_its_result() {
+        // Returned where an `Int` is expected, the parameter is measured,
+        // as returning it as the body's result does.
+        assert_eq!(
+            shown_result("fn id(x: Int): Int { return x }\nid"),
+            shown_result("fn id(x: Int): Int { x }\nid")
+        );
+        assert_eq!(
+            shown_result("fn id(x: Int): Int { return x }\nid"),
+            "fn(x: Int): Int"
+        );
+        // Returned where the either shape is expected, it is not.
+        assert_eq!(
+            shown_result("fn keep(x: Int): {v: Int | Future<Int>} { return { v = x } }\nkeep"),
+            "fn(x: Int | Future<Int>): {v: Int | Future<Int>}"
+        );
+        // A callback returned is used as a value, so not narrowed; one only
+        // called is.
+        assert_eq!(
+            shown_result("fn run(f: fn(Int) -> Int) -> Int { return f(1) }\nrun"),
+            "fn(f: fn(Int) -> Int | Future<Int>) -> Int | Future<Int>"
+        );
+        assert_eq!(
+            shown_result("fn pass(f: fn(Int) -> Int) -> fn(Int) -> Int { return f }\npass"),
+            "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> fn(Int | Future<Int>) -> Int | \
+             Future<Int>"
+        );
+    }
+
+    #[test]
+    fn return_errors() {
+        // At the top level.
+        let text = "let x = 1\nreturn x";
+        assert_eq!(
+            errors(text),
+            vec![("`return` outside a function".to_owned(), at(text, "return"))]
+        );
+        assert_eq!(
+            messages("let v = for x in [1] { if x > 0 { return 1 }; x }"),
+            vec!["`return` outside a function"]
+        );
+        // As an item of a record block.
+        let text = "fn f(): {a: Int} { { a = 1; return } }";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "`return` cannot be an item of a record block".to_owned(),
+                at(text, "return")
+            )]
+        );
+        // An unknown label.
+        let text = "fn f(): Int {'a return'b 1 }";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "no enclosing block or loop is labelled `'b`".to_owned(),
+                at(text, "'b")
+            )]
+        );
+        // A label only outside the function or `lazy`: block and loop.
+        for (text, kind, noun) in [
+            (
+                "let v = {'o let f = fn(): Int { return'o 1 }; 2 }",
+                "a function",
+                "block",
+            ),
+            (
+                "let v = for'o x in [1] { let f = fn(): Int { return'o 1 }; x }",
+                "a function",
+                "loop",
+            ),
+            (
+                "let v = {'o let l = lazy { return'o 1 }; 2 }",
+                "a `lazy`",
+                "block",
+            ),
+            (
+                "let v = for'o x in [1] { let l = lazy { return'o 1 }; x }",
+                "a `lazy`",
+                "loop",
+            ),
+        ] {
+            let found = &diagnostics(text)[0];
+            assert_eq!(
+                found.message,
+                format!("`return` cannot leave {kind}"),
+                "{text}"
+            );
+            assert_eq!(found.span, at(text, "return'o"), "{text}");
+            assert_eq!(
+                labels(found)[1],
+                (
+                    at(text, "'o"),
+                    format!("the {noun} it names is outside it").as_str()
+                ),
+                "{text}"
+            );
+        }
+        // A `break` or `continue` that names a block.
+        let text = "let v = {'blk for x in [1] { break'blk } }";
+        let found = &diagnostics(text)[0];
+        assert_eq!(found.message, "`'blk` labels a block, not a loop");
+        assert_eq!(found.span, at(text, "break'blk"));
+        assert_eq!(
+            labels(found),
+            vec![(at(text, "'blk"), "the block is labelled here")]
+        );
+        assert_eq!(found.notes, ["use `return'blk` to leave a block"]);
+        // An unlabelled one goes through the block to the loop.
+        assert_eq!(
+            loop_type("for x in xs {'b if x > 1 { break }; x }"),
+            "List<Int>"
+        );
+        // A `return'L` in a loop's iterable, guard or header is not for it.
+        assert_eq!(
+            messages("fn f(): Int { let v = for'a x in [1] if { return'a true } { x }; 1 }"),
+            vec!["no enclosing block or loop is labelled `'a`"]
+        );
+        // A `return` in error leaves nothing to warn about after it.
+        let found = errors("return\nlet y = 1");
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn labels_are_one_namespace() {
+        for (text, outer_noun, inner_noun) in [
+            ("let v = {'a for'a x in [1] { x } }", "block", "loop"),
+            ("let v = for'a x in [1] {'a x }", "loop", "block"),
+            ("let v = {'a {'a 1 } }", "block", "block"),
+        ] {
+            let found = &diagnostics(text)[0];
+            assert_eq!(found.message, "label `'a` is already in use", "{text}");
+            assert_eq!(found.span, last(text, "'a"), "{text}");
+            assert_eq!(
+                labels(found)[0].1,
+                format!("the {outer_noun} around this one is labelled so")
+            );
+            assert_eq!(
+                found.notes,
+                [format!("give the inner {inner_noun} another label")]
+            );
+        }
+        // A function nested in a labelled block starts with no labels, and
+        // its labels end with it.
+        assert!(
+            diagnostics_or_none("let v = {'a let f = fn(): Int {'a return'a 1 }; 2 }\n= v")
+                .is_empty()
+        );
+        // A return names the innermost of its label.
+        let text = "fn f(): Int {'a let v = for x in [1] {'b if x > 0 { return'a 3 }; x }; 1 }";
+        let (ast, resolution) = resolved(text);
+        let target = (0..ast.item_count())
+            .map(|item| ItemId::new(u32::try_from(item).unwrap()))
+            .find_map(|item| {
+                resolution
+                    .target(item)
+                    .filter(|_| matches!(ast.item(item).kind, ItemKind::Return(_)))
+            })
+            .unwrap();
+        let JumpTarget::Block(block) = target else {
+            panic!("expected a block, got {target:?}");
+        };
+        assert_eq!(ast.get(block).span.start, at(text, "{'a").start);
+        assert!(resolution.is_returned_block(block));
+    }
+
+    #[test]
+    fn a_lazy_returns_to_its_future() {
+        assert_eq!(
+            loop_type("lazy { if flag { return xs[0] }; 2 }"),
+            "Future<Int>"
+        );
+        // A widened join is a warning, labelled at each site.
+        let text = "let c = true\nlet l = lazy { if c { return 1.5 }; \"s\" }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "the values this `lazy` returns have different types"
+        );
+        assert_eq!(found[0].span, at(text, "lazy"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (at(text, "\"s\""), "this is String"),
+                (at(text, "1.5"), "this is Float"),
+            ]
+        );
+        assert_eq!(
+            found[0].notes,
+            [
+                "the `lazy` is `Future<Float | String>`; annotate it with that type if all are \
+              meant, or tell them apart with `is`"
+            ]
+        );
+        // Under an expected type, the future as a whole fits it, as before.
+        assert_eq!(
+            file_type("let l: Future<Int | String> = lazy { if true { return 1 }; \"s\" }\n= 1"),
+            "Int"
+        );
+        assert_eq!(
+            messages("let l: Future<String> = lazy { if true { return 1 }; \"s\" }"),
+            vec![
+                "mismatched types",
+                "the values this `lazy` returns have different types"
+            ]
+        );
+        // In a function, the `return` leaves the `lazy`, not the function.
+        assert_eq!(
+            shown_result("fn f() -> String { let j = lazy { return 1 }; \"x\" }\nf"),
+            "fn() -> String"
+        );
+        // A `lazy` inside a labelled block cannot return to the block.
+        assert_eq!(
+            messages("let v = {'b let l = lazy { return'b 1 }; 2 }"),
+            vec!["`return` cannot leave a `lazy`"]
+        );
+    }
+
+    #[test]
+    fn a_labelled_block_joins_its_result_and_its_returns() {
+        // Untyped values stay untyped together, and adapt to a type
+        // expected later.
+        assert_eq!(
+            file_type("let f: Float = {'a if true { return'a 1 }; 2 }\n= f"),
+            "Float"
+        );
+        assert_eq!(loop_type("{'a if flag { return'a 1 }; 2 }"), "Int");
+        // A widened join is a warning at the label, labelled at each site.
+        let text = "let c = true\nlet y = {'b if c { return'b 1 }; \"two\" }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "the values this block returns have different types"
+        );
+        assert_eq!(found[0].span, at(text, "'b"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![
+                (at(text, "\"two\""), "this is String"),
+                (last(text, "1"), "this is Int"),
+            ]
+        );
+        assert_eq!(
+            found[0].notes,
+            [
+                "the block is `Int | String`; annotate it with that type if all are meant, or tell \
+              them apart with `is`"
+            ]
+        );
+        // Under an expected union each fits it, and there is no warning.
+        let text = "let y: Int | String = {'b if true { return'b 1 }; \"two\" }\n= y";
+        assert_eq!(file_type(text), "Int | String");
+        assert!(warnings(text).is_empty());
+        assert_eq!(
+            messages("let y: Int | String = {'b if true { return'b 1.5 }; \"two\" }"),
+            vec!["mismatched types"]
+        );
+        // Never when every path returns, and its values' type then.
+        assert_eq!(loop_type("{'b return'b 1 }"), "Int");
+        assert_eq!(
+            loop_type("{'b if flag { return'b \"y\" } else { return'b \"n\" } }"),
+            "String"
+        );
+        assert_eq!(
+            file_type("let v = for x in [1] { {'b if x > 0 { break } else { continue } } }\n= v"),
+            "List<{}>"
+        );
+        // What follows an `if` every branch of which returns is never run.
+        let text = "let v = {'b if true { return'b 1 } else { return'b 2 }; 3 }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "this is never run");
+        assert_eq!(found[0].span, last(text, "3"));
+        // Nested labels: each `return` names its own.
+        assert_eq!(
+            loop_type("{'o let i = {'i if flag { return'o 2.5 }; 1 }; 3.5 }"),
+            "Float"
+        );
+        // An unused label is fine.
+        assert_eq!(loop_type("{'unused 1 }"), "Int");
+    }
+
+    #[test]
+    fn a_loop_that_returns_is_its_list_or_what_it_returns() {
+        let text = "let xs = [1, 7]\nlet hit = for'scan x in xs { if x > 5 { return'scan x } }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].message,
+            "this loop is its list or a value returned to it, of different types"
+        );
+        assert_eq!(found[0].span, at(text, "for"));
+        assert_eq!(found[0].label.as_deref(), Some("its list is List<{}>"));
+        assert_eq!(labels(&found[0]), vec![(last(text, "x"), "this is Int")]);
+        assert_eq!(
+            found[0].notes,
+            [
+                "the loop is `Int | List<{}>`; annotate it with that type if all are meant, or tell \
+              them apart with `is`"
+            ]
+        );
+        // The union is told apart with `is`.
+        assert_eq!(
+            file_type(&format!("{text}\n= if hit is Int {{ hit }} else {{ 0 }}")),
+            "Int"
+        );
+        // Under an expected type: a union covers it, with no warning.
+        let annotated = "let xs = [1, 7]\n\
+                         let hit: Int | List<{}> = for'scan x in xs { if x > 5 { return'scan x } }";
+        assert!(warnings(annotated).is_empty());
+        // A list type: the body against its element type, the values
+        // against the whole.
+        assert_eq!(
+            file_type("let v: List<Float> = for'l x in [1] { if x > 5 { return'l [2] }; 3 }\n= v"),
+            "List<Float>"
+        );
+        // A union with one list member: the body against its element type.
+        assert_eq!(
+            file_type(
+                "let v: Float | List<Float> = for'l x in [1] { if x > 5 { return'l 2 }; 3 }\n= v"
+            ),
+            "Float | List<Float>"
+        );
+        // A type the list does not fit: the loop's own error.
+        let text = "let v: Int = for'L x in [1, 2] { if x > 1 { return'L x } }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "this loop may end as a list, `List<{}>`, which is not Int"
+        );
+        assert_eq!(found[0].span, at(text, "for"));
+        assert_eq!(
+            found[0].notes,
+            ["annotate it as `Int | List<{}>`, or return from every way the loop can end"]
+        );
+        // A value returned that does not fit is a mismatch at it.
+        assert_eq!(
+            messages("let v: List<Int> = for'l x in [1] { if x > 5 { return'l \"a\" }; x }"),
+            vec!["mismatched types"]
+        );
+        // A loop no `return` leaves keeps the generic mismatch.
+        assert_eq!(
+            messages("let v: Int = for x in [1] { x }"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn a_loop_with_no_condition_and_no_break_never_ends() {
+        assert_eq!(
+            file_type("let v: Int = for'spin { let r = 4; if r > 0 { return'spin r } }\n= v"),
+            "Int"
+        );
+        assert!(warnings("let v: Int = for'spin { if true { return'spin 1 } }").is_empty());
+        assert_eq!(loop_type("for'spin { return'spin \"s\" }"), "String");
+        // With a `break`, its own or a labelled one from a loop inside it,
+        // it ends; one aimed further out does not end it.
+        assert_eq!(loop_type("for { break }"), "List<{}>");
+        assert_eq!(
+            loop_type("for'o { for x in xs { break'o } }"),
+            "List<List<{}>>"
+        );
+        // The inner loop is `Never`, a body that contributes nothing.
+        assert_eq!(loop_type("for'o x in xs { for { break'o } }"), "List<{}>");
+        // Numbered children first: the inner loop is 0.
+        let (_, resolution) = resolved("let v = for'o { for { break'o } }");
+        assert!(resolution.loop_of(ForId::new(0)).endless);
+        assert!(!resolution.loop_of(ForId::new(1)).endless);
+        // `for true` and a `do` loop are not the form.
+        assert_eq!(loop_type("for'l true { return'l 1 }"), "Int | List<{}>");
+        // As a statement, what follows it is never run.
+        let text = "fn work() -> {} { {} }\nfn serve() -> {} {\n  for { work() }\n  work()\n}";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "this is never run");
+        assert_eq!(found[0].span, last(text, "work()"));
+        // A function whose only result site is such a loop: honestly
+        // present.
+        assert_eq!(
+            shown_result("fn work() -> {} { {} }\nfn serve() -> {} { for { work() } }\nserve"),
+            "fn() -> {}"
+        );
+        assert_eq!(
+            shown_result("fn spin(c: Bool) -> Int { for'l { if c { return'l 5 } } }\nspin"),
+            "fn(c: Bool | Future<Bool>) -> Int"
+        );
+        let (_, resolution) = resolved("for { }");
+        assert!(resolution.loop_of(ForId::new(0)).endless);
+        let (_, resolution) = resolved("for { break }");
+        assert!(!resolution.loop_of(ForId::new(0)).endless);
+    }
+
+    #[test]
+    fn a_union_of_unit_like_members_is_unit_like() {
+        let mut types = TypeTable::new();
+        let empties = types.list(TyId::EMPTY);
+        let union = types.union([empties, TyId::EMPTY]);
+        assert!(types.is_unit_like(union));
+        let union = types.union([empties, TyId::INT]);
+        assert!(!types.is_unit_like(union));
+        // So a statement loop a bare `return` leaves is no unused value.
+        let text = "fn f() -> {} { for'l x in [1] { if x > 0 { return'l } }; {} }";
+        assert!(diagnostics_or_none(text).is_empty());
+        assert_eq!(
+            messages("fn f() -> {} { for'l x in [1] { if x > 0 { return'l 1 } }; {} }"),
+            vec![
+                "unused value of type `Int | List<{}>`",
+                "this loop is its list or a value returned to it, of different types"
+            ]
+        );
     }
 }

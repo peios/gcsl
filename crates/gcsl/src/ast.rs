@@ -53,7 +53,19 @@
 //!
 //! `break` and `continue` are items, [`ItemKind::Break`] and
 //! [`ItemKind::Continue`], each with a [`Jump`]: the label of the loop it
-//! is for, if it names one, and its value, if it has one.
+//! is for, if it names one, and its value, if it has one. So is `return`,
+//! [`ItemKind::Return`], whose [`Jump`]'s label names the block or loop it
+//! leaves, and which without one leaves the function or `lazy` around it.
+//!
+//! # Labelled blocks
+//!
+//! A block may be labelled, `{'name ... }`, the label written directly
+//! after its `{`: [`ExprKind::Block`] holds its items and, if it has one,
+//! a [`LabelId`] into an arena of [`Label`]s, [`Ast::label`]. The label is
+//! kept apart because a [`Label`] would not fit in an [`Expr`] beside the
+//! items, and only labelled blocks pay for it: an id with a niche, so that
+//! a block without a label costs nothing and an [`Expr`] stays 24 bytes.
+//! Loop labels and block labels are one namespace (see [`crate::check`]).
 //!
 //! # Functions
 //!
@@ -119,6 +131,7 @@
 //! of its string literals.
 
 use std::fmt;
+use std::num::NonZeroU32;
 
 use crate::names::{Name, Names};
 use crate::source::Span;
@@ -306,8 +319,9 @@ pub enum ForHead {
     },
 }
 
-/// A loop's label, `'NAME`, written directly after the `for`, `do`,
-/// `break` or `continue` it belongs to.
+/// A label, `'NAME`, written directly after the `for`, `do`, `break`,
+/// `continue` or `return` it belongs to, or after the `{` of the block it
+/// names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Label {
     /// The name, without its `'`.
@@ -316,14 +330,31 @@ pub struct Label {
     pub span: Span,
 }
 
-/// What a `break` or `continue` item says: the loop it is for, by label,
-/// and the value it contributes to that loop's list.
+/// Index of a labelled block's [`Label`] in the label arena of the [`Ast`]
+/// (or [`AstBuilder`]) that allocated it. Never zero, so that an
+/// `Option<LabelId>` is as small as the id, which keeps an unlabelled
+/// [`ExprKind::Block`] free of the label's cost. Like [`ExprId`], only
+/// meaningful for that arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LabelId(NonZeroU32);
+
+impl LabelId {
+    /// The id as an index into the arena.
+    const fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
+/// What a `break`, `continue` or `return` item says: the loop, or for a
+/// `return` the block or loop, it is for, by label, and its value: what it
+/// contributes to that loop's list, or what it returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Jump {
-    /// The label of the loop it is for; `None` for the innermost loop whose
-    /// body holds it.
+    /// The label of the loop or block it is for; `None` for the innermost
+    /// loop whose body holds it, or for a `return`, the innermost function
+    /// or `lazy`.
     pub label: Option<Label>,
-    /// The value it contributes, if it has one.
+    /// Its value, if it has one.
     pub value: Option<ExprId>,
 }
 
@@ -900,8 +931,15 @@ pub enum ExprKind {
     Name(Name),
     /// A block `{ ... }`: a body of items in a scope of its own. With at
     /// least one [`ItemKind::Field`] or [`ItemKind::Spread`] it is a record
-    /// block, whose value is the record of its fields.
-    Block(ItemRange),
+    /// block, whose value is the record of its fields. A block that is not
+    /// one may be labelled, `{'name ... }`, for the `return`s that leave it
+    /// (see [Labelled blocks](#labelled-blocks)).
+    Block {
+        /// Its items.
+        items: ItemRange,
+        /// Its label, if it has one: see [`Ast::label`].
+        label: Option<LabelId>,
+    },
     /// Field access, `EXPR.NAME` or `EXPR."quoted name"`. The span of the
     /// `.NAME` part is not stored; see [`Expr::member_span`].
     Field {
@@ -1001,7 +1039,7 @@ impl Expr {
             | ExprKind::If { .. }
             | ExprKind::Paren(_)
             | ExprKind::Name(_)
-            | ExprKind::Block(_)
+            | ExprKind::Block { .. }
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
             | ExprKind::Is { .. }
@@ -1120,11 +1158,15 @@ pub enum ItemKind {
     /// `continue`, with a value and a label as for `break`: ends an
     /// iteration of a loop.
     Continue(Jump),
+    /// `return`, `return VALUE`, `return'LABEL` or `return'LABEL VALUE`:
+    /// leaves the innermost function or `lazy`, or with a label, the block
+    /// or loop it names, which evaluates to the value, `{}` without one.
+    Return(Jump),
 }
 
 impl ItemKind {
     /// The expression the item holds, if it has one: every item's but a
-    /// `break`'s or `continue`'s without a value.
+    /// `break`'s, `continue`'s or `return`'s without a value.
     #[must_use]
     pub const fn value(self) -> Option<ExprId> {
         match self {
@@ -1134,7 +1176,7 @@ impl ItemKind {
             | ItemKind::Spread(value)
             | ItemKind::Result(value)
             | ItemKind::Expr(value) => Some(value),
-            ItemKind::Break(jump) | ItemKind::Continue(jump) => jump.value,
+            ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
         }
     }
 }
@@ -1145,9 +1187,9 @@ pub struct Item {
     /// What the item is.
     pub kind: ItemKind,
     /// The source it covers: from `let`, the path, `=`, `...` or the start
-    /// of the expression, through the end of the expression; for a `break`
-    /// or `continue`, from its keyword through its value, its label or
-    /// itself, whichever is last.
+    /// of the expression, through the end of the expression; for a
+    /// `break`, `continue` or `return`, from its keyword through its value,
+    /// its label or itself, whichever is last.
     pub span: Span,
 }
 
@@ -1230,6 +1272,7 @@ pub struct AstBuilder {
     param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
+    labels: Vec<Label>,
 }
 
 impl AstBuilder {
@@ -1335,6 +1378,15 @@ impl AstBuilder {
         id
     }
 
+    /// Adds the label of a labelled block to the label arena and returns
+    /// its id, which the block's [`ExprKind::Block`] then carries.
+    pub fn push_label(&mut self, label: Label) -> LabelId {
+        self.labels.push(label);
+        // The arena's length after the push, so never zero; saturating as
+        // every arena does (see [`AstBuilder::alloc`]).
+        LabelId(NonZeroU32::MIN.saturating_add(next_id(self.labels.len()) - 1))
+    }
+
     /// Appends `params` to the parameter pool as one function's parameters
     /// and returns their range.
     pub fn push_params(&mut self, params: &[Param]) -> ParamRange {
@@ -1409,6 +1461,17 @@ impl AstBuilder {
         &self.type_exprs[id.index()]
     }
 
+    /// Returns the items of the list `range`, in source order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` was not allocated by this builder.
+    #[must_use]
+    pub fn items(&self, range: ItemRange) -> &[ItemId] {
+        let start = range.start as usize;
+        &self.item_lists[start..start + range.len as usize]
+    }
+
     /// Finishes the arenas with `root` as the file's body, taking ownership
     /// of the `names` its identifiers were interned into and the `strings`
     /// holding the text of its string literals.
@@ -1428,6 +1491,7 @@ impl AstBuilder {
             param_tys: self.param_tys,
             elements: self.elements,
             fors: self.fors,
+            labels: self.labels,
             root,
             names,
             strings,
@@ -1452,6 +1516,7 @@ pub struct Ast {
     param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
+    labels: Vec<Label>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -1567,6 +1632,28 @@ impl Ast {
     #[must_use]
     pub fn for_count(&self) -> usize {
         self.fors.len()
+    }
+
+    /// Returns the label of a labelled block, `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn label(&self, id: LabelId) -> Label {
+        self.labels[id.index()]
+    }
+
+    /// The label of the expression `id`, if it is a labelled block, and
+    /// `None` for every other expression.
+    #[must_use]
+    pub fn block_label(&self, id: ExprId) -> Option<Label> {
+        match self.get(id).kind {
+            ExprKind::Block {
+                label: Some(label), ..
+            } => Some(self.label(label)),
+            _ => None,
+        }
     }
 
     /// Returns the parameters of the function expression whose parameters
@@ -1739,7 +1826,7 @@ impl Ast {
                         None => return node,
                     }
                 }
-                ExprKind::Block(items) => match self.first_of_items(items) {
+                ExprKind::Block { items, .. } => match self.first_of_items(items) {
                     Some(first) => first,
                     None => return node,
                 },
@@ -1891,10 +1978,12 @@ impl Annotate for NoAnnotation {
 /// the items before its condition, its condition as `(cond EXPR)` if it
 /// has one, the items after it and its body; a `do` loop as `(do ...)`
 /// followed by its body and its condition as `(cond EXPR)`. A loop's label
-/// follows its keyword as it is written, as in `(for'rows r ...)`. A
-/// `break` or `continue` item prints as `(break @0..5)`, its label after
-/// its keyword, as in `(continue'rows @0..14)`, and its value, if it has
-/// one, after its span. A range prints as its operator, `..` or `..=`,
+/// follows its keyword as it is written, as in `(for'rows r ...)`, and a
+/// block's follows `block`, as in `(block'pick @0..30 ...)`. A `break`,
+/// `continue` or `return` item prints as `(break @0..5)`, its label after
+/// its keyword, as in `(continue'rows @0..14)` or `(return'pick @2..16
+/// ...)`, and its value, if it has one, after its span. A range prints as
+/// its operator, `..` or `..=`,
 /// like any binary operator. Applied and
 /// union types print as written, `Future<Int>`, `Present<Int>` and
 /// `Int | Future<Int>`, a function type that is a member of a union in
@@ -1964,9 +2053,10 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("expr")?;
                 value
             }
-            ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+            ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                 let keyword = match item.kind {
                     ItemKind::Break(_) => "break",
+                    ItemKind::Return(_) => "return",
                     _ => "continue",
                 };
                 return self.jump(f, (keyword, jump), item.span, depth);
@@ -2253,7 +2343,10 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Binary { op, .. } => f.write_str(op.symbol()),
             ExprKind::Paren(_) => f.write_str("paren"),
             ExprKind::Name(name) => write!(f, "name {}", self.ast.names().get(name)),
-            ExprKind::Block(_) => f.write_str("block"),
+            ExprKind::Block { label, .. } => {
+                f.write_str("block")?;
+                self.label(f, label.map(|label| self.ast.label(label)))
+            }
             ExprKind::Field { name, .. } => {
                 write!(f, ". {}", FieldName(self.ast.names().get(name)))
             }
@@ -2348,7 +2441,7 @@ impl<A: Annotate> Pretty<'_, A> {
                     }
                 }
             }
-            ExprKind::Block(items) => self.items(f, items, depth + 1)?,
+            ExprKind::Block { items, .. } => self.items(f, items, depth + 1)?,
         }
         f.write_str(")")
     }
@@ -2373,6 +2466,11 @@ mod tests {
         })
     }
 
+    /// An unlabelled block of `items`.
+    const fn unlabelled(items: ItemRange) -> ExprKind {
+        ExprKind::Block { items, label: None }
+    }
+
     /// Finishes `builder` with a body of one expression item, `root`.
     fn finish_expr(mut builder: AstBuilder, root: ExprId) -> Ast {
         let span = builder.get(root).span;
@@ -2388,6 +2486,44 @@ mod tests {
     fn nodes_are_small() {
         // Guards the arena's density; grow this deliberately, not by accident.
         assert!(size_of::<Expr>() <= 24);
+    }
+
+    #[test]
+    fn a_blocks_label_fits_beside_its_items() {
+        // The label's id has a niche, so that a block's optional label
+        // costs four bytes, and an unlabelled block nothing beyond them.
+        assert_eq!(size_of::<Option<LabelId>>(), 4);
+        assert_eq!(size_of::<ExprKind>(), 16);
+        let mut builder = AstBuilder::new();
+        let a = Label {
+            name: Names::new().intern("a"),
+            span: Span::new(1, 3),
+        };
+        let first = builder.push_label(a);
+        let second = builder.push_label(Label {
+            span: Span::new(5, 7),
+            ..a
+        });
+        assert_ne!(first, second);
+        let empty = builder.push_item_list(&[]);
+        let block = builder.alloc(Expr {
+            kind: ExprKind::Block {
+                items: empty,
+                label: Some(second),
+            },
+            span: Span::new(4, 9),
+        });
+        let item = builder.alloc_item(Item {
+            kind: ItemKind::Expr(block),
+            span: Span::new(4, 9),
+        });
+        let body = builder.push_item_list(&[item]);
+        let ast = builder.finish(body, Names::new(), Strings::new());
+        assert_eq!(ast.label(first).span, Span::new(1, 3));
+        assert_eq!(
+            ast.block_label(block).map(|label| label.span),
+            Some(Span::new(5, 7))
+        );
     }
 
     #[test]
@@ -2515,7 +2651,7 @@ mod tests {
         });
         let body = builder.push_item_list(&[rebind, result]);
         let block = builder.alloc(Expr {
-            kind: ExprKind::Block(body),
+            kind: unlabelled(body),
             span: Span::new(16, 37),
         });
         let float_ty = builder.alloc_type(TypeExpr {
@@ -2537,7 +2673,7 @@ mod tests {
         });
         let empty_body = builder.push_item_list(&[]);
         let empty = builder.alloc(Expr {
-            kind: ExprKind::Block(empty_body),
+            kind: unlabelled(empty_body),
             span: Span::new(46, 48),
         });
         let y_path = builder.push_path(&[PathSegment {
@@ -2732,7 +2868,7 @@ mod tests {
         });
         let then_body = builder.push_item_list(&[then_item]);
         let then = builder.alloc(Expr {
-            kind: ExprKind::Block(then_body),
+            kind: unlabelled(then_body),
             span: Span::new(5, 15),
         });
         let lit = builder.alloc(Expr {
@@ -2745,7 +2881,7 @@ mod tests {
         });
         let else_body = builder.push_item_list(&[else_item]);
         let else_ = builder.alloc(Expr {
-            kind: ExprKind::Block(else_body),
+            kind: unlabelled(else_body),
             span: Span::new(21, 28),
         });
         let if_ = builder.alloc(Expr {
@@ -2932,7 +3068,7 @@ mod tests {
         });
         let items = builder.push_item_list(&[item]);
         let body = builder.alloc(Expr {
-            kind: ExprKind::Block(items),
+            kind: unlabelled(items),
             span: Span::new(19, 24),
         });
         let id = builder.push_for(ForDecl {
