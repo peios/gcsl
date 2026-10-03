@@ -1,0 +1,27 @@
+# A queue of jobs, worked through with every kind of loop.
+let jobs = [{ name = "fetch"; cost = 3 }, { name = "build"; cost = 8 }, { name = "test"; cost = 5 }]
+# A condition: the `while`.
+let mut done = 0
+for done < 2 { done := done + 1 }
+# A header: before-items, a condition and after-items.
+let costs = for let i = 0; i < len(jobs); i := i + 1 { jobs[i].cost }
+# Find-first: a body that can fall off its end contributes `{}`.
+let loose = for j in jobs { if j.cost > 5 { break j.name } }
+# A final `continue` makes the body contribute nothing.
+let first = for j in jobs { if j.cost > 5 { break j.name }; continue }
+# No condition: until something leaves it.
+let mut budget = 10
+let spent = for { if budget < 4 { break }; budget := budget - 4; budget }
+# The body runs before the condition.
+let mut tries = 0
+let attempts = do { tries := tries + 1; tries } for tries < 2
+# A label names the loop a `continue` goes on with.
+let grid = [[1, 2], [3, -1, 4], [5]]
+let rows = for'rows r in grid { for c in r { if c < 0 { continue'rows }; c * 10 } }
+done = done
+costs = costs
+loose = loose
+first = first
+spent = spent
+attempts = attempts
+rows = rows

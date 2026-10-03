@@ -25,9 +25,15 @@
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `mut`,
 //! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`,
-//! `await`, `for`, `in`, `is` and `as`; the whole identifier is scanned
-//! before it is compared with them, so `fn-x`, `lazy-x`, `await-x`,
-//! `for-x`, `mut-x` and `is-x` are identifiers. `mut` is only ever written
+//! `await`, `for`, `do`, `break`, `continue`, `in`, `is` and `as`; the
+//! whole identifier is scanned before it is compared with them, so `fn-x`,
+//! `lazy-x`, `await-x`, `for-x`, `do-x`, `break-x`, `mut-x` and `is-x` are
+//! identifiers. So no variable or unquoted field can be named `do`,
+//! `break` or `continue`. A *label*, [`TokenKind::Label`], is `'` directly
+//! followed by a name, scanned by the rule for identifiers, as in `'outer`,
+//! `'_` and `'a-b`, one token holding the name; its text is interned
+//! whatever it spells, so `'for` is a label named `for`. A `'` not directly
+//! followed by a letter or `_` is an unexpected character. `mut` is only ever written
 //! after `let`, which it makes a mutable variable's declaration, but it is
 //! a keyword wherever it appears, so no variable or unquoted field can be
 //! named `mut`; nor, likewise, `is` or `as`, which are only ever written
@@ -213,8 +219,20 @@ pub enum TokenKind {
     Lazy,
     /// The keyword `await`, which awaits the value after it.
     Await,
-    /// The keyword `for`, which starts a `for` expression.
+    /// The keyword `for`, which starts a `for` expression, and follows the
+    /// body of a `do`.
     For,
+    /// The keyword `do`, which starts a `do` loop: its body, then `for`
+    /// and its condition.
+    Do,
+    /// The keyword `break`, an item that ends a loop.
+    Break,
+    /// The keyword `continue`, an item that ends an iteration of a loop.
+    Continue,
+    /// A loop's label: `'` directly followed by a name, as in `'outer`,
+    /// holding the name, interned as an identifier is (a keyword's spelling
+    /// included, since the `'` makes it no keyword).
+    Label(Name),
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
     In,
@@ -323,6 +341,9 @@ impl TokenKind {
             TokenKind::Lazy => Some("lazy"),
             TokenKind::Await => Some("await"),
             TokenKind::For => Some("for"),
+            TokenKind::Do => Some("do"),
+            TokenKind::Break => Some("break"),
+            TokenKind::Continue => Some("continue"),
             TokenKind::In => Some("in"),
             TokenKind::Is => Some("is"),
             TokenKind::As => Some("as"),
@@ -365,6 +386,7 @@ impl TokenKind {
             | TokenKind::StrMid(_)
             | TokenKind::StrEnd(_)
             | TokenKind::Ident(_)
+            | TokenKind::Label(_)
             | TokenKind::Newline
             | TokenKind::Eof => None,
         }
@@ -387,6 +409,9 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "lazy" => TokenKind::Lazy,
         "await" => TokenKind::Await,
         "for" => TokenKind::For,
+        "do" => TokenKind::Do,
+        "break" => TokenKind::Break,
+        "continue" => TokenKind::Continue,
         "in" => TokenKind::In,
         "is" => TokenKind::Is,
         "as" => TokenKind::As,
@@ -699,6 +724,7 @@ impl<'a> Lexer<'a> {
             }
             b'0'..=b'9' => self.number(start)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.identifier(start),
+            b'\'' => self.label(start)?,
             _ => self.operator(start)?,
         };
         self.last_end = self.pos;
@@ -835,6 +861,19 @@ impl<'a> Lexer<'a> {
         self.pos = identifier_end(self.bytes, start);
         let text = &self.text[start..self.pos];
         keyword(text).unwrap_or_else(|| TokenKind::Ident(self.names.intern(text)))
+    }
+
+    /// Lexes a label starting at `start`, which holds a `'`: the `'` and
+    /// the name directly after it, scanned as an identifier is, whose text
+    /// is interned whatever it spells. A `'` not directly followed by the
+    /// start of a name is an unexpected character.
+    fn label(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        if !matches!(self.peek_at(1), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_')) {
+            return Err(self.unexpected_character());
+        }
+        self.pos = identifier_end(self.bytes, start + 1);
+        let text = &self.text[start + 1..self.pos];
+        Ok(TokenKind::Label(self.names.intern(text)))
     }
 
     /// Classifies a `-` at `start` that is not part of an identifier or a
@@ -2660,6 +2699,90 @@ mod tests {
         assert!(is_identifier("into"));
         assert_eq!(TokenKind::For.symbol(), Some("for"));
         assert_eq!(TokenKind::In.symbol(), Some("in"));
+    }
+
+    #[test]
+    fn do_break_and_continue_are_keywords_only_as_whole_words() {
+        assert_eq!(
+            show("do break continue do-x break-x continue-x done breaks Do _do"),
+            vec![
+                "Do",
+                "Break",
+                "Continue",
+                "Ident(do-x)",
+                "Ident(break-x)",
+                "Ident(continue-x)",
+                "Ident(done)",
+                "Ident(breaks)",
+                "Ident(Do)",
+                "Ident(_do)",
+                "Eof"
+            ]
+        );
+        for keyword in ["do", "break", "continue"] {
+            assert!(!is_identifier(keyword), "{keyword}");
+        }
+        assert_eq!(TokenKind::Do.symbol(), Some("do"));
+        assert_eq!(TokenKind::Break.symbol(), Some("break"));
+        assert_eq!(TokenKind::Continue.symbol(), Some("continue"));
+    }
+
+    /// The tokens of `text`, a label shown as `'` and its name, and every
+    /// other token by its kind.
+    fn with_labels(text: &str) -> Vec<String> {
+        let (tokens, names, _) = tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap();
+        tokens
+            .iter()
+            .map(|token| match token.kind {
+                TokenKind::Label(name) => format!("'{}", names.get(name)),
+                TokenKind::Ident(name) => names.get(name).to_owned(),
+                kind => format!("{kind:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_label_is_a_quote_and_a_name() {
+        assert_eq!(
+            with_labels("'a '_ 'a-b 'x1 'for"),
+            ["'a", "'_", "'a-b", "'x1", "'for", "Eof"]
+        );
+        // Written directly after its keyword, the label is a token of its
+        // own, spanning its quote and its name.
+        assert_eq!(
+            with_labels("for'rows r in rows { break'rows }"),
+            [
+                "For", "'rows", "r", "In", "rows", "LBrace", "Break", "'rows", "RBrace", "Eof"
+            ]
+        );
+        assert_eq!(spans("for'a"), [(0, 3), (3, 5), (5, 5)]);
+        assert_eq!(spans("do'a-b {"), [(0, 2), (2, 6), (7, 8), (8, 8)]);
+        // A label has no fixed spelling.
+        assert_eq!(kinds("'a")[0].symbol(), None);
+        // A label's name is interned as an identifier's is.
+        let (tokens, names, _) = tokenize(&SourceFile::new("test.gcsl", "'a a").unwrap()).unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Label(names.lookup("a").unwrap()));
+        assert_eq!(tokens[1].kind, TokenKind::Ident(names.lookup("a").unwrap()));
+    }
+
+    #[test]
+    fn a_stray_quote_is_an_unexpected_character() {
+        assert_eq!(
+            error("'"),
+            ("unexpected character `\\'`".to_owned(), Span::new(0, 1))
+        );
+        assert_eq!(
+            error("break ' a"),
+            ("unexpected character `\\'`".to_owned(), Span::new(6, 7))
+        );
+        assert_eq!(
+            error("'1"),
+            ("unexpected character `\\'`".to_owned(), Span::new(0, 1))
+        );
+        assert_eq!(
+            error("'-a"),
+            ("unexpected character `\\'`".to_owned(), Span::new(0, 1))
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //! separators, and so blank and comment-only lines, are skipped. An item is
 //! `let PATH (: TYPE)? = EXPR`, `let mut NAME (: TYPE)? = EXPR`, `PATH :=
 //! EXPR`, a field `PATH = EXPR`, `= EXPR`, a spread `...EXPR`, a named
-//! function `fn NAME(...) ...`, or an expression. After an item the next
+//! function `fn NAME(...) ...`, a `break` or a `continue` (see
+//! [Loops](#loops)), or an expression. After an item the next
 //! token must be a separator or the end of the body; anything else is
 //! "expected end of item".
 //!
@@ -194,15 +195,24 @@
 //! # Trailing blocks
 //!
 //! A trailing block would make `if x { ... }` a call of `x`, so while the
-//! parser is in the condition of an `if` (or `else if`), or the iterable or
-//! the guard of a `for`, a `{` after an expression never starts one: the
-//! parser keeps a flag, `Parser::no_trailing_block`, that `Parser::parse_if`
-//! sets around its condition and `Parser::parse_for` around its iterable
-//! and guard. The flag applies to the whole condition at every operator, so
-//! `if a and b { }` is an `if` with condition `a and b`. It is lifted, and
-//! restored afterwards, inside parentheses, argument lists, blocks and
-//! interpolations, so `if (f { }) { }` calls `f`. A newline before a `{`
-//! ends the item as always, so it never starts a trailing block either.
+//! parser is in the condition of an `if` (or `else if`), the iterable or
+//! the guard of a `for`, or the header of a condition loop, a `{` after an
+//! expression never starts one: the parser keeps a flag,
+//! `Parser::braces`, that `Parser::parse_if` sets around its condition and
+//! `Parser::parse_for` around its iterable and guard, or its header. The
+//! flag applies to the whole condition at every operator, so `if a and b {
+//! }` is an `if` with condition `a and b`. It is lifted, and restored
+//! afterwards, inside parentheses, argument lists, list literals, indexes,
+//! blocks and interpolations, so `if (f { }) { }` calls `f`. A newline
+//! before a `{` ends the item as always, so it never starts a trailing
+//! block either.
+//!
+//! In a `for` header the flag says more: a `{` is the body even where an
+//! expression starts, so a block, a record block included, written as a
+//! header's value or condition is an error, "a `{` in a `for` header begins
+//! its body", whose note says to put the block in parentheses, as in `for
+//! let r = ({ a = 1 }); r.a < 3; ... { }`. No `;` is looked for ahead to
+//! decide what a `{` is.
 //!
 //! # Newlines after an `if`
 //!
@@ -210,6 +220,70 @@
 //! before it could be complete is after the block of an `if`: an `else` may
 //! start the next line, so the parser looks past newlines for one, and puts
 //! them back for the item separator if it finds none.
+//!
+//! # Loops
+//!
+//! Every loop is a prefix expression, with its details in the tree's `for`
+//! arena (see [`crate::ast::ForDecl`]). After `for` and its label, if any
+//! (see [Labels](#labels)), what follows decides the form
+//! (`Parser::parse_for`):
+//!
+//! - A name directly followed by `in` begins the iteration, `for NAME in
+//!   ITERABLE (if GUARD)? BLOCK`: the iterable, parsed at minimum 0 as an
+//!   `if`'s condition is, optionally `if` and a guard, parsed the same way,
+//!   and the body, a block that must follow on the same line. No operator
+//!   starts with `if`, so an `if` after the complete iterable always begins
+//!   the guard; an iterable that is itself an `if` expression starts with
+//!   `if` and is parsed whole first.
+//! - A `{` begins the body of `for BLOCK`, which has no condition.
+//! - Anything else begins a header (`Parser::parse_header`): parts
+//!   separated by `;`, after each of which newlines are skipped, and then
+//!   the body. A part that begins `let` is a `let` item, parsed as one is
+//!   in a block, and one that begins as a path item does
+//!   (`Parser::starts_path_item`), with `:=`, is a rebind; any other part
+//!   is an expression, the condition. Every expression in it, the values of
+//!   its items included, is parsed as an `if`'s condition is, with no
+//!   trailing block, and a `{` where one would start is the body, and so
+//!   an error (see [Trailing blocks](#trailing-blocks)). Exactly one part
+//!   is the condition: a second is "a `for` header has one condition", at
+//!   it, labelled "the condition is here" at the first, and none is "a
+//!   `for` header needs a condition", at the header, with a note to write
+//!   `true`. A `let` after the condition is "a `let` after the condition
+//!   would be new on every iteration and seen by nothing", with a note to
+//!   declare it before the condition and rebind it with `:=`; a field item
+//!   is "a `for` header cannot define a field". Where neither `;` nor `{`
+//!   follows a part, the error is the one the iteration's would be when
+//!   the header is a single part that looks like one: "expected a name
+//!   after `for`" for a part that starts with no name and is followed by
+//!   `in` (a variable's name for a string literal), and "expected `in`
+//!   after the `for` variable" at what follows the name of a part that
+//!   starts with one; and "expected `;` or `{` in a `for` header"
+//!   otherwise.
+//!
+//! `do BLOCK for COND` (`Parser::parse_do`) is `do`, its label, if any,
+//! the body, and `for`, which must follow the body's `}` on the same line,
+//! "expected `for` and a condition after the body of a `do`" otherwise,
+//! and then the condition, an ordinary expression at minimum 0, which ends
+//! as an expression statement ends: a `{` after it on its line starts a
+//! trailing block, as anywhere else, not a body. Only a condition may
+//! follow the `for`: a label, a `let` or a name followed by `in` there is
+//! "only a condition follows the `for` of a `do`".
+//!
+//! `break` and `continue` are items (`Parser::parse_jump`), allowed where
+//! any item of a block is, the keyword followed by its label, if any, and
+//! its value, if one begins on the same line: a newline, a `;`, a `}` or
+//! the end of input after the keyword and the label means there is none.
+//! Where an expression starts, they are "expected expression", as `let` is.
+//!
+//! # Labels
+//!
+//! A label, [`TokenKind::Label`], is written directly after the `for`,
+//! `do`, `break` or `continue` it belongs to: with anything between, it is
+//! "a label is written directly after `for`, with no space" (or `do`,
+//! `break`, `continue`), at the label. Anywhere else, where an item or an
+//! expression starts or ends, or the name of a `for`'s variable or of a
+//! `let` is expected, it is "a label names a loop: it follows `for`, `do`,
+//! `break` or `continue`", at the label.
 //!
 //! # Expressions
 //!
@@ -314,14 +388,8 @@
 //! without `else` gets an empty block as its else branch, allocated by the
 //! parser with an empty span at the end of the `if`'s block.
 //!
-//! A `for` is a prefix expression too, usable wherever an `if` is: `for`,
-//! the variable's name, an identifier, `in`, the iterable, parsed at
-//! minimum 0 as an `if`'s condition is, optionally `if` and a guard, parsed
-//! the same way, and the body, a block that must follow on the same line.
-//! No operator starts with `if`, so an `if` after the complete iterable
-//! always begins the guard; an iterable that is itself an `if` expression
-//! starts with `if` and is parsed whole first. Its details are kept in the
-//! tree's `for` arena (see [`crate::ast::ForDecl`]).
+//! A `for` is a prefix expression too, usable wherever an `if` is, and so
+//! is a `do`: see [Loops](#loops).
 //!
 //! An interpolated string arrives from the lexer as a
 //! [`TokenKind::StrStart`], each expression's tokens, a
@@ -355,8 +423,12 @@
 //! folds each operator into the
 //! left-hand side, so the parser also tracks the height of every node it
 //! allocates, a block being one above the tallest of its items' expressions
-//! and types, an `if` or an interpolation one above its tallest child, a
+//! and types (a `break`'s or `continue`'s value among them), an `if` or an
+//! interpolation one above its tallest child, a
 //! `for` one above the tallest of its iterable, its guard and its body, a
+//! condition loop one above the tallest of its header's items, its
+//! condition and its body, a `do` loop one above the taller of its body and
+//! its condition, a
 //! list literal one above its tallest element (a spread's being its
 //! expression's), an index one above the taller of its list and its
 //! position, a
@@ -383,8 +455,9 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
-    FnDecl, ForDecl, Item, ItemId, ItemKind, ItemRange, Param, ParamTy, PathRange, PathSegment,
-    SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    FnDecl, ForDecl, ForHead, Item, ItemId, ItemKind, ItemRange, Jump, Label, Param, ParamTy,
+    PathRange, PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
+    path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -447,6 +520,23 @@ const LET_INDEX: &str = "a `let` path cannot index a list";
 
 /// The error for an index segment in the path of a field item.
 const FIELD_INDEX: &str = "a field's path cannot index a list";
+
+/// The error for a label anywhere but directly after the keyword of what it
+/// belongs to.
+const MISPLACED_LABEL: &str = "a label names a loop: it follows `for`, `do`, `break` or `continue`";
+
+/// The error for a `do` loop whose body is not followed by `for`.
+const MISSING_DO_FOR: &str = "expected `for` and a condition after the body of a `do`";
+
+/// The error for anything but a condition after the `for` of a `do` loop.
+const DO_CONDITION_ONLY: &str = "only a condition follows the `for` of a `do`";
+
+/// The error for a `{` where an expression starts in a `for` header.
+const HEADER_BRACE: &str = "a `{` in a `for` header begins its body";
+
+/// The note on [`HEADER_BRACE`].
+const HEADER_BRACE_NOTE: &str =
+    "put a block in a `for` header in parentheses, as in `for let r = ({ a = 1 }); ...`";
 
 /// The note on [`MISPLACED_MUT`] before a field.
 const MUT_FIELD_NOTE: &str = "a field is defined once; declare a variable with `let mut x = ...` \
@@ -518,7 +608,7 @@ pub(crate) fn parse_parts(
         arg_stack: Vec::new(),
         element_stack: Vec::new(),
         path: Vec::new(),
-        no_trailing_block: false,
+        braces: Braces::Free,
         diagnostics: Vec::new(),
     };
     match parser.parse_body(None) {
@@ -549,6 +639,22 @@ impl PathShape {
         segments: 1,
         positions: 0,
     };
+}
+
+/// What a `{` means where the parser is (see [Trailing
+/// blocks](#trailing-blocks)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Braces {
+    /// A `{` after an expression on its line starts a trailing block, and
+    /// one where an expression starts, a block.
+    Free,
+    /// A `{` after an expression never starts a trailing block, since it
+    /// begins the block of an `if`, or the body of a `for`; one where an
+    /// expression starts is a block.
+    NoTrailing,
+    /// As [`Braces::NoTrailing`], and a `{` where an expression starts is
+    /// the body too, and so an error: in the header of a `for`.
+    Header,
 }
 
 /// Proof that a diagnostic has been pushed to the parser's sink. Only
@@ -608,11 +714,13 @@ struct Parser<'a> {
     /// the position of an index segment may hold a block, whose items read
     /// paths of their own.
     path: Vec<PathSegment>,
-    /// Whether a `{` after an expression is kept from starting a trailing
-    /// block: set while parsing the condition of an `if`, so that its block
-    /// is not taken for one, and lifted inside parentheses, argument lists,
-    /// blocks and interpolations.
-    no_trailing_block: bool,
+    /// What a `{` means where the parser is: whether one after an
+    /// expression is kept from starting a trailing block, as it is while
+    /// parsing the condition of an `if`, so that its block is not taken for
+    /// one, and, in the header of a `for`, whether one that starts an
+    /// expression is the body too. Lifted inside parentheses, argument
+    /// lists, list literals, indexes, blocks and interpolations.
+    braces: Braces,
     /// Errors reported so far. Only one is ever pushed until error recovery
     /// exists.
     diagnostics: Vec<Diagnostic>,
@@ -669,48 +777,15 @@ impl Parser<'_> {
             let note = self.starts_field(1).then_some(MUT_FIELD_NOTE);
             return Err(self.misplaced_mut(token, note));
         }
-        let mut ty_height = 0;
         // The shape of the item's path, if it has one.
         let mut shape = PathShape::SINGLE;
         let (kind, value) = match token.kind {
             TokenKind::Let => {
-                self.advance();
-                self.skip_newlines();
-                let mutable = self.peek().kind == TokenKind::Mut;
-                let keyword = if mutable {
-                    let keyword = self.peek();
-                    self.advance();
-                    self.skip_newlines();
-                    keyword
-                } else {
-                    token
-                };
-                let (path, path_shape) = self.parse_let_path(keyword, mutable)?;
-                shape = path_shape;
-                let ty = if self.peek().kind == TokenKind::Colon {
-                    self.advance();
-                    self.skip_newlines();
-                    let (ty, height) = self.parse_type()?;
-                    ty_height = height;
-                    Some(ty)
-                } else {
-                    None
-                };
-                let eq = self.peek();
-                if eq.kind != TokenKind::Eq {
-                    return Err(self.error("expected `=` after variable name", eq.span));
-                }
-                self.advance();
-                self.skip_newlines();
-                let value = self.parse_expr(0)?;
-                let kind = ItemKind::Let {
-                    path,
-                    ty,
-                    value,
-                    mutable,
-                };
-                (kind, value)
+                let (kind, value, ty_height, path_shape) = self.parse_let(token)?;
+                return self.finish_item(token, (kind, value), ty_height, path_shape);
             }
+            TokenKind::Break | TokenKind::Continue => return self.parse_jump(token),
+            TokenKind::Label(_) => return Err(self.misplaced_label(token)),
             TokenKind::Eq => {
                 self.advance();
                 self.skip_newlines();
@@ -742,7 +817,115 @@ impl Parser<'_> {
                 return Err(self.not_a_path(expr, operator, rebind));
             }
         };
-        self.finish_item(token, (kind, value), ty_height, shape)
+        self.finish_item(token, (kind, value), 0, shape)
+    }
+
+    /// Parses a `let` item, `let PATH (: TYPE)? = EXPR` or `let mut NAME (:
+    /// TYPE)? = EXPR`, starting at its `let`, `token`. Returns its kind, its
+    /// value, its annotation's height (0 if it has none) and its path's
+    /// shape.
+    fn parse_let(&mut self, token: Token) -> ParseResult<(ItemKind, ExprId, u32, PathShape)> {
+        self.advance();
+        self.skip_newlines();
+        let mutable = self.peek().kind == TokenKind::Mut;
+        let keyword = if mutable {
+            let keyword = self.peek();
+            self.advance();
+            self.skip_newlines();
+            keyword
+        } else {
+            token
+        };
+        let (path, shape) = self.parse_let_path(keyword, mutable)?;
+        let (ty, ty_height) = if self.peek().kind == TokenKind::Colon {
+            self.advance();
+            self.skip_newlines();
+            let (ty, height) = self.parse_type()?;
+            (Some(ty), height)
+        } else {
+            (None, 0)
+        };
+        let eq = self.peek();
+        if eq.kind != TokenKind::Eq {
+            return Err(self.error("expected `=` after variable name", eq.span));
+        }
+        self.advance();
+        self.skip_newlines();
+        let value = self.parse_expr(0)?;
+        let kind = ItemKind::Let {
+            path,
+            ty,
+            value,
+            mutable,
+        };
+        Ok((kind, value, ty_height, shape))
+    }
+
+    /// Parses a `break` or `continue` item, starting at its keyword,
+    /// `keyword`: the keyword, its label, if one is written directly after
+    /// it, and its value, if one begins on the same line, since a newline,
+    /// a `;` or a `}` after the keyword and the label means there is none.
+    /// Returns it and its height: its value's, or 0 without one.
+    fn parse_jump(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        let label = self.parse_label(keyword)?;
+        let value = match self.peek().kind {
+            TokenKind::Newline | TokenKind::Semi | TokenKind::RBrace | TokenKind::Eof => None,
+            _ => Some(self.parse_expr(0)?),
+        };
+        let end = match (value, label) {
+            (Some(value), _) => self.span_of(value),
+            (None, Some(label)) => label.span,
+            (None, None) => keyword.span,
+        };
+        let span = Span::join(keyword.span, end);
+        let height = value.map_or(0, |value| self.height_of(value));
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(span));
+        }
+        let jump = Jump { label, value };
+        let kind = if keyword.kind == TokenKind::Break {
+            ItemKind::Break(jump)
+        } else {
+            ItemKind::Continue(jump)
+        };
+        let item = self.builder.alloc_item(Item { kind, span });
+        Ok((item, height))
+    }
+
+    /// Parses the label of the `for`, `do`, `break` or `continue`
+    /// `keyword`, just consumed, if one follows it: one written directly
+    /// after it, with no space, or the error "a label is written directly
+    /// after `for`, with no space" at a label with space before it.
+    fn parse_label(&mut self, keyword: Token) -> ParseResult<Option<Label>> {
+        let token = self.peek();
+        let TokenKind::Label(name) = token.kind else {
+            return Ok(None);
+        };
+        if token.span.start != keyword.span.end {
+            let written = keyword.kind.symbol().unwrap_or("its keyword");
+            return Err(self.error(
+                format!("a label is written directly after `{written}`, with no space"),
+                token.span,
+            ));
+        }
+        self.advance();
+        Ok(Some(Label {
+            name,
+            span: token.span,
+        }))
+    }
+
+    /// Reports `token`, a label where none is allowed: anywhere but directly
+    /// after `for`, `do`, `break` or `continue`.
+    fn misplaced_label(&mut self, token: Token) -> Reported {
+        self.error(MISPLACED_LABEL, token.span)
+    }
+
+    /// Reports `token`, a `{` where an expression starts in a `for` header,
+    /// which begins the body (see [Trailing blocks](#trailing-blocks)).
+    fn header_brace(&mut self, token: Token) -> Reported {
+        self.report(Diagnostic::error(HEADER_BRACE, token.span).with_note(HEADER_BRACE_NOTE))
     }
 
     /// Whether the tokens from `ahead` places after the current one begin a
@@ -898,6 +1081,7 @@ impl Parser<'_> {
                 return Err(self.error(PLAIN_VARIABLE_NAME, span));
             }
             TokenKind::Mut => return Err(self.misplaced_mut(name_token, None)),
+            TokenKind::Label(_) => return Err(self.misplaced_label(name_token)),
             _ => {
                 let after = self.describe(keyword);
                 return Err(self.error(format!("expected a name after {after}"), name_token.span));
@@ -1119,6 +1303,7 @@ impl Parser<'_> {
                 ))
             }
             TokenKind::Mut => Err(self.misplaced_mut(token, None)),
+            TokenKind::Label(_) => Err(self.misplaced_label(token)),
             _ => {
                 let found = self.describe(token);
                 Err(self.error(format!("expected end of item, found {found}"), token.span))
@@ -1484,7 +1669,7 @@ impl Parser<'_> {
             let token = self.peek();
             let starts_call = match token.kind {
                 TokenKind::LParen => true,
-                TokenKind::LBrace => !self.no_trailing_block,
+                TokenKind::LBrace => self.braces == Braces::Free,
                 _ => false,
             };
             if starts_call {
@@ -1634,6 +1819,11 @@ impl Parser<'_> {
             TokenKind::StrStart(first) => return self.parse_interpolation(first),
             TokenKind::If => return self.parse_if(),
             TokenKind::For => return self.parse_for(),
+            TokenKind::Do => return self.parse_do(),
+            TokenKind::Label(_) => return Err(self.misplaced_label(token)),
+            TokenKind::LBrace if self.braces == Braces::Header => {
+                return Err(self.header_brace(token));
+            }
             TokenKind::Fn => return self.parse_fn_expr(),
             TokenKind::Lazy => return self.parse_lazy(),
             TokenKind::Neg => return self.parse_unary(UnaryOp::Neg, PREFIX_BP),
@@ -1641,9 +1831,9 @@ impl Parser<'_> {
             TokenKind::Not => return self.parse_unary(UnaryOp::Not, NOT_BP),
             TokenKind::LParen => {
                 self.advance();
-                let outer = std::mem::replace(&mut self.no_trailing_block, false);
+                let outer = std::mem::replace(&mut self.braces, Braces::Free);
                 let inner = self.parse_expr(0);
-                self.no_trailing_block = outer;
+                self.braces = outer;
                 let inner = inner?;
                 let close = self.peek();
                 if close.kind != TokenKind::RParen {
@@ -1688,6 +1878,8 @@ impl Parser<'_> {
             | TokenKind::In
             | TokenKind::Is
             | TokenKind::As
+            | TokenKind::Break
+            | TokenKind::Continue
             | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::Let
@@ -1853,12 +2045,12 @@ impl Parser<'_> {
         if open.kind == TokenKind::LParen {
             self.advance();
             // An argument list is inside parentheses.
-            let outer = std::mem::replace(&mut self.no_trailing_block, false);
+            let outer = std::mem::replace(&mut self.braces, Braces::Free);
             let close = self.parse_arguments(open, &mut tallest);
-            self.no_trailing_block = outer;
+            self.braces = outer;
             end = close?;
         }
-        if self.peek().kind == TokenKind::LBrace && !self.no_trailing_block {
+        if self.peek().kind == TokenKind::LBrace && self.braces == Braces::Free {
             let block = self.parse_block()?;
             tallest = tallest.max(self.height_of(block));
             end = self.span_of(block);
@@ -1914,9 +2106,9 @@ impl Parser<'_> {
         let base = self.element_stack.len();
         let mut tallest = 0;
         // Elements are inside brackets.
-        let outer = std::mem::replace(&mut self.no_trailing_block, false);
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
         let close = self.parse_elements(open, &mut tallest);
-        self.no_trailing_block = outer;
+        self.braces = outer;
         let close = close?;
         let elements = self.builder.push_elements(&self.element_stack[base..]);
         self.element_stack.truncate(base);
@@ -1984,9 +2176,9 @@ impl Parser<'_> {
         let open = self.peek();
         self.advance();
         // The position is inside brackets.
-        let outer = std::mem::replace(&mut self.no_trailing_block, false);
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
         let index = self.parse_expr(0);
-        self.no_trailing_block = outer;
+        self.braces = outer;
         let index = index?;
         let close = self.peek();
         if close.kind != TokenKind::RBracket {
@@ -2016,9 +2208,9 @@ impl Parser<'_> {
         let open = self.peek();
         self.advance();
         self.enter()?;
-        let outer = std::mem::replace(&mut self.no_trailing_block, false);
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
         let body = self.parse_body(Some(open.span));
-        self.no_trailing_block = outer;
+        self.braces = outer;
         self.depth -= 1;
         let (items, tallest) = body?;
         // `parse_body` only returns successfully at the matching `}`.
@@ -2037,9 +2229,9 @@ impl Parser<'_> {
         self.advance();
         // A `{` after the condition is the `if`'s block, not a trailing
         // block of a call.
-        let outer = std::mem::replace(&mut self.no_trailing_block, true);
+        let outer = std::mem::replace(&mut self.braces, Braces::NoTrailing);
         let cond = self.parse_expr(0);
-        self.no_trailing_block = outer;
+        self.braces = outer;
         let cond = cond?;
         let open = self.peek();
         if open.kind != TokenKind::LBrace {
@@ -2093,45 +2285,55 @@ impl Parser<'_> {
         )
     }
 
-    /// Parses a `for` expression, starting at its `for`: the variable's
-    /// name, an identifier, `in`, the iterable, an optional guard, `if` and
-    /// an expression, and the body, a block. The iterable and the guard are
-    /// parsed as an `if`'s condition is, at minimum binding power 0 with no
-    /// trailing block, so a `{` after either is the body; an `if` after the
-    /// complete iterable, which no expression continues with, begins the
-    /// guard. The expression spans `for` through the body.
+    /// Parses a `for` expression, starting at its `for`, and its label, if
+    /// it has one: then, as what follows says (see [Loops](#loops)), an
+    /// iteration, `for BLOCK`, or a header and a body. The expression spans
+    /// `for` through the body.
     fn parse_for(&mut self) -> ParseResult<ExprId> {
         let keyword = self.peek();
         self.advance();
-        let name_token = self.peek();
-        let name = match name_token.kind {
-            TokenKind::Ident(name) => name,
-            TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, name_token.span)),
-            TokenKind::StrStart(first) => {
-                let literal = self.parse_interpolation(first)?;
-                let span = self.span_of(literal);
-                return Err(self.error(PLAIN_VARIABLE_NAME, span));
+        let label = self.parse_label(keyword)?;
+        let next = self.peek();
+        match (next.kind, self.peek_at(1).kind) {
+            (TokenKind::Ident(name), TokenKind::In) => {
+                self.advance();
+                self.advance();
+                self.parse_each(keyword, label, (name, next.span))
             }
-            TokenKind::Mut => return Err(self.misplaced_mut(name_token, None)),
-            _ => {
-                return Err(self.error("expected a name after `for`", error_span(name_token)));
+            (TokenKind::LBrace, _) => {
+                let body = self.parse_block()?;
+                let empty = self.builder.push_item_list(&[]);
+                let head = ForHead::While {
+                    before: empty,
+                    cond: None,
+                    after: empty,
+                };
+                let height = self.height_of(body) + 1;
+                self.finish_loop(keyword, (label, head, body), self.span_of(body), height)
             }
-        };
-        self.advance();
-        let in_token = self.peek();
-        if in_token.kind != TokenKind::In {
-            let found = self.describe(in_token);
-            return Err(self.error(
-                format!("expected `in` after the `for` variable, found {found}"),
-                error_span(in_token),
-            ));
+            _ => self.parse_header(keyword, label),
         }
-        self.advance();
+    }
+
+    /// Parses the rest of an iteration, `for NAME in ITERABLE (if GUARD)?
+    /// BLOCK`, whose keyword, label and variable's name with its span, `for
+    /// NAME in` having been consumed, are `keyword`, `label` and `name`: the
+    /// iterable, an optional guard, `if` and an expression, and the body, a
+    /// block. The iterable and the guard are parsed as an `if`'s condition
+    /// is, at minimum binding power 0 with no trailing block, so a `{` after
+    /// either is the body; an `if` after the complete iterable, which no
+    /// expression continues with, begins the guard.
+    fn parse_each(
+        &mut self,
+        keyword: Token,
+        label: Option<Label>,
+        (name, name_span): (Name, Span),
+    ) -> ParseResult<ExprId> {
         // A `{` after the iterable or the guard is the body, not a trailing
         // block of a call.
-        let outer = std::mem::replace(&mut self.no_trailing_block, true);
+        let outer = std::mem::replace(&mut self.braces, Braces::NoTrailing);
         let parts = self.parse_for_head();
-        self.no_trailing_block = outer;
+        self.braces = outer;
         let (iterable, guard) = parts?;
         let open = self.peek();
         if open.kind != TokenKind::LBrace {
@@ -2147,15 +2349,223 @@ impl Parser<'_> {
             .max(guard.map_or(0, |guard| self.height_of(guard)))
             .max(self.height_of(body))
             + 1;
-        let span = Span::join(keyword.span, self.span_of(body));
-        let id = self.builder.push_for(ForDecl {
+        let head = ForHead::Each {
             name,
-            name_span: name_token.span,
+            name_span,
             iterable,
             guard,
-            body,
-        });
+        };
+        self.finish_loop(keyword, (label, head, body), self.span_of(body), height)
+    }
+
+    /// Allocates the loop whose keyword is `keyword`, with `label`, `head`
+    /// and `body`, spanning `keyword` through `end`, of `height`.
+    fn finish_loop(
+        &mut self,
+        keyword: Token,
+        (label, head, body): (Option<Label>, ForHead, ExprId),
+        end: Span,
+        height: u32,
+    ) -> ParseResult<ExprId> {
+        let span = Span::join(keyword.span, end);
+        let id = self.builder.push_for(ForDecl { label, head, body });
         self.alloc(ExprKind::For(id), span, height)
+    }
+
+    /// Parses the header and the body of a condition loop whose keyword
+    /// and label are `keyword` and `label`, starting at the header's first
+    /// part (see [Loops](#loops)). The header's expressions are parsed with
+    /// [`Braces::Header`], so that a `{` anywhere in it, but inside
+    /// brackets, is the body.
+    fn parse_header(&mut self, keyword: Token, label: Option<Label>) -> ParseResult<ExprId> {
+        let outer = std::mem::replace(&mut self.braces, Braces::Header);
+        let header = self.parse_header_parts();
+        self.braces = outer;
+        let (head, tallest) = header?;
+        // The header ends only at a `{`.
+        let body = self.parse_block()?;
+        let height = tallest.max(self.height_of(body)) + 1;
+        self.finish_loop(keyword, (label, head, body), self.span_of(body), height)
+    }
+
+    /// Parses the parts of a `for` header, up to the `{` of the body, not
+    /// consumed: items and one condition, separated by `;`, after each of
+    /// which newlines are skipped. Returns the loop's head and the height of
+    /// its tallest part.
+    fn parse_header_parts(&mut self) -> ParseResult<(ForHead, u32)> {
+        let base = self.item_stack.len();
+        let first = self.peek();
+        let mut cond: Option<ExprId> = None;
+        // Where the items after the condition start on the item stack.
+        let mut split = base;
+        let mut tallest = 0;
+        // The span of the last part parsed.
+        let mut last;
+        let mut parts = 0;
+        loop {
+            let start = self.pos;
+            let token = self.peek();
+            if token.kind == TokenKind::Let || self.starts_path_item() {
+                let (item, height) = self.parse_header_item(token, cond.is_some())?;
+                self.item_stack.push(item);
+                tallest = tallest.max(height);
+                last = self.builder.item(item).span;
+            } else {
+                let expr = self.parse_expr(0)?;
+                if let Some(first) = cond {
+                    return Err(self.report(
+                        Diagnostic::error("a `for` header has one condition", self.span_of(expr))
+                            .with_context(self.span_of(first), "the condition is here"),
+                    ));
+                }
+                cond = Some(expr);
+                split = self.item_stack.len();
+                tallest = tallest.max(self.height_of(expr));
+                last = self.span_of(expr);
+            }
+            parts += 1;
+            match self.peek().kind {
+                TokenKind::Semi => {
+                    self.advance();
+                    self.skip_newlines();
+                }
+                TokenKind::LBrace => break,
+                _ => return Err(self.header_error(start, parts == 1 && cond.is_some())),
+            }
+        }
+        let Some(cond) = cond else {
+            return Err(self.report(
+                Diagnostic::error(
+                    "a `for` header needs a condition",
+                    Span::join(first.span, last),
+                )
+                .with_note("write `true` to loop until a `break`"),
+            ));
+        };
+        let before = self.builder.push_item_list(&self.item_stack[base..split]);
+        let after = self.builder.push_item_list(&self.item_stack[split..]);
+        self.item_stack.truncate(base);
+        let head = ForHead::While {
+            before,
+            cond: Some(cond),
+            after,
+        };
+        Ok((head, tallest))
+    }
+
+    /// Parses an item of a `for` header, starting at `token`, a `let` or
+    /// the first segment of a path, after the header's condition if
+    /// `after_cond`: a `let`, only before the condition, or a `:=`. Returns
+    /// it and its height.
+    fn parse_header_item(&mut self, token: Token, after_cond: bool) -> ParseResult<(ItemId, u32)> {
+        let (item, height) = if token.kind == TokenKind::Let {
+            let (kind, value, ty_height, shape) = self.parse_let(token)?;
+            self.finish_item(token, (kind, value), ty_height, shape)?
+        } else {
+            let (kind, value, shape) = self.parse_path_item()?;
+            self.finish_item(token, (kind, value), 0, shape)?
+        };
+        let Item { kind, span } = *self.builder.item(item);
+        match kind {
+            ItemKind::Let { .. } if after_cond => Err(self.report(
+                Diagnostic::error(
+                    "a `let` after the condition would be new on every iteration and seen by \
+                     nothing",
+                    span,
+                )
+                .with_note("declare it before the condition and rebind it here with `:=`"),
+            )),
+            ItemKind::Field { .. } => Err(self.report(
+                Diagnostic::error("a `for` header cannot define a field", span)
+                    .with_note("declare a variable with `let`, or rebind one with `:=`"),
+            )),
+            _ => Ok((item, height)),
+        }
+    }
+
+    /// The error for the token after a part of a `for` header that is
+    /// neither `;` nor the body's `{`, the part having started at token
+    /// number `start`. When the part is the header's only part so far and
+    /// an expression (`alone`), it may be meant as the variable of an
+    /// iteration: followed by `in`, it is "expected a name after `for`" at
+    /// the part, unless it starts with a name, when it is "expected `in`
+    /// after the `for` variable" at the token after the name, or a string
+    /// literal, when it is the error for a variable's name that is not
+    /// plain; and a lone name followed by anything on its line is
+    /// "expected `in` after the `for` variable" at what follows. Anything
+    /// else is "expected `;` or `{` in a `for` header".
+    fn header_error(&mut self, start: usize, alone: bool) -> Reported {
+        let token = self.peek();
+        let found = self.describe(token);
+        let (first, second) = (self.token_at(start), self.token_at(start + 1));
+        let after_name = |token: Token| {
+            format!(
+                "expected `in` after the `for` variable, found {}",
+                self.describe(token)
+            )
+        };
+        if alone && token.kind == TokenKind::In {
+            let part = Span::join(first.span, self.token_at(self.pos - 1).span);
+            return match first.kind {
+                TokenKind::Ident(_) => self.error(after_name(second), error_span(second)),
+                TokenKind::Str(_) | TokenKind::StrStart(_) => self.error(PLAIN_VARIABLE_NAME, part),
+                _ => self.error("expected a name after `for`", part),
+            };
+        }
+        let lone_name = matches!(first.kind, TokenKind::Ident(_)) && self.pos == start + 1;
+        if alone && lone_name && !matches!(token.kind, TokenKind::Newline | TokenKind::Eof) {
+            return self.error(after_name(token), error_span(token));
+        }
+        self.error(
+            format!("expected `;` or `{{` in a `for` header, found {found}"),
+            error_span(token),
+        )
+    }
+
+    /// Parses a `do` loop, starting at its `do`: its label, if it has one,
+    /// its body, a block, and `for`, which must follow the body's `}` on
+    /// the same line, and the condition, an ordinary expression at minimum
+    /// binding power 0, which ends as an expression statement does. Only a
+    /// condition may follow the `for`: a label, a `let` or a name followed
+    /// by `in` there is an error. The expression spans `do` through the
+    /// condition.
+    fn parse_do(&mut self) -> ParseResult<ExprId> {
+        let keyword = self.peek();
+        self.advance();
+        let label = self.parse_label(keyword)?;
+        let open = self.peek();
+        if open.kind != TokenKind::LBrace {
+            let found = self.describe(open);
+            return Err(self.error(
+                format!("expected `{{` after `do`, found {found}"),
+                error_span(open),
+            ));
+        }
+        let body = self.parse_block()?;
+        let for_token = self.peek();
+        if for_token.kind != TokenKind::For {
+            return Err(self.error(MISSING_DO_FOR, error_span(for_token)));
+        }
+        self.advance();
+        let next = self.peek();
+        let misplaced = match next.kind {
+            TokenKind::Label(_) | TokenKind::Let => Some(next.span),
+            TokenKind::Ident(_) if self.peek_at(1).kind == TokenKind::In => {
+                Some(Span::join(next.span, self.peek_at(1).span))
+            }
+            _ => None,
+        };
+        if let Some(span) = misplaced {
+            return Err(
+                self.report(Diagnostic::error(DO_CONDITION_ONLY, span).with_note(
+                    "a `do` loop runs its body, then its condition, and again while it is true",
+                )),
+            );
+        }
+        let cond = self.parse_expr(0)?;
+        let height = self.height_of(body).max(self.height_of(cond)) + 1;
+        let head = ForHead::Do { cond };
+        self.finish_loop(keyword, (label, head, body), self.span_of(cond), height)
     }
 
     /// Parses the iterable of a `for` and its guard, if an `if` follows the
@@ -2182,9 +2592,9 @@ impl Parser<'_> {
         // the token before it.
         let mut open = start.span;
         let end = loop {
-            let outer = std::mem::replace(&mut self.no_trailing_block, false);
+            let outer = std::mem::replace(&mut self.braces, Braces::Free);
             let expr = self.parse_expr(0);
-            self.no_trailing_block = outer;
+            self.braces = outer;
             let expr = expr?;
             tallest = tallest.max(self.height_of(expr));
             self.part_stack.push(StrPart::Expr(expr));
@@ -2359,6 +2769,10 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Lazy
         | TokenKind::Await
         | TokenKind::For
+        | TokenKind::Do
+        | TokenKind::Break
+        | TokenKind::Continue
+        | TokenKind::Label(_)
         | TokenKind::In
         | TokenKind::Is
         | TokenKind::As
@@ -2464,39 +2878,60 @@ mod tests {
             if index > 0 {
                 out.push_str("; ");
             }
-            match ast.item(id).kind {
-                ItemKind::Let {
-                    path, ty, value, ..
-                } => {
-                    out.push_str("let ");
-                    path_shape(ast, path, out);
-                    if let Some(ty) = ty {
-                        out.push_str(": ");
-                        type_name(ast, ty, out);
-                    }
-                    out.push_str(" = ");
+            body_item(ast, id, out);
+        }
+    }
+
+    /// One item of a body, as [`shape`] writes it: a `break` or `continue`
+    /// as it is written, its label after its keyword and its value after
+    /// a space.
+    fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
+        match ast.item(id).kind {
+            ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+                out.push_str(match ast.item(id).kind {
+                    ItemKind::Break(_) => "break",
+                    _ => "continue",
+                });
+                if let Some(label) = jump.label {
+                    out.push('\'');
+                    out.push_str(ast.names().get(label.name));
+                }
+                if let Some(value) = jump.value {
+                    out.push(' ');
                     expr(ast, value, out);
                 }
-                ItemKind::Rebind { path, value } => {
-                    path_shape(ast, path, out);
-                    out.push_str(" := ");
-                    expr(ast, value, out);
-                }
-                ItemKind::Field { path, value } => {
-                    path_shape(ast, path, out);
-                    out.push_str(" = ");
-                    expr(ast, value, out);
-                }
-                ItemKind::Spread(value) => {
-                    out.push_str("...");
-                    expr(ast, value, out);
-                }
-                ItemKind::Result(value) => {
-                    out.push_str("= ");
-                    expr(ast, value, out);
-                }
-                ItemKind::Expr(value) => expr(ast, value, out),
             }
+            ItemKind::Let {
+                path, ty, value, ..
+            } => {
+                out.push_str("let ");
+                path_shape(ast, path, out);
+                if let Some(ty) = ty {
+                    out.push_str(": ");
+                    type_name(ast, ty, out);
+                }
+                out.push_str(" = ");
+                expr(ast, value, out);
+            }
+            ItemKind::Rebind { path, value } => {
+                path_shape(ast, path, out);
+                out.push_str(" := ");
+                expr(ast, value, out);
+            }
+            ItemKind::Field { path, value } => {
+                path_shape(ast, path, out);
+                out.push_str(" = ");
+                expr(ast, value, out);
+            }
+            ItemKind::Spread(value) => {
+                out.push_str("...");
+                expr(ast, value, out);
+            }
+            ItemKind::Result(value) => {
+                out.push_str("= ");
+                expr(ast, value, out);
+            }
+            ItemKind::Expr(value) => expr(ast, value, out),
         }
     }
 
@@ -2688,17 +3123,63 @@ mod tests {
         }
     }
 
-    /// A `for` as `for x in xs if g {..}`, without ` if g` if it has no
-    /// guard: as it is written, so that it parses back to itself.
+    /// A loop as it is written, so that it parses back to itself: `for x in
+    /// xs if g {..}`, without ` if g` if it has no guard; `for BEFORE; c;
+    /// AFTER {..}`, each item as `body` writes it, `for c {..}` without
+    /// items and `for {..}` without a condition; and `do {..} for c`; each
+    /// with its label after its keyword, as in `for'rows`.
     fn for_shape(ast: &Ast, id: crate::ast::ForId, out: &mut String) {
         let decl = ast.for_decl(id);
-        out.push_str("for ");
-        out.push_str(ast.names().get(decl.name));
-        out.push_str(" in ");
-        expr(ast, decl.iterable, out);
-        if let Some(guard) = decl.guard {
-            out.push_str(" if ");
-            expr(ast, guard, out);
+        out.push_str(match decl.head {
+            ForHead::Do { .. } => "do",
+            ForHead::Each { .. } | ForHead::While { .. } => "for",
+        });
+        if let Some(label) = decl.label {
+            out.push('\'');
+            out.push_str(ast.names().get(label.name));
+        }
+        match decl.head {
+            ForHead::Each {
+                name,
+                iterable,
+                guard,
+                ..
+            } => {
+                out.push(' ');
+                out.push_str(ast.names().get(name));
+                out.push_str(" in ");
+                expr(ast, iterable, out);
+                if let Some(guard) = guard {
+                    out.push_str(" if ");
+                    expr(ast, guard, out);
+                }
+            }
+            ForHead::While {
+                before,
+                cond,
+                after,
+            } => {
+                for &item in ast.items(before) {
+                    out.push(' ');
+                    body_item(ast, item, out);
+                    out.push(';');
+                }
+                if let Some(cond) = cond {
+                    out.push(' ');
+                    expr(ast, cond, out);
+                }
+                for &item in ast.items(after) {
+                    out.push_str("; ");
+                    body_item(ast, item, out);
+                }
+            }
+            ForHead::Do { cond } => {
+                out.push(' ');
+                expr(ast, decl.body, out);
+                out.push_str(" for ");
+                expr(ast, cond, out);
+                return;
+            }
         }
         out.push(' ');
         expr(ast, decl.body, out);
@@ -5818,11 +6299,20 @@ mod tests {
             panic!("expected a for, got {expr:?}");
         };
         let decl = ast.for_decl(id);
-        assert_eq!(ast.names().get(decl.name), "x");
-        assert_eq!(decl.name_span, Span::new(4, 5));
-        assert_eq!(ast.get(decl.iterable).span, Span::new(9, 11));
+        let ForHead::Each {
+            name,
+            name_span,
+            iterable,
+            guard,
+        } = decl.head
+        else {
+            panic!("expected an iteration, got {decl:?}");
+        };
+        assert_eq!(ast.names().get(name), "x");
+        assert_eq!(name_span, Span::new(4, 5));
+        assert_eq!(ast.get(iterable).span, Span::new(9, 11));
         assert_eq!(
-            decl.guard.map(|guard| ast.get(guard).span),
+            guard.map(|guard| ast.get(guard).span),
             Some(Span::new(15, 16))
         );
         assert_eq!(ast.get(decl.body).span, Span::new(17, 22));
@@ -5832,7 +6322,10 @@ mod tests {
         let ExprKind::For(id) = ast.get(only_value(&ast)).kind else {
             panic!("expected a for");
         };
-        assert_eq!(ast.for_decl(id).guard, None);
+        let ForHead::Each { guard, .. } = ast.for_decl(id).head else {
+            panic!("expected an iteration");
+        };
+        assert_eq!(guard, None);
     }
 
     #[test]
@@ -6420,5 +6913,418 @@ mod tests {
             "]".repeat(MAX_DEPTH)
         );
         assert_eq!(too_deep(nested).message, "expression nested too deeply");
+    }
+
+    #[test]
+    fn every_loop_form_parses_and_prints_back_to_itself() {
+        for text in [
+            "for x in xs {x}",
+            "for x in xs if g {x}",
+            "for c {x}",
+            "for {break}",
+            "for let i = 0; c; i := n {i}",
+            "for let i = 0; let j: Int = 1; c {i}",
+            "for c; i := n; xs[i] := 1 {i}",
+            "for x := 1; c {x}",
+            "for let r.a = 1; c {r}",
+            "do {x} for c",
+            "do'again {break'again 1} for c",
+            "for'rows r in rows {for c in r {continue'rows 0}}",
+            "for'spin {break'spin}",
+            "for x in xs {break x}",
+            "for x in xs {continue}",
+            "for x in xs {continue x; break}",
+        ] {
+            assert_eq!(shape(text), text);
+        }
+        assert_eq!(
+            shape("let first = for x in xs { if x > 5 { break x }; continue }"),
+            "let first = for x in xs {(if (x > 5) {break x}); continue}"
+        );
+        // The summary's examples.
+        assert_eq!(
+            shape("for n < 3 { n := n + 1 }"),
+            "for (n < 3) {n := (n + 1)}"
+        );
+        assert_eq!(
+            shape("let sq = for let i = 0; i < 4; i := i + 1 { i * i }"),
+            "let sq = for let i = 0; (i < 4); i := (i + 1) {(i * i)}"
+        );
+        assert_eq!(
+            shape("let tries = do { attempt() } for not ok()"),
+            "let tries = do {attempt()} for (not ok())"
+        );
+    }
+
+    #[test]
+    fn a_name_before_in_begins_an_iteration_and_anything_else_a_condition() {
+        let head = |text: &str| {
+            let ast = parse_text(text).unwrap();
+            let ExprKind::For(id) = ast.get(only_value(&ast)).kind else {
+                panic!("{text}: expected a loop");
+            };
+            ast.for_decl(id).head
+        };
+        assert!(matches!(head("for x in xs {}"), ForHead::Each { .. }));
+        assert!(matches!(head("for'a x in xs {}"), ForHead::Each { .. }));
+        // A condition that starts with a name.
+        for text in ["for x {}", "for x < 3 {}", "for x.done {}", "for x(1) {}"] {
+            assert!(
+                matches!(head(text), ForHead::While { cond: Some(_), .. }),
+                "{text}"
+            );
+        }
+        assert!(matches!(head("for {}"), ForHead::While { cond: None, .. }));
+        assert!(matches!(head("do {} for x"), ForHead::Do { .. }));
+        // A `let mut` in a header.
+        let ast = parse_text("for let mut i = 0; c {}").unwrap();
+        assert!(matches!(
+            ast.items(ast.root()).first().map(|&id| ast.item(id).kind),
+            Some(ItemKind::Expr(_))
+        ));
+        assert!(ast.pretty().to_string().contains("(let mut i @4..17"));
+        // `in` is a keyword, so `for x in` is always an iteration's start.
+        assert_eq!(
+            error("for x in {}"),
+            (
+                "expected `{` or `if` after `for` iterable".to_owned(),
+                Span::new(11, 11)
+            )
+        );
+    }
+
+    #[test]
+    fn a_header_splits_into_items_and_one_condition() {
+        let parts = |text: &str| {
+            let ast = parse_text(text).unwrap();
+            let ExprKind::For(id) = ast.get(only_value(&ast)).kind else {
+                panic!("{text}: expected a loop");
+            };
+            let ForHead::While {
+                before,
+                cond,
+                after,
+            } = ast.for_decl(id).head
+            else {
+                panic!("{text}: expected a condition loop");
+            };
+            (
+                ast.items(before).len(),
+                cond.map(|cond| ast.get(cond).span),
+                ast.items(after).len(),
+            )
+        };
+        assert_eq!(parts("for c {}"), (0, Some(Span::new(4, 5)), 0));
+        assert_eq!(
+            parts("for let i = 0; c {}"),
+            (1, Some(Span::new(15, 16)), 0)
+        );
+        assert_eq!(parts("for c; i := 1 {}"), (0, Some(Span::new(4, 5)), 1));
+        assert_eq!(
+            parts("for let i = 0; let j = 0; c; i := 1; j := 2 {}"),
+            (2, Some(Span::new(26, 27)), 2)
+        );
+        // A `:=` may come before the condition too.
+        assert_eq!(parts("for i := 0; c {}"), (1, Some(Span::new(12, 13)), 0));
+        // A newline may follow a `;`.
+        assert_eq!(
+            parts("for let i = 0;\n  c;\n  i := 1 {}"),
+            (1, Some(Span::new(17, 18)), 1)
+        );
+        // The loop spans its keyword through its body, its header's items
+        // being items of the tree.
+        let ast = parse_text("for let i = 0; c; i := 1 {}").unwrap();
+        let expr = ast.get(only_value(&ast));
+        assert_eq!(expr.span, Span::new(0, 27));
+        assert_eq!(ast.loop_keyword(only_value(&ast)), Span::new(0, 3));
+    }
+
+    #[test]
+    fn header_errors() {
+        // Two conditions, at the second, labelled at the first.
+        let diagnostic = parse_text("for a; b {}").unwrap_err();
+        assert_eq!(diagnostic.message, "a `for` header has one condition");
+        assert_eq!(diagnostic.span, Span::new(7, 8));
+        assert_eq!(diagnostic.labels[0].span, Span::new(4, 5));
+        assert_eq!(diagnostic.labels[0].text, "the condition is here");
+        // Items alone.
+        let diagnostic = parse_text("for let i = 0; i := 1 {}").unwrap_err();
+        assert_eq!(diagnostic.message, "a `for` header needs a condition");
+        assert_eq!(diagnostic.span, Span::new(4, 21));
+        assert_eq!(diagnostic.notes, ["write `true` to loop until a `break`"]);
+        // A `let` after the condition.
+        let diagnostic = parse_text("for c; let i = 0 {}").unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "a `let` after the condition would be new on every iteration and seen by nothing"
+        );
+        assert_eq!(diagnostic.span, Span::new(7, 16));
+        assert_eq!(
+            diagnostic.notes,
+            ["declare it before the condition and rebind it here with `:=`"]
+        );
+        // No field, spread or named function.
+        assert_eq!(
+            error("for x = 1; c {}"),
+            (
+                "a `for` header cannot define a field".to_owned(),
+                Span::new(4, 9)
+            )
+        );
+        assert_eq!(error("for ...x; c {}").0, MISPLACED_SPREAD);
+        assert_eq!(
+            error("for c\n{}"),
+            (
+                "expected `;` or `{` in a `for` header, found newline".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("for a < b c {}"),
+            (
+                "expected `;` or `{` in a `for` header, found `c`".to_owned(),
+                Span::new(10, 11)
+            )
+        );
+        // A block as a header's value or condition is the body, so the
+        // header is in error; in parentheses it is a value.
+        let diagnostic =
+            parse_text("for let r = { a = 1 }; r.a < 3; r.a := r.a + 1 { }").unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "a `{` in a `for` header begins its body"
+        );
+        assert_eq!(diagnostic.span, Span::new(12, 13));
+        assert_eq!(
+            shape("for let r = ({ a = 1 }); r.a < 3; r.a := r.a + 1 { }"),
+            "for let r = [{a = 1}]; ((r . a) < 3); r.a := ((r . a) + 1) {}"
+        );
+        // `for` directly followed by `{` is `for BLOCK`, an operand like any
+        // other.
+        assert_eq!(shape("for {x} < 3; c {}"), "(for {x} < 3); c(){}");
+        // No `{` is looked for ahead: a block after a `;` is a part.
+        assert_eq!(
+            error("for c; { }").0,
+            "a `{` in a `for` header begins its body"
+        );
+        // Inside brackets and calls a block is a block again.
+        assert_eq!(
+            shape("for let x = f({ 1 }); [{ 2 }] != x {}"),
+            "for let x = f({1}); (list({2}) != x) {}"
+        );
+    }
+
+    #[test]
+    fn do_and_its_errors() {
+        let ast = parse_text("do { x } for c").unwrap();
+        let root = only_value(&ast);
+        assert_eq!(ast.get(root).span, Span::new(0, 14));
+        assert_eq!(ast.loop_keyword(root), Span::new(0, 2));
+        // No `for` after the body.
+        assert_eq!(
+            error("do { x }"),
+            (MISSING_DO_FOR.to_owned(), Span::new(8, 8))
+        );
+        assert_eq!(
+            error("do { x } c"),
+            (MISSING_DO_FOR.to_owned(), Span::new(9, 10))
+        );
+        // `for` on the next line.
+        assert_eq!(
+            error("do { x }\nfor c"),
+            (MISSING_DO_FOR.to_owned(), Span::new(8, 9))
+        );
+        // Only a condition after the `for`.
+        for (text, span) in [
+            ("do {} for let i = 0", Span::new(10, 13)),
+            ("do {} for x in xs", Span::new(10, 14)),
+            ("do {} for'a c", Span::new(9, 11)),
+        ] {
+            assert_eq!(error(text), (DO_CONDITION_ONLY.to_owned(), span), "{text}");
+        }
+        // A `{` after the condition is not a body: the condition ends as an
+        // expression statement does, where a `{` on its line starts a
+        // trailing block.
+        assert_eq!(shape("do {} for c {}"), "do {} for c(){}");
+        // On the next line, it is the next item.
+        assert_eq!(shape("do {} for c\n{}"), "do {} for c; {}");
+        assert_eq!(
+            error("do x for c"),
+            (
+                "expected `{` after `do`, found `x`".to_owned(),
+                Span::new(3, 4)
+            )
+        );
+    }
+
+    /// The `break` or `continue` that `text` consists of: its kind, as
+    /// written, its label's name, its value's span and its span.
+    fn jump(text: &str) -> (&'static str, Option<String>, Option<Span>, Span) {
+        let ast = parse_text(text).unwrap();
+        let [id] = ast.items(ast.root()) else {
+            panic!("{text}: expected one item");
+        };
+        let item = ast.item(*id);
+        let (keyword, jump) = match item.kind {
+            ItemKind::Break(jump) => ("break", jump),
+            ItemKind::Continue(jump) => ("continue", jump),
+            other => panic!("{text}: expected a jump, got {other:?}"),
+        };
+        (
+            keyword,
+            jump.label
+                .map(|label| ast.names().get(label.name).to_owned()),
+            jump.value.map(|value| ast.get(value).span),
+            item.span,
+        )
+    }
+
+    #[test]
+    fn break_and_continue_with_and_without_a_value_and_a_label() {
+        assert_eq!(jump("break"), ("break", None, None, Span::new(0, 5)));
+        assert_eq!(jump("continue"), ("continue", None, None, Span::new(0, 8)));
+        assert_eq!(
+            jump("break x + 1"),
+            ("break", None, Some(Span::new(6, 11)), Span::new(0, 11))
+        );
+        assert_eq!(
+            jump("break'rows"),
+            ("break", Some("rows".to_owned()), None, Span::new(0, 10))
+        );
+        assert_eq!(
+            jump("continue'rows 0"),
+            (
+                "continue",
+                Some("rows".to_owned()),
+                Some(Span::new(14, 15)),
+                Span::new(0, 15)
+            )
+        );
+        // A newline, a `;` or a `}` after the keyword means no value.
+        assert_eq!(shape("break\n1"), "break; 1");
+        assert_eq!(shape("continue'a\nx"), "continue'a; x");
+        assert_eq!(shape("break; 1"), "break; 1");
+        assert_eq!(shape("{ break }"), "{break}");
+        // They are items of any plain block, an operand or not.
+        assert_eq!(
+            shape("let x = if c { break } else { 1 }"),
+            "let x = (if c {break} else {1})"
+        );
+        assert_eq!(shape("f({ continue })"), "f({continue})");
+    }
+
+    #[test]
+    fn break_and_continue_are_never_expressions() {
+        for (text, found, span) in [
+            ("x or break", "break", Span::new(5, 10)),
+            ("1 + continue", "continue", Span::new(4, 12)),
+            ("f(break)", "break", Span::new(2, 7)),
+            ("[continue]", "continue", Span::new(1, 9)),
+            ("let x = break", "break", Span::new(8, 13)),
+            ("= break", "break", Span::new(2, 7)),
+        ] {
+            assert_eq!(
+                error(text),
+                (format!("expected expression, found `{found}`"), span),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_label_is_written_directly_after_its_keyword() {
+        for (text, keyword, span) in [
+            ("for 'a x in xs {}", "for", Span::new(4, 6)),
+            ("do 'a {} for c", "do", Span::new(3, 5)),
+            ("break 'a", "break", Span::new(6, 8)),
+            ("continue 'a", "continue", Span::new(9, 11)),
+        ] {
+            assert_eq!(
+                error(text),
+                (
+                    format!("a label is written directly after `{keyword}`, with no space"),
+                    span
+                ),
+                "{text}"
+            );
+        }
+        // Anywhere else, a label is misplaced.
+        for (text, span) in [
+            ("'a", Span::new(0, 2)),
+            ("x 'a", Span::new(2, 4)),
+            ("1 + 'a", Span::new(4, 6)),
+            ("f('a)", Span::new(2, 4)),
+            ("let 'a = 1", Span::new(4, 6)),
+            ("for'a'b x in xs {}", Span::new(5, 7)),
+        ] {
+            assert_eq!(error(text), (MISPLACED_LABEL.to_owned(), span), "{text}");
+        }
+        // Where a particular token is expected, the usual error stands.
+        assert_eq!(
+            error("if c 'a {}"),
+            (
+                "expected `{` after `if` condition".to_owned(),
+                Span::new(5, 7)
+            )
+        );
+    }
+
+    #[test]
+    fn do_break_and_continue_are_not_names() {
+        assert_eq!(
+            error("let do = 1"),
+            ("expected a name after `let`".to_owned(), Span::new(4, 6))
+        );
+        assert_eq!(
+            error("let break = 1"),
+            ("expected a name after `let`".to_owned(), Span::new(4, 9))
+        );
+        assert_eq!(
+            error("fn(continue: Int): Int { 1 }").0,
+            "expected a parameter name, found `continue`"
+        );
+        assert_eq!(error("x.do").0, "expected a field name after `.`");
+        // A quoted field name may still be any text.
+        assert_eq!(
+            shape("\"do\" = 1; \"break\".x = 2"),
+            "\"do\" = 1; \"break\".x = 2"
+        );
+    }
+
+    #[test]
+    fn pretty_output_for_loops_and_jumps() {
+        let ast = parse_text(
+            "for'w let i = 0; i < 2; i := i + 1 { continue'w i }\n\
+             do { break } for c\nfor {}",
+        )
+        .unwrap();
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n\
+             \x20 (expr @0..51\n\
+             \x20   (for'w @0..51\n\
+             \x20     (let i @6..15\n\
+             \x20       (int 0 @14..15))\n\
+             \x20     (cond\n\
+             \x20       (< @17..22\n\
+             \x20         (name i @17..18)\n\
+             \x20         (int 2 @21..22)))\n\
+             \x20     (rebind i @24..34\n\
+             \x20       (+ @29..34\n\
+             \x20         (name i @29..30)\n\
+             \x20         (int 1 @33..34)))\n\
+             \x20     (block @35..51\n\
+             \x20       (continue'w @37..49\n\
+             \x20         (name i @48..49)))))\n\
+             \x20 (expr @52..70\n\
+             \x20   (do @52..70\n\
+             \x20     (block @55..64\n\
+             \x20       (break @57..62))\n\
+             \x20     (cond\n\
+             \x20       (name c @69..70))))\n\
+             \x20 (expr @71..77\n\
+             \x20   (for @71..77\n\
+             \x20     (block @75..77))))"
+        );
     }
 }

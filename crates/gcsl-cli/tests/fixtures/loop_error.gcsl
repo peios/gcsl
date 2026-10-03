@@ -1,0 +1,2 @@
+let squares = for let i = 0; i < 3; i := i + 1 { i := i * i }
+let found = for x in [1, 2] { let check = fn(): Bool { break x }; x }

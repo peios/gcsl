@@ -136,6 +136,34 @@
 //! literal piece has no span of its own in the AST, so its node has its
 //! whole interpolated string's span.
 //!
+//! A condition loop lowers to a `Loop` of its condition, `true` for `for {
+//! ... }`, its body and the `Store`s of its header's items after the
+//! condition, in a `Block` of the `Store`s of the items before it, if it
+//! has any, and a `do` loop to a `Loop` that does not test first; each
+//! collects or discards as a `for` does (`Lowerer::lower_for`). A `break`
+//! or `continue` lowers to a `Break` or a `Continue` of its value, as it is
+//! used (awaited where the checker marked it to fit its loop's element
+//! type), that counts the loops it leaves before the one the checker found
+//! it is for: the lowerer keeps the loops whose bodies it is lowering, of
+//! the function it is lowering, on a stack, around each body only, never
+//! its iterable, guard, condition or header, and starts each function's
+//! body with an empty one, as the checker's frames are kept.
+//!
+//! A node of type `Never` is of kind [`ValueKind::Never`], which may stand
+//! where a node of any kind is expected (`Lowerer::lower_operand`): a
+//! `break`, a `continue`, a block ending in one, an `if` both of whose
+//! branches are such. An operation of type `Never` because an operand that
+//! always runs first is (see [`crate::check`]), which the type-specialised
+//! node of the operation could not hold, lowers instead to a `Block` whose
+//! items are the operands that run before that one, for their effects, and
+//! whose result is that operand (`Lowerer::lower_unreached`); the operands
+//! after it never run, and are lowered only so that the functions in them
+//! have their code, their nodes left out of the tree. A loop whose iterable
+//! or first condition is `Never` lowers so too, to the items before its
+//! condition and the iterable or condition. A load, field access, index or
+//! call of type `Never` that no operand makes so is lowered as it is, of
+//! kind `Never`: it is only ever in code that does not run.
+//!
 //! A `lazy` lowers like a function expression: its body, any expression,
 //! into the function table, as code of [`FnKind::Future`], and the
 //! expression to a `MakeFuture` that captures as a `MakeClosure` does.
@@ -197,8 +225,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForId, ItemId, ItemKind,
-    ItemRange, PartRange, PathRange, PathSegment, SegmentKind, StrPart, UnaryOp, path_span,
+    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead, ForId, ItemId,
+    ItemKind, ItemRange, Jump, PartRange, PathRange, PathSegment, SegmentKind, StrPart, UnaryOp,
+    path_span, symbol_span,
 };
 use crate::check::{AwaitMark, Builtin, Checked, PathResolution, Resolution, Slot, Types, VarRef};
 use crate::diagnostic::InternalError;
@@ -267,6 +296,7 @@ pub fn lower(
         lazy_shapes: HashMap::new(),
         lazy_pending: Vec::new(),
         functions: vec![None; ast.fn_count()],
+        loops: Vec::new(),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -328,6 +358,10 @@ struct Lowerer<'a> {
     lazy_pending: Vec<(TyId, bool)>,
     /// Each function lowered so far, indexed by [`FnId`].
     functions: Vec<Option<FnCode>>,
+    /// The loops whose bodies are being lowered, of the function being
+    /// lowered, outermost first: how many loops out a `break` or
+    /// `continue` goes is counted on it.
+    loops: Vec<ForId>,
 }
 
 impl Lowerer<'_> {
@@ -387,6 +421,7 @@ impl Lowerer<'_> {
             .map(|&id| self.ast.item(id).kind)
         {
             Some(ItemKind::Result(value) | ItemKind::Expr(value)) => self.kind(value),
+            Some(ItemKind::Break(_) | ItemKind::Continue(_)) => Ok(ValueKind::Never),
             Some(
                 ItemKind::Let { .. }
                 | ItemKind::Rebind { .. }
@@ -436,21 +471,19 @@ impl Lowerer<'_> {
             let is_result = !is_record && index + 1 == items.len();
             let item = self.ast.item(id);
             match item.kind {
-                ItemKind::Let { path, value, .. }
-                | ItemKind::Rebind { path, value }
-                | ItemKind::Field { path, value } => {
-                    let slot = self.resolution.item_slot(id);
-                    if slot == Slot::NONE {
-                        return Err(InternalError {
-                            message: "a declaration has no slot",
-                            span: item.span,
-                        });
-                    }
-                    let value = self.lower_declaration(id, path, value)?;
-                    let store = self.builder.alloc(IrKind::Store(slot, value), item.span);
+                ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. } => {
+                    let store = self.lower_store(id)?;
                     self.item_stack.push(store);
                 }
                 ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
+                ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+                    let node = self.lower_jump(id, jump)?;
+                    if is_result {
+                        result = Some(node);
+                    } else {
+                        self.item_stack.push(node);
+                    }
+                }
                 ItemKind::Result(value) | ItemKind::Expr(value) if is_result => {
                     result = Some(self.lower_operand(value, kind)?);
                 }
@@ -469,7 +502,7 @@ impl Lowerer<'_> {
                     let statement = if self.is_await(value) {
                         self.lower_expr(value)?
                     } else if let Some((for_id, span)) = self.discarded_for(value) {
-                        let kind = self.lower_for(for_id, false)?;
+                        let kind = self.lower_for(for_id, false, span)?;
                         self.builder.alloc(kind, span)
                     } else if self.kind(value)? == ValueKind::List {
                         self.lower_expr(value)?
@@ -494,6 +527,58 @@ impl Lowerer<'_> {
         let items = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(IrKind::Block { items, result })
+    }
+
+    /// Lowers the declaration `id`, a `let`, a field or a `:=`, to the
+    /// `Store` of its value (see [`Lowerer::lower_declaration`]) into the
+    /// slot the checker gave it.
+    fn lower_store(&mut self, id: ItemId) -> Result<IrId, InternalError> {
+        let item = self.ast.item(id);
+        let (ItemKind::Let { path, value, .. }
+        | ItemKind::Rebind { path, value }
+        | ItemKind::Field { path, value }) = item.kind
+        else {
+            return Err(InternalError {
+                message: "an item that declares nothing lowered as a declaration",
+                span: item.span,
+            });
+        };
+        let slot = self.resolution.item_slot(id);
+        if slot == Slot::NONE {
+            return Err(InternalError {
+                message: "a declaration has no slot",
+                span: item.span,
+            });
+        }
+        let value = self.lower_declaration(id, path, value)?;
+        Ok(self.builder.alloc(IrKind::Store(slot, value), item.span))
+    }
+
+    /// Lowers the `break` or `continue` item `id`, whose value, if any, is
+    /// `jump`'s, to a `Break` or a `Continue` of its value as it is used,
+    /// counting the loops it leaves before the one the checker found it is
+    /// for (see [`Resolution::jump_target`]), which is among those whose
+    /// bodies are being lowered.
+    fn lower_jump(&mut self, id: ItemId, jump: Jump) -> Result<IrId, InternalError> {
+        let item = self.ast.item(id);
+        let target = self.resolution.jump_target(id);
+        let Some(at) = self
+            .loops
+            .iter()
+            .rposition(|&loop_id| Some(loop_id) == target)
+        else {
+            return Err(InternalError {
+                message: "a `break` or `continue` is not in the body of its loop",
+                span: item.span,
+            });
+        };
+        let loops = u32::try_from(self.loops.len() - 1 - at).unwrap_or(u32::MAX);
+        let value = jump.value.map(|value| self.lower_expr(value)).transpose()?;
+        let kind = match item.kind {
+            ItemKind::Break(_) => IrKind::Break { loops, value },
+            _ => IrKind::Continue { loops, value },
+        };
+        Ok(self.builder.alloc(kind, item.span))
     }
 
     /// Lowers the value that the declaration `id`, whose path is `path`,
@@ -734,6 +819,10 @@ impl Lowerer<'_> {
         let operand = self.lower_expr(value)?;
         let store = self.builder.alloc(IrKind::Store(held, operand), span);
         self.item_stack.push(store);
+        // An operand of type `Never` never gives a record to read.
+        if self.kind(value)? == ValueKind::Never {
+            return Ok(());
+        }
         let operand_span = self.ast.get(value).span;
         let fields = table
             .record_fields(table.strip(self.used_type(value)))
@@ -875,11 +964,18 @@ impl Lowerer<'_> {
     }
 
     /// Lowers expression `id`, wrapped in an `Await` if the checker marked
-    /// it to be awaited where it is used.
+    /// it to be awaited where it is used. An operation of kind `Never`
+    /// because what it asks of an operand that always runs is `Never`,
+    /// which nothing awaits, is lowered by [`Lowerer::lower_unreached`].
     fn lower_expr(&mut self, id: ExprId) -> Result<IrId, InternalError> {
         match self.resolution.await_of(id) {
             AwaitMark::None => {
                 let kind = self.kind(id)?;
+                if kind == ValueKind::Never
+                    && let Some(unreached) = self.lower_unreached(id)?
+                {
+                    return Ok(self.builder.alloc(unreached, self.ast.get(id).span));
+                }
                 self.lower_plain(id, kind)
             }
             mark => self.lower_awaited(id, mark, self.ast.get(id).span),
@@ -1000,7 +1096,8 @@ impl Lowerer<'_> {
                 | ValueKind::List
                 | ValueKind::Fn
                 | ValueKind::Deferred
-                | ValueKind::Mixed,
+                | ValueKind::Mixed
+                | ValueKind::Never,
             ) => {
                 return Err(InternalError {
                     message: "numeric literal typed as a non-numeric type",
@@ -1029,12 +1126,124 @@ impl Lowerer<'_> {
     ) -> Result<IrKind, InternalError> {
         match (expr, kind) {
             (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements),
-            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true),
+            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true, span),
             _ => Err(InternalError {
                 message: "a list literal or a `for` typed as something other than a list",
                 span,
             }),
         }
+    }
+
+    /// Lowers the expression `id`, of type `Never` because what it asks of
+    /// an operand that always runs first is `Never` (see [`crate::check`]),
+    /// to a `Block` whose items are its operands that run before that one,
+    /// in order, each as it is used, for their effects, and whose result is
+    /// that operand, which never completes; the operands after it never run,
+    /// and are lowered only for the functions in them, their nodes left
+    /// out. A loop whose iterable or first condition is `Never` is lowered
+    /// so too, by [`Lowerer::lower_unreached_loop`]. `None` for any other
+    /// expression, and for one of type `Never` only because of the value it
+    /// reads, a field of a record type's that is `Never`, say, which no
+    /// value has: it is lowered as it is otherwise.
+    fn lower_unreached(&mut self, id: ExprId) -> Result<Option<IrKind>, InternalError> {
+        let expr = *self.ast.get(id);
+        let children: Vec<ExprId> = match expr.kind {
+            ExprKind::Unary { op, operand } if op != UnaryOp::Await => vec![operand],
+            ExprKind::Binary { lhs, rhs, .. }
+            | ExprKind::Index {
+                expr: lhs,
+                index: rhs,
+            } => vec![lhs, rhs],
+            ExprKind::Field { expr, .. }
+            | ExprKind::Is { expr, .. }
+            | ExprKind::As { expr, .. } => {
+                vec![expr]
+            }
+            ExprKind::Call { callee, args } => {
+                let values = self.ast.args(args).iter().map(|arg| arg.value);
+                match self.resolution.expr_var(callee) {
+                    VarRef::Builtin(_) => values.collect(),
+                    _ => std::iter::once(callee).chain(values).collect(),
+                }
+            }
+            ExprKind::Interp(parts) => self
+                .ast
+                .parts(parts)
+                .iter()
+                .filter_map(|&part| match part {
+                    StrPart::Expr(expr) => Some(expr),
+                    StrPart::Lit(_) => None,
+                })
+                .collect(),
+            ExprKind::If {
+                cond, then, else_, ..
+            } if self.kind(cond)? == ValueKind::Never => vec![cond, then, else_],
+            ExprKind::For(for_id) => return self.lower_unreached_loop(for_id),
+            _ => return Ok(None),
+        };
+        let mut first = None;
+        for (index, &child) in children.iter().enumerate() {
+            if self.kind(child)? == ValueKind::Never {
+                first = Some(index);
+                break;
+            }
+        }
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let base = self.item_stack.len();
+        let mut result = None;
+        for (index, &child) in children.iter().enumerate() {
+            let node = self.lower_expr(child)?;
+            match index.cmp(&first) {
+                std::cmp::Ordering::Less => self.item_stack.push(node),
+                std::cmp::Ordering::Equal => result = Some(node),
+                // Never run.
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        let items = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(result.map(|result| IrKind::Block { items, result }))
+    }
+
+    /// Lowers the loop `for_id`, of type `Never` because its iterable, or
+    /// its condition, which runs before the first iteration, is: to a
+    /// `Block` of the `Store`s of the items before a condition, which run
+    /// first, whose result is the iterable or the condition. Its guard, its
+    /// items after the condition and its body never run, and are lowered
+    /// only for the functions in them. `None` for any other loop.
+    fn lower_unreached_loop(&mut self, for_id: ForId) -> Result<Option<IrKind>, InternalError> {
+        let decl = *self.ast.for_decl(for_id);
+        let (before, first, after, guard) = match decl.head {
+            ForHead::Each {
+                iterable, guard, ..
+            } if self.kind(iterable)? == ValueKind::Never => (None, iterable, None, guard),
+            ForHead::While {
+                before,
+                cond: Some(cond),
+                after,
+            } if self.kind(cond)? == ValueKind::Never => (Some(before), cond, Some(after), None),
+            _ => return Ok(None),
+        };
+        let ast = self.ast;
+        let base = self.item_stack.len();
+        for &item in before.map_or(&[][..], |before| ast.items(before)) {
+            let store = self.lower_store(item)?;
+            self.item_stack.push(store);
+        }
+        let result = self.lower_expr(first)?;
+        let items = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        // Never run.
+        if let Some(guard) = guard {
+            self.lower_expr(guard)?;
+        }
+        for &item in after.map_or(&[][..], |after| ast.items(after)) {
+            self.lower_store(item)?;
+        }
+        self.lower_loop_body(for_id, decl.body)?;
+        Ok(Some(IrKind::Block { items, result }))
     }
 
     /// Lowers the `is` or `as` expression `id`, of kind `kind`: an `Is` of
@@ -1142,8 +1351,12 @@ impl Lowerer<'_> {
         function: FnId,
         kind: FnKind,
     ) -> Result<IrRange, InternalError> {
-        let body = self.lower_expr(self.ast.fn_decl(function).body)?;
-        self.enter_function(id, function, (kind, body))
+        // A function's body starts with no loop around it: no `break` leaves
+        // it.
+        let outer = std::mem::take(&mut self.loops);
+        let body = self.lower_expr(self.ast.fn_decl(function).body);
+        self.loops = outer;
+        self.enter_function(id, function, (kind, body?))
     }
 
     /// Enters function `function`, of kind `kind`, the function expression
@@ -1265,29 +1478,98 @@ impl Lowerer<'_> {
         Ok(IrKind::MakeList { items, spreads })
     }
 
-    /// Lowers the `for` expression `for_id` to a `For` on its variable's
-    /// slot, whose parts are its iterable, a list, as it is used, its
-    /// guard, if it has one, a `Bool`, and its body, as it is used, which
-    /// may be awaited to fit the element type expected of the `for`. It
-    /// collects the body's values into a list if `collect`, and discards
-    /// them otherwise.
-    fn lower_for(&mut self, for_id: ForId, collect: bool) -> Result<IrKind, InternalError> {
+    /// Lowers the loop `for_id`, spanning `span`, which collects what its
+    /// iterations contribute into a list if `collect`, and discards it
+    /// otherwise. An iteration lowers to a `For` on its variable's slot,
+    /// whose parts are its iterable, a list, as it is used, its guard, if
+    /// it has one, a `Bool`, and its body, as it is used, which may be
+    /// awaited to fit the element type expected of the loop. A condition
+    /// loop lowers to a `Loop` whose parts are its condition, a `Bool`, or
+    /// `true` for `for { ... }`, its body and the `Store`s of the items
+    /// after its condition, in a `Block` whose items are the `Store`s of
+    /// those before it, if it has any; a `do` loop to a `Loop` of its
+    /// condition and its body that does not test first. Each body is
+    /// lowered with its loop on [`Lowerer::loops`].
+    fn lower_for(
+        &mut self,
+        for_id: ForId,
+        collect: bool,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
         let decl = *self.ast.for_decl(for_id);
+        let (before, cond, after) = match decl.head {
+            ForHead::Each {
+                iterable, guard, ..
+            } => return self.lower_each(for_id, (iterable, guard, decl.body), collect),
+            ForHead::While {
+                before,
+                cond,
+                after,
+            } => (Some(before), cond, Some(after)),
+            ForHead::Do { cond } => (None, Some(cond), None),
+        };
+        let ast = self.ast;
+        let base = self.item_stack.len();
+        for &item in before.map_or(&[][..], |before| ast.items(before)) {
+            let store = self.lower_store(item)?;
+            self.item_stack.push(store);
+        }
+        let stores = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let cond = if let Some(cond) = cond {
+            self.lower_operand(cond, ValueKind::Bool)?
+        } else {
+            let keyword = symbol_span("for", span.start);
+            self.builder.alloc(IrKind::BoolConst(true), keyword)
+        };
+        self.item_stack.push(cond);
+        let body = self.lower_loop_body(for_id, decl.body)?;
+        self.item_stack.push(body);
+        for &item in after.map_or(&[][..], |after| ast.items(after)) {
+            let store = self.lower_store(item)?;
+            self.item_stack.push(store);
+        }
+        let parts = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let looped = IrKind::Loop {
+            parts,
+            collect,
+            test_first: before.is_some(),
+        };
+        if before.is_none_or(|before| ast.items(before).is_empty()) {
+            return Ok(looped);
+        }
+        let result = self.builder.alloc(looped, span);
+        Ok(IrKind::Block {
+            items: stores,
+            result,
+        })
+    }
+
+    /// Lowers the iteration `for_id`, whose iterable, guard, if any, and
+    /// body are `iterable`, `guard` and `body`, to a `For` (see
+    /// [`Lowerer::lower_for`]).
+    fn lower_each(
+        &mut self,
+        for_id: ForId,
+        (iterable, guard, body): (ExprId, Option<ExprId>, ExprId),
+        collect: bool,
+    ) -> Result<IrKind, InternalError> {
         let slot = self.resolution.for_slot(for_id);
         if slot == Slot::NONE {
             return Err(InternalError {
                 message: "a `for` has no slot for its variable",
-                span: self.ast.get(decl.body).span,
+                span: self.ast.get(body).span,
             });
         }
         let base = self.item_stack.len();
-        let iterable = self.lower_operand(decl.iterable, ValueKind::List)?;
+        let iterable = self.lower_operand(iterable, ValueKind::List)?;
         self.item_stack.push(iterable);
-        if let Some(guard) = decl.guard {
+        if let Some(guard) = guard {
             let guard = self.lower_operand(guard, ValueKind::Bool)?;
             self.item_stack.push(guard);
         }
-        let body = self.lower_expr(decl.body)?;
+        let body = self.lower_loop_body(for_id, body)?;
         self.item_stack.push(body);
         let parts = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
@@ -1296,6 +1578,16 @@ impl Lowerer<'_> {
             parts,
             collect,
         })
+    }
+
+    /// Lowers `body`, the body of the loop `for_id`, as it is used, with
+    /// the loop on [`Lowerer::loops`], so that the `break`s and `continue`s
+    /// in it count the loops they leave.
+    fn lower_loop_body(&mut self, for_id: ForId, body: ExprId) -> Result<IrId, InternalError> {
+        self.loops.push(for_id);
+        let body = self.lower_expr(body);
+        self.loops.pop();
+        body
     }
 
     /// The `for` expression that the statement `value` is, through any
@@ -1506,7 +1798,8 @@ impl Lowerer<'_> {
                 | ValueKind::List
                 | ValueKind::Fn
                 | ValueKind::Deferred
-                | ValueKind::Mixed,
+                | ValueKind::Mixed
+                | ValueKind::Never,
                 ..,
             ) => {
                 return Err(InternalError {
@@ -1701,7 +1994,10 @@ impl Lowerer<'_> {
     /// union may, but a future may not.
     fn lower_operand(&mut self, id: ExprId, expected: ValueKind) -> Result<IrId, InternalError> {
         let kind = self.kind(id)?;
+        // A node of kind `Never` never yields a value, so it may stand where
+        // one of any kind is expected: every walker passes on what it does.
         let accepted = match expected {
+            _ if kind == ValueKind::Never => true,
             ValueKind::Deferred => true,
             ValueKind::Mixed => kind != ValueKind::Deferred,
             _ => kind == expected,
@@ -4038,5 +4334,100 @@ mod tests {
         checked.resolution.forget_for_slots();
         let error = lower(&ast, &checked, &types, 0).unwrap_err();
         assert_eq!(error.message, "a `for` has no slot for its variable");
+    }
+
+    #[test]
+    fn a_condition_loop_lowers_to_a_loop_in_a_block_of_its_header() {
+        assert_eq!(
+            dump("for let i = 0; i < 2; i := i + 1 { i }"),
+            "(block @0..38\n\
+             \x20 (block @0..38\n\
+             \x20   (store i#0 @4..13\n\
+             \x20     (int 0 @12..13))\n\
+             \x20   (loop @0..38\n\
+             \x20     (int-cmp < @15..20\n\
+             \x20       (load i#0 @15..16)\n\
+             \x20       (int 2 @19..20))\n\
+             \x20     (block @33..38\n\
+             \x20       (load i#0 @35..36))\n\
+             \x20     (store i#0 @22..32\n\
+             \x20       (int-add @27..32\n\
+             \x20         (load i#0 @27..28)\n\
+             \x20         (int 1 @31..32))))))"
+        );
+        // `for { }` tests `true`, at its keyword; a `do` tests after.
+        assert_eq!(
+            dump("for { break 1 }"),
+            "(block @0..15\n\
+             \x20 (loop @0..15\n\
+             \x20   (bool true @0..3)\n\
+             \x20   (block @4..15\n\
+             \x20     (break 0 @6..13\n\
+             \x20       (int 1 @12..13)))))"
+        );
+        assert_eq!(
+            dump("do { continue } for false"),
+            "(block @0..25\n\
+             \x20 (do @0..25\n\
+             \x20   (bool false @20..25)\n\
+             \x20   (block @3..15\n\
+             \x20     (continue 0 @5..13))))"
+        );
+        let ir = lower_text("do { 1 } for false");
+        let node = result_of(&ir);
+        assert_eq!(ir.kind_of(node), ValueKind::List);
+        assert_eq!(ir.get(node).operator_span(), None);
+    }
+
+    #[test]
+    fn a_stop_counts_the_loops_it_leaves() {
+        let shown = dump("for'o x in [1] { for y in [2] { if y > x { break'o }; continue } }");
+        assert!(shown.contains("(break 1 @"), "{shown}");
+        assert!(shown.contains("(continue 0 @"), "{shown}");
+        // A function's body starts with no loop around it.
+        let shown =
+            dump("for x in [1] { let f = fn(): List<Int> { for y in [2] { break y } }; x }");
+        assert!(shown.contains("(break 0 @"), "{shown}");
+        // A stop is of kind Never, and so is a block ending in one, and an
+        // `if` is of the kind of its branch that is not.
+        let ir = lower_text("for x in [1] { if x > 0 { break } else { 5 } }");
+        let IrKind::For { parts, .. } = ir.get(result_of(&ir)).kind else {
+            panic!("expected a for");
+        };
+        let body = ir.items(parts)[1];
+        assert_eq!(ir.kind_of(body), ValueKind::Int);
+        let IrKind::Block { result, .. } = ir.get(body).kind else {
+            panic!("expected a block");
+        };
+        let IrKind::If { then, .. } = ir.get(result).kind else {
+            panic!("expected an if");
+        };
+        assert_eq!(ir.kind_of(then), ValueKind::Never);
+    }
+
+    #[test]
+    fn a_never_operation_lowers_to_its_operands_up_to_the_one_that_stops() {
+        // The left operand runs, as a statement, then the right one, which
+        // stops; the addition is never made. (`x`'s slot is named by `v`,
+        // the last variable stored in it.)
+        let shown = dump("let mut n = 0\nlet v = for x in [1] { ({ n := 1; x }) + { break } }");
+        assert!(
+            shown.contains(
+                "(block @37..64\n\
+                 \x20         (block @38..51\n\
+                 \x20           (store n#0 @40..46\n\
+                 \x20             (int 1 @45..46))\n\
+                 \x20           (load v#1 @48..49))\n\
+                 \x20         (block @55..64\n\
+                 \x20           (break 0 @57..62)))"
+            ),
+            "{shown}"
+        );
+        // A function in what never runs is still lowered.
+        let ir = lower_text("let v = for x in [1] { { break } + (fn(): Int { 1 })() }\nv");
+        assert_eq!(ir.function_count(), 1);
+        // A loop over a value of type Never is its iterable.
+        let shown = dump("let v = for x in [1] { for y in { break } { y } }\nv");
+        assert!(!shown.contains("(for y"), "{shown}");
     }
 }

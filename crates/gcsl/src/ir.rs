@@ -76,6 +76,28 @@
 //! as a statement whose value nothing would hold, discards them and is
 //! `{}`.
 //!
+//! # Loops and stops
+//!
+//! A condition loop or a `do` loop is an [`IrKind::Loop`], whose parts are
+//! its condition, a `Bool` node (`true` for `for { ... }`), its body and the
+//! `Store`s of its header's items after the condition, and which says
+//! whether it tests its condition before its first iteration, as all but a
+//! `do` loop do; the `Store`s of the items before the condition are the
+//! items of an [`IrKind::Block`] around it. It collects or discards as a
+//! `For` does. A `break` and a `continue` are an [`IrKind::Break`] and an
+//! [`IrKind::Continue`], each with its value, if it has one, a node of any
+//! kind, which is its child, and the number of loops it leaves before the
+//! one it is for, counted from the innermost loop whose body holds it.
+//!
+//! Such a node is of kind [`ValueKind::Never`], and so is a block whose
+//! result is one, an `if` both of whose branches are, and a node lowered
+//! from an expression of type `Never`; a node of that kind may stand where
+//! a node of any kind is expected, and every walker of the evaluator hands
+//! a `Break` or `Continue` it meets to the one place that unwinds (see
+//! [`crate::eval`]). The other nodes of kind `Never`, a load of a variable
+//! or a field access of type `Never`, say, are only ever in code that does
+//! not run.
+//!
 //! # Functions
 //!
 //! Every function expression of the program has an entry in the function
@@ -480,8 +502,9 @@ pub struct ShapedOperands {
 /// What an [`IrNode`] computes. Operand ids of `Int*` nodes always refer to
 /// Int-typed nodes, of `Float*` nodes (except [`IrKind::IntToFloat`]) to
 /// Float-typed nodes, of `Str*` nodes to String-typed nodes, of `Bool*`,
-/// `And`, `Or` and `Not` nodes and an `If`'s condition and a `For`'s guard
-/// to Bool-typed nodes, and of `Record*`, `Field` and `UpdateField` nodes
+/// `And`, `Or` and `Not` nodes, an `If`'s condition, a `For`'s guard and a
+/// `Loop`'s condition to Bool-typed nodes, and of `Record*`, `Field` and
+/// `UpdateField` nodes
 /// to record nodes (an `UpdateField`'s value excepted, which may be of any
 /// kind), of `List*` and `Spread` nodes, an `Index`'s list and a `For`'s
 /// iterable to list nodes, an `Index`'s position, an `Update`'s positions
@@ -491,7 +514,9 @@ pub struct ShapedOperands {
 /// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
 /// [`IrKind::Await`] of it; nor of kind [`ValueKind::Mixed`]: an operand of
 /// a union is narrowed first, by an `as`, or in the branch of an `if` whose
-/// `is` narrows it.
+/// `is` narrows it. Any operand may instead be of kind [`ValueKind::Never`],
+/// which never yields a value (see [Loops and
+/// stops](crate::ir#loops-and-stops)).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
     /// An `Int` constant.
@@ -741,6 +766,41 @@ pub enum IrKind {
         /// hold, and is of kind [`ValueKind::Record`].
         collect: bool,
     },
+    /// A condition loop or a `do` loop: of `parts`, the condition, a `Bool`
+    /// node, the body, a node of any kind, and the items after the
+    /// condition, each a node of any kind, run for their effect. While the
+    /// condition is true, evaluates the body and then the items; if not
+    /// `test_first`, a `do` loop's, the first iteration runs without the
+    /// test. Collects what each iteration contributes as a `For` does.
+    Loop {
+        /// The condition, the body, and the items after the condition.
+        parts: IrRange,
+        /// Whether the loop yields the list of what its iterations
+        /// contribute, of kind [`ValueKind::List`], or discards it and is
+        /// `{}`, as a `For`'s flag says.
+        collect: bool,
+        /// Whether the condition is tested before the first iteration:
+        /// `false` for a `do` loop.
+        test_first: bool,
+    },
+    /// `break`: evaluates `value`, if there is one, a node of any kind, and
+    /// unwinds to the loop `loops` loops out from the innermost one whose
+    /// body it is in, which collects the value and ends (see
+    /// [`crate::eval`]). Of kind [`ValueKind::Never`].
+    Break {
+        /// How many loops it leaves before its own: 0 for the innermost.
+        loops: u32,
+        /// What it contributes to its loop's list, if anything.
+        value: Option<IrId>,
+    },
+    /// `continue`: as [`IrKind::Break`], but its loop collects the value
+    /// and goes on with its next iteration.
+    Continue {
+        /// How many loops it leaves before its own: 0 for the innermost.
+        loops: u32,
+        /// What it contributes to its loop's list, if anything.
+        value: Option<IrId>,
+    },
     /// Builds a closure of function `function` of the IR, capturing the
     /// values of `captures`: loads in the frame creating it, one for each
     /// value the function captures, in capture order.
@@ -826,7 +886,9 @@ impl IrKind {
     /// and value, a dotted update's value, record or list and positions, an
     /// interpolation's pieces, a record's values, a list's items,
     /// a spread's list, an index's list and position, a length's list, a
-    /// range's bounds, a `for`'s iterable, guard and body, a closure's and
+    /// range's bounds, a `for`'s iterable, guard and body, a condition
+    /// loop's condition, body and items after it, a `break`'s and a
+    /// `continue`'s value, a closure's and
     /// a future's captures, and an await's, an `is`'s and an `as`'s value.
     /// A closure's
     /// or a future's
@@ -866,6 +928,9 @@ impl IrKind {
             | IrKind::Is { value: operand, .. }
             | IrKind::As { value: operand, .. }
             | IrKind::Await { value: operand, .. } => (None, &[], [Some(operand), None, None]),
+            IrKind::Break { value, .. } | IrKind::Continue { value, .. } => {
+                (None, &[], [value, None, None])
+            }
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
             | IrKind::IntMul(Operands { lhs, rhs, .. })
@@ -908,6 +973,7 @@ impl IrKind {
             | IrKind::MakeRecord { values: items, .. }
             | IrKind::MakeList { items, .. }
             | IrKind::For { parts: items, .. }
+            | IrKind::Loop { parts: items, .. }
             | IrKind::Update { parts: items, .. }
             | IrKind::MakeClosure {
                 captures: items, ..
@@ -979,6 +1045,9 @@ impl IrKind {
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
             | IrKind::For { .. }
+            | IrKind::Loop { .. }
+            | IrKind::Break { .. }
+            | IrKind::Continue { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. } => None,
         }
@@ -1011,6 +1080,28 @@ impl IrKind {
             IrKind::Range(true, _) => "range-inclusive",
             IrKind::For { collect: true, .. } => "for",
             IrKind::For { collect: false, .. } => "for-each",
+            IrKind::Loop {
+                collect: true,
+                test_first: true,
+                ..
+            } => "loop",
+            IrKind::Loop {
+                collect: false,
+                test_first: true,
+                ..
+            } => "loop-each",
+            IrKind::Loop {
+                collect: true,
+                test_first: false,
+                ..
+            } => "do",
+            IrKind::Loop {
+                collect: false,
+                test_first: false,
+                ..
+            } => "do-each",
+            IrKind::Break { .. } => "break",
+            IrKind::Continue { .. } => "continue",
             IrKind::And(_) => "and",
             IrKind::Or(_) => "or",
             IrKind::Not(_) => "not",
@@ -1103,6 +1194,9 @@ impl IrNode {
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
             | IrKind::For { .. }
+            | IrKind::Loop { .. }
+            | IrKind::Break { .. }
+            | IrKind::Continue { .. }
             | IrKind::IntConst(_)
             | IrKind::FloatConst(_)
             | IrKind::BoolConst(_)
@@ -1446,7 +1540,9 @@ impl Ir {
     /// [`ValueKind::Mixed`] for a load, capture, field access, index, call,
     /// await or `as` of a union of kinds. A block's kind is its result's,
     /// and an `if`'s its `then` branch's, which for an `if` of a union of
-    /// kinds, whose branches may be of different kinds, is one of them.
+    /// kinds, whose branches may be of different kinds, is one of them, or
+    /// its `else` branch's if the `then` branch is of kind
+    /// [`ValueKind::Never`], as a `break` and a `continue` are.
     ///
     /// # Panics
     ///
@@ -1462,8 +1558,14 @@ impl Ir {
                     id = result;
                     continue;
                 }
-                IrKind::If { then, .. } => {
-                    id = then;
+                // A branch that never completes says nothing of the `if`'s
+                // kind, unless both are such.
+                IrKind::If { then, else_, .. } => {
+                    id = if self.kind_of(then) == ValueKind::Never {
+                        else_
+                    } else {
+                        then
+                    };
                     continue;
                 }
                 IrKind::Arg { value, .. } => {
@@ -1501,7 +1603,9 @@ impl Ir {
                 IrKind::MakeList { .. }
                 | IrKind::Spread(_)
                 | IrKind::Range(..)
-                | IrKind::For { collect: true, .. } => ValueKind::List,
+                | IrKind::For { collect: true, .. }
+                | IrKind::Loop { collect: true, .. } => ValueKind::List,
+                IrKind::Break { .. } | IrKind::Continue { .. } => ValueKind::Never,
                 IrKind::FloatConst(_)
                 | IrKind::FloatNeg(_)
                 | IrKind::FloatAdd(_)
@@ -1513,7 +1617,8 @@ impl Ir {
                 | IrKind::Store(..)
                 | IrKind::MakeRecord { .. }
                 | IrKind::UpdateField { .. }
-                | IrKind::For { collect: false, .. } => ValueKind::Record,
+                | IrKind::For { collect: false, .. }
+                | IrKind::Loop { collect: false, .. } => ValueKind::Record,
                 IrKind::Load(_, kind)
                 | IrKind::Field { kind, .. }
                 | IrKind::Update { kind, .. }
@@ -1559,7 +1664,13 @@ impl Ir {
     /// and a `for` as `(for x#2 @0..20 ...)`, its variable's slot followed
     /// by ` if` if it has a guard, and then its iterable, its guard and its
     /// body; one that discards the body's values as `(for-each x#2 @0..20
-    /// ...)`. A closure shows its
+    /// ...)`. A condition loop shows as `(loop @0..20 ...)`, or
+    /// `(loop-each @0..20 ...)` if it discards, and a `do` loop as `(do
+    /// @0..20 ...)` or `(do-each @0..20 ...)`, each followed by its
+    /// condition, its body and the items after its condition; a `break` as
+    /// `(break 1 @0..7 ...)` and a `continue` as `(continue 0 @0..8)`, with
+    /// the number of loops it leaves before its own, and its value, if it
+    /// has one. A closure shows its
     /// function's
     /// number and then what it captures, as in `(make-closure #0 @0..9
     /// ...)`, a call its callee and then its arguments, each as
@@ -2099,6 +2210,7 @@ impl Pretty<'_> {
                 ValueKind::Fn => "fn",
                 ValueKind::Deferred => "deferred",
                 ValueKind::Mixed => "mixed",
+                ValueKind::Never => "never",
             }),
             ValueTest::Record(fields) => {
                 f.write_str("{")?;
@@ -2212,6 +2324,9 @@ impl Pretty<'_> {
                 if self.ir.items(parts).len() == 3 {
                     f.write_str(" if")?;
                 }
+            }
+            IrKind::Break { loops, .. } | IrKind::Continue { loops, .. } => {
+                write!(f, " {loops}")?;
             }
             _ => {}
         }

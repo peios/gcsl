@@ -838,6 +838,128 @@ fn rebinding_errors_are_rendered() {
 }
 
 #[test]
+fn run_works_through_a_queue_with_every_kind_of_loop() {
+    let output = gcsl(&["run", "tests/fixtures/loops.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{done = 2; costs = [3, 8, 5]; loose = [{}, \"build\"]; first = [\"build\"]; spent = [6, \
+         2]; attempts = [1, 2]; rows = [[10, 20], [50]]}\n"
+    );
+    // Find-first without a final `continue` collects `{}` too: a warning.
+    // With one, none.
+    assert_eq!(
+        stderr(&output),
+        "warning: the values this loop collects have different types\n\
+         \x20--> tests/fixtures/loops.gcsl:9:13\n\
+         \x20 |\n\
+         9 | let loose = for j in jobs { if j.cost > 5 { break j.name } }\n\
+         \x20 |             ^^^             ------------------------------\n\
+         \x20 |                             |                     |\n\
+         \x20 |                             |                     this is String\n\
+         \x20 |                             this is {}\n\
+         \x20 |\n\
+         \x20 = note: the loop is `List<String | {}>`; annotate it with that type if all are \
+         meant, or tell them apart with `is`\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_loops_and_their_stops() {
+    let output = gcsl(&["run", "tests/fixtures/loops.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in [
+        "\nDo @825..827\n",
+        "\nBreak @473..478\n",
+        "\nContinue @1017..1025\nLabel(rows) @1025..1030\n",
+        "\nFor @972..975\nLabel(rows) @975..980\n",
+    ] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/loops.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n    (for @306..363\n\
+         \x20     (let i @310..319\n\
+         \x20       (int 0 @318..319))\n\
+         \x20     (cond\n",
+        "\n      (rebind i @336..346\n",
+        "\n    (do @825..871\n\
+         \x20     (block @828..857\n",
+        "\n      (cond\n\
+         \x20       (< @862..871\n",
+        "(for'rows r @972..1044\n",
+        "(continue'rows @1017..1030)",
+        "(break @473..485\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/loops.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        "(for : List<{}> @205..238\n",
+        "(for : List<Int> @306..363\n",
+        "(for j : List<String | {}> @441..489\n",
+        "(for j : List<String> @558..616\n",
+        "(do : List<Int> @825..871\n",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/loops.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // A statement loop collects nothing.
+        "\n  (loop-each @205..238\n",
+        // A header's items before the condition run once, in a block
+        // around the loop; those after it are the loop's last parts.
+        "\n    (block @306..363\n\
+         \x20     (store costs#2 @310..319\n",
+        "\n      (loop @306..363\n",
+        // `for { }` tests `true`.
+        "\n    (loop @692..753\n\
+         \x20     (bool true @692..695)\n",
+        "\n    (do @825..871\n",
+        // A stop counts the loops it leaves.
+        "(break 0 @473..485\n",
+        "(continue 0 @606..614)",
+        "(continue 1 @1017..1030)",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn loop_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/loop_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot rebind `i` here: it is declared in the header of a `for`\n\
+         \x20--> tests/fixtures/loop_error.gcsl:1:50\n\
+         \x20 |\n\
+         1 | let squares = for let i = 0; i < 3; i := i + 1 { i := i * i }\n\
+         \x20 |                   --------- declared here        ^\n\
+         \x20 |\n\
+         \x20 = note: a variable of a `for` header is rebound in the header, after the \
+         condition; declare it with `let mut i = ...` in the header to rebind it from the body \
+         too\n\
+         \n\
+         error: `break` cannot leave a function\n\
+         \x20--> tests/fixtures/loop_error.gcsl:2:56\n\
+         \x20 |\n\
+         2 | let found = for x in [1, 2] { let check = fn(): Bool { break x }; x }\n\
+         \x20 |                                           --           ^^^^^\n\
+         \x20 |                                           |\n\
+         \x20 |                                           inside a function here\n\
+         \x20 |\n\
+         \x20 = note: the body of a function runs when it is called, which may be after the \
+         loop has ended\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn run_tells_the_members_of_unions_apart() {
     let output = gcsl(&["run", "tests/fixtures/unions.gcsl"]);
     assert_eq!(

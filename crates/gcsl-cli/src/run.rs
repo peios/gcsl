@@ -125,11 +125,12 @@ fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
     let (tokens, names, strings) = lexer::tokenize(source)?;
     if args.dump_tokens {
         // Names by their text and string pieces by their quoted text, as in
-        // `Ident(x)` and `StrStart("a\n")`.
+        // `Ident(x)`, `Label(outer)` and `StrStart("a\n")`.
         for token in &tokens {
             let span = token.span;
             match token.kind {
                 TokenKind::Ident(name) => writeln!(out, "Ident({}) @{span}", names.get(name))?,
+                TokenKind::Label(name) => writeln!(out, "Label({}) @{span}", names.get(name))?,
                 TokenKind::Str(id) => writeln!(out, "Str({}) @{span}", Quoted(strings.get(id)))?,
                 TokenKind::StrStart(id) => {
                     writeln!(out, "StrStart({}) @{span}", Quoted(strings.get(id)))?;

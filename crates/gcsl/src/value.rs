@@ -60,6 +60,11 @@ pub enum ValueKind {
     /// but is never a [`Value::Future`]. Only the evaluator's general
     /// walker evaluates such nodes, as it does [`ValueKind::Deferred`] ones.
     Mixed,
+    /// No value: the kind of a node of type `Never`, which never produces
+    /// one, a `break` or a `continue`, or a block or an `if` that always
+    /// ends in one. Every walker evaluates such a node, which always
+    /// unwinds (see [`crate::eval`]); no [`Value`] is of it.
+    Never,
 }
 
 /// The field names of a record, in definition order. Built once per record

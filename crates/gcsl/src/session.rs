@@ -715,6 +715,61 @@ mod tests {
     }
 
     #[test]
+    fn loops_over_a_session_variable() {
+        let mut session = Session::new();
+        value(&mut session, "let mut n = 0");
+        // A later input's loop rebinds it from its condition loop's body,
+        // and its header.
+        value(&mut session, "for n < 3 { n := n + 1 }");
+        assert_eq!(value(&mut session, "n"), Value::Int(3));
+        value(&mut session, "for n < 6; n := n + 1 { }");
+        assert_eq!(value(&mut session, "n"), Value::Int(6));
+        assert_eq!(
+            value(
+                &mut session,
+                "for { if n > 7 { break n }; n := n + 1; continue }"
+            )
+            .repr()
+            .to_string(),
+            "[8]"
+        );
+        assert_eq!(value_type(&session), "List<Int>");
+        // A failed input that loops leaves the session as it was: its
+        // rebinds of `n` are undone, and its loop's header variable is not
+        // declared.
+        assert_eq!(
+            messages(
+                &mut session,
+                "for let i = 0; i < 3; i := i + 1 { n := n + 10; i // 0 }"
+            ),
+            vec!["division by zero"]
+        );
+        assert_eq!(value(&mut session, "n"), Value::Int(8));
+        assert_eq!(messages(&mut session, "i"), vec!["undefined variable `i`"]);
+    }
+
+    #[test]
+    fn a_memoised_function_that_breaks_keeps_what_it_recorded() {
+        let mut session = Session::new();
+        value(
+            &mut session,
+            "fn f(n: Int) ->> {v: List<Int>} { v = for let i = 0; true; i := i + 1 \
+             { if i == n { break }; i } }",
+        );
+        let Value::Record(first) = value(&mut session, "f(2)") else {
+            panic!("expected a record");
+        };
+        // A later input finds the entry the `break` in the body did not
+        // disturb, and so does one after an input that failed.
+        messages(&mut session, "let a = f(3)\nlet b = 1 // 0");
+        let Value::Record(again) = value(&mut session, "f(2)") else {
+            panic!("expected a record");
+        };
+        assert!(Rc::ptr_eq(&first, &again));
+        assert_eq!(session.memo.running_count(), 0);
+    }
+
+    #[test]
     fn lists_across_inputs() {
         let mut session = Session::new();
         value(&mut session, "let xs = [1, 2, 3]");

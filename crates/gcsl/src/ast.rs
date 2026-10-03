@@ -37,10 +37,23 @@
 //!
 //! A range, `a..b` or `a..=b`, is a binary operator, [`BinaryOp::Range`]
 //! or [`BinaryOp::RangeInclusive`]. A `for` expression, `for x in xs if
-//! GUARD { ... }`, has more to it than fits in an [`Expr`], so its node,
-//! [`ExprKind::For`], holds only a [`ForId`] into an arena of
-//! [`ForDecl`]s, [`Ast::for_decl`]: its variable's name and where it is
-//! written, its iterable, its guard, if any, and its body, a block.
+//! GUARD { ... }`, is one of the loops (see [Loops](#loops)).
+//!
+//! # Loops
+//!
+//! Every loop is an expression, [`ExprKind::For`], whose details do not
+//! fit in an [`Expr`], so its node holds only a [`ForId`] into an arena of
+//! [`ForDecl`]s, [`Ast::for_decl`]: its label, if any ([`Label`]), its
+//! body, a block, and its form, a [`ForHead`]: an iteration, `for x in xs
+//! if GUARD { ... }`, with its variable's name and where it is written, its
+//! iterable and its guard, if any; a condition loop, `for BEFORE; COND;
+//! AFTER { ... }`, with the items before its condition and after it, each
+//! a list of items in the item pool, and its condition, `for { ... }`
+//! having none; or a `do` loop, `do { ... } for COND`, with its condition.
+//!
+//! `break` and `continue` are items, [`ItemKind::Break`] and
+//! [`ItemKind::Continue`], each with a [`Jump`]: the label of the loop it
+//! is for, if it names one, and its value, if it has one.
 //!
 //! # Functions
 //!
@@ -240,23 +253,78 @@ impl ForId {
     }
 }
 
-/// A `for` expression, `for NAME in ITERABLE BLOCK` or `for NAME in
-/// ITERABLE if GUARD BLOCK`. Held in the [`Ast`]'s `for` arena; the
-/// expression node is an [`ExprKind::For`] with its [`ForId`].
+/// A loop: a `for` expression of any form, or a `do` loop (see
+/// [Loops](#loops)). Held in the [`Ast`]'s `for` arena; the expression node
+/// is an [`ExprKind::For`] with its [`ForId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ForDecl {
-    /// The element variable's name, always an identifier.
-    pub name: Name,
-    /// Where the name is written.
-    pub name_span: Span,
-    /// What is iterated over, a list.
-    pub iterable: ExprId,
-    /// The guard after `if`, if any, which decides whether an element
-    /// contributes.
-    pub guard: Option<ExprId>,
-    /// The body, an [`ExprKind::Block`], whose value each element that
-    /// passes the guard contributes.
+    /// The loop's label, written directly after its `for` or `do`, if it
+    /// has one.
+    pub label: Option<Label>,
+    /// What runs around the body: the form of the loop.
+    pub head: ForHead,
+    /// The body, an [`ExprKind::Block`], whose value each iteration
+    /// contributes, unless a `break` or `continue` says otherwise.
     pub body: ExprId,
+}
+
+/// The form of a loop, [`ForDecl::head`]: what it runs around its body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ForHead {
+    /// `for NAME in ITERABLE BLOCK` or `for NAME in ITERABLE if GUARD
+    /// BLOCK`: an iteration over a list.
+    Each {
+        /// The element variable's name, always an identifier.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// What is iterated over, a list.
+        iterable: ExprId,
+        /// The guard after `if`, if any, which decides whether an element
+        /// contributes.
+        guard: Option<ExprId>,
+    },
+    /// `for BEFORE; COND; AFTER BLOCK`, each of `BEFORE` and `AFTER` items
+    /// separated by `;` and either series possibly empty, so `for COND
+    /// BLOCK` too; and `for BLOCK`, with no condition, which loops until
+    /// something leaves it.
+    While {
+        /// The items before the condition, run once: `let`s and `:=`s.
+        before: ItemRange,
+        /// The condition, tested before each iteration; `None` for `for
+        /// BLOCK`, which is the loop whose condition is `true`.
+        cond: Option<ExprId>,
+        /// The items after the condition, run after each iteration's body:
+        /// `:=`s only.
+        after: ItemRange,
+    },
+    /// `do BLOCK for COND`: the body, then the condition, and the body
+    /// again while it is true.
+    Do {
+        /// The condition, tested after each iteration.
+        cond: ExprId,
+    },
+}
+
+/// A loop's label, `'NAME`, written directly after the `for`, `do`,
+/// `break` or `continue` it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Label {
+    /// The name, without its `'`.
+    pub name: Name,
+    /// Where the label is written, its `'` included.
+    pub span: Span,
+}
+
+/// What a `break` or `continue` item says: the loop it is for, by label,
+/// and the value it contributes to that loop's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Jump {
+    /// The label of the loop it is for; `None` for the innermost loop whose
+    /// body holds it.
+    pub label: Option<Label>,
+    /// The value it contributes, if it has one.
+    pub value: Option<ExprId>,
 }
 
 /// The parameters of a function expression: a contiguous range of the
@@ -889,9 +957,11 @@ pub enum ExprKind {
         /// The position.
         index: ExprId,
     },
-    /// `for NAME in ITERABLE (if GUARD)? { ... }`: the list of the body's
-    /// values for the elements of the iterable that pass the guard. Its
-    /// details are in the `for` arena (see [`Ast::for_decl`]).
+    /// A loop, of any form: `for NAME in ITERABLE (if GUARD)? { ... }`, the
+    /// list of the body's values for the elements of the iterable that
+    /// pass the guard, or a condition loop, `for { ... }` or a `do` loop,
+    /// the list of what their iterations contribute. Its details are in
+    /// the `for` arena (see [`Ast::for_decl`]).
     For(ForId),
 }
 
@@ -911,7 +981,8 @@ pub struct Expr {
     /// its `)` or its trailing block's `}`, and a `Lazy` its `lazy` keyword
     /// through its operand. A `List` covers its brackets, an `Index` its
     /// list expression through its `]`, and a `For` its `for` keyword
-    /// through its body's `}`.
+    /// through its body's `}`, or, for a `do` loop, its `do` keyword
+    /// through its condition.
     pub span: Span,
 }
 
@@ -979,7 +1050,8 @@ impl Expr {
     }
 
     /// The span of the `if` keyword, for `If` nodes, and of the `for`
-    /// keyword, for `For` nodes.
+    /// keyword, for `For` nodes, which start with one, but a `do` loop's,
+    /// which starts with `do`: [`Ast::loop_keyword`] tells them apart.
     #[must_use]
     pub const fn keyword_span(&self) -> Option<Span> {
         match self.kind {
@@ -1042,6 +1114,29 @@ pub enum ItemKind {
     Result(ExprId),
     /// An expression evaluated on its own.
     Expr(ExprId),
+    /// `break`, `break VALUE`, `break'LABEL` or `break'LABEL VALUE`: ends a
+    /// loop.
+    Break(Jump),
+    /// `continue`, with a value and a label as for `break`: ends an
+    /// iteration of a loop.
+    Continue(Jump),
+}
+
+impl ItemKind {
+    /// The expression the item holds, if it has one: every item's but a
+    /// `break`'s or `continue`'s without a value.
+    #[must_use]
+    pub const fn value(self) -> Option<ExprId> {
+        match self {
+            ItemKind::Let { value, .. }
+            | ItemKind::Field { value, .. }
+            | ItemKind::Rebind { value, .. }
+            | ItemKind::Spread(value)
+            | ItemKind::Result(value)
+            | ItemKind::Expr(value) => Some(value),
+            ItemKind::Break(jump) | ItemKind::Continue(jump) => jump.value,
+        }
+    }
 }
 
 /// One item of a block body.
@@ -1050,7 +1145,9 @@ pub struct Item {
     /// What the item is.
     pub kind: ItemKind,
     /// The source it covers: from `let`, the path, `=`, `...` or the start
-    /// of the expression, through the end of the expression.
+    /// of the expression, through the end of the expression; for a `break`
+    /// or `continue`, from its keyword through its value, its label or
+    /// itself, whichever is last.
     pub span: Span,
 }
 
@@ -1601,8 +1698,11 @@ impl Ast {
     /// position of the first index segment of its path if it has one, an
     /// `if`'s condition, a call's callee, a binary operator's left operand,
     /// a function's or `lazy`'s body, an interpolated string's first
-    /// expression, a list literal's first element's, an index's list, a
-    /// `for`'s iterable.
+    /// expression, a list literal's first element's, an index's list, an
+    /// iteration's iterable, a condition loop's first header item's, its
+    /// condition or its body, whichever comes first, and a `do` loop's
+    /// body. (A block's first item may hold no expression, a `break`
+    /// without a value: the first item that holds one is followed.)
     /// Debug builds check that every node of the range lies
     /// within `id`'s span and the node before it starts before `id`.
     pub(crate) fn subtree(&self, id: ExprId) -> impl Iterator<Item = ExprId> + use<> {
@@ -1639,21 +1739,8 @@ impl Ast {
                         None => return node,
                     }
                 }
-                ExprKind::Block(items) => match self.items(items).first() {
-                    Some(&item) => match self.item(item).kind {
-                        // The positions of a path are parsed before the
-                        // value.
-                        ItemKind::Rebind { path, value } => self
-                            .path(path)
-                            .iter()
-                            .find_map(PathSegment::position)
-                            .unwrap_or(value),
-                        ItemKind::Let { value, .. }
-                        | ItemKind::Field { value, .. }
-                        | ItemKind::Spread(value)
-                        | ItemKind::Result(value)
-                        | ItemKind::Expr(value) => value,
-                    },
+                ExprKind::Block(items) => match self.first_of_items(items) {
+                    Some(first) => first,
                     None => return node,
                 },
                 ExprKind::If { cond, .. } => cond,
@@ -1671,8 +1758,58 @@ impl Ast {
                 | ExprKind::As { expr: inner, .. } => inner,
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::Call { callee, .. } => callee,
-                ExprKind::For(id) => self.for_decl(id).iterable,
+                ExprKind::For(id) => {
+                    let decl = self.for_decl(id);
+                    match decl.head {
+                        ForHead::Each { iterable, .. } => iterable,
+                        ForHead::While {
+                            before,
+                            cond,
+                            after,
+                        } => self
+                            .first_of_items(before)
+                            .or(cond)
+                            .or_else(|| self.first_of_items(after))
+                            .unwrap_or(decl.body),
+                        ForHead::Do { .. } => decl.body,
+                    }
+                }
             };
+        }
+    }
+
+    /// The expression whose subtree the parser allocates first among the
+    /// items `items`, in order: the first item's that has one, the
+    /// position of its path's first index segment if it has one, since a
+    /// path is parsed before its value, and its value otherwise; `None` if
+    /// no item holds an expression, as a `break` without a value holds
+    /// none.
+    fn first_of_items(&self, items: ItemRange) -> Option<ExprId> {
+        self.items(items)
+            .iter()
+            .find_map(|&item| match self.item(item).kind {
+                ItemKind::Rebind { path, value } => Some(
+                    self.path(path)
+                        .iter()
+                        .find_map(PathSegment::position)
+                        .unwrap_or(value),
+                ),
+                kind => kind.value(),
+            })
+    }
+
+    /// The span of the keyword that starts the loop `id`, an
+    /// [`ExprKind::For`]: its `do` for a `do` loop, and its `for` otherwise.
+    /// The span of the whole expression for any other node.
+    #[must_use]
+    pub fn loop_keyword(&self, id: ExprId) -> Span {
+        let expr = self.get(id);
+        match expr.kind {
+            ExprKind::For(for_id) => match self.for_decl(for_id).head {
+                ForHead::Do { .. } => symbol_span("do", expr.span.start),
+                ForHead::Each { .. } | ForHead::While { .. } => symbol_span("for", expr.span.start),
+            },
+            _ => expr.span,
         }
     }
 
@@ -1750,8 +1887,15 @@ impl Annotate for NoAnnotation {
 /// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by
 /// its list and its position. A `for` prints as `(for x ...)`, `x` being
 /// its variable, followed by its iterable, its guard as `(guard EXPR)` if
-/// it has one, and its body; a range as its operator, `..` or `..=`, like
-/// any binary operator. Applied and
+/// it has one, and its body; a condition loop as `(for ...)` followed by
+/// the items before its condition, its condition as `(cond EXPR)` if it
+/// has one, the items after it and its body; a `do` loop as `(do ...)`
+/// followed by its body and its condition as `(cond EXPR)`. A loop's label
+/// follows its keyword as it is written, as in `(for'rows r ...)`. A
+/// `break` or `continue` item prints as `(break @0..5)`, its label after
+/// its keyword, as in `(continue'rows @0..14)`, and its value, if it has
+/// one, after its span. A range prints as its operator, `..` or `..=`,
+/// like any binary operator. Applied and
 /// union types print as written, `Future<Int>`, `Present<Int>` and
 /// `Int | Future<Int>`, a function type that is a member of a union in
 /// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
@@ -1820,6 +1964,13 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("expr")?;
                 value
             }
+            ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+                let keyword = match item.kind {
+                    ItemKind::Break(_) => "break",
+                    _ => "continue",
+                };
+                return self.jump(f, (keyword, jump), item.span, depth);
+            }
         };
         writeln!(f, " @{}", item.span)?;
         // The positions of a `:=` path's index segments, in order, before
@@ -1833,6 +1984,35 @@ impl<A: Annotate> Pretty<'_, A> {
         }
         self.node(f, value, depth + 1)?;
         f.write_str(")")
+    }
+
+    /// Writes the rest of a `break` or `continue` item, `keyword`, whose
+    /// label and value are `jump`, spanning `span`, at `depth`, after its
+    /// `(`: the keyword and the label, as in `break'outer`, its span, and
+    /// its value, if it has one, on a line of its own.
+    fn jump(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        (keyword, jump): (&str, Jump),
+        span: Span,
+        depth: usize,
+    ) -> fmt::Result {
+        f.write_str(keyword)?;
+        self.label(f, jump.label)?;
+        write!(f, " @{span}")?;
+        if let Some(value) = jump.value {
+            f.write_str("\n")?;
+            self.node(f, value, depth + 1)?;
+        }
+        f.write_str(")")
+    }
+
+    /// Writes `label`, if there is one, as it is written: `'` and its name.
+    fn label(&self, f: &mut fmt::Formatter<'_>, label: Option<Label>) -> fmt::Result {
+        match label {
+            Some(label) => write!(f, "'{}", self.ast.names().get(label.name)),
+            None => Ok(()),
+        }
     }
 
     /// Writes a type expression as it is written in source.
@@ -1976,25 +2156,82 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
-    /// The name of the variable of the `for` expression `id`.
-    fn for_name(&self, id: ForId) -> &str {
-        self.ast.names().get(self.ast.for_decl(id).name)
+    /// Writes the head of the loop `id`: its keyword, `for` or `do`, its
+    /// label, if it has one, and, for an iteration, its variable's name, as
+    /// in `for x`, `for'rows r`, `for` and `do'again`.
+    fn for_head(&self, f: &mut fmt::Formatter<'_>, id: ForId) -> fmt::Result {
+        let decl = self.ast.for_decl(id);
+        f.write_str(match decl.head {
+            ForHead::Do { .. } => "do",
+            ForHead::Each { .. } | ForHead::While { .. } => "for",
+        })?;
+        self.label(f, decl.label)?;
+        match decl.head {
+            ForHead::Each { name, .. } => write!(f, " {}", self.ast.names().get(name)),
+            ForHead::While { .. } | ForHead::Do { .. } => Ok(()),
+        }
     }
 
-    /// Writes the iterable, the guard, as `(guard EXPR)`, if there is one,
-    /// and the body of the `for` expression `id`, each on a line of its own
-    /// at `depth`, with a leading newline.
+    /// Writes the parts of the loop `id`, each on a line of its own at
+    /// `depth`, with a leading newline: for an iteration, its iterable, its
+    /// guard, as `(guard EXPR)`, if there is one, and its body; for a
+    /// condition loop, the items before its condition, its condition, as
+    /// `(cond EXPR)`, if it has one, the items after it and its body; and
+    /// for a `do` loop, its body and its condition.
     fn for_parts(&self, f: &mut fmt::Formatter<'_>, id: ForId, depth: usize) -> fmt::Result {
         let decl = self.ast.for_decl(id);
-        f.write_str("\n")?;
-        self.node(f, decl.iterable, depth)?;
-        if let Some(guard) = decl.guard {
-            writeln!(f, "\n{:indent$}(guard", "", indent = depth * 2)?;
-            self.node(f, guard, depth + 1)?;
-            f.write_str(")")?;
+        let (first, guard, cond, last) = match decl.head {
+            ForHead::Each {
+                iterable, guard, ..
+            } => (Some(iterable), guard, None, Some(decl.body)),
+            ForHead::While {
+                before,
+                cond,
+                after,
+            } => {
+                for &item in self.ast.items(before) {
+                    f.write_str("\n")?;
+                    self.item(f, item, depth)?;
+                }
+                if let Some(cond) = cond {
+                    self.wrapped(f, ("cond", cond), depth)?;
+                }
+                for &item in self.ast.items(after) {
+                    f.write_str("\n")?;
+                    self.item(f, item, depth)?;
+                }
+                (Some(decl.body), None, None, None)
+            }
+            ForHead::Do { cond } => (Some(decl.body), None, Some(cond), None),
+        };
+        if let Some(first) = first {
+            f.write_str("\n")?;
+            self.node(f, first, depth)?;
         }
-        f.write_str("\n")?;
-        self.node(f, decl.body, depth)
+        if let Some(guard) = guard {
+            self.wrapped(f, ("guard", guard), depth)?;
+        }
+        if let Some(cond) = cond {
+            self.wrapped(f, ("cond", cond), depth)?;
+        }
+        if let Some(last) = last {
+            f.write_str("\n")?;
+            self.node(f, last, depth)?;
+        }
+        Ok(())
+    }
+
+    /// Writes `expr` wrapped as `(WORD EXPR)`, at `depth`, with a leading
+    /// newline: a loop's guard or condition.
+    fn wrapped(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        (word, expr): (&str, ExprId),
+        depth: usize,
+    ) -> fmt::Result {
+        writeln!(f, "\n{:indent$}({word}", "", indent = depth * 2)?;
+        self.node(f, expr, depth + 1)?;
+        f.write_str(")")
     }
 
     /// Writes the head of the node `expr`: what it is, and for a literal,
@@ -2037,7 +2274,7 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Lazy(_) => f.write_str("lazy"),
             ExprKind::List(_) => f.write_str("list"),
             ExprKind::Index { .. } => f.write_str("index"),
-            ExprKind::For(id) => write!(f, "for {}", self.for_name(id)),
+            ExprKind::For(id) => self.for_head(f, id),
         }
     }
 
@@ -2699,10 +2936,13 @@ mod tests {
             span: Span::new(19, 24),
         });
         let id = builder.push_for(ForDecl {
-            name: x,
-            name_span: Span::new(4, 5),
-            iterable: range,
-            guard: Some(guard),
+            label: None,
+            head: ForHead::Each {
+                name: x,
+                name_span: Span::new(4, 5),
+                iterable: range,
+                guard: Some(guard),
+            },
             body,
         });
         let for_expr = builder.alloc(Expr {

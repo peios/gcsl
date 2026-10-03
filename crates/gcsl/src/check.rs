@@ -42,7 +42,8 @@
 //! `coerce` pushes a type into both branches. The join always exists:
 //! branches that do not agree make a union, which is a warning, not an
 //! error (see [Unions](#unions)). An `if` without `else` is `{}`, and so
-//! must its block be. There is no truthiness: conditions and the operands
+//! must its block be, or `Never` (see [Never](#never)). There is no
+//! truthiness: conditions and the operands
 //! of `and`, `or` and `not` must be `Bool`.
 //!
 //! A node whose operator rejects its operands is reported once and given
@@ -1119,17 +1120,147 @@
 //! variables](#mutable-variables)), and the guard for each element reads
 //! what the body wrote for the elements before it.
 //!
-//! Where no list type is expected, the `for` is `List<B>`, `B` being the
-//! body's type, an untyped integer settled to `Int` as a list literal's
-//! element is. Where a list type `List<X>`, or its either shape, is
-//! expected, the expectation reaches the `for` as it reaches a list literal
-//! (see [Lists](#lists)), and the body is checked against `X` as a
-//! literal's element is (`Checker::fit`): an untyped integer adapts, a body
-//! that fits once awaited is awaited, and a record block is checked field
-//! by field. The `for` is then the list of what the body is once those
-//! awaits have run, the type of every value the evaluator collects, or
-//! `List<X>` if that is not a subtype of `X`, as for a literal. A body
-//! that is a record block makes a list of records.
+//! Every loop, of any form (see [Loops](#loops)), is the list of what its
+//! iterations contribute, `List<E>`, `E` being its *element type*
+//! (`Checker::element_type`): the join of what can contribute, the body's
+//! type and the type of the value of every `break E` and `continue E` for
+//! it (see [`break` and `continue`](#break-and-continue)), treated exactly
+//! as the elements of a list literal are (see [Lists](#lists) and
+//! [Unions](#unions)), in the order they are checked, the body last. Where
+//! no list type is expected, they are joined, untyped integers adapting to
+//! each other and settling to `Int` as a list literal's elements do, and a
+//! widened join is a warning, "the values this loop collects have
+//! different types", at the loop's keyword, labelled at each contributing
+//! site with its type (the body at its value, through blocks, as an `if`'s
+//! branch is shown), with a note naming the loop's type as a list's does.
+//! Where a list type `List<X>`, or its either shape, is expected, the
+//! expectation reaches the loop as it reaches a list literal, and the body
+//! and each value are checked against `X` as a literal's element is
+//! (`Checker::fit`): an untyped integer adapts, a value that fits once
+//! awaited is awaited, and a record block is checked field by field. `E` is
+//! then the join of what they are once those awaits have run, the type of
+//! every value the evaluator collects, or `X` if that is not a subtype of
+//! `X`, as for a literal, and is no warning. A bare `break` or `continue`
+//! contributes nothing, and a contribution of type `Never` joins as
+//! nothing (see [Never](#never)), so `for x in xs { break x }` is
+//! `List<Int>`. If nothing can contribute, as in `for { break }`, `E` is
+//! the expected element type, or `{}` without one, so that such a loop is
+//! unit-like as a statement. A body that can fall off its end contributes
+//! its own value: `for x in xs { if x > 5 { break x } }` is `List<Int |
+//! {}>`, with the warning, which a final `continue` removes. A body that
+//! is a record block makes a list of records.
+//!
+//! # Loops
+//!
+//! Besides the iteration, a loop is a condition loop, `for COND { ... }`,
+//! with a header, `for BEFORE; COND; AFTER { ... }`, or without a condition,
+//! `for { ... }`, the loop whose condition is `true`; or a `do` loop, `do {
+//! ... } for COND`, whose body runs before its condition. Each is an
+//! expression of the type above, with a scope of its own, as an
+//! iteration's: the header's items are declared in it, so they are visible
+//! in the later parts of the header and in the body, an inner block, and not
+//! after the loop. A condition is checked as an `if`'s is, measured and
+//! `Bool` ("`for` conditions are Bool"), once, and narrows nothing; a
+//! `do`'s is checked after the body, outside the body's block, whose
+//! variables it cannot see. The enclosing function's purity governs the
+//! awaits and calls of every part, and a loop is allowed in a pure
+//! function.
+//!
+//! A header's items are checked as a block's (`Checker::header_item`):
+//! before the condition, `let`s, of any form a block allows, and `:=`s;
+//! after it, `:=`s only. A plain `let` there declares a variable checked as
+//! a `let mut`'s is, one slot for its life and its type fixed by its
+//! initialiser or annotation, a dotted or indexed `:=` of it having to keep
+//! that type, but of kind `BindingKind::Header`, which only a `:=` of the
+//! header itself, its own block, may rebind, in its one slot
+//! (`Checker::header_rebind`); one from the body, an inner block, is
+//! "cannot rebind `i` here: it is declared in the header of a `for`",
+//! labelled at the declaration, with a note to write `let mut` in the
+//! header, and one from a function nested in the loop is the error of any
+//! variable declared in an enclosing block. A `let mut` in the header is a
+//! mutable variable, which the body may rebind too (see [Mutable
+//! variables](#mutable-variables)). A `:=` in the header of a variable from
+//! outside the loop follows the rules of any `:=`. Each iteration sees the
+//! variable's slot as the after-items left it, and a closure made in the
+//! body copies it, so it captures that iteration's value.
+//!
+//! # `break` and `continue`
+//!
+//! `break`, `continue`, each with an optional value and label, are items of
+//! a block, never expressions (see [`crate::parser`]). A block whose last
+//! item is one is of type `Never`. Each is for a *target loop*
+//! (`Checker::jump_target`, recorded for lowering in
+//! [`Resolution::jump_target`]): without a label, the innermost loop of the
+//! function being checked whose *body* holds it, a loop's iterable, guard,
+//! condition and header items being outside its body; with one, the loop of
+//! that label whose body holds it. To find it, the checker keeps the loops
+//! whose bodies are being checked on a stack (`LoopFrame`), each with the
+//! number of functions being checked when its body began, so that a loop
+//! outside the innermost function or `lazy` is not a target. Errors, each at
+//! the keyword and its label:
+//!
+//! - no loop holds it: "`break` outside a loop" (or "`continue`");
+//! - only loops outside the innermost function or `lazy` hold it, or have
+//!   its label: "`break` cannot leave a function" (or "a `lazy`"),
+//!   labelled "inside a function here" at the function's keyword, and, for
+//!   a label, "the loop it names is outside it" at the loop's label, with a
+//!   note that the body of a function runs when it is called (a `lazy`'s
+//!   when it is awaited), which may be after the loop has ended;
+//! - no loop it could be for has its label: "no enclosing loop is labelled
+//!   `'L`", at the label;
+//! - it is an item of a record block: "`break` cannot be an item of a
+//!   record block".
+//!
+//! Its value, if any, is what it contributes to its target's list (see
+//! [For](#for)), checked against the target's expected element type if it
+//! has one; where there is no target, it is checked on its own.
+//!
+//! # Labels
+//!
+//! A loop's label, `for'L` or `do'L`, names it for the `break'L` and
+//! `continue'L` in its body. A loop labelled `L` whose body is in that of a
+//! loop labelled `L` of the same function is "label `'L` is already in
+//! use", at the inner label, labelled "the loop around this one is labelled
+//! so" at the outer; a function nested in a loop starts with no labels, and
+//! an unused label is fine. A labelled `break` or `continue` leaves every
+//! loop between it and its target, and its value joins the target's
+//! element type only.
+//!
+//! # Never
+//!
+//! `Never` (see [`crate::types`]) is the type of what never completes: a
+//! block whose last item is a `break` or `continue`, and so anything whose
+//! value is such a block's. Everything else follows from the join, `Never`
+//! being its identity: an `if` both of whose branches are `Never` is
+//! `Never`, `if c { break } else { 5 }` is `Int`, and an `if` without
+//! `else` whose branch is `Never` is `{}`.
+//!
+//! Code that cannot be reached is never an error because of `Never`. Where
+//! a rule asks what an operand *is*, a record for a field access, a list to
+//! index, iterate, spread or count, a function to call, a number for
+//! arithmetic, a `Bool` condition, an operand of `is`, `as`, `await`, a
+//! comparison or an interpolation, an operand of type `Never` satisfies it,
+//! and the operation is `Never` if that operand always runs first: so `{
+//! break } + 1`, `f()({ break })`, `{ break }.a`, `if { break } { 1 } else
+//! { 2 }`, a loop whose iterable or first condition is `Never` and `"{ {
+//! break } }"` are `Never`. An operand that may not run asks nothing that
+//! makes its operation `Never`: the right operand of `and` and `or`, a
+//! `for`'s guard and a `do`'s condition, which comes after the body, the
+//! operation keeping its own type. Where a type is only compared with an
+//! expected one, an argument, an annotated `let`, a list element, a field,
+//! subtyping accepts `Never`, so `f({ continue })` is `f`'s result and `[{
+//! break }]` a `List<Never>`. A variable, a list element or a field may be
+//! of type `Never`, a value that is never there: a `:=` or a dotted `let`
+//! of such a variable, or along a path through such a field, is checked on
+//! its own and declares `Never`, quietly.
+//!
+//! **The unreachable warning.** In a block, the first item after one that
+//! never completes, a `break` or `continue` (not one that is an error, in
+//! a record block or with no loop to leave), or an expression, result,
+//! `let` or `:=` item whose
+//! value is `Never`, is warned about once: "this is never run", labelled
+//! "this always leaves the block" at the earlier item. The block's type is
+//! still its last item's.
 //!
 //! # Unions
 //!
@@ -1252,7 +1383,8 @@
 //!
 //! `if NAME is TYPE { A } else { B }`, the condition being exactly that
 //! through any parentheses, and `NAME`, through any parentheses, a
-//! variable, mutable or not, a parameter, a field or a `for`'s variable,
+//! variable, mutable or not, a parameter, a field, a `for`'s variable or a
+//! variable of a `for` header,
 //! narrows `NAME` in the branches (`Checker::if_condition`). The `is`
 //! writes the value it tests, awaited as the test awaited it, to a slot of
 //! its own, taken for the `if` and free again after it; in `A`, `NAME` is a
@@ -1318,7 +1450,8 @@
 //! # Scopes
 //!
 //! Every block, including the file's own body, is a scope, and so is the
-//! scope a `for` declares its variable in (see [For](#for)). A `let` declares
+//! scope a loop declares its variable, or its header's items, in (see
+//! [For](#for) and [Loops](#loops)). A `let` declares
 //! a variable visible from the next item to the end of its block; a later
 //! `let` of the same name shadows it, in the same block or an inner one. A
 //! `:=` is a new declaration too, allowed only for a name already declared
@@ -1380,8 +1513,9 @@ use std::fmt;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
-    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForId, ItemId, ItemKind, ItemRange, PartRange,
-    PathRange, PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
+    ItemRange, Jump, Label, PartRange, PathRange, PathSegment, SegmentKind, StrPart, TypeExprId,
+    TypeExprKind, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
@@ -1759,6 +1893,9 @@ pub struct Resolution {
     /// The slot each `for` expression's variable is stored in, indexed by
     /// [`ForId`].
     for_slots: Vec<Slot>,
+    /// The loop each `break` and `continue` item is for, indexed by
+    /// [`ItemId`]; `None` for every other item.
+    jumps: Vec<Option<ForId>>,
     /// What was decided for each `is` and `as` expression, by its id; only
     /// a program that has one has entries.
     tests: HashMap<ExprId, TestResolution>,
@@ -1859,6 +1996,15 @@ impl Resolution {
         self.for_slots[id.index()]
     }
 
+    /// The loop that the `break` or `continue` item `id` is for: the
+    /// innermost loop of its function whose body holds it, or the one its
+    /// label names. `None` for any other item, and for an id this table
+    /// does not have.
+    #[must_use]
+    pub fn jump_target(&self, id: ItemId) -> Option<ForId> {
+        self.jumps.get(id.index()).copied().flatten()
+    }
+
     /// What was decided for the `is` or `as` expression `id`: its test's
     /// plan, and where an `is` that narrows stores the value it tests, or
     /// how an `as` names what it tests. `None` for any other expression.
@@ -1927,6 +2073,7 @@ impl Resolution {
             functions: Vec::new(),
             arg_params: Vec::new(),
             for_slots: Vec::new(),
+            jumps: vec![None; items],
             tests: HashMap::new(),
         }
     }
@@ -1976,6 +2123,7 @@ impl Resolution {
             .len()
             .min(self.item_paths.len())
             .min(self.item_spreads.len())
+            .min(self.jumps.len())
     }
 }
 
@@ -2043,6 +2191,11 @@ enum BindingKind {
     /// A function's name for itself, inside its own body, which `:=` may
     /// not rebind either; it has no slot.
     Callee,
+    /// A variable declared by a plain `let` in the header of a `for`: one
+    /// slot for its life, as a mutable variable's, which a `:=` in the
+    /// header, after the condition, rebinds, keeping its type, but no `:=`
+    /// in the body may (see [For](#for)).
+    Header,
     /// The copy of a variable that a branch of `if NAME is TYPE` sees, of
     /// the narrowed type or the remainder, which `:=` may not rebind: the
     /// rebind would change the copy, not the variable it was copied from.
@@ -2100,6 +2253,9 @@ struct Function {
     effect: Effect,
     /// Its `:`, `->>` or `->`, or a `lazy`'s keyword.
     marker: Span,
+    /// Its `fn` or `lazy` keyword, where a `break` or `continue` that would
+    /// leave it points.
+    keyword: Span,
     /// For each parameter, where the body first measures it, in source
     /// order, so far; only a pure function's bare parameters, whose types
     /// are provisional, are ever measured. Empty for a `lazy`.
@@ -2314,6 +2470,33 @@ struct Tested {
     /// Whether the operand is marked to be awaited, which makes the value
     /// tested another than the operand's.
     awaited: bool,
+    /// Whether the operand is of type `Never`, so the test is never run:
+    /// the expression is `Never` too, nothing is planned and nothing
+    /// narrows.
+    unreached: bool,
+}
+
+/// A loop whose body is being checked, in `Checker::loops`, innermost last:
+/// what a `break` or `continue` in the body needs to find it, and what they
+/// contribute to its list (see [`break` and `continue`](#break-and-continue)).
+#[derive(Clone, Debug)]
+struct LoopFrame {
+    /// The loop.
+    id: ForId,
+    /// Its label, if it has one.
+    label: Option<Label>,
+    /// The number of functions being checked when its body began: a
+    /// `break` in a function or `lazy` nested in the body sees more, and
+    /// cannot leave it for this loop.
+    depth: usize,
+    /// The element type expected of the loop, if a list type is, with where
+    /// that is stated and its label: the value of each `break` and
+    /// `continue` for it is checked against it.
+    expected: Option<(TyId, Span, String)>,
+    /// The value of each `break` and `continue` for it, in the order they
+    /// are checked, with what it is: its type, or with an expected type,
+    /// what it is once the awaits marked on it have run.
+    values: Vec<(ExprId, TyId)>,
 }
 
 /// The bindings an `if` whose condition narrows a variable gives its
@@ -2478,6 +2661,18 @@ pub struct Checker<'a> {
     arg_params: Vec<u32>,
     /// The slot of each `for` expression's variable, indexed by [`ForId`].
     for_slots: Vec<Slot>,
+    /// The loop each `break` and `continue` item is for, indexed by
+    /// [`ItemId`]: see [`Resolution::jump_target`].
+    jumps: Vec<Option<ForId>>,
+    /// The loops whose bodies are being checked, outermost first.
+    loops: Vec<LoopFrame>,
+    /// `Never`, interned into the table once, as the checker starts.
+    never: TyId,
+    /// Set by [`Checker::walk_path`] when it stops at a record or list of
+    /// type `Never` along a path, which no value has, so that the update is
+    /// unreachable and its caller declares quietly, with `Never`, rather
+    /// than with `Error`.
+    unreached_path: bool,
     /// Every variable, field and callee in scope, outermost block first.
     bindings: Vec<Binding>,
     /// For each binding of the scope the check started from, its entry of
@@ -2597,6 +2792,7 @@ impl<'a> Checker<'a> {
             }
         }
         let next_slot = u32::try_from(slot_names.len()).unwrap_or(u32::MAX);
+        let never = types.never();
         Self {
             ast,
             types,
@@ -2614,6 +2810,10 @@ impl<'a> Checker<'a> {
             fn_resolutions: vec![FnResolution::default(); ast.fn_count()],
             arg_params: vec![u32::MAX; ast.arg_count()],
             for_slots: vec![Slot::NONE; ast.for_count()],
+            jumps: vec![None; ast.item_count()],
+            loops: Vec::new(),
+            never,
+            unreached_path: false,
             bindings: scope.bindings,
             scope_measured: scope.measured,
             functions: Vec::new(),
@@ -2730,6 +2930,7 @@ impl<'a> Checker<'a> {
                 functions: self.fn_resolutions,
                 arg_params: self.arg_params,
                 for_slots: self.for_slots,
+                jumps: self.jumps,
                 tests: self.tests,
             },
         };
@@ -2769,7 +2970,9 @@ impl<'a> Checker<'a> {
     /// checked against the expected type, which it does only for a list
     /// type or a union (see [`Checker::check_list_expected`]), and has the
     /// type its result has once any await marked on it has run (see
-    /// [`Checker::fit`]).
+    /// [`Checker::fit`]). A `break` or `continue` that is its last item
+    /// makes it `Never`. The first item after one that never completes is
+    /// warned about, "this is never run" (see [Never](#never)).
     fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let items = self.ast.items(body);
         let first_field = items.iter().copied().find(|&id| {
@@ -2779,9 +2982,19 @@ impl<'a> Checker<'a> {
             )
         });
         let mut result = TyId::EMPTY;
+        // The first item that never completes, and whether the item after
+        // it has been warned about.
+        let (mut leaves, mut warned) = (None, false);
         for (index, &id) in items.iter().enumerate() {
             let next = items.get(index + 1).copied();
             let item = *self.ast.item(id);
+            if let (Some(leaves), false) = (leaves, warned) {
+                self.warnings.push(
+                    Diagnostic::warning("this is never run", item.span)
+                        .with_context(leaves, "this always leaves the block"),
+                );
+                warned = true;
+            }
             // The result of a block that is not a record block, checked
             // against what is expected of the block.
             let result_expected = expecting.filter(|_| next.is_none() && first_field.is_none());
@@ -2802,64 +3015,109 @@ impl<'a> Checker<'a> {
                         }
                         None => self.check_expr(value),
                     };
-                    let eq = Span::new(item.span.start, item.span.start + 1);
-                    if let Some(first_field) = first_field {
-                        self.settle(value, ty);
-                        self.errors.push(
-                            Diagnostic::error("a block with fields cannot have a result", eq)
-                                .with_context(
-                                    self.ast.item(first_field).span,
-                                    "first field declared here",
-                                )
-                                .with_note(
-                                    "a block is either a record of its fields or a single \
-                                     value; bind the value with `let` or make it a field",
-                                ),
-                        );
-                        continue;
-                    }
-                    match next {
-                        None => result = ty,
-                        Some(next) => {
-                            self.settle(value, ty);
-                            self.errors.push(
-                                Diagnostic::error(
-                                    "the result must be the last item in its block",
-                                    eq,
-                                )
-                                .with_context(self.ast.item(next).span, "this item comes after it"),
-                            );
-                        }
+                    if self.result_item(item.span, (value, ty), (first_field, next)) {
+                        result = ty;
                     }
                 }
                 ItemKind::Expr(value) => {
                     // In a record block, even the final expression is a
                     // statement.
                     let is_result = next.is_none() && first_field.is_none();
-                    let ty = match result_expected {
-                        Some(expected) => {
-                            self.fit(value, expected.ty, (expected.context, expected.why))
-                        }
-                        None if !is_result && self.is_empty_list(value) => {
-                            // A statement `[]` holds nothing, and is the
-                            // unit-like `List<{}>`.
-                            let ty = self.types.list(TyId::EMPTY);
-                            self.expr_types[value.index()] = ty;
-                            ty
-                        }
-                        None => self.check_expr(value),
-                    };
+                    let ty = self.expression_item(value, is_result, result_expected);
                     if is_result {
                         result = ty;
                     } else {
                         self.check_statement(value, ty);
                     }
                 }
+                ItemKind::Break(jump) | ItemKind::Continue(jump) => {
+                    self.check_jump((id, item), jump, first_field);
+                    if next.is_none() && first_field.is_none() {
+                        result = self.never;
+                    }
+                }
+            }
+            if leaves.is_none() && self.never_completes(id, item.kind) {
+                leaves = Some(item.span);
             }
         }
         match first_field {
             Some(_) => self.record_type(expecting),
             None => result,
+        }
+    }
+
+    /// Checks the placement of the result item spanning `span`, `= VALUE`,
+    /// `value` being of type `ty`, in a block whose first field, if it has
+    /// one, is `first_field`, and whose item after it, if any, is `next`:
+    /// it cannot be in a record block, and it must be the last item.
+    /// Returns whether it is the block's result; otherwise, its value is
+    /// settled and the error reported.
+    fn result_item(
+        &mut self,
+        span: Span,
+        (value, ty): (ExprId, TyId),
+        (first_field, next): (Option<ItemId>, Option<ItemId>),
+    ) -> bool {
+        let eq = Span::new(span.start, span.start + 1);
+        if let Some(first_field) = first_field {
+            self.settle(value, ty);
+            self.errors.push(
+                Diagnostic::error("a block with fields cannot have a result", eq)
+                    .with_context(self.ast.item(first_field).span, "first field declared here")
+                    .with_note(
+                        "a block is either a record of its fields or a single value; bind the \
+                         value with `let` or make it a field",
+                    ),
+            );
+            return false;
+        }
+        let Some(next) = next else {
+            return true;
+        };
+        self.settle(value, ty);
+        self.errors.push(
+            Diagnostic::error("the result must be the last item in its block", eq)
+                .with_context(self.ast.item(next).span, "this item comes after it"),
+        );
+        false
+    }
+
+    /// Checks the expression item `value`, which is its block's result if
+    /// `is_result`, and a statement otherwise, against what is expected of
+    /// the block's result, if anything is, and returns its type.
+    fn expression_item(
+        &mut self,
+        value: ExprId,
+        is_result: bool,
+        expected: Option<Expecting<'_>>,
+    ) -> TyId {
+        match expected {
+            Some(expected) => self.fit(value, expected.ty, (expected.context, expected.why)),
+            None if !is_result && self.is_empty_list(value) => {
+                // A statement `[]` holds nothing, and is the unit-like
+                // `List<{}>`.
+                let ty = self.types.list(TyId::EMPTY);
+                self.expr_types[value.index()] = ty;
+                ty
+            }
+            None => self.check_expr(value),
+        }
+    }
+
+    /// Whether the item `id`, of `kind`, checked, never completes, so that
+    /// no item after it in its block runs: a `break` or a `continue`, but
+    /// one that is an error and so has no loop to leave for, and an
+    /// expression item, a result, a `let` or a `:=` whose value is of type
+    /// `Never`.
+    fn never_completes(&self, id: ItemId, kind: ItemKind) -> bool {
+        match kind {
+            ItemKind::Break(_) | ItemKind::Continue(_) => self.jumps[id.index()].is_some(),
+            ItemKind::Expr(value)
+            | ItemKind::Result(value)
+            | ItemKind::Let { value, .. }
+            | ItemKind::Rebind { value, .. } => self.expr_types[value.index()] == self.never,
+            ItemKind::Field { .. } | ItemKind::Spread(_) => false,
         }
     }
 
@@ -3150,7 +3408,14 @@ impl<'a> Checker<'a> {
             self.spreads = BlockSpreads::Rejected;
             return;
         }
-        let Some(fields) = self.types.record_fields(ty) else {
+        // An operand of type `Never` never gives a record: it spreads
+        // nothing, and nothing after it runs.
+        let fields = if ty == self.never {
+            Some(&[][..])
+        } else {
+            self.types.record_fields(ty)
+        };
+        let Some(fields) = fields else {
             let shown = self.in_message(ty);
             let label = format!("this is {}", self.in_label(ty));
             self.errors.push(
@@ -3887,6 +4152,12 @@ impl<'a> Checker<'a> {
                 self.check_mutable_rebind(id, segments, (index, binding), value);
                 return;
             }
+            Some((index, binding)) if binding.kind == BindingKind::Header => {
+                if self.header_rebind(id, segments, (index, binding), value) {
+                    return;
+                }
+                None
+            }
             Some((_, binding)) if binding.kind == BindingKind::Narrowed => {
                 let error = narrowed_rebind_error(text, name_span, binding);
                 self.errors.push(error);
@@ -3912,27 +4183,10 @@ impl<'a> Checker<'a> {
                 None
             }
         };
-        let Some((index, target)) = target.filter(|(_, target)| target.ty != TyId::ERROR) else {
-            // The rebind was rejected (or the variable is already erroneous):
-            // check the positions and the value on their own and declare the
-            // name with what it has, so later uses do not cascade. The path
-            // of a variable that may be a future is not walked: awaiting it
-            // would be reported of a variable that cannot be rebound anyway.
-            // Nor is one with an index segment, whose walk would check the
-            // positions again.
-            self.check_positions_alone(segments);
-            let ty = self.check_alone(value);
-            let lazy = self.lookup(name).is_some_and(|(_, binding)| {
-                binding.ty != TyId::ERROR && self.types.laziness(binding.ty) != Laziness::Present
-            });
-            let indexed = segments.iter().any(|segment| segment.position().is_some());
-            if segments.len() == 1 {
-                self.declare(name, ty, id, BindingKind::Variable);
-            } else if lazy || indexed {
-                self.declare(name, TyId::ERROR, id, BindingKind::Variable);
-            } else {
-                self.declare_update(id, segments, ty);
-            }
+        let Some((index, target)) =
+            target.filter(|(_, target)| target.ty != TyId::ERROR && target.ty != self.never)
+        else {
+            self.rejected_rebind(id, (segments, name), value, target.map(|(_, t)| t.ty));
             return;
         };
         // `:=` is assignment-compatible: the value must fit the variable's
@@ -3953,8 +4207,114 @@ impl<'a> Checker<'a> {
             self.finish_update(id, segments, (Some((index, target)), base), leaf);
         } else {
             self.check_alone(value);
-            self.declare(name, TyId::ERROR, id, BindingKind::Variable);
+            // A path through a value of type `Never` is never walked.
+            let ty = if std::mem::take(&mut self.unreached_path) {
+                self.never
+            } else {
+                TyId::ERROR
+            };
+            self.declare(name, ty, id, BindingKind::Variable);
         }
+    }
+
+    /// Checks `PATH := VALUE`, the item `id` whose path is `segments`, of
+    /// `target`, at `index` in `bindings`, a variable a plain `let` of a
+    /// `for` header declared (see [For](#for)): from the header, its own
+    /// block, and of its own function, it is a rebind of the variable in
+    /// its one slot, keeping its type, as a mutable variable's is (see
+    /// [`Checker::check_mutable_rebind`]), and this returns `true`;
+    /// otherwise it is reported (see [`Checker::header_rebind_error`]), and
+    /// this returns `false`, the caller checking the rest as for any
+    /// rejected `:=`.
+    fn header_rebind(
+        &mut self,
+        id: ItemId,
+        segments: &[PathSegment],
+        (index, target): (usize, Binding),
+        value: ExprId,
+    ) -> bool {
+        let own_function = self
+            .functions
+            .last()
+            .is_none_or(|function| index >= function.bindings_start);
+        if index >= self.block_start && own_function {
+            self.check_mutable_rebind(id, segments, (index, target), value);
+            return true;
+        }
+        let name_span = segments.first().map_or(Span::new(0, 0), |first| first.span);
+        let error = self.header_rebind_error(name_span, (index, target));
+        self.errors.push(error);
+        false
+    }
+
+    /// Checks the `:=` item `id`, whose path is `segments`, of the variable
+    /// `name`, with the value `value`, which was rejected, or whose
+    /// variable, of type `ty`, is erroneous or `Never`: the positions and
+    /// the value are checked on their own, and the name declared with what
+    /// it has, so later uses do not cascade. The path of a variable that may
+    /// be a future is not walked: awaiting it would be reported of a
+    /// variable that cannot be rebound anyway. Nor is one with an index
+    /// segment, whose walk would check the positions again. A variable of
+    /// type `Never` never holds a value, so the `:=` is never run, and the
+    /// name is declared `Never` again, so that nothing after it is an
+    /// error.
+    fn rejected_rebind(
+        &mut self,
+        id: ItemId,
+        (segments, name): (&[PathSegment], Name),
+        value: ExprId,
+        ty: Option<TyId>,
+    ) {
+        self.check_positions_alone(segments);
+        let value_ty = self.check_alone(value);
+        if ty == Some(self.never) {
+            self.declare(name, self.never, id, BindingKind::Variable);
+            return;
+        }
+        let lazy = self.lookup(name).is_some_and(|(_, binding)| {
+            binding.ty != TyId::ERROR && self.types.laziness(binding.ty) != Laziness::Present
+        });
+        let indexed = segments.iter().any(|segment| segment.position().is_some());
+        if segments.len() == 1 {
+            self.declare(name, value_ty, id, BindingKind::Variable);
+        } else if lazy || indexed {
+            self.declare(name, TyId::ERROR, id, BindingKind::Variable);
+        } else {
+            self.declare_update(id, segments, value_ty);
+        }
+    }
+
+    /// The error for a `:=`, whose name is at `name_span`, of the variable
+    /// `binding`, at `index` in `bindings`, a plain `let` of a `for` header,
+    /// from outside the header: "cannot rebind `i` here: it is declared in
+    /// the header of a `for`", labelled at the declaration, with a note
+    /// that a `let mut` in the header can be rebound from the body; or, from
+    /// a function or a `lazy` nested in the variable's own, the error for
+    /// any variable declared in an enclosing block.
+    fn header_rebind_error(
+        &self,
+        name_span: Span,
+        (index, binding): (usize, Binding),
+    ) -> Diagnostic {
+        let outside = self
+            .functions
+            .last()
+            .is_some_and(|function| index < function.bindings_start);
+        if outside {
+            return self.enclosing_rebind_error(name_span, (index, binding));
+        }
+        let text = self.ast.names().get(binding.name);
+        let mut error = Diagnostic::error(
+            format!("cannot rebind `{text}` here: it is declared in the header of a `for`"),
+            name_span,
+        );
+        if let Some(declared) = binding.declared {
+            error = error.with_context(declared, "declared here");
+        }
+        error.with_note(format!(
+            "a variable of a `for` header is rebound in the header, after the condition; declare \
+             it with `let mut {text} = ...` in the header to rebind it from the body too"
+        ))
     }
 
     /// Checks `PATH := VALUE`, the item `id` whose path is `segments`, of
@@ -3994,9 +4354,14 @@ impl<'a> Checker<'a> {
             self.check_alone(value);
             return;
         }
-        if target.ty == TyId::ERROR {
+        if target.ty == TyId::ERROR || target.ty == self.never {
             self.check_positions_alone(segments);
             self.check_alone(value);
+            // A variable of type `Never` never holds a value, so the `:=`
+            // is never run, but is lowered as any other is.
+            if target.ty == self.never {
+                self.item_slots[id.index()] = target.slot;
+            }
             return;
         }
         if segments.len() == 1 {
@@ -4010,6 +4375,9 @@ impl<'a> Checker<'a> {
         let base = self.path_types.len();
         let Some(leaf) = self.rebind_leaf(segments, (target.ty, index)) else {
             self.check_alone(value);
+            if std::mem::take(&mut self.unreached_path) {
+                self.item_slots[id.index()] = target.slot;
+            }
             return;
         };
         self.check_expr_expecting(value, leaf, path_span(segments), leaf_label(segments));
@@ -4219,6 +4587,14 @@ impl<'a> Checker<'a> {
                 root = measured;
             }
             let record = self.types.strip(measured);
+            if record == self.never {
+                // No value has it, so the update is never run: the path
+                // stops quietly, and the caller declares `Never`.
+                self.path_types.truncate(base);
+                self.check_positions_alone(&segments[index..]);
+                self.unreached_path = true;
+                return None;
+            }
             let inner = match position {
                 None if self.types.is_record(record) => {
                     next.name().map(|name| self.types.field(record, name))
@@ -4356,11 +4732,17 @@ impl<'a> Checker<'a> {
             return;
         };
         let base = self.path_types.len();
-        let found = self.lookup(name);
+        let mut found = self.lookup(name);
         let mut failed = leaf_ty == TyId::ERROR;
         if let Some((index, old)) = found {
             // An erroneous variable has been reported already.
             failed |= old.ty == TyId::ERROR || self.walk_path(segments, (old.ty, index)).is_none();
+        }
+        // A path through a value of type `Never` is never walked: the
+        // update builds its records from nothing, as if no variable were in
+        // scope, and is never run.
+        if std::mem::take(&mut self.unreached_path) {
+            (failed, found) = (leaf_ty == TyId::ERROR, None);
         }
         let leaf_ty = if failed { TyId::ERROR } else { leaf_ty };
         self.finish_update(id, segments, (found, base), leaf_ty);
@@ -4576,6 +4958,7 @@ impl<'a> Checker<'a> {
             BindingKind::Callee => VarRef::Callee,
             BindingKind::Variable
             | BindingKind::Mutable
+            | BindingKind::Header
             | BindingKind::Field
             | BindingKind::Narrowed => VarRef::Local(binding.slot),
         };
@@ -5678,6 +6061,9 @@ impl<'a> Checker<'a> {
                 }
                 if then_ty == TyId::ERROR || else_ty == TyId::ERROR {
                     TyId::ERROR
+                } else if self.expr_types[cond.index()] == self.never {
+                    // A condition of type `Never` never picks a branch.
+                    self.never
                 } else {
                     // What the branches hold has a join that fits, or the
                     // expected type describes both. Each branch fits what
@@ -5854,6 +6240,7 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Is { expr: operand, ty } => match self.check_test(id, operand, ty, "is") {
+                Some(tested) if tested.unreached => self.never,
                 Some(_) => TyId::BOOL,
                 None => TyId::ERROR,
             },
@@ -5862,7 +6249,9 @@ impl<'a> Checker<'a> {
                 .map_or(TyId::ERROR, |tested| tested.narrowed),
             ExprKind::Fn(function) => self.check_fn(id, function),
             ExprKind::Call { callee, args } => self.check_call(id, callee, args),
-            ExprKind::Lazy(function) => self.check_lazy(function),
+            ExprKind::Lazy(function) => {
+                self.check_lazy(function, symbol_span("lazy", expr.span.start))
+            }
             ExprKind::List(elements) => self.check_list(id, elements),
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, None),
@@ -5887,6 +6276,12 @@ impl<'a> Checker<'a> {
         }
         let lhs_ty = self.measure(lhs, lhs_ty);
         let rhs_ty = self.measure(rhs, rhs_ty);
+        // The right operand of `and` and `or` may not run, so only the left
+        // makes them `Never`.
+        let logic = matches!(op, BinaryOp::And | BinaryOp::Or);
+        if lhs_ty == self.never || (rhs_ty == self.never && !logic) {
+            return self.unreached_operands(lhs, rhs);
+        }
         match op {
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
                 self.arithmetic(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
@@ -5992,7 +6387,22 @@ impl<'a> Checker<'a> {
         }
         let lhs_ty = self.measure_deep(lhs, lhs_ty);
         let rhs_ty = self.measure_deep(rhs, rhs_ty);
+        if lhs_ty == self.never || rhs_ty == self.never {
+            return self.unreached_operands(lhs, rhs);
+        }
         self.comparison(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
+    }
+
+    /// The type of a binary operator one of whose operands, `lhs` and
+    /// `rhs`, which always runs, is of type `Never`: `Never`, the operator
+    /// never being applied, so asking nothing of either operand; an untyped
+    /// integer among them settles to `Int`.
+    fn unreached_operands(&mut self, lhs: ExprId, rhs: ExprId) -> TyId {
+        for operand in [lhs, rhs] {
+            let ty = self.expr_types[operand.index()];
+            self.settle(operand, ty);
+        }
+        self.never
     }
 
     /// Types a `lazy` expression, whose body is function `function`:
@@ -6001,8 +6411,9 @@ impl<'a> Checker<'a> {
     /// enclosing scopes as a closure does, and the expression's type is
     /// `Future<T>`, `T` being the body's type with an untyped integer
     /// settled to `Int`, stripped (see [`TypeTable::future`]: `lazy lazy 1`
-    /// is `Future<Int>`); or `Error` if the body is erroneous.
-    fn check_lazy(&mut self, function: FnId) -> TyId {
+    /// is `Future<Int>`); or `Error` if the body is erroneous. The `lazy`
+    /// keyword is at `keyword`.
+    fn check_lazy(&mut self, function: FnId, keyword: Span) -> TyId {
         // A function in the body must not see a name meant for another.
         self.callee_name = None;
         let decl = *self.ast.fn_decl(function);
@@ -6015,6 +6426,7 @@ impl<'a> Checker<'a> {
             captures: Vec::new(),
             effect: Effect::Impure,
             marker: decl.marker,
+            keyword,
             demanded: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
@@ -6114,6 +6526,7 @@ impl<'a> Checker<'a> {
             captures: Vec::new(),
             effect: decl.effect,
             marker: decl.marker,
+            keyword: symbol_span("fn", self.ast.get(id).span.start),
             demanded: vec![None; params.len()],
         });
         (self.next_slot, self.frame_size) = (0, 0);
@@ -6724,6 +7137,13 @@ impl<'a> Checker<'a> {
         let (callee_ty, callback) = self.check_callee(callee);
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
+            // A callee of type `Never` is never there to call.
+            if callee_ty == self.never {
+                for arg in self.ast.args(args) {
+                    self.check_alone(arg.value);
+                }
+                return self.never;
+            }
             if callee_ty != TyId::ERROR {
                 let callee_ty = self.settle(callee, callee_ty);
                 let message = format!("cannot call a value of type {}", self.in_message(callee_ty));
@@ -6854,6 +7274,13 @@ impl<'a> Checker<'a> {
         let ty = self.measure(list, found);
         if ty == TyId::ERROR {
             return TyId::ERROR;
+        }
+        // A list of type `Never` is never there to count.
+        if ty == self.never {
+            self.expr_types[callee.index()] =
+                self.types
+                    .fn_type([(None, ty)], TyId::INT, Builtin::Len.effect());
+            return self.never;
         }
         if self.element_of(ty).is_none() {
             let shown = self.in_message(ty);
@@ -7523,8 +7950,9 @@ impl<'a> Checker<'a> {
         name: Name,
     ) -> TyId {
         let record_ty = self.measure(record, record_ty);
-        if record_ty == TyId::ERROR {
-            return TyId::ERROR;
+        // A record of type `Never` is never there to read.
+        if record_ty == TyId::ERROR || record_ty == self.never {
+            return record_ty;
         }
         if let Some(ty) = self.field_of(record_ty, name) {
             return ty;
@@ -7594,6 +8022,12 @@ impl<'a> Checker<'a> {
         if let Some(next_slot) = narrowing.next_slot {
             self.next_slot = next_slot;
         }
+        // A condition of type `Never` never picks a branch.
+        if self.expr_types[cond.index()] == self.never {
+            self.settle(then, then_ty);
+            self.settle(else_, else_ty);
+            return self.never;
+        }
         if has_else {
             self.branches((then, then_ty), (else_, else_ty))
         } else {
@@ -7625,11 +8059,14 @@ impl<'a> Checker<'a> {
             return Narrowing::default();
         };
         let tested = self.check_test(test, operand, ty, "is");
-        let cond_ty = if tested.is_some() {
-            TyId::BOOL
-        } else {
-            TyId::ERROR
+        let cond_ty = match tested {
+            Some(tested) if tested.unreached => self.never,
+            Some(_) => TyId::BOOL,
+            None => TyId::ERROR,
         };
+        // A test of a value of type `Never` is never run, and narrows
+        // nothing.
+        let tested = tested.filter(|tested| !tested.unreached);
         let mut node = cond;
         loop {
             self.expr_types[node.index()] = cond_ty;
@@ -7696,6 +8133,7 @@ impl<'a> Checker<'a> {
             binding.kind,
             BindingKind::Variable
                 | BindingKind::Mutable
+                | BindingKind::Header
                 | BindingKind::Field
                 | BindingKind::Narrowed
         )
@@ -7763,6 +8201,16 @@ impl<'a> Checker<'a> {
         if target == TyId::ERROR || found == TyId::ERROR || !self.testable(target, ty, keyword) {
             return None;
         }
+        // An operand of type `Never` is never there to test.
+        if found == self.never {
+            return Some(Tested {
+                narrowed: self.never,
+                remainder: None,
+                whole: false,
+                awaited: false,
+                unreached: true,
+            });
+        }
         let present = self.types.present(found);
         let present_members = self.flat_members(present);
         let plan = self.types.test_plan(Some(&present_members), target);
@@ -7808,6 +8256,7 @@ impl<'a> Checker<'a> {
             remainder,
             whole,
             awaited,
+            unreached: false,
         })
     }
 
@@ -7924,8 +8373,9 @@ impl<'a> Checker<'a> {
     /// the operand's stripped of every future layer at its top; on an
     /// operand that is present it does nothing.
     fn unary(&mut self, op: UnaryOp, op_span: Span, (operand, operand_ty): (ExprId, TyId)) -> TyId {
-        if operand_ty == TyId::ERROR {
-            return TyId::ERROR;
+        // An operand of type `Never` never gives the operator a value.
+        if operand_ty == TyId::ERROR || operand_ty == self.never {
+            return operand_ty;
         }
         if op == UnaryOp::Await {
             return self.explicit_await(op_span, operand, operand_ty);
@@ -8329,6 +8779,9 @@ impl<'a> Checker<'a> {
         match self.claim(then, then_ty) {
             TyId::EMPTY => TyId::EMPTY,
             TyId::ERROR => TyId::ERROR,
+            // A block that never completes gives no value to drop: the
+            // `if` is `{}`, as the `else` it lacks is.
+            ty if ty == self.never => TyId::EMPTY,
             _ => {
                 let then_ty = self.settle(then, then_ty);
                 let label = format!("this branch is {}", self.in_label(then_ty));
@@ -8357,8 +8810,11 @@ impl<'a> Checker<'a> {
             // its `repr` form. Once some type's values cannot be, it is
             // reported here as "cannot display".
             let found = self.settle(expr, found);
-            if self.measure_deep(expr, found) == TyId::ERROR {
-                ty = TyId::ERROR;
+            match self.measure_deep(expr, found) {
+                TyId::ERROR => ty = TyId::ERROR,
+                // A value of type `Never` is never there to show.
+                found if found == self.never && ty != TyId::ERROR => ty = self.never,
+                _ => {}
             }
         }
         ty
@@ -8418,7 +8874,12 @@ impl<'a> Checker<'a> {
                 joined = Some(ty);
                 continue;
             };
-            let earlier = list.get(..index).unwrap_or_default();
+            let earlier = list
+                .get(..index)
+                .unwrap_or_default()
+                .iter()
+                .filter(|earlier| earlier.spread.is_none())
+                .map(|earlier| earlier.value);
             let (ty, widens, sides) = self.join_element((earlier, element.value), so_far, ty);
             joined = Some(ty);
             if widens && widened.is_none() {
@@ -8443,19 +8904,20 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    /// The join of `so_far`, the join of the types of the elements
-    /// `earlier` of a list literal, with `ty`, the type of the element after
-    /// them, whose expression is `value`, a spread's being its list's
-    /// element type: the join, whether it is widened, and the two types as
-    /// they were joined. As for an `if`'s branches, an untyped integer, or
-    /// the untyped elements so far, adapt to the other side's `Int` or
-    /// `Float` once stripped, or to `Int`; and if the two types differ, each
+    /// The join of `so_far`, the join of the types of the expressions
+    /// `earlier`, the elements of a list literal but its spreads or the
+    /// values a loop collects, with `ty`, the type of the one after them,
+    /// whose expression is `value`, a spread's being its list's element
+    /// type: the join, whether it is widened, and the two types as they
+    /// were joined. As for an `if`'s branches, an untyped integer, or the
+    /// untyped values so far, adapt to the other side's `Int` or `Float`
+    /// once stripped, or to `Int`; and if the two types differ, each
     /// parameter of a claimable function (see [`Checker::claimable`]) whose
     /// provisional type is in either is measured, conservatively, at the
-    /// element.
+    /// value.
     fn join_element(
         &mut self,
-        (earlier, value): (&[Element], ExprId),
+        (earlier, value): (impl Iterator<Item = ExprId>, ExprId),
         so_far: TyId,
         ty: TyId,
     ) -> (TyId, bool, (TyId, TyId)) {
@@ -8466,9 +8928,7 @@ impl<'a> Checker<'a> {
         if so_far == TyId::UNTYPED_INT {
             so_far = self.numeric_target(ty);
             for earlier in earlier {
-                if earlier.spread.is_none() {
-                    self.coerce(earlier.value, so_far);
-                }
+                self.coerce(earlier, so_far);
             }
         }
         if ty == TyId::UNTYPED_INT {
@@ -8558,6 +9018,11 @@ impl<'a> Checker<'a> {
         }
         if self.types.list_element(ty).is_some() {
             return Some(ty);
+        }
+        // A list of type `Never` is never there to spread: as a list of
+        // `Never`, it adds nothing to the join of the elements.
+        if ty == self.never {
+            return Some(self.types.list(ty));
         }
         let shown = self.in_message(ty);
         let label = format!("this is {}", self.in_label(ty));
@@ -8699,8 +9164,12 @@ impl<'a> Checker<'a> {
         let list_ty = self.settle(list, list_ty);
         let list_ty = self.measure(list, list_ty);
         let index_fits = self.check_position(index);
-        if list_ty == TyId::ERROR {
-            return TyId::ERROR;
+        // A list or a position of type `Never` is never there to read.
+        if list_ty == TyId::ERROR || list_ty == self.never {
+            return list_ty;
+        }
+        if self.expr_types[index.index()] == self.never {
+            return self.never;
         }
         let Some(element) = self.element_of(list_ty) else {
             let expr = self.ast.get(id);
@@ -8737,6 +9206,8 @@ impl<'a> Checker<'a> {
             }
             TyId::INT => true,
             TyId::ERROR => false,
+            // A position of type `Never` is never there to use.
+            ty if ty == self.never => true,
             _ => {
                 let shown = self.in_message(index_ty);
                 let label = format!("this is {}", self.in_label(index_ty));
@@ -8754,21 +9225,20 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Types the `for` expression `id`, whose details are `for_id` (see the
-    /// module documentation). The iterable is measured at the top and must
-    /// be a list, "cannot iterate over a value of type T: it is not a list",
-    /// its elements not measured. The variable is declared, with the
-    /// element type as it is, in a scope of its own, holding the guard and
-    /// the body, in the next free slot of the current frame, which it
-    /// leaves when the `for` ends. The guard is checked as an `if`'s
-    /// condition is. With `element`, the element type of the list type
-    /// expected of the `for`, with where that is stated and its label, the
-    /// body is checked against it as a list literal's element is (see
-    /// [`Checker::fit`]), and the type is the list of what the body is once
-    /// any await marked on it has run, or of `element` should that not fit
-    /// it. Without, the type is the list of the body's type, an untyped
-    /// integer settled to `Int`. `Error` if the iterable or the body is
-    /// erroneous.
+    /// Types the loop `id`, whose details are `for_id` (see the module
+    /// documentation, [For](#for) and [Loops](#loops)). The loop has a
+    /// scope of its own, as a block has, which holds an iteration's
+    /// variable, or a header's items, and the body; a `do` loop's condition
+    /// is outside its body's block. The body is checked with the loop on
+    /// [`Checker::loops`], so that the `break`s and `continue`s in it find
+    /// it, and what they and the body contribute make the loop's element
+    /// type (see [`Checker::element_type`]). With `element`, the element
+    /// type of the list type expected of the loop, with where that is
+    /// stated and its label, the body and each value are checked against it
+    /// as a list literal's elements are (see [`Checker::fit`]). The loop is
+    /// the list of its element type, or `Never` if what always runs first,
+    /// an iterable or a condition before the first iteration, is; `Error`
+    /// if the iterable, the body or a value is erroneous.
     fn check_for(
         &mut self,
         id: ExprId,
@@ -8776,44 +9246,413 @@ impl<'a> Checker<'a> {
         element: Option<(TyId, (Span, &str))>,
     ) -> TyId {
         let decl = *self.ast.for_decl(for_id);
-        let iterable = self.check_expr(decl.iterable);
-        let iterable = self.settle(decl.iterable, iterable);
-        let iterable = self.measure(decl.iterable, iterable);
-        let item = self.iterated(decl.iterable, iterable);
-        // The variable's scope, holding the guard and the body, as a block
-        // holds its items.
         let outer = (self.block_start, self.fields_start, self.next_slot);
         let outer_spreads = std::mem::take(&mut self.spreads);
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
-        let slot =
-            self.declare_binding(decl.name, item, Some(decl.name_span), BindingKind::Variable);
-        self.for_slots[for_id.index()] = slot;
-        if let Some(guard) = decl.guard {
-            let expr = self.ast.get(id);
-            let keyword = expr.keyword_span().unwrap_or(expr.span);
-            let ty = self.check_expr(guard);
-            self.expect(guard, ty, TyId::BOOL, keyword, "`for` guards are Bool");
-        }
-        let body = if let Some((element, (context, why))) = element {
-            let held = self.fit(decl.body, element, (context, why));
-            if held == TyId::ERROR || self.types.is_subtype(held, element) {
-                held
-            } else {
-                element
-            }
-        } else {
-            let ty = self.check_expr(decl.body);
-            self.settle(decl.body, ty)
+        let head = match decl.head {
+            ForHead::Each {
+                name,
+                name_span,
+                iterable,
+                guard,
+            } => self.each_head(id, for_id, (name, name_span), (iterable, guard)),
+            ForHead::While {
+                before,
+                cond,
+                after,
+            } => self.while_head(id, before, cond, after),
+            ForHead::Do { .. } => TyId::EMPTY,
         };
+        let expected = element.map(|(element, (context, why))| (element, context, why.to_owned()));
+        self.enter_loop(for_id, decl.label, expected);
+        let body = match element {
+            Some((element, context)) => self.fit(decl.body, element, context),
+            None => self.check_expr(decl.body),
+        };
+        let frame = self.loops.pop();
+        if let ForHead::Do { cond } = decl.head {
+            // Outside the body's block, and asked only after the body: it
+            // makes the loop `Never` in no case.
+            self.loop_condition(id, cond);
+        }
         self.bindings.truncate(self.block_start);
         (self.block_start, self.fields_start, self.next_slot) = outer;
         self.spreads = outer_spreads;
-        if item == TyId::ERROR || body == TyId::ERROR {
+        let values = frame.map(|frame| frame.values).unwrap_or_default();
+        let collected = self.element_type(id, (decl.body, body), values, element);
+        if head == TyId::ERROR || collected == TyId::ERROR {
             TyId::ERROR
+        } else if head == self.never {
+            self.never
         } else {
-            self.types.list(body)
+            self.types.list(collected)
         }
+    }
+
+    /// Checks the head of the iteration `id`, whose details are `for_id`,
+    /// in the loop's scope: the iterable, outside it, measured at the top,
+    /// which must be a list, "cannot iterate over a value of type T: it is
+    /// not a list", its elements not measured; the variable `name`, written
+    /// at `name_span`, declared with the element type as it is in the next
+    /// free slot of the current frame, which the loop leaves when it ends;
+    /// and the guard, if any, checked as an `if`'s condition is. Returns
+    /// `Error` if the iterable is erroneous, `Never` if it is of that type,
+    /// the variable then being `Never` too, and `{}` otherwise.
+    fn each_head(
+        &mut self,
+        id: ExprId,
+        for_id: ForId,
+        (name, name_span): (Name, Span),
+        (iterable, guard): (ExprId, Option<ExprId>),
+    ) -> TyId {
+        let ty = self.check_expr(iterable);
+        let ty = self.settle(iterable, ty);
+        let ty = self.measure(iterable, ty);
+        // An iterable of type `Never` is never there to iterate over.
+        let item = if ty == self.never {
+            self.never
+        } else {
+            self.iterated(iterable, ty)
+        };
+        let slot = self.declare_binding(name, item, Some(name_span), BindingKind::Variable);
+        self.for_slots[for_id.index()] = slot;
+        if let Some(guard) = guard {
+            let keyword = self.ast.loop_keyword(id);
+            let ty = self.check_expr(guard);
+            self.expect(guard, ty, TyId::BOOL, keyword, "`for` guards are Bool");
+        }
+        match item {
+            TyId::ERROR => TyId::ERROR,
+            item if item == self.never => item,
+            _ => TyId::EMPTY,
+        }
+    }
+
+    /// Checks the header of the condition loop `id`, in the loop's scope:
+    /// the items `before` its condition, in order, the condition `cond`, if
+    /// it has one (see [`Checker::loop_condition`]), and the items `after`
+    /// it. A plain `let` there declares a variable that only the header may
+    /// rebind (see [`Checker::header_item`]). Returns `Never` if the
+    /// condition, which runs before the first iteration, is of that type,
+    /// and `{}` otherwise.
+    fn while_head(
+        &mut self,
+        id: ExprId,
+        before: ItemRange,
+        cond: Option<ExprId>,
+        after: ItemRange,
+    ) -> TyId {
+        for &item in self.ast.items(before) {
+            self.header_item(item);
+        }
+        let cond = cond.map(|cond| self.loop_condition(id, cond));
+        for &item in self.ast.items(after) {
+            self.header_item(item);
+        }
+        match cond {
+            Some(cond) if cond == self.never => cond,
+            _ => TyId::EMPTY,
+        }
+    }
+
+    /// Checks the condition `cond` of the loop `id`, which is checked once
+    /// and evaluated before every iteration, or after each for a `do` loop:
+    /// as an `if`'s condition is, measured, and `Bool`, but narrowing
+    /// nothing. Returns its type.
+    fn loop_condition(&mut self, id: ExprId, cond: ExprId) -> TyId {
+        let keyword = self.ast.loop_keyword(id);
+        let ty = self.check_expr(cond);
+        self.expect(cond, ty, TyId::BOOL, keyword, "`for` conditions are Bool");
+        ty
+    }
+
+    /// Checks the item `id` of a `for` header: a `let`, checked as in a
+    /// block, whose variable, unless it is a `let mut`, is one that only a
+    /// `:=` of the header may rebind ([`BindingKind::Header`]), keeping its
+    /// one slot and its type; or a `:=`, checked as in a block, so that it
+    /// rebinds such a variable, or a `let mut`, in its slot.
+    fn header_item(&mut self, id: ItemId) {
+        match self.ast.item(id).kind {
+            ItemKind::Let {
+                path,
+                ty,
+                value,
+                mutable,
+            } => {
+                let before = self.bindings.len();
+                self.check_let(id, path, ty, (value, mutable));
+                if self.bindings.len() > before
+                    && let Some(binding) = self.bindings.last_mut()
+                    && binding.kind == BindingKind::Variable
+                {
+                    binding.kind = BindingKind::Header;
+                }
+            }
+            ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
+            // The parser allows no other item in a header.
+            ItemKind::Field { .. }
+            | ItemKind::Spread(_)
+            | ItemKind::Result(_)
+            | ItemKind::Expr(_)
+            | ItemKind::Break(_)
+            | ItemKind::Continue(_) => {}
+        }
+    }
+
+    /// Puts the loop `id`, labelled `label` if it has one, of which the
+    /// element type `expected`, with where that is stated and its label, is
+    /// expected if one is, on [`Checker::loops`], for its body. A label
+    /// that a loop of the same function whose body holds this one has
+    /// already is "label `'L` is already in use", at the label, labelled at
+    /// the other; a function starts with no labels.
+    fn enter_loop(
+        &mut self,
+        id: ForId,
+        label: Option<Label>,
+        expected: Option<(TyId, Span, String)>,
+    ) {
+        let depth = self.functions.len();
+        if let Some(label) = label
+            && let Some(outer) = self
+                .loops
+                .iter()
+                .rev()
+                .take_while(|frame| frame.depth == depth)
+                .find_map(|frame| frame.label.filter(|outer| outer.name == label.name))
+        {
+            let text = self.ast.names().get(label.name);
+            self.errors.push(
+                Diagnostic::error(format!("label `'{text}` is already in use"), label.span)
+                    .with_context(outer.span, "the loop around this one is labelled so")
+                    .with_note("give the inner loop another label"),
+            );
+        }
+        self.loops.push(LoopFrame {
+            id,
+            label,
+            depth,
+            expected,
+            values: Vec::new(),
+        });
+    }
+
+    /// The element type of the loop `id`, whose body, `body`, is of type
+    /// `body_ty`, and for which the `break`s and `continue`s with a value
+    /// gave `values`: each value with its type (see [`LoopFrame::values`]).
+    /// These are joined as the elements of a list literal are (see
+    /// [`Checker::check_list`]), in order, the body last, a `Never` among
+    /// them adding nothing: with `element`, the element type expected, each
+    /// fits it already, and the join is no warning, but is `element` should
+    /// it not be a subtype of it; without, untyped integers adapt to each
+    /// other and settle to `Int`, and a join that widens is a warning (see
+    /// [`Checker::values_widened`]). If nothing contributes, or only
+    /// `Never`, it is `element`, or `{}` without one. `Error` if anything
+    /// contributing is.
+    fn element_type(
+        &mut self,
+        id: ExprId,
+        (body, body_ty): (ExprId, TyId),
+        values: Vec<(ExprId, TyId)>,
+        element: Option<(TyId, (Span, &str))>,
+    ) -> TyId {
+        let mut sites = values;
+        sites.push((body, body_ty));
+        sites.retain(|&(_, ty)| ty != self.never);
+        if let Some((element, _)) = element {
+            let mut joined = None;
+            for &(_, ty) in &sites {
+                joined = Some(match joined {
+                    None => ty,
+                    Some(so_far) => self.types.join(so_far, ty).0,
+                });
+            }
+            return match joined {
+                Some(TyId::ERROR) => TyId::ERROR,
+                Some(joined) if self.types.is_subtype(joined, element) => joined,
+                _ => element,
+            };
+        }
+        let mut joined = None;
+        let mut widened = false;
+        for index in 0..sites.len() {
+            let Some(&(value, ty)) = sites.get(index) else {
+                continue;
+            };
+            let Some(so_far) = joined else {
+                joined = Some(ty);
+                continue;
+            };
+            let earlier: Vec<ExprId> = sites.iter().take(index).map(|&(at, _)| at).collect();
+            let (ty, widens, _) = self.join_element((earlier.into_iter(), value), so_far, ty);
+            joined = Some(ty);
+            widened |= widens;
+        }
+        // Whatever has not adapted to a concrete type is an `Int`.
+        for &(value, _) in &sites {
+            let ty = self.expr_types[value.index()];
+            self.settle(value, ty);
+        }
+        let element = match joined {
+            _ if sites.iter().any(|&(_, ty)| ty == TyId::ERROR) => return TyId::ERROR,
+            Some(TyId::UNTYPED_INT) => TyId::INT,
+            Some(joined) => joined,
+            None => TyId::EMPTY,
+        };
+        if widened {
+            self.values_widened(id, &sites, element);
+        }
+        element
+    }
+
+    /// Warns that the values the loop `id` collects, at `sites`, its
+    /// `break`s' and `continue`s' values and its body last, each with its
+    /// type, have different types, which `element`, its element type,
+    /// widened to a union of: "the values this loop collects have different
+    /// types", at the loop's keyword, labelled at each site with its type,
+    /// the body at its value (see [`Checker::branch_value`]), and a note
+    /// naming the loop's type.
+    fn values_widened(&mut self, id: ExprId, sites: &[(ExprId, TyId)], element: TyId) {
+        let list = self.types.list(element);
+        let note = format!(
+            "the loop is {}; annotate it with that type if all are meant, or tell them apart \
+             with `is`",
+            self.in_message(list)
+        );
+        let mut warning = Diagnostic::warning(
+            "the values this loop collects have different types",
+            self.ast.loop_keyword(id),
+        );
+        for &(value, _) in sites {
+            let ty = self.expr_types[value.index()];
+            let label = format!("this is {}", self.in_label(ty));
+            let at = self.branch_value(value);
+            warning = warning.with_context(self.ast.get(at).span, label);
+        }
+        self.warnings.push(warning.with_note(note));
+    }
+
+    /// Checks the `break` or `continue` item `id`, `item`, whose label and
+    /// value are `jump`, in a block whose first field, if it has one, is
+    /// `first_field` (see the module documentation): as an item of a record
+    /// block, it is "`break` cannot be an item of a record block";
+    /// otherwise it is for the loop [`Checker::jump_target`] finds, which
+    /// is recorded for lowering, and its value, if it has one, is one of
+    /// what that loop collects (see [`Checker::element_type`]), checked
+    /// against the loop's expected element type if it has one. Where there
+    /// is no loop for it, its value is checked on its own.
+    fn check_jump(&mut self, (id, item): (ItemId, Item), jump: Jump, first_field: Option<ItemId>) {
+        let keyword = match item.kind {
+            ItemKind::Break(_) => "break",
+            _ => "continue",
+        };
+        let written = symbol_span(keyword, item.span.start);
+        let at = jump
+            .label
+            .map_or(written, |label| Span::join(written, label.span));
+        let target = if first_field.is_some() {
+            self.errors.push(
+                Diagnostic::error(
+                    format!("`{keyword}` cannot be an item of a record block"),
+                    at,
+                )
+                .with_note(
+                    "a record block's value is the record of its fields; leave the loop from \
+                         a block that is not one, such as a field's value",
+                ),
+            );
+            None
+        } else {
+            self.jump_target(keyword, at, jump.label)
+        };
+        let Some(frame) = target else {
+            if let Some(value) = jump.value {
+                self.check_alone(value);
+            }
+            return;
+        };
+        let Some((loop_id, expected)) = self
+            .loops
+            .get(frame)
+            .map(|frame| (frame.id, frame.expected.clone()))
+        else {
+            return;
+        };
+        self.jumps[id.index()] = Some(loop_id);
+        let Some(value) = jump.value else {
+            return;
+        };
+        let ty = match expected {
+            Some((element, context, why)) => self.fit(value, element, (context, &why)),
+            None => self.check_expr(value),
+        };
+        if let Some(frame) = self.loops.get_mut(frame) {
+            frame.values.push((value, ty));
+        }
+    }
+
+    /// The index in [`Checker::loops`] of the loop that the `break` or
+    /// `continue`, as `keyword` says, written at `at`, with `label`, if it
+    /// has one, is for: the innermost loop of the function being checked
+    /// whose body holds it, labelled `label` if it has one. Where there is
+    /// none, reports why and returns `None`: "`break` outside a loop", if
+    /// no loop holds it; "no enclosing loop is labelled `'L`", at the
+    /// label, if no loop it could be for is labelled so; and if the only
+    /// such loops are outside the function or `lazy` being checked, "`break`
+    /// cannot leave a function" (or "a `lazy`"), labelled at the function's
+    /// keyword, and at the loop's label for a label, with a note saying
+    /// when the body runs.
+    fn jump_target(&mut self, keyword: &str, at: Span, label: Option<Label>) -> Option<usize> {
+        let depth = self.functions.len();
+        let names = |frame: &LoopFrame| {
+            label.is_none_or(|label| frame.label.is_some_and(|own| own.name == label.name))
+        };
+        let found = self.loops.iter().rposition(names);
+        let found = match found {
+            Some(index)
+                if self
+                    .loops
+                    .get(index)
+                    .is_some_and(|frame| frame.depth == depth) =>
+            {
+                return Some(index);
+            }
+            found => found.and_then(|index| self.loops.get(index)),
+        };
+        let error = match (found, label) {
+            (Some(outer), _) => {
+                let outer_label = outer.label;
+                let function = self.functions.last();
+                let (kind, when) = match function.map(|function| self.ast.fn_decl(function.fn_id)) {
+                    Some(decl) if decl.ret.is_none() => ("a `lazy`", "awaited"),
+                    _ => ("a function", "called"),
+                };
+                let mut error = Diagnostic::error(format!("`{keyword}` cannot leave {kind}"), at)
+                    .with_note(format!(
+                        "the body of {kind} runs when it is {when}, which may be after the loop \
+                         has ended"
+                    ));
+                if let Some(function) = function {
+                    error = error.with_context(function.keyword, format!("inside {kind} here"));
+                }
+                match (label, outer_label) {
+                    (Some(_), Some(outer)) => {
+                        error.with_context(outer.span, "the loop it names is outside it")
+                    }
+                    _ => error,
+                }
+            }
+            (None, None) => Diagnostic::error(format!("`{keyword}` outside a loop"), at),
+            (None, Some(label)) => {
+                let text = self.ast.names().get(label.name);
+                Diagnostic::error(
+                    format!("no enclosing loop is labelled `'{text}`"),
+                    label.span,
+                )
+            }
+        };
+        self.errors.push(error);
+        None
     }
 
     /// The element type of `ty`, the type of the iterable `iterable` of a
@@ -9073,7 +9912,9 @@ impl<'a> Checker<'a> {
             ItemKind::Let { .. }
             | ItemKind::Rebind { .. }
             | ItemKind::Field { .. }
-            | ItemKind::Spread(_) => {}
+            | ItemKind::Spread(_)
+            | ItemKind::Break(_)
+            | ItemKind::Continue(_) => {}
         }
     }
 
@@ -9099,7 +9940,8 @@ impl<'a> Checker<'a> {
             | TyKind::Bool
             | TyKind::String
             | TyKind::UntypedInt
-            | TyKind::Error => shown.to_string(),
+            | TyKind::Error
+            | TyKind::Never => shown.to_string(),
         }
     }
 
@@ -10037,9 +10879,14 @@ mod tests {
                 }
                 ExprKind::For(id) => {
                     let decl = ast.for_decl(id);
-                    visit(ast, decl.iterable, out);
-                    if let Some(guard) = decl.guard {
-                        visit(ast, guard, out);
+                    if let ForHead::Each {
+                        iterable, guard, ..
+                    } = decl.head
+                    {
+                        visit(ast, iterable, out);
+                        if let Some(guard) = guard {
+                            visit(ast, guard, out);
+                        }
                     }
                     visit(ast, decl.body, out);
                 }
@@ -10063,6 +10910,7 @@ mod tests {
                 | ItemKind::Expr(value) => {
                     visit(ast, value, out);
                 }
+                ItemKind::Break(_) | ItemKind::Continue(_) => {}
             }
         }
     }
@@ -18805,5 +19653,550 @@ mod tests {
         check(&parse_text(text), &mut TypeTable::new())
             .err()
             .unwrap_or_default()
+    }
+
+    // ----- Loops, `break`, `continue`, labels and Never -----
+
+    /// The type of the file's value as shown, after `xs`, a list of three
+    /// `Int`s, and `flag`, a `Bool`, are declared.
+    fn loop_type(text: &str) -> String {
+        file_type(&format!("let xs = [1, 7, 3]\nlet flag = true\n= {text}"))
+    }
+
+    #[test]
+    fn the_types_of_the_loop_forms() {
+        assert_eq!(loop_type("for flag { 1 }"), "List<Int>");
+        assert_eq!(
+            loop_type("for let i = 0; i < 4; i := i + 1 { i * i }"),
+            "List<Int>"
+        );
+        assert_eq!(loop_type("for { break }"), "List<{}>");
+        assert_eq!(loop_type("do { 2.5 } for flag"), "List<Float>");
+        // Find-first, with a final `continue` and without.
+        assert_eq!(
+            loop_type("for x in xs { if x > 5 { break x }; continue }"),
+            "List<Int>"
+        );
+        assert_eq!(
+            loop_type("for x in xs { if x > 5 { break x } }"),
+            "List<Int | {}>"
+        );
+        // A body of type Never contributes nothing.
+        assert_eq!(loop_type("for x in xs { break x }"), "List<Int>");
+        assert_eq!(loop_type("for x in xs { continue }"), "List<{}>");
+        // A labelled value joins its target's element type only.
+        assert_eq!(
+            loop_type("for'outer x in xs { for y in xs { if y > x { continue'outer 1.5 }; y } }"),
+            "List<Float | List<Int>>"
+        );
+        // A loop whose body is `{}` is a unit-like statement.
+        assert_eq!(
+            file_type("let mut n = 0\nfor n < 3 { n := n + 1 }"),
+            "List<{}>"
+        );
+        assert!(warnings("let mut n = 0\nfor n < 3 { n := n + 1 }\nn").is_empty());
+    }
+
+    #[test]
+    fn untyped_values_settle_together_and_expected_types_reach_them() {
+        assert_eq!(
+            loop_type("for x in xs { if x > 5 { break 1 }; 2.5 }"),
+            "List<Float>"
+        );
+        assert_eq!(
+            loop_type("for x in xs { if x > 5 { continue 2.5 }; 1 }"),
+            "List<Float>"
+        );
+        assert_eq!(
+            loop_type("for x in xs { if x > 5 { break 1 }; 2 }"),
+            "List<Int>"
+        );
+        // Under an expected type, each value is checked against it.
+        assert_eq!(
+            file_type("let fs: List<Float> = for x in [1] { if x > 5 { break 1 }; 2 }\n= fs"),
+            "List<Float>"
+        );
+        assert_eq!(
+            file_type(
+                "let us: List<Int | String> = for x in [1] { if x > 5 { break \"a\" }; x }\n= us"
+            ),
+            "List<Int | String>"
+        );
+        let text = "let ns: List<Int> = for x in [1] { if x > 5 { break \"a\" }; x }";
+        assert_eq!(messages(text), vec!["mismatched types"]);
+        // The Never case takes the expected element type.
+        assert_eq!(
+            file_type("let ns: List<Int> = for { break }\n= ns"),
+            "List<Int>"
+        );
+    }
+
+    #[test]
+    fn a_widened_loop_is_warned_about_at_each_contributing_site() {
+        let text = "let xs = [1]\nlet r = for x in xs { if x > 5 { break \"big\" }; x }";
+        let warnings = warnings(text);
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        assert_eq!(
+            warning.message,
+            "the values this loop collects have different types"
+        );
+        assert_eq!(warning.span, at(text, "for"));
+        assert_eq!(
+            labels(warning),
+            vec![
+                (at(text, "\"big\""), "this is String"),
+                (last(text, "x"), "this is Int"),
+            ]
+        );
+        assert_eq!(
+            warning.notes,
+            [
+                "the loop is `List<Int | String>`; annotate it with that type if all are meant, or \
+              tell them apart with `is`"
+            ]
+        );
+        // Bare `break` and `continue` contribute nothing, so join nothing.
+        assert!(warnings_of("for x in [1] { if x > 5 { break }; x }").is_empty());
+    }
+
+    /// The warnings of a check that must succeed, of `text` as a statement
+    /// bound to a name.
+    fn warnings_of(text: &str) -> Vec<Diagnostic> {
+        warnings(&format!("let v = {text}"))
+    }
+
+    #[test]
+    fn a_statement_loop_with_a_value_is_an_unused_value() {
+        assert_eq!(
+            messages("for x in [1] { break 5 }\n1"),
+            vec!["unused value of type `List<Int>`"]
+        );
+        assert!(warnings("for x in [1] { break }\n1").is_empty());
+    }
+
+    #[test]
+    fn header_variables_keep_their_slot_and_type() {
+        // Rebound from the header, keeping its type.
+        assert_eq!(
+            messages("let v = for let i = 0; i < 3; i := 1.5 { i }"),
+            vec!["mismatched types"]
+        );
+        // From the body, an error whose note says to write `let mut`.
+        let text = "let v = for let i = 0; i < 3; i := i + 1 { i := 5; i }";
+        let diagnostics = diagnostics(text);
+        assert_eq!(diagnostics.len(), 1);
+        let error = &diagnostics[0];
+        assert_eq!(
+            error.message,
+            "cannot rebind `i` here: it is declared in the header of a `for`"
+        );
+        assert_eq!(error.span, nth(text, "i", 4));
+        assert_eq!(
+            labels(error),
+            vec![(at(text, "let i = 0"), "declared here")]
+        );
+        assert!(error.notes[0].contains("`let mut i = ...` in the header"));
+        // A typed `let` in the header adapts its literal as any does.
+        assert_eq!(
+            file_type("let v = for let i: Float = 0; i < 2.0; i := i + 1.0 { i }\n= v"),
+            "List<Float>"
+        );
+        // A `let mut` in the header may be rebound from the body too.
+        assert_eq!(
+            file_type("let v = for let mut i = 0; i < 3; i := i + 1 { i := i + 1; i }\n= v"),
+            "List<Int>"
+        );
+        // A `:=` in the header of a variable from outside follows the
+        // existing rules.
+        assert_eq!(
+            file_type("let mut k = 0\nlet v = for k < 3; k := k + 1 { k }\n= v"),
+            "List<Int>"
+        );
+        assert_eq!(
+            messages("let k = 0\nlet v = { for k < 3; k := k + 1 { k } }"),
+            vec!["cannot rebind `k` here: it is declared in an enclosing block"]
+        );
+        // Not visible after the loop.
+        assert_eq!(
+            messages("let v = for let i = 0; i < 3; i := i + 1 { i }\ni"),
+            vec!["undefined variable `i`"]
+        );
+        // From a function in the body, the error for any variable outside
+        // a function.
+        assert_eq!(
+            messages(
+                "let v = for let i = 0; i < 3; i := i + 1 { let f = fn(): Int { i := 1; i }; i }"
+            ),
+            vec!["cannot rebind `i` here: it is declared in an enclosing block"]
+        );
+    }
+
+    #[test]
+    fn a_header_variable_is_one_slot_for_life() {
+        let (ast, resolution) = resolved("let v = for let i = 0; i < 3; i := i + 1 { i }");
+        // The `let` and the `:=` write the same slot, which `v` takes once
+        // the loop has left it.
+        let slots: Vec<Slot> = (0..ast.item_count())
+            .map(|item| resolution.item_slot(ItemId::new(u32::try_from(item).unwrap())))
+            .filter(|&slot| slot != Slot::NONE)
+            .collect();
+        assert_eq!(slots, vec![Slot(0), Slot(0), Slot(0)]);
+    }
+
+    #[test]
+    fn conditions_are_measured_bools_and_narrow_nothing() {
+        assert_eq!(messages("let v = for 1 { 2 }"), vec!["mismatched types"]);
+        assert_eq!(
+            messages("let v = do { 2 } for \"no\""),
+            vec!["mismatched types"]
+        );
+        // `for x is Int` leaves `x` as it was.
+        assert_eq!(
+            messages("let x: Int | String = 1\nlet v = for x is Int { x + 1 }"),
+            vec!["cannot add `Int | String` and Int"]
+        );
+        // A `do`'s condition cannot see the body's variables.
+        assert_eq!(
+            messages("let v = do { let t = true; 1 } for t"),
+            vec!["undefined variable `t`"]
+        );
+        // In a pure function, a condition that may be a future is awaited,
+        // which is the purity error; in an impure one it is fine.
+        let pure = "fn f(c: Future<Bool>): List<Int> { for c { 1 } }";
+        assert_eq!(
+            messages(pure),
+            vec!["cannot use a value that may be a future in a pure function"]
+        );
+        let impure =
+            "fn f(c: Future<Bool>) -> List<Int> { for await c { break 1 } }\n= f(lazy true)";
+        assert_eq!(file_type(impure), "List<Int>");
+        // Loops are allowed in pure functions.
+        assert_eq!(
+            shown_result("fn f(n: Int): List<Int> { for let i = 0; i < n; i := i + 1 { i } }\nf"),
+            "fn(n: Int): List<Int>"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_errors() {
+        // No loop at all.
+        let text = "break";
+        assert_eq!(
+            errors(text),
+            vec![("`break` outside a loop".to_owned(), at(text, "break"))]
+        );
+        assert_eq!(messages("continue 1"), vec!["`continue` outside a loop"]);
+        // In a guard, a condition or a header item, a `break` belongs to an
+        // outer loop, if there is one.
+        assert_eq!(
+            messages("let v = for x in [1] if { break } { x }"),
+            vec!["`break` outside a loop"]
+        );
+        assert_eq!(
+            messages("let v = for ({ break }) { 1 }"),
+            vec!["`break` outside a loop"]
+        );
+        assert_eq!(
+            messages("let v = for let i = ({ break }); true; i := ({ continue }) { 1 }"),
+            vec!["`break` outside a loop", "`continue` outside a loop"]
+        );
+        assert_eq!(
+            messages("let v = do { 1 } for { continue }"),
+            vec!["`continue` outside a loop"]
+        );
+        assert_eq!(
+            file_type("let v = for x in [1] { for y in [2] if { continue } { y } }\n= v"),
+            "List<List<Int>>"
+        );
+        // Across a function and a `lazy`.
+        let text = "let v = for x in [1] { let f = fn(): Int { break; 1 }; x }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "`break` cannot leave a function");
+        assert_eq!(diagnostic.span, at(text, "break"));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "fn"), "inside a function here")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            [
+                "the body of a function runs when it is called, which may be after the loop has \
+              ended"
+            ]
+        );
+        let text = "let v = for x in [1] { let l = lazy { continue 2 }; x }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "`continue` cannot leave a `lazy`");
+        assert_eq!(diagnostic.span, at(text, "continue"));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "lazy"), "inside a `lazy` here")]
+        );
+        assert_eq!(
+            diagnostic.notes,
+            [
+                "the body of a `lazy` runs when it is awaited, which may be after the loop has \
+              ended"
+            ]
+        );
+        // As an item of a record block.
+        let text = "let v = for x in [1] { { a = 1; break } }";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "`break` cannot be an item of a record block".to_owned(),
+                at(text, "break")
+            )]
+        );
+        assert_eq!(
+            messages("let v = for x in [1] { { continue'a; a = 1 } }"),
+            vec!["`continue` cannot be an item of a record block"]
+        );
+        // The fields after it are checked, and nothing else is reported.
+        assert_eq!(
+            messages("let v = for x in [1] { { a = 1; break 2; b = \"x\" + 1 } }"),
+            vec![
+                "`break` cannot be an item of a record block",
+                "cannot add String and Int"
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_resolve_to_the_loop_whose_body_holds_them() {
+        let text = "let v = for'a x in [1] { for'b y in [2] { break'a } }";
+        let (ast, resolution) = resolved(text);
+        let jump = (0..ast.item_count())
+            .map(|item| ItemId::new(u32::try_from(item).unwrap()))
+            .find_map(|item| resolution.jump_target(item))
+            .unwrap();
+        assert_eq!(jump, ForId::new(1));
+        // Unknown.
+        let text = "let v = for'a x in [1] { break'b }";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "no enclosing loop is labelled `'b`".to_owned(),
+                at(text, "'b")
+            )]
+        );
+        // A label in the loop's own header is not in its body.
+        assert_eq!(
+            messages("let v = for'a x in [1] if { break'a } { x }"),
+            vec!["no enclosing loop is labelled `'a`"]
+        );
+        // Reused inside its own loop's body, labelled at the outer one.
+        let text = "let v = for'a x in [1] { for'a y in [2] { y } }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "label `'a` is already in use");
+        assert_eq!(diagnostic.span, nth(text, "'a", 1));
+        assert_eq!(
+            labels(diagnostic),
+            vec![(at(text, "'a"), "the loop around this one is labelled so")]
+        );
+        // Reused after the loop, or in a function nested in it, is fine.
+        assert!(warnings("let v = for'a x in [1] { x }\nlet w = for'a y in [2] { y }").is_empty());
+        assert!(
+            warnings(
+                "let v = for'a x in [1] { let f = fn(): List<Int> { for'a y in [2] { y } }; x }"
+            )
+            .is_empty()
+        );
+        // A label outside the function is "cannot leave", labelling the loop.
+        let text =
+            "let v = for'a x in [1] { let f = fn(): Int { for y in [2] { break'a }; 1 }; x }";
+        let diagnostic = &diagnostics(text)[0];
+        assert_eq!(diagnostic.message, "`break` cannot leave a function");
+        assert_eq!(diagnostic.span, at(text, "break'a"));
+        assert_eq!(
+            labels(diagnostic),
+            vec![
+                (at(text, "fn"), "inside a function here"),
+                (at(text, "'a"), "the loop it names is outside it"),
+            ]
+        );
+        // An unused label is fine.
+        assert!(warnings("let v = for'unused x in [1] { x }").is_empty());
+    }
+
+    #[test]
+    fn never_is_the_type_of_what_never_completes() {
+        // The type of the last item of the body of a loop, given as `body`.
+        let in_loop = |body: &str| {
+            let (ast, types, output) = check_text(&format!("let v = for x in [1] {{ {body} }}"));
+            let output = output.unwrap_or_else(|errors| panic!("{body}: {errors:?}"));
+            let ExprKind::For(id) = ast.get(result_expr_of_let(&ast)).kind else {
+                panic!("{body}: expected a loop");
+            };
+            let ExprKind::Block(items) = ast.get(ast.for_decl(id).body).kind else {
+                panic!("{body}: expected a block");
+            };
+            let last = *ast.items(items).last().unwrap();
+            let value = ast.item(last).kind.value().unwrap();
+            types
+                .display(output.checked.types.get(value), ast.names())
+                .to_string()
+        };
+        assert_eq!(in_loop("{ break }"), "Never");
+        assert_eq!(in_loop("if x > 1 { break } else { continue }"), "Never");
+        assert_eq!(in_loop("if x > 1 { break } else { 5 }"), "Int");
+        assert_eq!(in_loop("if x > 1 { break }"), "{}");
+        assert_eq!(in_loop("{ { break } }"), "Never");
+        assert_eq!(in_loop("{ break } + 1"), "Never");
+        assert_eq!(in_loop("1 + { break }"), "Never");
+        assert_eq!(in_loop("x > 1 and { break }"), "Bool");
+        assert_eq!(in_loop("{ break } and true"), "Never");
+        assert_eq!(in_loop("{ break } == 1"), "Never");
+        assert_eq!(in_loop("-{ break }"), "Never");
+        assert_eq!(in_loop("{ break }.a"), "Never");
+        assert_eq!(in_loop("{ break }[0]"), "Never");
+        assert_eq!(in_loop("[1][{ break }]"), "Never");
+        assert_eq!(in_loop("{ break }(1)"), "Never");
+        assert_eq!(in_loop("len({ break })"), "Never");
+        assert_eq!(in_loop("\"{ { break } }\""), "Never");
+        assert_eq!(in_loop("{ break } is Int"), "Never");
+        assert_eq!(in_loop("{ break } as Int"), "Never");
+        assert_eq!(in_loop("await { break }"), "Never");
+        assert_eq!(in_loop("if { break } { 1 } else { 2 }"), "Never");
+        assert_eq!(in_loop("for y in { break } { y }"), "Never");
+        // A condition runs before the first iteration; a `do`'s, after.
+        assert_eq!(in_loop("for ({ break }) { 1 }"), "Never");
+        assert_eq!(in_loop("do { 1 } for ({ break })"), "List<Int>");
+        // A guard may never run.
+        assert_eq!(in_loop("for y in [1] if { break } { y }"), "List<Int>");
+        assert_eq!(in_loop("[{ break }]"), "List<Never>");
+        assert_eq!(in_loop("{ a = { break } }"), "{a: Never}");
+        assert_eq!(in_loop("({ break } : Int)"), "Int");
+        assert_eq!(in_loop("let r = { break }; r"), "Never");
+    }
+
+    /// The value of the file's first `let`.
+    fn result_expr_of_let(ast: &Ast) -> ExprId {
+        let first = *ast.items(ast.root()).first().unwrap();
+        ast.item(first).kind.value().unwrap()
+    }
+
+    #[test]
+    fn never_is_a_subtype_of_everything_and_joins_as_nothing() {
+        let mut table = TypeTable::new();
+        let never = table.never();
+        assert_eq!(table.never(), never);
+        let list = table.list(TyId::INT);
+        for ty in [TyId::INT, TyId::STRING, TyId::EMPTY, list] {
+            assert!(table.is_subtype(never, ty));
+            assert!(!table.is_subtype(ty, never));
+            assert_eq!(table.join(never, ty), (ty, false));
+            assert_eq!(table.join(ty, never), (ty, false));
+            assert_eq!(table.union([never, ty]), ty);
+        }
+        assert_eq!(table.union([never]), never);
+        assert!(table.is_unit_like(never));
+        assert_eq!(table.strip(never), never);
+        assert_eq!(table.present(never), never);
+        assert_eq!(table.laziness(never), Laziness::Present);
+        assert!(!table.contains_future(never));
+        assert!(!table.contains_fn(never));
+        assert_eq!(table.value_kind(never), Some(ValueKind::Never));
+        assert_eq!(table.display(never, &Names::new()).to_string(), "Never");
+    }
+
+    #[test]
+    fn unreachable_code_is_never_an_error_because_of_never() {
+        for body in [
+            "{ break } + 1",
+            "f({ continue })",
+            "[{ break }]",
+            "{ break }.a",
+            "{ break }[0]",
+            "{ break }(1)",
+            "not { break }",
+            "if { break } { 1 } else { 2 }",
+            "for y in { break } { y }",
+            "let r = { break }; r.a",
+            "\"{ { break } }\"",
+            "{ a = { break } }",
+            "{ break } is Int",
+            "await { break }",
+            "len({ break })",
+            "[...{ break }]",
+            "{ ...{ break } }",
+            "let mut r = { break }; r := 1; r.a := 2; let r.b = 3; r",
+            "let r = { a = { break } }; r.a.b := 1; let r.a.c = 2; r",
+            "if (r is Int) { r } else { 0 }",
+        ] {
+            let text = format!(
+                "fn f(n: Int): Int {{ n }}\nlet r: Int | String = 1\nlet v = for x in [1] {{ {body} }}"
+            );
+            let found = diagnostics_or_none(&text);
+            assert!(
+                found.iter().all(|d| d.severity == Severity::Warning),
+                "{body}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_item_after_one_that_never_completes_is_warned_about() {
+        let text = "let v = for x in [1] { break; let y = x + 1; y }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "this is never run");
+        assert_eq!(found[0].span, at(text, "let y = x + 1"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "break"), "this always leaves the block")]
+        );
+        // After an expression, a `let` or a `:=` of type Never too, once
+        // per block, the block's type being its last item's.
+        for body in [
+            "{ continue }; 1",
+            "let y = { break }; y",
+            "let mut z = 0; z := { break }; z",
+        ] {
+            let found = warnings(&format!("let v = for x in [1] {{ {body} }}"));
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert_eq!(found[0].message, "this is never run");
+        }
+        // Nested blocks warn each for itself; nothing follows the last item.
+        assert!(warnings("let v = for x in [1] { if x > 1 { break }; x }").is_empty());
+        assert_eq!(
+            file_type("let v = for x in [1] { break; 1 }\n= v"),
+            "List<Int>"
+        );
+        // A `break` that is an error leaves nothing, so nothing after it is
+        // warned about.
+        let found = errors("break\nlet y = 1");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "`break` outside a loop");
+    }
+
+    #[test]
+    fn closures_made_in_a_header_loop_capture_each_iteration() {
+        let text = "let fs = for let i = 0; i < 3; i := i + 1 { fn(): Int { i } }\n= fs";
+        assert_eq!(file_type(text), "List<fn(): Int>");
+    }
+
+    #[test]
+    fn result_inference_sees_each_loop_form() {
+        // An impure function's bare result takes what the body returns, a
+        // list of what its loop collects.
+        for (body, ty) in [
+            ("for x in [1, 2] { x }", "fn() -> List<Int>"),
+            (
+                "for let i = 0; i < 2; i := i + 1 { i }",
+                "fn() -> List<Int>",
+            ),
+            ("do { lazy 1 } for false", "fn() -> List<Future<Int>>"),
+            (
+                "for x in [1] { if x > 0 { break lazy x }; 1 }",
+                "fn() -> List<Int | Future<Int>>",
+            ),
+            // Nothing is collected: the element type is the expected one.
+            ("for { break }", "fn() -> List<Int | Future<Int>>"),
+        ] {
+            let text = format!("fn f() -> List<Int> {{ {body} }}\nf");
+            assert_eq!(shown_result(&text), ty, "{body}");
+        }
     }
 }

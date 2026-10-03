@@ -10,7 +10,8 @@
 //! `Evaluator::function` returns the closure of a function value. Each
 //! typed walker handles the nodes of its kind and also loads, captures,
 //! blocks, `if`s, field accesses, indexes, calls, awaits and `as`es, which
-//! can be of any kind: an `if` evaluates its condition through `bool` and
+//! can be of any kind, and `break`s and `continue`s, which yield none (see
+//! [Stops](#stops)): an `if` evaluates its condition through `bool` and
 //! then exactly one branch through the walker it was called with, and a
 //! field access, an index, a call, an await or an `as` produces a [`Value`]
 //! from which the walker extracts its kind's. A general walker,
@@ -93,6 +94,77 @@
 //! counts from one to the other, the last included for `..=`, stopping at
 //! the last rather than stepping past it, so that counting up to
 //! `i64::MAX` never overflows; so it has no limit on the range's length.
+//!
+//! A `Loop`, a condition loop's or a `do` loop's, is evaluated by
+//! `Evaluator::condition_loop`: while its condition is true, tested first
+//! unless it is a `do` loop's, its body, and then the items after its
+//! condition, each for its effects; it collects or discards as a `For`
+//! does, but reserves nothing, its length not being known up front. Both
+//! helpers are reached through `Evaluator::looped`. A `break` or `continue`
+//! in a body ends its iteration, or its loop, through the stop channel (see
+//! [Stops](#stops)).
+//!
+//! # Stops
+//!
+//! Every walker returns a `Flow`: a value, or an `Unwind`, the one road out
+//! of a node that does not yield one. An `Unwind` is an error, a
+//! [`Diagnostic`], which ends the evaluation, or a *stop*, a `Stop`: a
+//! `break` or a `continue` on its way to its loop, with the number of loops
+//! it is still to leave and the value it contributes, if any. A stop travels
+//! as an error does, through every `?`, so every node between a `break` and
+//! its loop is left at once, with nothing after the `break` evaluated: in
+//! `{ if c { break }; 1 } + g()`, `g` is not called. (A flag that the loop
+//! checks would let the `+` and its call run.) A `Break` or `Continue` node
+//! evaluates its value through the general walker and then unwinds
+//! (`Evaluator::leave`); every walker, typed or general, hands it such a
+//! node, since a node of kind [`ValueKind::Never`] may stand where one of
+//! any kind is expected, so the typed walkers grow by one arm each and pay
+//! nothing else.
+//!
+//! Only a loop catches a stop, and only one that comes out of its body
+//! (`caught`): a stop out of its iterable, guard, condition or items after
+//! its condition is for a loop around it, and goes on with `?`. A stop with
+//! no loops left to leave is this loop's: its value, if any, is collected,
+//! and the loop ends, for a `break`, or goes on with its items after the
+//! condition and its next test, for a `continue`. Any other goes on, one
+//! loop nearer its own, and this loop's list is dropped with it. The
+//! checker lets no stop out of a function, a `lazy` or a memoised call, nor
+//! out of the top level, so one that reaches such a boundary is an internal
+//! error there (`Unwind::into_error`), never a diagnostic, and never caught
+//! by a loop of another frame. Slice 22's `return` is meant to be one more
+//! kind of stop, caught by a call.
+//!
+//! Since evaluation goes on after a stop, nothing may assume that an `Err`
+//! ends it all and skip restoring what it changed. What was found, and done:
+//!
+//! - The nesting budget is a field of each frame's `Evaluator`, `levels`,
+//!   set when the frame is made and never changed, and charged statically:
+//!   nothing is counted up and down around a node, so nothing can leak.
+//! - The value stack: a call grows it by the callee's frame before its
+//!   arguments are evaluated, and an argument may now stop, as in `f({
+//!   continue })`: `Evaluator::call` and `Evaluator::memo_begin` truncate it
+//!   back on any `Err` of an argument, as they did for an error, and the
+//!   stop goes on. A call, a memoised call and a future truncate it after
+//!   the body whatever the body gave, and `eval_with` at the top.
+//! - A future's running mark: `Evaluator::run_future` puts the future back
+//!   unrun on any `Err` of its body; a stop cannot come out of a body, and
+//!   is made an internal error first.
+//! - A memoised call's running entry: `Evaluator::memo_end` removes it on
+//!   any `Err` of the body, a stop again made an internal error first. The
+//!   memo tables' checkpoint is rolled back only by a
+//!   [`crate::session::Session`], and only when a whole input fails: a stop
+//!   in the body of a `->>` function is caught by its loop, in the body, and
+//!   reaches neither the call nor the session, so the entries the body's
+//!   calls rightly recorded stay.
+//! - The input stamped on an error from another input's code, and the
+//!   "awaited here" and "called here with the same arguments" labels, are
+//!   added to errors only.
+//! - What a node holds while it evaluates its children (a list being built,
+//!   the records an update passes through, a loop's collected values) is
+//!   local to its helper's frame, and dropped as the stop passes.
+//! - Slots written for a node, a loop's variable and an `is`'s narrowed
+//!   value, are not restored: they belong to that node's scope, which no
+//!   code after it reads without writing first.
 //!
 //! An `UpdateField`, a dotted field's, builds a new record and never
 //! changes the old one, as a step of an `Update` that sets a field does
@@ -518,8 +590,67 @@ pub fn eval_with(
     }
     .value(root);
     stack.truncate(frame_size);
-    result
+    // The checker lets no `break` or `continue` out of the top level's
+    // loops, so a stop arriving here is a bug.
+    result.map_err(|unwind| unwind.into_error(ir.get(root).span))
 }
+
+/// Why the evaluation of a node ended without a value: the one road out of
+/// a node, which every walker passes along with `?` (see [Stops](#stops)).
+#[derive(Debug)]
+enum Unwind {
+    /// A runtime error, or an internal one, which ends the evaluation.
+    Error(Diagnostic),
+    /// A `break` or a `continue` on its way to the loop it is for, which
+    /// catches it, after which evaluation goes on.
+    Stop(Stop),
+}
+
+impl From<Diagnostic> for Unwind {
+    fn from(error: Diagnostic) -> Self {
+        Unwind::Error(error)
+    }
+}
+
+impl Unwind {
+    /// The error this is, where nothing may catch a stop: a stop is an
+    /// internal error at `span`, the boundary it reached.
+    fn into_error(self, span: Span) -> Diagnostic {
+        match self {
+            Unwind::Error(error) => error,
+            Unwind::Stop(_) => internal("a `break` or `continue` left its function", span),
+        }
+    }
+}
+
+/// A `break` or a `continue` unwinding to its loop: which loop, counted
+/// outwards from the innermost loop whose body it is unwinding out of, and
+/// what it contributes to that loop's list.
+#[derive(Debug)]
+struct Stop {
+    /// How many loops the stop leaves before it reaches its own: 0 when the
+    /// loop whose body it comes out of is its target. Each loop it passes
+    /// through takes one off and drops its own list.
+    loops: u32,
+    /// What it does when it gets there.
+    kind: StopKind,
+    /// The value of its expression, which the target loop collects, if it
+    /// has one.
+    value: Option<Value>,
+}
+
+/// What a [`Stop`] does at its loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopKind {
+    /// `break`: ends the loop, after collecting the value, if any.
+    Break,
+    /// `continue`: ends the iteration, after collecting the value, if any,
+    /// and goes on with the after-items and the next test.
+    Continue,
+}
+
+/// What evaluating a node gives: its value, or why there is none.
+type Flow<T> = Result<T, Unwind>;
 
 /// The state of one frame's evaluation: the top level's, or a call's.
 struct Evaluator<'a> {
@@ -555,7 +686,7 @@ struct Evaluator<'a> {
 // kilobytes and `crate::STACK_SIZE` too small at `crate::MAX_DEPTH`.
 impl Evaluator<'_> {
     /// Evaluates a node of any kind.
-    fn value(&mut self, id: IrId) -> Result<Value, Diagnostic> {
+    fn value(&mut self, id: IrId) -> Flow<Value> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty => Ok(Value::Empty),
@@ -591,11 +722,8 @@ impl Evaluator<'_> {
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
-            IrKind::For {
-                slot,
-                parts,
-                collect,
-            } => self.for_loop((slot, parts, collect), node),
+            IrKind::For { .. } | IrKind::Loop { .. } => self.looped(node),
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             IrKind::Index { list, index, .. } => self.index((list, index), node),
             IrKind::Spread(_) => mistyped(node, "a spread outside a list"),
             IrKind::IntConst(_)
@@ -641,7 +769,7 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a block's items, in order, for their effects.
-    fn items(&mut self, items: IrRange) -> Result<(), Diagnostic> {
+    fn items(&mut self, items: IrRange) -> Flow<()> {
         for &item in self.ir.items(items) {
             self.value(item)?;
         }
@@ -649,12 +777,12 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates the condition of an `if` and returns the branch it selects.
-    fn branch(&mut self, cond: IrId, then: IrId, else_: IrId) -> Result<IrId, Diagnostic> {
+    fn branch(&mut self, cond: IrId, then: IrId, else_: IrId) -> Flow<IrId> {
         Ok(if self.bool(cond)? { then } else { else_ })
     }
 
     /// Evaluates `value` and writes it to `slot`, for the `Store` `node`.
-    fn store(&mut self, slot: Slot, value: IrId, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn store(&mut self, slot: Slot, value: IrId, node: &IrNode) -> Flow<Value> {
         let value = self.value(value)?;
         let target = self
             .stack
@@ -666,27 +794,27 @@ impl Evaluator<'_> {
 
     /// The captured value number `index` of the running closure, for the
     /// `LoadCapture` `node`.
-    fn capture(&self, index: u32, node: &IrNode) -> Result<&Value, Diagnostic> {
+    fn capture(&self, index: u32, node: &IrNode) -> Flow<&Value> {
         self.captures
             .get(index as usize)
-            .ok_or_else(|| internal("load of a capture the closure lacks", node.span))
+            .ok_or_else(|| internal("load of a capture the closure lacks", node.span).into())
     }
 
     /// A copy of the value in `slot`, of any kind, for the `Load` `node`.
-    fn load_value(&self, slot: Slot, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn load_value(&self, slot: Slot, node: &IrNode) -> Flow<Value> {
         self.load(slot, node).cloned()
     }
 
     /// A copy of the captured value number `index`, of any kind, for the
     /// `LoadCapture` `node`.
-    fn capture_value(&self, index: u32, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn capture_value(&self, index: u32, node: &IrNode) -> Flow<Value> {
         self.capture(index, node).cloned()
     }
 
     /// The value in `slot`, read by the `Load` `node` as `extract` accepts
     /// it. The walkers read slots through this and `capture_as`, returning
     /// the call, so that they hold no temporaries for the reads.
-    fn slot_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Result<T, Diagnostic> {
+    fn slot_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -695,12 +823,7 @@ impl Evaluator<'_> {
 
     /// The captured value number `index`, read by the `LoadCapture` `node`
     /// as `extract` accepts it.
-    fn capture_as<T>(
-        &self,
-        index: u32,
-        node: &IrNode,
-        extract: Extract<T>,
-    ) -> Result<T, Diagnostic> {
+    fn capture_as<T>(&self, index: u32, node: &IrNode, extract: Extract<T>) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -709,7 +832,7 @@ impl Evaluator<'_> {
 
     /// The closure the `LoadCallee` or `MakeClosure` `node` yields, as a
     /// value.
-    fn closure_value(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn closure_value(&mut self, node: &IrNode) -> Flow<Value> {
         match node.kind {
             IrKind::LoadCallee => self.callee(node).map(Value::Fn),
             IrKind::MakeClosure { function, captures } => {
@@ -721,21 +844,17 @@ impl Evaluator<'_> {
 
     /// A new reference to the running closure, for the `LoadCallee`
     /// `node`.
-    fn callee(&self, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> {
+    fn callee(&self, node: &IrNode) -> Flow<Rc<Closure>> {
         self.callee
             .map(Rc::clone)
-            .ok_or_else(|| internal("load of the callee outside a function", node.span))
+            .ok_or_else(|| internal("load of the callee outside a function", node.span).into())
     }
 
     /// Builds a closure of `function` capturing the values of `captures`,
     /// read in this frame: one allocation for the captured values, sized
     /// exactly (none if there are none), and one for the closure, which
     /// shares the IR.
-    fn make_closure(
-        &mut self,
-        function: FnId,
-        captures: IrRange,
-    ) -> Result<Rc<Closure>, Diagnostic> {
+    fn make_closure(&mut self, function: FnId, captures: IrRange) -> Flow<Rc<Closure>> {
         let items = self.ir.items(captures);
         let mut values = Vec::with_capacity(items.len());
         for &item in items {
@@ -752,7 +871,7 @@ impl Evaluator<'_> {
     /// read in this frame, as [`Evaluator::make_closure`] builds a closure:
     /// one allocation for the captured values and one for the future, which
     /// shares the IR. Nothing is run.
-    fn make_future(&mut self, function: FnId, captures: IrRange) -> Result<Value, Diagnostic> {
+    fn make_future(&mut self, function: FnId, captures: IrRange) -> Flow<Value> {
         let items = self.ir.items(captures);
         let mut values = Vec::with_capacity(items.len());
         for &item in items {
@@ -768,7 +887,7 @@ impl Evaluator<'_> {
     /// Evaluates the `Await` `node` (see the module documentation) as a
     /// value, which must be of the kind the node states, or, for
     /// [`ValueKind::Mixed`], of any kind but a future's.
-    fn await_node(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn await_node(&mut self, node: &IrNode) -> Flow<Value> {
         let value = self.await_value(node)?;
         match node.kind {
             IrKind::Await { kind, .. } if of_kind(&value, kind) => Ok(value),
@@ -782,7 +901,7 @@ impl Evaluator<'_> {
     /// Evaluates the `As` `node` (see the module documentation) as a value,
     /// which must be of the kind the node states, or, for
     /// [`ValueKind::Mixed`], of any kind but a future's.
-    fn narrow_node(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn narrow_node(&mut self, node: &IrNode) -> Flow<Value> {
         let value = self.narrowed(node)?;
         match node.kind {
             IrKind::As { kind, .. } if of_kind(&value, kind) => Ok(value),
@@ -795,11 +914,7 @@ impl Evaluator<'_> {
 
     /// Evaluates the `As` `node` as a value that `extract` accepts: one of
     /// the kind the node states.
-    fn narrow_as<T>(
-        &mut self,
-        node: &IrNode,
-        extract: fn(Value) -> Option<T>,
-    ) -> Result<T, Diagnostic> {
+    fn narrow_as<T>(&mut self, node: &IrNode, extract: fn(Value) -> Option<T>) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -816,7 +931,7 @@ impl Evaluator<'_> {
     /// which it yields if it passes the node's test, and otherwise "`x` is
     /// not an Int", at the node, labelled with what the value is (see
     /// [`failure`]).
-    fn narrowed(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn narrowed(&mut self, node: &IrNode) -> Flow<Value> {
         let IrKind::As { value, test, .. } = node.kind else {
             return mistyped(node, "a node that is not an `as` narrowed");
         };
@@ -832,13 +947,14 @@ impl Evaluator<'_> {
             format!("{} is not {}", code.subject, code.target),
             node.span,
         )
-        .with_label(failure(ir, &code.test, &value)))
+        .with_label(failure(ir, &code.test, &value))
+        .into())
     }
 
     /// Evaluates the `Is` `node`: its value, through the general walker,
     /// written to the node's slot if it has one, and whether it passes the
     /// node's test.
-    fn is_test(&mut self, node: &IrNode) -> Result<bool, Diagnostic> {
+    fn is_test(&mut self, node: &IrNode) -> Flow<bool> {
         let IrKind::Is { value, test, slot } = node.kind else {
             return mistyped(node, "a node that is not an `is` tested");
         };
@@ -860,7 +976,7 @@ impl Evaluator<'_> {
     /// Evaluates a total comparison of two values of a union of kinds, a
     /// `ValueSame` if `equal` and a `ValueNotSame` otherwise: the values
     /// compare whole, deeply, as [`Value`]'s equality does.
-    fn value_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
+    fn value_same(&mut self, operands: Operands, equal: bool) -> Flow<bool> {
         let lhs = self.value(operands.lhs)?;
         let rhs = self.value(operands.rhs)?;
         Ok((lhs == rhs) == equal)
@@ -868,11 +984,7 @@ impl Evaluator<'_> {
 
     /// Evaluates the `Await` `node` as a value that `extract` accepts: one
     /// of the kind the node states.
-    fn await_as<T>(
-        &mut self,
-        node: &IrNode,
-        extract: fn(Value) -> Option<T>,
-    ) -> Result<T, Diagnostic> {
+    fn await_as<T>(&mut self, node: &IrNode, extract: fn(Value) -> Option<T>) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -887,7 +999,7 @@ impl Evaluator<'_> {
 
     /// Evaluates the `Await` `node`: its value, through the general walker,
     /// awaited fully and then, if it has a lazy shape, deeply.
-    fn await_value(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn await_value(&mut self, node: &IrNode) -> Flow<Value> {
         let IrKind::Await {
             value,
             shape,
@@ -918,7 +1030,7 @@ impl Evaluator<'_> {
         depth: u16,
         level: usize,
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let mut value = value;
         loop {
             match value {
@@ -948,7 +1060,7 @@ impl Evaluator<'_> {
         shape: LazyShapeId,
         (depth, level, tolerant): (u16, usize, bool),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let ir = self.ir;
         if let Some(members) = ir.lazy_union(shape) {
             let mut value = value;
@@ -1022,7 +1134,7 @@ impl Evaluator<'_> {
         shape: LazyShapeId,
         (depth, level, tolerant): (u16, usize, bool),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let Value::List(list) = &value else {
             return Ok(value);
         };
@@ -1073,17 +1185,17 @@ impl Evaluator<'_> {
         depth: u16,
         level: usize,
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let Some(code) = future.code.find_function(future.function) else {
             return mistyped(node, "a future of a function its IR lacks");
         };
         let entering = self.levels + usize::from(depth) + level + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
-            return Err(nested_too_deeply(node));
+            return Err(nested_too_deeply(node).into());
         }
         let captures = match future.begin() {
             Some(Begin::Done(value)) => return Ok(value),
-            Some(Begin::Running) => return Err(depends_on_itself(node)),
+            Some(Begin::Running) => return Err(depends_on_itself(node).into()),
             Some(Begin::Pending(captures)) => captures,
             None => return mistyped(node, "a future's state is in use"),
         };
@@ -1101,7 +1213,8 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        match result {
+        // No stop leaves a `lazy`'s body: the checker sees to it.
+        match result.map_err(|unwind| unwind.into_error(node.span)) {
             Ok(value) => {
                 // The captures are dropped on return: a future that has
                 // run holds only its value.
@@ -1114,7 +1227,7 @@ impl Evaluator<'_> {
             Err(error) => {
                 // Left unrun, so that a later await runs it again.
                 if future.finish(FutureState::Pending(captures)) {
-                    Err(self.awaited_error(error, future, node))
+                    Err(self.awaited_error(error, future, node).into())
                 } else {
                     mistyped(node, "a future's state is in use")
                 }
@@ -1143,11 +1256,7 @@ impl Evaluator<'_> {
     /// at depth `depth` in this frame's body (see the module documentation),
     /// and returns the body's value; or, if the callee is a closure of a
     /// memoised function, hands the call to [`Evaluator::memo_call`].
-    fn call(
-        &mut self,
-        (callee, args, depth): (IrId, IrRange, u16),
-        node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    fn call(&mut self, (callee, args, depth): (IrId, IrRange, u16), node: &IrNode) -> Flow<Value> {
         let closure = self.function(callee)?;
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
@@ -1157,14 +1266,16 @@ impl Evaluator<'_> {
         }
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
-            return Err(nested_too_deeply(node));
+            return Err(nested_too_deeply(node).into());
         }
         let base = self.stack.len();
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
-        if let Err(error) = self.arguments(args, base) {
+        // An argument may fail, or stop for a loop around the call, after
+        // the frame has grown: either way the frame goes.
+        if let Err(unwind) = self.arguments(args, base) {
             self.stack.truncate(base);
-            return Err(error);
+            return Err(unwind);
         }
         let result = Evaluator {
             ir: &closure.code,
@@ -1177,12 +1288,13 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
-        match result {
+        // No stop leaves a function's body: the checker sees to it.
+        match result.map_err(|unwind| unwind.into_error(node.span)) {
             Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
                 error.input = Some(closure.code.input());
-                Err(error)
+                Err(error.into())
             }
-            result => result,
+            result => result.map_err(Unwind::from),
         }
     }
 
@@ -1200,7 +1312,7 @@ impl Evaluator<'_> {
         (closure, code): (&Rc<Closure>, &FnCode),
         (args, depth): (IrRange, u16),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let base = self.stack.len();
         let (mark, entering) = match self.memo_begin((closure, code), (args, depth), node)? {
             MemoBegin::Found(value) => return Ok(value),
@@ -1218,9 +1330,11 @@ impl Evaluator<'_> {
         }
         .value(code.body);
         self.stack.truncate(base);
+        // No stop leaves a function's body: the checker sees to it.
+        let result = result.map_err(|unwind| unwind.into_error(node.span));
         match mark {
             Some(mark) => self.memo_end(closure, mark, result, node),
-            None => result.map_err(|error| self.memo_error(error, closure, false, node)),
+            None => result.map_err(|error| self.memo_error(error, closure, false, node).into()),
         }
     }
 
@@ -1239,13 +1353,16 @@ impl Evaluator<'_> {
         (closure, code): (&Rc<Closure>, &FnCode),
         (args, depth): (IrRange, u16),
         node: &IrNode,
-    ) -> Result<MemoBegin, Diagnostic> {
+    ) -> Flow<MemoBegin> {
         let base = self.stack.len();
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
-        if let Err(error) = self.arguments(args, base) {
+        // An argument may fail, or stop for a loop around the call, after
+        // the frame has grown: either way the frame goes, and no entry has
+        // been made yet.
+        if let Err(unwind) = self.arguments(args, base) {
             self.stack.truncate(base);
-            return Err(error);
+            return Err(unwind);
         }
         let params = base..base + code.param_count as usize;
         let Some(key) = self.stack.get(params.clone()) else {
@@ -1260,13 +1377,13 @@ impl Evaluator<'_> {
             }
             Lookup::Running => {
                 self.stack.truncate(base);
-                return Err(depends_on_own_result(node));
+                return Err(depends_on_own_result(node).into());
             }
         };
         let entering = self.levels + usize::from(depth) + CALL_LEVELS;
         if entering + code.height as usize > MAX_DEPTH {
             self.stack.truncate(base);
-            return Err(nested_too_deeply(node));
+            return Err(nested_too_deeply(node).into());
         }
         let key = self.stack.get(params).unwrap_or_default();
         // Arguments that equal nothing, themselves included, as those
@@ -1293,14 +1410,14 @@ impl Evaluator<'_> {
         mark: Mark,
         result: Result<Value, Diagnostic>,
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         match result {
             Ok(value) => match self.memo.finish(closure, &mark, Some(&value)) {
                 Some(_) => Ok(value),
                 None => mistyped(node, "a memoised call's entry is missing"),
             },
             Err(error) => match self.memo.finish(closure, &mark, None) {
-                Some(reentered) => Err(self.memo_error(error, closure, reentered, node)),
+                Some(reentered) => Err(self.memo_error(error, closure, reentered, node).into()),
                 None => mistyped(node, "a memoised call's entry is missing"),
             },
         }
@@ -1338,7 +1455,7 @@ impl Evaluator<'_> {
     /// Evaluates the arguments `args` of a call, `Arg` nodes, in order, in
     /// this frame, writing each to its parameter's slot of the frame that
     /// starts at `base`.
-    fn arguments(&mut self, args: IrRange, base: usize) -> Result<(), Diagnostic> {
+    fn arguments(&mut self, args: IrRange, base: usize) -> Flow<()> {
         for &arg in self.ir.items(args) {
             let node = self.ir.get(arg);
             let IrKind::Arg { param, value } = node.kind else {
@@ -1361,7 +1478,7 @@ impl Evaluator<'_> {
         call: (IrId, IrRange, u16),
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
-    ) -> Result<T, Diagnostic> {
+    ) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -1375,7 +1492,7 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a function-typed node to its closure.
-    fn function(&mut self, id: IrId) -> Result<Rc<Closure>, Diagnostic> {
+    fn function(&mut self, id: IrId) -> Flow<Rc<Closure>> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Load(_, ValueKind::Deferred)
@@ -1434,6 +1551,7 @@ impl Evaluator<'_> {
                 Value::Fn(closure) => Some(closure),
                 _ => None,
             }),
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             _ => mistyped(node, "a node of another kind where a function was expected"),
         }
     }
@@ -1441,7 +1559,7 @@ impl Evaluator<'_> {
     /// Builds a record of the values of `values`, in the order of `layout`'s
     /// names: the one allocation for its values, sized exactly, and one for
     /// the record, which shares the layout.
-    fn make_record(&mut self, layout: LayoutId, values: IrRange) -> Result<Value, Diagnostic> {
+    fn make_record(&mut self, layout: LayoutId, values: IrRange) -> Flow<Value> {
         let items = self.ir.items(values);
         let mut fields = Vec::with_capacity(items.len());
         for &item in items {
@@ -1456,7 +1574,7 @@ impl Evaluator<'_> {
     /// Evaluates `record` and returns its field `name`, for the `Field`
     /// `node`. The checker guarantees the field is there, so a missing
     /// one, or an empty record, is an internal error.
-    fn field(&mut self, record: IrId, name: Name, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn field(&mut self, record: IrId, name: Name, node: &IrNode) -> Flow<Value> {
         match self.record(record)? {
             Value::Record(fields) => match fields.get(name) {
                 Some(value) => Ok(value.clone()),
@@ -1473,7 +1591,7 @@ impl Evaluator<'_> {
         (record, name): (IrId, Name),
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
-    ) -> Result<T, Diagnostic> {
+    ) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -1485,7 +1603,7 @@ impl Evaluator<'_> {
 
     /// Evaluates a list node, through the general walker, to its list (see
     /// the module documentation).
-    fn list(&mut self, id: IrId) -> Result<List, Diagnostic> {
+    fn list(&mut self, id: IrId) -> Flow<List> {
         match self.value(id)? {
             Value::List(list) => Ok(list),
             _ => mistyped(
@@ -1499,7 +1617,7 @@ impl Evaluator<'_> {
     /// list of each `Spread` among them if `spreads` says there is one: one
     /// allocation, sized exactly and filled in place, if there is none,
     /// and none at all for the empty list.
-    fn make_list(&mut self, items: IrRange, spreads: bool) -> Result<Value, Diagnostic> {
+    fn make_list(&mut self, items: IrRange, spreads: bool) -> Flow<Value> {
         let ir = self.ir;
         let items = ir.items(items);
         if spreads {
@@ -1533,16 +1651,11 @@ impl Evaluator<'_> {
     /// place, and none for an empty range. A range of more than
     /// [`MAX_LIST_LEN`] integers, whose list cannot exist, is "range too
     /// large".
-    fn range(
-        &mut self,
-        operands: Operands,
-        inclusive: bool,
-        node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    fn range(&mut self, operands: Operands, inclusive: bool, node: &IrNode) -> Flow<Value> {
         let (start, end) = self.ints(operands)?;
         let len = range_len(start, end, inclusive);
         let Some(len) = usize::try_from(len).ok().filter(|&len| len <= MAX_LIST_LEN) else {
-            return Err(range_too_large(node, len));
+            return Err(range_too_large(node, len).into());
         };
         // No integer of the range passes its end, so none overflows.
         let list = List::from_exact((0..len).map(|offset| {
@@ -1566,7 +1679,7 @@ impl Evaluator<'_> {
         &mut self,
         (slot, parts, collect): (Slot, IrRange, bool),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let (iterable, guard, body) = match *self.ir.items(parts) {
             [iterable, body] => (iterable, None, body),
             [iterable, guard, body] => (iterable, Some(guard), body),
@@ -1583,20 +1696,23 @@ impl Evaluator<'_> {
         let at = self.base + slot.index();
         for element in elements {
             let Some(variable) = self.stack.get_mut(at) else {
-                return Err(internal(
-                    "a `for`'s variable is outside the frame",
-                    node.span,
-                ));
+                return Err(internal("a `for`'s variable is outside the frame", node.span).into());
             };
             *variable = element;
+            // A stop out of the guard is for a loop around this one.
             if let Some(guard) = guard
                 && !self.bool(guard)?
             {
                 continue;
             }
-            let value = self.value(body)?;
-            if collect {
-                values.push(value);
+            match self.value(body) {
+                Ok(value) if collect => values.push(value),
+                Ok(_) => {}
+                Err(unwind) => {
+                    if caught(unwind, &mut values, collect)? {
+                        break;
+                    }
+                }
             }
         }
         Ok(if collect {
@@ -1606,12 +1722,103 @@ impl Evaluator<'_> {
         })
     }
 
+    /// Evaluates the loop `node`, a `For` or a `Loop`, by the helper for its
+    /// kind: the walkers only call this.
+    fn looped(&mut self, node: &IrNode) -> Flow<Value> {
+        match node.kind {
+            IrKind::For {
+                slot,
+                parts,
+                collect,
+            } => self.for_loop((slot, parts, collect), node),
+            IrKind::Loop {
+                parts,
+                collect,
+                test_first,
+            } => self.condition_loop((parts, collect, test_first), node),
+            _ => mistyped(node, "a node that is not a loop looped"),
+        }
+    }
+
+    /// Evaluates the `Loop` `node`, whose parts are `parts`, a condition
+    /// loop or a `do` loop (see [`IrKind::Loop`]): while its condition is
+    /// true, tested first only if `test_first`, its body, and then the items
+    /// after its condition, each for its effects. If `collect`, what each
+    /// iteration contributes is collected, in a vector that grows as it
+    /// comes, its length not being known up front, and then copied into the
+    /// list's allocation; otherwise it is dropped, and the loop is `{}`. A
+    /// stop out of its body is caught as [`caught`] says; one out of its
+    /// condition or an item after it is for a loop around this one. Each
+    /// iteration evaluates the body afresh at the same depth, so none nests
+    /// in another.
+    fn condition_loop(
+        &mut self,
+        (parts, collect, test_first): (IrRange, bool, bool),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let ir = self.ir;
+        let Some((&cond, rest)) = ir.items(parts).split_first() else {
+            return mistyped(node, "a loop without its condition");
+        };
+        let Some((&body, after)) = rest.split_first() else {
+            return mistyped(node, "a loop without its body");
+        };
+        let mut values = Vec::new();
+        let mut test = test_first;
+        loop {
+            if test && !self.bool(cond)? {
+                break;
+            }
+            test = true;
+            match self.value(body) {
+                Ok(value) if collect => values.push(value),
+                Ok(_) => {}
+                Err(unwind) => {
+                    if caught(unwind, &mut values, collect)? {
+                        break;
+                    }
+                }
+            }
+            for &item in after {
+                self.value(item)?;
+            }
+        }
+        Ok(if collect {
+            Value::List(List::from_vec(values))
+        } else {
+            Value::Empty
+        })
+    }
+
+    /// Evaluates the `Break` or `Continue` `node`: its value, if it has
+    /// one, through the general walker, and then the stop that carries it
+    /// to its loop, unwinding every node on the way, as an error does.
+    /// Every walker hands such a node here, since one of kind
+    /// [`ValueKind::Never`] may stand where a value of any kind is expected.
+    fn leave<T>(&mut self, node: &IrNode) -> Flow<T> {
+        let (kind, loops, value) = match node.kind {
+            IrKind::Break { loops, value } => (StopKind::Break, loops, value),
+            IrKind::Continue { loops, value } => (StopKind::Continue, loops, value),
+            _ => {
+                return mistyped(
+                    node,
+                    "a node that is not a `break` or `continue` left a loop",
+                );
+            }
+        };
+        let value = match value {
+            Some(value) => Some(self.value(value)?),
+            None => None,
+        };
+        Err(Unwind::Stop(Stop { loops, kind, value }))
+    }
+
     /// What a `for` whose iterable is `iterable` iterates over: if the
     /// iterable is directly a range, its integers, from its bounds,
     /// evaluated left to right, without building its list, so that
     /// [`MAX_LIST_LEN`] does not apply; otherwise the elements of the list
     /// it evaluates to.
-    fn elements(&mut self, iterable: IrId) -> Result<Elements, Diagnostic> {
+    fn elements(&mut self, iterable: IrId) -> Flow<Elements> {
         match self.ir.get(iterable).kind {
             IrKind::Range(inclusive, operands) => {
                 let (start, end) = self.ints(operands)?;
@@ -1626,7 +1833,7 @@ impl Evaluator<'_> {
     /// in a vector, which grows by amortised doubling, so that the whole
     /// takes time linear in the list's length, and then copied into the
     /// list's one allocation.
-    fn make_spread_list(&mut self, items: &[IrId]) -> Result<Value, Diagnostic> {
+    fn make_spread_list(&mut self, items: &[IrId]) -> Flow<Value> {
         let mut values = Vec::with_capacity(items.len());
         for &item in items {
             if let IrKind::Spread(list) = self.ir.get(item).kind {
@@ -1641,7 +1848,7 @@ impl Evaluator<'_> {
     /// Evaluates `list` and then `index`, and returns the element at the
     /// position, counting from 0, for the `Index` `node`; a position
     /// outside the list, a negative one included, is "index out of range".
-    fn index(&mut self, (list, index): (IrId, IrId), node: &IrNode) -> Result<Value, Diagnostic> {
+    fn index(&mut self, (list, index): (IrId, IrId), node: &IrNode) -> Flow<Value> {
         let list = self.list(list)?;
         let at = self.int(index)?;
         match usize::try_from(at)
@@ -1649,7 +1856,7 @@ impl Evaluator<'_> {
             .and_then(|position| list.values().get(position))
         {
             Some(value) => Ok(value.clone()),
-            None => Err(out_of_range(node.span, at, list.len())),
+            None => Err(out_of_range(node.span, at, list.len()).into()),
         }
     }
 
@@ -1661,7 +1868,7 @@ impl Evaluator<'_> {
         operands: (IrId, IrId),
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
-    ) -> Result<T, Diagnostic> {
+    ) -> Flow<T> {
         if mixed(node) {
             return mistyped(node, MIXED);
         }
@@ -1675,7 +1882,7 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a `ListLen` of `list`: the number of its elements.
-    fn list_len(&mut self, list: IrId) -> Result<i64, Diagnostic> {
+    fn list_len(&mut self, list: IrId) -> Flow<i64> {
         // A list has far fewer elements than `i64::MAX`.
         Ok(i64::try_from(self.list(list)?.len()).unwrap_or(i64::MAX))
     }
@@ -1683,12 +1890,7 @@ impl Evaluator<'_> {
     /// Evaluates the typed list comparison `node`, a `ListEq` if `equal` and
     /// a `ListNe` otherwise: the operands compare element by element over
     /// the list's shape (see [`record_eq_shaped`]).
-    fn list_eq(
-        &mut self,
-        operands: ShapedOperands,
-        equal: bool,
-        node: &IrNode,
-    ) -> Result<bool, Diagnostic> {
+    fn list_eq(&mut self, operands: ShapedOperands, equal: bool, node: &IrNode) -> Flow<bool> {
         let lhs = Value::List(self.list(operands.lhs)?);
         let rhs = Value::List(self.list(operands.rhs)?);
         match record_eq_shaped(self.ir, operands.shape, &lhs, &rhs) {
@@ -1700,21 +1902,21 @@ impl Evaluator<'_> {
     /// Evaluates a total list comparison, a `ListSame` if `equal` and a
     /// `ListNotSame` otherwise: lists compare whole, element by element,
     /// deeply.
-    fn list_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
+    fn list_same(&mut self, operands: Operands, equal: bool) -> Flow<bool> {
         let lhs = self.list(operands.lhs)?;
         let rhs = self.list(operands.rhs)?;
         Ok((lhs == rhs) == equal)
     }
 
     /// The value in `slot` of this frame.
-    fn load(&self, slot: Slot, node: &IrNode) -> Result<&Value, Diagnostic> {
+    fn load(&self, slot: Slot, node: &IrNode) -> Flow<&Value> {
         self.stack
             .get(self.base + slot.index())
-            .ok_or_else(|| internal("load from a slot outside the frame", node.span))
+            .ok_or_else(|| internal("load from a slot outside the frame", node.span).into())
     }
 
     /// Evaluates an `Int`-typed node.
-    fn int(&mut self, id: IrId) -> Result<i64, Diagnostic> {
+    fn int(&mut self, id: IrId) -> Flow<i64> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::IntConst(value) => Ok(value),
@@ -1800,12 +2002,14 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where an Int was expected"),
-            // A `for` that discards its values is `{}`, but only ever a
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
+            // A loop that discards its values is `{}`, but only ever a
             // statement.
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. } => mistyped(node, "list node where an Int was expected"),
+            | IrKind::For { .. }
+            | IrKind::Loop { .. } => mistyped(node, "list node where an Int was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where an Int was expected")
             }
@@ -1813,18 +2017,18 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates both `Int` operands, left to right.
-    fn ints(&mut self, operands: Operands) -> Result<(i64, i64), Diagnostic> {
+    fn ints(&mut self, operands: Operands) -> Flow<(i64, i64)> {
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
         Ok((lhs, rhs))
     }
 
     /// Evaluates the `IntNeg` `node` of `operand`.
-    fn int_neg(&mut self, node: &IrNode, operand: IrId) -> Result<i64, Diagnostic> {
+    fn int_neg(&mut self, node: &IrNode, operand: IrId) -> Flow<i64> {
         let value = self.int(operand)?;
         value
             .checked_neg()
-            .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value))
+            .ok_or_else(|| self.unary_error(node, operand, OVERFLOW, value).into())
     }
 
     /// Evaluates the `+`, `-` or `*` `node`, which `op` computes, `None`
@@ -1834,12 +2038,12 @@ impl Evaluator<'_> {
         node: &IrNode,
         operands: Operands,
         op: fn(i64, i64) -> Option<i64>,
-    ) -> Result<i64, Diagnostic> {
+    ) -> Flow<i64> {
         // Not through `ints`: this is on the recursion path of every
         // arithmetic chain, so it saves that frame.
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
-        op(lhs, rhs).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
+        op(lhs, rhs).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs).into())
     }
 
     /// Evaluates the `//` or `%` `node`, which `op` computes for a nonzero
@@ -1849,19 +2053,21 @@ impl Evaluator<'_> {
         node: &IrNode,
         operands: Operands,
         op: fn(i64, NonZeroI64) -> Option<i64>,
-    ) -> Result<i64, Diagnostic> {
+    ) -> Flow<i64> {
         let lhs = self.int(operands.lhs)?;
         let rhs = self.int(operands.rhs)?;
         let Some(divisor) = NonZeroI64::new(rhs) else {
-            return Err(self.binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs));
+            return Err(self
+                .binary_error(node, operands, DIVISION_BY_ZERO, lhs, rhs)
+                .into());
         };
-        op(lhs, divisor).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs))
+        op(lhs, divisor).ok_or_else(|| self.binary_error(node, operands, OVERFLOW, lhs, rhs).into())
     }
 
     /// Evaluates a `Float`-typed node. IEEE 754 semantics; never fails except
     /// through an `Int` operand of `IntToFloat`, an item of a block or the
     /// condition of an `if`.
-    fn float(&mut self, id: IrId) -> Result<f64, Diagnostic> {
+    fn float(&mut self, id: IrId) -> Flow<f64> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::FloatConst(value) => Ok(value),
@@ -1947,10 +2153,12 @@ impl Evaluator<'_> {
                 mistyped(node, "record node where a Float was expected")
             }
             IrKind::Update { .. } => mistyped(node, "update node where a Float was expected"),
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. } => mistyped(node, "list node where a Float was expected"),
+            | IrKind::For { .. }
+            | IrKind::Loop { .. } => mistyped(node, "list node where a Float was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Float was expected")
             }
@@ -1958,16 +2166,12 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a `FloatNeg` of `operand`.
-    fn float_neg(&mut self, operand: IrId) -> Result<f64, Diagnostic> {
+    fn float_neg(&mut self, operand: IrId) -> Flow<f64> {
         Ok(-self.float(operand)?)
     }
 
     /// Evaluates a `Float` operator that `op` computes.
-    fn float_arithmetic(
-        &mut self,
-        operands: Operands,
-        op: fn(f64, f64) -> f64,
-    ) -> Result<f64, Diagnostic> {
+    fn float_arithmetic(&mut self, operands: Operands, op: fn(f64, f64) -> f64) -> Flow<f64> {
         let lhs = self.float(operands.lhs)?;
         let rhs = self.float(operands.rhs)?;
         Ok(op(lhs, rhs))
@@ -1975,7 +2179,7 @@ impl Evaluator<'_> {
 
     /// Evaluates a `Bool`-typed node. `and` and `or` evaluate their right
     /// operand only when the left does not decide the result.
-    fn bool(&mut self, id: IrId) -> Result<bool, Diagnostic> {
+    fn bool(&mut self, id: IrId) -> Flow<bool> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::BoolConst(value) => Ok(value),
@@ -2059,10 +2263,12 @@ impl Evaluator<'_> {
             | IrKind::MakeRecord { .. }
             | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Bool was expected"),
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. } => mistyped(node, "list node where a Bool was expected"),
+            | IrKind::For { .. }
+            | IrKind::Loop { .. } => mistyped(node, "list node where a Bool was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a Bool was expected")
             }
@@ -2070,27 +2276,27 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates an `IntCmp` testing `cmp`.
-    fn int_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+    fn int_cmp(&mut self, cmp: Cmp, operands: Operands) -> Flow<bool> {
         let (lhs, rhs) = self.ints(operands)?;
         Ok(cmp.test(&lhs, &rhs))
     }
 
     /// Evaluates a `FloatCmp` testing `cmp`.
-    fn float_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+    fn float_cmp(&mut self, cmp: Cmp, operands: Operands) -> Flow<bool> {
         let lhs = self.float(operands.lhs)?;
         let rhs = self.float(operands.rhs)?;
         Ok(cmp.test(&lhs, &rhs))
     }
 
     /// Evaluates a `StrCmp` testing `cmp`.
-    fn str_cmp(&mut self, cmp: Cmp, operands: Operands) -> Result<bool, Diagnostic> {
+    fn str_cmp(&mut self, cmp: Cmp, operands: Operands) -> Flow<bool> {
         let lhs = self.string(operands.lhs)?;
         let rhs = self.string(operands.rhs)?;
         Ok(cmp.test(&*lhs, &*rhs))
     }
 
     /// Evaluates a `BoolEq`: `==` if `equal`, `!=` otherwise.
-    fn bool_eq(&mut self, equal: bool, operands: Operands) -> Result<bool, Diagnostic> {
+    fn bool_eq(&mut self, equal: bool, operands: Operands) -> Flow<bool> {
         let lhs = self.bool(operands.lhs)?;
         let rhs = self.bool(operands.rhs)?;
         Ok((lhs == rhs) == equal)
@@ -2099,12 +2305,7 @@ impl Evaluator<'_> {
     /// Evaluates the typed record comparison `node`, a `RecordEq` if `equal`
     /// and a `RecordNe` otherwise: the operands compare over their shape
     /// (see [`record_eq_shaped`]).
-    fn record_eq(
-        &mut self,
-        operands: ShapedOperands,
-        equal: bool,
-        node: &IrNode,
-    ) -> Result<bool, Diagnostic> {
+    fn record_eq(&mut self, operands: ShapedOperands, equal: bool, node: &IrNode) -> Flow<bool> {
         let lhs = self.record(operands.lhs)?;
         let rhs = self.record(operands.rhs)?;
         match record_eq_shaped(self.ir, operands.shape, &lhs, &rhs) {
@@ -2116,7 +2317,7 @@ impl Evaluator<'_> {
     /// Evaluates a total record comparison, a `RecordSame` if `equal` and a
     /// `RecordNotSame` otherwise: records compare whole, deeply and by field
     /// name; empty records are all equal.
-    fn record_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
+    fn record_same(&mut self, operands: Operands, equal: bool) -> Flow<bool> {
         let lhs = self.record(operands.lhs)?;
         let rhs = self.record(operands.rhs)?;
         Ok((lhs == rhs) == equal)
@@ -2125,7 +2326,7 @@ impl Evaluator<'_> {
     /// Evaluates `and`, which a `false` left operand decides, or `or`, which
     /// a `true` one decides, as `decisive` says. The right operand is only
     /// evaluated when the left does not decide.
-    fn logic(&mut self, operands: Operands, decisive: bool) -> Result<bool, Diagnostic> {
+    fn logic(&mut self, operands: Operands, decisive: bool) -> Flow<bool> {
         let lhs = self.bool(operands.lhs)?;
         if lhs == decisive {
             Ok(lhs)
@@ -2135,12 +2336,12 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a `Not` of `operand`.
-    fn not(&mut self, operand: IrId) -> Result<bool, Diagnostic> {
+    fn not(&mut self, operand: IrId) -> Flow<bool> {
         Ok(!self.bool(operand)?)
     }
 
     /// Evaluates a `String`-typed node.
-    fn string(&mut self, id: IrId) -> Result<Rc<str>, Diagnostic> {
+    fn string(&mut self, id: IrId) -> Flow<Rc<str>> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::StrConst(constant) => Ok(Rc::clone(self.ir.string(constant))),
@@ -2226,10 +2427,12 @@ impl Evaluator<'_> {
                 mistyped(node, "record node where a String was expected")
             }
             IrKind::Update { .. } => mistyped(node, "update node where a String was expected"),
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
-            | IrKind::For { .. } => mistyped(node, "list node where a String was expected"),
+            | IrKind::For { .. }
+            | IrKind::Loop { .. } => mistyped(node, "list node where a String was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a String was expected")
             }
@@ -2237,7 +2440,7 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates a record node: [`Value::Empty`] or a [`Value::Record`].
-    fn record(&mut self, id: IrId) -> Result<Value, Diagnostic> {
+    fn record(&mut self, id: IrId) -> Flow<Value> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Empty => Ok(Value::Empty),
@@ -2324,15 +2527,15 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
                 mistyped(node, "String node where a record was expected")
             }
-            IrKind::For {
-                slot,
-                parts,
-                collect: false,
-            } => self.for_loop((slot, parts, false), node),
+            IrKind::For { collect: false, .. } | IrKind::Loop { collect: false, .. } => {
+                self.looped(node)
+            }
+            IrKind::Break { .. } | IrKind::Continue { .. } => self.leave(node),
             IrKind::MakeList { .. }
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::For { .. }
+            | IrKind::Loop { .. }
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
             IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
                 mistyped(node, "function node where a record was expected")
@@ -2347,7 +2550,7 @@ impl Evaluator<'_> {
         &mut self,
         (record, name, value): (IrId, Name, IrId),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let old = self.record(record)?;
         let value = self.value(value)?;
         self.with_field(old, name, value, node)
@@ -2357,7 +2560,7 @@ impl Evaluator<'_> {
     /// value, first, then the record or list it updates, and then the walk
     /// of its path (see [`Evaluator::walk_update`]). Apart from the walk,
     /// so that the recursion through the value holds nothing of it.
-    fn update(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+    fn update(&mut self, node: &IrNode) -> Flow<Value> {
         let IrKind::Update {
             parts, path, depth, ..
         } = node.kind
@@ -2391,7 +2594,7 @@ impl Evaluator<'_> {
         (root, value): (Value, Value),
         (positions, path, depth): (&[IrId], UpdatePathId, u16),
         node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    ) -> Flow<Value> {
         let ir = self.ir;
         let Some((leaf, steps)) = ir.update_path(path).and_then(<[UpdateStep]>::split_last) else {
             return mistyped(node, "an update of a path its IR lacks");
@@ -2440,7 +2643,7 @@ impl Evaluator<'_> {
         step: &UpdateStep,
         positions: &mut impl Iterator<Item = IrId>,
         node: &IrNode,
-    ) -> Result<Selected, Diagnostic> {
+    ) -> Flow<Selected> {
         let StepAt::Field(name) = step.at else {
             let Some(position) = positions.next() else {
                 return mistyped(node, "an update lacks the position of an element");
@@ -2451,7 +2654,7 @@ impl Evaluator<'_> {
             };
             return match usize::try_from(at).ok().filter(|&index| index < list.len()) {
                 Some(index) => Ok(Selected::Element(index)),
-                None => Err(out_of_range(step.span, at, list.len())),
+                None => Err(out_of_range(step.span, at, list.len()).into()),
             };
         };
         Ok(Selected::Field(name))
@@ -2461,13 +2664,7 @@ impl Evaluator<'_> {
     /// what `at` selects in it replaced by `value`, or added for a field
     /// the record lacks, for the `Update` `node`: a new record or list,
     /// `container` unchanged.
-    fn replace(
-        &self,
-        container: Value,
-        at: Selected,
-        value: Value,
-        node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    fn replace(&self, container: Value, at: Selected, value: Value, node: &IrNode) -> Flow<Value> {
         match (container, at) {
             (container, Selected::Field(name)) => self.with_field(container, name, value, node),
             (Value::List(list), Selected::Element(index)) => {
@@ -2480,13 +2677,7 @@ impl Evaluator<'_> {
     /// `old`, a record, with field `name` set to `value`, for the update
     /// `node`: a new record, the old one unchanged. See the module
     /// documentation.
-    fn with_field(
-        &self,
-        old: Value,
-        name: Name,
-        value: Value,
-        node: &IrNode,
-    ) -> Result<Value, Diagnostic> {
+    fn with_field(&self, old: Value, name: Name, value: Value, node: &IrNode) -> Flow<Value> {
         let old = match old {
             Value::Record(old) => old,
             Value::Empty => {
@@ -2546,7 +2737,7 @@ impl Evaluator<'_> {
 
     /// Evaluates a `StrConcat`, allocating exactly the length the result
     /// needs.
-    fn concat(&mut self, operands: Operands) -> Result<Rc<str>, Diagnostic> {
+    fn concat(&mut self, operands: Operands) -> Flow<Rc<str>> {
         let lhs = self.string(operands.lhs)?;
         let rhs = self.string(operands.rhs)?;
         let mut text = String::with_capacity(lhs.len() + rhs.len());
@@ -2559,7 +2750,7 @@ impl Evaluator<'_> {
     /// `items`: a `StrConst` is literal text, pushed as it is, and any other
     /// item is a value shown with its `Display`. The text is built in one
     /// buffer, reserved for the literal pieces and a little per value.
-    fn interpolate(&mut self, items: IrRange, span: Span) -> Result<Rc<str>, Diagnostic> {
+    fn interpolate(&mut self, items: IrRange, span: Span) -> Flow<Rc<str>> {
         let items = self.ir.items(items);
         let estimate = items.iter().fold(0_usize, |total, &item| {
             let len = match self.ir.get(item).kind {
@@ -2626,6 +2817,34 @@ const DEFERRED_FUNCTION: &str = "a node that may be a future where a function wa
 /// members are of different kinds, which only the general walker
 /// evaluates (see [`mixed`]).
 const MIXED: &str = "a node of a union of kinds where one kind was expected";
+
+/// What a loop does with `unwind`, which came out of its body: if it is a
+/// stop for this loop, one with no loops left to leave, its value, if any,
+/// is collected into `values` when the loop `collect`s, and the result is
+/// whether the loop ends there, as after a `break`, or goes on, as after a
+/// `continue`. A stop for a loop further out goes on with one loop fewer to
+/// leave, and an error goes on as it is; this loop's list is dropped with
+/// it.
+fn caught(unwind: Unwind, values: &mut Vec<Value>, collect: bool) -> Flow<bool> {
+    match unwind {
+        Unwind::Stop(Stop {
+            loops: 0,
+            kind,
+            value,
+        }) => {
+            if collect && let Some(value) = value {
+                values.push(value);
+            }
+            Ok(kind == StopKind::Break)
+        }
+        Unwind::Stop(Stop { loops, kind, value }) => Err(Unwind::Stop(Stop {
+            loops: loops - 1,
+            kind,
+            value,
+        })),
+        error @ Unwind::Error(_) => Err(error),
+    }
+}
 
 /// Whether a deep await replaced `old`, a record's field or a list's
 /// element, with `new`: a future by what it yielded, or a record or list by
@@ -3234,7 +3453,7 @@ enum Selected {
 /// `node` to go down a level: a field the checker guarantees the record
 /// has, or an element at an index that `Evaluator::select` found in the
 /// list.
-fn selected(container: &Value, at: Selected, node: &IrNode) -> Result<Value, Diagnostic> {
+fn selected(container: &Value, at: Selected, node: &IrNode) -> Flow<Value> {
     let found = match (container, at) {
         (Value::Record(record), Selected::Field(name)) => record.get(name),
         (Value::List(list), Selected::Element(index)) => list.values().get(index),
@@ -3376,7 +3595,7 @@ fn depends_on_own_result(node: &IrNode) -> Diagnostic {
 
 /// Extracts a value of one kind from a slot or capture, for the node
 /// reading it: [`as_int`], [`as_float`], and so on.
-type Extract<T> = fn(&Value, &IrNode) -> Result<T, Diagnostic>;
+type Extract<T> = fn(&Value, &IrNode) -> Flow<T>;
 
 /// Whether `node`, a load, a capture, a field access, a call, an index, an
 /// await or an `as`, which a typed walker reads through a helper, is of
@@ -3514,7 +3733,7 @@ const fn described(value: &Value) -> &'static str {
 }
 
 /// The `Int` in `value`, read by the load or capture read `node`.
-fn as_int(value: &Value, node: &IrNode) -> Result<i64, Diagnostic> {
+fn as_int(value: &Value, node: &IrNode) -> Flow<i64> {
     match value {
         Value::Int(value) => Ok(*value),
         _ => mistyped(node, "Int load from a slot holding another type"),
@@ -3522,7 +3741,7 @@ fn as_int(value: &Value, node: &IrNode) -> Result<i64, Diagnostic> {
 }
 
 /// The `Float` in `value`, read by the load or capture read `node`.
-fn as_float(value: &Value, node: &IrNode) -> Result<f64, Diagnostic> {
+fn as_float(value: &Value, node: &IrNode) -> Flow<f64> {
     match value {
         Value::Float(value) => Ok(*value),
         _ => mistyped(node, "Float load from a slot holding another type"),
@@ -3530,7 +3749,7 @@ fn as_float(value: &Value, node: &IrNode) -> Result<f64, Diagnostic> {
 }
 
 /// The `Bool` in `value`, read by the load or capture read `node`.
-fn as_bool(value: &Value, node: &IrNode) -> Result<bool, Diagnostic> {
+fn as_bool(value: &Value, node: &IrNode) -> Flow<bool> {
     match value {
         Value::Bool(value) => Ok(*value),
         _ => mistyped(node, "Bool load from a slot holding another type"),
@@ -3539,7 +3758,7 @@ fn as_bool(value: &Value, node: &IrNode) -> Result<bool, Diagnostic> {
 
 /// A new reference to the `String` in `value`, read by the load or capture
 /// read `node`: not a copy.
-fn as_string(value: &Value, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
+fn as_string(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
     match value {
         Value::Str(text) => Ok(Rc::clone(text)),
         _ => mistyped(node, "String load from a slot holding another type"),
@@ -3548,7 +3767,7 @@ fn as_string(value: &Value, node: &IrNode) -> Result<Rc<str>, Diagnostic> {
 
 /// A new reference to the record in `value`, read by the load or capture
 /// read `node`: not a copy.
-fn as_record(value: &Value, node: &IrNode) -> Result<Value, Diagnostic> {
+fn as_record(value: &Value, node: &IrNode) -> Flow<Value> {
     match value {
         Value::Empty | Value::Record(_) => Ok(value.clone()),
         _ => mistyped(node, "record load from a slot holding another type"),
@@ -3565,7 +3784,7 @@ fn into_record(value: Value) -> Option<Value> {
 }
 /// A new reference to the closure in `value`, read by the load or capture
 /// read `node`.
-fn as_function(value: &Value, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> {
+fn as_function(value: &Value, node: &IrNode) -> Flow<Rc<Closure>> {
     match value {
         Value::Fn(closure) => Ok(Rc::clone(closure)),
         _ => mistyped(node, "function load from a slot holding another type"),
@@ -3575,8 +3794,8 @@ fn as_function(value: &Value, node: &IrNode) -> Result<Rc<Closure>, Diagnostic> 
 /// Fails with the internal error `message` at `node`: a node of a type its
 /// walker does not handle. Returned directly by the walkers' error arms, so
 /// that they hold no temporary for it (see the note on `Evaluator`).
-fn mistyped<T>(node: &IrNode, message: &'static str) -> Result<T, Diagnostic> {
-    Err(internal(message, node.span))
+fn mistyped<T>(node: &IrNode, message: &'static str) -> Flow<T> {
+    Err(internal(message, node.span).into())
 }
 
 #[cfg(test)]
@@ -4869,8 +5088,19 @@ mod tests {
             memo: &mut MemoTables::new(),
             levels: 0,
         }
-        .value(ir.root());
+        .value(ir.root())
+        .map_err(|unwind| unwind.into_error(ir.get(ir.root()).span));
         (result, stack.len())
+    }
+
+    #[test]
+    fn a_stop_makes_a_walkers_result_no_larger() {
+        // Every walker returns one of these, so its size is what each level
+        // of nesting copies; a stop rides in the error's room.
+        assert_eq!(
+            size_of::<Flow<Value>>(),
+            size_of::<Result<Value, Diagnostic>>()
+        );
     }
 
     #[test]
@@ -7520,6 +7750,326 @@ mod tests {
         assert_eq!(
             diagnostic.message,
             "internal error: a node of a union of kinds where one kind was expected"
+        );
+    }
+
+    #[test]
+    fn the_values_of_the_loop_forms() {
+        assert_eq!(int("let mut n = 0\nfor n < 3 { n := n + 1 }\nn"), 3);
+        assert_eq!(
+            shown("for let i = 0; i < 4; i := i + 1 { i * i }"),
+            "[0, 1, 4, 9]"
+        );
+        assert_eq!(
+            shown("let mut k = 0\nfor { k := k + 1; if k > 3 { break }; k * 10 }"),
+            "[10, 20, 30]"
+        );
+        assert_eq!(
+            shown("let mut t = 0\ndo { t := t + 1; t } for t < 3"),
+            "[1, 2, 3]"
+        );
+        // A `do` runs once with a false condition; a condition loop not at
+        // all.
+        assert_eq!(shown("do { 99 } for false"), "[99]");
+        assert_eq!(shown("for false { 99 }"), "[]");
+        // Find-first, both ways.
+        let xs = "let xs = [1, 7, 3, 9]\n";
+        assert_eq!(
+            shown(&format!(
+                "{xs}for x in xs {{ if x > 5 {{ break x }}; continue }}"
+            )),
+            "[7]"
+        );
+        assert_eq!(
+            shown(&format!("{xs}for x in xs {{ if x > 5 {{ break x }} }}")),
+            "[{}, 7]"
+        );
+        // Values: `continue E` contributes `E` in the body's place, and
+        // `break E` contributes `E` and ends the loop.
+        assert_eq!(
+            shown(&format!(
+                "{xs}for x in xs {{ if x == 7 {{ continue 70 }}; if x == 3 {{ break 30 }}; x }}"
+            )),
+            "[1, 70, 30]"
+        );
+        assert_eq!(
+            shown(&format!("{xs}for x in xs {{ if x == 3 {{ break }}; x }}")),
+            "[1, 7]"
+        );
+    }
+
+    #[test]
+    fn a_loop_runs_its_parts_in_order() {
+        // Before-items once, then the condition, the body and the
+        // after-items, again and again.
+        let text = "let mut s = \"\"\n\
+                    let v = for let k = ({ s := s + \"b\"; 0 }); ({ s := s + \"c\"; k < 2 }); \
+                    k := ({ s := s + \"a\"; k + 1 }) { s := s + \"B\"; k }\n\
+                    \"{s} {v}\"";
+        assert_eq!(string(text), "bcBacBac [0, 1]");
+        // `continue` skips the rest of the body but not the after-items.
+        let text = "let mut s = \"\"\n\
+                    let v = for let k = 0; k < 2; k := ({ s := s + \"a\"; k + 1 }) \
+                    { s := s + \"B\"; continue; s := s + \"X\" }\n\
+                    \"{s} {v}\"";
+        assert_eq!(string(text), "BaBa []");
+        // `break` skips them, and its value is collected.
+        let text = "let mut s = \"\"\n\
+                    let v = for let k = 0; true; k := ({ s := s + \"a\"; k + 1 }) \
+                    { if k == 1 { break k * 10 }; s := s + \"B\"; k }\n\
+                    \"{s} {v}\"";
+        assert_eq!(string(text), "Ba [0, 10]");
+        // A `do` tests its condition after each body, and `continue` goes
+        // on with that test.
+        let text = "let mut s = \"\"\nlet mut n = 0\n\
+                    let v = do { n := n + 1; s := s + \"B\"; if n == 1 { continue }; n } \
+                    for ({ s := s + \"c\"; n < 3 })\n\
+                    \"{s} {v}\"";
+        assert_eq!(string(text), "BcBcBc [2, 3]");
+        // An iteration's guard reads what the body wrote, as before.
+        assert_eq!(
+            shown("let mut seen = 0\nfor x in [1, 2, 3] if seen < 2 { seen := seen + 1; x }"),
+            "[1, 2]"
+        );
+    }
+
+    #[test]
+    fn a_labelled_stop_drops_the_lists_of_the_loops_it_leaves() {
+        let rows = "let rows = [[1, 2], [3, -1, 4], [5]]\n";
+        assert_eq!(
+            shown(&format!(
+                "{rows}for'rows r in rows {{ for c in r {{ if c < 0 {{ continue'rows 0 }}; c }} }}"
+            )),
+            "[[1, 2], 0, [5]]"
+        );
+        assert_eq!(
+            shown(&format!(
+                "{rows}for'rows r in rows {{ for c in r {{ if c < 0 {{ break'rows }}; c }} }}"
+            )),
+            "[[1, 2]]"
+        );
+        // Through a condition loop and a `do`, whose items after the
+        // condition do not run once the stop has left them.
+        let text = "let mut s = \"\"\n\
+                    let v = for'o x in [1, 2] { for let k = 0; k < 2; k := ({ s := s + \"a\"; k + 1 }) \
+                    { do { if x == 2 { break'o 9 } } for false; k } }\n\
+                    \"{s} {v}\"";
+        assert_eq!(string(text), "aa [[0, 1], 9]");
+    }
+
+    #[test]
+    fn a_stop_passes_through_every_kind_of_node() {
+        // Each evaluates what it holds up to the stop, and nothing after
+        // it: `ran` counts what ran after the stopping operand, which only
+        // the first iteration reaches.
+        for (expr, value) in [
+            (
+                "{ if x == 2 { break }; x } + ({ ran := ran + 1; 0 })",
+                "[1]",
+            ),
+            (
+                "f({ if x == 2 { break }; x }, { ran := ran + 1; 0 })",
+                "[1]",
+            ),
+            (
+                "[{ if x == 2 { break }; x }, { ran := ran + 1; 0 }]",
+                "[[1, 0]]",
+            ),
+            (
+                "{ a = { if x == 2 { break }; x }; b = { ran := ran + 1; 0 } }",
+                "[{a = 1; b = 0}]",
+            ),
+            (
+                "{ let mut r = { a = 0 }; r.a := { if x == 2 { break }; x }; ran := ran + 1; r.a }",
+                "[1]",
+            ),
+            // An update's value runs first, and its position after.
+            (
+                "{ let mut l = [0]; l[{ if x == 2 { break }; 0 }] := x; ran := ran + 1; l[0] }",
+                "[1]",
+            ),
+            (
+                "if { if x == 2 { break }; true } { ran := ran + 1; x } else { 0 }",
+                "[1]",
+            ),
+            (
+                "\"{ { if x == 2 { break }; x } }{ { ran := ran + 1; 0 } }\"",
+                "[\"10\"]",
+            ),
+            (
+                "if u is Int { if x == 2 { break }; ran := ran + 1; u } else { 0 }",
+                "[5]",
+            ),
+            // A stop out of an `is`'s operand leaves before the test writes
+            // its slot.
+            (
+                "if { if x == 2 { break }; u } is Int { ran := ran + 1; 1 } else { 0 }",
+                "[1]",
+            ),
+            (
+                "-{ if x == 2 { break }; x } * { ran := ran + 1; 1 }",
+                "[-1]",
+            ),
+        ] {
+            let text = format!(
+                "fn f(a: Int, b: Int): Int {{ a + b }}\nlet u: Int | String = 5\nlet mut ran = 0\n\
+                 let v = for x in [1, 2, 3] {{ {expr} }}\n\"{{v}} {{ran}}\""
+            );
+            assert_eq!(string(&text), format!("{value} 1"), "{expr}");
+        }
+    }
+
+    #[test]
+    fn never_typed_code_runs_to_its_stop() {
+        for body in [
+            "{ break } + 1",
+            "f({ continue })",
+            "[{ break }]",
+            "{ break }.a",
+            "{ break }[0]",
+            "{ break }(1)",
+            "not { break }",
+            "if { break } { 1 } else { 2 }",
+            "for y in { break } { y }",
+            "let r = { break }; r.a",
+            "\"{ { break } }\"",
+            "{ a = { break } }",
+            "{ break } is Int",
+            "await { break }",
+            "len({ break })",
+            "[...{ break }]",
+            "{ ...{ break } }",
+            "for ({ continue }) { 1 }",
+            "for let i = ({ break }); true; i := 1 { i }",
+            "let mut r = { break }; r := 1; r.a := 2; let r.b = 3; r",
+            "{ break } and true",
+            "x > 0 and { break }",
+        ] {
+            let text =
+                format!("fn f(n: Int): Int {{ n }}\nlet v = for x in [1, 2] {{ {body} }}\nlen(v)");
+            assert_eq!(run(&text), Ok(Value::Int(0)), "{body}");
+        }
+    }
+
+    #[test]
+    fn loops_in_functions_lazies_and_memoised_functions() {
+        // A loop inside a function inside a loop.
+        assert_eq!(
+            shown(
+                "fn g(n: Int): List<Int> { for y in [n, n + 1] { if y > n { break y * 10 }; y } }\n\
+                 for x in [1, 2] { g(x) }"
+            ),
+            "[[1, 20], [2, 30]]"
+        );
+        // A memoised function's and a `lazy`'s bodies loop and break.
+        assert_eq!(
+            shown(
+                "fn m(n: Int) ->> List<Int> { for let i = 0; true; i := i + 1 { if i == n { break }; i } }\n\
+                 [m(3), m(3), m(1)]"
+            ),
+            "[[0, 1, 2], [0, 1, 2], [0]]"
+        );
+        assert_eq!(
+            shown("let l = lazy { for x in [1, 2, 3] { if x == 2 { continue }; x } }\nawait l"),
+            "[1, 3]"
+        );
+        // A closure made in a loop's body captures that iteration's
+        // variable, a header's included.
+        assert_eq!(
+            shown(
+                "let fs = for let i = 0; i < 3; i := i + 1 { fn(): Int { i } }\n\
+                 for f in fs { f() }"
+            ),
+            "[0, 1, 2]"
+        );
+    }
+
+    #[test]
+    fn a_statement_loop_builds_no_list() {
+        // It is `{}`, and runs for its effects.
+        assert_eq!(int("let mut n = 0\nfor n < 5 { n := n + 1 }\nn"), 5);
+        assert_eq!(
+            int(
+                "let mut n = 0\ndo { n := n + 1 } for n < 5\nfor { if n > 7 { break }; n := n + 1 }\nn"
+            ),
+            8
+        );
+        // Each statement loop lowers to a loop that discards.
+        let ir = compile("let mut n = 0\nfor n < 2 { n := n + 1 }\ndo { n := n + 1 } for n < 4\nn");
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        let kinds: Vec<IrKind> = ir
+            .items(items)
+            .iter()
+            .map(|&item| ir.get(item).kind)
+            .collect();
+        assert!(matches!(
+            kinds[..],
+            [
+                IrKind::Store(..),
+                IrKind::Loop {
+                    collect: false,
+                    test_first: true,
+                    ..
+                },
+                IrKind::Loop {
+                    collect: false,
+                    test_first: false,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[test]
+    fn errors_inside_loops_report_as_before() {
+        assert_eq!(
+            error("for let i = 3; true; i := i - 1 { 10 // i }"),
+            ("division by zero".to_owned(), Span::new(37, 39))
+        );
+        assert_eq!(error("do { [1][5] } for true").0, "index out of range");
+        assert_eq!(
+            error("for (1 // 0) == 0 { 1 }"),
+            ("division by zero".to_owned(), Span::new(7, 9))
+        );
+    }
+
+    #[test]
+    fn a_stop_leaves_the_stack_as_it_found_it() {
+        // A `continue` in an argument, after the callee's frame has grown,
+        // and a `break` out of a deep nest of blocks: the stack is the top
+        // level's frame again.
+        let ir = compile(
+            "fn f(a: Int, b: Int): Int { a + b }\n\
+             let v = for x in [1, 2, 3] { if x == 2 { 0 } else { f(x, { { { if x == 3 { break }; continue } } }) } }\n\
+             len(v)",
+        );
+        let frame = ir.frame_size() as usize;
+        let mut stack = vec![Value::Empty; frame];
+        let (result, len) = run_on(&ir, &mut stack);
+        assert_eq!(result.unwrap(), Value::Int(1));
+        assert_eq!(len, frame);
+    }
+
+    #[test]
+    fn a_stop_at_a_boundary_is_an_internal_error() {
+        // No checked program lets a stop out of a function, so one built by
+        // hand reaching the top is an internal error, not a diagnostic.
+        let mut builder = crate::ir::IrBuilder::with_capacity(2);
+        let span = Span::new(0, 5);
+        let stop = builder.alloc(
+            IrKind::Break {
+                loops: 0,
+                value: None,
+            },
+            span,
+        );
+        let ir = Rc::new(builder.finish(stop, 0, Vec::new()));
+        let diagnostic = eval(&ir).unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "internal error: a `break` or `continue` left its function"
         );
     }
 }

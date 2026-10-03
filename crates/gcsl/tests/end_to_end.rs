@@ -2209,6 +2209,179 @@ fn unions_is_and_as_run_end_to_end() {
     assert_eq!(outcome.warnings.len(), 1);
 }
 
+/// The costly kinds of nesting the new loops make, for
+/// `the_nesting_budget_fits_the_stack_for_every_kind_of_loop`: each level
+/// of wrapping is four levels of IR, an index, a loop (in a block for a
+/// header with an item), a body and a stop or another block.
+fn loop_nesting_kinds() -> [Nesting; 2] {
+    [
+        Nesting {
+            name: "condition loops",
+            ret: "Int",
+            // The index, the header's block, the loop and its body.
+            wrap: |inner| {
+                format!(
+                    "{}{inner}{}",
+                    "for let w = 0; w < 1; w := 1 { ".repeat(WRAP / 4),
+                    " }[0]".repeat(WRAP / 4)
+                )
+            },
+            value: |_| Value::Int(-1),
+        },
+        Nesting {
+            name: "do loops and breaks",
+            ret: "Int",
+            // The index, the loop, its body and the `break`.
+            wrap: |inner| {
+                format!(
+                    "{}{inner}{}",
+                    "(do { break ".repeat(WRAP / 4),
+                    " } for false)[0]".repeat(WRAP / 4)
+                )
+            },
+            value: |_| Value::Int(-1),
+        },
+    ]
+}
+
+/// As `the_nesting_budget_fits_the_stack_for_every_kind_of_nesting`, for
+/// the nesting of condition loops, `do` loops and `break`s.
+#[test]
+fn the_nesting_budget_fits_the_stack_for_every_kind_of_loop() {
+    on_recommended_stack(|| {
+        let depth = WRAP + 3;
+        let height = WRAP + 7;
+        let step = depth + gcsl::CALL_LEVELS;
+        let room = gcsl::MAX_DEPTH - height - gcsl::CALL_LEVELS - 1;
+        let padding = room % step;
+        let calls = 1 + room / step;
+        for Nesting {
+            name: kind,
+            ret,
+            wrap,
+            value,
+        } in loop_nesting_kinds()
+        {
+            let program = |calls: usize, padding: usize| {
+                format!(
+                    "fn f(n: Int): {ret} {{ if n == 0 {{ {} }} else {{ {} }} }}\n{}f({}){}",
+                    wrap("-(-(n - 1))"),
+                    wrap("f(n - 1)"),
+                    "{ ".repeat(padding),
+                    calls - 1,
+                    " }".repeat(padding)
+                )
+            };
+            let file = source(&program(calls, padding));
+            let (tokens, names, strings) = gcsl::lexer::tokenize(&file).unwrap();
+            let ast = gcsl::parser::parse(&tokens, names, strings, &file).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = gcsl::check::check(&ast, &mut types).unwrap();
+            let ir = Rc::new(gcsl::lower::lower(&ast, &checked, &types, 0).unwrap());
+            let gcsl::ir::IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+                panic!("{kind}: the root is not a block");
+            };
+            let gcsl::ir::IrKind::Store(_, closure) = ir.get(ir.items(items)[0]).kind else {
+                panic!("{kind}: the first item is not a store");
+            };
+            let gcsl::ir::IrKind::MakeClosure { function, .. } = ir.get(closure).kind else {
+                panic!("{kind}: the function item is not a closure");
+            };
+            assert_eq!(ir.function(function).height as usize, height, "{kind}");
+            let expected = value(i64::try_from(calls).unwrap());
+            assert_eq!(gcsl::eval::eval(&ir), Ok(expected), "{kind}");
+            for past in [program(calls + 1, padding), program(calls, padding + 1)] {
+                let diagnostics = run(&past).unwrap_err();
+                assert_eq!(diagnostics[0].message, BUDGET_ERROR, "{kind}");
+            }
+        }
+    });
+}
+
+/// Ten thousand `break`s and ten thousand `continue`s, each out of a nest
+/// of blocks, leave the nesting budget as it was: the deepest recursion the
+/// budget allows still runs after them, and one call more still does not.
+#[test]
+fn stops_leave_the_nesting_budget_as_it_was() {
+    on_recommended_stack(|| {
+        let recursion = "fn f(n: Int): Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\n";
+        let stops = "let v = for i in 0..10000 { for j in [1] { { { { break } } } }; \
+                     { { { if i < 0 { break }; continue } } } }\n";
+        // The most calls the budget allows, found from the recursion alone.
+        let fits = |calls: usize, before: &str| {
+            run(&format!("{recursion}{before}f({})", calls - 1)).is_ok()
+        };
+        let (mut low, mut high) = (1, gcsl::MAX_DEPTH);
+        while low + 1 < high {
+            let middle = usize::midpoint(low, high);
+            if fits(middle, "") {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        assert!(fits(low, "") && !fits(low + 1, ""));
+        assert!(fits(low, stops), "{low}");
+        assert!(!fits(low + 1, stops), "{low}");
+    });
+}
+
+/// Loops of every form, through every stage.
+#[test]
+fn programs_with_loops() {
+    for (text, value) in [
+        ("let mut n = 0\nfor n < 3 { n := n + 1 }\nn", "3"),
+        ("for let i = 0; i < 4; i := i + 1 { i * i }", "[0, 1, 4, 9]"),
+        (
+            "let mut k = 0\nfor { k := k + 1; if k > 2 { break }; k }",
+            "[1, 2]",
+        ),
+        ("let mut t = 0\ndo { t := t + 1; t } for t < 3", "[1, 2, 3]"),
+        (
+            "for x in [1, 7, 3] { if x > 5 { break x }; continue }",
+            "[7]",
+        ),
+        (
+            "for'rows r in [[1, 2], [3, -1], [5]] { for c in r { if c < 0 { continue'rows }; c } }",
+            "[[1, 2], [5]]",
+        ),
+    ] {
+        assert_eq!(run(text).unwrap().repr().to_string(), value, "{text}");
+    }
+    assert_eq!(
+        show("for let i = 0.0; i < 2.0; i := i + 1.5 { if i > 1.0 { break 9 }; i }"),
+        "[0.0, 9.0] : List<Float>"
+    );
+}
+
+#[test]
+fn loop_warnings_render_exactly() {
+    assert_eq!(
+        rendered_warnings("let first = for x in [1, 7] { if x > 5 { break x } }\n"),
+        "warning: the values this loop collects have different types\n\
+         \x20--> calc.gcsl:1:13\n\
+         \x20 |\n\
+         1 | let first = for x in [1, 7] { if x > 5 { break x } }\n\
+         \x20 |             ^^^               --------------------\n\
+         \x20 |                               |                |\n\
+         \x20 |                               |                this is Int\n\
+         \x20 |                               this is {}\n\
+         \x20 |\n\
+         \x20 = note: the loop is `List<Int | {}>`; annotate it with that type if all are meant, \
+         or tell them apart with `is`\n"
+    );
+    assert_eq!(
+        rendered_warnings("let v = for x in [1] { break\n  x }\n"),
+        "warning: this is never run\n\
+         \x20--> calc.gcsl:2:3\n\
+         \x20 |\n\
+         1 | let v = for x in [1] { break\n\
+         \x20 |                        ----- this always leaves the block\n\
+         2 |   x }\n\
+         \x20 |   ^\n"
+    );
+}
+
 #[test]
 fn list_elements_without_a_join_render_exactly() {
     assert_eq!(

@@ -160,6 +160,20 @@
 //! the value, looking no further into it than what the static type of the
 //! value leaves in doubt.
 //!
+//! # Never
+//!
+//! `Never`, [`TyKind::Never`], is the type of an expression that never
+//! completes, a block that ends with a `break` or a `continue`, say: no
+//! value has it. It cannot be written in source, and is not one of the
+//! pre-interned types: [`TypeTable::never`] interns it on first use. It is
+//! a subtype of every type, and no other type is a subtype of it, and it is
+//! the identity of the join and of the union: `join(Never, T)` is `T`, not
+//! widened, and a union drops it. It is present, holds no future and no
+//! function, and [`TypeTable::strip`], [`TypeTable::present`] and
+//! [`TypeTable::settle`] leave it as it is. It is unit-like
+//! ([`TypeTable::is_unit_like`]), so a statement of it is no unused value,
+//! and its kind is [`ValueKind::Never`], the kind of no value.
+//!
 //! # Provisional types
 //!
 //! A pure function's bare parameter is present if the function's body
@@ -295,6 +309,10 @@ pub enum TyKind {
     UntypedInt,
     /// See [`TyId::ERROR`].
     Error,
+    /// `Never`, the type of an expression that never completes, such as a
+    /// block that ends with a `break`: no value has it. See
+    /// [Never](#never).
+    Never,
 }
 
 /// The fields of a record type.
@@ -481,7 +499,8 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::UntypedInt
-            | TyKind::Error => false,
+            | TyKind::Error
+            | TyKind::Never => false,
         };
         self.provisional.push(provisional);
         self.kinds.push(kind.clone());
@@ -493,6 +512,19 @@ impl TypeTable {
     /// for an id this table did not produce.
     fn has_provisional(&self, id: TyId) -> bool {
         self.provisional.get(id.index()).copied().unwrap_or(false)
+    }
+
+    /// The id of `Never` (see [Never](#never)), adding it to the table if
+    /// it is new: it is not one of the pre-interned types, but interned on
+    /// first use, as any type is.
+    pub fn never(&mut self) -> TyId {
+        self.intern(TyKind::Never)
+    }
+
+    /// Whether `id` is `Never`.
+    #[must_use]
+    pub fn is_never(&self, id: TyId) -> bool {
+        matches!(self.kinds.get(id.index()), Some(TyKind::Never))
     }
 
     /// Returns the id of the record type with `fields`, in any order, adding
@@ -535,17 +567,17 @@ impl TypeTable {
         }
     }
 
-    /// Whether `id` is *unit-like*: `{}`, or a list type whose element type
-    /// is unit-like, as `List<{}>` and `List<List<{}>>` are. A value of such
-    /// a type holds nothing but empty records and lists of them, so a
-    /// statement of one is not an unused value (see [`crate::check`]). A
-    /// type that is unit-like only once awaited, as `List<Future<{}>>` is,
-    /// is not.
+    /// Whether `id` is *unit-like*: `{}`, `Never`, or a list type whose
+    /// element type is unit-like, as `List<{}>` and `List<List<{}>>` are. A
+    /// value of such a type holds nothing but empty records and lists of
+    /// them, and `Never` has no value at all, so a statement of one is not
+    /// an unused value (see [`crate::check`]). A type that is unit-like
+    /// only once awaited, as `List<Future<{}>>` is, is not.
     #[must_use]
     pub fn is_unit_like(&self, id: TyId) -> bool {
         let mut id = id;
         loop {
-            if id == TyId::EMPTY {
+            if id == TyId::EMPTY || self.is_never(id) {
                 return true;
             }
             match self.list_element(id) {
@@ -635,7 +667,9 @@ impl TypeTable {
     /// that is a subtype of another dropped, of two members that are each a
     /// subtype of the other the one with the greater id; the one member
     /// left if only one is, and a [`TyKind::Union`] of those left, sorted by
-    /// id, otherwise. `Error` if any member is `Error`, or if there are none.
+    /// id, otherwise. `Never` is dropped, since it adds no value, and is the
+    /// union only if it is every member. `Error` if any member is `Error`, or
+    /// if there are none.
     /// No member may be a future, an either shape, a provisional type or an
     /// untyped integer: the checker joins those through
     /// [`TypeTable::join`], which never makes a union of them.
@@ -644,12 +678,18 @@ impl TypeTable {
     /// between them; unions are small.
     pub fn union(&mut self, members: impl IntoIterator<Item = TyId>) -> TyId {
         let mut flat = Vec::new();
+        let mut never = None;
         for member in members {
             match self.kinds.get(member.index()) {
                 Some(TyKind::Union(inner)) => flat.extend_from_slice(inner),
                 Some(TyKind::Error) | None => return TyId::ERROR,
+                // `Never` adds no value to a union.
+                Some(TyKind::Never) => never = Some(member),
                 Some(_) => flat.push(member),
             }
+        }
+        if let (Some(never), true) = (never, flat.is_empty()) {
+            return never;
         }
         flat.sort_unstable();
         flat.dedup();
@@ -770,7 +810,8 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::UntypedInt
-            | TyKind::Error => id,
+            | TyKind::Error
+            | TyKind::Never => id,
         }
     }
 
@@ -1169,11 +1210,14 @@ impl TypeTable {
     /// is a subtype of exactly what `T | Future<T>` is) and its present type
     /// `T` as `sup`, unless the two are the same provisional type.
     ///
+    /// `Never`, which no value has, is a subtype of every type, and no
+    /// other type is a subtype of it.
+    ///
     /// Recurses once per level of record, list, function type, future or
     /// union nesting in the two types.
     #[must_use]
     pub fn is_subtype(&self, sub: TyId, sup: TyId) -> bool {
-        if sub == sup {
+        if sub == sup || self.is_never(sub) {
             return true;
         }
         match self.kinds.get(sup.index()) {
@@ -1234,6 +1278,7 @@ impl TypeTable {
     /// It always exists (see the module documentation):
     ///
     /// - `a` itself if the two are the same type, not widened;
+    /// - the other if either is `Never`, which adds no value, not widened;
     /// - `Error` if either is `Error`, not widened, the error having been
     ///   reported; an untyped integer joins as the `Int` it settles to
     ///   (numeric adaptation is the checker's business, done before it
@@ -1258,8 +1303,11 @@ impl TypeTable {
     /// Recurses once per level of record, list, return type or future
     /// nesting shared by `a` and `b`.
     pub fn join(&mut self, a: TyId, b: TyId) -> (TyId, bool) {
-        if a == b {
+        if a == b || self.is_never(b) {
             return (a, false);
+        }
+        if self.is_never(a) {
+            return (b, false);
         }
         if a == TyId::ERROR || b == TyId::ERROR {
             return (TyId::ERROR, false);
@@ -1381,12 +1429,14 @@ impl TypeTable {
     /// value that may be a future. A union whose members are all of one
     /// kind, as `List<Int> | List<String>` and `{a: Int} | {b: Int}` are,
     /// is of that kind, and any other union is [`ValueKind::Mixed`]: a
-    /// present value of a kind only the value itself says. Also `None`,
+    /// present value of a kind only the value itself says. `Never` is
+    /// [`ValueKind::Never`], the kind of no value. Also `None`,
     /// rather than a panic, for an id this table did not produce, so that
     /// lowering can report a mismatched table as an internal error.
     #[must_use]
     pub fn value_kind(&self, id: TyId) -> Option<ValueKind> {
         match self.kinds.get(id.index())? {
+            TyKind::Never => Some(ValueKind::Never),
             TyKind::Int => Some(ValueKind::Int),
             TyKind::Float => Some(ValueKind::Float),
             TyKind::Bool => Some(ValueKind::Bool),
@@ -1668,6 +1718,7 @@ impl fmt::Display for Display<'_> {
             TyKind::Bool => f.write_str("Bool"),
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
+            TyKind::Never => f.write_str("Never"),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
             TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
             TyKind::Provisional { inner, .. } => {
