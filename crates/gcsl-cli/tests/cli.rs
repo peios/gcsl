@@ -838,6 +838,116 @@ fn rebinding_errors_are_rendered() {
 }
 
 #[test]
+fn run_tells_the_members_of_unions_apart() {
+    let output = gcsl(&["run", "tests/fixtures/unions.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{ports = [8080, 5432]; label = 2; first = 8081; same = false}\n"
+    );
+    // The two services' ports differ: a union, and a warning.
+    assert_eq!(
+        stderr(&output),
+        "warning: the elements of this list have different types\n\
+         \x20--> tests/fixtures/unions.gcsl:2:48\n\
+         \x20 |\n\
+         2 | let services = [{ name = \"web\"; port = 8080 }, { name = \"db\"; port = \
+         \"postgres\" }]\n\
+         \x20 |                 -----------------------------  \
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this is {name: String, port: String}\n\
+         \x20 |                 |\n\
+         \x20 |                 the elements so far are {name: String, port: Int}\n\
+         \x20 |\n\
+         \x20 = note: the list is `List<{name: String, port: Int | String}>`; annotate it with \
+         that type if both are meant, or tell them apart with `is`\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_unions_tests_and_narrowing() {
+    let output = gcsl(&["run", "tests/fixtures/unions.gcsl", "--dump-tokens"]);
+    let tokens = stdout(&output);
+    for token in ["\nIs @326..328\n", "\nAs @629..631\n"] {
+        assert!(tokens.contains(token), "{token}: {tokens}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/unions.gcsl", "--dump-ast"]);
+    let ast = stdout(&output);
+    let node = "(is Int @324..332\n\
+                \x20             (name p @324..325))\n";
+    assert!(ast.contains(node), "{node}: {ast}");
+    let output = gcsl(&["run", "tests/fixtures/unions.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    for node in [
+        // The field the elements disagree on is the union of both.
+        "(name s : {name: String, port: Int | String} @312..313)",
+        // `p` is an Int in one branch and a String in the other.
+        "(name p : Int | String @324..325))",
+        "(name p : Int @335..336)",
+        "(name p : String @347..348)",
+        "(as Int : Int @612..635",
+        "(=== : Bool @708..745",
+    ] {
+        assert!(types.contains(node), "{node}: {types}");
+    }
+    let output = gcsl(&["run", "tests/fixtures/unions.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // The test looks at the kind alone, and writes the slot the
+        // branches read, which a later variable takes once it is free.
+        "(is int first#4 @324..332\n\
+         \x20           (load label#3 @324..325))\n\
+         \x20         (block @333..338\n\
+         \x20           (load first#4 @335..336))\n",
+        "(as int @612..635\n",
+        "(value-same === @708..745\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn union_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/union_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "warning: the branches of this `if` have different types\n\
+         \x20--> tests/fixtures/union_error.gcsl:1:36\n\
+         \x20 |\n\
+         1 | let port = if true { 8080 } else { \"http\" }\n\
+         \x20 |                      ----          ^^^^^^ this is String\n\
+         \x20 |                      |\n\
+         \x20 |                      this is Int\n\
+         \x20 |\n\
+         \x20 = note: the `if` is `Int | String`; annotate it with that type if both are meant, \
+         or tell them apart with `is`\n\
+         \n\
+         error: cannot add `Int | String` and Int\n\
+         \x20--> tests/fixtures/union_error.gcsl:2:6\n\
+         \x20 |\n\
+         2 | port + 1\n\
+         \x20 | ---- ^ - Int\n\
+         \x20 | |\n\
+         \x20 | Int | String\n\
+         \x20 |\n\
+         \x20 = note: tell them apart first, as in `if port is Int { ... }`\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl(&["run", "tests/fixtures/as_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `port` is not an Int\n\
+         \x20--> tests/fixtures/as_error.gcsl:2:1\n\
+         \x20 |\n\
+         2 | port as Int\n\
+         \x20 | ^^^^^^^^^^^ it is a String\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
 fn run_updates_elements_of_lists() {
     let output = gcsl(&["run", "tests/fixtures/update.gcsl"]);
     assert_eq!(

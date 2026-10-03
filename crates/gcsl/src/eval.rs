@@ -9,18 +9,19 @@
 //! parent and no runtime value is ever inspected to choose an operation.
 //! `Evaluator::function` returns the closure of a function value. Each
 //! typed walker handles the nodes of its kind and also loads, captures,
-//! blocks, `if`s, field accesses, indexes, calls and awaits, which can be of
-//! any kind: an `if` evaluates its condition through `bool` and then exactly
-//! one branch through the walker it was called with, and a field access, an
-//! index, a call or an await produces a [`Value`] from which the walker
-//! extracts its kind's. A general walker, `Evaluator::value`, handles every
-//! node, and hands the typed nodes to the typed walkers, building a
-//! [`Value`] only where a value of statically unknown kind is needed: at the
-//! root, in a slot, in a record, in a list, in a closure's or a future's
-//! captures, as an interpolated value, as a block's or a function body's
-//! result evaluated through `value`, where a list is needed (see
-//! [Lists](#lists)), or where the value may be a future (see
-//! [Futures](#futures)).
+//! blocks, `if`s, field accesses, indexes, calls, awaits and `as`es, which
+//! can be of any kind: an `if` evaluates its condition through `bool` and
+//! then exactly one branch through the walker it was called with, and a
+//! field access, an index, a call, an await or an `as` produces a [`Value`]
+//! from which the walker extracts its kind's. A general walker,
+//! `Evaluator::value`, handles every node, and hands the typed nodes to the
+//! typed walkers, building a [`Value`] only where a value of statically
+//! unknown kind is needed: at the root, in a slot, in a record, in a list,
+//! in a closure's or a future's captures, as an interpolated value, as a
+//! block's or a function body's result evaluated through `value`, where a
+//! list is needed (see [Lists](#lists)), where the value may be a future
+//! (see [Futures](#futures)), or where it is of a union of kinds (see
+//! [Unions](#unions)).
 //!
 //! A record is built from its record block's shared [`crate::value::Layout`]
 //! and its field values in layout order, the one allocation for the values
@@ -266,6 +267,41 @@
 //! so that an await of it from inside its own body, which the checker never
 //! lets through, is an error rather than an endless loop.
 //!
+//! # Unions
+//!
+//! A node of a union of kinds, of [`crate::value::ValueKind::Mixed`], is
+//! evaluated by the general walker only, as a node that may be a future is:
+//! its value is whatever its member's kind's is, built as a [`Value`]. The
+//! typed walkers read loads, captures, field accesses, indexes, calls,
+//! awaits and `as`es through helpers, each of which treats a `Mixed` node
+//! as mistyped (`mixed`), so the one check costs a node of any other kind
+//! one comparison, and no typed walker grows. An `await` of kind `Mixed`
+//! yields a present value of any kind.
+//!
+//! An `Is` evaluates its value through `value`, writes it to its slot if it
+//! has one, for the narrowed bindings of the branches of the `if` it is the
+//! condition of, and runs its test: the plan the checker made, which looks
+//! at the value's kind and, as far as the plan says, at its fields and
+//! elements, by name and in order (`passes`), recursing once per level of
+//! the plan, which is no deeper than the type tested for. An `As` runs the
+//! test the same way and yields the value if it passes, and otherwise
+//! fails with "`x` is not an Int", at the `as`, labelled with what the value
+//! is, and for a record or a list that fails inside, one level down: "it
+//! is a String", "it is a record, and its field `a` is a String", "it is a
+//! record without a field `a`" or "it is a list, and its element 3 is a
+//! String" (`failure`). Nothing is changed, so a failed `as` leaves
+//! everything as it was but what the input ran before it.
+//!
+//! A deep await of a union applies the lazy shape of each of its members
+//! that has one, in turn, *tolerantly* (see [`Ir::lazy_union`]): which
+//! member the value is of is not known, so a field a member's shape lists
+//! that the record lacks, and a shape of another kind than the value it
+//! meets, are passed over, at every level below, where for any other
+//! shape they are internal errors. Awaiting a value that is present does
+//! nothing, so applying several shapes awaits nothing twice; but a future
+//! in a field that the value's own type hides, which another member's
+//! shape lists, is awaited too.
+//!
 //! # Memoised functions
 //!
 //! A function declared with `->>` is lowered to code of [`FnKind::Memo`],
@@ -382,6 +418,8 @@ use crate::ir::{
 };
 use crate::names::Name;
 use crate::source::Span;
+use crate::strings::FieldName;
+use crate::types::ValueTest;
 use crate::value::{
     Begin, Closure, Future, FutureState, Layout, List, Record, Value, ValueKind, int_to_float,
 };
@@ -549,6 +587,7 @@ impl Evaluator<'_> {
             } => self.call((callee, args, depth), node),
             IrKind::MakeFuture { function, captures } => self.make_future(function, captures),
             IrKind::Await { .. } => self.await_node(node),
+            IrKind::As { .. } => self.narrow_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
             IrKind::MakeList { items, spreads } => self.make_list(items, spreads),
             IrKind::Range(inclusive, operands) => self.range(operands, inclusive, node),
@@ -587,6 +626,9 @@ impl Evaluator<'_> {
             | IrKind::ListNe(_)
             | IrKind::ListSame(_)
             | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
@@ -645,6 +687,9 @@ impl Evaluator<'_> {
     /// it. The walkers read slots through this and `capture_as`, returning
     /// the call, so that they hold no temporaries for the reads.
     fn slot_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         extract(self.load(slot, node)?, node)
     }
 
@@ -656,6 +701,9 @@ impl Evaluator<'_> {
         node: &IrNode,
         extract: Extract<T>,
     ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         extract(self.capture(index, node)?, node)
     }
 
@@ -718,16 +766,104 @@ impl Evaluator<'_> {
     }
 
     /// Evaluates the `Await` `node` (see the module documentation) as a
-    /// value, which must be of the kind the node states.
+    /// value, which must be of the kind the node states, or, for
+    /// [`ValueKind::Mixed`], of any kind but a future's.
     fn await_node(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
         let value = self.await_value(node)?;
         match node.kind {
-            IrKind::Await { kind, .. } if value.kind() == kind => Ok(value),
+            IrKind::Await { kind, .. } if of_kind(&value, kind) => Ok(value),
             _ => mistyped(
                 node,
                 "an await produced a value of another kind than its node",
             ),
         }
+    }
+
+    /// Evaluates the `As` `node` (see the module documentation) as a value,
+    /// which must be of the kind the node states, or, for
+    /// [`ValueKind::Mixed`], of any kind but a future's.
+    fn narrow_node(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        let value = self.narrowed(node)?;
+        match node.kind {
+            IrKind::As { kind, .. } if of_kind(&value, kind) => Ok(value),
+            _ => mistyped(
+                node,
+                "an `as` produced a value of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates the `As` `node` as a value that `extract` accepts: one of
+    /// the kind the node states.
+    fn narrow_as<T>(
+        &mut self,
+        node: &IrNode,
+        extract: fn(Value) -> Option<T>,
+    ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
+        match extract(self.narrowed(node)?) {
+            Some(value) => Ok(value),
+            None => mistyped(
+                node,
+                "an `as` produced a value of another kind than its node",
+            ),
+        }
+    }
+
+    /// Evaluates the `As` `node`: its value, through the general walker,
+    /// which it yields if it passes the node's test, and otherwise "`x` is
+    /// not an Int", at the node, labelled with what the value is (see
+    /// [`failure`]).
+    fn narrowed(&mut self, node: &IrNode) -> Result<Value, Diagnostic> {
+        let IrKind::As { value, test, .. } = node.kind else {
+            return mistyped(node, "a node that is not an `as` narrowed");
+        };
+        let value = self.value(value)?;
+        let ir = self.ir;
+        let Some(code) = ir.test(test) else {
+            return mistyped(node, "an `as` of a test its IR lacks");
+        };
+        if passes(&code.test, &value) {
+            return Ok(value);
+        }
+        Err(Diagnostic::error(
+            format!("{} is not {}", code.subject, code.target),
+            node.span,
+        )
+        .with_label(failure(ir, &code.test, &value)))
+    }
+
+    /// Evaluates the `Is` `node`: its value, through the general walker,
+    /// written to the node's slot if it has one, and whether it passes the
+    /// node's test.
+    fn is_test(&mut self, node: &IrNode) -> Result<bool, Diagnostic> {
+        let IrKind::Is { value, test, slot } = node.kind else {
+            return mistyped(node, "a node that is not an `is` tested");
+        };
+        let value = self.value(value)?;
+        let Some(code) = self.ir.test(test) else {
+            return mistyped(node, "an `is` of a test its IR lacks");
+        };
+        let passed = passes(&code.test, &value);
+        if slot != Slot::NONE {
+            let target = self
+                .stack
+                .get_mut(self.base + slot.index())
+                .ok_or_else(|| internal("store to a slot outside the frame", node.span))?;
+            *target = value;
+        }
+        Ok(passed)
+    }
+
+    /// Evaluates a total comparison of two values of a union of kinds, a
+    /// `ValueSame` if `equal` and a `ValueNotSame` otherwise: the values
+    /// compare whole, deeply, as [`Value`]'s equality does.
+    fn value_same(&mut self, operands: Operands, equal: bool) -> Result<bool, Diagnostic> {
+        let lhs = self.value(operands.lhs)?;
+        let rhs = self.value(operands.rhs)?;
+        Ok((lhs == rhs) == equal)
     }
 
     /// Evaluates the `Await` `node` as a value that `extract` accepts: one
@@ -737,6 +873,9 @@ impl Evaluator<'_> {
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
     ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         match extract(self.await_value(node)?) {
             Some(value) => Ok(value),
             None => mistyped(
@@ -765,7 +904,7 @@ impl Evaluator<'_> {
         } else {
             // The fields of the record awaited are one level of nesting
             // below it.
-            self.await_deep(awaited, shape, depth, 1, node)
+            self.await_deep(awaited, shape, (depth, 1, false), node)
         }
     }
 
@@ -798,22 +937,32 @@ impl Evaluator<'_> {
     /// deeply. If any field changed, the result is a new record sharing the
     /// layout and the values that did not; otherwise it is the record as it
     /// was. The empty record has no fields to await. A list's elements are
-    /// awaited by [`Evaluator::await_elements`] instead.
+    /// awaited by [`Evaluator::await_elements`] instead. A union's shape
+    /// applies each of its members' in turn, `tolerant`ly: a field the
+    /// record lacks, or a shape of another kind than the value's, is passed
+    /// over, there and at every level below (see [`Ir::lazy_union`]), where
+    /// otherwise it is an internal error.
     fn await_deep(
         &mut self,
         value: Value,
         shape: LazyShapeId,
-        depth: u16,
-        level: usize,
+        (depth, level, tolerant): (u16, usize, bool),
         node: &IrNode,
     ) -> Result<Value, Diagnostic> {
+        let ir = self.ir;
+        if let Some(members) = ir.lazy_union(shape) {
+            let mut value = value;
+            for &member in members {
+                value = self.await_deep(value, member, (depth, level, true), node)?;
+            }
+            return Ok(value);
+        }
         if matches!(value, Value::List(_)) {
-            return self.await_elements(value, shape, depth, level, node);
+            return self.await_elements(value, shape, (depth, level, tolerant), node);
         }
         let Value::Record(record) = &value else {
             return Ok(value);
         };
-        let ir = self.ir;
         let Some(lazy) = ir.find_lazy_shape(shape) else {
             return mistyped(node, "an await of a lazy shape its IR lacks");
         };
@@ -823,6 +972,9 @@ impl Evaluator<'_> {
             let Some((index, old)) =
                 found.and_then(|index| Some((index, record.values.get(index)?)))
             else {
+                if tolerant {
+                    continue;
+                }
                 return mistyped(node, "a record lacks a field of its lazy shape");
             };
             let new = match field {
@@ -831,11 +983,11 @@ impl Evaluator<'_> {
                     if inner == LazyShapeId::NONE {
                         awaited
                     } else {
-                        self.await_deep(awaited, inner, depth, level + 1, node)?
+                        self.await_deep(awaited, inner, (depth, level + 1, tolerant), node)?
                     }
                 }
                 LazyField::Within(inner) => {
-                    self.await_deep(old.clone(), inner, depth, level + 1, node)?
+                    self.await_deep(old.clone(), inner, (depth, level + 1, tolerant), node)?
                 }
             };
             if replaced(old, &new) {
@@ -862,19 +1014,22 @@ impl Evaluator<'_> {
     /// awaited fully and then, if the shape says so, deeply, or, if it is
     /// present, deeply. If any element changed, the result is a new list,
     /// sharing the elements that did not; otherwise it is the list as it
-    /// was.
+    /// was. A shape that is not a list's is passed over if `tolerant`, as
+    /// a member's shape of a union's is (see [`Evaluator::await_deep`]).
     fn await_elements(
         &mut self,
         value: Value,
         shape: LazyShapeId,
-        depth: u16,
-        level: usize,
+        (depth, level, tolerant): (u16, usize, bool),
         node: &IrNode,
     ) -> Result<Value, Diagnostic> {
         let Value::List(list) = &value else {
             return Ok(value);
         };
         let Some(each) = self.ir.lazy_list(shape) else {
+            if tolerant {
+                return Ok(value);
+            }
             return mistyped(node, "an await of a list's lazy shape its IR lacks");
         };
         let mut changed: Option<Vec<Value>> = None;
@@ -885,11 +1040,11 @@ impl Evaluator<'_> {
                     if inner == LazyShapeId::NONE {
                         awaited
                     } else {
-                        self.await_deep(awaited, inner, depth, level + 1, node)?
+                        self.await_deep(awaited, inner, (depth, level + 1, tolerant), node)?
                     }
                 }
                 LazyField::Within(inner) => {
-                    self.await_deep(old.clone(), inner, depth, level + 1, node)?
+                    self.await_deep(old.clone(), inner, (depth, level + 1, tolerant), node)?
                 }
             };
             if replaced(old, &new) {
@@ -1207,6 +1362,9 @@ impl Evaluator<'_> {
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
     ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         match extract(self.call(call, node)?) {
             Some(value) => Ok(value),
             None => mistyped(
@@ -1236,6 +1394,10 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FUNCTION),
             IrKind::Await { .. } => self.await_as(node, |value| match value {
+                Value::Fn(closure) => Some(closure),
+                _ => None,
+            }),
+            IrKind::As { .. } => self.narrow_as(node, |value| match value {
                 Value::Fn(closure) => Some(closure),
                 _ => None,
             }),
@@ -1312,6 +1474,9 @@ impl Evaluator<'_> {
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
     ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         match extract(self.field(record, name, node)?) {
             Some(value) => Ok(value),
             None => mistyped(node, "a field holds a value of another kind than its node"),
@@ -1497,6 +1662,9 @@ impl Evaluator<'_> {
         node: &IrNode,
         extract: fn(Value) -> Option<T>,
     ) -> Result<T, Diagnostic> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
         match extract(self.index(operands, node)?) {
             Some(value) => Ok(value),
             None => mistyped(
@@ -1566,6 +1734,7 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
             IrKind::Await { .. } => self.await_as(node, Value::into_int),
+            IrKind::As { .. } => self.narrow_as(node, Value::into_int),
             IrKind::Index { list, index, .. } => {
                 self.index_as((list, index), node, Value::into_int)
             }
@@ -1617,6 +1786,9 @@ impl Evaluator<'_> {
             | IrKind::ListNe(_)
             | IrKind::ListSame(_)
             | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
@@ -1709,6 +1881,7 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FLOAT),
             IrKind::Await { .. } => self.await_as(node, Value::into_float),
+            IrKind::As { .. } => self.narrow_as(node, Value::into_float),
             IrKind::Index { list, index, .. } => {
                 self.index_as((list, index), node, Value::into_float)
             }
@@ -1758,6 +1931,9 @@ impl Evaluator<'_> {
             | IrKind::ListNe(_)
             | IrKind::ListSame(_)
             | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
@@ -1819,6 +1995,10 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_BOOL),
             IrKind::Await { .. } => self.await_as(node, Value::into_bool),
+            IrKind::As { .. } => self.narrow_as(node, Value::into_bool),
+            IrKind::Is { .. } => self.is_test(node),
+            IrKind::ValueSame(o) => self.value_same(o, true),
+            IrKind::ValueNotSame(o) => self.value_same(o, false),
             IrKind::Index { list, index, .. } => {
                 self.index_as((list, index), node, Value::into_bool)
             }
@@ -1980,6 +2160,7 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_STRING),
             IrKind::Await { .. } => self.await_as(node, Value::into_string),
+            IrKind::As { .. } => self.narrow_as(node, Value::into_string),
             IrKind::Index { list, index, .. } => {
                 self.index_as((list, index), node, Value::into_string)
             }
@@ -2032,6 +2213,9 @@ impl Evaluator<'_> {
             | IrKind::ListNe(_)
             | IrKind::ListSame(_)
             | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a String was expected"),
@@ -2073,6 +2257,7 @@ impl Evaluator<'_> {
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_RECORD),
             IrKind::Await { .. } => self.await_as(node, into_record),
+            IrKind::As { .. } => self.narrow_as(node, into_record),
             IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_record),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
@@ -2081,10 +2266,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Empty | Value::Record(_) => Some(value),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, into_record),
             IrKind::Store(slot, value) => self.store(slot, value, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -2133,6 +2315,9 @@ impl Evaluator<'_> {
             | IrKind::ListNe(_)
             | IrKind::ListSame(_)
             | IrKind::ListNotSame(_)
+            | IrKind::ValueSame(_)
+            | IrKind::ValueNotSame(_)
+            | IrKind::Is { .. }
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
@@ -2436,6 +2621,11 @@ const DEFERRED_BOOL: &str = "a node that may be a future where a Bool was expect
 const DEFERRED_STRING: &str = "a node that may be a future where a String was expected";
 const DEFERRED_RECORD: &str = "a node that may be a future where a record was expected";
 const DEFERRED_FUNCTION: &str = "a node that may be a future where a function was expected";
+
+/// The internal error of a typed walker meeting a node of a union whose
+/// members are of different kinds, which only the general walker
+/// evaluates (see [`mixed`]).
+const MIXED: &str = "a node of a union of kinds where one kind was expected";
 
 /// Whether a deep await replaced `old`, a record's field or a list's
 /// element, with `new`: a future by what it yielded, or a record or list by
@@ -3187,6 +3377,141 @@ fn depends_on_own_result(node: &IrNode) -> Diagnostic {
 /// Extracts a value of one kind from a slot or capture, for the node
 /// reading it: [`as_int`], [`as_float`], and so on.
 type Extract<T> = fn(&Value, &IrNode) -> Result<T, Diagnostic>;
+
+/// Whether `node`, a load, a capture, a field access, a call, an index, an
+/// await or an `as`, which a typed walker reads through a helper, is of
+/// kind [`ValueKind::Mixed`], which only the general walker evaluates: the
+/// one check the typed walkers make of a union's node, in the helpers, so
+/// that a node of any other kind costs them one comparison.
+const fn mixed(node: &IrNode) -> bool {
+    matches!(
+        node.kind,
+        IrKind::Load(_, ValueKind::Mixed)
+            | IrKind::LoadCapture(_, ValueKind::Mixed)
+            | IrKind::Field {
+                kind: ValueKind::Mixed,
+                ..
+            }
+            | IrKind::Call {
+                kind: ValueKind::Mixed,
+                ..
+            }
+            | IrKind::Index {
+                kind: ValueKind::Mixed,
+                ..
+            }
+            | IrKind::Await {
+                kind: ValueKind::Mixed,
+                ..
+            }
+            | IrKind::As {
+                kind: ValueKind::Mixed,
+                ..
+            }
+    )
+}
+
+/// Whether `value` is of kind `kind`, where a node of that kind yields it:
+/// of that very kind, or, for [`ValueKind::Mixed`], of any kind but a
+/// future's.
+fn of_kind(value: &Value, kind: ValueKind) -> bool {
+    match kind {
+        ValueKind::Mixed => value.kind() != ValueKind::Deferred,
+        kind => value.kind() == kind,
+    }
+}
+
+/// Whether `value` passes the test `test` (see [`ValueTest`]): by its kind,
+/// and as far as the test looks, its fields and elements.
+///
+/// Recurses once per level of record, list or union nesting in the test,
+/// which is no deeper than the type it tests for.
+fn passes(test: &ValueTest, value: &Value) -> bool {
+    match test {
+        ValueTest::Pass => true,
+        ValueTest::Kind(kind) => value.kind() == *kind,
+        ValueTest::Record(fields) => match value {
+            Value::Record(record) => fields
+                .iter()
+                .all(|(name, field)| record.get(*name).is_some_and(|value| passes(field, value))),
+            _ => false,
+        },
+        ValueTest::List(element) => match value {
+            Value::List(list) => list.values().iter().all(|value| passes(element, value)),
+            _ => false,
+        },
+        ValueTest::Any(alternatives) => alternatives
+            .iter()
+            .any(|alternative| passes(alternative, value)),
+    }
+}
+
+/// The label on the failure of `value` to pass `test`, an `as`'s, saying
+/// what it is: "it is a String"; and for a record or a list that a test of
+/// its fields or elements fails inside, one level down, "it is a record,
+/// and its field `a` is a String", "it is a record without a field `a`" or
+/// "it is a list, and its element 3 is a String". A union's test fails
+/// inside as the first of its alternatives that looks inside a value of
+/// this one's kind does. Field names are taken from `ir`.
+fn failure(ir: &Ir, test: &ValueTest, value: &Value) -> String {
+    let inside = match test {
+        ValueTest::Any(alternatives) => alternatives.iter().find(|alternative| {
+            matches!(
+                (alternative, value),
+                (ValueTest::Record(_), Value::Record(_)) | (ValueTest::List(_), Value::List(_))
+            )
+        }),
+        _ => Some(test),
+    };
+    match (inside, value) {
+        (Some(ValueTest::Record(fields)), Value::Record(record)) => {
+            for (name, field) in fields {
+                let shown = FieldName(ir.name_text(*name).unwrap_or("?"));
+                match record.get(*name) {
+                    None => return format!("it is a record without a field `{shown}`"),
+                    Some(found) if !passes(field, found) => {
+                        return format!(
+                            "it is a record, and its field `{shown}` is {}",
+                            described(found)
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        (Some(ValueTest::List(element)), Value::List(list)) => {
+            if let Some((index, found)) = list
+                .values()
+                .iter()
+                .enumerate()
+                .find(|(_, found)| !passes(element, found))
+            {
+                return format!(
+                    "it is a list, and its element {index} is {}",
+                    described(found)
+                );
+            }
+        }
+        _ => {}
+    }
+    format!("it is {}", described(value))
+}
+
+/// What `value` is, after its indefinite article, as a failed test's label
+/// says it: "an Int", "a Float", "a Bool", "a String", "a record", "a
+/// list", "a function" or "a future".
+const fn described(value: &Value) -> &'static str {
+    match value {
+        Value::Int(_) => "an Int",
+        Value::Float(_) => "a Float",
+        Value::Bool(_) => "a Bool",
+        Value::Str(_) => "a String",
+        Value::Empty | Value::Record(_) => "a record",
+        Value::List(_) => "a list",
+        Value::Fn(_) => "a function",
+        Value::Future(_) => "a future",
+    }
+}
 
 /// The `Int` in `value`, read by the load or capture read `node`.
 fn as_int(value: &Value, node: &IrNode) -> Result<i64, Diagnostic> {
@@ -7005,5 +7330,196 @@ mod tests {
                 .height
         };
         assert_eq!(height(1), height(n));
+    }
+
+    // ----- Unions -----
+
+    #[test]
+    fn values_of_unions_go_through_the_general_walker() {
+        assert_eq!(
+            run("let v = if 1 > 2 { 1 } else { \"one\" }\nv")
+                .unwrap()
+                .to_string(),
+            "one"
+        );
+        assert_eq!(
+            string("let v: Int | String = 5\n\"{v} {[v, \"x\"]}\""),
+            "5 [5, \"x\"]"
+        );
+        booleans(&[
+            ("let v: Int | String = 1\nv === v", true),
+            (
+                "let v: Int | String = 1\nlet w: Int | String = \"1\"\nv === w",
+                false,
+            ),
+            (
+                "let v: Int | String = 1\nlet w: Int | String = \"1\"\nv !== w",
+                true,
+            ),
+        ]);
+        // A union of records, or of lists, is read as its members agree.
+        assert_eq!(
+            run("let r: {a: Int, b: Int} | {a: String} = { a = \"s\" }\nr.a")
+                .unwrap()
+                .to_string(),
+            "s"
+        );
+        assert_eq!(
+            int("let xs: List<Int> | List<String> = [\"a\", \"b\"]\nlen(xs)"),
+            2
+        );
+    }
+
+    #[test]
+    fn is_tests_by_structure() {
+        booleans(&[
+            // Scalars, by kind.
+            ("let v: Int | String = 1\nv is Int", true),
+            ("let v: Int | String = \"1\"\nv is Int", false),
+            ("let v: Int | Float = 1.5\nv is Float", true),
+            // Records, by the fields asked for, whatever else they have.
+            (
+                "let r: {a: Int} | {b: Int} = { a = 1; c = 2 }\nr is {a: Int}",
+                true,
+            ),
+            (
+                "let r: {a: Int} | {b: Int} = { b = 1 }\nr is {a: Int}",
+                false,
+            ),
+            (
+                "let r: {a: Int | String} | Int = { a = \"s\" }\nr is {a: Int}",
+                false,
+            ),
+            (
+                "let r: {a: {b: Int | String}} | Int = { a = { b = 1 } }\nr is {a: {b: Int}}",
+                true,
+            ),
+            // Lists, element by element; the empty list is every list.
+            ("let xs: List<Int | String> = [1, 2]\nxs is List<Int>", true),
+            (
+                "let xs: List<Int | String> = [1, \"a\"]\nxs is List<Int>",
+                false,
+            ),
+            ("let xs: List<Int | String> = []\nxs is List<String>", true),
+            (
+                "let xs: List<List<Int | String>> = [[1], [\"a\"]]\nxs is List<List<Int>>",
+                false,
+            ),
+            // A union is any of its members.
+            ("let v: Int | String | Bool = true\nv is Int | Bool", true),
+            ("let v: Int | String | Bool = \"s\"\nv is Int | Bool", false),
+        ]);
+    }
+
+    #[test]
+    fn narrowed_branches_hold_the_tested_value() {
+        let text = "let v: Int | String = 41\nif v is Int { v + 1 } else { len([v]) }";
+        assert_eq!(int(text), 42);
+        let text = "let v: Int | String = \"s\"\nif v is Int { v + 1 } else { len([v]) }";
+        assert_eq!(int(text), 1);
+        // Awaited once, by the test: both branches read what it awaited.
+        let frame = frame_after(
+            "let f = lazy { a = 1 }\n\
+             let v: {a: Int} | Int | Future<{a: Int} | Int> = f\n\
+             let n = if v is Int { v } else { v.a }",
+        );
+        // The narrowing slot, free again after the `if`, is `n`'s.
+        let [Value::Future(future), Value::Future(v), Value::Int(1)] = &frame[..] else {
+            panic!("unexpected frame {frame:?}");
+        };
+        assert!(Rc::ptr_eq(future, v));
+        assert!(future.is_done());
+        // A mutable variable rebound after the test leaves the copy alone,
+        // and tested under another name it is rebound from the branch.
+        let text = "let mut m: Int | String = 1\n\
+                    let kept = if m is Int { let f = fn(): Int { m }\nf } else { fn(): Int { 0 } }\n\
+                    m := \"s\"\n\
+                    kept()";
+        assert_eq!(int(text), 1);
+        let text = "let mut m: Int | String = 1\n\
+                    let v = m\n\
+                    let inner = if v is Int { m := v + 4\nv } else { 0 }\n\
+                    [inner, m as Int]";
+        assert_eq!(run(text).unwrap().to_string(), "[1, 5]");
+        // The hidden field: a record of one member that has the field of
+        // another passes the test, and is narrowed to what it passed.
+        let text = "let hidden: {c: Int} = { c = 1; a = 2 }\n\
+                    let x: {a: Int, b: Int} | {c: Int} = hidden\n\
+                    if x is {a: Int} { x.a } else { 0 }";
+        assert_eq!(int(text), 2);
+    }
+
+    #[test]
+    fn as_narrows_or_fails() {
+        assert_eq!(int("let v: Int | String = 3\n(v as Int) * 2"), 6);
+        assert_eq!(string("let v: Int | String = \"s\"\nv as String"), "s");
+        let text = "let v: Int | String = \"s\"\nv as Int";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "`v` is not an Int");
+        assert_eq!(diagnostic.span, Span::new(26, 34));
+        assert_eq!(diagnostic.label.as_deref(), Some("it is a String"));
+        for (text, message, label) in [
+            (
+                "let xs: List<Int | String> = [1, 2, 3, \"a\"]\nxs as List<Int>",
+                "`xs` is not a `List<Int>`",
+                "it is a list, and its element 3 is a String",
+            ),
+            (
+                "let r: {a: Int | String} | Int = { a = \"s\" }\nr as {a: Int}",
+                "`r` is not a `{a: Int}`",
+                "it is a record, and its field `a` is a String",
+            ),
+            (
+                "let r: {a: Int} | {b: Int} = { b = 1 }\nr as {a: Int}",
+                "`r` is not a `{a: Int}`",
+                "it is a record without a field `a`",
+            ),
+            (
+                "fn f(): Int | Bool { true }\nf() as Int",
+                "this value is not an Int",
+                "it is a Bool",
+            ),
+            (
+                "let v: Int | List<Int | String> = [\"a\"]\nv as Int | List<Int>",
+                "`v` is not an `Int | List<Int>`",
+                "it is a list, and its element 0 is a String",
+            ),
+        ] {
+            let diagnostic = run(text).unwrap_err();
+            assert_eq!(diagnostic.message, message, "{text}");
+            assert_eq!(diagnostic.label.as_deref(), Some(label), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_memoised_function_takes_and_returns_a_union() {
+        let text = "fn m(v: Int | String) ->> Int | String { if v is Int { v + 1 } else { v } }\n\
+                    let a = m(lazy 1)\n\
+                    let b = m(\"s\")\n\
+                    \"{a} {b} {m(1)}\"";
+        assert_eq!(string(text), "2 s 2");
+    }
+
+    #[test]
+    fn a_typed_walker_rejects_a_node_of_a_union_of_kinds() {
+        let mut builder = crate::ir::IrBuilder::with_capacity(4);
+        let span = Span::new(0, 1);
+        let load = builder.alloc(IrKind::Load(Slot::new(0), ValueKind::Mixed), span);
+        let one = builder.alloc(IrKind::IntConst(1), span);
+        let add = builder.alloc(
+            IrKind::IntAdd(Operands {
+                lhs: load,
+                rhs: one,
+                op_start: 0,
+            }),
+            span,
+        );
+        let ir = Rc::new(builder.finish(add, 1, Vec::new()));
+        let mut frame = vec![Value::Int(1)];
+        let diagnostic = eval_in(&ir, &mut frame).unwrap_err();
+        assert_eq!(
+            diagnostic.message,
+            "internal error: a node of a union of kinds where one kind was expected"
+        );
     }
 }

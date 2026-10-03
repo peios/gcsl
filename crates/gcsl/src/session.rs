@@ -1002,4 +1002,27 @@ mod tests {
             Value::Str("h 8080 1 s 3 4 5".into())
         );
     }
+
+    #[test]
+    fn a_union_variable_is_used_by_later_inputs() {
+        let mut session = Session::new();
+        // The warning does not stop the input.
+        let outcome = eval(&mut session, "let mut v = if 1 > 2 { 1 } else { \"one\" }").unwrap();
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(value(&mut session, "v"), Value::Str("one".into()));
+        assert_eq!(value_type(&session), "Int | String");
+        assert_eq!(
+            value(&mut session, "if v is Int { v } else { len([v, v]) }"),
+            Value::Int(2)
+        );
+        value(&mut session, "v := 5");
+        assert_eq!(value(&mut session, "(v as Int) + 1"), Value::Int(6));
+        // A failed `as` leaves the session as it was, a rebind it made
+        // before it failed included.
+        let failed = eval(&mut session, "v := \"no\"\nlet n = v as Int").unwrap_err();
+        assert_eq!(failed[0].message, "`v` is not an Int");
+        assert_eq!(failed[0].severity, Severity::Error);
+        assert_eq!(value(&mut session, "v"), Value::Int(5));
+        assert_eq!(messages(&mut session, "n"), vec!["undefined variable `n`"]);
+    }
 }

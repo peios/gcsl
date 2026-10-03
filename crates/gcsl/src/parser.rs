@@ -86,7 +86,8 @@
 //!
 //! A newline ends an item except where the item cannot be complete: after
 //! a binary operator, after `:` (in an annotation or an ascription, or as a
-//! function's return marker), `->>` and `->`, and after `=`, `:=`, `let`,
+//! function's return marker), `->>`, `->`, `is` and `as`, and after `=`,
+//! `:=`, `let`,
 //! the `mut` of a `let mut` and a spread item's `...`. There
 //! the parser skips newlines before going on. Directly inside parentheses,
 //! brackets and interpolations the lexer emits no newlines at all, so an
@@ -237,10 +238,11 @@
 //! | prefix `not`                | (none)  | operand parsed with min 5  |
 //! | `==` `!=` `===` `!==`       | 5       | 6 (non-associative)        |
 //! | `<` `<=` `>` `>=`           | 5       | 6 (non-associative)        |
+//! | postfix `is` TYPE           | 5       | (none: non-associative)    |
 //! | `..` `..=`                  | 6       | 7 (non-associative)        |
 //! | `+` `-`                     | 7       | 8                          |
 //! | `*` `/` `//` `%`            | 9       | 10                         |
-//! | postfix `:` TYPE            | 11      | (none: parses a type)      |
+//! | postfix `:` TYPE, `as` TYPE | 11      | (none: parses a type)      |
 //! | prefix `-` and `await`      | (none)  | operand parsed with min 13 |
 //! | postfix `.` NAME            | 15      | (none: takes a name)       |
 //! | postfix call `(`...`)` `{`  | 15      | (none: arguments at min 0) |
@@ -279,6 +281,18 @@
 //! tighter than every binary operator, so `1 + 2 : Float` is
 //! `1 + (2 : Float)`, and looser than negation, whose operand is parsed with
 //! minimum 13, so `-5 : Float` is `(-5) : Float`. It chains left to right.
+//!
+//! `EXPR as TYPE`, a checked narrowing, is a postfix operator binding
+//! exactly as the ascription does, chaining with it left to right: `-x as
+//! Int` is `(-x) as Int`, and `a + b as Int` is `a + (b as Int)`. `EXPR is
+//! TYPE`, a type test, is a postfix operator binding as a comparison does:
+//! its left power is comparison's, so `x + 1 is Int` is `(x + 1) is Int`,
+//! `not x is Int` is `not (x is Int)` and `x is Int and y` is `(x is Int)
+//! and y`; and it does not chain with a comparison or another `is`, either
+//! way round, so `a == b is Int` and `x is Int == y` are "comparison
+//! operators cannot be chained" (`Parser::not_chained`). Each parses a
+//! whole type after its keyword, a union included, so `x is Int | String`
+//! tests for the union. `is` and `as` are keywords (see [`crate::lexer`]).
 //!
 //! Field access `EXPR.NAME` is a postfix operator too, binding tighter than
 //! everything: its left power 15 is above every minimum, so a `.` always
@@ -346,8 +360,9 @@
 //! list literal one above its tallest element (a spread's being its
 //! expression's), an index one above the taller of its list and its
 //! position, a
-//! field access one above its record, an ascription one above the taller of
-//! its expression and its type (a record type being one above its tallest
+//! field access one above its record, an ascription, an `is` or an `as`
+//! one above the taller of its expression and its type (a record type
+//! being one above its tallest
 //! field type, a function type one above the tallest of its parameter and
 //! return types, an applied type one above its argument, a `T[]` one above
 //! `T`, a parenthesised
@@ -385,9 +400,13 @@ const NOT_BP: u8 = 5;
 /// binary operator and than ascription.
 const PREFIX_BP: u8 = 13;
 
-/// Left binding power of postfix `:` (type ascription): tighter than every
-/// binary operator, looser than prefix `-`.
+/// Left binding power of postfix `:` (type ascription) and of postfix `as`:
+/// tighter than every binary operator, looser than prefix `-`.
 const ASCRIBE_BP: u8 = 11;
+
+/// Left binding power of postfix `is` (a type test): the left power of
+/// comparison, which it binds as.
+const IS_BP: u8 = 5;
 
 /// Left binding power of postfix `.` (field access): tighter than
 /// everything, prefix `-` included.
@@ -1510,6 +1529,14 @@ impl Parser<'_> {
                 lhs = self.alloc(ExprKind::Ascribe { expr: lhs, ty }, span, height)?;
                 continue;
             }
+            if matches!(token.kind, TokenKind::Is | TokenKind::As) {
+                let is = token.kind == TokenKind::Is;
+                if (if is { IS_BP } else { ASCRIBE_BP }) < min_bp {
+                    break;
+                }
+                lhs = self.parse_type_operator(lhs, is)?;
+                continue;
+            }
             let Some(op) = binary_op(token.kind) else {
                 break;
             };
@@ -1537,13 +1564,7 @@ impl Parser<'_> {
             // its minimum is above comparison's left power; one following
             // directly would chain.
             if op.is_comparison() {
-                let next = self.peek();
-                if binary_op(next.kind).is_some_and(BinaryOp::is_comparison) {
-                    return Err(self.report(
-                        Diagnostic::error("comparison operators cannot be chained", next.span)
-                            .with_note("write `a < b and b < c`, or add parentheses"),
-                    ));
-                }
+                self.not_chained()?;
             }
             // Likewise for a range, whose right operand stops before any
             // further range.
@@ -1556,6 +1577,44 @@ impl Parser<'_> {
             }
         }
         Ok(lhs)
+    }
+
+    /// Parses the postfix `is TYPE`, if `is`, or `as TYPE` otherwise, whose
+    /// keyword is the next token, applied to `lhs`: the type is parsed as
+    /// an ascription's is, newlines before it skipped. An `is` binds as a
+    /// comparison and, like one, may not be followed by a comparison or
+    /// another `is` (see [`Parser::not_chained`]).
+    fn parse_type_operator(&mut self, lhs: ExprId, is: bool) -> ParseResult<ExprId> {
+        self.advance();
+        self.skip_newlines();
+        let (ty, ty_height) = self.parse_type()?;
+        let span = Span::join(self.span_of(lhs), self.type_span(ty));
+        let height = self.height_of(lhs).max(ty_height) + 1;
+        let kind = if is {
+            ExprKind::Is { expr: lhs, ty }
+        } else {
+            ExprKind::As { expr: lhs, ty }
+        };
+        let expr = self.alloc(kind, span, height)?;
+        if is {
+            self.not_chained()?;
+        }
+        Ok(expr)
+    }
+
+    /// After a comparison or an `is`, whose right side stops before any
+    /// further comparison or `is`: reports one that follows directly,
+    /// "comparison operators cannot be chained", since `a < b < c` would
+    /// otherwise mean `(a < b) < c`.
+    fn not_chained(&mut self) -> ParseResult<()> {
+        let next = self.peek();
+        if next.kind == TokenKind::Is || binary_op(next.kind).is_some_and(BinaryOp::is_comparison) {
+            return Err(self.report(
+                Diagnostic::error("comparison operators cannot be chained", next.span)
+                    .with_note("write `a < b and b < c`, or add parentheses"),
+            ));
+        }
+        Ok(())
     }
 
     /// Parses a literal, a name, a string, a parenthesised expression, a
@@ -1627,6 +1686,8 @@ impl Parser<'_> {
             | TokenKind::Or
             | TokenKind::Else
             | TokenKind::In
+            | TokenKind::Is
+            | TokenKind::As
             | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::Let
@@ -2299,6 +2360,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Await
         | TokenKind::For
         | TokenKind::In
+        | TokenKind::Is
+        | TokenKind::As
         | TokenKind::Pipe
         | TokenKind::Neg
         | TokenKind::Colon
@@ -2383,7 +2446,8 @@ mod tests {
     /// Renders a file compactly, making grouping explicit: items are joined
     /// by `; `, binary operations and prefix operations are parenthesised,
     /// parens show as `[ ]`, blocks as `{ }`, ascriptions as `(e : T)`,
-    /// field accesses as `(e . x)`, fields as `x = e`, strings as `"text"`
+    /// type tests and narrowings as `(e is T)` and `(e as T)`, field
+    /// accesses as `(e . x)`, fields as `x = e`, strings as `"text"`
     /// with interpolations as `<e>`, an `if` as `(if c {..} else ..)`, or
     /// `(if c {..})` without `else`, and a `for` as it is written, `for x in
     /// xs if g {..}`. Record types show as
@@ -2511,6 +2575,16 @@ mod tests {
         }
     }
 
+    /// The operator between an expression and the type after it, with the
+    /// spaces around it, as `expr` writes it: ` : `, ` is ` or ` as `.
+    fn type_operator(kind: ExprKind) -> &'static str {
+        match kind {
+            ExprKind::Is { .. } => " is ",
+            ExprKind::As { .. } => " as ",
+            _ => " : ",
+        }
+    }
+
     fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         use std::fmt::Write as _;
         match ast.get(id).kind {
@@ -2590,10 +2664,12 @@ mod tests {
                 body(ast, items, out);
                 out.push('}');
             }
-            ExprKind::Ascribe { expr: inner, ty } => {
+            ExprKind::Ascribe { expr: inner, ty }
+            | ExprKind::Is { expr: inner, ty }
+            | ExprKind::As { expr: inner, ty } => {
                 out.push('(');
                 expr(ast, inner, out);
-                out.push_str(" : ");
+                out.push_str(type_operator(ast.get(id).kind));
                 type_name(ast, ty, out);
                 out.push(')');
             }
@@ -3398,6 +3474,81 @@ mod tests {
             );
         }
         assert_eq!(shape("not a === b"), "(not (a === b))");
+    }
+
+    #[test]
+    fn is_binds_as_comparisons_and_as_as_ascription() {
+        // `is` takes in arithmetic, and is taken in by `not` and `and`.
+        assert_eq!(shape("x + 1 is Int"), "((x + 1) is Int)");
+        assert_eq!(shape("not x is Int"), "(not (x is Int))");
+        assert_eq!(
+            shape("x is Int and y is String"),
+            "((x is Int) and (y is String))"
+        );
+        assert_eq!(shape("x is Int | String"), "(x is (Int | String))");
+        assert_eq!(shape("x.a is {a: Int}"), "((x . a) is {a: Int})");
+        // `as` binds as `:` does, and chains with it.
+        assert_eq!(shape("a + b as Int"), "(a + (b as Int))");
+        assert_eq!(shape("-x as Int"), "((-x) as Int)");
+        assert_eq!(shape("x as Int : Int"), "((x as Int) : Int)");
+        assert_eq!(shape("x : Int as Int"), "((x : Int) as Int)");
+        assert_eq!(shape("x as Int is Int"), "((x as Int) is Int)");
+        assert_eq!(shape("x as Int == 1"), "((x as Int) == 1)");
+        // In a condition, the block after the type is the `if`'s.
+        assert_eq!(shape("if x is Int { x }"), "(if (x is Int) {x})");
+        assert_eq!(
+            shape("if x is {a: Int} { x } else { 0 }"),
+            "(if (x is {a: Int}) {x} else {0})"
+        );
+        // A newline after the keyword continues the item.
+        assert_eq!(shape("x is\n  Int"), "(x is Int)");
+        assert_eq!(shape("x as\n  Int"), "(x as Int)");
+        let ast = parse_text("x is Int").unwrap();
+        let printed = ast.pretty().to_string();
+        assert!(printed.contains("(is Int @0..8"), "{printed}");
+        let ast = parse_text("x as Int").unwrap();
+        assert!(ast.pretty().to_string().contains("(as Int @0..8"));
+    }
+
+    #[test]
+    fn is_does_not_chain_with_comparisons() {
+        for (text, at) in [
+            ("a == b is Int", Span::new(7, 9)),
+            ("x is Int == y", Span::new(9, 11)),
+            ("x is Int is Bool", Span::new(9, 11)),
+            ("a < b is Bool", Span::new(6, 8)),
+        ] {
+            assert_eq!(
+                error(text),
+                ("comparison operators cannot be chained".to_owned(), at),
+                "{text}"
+            );
+        }
+        assert_eq!(shape("(a == b) is Bool"), "([(a == b)] is Bool)");
+        // Neither keyword can be a name.
+        assert_eq!(error("let is = 1").0, "expected a name after `let`");
+        assert_eq!(error("as").0, "expected expression, found `as`");
+    }
+
+    #[test]
+    fn written_unions_of_any_members() {
+        for (text, shown) in [
+            ("let x: Int | String = y", "let x: (Int | String) = y"),
+            (
+                "let x: {a: Int} | List<Int> | Bool = y",
+                "let x: (({a: Int} | List<Int>) | Bool) = y",
+            ),
+            (
+                "let x: (fn(): Int) | Int = y",
+                "let x: (fn(): Int | Int) = y",
+            ),
+            (
+                "let x: Int | String | Future<Int | String> = y",
+                "let x: ((Int | String) | Future<(Int | String)>) = y",
+            ),
+        ] {
+            assert_eq!(shape(text), shown, "{text}");
+        }
     }
 
     #[test]

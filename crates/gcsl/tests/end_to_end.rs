@@ -294,14 +294,17 @@ fn value_display_does_not_include_the_type() {
 #[test]
 fn if_branch_mismatch_renders_exactly() {
     assert_eq!(
-        rendered("let x = if true { 1 } else { \"no\" }\n"),
-        "error: `if` branches have different types\n\
-         \x20--> calc.gcsl:1:9\n\
+        rendered_warnings("let x = if true { 1 } else { \"no\" }\n"),
+        "warning: the branches of this `if` have different types\n\
+         \x20--> calc.gcsl:1:30\n\
          \x20 |\n\
          1 | let x = if true { 1 } else { \"no\" }\n\
-         \x20 |         ^^      -----      -------- this is String\n\
-         \x20 |                 |\n\
-         \x20 |                 this is Int\n"
+         \x20 |                   -          ^^^^ this is String\n\
+         \x20 |                   |\n\
+         \x20 |                   this is Int\n\
+         \x20 |\n\
+         \x20 = note: the `if` is `Int | String`; annotate it with that type if both are meant, \
+         or tell them apart with `is`\n"
     );
 }
 
@@ -2163,15 +2166,62 @@ fn a_spread_of_a_field_defined_before_it_renders_exactly() {
 }
 
 #[test]
+fn a_misused_union_renders_with_its_note() {
+    assert_eq!(
+        rendered("let v: Int | String = 1\nv + 1\n"),
+        "error: cannot add `Int | String` and Int\n\
+         \x20--> calc.gcsl:2:3\n\
+         \x20 |\n\
+         2 | v + 1\n\
+         \x20 | - ^ - Int\n\
+         \x20 | |\n\
+         \x20 | Int | String\n\
+         \x20 |\n\
+         \x20 = note: tell them apart first, as in `if v is Int { ... }`\n"
+    );
+}
+
+#[test]
+fn a_failed_as_renders_what_the_value_is() {
+    assert_eq!(
+        rendered("let ports: List<Int | String> = [8080, \"8443\"]\nports as List<Int>\n"),
+        "error: `ports` is not a `List<Int>`\n\
+         \x20--> calc.gcsl:2:1\n\
+         \x20 |\n\
+         2 | ports as List<Int>\n\
+         \x20 | ^^^^^^^^^^^^^^^^^^ it is a list, and its element 1 is a String\n"
+    );
+}
+
+#[test]
+fn unions_is_and_as_run_end_to_end() {
+    let file = source(
+        "let ports = [8080, \"8443\"]\n\
+         let total = for p in ports { if p is Int { p } else { 0 } }\n\
+         let first = ports[0] as Int\n\
+         { total = total; first = first + 1 }\n",
+    );
+    let outcome = gcsl::run(&file).unwrap();
+    assert_eq!(
+        outcome.value.to_string(),
+        "{total = [8080, 0]; first = 8081}"
+    );
+    assert_eq!(outcome.warnings.len(), 1);
+}
+
+#[test]
 fn list_elements_without_a_join_render_exactly() {
     assert_eq!(
-        rendered("let ports = [8080, 8443,\n  \"9000\"]\n"),
-        "error: list elements have different types\n\
+        rendered_warnings("let ports = [8080, 8443,\n  \"9000\"]\n"),
+        "warning: the elements of this list have different types\n\
          \x20--> calc.gcsl:2:3\n\
          \x20 |\n\
          1 | let ports = [8080, 8443,\n\
          \x20 |              ---- the elements so far are Int\n\
          2 |   \"9000\"]\n\
-         \x20 |   ^^^^^^ this is String\n"
+         \x20 |   ^^^^^^ this is String\n\
+         \x20 |\n\
+         \x20 = note: the list is `List<Int | String>`; annotate it with that type if both are \
+         meant, or tell them apart with `is`\n"
     );
 }

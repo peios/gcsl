@@ -92,6 +92,13 @@
 //! [`crate::check`]). It is an [`ItemKind::Let`] like any other, marked as
 //! mutable, whose path is always a single name.
 //!
+//! # Type tests
+//!
+//! `EXPR is TYPE`, [`ExprKind::Is`], tests whether a value is of a type, and
+//! `EXPR as TYPE`, [`ExprKind::As`], narrows it to the type, failing at
+//! runtime if it is not one; each holds its expression and its type, as an
+//! ascription does (see [`crate::check`]).
+//!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
 //! `Ast` always has a valid root. The `Ast` also owns the [`Names`] table its
@@ -842,6 +849,21 @@ pub enum ExprKind {
         /// The stated type.
         ty: TypeExprId,
     },
+    /// A type test `expr is Type`: whether the value is of the type.
+    Is {
+        /// The expression whose value is tested.
+        expr: ExprId,
+        /// The type tested for.
+        ty: TypeExprId,
+    },
+    /// A checked narrowing `expr as Type`: the value, as of the type, or a
+    /// runtime error if it is not.
+    As {
+        /// The expression whose value is narrowed.
+        expr: ExprId,
+        /// The type it is narrowed to.
+        ty: TypeExprId,
+    },
     /// A function expression, whose details are in the function arena (see
     /// [`Ast::fn_decl`]).
     Fn(FnId),
@@ -880,8 +902,9 @@ pub struct Expr {
     pub kind: ExprKind,
     /// The source it covers. A `Paren` covers its parentheses and a `Block`
     /// its braces, a `Binary` its left operand through its right operand, a
-    /// `Unary` its operator through its operand, and an `Ascribe` its
-    /// expression through its type. A string literal covers its prefix and
+    /// `Unary` its operator through its operand, and an `Ascribe`, an `Is`
+    /// and an `As` its expression through its type. A string literal covers
+    /// its prefix and
     /// delimiters, an `If` its `if` keyword through its last branch, and a
     /// `Field` its record expression through its name. A `Fn` covers its
     /// `fn` keyword through its body's `}`, a `Call` its callee through
@@ -910,6 +933,8 @@ impl Expr {
             | ExprKind::Block(_)
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
+            | ExprKind::Is { .. }
+            | ExprKind::As { .. }
             | ExprKind::Fn(_)
             | ExprKind::Call { .. }
             | ExprKind::Lazy(_)
@@ -1641,7 +1666,9 @@ impl Ast {
                 ExprKind::Paren(inner)
                 | ExprKind::Field { expr: inner, .. }
                 | ExprKind::Index { expr: inner, .. }
-                | ExprKind::Ascribe { expr: inner, .. } => inner,
+                | ExprKind::Ascribe { expr: inner, .. }
+                | ExprKind::Is { expr: inner, .. }
+                | ExprKind::As { expr: inner, .. } => inner,
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::Call { callee, .. } => callee,
                 ExprKind::For(id) => self.for_decl(id).iterable,
@@ -1970,39 +1997,54 @@ impl<A: Annotate> Pretty<'_, A> {
         self.node(f, decl.body, depth)
     }
 
-    fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
-        let expr = self.ast.get(id);
-        write!(f, "{:indent$}(", "", indent = depth * 2)?;
+    /// Writes the head of the node `expr`: what it is, and for a literal,
+    /// a name, a field access, an operator, an ascription, an `is` and an
+    /// `as`, what it holds.
+    fn head(&self, f: &mut fmt::Formatter<'_>, expr: &Expr) -> fmt::Result {
         match expr.kind {
-            ExprKind::Int(value) => write!(f, "int {value}")?,
-            ExprKind::Float(value) => write!(f, "float {value:?}")?,
-            ExprKind::Bool(value) => write!(f, "bool {value}")?,
-            ExprKind::Str(id) => write!(f, "str {}", Quoted(self.ast.strings().get(id)))?,
-            ExprKind::Interp(_) => f.write_str("interp")?,
-            ExprKind::If { .. } => f.write_str("if")?,
+            ExprKind::Int(value) => write!(f, "int {value}"),
+            ExprKind::Float(value) => write!(f, "float {value:?}"),
+            ExprKind::Bool(value) => write!(f, "bool {value}"),
+            ExprKind::Str(id) => write!(f, "str {}", Quoted(self.ast.strings().get(id))),
+            ExprKind::Interp(_) => f.write_str("interp"),
+            ExprKind::If { .. } => f.write_str("if"),
             ExprKind::Unary { op, .. } => match op {
-                UnaryOp::Neg => f.write_str("neg")?,
-                UnaryOp::Not => f.write_str("not")?,
-                UnaryOp::Await => f.write_str("await")?,
+                UnaryOp::Neg => f.write_str("neg"),
+                UnaryOp::Not => f.write_str("not"),
+                UnaryOp::Await => f.write_str("await"),
             },
-            ExprKind::Binary { op, .. } => f.write_str(op.symbol())?,
-            ExprKind::Paren(_) => f.write_str("paren")?,
-            ExprKind::Name(name) => write!(f, "name {}", self.ast.names().get(name))?,
-            ExprKind::Block(_) => f.write_str("block")?,
+            ExprKind::Binary { op, .. } => f.write_str(op.symbol()),
+            ExprKind::Paren(_) => f.write_str("paren"),
+            ExprKind::Name(name) => write!(f, "name {}", self.ast.names().get(name)),
+            ExprKind::Block(_) => f.write_str("block"),
             ExprKind::Field { name, .. } => {
-                write!(f, ". {}", FieldName(self.ast.names().get(name)))?;
+                write!(f, ". {}", FieldName(self.ast.names().get(name)))
             }
             ExprKind::Ascribe { ty, .. } => {
                 f.write_str(": ")?;
-                self.type_expr(f, ty)?;
+                self.type_expr(f, ty)
             }
-            ExprKind::Fn(_) => f.write_str("fn")?,
-            ExprKind::Call { .. } => f.write_str("call")?,
-            ExprKind::Lazy(_) => f.write_str("lazy")?,
-            ExprKind::List(_) => f.write_str("list")?,
-            ExprKind::Index { .. } => f.write_str("index")?,
-            ExprKind::For(id) => write!(f, "for {}", self.for_name(id))?,
+            ExprKind::Is { ty, .. } => {
+                f.write_str("is ")?;
+                self.type_expr(f, ty)
+            }
+            ExprKind::As { ty, .. } => {
+                f.write_str("as ")?;
+                self.type_expr(f, ty)
+            }
+            ExprKind::Fn(_) => f.write_str("fn"),
+            ExprKind::Call { .. } => f.write_str("call"),
+            ExprKind::Lazy(_) => f.write_str("lazy"),
+            ExprKind::List(_) => f.write_str("list"),
+            ExprKind::Index { .. } => f.write_str("index"),
+            ExprKind::For(id) => write!(f, "for {}", self.for_name(id)),
         }
+    }
+
+    fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
+        let expr = self.ast.get(id);
+        write!(f, "{:indent$}(", "", indent = depth * 2)?;
+        self.head(f, expr)?;
         self.annotation.annotate(id, f)?;
         write!(f, " @{}", expr.span)?;
         match expr.kind {
@@ -2028,7 +2070,9 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::Field { expr: operand, .. }
-            | ExprKind::Ascribe { expr: operand, .. } => {
+            | ExprKind::Ascribe { expr: operand, .. }
+            | ExprKind::Is { expr: operand, .. }
+            | ExprKind::As { expr: operand, .. } => {
                 f.write_str("\n")?;
                 self.node(f, operand, depth + 1)?;
             }

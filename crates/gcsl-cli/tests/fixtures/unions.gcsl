@@ -1,0 +1,18 @@
+# Services, each on a port given as a number or by a well-known name.
+let services = [{ name = "web"; port = 8080 }, { name = "db"; port = "postgres" }]
+let known = { postgres = 5432; http = 80 }
+# `is` tests a value at runtime, and narrows the variable in each branch.
+let ports = for s in services {
+  let p = s.port
+  if p is Int { p } else if p == "postgres" { known.postgres } else { known.http }
+}
+# Annotated, a union is meant: no warning.
+let label: Int | String = if len(ports) > 2 { "many" } else { len(ports) }
+# `as` narrows with a check, which fails at runtime if the value is not one.
+let first = (services[0].port as Int) + 1
+# Total equality compares two values of one union type.
+let same = services[0].port === services[1].port
+ports = ports
+label = label
+first = first
+same = same

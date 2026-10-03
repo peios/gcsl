@@ -156,6 +156,21 @@
 //! of a block of such a type, a node of any kind is accepted, since a
 //! present value may be where a future may.
 //!
+//! A union's nodes are of the kind [`TypeTable::value_kind`] gives it:
+//! its members' one kind, or [`ValueKind::Mixed`] for members of different
+//! kinds. Where a node of kind `Mixed` is expected, a node of any kind but
+//! `Deferred` is accepted, since a value of any member's kind may be where
+//! the union may, but a future may not (`Lowerer::lower_operand`). `===`
+//! and `!==` of two `Mixed` operands lower to a `ValueSame` or a
+//! `ValueNotSame`. A deep await of a union carries the lazy shapes of its
+//! members (see [`Ir::lazy_union`]), made in the same work list as a
+//! record's and a list's. An `is` lowers to an `Is` and an `as` to an `As`
+//! of its operand, awaited where the checker marked it, with the test the
+//! checker planned added to the IR's table, and the text of each field name
+//! the plan looks at recorded for the evaluator's failure labels; an `Is`
+//! that narrows has the slot the checker gave it (see
+//! [`crate::check::Resolution::test_of`]).
+//!
 //! Once every node is built, one post-pass computes what the evaluator's
 //! nesting budget needs (see [`crate::MAX_DEPTH`]): each `Call`'s and each
 //! `Await`'s depth in the body of its frame, the body node being at depth 0,
@@ -189,11 +204,12 @@ use crate::check::{AwaitMark, Builtin, Checked, PathResolution, Resolution, Slot
 use crate::diagnostic::InternalError;
 use crate::ir::{
     Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField, LazyShape,
-    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode, UpdateStep,
+    LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode, TestCode,
+    TestId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{Laziness, TyId, TypeTable};
+use crate::types::{Laziness, TyId, TypeTable, ValueTest};
 use crate::value::{Layout, ValueKind, int_to_float};
 
 /// Lowers `ast`, whose types and resolution are `checked`, with its types
@@ -966,13 +982,9 @@ impl Lowerer<'_> {
                 index: self.lower_operand(index, ValueKind::Int)?,
                 kind,
             },
-            (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements)?,
-            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true)?,
+            (ExprKind::Is { .. } | ExprKind::As { .. }, _) => self.lower_type_test(id, kind)?,
             (ExprKind::List(_) | ExprKind::For(_), _) => {
-                return Err(InternalError {
-                    message: "a list literal or a `for` typed as something other than a list",
-                    span,
-                });
+                self.lower_listing(expr.kind, kind, span)?
             }
             (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
@@ -987,7 +999,8 @@ impl Lowerer<'_> {
                 | ValueKind::Record
                 | ValueKind::List
                 | ValueKind::Fn
-                | ValueKind::Deferred,
+                | ValueKind::Deferred
+                | ValueKind::Mixed,
             ) => {
                 return Err(InternalError {
                     message: "numeric literal typed as a non-numeric type",
@@ -1002,6 +1015,54 @@ impl Lowerer<'_> {
             }
         };
         Ok(self.builder.alloc(lowered, span))
+    }
+
+    /// Lowers the list literal or `for`, as `expr` is, of kind `kind`,
+    /// spanning `span`: an internal error unless `kind` is a list's. Apart
+    /// from `lower_plain`, which is on the recursion path of every
+    /// expression.
+    fn lower_listing(
+        &mut self,
+        expr: ExprKind,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        match (expr, kind) {
+            (ExprKind::List(elements), ValueKind::List) => self.lower_list(elements),
+            (ExprKind::For(for_id), ValueKind::List) => self.lower_for(for_id, true),
+            _ => Err(InternalError {
+                message: "a list literal or a `for` typed as something other than a list",
+                span,
+            }),
+        }
+    }
+
+    /// Lowers the `is` or `as` expression `id`, of kind `kind`: an `Is` of
+    /// its operand, a `Bool`, writing the value it tests to the slot the
+    /// checker gave it if it narrows an `if`'s branches, or an `As` of its
+    /// operand, of the kind of its narrowed type; each with the test the
+    /// checker planned (see [`Lowerer::lower_test`]). Apart from
+    /// `lower_plain`, which is on the recursion path of every expression.
+    fn lower_type_test(&mut self, id: ExprId, kind: ValueKind) -> Result<IrKind, InternalError> {
+        let expr = *self.ast.get(id);
+        match (expr.kind, kind) {
+            (ExprKind::Is { expr: operand, .. }, ValueKind::Bool) => {
+                let (value, test) = self.lower_test(id, operand)?;
+                let slot = self
+                    .resolution
+                    .test_of(id)
+                    .map_or(Slot::NONE, |resolution| resolution.slot);
+                Ok(IrKind::Is { value, test, slot })
+            }
+            (ExprKind::As { expr: operand, .. }, _) => {
+                let (value, test) = self.lower_test(id, operand)?;
+                Ok(IrKind::As { value, test, kind })
+            }
+            _ => Err(InternalError {
+                message: "an `is` typed as something other than a Bool",
+                span: expr.span,
+            }),
+        }
     }
 
     /// Lowers `id`, of kind `kind`, which is a variable use, a function
@@ -1437,12 +1498,15 @@ impl Lowerer<'_> {
             }
             (ValueKind::List, BinaryOp::Same, _) => IrKind::ListSame(operands),
             (ValueKind::List, BinaryOp::NotSame, _) => IrKind::ListNotSame(operands),
+            (ValueKind::Mixed, BinaryOp::Same, _) => IrKind::ValueSame(operands),
+            (ValueKind::Mixed, BinaryOp::NotSame, _) => IrKind::ValueNotSame(operands),
             (
                 ValueKind::Bool
                 | ValueKind::Record
                 | ValueKind::List
                 | ValueKind::Fn
-                | ValueKind::Deferred,
+                | ValueKind::Deferred
+                | ValueKind::Mixed,
                 ..,
             ) => {
                 return Err(InternalError {
@@ -1535,11 +1599,12 @@ impl Lowerer<'_> {
     /// of its type stripped, and each present record or list field with
     /// lazy values somewhere inside, with its own; for a list type, what is
     /// done with each element, in the same way, if its type is lazy or has
-    /// lazy values inside; [`LazyShapeId::NONE`] if it has no such field or
-    /// element, or is neither. Made once per type, and the shapes of the
-    /// record and list types inside it first, through a work list rather
-    /// than recursion, since record and list types can nest as deeply as a
-    /// program is long.
+    /// lazy values inside; for a union, the lazy shapes of its members that
+    /// have one (see [`Ir::lazy_union`]); [`LazyShapeId::NONE`] if it has no
+    /// such field, element or member, or is none of those. Made once per
+    /// type, and the shapes of the record, list and union types inside it
+    /// first, through a work list rather than recursion, since record and
+    /// list types can nest as deeply as a program is long.
     fn lazy_shape(&mut self, ty: TyId) -> LazyShapeId {
         let table = self.table;
         if let Some(&id) = self.lazy_shapes.get(&ty) {
@@ -1552,16 +1617,38 @@ impl Lowerer<'_> {
             }
             let element = table.list_element(container);
             let fields = table.record_fields(container).unwrap_or_default();
+            let members = table.union_members(container).unwrap_or_default();
             if !queued {
-                // The record and list types inside it first, then it again.
+                // The record, list and union types inside it first, then it
+                // again.
                 self.lazy_pending.push((container, true));
-                let inside = fields.iter().map(|&(_, field_ty)| field_ty).chain(element);
+                let inside = fields
+                    .iter()
+                    .map(|&(_, field_ty)| field_ty)
+                    .chain(element)
+                    .chain(members.iter().copied());
                 for inner in inside {
                     let inner = table.strip(inner);
-                    if self.is_container(inner) && !self.lazy_shapes.contains_key(&inner) {
+                    if (self.is_container(inner) || table.union_members(inner).is_some())
+                        && !self.lazy_shapes.contains_key(&inner)
+                    {
                         self.lazy_pending.push((inner, false));
                     }
                 }
+                continue;
+            }
+            if !members.is_empty() {
+                let shapes: Box<[LazyShapeId]> = members
+                    .iter()
+                    .filter_map(|member| self.lazy_shapes.get(member).copied())
+                    .filter(|&shape| shape != LazyShapeId::NONE)
+                    .collect();
+                let id = if shapes.is_empty() {
+                    LazyShapeId::NONE
+                } else {
+                    self.builder.push_lazy_union(shapes)
+                };
+                self.lazy_shapes.insert(container, id);
                 continue;
             }
             // What a deep await does with a value of type `ty` inside it.
@@ -1609,9 +1696,17 @@ impl Lowerer<'_> {
     /// Lowers an operand that must already be of kind `expected`, where it
     /// is used. Where a value of kind `Deferred` is expected, a value of
     /// any kind is accepted, since a present value may be where a future
-    /// may.
+    /// may; where one of kind `Mixed` is, a union's, a value of any kind but
+    /// `Deferred` is, since a value of any member's kind may be where the
+    /// union may, but a future may not.
     fn lower_operand(&mut self, id: ExprId, expected: ValueKind) -> Result<IrId, InternalError> {
-        if expected == ValueKind::Deferred || self.kind(id)? == expected {
+        let kind = self.kind(id)?;
+        let accepted = match expected {
+            ValueKind::Deferred => true,
+            ValueKind::Mixed => kind != ValueKind::Deferred,
+            _ => kind == expected,
+        };
+        if accepted {
             self.lower_expr(id)
         } else {
             Err(InternalError {
@@ -1619,6 +1714,49 @@ impl Lowerer<'_> {
                 span: self.ast.get(id).span,
             })
         }
+    }
+
+    /// Lowers the operand `operand` of the `is` or `as` expression `id`,
+    /// awaited where the checker marked it, which must not then be of kind
+    /// [`ValueKind::Deferred`], and adds the test the checker planned for
+    /// it to the IR, with the text of each field name the test looks at;
+    /// returns the operand's node and the test.
+    fn lower_test(&mut self, id: ExprId, operand: ExprId) -> Result<(IrId, TestId), InternalError> {
+        let span = self.ast.get(id).span;
+        let Some(resolution) = self.resolution.test_of(id) else {
+            return Err(InternalError {
+                message: "an `is` or `as` has no test",
+                span,
+            });
+        };
+        if self.kind(operand)? == ValueKind::Deferred {
+            return Err(InternalError {
+                message: "the operand of an `is` or `as` may be a future",
+                span,
+            });
+        }
+        let code = TestCode {
+            test: resolution.test.clone(),
+            subject: resolution.subject.clone(),
+            target: resolution.target.clone(),
+        };
+        let mut pending = vec![&resolution.test];
+        while let Some(test) = pending.pop() {
+            match test {
+                ValueTest::Pass | ValueTest::Kind(_) => {}
+                ValueTest::Record(fields) => {
+                    for (name, field) in fields {
+                        self.builder
+                            .add_name_text(*name, self.ast.names().get(*name));
+                        pending.push(field);
+                    }
+                }
+                ValueTest::List(element) => pending.push(element),
+                ValueTest::Any(alternatives) => pending.extend(alternatives),
+            }
+        }
+        let value = self.lower_expr(operand)?;
+        Ok((value, self.builder.push_test(code)))
     }
 
     /// Lowers an operand of `/`, converting a concrete `Int` to `Float`.
@@ -3788,6 +3926,108 @@ mod tests {
         // Nested, each `for` and its body are a level each.
         let ir = lower_text(&format!("{g}for x in [1] {{ for y in [2] {{ g(y) }} }}"));
         assert_eq!(depths(&ir, ir.root()), vec![5]);
+    }
+
+    /// The result of the root block of `ir`, items or no items.
+    fn root_result(ir: &Ir) -> IrId {
+        let IrKind::Block { result, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block");
+        };
+        result
+    }
+
+    #[test]
+    fn a_union_is_of_mixed_kind_unless_its_members_agree() {
+        let ir = lower_text("let v = if true { 1 } else { \"one\" }\nv");
+        let result = root_result(&ir);
+        assert_eq!(
+            ir.get(result).kind,
+            IrKind::Load(Slot::new(0), ValueKind::Mixed)
+        );
+        // The `if` holds branches of each member's kind.
+        let dumped = dump("let v = if true { 1 } else { \"one\" }\nv");
+        assert!(dumped.contains("(int 1 @"), "{dumped}");
+        assert!(dumped.contains("(str \"one\" @"), "{dumped}");
+        // A union of lists is a list.
+        let ir = lower_text("let xs: List<Int> | List<String> = [1]\nxs");
+        let result = root_result(&ir);
+        assert_eq!(
+            ir.get(result).kind,
+            IrKind::Load(Slot::new(0), ValueKind::List)
+        );
+        // Total equality on values of a union of kinds.
+        let dumped = dump("let v: Int | String = 1\nv === v");
+        assert!(dumped.contains("(value-same === @24..31"), "{dumped}");
+        let dumped = dump("let v: Int | String = 1\nv !== v");
+        assert!(dumped.contains("(value-same !== @24..31"), "{dumped}");
+    }
+
+    #[test]
+    fn a_test_shows_its_plan() {
+        // Only what the value's type leaves in doubt is looked at.
+        for (text, plan) in [
+            ("let v: Int | List<Int> = 1\nv is Int", "(is int @"),
+            ("let v: Int | List<Int> = 1\nv is List<Int>", "(is list @"),
+            (
+                "let v: List<Int | String> = []\nv is List<Int>",
+                "(is [int] @",
+            ),
+            (
+                "let v: {a: Int | String, b: Int} | Int = 1\nv is {a: Int, b: Int}",
+                "(is {a: int} @",
+            ),
+            (
+                "let v: Int | String | Bool = 1\nv is Int | String",
+                "(is (int | string) @",
+            ),
+            ("let v: Int | String = 1\nv as Int", "(as int @"),
+        ] {
+            let dumped = dump(text);
+            assert!(dumped.contains(plan), "{text}: {dumped}");
+        }
+        // An `as` is of the kind of what it narrows to.
+        let ir = lower_text("let v: Int | String = 1\nv as Int");
+        let result = root_result(&ir);
+        assert_eq!(ir.kind_of(result), ValueKind::Int);
+        // A narrowing `is` writes its slot, which its branches read.
+        let dumped = dump("let v: Int | String = 1\nif v is Int { v } else { 0 }");
+        assert!(
+            dumped.contains(
+                "(is int v#1 @27..35\n\
+                 \x20     (load v#0 @27..28))\n\
+                 \x20   (block @36..41\n\
+                 \x20     (load v#1 @38..39))"
+            ),
+            "{dumped}"
+        );
+    }
+
+    #[test]
+    fn a_unions_deep_await_awaits_each_members_shape() {
+        let dumped = dump("let u: Int | {a: Int | Future<Int>} | List<Future<Int>> = 1\n\"{u}\"");
+        assert!(dumped.contains("(await ([a!] | *!) @"), "{dumped}");
+        // A union with nothing lazy inside is not awaited deeply.
+        let dumped = dump("let u: Int | {a: Int} = 1\n\"{u}\"");
+        assert!(!dumped.contains("(await"), "{dumped}");
+    }
+
+    #[test]
+    fn a_test_the_checker_did_not_plan_is_an_internal_error() {
+        let ast = parse_text("let v: Int | String = 1\nv is Int");
+        let mut types = TypeTable::new();
+        let (checked, _) = check(&ast, &mut types).unwrap();
+        let unplanned = Checked {
+            types: checked.types.clone(),
+            resolution: Resolution::without_variables(ast.len(), ast.item_count()),
+        };
+        let error = lower(&ast, &unplanned, &types, 0).unwrap_err();
+        assert!(
+            matches!(
+                error.message,
+                "an `is` or `as` has no test" | "a declaration has no slot"
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]

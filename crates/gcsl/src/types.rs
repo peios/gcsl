@@ -26,8 +26,9 @@
 //! each with a type that is a subtype of the field's type in `T`: width and
 //! depth subtyping, covariant. Every record type is therefore a subtype of
 //! `{}`. `Int`, `Float`, `Bool` and `String` are subtypes only of
-//! themselves. The *join* of two record types is the record of the fields
-//! they share whose types have a join, so it always exists; see
+//! themselves (and of the unions they are members of: see
+//! [Unions](#unions)). The *join* of two record types is the record of the
+//! fields they share, each with the join of its two types; see
 //! [`TypeTable::join`].
 //!
 //! # Lists
@@ -40,8 +41,7 @@
 //! through a list's element type the same way ([`TypeTable::present`],
 //! [`TypeTable::contains_future`], [`TypeTable::settle`] and the others).
 //! Subtyping is covariant, `List<S> <: List<T>` iff `S <: T`, and the join
-//! of two list types is the list of the join of their element types, if
-//! that exists.
+//! of two list types is the list of the join of their element types.
 //!
 //! # Functions
 //!
@@ -61,13 +61,14 @@
 //! equal, each `Qi` is a subtype of `Pi` (parameters are contravariant: a
 //! function that accepts more can stand in for one that accepts less), `R`
 //! is a subtype of `R'` (the return type is covariant), and `m <= m'`. Two
-//! function types have a join when their arities are equal, of each pair
-//! of parameter types one is a subtype of the other, and their return types
-//! have a join: each parameter is the narrower of its pair, which both
-//! functions accept (their types need not be identical, since two functions
-//! written with one signature may be inferred different ones), and keeps
-//! its name if both sides agree on it; its return type is that join, and
-//! its effect is the greater of the two.
+//! function types whose arities are equal, and of each pair of whose
+//! parameter types one is a subtype of the other, join to a function type:
+//! each parameter is the narrower of its pair, which both functions accept
+//! (their types need not be identical, since two functions written with one
+//! signature may be inferred different ones), and keeps its name if both
+//! sides agree on it; its return type is the join of the two, and its
+//! effect is the greater of the two. Any other two function types join to
+//! their union.
 //!
 //! What a memoised function's bare parameter types mean is the checker's
 //! business (see [`crate::check`]): they are present, since its arguments
@@ -86,16 +87,18 @@
 //! - a *present* `T`, whose values are never futures (every type that is
 //!   neither of the others, records whose fields are futures included);
 //! - `Future<T>`, a future whose await yields a `T`;
-//! - `T | Future<T>`, the *either* shape, a [`TyKind::Union`] of exactly
-//!   those two members: a present `T` or a `Future<T>`. It is the only union
-//!   the table builds, through [`TypeTable::deferrable`], and its present
-//!   member is never itself a future or an either.
+//! - `T | Future<T>`, the *either* shape, a [`TyKind::Either`] of `T`: a
+//!   present `T` or a `Future<T>`. [`TypeTable::deferrable`] builds it, and
+//!   its present member is never itself a future or an either, but may be
+//!   a union (see [Unions](#unions)): `Int | String | Future<Int | String>`
+//!   is the either of `Int | String`.
 //!
 //! Awaiting resolves a future fully, so no program can tell a future of a
 //! future from a future of what it yields in the end, and
 //! [`TypeTable::future`] interns `Future<Future<Int>>` and `Future<Int |
 //! Future<Int>>` as `Future<Int>`: what a future yields is never itself a
-//! future or an either (the fields of a record it yields are untouched).
+//! future or an either (the fields of a record it yields are untouched),
+//! but may be a union.
 //!
 //! [`TypeTable::strip`] removes every `Future` and either layer at the top of
 //! a type, which is what awaiting a value fully does to its type, and
@@ -113,6 +116,49 @@
 //! join to the future
 //! of the join of what they yield, and a future or an either with anything
 //! else to the either of the join of both sides stripped.
+//!
+//! # Unions
+//!
+//! A *union*, [`TyKind::Union`], is the type of every value of any of its
+//! members: `Int | String` holds an `Int` or a `String`. Its members are
+//! two or more *present* types, none of them a union, a future, an either
+//! or a provisional type, and none a subtype of another;
+//! [`TypeTable::union`] builds one from any present types, flattening the
+//! unions among them, removing duplicates and every member that is a
+//! subtype of another (so `{a: Int, b: Int} | {a: Int}` is `{a: Int}`, and
+//! of two members that are each a subtype of the other, as `fn(x: Int):
+//! Int` and `fn(Int): Int` are, keeping the one interned first), and making
+//! a union of one member that member. The members are kept sorted by
+//! [`TyId`], so that a union is interned once whatever order its members are
+//! given in. A union is present: its values are never futures, though the
+//! either shape and a future may hold one.
+//!
+//! Subtyping: a type that is not a union is a subtype of a union if it is a
+//! subtype of one of its members, and a union is a subtype of a type if
+//! each of its members is. With the rules above, that reaches through
+//! record fields, list elements, function types and futures.
+//! [`TypeTable::strip`] leaves a union as it is, since it is present;
+//! [`TypeTable::present`] presents each member; [`TypeTable::contains_fn`],
+//! [`TypeTable::contains_future`], [`TypeTable::settle`] and the helpers for
+//! provisional types look through its members as they look through a
+//! record's fields.
+//!
+//! The join of two types always exists ([`TypeTable::join`]): where two
+//! types have no common supertype of the shapes above, at the top or inside
+//! a record field, a list's element type or a function's return type, their
+//! join is their union, and the join says it has *widened*, which the
+//! checker warns about (see [`crate::check`]). A union joins with a type it
+//! is a supertype of to itself, and with any other to the union of both
+//! sides' members.
+//!
+//! A union of members of one kind of value (lists, say) has that kind (see
+//! [`TypeTable::value_kind`]); any other has [`ValueKind::Mixed`], whose
+//! values only the evaluator's general walker handles.
+//!
+//! A *test* of a type (see [`ValueTest`]) is how the checker's `is` and
+//! `as` ask at runtime whether a value is of a type: by the structure of
+//! the value, looking no further into it than what the static type of the
+//! value leaves in doubt.
 //!
 //! # Provisional types
 //!
@@ -221,10 +267,15 @@ pub enum TyKind {
     /// future nor an either shape; [`TypeTable::future`] builds one. See
     /// the module documentation.
     Future(TyId),
-    /// A union of at least two types, sorted, deduplicated and flattened
-    /// (no member is itself a union). The only one built is the either
-    /// shape, `T | Future<T>`, through [`TypeTable::deferrable`]; see the
-    /// module documentation.
+    /// The either shape, `T | Future<T>`, of the type given, `T`, which is
+    /// neither a future, an either shape nor a provisional type;
+    /// [`TypeTable::deferrable`] builds one. See the module documentation.
+    Either(TyId),
+    /// A union of at least two present types, sorted by [`TyId`], with no
+    /// duplicates, none of them a union, a future, an either shape, a
+    /// provisional type or a checker-internal type, and none a subtype of
+    /// another; [`TypeTable::union`] builds one. See the module
+    /// documentation.
     Union(Box<[TyId]>),
     /// A pure function's bare parameter whose laziness is not decided yet:
     /// `inner` if the function's body measures it, and `inner`'s either
@@ -237,7 +288,7 @@ pub enum TyKind {
         /// The parameter's position among the function's parameters.
         param: u32,
         /// The parameter's type as written, resolved: never a future, an
-        /// either shape or a provisional.
+        /// either shape or a provisional, but possibly a union.
         inner: TyId,
     },
     /// See [`TyId::UNTYPED_INT`].
@@ -289,6 +340,46 @@ pub enum AwaitKind {
     /// Awaited fully at the top and then in every field of a record, at any
     /// depth, whose type is a future or an either.
     Deep,
+}
+
+/// A test of whether a value is of a type, by the value's structure, as
+/// `is` and `as` run it: the *plan* the checker decides for a test of a
+/// type against what the static type of the value already says, looking
+/// into the value only where that leaves the answer in doubt. The value
+/// tested is present wherever the test looks (the checker awaits it as
+/// deeply as its plan reaches).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueTest {
+    /// Passes for every value: what the static type already guarantees.
+    Pass,
+    /// Passes for a value of this kind: `Int`, `Float`, `Bool` or `String`,
+    /// any record or any list; never [`ValueKind::Fn`],
+    /// [`ValueKind::Deferred`] or [`ValueKind::Mixed`].
+    Kind(ValueKind),
+    /// Passes for a record that has each of these fields, whatever else it
+    /// has, the value of each passing the field's test. Never empty: a test
+    /// of no field is `Kind(ValueKind::Record)`.
+    Record(Box<[(Name, ValueTest)]>),
+    /// Passes for a list each of whose elements passes the test, the empty
+    /// list included. Never of [`ValueTest::Pass`]: that is
+    /// `Kind(ValueKind::List)`.
+    List(Box<ValueTest>),
+    /// Passes for a value that passes any of the tests, of which there are
+    /// at least two.
+    Any(Box<[ValueTest]>),
+}
+
+impl ValueTest {
+    /// Whether the test looks inside the value, at a record's fields or a
+    /// list's elements, and so needs them present.
+    #[must_use]
+    pub fn walks(&self) -> bool {
+        match self {
+            ValueTest::Pass | ValueTest::Kind(_) => false,
+            ValueTest::Record(_) | ValueTest::List(_) => true,
+            ValueTest::Any(tests) => tests.iter().any(ValueTest::walks),
+        }
+    }
 }
 
 /// The interning table: each distinct type once, with its [`TyId`]. See the
@@ -344,18 +435,19 @@ impl TypeTable {
     ///
     /// A record's fields are sorted by name here, so they may be given in
     /// any order; they must not repeat a name (the checker reports repeated
-    /// names before it builds a type). A future, a union and a provisional
-    /// type must already satisfy the invariants documented on
-    /// [`TyKind::Future`], [`TyKind::Union`] and [`TyKind::Provisional`].
+    /// names before it builds a type). A future, an either shape, a union
+    /// and a provisional type must already satisfy the invariants
+    /// documented on [`TyKind::Future`], [`TyKind::Either`],
+    /// [`TyKind::Union`] and [`TyKind::Provisional`].
     ///
     /// A table holds at most `u32::MAX` types. Every type but the
     /// pre-interned ones is built from source (a record block, a list
     /// literal, a record, list or function type expression, a function
     /// expression or a parameter, each at least two bytes of it, the join of
-    /// two types already in the table,
-    /// which is no larger than either, or a type already in the table with
-    /// its provisionals settled, which is no larger than it), so the limit is
-    /// far beyond any table; past it, ids would saturate.
+    /// two types already in the table, which is no larger than the two
+    /// together, or a type already in the table with its provisionals
+    /// settled, which is no larger than it), so the limit is far beyond any
+    /// table; past it, ids would saturate.
     pub fn intern(&mut self, kind: TyKind) -> TyId {
         let kind = match kind {
             TyKind::Record(RecordTy { mut fields }) => {
@@ -380,7 +472,9 @@ impl TypeTable {
                 self.has_provisional(sig.ret)
                     || sig.params.iter().any(|&(_, ty)| self.has_provisional(ty))
             }
-            TyKind::Future(inner) | TyKind::List(inner) => self.has_provisional(*inner),
+            TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner) => {
+                self.has_provisional(*inner)
+            }
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -488,7 +582,10 @@ impl TypeTable {
                 .iter()
                 .any(|&(_, field)| self.contains_fn(field)),
             Some(
-                TyKind::Future(inner) | TyKind::List(inner) | TyKind::Provisional { inner, .. },
+                TyKind::Future(inner)
+                | TyKind::Either(inner)
+                | TyKind::List(inner)
+                | TyKind::Provisional { inner, .. },
             ) => self.contains_fn(*inner),
             Some(TyKind::Union(members)) => members.iter().any(|&member| self.contains_fn(member)),
             _ => false,
@@ -508,46 +605,80 @@ impl TypeTable {
 
     /// The either shape of `inner`, `T | Future<T>` with `T` being `inner`
     /// stripped (see [`TypeTable::strip`]), adding it to the table if it is
-    /// new: the one kind of union there is. `Error` for `Error`, which has
-    /// no either shape.
+    /// new. `Error` for `Error`, which has no either shape.
     pub fn deferrable(&mut self, inner: TyId) -> TyId {
         let present = self.strip(inner);
         if present == TyId::ERROR {
             return TyId::ERROR;
         }
-        let future = self.future(present);
-        // A future is interned after what it yields, but the order is the
-        // union's invariant, so it is not left to that.
-        let mut members = [present, future];
-        members.sort_unstable();
-        self.intern(TyKind::Union(Box::new(members)))
+        self.intern(TyKind::Either(present))
     }
 
     /// The present member of `id` if it is an either shape, `T | Future<T>`:
-    /// `T`. `None` for every other type, other unions included.
+    /// `T`. `None` for every other type, unions included.
     fn either_member(&self, id: TyId) -> Option<TyId> {
-        let Some(TyKind::Union(members)) = self.kinds.get(id.index()) else {
-            return None;
-        };
-        let [first, second] = **members else {
-            return None;
-        };
-        let future_of =
-            |future: TyId, of: TyId| self.kinds.get(future.index()) == Some(&TyKind::Future(of));
-        if future_of(second, first) {
-            Some(first)
-        } else if future_of(first, second) {
-            Some(second)
-        } else {
-            None
+        match self.kinds.get(id.index()) {
+            Some(&TyKind::Either(present)) => Some(present),
+            _ => None,
         }
     }
 
-    /// Whether `id` is an either shape, `T | Future<T>`, the one union a
-    /// successful check may leave in its types.
+    /// Whether `id` is an either shape, `T | Future<T>`.
     #[must_use]
     pub fn is_deferrable(&self, id: TyId) -> bool {
         self.either_member(id).is_some()
+    }
+
+    /// The union of `members`, present types, adding it to the table if it
+    /// is new (see the module documentation): the unions among them
+    /// flattened into their members, duplicates removed, and every member
+    /// that is a subtype of another dropped, of two members that are each a
+    /// subtype of the other the one with the greater id; the one member
+    /// left if only one is, and a [`TyKind::Union`] of those left, sorted by
+    /// id, otherwise. `Error` if any member is `Error`, or if there are none.
+    /// No member may be a future, an either shape, a provisional type or an
+    /// untyped integer: the checker joins those through
+    /// [`TypeTable::join`], which never makes a union of them.
+    ///
+    /// Takes time quadratic in the number of members, for the subtype tests
+    /// between them; unions are small.
+    pub fn union(&mut self, members: impl IntoIterator<Item = TyId>) -> TyId {
+        let mut flat = Vec::new();
+        for member in members {
+            match self.kinds.get(member.index()) {
+                Some(TyKind::Union(inner)) => flat.extend_from_slice(inner),
+                Some(TyKind::Error) | None => return TyId::ERROR,
+                Some(_) => flat.push(member),
+            }
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        let kept: Vec<TyId> = flat
+            .iter()
+            .enumerate()
+            .filter(|&(at, &member)| {
+                !flat.iter().enumerate().any(|(other_at, &other)| {
+                    other_at != at
+                        && self.is_subtype(member, other)
+                        && (other_at < at || !self.is_subtype(other, member))
+                })
+            })
+            .map(|(_, &member)| member)
+            .collect();
+        match *kept.as_slice() {
+            [] => TyId::ERROR,
+            [only] => only,
+            _ => self.intern(TyKind::Union(kept.into_boxed_slice())),
+        }
+    }
+
+    /// The members of `id` if it is a union, `None` for every other type.
+    #[must_use]
+    pub fn union_members(&self, id: TyId) -> Option<&[TyId]> {
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Union(members)) => Some(members),
+            _ => None,
+        }
     }
 
     /// The provisional type of parameter number `param` of function
@@ -565,8 +696,8 @@ impl TypeTable {
     }
 
     /// Type `id` with every provisional type of function `function` in it,
-    /// at any depth, through records, lists, futures, unions and function
-    /// types,
+    /// at any depth, through records, lists, futures, either shapes, unions
+    /// and function types,
     /// replaced by what was decided for its parameter: its present type if
     /// `decisions[param]` is `true`, the parameter being measured, and the
     /// either shape of it otherwise. Provisional types of other functions
@@ -620,18 +751,18 @@ impl TypeTable {
                 let element = self.settle(element, function, decisions);
                 self.list(element)
             }
+            TyKind::Either(present) => {
+                let present = self.settle(present, function, decisions);
+                self.deferrable(present)
+            }
             TyKind::Union(members) => {
-                if let Some(present) = self.either_member(id) {
-                    let present = self.settle(present, function, decisions);
-                    return self.deferrable(present);
-                }
-                let mut members: Vec<TyId> = members
+                // Settling may make one member a subtype of another, so
+                // the union is built again.
+                let members: Vec<TyId> = members
                     .iter()
                     .map(|&member| self.settle(member, function, decisions))
                     .collect();
-                members.sort_unstable();
-                members.dedup();
-                self.intern(TyKind::Union(members.into_boxed_slice()))
+                self.union(members)
             }
             TyKind::Provisional { .. }
             | TyKind::Int
@@ -644,7 +775,8 @@ impl TypeTable {
     }
 
     /// Whether type `id` is or contains, at any depth, through records,
-    /// lists, futures, unions and function types, a provisional type: one of
+    /// lists, futures, either shapes, unions and function types, a
+    /// provisional type: one of
     /// function `function`'s parameters, or of any function's for `None`.
     /// Constant time for `None`, and for a type with no provisional type at
     /// all.
@@ -671,7 +803,7 @@ impl TypeTable {
                         .iter()
                         .any(|&(_, ty)| self.contains_provisional(ty, Some(function)))
             }
-            Some(TyKind::Future(inner) | TyKind::List(inner)) => {
+            Some(TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner)) => {
                 self.contains_provisional(*inner, Some(function))
             }
             Some(TyKind::Union(members)) => members
@@ -683,8 +815,8 @@ impl TypeTable {
 
     /// Adds to `out` the parameter of each provisional type of function
     /// `function` in type `id`, at any depth, through records, lists,
-    /// futures, unions and function types, in no particular order and
-    /// possibly more than once.
+    /// futures, either shapes, unions and function types, in no particular
+    /// order and possibly more than once.
     ///
     /// Recurses once per level of nesting in the type.
     pub fn provisional_params(&self, id: TyId, function: FnId, out: &mut Vec<u32>) {
@@ -708,7 +840,7 @@ impl TypeTable {
                 }
                 self.provisional_params(sig.ret, function, out);
             }
-            Some(TyKind::Future(inner) | TyKind::List(inner)) => {
+            Some(TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner)) => {
                 self.provisional_params(*inner, function, out);
             }
             Some(TyKind::Union(members)) => {
@@ -728,11 +860,15 @@ impl TypeTable {
     /// more than once. The two types are walked together, through record
     /// fields that both have, through the element types of list types,
     /// through future and either layers (with
-    /// `expected` stripped to match), and through the return types of
-    /// function types, but not their parameters: a parameter is
-    /// contravariant, so a provisional one fits no worse for being left
-    /// undecided. Nothing is added where `expected` is a `Future`, which no
-    /// present value fits.
+    /// `expected` stripped to match), through the members of a union on
+    /// either side (each member of `found` against `expected`, and `found`
+    /// against each member of `expected` where `expected` is a union once
+    /// stripped and `found` is not a provisional type, conservatively: a
+    /// parameter that would need to be present to fit any member is
+    /// added), and through the return types of function types, but not
+    /// their parameters: a parameter is contravariant, so a provisional one
+    /// fits no worse for being left undecided. Nothing is added where
+    /// `expected` is a `Future`, which no present value fits.
     ///
     /// Recurses once per level of nesting shared by the two types.
     pub fn provisionals_at_present(
@@ -743,6 +879,19 @@ impl TypeTable {
         out: &mut Vec<u32>,
     ) {
         if !self.has_provisional(found) || expected == TyId::ERROR {
+            return;
+        }
+        let provisional = matches!(
+            self.kinds.get(found.index()),
+            Some(TyKind::Provisional { .. })
+        );
+        if !provisional
+            && self.laziness(expected) != Laziness::Future
+            && let Some(members) = self.union_members(self.strip(expected))
+        {
+            for &member in members {
+                self.provisionals_at_present(found, member, function, out);
+            }
             return;
         }
         match self.kinds.get(found.index()) {
@@ -779,11 +928,10 @@ impl TypeTable {
                     self.provisionals_at_present(*element, expected, function, out);
                 }
             }
-            Some(TyKind::Future(inner)) => {
+            Some(TyKind::Future(inner) | TyKind::Either(inner)) => {
                 self.provisionals_at_present(*inner, self.strip(expected), function, out);
             }
             Some(TyKind::Union(members)) => {
-                let expected = self.strip(expected);
                 for &member in members {
                     self.provisionals_at_present(member, expected, function, out);
                 }
@@ -801,12 +949,12 @@ impl TypeTable {
     /// [`Laziness::Future`] for a `Future<T>`, [`Laziness::Either`] for a
     /// `T | Future<T>`, [`Laziness::Provisional`] for a provisional type,
     /// and [`Laziness::Present`] for everything else, a record with futures
-    /// in its fields and a list of futures included.
+    /// in its fields, a list of futures and a union included.
     #[must_use]
     pub fn laziness(&self, id: TyId) -> Laziness {
         match self.kinds.get(id.index()) {
             Some(TyKind::Future(_)) => Laziness::Future,
-            Some(TyKind::Union(_)) if self.is_deferrable(id) => Laziness::Either,
+            Some(TyKind::Either(_)) => Laziness::Either,
             Some(TyKind::Provisional { .. }) => Laziness::Provisional,
             _ => Laziness::Present,
         }
@@ -815,17 +963,18 @@ impl TypeTable {
     /// Type `id` with every `Future`, either and provisional layer at its
     /// top removed: the type of its value once awaited fully. `Future<Int>`,
     /// `Int | Future<Int>`, `Int?` and `Int` all strip to `Int`; a record's
-    /// fields and a list's element type are left as they are.
+    /// fields, a list's element type and a union's members are left as they
+    /// are.
     #[must_use]
     pub fn strip(&self, id: TyId) -> TyId {
         let mut id = id;
         loop {
             match self.kinds.get(id.index()) {
-                Some(TyKind::Future(inner) | TyKind::Provisional { inner, .. }) => id = *inner,
-                Some(TyKind::Union(_)) => match self.either_member(id) {
-                    Some(present) => id = present,
-                    None => return id,
-                },
+                Some(
+                    TyKind::Future(inner)
+                    | TyKind::Either(inner)
+                    | TyKind::Provisional { inner, .. },
+                ) => id = *inner,
                 _ => return id,
             }
         }
@@ -833,15 +982,27 @@ impl TypeTable {
 
     /// Type `id` stripped (see [`TypeTable::strip`]) and then, if it is a
     /// record type, with each field's type made present in the same way,
-    /// and if it is a list type, with its element type made present,
-    /// recursively: the type of its value once awaited deeply. Provisional
-    /// types are stripped like the either shapes they may become. Function
-    /// types are left as they are, parameters and results alike. Interns the
-    /// record and list types it makes.
+    /// if it is a list type, with its element type made present, and if it
+    /// is a union, with each member made present (the union built again,
+    /// since that may make one member a subtype of another), recursively:
+    /// the type of its value once awaited deeply. Provisional types are
+    /// stripped like the either shapes they may become. Function types are
+    /// left as they are, parameters and results alike. Interns the record,
+    /// list and union types it makes.
     ///
-    /// Recurses once per level of record or list nesting.
+    /// Recurses once per level of record, list or union nesting.
     pub fn present(&mut self, id: TyId) -> TyId {
         let top = self.strip(id);
+        if let Some(members) = self.union_members(top) {
+            // A copy (ids only), since presenting a member may intern types.
+            let members = members.to_vec();
+            let presented: Vec<TyId> = members.iter().map(|&member| self.present(member)).collect();
+            return if presented == members {
+                top
+            } else {
+                self.union(presented)
+            };
+        }
         if let Some(element) = self.list_element(top) {
             let presented = self.present(element);
             return if presented == element {
@@ -894,22 +1055,23 @@ impl TypeTable {
 
     /// Whether type `id` is a `Future`, or a record type with a field of a
     /// type that is or contains one, or a list type whose element type is or
-    /// contains one, at any depth of record and list nesting. An either
-    /// shape counts only through its present member, so `Int | Future<Int>`
-    /// contains none, a provisional type likewise through its present type,
-    /// and function types are not looked into.
+    /// contains one, or a union with a member that does, at any depth of
+    /// record, list and union nesting. An either shape counts only through
+    /// its present member, so `Int | Future<Int>` contains none, a
+    /// provisional type likewise through its present type, and function
+    /// types are not looked into.
     ///
-    /// Recurses once per level of record or list nesting.
+    /// Recurses once per level of record, list or union nesting.
     #[must_use]
     pub fn contains_future(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
             Some(TyKind::Future(_)) => true,
-            Some(TyKind::Provisional { inner, .. } | TyKind::List(inner)) => {
-                self.contains_future(*inner)
+            Some(
+                TyKind::Provisional { inner, .. } | TyKind::List(inner) | TyKind::Either(inner),
+            ) => self.contains_future(*inner),
+            Some(TyKind::Union(members)) => {
+                members.iter().any(|&member| self.contains_future(member))
             }
-            Some(TyKind::Union(_)) => self
-                .either_member(id)
-                .is_some_and(|present| self.contains_future(present)),
             Some(TyKind::Record(record)) => record
                 .fields
                 .iter()
@@ -1000,13 +1162,15 @@ impl TypeTable {
     /// both are function types and `sub`'s signature fits `sup`'s; or `sup` is
     /// `Future<T>` and `sub` is `Future<S>` with `S <: T`; or `sup` is `T |
     /// Future<T>` and `sub` stripped is a subtype of `T` (see the module
-    /// documentation). Nothing lazy is a subtype of a present type. A
-    /// provisional type, `T?`, is its either shape as `sub` (so it is a
-    /// subtype of exactly what `T | Future<T>` is) and its present type `T`
-    /// as `sup`, unless the two are the same provisional type.
+    /// documentation); or `sub` is a union each of whose members is a
+    /// subtype of `sup`; or `sub` is not a union and `sup` is one with a
+    /// member `sub` is a subtype of. Nothing lazy is a subtype of a present
+    /// type. A provisional type, `T?`, is its either shape as `sub` (so it
+    /// is a subtype of exactly what `T | Future<T>` is) and its present type
+    /// `T` as `sup`, unless the two are the same provisional type.
     ///
-    /// Recurses once per level of record, list, function type or future
-    /// nesting in the two types.
+    /// Recurses once per level of record, list, function type, future or
+    /// union nesting in the two types.
     #[must_use]
     pub fn is_subtype(&self, sub: TyId, sup: TyId) -> bool {
         if sub == sup {
@@ -1020,15 +1184,19 @@ impl TypeTable {
                     _ => false,
                 };
             }
-            Some(TyKind::Union(_)) => {
-                return self
-                    .either_member(sup)
-                    .is_some_and(|required| self.is_subtype(self.strip(sub), required));
+            Some(&TyKind::Either(required)) => {
+                return self.is_subtype(self.strip(sub), required);
             }
             _ => {}
         }
         if self.laziness(sub) != Laziness::Present {
             return false;
+        }
+        if let Some(members) = self.union_members(sub) {
+            return members.iter().all(|&member| self.is_subtype(member, sup));
+        }
+        if let Some(members) = self.union_members(sup) {
+            return members.iter().any(|&member| self.is_subtype(sub, member));
         }
         if let (Some(offered), Some(required)) = (self.list_element(sub), self.list_element(sup)) {
             return self.is_subtype(offered, required);
@@ -1061,50 +1229,98 @@ impl TypeTable {
     }
 
     /// The least common supertype of `a` and `b`, for the branches of an
-    /// `if`: `a` itself if the two are the same type; for two record types,
-    /// the record of the fields they share whose types have a join, each
-    /// with that join (the empty record if there are none); for two list
-    /// types, the list of the join of their element types, if they have
-    /// one; for two
-    /// function types, the join described in the module documentation, if
-    /// they have one; for two futures, the future of the join of what they
-    /// yield; for a future, an either or a provisional type (which joins as
-    /// its either shape) with anything else, the either of the join of both
-    /// stripped; each of the last two existing if the inner join does; and
-    /// `None` otherwise. Numeric adaptation of untyped
-    /// integers is the checker's business, not the table's, so `Int` and an
-    /// untyped integer have no join here.
+    /// `if` and the elements of a list, and whether making it *widened*:
+    /// introduced a union anywhere in it, which the checker warns about.
+    /// It always exists (see the module documentation):
+    ///
+    /// - `a` itself if the two are the same type, not widened;
+    /// - `Error` if either is `Error`, not widened, the error having been
+    ///   reported; an untyped integer joins as the `Int` it settles to
+    ///   (numeric adaptation is the checker's business, done before it
+    ///   joins);
+    /// - for two futures, the future of the join of what they yield; for a
+    ///   future, an either or a provisional type (which joins as its either
+    ///   shape) with anything else, the either of the join of both sides
+    ///   stripped; widened if that join is;
+    /// - for a union and a type, the one of the two that is a supertype of
+    ///   the other, not widened, or else the union of both sides' members,
+    ///   widened;
+    /// - for two list types, the list of the join of their element types;
+    /// - for two function types, the join described in the module
+    ///   documentation, widened if the join of their return types is, or
+    ///   their union, widened, if they have different arities or a pair of
+    ///   parameter types neither of which is a subtype of the other;
+    /// - for two record types, the record of the fields they share, each
+    ///   with the join of its two types (the empty record if there are
+    ///   none), widened if any of those is;
+    /// - for any other two types, their union, widened.
     ///
     /// Recurses once per level of record, list, return type or future
     /// nesting shared by `a` and `b`.
-    pub fn join(&mut self, a: TyId, b: TyId) -> Option<TyId> {
+    pub fn join(&mut self, a: TyId, b: TyId) -> (TyId, bool) {
         if a == b {
-            return Some(a);
+            return (a, false);
+        }
+        if a == TyId::ERROR || b == TyId::ERROR {
+            return (TyId::ERROR, false);
+        }
+        let settled = |ty: TyId| {
+            if ty == TyId::UNTYPED_INT {
+                TyId::INT
+            } else {
+                ty
+            }
+        };
+        let (a, b) = (settled(a), settled(b));
+        if a == b {
+            return (a, false);
         }
         if self.laziness(a) != Laziness::Present || self.laziness(b) != Laziness::Present {
             if let (TyKind::Future(a_inner), TyKind::Future(b_inner)) = (self.kind(a), self.kind(b))
             {
                 let (a_inner, b_inner) = (*a_inner, *b_inner);
-                let joined = self.join(a_inner, b_inner)?;
-                return Some(self.future(joined));
+                let (joined, widened) = self.join(a_inner, b_inner);
+                return (self.future(joined), widened);
             }
             let (a_present, b_present) = (self.strip(a), self.strip(b));
-            let joined = self.join(a_present, b_present)?;
-            return Some(self.deferrable(joined));
+            let (joined, widened) = self.join(a_present, b_present);
+            return (self.deferrable(joined), widened);
+        }
+        if self.union_members(a).is_some() || self.union_members(b).is_some() {
+            return if self.is_subtype(a, b) {
+                (b, false)
+            } else if self.is_subtype(b, a) {
+                (a, false)
+            } else {
+                (self.union([a, b]), true)
+            };
         }
         if let (Some(a_element), Some(b_element)) = (self.list_element(a), self.list_element(b)) {
-            let joined = self.join(a_element, b_element)?;
-            return Some(self.list(joined));
+            let (joined, widened) = self.join(a_element, b_element);
+            return (self.list(joined), widened);
         }
-        if let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) {
-            if a_sig.params.len() != b_sig.params.len() {
-                return None;
-            }
-            // Parameters are contravariant, so each is the narrower of the
-            // two, which both functions accept: one of them, if it is a
-            // subtype of the other. A copy, since joining the return types
-            // may intern new types and so needs the table mutably.
-            let params: Vec<(Option<Name>, TyId)> = a_sig
+        if self.fn_sig(a).is_some() && self.fn_sig(b).is_some() {
+            return self.join_fns(a, b);
+        }
+        if self.is_record(a) && self.is_record(b) {
+            return self.join_records(a, b);
+        }
+        (self.union([a, b]), true)
+    }
+
+    /// The join of the function types `a` and `b`, and whether it is
+    /// widened, as [`TypeTable::join`] says.
+    fn join_fns(&mut self, a: TyId, b: TyId) -> (TyId, bool) {
+        let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) else {
+            return (self.union([a, b]), true);
+        };
+        // Parameters are contravariant, so each is the narrower of the two,
+        // which both functions accept: one of them, if it is a subtype of
+        // the other. A copy, since joining the return types may intern new
+        // types and so needs the table mutably.
+        let params: Option<Vec<(Option<Name>, TyId)>> = if a_sig.params.len() == b_sig.params.len()
+        {
+            a_sig
                 .params
                 .iter()
                 .zip(&b_sig.params)
@@ -1118,19 +1334,30 @@ impl TypeTable {
                     };
                     Some((a_name.filter(|_| a_name == b_name), param))
                 })
-                .collect::<Option<_>>()?;
-            let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
-            let ret = self.join(a_ret, b_ret)?;
-            return Some(self.fn_type(params, ret, effect));
-        }
-        let (TyKind::Record(a_record), TyKind::Record(b_record)) = (self.kind(a), self.kind(b))
+                .collect()
+        } else {
+            None
+        };
+        let Some(params) = params else {
+            return (self.union([a, b]), true);
+        };
+        let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
+        let (ret, widened) = self.join(a_ret, b_ret);
+        (self.fn_type(params, ret, effect), widened)
+    }
+
+    /// The join of the record types `a` and `b`, and whether it is widened,
+    /// as [`TypeTable::join`] says.
+    fn join_records(&mut self, a: TyId, b: TyId) -> (TyId, bool) {
+        let (Some(a_fields), Some(b_fields)) = (self.record_fields(a), self.record_fields(b))
         else {
-            return None;
+            return (self.union([a, b]), true);
         };
         // Copies of the two field lists (ids only), since joining a field
         // may intern new types and so needs the table mutably.
-        let (a_fields, b_fields) = (a_record.fields.clone(), b_record.fields.clone());
+        let (a_fields, b_fields) = (a_fields.to_vec(), b_fields.to_vec());
         let mut shared = Vec::with_capacity(a_fields.len().min(b_fields.len()));
+        let mut widened = false;
         for &(name, a_ty) in &a_fields {
             let Ok(index) = b_fields.binary_search_by_key(&name, |&(field, _)| field) else {
                 continue;
@@ -1138,24 +1365,25 @@ impl TypeTable {
             let Some(&(_, b_ty)) = b_fields.get(index) else {
                 continue;
             };
-            if let Some(joined) = self.join(a_ty, b_ty) {
-                shared.push((name, joined));
-            }
+            let (joined, field_widened) = self.join(a_ty, b_ty);
+            widened |= field_widened;
+            shared.push((name, joined));
         }
         // `shared` is in `a`'s order, which is sorted, so interning does
         // not sort it again.
-        Some(self.record(shared))
+        (self.record(shared), widened)
     }
 
     /// The kind of value an expression of type `id` produces at runtime, or
-    /// `None` for the checker-internal types and the unions other than the
-    /// either shape, which no value has: an untyped integer, a provisional
-    /// type or an error never survives a successful check, and no other
-    /// union is built. A
-    /// `Future` and an either shape are [`ValueKind::Deferred`]: a value
-    /// that may be a future. Also `None`, rather than a panic, for an id
-    /// this table did not produce, so that lowering can report a mismatched
-    /// table as an internal error.
+    /// `None` for the checker-internal types, which no value has: an untyped
+    /// integer, a provisional type or an error never survives a successful
+    /// check. A `Future` and an either shape are [`ValueKind::Deferred`]: a
+    /// value that may be a future. A union whose members are all of one
+    /// kind, as `List<Int> | List<String>` and `{a: Int} | {b: Int}` are,
+    /// is of that kind, and any other union is [`ValueKind::Mixed`]: a
+    /// present value of a kind only the value itself says. Also `None`,
+    /// rather than a panic, for an id this table did not produce, so that
+    /// lowering can report a mismatched table as an internal error.
     #[must_use]
     pub fn value_kind(&self, id: TyId) -> Option<ValueKind> {
         match self.kinds.get(id.index())? {
@@ -1166,12 +1394,155 @@ impl TypeTable {
             TyKind::Record(_) => Some(ValueKind::Record),
             TyKind::List(_) => Some(ValueKind::List),
             TyKind::Fn(_) => Some(ValueKind::Fn),
-            TyKind::Future(_) => Some(ValueKind::Deferred),
-            TyKind::Union(_) if self.is_deferrable(id) => Some(ValueKind::Deferred),
-            TyKind::Union(_) | TyKind::Provisional { .. } | TyKind::UntypedInt | TyKind::Error => {
-                None
+            TyKind::Future(_) | TyKind::Either(_) => Some(ValueKind::Deferred),
+            TyKind::Union(members) => {
+                let mut kinds = members.iter().map(|&member| self.value_kind(member));
+                let first = kinds.next()??;
+                Some(if kinds.all(|kind| kind == Some(first)) {
+                    first
+                } else {
+                    ValueKind::Mixed
+                })
+            }
+            TyKind::Provisional { .. } | TyKind::UntypedInt | TyKind::Error => None,
+        }
+    }
+
+    /// Whether a value could be both of type `a` and of type `b`, present
+    /// types, as far as their structure says: whether one of them is a
+    /// union with a member that overlaps the other; or both are the same
+    /// scalar type; or both are record types and each field they both have
+    /// has types that overlap (a field only one of them has may be a field
+    /// the other's value has without its type saying so); or both are list
+    /// types whose element types overlap; or both are function types,
+    /// whose signatures no value can be asked for. `true` if either is
+    /// `Error`, which has been reported.
+    ///
+    /// Recurses once per level of record, list or union nesting shared by
+    /// the two types.
+    #[must_use]
+    pub fn overlaps(&self, a: TyId, b: TyId) -> bool {
+        if a == b || a == TyId::ERROR || b == TyId::ERROR {
+            return true;
+        }
+        if let Some(members) = self.union_members(a) {
+            return members.iter().any(|&member| self.overlaps(member, b));
+        }
+        if let Some(members) = self.union_members(b) {
+            return members.iter().any(|&member| self.overlaps(a, member));
+        }
+        match (self.kind(a), self.kind(b)) {
+            (TyKind::Record(a_record), TyKind::Record(_)) => {
+                a_record.fields.iter().all(|&(name, a_field)| {
+                    self.field(b, name)
+                        .is_none_or(|b_field| self.overlaps(a_field, b_field))
+                })
+            }
+            (TyKind::List(a_element), TyKind::List(b_element)) => {
+                self.overlaps(*a_element, *b_element)
+            }
+            (TyKind::Fn(_), TyKind::Fn(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The plan for testing at runtime whether a value is of type `ty`, a
+    /// present type with no future and no function type in it, given that
+    /// it is of one of the present types `value`, a union's members
+    /// flattened, or of any type at all for `None` (see [`ValueTest`]):
+    /// [`ValueTest::Pass`] if every type of `value` is a subtype of `ty`;
+    /// for a union, a test of whether any member passes; for a scalar type,
+    /// a test of the value's kind; and for a record or list type, a test of
+    /// the value's kind alone if every type of `value` of that kind is a
+    /// subtype of `ty`, and otherwise a test of the record's fields of
+    /// `ty`, each against what the record types of `value` say of the field
+    /// (nothing, if one lacks it), or of the list's elements, against the
+    /// element types of its list types, leaving out a field whose test is
+    /// `Pass`.
+    ///
+    /// Recurses once per level of record, list or union nesting in `ty`.
+    #[must_use]
+    pub fn test_plan(&self, value: Option<&[TyId]>, ty: TyId) -> ValueTest {
+        if let Some(value) = value
+            && value.iter().all(|&member| self.is_subtype(member, ty))
+        {
+            return ValueTest::Pass;
+        }
+        if let Some(alternatives) = self.union_members(ty) {
+            let tests: Vec<ValueTest> = alternatives
+                .iter()
+                .map(|&alternative| self.test_plan(value, alternative))
+                .collect();
+            return if tests.contains(&ValueTest::Pass) {
+                ValueTest::Pass
+            } else {
+                ValueTest::Any(tests.into_boxed_slice())
+            };
+        }
+        let Some(kind) = self.value_kind(ty) else {
+            return ValueTest::Pass;
+        };
+        // The types the value may have that are of the kind tested, which
+        // the test of the kind leaves in doubt only if one does not pass.
+        let of_kind: Option<Vec<TyId>> = value.map(|value| {
+            value
+                .iter()
+                .copied()
+                .filter(|&member| self.value_kind(member) == Some(kind))
+                .collect()
+        });
+        if of_kind
+            .as_ref()
+            .is_some_and(|of_kind| of_kind.iter().all(|&member| self.is_subtype(member, ty)))
+        {
+            return ValueTest::Kind(kind);
+        }
+        if let Some(element) = self.list_element(ty) {
+            let elements = of_kind.map(|lists| {
+                self.flattened(lists.iter().filter_map(|&list| self.list_element(list)))
+            });
+            return match self.test_plan(elements.as_deref(), element) {
+                ValueTest::Pass => ValueTest::Kind(ValueKind::List),
+                test => ValueTest::List(Box::new(test)),
+            };
+        }
+        if let Some(fields) = self.record_fields(ty) {
+            let mut tests = Vec::with_capacity(fields.len());
+            for &(name, field_ty) in fields {
+                let values = of_kind.as_ref().and_then(|records| {
+                    let found: Option<Vec<TyId>> = records
+                        .iter()
+                        .map(|&record| self.field(record, name))
+                        .collect();
+                    found.map(|found| self.flattened(found))
+                });
+                match self.test_plan(values.as_deref(), field_ty) {
+                    ValueTest::Pass => {}
+                    test => tests.push((name, test)),
+                }
+            }
+            return if tests.is_empty() {
+                ValueTest::Kind(ValueKind::Record)
+            } else {
+                ValueTest::Record(tests.into_boxed_slice())
+            };
+        }
+        ValueTest::Kind(kind)
+    }
+
+    /// `types`, each union among them replaced by its members, without
+    /// duplicates: the types a value of any of them may have.
+    fn flattened(&self, types: impl IntoIterator<Item = TyId>) -> Vec<TyId> {
+        let mut flat = Vec::new();
+        for ty in types {
+            match self.union_members(ty) {
+                Some(members) => flat.extend_from_slice(members),
+                None => flat.push(ty),
             }
         }
+        flat.sort_unstable();
+        flat.dedup();
+        flat
     }
 
     /// Shows type `id` as it is written in source, using `names` for the
@@ -1191,12 +1562,17 @@ impl TypeTable {
     /// | Future<Int>`, which returns the either. A provisional type, which
     /// only the types of a failed check hold, shows as its present type
     /// followed by `?`, `Int?`, the present type in parentheses if it is a
-    /// function type, `(fn(): Int)?`, as for the either shape. An untyped
-    /// integer shows as `Int`, an error as `<error>`, and any other union as
-    /// its members separated by ` | `.
+    /// function type or a union, `(fn(): Int)?` and `(Int | String)?`, as
+    /// for the either shape. An untyped integer shows as `Int`, and an error
+    /// as `<error>`. A union shows as its members separated by ` | `, in the
+    /// order of their kinds in [`TyKind`] (`Int`, `Float`, `Bool`, `String`,
+    /// records, lists, functions) and, among members of one kind, of their
+    /// text, each function type in parentheses, as in `Int | {a: Int} |
+    /// (fn(): Int)`; the either of a union shows the union as its present
+    /// member, as in `Int | String | Future<Int | String>`.
     ///
     /// `names` must be the table the names were interned into. Recurses
-    /// once per level of record or function type nesting.
+    /// once per level of record, function type or union nesting.
     #[must_use]
     pub fn display<'a>(&'a self, id: TyId, names: &'a Names) -> impl fmt::Display + 'a {
         Display {
@@ -1204,6 +1580,41 @@ impl TypeTable {
             names,
             id,
         }
+    }
+
+    /// The `members` of a union, each with its text as
+    /// [`TypeTable::display`] shows it (a function type without the
+    /// parentheses a union puts around it), in the order a union shows its
+    /// members: by kind, in the order of [`TyKind`] (`Int`, `Float`,
+    /// `Bool`, `String`, records, lists, functions), and among members of
+    /// one kind by text.
+    #[must_use]
+    pub fn shown_members(&self, members: &[TyId], names: &Names) -> Vec<(TyId, String)> {
+        let rank = |member: TyId| match self.kinds.get(member.index()) {
+            Some(TyKind::Int | TyKind::UntypedInt) => 0,
+            Some(TyKind::Float) => 1,
+            Some(TyKind::Bool) => 2,
+            Some(TyKind::String) => 3,
+            Some(TyKind::Record(_)) => 4,
+            Some(TyKind::List(_)) => 5,
+            Some(TyKind::Fn(_)) => 6,
+            _ => 7,
+        };
+        let mut shown: Vec<(u8, String, TyId)> = members
+            .iter()
+            .map(|&member| {
+                (
+                    rank(member),
+                    self.display(member, names).to_string(),
+                    member,
+                )
+            })
+            .collect();
+        shown.sort_unstable();
+        shown
+            .into_iter()
+            .map(|(_, text, member)| (member, text))
+            .collect()
     }
 }
 
@@ -1216,12 +1627,36 @@ struct Display<'a> {
 }
 
 impl Display<'_> {
+    /// Type `id` shown with the same table and names.
     fn nested(&self, id: TyId) -> Self {
         Self {
             table: self.table,
             names: self.names,
             id,
         }
+    }
+
+    /// Writes the union of `members` (see [`TypeTable::display`]): in the
+    /// order [`TypeTable::shown_members`] gives, separated by ` | `,
+    /// function types in parentheses, since a function type's return type
+    /// would take the members after it.
+    fn union(&self, members: &[TyId], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, (member, text)) in self
+            .table
+            .shown_members(members, self.names)
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                f.write_str(" | ")?;
+            }
+            if self.table.fn_sig(member).is_some() {
+                write!(f, "({text})")?;
+            } else {
+                f.write_str(&text)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1237,31 +1672,25 @@ impl fmt::Display for Display<'_> {
             TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
             TyKind::Provisional { inner, .. } => {
                 let shown = self.nested(*inner);
-                // A function type's return type would take the `?`.
-                if self.table.fn_sig(*inner).is_some() {
+                // A function type's return type, or a union's last member,
+                // would take the `?`.
+                if self.table.fn_sig(*inner).is_some() || self.table.union_members(*inner).is_some()
+                {
                     write!(f, "({shown})?")
                 } else {
                     write!(f, "{shown}?")
                 }
             }
-            TyKind::Union(members) => {
-                if let Some(present) = self.table.either_member(self.id) {
-                    let shown = self.nested(present);
-                    // A function type's return type would take the union.
-                    return if self.table.fn_sig(present).is_some() {
-                        write!(f, "({shown}) | Future<{shown}>")
-                    } else {
-                        write!(f, "{shown} | Future<{shown}>")
-                    };
+            TyKind::Either(present) => {
+                let shown = self.nested(*present);
+                // A function type's return type would take the union.
+                if self.table.fn_sig(*present).is_some() {
+                    write!(f, "({shown}) | Future<{shown}>")
+                } else {
+                    write!(f, "{shown} | Future<{shown}>")
                 }
-                for (index, &member) in members.iter().enumerate() {
-                    if index > 0 {
-                        f.write_str(" | ")?;
-                    }
-                    self.nested(member).fmt(f)?;
-                }
-                Ok(())
             }
+            TyKind::Union(members) => self.union(members, f),
             TyKind::Record(record) => {
                 // Stored by `Name`, shown by text.
                 let mut fields: Vec<(&str, TyId)> = record
@@ -1480,45 +1909,51 @@ mod tests {
     fn joins() {
         let (mut table, _, [a, b, c]) = setup();
         // Identical types join to themselves, records or not.
-        assert_eq!(table.join(TyId::INT, TyId::INT), Some(TyId::INT));
-        assert_eq!(table.join(TyId::EMPTY, TyId::EMPTY), Some(TyId::EMPTY));
-        // Different non-record types, or a record and a non-record, have
-        // no join.
-        assert_eq!(table.join(TyId::INT, TyId::FLOAT), None);
-        assert_eq!(table.join(TyId::INT, TyId::UNTYPED_INT), None);
-        assert_eq!(table.join(TyId::EMPTY, TyId::STRING), None);
+        assert_eq!(table.join(TyId::INT, TyId::INT), (TyId::INT, false));
+        assert_eq!(table.join(TyId::EMPTY, TyId::EMPTY), (TyId::EMPTY, false));
+        // Different non-record types, or a record and a non-record, join
+        // to their union, widened.
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        assert_eq!(table.join(TyId::INT, TyId::FLOAT), (int_float, true));
+        assert_eq!(table.join(TyId::INT, TyId::UNTYPED_INT), (TyId::INT, false));
+        let empty_string = table.union([TyId::EMPTY, TyId::STRING]);
+        assert_eq!(table.join(TyId::EMPTY, TyId::STRING), (empty_string, true));
         // Shared fields.
         let ab = table.record([(a, TyId::INT), (b, TyId::STRING)]);
         let a_int = table.record([(a, TyId::INT)]);
-        assert_eq!(table.join(ab, a_int), Some(a_int));
-        assert_eq!(table.join(a_int, ab), Some(a_int));
+        assert_eq!(table.join(ab, a_int), (a_int, false));
+        assert_eq!(table.join(a_int, ab), (a_int, false));
         let bc = table.record([(b, TyId::STRING), (c, TyId::BOOL)]);
         let b_string = table.record([(b, TyId::STRING)]);
-        assert_eq!(table.join(ab, bc), Some(b_string));
-        assert_eq!(table.join(bc, ab), Some(b_string));
+        assert_eq!(table.join(ab, bc), (b_string, false));
+        assert_eq!(table.join(bc, ab), (b_string, false));
         // No shared fields: the empty record.
         let c_bool = table.record([(c, TyId::BOOL)]);
-        assert_eq!(table.join(a_int, c_bool), Some(TyId::EMPTY));
-        assert_eq!(table.join(a_int, TyId::EMPTY), Some(TyId::EMPTY));
-        // A shared field whose types have no join is not shared.
+        assert_eq!(table.join(a_int, c_bool), (TyId::EMPTY, false));
+        assert_eq!(table.join(a_int, TyId::EMPTY), (TyId::EMPTY, false));
+        // A shared field whose types do not agree is kept, with their
+        // union, widened.
         let a_float = table.record([(a, TyId::FLOAT)]);
-        assert_eq!(table.join(ab, a_float), Some(TyId::EMPTY));
+        let a_either_number = table.record([(a, int_float)]);
+        assert_eq!(table.join(ab, a_float), (a_either_number, true));
         // Recursive.
         let outer_ab = table.record([(c, ab), (a, TyId::BOOL)]);
         let outer_bc = table.record([(c, bc)]);
         let joined = table.record([(c, b_string)]);
-        assert_eq!(table.join(outer_ab, outer_bc), Some(joined));
+        assert_eq!(table.join(outer_ab, outer_bc), (joined, false));
         let outer_int = table.record([(c, TyId::INT)]);
-        assert_eq!(table.join(outer_ab, outer_int), Some(TyId::EMPTY));
+        let ab_or_int = table.union([ab, TyId::INT]);
+        let outer_union = table.record([(c, ab_or_int)]);
+        assert_eq!(table.join(outer_ab, outer_int), (outer_union, true));
         // A field matched out of step: `b` of the second record lies
         // between fields of the first.
         let ac = table.record([(a, TyId::INT), (c, TyId::BOOL)]);
         let bc2 = table.record([(b, TyId::FLOAT), (c, TyId::BOOL)]);
-        assert_eq!(table.join(ac, bc2), Some(c_bool));
+        assert_eq!(table.join(ac, bc2), (c_bool, false));
         let abc = table.record([(a, TyId::INT), (b, TyId::STRING), (c, TyId::BOOL)]);
-        assert_eq!(table.join(abc, bc), Some(bc));
-        assert_eq!(table.join(bc, abc), Some(bc));
-        assert_eq!(table.join(ac, c_bool), Some(c_bool));
+        assert_eq!(table.join(abc, bc), (bc, false));
+        assert_eq!(table.join(bc, abc), (bc, false));
+        assert_eq!(table.join(ac, c_bool), (c_bool, false));
     }
 
     #[test]
@@ -1680,7 +2115,7 @@ mod tests {
             for b in effects {
                 let (left, right) = (of(&mut table, a), of(&mut table, b));
                 let joined = table.join(left, right);
-                assert_eq!(joined, Some(of(&mut table, a.max(b))), "{a:?} and {b:?}");
+                assert_eq!(joined, (of(&mut table, a.max(b)), false), "{a:?} and {b:?}");
             }
         }
         // A memoised function's bare parameter is present, which the
@@ -1722,8 +2157,8 @@ mod tests {
             a_only,
             Effect::Impure,
         );
-        assert_eq!(table.join(left, right), Some(joined));
-        assert_eq!(table.join(right, left), Some(joined));
+        assert_eq!(table.join(left, right), (joined, false));
+        assert_eq!(table.join(right, left), (joined, false));
         let pure_right = table.fn_type(
             [(Some(a), TyId::INT), (None, TyId::BOOL)],
             b_only,
@@ -1734,7 +2169,7 @@ mod tests {
             b_only,
             Effect::Pure,
         );
-        assert_eq!(table.join(left, pure_right), Some(pure_join));
+        assert_eq!(table.join(left, pure_right), (pure_join, false));
         let gives_a = table.fn_type(
             [(Some(a), TyId::INT), (None, TyId::BOOL)],
             a_only,
@@ -1745,44 +2180,53 @@ mod tests {
             TyId::EMPTY,
             Effect::Pure,
         );
-        assert_eq!(table.join(pure_right, gives_a), Some(gives_empty));
+        assert_eq!(table.join(pure_right, gives_a), (gives_empty, false));
         // A parameter is the narrower of the two types, which both
         // functions accept, if one is a subtype of the other.
         let takes_a = table.fn_type([(None, a_only)], TyId::INT, Effect::Pure);
         let takes_ab = table.fn_type([(None, ab)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(takes_a, takes_ab), Some(takes_ab));
-        assert_eq!(table.join(takes_ab, takes_a), Some(takes_ab));
+        assert_eq!(table.join(takes_a, takes_ab), (takes_ab, false));
+        assert_eq!(table.join(takes_ab, takes_a), (takes_ab, false));
         let either = table.deferrable(TyId::INT);
         let takes_either = table.fn_type([(None, either)], TyId::INT, Effect::Pure);
         let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(takes_either, takes_int), Some(takes_int));
-        assert_eq!(table.join(takes_int, takes_either), Some(takes_int));
+        assert_eq!(table.join(takes_either, takes_int), (takes_int, false));
+        assert_eq!(table.join(takes_int, takes_either), (takes_int, false));
         // Each parameter on its own.
         let mixed = table.fn_type([(None, either), (None, ab)], TyId::INT, Effect::Pure);
         let other = table.fn_type([(None, TyId::INT), (None, a_only)], TyId::INT, Effect::Pure);
         let narrow = table.fn_type([(None, TyId::INT), (None, ab)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(mixed, other), Some(narrow));
-        // Unrelated parameter types have none.
+        assert_eq!(table.join(mixed, other), (narrow, false));
+        // Unrelated parameter types join to the union of the two, widened.
         let unrelated = table.fn_type([(None, b_only)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(takes_a, unrelated), None);
+        let either_taker = table.union([takes_a, unrelated]);
+        assert_eq!(table.join(takes_a, unrelated), (either_taker, true));
         let takes_bool = table.fn_type([(None, TyId::BOOL)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(takes_int, takes_bool), None);
-        // Arities must match, and the return types must have a join.
+        let int_or_bool_taker = table.union([takes_int, takes_bool]);
+        assert_eq!(table.join(takes_int, takes_bool), (int_or_bool_taker, true));
+        // So do different arities; return types that do not agree join to
+        // their union, widened.
         let nullary = table.fn_type([], TyId::INT, Effect::Pure);
         let unary = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
-        assert_eq!(table.join(nullary, unary), None);
+        let arities = table.union([nullary, unary]);
+        assert_eq!(table.join(nullary, unary), (arities, true));
         let gives_float = table.fn_type([], TyId::FLOAT, Effect::Pure);
-        assert_eq!(table.join(nullary, gives_float), None);
-        // A function and anything else have none; a function and itself is
-        // itself.
-        assert_eq!(table.join(nullary, TyId::INT), None);
-        assert_eq!(table.join(nullary, TyId::EMPTY), None);
-        assert_eq!(table.join(nullary, nullary), Some(nullary));
-        // Through records: a field whose function types do not join is not
-        // shared.
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        let gives_number = table.fn_type([], int_float, Effect::Pure);
+        assert_eq!(table.join(nullary, gives_float), (gives_number, true));
+        // A function and anything else join to their union; a function and
+        // itself is itself.
+        let with_int = table.union([nullary, TyId::INT]);
+        assert_eq!(table.join(nullary, TyId::INT), (with_int, true));
+        let with_empty = table.union([nullary, TyId::EMPTY]);
+        assert_eq!(table.join(nullary, TyId::EMPTY), (with_empty, true));
+        assert_eq!(table.join(nullary, nullary), (nullary, false));
+        // Through records: a field whose function types do not join is
+        // kept, with their union.
         let with_nullary = table.record([(a, nullary), (b, TyId::INT)]);
         let with_unary = table.record([(a, unary), (b, TyId::INT)]);
-        assert_eq!(table.join(with_nullary, with_unary), Some(b_only));
+        let with_either = table.record([(a, arities), (b, TyId::INT)]);
+        assert_eq!(table.join(with_nullary, with_unary), (with_either, true));
     }
 
     #[test]
@@ -1827,7 +2271,7 @@ mod tests {
         assert_eq!(table.value_kind(TyId::UNTYPED_INT), None);
         assert_eq!(table.value_kind(TyId::ERROR), None);
         let union = table.intern(TyKind::Union(Box::new([TyId::INT, TyId::BOOL])));
-        assert_eq!(table.value_kind(union), None);
+        assert_eq!(table.value_kind(union), Some(ValueKind::Mixed));
         let function = table.fn_type([(None, record)], TyId::INT, Effect::Impure);
         assert_eq!(table.value_kind(function), Some(ValueKind::Fn));
         // An id from a bigger table.
@@ -1848,10 +2292,7 @@ mod tests {
         assert_eq!(table.future(TyId::INT), future);
         assert_eq!(table.kind(future), &TyKind::Future(TyId::INT));
         let either = table.deferrable(TyId::INT);
-        assert_eq!(
-            table.kind(either),
-            &TyKind::Union(Box::new([TyId::INT, future]))
-        );
+        assert_eq!(table.kind(either), &TyKind::Either(TyId::INT));
         // A future of a future, or of an either, is a future of what it
         // yields in the end.
         assert_eq!(table.future(future), future);
@@ -1864,11 +2305,8 @@ mod tests {
         // Whatever it is given, stripped: a future or the either itself.
         assert_eq!(table.deferrable(future), either);
         assert_eq!(table.deferrable(either), either);
-        // Interning is order-insensitive: the members are sorted.
-        assert_eq!(
-            table.intern(TyKind::Union(Box::new([TyId::INT, future]))),
-            either
-        );
+        // Interning is by structure.
+        assert_eq!(table.intern(TyKind::Either(TyId::INT)), either);
         let record = table.record([(a, TyId::INT)]);
         let record_either = table.deferrable(record);
         assert_ne!(record_either, either);
@@ -2057,31 +2495,35 @@ mod tests {
         let future = table.future(TyId::INT);
         let either = table.deferrable(TyId::INT);
         // Two futures: the future of the join.
-        assert_eq!(table.join(future, future), Some(future));
+        assert_eq!(table.join(future, future), (future, false));
         let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
         let a_only = table.record([(a, TyId::INT)]);
         let future_ab = table.future(ab);
         let future_a = table.future(a_only);
-        assert_eq!(table.join(future_ab, future_a), Some(future_a));
+        assert_eq!(table.join(future_ab, future_a), (future_a, false));
         // A present value and a future, or an either and anything: the
         // either of the join, stripped.
-        assert_eq!(table.join(TyId::INT, future), Some(either));
-        assert_eq!(table.join(future, TyId::INT), Some(either));
-        assert_eq!(table.join(either, future), Some(either));
-        assert_eq!(table.join(either, TyId::INT), Some(either));
+        assert_eq!(table.join(TyId::INT, future), (either, false));
+        assert_eq!(table.join(future, TyId::INT), (either, false));
+        assert_eq!(table.join(either, future), (either, false));
+        assert_eq!(table.join(either, TyId::INT), (either, false));
         let nested = table.future(future);
-        assert_eq!(table.join(nested, TyId::INT), Some(either));
+        assert_eq!(table.join(nested, TyId::INT), (either, false));
         let either_a = table.deferrable(a_only);
-        assert_eq!(table.join(ab, future_a), Some(either_a));
-        // Each exists iff the inner join does.
+        assert_eq!(table.join(ab, future_a), (either_a, false));
+        // Each widens iff the inner join does: the future, or the either, of
+        // the union.
         let float_future = table.future(TyId::FLOAT);
-        assert_eq!(table.join(future, float_future), None);
-        assert_eq!(table.join(TyId::FLOAT, future), None);
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        let future_number = table.future(int_float);
+        assert_eq!(table.join(future, float_future), (future_number, true));
+        let either_number = table.deferrable(int_float);
+        assert_eq!(table.join(TyId::FLOAT, future), (either_number, true));
         // Records join field by field, with these rules per field.
         let with_future = table.record([(a, future), (b, TyId::INT)]);
         let with_int = table.record([(a, TyId::INT)]);
         let with_either = table.record([(a, either)]);
-        assert_eq!(table.join(with_future, with_int), Some(with_either));
+        assert_eq!(table.join(with_future, with_int), (with_either, false));
     }
 
     #[test]
@@ -2287,20 +2729,22 @@ mod tests {
         let future = table.future(TyId::INT);
         // With itself, itself; with anything else, the either shape of the
         // join.
-        assert_eq!(table.join(x, x), Some(x));
-        assert_eq!(table.join(x, y), Some(either));
-        assert_eq!(table.join(x, other), Some(either));
-        assert_eq!(table.join(x, TyId::INT), Some(either));
-        assert_eq!(table.join(TyId::INT, x), Some(either));
-        assert_eq!(table.join(x, future), Some(either));
-        assert_eq!(table.join(x, either), Some(either));
-        assert_eq!(table.join(x, TyId::FLOAT), None);
+        assert_eq!(table.join(x, x), (x, false));
+        assert_eq!(table.join(x, y), (either, false));
+        assert_eq!(table.join(x, other), (either, false));
+        assert_eq!(table.join(x, TyId::INT), (either, false));
+        assert_eq!(table.join(TyId::INT, x), (either, false));
+        assert_eq!(table.join(x, future), (either, false));
+        assert_eq!(table.join(x, either), (either, false));
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        let either_number = table.deferrable(int_float);
+        assert_eq!(table.join(x, TyId::FLOAT), (either_number, true));
         // Through records, field by field.
         let holder = table.record([(a, x)]);
         let holds_int = table.record([(a, TyId::INT)]);
         let holds_either = table.record([(a, either)]);
-        assert_eq!(table.join(holder, holder), Some(holder));
-        assert_eq!(table.join(holder, holds_int), Some(holds_either));
+        assert_eq!(table.join(holder, holder), (holder, false));
+        assert_eq!(table.join(holder, holds_int), (holds_either, false));
     }
 
     #[test]
@@ -2539,21 +2983,29 @@ mod tests {
         let abs = table.list(ab);
         let a_strings = table.list(a_string);
         let just_as = table.list(just_a);
-        assert_eq!(table.join(abs, a_strings), Some(just_as));
+        assert_eq!(table.join(abs, just_as), (just_as, false));
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        let a_either = table.record([(a, TyId::INT), (b, int_string)]);
+        let a_eithers = table.list(a_either);
+        assert_eq!(table.join(abs, a_strings), (a_eithers, true));
         let ints = table.list(TyId::INT);
         let floats = table.list(TyId::FLOAT);
-        assert_eq!(table.join(ints, floats), None);
-        assert_eq!(table.join(ints, TyId::INT), None);
-        assert_eq!(table.join(ints, TyId::EMPTY), None);
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        let numbers = table.list(int_float);
+        assert_eq!(table.join(ints, floats), (numbers, true));
+        let ints_or_int = table.union([ints, TyId::INT]);
+        assert_eq!(table.join(ints, TyId::INT), (ints_or_int, true));
+        let ints_or_empty = table.union([ints, TyId::EMPTY]);
+        assert_eq!(table.join(ints, TyId::EMPTY), (ints_or_empty, true));
         let future = table.future(TyId::INT);
         let futures = table.list(future);
         let either = table.deferrable(TyId::INT);
         let eithers = table.list(either);
-        assert_eq!(table.join(ints, futures), Some(eithers));
+        assert_eq!(table.join(ints, futures), (eithers, false));
         // A list and a future of one join to the either shape.
         let future_ints = table.future(ints);
         let outer = table.deferrable(ints);
-        assert_eq!(table.join(ints, future_ints), Some(outer));
+        assert_eq!(table.join(ints, future_ints), (outer, false));
     }
 
     #[test]
@@ -2634,5 +3086,344 @@ mod tests {
         assert!(!table.is_subtype(list_param, ints));
         let outer_eithers = table.deferrable(ints);
         assert!(table.is_subtype(list_param, outer_eithers));
+    }
+
+    // ----- Unions -----
+
+    #[test]
+    fn unions_intern_normalised() {
+        let (mut table, _, [a, b, _]) = setup();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        assert_eq!(
+            table.kind(int_string),
+            &TyKind::Union(Box::new([TyId::INT, TyId::STRING]))
+        );
+        // Any order, duplicates and nested unions intern to the same union.
+        assert_eq!(table.union([TyId::STRING, TyId::INT]), int_string);
+        assert_eq!(
+            table.union([TyId::STRING, TyId::INT, TyId::STRING]),
+            int_string
+        );
+        let three = table.union([int_string, TyId::BOOL]);
+        assert_eq!(table.union([TyId::BOOL, TyId::STRING, TyId::INT]), three);
+        assert_eq!(
+            table.union_members(three),
+            Some(&[TyId::INT, TyId::BOOL, TyId::STRING][..])
+        );
+        // One member is that member; a subtype of another member is dropped.
+        assert_eq!(table.union([TyId::INT, TyId::INT]), TyId::INT);
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_only = table.record([(a, TyId::INT)]);
+        assert_eq!(table.union([ab, a_only]), a_only);
+        let with_int = table.union([ab, TyId::INT, a_only]);
+        assert_eq!(
+            table.union_members(with_int),
+            Some(&[TyId::INT, a_only][..])
+        );
+        // Of two function types each a subtype of the other, the one
+        // interned first stays.
+        let named = table.fn_type([(Some(a), TyId::INT)], TyId::INT, Effect::Pure);
+        let unnamed = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
+        assert_eq!(table.union([unnamed, named]), named);
+        // An error, or nothing, is an error.
+        assert_eq!(table.union([TyId::INT, TyId::ERROR]), TyId::ERROR);
+        assert_eq!(table.union([]), TyId::ERROR);
+        assert_eq!(table.union_members(TyId::INT), None);
+    }
+
+    #[test]
+    fn the_either_and_the_future_of_a_union() {
+        let mut table = TypeTable::new();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        let either = table.deferrable(int_string);
+        assert_eq!(table.kind(either), &TyKind::Either(int_string));
+        assert_eq!(table.laziness(either), Laziness::Either);
+        assert_eq!(table.strip(either), int_string);
+        let future = table.future(int_string);
+        assert_eq!(table.kind(future), &TyKind::Future(int_string));
+        assert_eq!(table.future(either), future);
+        assert_eq!(table.deferrable(future), either);
+        // A union is present.
+        assert_eq!(table.laziness(int_string), Laziness::Present);
+        assert_eq!(table.strip(int_string), int_string);
+        assert_eq!(table.value_kind(either), Some(ValueKind::Deferred));
+    }
+
+    #[test]
+    fn subtyping_with_unions() {
+        let (mut table, _, [a, b, _]) = setup();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        let three = table.union([TyId::INT, TyId::STRING, TyId::BOOL]);
+        // A member, or a subtype of one, is a subtype of the union.
+        assert!(table.is_subtype(TyId::INT, int_string));
+        assert!(!table.is_subtype(TyId::FLOAT, int_string));
+        // A union is a subtype of a type if each of its members is.
+        assert!(table.is_subtype(int_string, three));
+        assert!(!table.is_subtype(three, int_string));
+        assert!(!table.is_subtype(int_string, TyId::INT));
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_only = table.record([(a, TyId::INT)]);
+        let b_only = table.record([(b, TyId::INT)]);
+        let records = table.union([a_only, b_only]);
+        assert!(table.is_subtype(ab, records));
+        assert!(table.is_subtype(records, TyId::EMPTY));
+        // Through records, lists, functions and futures.
+        let holds = table.record([(a, int_string)]);
+        let holds_int = table.record([(a, TyId::INT)]);
+        assert!(table.is_subtype(holds_int, holds));
+        assert!(!table.is_subtype(holds, holds_int));
+        let ints = table.list(TyId::INT);
+        let either_ints = table.list(int_string);
+        assert!(table.is_subtype(ints, either_ints));
+        let strings = table.list(TyId::STRING);
+        let lists = table.union([ints, strings]);
+        assert!(!table.is_subtype(either_ints, lists));
+        assert!(table.is_subtype(lists, either_ints));
+        let takes_union = table.fn_type([(None, int_string)], TyId::INT, Effect::Pure);
+        let takes_int = table.fn_type([(None, TyId::INT)], TyId::INT, Effect::Pure);
+        assert!(table.is_subtype(takes_union, takes_int));
+        assert!(!table.is_subtype(takes_int, takes_union));
+        let future = table.future(TyId::INT);
+        let future_union = table.future(int_string);
+        assert!(table.is_subtype(future, future_union));
+        // The either of a union takes a member, a future of one, and the
+        // either of a narrower union; nothing lazy is a subtype of a union.
+        let either = table.deferrable(int_string);
+        assert!(table.is_subtype(TyId::STRING, either));
+        assert!(table.is_subtype(future, either));
+        assert!(table.is_subtype(int_string, either));
+        assert!(!table.is_subtype(future, int_string));
+        assert!(!table.is_subtype(either, int_string));
+    }
+
+    #[test]
+    fn total_joins_report_widening() {
+        let (mut table, _, [a, _, _]) = setup();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        // At the top.
+        assert_eq!(table.join(TyId::INT, TyId::STRING), (int_string, true));
+        let a_int = table.record([(a, TyId::INT)]);
+        let ints = table.list(TyId::INT);
+        let record_or_list = table.union([a_int, ints]);
+        assert_eq!(table.join(a_int, ints), (record_or_list, true));
+        // A union with a type it is a supertype of is itself, not widened;
+        // with any other, the union of both sides' members, widened.
+        assert_eq!(table.join(int_string, TyId::INT), (int_string, false));
+        assert_eq!(table.join(TyId::STRING, int_string), (int_string, false));
+        let three = table.union([TyId::INT, TyId::STRING, TyId::BOOL]);
+        assert_eq!(table.join(int_string, TyId::BOOL), (three, true));
+        assert_eq!(table.join(three, int_string), (three, false));
+        // Inside: list elements and record fields.
+        let strings = table.list(TyId::STRING);
+        let either_list = table.list(int_string);
+        assert_eq!(table.join(ints, strings), (either_list, true));
+        let a_string = table.record([(a, TyId::STRING)]);
+        let a_union = table.record([(a, int_string)]);
+        assert_eq!(table.join(a_int, a_string), (a_union, true));
+        // Futures and either shapes, on what they yield.
+        let future_int = table.future(TyId::INT);
+        let future_string = table.future(TyId::STRING);
+        let future_union = table.future(int_string);
+        assert_eq!(table.join(future_int, future_string), (future_union, true));
+        let either_union = table.deferrable(int_string);
+        assert_eq!(table.join(future_int, TyId::STRING), (either_union, true));
+        assert_eq!(table.join(either_union, TyId::INT), (either_union, false));
+        // An error joins to an error, unwidened.
+        assert_eq!(table.join(TyId::ERROR, TyId::INT), (TyId::ERROR, false));
+    }
+
+    #[test]
+    fn strip_present_laziness_and_futures_through_unions() {
+        let (mut table, _, [a, _, _]) = setup();
+        let future = table.future(TyId::INT);
+        let either = table.deferrable(TyId::INT);
+        let lazy_record = table.record([(a, either)]);
+        let futures = table.list(future);
+        let union = table.union([lazy_record, futures]);
+        assert_eq!(table.laziness(union), Laziness::Present);
+        assert_eq!(table.strip(union), union);
+        let present_record = table.record([(a, TyId::INT)]);
+        let ints = table.list(TyId::INT);
+        let presented = table.union([present_record, ints]);
+        assert_eq!(table.present(union), presented);
+        assert!(table.contains_future(union));
+        let quiet = table.union([lazy_record, TyId::INT]);
+        assert!(!table.contains_future(quiet));
+        assert_eq!(table.needs_await(union, presented), Some(AwaitKind::Deep));
+        // Presenting may make one member a subtype of another.
+        let both = table.union([lazy_record, present_record]);
+        assert_eq!(table.present(both), present_record);
+        // Functions inside.
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
+        let with_fn = table.union([function, TyId::INT]);
+        assert!(table.contains_fn(with_fn));
+        assert!(!table.contains_fn(quiet));
+    }
+
+    #[test]
+    fn provisional_types_through_unions() {
+        let (mut table, _, [a, _, _]) = setup();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        let x = table.provisional(F, 0, int_string);
+        assert_eq!(table.strip(x), int_string);
+        let holder = table.record([(a, x)]);
+        let with_holder = table.union([holder, TyId::BOOL]);
+        assert!(table.contains_provisional(with_holder, Some(F)));
+        let mut found = Vec::new();
+        table.provisional_params(with_holder, F, &mut found);
+        assert_eq!(found, vec![0]);
+        let present_holder = table.record([(a, int_string)]);
+        let settled = table.union([present_holder, TyId::BOOL]);
+        assert_eq!(table.settle(with_holder, F, &[true]), settled);
+        // A provisional type where a member of an expected union is present
+        // is one to measure, and not where it is the either shape.
+        let expected = table.union([present_holder, TyId::STRING]);
+        let mut out = Vec::new();
+        table.provisionals_at_present(holder, expected, F, &mut out);
+        assert_eq!(out, vec![0]);
+        let either = table.deferrable(int_string);
+        let lazy_holder = table.record([(a, either)]);
+        let lazy_expected = table.union([lazy_holder, TyId::STRING]);
+        let mut out = Vec::new();
+        table.provisionals_at_present(holder, lazy_expected, F, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn display_unions() {
+        let mut names = Names::new();
+        let (b, a) = (names.intern("b"), names.intern("a"));
+        let mut table = TypeTable::new();
+        let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+        // By kind, in the order of `TyKind`, then by text.
+        let a_int = table.record([(a, TyId::INT)]);
+        let b_int = table.record([(b, TyId::INT)]);
+        let ints = table.list(TyId::INT);
+        let function = table.fn_type([], TyId::INT, Effect::Pure);
+        let union = table.union([function, ints, b_int, a_int, TyId::STRING, TyId::FLOAT]);
+        assert_eq!(
+            show(&table, union),
+            "Float | String | {a: Int} | {b: Int} | List<Int> | (fn(): Int)"
+        );
+        // Inside a list, a parameter and a field it needs no parentheses;
+        // a function type's return type takes it.
+        let int_string = table.union([TyId::STRING, TyId::INT]);
+        assert_eq!(show(&table, int_string), "Int | String");
+        let list = table.list(int_string);
+        assert_eq!(show(&table, list), "List<Int | String>");
+        let takes = table.fn_type([(Some(a), int_string)], int_string, Effect::Impure);
+        assert_eq!(show(&table, takes), "fn(a: Int | String) -> Int | String");
+        let record = table.record([(b, int_string)]);
+        assert_eq!(show(&table, record), "{b: Int | String}");
+        // The either of a union, and a provisional one.
+        let either = table.deferrable(int_string);
+        assert_eq!(show(&table, either), "Int | String | Future<Int | String>");
+        let provisional = table.provisional(F, 0, int_string);
+        assert_eq!(show(&table, provisional), "(Int | String)?");
+        let with_fn = table.union([function, TyId::INT]);
+        let either_fn = table.deferrable(with_fn);
+        assert_eq!(
+            show(&table, either_fn),
+            "Int | (fn(): Int) | Future<Int | (fn(): Int)>"
+        );
+    }
+
+    #[test]
+    fn value_kinds_of_unions() {
+        let (mut table, _, [a, b, _]) = setup();
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        assert_eq!(table.value_kind(int_string), Some(ValueKind::Mixed));
+        let ints = table.list(TyId::INT);
+        let strings = table.list(TyId::STRING);
+        let lists = table.union([ints, strings]);
+        assert_eq!(table.value_kind(lists), Some(ValueKind::List));
+        let a_int = table.record([(a, TyId::INT)]);
+        let b_int = table.record([(b, TyId::INT)]);
+        let records = table.union([a_int, b_int]);
+        assert_eq!(table.value_kind(records), Some(ValueKind::Record));
+    }
+
+    #[test]
+    fn overlapping_types() {
+        let (mut table, _, [a, b, _]) = setup();
+        assert!(table.overlaps(TyId::INT, TyId::INT));
+        assert!(!table.overlaps(TyId::INT, TyId::STRING));
+        // Records overlap unless a field both have cannot.
+        let a_int = table.record([(a, TyId::INT)]);
+        let a_string = table.record([(a, TyId::STRING)]);
+        let b_int = table.record([(b, TyId::INT)]);
+        assert!(!table.overlaps(a_int, a_string));
+        assert!(table.overlaps(a_int, b_int));
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        let a_union = table.record([(a, int_string), (b, TyId::INT)]);
+        assert!(table.overlaps(a_union, a_int));
+        // Lists by their elements; unions by any member.
+        let ints = table.list(TyId::INT);
+        let strings = table.list(TyId::STRING);
+        assert!(!table.overlaps(ints, strings));
+        assert!(table.overlaps(int_string, TyId::STRING));
+        assert!(!table.overlaps(int_string, TyId::BOOL));
+        assert!(!table.overlaps(a_int, ints));
+    }
+
+    #[test]
+    fn test_plans_look_only_where_in_doubt() {
+        let (mut table, _, [a, b, _]) = setup();
+        let ints = table.list(TyId::INT);
+        let int_string = table.union([TyId::INT, TyId::STRING]);
+        // The kind alone, where every value of that kind passes.
+        assert_eq!(
+            table.test_plan(Some(&[TyId::INT, ints]), ints),
+            ValueTest::Kind(ValueKind::List)
+        );
+        assert_eq!(
+            table.test_plan(Some(&[ints]), TyId::INT),
+            ValueTest::Kind(ValueKind::Int)
+        );
+        assert_eq!(
+            table.test_plan(Some(&[TyId::INT]), TyId::INT),
+            ValueTest::Pass
+        );
+        // Into the elements, where a list's elements are in doubt.
+        let mixed = table.list(int_string);
+        assert_eq!(
+            table.test_plan(Some(&[mixed]), ints),
+            ValueTest::List(Box::new(ValueTest::Kind(ValueKind::Int)))
+        );
+        // Into the fields in doubt only.
+        let ab = table.record([(a, int_string), (b, TyId::INT)]);
+        let wants = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        assert_eq!(
+            table.test_plan(Some(&[ab]), wants),
+            ValueTest::Record(Box::new([(a, ValueTest::Kind(ValueKind::Int))]))
+        );
+        // A field some record type lacks is tested whole.
+        let b_only = table.record([(b, TyId::INT)]);
+        let a_list = table.record([(a, ints)]);
+        assert_eq!(
+            table.test_plan(Some(&[b_only]), a_list),
+            ValueTest::Record(Box::new([(
+                a,
+                ValueTest::List(Box::new(ValueTest::Kind(ValueKind::Int)))
+            )]))
+        );
+        // A union is any of its members' tests.
+        let strings = table.list(TyId::STRING);
+        let value = [TyId::INT, TyId::BOOL, strings];
+        let target = table.union([TyId::INT, strings]);
+        assert_eq!(
+            table.test_plan(Some(&value), target),
+            ValueTest::Any(Box::new([
+                ValueTest::Kind(ValueKind::Int),
+                ValueTest::Kind(ValueKind::List)
+            ]))
+        );
+        assert!(table.test_plan(Some(&[mixed]), ints).walks());
+        assert!(!table.test_plan(Some(&value), target).walks());
+        // `{}` is every record's kind.
+        assert_eq!(
+            table.test_plan(None, TyId::EMPTY),
+            ValueTest::Kind(ValueKind::Record)
+        );
     }
 }

@@ -132,6 +132,31 @@
 //! its own, so, like a call, it records its depth in its frame's body for
 //! the nesting budget.
 //!
+//! # Unions
+//!
+//! A node whose static type is a union of members of different kinds,
+//! `Int | String`, is of kind [`ValueKind::Mixed`]: its value is present,
+//! but of a kind only the value says. As for [`ValueKind::Deferred`], only
+//! the evaluator's general walker evaluates such nodes; every typed walker
+//! treats one as mistyped. They are loads, captures, field accesses,
+//! indexes, calls, awaits, `as`es, blocks and `if`s of such types; where one
+//! is expected, as a branch of an `if` of a union type, a node of any kind
+//! but `Deferred` is accepted, since a value of any member's kind may be
+//! where the union may. A union whose members are all of one kind, lists
+//! or records, say, is of that kind, and needs nothing new. Total equality
+//! of two `Mixed` values is an [`IrKind::ValueSame`] (or
+//! [`IrKind::ValueNotSame`]), which compares them whole. A deep await of a
+//! union carries the lazy shape of each member that has one
+//! ([`Ir::lazy_union`]).
+//!
+//! `is` lowers to an [`IrKind::Is`] and `as` to an [`IrKind::As`], each of
+//! its operand, awaited where the checker marked it, and of its test, in
+//! [`Ir::test`]'s table: the *plan* the checker made of the test (a
+//! [`ValueTest`]), which says exactly how far into the value the test
+//! looks, and what an `as`'s failure says. The evaluator walks no types.
+//! An `is` that narrows an `if`'s branches also writes the value it tests
+//! to the slot the branches' narrowed bindings read.
+//!
 //! An `Ir` is shared, by reference count, between the evaluator and every
 //! closure and future made from its code, and records which session input it was
 //! lowered from, [`Ir::input`], so that a runtime error in a function of an
@@ -149,6 +174,7 @@ use crate::check::Slot;
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
+use crate::types::ValueTest;
 use crate::value::{Layout, ValueKind};
 
 /// Index of an [`IrNode`] in its [`Ir`].
@@ -316,7 +342,9 @@ impl LazyShapeId {
 /// that is lazy itself or holds a record or list with lazy values somewhere
 /// inside. The fields are sorted by [`Name`], as a record type's are. A
 /// list's lazy shape is in the same table, with no fields, and says what is
-/// done with each element instead: see [`Ir::lazy_list`].
+/// done with each element instead: see [`Ir::lazy_list`]. So is a union's,
+/// which lists the lazy shapes of its members that have one instead: see
+/// [`Ir::lazy_union`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LazyShape {
     /// Each such field's name and what is done with its value.
@@ -334,6 +362,30 @@ pub enum LazyField {
     /// The field or element is a present record or list with lazy values
     /// somewhere inside: they are awaited as the shape says.
     Within(LazyShapeId),
+}
+
+/// Index of a test of an `is` or an `as` in its [`Ir`]'s table. Resolve it
+/// with [`Ir::test`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TestId(u32);
+
+impl TestId {
+    const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// The test an [`IrKind::Is`] or [`IrKind::As`] runs, as the checker
+/// planned it, with what an `as` says when its test fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestCode {
+    /// The plan of the test.
+    pub test: ValueTest,
+    /// How a failure names the value tested: "`x`" or "this value".
+    pub subject: Box<str>,
+    /// How a failure names the type tested for, with its article: "an
+    /// Int".
+    pub target: Box<str>,
 }
 
 /// Whether a function of the table is a function expression, memoised or
@@ -437,7 +489,9 @@ pub struct ShapedOperands {
 /// of the update's kind, and a `Call`'s
 /// callee is a function node; see [`Ir::kind_of`]. No typed operand is ever
 /// of kind [`ValueKind::Deferred`]: an operand that may be a future is an
-/// [`IrKind::Await`] of it.
+/// [`IrKind::Await`] of it; nor of kind [`ValueKind::Mixed`]: an operand of
+/// a union is narrowed first, by an `as`, or in the branch of an `if` whose
+/// `is` narrows it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IrKind {
     /// An `Int` constant.
@@ -485,6 +539,37 @@ pub enum IrKind {
     /// `!==` on two lists of the same type: the negation of
     /// [`IrKind::ListSame`].
     ListNotSame(Operands),
+    /// `===` on two values of the same union type of members of different
+    /// kinds, nodes of kind [`ValueKind::Mixed`]: total equality, comparing
+    /// whole values deeply, as [`Value`](crate::value::Value)'s equality
+    /// does.
+    ValueSame(Operands),
+    /// `!==` on two such values: the negation of [`IrKind::ValueSame`].
+    ValueNotSame(Operands),
+    /// `is`: evaluates `value`, a node of any kind but
+    /// [`ValueKind::Deferred`], and yields whether it passes the test
+    /// `test`, a `Bool`; first, unless `slot` is [`Slot::NONE`], writes the
+    /// value to `slot` of the current frame, where the narrowed bindings of
+    /// the branches of the `if` it is the condition of read it.
+    Is {
+        /// The value tested.
+        value: IrId,
+        /// The test.
+        test: TestId,
+        /// The slot the value is written to, or [`Slot::NONE`].
+        slot: Slot,
+    },
+    /// `as`: evaluates `value`, a node of any kind but
+    /// [`ValueKind::Deferred`], and yields it, of kind `kind`, if it passes
+    /// the test `test`; otherwise fails with "`x` is not an Int".
+    As {
+        /// The value narrowed.
+        value: IrId,
+        /// The test.
+        test: TestId,
+        /// The kind of the narrowed type, and so of the node.
+        kind: ValueKind,
+    },
     /// `Bool` conjunction, evaluating the right operand only if the left is
     /// `true`.
     And(Operands),
@@ -742,7 +827,8 @@ impl IrKind {
     /// interpolation's pieces, a record's values, a list's items,
     /// a spread's list, an index's list and position, a length's list, a
     /// range's bounds, a `for`'s iterable, guard and body, a closure's and
-    /// a future's captures, and an await's value. A closure's
+    /// a future's captures, and an await's, an `is`'s and an `as`'s value.
+    /// A closure's
     /// or a future's
     /// function is not a child: its body is evaluated in a frame of its own.
     /// This is the one list of every node's children, and its match is
@@ -777,6 +863,8 @@ impl IrKind {
             | IrKind::Arg { value: operand, .. }
             | IrKind::Spread(operand)
             | IrKind::ListLen(operand)
+            | IrKind::Is { value: operand, .. }
+            | IrKind::As { value: operand, .. }
             | IrKind::Await { value: operand, .. } => (None, &[], [Some(operand), None, None]),
             IrKind::IntAdd(Operands { lhs, rhs, .. })
             | IrKind::IntSub(Operands { lhs, rhs, .. })
@@ -796,6 +884,8 @@ impl IrKind {
             | IrKind::RecordNotSame(Operands { lhs, rhs, .. })
             | IrKind::ListSame(Operands { lhs, rhs, .. })
             | IrKind::ListNotSame(Operands { lhs, rhs, .. })
+            | IrKind::ValueSame(Operands { lhs, rhs, .. })
+            | IrKind::ValueNotSame(Operands { lhs, rhs, .. })
             | IrKind::And(Operands { lhs, rhs, .. })
             | IrKind::Or(Operands { lhs, rhs, .. })
             | IrKind::Range(_, Operands { lhs, rhs, .. })
@@ -853,8 +943,10 @@ impl IrKind {
             }
             IrKind::BoolEq(true, _) | IrKind::RecordEq(_) | IrKind::ListEq(_) => Some("=="),
             IrKind::BoolEq(false, _) | IrKind::RecordNe(_) | IrKind::ListNe(_) => Some("!="),
-            IrKind::RecordSame(_) | IrKind::ListSame(_) => Some("==="),
-            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) => Some("!=="),
+            IrKind::RecordSame(_) | IrKind::ListSame(_) | IrKind::ValueSame(_) => Some("==="),
+            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) | IrKind::ValueNotSame(_) => {
+                Some("!==")
+            }
             IrKind::And(_) => Some("and"),
             IrKind::Or(_) => Some("or"),
             IrKind::Not(_) => Some("not"),
@@ -886,7 +978,9 @@ impl IrKind {
             | IrKind::Spread(_)
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
-            | IrKind::For { .. } => None,
+            | IrKind::For { .. }
+            | IrKind::Is { .. }
+            | IrKind::As { .. } => None,
         }
     }
 
@@ -906,6 +1000,9 @@ impl IrKind {
             IrKind::RecordSame(_) | IrKind::RecordNotSame(_) => "record-same",
             IrKind::ListEq(_) | IrKind::ListNe(_) => "list-eq",
             IrKind::ListSame(_) | IrKind::ListNotSame(_) => "list-same",
+            IrKind::ValueSame(_) | IrKind::ValueNotSame(_) => "value-same",
+            IrKind::Is { .. } => "is",
+            IrKind::As { .. } => "as",
             IrKind::MakeList { .. } => "make-list",
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
@@ -990,6 +1087,8 @@ impl IrNode {
             | IrKind::RecordNotSame(operands)
             | IrKind::ListSame(operands)
             | IrKind::ListNotSame(operands)
+            | IrKind::ValueSame(operands)
+            | IrKind::ValueNotSame(operands)
             | IrKind::And(operands)
             | IrKind::Or(operands)
             | IrKind::Range(_, operands) => operands.op_start,
@@ -1025,7 +1124,9 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::LoadCallee
             | IrKind::MakeFuture { .. }
-            | IrKind::Await { .. } => return None,
+            | IrKind::Await { .. }
+            | IrKind::Is { .. }
+            | IrKind::As { .. } => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
@@ -1084,6 +1185,12 @@ pub struct Ir {
     /// For each lazy shape of `lazy_shapes`, if it is a list's, what is done
     /// with each element; its entry in `lazy_shapes` then has no fields.
     lazy_lists: Vec<Option<LazyField>>,
+    /// For each lazy shape of `lazy_shapes`, if it is a union's, the lazy
+    /// shapes of its members; its entry in `lazy_shapes` then has no
+    /// fields, and it has none in `lazy_lists`.
+    lazy_unions: Vec<Option<Box<[LazyShapeId]>>>,
+    /// The test of every `is` and `as`, indexed by [`TestId`].
+    tests: Vec<TestCode>,
     /// The text of the name of every [`IrKind::UpdateField`], and of every
     /// field an [`IrKind::Update`]'s path steps to, which may add it to a
     /// record's layout at runtime.
@@ -1246,15 +1353,36 @@ impl Ir {
         self.lazy_lists.get(id.index()).copied().flatten()
     }
 
-    /// The number of distinct lazy shapes, of records and lists.
+    /// The lazy shapes of the members of the union whose lazy shape is
+    /// `id`, those that have one, or `None` if `id` is not a union's lazy
+    /// shape, is [`LazyShapeId::NONE`], or is an id this IR does not have.
+    /// A deep await applies each to a value of its member's kind, a
+    /// record's to a record and a list's to a list, *tolerantly*: since
+    /// which member the value is of is not known, a field the shape lists
+    /// that the record lacks, and a value inside that is not of the kind its
+    /// shape is for, are passed over, at every level below.
+    #[must_use]
+    pub fn lazy_union(&self, id: LazyShapeId) -> Option<&[LazyShapeId]> {
+        self.lazy_unions.get(id.index())?.as_deref()
+    }
+
+    /// The number of distinct lazy shapes, of records, lists and unions.
     #[must_use]
     pub fn lazy_shape_count(&self) -> usize {
         self.lazy_shapes.len()
     }
 
-    /// The text of `name`, if it is the name of an [`IrKind::UpdateField`]
-    /// or of a field an [`IrKind::Update`]'s path steps to: what the
-    /// evaluator shows a field it adds to a record as.
+    /// The test of an `is` or an `as`, `id`, or `None` for an id this IR
+    /// does not have.
+    #[must_use]
+    pub fn test(&self, id: TestId) -> Option<&TestCode> {
+        self.tests.get(id.index())
+    }
+
+    /// The text of `name`, if it is the name of an [`IrKind::UpdateField`],
+    /// of a field an [`IrKind::Update`]'s path steps to, or of a field a
+    /// test looks at: what the evaluator shows a field it adds to a record,
+    /// or that fails a test, as.
     #[must_use]
     pub fn name_text(&self, name: Name) -> Option<&str> {
         self.name_texts.get(&name).map(AsRef::as_ref)
@@ -1314,7 +1442,11 @@ impl Ir {
 
     /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
     /// `MakeFuture` and for a load, capture, field access, index or call of
-    /// a value that may be a future, and never for an `Await`.
+    /// a value that may be a future, and never for an `Await`;
+    /// [`ValueKind::Mixed`] for a load, capture, field access, index, call,
+    /// await or `as` of a union of kinds. A block's kind is its result's,
+    /// and an `if`'s its `then` branch's, which for an `if` of a union of
+    /// kinds, whose branches may be of different kinds, is one of them.
     ///
     /// # Panics
     ///
@@ -1351,6 +1483,9 @@ impl Ir {
                 | IrKind::ListNe(_)
                 | IrKind::ListSame(_)
                 | IrKind::ListNotSame(_)
+                | IrKind::ValueSame(_)
+                | IrKind::ValueNotSame(_)
+                | IrKind::Is { .. }
                 | IrKind::And(_)
                 | IrKind::Or(_)
                 | IrKind::Not(_) => ValueKind::Bool,
@@ -1385,7 +1520,8 @@ impl Ir {
                 | IrKind::Index { kind, .. }
                 | IrKind::Call { kind, .. }
                 | IrKind::LoadCapture(_, kind)
-                | IrKind::Await { kind, .. } => kind,
+                | IrKind::Await { kind, .. }
+                | IrKind::As { kind, .. } => kind,
                 IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
                 IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
@@ -1436,8 +1572,14 @@ impl Ir {
     /// if its value is awaited and by its own shape in brackets if the
     /// await descends into it, as in `(await [a! b[c!]] @0..9 ...)`, or for
     /// a list, `*`, `!` if each element is awaited, and the element's shape
-    /// if the await descends into it, as in `(await *! @0..9 ...)`. The
-    /// depths of calls and awaits are not shown. After the root, each
+    /// if the await descends into it, as in `(await *! @0..9 ...)`, or for
+    /// a union, its members' shapes separated by ` | ` in parentheses, as in
+    /// `(await ([a!] | *!) @0..9 ...)`. The depths of calls and awaits are
+    /// not shown. An `is` shows its test's plan and, if it narrows, its
+    /// slot, as in `(is [int] x#2 @0..9 ...)`, and an `as` its plan, as in
+    /// `(as {a: int} @0..9 ...)` (see `Pretty::test` for how a plan is
+    /// written); a total comparison of two values of a union of kinds shows
+    /// as `(value-same === @0..9 ...)`. After the root, each
     /// function is shown on a line of its own as
     /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
     /// `fn #1 (frame ...)` if it has no name, a memoised function as
@@ -1465,6 +1607,8 @@ pub(crate) struct IrBuilder {
     list_shapes: Vec<Option<ListShape>>,
     lazy_shapes: Vec<LazyShape>,
     lazy_lists: Vec<Option<LazyField>>,
+    lazy_unions: Vec<Option<Box<[LazyShapeId]>>>,
+    tests: Vec<TestCode>,
     name_texts: HashMap<Name, Box<str>>,
     update_steps: Vec<UpdateStep>,
     update_paths: Vec<StepRange>,
@@ -1481,6 +1625,8 @@ impl IrBuilder {
             list_shapes: Vec::new(),
             lazy_shapes: Vec::new(),
             lazy_lists: Vec::new(),
+            lazy_unions: Vec::new(),
+            tests: Vec::new(),
             name_texts: HashMap::new(),
             update_steps: Vec::new(),
             update_paths: Vec::new(),
@@ -1566,6 +1712,7 @@ impl IrBuilder {
         let id = LazyShapeId(u32::try_from(self.lazy_shapes.len()).unwrap_or(u32::MAX));
         self.lazy_shapes.push(shape);
         self.lazy_lists.push(None);
+        self.lazy_unions.push(None);
         id
     }
 
@@ -1581,9 +1728,33 @@ impl IrBuilder {
         id
     }
 
+    /// Adds a union's lazy shape, which awaits what each of `members`, the
+    /// lazy shapes of the union's members that have one, says, of a value
+    /// of that member's kind and as far as the value has what it lists (see
+    /// [`Ir::lazy_union`]), and returns its id, as
+    /// [`IrBuilder::push_lazy_shape`] does.
+    pub(crate) fn push_lazy_union(&mut self, members: Box<[LazyShapeId]>) -> LazyShapeId {
+        let id = self.push_lazy_shape(LazyShape {
+            fields: Box::default(),
+        });
+        if let Some(entry) = self.lazy_unions.get_mut(id.index()) {
+            *entry = Some(members);
+        }
+        id
+    }
+
+    /// Adds the test of an `is` or an `as` and returns its id. There is at
+    /// most one per such expression, so ids never saturate either.
+    pub(crate) fn push_test(&mut self, test: TestCode) -> TestId {
+        let id = TestId(u32::try_from(self.tests.len()).unwrap_or(u32::MAX));
+        self.tests.push(test);
+        id
+    }
+
     /// Records `text` as the text of `name`, the name of an
-    /// [`IrKind::UpdateField`] or of a field an [`IrKind::Update`]'s path
-    /// steps to, unless it is recorded already.
+    /// [`IrKind::UpdateField`], of a field an [`IrKind::Update`]'s path
+    /// steps to or of a field a test looks at, unless it is recorded
+    /// already.
     pub(crate) fn add_name_text(&mut self, name: Name, text: &str) {
         self.name_texts
             .entry(name)
@@ -1731,6 +1902,8 @@ impl IrBuilder {
             list_shapes: self.list_shapes,
             lazy_shapes: self.lazy_shapes,
             lazy_lists: self.lazy_lists,
+            lazy_unions: self.lazy_unions,
+            tests: self.tests,
             name_texts: self.name_texts,
             update_steps: self.update_steps,
             update_paths: self.update_paths,
@@ -1842,8 +2015,10 @@ impl Pretty<'_> {
 
     /// Starts writing lazy shape `id` (see `Pretty::lazy_shape`): a `*`,
     /// and a `!` for an awaited element, for each list's lazy shape down to
-    /// the first that is not a list's, and if that is a record's, its `[`,
-    /// queueing it on `pending` to have its fields written.
+    /// the first that is not a list's; then, if that is a union's, its
+    /// members' shapes separated by ` | ` in parentheses, as in `(*! |
+    /// [a!])`, and if it is a record's, its `[`, queueing it on `pending` to
+    /// have its fields written.
     fn open_lazy_shape(
         &self,
         f: &mut fmt::Formatter<'_>,
@@ -1863,6 +2038,18 @@ impl Pretty<'_> {
             if current == LazyShapeId::NONE {
                 return Ok(());
             }
+        }
+        // A union's members' shapes, each whole, recursing once per union
+        // nested in one of them.
+        if let Some(members) = self.ir.lazy_union(current) {
+            f.write_str("(")?;
+            for (index, &member) in members.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(" | ")?;
+                }
+                self.lazy_shape(f, member)?;
+            }
+            return f.write_str(")");
         }
         f.write_str("[")?;
         pending.push((current, 0));
@@ -1886,6 +2073,60 @@ impl Pretty<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Writes the plan of the test `test` (see [`ValueTest`]): `*` for one
+    /// that always passes, a kind's name for a test of the kind alone
+    /// (`int`, `float`, `bool`, `string`, `record`, `list`), the fields a
+    /// record must have, each with its own test, in braces, as in `{a:
+    /// int}`, the test of a list's elements in brackets, as in `[int]`, and
+    /// the alternatives of a union separated by ` | ` in parentheses, as in
+    /// `(int | [string])`. So the dump shows how far into a value a test
+    /// walks.
+    ///
+    /// Recurses once per level of record, list or union nesting in the
+    /// plan, which is no deeper than the type it tests for.
+    fn test(&self, f: &mut fmt::Formatter<'_>, test: &ValueTest) -> fmt::Result {
+        match test {
+            ValueTest::Pass => f.write_str("*"),
+            ValueTest::Kind(kind) => f.write_str(match kind {
+                ValueKind::Int => "int",
+                ValueKind::Float => "float",
+                ValueKind::Bool => "bool",
+                ValueKind::String => "string",
+                ValueKind::Record => "record",
+                ValueKind::List => "list",
+                ValueKind::Fn => "fn",
+                ValueKind::Deferred => "deferred",
+                ValueKind::Mixed => "mixed",
+            }),
+            ValueTest::Record(fields) => {
+                f.write_str("{")?;
+                for (index, (name, field)) in fields.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: ", FieldName(self.names.get(*name)))?;
+                    self.test(f, field)?;
+                }
+                f.write_str("}")
+            }
+            ValueTest::List(element) => {
+                f.write_str("[")?;
+                self.test(f, element)?;
+                f.write_str("]")
+            }
+            ValueTest::Any(alternatives) => {
+                f.write_str("(")?;
+                for (index, alternative) in alternatives.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(" | ")?;
+                    }
+                    self.test(f, alternative)?;
+                }
+                f.write_str(")")
+            }
+        }
     }
 
     /// Writes a slot as `name#slot`, the name quoted if it is a field's
@@ -1919,8 +2160,27 @@ impl Pretty<'_> {
                 f.write_str(if eq { " == " } else { " != " })?;
                 self.shape(f, operands.shape)?;
             }
-            IrKind::RecordSame(_) | IrKind::ListSame(_) => f.write_str(" ===")?,
-            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) => f.write_str(" !==")?,
+            IrKind::RecordSame(_) | IrKind::ListSame(_) | IrKind::ValueSame(_) => {
+                f.write_str(" ===")?;
+            }
+            IrKind::RecordNotSame(_) | IrKind::ListNotSame(_) | IrKind::ValueNotSame(_) => {
+                f.write_str(" !==")?;
+            }
+            IrKind::Is { test, slot, .. } => {
+                if let Some(code) = self.ir.test(test) {
+                    f.write_str(" ")?;
+                    self.test(f, &code.test)?;
+                }
+                if slot != Slot::NONE {
+                    self.slot(f, slot)?;
+                }
+            }
+            IrKind::As { test, .. } => {
+                if let Some(code) = self.ir.test(test) {
+                    f.write_str(" ")?;
+                    self.test(f, &code.test)?;
+                }
+            }
             IrKind::MakeRecord { layout, .. } => {
                 f.write_str(" [")?;
                 for (index, text) in self.ir.layout(layout).texts.iter().enumerate() {

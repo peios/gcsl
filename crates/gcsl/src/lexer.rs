@@ -25,11 +25,13 @@
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `mut`,
 //! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`,
-//! `await`, `for` and `in`; the whole identifier is scanned before it is
-//! compared with them, so `fn-x`, `lazy-x`, `await-x`, `for-x` and `mut-x`
-//! are identifiers. `mut` is only ever written after `let`, which it makes
-//! a mutable variable's declaration, but it is a keyword wherever it
-//! appears, so no variable or unquoted field can be named `mut`.
+//! `await`, `for`, `in`, `is` and `as`; the whole identifier is scanned
+//! before it is compared with them, so `fn-x`, `lazy-x`, `await-x`,
+//! `for-x`, `mut-x` and `is-x` are identifiers. `mut` is only ever written
+//! after `let`, which it makes a mutable variable's declaration, but it is
+//! a keyword wherever it appears, so no variable or unquoted field can be
+//! named `mut`; nor, likewise, `is` or `as`, which are only ever written
+//! between an expression and a type.
 //! An `r` directly followed by `"` begins a raw string literal; anywhere
 //! else it is an ordinary identifier. `Future` and `Present` are not
 //! keywords: they are ordinary
@@ -216,6 +218,12 @@ pub enum TokenKind {
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
     In,
+    /// The keyword `is`, which tests whether the value before it is of the
+    /// type after it.
+    Is,
+    /// The keyword `as`, which narrows the value before it to the type
+    /// after it, checked at runtime.
+    As,
     /// `+`
     Plus,
     /// `-` as subtraction: not directly after an operand, and followed by
@@ -316,6 +324,8 @@ impl TokenKind {
             TokenKind::Await => Some("await"),
             TokenKind::For => Some("for"),
             TokenKind::In => Some("in"),
+            TokenKind::Is => Some("is"),
+            TokenKind::As => Some("as"),
             TokenKind::Plus => Some("+"),
             TokenKind::Minus | TokenKind::Neg => Some("-"),
             TokenKind::Star => Some("*"),
@@ -378,6 +388,8 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "await" => TokenKind::Await,
         "for" => TokenKind::For,
         "in" => TokenKind::In,
+        "is" => TokenKind::Is,
+        "as" => TokenKind::As,
         _ => return None,
     })
 }
@@ -1705,6 +1717,31 @@ mod tests {
         assert_eq!(Lazy.symbol(), Some("lazy"));
         assert_eq!(Await.symbol(), Some("await"));
         assert_eq!(Pipe.symbol(), Some("|"));
+    }
+
+    #[test]
+    fn is_and_as_are_keywords_only_as_whole_words() {
+        assert_eq!(
+            show("x is Int as is-x as-x isa asy Is As"),
+            vec![
+                "Ident(x)",
+                "Is",
+                "Ident(Int)",
+                "As",
+                "Ident(is-x)",
+                "Ident(as-x)",
+                "Ident(isa)",
+                "Ident(asy)",
+                "Ident(Is)",
+                "Ident(As)",
+                "Eof"
+            ]
+        );
+        assert_eq!(TokenKind::Is.symbol(), Some("is"));
+        assert_eq!(TokenKind::As.symbol(), Some("as"));
+        assert!(!is_identifier("is"));
+        assert!(!is_identifier("as"));
+        assert!(is_identifier("is-x"));
     }
 
     #[test]

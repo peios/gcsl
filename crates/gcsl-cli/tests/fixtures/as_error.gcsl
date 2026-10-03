@@ -1,0 +1,2 @@
+let port: Int | String = "http"
+port as Int

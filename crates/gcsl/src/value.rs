@@ -55,6 +55,11 @@ pub enum ValueKind {
     /// the evaluator's general walker evaluates such nodes; see
     /// [`crate::ir::Ir::kind_of`].
     Deferred,
+    /// A present value whose static type is a union of types of different
+    /// kinds, as `Int | String` is, so which may be of any of their kinds,
+    /// but is never a [`Value::Future`]. Only the evaluator's general
+    /// walker evaluates such nodes, as it does [`ValueKind::Deferred`] ones.
+    Mixed,
 }
 
 /// The field names of a record, in definition order. Built once per record

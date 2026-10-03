@@ -36,13 +36,14 @@
 //! nearest concrete context or defaulted where it is bound or used, so
 //! afterwards the table contains no `UntypedInt`.
 //!
-//! An `if` with `else` has the type its branches agree on, with untyped
-//! branches adapting as operands of `+` do; if both are untyped, the `if`
-//! stays untyped, like a block, and `coerce` pushes a type into both
-//! branches. Two record branches agree on their join (see
-//! [`TypeTable::join`]), so they never mismatch. An `if` without `else` is
-//! `{}`, and so must its block be. There is no truthiness: conditions and
-//! the operands of `and`, `or` and `not` must be `Bool`.
+//! An `if` with `else` has the join of its branches' types (see
+//! [`TypeTable::join`]), with untyped branches adapting as operands of `+`
+//! do first; if both are untyped, the `if` stays untyped, like a block, and
+//! `coerce` pushes a type into both branches. The join always exists:
+//! branches that do not agree make a union, which is a warning, not an
+//! error (see [Unions](#unions)). An `if` without `else` is `{}`, and so
+//! must its block be. There is no truthiness: conditions and the operands
+//! of `and`, `or` and `not` must be `Bool`.
 //!
 //! A node whose operator rejects its operands is reported once and given
 //! [`TyId::ERROR`]. Every operator accepts `Error` operands silently and
@@ -421,7 +422,11 @@
 //! identical type, a type that is a function type, or a record or list type
 //! containing one at any depth (see [`TypeTable::contains_fn`]), is an
 //! error. Nor do they have an order. Lists compare as records do, element by
-//! element (see [Lists](#lists)).
+//! element (see [Lists](#lists)). A union has no static type to compare
+//! typed by: `==` and `!=` of two operands of one union type are "cannot
+//! compare `Int | String` with `==`", with the note "narrow it, or compare
+//! with `===`", while `===` and `!==` compare their runtime values whole;
+//! nor does a union have an order (see [Unions](#unions)).
 //!
 //! # Functions
 //!
@@ -524,8 +529,9 @@
 //! its own `lazy` initialiser, as for any initialiser.
 //!
 //! **Bare types.** In a type expression, a type written as a name, a
-//! record type or a list type (`List<T>` or `T[]`) means what the position
-//! it is written in says (`Bareness`):
+//! record type, a list type (`List<T>` or `T[]`) or a union with no member
+//! written `Future<...>` means what the position it is written in says
+//! (`Bareness`):
 //! the either shape, `T | Future<T>`, in the parameters and the return type
 //! of an impure function expression and of a written impure function type,
 //! and in the return type of a memoised one, at that position and at every
@@ -555,14 +561,26 @@
 //! marker, and a function value that may be a future must be written so,
 //! as `Future<fn(): Int>` or `(fn(): Int) | Future<fn(): Int>` (in
 //! parentheses, since a function type's return type would take the union).
-//! An applied type and a union are explicit, and so never wrapped either.
-//! `Future<T>` and `Present<T>` override that at their
-//! position, their own interiors being present, and `T | Future<T>` may be
-//! written, with the same `T` either side; any other union, any other name
-//! applied to a type, and `Future` or `Present` without a type argument are
-//! errors. So an impure function takes, and says it returns, values that
-//! may be futures, since its body awaits them on demand, while a pure function
-//! takes present values where its body needs them, since its body cannot
+//! A bare union is what the rule makes of each member, as it is written
+//! (each record member's fields and list member's elements as the rule
+//! says, a function type member following its own marker), the union of
+//! them at its own position, and the either shape of that union where a
+//! bare name would be: `Int | String` in an impure function's parameter is
+//! `Int | String | Future<Int | String>`, so widening a parameter from
+//! `Int` to `Int | String` does not stop it taking a future
+//! (`Checker::resolve_union`). An applied type other than `List` and a
+//! union with a member written `Future<...>` are explicit, and so never
+//! wrapped. `Future<T>` and `Present<T>` override that at their position,
+//! their own interiors being present, and a union with a `Future` member
+//! may be written if it is the either shape, `T | Future<T>`: exactly one
+//! member a `Future`, of the union of the others, as in `Int | String |
+//! Future<Int | String>`; any other union with a `Future` member ("a union
+//! with a `Future` member must be `T | Future<T>`", at its last `|`), any
+//! other name applied to a type, and `Future` or `Present` without a type
+//! argument are errors. So an impure function takes, and says it returns,
+//! values that may be futures, since its body awaits them on demand, while
+//! a pure function takes present values where its body needs them, since
+//! its body cannot
 //! await, and a memoised function takes present values, the key it looks
 //! its results up by; and a pure `fn(Int): Int` is not a subtype of the
 //! impure `fn(Int) -> Int`, which promises to pass futures (parameters are
@@ -643,9 +661,10 @@
 //! # Inferred parameters
 //!
 //! A pure function's bare parameter, one whose type is written as a name, a
-//! record type or a list type (not `Present<...>`, `Future<...>`, a union
-//! or a function type, which say what they are), is present if the
-//! function's body
+//! record type, a list type or a union with no `Future` member (not
+//! `Present<...>`, `Future<...>`, a union with a `Future` member or a
+//! function type, which say what they are), is present if the function's
+//! body
 //! *measures* it, and the either shape if it never does, so that a pure
 //! function can pass a future through without declaring it: `fn double(x:
 //! Int): Int { x * 2 }` is `fn(x: Int): Int`, and `fn keep(x: Int): {v: Int
@@ -760,8 +779,8 @@
 //! # Inferred results
 //!
 //! An impure or memoised function's bare result position, one written as a
-//! name, a record type or a list type, is the either shape while the body
-//! is checked,
+//! name, a record type, a list type or a union with no `Future` member, is
+//! the either shape while the body is checked,
 //! as the bare type rule says, and then takes the laziness of what the body
 //! returns there: `T` if it is present, `Future<T>` if it is a future, and
 //! the either shape, as written, if it may be either or has a provisional
@@ -777,9 +796,13 @@
 //! parameter being the either shape, while `fn add(x: Int) -> Int { x + 1 }`
 //! is `fn(x: Int | Future<Int>) -> Int`, and `fn l() -> List<Int> { [1,
 //! lazy 2] }` is `fn() -> List<Int | Future<Int>>` (see
-//! [Lists](#lists)). A position that is not bare keeps
+//! [Lists](#lists)). A bare union is inferred at its top only, as a name
+//! is: `fn f(c: Bool) -> Int | String { if c { 1 } else { "a" } }` is
+//! `fn(c: Bool | Future<Bool>) -> Int | String`, the inside of each member
+//! staying as declared. A position that is not bare keeps
 //! what is written, with everything inside it: `Present<...>`,
-//! `Future<...>`, a union and a function type say what they are. A
+//! `Future<...>`, a union with a `Future` member and a function type say
+//! what they are. A
 //! parenthesised type is what is inside it. The parameters are never
 //! inferred, nor is anything of a pure function's, though a callback
 //! parameter may be narrowed, in the same step (see [Narrowed
@@ -848,7 +871,8 @@
 //! one whose type is written directly as an impure function type, `fn(...)
 //! -> T` (not inside `Future<...>`, a union, a record type or another
 //! function type), and each parameter position of that type written bare,
-//! as a name, a record type or a list type, is *narrowable*. As written,
+//! as a name, a record type, a list type or a union with no `Future`
+//! member, is *narrowable*. As written,
 //! such a position
 //! is the either shape: the function says it may pass the callback a
 //! future there, so a pure callback that measures its parameter does not
@@ -951,10 +975,11 @@
 //! an `if`'s branches do, so `[1, 2.5]` is `List<Float>` and `[1, 2]`
 //! `List<Int>`, and two element types that differ measure the provisional
 //! parameters in them, as an `if`'s branches do (see [Inferred
-//! parameters](#inferred-parameters)). Two elements with no join are "list
-//! elements have different types", reported at the first that does not
-//! join with those before it; `[]` has nothing to join, and is "cannot
-//! infer the element type of `[]`". Nothing is awaited: `[1, lazy 2]` is
+//! parameters](#inferred-parameters)). Elements that do not agree make a
+//! union, which is the warning "the elements of this list have different
+//! types", at the first element that widens the join of those before it
+//! (see [Unions](#unions)); `[]` has nothing to join, and is "cannot infer
+//! the element type of `[]`". Nothing is awaited: `[1, lazy 2]` is
 //! `List<Int | Future<Int>>`.
 //!
 //! A literal where a list type `List<X>` (or its either shape) is expected
@@ -969,12 +994,16 @@
 //! is a future. The expected type reaches a literal where it reaches a
 //! record block (an annotation, an argument, a function's body, a field of
 //! an expected record type, a `:=`, an ascription) through parentheses, and,
-//! for a list type only, also through a block's result and the branches of
-//! an `if` with `else`, so that a function's body, a block, reaches its
-//! literal; it reaches a `for` in the same way (see [For](#for)); such a
-//! block or `if` has the type of what its result, or the join of what its
-//! branches, are once awaited. It never flows from one
-//! branch of an `if` to the other.
+//! for a list type or a union only, also through a block's result and the
+//! branches of an `if` with `else`, so that a function's body, a block,
+//! reaches its literal; it reaches a `for` in the same way (see
+//! [For](#for)); such a block or `if` has the type of what its result, or
+//! the join of what its branches, are once awaited, or the expected type
+//! if that join is not a subtype of it. Under an expected type, a join is
+//! never a warning, since each part fits what is expected. Where a union
+//! is expected, a list literal or a `for` is checked against its one list
+//! member, and `[]` against any (`Checker::expected_member`). It never
+//! flows from one branch of an `if` to the other.
 //!
 //! A spread's operand is used as its bits at the top (`Checker::measure`),
 //! and must be a list: "cannot spread a value of type T: it is not a list".
@@ -1102,6 +1131,169 @@
 //! `List<X>` if that is not a subtype of `X`, as for a literal. A body
 //! that is a record block makes a list of records.
 //!
+//! # Unions
+//!
+//! `Int | String` is the type of a value that is an `Int` or a `String`;
+//! any present types may be members (see [`crate::types`]). The checker
+//! does not block where two types merely disagree: it joins the types of
+//! the expressions whose values one expression may have, the branches of
+//! an `if` and the elements of a list literal (and its spreads' elements),
+//! and the join always exists ([`TypeTable::join`]). Where two types have
+//! no common supertype, at the top or inside a record field, a list's
+//! element type or a function's return type, the join is their union, and
+//! *widened*; a widened join is a warning, not an error, at the expression
+//! that does not agree with what came before it:
+//!
+//! - an `if`'s branches, "the branches of this `if` have different types",
+//!   at the `else` branch's value (a block's result, through blocks and
+//!   parentheses), labelled with its type, with a label of the `then`
+//!   branch's value's type on it, and the note "the `if` is `Int |
+//!   String`; annotate it with that type if both are meant, or tell them
+//!   apart with `is`" (`Checker::branches_widened`);
+//! - a list literal's elements, "the elements of this list have different
+//!   types", at the first element (or spread) that widens the join of those
+//!   before it, labelled with its type, with a label of the elements' so far
+//!   on the first, and the note "the list is `List<Int | String>`; ..."
+//!   (`Checker::elements_widened`).
+//!
+//! There are no other joins of expressions' types that could widen: a
+//! field access, an index or an iteration of a union whose members are all
+//! records with the field, or all lists, has the join of what the members
+//! have there, which is no warning, since the union says the value may be
+//! any of them. Nor is there a warning where a type is expected that the
+//! union fits: the expected type reaches the branches of an `if`, a
+//! block's result and a list's elements (see [Lists](#lists)), each is
+//! checked against it, and the join of what they are is no warning. So
+//! `let w: Int | String = if c { 1 } else { "one" }` warns about nothing.
+//! An integer literal adapts to a union's `Int` member, or its `Float`
+//! member if it has no `Int` one; one that cannot adapt to the other side
+//! of a join settles to `Int` first, so `if c { 1 } else { "a" }` is `Int |
+//! String`.
+//!
+//! A union is used by narrowing it (see [`is`](#is), [Narrowing](#narrowing)
+//! and [`as`](#as)). Used as it is where one particular type is needed, an
+//! operand of an operator, a condition, an index position, a range bound,
+//! a callee, the record of a field access, the list of an index, an
+//! iteration, `len` or a list's spread, it gives that place's existing
+//! error, the union shown in it ("cannot add `Int | String` and Int"),
+//! with the note "tell them apart first, as in `if v is Int { ... }`",
+//! naming the variable when the operand is one, through parentheses, and
+//! `x` otherwise, and the union's first member that `is` can test, as the
+//! union shows its members, or, for a union of function types only, which
+//! `is` cannot tell apart, a note to annotate the value with one function
+//! type (`Checker::union_note`). An expected type the
+//! union does not fit gives the mismatch it always has, with the same note.
+//! A field access is allowed when every member is a record type with the
+//! field, and an index, a `for` and `len` when every member is a list type;
+//! a spread needs a list, or a record, as before, and the path of a dotted
+//! `let` or `:=` records or lists, as before, without the note.
+//! Interpolating, passing, storing,
+//! returning and capturing a union need nothing. Awaiting an either of a
+//! union gives the union.
+//!
+//! A union whose members are of different kinds is of
+//! [`ValueKind::Mixed`] at runtime: lowering gives its nodes to the
+//! evaluator's general walker only, as it does a value that may be a
+//! future (see [`crate::lower`]).
+//!
+//! # `is`
+//!
+//! `EXPR is TYPE` is a `Bool`: whether the value is a `TYPE`
+//! (`Checker::check_test`). `TYPE` is resolved with every bare type
+//! present, and may hold no future, nor an either shape ("`is` cannot test
+//! a future"), and no function type ("`is` cannot test a function type":
+//! a function's signature is not something a value can be asked for; a
+//! function is told apart by the other members, in the `else` branch). The
+//! operand is checked, an untyped integer settling to `Int`, and measured
+//! at the top, as a measuring operator's operand is: awaited if it may be a
+//! future, subject to the purity rule, a pure function's parameter being
+//! measured. Its type then, `S`, has *members*: its members if it is a
+//! union, and itself otherwise. Each member `M`, made present (a list of
+//! futures being asked about as a list of what they yield), *always
+//! passes* if it is a subtype of `TYPE`, *may pass* if not but it
+//! *overlaps* `TYPE` ([`TypeTable::overlaps`]: a value could be both, as
+//! far as their structure says), and otherwise *cannot pass*. If every
+//! member always passes, the test is `true`, and a warning, "`x` is always
+//! an Int", at the `is`; if none passes or may, it is an error, "`x` is
+//! never a String", at `TYPE`, labelled with the operand's type at the
+//! operand. `x` is the operand as written when it is a name or a dotted
+//! path, and "this value" otherwise.
+//!
+//! The test at runtime is by the value's structure, as its *plan*
+//! ([`TypeTable::test_plan`]) says, which is recorded for lowering in
+//! [`Resolution::test_of`]: a scalar type by the value's kind; a record
+//! type by the record's having each field, each passing its own test,
+//! whatever else it has; a list type by each element's passing (the empty
+//! list passes every list type); a union by any member's. The plan looks no
+//! further than `S` leaves in doubt: if every member of `S` of the kind
+//! tested always passes, it tests the value's kind alone (`x is List<Int>`
+//! for `x: Int | List<Int>`), and otherwise it looks inside, applying the
+//! same rule at each field and element, from what `S`'s members of that
+//! kind say of it (or nothing, where one lacks the field). How deeply the
+//! operand is awaited follows the plan: at the top for one that tests the
+//! kind alone, so that `xs is Int` awaits no element of a list of futures,
+//! and deeply, as an operand of an equality is (`Checker::measure_deep`),
+//! for one that looks inside, `S` then being made present for everything
+//! below. Values are immutable and types structural, so a value that
+//! passes the test of a type is of that type, whatever it was built as,
+//! which is what makes narrowing on the test sound.
+//!
+//! The *narrowed type* `N` is the union of each member that always passes,
+//! as it is, and `TYPE`, if any member may pass; the *remainder* `R` is the
+//! union of the members that do not always pass. "May pass" asks whether
+//! `M` and `TYPE` overlap, not merely whether `TYPE` is a subtype of `M`, so
+//! that `x is {value: Int}` is a real test for `x: {kind: String, value:
+//! Int | String}`, and so that a member that cannot pass is one no value of
+//! which passes the test: were it one whose record could have a field its
+//! type hides, such a record could pass and be taken for another member's
+//! type than its own.
+//!
+//! # Narrowing
+//!
+//! `if NAME is TYPE { A } else { B }`, the condition being exactly that
+//! through any parentheses, and `NAME`, through any parentheses, a
+//! variable, mutable or not, a parameter, a field or a `for`'s variable,
+//! narrows `NAME` in the branches (`Checker::if_condition`). The `is`
+//! writes the value it tests, awaited as the test awaited it, to a slot of
+//! its own, taken for the `if` and free again after it; in `A`, `NAME` is a
+//! new binding of `N` in that slot, in a scope around `A`, as a `for`'s
+//! variable is around its body, and in `B` a new binding of `R` there in
+//! the same way, unless `R` is the whole of `S` (no member always passes)
+//! and the test awaited nothing, when `B` keeps `NAME` as it was. Each is
+//! a copy (`BindingKind::Narrowed`), declared, as its diagnostics say, by
+//! the `is`. Being a copy, nothing that rebinds the variable it was copied
+//! from can change it, which keeps the narrowing sound for a mutable
+//! variable. For the same reason `NAME := v` in the branch is an error,
+//! "cannot rebind `x` here: it is narrowed by `is`": it would change the
+//! copy and leave the variable as it was, silently for a mutable one, so
+//! the note says to test a copy under another name, which leaves the
+//! variable free to rebind. A `let NAME` in the branch shadows it as any
+//! `let` does. When the
+//! test always passes (and is warned about), `A` is narrowed and `B` keeps
+//! `NAME`. An `else if` is an `if` inside `B`, narrowing in turn. Both
+//! paths that check an `if`, with and without an expected type, narrow
+//! alike.
+//!
+//! Nothing else narrows, for now: not `x is Int and x > 5`, not `not (x is
+//! Int)`, not a field path (`r.a is Int`), and nothing after the `if` (an
+//! early exit from `A` does not make `NAME` the remainder after it). These
+//! are flow narrowing, deferred to a later slice.
+//!
+//! # `as`
+//!
+//! `EXPR as TYPE` is the operand as a `TYPE`, or a runtime error: a checked
+//! narrowing, never a blind promise. The operand and `TYPE` follow the
+//! rules of `is`, the same members, the same plan, awaited the same way,
+//! the same "never" error and the same rejection of futures and function
+//! types; if every member always passes, it is a warning, "`as` changes
+//! nothing here: `x` is already an Int", with the note "`: Int` says the
+//! same without a test". Its type is `N`, `TYPE` or what is more precise,
+//! and its value the operand, awaited as the test awaited it. The test runs
+//! at runtime, and a value that fails it is "`x` is not an Int", at the
+//! whole expression, labelled with what the value is (see [`crate::eval`]).
+//! It does nothing impure, so a pure function may use it on an operand that
+//! needs no await.
+//!
 //! # Built-in functions
 //!
 //! A [`Builtin`] is a name of a scope outside the outermost one, present in
@@ -1166,7 +1358,10 @@
 //! first, a dotted path extending an open field or an item overriding a
 //! soft one, writes the field's one slot. A spread's operand is held in the next free slot,
 //! which counts towards the frame size but stays free (see [Spreads and
-//! soft assignment](#spreads-and-soft-assignment)).
+//! soft assignment](#spreads-and-soft-assignment)). An `if` that narrows
+//! takes the next free slot for the value its test writes, which both
+//! branches' narrowed bindings share, and leaves it when it ends (see
+//! [Narrowing](#narrowing)).
 //!
 //! # Sessions
 //!
@@ -1180,6 +1375,7 @@
 //! it lists their slots ([`Scope::mutable_slots`]), the only ones of the
 //! scope a later input can write.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::{
@@ -1191,13 +1387,13 @@ use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
-use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable};
+use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable, ValueTest};
+use crate::value::ValueKind;
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
 /// A `Types` returned by [`check`] contains neither [`TyId::UNTYPED_INT`]
-/// nor [`TyId::ERROR`], nor any union other than the either shape, `T |
-/// Future<T>`, nor any provisional type. An expression that is awaited where
+/// nor [`TyId::ERROR`], nor any provisional type. An expression that is awaited where
 /// it is used keeps the type it has before the await; see
 /// [`Resolution::await_of`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1495,6 +1691,26 @@ impl PathResolution {
     }
 }
 
+/// What the checker decided for one `is` or `as` expression, in
+/// [`Resolution::test_of`]. See the module documentation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestResolution {
+    /// The plan of the test the expression runs at runtime, against the
+    /// value of its operand once awaited as [`Resolution::await_of`] says.
+    pub test: ValueTest,
+    /// For an `is` that narrows the branches of the `if` it is the
+    /// condition of, the slot the value it tests is stored in, which the
+    /// branches' narrowed bindings read; [`Slot::NONE`] for every other.
+    pub slot: Slot,
+    /// For an `as`, its operand as its failure names it: the operand as
+    /// written in backticks if it is a name or a path, as in "`x`", and
+    /// "this value" otherwise.
+    pub subject: Box<str>,
+    /// For an `as`, the type it tests for as its failure names it, with its
+    /// article, as in "an Int" or "a `List<Int>`".
+    pub target: Box<str>,
+}
+
 /// Where every variable of an [`Ast`] is stored, what every function's
 /// frame and captures are, and which parameter every argument fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1543,6 +1759,9 @@ pub struct Resolution {
     /// The slot each `for` expression's variable is stored in, indexed by
     /// [`ForId`].
     for_slots: Vec<Slot>,
+    /// What was decided for each `is` and `as` expression, by its id; only
+    /// a program that has one has entries.
+    tests: HashMap<ExprId, TestResolution>,
 }
 
 impl Resolution {
@@ -1640,6 +1859,14 @@ impl Resolution {
         self.for_slots[id.index()]
     }
 
+    /// What was decided for the `is` or `as` expression `id`: its test's
+    /// plan, and where an `is` that narrows stores the value it tests, or
+    /// how an `as` names what it tests. `None` for any other expression.
+    #[must_use]
+    pub fn test_of(&self, id: ExprId) -> Option<&TestResolution> {
+        self.tests.get(&id)
+    }
+
     /// How the path of item `id` resolves: [`PathResolution::NONE`] if it
     /// is not a dotted declaration or builds its record from nothing.
     ///
@@ -1700,6 +1927,7 @@ impl Resolution {
             functions: Vec::new(),
             arg_params: Vec::new(),
             for_slots: Vec::new(),
+            tests: HashMap::new(),
         }
     }
 
@@ -1815,6 +2043,10 @@ enum BindingKind {
     /// A function's name for itself, inside its own body, which `:=` may
     /// not rebind either; it has no slot.
     Callee,
+    /// The copy of a variable that a branch of `if NAME is TYPE` sees, of
+    /// the narrowed type or the remainder, which `:=` may not rebind: the
+    /// rebind would change the copy, not the variable it was copied from.
+    Narrowed,
 }
 
 /// What a bare type written in a type expression means: see the module
@@ -1823,10 +2055,11 @@ enum BindingKind {
 enum Bareness {
     /// A bare type is present: `Int` is `Int`.
     Present,
-    /// A bare type written as a name or a record type is the either shape:
-    /// `Int` is `Int | Future<Int>`, and `{a: Int}` is `{a: Int |
-    /// Future<Int>} | Future<{a: Int | Future<Int>}>`. A function type is
-    /// not (see `Checker::resolve_type`).
+    /// A bare type written as a name, a record type, a list type or a union
+    /// with no `Future` member is the either shape: `Int` is `Int |
+    /// Future<Int>`, `{a: Int}` is `{a: Int | Future<Int>} | Future<{a: Int
+    /// | Future<Int>}>`, and `Int | String` is `Int | String | Future<Int |
+    /// String>`. A function type is not (see `Checker::resolve_type`).
     Either,
 }
 
@@ -2042,8 +2275,8 @@ struct Node {
 /// expectation comes from, for [`Checker::check_expr_expecting`].
 #[derive(Clone, Copy, Debug)]
 struct Expecting<'w> {
-    /// The expected record type, present; or the expected list type, as it
-    /// is expected, which may be its either shape.
+    /// The expected record type, present; or the expected list type or
+    /// union, as it is expected, which may be its either shape.
     ty: TyId,
     /// The annotation, ascription, return type or callee stating it.
     context: Span,
@@ -2064,6 +2297,37 @@ impl<'w> Expecting<'w> {
             close: Span::new(block.end.saturating_sub(1), block.end),
         }
     }
+}
+
+/// What [`Checker::check_test`] found of an `is` or `as` that is not
+/// erroneous. See the module documentation.
+#[derive(Clone, Copy, Debug)]
+struct Tested {
+    /// The narrowed type: what the value is when the test passes.
+    narrowed: TyId,
+    /// The remainder: what the value is when the test fails; `None` if it
+    /// always passes.
+    remainder: Option<TyId>,
+    /// Whether the remainder is the whole of the value's type: whether no
+    /// member of it always passes.
+    whole: bool,
+    /// Whether the operand is marked to be awaited, which makes the value
+    /// tested another than the operand's.
+    awaited: bool,
+}
+
+/// The bindings an `if` whose condition narrows a variable gives its
+/// branches, and the slot they share. See the module documentation.
+#[derive(Clone, Copy, Debug, Default)]
+struct Narrowing {
+    /// The `then` branch's binding.
+    then: Option<Binding>,
+    /// The `else` branch's binding, if it has one.
+    else_: Option<Binding>,
+    /// The next free slot before the slot the bindings share was taken,
+    /// to which it goes back once the `if` is checked; `None` if the `if`
+    /// does not narrow.
+    next_slot: Option<u32>,
 }
 
 /// What an impure function's body is known to return at one position of
@@ -2302,6 +2566,8 @@ pub struct Checker<'a> {
     /// The parameter positions of the function types of `callbacks`, each
     /// callback's together, in the same order.
     callback_positions: Vec<CallbackPosition>,
+    /// See [`Resolution::test_of`].
+    tests: HashMap<ExprId, TestResolution>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -2381,6 +2647,7 @@ impl<'a> Checker<'a> {
             pending: Vec::new(),
             callbacks: Vec::new(),
             callback_positions: Vec::new(),
+            tests: HashMap::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -2409,20 +2676,15 @@ impl<'a> Checker<'a> {
         let types = &*self.types;
         let unsettled = |ty: TyId| types.contains_provisional(ty, None);
         if self.expr_types.iter().any(|&ty| {
-            unsettled(ty)
-                || match types.kind(ty) {
-                    TyKind::Error | TyKind::UntypedInt => true,
-                    TyKind::Union(_) => !types.is_deferrable(ty),
-                    _ => false,
-                }
+            unsettled(ty) || matches!(types.kind(ty), TyKind::Error | TyKind::UntypedInt)
         }) || self
             .fn_resolutions
             .iter()
             .any(|function| function.captures.iter().any(|&(_, ty)| unsettled(ty)))
         {
             let error = InternalError {
-                message: "a type table entry is untyped, erroneous, provisional or a union after \
-                          a successful check",
+                message: "a type table entry is untyped, erroneous or provisional after a \
+                          successful check",
                 span: self.ast.root_span(),
             };
             return Err(vec![error.into()]);
@@ -2468,6 +2730,7 @@ impl<'a> Checker<'a> {
                 functions: self.fn_resolutions,
                 arg_params: self.arg_params,
                 for_slots: self.for_slots,
+                tests: self.tests,
             },
         };
         let mut warnings = self.warnings;
@@ -2504,8 +2767,8 @@ impl<'a> Checker<'a> {
     /// it has none. With `expecting`, a record block is checked against the
     /// expected record type, and a block that is not one has its result
     /// checked against the expected type, which it does only for a list
-    /// type (see [`Checker::check_list_expected`]), and has the type its
-    /// result has once any await marked on it has run (see
+    /// type or a union (see [`Checker::check_list_expected`]), and has the
+    /// type its result has once any await marked on it has run (see
     /// [`Checker::fit`]).
     fn check_body(&mut self, body: ItemRange, expecting: Option<Expecting<'_>>) -> TyId {
         let items = self.ast.items(body);
@@ -3624,6 +3887,14 @@ impl<'a> Checker<'a> {
                 self.check_mutable_rebind(id, segments, (index, binding), value);
                 return;
             }
+            Some((_, binding)) if binding.kind == BindingKind::Narrowed => {
+                let error = narrowed_rebind_error(text, name_span, binding);
+                self.errors.push(error);
+                // Nothing is declared: the copy stands, so nothing cascades.
+                self.check_positions_alone(segments);
+                self.check_alone(value);
+                return;
+            }
             Some((index, binding)) if index >= self.block_start => Some((index, binding)),
             Some((index, binding)) => {
                 let error = self.enclosing_rebind_error(name_span, (index, binding));
@@ -4303,9 +4574,10 @@ impl<'a> Checker<'a> {
     fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
         let home = match binding.kind {
             BindingKind::Callee => VarRef::Callee,
-            BindingKind::Variable | BindingKind::Mutable | BindingKind::Field => {
-                VarRef::Local(binding.slot)
-            }
+            BindingKind::Variable
+            | BindingKind::Mutable
+            | BindingKind::Field
+            | BindingKind::Narrowed => VarRef::Local(binding.slot),
         };
         // The outermost function the binding is not in: every function from
         // there inwards must capture it.
@@ -4373,27 +4645,7 @@ impl<'a> Checker<'a> {
             TypeExprKind::Applied { name, span, arg } => {
                 self.resolve_applied((name, span), arg, mode)
             }
-            TypeExprKind::Union { lhs, rhs, bar } => {
-                let lhs = self.resolve_type(lhs, Bareness::Present);
-                let rhs = self.resolve_type(rhs, Bareness::Present);
-                if lhs == TyId::ERROR || rhs == TyId::ERROR {
-                    return TyId::ERROR;
-                }
-                let future_of = |future: TyId, of: TyId, types: &TypeTable| {
-                    types.kind(future) == &TyKind::Future(of)
-                };
-                if future_of(rhs, lhs, self.types) {
-                    self.types.deferrable(lhs)
-                } else if future_of(lhs, rhs, self.types) {
-                    self.types.deferrable(rhs)
-                } else {
-                    self.errors.push(Diagnostic::error(
-                        "unions other than `T | Future<T>` are not supported yet",
-                        bar,
-                    ));
-                    TyId::ERROR
-                }
-            }
+            TypeExprKind::Union { bar, .. } => self.resolve_union(id, bar, mode),
             TypeExprKind::Record(range) => {
                 let fields = self.ast.field_tys(range);
                 let base = self.sorted_fields.len();
@@ -4458,6 +4710,95 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The type the union written as `id`, whose last `|` is at `bar`,
+    /// denotes in `mode` (see the module documentation): its members are
+    /// the types the `|`s separate, at any depth of the written tree. If one
+    /// of them is written `Future<...>`, each is resolved with every bare
+    /// type present, and the union must be the either shape: exactly one
+    /// member a future, of the union of the others, which it is the either
+    /// shape of; anything else is "unions other than `T | Future<T>` are not
+    /// supported yet", at `bar`. Otherwise the union is bare: each member is
+    /// resolved in `mode`, the either shape the bare type rule gave a bare
+    /// member at its own position taken off it, and the union of the
+    /// members is what [`Checker::bare`] makes of it in `mode`. `Error` if a
+    /// member is erroneous.
+    fn resolve_union(&mut self, id: TypeExprId, bar: Span, mode: Bareness) -> TyId {
+        let mut written = Vec::new();
+        let mut pending = vec![id];
+        while let Some(member) = pending.pop() {
+            match self.ast.type_expr(member).kind {
+                TypeExprKind::Union { lhs, rhs, .. } => pending.extend([rhs, lhs]),
+                _ => written.push(member),
+            }
+        }
+        let explicit = written.iter().any(|&member| self.is_future(member));
+        let member_mode = if explicit { Bareness::Present } else { mode };
+        let mut members = Vec::with_capacity(written.len());
+        let mut erroneous = false;
+        for &member in &written {
+            let mut ty = self.resolve_type(member, member_mode);
+            if member_mode == Bareness::Either && self.is_bare(member) {
+                ty = self.types.strip(ty);
+            }
+            erroneous |= ty == TyId::ERROR;
+            members.push(ty);
+        }
+        if erroneous {
+            return TyId::ERROR;
+        }
+        let (lazy, present): (Vec<TyId>, Vec<TyId>) = members
+            .into_iter()
+            .partition(|&member| self.types.laziness(member) != Laziness::Present);
+        match *lazy.as_slice() {
+            [] => {
+                let union = self.types.union(present);
+                self.bare(union, mode)
+            }
+            [future] if !present.is_empty() => {
+                let union = self.types.union(present);
+                if self.types.kind(future) == &TyKind::Future(union) {
+                    self.types.deferrable(union)
+                } else {
+                    self.union_future_error(bar)
+                }
+            }
+            _ => self.union_future_error(bar),
+        }
+    }
+
+    /// Reports a union with a `Future` member that is not the either shape,
+    /// at its last `|`, `bar`, and returns `Error`.
+    fn union_future_error(&mut self, bar: Span) -> TyId {
+        self.errors.push(Diagnostic::error(
+            "a union with a `Future` member must be `T | Future<T>`",
+            bar,
+        ));
+        TyId::ERROR
+    }
+
+    /// Whether `ty` is written `Future<...>`.
+    fn is_future(&self, ty: TypeExprId) -> bool {
+        matches!(
+            self.ast.type_expr(ty).kind,
+            TypeExprKind::Applied { name, .. } if Some(name) == self.future_name
+        )
+    }
+
+    /// Whether the union written as `id` has a member written
+    /// `Future<...>`, at any depth of the written tree, which makes it say
+    /// what it is.
+    fn has_future_member(&self, id: TypeExprId) -> bool {
+        let mut pending = vec![id];
+        while let Some(member) = pending.pop() {
+            match self.ast.type_expr(member).kind {
+                TypeExprKind::Union { lhs, rhs, .. } => pending.extend([rhs, lhs]),
+                _ if self.is_future(member) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// What the type `ty`, written bare, means in `mode`: `ty` itself in
     /// `Present` mode, and its either shape in `Either` mode.
     fn bare(&mut self, ty: TyId, mode: Bareness) -> TyId {
@@ -4489,14 +4830,16 @@ impl<'a> Checker<'a> {
     }
 
     /// Whether a type written as `ty` is *bare*, so that the bare type rule
-    /// applies to it: a name, a record type or a list type, written
-    /// `List<T>` or `T[]`. Not `Present<...>`, `Future<...>`, a union or a
+    /// applies to it: a name, a record type, a list type, written `List<T>`
+    /// or `T[]`, or a union with no member written `Future<...>`. Not
+    /// `Present<...>`, `Future<...>`, a union with a `Future` member or a
     /// function type, which say what they are.
     fn is_bare(&self, ty: TypeExprId) -> bool {
         match self.ast.type_expr(ty).kind {
             TypeExprKind::Named(_) | TypeExprKind::Record(_) | TypeExprKind::List(_) => true,
             TypeExprKind::Applied { name, .. } => Some(name) == self.list_name,
-            TypeExprKind::Fn { .. } | TypeExprKind::Union { .. } => false,
+            TypeExprKind::Union { .. } => !self.has_future_member(ty),
+            TypeExprKind::Fn { .. } => false,
         }
     }
 
@@ -4593,14 +4936,13 @@ impl<'a> Checker<'a> {
             (TyId::UNTYPED_INT, TyId::INT | TyId::FLOAT) => self.coerce(expr, expected),
             // A literal is present, so it satisfies the either shape of its
             // type, `Int | Future<Int>`, as it would `Int`, and a provisional
-            // one, which stands for its present type as a supertype.
+            // one, which stands for its present type as a supertype; and a
+            // union with a numeric member, as that member.
             (TyId::UNTYPED_INT, _)
-                if matches!(
-                    self.types.laziness(expected),
-                    Laziness::Either | Laziness::Provisional
-                ) && matches!(self.types.strip(expected), TyId::INT | TyId::FLOAT) =>
+                if self.types.laziness(expected) != Laziness::Future
+                    && self.numeric_member(self.types.strip(expected)).is_some() =>
             {
-                let present = self.types.strip(expected);
+                let present = self.numeric_target(expected);
                 self.coerce(expr, present);
             }
             _ if self.types.is_subtype(found, expected) => {}
@@ -4751,8 +5093,10 @@ impl<'a> Checker<'a> {
     /// known callee of this input, `filling` being the callee's function
     /// and the parameter the argument fills, with a label at what kept the
     /// parameter from being narrowed, if that is the cause (see
-    /// [`Checker::narrowing_label`]); and with a note when a future is
-    /// expected and what is found is not one.
+    /// [`Checker::narrowing_label`]); with a note when a future is expected
+    /// and what is found is not one; and with the note saying to tell a
+    /// union's members apart when what is found is one (see
+    /// [`Checker::union_note`]).
     fn mismatch(
         &mut self,
         expr: ExprId,
@@ -4772,6 +5116,9 @@ impl<'a> Checker<'a> {
             .with_context(context, why);
         if let Some((span, label)) = narrowing {
             error = error.with_context(span, label);
+        }
+        if let Some(note) = self.union_note(expr, found) {
+            error = error.with_note(note);
         }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);
@@ -5181,10 +5528,9 @@ impl<'a> Checker<'a> {
         (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) -> TyId {
         // A record block is present, so it is checked against the present
-        // member of an either shape (or of a provisional type).
-        let record = self.types.strip(expected);
-        if self.types.laziness(expected) != Laziness::Future
-            && self.types.is_record(record)
+        // member of an either shape (or of a provisional type), or the one
+        // record member of a union.
+        if let Some(record) = self.expected_member(expected, ValueKind::Record)
             && let Some((block, body)) = self.record_block_within(id)
         {
             let span = self.ast.get(block).span;
@@ -5215,16 +5561,47 @@ impl<'a> Checker<'a> {
         found
     }
 
-    /// Whether a value where `expected` is expected is checked against a
-    /// list type (see [`Checker::check_list_expected`]): whether `expected`
-    /// is a list type, or its either shape (or a provisional one), but not
-    /// a future, which no list literal is.
+    /// Whether a value where `expected` is expected is checked against it
+    /// as [`Checker::check_list_expected`] says: whether `expected` is a
+    /// list type or a union, or the either shape of one (or a provisional
+    /// one), but not a future, which no list literal, block or `if` is.
     fn expects_list(&self, expected: TyId) -> bool {
-        self.types.laziness(expected) != Laziness::Future
-            && self
-                .types
-                .list_element(self.types.strip(expected))
-                .is_some()
+        if self.types.laziness(expected) == Laziness::Future {
+            return false;
+        }
+        let stripped = self.types.strip(expected);
+        self.types.list_element(stripped).is_some() || self.types.union_members(stripped).is_some()
+    }
+
+    /// The type a record block, for `kind` [`ValueKind::Record`], or a list
+    /// literal or a `for`, for [`ValueKind::List`], is checked against
+    /// where `expected` is expected: `expected` once stripped, if it is of
+    /// that kind, or the one member of that kind of the union it is once
+    /// stripped, if it has exactly one; `None` otherwise, and where
+    /// `expected` is a future, which no such value is.
+    fn expected_member(&self, expected: TyId, kind: ValueKind) -> Option<TyId> {
+        if self.types.laziness(expected) == Laziness::Future {
+            return None;
+        }
+        let stripped = self.types.strip(expected);
+        let of_kind = |ty: TyId| match kind {
+            ValueKind::Record => self.types.is_record(ty),
+            ValueKind::List => self.types.list_element(ty).is_some(),
+            _ => false,
+        };
+        if of_kind(stripped) {
+            return Some(stripped);
+        }
+        let mut members = self
+            .types
+            .union_members(stripped)?
+            .iter()
+            .copied()
+            .filter(|&member| of_kind(member));
+        match (members.next(), members.next()) {
+            (Some(member), None) => Some(member),
+            _ => None,
+        }
     }
 
     /// Whether `body`, a block's, has a result: whether it is not a record
@@ -5239,19 +5616,22 @@ impl<'a> Checker<'a> {
             })
     }
 
-    /// Where a value of type `expected`, a list type or its either shape,
-    /// is expected, as stated at `context`, labelled `why`: checks `id`
-    /// against it and returns the type it has, if `id` is, through any
-    /// parentheses, a list literal, a block with a result, an `if` with
-    /// `else` or a `for`, and `None`, having checked nothing, otherwise. The
-    /// type of a list literal is found as [`Checker::check_list_expecting`]
-    /// says, that of a `for` as [`Checker::check_for`] says, and that of a
-    /// block or an `if` is what its result, or each branch,
-    /// checked against `expected` in turn, is once any await marked on it
-    /// has run (see [`Checker::fit`]); it is recorded for `id` and every
-    /// parenthesis around it. So the expected type reaches a list literal
-    /// that is a function's body's result, a branch's, or either nested in
-    /// the other.
+    /// Where a value of type `expected`, a list type or a union, or the
+    /// either shape of one, is expected, as stated at `context`, labelled
+    /// `why`: checks `id` against it and returns the type it has, if `id`
+    /// is, through any parentheses, a list literal or a `for` and `expected`
+    /// has a list type to check it against (see
+    /// [`Checker::expected_member`]), a block with a result or an `if` with
+    /// `else`, and `None`, having checked nothing, otherwise. The type of a
+    /// list literal is found as [`Checker::check_list_expecting`] says,
+    /// that of a `for` as [`Checker::check_for`] says, and that of a block
+    /// or an `if` is what its result, or each branch, checked against
+    /// `expected` in turn, is once any await marked on it has run (see
+    /// [`Checker::fit`]); it is recorded for `id` and every parenthesis
+    /// around it. So the expected type reaches a list literal that is a
+    /// function's body's result, a branch's, or either nested in the other,
+    /// and each branch of an `if` that a union is expected of, so that
+    /// branches of different types make no join, and no warning.
     fn check_list_expected(
         &mut self,
         id: ExprId,
@@ -5265,7 +5645,18 @@ impl<'a> Checker<'a> {
         let expr = *self.ast.get(node);
         let ty = match expr.kind {
             ExprKind::List(elements) => {
-                self.check_list_expecting(elements, expected, (context, why))
+                // `[]` is a list of every type, so any of a union's lists.
+                let list = self
+                    .expected_member(expected, ValueKind::List)
+                    .or_else(|| {
+                        let members = self.types.union_members(self.types.strip(expected))?;
+                        let empty = self.ast.elements(elements).is_empty();
+                        members
+                            .iter()
+                            .copied()
+                            .find(|&member| empty && self.types.list_element(member).is_some())
+                    })?;
+                self.check_list_expecting(elements, list, (context, why))
             }
             ExprKind::Block(body) if self.has_result(body) => {
                 let expecting = Expecting::new(expected, (context, why), expr.span);
@@ -5278,32 +5669,30 @@ impl<'a> Checker<'a> {
                 has_else: true,
             } => {
                 let keyword = expr.keyword_span().unwrap_or(expr.span);
-                let cond_ty = self.check_expr(cond);
-                self.expect(
-                    cond,
-                    cond_ty,
-                    TyId::BOOL,
-                    keyword,
-                    "`if` conditions are Bool",
-                );
-                let then_ty = self.fit(then, expected, (context, why));
-                let else_ty = self.fit(else_, expected, (context, why));
+                let narrowing = self.if_condition(keyword, cond);
+                let expecting = Some((expected, (context, why)));
+                let then_ty = self.check_branch(then, narrowing.then, expecting);
+                let else_ty = self.check_branch(else_, narrowing.else_, expecting);
+                if let Some(next_slot) = narrowing.next_slot {
+                    self.next_slot = next_slot;
+                }
                 if then_ty == TyId::ERROR || else_ty == TyId::ERROR {
                     TyId::ERROR
                 } else {
                     // What the branches hold has a join that fits, or the
-                    // expected type describes both.
-                    self.types
-                        .join(then_ty, else_ty)
-                        .filter(|&joined| self.types.is_subtype(joined, expected))
-                        .unwrap_or(expected)
+                    // expected type describes both. Each branch fits what
+                    // is expected, so a widened join is no warning.
+                    let (joined, _) = self.types.join(then_ty, else_ty);
+                    if self.types.is_subtype(joined, expected) {
+                        joined
+                    } else {
+                        expected
+                    }
                 }
             }
             ExprKind::For(for_id) => {
-                let element = self
-                    .types
-                    .list_element(self.types.strip(expected))
-                    .unwrap_or(TyId::ERROR);
+                let list = self.expected_member(expected, ValueKind::List)?;
+                let element = self.types.list_element(list).unwrap_or(TyId::ERROR);
                 self.check_for(node, for_id, Some((element, (context, why))))
             }
             _ => return None,
@@ -5464,6 +5853,13 @@ impl<'a> Checker<'a> {
                     expected
                 }
             }
+            ExprKind::Is { expr: operand, ty } => match self.check_test(id, operand, ty, "is") {
+                Some(_) => TyId::BOOL,
+                None => TyId::ERROR,
+            },
+            ExprKind::As { expr: operand, ty } => self
+                .check_test(id, operand, ty, "as")
+                .map_or(TyId::ERROR, |tested| tested.narrowed),
             ExprKind::Fn(function) => self.check_fn(id, function),
             ExprKind::Call { callee, args } => self.check_call(id, callee, args),
             ExprKind::Lazy(function) => self.check_lazy(function),
@@ -5544,13 +5940,15 @@ impl<'a> Checker<'a> {
             _ => {
                 let shown = self.in_message(ty);
                 let label = format!("this is {}", self.in_label(ty));
-                self.errors.push(
-                    Diagnostic::error(
-                        format!("a range's bounds must be Int, found {shown}"),
-                        self.ast.get(bound).span,
-                    )
-                    .with_label(label),
-                );
+                let mut error = Diagnostic::error(
+                    format!("a range's bounds must be Int, found {shown}"),
+                    self.ast.get(bound).span,
+                )
+                .with_label(label);
+                if let Some(note) = self.union_note(bound, ty) {
+                    error = error.with_note(note);
+                }
+                self.errors.push(error);
                 false
             }
         }
@@ -5875,11 +6273,12 @@ impl<'a> Checker<'a> {
 
     /// Whether a pure function's parameter whose type is written as `ty` is
     /// inferred: present if the body measures it, the either shape if not.
-    /// So is one written bare, as a name, a record type or a list type (see
-    /// [`Checker::is_bare`]); not one written as `Present<...>` or
-    /// `Future<...>` or a union, which says what it is, nor as a function
-    /// type, which is never made the either shape at its own position (see
-    /// the module documentation).
+    /// So is one written bare, as a name, a record type, a list type or a
+    /// union with no `Future` member (see [`Checker::is_bare`]); not one
+    /// written as `Present<...>` or `Future<...>` or a union with a
+    /// `Future` member, which says what it is, nor as a function type,
+    /// which is never made the either shape at its own position (see the
+    /// module documentation).
     fn is_inferred(&self, ty: TypeExprId) -> bool {
         self.is_bare(ty)
     }
@@ -5887,8 +6286,9 @@ impl<'a> Checker<'a> {
     /// The inferred result of an impure function at the position of its
     /// result type written as `ty`, whose declared type is `declared`, where
     /// the body returns `value` (see the module documentation). A position
-    /// written bare, as a name, a record type or a list type, whose declared
-    /// type is therefore the either shape of a `T`, is `T` if the value is
+    /// written bare, as a name, a record type, a list type or a union with
+    /// no `Future` member, whose declared type is therefore the either
+    /// shape of a `T`, is `T` if the value is
     /// present, `Future<T>` if it is a future, and the either shape, as
     /// declared, if it may be either or is a provisional type; for a record
     /// type, `T` is the record of its declared fields, each inferred in turn
@@ -5904,7 +6304,9 @@ impl<'a> Checker<'a> {
     fn inferred(&mut self, ty: TypeExprId, declared: TyId, value: BodyValue) -> TyId {
         // The fields of a record type, or the element type of a list type.
         let (fields, element) = match self.ast.type_expr(ty).kind {
+            // A bare union is inferred at its top only, as a name is.
             TypeExprKind::Named(_) => (None, None),
+            TypeExprKind::Union { .. } if self.is_bare(ty) => (None, None),
             TypeExprKind::Record(fields) => (Some(fields), None),
             TypeExprKind::List(element) => (None, Some(element)),
             TypeExprKind::Applied { name, arg, .. } if Some(name) == self.list_name => {
@@ -6326,11 +6728,13 @@ impl<'a> Checker<'a> {
                 let callee_ty = self.settle(callee, callee_ty);
                 let message = format!("cannot call a value of type {}", self.in_message(callee_ty));
                 let label = format!("this is {}", self.in_label(callee_ty));
-                self.errors.push(
-                    Diagnostic::error(message, self.ast.get(id).span)
-                        .with_context(self.ast.get(callee).span, label)
-                        .with_note("only functions can be called"),
-                );
+                let mut error = Diagnostic::error(message, self.ast.get(id).span)
+                    .with_context(self.ast.get(callee).span, label)
+                    .with_note("only functions can be called");
+                if let Some(note) = self.union_note(callee, callee_ty) {
+                    error = error.with_note(note);
+                }
+                self.errors.push(error);
             }
             for arg in self.ast.args(args) {
                 self.check_alone(arg.value);
@@ -6441,9 +6845,9 @@ impl<'a> Checker<'a> {
     /// Types the call of `len`, the callee `callee`, whose argument is
     /// `list`: the argument is used as its bits at the top (see
     /// [`Checker::measure`]), its elements not at all, and must be a list,
-    /// "`len` takes a list, found T". The call is an `Int`, and the callee
-    /// a pure function from that list type to `Int`; `Error` if the
-    /// argument is not a list or is erroneous.
+    /// or a union of lists, "`len` takes a list, found T". The call is an
+    /// `Int`, and the callee a pure function from that type to `Int`;
+    /// `Error` if the argument is not a list or is erroneous.
     fn check_len(&mut self, callee: ExprId, list: ExprId) -> TyId {
         let found = self.check_expr(list);
         let found = self.settle(list, found);
@@ -6451,16 +6855,18 @@ impl<'a> Checker<'a> {
         if ty == TyId::ERROR {
             return TyId::ERROR;
         }
-        if self.types.list_element(ty).is_none() {
+        if self.element_of(ty).is_none() {
             let shown = self.in_message(ty);
             let label = format!("this is {}", self.in_label(ty));
-            self.errors.push(
-                Diagnostic::error(
-                    format!("`{}` takes a list, found {shown}", Builtin::Len.name()),
-                    self.ast.get(list).span,
-                )
-                .with_label(label),
-            );
+            let mut error = Diagnostic::error(
+                format!("`{}` takes a list, found {shown}", Builtin::Len.name()),
+                self.ast.get(list).span,
+            )
+            .with_label(label);
+            if let Some(note) = self.union_note(list, ty) {
+                error = error.with_note(note);
+            }
+            self.errors.push(error);
             return TyId::ERROR;
         }
         self.expr_types[callee.index()] =
@@ -7103,10 +7509,13 @@ impl<'a> Checker<'a> {
     }
 
     /// Types the field access `id`, reading field `name` of `record`, of
-    /// type `record_ty`: the field's type, as the record type declares it.
-    /// A record that may be a future is awaited at the top first. Reading a
-    /// field the record type lacks, or reading any field of a value that is
-    /// not a record, is reported at the `.NAME`.
+    /// type `record_ty`: the field's type, as the record type declares it,
+    /// or for a union of record types each with the field, the join of
+    /// theirs (see [`Checker::field_of`]). A record that may be a future is
+    /// awaited at the top first. Reading a field the record type lacks, or
+    /// reading any field of a value that is not a record, or of a union not
+    /// every member of which has the field, is reported at the `.NAME`, a
+    /// union's with the note saying to tell its members apart first.
     fn field_access(
         &mut self,
         id: ExprId,
@@ -7117,13 +7526,13 @@ impl<'a> Checker<'a> {
         if record_ty == TyId::ERROR {
             return TyId::ERROR;
         }
+        if let Some(ty) = self.field_of(record_ty, name) {
+            return ty;
+        }
         let expr = self.ast.get(id);
         let member = expr.member_span(self.ast).unwrap_or(expr.span);
         let text = FieldName(self.ast.names().get(name));
         if let Some(fields) = self.types.record_fields(record_ty) {
-            if let Some(ty) = self.types.field(record_ty, name) {
-                return ty;
-            }
             let note = self.field_list(fields);
             let message = format!("no field `{text}` in {}", self.in_message(record_ty));
             self.errors
@@ -7136,9 +7545,12 @@ impl<'a> Checker<'a> {
             self.in_message(record_ty)
         );
         let label = format!("this is {}", self.in_label(record_ty));
-        self.errors.push(
-            Diagnostic::error(message, member).with_context(self.ast.get(record).span, label),
-        );
+        let mut error =
+            Diagnostic::error(message, member).with_context(self.ast.get(record).span, label);
+        if let Some(note) = self.union_note(record, record_ty) {
+            error = error.with_note(note);
+        }
+        self.errors.push(error);
         TyId::ERROR
     }
 
@@ -7167,7 +7579,8 @@ impl<'a> Checker<'a> {
 
     /// Types an `if` whose keyword is at `keyword`: its condition must be
     /// `Bool`, and its branches agree (see [`Checker::branches`]) or, without
-    /// `else`, its block is `{}`.
+    /// `else`, its block is `{}`. A condition that narrows a variable gives
+    /// each branch its binding (see [`Checker::if_condition`]).
     fn check_if(
         &mut self,
         keyword: Span,
@@ -7175,20 +7588,332 @@ impl<'a> Checker<'a> {
         (then, else_): (ExprId, ExprId),
         has_else: bool,
     ) -> TyId {
-        let cond_ty = self.check_expr(cond);
-        self.expect(
-            cond,
-            cond_ty,
-            TyId::BOOL,
-            keyword,
-            "`if` conditions are Bool",
-        );
-        let then_ty = self.check_expr(then);
-        let else_ty = self.check_expr(else_);
+        let narrowing = self.if_condition(keyword, cond);
+        let then_ty = self.check_branch(then, narrowing.then, None);
+        let else_ty = self.check_branch(else_, narrowing.else_, None);
+        if let Some(next_slot) = narrowing.next_slot {
+            self.next_slot = next_slot;
+        }
         if has_else {
-            self.branches(keyword, (then, then_ty), (else_, else_ty))
+            self.branches((then, then_ty), (else_, else_ty))
         } else {
             self.empty_branch(keyword, then, then_ty)
+        }
+    }
+
+    /// Checks the condition `cond` of the `if` whose keyword is at
+    /// `keyword`, which must be `Bool`, and returns the bindings it gives
+    /// the branches. A condition that is, through any parentheses, `NAME is
+    /// TYPE`, NAME being, through any parentheses, a variable, a field, a
+    /// parameter or a `for`'s variable in scope, narrows it (see the module
+    /// documentation): the test's value is stored in a slot of its own,
+    /// taken here, and the `then` branch has a binding of NAME there of the
+    /// narrowed type, and the `else` branch one of the remainder, unless the
+    /// test always passes, or the remainder is the whole of the value's
+    /// type and the test awaits nothing. Any other condition narrows
+    /// nothing.
+    fn if_condition(&mut self, keyword: Span, cond: ExprId) -> Narrowing {
+        let Some((test, operand, ty, name)) = self.narrowing_test(cond) else {
+            let cond_ty = self.check_expr(cond);
+            self.expect(
+                cond,
+                cond_ty,
+                TyId::BOOL,
+                keyword,
+                "`if` conditions are Bool",
+            );
+            return Narrowing::default();
+        };
+        let tested = self.check_test(test, operand, ty, "is");
+        let cond_ty = if tested.is_some() {
+            TyId::BOOL
+        } else {
+            TyId::ERROR
+        };
+        let mut node = cond;
+        loop {
+            self.expr_types[node.index()] = cond_ty;
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                _ => break,
+            }
+        }
+        let Some(tested) = tested else {
+            return Narrowing::default();
+        };
+        let next_slot = self.next_slot;
+        let slot = Slot(next_slot);
+        self.next_slot = next_slot.saturating_add(1);
+        self.frame_size = self.frame_size.max(self.next_slot);
+        match self.slot_names.get_mut(slot.index()) {
+            Some(entry) => *entry = name,
+            None => self.slot_names.push(name),
+        }
+        if let Some(resolution) = self.tests.get_mut(&test) {
+            resolution.slot = slot;
+        }
+        // Declared by the test, where a rebind of it points.
+        let binding = |ty: TyId| Binding {
+            name,
+            slot,
+            ty,
+            declared: Some(self.ast.get(test).span),
+            kind: BindingKind::Narrowed,
+            function: None,
+            callback: None,
+        };
+        let else_ = match tested.remainder {
+            Some(remainder) if !tested.whole || tested.awaited => Some(binding(remainder)),
+            _ => None,
+        };
+        Narrowing {
+            then: Some(binding(tested.narrowed)),
+            else_,
+            next_slot: Some(next_slot),
+        }
+    }
+
+    /// If `cond`, an `if`'s condition, narrows a variable (see
+    /// [`Checker::if_condition`]): the `is` expression, its operand, its
+    /// type and the variable's name. `None` for every other condition.
+    fn narrowing_test(&self, cond: ExprId) -> Option<(ExprId, ExprId, TypeExprId, Name)> {
+        let mut test = cond;
+        while let ExprKind::Paren(inner) = self.ast.get(test).kind {
+            test = inner;
+        }
+        let ExprKind::Is { expr: operand, ty } = self.ast.get(test).kind else {
+            return None;
+        };
+        let mut node = operand;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        let ExprKind::Name(name) = self.ast.get(node).kind else {
+            return None;
+        };
+        let (_, binding) = self.lookup(name)?;
+        matches!(
+            binding.kind,
+            BindingKind::Variable
+                | BindingKind::Mutable
+                | BindingKind::Field
+                | BindingKind::Narrowed
+        )
+        .then_some((test, operand, ty, name))
+    }
+
+    /// Checks the branch `branch` of an `if`, with the narrowed binding
+    /// `narrowed`, if it has one, bound in a scope around it, as a `for`'s
+    /// variable is around its body, so that a `:=` of it in the branch
+    /// finds it and is rejected (see [`Checker::check_rebind`]). With
+    /// `expected`, the type the branch is expected to have,
+    /// with where that is stated and its label, it is checked against it
+    /// and has what it is once any await marked on it has run (see
+    /// [`Checker::fit`]); otherwise it is checked bottom-up.
+    fn check_branch(
+        &mut self,
+        branch: ExprId,
+        narrowed: Option<Binding>,
+        expected: Option<(TyId, (Span, &str))>,
+    ) -> TyId {
+        let Some(narrowed) = narrowed else {
+            return self.branch_type(branch, expected);
+        };
+        let start = self.bindings.len();
+        self.bind(narrowed);
+        let ty = self.branch_type(branch, expected);
+        self.bindings.truncate(start);
+        ty
+    }
+
+    /// Checks the branch `branch` of an `if` as [`Checker::check_branch`]
+    /// says, its narrowed binding, if any, being in place already.
+    fn branch_type(&mut self, branch: ExprId, expected: Option<(TyId, (Span, &str))>) -> TyId {
+        match expected {
+            Some((expected, context)) => self.fit(branch, expected, context),
+            None => self.check_expr(branch),
+        }
+    }
+
+    /// Types the `is` or `as`, as `keyword` says, expression `id`, testing
+    /// whether `operand` is of the type written `ty` (see the module
+    /// documentation): the type is resolved with every bare type present,
+    /// and may contain no future and no function type; the operand is
+    /// checked, an untyped integer settling to `Int`, and measured at the
+    /// top, or deeply if the test's plan walks into it (see
+    /// [`TypeTable::test_plan`]), subject to the purity rule. Each member of
+    /// the operand's type once measured, made present, *always passes* if
+    /// it is a subtype of the type tested, *may pass* if it does not but
+    /// overlaps it (see [`TypeTable::overlaps`]), and *cannot pass*
+    /// otherwise. If every member always passes, the test is `true`, which
+    /// is a warning; if none passes or may, it is the error "`x` is never a
+    /// String", at the type. Records the plan for lowering (see
+    /// [`Resolution::test_of`]). `None` if the type, the operand or the
+    /// test is erroneous.
+    fn check_test(
+        &mut self,
+        id: ExprId,
+        operand: ExprId,
+        ty: TypeExprId,
+        keyword: &str,
+    ) -> Option<Tested> {
+        let target = self.resolve_type(ty, Bareness::Present);
+        let found = self.check_expr(operand);
+        let found = self.settle(operand, found);
+        if target == TyId::ERROR || found == TyId::ERROR || !self.testable(target, ty, keyword) {
+            return None;
+        }
+        let present = self.types.present(found);
+        let present_members = self.flat_members(present);
+        let plan = self.types.test_plan(Some(&present_members), target);
+        let awaits = self.awaits[operand.index()];
+        let used = if plan.walks() {
+            self.measure_deep(operand, found)
+        } else {
+            self.measure(operand, found)
+        };
+        let awaited = self.awaits[operand.index()] != awaits;
+        let (mut always, mut rest, mut may) = (Vec::new(), Vec::new(), false);
+        for member in self.flat_members(used) {
+            let shown = self.types.present(member);
+            if self.types.is_subtype(shown, target) {
+                always.push(member);
+            } else {
+                may |= self.types.overlaps(shown, target);
+                rest.push(member);
+            }
+        }
+        if always.is_empty() && !may {
+            self.never_error((operand, ty), found, target);
+            return None;
+        }
+        let (all, whole) = (rest.is_empty(), always.is_empty());
+        if all {
+            self.always_warning(id, operand, target, keyword);
+        }
+        if may {
+            always.push(target);
+        }
+        let narrowed = self.types.union(always);
+        let remainder = (!all).then(|| self.types.union(rest));
+        let resolution = TestResolution {
+            test: if all { ValueTest::Pass } else { plan },
+            slot: Slot::NONE,
+            subject: self.subject(operand).into(),
+            target: self.with_article(target).into(),
+        };
+        self.tests.insert(id, resolution);
+        Some(Tested {
+            narrowed,
+            remainder,
+            whole,
+            awaited,
+        })
+    }
+
+    /// Whether `target`, the type written `ty` that the `is` or `as`, as
+    /// `keyword` says, tests for, can be tested: it holds no future, nor an
+    /// either shape, which "`is` cannot test a future" reports at the type,
+    /// and no function type, which "`is` cannot test a function type"
+    /// reports, since a function's signature is not something a value can
+    /// be asked for.
+    fn testable(&mut self, target: TyId, ty: TypeExprId, keyword: &str) -> bool {
+        let span = self.ast.type_expr(ty).span;
+        if self.types.present(target) != target {
+            self.errors.push(
+                Diagnostic::error(format!("`{keyword}` cannot test a future"), span)
+                    .with_note("await the value and test what it yields"),
+            );
+            return false;
+        }
+        if self.types.contains_fn(target) {
+            self.errors.push(
+                Diagnostic::error(format!("`{keyword}` cannot test a function type"), span)
+                    .with_note(
+                        "a function's signature is not something a value can be asked for; tell \
+                         a function apart by the other members, in the `else` branch",
+                    ),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Reports that no member of `found`, the type of `operand`, the
+    /// operand of an `is` or `as`, may be a `target`, the type written
+    /// `ty`: "`x` is never a String", at the type, labelled with the
+    /// operand's type at the operand.
+    fn never_error(&mut self, (operand, ty): (ExprId, TypeExprId), found: TyId, target: TyId) {
+        let message = format!(
+            "{} is never {}",
+            self.subject(operand),
+            self.with_article(target)
+        );
+        let label = format!("this is {}", self.in_label(found));
+        self.errors.push(
+            Diagnostic::error(message, self.ast.type_expr(ty).span)
+                .with_context(self.ast.get(operand).span, label),
+        );
+    }
+
+    /// Warns that every member of the operand's type of the `is` or `as`,
+    /// as `keyword` says, expression `id` is a `target`: for `is`, "`x` is
+    /// always an Int", since the test is `true`; for `as`, "`as` changes
+    /// nothing here: `x` is already an Int", with a note that an ascription
+    /// says the same without a test.
+    fn always_warning(&mut self, id: ExprId, operand: ExprId, target: TyId, keyword: &str) {
+        let (subject, target_text) = (self.subject(operand), self.with_article(target));
+        let span = self.ast.get(id).span;
+        let warning = if keyword == "as" {
+            let written = self.types.display(target, self.ast.names()).to_string();
+            Diagnostic::warning(
+                format!("`as` changes nothing here: {subject} is already {target_text}"),
+                span,
+            )
+            .with_note(format!("`: {written}` says the same without a test"))
+        } else {
+            Diagnostic::warning(format!("{subject} is always {target_text}"), span)
+        };
+        self.warnings.push(warning);
+    }
+
+    /// The operand `operand` of an `is` or `as` as its messages name it:
+    /// as written, in backticks, if it is a plain name or a dotted path, as
+    /// in "`x`", and "this value" otherwise.
+    fn subject(&self, operand: ExprId) -> String {
+        let mut node = operand;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        match self.path_text(node) {
+            Some(text) => format!("`{text}`"),
+            None => "this value".to_owned(),
+        }
+    }
+
+    /// Type `ty` as a message shows it (see [`Checker::in_message`]), after
+    /// its indefinite article: "an Int", "a String", "a `List<Int>`", "an
+    /// `Int | String`".
+    fn with_article(&mut self, ty: TyId) -> String {
+        let shown = self.in_message(ty);
+        let first = shown
+            .chars()
+            .find(char::is_ascii_alphanumeric)
+            .unwrap_or('x');
+        let starts_type = shown.trim_start_matches('`').starts_with(first);
+        let article = if starts_type && "AEIOUaeiou".contains(first) {
+            "an"
+        } else {
+            "a"
+        };
+        format!("{article} {shown}")
+    }
+
+    /// The members of `ty` if it is a union, and `ty` alone otherwise.
+    fn flat_members(&self, ty: TyId) -> Vec<TyId> {
+        match self.types.union_members(ty) {
+            Some(members) => members.to_vec(),
+            None => vec![ty],
         }
     }
 
@@ -7211,10 +7936,12 @@ impl<'a> Checker<'a> {
             UnaryOp::Neg => {
                 let message = format!("cannot {} {}", op.verb(), self.in_message(operand_ty));
                 let label = self.in_label(operand_ty);
-                self.errors.push(
-                    Diagnostic::error(message, op_span)
-                        .with_context(self.ast.get(operand).span, label),
-                );
+                let mut error = Diagnostic::error(message, op_span)
+                    .with_context(self.ast.get(operand).span, label);
+                if let Some(note) = self.union_note(operand, operand_ty) {
+                    error = error.with_note(note);
+                }
+                self.errors.push(error);
                 TyId::ERROR
             }
             UnaryOp::Not => {
@@ -7373,10 +8100,11 @@ impl<'a> Checker<'a> {
 
     /// Types a comparison. Both operands must be the same type, untyped
     /// operands adapting as for arithmetic and two untyped operands
-    /// settling to `Int`: any type without functions in it for `==`, `!=`,
-    /// `===` and `!==` (two records, or two lists, must be exactly the same
-    /// type), and `Int`, `Float` or `String` for ordering. The result is
-    /// `Bool`.
+    /// settling to `Int`: any type without functions in it for `===` and
+    /// `!==` (two records, two lists, or two unions, must be exactly the same
+    /// type), and any such type but a union for `==` and `!=`, a union being
+    /// "cannot compare `Int | String` with `==`", and `Int`, `Float` or
+    /// `String` for ordering. The result is `Bool`.
     fn comparison(
         &mut self,
         id: ExprId,
@@ -7393,6 +8121,7 @@ impl<'a> Checker<'a> {
                     || self.types.is_record(ty)
                     || self.types.list_element(ty).is_some()
                     || self.types.fn_sig(ty).is_some()
+                    || self.types.union_members(ty).is_some()
             });
             if let Some(unordered) = unordered {
                 self.coerce(lhs, TyId::INT);
@@ -7430,6 +8159,29 @@ impl<'a> Checker<'a> {
                 );
                 TyId::ERROR
             }
+            // Typed equality compares by the static type, which a union's
+            // value does not have.
+            Some(ty)
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne)
+                    && self.types.union_members(ty).is_some() =>
+            {
+                let (symbol, total) = if op == BinaryOp::Eq {
+                    ("==", "===")
+                } else {
+                    ("!=", "!==")
+                };
+                let message = format!("cannot compare {} with `{symbol}`", self.in_message(ty));
+                let label = format!("this is {}", self.in_label(ty));
+                let expr = self.ast.get(id);
+                let span = expr.operator_span().unwrap_or(expr.span);
+                self.errors.push(
+                    Diagnostic::error(message, span)
+                        .with_context(self.ast.get(lhs).span, label.as_str())
+                        .with_context(self.ast.get(rhs).span, label)
+                        .with_note(format!("narrow it, or compare with `{total}`")),
+                );
+                TyId::ERROR
+            }
             Some(_) => TyId::BOOL,
             None => {
                 let message = format!(
@@ -7445,9 +8197,9 @@ impl<'a> Checker<'a> {
     }
 
     /// Decides the common type of two expressions that must have the same
-    /// type: `Bool`, `String`, record, list and function types must match
-    /// exactly, and numeric types agree as for [`Checker::numeric`], whose
-    /// results this returns.
+    /// type: `Bool`, `String`, record, list and function types and unions
+    /// must match exactly, and numeric types agree as for
+    /// [`Checker::numeric`], whose results this returns.
     fn agree(
         &mut self,
         (lhs, lhs_ty): (ExprId, TyId),
@@ -7458,7 +8210,8 @@ impl<'a> Checker<'a> {
                 || lhs_ty == TyId::STRING
                 || self.types.is_record(lhs_ty)
                 || self.types.list_element(lhs_ty).is_some()
-                || self.types.fn_sig(lhs_ty).is_some())
+                || self.types.fn_sig(lhs_ty).is_some()
+                || self.types.union_members(lhs_ty).is_some())
         {
             Some(lhs_ty)
         } else {
@@ -7473,97 +8226,100 @@ impl<'a> Checker<'a> {
         self.expect(operand, ty, TyId::BOOL, op_span, &why);
     }
 
-    /// Types the branches of an `if` with `else`, whose keyword is at
-    /// `keyword`: two record branches, or two function branches, have their
-    /// join, and otherwise the branches must agree, untyped branches
-    /// adapting as operands of arithmetic do, and two untyped branches
-    /// leaving the `if` untyped.
+    /// Types the branches of an `if` with `else`: they have their join (see
+    /// [`TypeTable::join`]), an untyped branch first adapting to the other
+    /// branch's `Int` or `Float` once stripped, or settling to `Int`, and
+    /// two untyped branches leaving the `if` untyped. A join that is widened,
+    /// a union of what the branches are where they do not agree, is a
+    /// warning (see [`Checker::branches_widened`]).
     ///
     /// Two branches of the same type have it, a provisional type of the
     /// innermost function's included, so a parameter passes through an
     /// `if` unmeasured. Otherwise every parameter of the function whose
     /// provisional type is in either branch is measured, conservatively,
-    /// and the branches agree on their types with those parameters present.
+    /// and the branches join with those parameters present.
     fn branches(
         &mut self,
-        keyword: Span,
         (then, then_ty): (ExprId, TyId),
         (else_, else_ty): (ExprId, TyId),
     ) -> TyId {
-        let (then_ty, else_ty) = if then_ty == else_ty {
-            (then_ty, else_ty)
-        } else {
-            (self.claim(then, then_ty), self.claim(else_, else_ty))
-        };
-        let lazy = self.types.laziness(then_ty) != Laziness::Present
-            || self.types.laziness(else_ty) != Laziness::Present;
-        if lazy {
-            return self.lazy_branches(keyword, (then, then_ty), (else_, else_ty));
+        if then_ty == else_ty {
+            return then_ty;
         }
-        let joinable = (self.types.is_record(then_ty) && self.types.is_record(else_ty))
-            || (self.types.fn_sig(then_ty).is_some() && self.types.fn_sig(else_ty).is_some());
-        let common = if joinable {
-            self.types.join(then_ty, else_ty)
-        } else {
-            self.agree((then, then_ty), (else_, else_ty))
-        };
-        common.unwrap_or_else(|| self.branch_mismatch(keyword, (then, then_ty), (else_, else_ty)))
-    }
-
-    /// Types the branches of an `if` with `else`, whose keyword is at
-    /// `keyword`, when either may be a future: they have their join (see
-    /// [`TypeTable::join`]). An untyped branch first adapts to the other
-    /// branch's `Int` or `Float` once stripped, or settles to `Int`.
-    fn lazy_branches(
-        &mut self,
-        keyword: Span,
-        (then, then_ty): (ExprId, TyId),
-        (else_, else_ty): (ExprId, TyId),
-    ) -> TyId {
+        let (then_ty, else_ty) = (self.claim(then, then_ty), self.claim(else_, else_ty));
         let then_ty = self.adapt_to(then, then_ty, else_ty);
         let else_ty = self.adapt_to(else_, else_ty, then_ty);
-        if then_ty == TyId::ERROR || else_ty == TyId::ERROR {
-            return TyId::ERROR;
+        let (joined, widened) = self.types.join(then_ty, else_ty);
+        if widened {
+            self.branches_widened((then, then_ty), (else_, else_ty), joined);
         }
-        match self.types.join(then_ty, else_ty) {
-            Some(common) => common,
-            None => self.branch_mismatch(keyword, (then, then_ty), (else_, else_ty)),
+        joined
+    }
+
+    /// Warns that the branches of an `if`, `then` and `else_`, of types
+    /// `then_ty` and `else_ty`, have different types, which `joined`, the
+    /// `if`'s type, widened to a union of: at the `else` branch's value
+    /// (see [`Checker::branch_value`]), labelled with its type, with a label
+    /// of the other branch's on its value, and a note naming the union.
+    fn branches_widened(
+        &mut self,
+        (then, then_ty): (ExprId, TyId),
+        (else_, else_ty): (ExprId, TyId),
+        joined: TyId,
+    ) {
+        let then_label = format!("this is {}", self.in_label(then_ty));
+        let else_label = format!("this is {}", self.in_label(else_ty));
+        let note = format!(
+            "the `if` is {}; annotate it with that type if both are meant, or tell them apart \
+             with `is`",
+            self.in_message(joined)
+        );
+        let (then_at, else_at) = (self.branch_value(then), self.branch_value(else_));
+        self.warnings.push(
+            Diagnostic::warning(
+                "the branches of this `if` have different types",
+                self.ast.get(else_at).span,
+            )
+            .with_label(else_label)
+            .with_context(self.ast.get(then_at).span, then_label)
+            .with_note(note),
+        );
+    }
+
+    /// The expression that gives the value of `branch`, an `if`'s branch:
+    /// through any parentheses and blocks, each block's result, if it has
+    /// one; `branch` itself if it is not a block with a result.
+    fn branch_value(&self, branch: ExprId) -> ExprId {
+        let mut node = branch;
+        loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::Block(body) if self.has_result(body) => {
+                    match self
+                        .ast
+                        .items(body)
+                        .last()
+                        .map(|&last| self.ast.item(last).kind)
+                    {
+                        Some(ItemKind::Result(value) | ItemKind::Expr(value)) => node = value,
+                        _ => return node,
+                    }
+                }
+                _ => return node,
+            }
         }
     }
 
     /// The type of `expr`, of type `ty`, once an untyped integer in it
-    /// adapts to `other`, the type of the expression it must agree with:
-    /// to `Int` or `Float` if `other` stripped is one, and to `Int`
-    /// otherwise. Any other type is returned as it is.
+    /// adapts to `other`, the type of the expression it must agree with (see
+    /// [`Checker::numeric_target`]). Any other type is returned as it is.
     fn adapt_to(&mut self, expr: ExprId, ty: TyId, other: TyId) -> TyId {
         if ty != TyId::UNTYPED_INT {
             return ty;
         }
-        match self.types.strip(other) {
-            concrete @ (TyId::INT | TyId::FLOAT) => {
-                self.coerce(expr, concrete);
-                concrete
-            }
-            _ => self.settle(expr, ty),
-        }
-    }
-
-    /// Reports that the branches of the `if` whose keyword is at `keyword`
-    /// have no common type, and returns `Error`.
-    fn branch_mismatch(
-        &mut self,
-        keyword: Span,
-        (then, then_ty): (ExprId, TyId),
-        (else_, else_ty): (ExprId, TyId),
-    ) -> TyId {
-        let then_label = format!("this is {}", self.in_label(then_ty));
-        let else_label = format!("this is {}", self.in_label(else_ty));
-        self.errors.push(
-            Diagnostic::error("`if` branches have different types", keyword)
-                .with_context(self.ast.get(then).span, then_label)
-                .with_context(self.ast.get(else_).span, else_label),
-        );
-        TyId::ERROR
+        let target = self.numeric_target(other);
+        self.coerce(expr, target);
+        target
     }
 
     /// Types an `if` without `else`, whose keyword is at `keyword`: it is
@@ -7613,11 +8369,12 @@ impl<'a> Checker<'a> {
     /// checked, a spread's operand being measured and having to be a list,
     /// and the literal is the list of the join of the elements' types, in
     /// order, a spread contributing its list's element type, untyped
-    /// integers adapting as an `if`'s branches do. Two elements with no join
-    /// are "list elements have different types", at the first element that
-    /// does not join with those before it; and an empty literal has nothing
-    /// to join, "cannot infer the element type of `[]`". `Error` for either,
-    /// and for a literal with an erroneous element.
+    /// integers adapting as an `if`'s branches do. A join that is widened,
+    /// a union of element types that do not agree, is a warning, at the
+    /// first element whose type widens the join of those before it (see
+    /// [`Checker::elements_widened`]). An empty literal has nothing to join,
+    /// "cannot infer the element type of `[]`". `Error` for that, and for a
+    /// literal with an erroneous element.
     fn check_list(&mut self, id: ExprId, elements: ElementRange) -> TyId {
         let ast = self.ast;
         let list = ast.elements(elements);
@@ -7642,6 +8399,9 @@ impl<'a> Checker<'a> {
         }
         let mut joined = None;
         let mut failed = false;
+        // The first element that widens the join, with the two types it
+        // joined.
+        let mut widened = None;
         for (index, element) in list.iter().enumerate() {
             let ty = self
                 .element_types
@@ -7659,12 +8419,10 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let earlier = list.get(..index).unwrap_or_default();
-            match self.join_element((earlier, element.value), so_far, ty) {
-                Ok(ty) => joined = Some(ty),
-                Err((so_far, ty)) => {
-                    self.report_element_mismatch(list, index, so_far, ty);
-                    failed = true;
-                }
+            let (ty, widens, sides) = self.join_element((earlier, element.value), so_far, ty);
+            joined = Some(ty);
+            if widens && widened.is_none() {
+                widened = Some((index, sides));
             }
         }
         self.element_types.truncate(base);
@@ -7673,33 +8431,37 @@ impl<'a> Checker<'a> {
             let ty = self.expr_types[element.value.index()];
             self.settle(element.value, ty);
         }
-        match joined {
-            _ if failed => TyId::ERROR,
+        let ty = match joined {
+            _ if failed => return TyId::ERROR,
             Some(TyId::UNTYPED_INT) => self.types.list(TyId::INT),
             Some(element) => self.types.list(element),
-            None => TyId::ERROR,
+            None => return TyId::ERROR,
+        };
+        if let Some((index, sides)) = widened {
+            self.elements_widened(list, index, sides, ty);
         }
+        ty
     }
 
     /// The join of `so_far`, the join of the types of the elements
     /// `earlier` of a list literal, with `ty`, the type of the element after
     /// them, whose expression is `value`, a spread's being its list's
-    /// element type: `Ok` with the join, or `Err` with the two types as they
-    /// were joined if they have none. As for an `if`'s branches, an untyped
-    /// integer, or the untyped elements so far, adapt to the other side's
-    /// `Int` or `Float` once stripped, or to `Int`; and if the two types
-    /// differ, each parameter of a claimable function (see
-    /// [`Checker::claimable`]) whose provisional type is in either is
-    /// measured, conservatively, at the element.
+    /// element type: the join, whether it is widened, and the two types as
+    /// they were joined. As for an `if`'s branches, an untyped integer, or
+    /// the untyped elements so far, adapt to the other side's `Int` or
+    /// `Float` once stripped, or to `Int`; and if the two types differ, each
+    /// parameter of a claimable function (see [`Checker::claimable`]) whose
+    /// provisional type is in either is measured, conservatively, at the
+    /// element.
     fn join_element(
         &mut self,
         (earlier, value): (&[Element], ExprId),
         so_far: TyId,
         ty: TyId,
-    ) -> Result<TyId, (TyId, TyId)> {
+    ) -> (TyId, bool, (TyId, TyId)) {
         let (mut so_far, mut ty) = (so_far, ty);
         if so_far == TyId::UNTYPED_INT && ty == TyId::UNTYPED_INT {
-            return Ok(so_far);
+            return (so_far, false, (so_far, ty));
         }
         if so_far == TyId::UNTYPED_INT {
             so_far = self.numeric_target(ty);
@@ -7714,27 +8476,50 @@ impl<'a> Checker<'a> {
             self.coerce(value, ty);
         }
         if so_far == ty {
-            return Ok(ty);
+            return (ty, false, (so_far, ty));
         }
         let so_far = self.claim(value, so_far);
         let ty = self.claim(value, ty);
-        self.types.join(so_far, ty).ok_or((so_far, ty))
+        let (joined, widened) = self.types.join(so_far, ty);
+        (joined, widened, (so_far, ty))
     }
 
     /// The type an untyped integer adapts to where it must agree with a
     /// value of type `other`: `other`'s `Int` or `Float`, once stripped, or
-    /// `Int`.
+    /// its union's (`Int` if it has both), or `Int`.
     fn numeric_target(&self, other: TyId) -> TyId {
-        match self.types.strip(other) {
-            concrete @ (TyId::INT | TyId::FLOAT) => concrete,
-            _ => TyId::INT,
+        self.numeric_member(self.types.strip(other))
+            .unwrap_or(TyId::INT)
+    }
+
+    /// The numeric type of `ty`, a present type: `ty` itself if it is `Int`
+    /// or `Float`, and for a union its `Int` member if it has one and its
+    /// `Float` member otherwise; `None` if it has neither.
+    fn numeric_member(&self, ty: TyId) -> Option<TyId> {
+        match ty {
+            TyId::INT | TyId::FLOAT => Some(ty),
+            _ => {
+                let members = self.types.union_members(ty)?;
+                [TyId::INT, TyId::FLOAT]
+                    .into_iter()
+                    .find(|numeric| members.contains(numeric))
+            }
         }
     }
 
-    /// Reports that element number `index` of `list`, whose type (or, for a
-    /// spread, whose list's element type) is `ty`, has no join with the
-    /// type `so_far` of the elements before it.
-    fn report_element_mismatch(&mut self, list: &[Element], index: usize, so_far: TyId, ty: TyId) {
+    /// Warns that element number `index` of `list`, whose type (or, for a
+    /// spread, whose list's element type) is `ty`, does not agree with the
+    /// type `so_far` of the elements before it, the join of the two being
+    /// widened to a union, and the literal being of type `list_ty`: at the
+    /// element, labelled with its type, with a label of the elements' so
+    /// far on the first, and a note naming the list's type.
+    fn elements_widened(
+        &mut self,
+        list: &[Element],
+        index: usize,
+        (so_far, ty): (TyId, TyId),
+        list_ty: TyId,
+    ) {
         let (Some(first), Some(element)) = (list.first(), list.get(index)) else {
             return;
         };
@@ -7743,10 +8528,19 @@ impl<'a> Checker<'a> {
             None => format!("this is {}", self.in_label(ty)),
         };
         let context = format!("the elements so far are {}", self.in_label(so_far));
-        self.errors.push(
-            Diagnostic::error("list elements have different types", element.span(self.ast))
-                .with_label(label)
-                .with_context(first.span(self.ast), context),
+        let note = format!(
+            "the list is {}; annotate it with that type if both are meant, or tell them apart \
+             with `is`",
+            self.in_message(list_ty)
+        );
+        self.warnings.push(
+            Diagnostic::warning(
+                "the elements of this list have different types",
+                element.span(self.ast),
+            )
+            .with_label(label)
+            .with_context(first.span(self.ast), context)
+            .with_note(note),
         );
     }
 
@@ -7768,13 +8562,15 @@ impl<'a> Checker<'a> {
         let shown = self.in_message(ty);
         let label = format!("this is {}", self.in_label(ty));
         let span = self.ast.get(value).span;
-        self.errors.push(
-            Diagnostic::error(
-                format!("cannot spread a value of type {shown}: it is not a list"),
-                Span::join(spread, span),
-            )
-            .with_context(span, label),
-        );
+        let mut error = Diagnostic::error(
+            format!("cannot spread a value of type {shown}: it is not a list"),
+            Span::join(spread, span),
+        )
+        .with_context(span, label);
+        if let Some(note) = self.union_note(value, ty) {
+            error = error.with_note(note);
+        }
+        self.errors.push(error);
         None
     }
 
@@ -7818,10 +8614,12 @@ impl<'a> Checker<'a> {
             self.element_types.push(ty);
         }
         let end = self.element_types.len();
+        // Each element fits what is expected, so a widened join is no
+        // warning.
         let mut joined = self.element_types.get(base).copied();
         for at in base + 1..end {
             let value = self.element_types.get(at).copied().unwrap_or(TyId::ERROR);
-            joined = joined.and_then(|so_far| self.types.join(so_far, value));
+            joined = joined.map(|so_far| self.types.join(so_far, value).0);
         }
         let failed = self
             .element_types
@@ -7890,8 +8688,9 @@ impl<'a> Checker<'a> {
 
     /// Types the index `id`, reading the element of `list` at `index` (see
     /// the module documentation): the list is measured at the top, and must
-    /// be a list, "cannot index a value of type T: it is not a list",
-    /// reported at the `[INDEX]`; the position is measured, and must be an
+    /// be a list, or a union of lists (see [`Checker::element_of`]),
+    /// "cannot index a value of type T: it is not a list", reported at the
+    /// `[INDEX]`; the position is measured, and must be an
     /// `Int`, an untyped integer being one, "a list index must be an Int,
     /// found T". The index's type is the list's element type as it is, which
     /// may be a future or the either shape; `Error` if either is wrong.
@@ -7903,18 +8702,20 @@ impl<'a> Checker<'a> {
         if list_ty == TyId::ERROR {
             return TyId::ERROR;
         }
-        let Some(element) = self.types.list_element(list_ty) else {
+        let Some(element) = self.element_of(list_ty) else {
             let expr = self.ast.get(id);
             let brackets = expr.bracket_span(self.ast).unwrap_or(expr.span);
             let shown = self.in_message(list_ty);
             let label = format!("this is {}", self.in_label(list_ty));
-            self.errors.push(
-                Diagnostic::error(
-                    format!("cannot index a value of type {shown}: it is not a list"),
-                    brackets,
-                )
-                .with_context(self.ast.get(list).span, label),
-            );
+            let mut error = Diagnostic::error(
+                format!("cannot index a value of type {shown}: it is not a list"),
+                brackets,
+            )
+            .with_context(self.ast.get(list).span, label);
+            if let Some(note) = self.union_note(list, list_ty) {
+                error = error.with_note(note);
+            }
+            self.errors.push(error);
             return TyId::ERROR;
         };
         if index_fits { element } else { TyId::ERROR }
@@ -7939,13 +8740,15 @@ impl<'a> Checker<'a> {
             _ => {
                 let shown = self.in_message(index_ty);
                 let label = format!("this is {}", self.in_label(index_ty));
-                self.errors.push(
-                    Diagnostic::error(
-                        format!("a list index must be an Int, found {shown}"),
-                        self.ast.get(index).span,
-                    )
-                    .with_label(label),
-                );
+                let mut error = Diagnostic::error(
+                    format!("a list index must be an Int, found {shown}"),
+                    self.ast.get(index).span,
+                )
+                .with_label(label);
+                if let Some(note) = self.union_note(index, index_ty) {
+                    error = error.with_note(note);
+                }
+                self.errors.push(error);
                 false
             }
         }
@@ -8014,25 +8817,28 @@ impl<'a> Checker<'a> {
     }
 
     /// The element type of `ty`, the type of the iterable `iterable` of a
-    /// `for` once measured, or `Error`, having reported "cannot iterate over
-    /// a value of type T: it is not a list" if it is not a list, or if it is
-    /// erroneous.
+    /// `for` once measured, a list or a union of lists (see
+    /// [`Checker::element_of`]), or `Error`, having reported "cannot iterate
+    /// over a value of type T: it is not a list" if it is neither, or if it
+    /// is erroneous.
     fn iterated(&mut self, iterable: ExprId, ty: TyId) -> TyId {
         if ty == TyId::ERROR {
             return TyId::ERROR;
         }
-        if let Some(element) = self.types.list_element(ty) {
+        if let Some(element) = self.element_of(ty) {
             return element;
         }
         let shown = self.in_message(ty);
         let label = format!("this is {}", self.in_label(ty));
-        self.errors.push(
-            Diagnostic::error(
-                format!("cannot iterate over a value of type {shown}: it is not a list"),
-                self.ast.get(iterable).span,
-            )
-            .with_label(label),
-        );
+        let mut error = Diagnostic::error(
+            format!("cannot iterate over a value of type {shown}: it is not a list"),
+            self.ast.get(iterable).span,
+        )
+        .with_label(label);
+        if let Some(note) = self.union_note(iterable, ty) {
+            error = error.with_note(note);
+        }
+        self.errors.push(error);
         TyId::ERROR
     }
 
@@ -8064,7 +8870,9 @@ impl<'a> Checker<'a> {
     }
 
     /// Reports an operator rejecting its operands: the message points at the
-    /// operator, and each operand is labelled with its type.
+    /// operator, and each operand is labelled with its type; an operand that
+    /// is a union adds the note saying to tell its members apart first (see
+    /// [`Checker::union_note`]).
     fn operand_error(
         &mut self,
         id: ExprId,
@@ -8075,11 +8883,92 @@ impl<'a> Checker<'a> {
         let expr = self.ast.get(id);
         let span = expr.operator_span().unwrap_or(expr.span);
         let (lhs_label, rhs_label) = (self.in_label(lhs_ty), self.in_label(rhs_ty));
-        self.errors.push(
-            Diagnostic::error(message, span)
-                .with_context(self.ast.get(lhs).span, lhs_label)
-                .with_context(self.ast.get(rhs).span, rhs_label),
-        );
+        let mut error = Diagnostic::error(message, span)
+            .with_context(self.ast.get(lhs).span, lhs_label)
+            .with_context(self.ast.get(rhs).span, rhs_label);
+        for (operand, ty) in [(lhs, lhs_ty), (rhs, rhs_ty)] {
+            if let Some(note) = self.union_note(operand, ty)
+                && !error.notes.contains(&note)
+            {
+                error = error.with_note(note);
+            }
+        }
+        self.errors.push(error);
+    }
+
+    /// The note on an error where `operand`, of type `ty`, is used as one
+    /// particular type and is a union, once stripped: "tell them apart
+    /// first, as in `if x is Int { ... }`", naming the variable when
+    /// `operand` is one, through any parentheses, and the union's first
+    /// member as it shows it that `is` can test (one that is not a function
+    /// type); for a union of function types only, which `is` cannot tell
+    /// apart, a note saying to annotate the value with one function type
+    /// instead. `None` if `ty` is not a union.
+    fn union_note(&mut self, operand: ExprId, ty: TyId) -> Option<String> {
+        let ty = self.shown(ty);
+        let members = self.types.union_members(self.types.strip(ty))?.to_vec();
+        let mut node = operand;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        let name = match self.ast.get(node).kind {
+            ExprKind::Name(name) => self.ast.names().get(name),
+            _ => "x",
+        };
+        let example = self
+            .types
+            .shown_members(&members, self.ast.names())
+            .into_iter()
+            .find(|&(member, _)| self.types.fn_sig(member).is_none());
+        Some(match example {
+            Some((_, shown)) => {
+                format!("tell them apart first, as in `if {name} is {shown} {{ ... }}`")
+            }
+            None => "`is` cannot tell function types apart; annotate the value with one \
+                     function type that each of them fits"
+                .to_owned(),
+        })
+    }
+
+    /// The element type of `ty`, a type once measured, if it is a list type,
+    /// or a union whose members are all list types: the join of their
+    /// element types, which is no warning, since the union says the value
+    /// is any of them. `None` for any other type.
+    fn element_of(&mut self, ty: TyId) -> Option<TyId> {
+        if let Some(element) = self.types.list_element(ty) {
+            return Some(element);
+        }
+        let members = self.types.union_members(ty)?.to_vec();
+        let mut joined: Option<TyId> = None;
+        for member in members {
+            let element = self.types.list_element(member)?;
+            joined = Some(match joined {
+                Some(so_far) => self.types.join(so_far, element).0,
+                None => element,
+            });
+        }
+        joined
+    }
+
+    /// The type of field `name` of `ty`, a type once measured, if it is a
+    /// record type with that field, or a union whose members are all record
+    /// types with it: the join of their fields' types, which is no warning,
+    /// since the union says the value is any of them. `None` for any other
+    /// type.
+    fn field_of(&mut self, ty: TyId, name: Name) -> Option<TyId> {
+        if self.types.is_record(ty) {
+            return self.types.field(ty, name);
+        }
+        let members = self.types.union_members(ty)?.to_vec();
+        let mut joined: Option<TyId> = None;
+        for member in members {
+            let field = self.types.field(member, name)?;
+            joined = Some(match joined {
+                Some(so_far) => self.types.join(so_far, field).0,
+                None => field,
+            });
+        }
+        joined
     }
 
     /// Types `//` and `%`: both operands must be integers, and the result is
@@ -8147,6 +9036,8 @@ impl<'a> Checker<'a> {
             | ExprKind::Name(_)
             | ExprKind::Field { .. }
             | ExprKind::Ascribe { .. }
+            | ExprKind::Is { .. }
+            | ExprKind::As { .. }
             | ExprKind::Fn(_)
             | ExprKind::Call { .. }
             | ExprKind::Lazy(_)
@@ -8198,6 +9089,7 @@ impl<'a> Checker<'a> {
             | TyKind::List(_)
             | TyKind::Fn(_)
             | TyKind::Future(_)
+            | TyKind::Either(_)
             | TyKind::Union(_)
             | TyKind::Provisional { .. } => {
                 format!("`{shown}`")
@@ -8267,6 +9159,27 @@ fn leaf_label(segments: &[PathSegment]) -> &'static str {
         Some(SegmentKind::Index { .. }) => "`:=` keeps the element's type",
         _ => "`:=` keeps the field's type",
     }
+}
+
+/// The error for a `:=`, whose name `text` is at `name_span`, of
+/// `binding`, the copy of a variable that a branch of an `if NAME is TYPE`
+/// sees: "cannot rebind `x` here: it is narrowed by `is`", labelled at the
+/// test. Rebinding the copy would not change the variable it was copied
+/// from, a mutable one included, so the note says how to keep the variable
+/// free to rebind.
+fn narrowed_rebind_error(text: &str, name_span: Span, binding: Binding) -> Diagnostic {
+    let mut error = Diagnostic::error(
+        format!("cannot rebind `{text}` here: it is narrowed by `is`"),
+        name_span,
+    );
+    if let Some(declared) = binding.declared {
+        error = error.with_context(declared, "narrowed here");
+    }
+    error.with_note(format!(
+        "in this branch `{text}` is a copy of the value that was tested, so rebinding it would \
+         not change the variable; test a copy under another name instead, as in `let v = \
+         {text}` and `if v is ...`, which leaves `{text}` free to rebind"
+    ))
 }
 
 /// The note on a dotted path under a field, or a segment, defined whole.
@@ -9087,7 +10000,9 @@ mod tests {
                 ExprKind::Paren(inner)
                 | ExprKind::Unary { operand: inner, .. }
                 | ExprKind::Field { expr: inner, .. }
-                | ExprKind::Ascribe { expr: inner, .. } => visit(ast, inner, out),
+                | ExprKind::Ascribe { expr: inner, .. }
+                | ExprKind::Is { expr: inner, .. }
+                | ExprKind::As { expr: inner, .. } => visit(ast, inner, out),
                 ExprKind::If {
                     cond, then, else_, ..
                 } => {
@@ -9496,37 +10411,37 @@ mod tests {
         assert_eq!(result_type("if true { true } else { false }"), TyId::BOOL);
         assert_eq!(result_type("if true {} else {}"), TyId::EMPTY);
         assert_eq!(result_type("if true { 1.5 } else { 2.5 }"), TyId::FLOAT);
-        let diagnostic = &diagnostics("if true { 1 } else { \"a\" }")[0];
-        assert_eq!(diagnostic.message, "`if` branches have different types");
-        assert_eq!(diagnostic.span, Span::new(0, 2));
+        let diagnostic = &warnings("if true { 1 } else { \"a\" }")[0];
+        assert_eq!(
+            diagnostic.message,
+            "the branches of this `if` have different types"
+        );
+        assert_eq!(diagnostic.span, Span::new(21, 24));
+        assert_eq!(diagnostic.label.as_deref(), Some("this is String"));
+        assert_eq!(labels(diagnostic), vec![(Span::new(10, 11), "this is Int")]);
+        assert_eq!(
+            warnings("if true { 1.5 } else { 7 // 2 }")[0].message,
+            "the branches of this `if` have different types"
+        );
+        assert_eq!(
+            warnings("if true {} else { 1 }")[0].message,
+            "the branches of this `if` have different types"
+        );
+        // In an `else if`, the warning is on the nested `if`.
+        let diagnostic = &warnings("if true { 1.5 } else if false { true } else { false }")[0];
+        assert_eq!(diagnostic.span, Span::new(21, 53));
+        assert_eq!(diagnostic.label.as_deref(), Some("this is Bool"));
         assert_eq!(
             labels(diagnostic),
-            vec![
-                (Span::new(8, 13), "this is Int"),
-                (Span::new(19, 26), "this is String")
-            ]
+            vec![(Span::new(10, 13), "this is Float")]
         );
-        assert_eq!(
-            messages("if true { 1.5 } else { 7 // 2 }"),
-            vec!["`if` branches have different types"]
-        );
-        assert_eq!(
-            messages("if true {} else { 1 }"),
-            vec!["`if` branches have different types"]
-        );
-        // In an `else if`, the label is on the nested `if`.
-        let diagnostic = &diagnostics("if true { 1.5 } else if false { true } else { false }")[0];
-        assert_eq!(
-            labels(diagnostic),
-            vec![
-                (Span::new(8, 15), "this is Float"),
-                (Span::new(21, 53), "this is Bool")
-            ]
-        );
-        // A mismatch does not cascade.
+        // The union is misused, not the `if`.
         assert_eq!(
             messages("let x = if true { 1 } else { \"a\" }\nx + 1"),
-            vec!["`if` branches have different types"]
+            vec![
+                "the branches of this `if` have different types",
+                "cannot add `Int | String` and Int"
+            ]
         );
         assert_eq!(
             messages("if true { 1.0 // 2 } else { \"a\" }"),
@@ -10220,25 +11135,29 @@ mod tests {
             "{}"
         );
         assert_eq!(shown_result("if true { {} } else { { x = 1 } }"), "{}");
-        // A shared field whose types have no join is not shared.
+        // A shared field whose types have no join is kept, with their
+        // union.
         assert_eq!(
             shown_result("if true { { x = 1; y = 2 } } else { { x = 1.5; y = 3 } }"),
-            "{y: Int}"
+            "{x: Int | Float, y: Int}"
         );
         // Nested.
         assert_eq!(
             shown_result("if true { { a = { n = 1; m = 2 }; b = 1 } } else { { a = { n = 3 } } }"),
             "{a: {n: Int}}"
         );
-        // A record branch and a non-record branch mismatch.
-        let diagnostic = &diagnostics("if true { { x = 1 } } else { 1 }")[0];
-        assert_eq!(diagnostic.message, "`if` branches have different types");
+        // A record branch and a non-record branch make a union, and a
+        // warning.
+        let diagnostic = &warnings("if true { { x = 1 } } else { 1 }")[0];
+        assert_eq!(
+            diagnostic.message,
+            "the branches of this `if` have different types"
+        );
+        assert_eq!(diagnostic.span, Span::new(29, 30));
+        assert_eq!(diagnostic.label.as_deref(), Some("this is Int"));
         assert_eq!(
             labels(diagnostic),
-            vec![
-                (Span::new(8, 21), "this is {x: Int}"),
-                (Span::new(27, 32), "this is Int")
-            ]
+            vec![(Span::new(10, 19), "this is {x: Int}")]
         );
     }
 
@@ -11937,10 +12856,11 @@ mod tests {
             ),
             "fn(f: fn(Int | Future<Int>) -> Int | Future<Int>) -> Int | Future<Int>"
         );
-        // Unrelated parameter types have no join.
+        // Unrelated parameter types join to the union of the two.
         assert_eq!(
-            messages("if true { fn(a: Int): Int { a } } else { fn(a: String): Int { 1 } }"),
-            vec!["`if` branches have different types"]
+            warnings("if true { fn(a: Int): Int { a } } else { fn(a: String): Int { 1 } }")[0]
+                .message,
+            "the branches of this `if` have different types"
         );
         assert_eq!(
             shown_result(
@@ -11950,8 +12870,8 @@ mod tests {
             "fn(a: Int): {x: Int}"
         );
         assert_eq!(
-            messages("if true { fn(a: Int): Int { a } } else { fn(): Int { 1 } }"),
-            vec!["`if` branches have different types"]
+            warnings("if true { fn(a: Int): Int { a } } else { fn(): Int { 1 } }")[0].message,
+            "the branches of this `if` have different types"
         );
         // Annotations and ascriptions with function types.
         assert_eq!(
@@ -12186,7 +13106,7 @@ mod tests {
         assert_eq!(
             messages("let f: fn(): Int | Future<fn(): Int> = g"),
             vec![
-                "unions other than `T | Future<T>` are not supported yet",
+                "a union with a `Future` member must be `T | Future<T>`",
                 "undefined variable `g`"
             ]
         );
@@ -12677,7 +13597,6 @@ mod tests {
     #[test]
     fn unions_other_than_the_either_shape_are_rejected() {
         for (text, bar) in [
-            ("let x: Int | String = 1", 11),
             ("let x: Int | Future<Float> = 1", 11),
             ("let x: Future<Int> | Future<Int> = lazy 1", 19),
             ("let x: Int | Future<Int> | Future<Int> = 1", 25),
@@ -12685,7 +13604,7 @@ mod tests {
             let found = diagnostics(text);
             assert_eq!(found.len(), 1, "{text}");
             assert_eq!(
-                found[0].message, "unions other than `T | Future<T>` are not supported yet",
+                found[0].message, "a union with a `Future` member must be `T | Future<T>`",
                 "{text}"
             );
             assert_eq!(found[0].span, Span::new(bar, bar + 1), "{text}");
@@ -12809,15 +13728,18 @@ mod tests {
             "Future<{a: Int}>"
         );
         let text = "if true { lazy 1 } else { lazy \"s\" }";
-        let found = diagnostics(text);
-        assert_eq!(found[0].message, "`if` branches have different types");
+        let found = warnings(text);
+        assert_eq!(
+            found[0].message,
+            "the branches of this `if` have different types"
+        );
+        assert_eq!(found[0].span, at(text, "lazy \"s\""));
+        assert_eq!(found[0].label.as_deref(), Some("this is Future<String>"));
         assert_eq!(
             labels(&found[0]),
-            vec![
-                (at(text, "{ lazy 1 }"), "this is Future<Int>"),
-                (at(text, "{ lazy \"s\" }"), "this is Future<String>")
-            ]
+            vec![(at(text, "lazy 1"), "this is Future<Int>")]
         );
+        assert_eq!(shown_result(text), "Future<Int | String>");
         // An erroneous branch is reported once.
         assert_eq!(
             messages("if true { lazy 1 } else { nope }"),
@@ -14854,14 +15776,10 @@ mod tests {
             messages("let x: Lust<Int> = 1"),
             vec!["unknown type `Lust`"]
         );
-        // `[]` binds tighter than `|`: a future of a list, not an either.
-        let text = "let x: Int | Future<Int>[] = 1";
+        // `[]` binds tighter than `|`: a list of futures, not an either.
         assert_eq!(
-            errors(text),
-            vec![(
-                "unions other than `T | Future<T>` are not supported yet".to_owned(),
-                at(text, "|")
-            )]
+            shown_result("let x: Int | Future<Int>[] = 1\nx"),
+            "Int | List<Future<Int>>"
         );
     }
 
@@ -15036,10 +15954,13 @@ mod tests {
     #[test]
     fn list_elements_without_a_join_are_reported() {
         let text = "[1, 2, \"a\", 3]";
-        let found = diagnostics(text);
+        let found = warnings(text);
         assert_eq!(found.len(), 1, "{found:?}");
         let error = &found[0];
-        assert_eq!(error.message, "list elements have different types");
+        assert_eq!(
+            error.message,
+            "the elements of this list have different types"
+        );
         assert_eq!(error.span, at(text, "\"a\""));
         assert_eq!(error.label.as_deref(), Some("this is String"));
         assert_eq!(
@@ -15048,8 +15969,11 @@ mod tests {
         );
         // A spread is labelled with its elements' type.
         let text = "[1.5, ...[\"a\"]]";
-        let error = &diagnostics(text)[0];
-        assert_eq!(error.message, "list elements have different types");
+        let error = &warnings(text)[0];
+        assert_eq!(
+            error.message,
+            "the elements of this list have different types"
+        );
         assert_eq!(error.span, at(text, "...[\"a\"]"));
         assert_eq!(error.label.as_deref(), Some("its elements are String"));
         assert_eq!(
@@ -15057,10 +15981,11 @@ mod tests {
             vec![(at(text, "1.5"), "the elements so far are Float")]
         );
         // Records of any width join; functions whose parameters do not
-        // compare do not.
+        // compare join to their union.
+        let text = "[fn(x: {a: Int}): Int { 1 }, fn(x: {b: Int}): Int { 1 }]";
         assert_eq!(
-            messages("[fn(x: {a: Int}): Int { 1 }, fn(x: {b: Int}): Int { 1 }]"),
-            vec!["list elements have different types"]
+            warnings(text)[0].message,
+            "the elements of this list have different types"
         );
         // An erroneous element is not reported again.
         assert_eq!(messages("[1, y, \"a\"]"), vec!["undefined variable `y`"]);
@@ -17384,5 +18309,501 @@ mod tests {
         // A pure function's, present throughout.
         let text = "fn f(xs: Int[], x: Int): Int[] { let mut ys = xs\nys[0] := x\nys }";
         assert_eq!(type_of_f(text), "fn(xs: List<Int>, x: Int): List<Int>");
+    }
+
+    // ----- Unions -----
+
+    /// The message of each warning of `text`, which must check.
+    fn warning_messages(text: &str) -> Vec<String> {
+        warnings(text).into_iter().map(|w| w.message).collect()
+    }
+
+    #[test]
+    fn written_unions_are_accepted() {
+        assert_eq!(shown_result("let w: Int | String = 1\nw"), "Int | String");
+        assert_eq!(
+            shown_result("let w: {a: Int} | List<Int> | Bool = true\nw"),
+            "Bool | {a: Int} | List<Int>"
+        );
+        // A `Future` member makes it the either shape of the others.
+        assert_eq!(
+            shown_result("let w: Int | String | Future<String | Int> = 1\nw"),
+            "Int | String | Future<Int | String>"
+        );
+        assert_eq!(
+            shown_result("let w: Future<Int | String> | String | Int = 1\nw"),
+            "Int | String | Future<Int | String>"
+        );
+        // Anything else with a `Future` member is rejected, at the last `|`.
+        let text = "let w: Int | String | Future<Int> = 1";
+        assert_eq!(
+            errors(text),
+            vec![(
+                "a union with a `Future` member must be `T | Future<T>`".to_owned(),
+                last(text, "|")
+            )]
+        );
+    }
+
+    #[test]
+    fn unions_display_as_they_are_written_and_round_trip() {
+        for ty in [
+            "Int | String",
+            "Bool | {a: Int} | List<Int>",
+            "Int | (fn(): Int)",
+            "(fn(): Int) | (fn(): String)",
+            "Int | String | Future<Int | String>",
+            "List<Int | String>",
+            "{a: Int | String}",
+            "fn(Int | String): Int | String",
+            "Bool | (fn(): Int | String)",
+        ] {
+            let text = format!("let f = fn(x: Present<{ty}>): {{}} {{ }}\nf");
+            assert_eq!(shown_result(&text), format!("fn(x: {ty}): {{}}"), "{ty}");
+        }
+        // Written in any order, they show in one.
+        assert_eq!(
+            shown_result("let f = fn(x: Present<List<Int> | String | {a: Int}>): {} { }\nf"),
+            "fn(x: String | {a: Int} | List<Int>): {}"
+        );
+    }
+
+    #[test]
+    fn bare_unions_follow_the_bare_type_rule() {
+        // An impure function's parameter and result are the either shape of
+        // the union, each member's inside following the rule too.
+        assert_eq!(
+            type_of_f("fn f(v: Int | {a: Int}) -> Int { 1 }"),
+            "fn(v: Int | {a: Int | Future<Int>} | Future<Int | {a: Int | Future<Int>}>) -> Int"
+        );
+        // A memoised function's parameter is present; its result inferred.
+        assert_eq!(
+            type_of_f("fn f(v: Int | String) ->> Int | String { v }"),
+            "fn(v: Int | String) ->> Int | String"
+        );
+        // A pure function's parameter is inferred: present if measured, the
+        // either shape if passed through.
+        assert_eq!(
+            type_of_f("fn f(v: Int | String): Int { if v is Int { v } else { 0 } }"),
+            "fn(v: Int | String): Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(v: Int | String): {k: Int | String | Future<Int | String>} { k = v }"),
+            "fn(v: Int | String | Future<Int | String>): {k: Int | String | Future<Int | String>}"
+        );
+        // A function type member follows its own marker.
+        assert_eq!(
+            type_of_f("fn f(v: Int | fn(Int) -> Int) -> Int { 1 }"),
+            "fn(v: Int | (fn(Int | Future<Int>) -> Int | Future<Int>) | Future<Int | (fn(Int | \
+             Future<Int>) -> Int | Future<Int>)>) -> Int"
+        );
+        // The result of an impure function is inferred at its top.
+        assert_eq!(
+            type_of_f("fn f(c: Bool) -> Int | String { if c { 1 } else { \"a\" } }"),
+            "fn(c: Bool | Future<Bool>) -> Int | String"
+        );
+        assert_eq!(
+            type_of_f("fn f() -> Int | String { lazy 1 }"),
+            "fn() -> Future<Int | String>"
+        );
+    }
+
+    #[test]
+    fn a_widened_join_is_a_warning() {
+        let text = "let v = if true { 1 } else { \"one\" }\nv";
+        assert_eq!(shown_result(text), "Int | String");
+        let warning = &warnings(text)[0];
+        assert_eq!(warning.severity, Severity::Warning);
+        assert_eq!(
+            warning.notes,
+            vec![
+                "the `if` is `Int | String`; annotate it with that type if both are meant, or \
+                 tell them apart with `is`"
+            ]
+        );
+        // A join that finds a supertype is not widened.
+        assert!(warnings("if true { { a = 1; b = 2 } } else { { a = 3 } }").is_empty());
+        assert!(warnings("let u: Int | String = 1\nif true { u } else { 2 }").is_empty());
+        // Literals adapt before the join.
+        assert!(warnings("if true { 1 } else { 2.5 }").is_empty());
+        assert_eq!(result_type("if true { 1 } else { 2.5 }"), TyId::FLOAT);
+        // Lists: the elements, with the type the list has.
+        let text = "let xs = [1, \"a\", true]\nxs";
+        assert_eq!(shown_result(text), "List<Int | Bool | String>");
+        let found = warnings(text);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span, at(text, "\"a\""));
+        assert_eq!(
+            found[0].notes,
+            vec![
+                "the list is `List<Int | Bool | String>`; annotate it with that type if both \
+                 are meant, or tell them apart with `is`"
+            ]
+        );
+        // Inside: a record field the branches disagree on.
+        let text = "if true { { a = 1; b = 2 } } else { { a = \"x\" } }";
+        assert_eq!(shown_result(text), "{a: Int | String}");
+        assert_eq!(warning_messages(text).len(), 1);
+    }
+
+    #[test]
+    fn an_expected_union_makes_no_join() {
+        for text in [
+            "let w: Int | String = if true { 1 } else { \"one\" }",
+            "let w = (if true { 1 } else { \"one\" }) : Int | String",
+            "fn f(v: Int | String): Int { 1 }\nf(if true { 1 } else { \"one\" })",
+            "fn f(c: Bool): Int | String { if c { 1 } else { \"one\" } }",
+            "let r: {a: Int | String} = { a = if true { 1 } else { \"one\" } }",
+            "let w: Int | String = { let c = true\nif c { 1 } else { \"one\" } }",
+            "let xs: List<Int | String> = [1, \"one\", if true { 2 } else { \"two\" }]",
+            "let w: List<Int | String> | Bool = [1, \"one\"]",
+        ] {
+            assert!(warnings(text).is_empty(), "{text}: {:?}", warnings(text));
+        }
+        // Literals adapt to a union's numeric member.
+        let text = "let w: Float | String = 1\nw";
+        assert_eq!(shown_result(text), "Float | String");
+        assert_eq!(all_types(text)[0], TyId::FLOAT);
+        // A record block is checked against a union's one record member.
+        assert_eq!(
+            messages("let w: {a: Int} | String = { b = 1 }"),
+            vec![
+                "field `b` is not in `{a: Int}`",
+                "missing field `a` in record"
+            ]
+        );
+        // An annotation the value does not fit is still an error.
+        assert_eq!(
+            messages("let w: Int | String = true"),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn a_misused_union_is_an_error_with_a_note() {
+        let note = "tell them apart first, as in `if v is Int { ... }`";
+        let union = "let v: Int | String = 1\n";
+        for (rest, message) in [
+            ("v + 1", "cannot add `Int | String` and Int"),
+            ("v < 1", "cannot order `Int | String`"),
+            ("-v", "cannot negate `Int | String`"),
+            ("if v { 1 } else { 2 }", "mismatched types"),
+            (
+                "[1, 2][v]",
+                "a list index must be an Int, found `Int | String`",
+            ),
+            ("v..3", "a range's bounds must be Int, found `Int | String`"),
+            ("v.a", "cannot access field `a` of `Int | String`"),
+            (
+                "v[0]",
+                "cannot index a value of type `Int | String`: it is not a list",
+            ),
+            (
+                "for x in v { x }",
+                "cannot iterate over a value of type `Int | String`: it is not a list",
+            ),
+            ("len(v)", "`len` takes a list, found `Int | String`"),
+            ("v(1)", "cannot call a value of type `Int | String`"),
+            ("v and true", "mismatched types"),
+        ] {
+            let text = format!("{union}{rest}");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(found[0].message, message, "{text}");
+            assert!(
+                found[0].notes.iter().any(|n| n == note),
+                "{text}: {:?}",
+                found[0].notes
+            );
+        }
+        // Not a variable: a placeholder name.
+        let found = diagnostics("fn f(): Int | String { 1 }\nf() + 1");
+        assert_eq!(
+            found[0].notes,
+            vec!["tell them apart first, as in `if x is Int { ... }`"]
+        );
+        // Functions alone cannot be told apart.
+        let found =
+            diagnostics("let g = if true { fn(a: Int): Int { a } } else { fn(): Int { 1 } }\ng(1)");
+        assert_eq!(
+            found
+                .iter()
+                .find(|d| d.severity == Severity::Error)
+                .map(|d| d.notes.clone()),
+            Some(vec![
+                "only functions can be called".to_owned(),
+                "`is` cannot tell function types apart; annotate the value with one function \
+                 type that each of them fits"
+                    .to_owned()
+            ])
+        );
+        // `==` needs one type that is not a union; `===` compares values.
+        let found = diagnostics(&format!("{union}v == v"));
+        assert_eq!(found[0].message, "cannot compare `Int | String` with `==`");
+        assert_eq!(found[0].notes, vec!["narrow it, or compare with `===`"]);
+        assert_eq!(result_type(&format!("{union}v === v")), TyId::BOOL);
+        assert_eq!(result_type(&format!("{union}v !== v")), TyId::BOOL);
+        // Interpolation shows any value.
+        assert_eq!(result_type(&format!("{union}\"{{v}}\"")), TyId::STRING);
+    }
+
+    #[test]
+    fn records_and_lists_of_unions_are_used_as_their_members_agree() {
+        // A field every member has: the join of its types, no warning.
+        let text = "let r: {a: Int, b: Int} | {a: String} = { a = 1; b = 2 }\nr.a";
+        assert_eq!(shown_result(text), "Int | String");
+        assert!(warnings(text).is_empty());
+        let found = diagnostics("let r: {a: Int} | {b: Int} = { a = 1 }\nr.b");
+        assert_eq!(
+            found[0].message,
+            "cannot access field `b` of `{a: Int} | {b: Int}`"
+        );
+        assert_eq!(
+            found[0].notes,
+            vec!["tell them apart first, as in `if r is {a: Int} { ... }`"]
+        );
+        // Indexing, iterating and `len` of a union of lists.
+        let lists = "let xs: List<Int> | List<String> = [1]\n";
+        assert_eq!(shown_result(&format!("{lists}xs[0]")), "Int | String");
+        assert_eq!(
+            shown_result(&format!("{lists}for x in xs {{ x }}")),
+            "List<Int | String>"
+        );
+        assert_eq!(result_type(&format!("{lists}len(xs)")), TyId::INT);
+    }
+
+    #[test]
+    fn is_tests_a_type() {
+        let union = "let v: Int | List<Int> = 1\n";
+        assert_eq!(result_type(&format!("{union}v is Int")), TyId::BOOL);
+        assert!(warnings(&format!("{union}v is List<Int>")).is_empty());
+        // A test that always passes is a warning.
+        let text = "let n = 1\nn is Int";
+        let found = warnings(text);
+        assert_eq!(found[0].message, "`n` is always an Int");
+        assert_eq!(found[0].span, at(text, "n is Int"));
+        let found = warnings("let r = { a = 1 }\n(r) is {}");
+        assert_eq!(found[0].message, "`r` is always a `{}`");
+        // One that cannot is an error, at the type.
+        let text = format!("{union}v is String");
+        let found = diagnostics(&text);
+        assert_eq!(found[0].message, "`v` is never a String");
+        assert_eq!(found[0].span, last(&text, "String"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(last(&text, "v"), "this is Int | List<Int>")]
+        );
+        assert_eq!(messages("[1, 2] is {}"), vec!["this value is never a `{}`"]);
+        // Width: `{}` may be any member record.
+        assert!(warnings("let x: Int | {a: Int} = 1\nx is {}").is_empty());
+        // A member that overlaps the type may pass, though neither is a
+        // subtype of the other.
+        let text = "let x: {kind: String, value: Int | String} = { kind = \"n\"; value = 1 }\n\
+                    x is {value: Int}";
+        assert_eq!(result_type(text), TyId::BOOL);
+        // Futures and function types cannot be tested.
+        let found = diagnostics(&format!("{union}v is Future<Int>"));
+        assert_eq!(found[0].message, "`is` cannot test a future");
+        let found = diagnostics(&format!("{union}v is {{a: Int | Future<Int>}}"));
+        assert_eq!(found[0].message, "`is` cannot test a future");
+        let found = diagnostics(&format!("{union}v is fn(): Int"));
+        assert_eq!(found[0].message, "`is` cannot test a function type");
+        assert_eq!(
+            messages(&format!("{union}v is Nope")),
+            vec!["unknown type `Nope`"]
+        );
+    }
+
+    #[test]
+    fn is_awaits_as_deep_as_its_plan_looks() {
+        // At the top, for a test of the kind alone.
+        assert_eq!(
+            marks(
+                "let x: List<Int | Future<Int>> | Int | Future<List<Int | Future<Int>> | Int> = 1\n\
+                 x is Int"
+            ),
+            vec![("x", AwaitMark::Top)]
+        );
+        // Deeply, for one that looks at the elements.
+        assert_eq!(
+            marks("let x: List<Int | Future<Int>> | List<String> = []\nx is List<Int>"),
+            vec![("x", AwaitMark::Deep)]
+        );
+        // In a pure function, an await is the purity error; a parameter is
+        // measured instead.
+        let text = "fn f(): Bool { let l: Int | String | Future<Int | String> = 1\nl is Int }";
+        assert_eq!(
+            messages(text),
+            vec!["cannot use a value that may be a future in a pure function"]
+        );
+        assert_eq!(
+            type_of_f("fn f(v: Int | String): Bool { v is Int }"),
+            "fn(v: Int | String): Bool"
+        );
+        assert_eq!(
+            demands("fn f(v: Int | String): Bool { v is Int }", 0),
+            vec![Some("v")]
+        );
+    }
+
+    #[test]
+    fn as_narrows_with_a_check() {
+        let union = "let v: Int | String = 1\n";
+        assert_eq!(result_type(&format!("{union}v as Int")), TyId::INT);
+        // As precise as the value's type allows.
+        assert_eq!(
+            shown_result("let r: {a: Int, b: Int} | String = \"s\"\nr as {a: Int}"),
+            "{a: Int, b: Int}"
+        );
+        let found = warnings("let n = 1\nn as Int");
+        assert_eq!(
+            found[0].message,
+            "`as` changes nothing here: `n` is already an Int"
+        );
+        assert_eq!(found[0].notes, vec!["`: Int` says the same without a test"]);
+        assert_eq!(
+            messages(&format!("{union}v as Bool")),
+            vec!["`v` is never a Bool"]
+        );
+        let found = diagnostics(&format!("{union}v as Future<Int>"));
+        assert_eq!(found[0].message, "`as` cannot test a future");
+        // It is pure, where its operand needs no await.
+        assert_eq!(
+            type_of_f("fn f(v: Int | String): Int { v as Int }"),
+            "fn(v: Int | String): Int"
+        );
+        // Its resolution names what it tests.
+        let (ast, resolution) = resolved(&format!("{union}v as Int"));
+        let id = result_expr(&ast);
+        let test = resolution.test_of(id).unwrap();
+        assert_eq!(&*test.subject, "`v`");
+        assert_eq!(&*test.target, "an Int");
+        assert_eq!(test.test, ValueTest::Kind(ValueKind::Int));
+        assert_eq!(test.slot, Slot::NONE);
+    }
+
+    #[test]
+    fn an_if_narrows_its_branches() {
+        let text = "let v: Int | String = 1\nif v is Int { v + 1 } else { len([v]) }";
+        assert_eq!(type_at(text, nth(text, "v", 2)), "Int");
+        assert_eq!(type_at(text, nth(text, "v", 3)), "String");
+        // The branches read a slot of their own, which the test writes.
+        let (ast, resolution) = resolved(text);
+        let uses = uses(&ast, &resolution, "v");
+        assert_eq!(
+            uses,
+            vec![
+                VarRef::Local(Slot(0)),
+                VarRef::Local(Slot(1)),
+                VarRef::Local(Slot(1))
+            ]
+        );
+        // `else if` narrows the remainder in turn.
+        let text = "let v: Int | String | Bool = 1\n\
+                    if v is Int { 0 } else if v is String { len([v]) } else { if v { 1 } else { 2 } }";
+        assert_eq!(type_at(text, nth(text, "v", 3)), "String");
+        assert_eq!(type_at(text, nth(text, "v", 4)), "Bool");
+        // A mutable variable, a parameter, a field and a `for`'s variable:
+        // the use in the `then` branch, `{ n }`.
+        let inside = |text: &str| {
+            let block = at(text, "{ n }");
+            Span::new(block.start + 2, block.start + 3)
+        };
+        for text in [
+            "let mut n: Int | String = 1\nif n is Int { n } else { 0 }",
+            "fn f(n: Int | String): Int { if n is Int { n } else { 0 } }",
+            "{ n = if true { 1 } else { \"s\" }; b = if n is Int { n } else { 0 } }",
+            "let ns: List<Int | String> = []\nfor n in ns { if n is Int { n } else { 0 } }",
+        ] {
+            assert_eq!(type_at(text, inside(text)), "Int", "{text}");
+        }
+        // The `else` branch keeps the variable when nothing always passes
+        // and nothing was awaited, so a mutable variable is still one.
+        let text = "let mut w: {a: Int} | String = \"s\"\n\
+                    if w is {a: Int, b: Int} { 0 } else { w := \"t\"\n0 }";
+        assert!(diagnostics_or_none(text).is_empty());
+        // Where a member always passes, it is a copy of the remainder
+        // there, which `:=` may not rebind, in either branch, at any depth,
+        // by a plain or a dotted path: it would not change the variable.
+        for text in [
+            "let mut w: Int | String = 1\nif w is Int { 0 } else { w := \"t\"\n0 }",
+            "let mut w: Int | String = 1\nif w is Int { w := 2\n0 } else { 0 }",
+            "let mut w: Int | String = 1\nif w is Int { for i in 0..2 { w := i }\n0 } else { 0 }",
+            "let w: Int | String = 1\nif w is Int { w := 2\n0 } else { 0 }",
+            "let mut w: {a: Int} | String = \"s\"\nif w is String { 0 } else { w.a := 2\n0 }",
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}");
+            assert_eq!(
+                found[0].message, "cannot rebind `w` here: it is narrowed by `is`",
+                "{text}"
+            );
+            let narrowing = if text.contains("w is Int") {
+                at(text, "w is Int")
+            } else {
+                at(text, "w is String")
+            };
+            assert_eq!(
+                labels(&found[0]),
+                vec![(narrowing, "narrowed here")],
+                "{text}"
+            );
+            assert_eq!(
+                found[0].notes,
+                vec![
+                    "in this branch `w` is a copy of the value that was tested, so rebinding it \
+                     would not change the variable; test a copy under another name instead, as \
+                     in `let v = w` and `if v is ...`, which leaves `w` free to rebind"
+                ],
+                "{text}"
+            );
+        }
+        // Tested under another name, the variable is free to rebind, and a
+        // `let` in the branch shadows the copy as any `let` does.
+        for text in [
+            "let mut w: Int | String = 1\nlet v = w\nif v is Int { w := v + 1 }",
+            "let w: Int | String = 1\nif w is Int { let w = w + 1\nw } else { 0 }",
+        ] {
+            assert!(diagnostics_or_none(text).is_empty(), "{text}");
+        }
+        // ...and has the remainder when the test awaited the value.
+        let text = "let q: Int | String | Future<Int | String> = 1\nif q is Int { q } else { q }";
+        assert_eq!(type_at(text, nth(text, "q", 2)), "Int");
+        assert_eq!(type_at(text, nth(text, "q", 3)), "String");
+        // Through parentheses.
+        let text = "let v: Int | String = 1\nif ((v) is Int) { v } else { 0 }";
+        assert_eq!(type_at(text, nth(text, "v", 2)), "Int");
+    }
+
+    #[test]
+    fn other_conditions_narrow_nothing() {
+        let union = "let v: Int | String = 1\nlet r = { a = v }\n";
+        for rest in [
+            "if v is Int and true { v + 1 } else { 0 }",
+            "if not (v is Int) { 0 } else { v + 1 }",
+            "if r.a is Int { r.a + 1 } else { 0 }",
+        ] {
+            let found = diagnostics(&format!("{union}{rest}"));
+            assert!(
+                found.iter().any(|d| d.severity == Severity::Error),
+                "{rest}: {found:?}"
+            );
+        }
+        // Nothing narrows after the `if`.
+        let text = format!("{union}let n = if v is Int {{ v }} else {{ 0 }}\nv + 1");
+        assert_eq!(messages(&text), vec!["cannot add `Int | String` and Int"]);
+    }
+
+    #[test]
+    fn a_union_of_functions_narrowed_in_else_is_called() {
+        let text = "let g: Int | fn(): Int = fn(): Int { 7 }\nif g is Int { g } else { g() }";
+        assert_eq!(result_type(text), TyId::INT);
+    }
+
+    /// The diagnostics of `text`, or none if it checks.
+    fn diagnostics_or_none(text: &str) -> Vec<Diagnostic> {
+        check(&parse_text(text), &mut TypeTable::new())
+            .err()
+            .unwrap_or_default()
     }
 }
