@@ -24,12 +24,14 @@
 //! with an ASCII letter or `_` and continues with ASCII letters, digits and
 //! `_`, and with `-` when the `-` is directly followed by one of those:
 //! `hello-world` and `x-1` are single names. The keywords are `let`, `mut`,
-//! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `lazy`,
+//! `if`, `else`, `true`, `false`, `and`, `or`, `not`, `fn`, `def`, `lazy`,
 //! `await`, `for`, `do`, `break`, `continue`, `return`, `in`, `is` and
 //! `as`; the whole identifier is scanned before it is compared with them,
-//! so `fn-x`, `lazy-x`, `await-x`, `for-x`, `do-x`, `break-x`, `return-x`,
-//! `mut-x` and `is-x` are identifiers. So no variable or unquoted field can
-//! be named `do`, `break`, `continue` or `return`. A *label*,
+//! so `fn-x`, `def-x`, `lazy-x`, `await-x`, `for-x`, `do-x`, `break-x`,
+//! `return-x`, `mut-x` and `is-x` are identifiers. So no variable or
+//! unquoted field can be named `def`, `do`, `break`, `continue` or `return`.
+//! `def` is only ever written at the start of an item, a public function
+//! (see the parser). A *label*,
 //! [`TokenKind::Label`], is `'` directly
 //! followed by a name, scanned by the rule for identifiers, as in `'outer`,
 //! `'_` and `'a-b`, one token holding the name; its text is interned
@@ -216,6 +218,8 @@ pub enum TokenKind {
     Not,
     /// The keyword `fn`.
     Fn,
+    /// The keyword `def`, which begins a public function item.
+    Def,
     /// The keyword `lazy`, which defers the expression after it.
     Lazy,
     /// The keyword `await`, which awaits the value after it.
@@ -342,6 +346,7 @@ impl TokenKind {
             TokenKind::Or => Some("or"),
             TokenKind::Not => Some("not"),
             TokenKind::Fn => Some("fn"),
+            TokenKind::Def => Some("def"),
             TokenKind::Lazy => Some("lazy"),
             TokenKind::Await => Some("await"),
             TokenKind::For => Some("for"),
@@ -411,6 +416,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "or" => TokenKind::Or,
         "not" => TokenKind::Not,
         "fn" => TokenKind::Fn,
+        "def" => TokenKind::Def,
         "lazy" => TokenKind::Lazy,
         "await" => TokenKind::Await,
         "for" => TokenKind::For,
@@ -1765,6 +1771,25 @@ mod tests {
     }
 
     #[test]
+    fn def_is_a_keyword_only_as_a_whole_word() {
+        assert_eq!(
+            show("def def-x defx de f _def def_ Def"),
+            [
+                "Def",
+                "Ident(def-x)",
+                "Ident(defx)",
+                "Ident(de)",
+                "Ident(f)",
+                "Ident(_def)",
+                "Ident(def_)",
+                "Ident(Def)",
+                "Eof"
+            ]
+        );
+        assert_eq!(TokenKind::Def.symbol(), Some("def"));
+    }
+
+    #[test]
     fn is_and_as_are_keywords_only_as_whole_words() {
         assert_eq!(
             show("x is Int as is-x as-x isa asy Is As"),
@@ -2511,7 +2536,7 @@ mod tests {
         }
         for text in [
             "", "1x", "a b", "a-", "-a", "a--b", "é", "let", "if", "else", "true", "false", "and",
-            "or", "not", "a.b", "fn", "lazy", "await", "a|b",
+            "or", "not", "a.b", "fn", "def", "lazy", "await", "a|b",
         ] {
             assert!(!is_identifier(text), "{text}");
         }

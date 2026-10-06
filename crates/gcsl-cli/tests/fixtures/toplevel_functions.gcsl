@@ -1,0 +1,18 @@
+# Top-level functions are visible in the whole file: used above their
+# declarations, and calling each other in any order.
+limit = 10
+total = sum-to(limit)
+def describe(n: Int): String { if even(n) { "even" } else { "odd" } }
+fn even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }
+fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }
+fn sum-to(n: Int): Int { if n == 0 { 0 } else { n + sum-to(n - 1) } }
+# A function that reads `rate` is made just after `rate` is bound.
+let rate = 3
+scaled = scale(4)
+fn scale(n: Int): Int { n * rate }
+# One that reads a mutable variable is made where it is written.
+let mut count = 1
+fn counted(): Int { count }
+count := 2
+seen = [counted(), count]
+kind = describe(7)

@@ -303,7 +303,7 @@ fn dumps_show_functions_and_calls() {
     assert!(
         ast.starts_with(
             "(file\n\
-             \x20 (let service @69..189\n\
+             \x20 (fn service @69..189\n\
              \x20   (fn @69..189\n\
              \x20     (params (name String) (config {port: Int, image: String}))\n\
              \x20     (ret pure String)\n"
@@ -419,9 +419,8 @@ fn dumps_show_futures() {
     for node in [
         "\n    (store build#2 @213..239\n\
          \x20     (make-future #1 @221..239\n\
-         \x20       (load-capture 0 @221..239)\n\
          \x20       (load name#1 @221..239)))\n",
-        "\nfuture #1 (frame 0, params 0, captures 2, height 3)\n",
+        "\nfuture #1 (frame 0, params 0, captures 1, height 3)\n",
         "\n    (await @397..413\n\
          \x20     (field build @403..413\n\
          \x20       (load conf#2 @403..407)))\n",
@@ -440,7 +439,7 @@ fn run_memoises_fetches() {
     // `weight(80)` finishes only because each argument runs once.
     assert_eq!(
         stdout(&output),
-        "{core = \"core\"; deps = 1; weight = 23416728348467685; step = Future<Int>; \
+        "{core = \"core\"; deps = 1; fib-80 = 23416728348467685; step = Future<Int>; \
          doubled = 42}\n"
     );
     assert_eq!(stderr(&output), "");
@@ -774,24 +773,24 @@ fn dumps_show_mutable_variables() {
     for node in [
         // A rebind in a `for`'s body, and in an `if` in it, stores into the
         // variable's one slot.
-        "\n  (store total#1 @159..176\n\
+        "\n  (store total#2 @159..176\n\
          \x20   (int 0 @175..176))\n",
         "\n    (block @299..366\n\
-         \x20     (store total#1 @303..324\n\
+         \x20     (store total#2 @303..324\n\
          \x20       (int-add @312..324\n\
-         \x20         (load total#1 @312..317)\n",
+         \x20         (load total#2 @312..317)\n",
         "\n        (block @348..364\n\
-         \x20         (store slowest#2 @350..362\n\
-         \x20           (load conf#3 @361..362))\n",
+         \x20         (store slowest#3 @350..362\n\
+         \x20           (load conf#4 @361..362))\n",
         // The guard reads the slot the body writes.
         "\n      (int-cmp >= @621..635\n\
-         \x20       (load budget#4 @621..627)\n",
-        "\n        (store budget#4 @638..661\n",
+         \x20       (load budget#5 @621..627)\n",
+        "\n        (store budget#5 @638..661\n",
         // The closure copies the variable when it is made.
-        "\n  (store report#6 @721..753\n\
+        "\n  (store report#7 @721..753\n\
          \x20   (make-closure #0 @734..753\n\
-         \x20     (load total#1 @734..753)))\n\
-         \x20 (store total#1 @754..764\n",
+         \x20     (load total#2 @734..753)))\n\
+         \x20 (store total#2 @754..764\n",
         // A function's own variable, in its own frame.
         "\n      (block @823..841\n\
          \x20       (store sum#1 @825..839\n",
@@ -1644,6 +1643,92 @@ fn run_leaves_functions_blocks_and_loops_early() {
          meant, or tell them apart with `is`\n"
     );
     assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_uses_top_level_functions_in_any_order() {
+    let output = gcsl(&["run", "tests/fixtures/toplevel_functions.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{limit = 10; total = 55; describe = fn(n: Int): String; scaled = 12; seen = [1, 2]; \
+         kind = \"odd\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn dumps_show_top_level_functions_and_where_they_are_made() {
+    let path = "tests/fixtures/toplevel_functions.gcsl";
+    let output = gcsl(&["run", path, "--dump-tokens"]);
+    let tokens = stdout(&output);
+    assert!(tokens.contains("\nDef @156..159\n"), "{tokens}");
+    let output = gcsl(&["run", path, "--dump-ast"]);
+    let ast = stdout(&output);
+    for node in [
+        "\n  (def describe @156..225\n",
+        "\n  (fn even @226..290\n",
+        "\n  (fn scale @525..559\n",
+    ] {
+        assert!(ast.contains(node), "{node}: {ast}");
+    }
+    let output = gcsl(&["run", path, "--dump-ir"]);
+    let ir = stdout(&output);
+    for node in [
+        // Those that copy nothing are made as the input starts, in their
+        // own slots, the first of the input's.
+        "(block @123..726\n\
+         \x20 (store describe#0 @156..225\n\
+         \x20   (make-closure #0 @156..225))\n\
+         \x20 (store even#1 @226..290\n",
+        // One that copies `rate` just after `rate` is bound.
+        "\n  (store rate#8 @494..506\n\
+         \x20   (int 3 @505..506))\n\
+         \x20 (store scale#4 @525..559\n\
+         \x20   (make-closure #4 @525..559\n\
+         \x20     (load rate#8 @525..559)))\n\
+         \x20 (store scaled#9 @507..524\n",
+        // One that copies a mutable variable where it is written.
+        "\n  (store counted#5 @643..670\n\
+         \x20   (make-closure #5 @643..670\n",
+        // A function reads another of the top level from the top level's
+        // frame, not by a capture.
+        "\n        (fn top even#1 @190..194)\n",
+    ] {
+        assert!(ir.contains(node), "{node}: {ir}");
+    }
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn run_reports_a_function_used_before_it_exists() {
+    let output = gcsl(&["run", "tests/fixtures/functions_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `total` cannot be used here yet\n\
+         \x20--> tests/fixtures/functions_error.gcsl:1:9\n\
+         \x20 |\n\
+         1 | let x = total()\n\
+         \x20 |         ^^^^^\n\
+         2 | let k = 10\n\
+         \x20 | ---------- `total` reads `k`, which is bound here\n\
+         \x20 |\n\
+         \x20 = note: a function can be used once every variable it reads is bound\n\
+         \n\
+         error: `first` cannot be used here yet\n\
+         \x20--> tests/fixtures/functions_error.gcsl:5:9\n\
+         \x20 |\n\
+         5 | let y = first()\n\
+         \x20 |         ^^^^^\n\
+         6 | fn first(): Int { second() }\n\
+         7 | fn second(): Int { n }\n\
+         \x20 | ---------------------- `first` uses `second`, and `second` reads the mutable \
+         variable `n`, so it exists from here\n\
+         \x20 |\n\
+         \x20 = note: a function copies a mutable variable where the function is written\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
 }
 
 #[test]

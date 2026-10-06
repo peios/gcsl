@@ -446,6 +446,14 @@
 //! results](#inferred-results) and [Narrowed
 //! callbacks](#narrowed-callbacks).)
 //!
+//! A named function item, `fn f(...) ...`, is checked as the `let f =
+//! fn(...) ...` it is parsed as, and a public function item, `def f(...)
+//! ...`, as the field `f = fn(...) ...`: in every rule about fields (whether
+//! a block has fields and so cannot have a result, the record's fields and
+//! their order, a field defined twice, a soft field overridden) a `def` is
+//! that field. The tree marks both as written, which only the printer
+//! reads here.
+//!
 //! **Frames.** Each function runs in a frame of its own. The checker keeps a
 //! stack of the functions it is inside (`Function`); entering one saves the
 //! enclosing frame's slot allocation and starts a fresh one at slot 0, in
@@ -479,16 +487,22 @@
 //! list is searched linearly, since it is short.
 //!
 //! **Self-reference.** A function expression that is the direct initialiser
-//! of a single-name `let`, field or named function item (not through
+//! of a single-name `let`, field, named function item or `def` (not through
 //! parentheses) sees that name throughout its body as the function being
 //! called: a binding declared before the parameters, so a parameter of the
 //! same name shadows it, of kind `BindingKind::Callee`, with no slot. It
 //! resolves to [`VarRef::Callee`], which the evaluator serves from the
 //! closure being run, so a recursive closure never holds a reference to
 //! itself and reference counts stay free of cycles. It cannot be rebound
-//! with `:=`, and never reaches a session's [`Scope`]. Functions are
-//! visible only from the item after their own, so there is no mutual
-//! recursion or forward reference.
+//! with `:=`, and never reaches a session's [`Scope`]. A function is
+//! visible from the item after its own, as any binding is, except a
+//! top-level function, whose name is in scope in its whole input, so that
+//! top-level functions may be used above their declarations and call each
+//! other in any order (see [Top-level functions](#top-level-functions)).
+//! One top-level function's use of another is not self-reference and not a
+//! capture: it reads the other's slot of the top level's frame
+//! ([`VarRef::Fn`]). Mutual recursion between functions that are not
+//! top-level does not exist: an inner function sees only what is above it.
 //!
 //! **Calls.** The callee must have a function type. Positional arguments
 //! fill its parameters left to right, the trailing block fills the last,
@@ -516,6 +530,133 @@
 //! is awaiting (see [Futures](#futures)). Those are the only gated
 //! operations: a pure function may create, pass, store and return impure
 //! and memoised functions and futures.
+//!
+//! # Top-level functions
+//!
+//! A *top-level function* of an input is a named function item (`fn f`)
+//! or a `def` that is directly an item of the input's outermost block;
+//! nothing inside a nested block, a loop body, a labelled block, a function
+//! or a `lazy` is one. Everything else is ordered as described above: `let`,
+//! `let mut`, fields, spreads, `:=`, statements, and every `fn` or `def`
+//! that is not at the top level of an input.
+//!
+//! **Names.** A top-level function's name is in scope in its whole input,
+//! above its declaration as well as below, and inside every function and
+//! `lazy` of the input, unless a nearer declaration shadows it there. As
+//! the input starts (`Checker::declare_top_fns`), every top-level function
+//! is declared, in source order, with the type its signature declares, so
+//! its binding comes first among the input's bindings and its slot is one
+//! of the input's first. The input's other bindings are declared after
+//! them as the walk reaches them, so a scope's bindings still occupy slots
+//! in order, and a session's [`Scope`] keeps that order. A top-level
+//! function hides a variable or field of its name from an earlier input,
+//! and a soft field of its name that a spread of this input defines (the
+//! spread still defines the record's field; a `def` of that name overrides
+//! it, as a field does). Two top-level `fn`s of one name are "function `f`
+//! is declared twice", at the second (two `def`s, or a `def` and a field,
+//! are the field defined twice); a top-level `let`, `let mut`, field or
+//! `:=` whose name, or its path's first segment, is a top-level function's
+//! is "`f` is a function of this file". In inner blocks a name shadows as
+//! it always has.
+//!
+//! **What a function sees.** A function sees the variables and fields
+//! declared above its own declaration and copies the ones it uses when it
+//! is made, as any function does. A top-level variable declared below it
+//! is "undefined variable" inside it, with a label on that declaration,
+//! "`k` is declared here, below the function". What is new is only how one
+//! top-level function refers to another of its input: through the top
+//! level's frame, by [`VarRef::Fn`], never by a capture. That is what lets
+//! two functions refer to each other.
+//!
+//! **Mentions.** What follows is decided from one relation, found from the
+//! tree before the input is checked (see [`crate::mentions`]): an item or
+//! a body *mentions* a top-level function when a name in it is the
+//! function's and no declaration the tree shows shadows it there. A name
+//! that a spread inside a nested block defines is not known before
+//! checking, so it does not shadow: a read of it counts as a mention
+//! although it reads the spread's field. The relation only ever
+//! over-approximates, which can only make a body be checked earlier or an
+//! item be held to the rule of [When a function may be
+//! used](#when-a-function-may-be-used).
+//!
+//! **Groups, and the order bodies are checked in.** A caller needs more
+//! than a callee's written signature (what the body decides: inferred
+//! parameters, an inferred result, narrowed callbacks), and that must not
+//! depend on which is written first. The top-level functions are grouped
+//! by mutual recursion, the strongly connected components of "mentions"
+//! between them, and every body is checked exactly once
+//! (`Checker::check_group`): before the walk checks a top-level item that
+//! is not itself a top-level function, the bodies of the functions it
+//! mentions, and of those they mention, and so on, that are not checked
+//! yet (`Checker::check_mentioned`); after the last item, the rest
+//! (`Checker::check_remaining_bodies`). In both, the groups a group
+//! mentions come first, then the group's members in source order. A use of
+//! a top-level function from outside its group sees the function fully
+//! resolved, exactly as a use below a function's declaration does. A use
+//! from inside its group, its own body included, sees the declared type
+//! and is treated as a recursive call: the declared type at the bare
+//! positions, arguments measured conservatively, no `KnownCallee`,
+//! nothing iterated. A function whose signature or body is erroneous is,
+//! for its users, an erroneous function declared above them.
+//!
+//! **The view a body is checked in.** A body checked before the walk
+//! reaches item `P` sees, of the input's top level, the bindings declared
+//! above whichever is higher, `P` or its own declaration, and every
+//! top-level function, and everything of earlier inputs; a body checked
+//! when the walk reaches it, or after the last item, sees the bindings
+//! above its own declaration, which is what a function always saw. The
+//! bindings are in declaration order, so the view is a prefix, and
+//! `Checker::check_top_body` makes it by setting the suffix aside while the
+//! body is checked and putting it back after: slots and `measured` are not
+//! touched. A body checked at an item above its own declaration reads
+//! nothing declared between the two: a read of a name that a top-level
+//! item between them declares (by `let`, a field, a dotted path's first
+//! segment, or a `:=` of a variable that is not mutable) is not resolved
+//! to an older binding but makes the function not usable at the item (see
+//! below), and so is any read of a variable or field of the top level when
+//! a top-level spread lies between them, since its names are not known
+//! yet. That spread rule is conservative: it holds whether or not the
+//! spread defines the name.
+//!
+//! # When a function may be used
+//!
+//! Top-level code (the initialiser of a `let` or a field, a spread, a `:=`,
+//! a statement, the result) can only use a function that exists by then,
+//! and a function exists once it has copied what it reads. From the
+//! captures its checked body resolved (not from the tree), each top-level
+//! function is made ([`MadeAt`]):
+//!
+//! - at the start of the input, if it copies nothing from this input's top
+//!   level (what it copies from an earlier input is bound before the input
+//!   starts, and does not count);
+//! - just after the item that binds the last of what it copies, if it
+//!   copies only variables that are not mutable, and fields: the latest
+//!   definition of each name above the function;
+//! - at its own declaration, if it copies a mutable variable, whose value
+//!   it copies there, as any function does.
+//!
+//! A function nested in a top-level function, or a `lazy` in it, that
+//! reads a top-level variable makes the top-level function copy it. A
+//! top-level function *needs* every function it mentions, and what those
+//! need, and so on. A top-level item that mentions a top-level function
+//! anywhere in it, even inside a function expression or a `lazy` it only
+//! builds, is "`f` cannot be used here yet" unless every function `f`
+//! needs exists before the item starts (`Checker::check_uses`). The label
+//! names the reason first in source order and the shortest chain to it:
+//! "`f` reads `k`, which is bound here", "`a` uses `b`, and `b` reads `k`,
+//! which is bound here", up to three names, and "`a` uses `b`, ..., and
+//! `z` reads" beyond; for a mutable variable it is on the function that
+//! copies it, "`b` reads the mutable variable `n`, so it exists from here";
+//! for a read blocked by a spread, "`g` reads `port`, which this spread may
+//! define". There is one error per item and function. Inside function
+//! bodies there is no such check: the rule, applied where top-level code
+//! mentions the function whose body it is, covers what it calls. The rule
+//! asks what is mentioned, not what is called, which is conservative, and
+//! deliberately so.
+//!
+//! The "this is never run" warning neither starts at nor counts a
+//! top-level function, since its closure may be made before the item that
+//! never completes.
 //!
 //! # Futures
 //!
@@ -1647,7 +1788,10 @@
 //! changes, and evaluation needs no environment lookups and no allocation
 //! per block. Some items share a slot: each definition of a field after its
 //! first, a dotted path extending an open field or an item overriding a
-//! soft one, writes the field's one slot. A spread's operand is held in the next free slot,
+//! soft one, writes the field's one slot. The top-level functions of an
+//! input take its first slots, in source order, before the walk starts
+//! (see [Top-level functions](#top-level-functions)); a `def` among them is
+//! a field whose slot is the function's. A spread's operand is held in the next free slot,
 //! which counts towards the frame size but stays free (see [Spreads and
 //! soft assignment](#spreads-and-soft-assignment)). An `if` that narrows
 //! takes the next free slot for the value its test writes, which both
@@ -1665,6 +1809,15 @@
 //! not from a function or a `lazy`, as if it continued the same block; and
 //! it lists their slots ([`Scope::mutable_slots`]), the only ones of the
 //! scope a later input can write.
+//!
+//! Within an input, top-level functions are in any order (see [Top-level
+//! functions](#top-level-functions)); between inputs, order is as it was: a
+//! later input sees the earlier ones, and an earlier one is never changed by
+//! a later one. A later input's top-level functions take its own first
+//! slots, after the scope's, and may hide an earlier input's names, and an
+//! earlier input's functions keep reading their own input's slots, which no
+//! later input writes. Nothing about top-level functions is kept in the
+//! [`Scope`] beyond their bindings.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1676,6 +1829,7 @@ use crate::ast::{
     TypeExprId, TypeExprKind, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
+use crate::mentions::{self, Mentions};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
@@ -1789,6 +1943,11 @@ pub enum VarRef {
     /// One of the values the current closure captured, by its index in the
     /// function's capture order.
     Capture(u32),
+    /// A top-level function of the input, by its slot in the top level's
+    /// frame, read from inside a function or `lazy` of the same input:
+    /// never captured, read where the top level's frame is when it runs
+    /// (see [Top-level functions](#top-level-functions)).
+    Fn(Slot),
     /// The closure being called: a function's reference to itself.
     Callee,
     /// A built-in function, which is not a value: only the callee of a call
@@ -2036,6 +2195,9 @@ pub struct Resolution {
     /// source down, where its [`PathResolution::awaits`] says. Items with no
     /// awaited record have no entries.
     path_awaits: Vec<bool>,
+    /// Each top-level function of the input, by its item, in source order,
+    /// with where its closure is made.
+    top_functions: Vec<(ItemId, MadeAt)>,
     /// The number of slots the top level's frame needs.
     frame_size: u32,
     /// For each slot of the top level's frame, the name of the last
@@ -2151,6 +2313,15 @@ impl Resolution {
     #[must_use]
     pub fn item_slot(&self, id: ItemId) -> Slot {
         self.item_slots[id.index()]
+    }
+
+    /// Each top-level function of the input, by its item, in source order,
+    /// with where its closure is made: what lowering stores in each one's
+    /// slot, and when (see [When a function may be
+    /// used](#when-a-function-may-be-used)).
+    #[must_use]
+    pub fn top_functions(&self) -> &[(ItemId, MadeAt)] {
+        &self.top_functions
     }
 
     /// The slot each field of the spread item `id`'s operand is stored in,
@@ -2283,6 +2454,7 @@ impl Resolution {
             spread_slots: Vec::new(),
             item_paths: vec![PathResolution::NONE; items],
             path_awaits: Vec::new(),
+            top_functions: Vec::new(),
             frame_size: 0,
             slot_names: Vec::new(),
             functions: Vec::new(),
@@ -2447,6 +2619,110 @@ const fn bareness_of(effect: Effect) -> (Bareness, Bareness) {
         Effect::Memo => (Bareness::Present, Bareness::Either),
         Effect::Impure => (Bareness::Either, Bareness::Either),
     }
+}
+
+/// The name the item `id` of the outermost block declares as a variable or
+/// field: the first segment of the path of a `let`, `let mut`, field or
+/// `:=` that is not a named function item or a `def`.
+fn root_declares(ast: &Ast, id: ItemId) -> Option<Name> {
+    let (ItemKind::Let {
+        path,
+        function: false,
+        ..
+    }
+    | ItemKind::Field {
+        path,
+        function: false,
+        ..
+    }
+    | ItemKind::Rebind { path, .. }) = ast.item(id).kind
+    else {
+        return None;
+    };
+    ast.path(path).first().and_then(PathSegment::name)
+}
+
+/// Where the check of a top-level function's body is (see [Top-level
+/// functions](#top-level-functions)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyState {
+    /// Not checked yet: a use sees the declared type.
+    Unchecked,
+    /// Its group's bodies are being checked: a use from inside the group is
+    /// treated as a recursive call through a function's own name is.
+    Checking,
+    /// Checked: a use sees the function fully resolved.
+    Done,
+}
+
+/// One top-level function of the input being checked.
+#[derive(Clone, Copy, Debug)]
+struct TopFn {
+    /// Its item, `fn NAME ...` or `def NAME ...`.
+    item: ItemId,
+    /// Its function expression.
+    expr: ExprId,
+    /// Its function.
+    function: FnId,
+    /// Its name.
+    name: Name,
+    /// Its binding's index in `bindings`, declared as the input starts.
+    binding: usize,
+    /// The number of bindings declared when the walk reached its
+    /// declaration, once it has: the bindings its body sees.
+    cut: Option<usize>,
+    /// How far its body's check is.
+    state: BodyState,
+    /// Once its body is checked, the position among the outermost block's
+    /// items of the first item before which its closure exists: `0` if it
+    /// copies nothing of this input's top level, `usize::MAX` if its body
+    /// read a name it cannot see yet (see [When a function may be
+    /// used](#when-a-function-may-be-used)).
+    ready: usize,
+    /// Why it does not exist before `ready`, if it does not exist from the
+    /// start.
+    blocker: Option<Blocker>,
+    /// Where its closure is made.
+    made: MadeAt,
+}
+
+/// Why a top-level function does not exist before some item: what it
+/// reads, and where that is bound.
+#[derive(Clone, Copy, Debug)]
+struct Blocker {
+    /// The name it reads.
+    name: Name,
+    /// The declaration labelled: the item binding the name, the spread
+    /// that may define it, or, for a mutable variable, the function's own.
+    span: Span,
+    /// Which of those it is.
+    kind: BlockerKind,
+}
+
+/// What a [`Blocker`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockerKind {
+    /// A variable or field that is not mutable, bound by an item.
+    Bound,
+    /// A mutable variable, which the function copies where it is written.
+    Mutable,
+    /// A name a top-level spread may define.
+    Spread,
+}
+
+/// Where the closure of a top-level function is made and stored in its
+/// slot (see [When a function may be used](#when-a-function-may-be-used)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MadeAt {
+    /// As the input starts, before its first item: it copies nothing of
+    /// the input's top level.
+    Start,
+    /// Just after the item given, the one that binds the last of the
+    /// variables and fields it copies.
+    After(ItemId),
+    /// At its own declaration: it copies a mutable variable, or it is
+    /// erroneous.
+    Own,
 }
 
 /// A function expression or a `lazy` being checked: one entry of the
@@ -2984,6 +3260,32 @@ pub struct Checker<'a> {
     /// For each binding of the scope the check started from, its entry of
     /// [`Scope`]'s `measured`.
     scope_measured: Vec<Option<Box<[bool]>>>,
+    /// What the input's top-level items mention, and the groups of its
+    /// top-level functions (see [`crate::mentions`]).
+    mentions: Mentions,
+    /// The input's top-level functions, indexed as in `mentions`.
+    top_fns: Vec<TopFn>,
+    /// The index in `bindings` of the first top-level function's binding:
+    /// those of `top_fns` follow it, in order.
+    top_start: usize,
+    /// For each top-level function, once its body is checked, the indexes
+    /// in `bindings` of what it copies.
+    top_copies: Vec<Vec<usize>>,
+    /// The top-level function whose body is being checked, if one is.
+    checking_top: Option<usize>,
+    /// While a top-level function's body is checked before the walk has
+    /// reached it: the positions among the outermost block's items of the
+    /// item being checked and of the function's declaration. A read of a
+    /// name an item between them declares is not resolved (see [When each
+    /// body is checked](#top-level-functions)).
+    early: Option<(usize, usize)>,
+    /// The position among the outermost block's items of the item the walk
+    /// is at.
+    root_position: usize,
+    /// While a block nested in the top level's code (not in a function) is
+    /// being checked, the number of the top level's own bindings: those
+    /// below are the nested blocks'.
+    root_end: Option<usize>,
     /// The functions being checked, innermost last; empty at the top
     /// level.
     functions: Vec<Function>,
@@ -3125,6 +3427,14 @@ impl<'a> Checker<'a> {
             unreached_path: false,
             bindings: scope.bindings,
             scope_measured: scope.measured,
+            mentions: Mentions::default(),
+            top_fns: Vec::new(),
+            top_copies: Vec::new(),
+            checking_top: None,
+            early: None,
+            root_position: 0,
+            top_start: 0,
+            root_end: None,
             functions: Vec::new(),
             claimed: Vec::new(),
             callee_name: None,
@@ -3171,6 +3481,7 @@ impl<'a> Checker<'a> {
     /// As [`check`].
     pub fn check(mut self) -> Result<CheckOutput, Vec<Diagnostic>> {
         let root = self.ast.root();
+        self.declare_top_fns();
         let ty = self.check_body(root, None);
         // Finalisation: an integer result with no context defaults to Int.
         self.coerce_result(root, TyId::INT);
@@ -3224,6 +3535,11 @@ impl<'a> Checker<'a> {
                 ..binding
             })
             .collect();
+        let top_functions = self
+            .top_fns
+            .iter()
+            .map(|top| (top.item, top.made))
+            .collect();
         let checked = Checked {
             types: Types::new(self.expr_types),
             resolution: Resolution {
@@ -3234,6 +3550,7 @@ impl<'a> Checker<'a> {
                 spread_slots: self.spread_slots,
                 item_paths: self.item_paths,
                 path_awaits: self.path_awaits,
+                top_functions,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
                 functions: self.fn_resolutions,
@@ -3262,9 +3579,16 @@ impl<'a> Checker<'a> {
         let outer = (self.block_start, self.fields_start, self.next_slot);
         let outer_spreads = std::mem::take(&mut self.spreads);
         let nodes_start = self.nodes.len();
+        let leaves_root = self.functions.is_empty() && self.root_end.is_none();
+        if leaves_root {
+            self.root_end = Some(self.bindings.len());
+        }
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
         let ty = self.check_body(body, expecting);
+        if leaves_root {
+            self.root_end = None;
+        }
         self.bindings.truncate(self.block_start);
         self.fields.truncate(self.fields_start);
         self.nodes.truncate(nodes_start);
@@ -3293,12 +3617,24 @@ impl<'a> Checker<'a> {
             )
         });
         let mut result = TyId::EMPTY;
+        // Whether this is the input's outermost block, whose top-level
+        // functions are order-free.
+        let root = body == self.ast.root() && self.functions.is_empty();
         // The first item that never completes, and whether the item after
         // it has been warned about.
         let (mut leaves, mut warned) = (None, false);
         for (index, &id) in items.iter().enumerate() {
             let next = items.get(index + 1).copied();
             let item = *self.ast.item(id);
+            if root {
+                self.root_position = index;
+                if self.reach_top_fn(id) {
+                    continue;
+                }
+                self.check_mentioned(index);
+                self.check_uses(index);
+                self.check_clash(id);
+            }
             if let (Some(leaves), false) = (leaves, warned) {
                 self.warnings.push(
                     Diagnostic::warning("this is never run", item.span)
@@ -3315,9 +3651,12 @@ impl<'a> Checker<'a> {
                     ty,
                     value,
                     mutable,
+                    ..
                 } => self.check_let(id, path, ty, (value, mutable)),
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
-                ItemKind::Field { path, value } => self.check_field(id, path, value, expecting),
+                ItemKind::Field { path, value, .. } => {
+                    self.check_field(id, path, value, expecting);
+                }
                 ItemKind::Spread(value) => self.check_spread_item(id, value),
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
@@ -3357,6 +3696,9 @@ impl<'a> Checker<'a> {
             if leaves.is_none() && self.never_completes(id, item.kind) {
                 leaves = Some(item.span);
             }
+        }
+        if root {
+            self.check_remaining_bodies();
         }
         match first_field {
             Some(_) => self.record_type(expecting),
@@ -5205,6 +5547,507 @@ impl<'a> Checker<'a> {
         TyId::ERROR
     }
 
+    /// As the input starts: finds what its top-level items mention (see
+    /// [`crate::mentions`]) and declares each top-level function, in source
+    /// order, with its declared type, so the bindings of the input's
+    /// top-level functions take its first slots and come first among its
+    /// bindings (see [Top-level functions](#top-level-functions)).
+    fn declare_top_fns(&mut self) {
+        self.mentions = mentions::find(self.ast);
+        self.top_start = self.bindings.len();
+        for index in 0..self.mentions.functions.len() {
+            let Some(&top) = self.mentions.functions.get(index) else {
+                break;
+            };
+            let kind = match self.ast.item(top.item).kind {
+                ItemKind::Field { .. } => BindingKind::Field,
+                _ => BindingKind::Variable,
+            };
+            let ty = self.declared_type(top.function);
+            let binding = self.bindings.len();
+            let span = self.ast.item(top.item).span;
+            self.declare_binding(top.name, ty, Some(span), kind);
+            self.top_fns.push(TopFn {
+                item: top.item,
+                expr: top.expr,
+                function: top.function,
+                name: top.name,
+                binding,
+                cut: None,
+                state: BodyState::Unchecked,
+                ready: 0,
+                blocker: None,
+                made: MadeAt::Own,
+            });
+        }
+        self.top_copies = vec![Vec::new(); self.top_fns.len()];
+    }
+
+    /// The type `function`'s parameters and return type declare, as its
+    /// signature is written, without inferring anything from its body:
+    /// what a use of a top-level function sees before its body is checked.
+    /// `Error` if the signature is erroneous, which this reports nothing
+    /// of: the function's own check does.
+    fn declared_type(&mut self, function: FnId) -> TyId {
+        let (errors, warnings) = (self.errors.len(), self.warnings.len());
+        let decl = *self.ast.fn_decl(function);
+        let (params_mode, ret_mode) = bareness_of(decl.effect);
+        let base = self.fn_params.len();
+        for param in self.ast.params(decl.params) {
+            let ty = self.resolve_type(param.ty, params_mode);
+            self.fn_params.push((Some(param.name), ty));
+        }
+        let ret = decl
+            .ret
+            .map_or(TyId::ERROR, |ret| self.resolve_type(ret, ret_mode));
+        let ty = self.intern_fn_type(base, ret, decl.effect);
+        self.fn_params.truncate(base);
+        let clean = self.errors.len() == errors && ret != TyId::ERROR;
+        self.errors.truncate(errors);
+        self.warnings.truncate(warnings);
+        if clean { ty } else { TyId::ERROR }
+    }
+
+    /// When the walk of the outermost block reaches the item `id`: if it
+    /// is a top-level function, which is declared already, records the
+    /// bindings above it, which its body sees, gives the item its slot
+    /// and, for a `def`, adds the field, and returns `true`.
+    fn reach_top_fn(&mut self, id: ItemId) -> bool {
+        let Some(top) = self.top_fns.iter_mut().find(|top| top.item == id) else {
+            return false;
+        };
+        top.cut = Some(self.bindings.len());
+        let (name, binding) = (top.name, top.binding);
+        self.check_declared_twice(id, name);
+        let Some(&Binding { slot, ty, .. }) = self.bindings.get(binding) else {
+            return true;
+        };
+        self.item_slots[id.index()] = slot;
+        if let ItemKind::Field { path, .. } = self.ast.item(id).kind {
+            let name_span = self
+                .ast
+                .path(path)
+                .first()
+                .map_or(self.ast.item(id).span, |segment| segment.span);
+            let soft = match self.spreads {
+                BlockSpreads::None => None,
+                BlockSpreads::Some | BlockSpreads::Rejected => self
+                    .block_field(name)
+                    .filter(|&index| self.fields[index].spread.is_some()),
+            };
+            match soft {
+                // The `def` overrides the soft field: the field keeps its
+                // place and takes the function's slot.
+                Some(index) => {
+                    let field = &mut self.fields[index];
+                    (field.ty, field.slot, field.name_span) = (ty, slot, name_span);
+                    field.spread = None;
+                }
+                None => self.fields.push(FieldDecl {
+                    name,
+                    name_span,
+                    ty,
+                    slot,
+                    open: None,
+                    spread: None,
+                    rejected: false,
+                }),
+            }
+        }
+        true
+    }
+
+    /// Where the item `id`'s name is written: the first segment of its
+    /// path, or the item, if it has none.
+    fn name_span(&self, id: ItemId) -> Span {
+        let item = self.ast.item(id);
+        match item.kind {
+            ItemKind::Let { path, .. }
+            | ItemKind::Field { path, .. }
+            | ItemKind::Rebind { path, .. } => self
+                .ast
+                .path(path)
+                .first()
+                .map_or(item.span, |segment| segment.span),
+            _ => item.span,
+        }
+    }
+
+    /// When the walk reaches the top-level function `id`, named `name`:
+    /// "function `f` is declared twice" if a top-level function above it
+    /// has its name, unless both are `def`s, which are fields defined
+    /// twice.
+    fn check_declared_twice(&mut self, id: ItemId, name: Name) {
+        let is_def =
+            |ast: &Ast, item: ItemId| matches!(ast.item(item).kind, ItemKind::Field { .. });
+        let Some(first) = self
+            .top_fns
+            .iter()
+            .take_while(|top| top.item != id)
+            .find(|top| top.name == name)
+            .map(|top| top.item)
+        else {
+            return;
+        };
+        if is_def(self.ast, first) && is_def(self.ast, id) {
+            return;
+        }
+        let text = self.ast.names().get(name);
+        self.errors.push(
+            Diagnostic::error(
+                format!("function `{text}` is declared twice"),
+                self.name_span(id),
+            )
+            .with_context(self.name_span(first), "first declared here"),
+        );
+    }
+
+    /// Before the walk checks the top-level item `id`, which is not a
+    /// top-level function: "`f` is a function of this file" if it is a
+    /// `let`, `let mut`, field or `:=` whose name is a top-level function's,
+    /// unless it is a field and the function a `def`, which is a field
+    /// defined twice.
+    fn check_clash(&mut self, id: ItemId) {
+        let Some(name) = root_declares(self.ast, id) else {
+            return;
+        };
+        let Some(function) = self
+            .top_fns
+            .iter()
+            .find(|top| top.name == name)
+            .map(|top| top.item)
+        else {
+            return;
+        };
+        let field = |item: ItemId| matches!(self.ast.item(item).kind, ItemKind::Field { .. });
+        if field(id) && field(function) {
+            return;
+        }
+        let text = self.ast.names().get(name);
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{text}` is a function of this file"),
+                self.name_span(id),
+            )
+            .with_context(self.name_span(function), "declared here")
+            .with_note(
+                "a function declared at the top level is visible in the whole file, so its \
+                 name cannot also be a variable or a field",
+            ),
+        );
+    }
+
+    /// Before the walk checks the top-level item at `position` in the
+    /// outermost block, once the bodies it needs are checked: "`f` cannot
+    /// be used here yet" for each top-level function it mentions that
+    /// needs a function that does not exist before the item (see [When a
+    /// function may be used](#when-a-function-may-be-used)).
+    fn check_uses(&mut self, position: usize) {
+        let (Some(mentioned), Some(spans)) = (
+            self.mentions.items.get(position),
+            self.mentions.spans.get(position),
+        ) else {
+            return;
+        };
+        let errors: Vec<Diagnostic> = mentioned
+            .iter()
+            .zip(spans)
+            .filter_map(|(&function, &span)| self.not_ready(function as usize, position, span))
+            .collect();
+        self.errors.extend(errors);
+    }
+
+    /// The error for a mention at `span`, by the item at `position`, of the
+    /// top-level function `start`, if a function it needs (itself, or one
+    /// it mentions, and so on) does not exist before the item: the reason
+    /// first in source order, with the chain of uses that leads to it.
+    fn not_ready(&self, start: usize, position: usize, span: Span) -> Option<Diagnostic> {
+        // Breadth first, so the chain to each function is a shortest one.
+        let mut parent = vec![usize::MAX; self.top_fns.len()];
+        *parent.get_mut(start)? = start;
+        let (mut queue, mut head) = (vec![start], 0);
+        let mut culprit: Option<(usize, Blocker)> = None;
+        while let Some(&function) = queue.get(head) {
+            head += 1;
+            let top = self.top_fns.get(function)?;
+            if top.ready > position
+                && let Some(blocker) = top.blocker
+                && culprit.is_none_or(|(_, first)| blocker.span.start < first.span.start)
+            {
+                culprit = Some((function, blocker));
+            }
+            let position = self.mentions.functions.get(function)?.position;
+            for &callee in self.mentions.items.get(position)? {
+                if let Some(entry) = parent.get_mut(callee as usize)
+                    && *entry == usize::MAX
+                {
+                    *entry = function;
+                    queue.push(callee as usize);
+                }
+            }
+        }
+        let (culprit, blocker) = culprit?;
+        let mut chain = vec![culprit];
+        while let Some(&last) = chain.last()
+            && last != start
+        {
+            chain.push(*parent.get(last)?);
+        }
+        chain.reverse();
+        let names = self.ast.names();
+        let text = |function: usize| {
+            self.top_fns
+                .get(function)
+                .map_or("", |top| names.get(top.name))
+        };
+        let uses = match chain.as_slice() {
+            [only] => format!("`{}`", text(*only)),
+            [first, second, .., last] if chain.len() > 3 => format!(
+                "`{}` uses `{}`, ..., and `{}`",
+                text(*first),
+                text(*second),
+                text(*last)
+            ),
+            [.., last] => {
+                let steps: Vec<String> = chain
+                    .windows(2)
+                    .map(|pair| format!("`{}` uses `{}`", text(pair[0]), text(pair[1])))
+                    .collect();
+                format!("{}, and `{}`", steps.join(", "), text(*last))
+            }
+            [] => return None,
+        };
+        let read = names.get(blocker.name);
+        let (label, note) = match blocker.kind {
+            BlockerKind::Bound => (
+                format!("{uses} reads `{read}`, which is bound here"),
+                "a function can be used once every variable it reads is bound",
+            ),
+            BlockerKind::Spread => (
+                format!("{uses} reads `{read}`, which this spread may define"),
+                "a function can be used once every variable it reads is bound",
+            ),
+            BlockerKind::Mutable => (
+                format!("{uses} reads the mutable variable `{read}`, so it exists from here"),
+                "a function copies a mutable variable where the function is written",
+            ),
+        };
+        Some(
+            Diagnostic::error(format!("`{}` cannot be used here yet", text(start)), span)
+                .with_context(blocker.span, label)
+                .with_note(note),
+        )
+    }
+
+    /// Before the walk checks the top-level item at `position` in the
+    /// outermost block: checks the body of every top-level function the
+    /// item mentions that is not checked yet, with the groups they mention
+    /// first.
+    fn check_mentioned(&mut self, position: usize) {
+        let Some(mentioned) = self.mentions.items.get(position).cloned() else {
+            return;
+        };
+        for function in mentioned {
+            if let Some(&group) = self.mentions.group_of.get(function as usize) {
+                self.check_group(group);
+            }
+        }
+    }
+
+    /// After the last item of the outermost block: checks the bodies not
+    /// checked yet, groups callee first, and gives each `def`'s field its
+    /// function's type.
+    fn check_remaining_bodies(&mut self) {
+        for group in 0..self.mentions.groups.len() {
+            self.check_group(position(group));
+        }
+        for top in &self.top_fns {
+            let Some(binding) = self.bindings.get(top.binding) else {
+                continue;
+            };
+            if let Some(field) = self.fields[self.fields_start..]
+                .iter_mut()
+                .find(|field| field.slot == binding.slot)
+            {
+                field.ty = binding.ty;
+            }
+        }
+    }
+
+    /// Checks the bodies of the group `group` of top-level functions, if
+    /// they are not checked yet: first those of the groups it mentions,
+    /// then its members', in source order, each exactly once. A use of a
+    /// member inside the group sees its declared type; once the group is
+    /// checked, every member's binding has the type its body gives it and
+    /// its function, as a function declared above its users' has.
+    fn check_group(&mut self, group: u32) {
+        let Some(members) = self.mentions.groups.get(group as usize).cloned() else {
+            return;
+        };
+        if members.iter().any(|&member| {
+            self.top_fns
+                .get(member as usize)
+                .is_none_or(|top| top.state != BodyState::Unchecked)
+        }) {
+            return;
+        }
+        for &member in &members {
+            if let Some(top) = self.top_fns.get_mut(member as usize) {
+                top.state = BodyState::Checking;
+            }
+        }
+        for &member in &members {
+            let position = self
+                .mentions
+                .functions
+                .get(member as usize)
+                .map_or(usize::MAX, |top| top.position);
+            let callees = self
+                .mentions
+                .items
+                .get(position)
+                .cloned()
+                .unwrap_or_default();
+            for callee in callees {
+                match self.mentions.group_of.get(callee as usize) {
+                    Some(&callee_group) if callee_group != group => {
+                        self.check_group(callee_group);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for &member in &members {
+            self.check_top_body(member as usize);
+        }
+        for &member in &members {
+            let Some(top) = self.top_fns.get_mut(member as usize) else {
+                continue;
+            };
+            top.state = BodyState::Done;
+            // A function whose body read a name it cannot see yet is
+            // erroneous for its users.
+            let (ty, function) = match top.ready {
+                usize::MAX => (TyId::ERROR, None),
+                _ => (self.expr_types[top.expr.index()], Some(top.function)),
+            };
+            if let Some(binding) = self.bindings.get_mut(top.binding) {
+                binding.ty = ty;
+                binding.function = function;
+            }
+        }
+    }
+
+    /// Checks the body of the top-level function `index` in the view of
+    /// the top level it sees: the bindings above its own declaration, or,
+    /// before the walk has reached it, above the item being checked. The
+    /// bindings below are set aside while it is checked, which is cheap,
+    /// since they are a suffix of `bindings`.
+    fn check_top_body(&mut self, index: usize) {
+        let Some(top) = self.top_fns.get(index).copied() else {
+            return;
+        };
+        let cut = top
+            .cut
+            .unwrap_or(self.bindings.len())
+            .max(self.top_start + self.top_fns.len())
+            .min(self.bindings.len());
+        let own = self
+            .mentions
+            .functions
+            .get(index)
+            .map_or(usize::MAX, |function| function.position);
+        self.early = top.cut.is_none().then_some((self.root_position, own));
+        self.checking_top = Some(index);
+        let below = self.bindings.split_off(cut);
+        self.callee_name = Some(top.name);
+        let found = self.check_expr(top.expr);
+        self.settle(top.expr, found);
+        self.callee_name = None;
+        self.bindings.extend(below);
+        (self.early, self.checking_top) = (None, None);
+        self.settle_top(index, own);
+    }
+
+    /// Once the body of the top-level function `index`, declared at the
+    /// position `own` among the outermost block's items, is checked: works
+    /// out from what it copies where its closure is made, and so before
+    /// which item it exists (see [When a function may be
+    /// used](#when-a-function-may-be-used)). What it copies from an
+    /// earlier input does not count.
+    fn settle_top(&mut self, index: usize, own: usize) {
+        let copies = self
+            .top_copies
+            .get(index)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let bindings = copies
+            .iter()
+            .filter(|&&binding| binding >= self.top_start)
+            .filter_map(|&binding| self.bindings.get(binding).copied());
+        let blocked = self
+            .top_fns
+            .get(index)
+            .is_some_and(|top| top.blocker.is_some());
+        let (mut ready, mut why, mut made) = (0, None, MadeAt::Start);
+        if blocked {
+            ready = usize::MAX;
+            made = MadeAt::Own;
+        } else if let Some(mutable) = bindings
+            .clone()
+            .find(|binding| binding.kind == BindingKind::Mutable)
+        {
+            let span = self
+                .top_fns
+                .get(index)
+                .map(|top| self.ast.item(top.item).span);
+            ready = own.saturating_add(1);
+            made = MadeAt::Own;
+            why = span.map(|span| Blocker {
+                name: mutable.name,
+                span,
+                kind: BlockerKind::Mutable,
+            });
+        } else {
+            let root = self.ast.items(self.ast.root());
+            for binding in bindings {
+                let Some(declared) = binding.declared else {
+                    continue;
+                };
+                let Some((position, &item)) = root.iter().enumerate().find(|&(_, &id)| {
+                    let span = self.ast.item(id).span;
+                    (span.start..span.end).contains(&declared.start)
+                }) else {
+                    continue;
+                };
+                if position + 1 > ready {
+                    ready = position + 1;
+                    made = MadeAt::After(item);
+                    why = Some(Blocker {
+                        name: binding.name,
+                        span: declared,
+                        kind: BlockerKind::Bound,
+                    });
+                }
+            }
+        }
+        if let Some(top) = self.top_fns.get_mut(index) {
+            top.ready = ready;
+            top.made = made;
+            top.blocker = top.blocker.or(why);
+        }
+    }
+
+    /// The top-level function whose binding is in `slot`, if one of this
+    /// input's is.
+    fn top_fn_in(&self, slot: Slot) -> Option<&TopFn> {
+        self.top_fns.iter().find(|top| {
+            self.bindings
+                .get(top.binding)
+                .is_some_and(|binding| binding.slot == slot)
+        })
+    }
+
     /// Declares a variable or field, as `kind` says, for the item `id`, in
     /// the innermost block, in the next free slot, which the item writes.
     fn declare(&mut self, name: Name, ty: TyId, id: ItemId, kind: BindingKind) {
@@ -5271,12 +6114,34 @@ impl<'a> Checker<'a> {
     /// The innermost, latest binding of `name`, with its index in
     /// `bindings`.
     fn lookup(&self, name: Name) -> Option<(usize, Binding)> {
-        self.bindings
+        let (index, binding) = self
+            .bindings
             .iter()
             .enumerate()
             .rev()
             .find(|(_, binding)| binding.name == name)
-            .map(|(index, &binding)| (index, binding))
+            .map(|(index, &binding)| (index, binding))?;
+        // A top-level function shadows a soft field of its name that a
+        // spread of the top level defines, wherever it is read.
+        let top_end = self.top_start + self.top_fns.len();
+        let root_end = self
+            .functions
+            .first()
+            .map(|function| function.bindings_start)
+            .into_iter()
+            .chain(self.root_end)
+            .min()
+            .unwrap_or(self.bindings.len());
+        if binding.kind == BindingKind::Field
+            && (top_end..root_end).contains(&index)
+            && let Some(top) = self.top_fns.iter().find(|top| top.name == name)
+        {
+            return self
+                .bindings
+                .get(top.binding)
+                .map(|&binding| (top.binding, binding));
+        }
+        Some((index, binding))
     }
 
     /// Where a use of `binding`, at `index` in `bindings`, reads its value
@@ -5285,6 +6150,15 @@ impl<'a> Checker<'a> {
     /// which this adds to every function between the binding's home and
     /// the current one that lacks it (see the module documentation).
     fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
+        // A top-level function of this input is read through the top
+        // level's frame from any function, never captured.
+        if (self.top_start..self.top_start + self.top_fns.len()).contains(&index) {
+            return if self.functions.is_empty() {
+                VarRef::Local(binding.slot)
+            } else {
+                VarRef::Fn(binding.slot)
+            };
+        }
         let home = match binding.kind {
             BindingKind::Callee => VarRef::Callee,
             BindingKind::Variable
@@ -6514,7 +7388,7 @@ impl<'a> Checker<'a> {
         let base = self.sorted_fields.len();
         for &item in ast.items(items) {
             let (path, value) = match ast.item(item).kind {
-                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Field { path, value, .. } => (path, value),
                 ItemKind::Spread(_) => {
                     self.sorted_fields.truncate(base);
                     return found;
@@ -6896,6 +7770,18 @@ impl<'a> Checker<'a> {
             // Recorded by `check_fn`, for a function that has any.
             unnarrowed: Vec::new(),
         };
+        // A top-level function's copies decide where its closure is made.
+        if self.functions.is_empty()
+            && let Some(copies) = self
+                .checking_top
+                .and_then(|top| self.top_copies.get_mut(top))
+        {
+            *copies = finished
+                .captures
+                .iter()
+                .map(|capture| capture.binding)
+                .collect();
+        }
         (self.next_slot, self.frame_size) = (finished.outer_next_slot, finished.outer_frame_size);
         finished.demanded
     }
@@ -7390,7 +8276,7 @@ impl<'a> Checker<'a> {
         let mut spread = false;
         for &item in ast.items(items) {
             let (path, value) = match ast.item(item).kind {
-                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Field { path, value, .. } => (path, value),
                 ItemKind::Spread(operand) => {
                     if !spread {
                         spread = true;
@@ -8145,7 +9031,15 @@ impl<'a> Checker<'a> {
         while let ExprKind::Paren(inner) = self.ast.get(node).kind {
             node = inner;
         }
-        self.expr_vars.get(node.index()) == Some(&VarRef::Callee)
+        match self.expr_vars.get(node.index()) {
+            Some(VarRef::Callee) => true,
+            // A call of a member of the group being checked is treated as
+            // a recursive call, from whichever member.
+            Some(&VarRef::Fn(slot)) => self
+                .top_fn_in(slot)
+                .is_some_and(|top| top.state == BodyState::Checking),
+            _ => false,
+        }
     }
 
     /// Reports that the call `call`, whose callee is at `callee_span` and
@@ -8959,7 +9853,11 @@ impl<'a> Checker<'a> {
     /// parameter: returns the type, and the index in `callbacks` of the
     /// callback parameter the name's binding is, if it is one.
     fn use_name(&mut self, id: ExprId, name: Name, span: Span) -> (TyId, Option<usize>) {
-        if let Some((index, binding)) = self.lookup(name) {
+        let found = self.lookup(name);
+        if self.early.is_some() && self.reads_between(name, found) {
+            return (TyId::ERROR, None);
+        }
+        if let Some((index, binding)) = found {
             self.expr_vars[id.index()] = self.resolve(index, binding);
             return (binding.ty, binding.callback);
         }
@@ -8974,8 +9872,66 @@ impl<'a> Checker<'a> {
                 "names may contain `-`, so `x-1` is one name; write `x - 1` for subtraction",
             );
         }
+        // Inside a function, a name the top level declares further down.
+        if !self.functions.is_empty()
+            && let Some(below) = self.ast.items(self.ast.root()).iter().find(|&&item| {
+                self.ast.item(item).span.start > span.start
+                    && root_declares(self.ast, item) == Some(name)
+            })
+        {
+            error = error
+                .with_context(
+                    self.ast.item(*below).span,
+                    format!("`{text}` is declared here, below the function"),
+                )
+                .with_note("a function sees the variables declared above it");
+        }
         self.errors.push(error);
         (TyId::ERROR, None)
+    }
+
+    /// While a top-level function's body is checked before the walk has
+    /// reached its declaration (see `early`): whether a read of `name`,
+    /// which the lookup found as `found`, is of a name the top level
+    /// declares between the item being checked and the function, by an
+    /// item or possibly by a spread, if it reads the top level or an
+    /// earlier input. If so, it records the first such read as why the
+    /// function cannot be used yet, and the read is not resolved.
+    fn reads_between(&mut self, name: Name, found: Option<(usize, Binding)>) -> bool {
+        let (Some((from, to)), Some(top)) = (self.early, self.checking_top) else {
+            return false;
+        };
+        let inner = self
+            .functions
+            .first()
+            .map_or(usize::MAX, |function| function.bindings_start);
+        let top_range = self.top_start..self.top_start + self.top_fns.len();
+        match found {
+            Some((index, _)) if index >= inner || top_range.contains(&index) => return false,
+            None if self.builtin(name).is_some() => return false,
+            _ => {}
+        }
+        let mutable = found.is_some_and(|(_, binding)| binding.kind == BindingKind::Mutable);
+        let root = self.ast.items(self.ast.root());
+        let between = root.get(from..to).unwrap_or_default();
+        let Some((span, kind)) = between.iter().find_map(|&item| {
+            let declared = self.ast.item(item);
+            match declared.kind {
+                ItemKind::Spread(_) => Some((declared.span, BlockerKind::Spread)),
+                // A `:=` of a mutable variable declares nothing.
+                ItemKind::Rebind { .. } if mutable => None,
+                _ => (root_declares(self.ast, item) == Some(name))
+                    .then_some((declared.span, BlockerKind::Bound)),
+            }
+        }) else {
+            return false;
+        };
+        if let Some(top) = self.top_fns.get_mut(top)
+            && top.blocker.is_none()
+        {
+            top.blocker = Some(Blocker { name, span, kind });
+        }
+        true
     }
 
     /// Types `+`, `-` and `*`: both operands must end up the same numeric
@@ -9982,6 +10938,7 @@ impl<'a> Checker<'a> {
                 ty,
                 value,
                 mutable,
+                ..
             } => {
                 let before = self.bindings.len();
                 self.check_let(id, path, ty, (value, mutable));
@@ -13948,15 +14905,19 @@ mod tests {
         assert_eq!(found[0].span, nth(text, "f", 2));
         assert_eq!(found[0].notes, vec!["shadow it with `let` instead"]);
         assert!(found[0].labels.is_empty());
-        // No hoisting, and so no mutual recursion.
+        // A top-level function is visible above its declaration.
         assert_eq!(
             messages("f()\nfn f(): Int { 1 }"),
-            vec!["undefined variable `f`"]
+            vec!["unused value of type Int"]
         );
+        // And top-level functions may be mutually recursive, each reading
+        // the other through the top level's frame.
         assert_eq!(
-            messages("fn a(): Int { b() }\nfn b(): Int { a() }"),
-            vec!["undefined variable `b`"]
+            shown_result("fn a(): Int { b() }\nfn b(): Int { a() }\na"),
+            "fn(): Int"
         );
+        let (ast, resolution) = resolved("fn a(): Int { b() }\nfn b(): Int { a() }");
+        assert_eq!(uses(&ast, &resolution, "b"), vec![VarRef::Fn(Slot(1))]);
     }
 
     #[test]
@@ -18188,6 +19149,364 @@ mod tests {
         "a spread cannot replace a field defined before it; put the spread first";
 
     #[test]
+    fn a_def_is_a_field_whose_value_is_the_function() {
+        // A field of the record, in order among the other fields.
+        assert_eq!(
+            file_type("def f(): Int { 1 }\na = 2"),
+            file_type("f = fn(): Int { 1 }\na = 2")
+        );
+        assert_eq!(
+            file_type("a = 2\ndef f(n: Int) ->> Int { n }"),
+            "{a: Int, f: fn(n: Int) ->> Int}"
+        );
+        // In an inner record block, from the next item on.
+        assert_eq!(
+            file_type("r = { def f(): Int { 1 }; g = f() }"),
+            "{r: {f: fn(): Int, g: Int}}"
+        );
+        // Its body sees its own name as the function being called.
+        assert_eq!(
+            file_type("def down(n: Int): Int { if n == 0 { 0 } else { down(n - 1) } }"),
+            "{down: fn(n: Int): Int}"
+        );
+        // Defined twice, with a field and with another `def`.
+        for text in [
+            "def f(): Int { 1 }\nf = 2",
+            "f = 2\ndef f(): Int { 1 }",
+            "def f(): Int { 1 }\ndef f(): Int { 2 }",
+        ] {
+            assert_eq!(messages(text), ["field `f` is defined twice"], "{text}");
+        }
+        // It overrides a soft field from a spread (which keeps its place:
+        // see the evaluator's tests).
+        assert_eq!(
+            file_type("...{f = 1; a = 2}\ndef f(): Int { 3 }"),
+            "{a: Int, f: fn(): Int}"
+        );
+        // A block with a `def` is a record block.
+        assert_eq!(
+            messages("let x = { def f(): Int { 1 }; = 2 }"),
+            ["a block with fields cannot have a result"]
+        );
+    }
+
+    #[test]
+    fn top_level_functions_are_visible_in_the_whole_input() {
+        // Used above its declaration.
+        assert_eq!(file_type("x = f()\nfn f(): Int { 1 }"), "{x: Int}");
+        assert_eq!(
+            file_type("x = f()\ndef f(): Int { 1 }"),
+            "{f: fn(): Int, x: Int}"
+        );
+        // Mutual recursion of two and of three, in any order.
+        let even = "fn even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }";
+        let odd = "fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
+        for text in [
+            format!("x = even(4)\n{even}\n{odd}"),
+            format!("{odd}\nx = even(4)\n{even}"),
+            format!("{even}\n{odd}\nx = even(4)"),
+        ] {
+            assert_eq!(file_type(&text), "{x: Bool}", "{text}");
+        }
+        assert_eq!(
+            file_type(
+                "x = a(9)\nfn a(n: Int): Int { if n == 0 { 0 } else { b(n - 1) } }\n\
+                 fn b(n: Int): Int { c(n) }\nfn c(n: Int): Int { a(n) + 1 }"
+            ),
+            "{x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_top_level_function_outside_a_group_is_seen_resolved() {
+        // `a`'s parameter `b` shadows the function `b`, so `a` does not
+        // mention `b`: they are not a group, and `b` sees `a` resolved
+        // (its result a future) in either order.
+        let a = "fn a(b: Int) -> Int { lazy b }";
+        let b = "fn b() -> Int { a(1) }";
+        for text in [format!("{a}\n{b}\nx = b"), format!("{b}\n{a}\nx = b")] {
+            assert_eq!(file_type(&text), "{x: fn() -> Future<Int>}", "{text}");
+        }
+        // Inside a group, a use of another member sees its declared type,
+        // as a recursive call through a function's own name does, from
+        // either member and in either order.
+        let a = "fn a(n: Int) -> Int { if n == 0 { lazy 5 } else { b(n - 1) } }";
+        let b = "fn b(n: Int) -> Int { a(n) }";
+        let first = file_type(&format!("{a}\n{b}\nx = a\ny = b"));
+        let either = "fn(n: Int | Future<Int>) -> Int | Future<Int>";
+        assert_eq!(first, format!("{{x: {either}, y: {either}}}"));
+        // As a function calling itself is.
+        assert_eq!(
+            file_type("fn a(n: Int) -> Int { if n == 0 { lazy 5 } else { a(n - 1) } }\nx = a"),
+            format!("{{x: {either}}}")
+        );
+        assert_eq!(first, file_type(&format!("{b}\n{a}\nx = a\ny = b")));
+        assert_eq!(first, file_type(&format!("x = a\ny = b\n{a}\n{b}")));
+    }
+
+    #[test]
+    fn a_top_level_functions_body_sees_the_bindings_above_it() {
+        // Checked early, at the item above its declaration that uses it.
+        assert_eq!(
+            file_type("let k = 1\nx = g()\nfn g(): Int { k }"),
+            "{x: Int}"
+        );
+        // Checked after the last item: the `k` above it, not the one below.
+        let text = "let k = 1\nfn g(): Int { k }\nlet k = \"s\"\nx = k";
+        assert_eq!(file_type(text), "{x: String}");
+        // First used by an item below a `let` that is below the function:
+        // it does not see that `let`.
+        let text = "let k = 1\nfn g(): Int { k }\nlet k = \"s\"\nx = g()";
+        assert_eq!(file_type(text), "{x: Int}");
+    }
+
+    #[test]
+    fn a_top_level_function_shadows_a_soft_field_of_its_name() {
+        // The spread still defines the record's field `f`, but every read of
+        // `f` in the input is the function, above the spread and below it.
+        let spread = "let r = {f = 2; g = 3}";
+        assert_eq!(
+            file_type(&format!(
+                "{spread}\n...r\nx = f()\ny = g\nfn f(): String {{ \"fn\" }}"
+            )),
+            "{f: Int, g: Int, x: String, y: Int}"
+        );
+        assert_eq!(
+            file_type(&format!(
+                "{spread}\nx = f()\n...r\nfn f(): String {{ \"fn\" }}"
+            )),
+            "{f: Int, g: Int, x: String}"
+        );
+        // A `def` of that name overrides the soft field, as a field does.
+        assert_eq!(
+            file_type(&format!(
+                "{spread}\nx = f()\n...r\ndef f(): String {{ \"fn\" }}"
+            )),
+            "{f: fn(): String, g: Int, x: String}"
+        );
+    }
+
+    /// Each error of `text`, as its message and the text it is at, then
+    /// each label's text and the text it is at, then each note.
+    fn explained(text: &str) -> Vec<String> {
+        let at = |span: Span| {
+            text.get(span.start as usize..span.end as usize)
+                .unwrap_or("")
+        };
+        diagnostics(text)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == Severity::Error)
+            .map(|diagnostic| {
+                let mut parts = vec![format!(
+                    "{} at `{}`",
+                    diagnostic.message,
+                    at(diagnostic.span)
+                )];
+                for label in &diagnostic.labels {
+                    parts.push(format!("{} at `{}`", label.text, at(label.span)));
+                }
+                parts.extend(diagnostic.notes.iter().cloned());
+                parts.join(" | ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_top_level_function_is_used_once_what_it_reads_is_bound() {
+        const BOUND: &str = "a function can be used once every variable it reads is bound";
+        const MUTABLE: &str = "a function copies a mutable variable where the function is written";
+        // Allowed: it copies nothing, or a `let` above the use.
+        assert_eq!(file_type("x = f()\nfn f(): Int { 1 }"), "{x: Int}");
+        assert_eq!(
+            file_type("let k = 1\nx = f()\nfn f(): Int { k }"),
+            "{x: Int}"
+        );
+        // Not allowed: a `let` below the use.
+        assert_eq!(
+            explained("let x = total()\nlet k = 10\nfn total(): Int { k }"),
+            vec![format!(
+                "`total` cannot be used here yet at `total` | `total` reads `k`, which is bound \
+                 here at `let k = 10` | {BOUND}"
+            )]
+        );
+        // A mutable, even above the use: it exists from its function's line.
+        assert_eq!(
+            explained("let mut n = 1\nx = f()\nfn f(): Int { n }"),
+            vec![format!(
+                "`f` cannot be used here yet at `f` | `f` reads the mutable variable `n`, so it \
+                 exists from here at `fn f(): Int {{ n }}` | {MUTABLE}"
+            )]
+        );
+        // Through one, two and four other functions.
+        let chain = "let k = 1\nfn b(): Int { c() }\nfn c(): Int { d() }\nfn d(): Int { e() }\n\
+                     fn e(): Int { k }";
+        let reads = "reads `k`, which is bound here at `let k = 1`";
+        assert_eq!(
+            explained(&format!("x = d()\n{chain}")),
+            vec![format!(
+                "`d` cannot be used here yet at `d` | `d` uses `e`, and `e` {reads} | {BOUND}"
+            )]
+        );
+        assert_eq!(
+            explained(&format!("x = c()\n{chain}")),
+            vec![format!(
+                "`c` cannot be used here yet at `c` | `c` uses `d`, `d` uses `e`, and `e` \
+                 {reads} | {BOUND}"
+            )]
+        );
+        assert_eq!(
+            explained(&format!("x = a()\nfn a(): Int {{ b() }}\n{chain}")),
+            vec![format!(
+                "`a` cannot be used here yet at `a` | `a` uses `b`, ..., and `e` {reads} | \
+                 {BOUND}"
+            )]
+        );
+        // Mentioned only inside a `lazy` or a function expression the item
+        // builds.
+        for item in ["x = lazy f()", "x = fn(): Int { f() }"] {
+            let found = explained(&format!("{item}\nlet k = 1\nfn f(): Int {{ k }}"));
+            assert_eq!(found.len(), 1, "{item}");
+            assert!(
+                found[0].starts_with("`f` cannot be used here yet"),
+                "{item}"
+            );
+        }
+        // No error where a parameter or a local shadows the name.
+        for text in [
+            "x = fn(f: Int): Int { f }\nlet k = 1\nfn f(): Int { k }",
+            "x = { let f = 2; = f }\nlet k = 1\nfn f(): Int { k }",
+            // Inside function bodies there is no check.
+            "fn g(): Int { f() }\nlet k = 1\nfn f(): Int { k }",
+        ] {
+            assert!(
+                check(&parse_text(text), &mut TypeTable::new()).is_ok(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_functions_closure_is_made_once_what_it_copies_is_bound() {
+        let text = "let k = 1\nlet mut n = 2\nfn a(): Int { 1 }\nfn b(): Int { k }\n\
+                    fn c(): Int { n }\nfn d(): Int { e() }\nfn e(): Int { 1 }";
+        let ast = parse_text(text);
+        let (checked, _) = check(&ast, &mut TypeTable::new()).unwrap();
+        let root = ast.items(ast.root());
+        assert_eq!(
+            checked.resolution.top_functions(),
+            [
+                // Copies nothing: made as the input starts.
+                (root[2], MadeAt::Start),
+                // Copies `k`: made just after its `let`.
+                (root[3], MadeAt::After(root[0])),
+                // Copies a mutable: made at its own declaration.
+                (root[4], MadeAt::Own),
+                // Reads another top-level function, which it does not copy.
+                (root[5], MadeAt::Start),
+                (root[6], MadeAt::Start),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_body_checked_early_does_not_see_what_is_declared_below_the_use() {
+        const BOUND: &str = "a function can be used once every variable it reads is bound";
+        // The function reads the second `k`, the latest above itself.
+        assert_eq!(
+            explained("let k = 1\nx = g()\nlet k = 2\nfn g(): Int { k }"),
+            vec![format!(
+                "`g` cannot be used here yet at `g` | `g` reads `k`, which is bound here at \
+                 `let k = 2` | {BOUND}"
+            )]
+        );
+        // Declared again between the use and the function by `:=` and by a
+        // dotted field.
+        assert_eq!(
+            explained("let r = {a = 1}\nx = g()\nr.a := 2\nfn g(): Int { r.a }"),
+            vec![format!(
+                "`g` cannot be used here yet at `g` | `g` reads `r`, which is bound here at \
+                 `r.a := 2` | {BOUND}"
+            )]
+        );
+        assert_eq!(
+            explained("x = g()\nr.a = 2\nfn g(): Int { r.a }"),
+            vec![format!(
+                "`g` cannot be used here yet at `g` | `g` reads `r`, which is bound here at \
+                 `r.a = 2` | {BOUND}"
+            )]
+        );
+        // A spread between may define any name.
+        assert_eq!(
+            explained("let s = {port = 1}\nx = g()\n...s\nfn g(): Int { port }"),
+            vec![format!(
+                "`g` cannot be used here yet at `g` | `g` reads `port`, which this spread may \
+                 define at `...s` | {BOUND}"
+            )]
+        );
+        // The function is then erroneous for its users, and its body's
+        // errors are reported once.
+        let text = "x = g()\nlet k = 1\nfn g(): Int { k + true }\ny = g()";
+        let found = messages(text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0], "`g` cannot be used here yet");
+    }
+
+    #[test]
+    fn a_top_level_functions_name_is_not_also_a_variable() {
+        const NOTE: &str = "a function declared at the top level is visible in the whole \
+                            file, so its name cannot also be a variable or a field";
+        assert_eq!(
+            explained("fn f(): Int { 1 }\nfn f(): Int { 2 }"),
+            vec!["function `f` is declared twice at `f` | first declared here at `f`"]
+        );
+        for (text, at) in [
+            ("fn f(): Int { 1 }\nlet f = 2", "f"),
+            ("let f = 2\nfn f(): Int { 1 }", "f"),
+            ("fn f(): Int { 1 }\nlet mut f = 2", "f"),
+            ("fn f(): Int { 1 }\nf = 2", "f"),
+            ("let mut x = 1\nfn f(): Int { 1 }\nf := 2", "f"),
+            ("def f(): Int { 1 }\nlet f = 2", "f"),
+        ] {
+            let found = explained(text);
+            assert_eq!(
+                found.first(),
+                Some(&format!(
+                    "`f` is a function of this file at `{at}` | declared here at `f` | {NOTE}"
+                )),
+                "{text}"
+            );
+        }
+        // A `def` and a field, or two `def`s, are a field defined twice.
+        for text in [
+            "def f(): Int { 1 }\nf = 2",
+            "def f(): Int { 1 }\ndef f(): Int { 2 }",
+        ] {
+            assert_eq!(messages(text), vec!["field `f` is defined twice"], "{text}");
+        }
+        // Inner blocks still shadow.
+        assert_eq!(
+            file_type("fn f(): Int { 1 }\nx = { let f = \"s\"; = f }"),
+            "{x: String}"
+        );
+    }
+
+    #[test]
+    fn an_undefined_variable_declared_below_the_function_says_so() {
+        assert_eq!(
+            explained("fn d(): Int { q }\nlet q = 2"),
+            vec![
+                "undefined variable `q` at `q` | `q` is declared here, below the function at \
+                 `let q = 2` | a function sees the variables declared above it"
+            ]
+        );
+        // Not for a name declared nowhere.
+        assert_eq!(
+            explained("fn d(): Int { q }"),
+            vec!["undefined variable `q` at `q`"]
+        );
+    }
+
+    #[test]
     fn a_spread_defines_the_fields_of_its_record() {
         let text = "let defaults = { host = \"localhost\"; port = 80 }\n\
                     let conf = {\n  ...defaults\n  port = 8080\n  url = \"{host}:{port}\"\n}\n\
@@ -21097,6 +22416,29 @@ mod tests {
                 "{body}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_top_level_function_is_not_code_that_is_never_run() {
+        // Its closure may have been made already, so the warning neither
+        // starts at a top-level function nor counts it: it is at the first
+        // other item.
+        let text = "let x = for { }\nfn f(): Int { 1 }\ndef g(): Int { 2 }\nlet y = f()";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "this is never run");
+        assert_eq!(found[0].span, at(text, "let y = f()"));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "let x = for { }"), "this always leaves the block")]
+        );
+        // Nothing after it but functions: no warning.
+        assert_eq!(warnings("let x = for { }\nfn f(): Int { 1 }"), vec![]);
+        // In an inner block a named function is an item as any other.
+        let text = "x = { let a = for { }; fn f(): Int { 1 }; f() }";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].span, at(text, "fn f(): Int { 1 }"));
     }
 
     #[test]

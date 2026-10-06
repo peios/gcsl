@@ -1,0 +1,7 @@
+let x = total()
+let k = 10
+fn total(): Int { k }
+let mut n = 1
+let y = first()
+fn first(): Int { second() }
+fn second(): Int { n }

@@ -36,6 +36,16 @@
 //! from its '(' on>`, both spanning `fn` through the body's `}`. `fn`
 //! followed by anything else starts an ordinary expression item.
 //!
+//! A public function, `def NAME PARAMS RETURN BODY`, is recognised by `def`
+//! at the start of an item, and has exactly a named function's grammar,
+//! with the same three markers; it is parsed as the field `NAME = <the
+//! function expression from its '(' on>`. Both forms are marked as written
+//! (`function` on [`ItemKind::Let`] and [`ItemKind::Field`]), so the tree
+//! tells them from `let NAME = fn ...` and `NAME = fn ...`. `def` must be
+//! followed by a single identifier: a string or a dotted path is an error
+//! at it, and so is anything else. `def` is a keyword, so anywhere else,
+//! as a name or an expression, it is reported as any keyword is there.
+//!
 //! # Paths
 //!
 //! A path is a name followed by any number of segments, each `.` and a
@@ -503,6 +513,12 @@ const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
 /// The error for a string literal where a variable's name is expected.
 const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 
+/// The error for a `def` named by a dotted path, at its first `.`.
+const DEF_DOTTED_NAME: &str = "a `def` is named by one identifier, not a dotted path";
+
+/// The error for a `def` named by a string, at the string.
+const DEF_STRING_NAME: &str = "a `def` is named by an identifier, not a string";
+
 /// The error for a function, or a function type, without a return marker.
 const MISSING_RETURN_TYPE: &str =
     "expected `:`, `->` or `->>` and a return type after the parameters";
@@ -786,6 +802,9 @@ impl Parser<'_> {
         {
             return self.parse_named_fn(token, (name, name_token.span));
         }
+        if token.kind == TokenKind::Def {
+            return self.parse_def(token);
+        }
         if token.kind == TokenKind::Mut {
             let note = self.starts_field(1).then_some(MUT_FIELD_NOTE);
             return Err(self.misplaced_mut(token, note));
@@ -872,6 +891,7 @@ impl Parser<'_> {
             ty,
             value,
             mutable,
+            function: false,
         };
         Ok((kind, value, ty_height, shape))
     }
@@ -1020,10 +1040,37 @@ impl Parser<'_> {
         })
     }
 
-    /// Parses a named function item, `fn NAME(...) ...`, starting at its
-    /// `fn` keyword, `keyword`, followed by `name` and its span: a `let` of
-    /// the name whose value is the function expression from `(` on, both
-    /// spanning `fn` through the body's `}`.
+    /// Parses a public function item, `def NAME(...) ...`, starting at its
+    /// `def` keyword, `keyword`. The name must be a single identifier
+    /// directly followed by the parameters: a string, a dotted path or
+    /// anything else is an error at it.
+    fn parse_def(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        let name_token = self.peek_at(1);
+        let after = self.peek_at(2);
+        match name_token.kind {
+            TokenKind::Ident(_) if after.kind == TokenKind::Dot => {
+                Err(self.error(DEF_DOTTED_NAME, after.span))
+            }
+            TokenKind::Ident(name) => self.parse_named_fn(keyword, (name, name_token.span)),
+            TokenKind::Str(_) | TokenKind::StrStart(_) => {
+                Err(self.error(DEF_STRING_NAME, name_token.span))
+            }
+            _ => {
+                let found = self.describe(name_token);
+                Err(self.report(Diagnostic::error(
+                    format!("expected the function's name after `def`, found {found}"),
+                    name_token.span,
+                )))
+            }
+        }
+    }
+
+    /// Parses a named function item, `fn NAME(...) ...` or `def NAME(...)
+    /// ...`, starting at its keyword, `keyword`, followed by `name` and its
+    /// span. After `fn`, a `let` of the name, and after `def`, a field of
+    /// the name, whose value is the function expression from `(` on, both
+    /// spanning the keyword through the body's `}`; either marked as
+    /// written as a named function, not as `let NAME = fn` or `NAME = fn`.
     fn parse_named_fn(
         &mut self,
         keyword: Token,
@@ -1038,11 +1085,20 @@ impl Parser<'_> {
             span: name_span,
         });
         let (path, shape) = self.finish_path(base);
-        let kind = ItemKind::Let {
-            path,
-            ty: None,
-            value,
-            mutable: false,
+        let kind = if keyword.kind == TokenKind::Def {
+            ItemKind::Field {
+                path,
+                value,
+                function: true,
+            }
+        } else {
+            ItemKind::Let {
+                path,
+                ty: None,
+                value,
+                mutable: false,
+                function: true,
+            }
         };
         self.finish_item(keyword, (kind, value), 0, shape)
     }
@@ -1171,7 +1227,11 @@ impl Parser<'_> {
         let kind = if rebind {
             ItemKind::Rebind { path, value }
         } else {
-            ItemKind::Field { path, value }
+            ItemKind::Field {
+                path,
+                value,
+                function: false,
+            }
         };
         Ok((kind, value, shape))
     }
@@ -1877,6 +1937,7 @@ impl Parser<'_> {
             | TokenKind::DotDot
             | TokenKind::DotDotEq
             | TokenKind::Let
+            | TokenKind::Def
             | TokenKind::Colon
             | TokenKind::ColonEq
             | TokenKind::Arrow
@@ -2811,6 +2872,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::False
         | TokenKind::Not
         | TokenKind::Fn
+        | TokenKind::Def
         | TokenKind::Lazy
         | TokenKind::Await
         | TokenKind::For
@@ -2949,6 +3011,29 @@ mod tests {
                 }
             }
             ItemKind::Let {
+                path,
+                value,
+                function: true,
+                ..
+            }
+            | ItemKind::Field {
+                path,
+                value,
+                function: true,
+            } => {
+                // As written: the keyword, the name, then the function
+                // expression from its `(` on.
+                let keyword = match ast.item(id).kind {
+                    ItemKind::Field { .. } => "def ",
+                    _ => "fn ",
+                };
+                out.push_str(keyword);
+                path_shape(ast, path, out);
+                let mut function = String::new();
+                expr(ast, value, &mut function);
+                out.push_str(function.strip_prefix("fn").unwrap());
+            }
+            ItemKind::Let {
                 path, ty, value, ..
             } => {
                 out.push_str("let ");
@@ -2965,7 +3050,7 @@ mod tests {
                 out.push_str(" := ");
                 expr(ast, value, out);
             }
-            ItemKind::Field { path, value } => {
+            ItemKind::Field { path, value, .. } => {
                 path_shape(ast, path, out);
                 out.push_str(" = ");
                 expr(ast, value, out);
@@ -4990,7 +5075,7 @@ mod tests {
                 .pretty()
                 .to_string(),
             "(file\n\
-             \x20 (let f @0..38\n\
+             \x20 (fn f @0..38\n\
              \x20   (fn @0..38\n\
              \x20     (params (g fn(Int) ->> Int))\n\
              \x20     (ret memo Int)\n\
@@ -5104,12 +5189,118 @@ mod tests {
     }
 
     #[test]
+    fn a_def_is_a_field_of_a_function_expression() {
+        let ast = parse_text("def add(a: Int, b: Int): Int { a + b }").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        let ItemKind::Field {
+            path,
+            value,
+            function: true,
+        } = item.kind
+        else {
+            panic!("expected a def, got {item:?}");
+        };
+        assert_eq!(item.span, Span::new(0, 38));
+        assert_eq!(ast.path(path)[0].span, Span::new(4, 7));
+        assert_eq!(ast.get(value).span, Span::new(0, 38));
+        // Each marker, as `fn` has them.
+        for (marker, printed) in [(":", "():"), ("->>", "() ->>"), ("->", "() ->")] {
+            let text = format!("def f(){marker} Int {{ 1 }}");
+            assert_eq!(shape(&text), format!("def f{printed} Int {{1}}"));
+        }
+        // In a record block, among fields, in order.
+        assert_eq!(
+            shape("{ def f(): Int { 1 }; a = 2 }"),
+            "{def f(): Int {1}; a = 2}"
+        );
+        assert!(
+            ast.pretty()
+                .to_string()
+                .starts_with("(file\n  (def add @0..38\n    (fn @0..38\n")
+        );
+    }
+
+    #[test]
+    fn the_four_forms_of_a_function_binding_print_as_written() {
+        for (text, printed) in [
+            ("fn f(): Int { 1 }", "fn f(): Int {1}"),
+            ("def f(): Int { 1 }", "def f(): Int {1}"),
+            ("let f = fn(): Int { 1 }", "let f = fn(): Int {1}"),
+            ("f = fn(): Int { 1 }", "f = fn(): Int {1}"),
+        ] {
+            assert_eq!(shape(text), printed);
+            assert_eq!(shape(printed), printed);
+        }
+        let heads = ["(fn f @", "(def f @", "(let f @", "(field f @"];
+        for (text, head) in [
+            "fn f(): Int { 1 }",
+            "def f(): Int { 1 }",
+            "let f = fn(): Int { 1 }",
+            "f = fn(): Int { 1 }",
+        ]
+        .into_iter()
+        .zip(heads)
+        {
+            let pretty = parse_text(text).unwrap().pretty().to_string();
+            assert!(pretty.starts_with(&format!("(file\n  {head}")), "{pretty}");
+        }
+    }
+
+    #[test]
+    fn a_def_needs_one_plain_name_and_the_grammar_of_fn() {
+        assert_eq!(
+            error("def a.b(): Int { 1 }"),
+            (
+                "a `def` is named by one identifier, not a dotted path".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        assert_eq!(
+            error("def \"a b\"(): Int { 1 }"),
+            (
+                "a `def` is named by an identifier, not a string".to_owned(),
+                Span::new(4, 9)
+            )
+        );
+        assert_eq!(
+            error("def (): Int { 1 }"),
+            (
+                "expected the function's name after `def`, found `(`".to_owned(),
+                Span::new(4, 5)
+            )
+        );
+        // Without a return type or a body, what `fn` reports, one byte on.
+        for rest in ["f() { 1 }", "f(): Int", "f()"] {
+            let (message, span) = error(&format!("fn {rest}"));
+            let shifted = Span::new(span.start + 1, span.end + 1);
+            assert_eq!(error(&format!("def {rest}")), (message, shifted), "{rest}");
+        }
+        // At the start of an item it always begins a `def`, so a field
+        // named `def` is one without a name.
+        assert_eq!(
+            error("def = 1"),
+            (
+                "expected the function's name after `def`, found `=`".to_owned(),
+                Span::new(4, 5)
+            )
+        );
+        // As a name elsewhere, it is reported as any keyword is.
+        for (with_def, with_let) in [("let def = 1", "let let = 1"), ("x = def", "x = let")] {
+            assert_eq!(
+                error(with_def).0.replace("`def`", "`let`"),
+                error(with_let).0,
+                "{with_def}"
+            );
+        }
+    }
+
+    #[test]
     fn named_functions_are_lets_of_function_expressions() {
         assert_eq!(
             shape("fn greet(name: String): String { \"hello {name}\" }"),
-            "let greet = fn(name: String): String {\"hello <name>\"}"
+            "fn greet(name: String): String {\"hello <name>\"}"
         );
-        assert_eq!(shape("fn f() -> {} {}\nf()"), "let f = fn() -> {} {}; f()");
+        assert_eq!(shape("fn f() -> {} {}\nf()"), "fn f() -> {} {}; f()");
         // The item and its value both span `fn` through the body; the path
         // is the name.
         let ast = parse_text("  fn add(a: Int, b: Int): Int { a + b }").unwrap();
@@ -5131,7 +5322,7 @@ mod tests {
         // In a block, and as the pretty printer shows it.
         assert_eq!(
             shape("{ fn f(): Int { 1 }; = f }"),
-            "{let f = fn(): Int {1}; = f}"
+            "{fn f(): Int {1}; = f}"
         );
         assert_eq!(
             parse_text("fn f(): Int { 1 }")
@@ -5139,7 +5330,7 @@ mod tests {
                 .pretty()
                 .to_string(),
             "(file\n\
-             \x20 (let f @0..17\n\
+             \x20 (fn f @0..17\n\
              \x20   (fn @0..17\n\
              \x20     (params)\n\
              \x20     (ret pure Int)\n\
@@ -5400,7 +5591,7 @@ mod tests {
         assert_eq!(
             ast.pretty().to_string(),
             "(file\n\
-             \x20 (let f @0..43\n\
+             \x20 (fn f @0..43\n\
              \x20   (fn @0..43\n\
              \x20     (params (x Int) (y fn(Int) -> String))\n\
              \x20     (ret impure {})\n\
@@ -5591,7 +5782,7 @@ mod tests {
         );
         assert_eq!(
             shape("fn plan(): {build: Future<{}>} { build = lazy { run(compiler) } }"),
-            "let plan = fn(): {build: Future<{}>} {build = (lazy {run(compiler)})}"
+            "fn plan(): {build: Future<{}>} {build = (lazy {run(compiler)})}"
         );
         assert_eq!(
             shape("1 : {a: Int | Future<Int>, b: Present<{c: Int}>}"),
@@ -7448,7 +7639,7 @@ mod tests {
         // A function's body may be labelled, as any block.
         assert_eq!(
             shape("fn f(): Int {'body return'body 1}"),
-            "let f = fn(): Int {'body return'body 1}"
+            "fn f(): Int {'body return'body 1}"
         );
         // The summary's examples.
         assert_eq!(
@@ -7457,7 +7648,7 @@ mod tests {
         );
         assert_eq!(
             shape("fn sign(n: Int): Int { if n < 0 { return -1 }; 0 }"),
-            "let sign = fn(n: Int): Int {(if (n < 0) {return (-1)}); 0}"
+            "fn sign(n: Int): Int {(if (n < 0) {return (-1)}); 0}"
         );
         assert_eq!(
             shape("let v: Int = for'spin { let r = poll(); if r > 0 { return'spin r } }"),

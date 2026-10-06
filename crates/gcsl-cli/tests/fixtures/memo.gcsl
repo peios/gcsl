@@ -11,6 +11,6 @@ let first = fetch("core")
 let again = fetch("core")
 core = first.name
 deps = again.deps + fetch("gcsl").deps
-weight = weight(80)
+fib-80 = weight(80)
 step = later(21)
 doubled = await later(21)

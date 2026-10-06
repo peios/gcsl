@@ -33,6 +33,17 @@
 //! its arguments in source order, each with the parameter the checker bound
 //! it to.
 //!
+//! A top-level function's closure is a `Store` of its `MakeClosure` into
+//! the function's slot, placed where the checker says the closure is made
+//! ([`crate::check::Resolution::top_functions`]): before the outermost
+//! block's first item, just after the item that binds the last of what it
+//! copies, or at its own item. Where it is stored before its own item, its
+//! own item lowers to nothing, or, for a `def`, only to its place among the
+//! record's fields. A function's or `lazy`'s use of a top-level function of
+//! its input is an [`IrKind::Fn`] of the function's slot, read from the top
+//! level's frame, not a capture; top-level code's is the `Load` any read
+//! is.
+//!
 //! A record block's fields become `Store`s to their slots, as `let`s do, so
 //! that later items can read them, and its result is a `MakeRecord` whose
 //! values are `Load`s of those slots in definition order; every expression
@@ -252,7 +263,8 @@ use crate::ast::{
     UnaryOp, path_span, symbol_span,
 };
 use crate::check::{
-    AwaitMark, Builtin, Checked, JumpTarget, PathResolution, Resolution, Slot, Types, VarRef,
+    AwaitMark, Builtin, Checked, JumpTarget, MadeAt, PathResolution, Resolution, Slot, Types,
+    VarRef,
 };
 use crate::diagnostic::InternalError;
 use crate::ir::{
@@ -502,10 +514,18 @@ impl Lowerer<'_> {
         let is_record = self.is_record_body(body);
         let base = self.item_stack.len();
         let mut result = None;
+        let is_root = body == self.ast.root();
+        if is_root {
+            self.store_top_closures(None)?;
+        }
         for (index, &id) in items.iter().enumerate() {
             // A record block's final expression is a statement.
             let is_result = !is_record && index + 1 == items.len();
             let item = self.ast.item(id);
+            if is_root && self.is_stored_elsewhere(id) {
+                self.store_top_closures(Some(id))?;
+                continue;
+            }
             match item.kind {
                 ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. } => {
                     let store = self.lower_store(id)?;
@@ -550,6 +570,9 @@ impl Lowerer<'_> {
                     self.item_stack.push(statement);
                 }
             }
+            if is_root {
+                self.store_top_closures(Some(id))?;
+            }
         }
         let result = match result {
             Some(result) => result,
@@ -567,6 +590,39 @@ impl Lowerer<'_> {
         Ok(IrKind::Block { items, result })
     }
 
+    /// Whether the root item `id` is a top-level function whose closure is
+    /// made somewhere other than at its own declaration (see
+    /// [`MadeAt`]): it then lowers to nothing where it is written, the
+    /// `Store` of its closure being placed by
+    /// [`Lowerer::store_top_closures`]. A `def`'s field is still where it
+    /// is written in its record, which reads the slot when it is made.
+    fn is_stored_elsewhere(&self, id: ItemId) -> bool {
+        self.resolution
+            .top_functions()
+            .iter()
+            .any(|&(item, made)| item == id && made != MadeAt::Own)
+    }
+
+    /// Pushes, as items of the root block, the `Store`s of the closures of
+    /// the top-level functions made at `at`, in source order: those made
+    /// as the input starts for `None`, and those made just after the root
+    /// item `item` for `Some(item)` (see [`MadeAt`]).
+    fn store_top_closures(&mut self, at: Option<ItemId>) -> Result<(), InternalError> {
+        let resolution = self.resolution;
+        for &(item, made) in resolution.top_functions() {
+            let here = match (made, at) {
+                (MadeAt::Start, None) => true,
+                (MadeAt::After(after), Some(at)) => after == at,
+                _ => false,
+            };
+            if here {
+                let store = self.lower_store(item)?;
+                self.item_stack.push(store);
+            }
+        }
+        Ok(())
+    }
+
     /// Lowers the declaration `id`, a `let`, a field or a `:=`, to the
     /// `Store` of its value (see [`Lowerer::lower_declaration`]) into the
     /// slot the checker gave it.
@@ -574,7 +630,7 @@ impl Lowerer<'_> {
         let item = self.ast.item(id);
         let (ItemKind::Let { path, value, .. }
         | ItemKind::Rebind { path, value }
-        | ItemKind::Field { path, value }) = item.kind
+        | ItemKind::Field { path, value, .. }) = item.kind
         else {
             return Err(InternalError {
                 message: "an item that declares nothing lowered as a declaration",
@@ -965,7 +1021,7 @@ impl Lowerer<'_> {
         let mut spread = false;
         for &id in items {
             let (path, value) = match self.ast.item(id).kind {
-                ItemKind::Field { path, value } => (path, value),
+                ItemKind::Field { path, value, .. } => (path, value),
                 ItemKind::Spread(operand) => {
                     spread = true;
                     let operand_span = self.ast.get(operand).span;
@@ -2255,6 +2311,7 @@ const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
     match var {
         VarRef::Local(slot) if slot.get() != Slot::NONE.get() => Some(IrKind::Load(slot, kind)),
         VarRef::Capture(index) => Some(IrKind::LoadCapture(index, kind)),
+        VarRef::Fn(slot) => Some(IrKind::Fn(slot)),
         VarRef::Callee => Some(IrKind::LoadCallee),
         VarRef::Local(_) | VarRef::Builtin(_) | VarRef::None => None,
     }
@@ -3280,12 +3337,13 @@ mod tests {
         assert_eq!(depths(&ir, closure.body), vec![1]);
         assert_eq!(closure.height, 4);
         // A body that makes a closure is as tall as the loads of what it
-        // captures, not the closure's body: the block, the closure, its
-        // capture of `g`.
+        // captures, not the closure's body: the block and the closure, which
+        // captures nothing, since `g` is a top-level function, read through
+        // the top level's frame.
         let ir = lower_text(
             "fn g(n: Int): Int { n }\nfn outer(): fn(): Int { fn(): Int { g(g(g(1))) } }",
         );
-        assert_eq!(ir.function(FnId::new(2)).height, 3);
+        assert_eq!(ir.function(FnId::new(2)).height, 2);
         // The block, three calls and their arguments, and the literal.
         assert_eq!(ir.function(FnId::new(1)).height, 8);
     }
@@ -4668,5 +4726,161 @@ mod tests {
             ir.get(body).kind,
             IrKind::For { collect: false, .. }
         ));
+    }
+
+    /// Everything the checker and lowering decide about `text` that does
+    /// not depend on where its items are written: the file's type; each
+    /// diagnostic's severity and message, sorted; and the lines of the IR
+    /// dump with spans, slot numbers and function numbers removed, the
+    /// names of a record's fields sorted, and the lines sorted, so that
+    /// neither slots nor item order count.
+    fn decided(text: &str) -> (String, Vec<String>, Vec<String>) {
+        let ast = parse_text(text);
+        let mut types = TypeTable::new();
+        let output = match crate::check::Checker::new(&ast, &mut types).check() {
+            Ok(output) => output,
+            Err(diagnostics) => {
+                let mut messages: Vec<String> = diagnostics
+                    .iter()
+                    .map(|d| format!("{:?}: {}", d.severity, d.message))
+                    .collect();
+                messages.sort();
+                return (String::new(), messages, Vec::new());
+            }
+        };
+        let mut messages: Vec<String> = output
+            .warnings
+            .iter()
+            .map(|d| format!("{:?}: {}", d.severity, d.message))
+            .collect();
+        messages.sort();
+        let shown = types.display(output.ty, ast.names()).to_string();
+        let ir = lower(&ast, &output.checked, &types, 0).unwrap();
+        let mut lines: Vec<String> = ir
+            .pretty(ast.names())
+            .to_string()
+            .lines()
+            .map(normalised)
+            .collect();
+        lines.sort();
+        (shown, messages, lines)
+    }
+
+    /// A line of an IR dump without its span, the numbers after each `#`,
+    /// and with the names in its `[...]` sorted.
+    fn normalised(line: &str) -> String {
+        let line = line.split(" @").next().unwrap_or(line);
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == '#' {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+            }
+        }
+        if let (Some(open), Some(close)) = (out.find('['), out.find(']')) {
+            let mut names: Vec<&str> = out[open + 1..close].split(' ').collect();
+            names.sort_unstable();
+            out = format!("{}[{}]{}", &out[..open], names.join(" "), &out[close + 1..]);
+        }
+        out
+    }
+
+    /// Asserts that `parts`, joined by newlines in the order given and in
+    /// the reverse order, decide the same: a program and its reordering
+    /// checked against each other. Returns what they decide.
+    fn order_free(parts: &[&str]) -> (String, Vec<String>, Vec<String>) {
+        let forward = parts.join("\n");
+        let backward: Vec<&str> = parts.iter().rev().copied().collect();
+        let backward = backward.join("\n");
+        let first = decided(&forward);
+        assert_eq!(first, decided(&backward), "{forward}\n----\n{backward}");
+        first
+    }
+
+    #[test]
+    fn the_reordering_helper_sees_a_difference() {
+        // A field's position decides nothing it compares, but a `let`'s
+        // does: below its user it is undefined.
+        assert_eq!(
+            normalised("(make-record [x run show] @0..75"),
+            "(make-record [run show x]"
+        );
+        assert_eq!(normalised("  (fn top even#12 @51..55)"), "  (fn top even#");
+        assert_ne!(decided("let k = 1\nx = k"), decided("x = k\nlet k = 1"));
+    }
+
+    #[test]
+    fn inferred_parameters_do_not_depend_on_order() {
+        // `show` leaves its parameter provisional; `add` measures it.
+        let (shown, messages, _) = order_free(&[
+            "def show(n: Int): Int { n }",
+            "def add(n: Int): Int { n + 1 }",
+            "def run(n: Int): Int { add(show(n)) }",
+            "x = run(lazy 1)",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(shown.contains("x: Int"), "{shown}");
+        // The callee written below its caller, and above it.
+        let used = "def pass(n: Int): Int { n }";
+        let client = "def use(n: Int): Int { pass(n) }";
+        let a = order_free(&[used, client, "x = use(lazy 2)"]);
+        let b = order_free(&[client, used, "x = use(lazy 2)"]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn inferred_results_do_not_depend_on_order() {
+        // An impure function's result is inferred from its body.
+        let used = "def get(n: Int) -> Int { if n == 0 { lazy 0 } else { n } }";
+        let client = "def twice(n: Int) -> Int { get(n) + get(n) }";
+        let a = order_free(&[used, client, "x = twice(1)"]);
+        let b = order_free(&[client, used, "x = twice(1)"]);
+        assert_eq!(a, b);
+        assert!(a.1.is_empty(), "{:?}", a.1);
+        // A pure caller of a pure callee that leaves its parameter
+        // provisional: outside a group it sees the callee resolved, so
+        // the call needs no `await` and is no error, in either order.
+        let used = "def a(b: Int): Int { b }";
+        let pure = "def total(): Int { a(1) + 1 }";
+        let a = order_free(&[used, pure, "x = total()"]);
+        let b = order_free(&[pure, used, "x = total()"]);
+        assert_eq!(a, b);
+        assert!(a.1.is_empty(), "{:?}", a.1);
+    }
+
+    #[test]
+    fn narrowed_callbacks_do_not_depend_on_order() {
+        // `apply`'s callback parameter is narrowed by its body, so `run`
+        // may pass it the pure `double`, wherever the three are written.
+        let host = "def apply(f: fn(Int) -> Int) -> Int { f(1) }";
+        let user = "def run() -> Int { apply(double) }";
+        let double = "fn double(x: Int): Int { x * 2 }";
+        let a = order_free(&[double, host, user, "x = run()"]);
+        let b = order_free(&[user, host, double, "x = run()"]);
+        assert_eq!(a, b);
+        assert!(a.1.is_empty(), "{:?}", a.1);
+    }
+
+    #[test]
+    fn groups_and_their_neighbours_do_not_depend_on_order() {
+        // Not a group: `a`'s parameter shadows `b`.
+        order_free(&["def a(b: Int) -> Int { lazy b }", "def b() -> Int { a(1) }"]);
+        // A group: the conservative view, the same from either member.
+        let (shown, _, _) = order_free(&[
+            "def a(n: Int) -> Int { if n == 0 { lazy 5 } else { b(n - 1) } }",
+            "def b(n: Int) -> Int { a(n) }",
+        ]);
+        let either = "fn(n: Int | Future<Int>) -> Int | Future<Int>";
+        assert_eq!(shown, format!("{{a: {either}, b: {either}}}"));
+        // A nested spread that defines the function's name: the mention is
+        // counted (the documented over-approximation), so `f`'s body is
+        // checked before the item, and the item reads the spread's field.
+        let (shown, messages, _) =
+            order_free(&["let r = {f = 2}\nx = { ...r; y = f }", "fn f(): Int { 1 }"]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(shown, "{x: {f: Int, y: Int}}");
     }
 }

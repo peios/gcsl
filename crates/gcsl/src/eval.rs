@@ -309,7 +309,16 @@
 //! which the closure keeps alive: two allocations. `LoadCapture` reads the
 //! running closure's captures, and `LoadCallee` yields the running closure
 //! itself, which the evaluator holds while it runs, so a recursive function
-//! refers to itself without holding itself.
+//! refers to itself without holding itself. `Fn` reads a slot of the top
+//! level's frame, at base 0 of the value stack, from whatever frame it is
+//! evaluated in: a top-level function of the input, which another
+//! function or a `lazy` refers to there rather than by a capture. Every
+//! call, memoised call, future and await of a run, and every input of a
+//! session, shares the one value stack whose bottom is the top level's
+//! frame, which is what makes base 0 that frame. The checker sees to it
+//! that the slot holds the function's closure before any read of it runs;
+//! a read of a slot that holds no closure is still an internal error
+//! diagnostic, not a panic.
 //!
 //! A call evaluates its callee to a closure through the `function` walker,
 //! checks the nesting budget, and grows the stack by the callee's frame
@@ -785,6 +794,7 @@ impl Evaluator<'_> {
             } => self.update_field((record, name, value), node),
             IrKind::Update { .. } => self.update(node),
             IrKind::LoadCapture(index, _) => self.capture_value(index, node),
+            IrKind::Fn(slot) => self.top_function_value(slot, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
             IrKind::Call {
                 callee,
@@ -918,6 +928,30 @@ impl Evaluator<'_> {
                 self.make_closure(function, captures).map(Value::Fn)
             }
             _ => mistyped(node, "a node that is not a closure where one was expected"),
+        }
+    }
+
+    /// The closure of the top-level function in `slot` of the top level's
+    /// frame, which is at the bottom of the value stack (frame base 0), for
+    /// the `Fn` `node`. A slot that holds no closure is an internal error:
+    /// the checker's rule on when a function may be used means it never
+    /// happens. Never inlined, so that the frames of the recursive walkers
+    /// that read one stay small.
+    #[inline(never)]
+    fn top_function_value(&self, slot: Slot, node: &IrNode) -> Flow<Value> {
+        self.top_function(slot, node).map(Value::Fn)
+    }
+
+    /// The closure of the top-level function in `slot`, as
+    /// [`Evaluator::top_function_value`] gives it as a value.
+    /// Inlined where a callee is evaluated, as a capture's read is, so that
+    /// a call through it costs no more than one through a capture; the
+    /// error, which the checker rules out, is out of line.
+    #[inline]
+    fn top_function(&self, slot: Slot, node: &IrNode) -> Flow<Rc<Closure>> {
+        match self.stack.get(slot.index()) {
+            Some(Value::Fn(closure)) => Ok(Rc::clone(closure)),
+            _ => Err(not_made(node).into()),
         }
     }
 
@@ -1611,6 +1645,7 @@ impl Evaluator<'_> {
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node),
+            IrKind::Fn(slot) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => self.make_closure(function, captures),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -2172,9 +2207,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where an Int was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where an Int was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Fn(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
         }
     }
 
@@ -2324,9 +2360,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Float was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a Float was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Fn(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
         }
     }
 
@@ -2437,9 +2474,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Bool was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a Bool was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Fn(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
         }
     }
 
@@ -2604,9 +2642,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a String was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a String was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Fn(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),
         }
     }
 
@@ -2707,9 +2746,10 @@ impl Evaluator<'_> {
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a record was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Fn(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
         }
     }
 
@@ -3584,6 +3624,19 @@ fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
 
+/// The internal error for the [`IrKind::Fn`] `node`, whose slot holds no
+/// closure: the checker lets no code run before the closure it reads is
+/// made (see [`crate::check`]), so this is a bug, reported rather than
+/// panicked on. Out of line, off the path of the read that succeeds.
+#[cold]
+#[inline(never)]
+fn not_made(node: &IrNode) -> Diagnostic {
+    internal(
+        "read of a top-level function whose closure is not made yet",
+        node.span,
+    )
+}
+
 /// The error for the call `node`, which would take the program's nesting,
 /// calls included, past [`MAX_DEPTH`] levels.
 fn nested_too_deeply(node: &IrNode) -> Diagnostic {
@@ -4455,6 +4508,184 @@ mod tests {
         assert_eq!(
             run("x = 1\ny = \"a\"").unwrap().to_string(),
             "{x = 1; y = \"a\"}"
+        );
+    }
+
+    #[test]
+    fn top_level_functions_call_each_other_in_any_order() {
+        // Mutual recursion of two, each written before the other.
+        let even = "fn even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }";
+        let odd = "fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
+        for text in [
+            format!("{even}\n{odd}\neven(10)"),
+            format!("{odd}\n{even}\neven(10)"),
+        ] {
+            assert_eq!(run(&text).unwrap(), Value::Bool(true), "{text}");
+        }
+        // Of three.
+        assert_eq!(
+            int("fn a(n: Int): Int { if n == 0 { 0 } else { b(n - 1) } }\n\
+                 fn b(n: Int): Int { c(n) }\nfn c(n: Int): Int { a(n) + 1 }\na(9)"),
+            9
+        );
+        // Used, from a function declared above it, inside a loop body, a
+        // labelled block, an inner function and a `lazy`.
+        let f = "fn f(n: Int): Int { n * 2 }";
+        assert_eq!(
+            run(&format!(
+                "fn g(): List<Int> {{ for i in [1, 2] {{ f(i) }} }}\n{f}\ng()"
+            ))
+            .unwrap()
+            .to_string(),
+            "[2, 4]"
+        );
+        assert_eq!(
+            int(&format!(
+                "fn g(): Int {{ {{'l return'l f(3) }} }}\n{f}\ng()"
+            )),
+            6
+        );
+        assert_eq!(
+            int(&format!(
+                "fn g(): Int {{ let h = fn(): Int {{ f(1) }}\nh() }}\n{f}\ng()"
+            )),
+            2
+        );
+        assert_eq!(
+            int(&format!(
+                "fn g() -> Int {{ lazy f(4) }}\n{f}\nlet x = g()\nx + 0"
+            )),
+            8
+        );
+    }
+
+    #[test]
+    fn a_top_level_function_and_a_soft_field_of_its_name() {
+        // `fn f` is private: the spread's field stays in the record, and
+        // reads of `f` call the function.
+        assert_eq!(
+            run("let r = {f = 2; g = 3}\n...r\nx = f()\ny = g\nfn f(): String { \"fn\" }")
+                .unwrap()
+                .to_string(),
+            "{f = 2; g = 3; x = \"fn\"; y = 3}"
+        );
+        // A `def` overrides the soft field with the function.
+        assert_eq!(
+            run("let r = {f = 2; g = 3}\nx = f()\n...r\ndef f(): String { \"fn\" }")
+                .unwrap()
+                .to_string(),
+            "{x = \"fn\"; f = fn(): String; g = 3}"
+        );
+    }
+
+    #[test]
+    fn top_level_code_uses_a_function_once_it_is_made() {
+        // The summary of the slice: used above their declarations, and
+        // calling each other.
+        let summary = "limit = 10\ntotal = sum-to(limit)\n\
+             def describe(n: Int): String { if even(n) { \"even\" } else { \"odd\" } }\n\
+             fn even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }\n\
+             fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }\n\
+             fn sum-to(n: Int): Int { if n == 0 { 0 } else { n + sum-to(n - 1) } }";
+        assert_eq!(
+            run(summary).unwrap().to_string(),
+            "{limit = 10; total = 55; describe = fn(n: Int): String}"
+        );
+        // One that copies nothing, made as the input starts.
+        assert_eq!(int("let x = f(2)\nfn f(n: Int): Int { n * 3 }\nx"), 6);
+        // One that copies a `let` above the use, made just after it.
+        assert_eq!(
+            int("let k = 5\nlet x = f(2)\nfn f(n: Int): Int { n + k }\nx"),
+            7
+        );
+        // Through another function, which copies what it reads.
+        assert_eq!(
+            int(
+                "let k = 5\nlet x = f(2)\nfn f(n: Int): Int { g(n) }\nfn g(n: Int): Int { n * k }\nx"
+            ),
+            10
+        );
+        // A `def`'s value, made before its field, is the field's.
+        assert_eq!(
+            run("a = f(1)\ndef f(n: Int): Int { n + 1 }\nb = f(a)")
+                .unwrap()
+                .to_string(),
+            "{a = 2; f = fn(n: Int): Int; b = 3}"
+        );
+        // A `lazy` that calls a function declared below it.
+        assert_eq!(
+            int("let x = lazy f(4)\nfn f(n: Int): Int { n * 2 }\nx + 0"),
+            8
+        );
+        // A function that copies a mutable variable copies the value it has
+        // at the function's own line, as before.
+        assert_eq!(
+            int("let mut n = 1\nn := 2\nfn f(): Int { n }\nn := 3\nf() * 10 + n"),
+            23
+        );
+    }
+
+    #[test]
+    fn mutually_recursive_top_level_functions_run_to_depth() {
+        // Too deep, the nesting budget ends the recursion with its error.
+        let (message, _) = on_big_stack(|| {
+            error(
+                "fn a(n: Int): Int { if n == 0 { 0 } else { b(n - 1) + 1 } }\n\
+                 fn b(n: Int): Int { a(n) }\na(100000)",
+            )
+        });
+        assert!(message.starts_with("call nested too deeply"), "{message}");
+        // Within it, to depth.
+        let depth = on_big_stack(|| {
+            int(
+                "fn a(n: Int): Int { if n == 0 { 0 } else { b(n - 1) + 1 } }\n\
+                 fn b(n: Int): Int { a(n) }\na(700)",
+            )
+        });
+        assert_eq!(depth, 700);
+        // Memoised, each body runs once per argument: `a(80)` would not
+        // end otherwise.
+        assert_eq!(
+            int(
+                "fn a(n: Int) ->> Int { if n < 2 { n } else { b(n - 1) + a(n - 2) } }\n\
+                 fn b(n: Int) ->> Int { if n < 2 { n } else { a(n - 1) + b(n - 2) } }\n\
+                 a(80)"
+            ),
+            23_416_728_348_467_685
+        );
+    }
+
+    #[test]
+    fn a_def_is_a_field_of_its_record() {
+        // Where it is written, among the other fields.
+        assert_eq!(
+            run("a = 1\ndef f(n: Int): Int { n + a }\nb = f(2)")
+                .unwrap()
+                .to_string(),
+            "{a = 1; f = fn(n: Int): Int; b = 3}"
+        );
+        // Recursion through its own name, and in an inner record block.
+        assert_eq!(
+            run("r = { def sum(n: Int): Int { if n == 0 { 0 } else { n + sum(n - 1) } }; s = sum(4) }")
+                .unwrap()
+                .to_string(),
+            "{r = {sum = fn(n: Int): Int; s = 10}}"
+        );
+        // Overriding a soft field, it keeps the soft field's place, as a
+        // field does (a spread defines its fields in its type's order).
+        assert_eq!(
+            run("...{f = 1; a = 2}\ndef f(): Int { 3 }\nb = f()")
+                .unwrap()
+                .to_string(),
+            run("...{f = 1; a = 2}\nf = fn(): Int { 3 }\nb = f()")
+                .unwrap()
+                .to_string()
+        );
+        assert_eq!(
+            run("...{f = 1; a = 2}\ndef f(): Int { 3 }\nb = f()")
+                .unwrap()
+                .to_string(),
+            "{a = 2; f = fn(): Int; b = 3}"
         );
     }
 
@@ -6599,7 +6830,8 @@ mod tests {
         let mut frame = vec![Value::Empty; ir.frame_size() as usize];
         let mut memo = MemoTables::new();
         eval_with(&ir, &mut frame, &mut memo).unwrap();
-        let Value::Record(record) = frame[0].clone() else {
+        // `make`, a top-level function, has slot 0, and `r` slot 1.
+        let Value::Record(record) = frame[1].clone() else {
             panic!("expected a record");
         };
         // Held here, by the frame, by `make`'s captures and by `g`'s table,

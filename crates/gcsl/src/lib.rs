@@ -47,6 +47,7 @@ pub mod eval;
 pub mod ir;
 pub mod lexer;
 pub mod lower;
+pub mod mentions;
 pub mod names;
 pub mod parser;
 pub mod session;

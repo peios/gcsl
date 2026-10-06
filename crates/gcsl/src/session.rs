@@ -57,6 +57,20 @@
 //! which would mean something else, or nothing, to a later input. So a
 //! memoised call the failed input made runs again when a later input makes
 //! it, although its effects have happened.
+//!
+//! Within one input, top-level functions are in any order: each is visible
+//! in the whole input, and its closure is stored where it is made, which
+//! may be before its own line (see the checker's "Top-level functions").
+//! Between inputs, order is as it was: a later input sees the earlier ones
+//! and may declare their names again, and an earlier one is never changed
+//! by a later one. Nothing new is kept for this: a top-level function is a
+//! variable of the scope like any other, whose slot is among its input's
+//! first. A function of an earlier input reads the other top-level
+//! functions of its input from their slots at the bottom of the shared
+//! value stack, slots that no later input writes, since a later input's
+//! declarations take slots above the scope's, so a pair of mutually
+//! recursive functions keeps calling each other after a later input
+//! declares one of their names again.
 
 use std::mem;
 use std::rc::Rc;
@@ -537,6 +551,38 @@ mod tests {
             value(&mut session, "apply(fn(n: Int): Int { n + x }, 1)"),
             Value::Int(21)
         );
+    }
+
+    #[test]
+    fn top_level_functions_across_inputs() {
+        let mut session = Session::new();
+        let even = "fn even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }";
+        let odd = "fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
+        value(&mut session, &format!("let a = 1\n{odd}\n{even}"));
+        // The frame is the input's variables plus a slot for each function.
+        assert_eq!(session.frame.len(), 3);
+        // A later input calls the earlier input's mutually recursive pair.
+        assert_eq!(value(&mut session, "even(10)"), Value::Bool(true));
+        // Declaring one of them again leaves the earlier pair calling each
+        // other: the earlier closures read their own input's slots.
+        value(&mut session, "fn odd(n: Int): Bool { true }");
+        assert_eq!(value(&mut session, "even(3)"), Value::Bool(false));
+        assert_eq!(value(&mut session, "odd(4)"), Value::Bool(true));
+        // A function shadows an earlier input's variable, and the reverse.
+        value(&mut session, "let three = 3");
+        value(&mut session, "let x = three()\nfn three(): Int { 4 }");
+        assert_eq!(value(&mut session, "x"), Value::Int(4));
+        value(&mut session, "let even = 5");
+        assert_eq!(value(&mut session, "even + 1"), Value::Int(6));
+        // A failed input leaves the session as it was.
+        let scope = session.scope.clone();
+        assert_eq!(
+            messages(&mut session, "let y = f(0)\nfn f(n: Int): Int { 1 // n }"),
+            vec!["division by zero"]
+        );
+        assert_eq!(session.scope, scope);
+        assert_eq!(messages(&mut session, "f"), vec!["undefined variable `f`"]);
+        assert_eq!(value(&mut session, "odd(4)"), Value::Bool(true));
     }
 
     #[test]

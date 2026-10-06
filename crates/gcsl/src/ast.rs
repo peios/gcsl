@@ -75,8 +75,11 @@
 //! return type, [`Effect`] and body. Every function expression of a tree has
 //! an id, from 0 to [`Ast::fn_count`], which later stages use to index
 //! their own per-function tables. A named function item, `fn f(...) ...`,
-//! is a `let` whose value is a function expression; the tree does not
-//! distinguish them. A call, [`ExprKind::Call`], lists its arguments in
+//! is a `let` whose value is a function expression, and a public function
+//! item, `def f(...) ...`, is a field whose value is one; each is marked as
+//! written (`function` on [`ItemKind::Let`] and [`ItemKind::Field`]), so the
+//! tree tells `fn f`, `def f`, `let f = fn` and `f = fn` apart, and the
+//! printer prints each as it was written. A call, [`ExprKind::Call`], lists its arguments in
 //! source order, each positional, named or the trailing block, which is
 //! always last.
 //!
@@ -1109,8 +1112,9 @@ pub enum ItemKind {
     /// any, with the rest of the path set, and an annotation then applies to
     /// the path's last segment. A named function item, `fn NAME(...) ...`,
     /// is one of these too: a `let` of `NAME`, without an annotation, whose
-    /// value is the function expression. So is `let mut NAME = EXPR`, with
-    /// or without an annotation, whose path is a single name.
+    /// value is the function expression, with `function` set. So is `let
+    /// mut NAME = EXPR`, with or without an annotation, whose path is a
+    /// single name.
     Let {
         /// The variable's name, then any further segments.
         path: PathRange,
@@ -1120,17 +1124,25 @@ pub enum ItemKind {
         value: ExprId,
         /// Whether it is a `let mut`, which declares a mutable variable.
         mutable: bool,
+        /// Whether it was written as a named function item, `fn NAME(...)
+        /// ...`, rather than as `let NAME = fn(...) ...`.
+        function: bool,
     },
     /// `PATH = EXPR`, as in `x = 1`, `"quoted name" = 1` or `a.b = 1`:
     /// declares a field of the record its block evaluates to, named by the
     /// path's first segment, which is also a name in scope for the block's
     /// later items. A dotted path declares or extends a field that is a
-    /// record built by such paths.
+    /// record built by such paths. A public function item, `def NAME(...)
+    /// ...`, is one of these too: the field `NAME`, whose value is the
+    /// function expression, with `function` set.
     Field {
         /// The field's name, then any further segments.
         path: PathRange,
         /// The field's value, or the value at the end of the path.
         value: ExprId,
+        /// Whether it was written as a public function item, `def NAME(...)
+        /// ...`, rather than as `NAME = fn(...) ...`.
+        function: bool,
     },
     /// `...EXPR`, a spread: defines each field of the record `EXPR` is, by
     /// its static type, as a *soft* field of the record its block evaluates
@@ -1968,7 +1980,9 @@ impl Annotate for NoAnnotation {
 /// `(call ...)` followed by its callee and its arguments in source order, a
 /// named one as `(named x EXPR)` and the trailing block as
 /// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
-/// `(let f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its body,
+/// printed as written, `(fn f (fn ...))`, and a `def` the field,
+/// `(def f (fn ...))`; `let f = fn ...` and `f = fn ...` print as `(let f
+/// (fn ...))` and `(field f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its body,
 /// and an `await` as `(await ...)` followed by its operand. A list literal
 /// prints as `(list ...)` followed by its elements in source order, a
 /// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by
@@ -2024,8 +2038,13 @@ impl<A: Annotate> Pretty<'_, A> {
                 ty,
                 value,
                 mutable,
+                function,
             } => {
-                let keyword = if mutable { "let mut" } else { "let" };
+                let keyword = match (mutable, function) {
+                    (_, true) => "fn",
+                    (true, false) => "let mut",
+                    (false, false) => "let",
+                };
                 write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?;
                 if let Some(ty) = ty {
                     f.write_str(" : ")?;
@@ -2033,8 +2052,13 @@ impl<A: Annotate> Pretty<'_, A> {
                 }
                 value
             }
-            ItemKind::Field { path, value } => {
-                write!(f, "field {}", ast.show_path(ast.path(path)))?;
+            ItemKind::Field {
+                path,
+                value,
+                function,
+            } => {
+                let keyword = if function { "def" } else { "field" };
+                write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?;
                 value
             }
             ItemKind::Rebind { path, value } => {
@@ -2489,6 +2513,13 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_small() {
+        // What tells a named function item and a `def` from a `let` or a
+        // field whose value is a function expression fits in the padding.
+        assert_eq!(size_of::<Item>(), 36);
+    }
+
+    #[test]
     fn a_blocks_label_fits_beside_its_items() {
         // The label's id has a niche, so that a block's optional label
         // costs four bytes, and an unlabelled block nothing beyond them.
@@ -2668,6 +2699,7 @@ mod tests {
                 ty: Some(float_ty),
                 value: block,
                 mutable: false,
+                function: false,
             },
             span: Span::new(0, 37),
         });
@@ -2686,6 +2718,7 @@ mod tests {
                 ty: None,
                 value: empty,
                 mutable: false,
+                function: false,
             },
             span: Span::new(38, 48),
         });
@@ -2800,10 +2833,12 @@ mod tests {
                 ty: None,
                 value: one,
                 mutable: false,
+                function: false,
             },
             ItemKind::Field {
                 path: dotted,
                 value: one,
+                function: false,
             },
             ItemKind::Rebind {
                 path: single,
