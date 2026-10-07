@@ -1,0 +1,6 @@
+x = com
+com.x.app.name = "app-{version}"
+let major = 2
+version = "v{major}"
+a = b + 1
+b = a + 1

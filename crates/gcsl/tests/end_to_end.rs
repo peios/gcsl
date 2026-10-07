@@ -1327,15 +1327,16 @@ fn a_missing_field_error_renders_exactly() {
 fn rebinding_a_field_renders_exactly() {
     assert_eq!(
         rendered("total = 0\ntotal := 1\n"),
-        "error: cannot rebind `total`: it is a field, not a variable\n\
+        "error: `total` is a field of this file\n\
          \x20--> calc.gcsl:2:1\n\
          \x20 |\n\
          1 | total = 0\n\
-         \x20 | --------- declared here\n\
+         \x20 | ----- declared here\n\
          2 | total := 1\n\
          \x20 | ^^^^^\n\
          \x20 |\n\
-         \x20 = note: rebind with `total = ...` is not allowed either: a field is defined once\n"
+         \x20 = note: a field declared at the top level is visible in the whole file, so its \
+         name cannot also be a variable\n"
     );
 }
 

@@ -14,9 +14,11 @@ counts[1] := 5
 # The update applies to the variable as it is when it happens.
 let mut r = { a = 1; b = 2 }
 r.a := { r := { a = 100; b = 7 }; r.b + 1 }
-up = hosts[0].up
-ports = for h in hosts { h.ports[0] }
-cells = grid
-counts = counts
-before = before
-r = r
+{
+  up = hosts[0].up
+  ports = for h in hosts { h.ports[0] }
+  cells = grid
+  counts = counts
+  before = before
+  r = r
+}

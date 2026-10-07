@@ -18,10 +18,12 @@ let attempts = do { tries := tries + 1; tries } for tries < 2
 # A label names the loop a `continue` goes on with.
 let grid = [[1, 2], [3, -1, 4], [5]]
 let rows = for'rows r in grid { for c in r { if c < 0 { continue'rows }; c * 10 } }
-done = done
-costs = costs
-loose = loose
-first = first
-spent = spent
-attempts = attempts
-rows = rows
+{
+  done = done
+  costs = costs
+  loose = loose
+  first = first
+  spent = spent
+  attempts = attempts
+  rows = rows
+}

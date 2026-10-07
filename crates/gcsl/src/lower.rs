@@ -40,9 +40,9 @@
 //! copies, or at its own item. Where it is stored before its own item, its
 //! own item lowers to nothing, or, for a `def`, only to its place among the
 //! record's fields. A function's or `lazy`'s use of a top-level function of
-//! its input is an [`IrKind::Fn`] of the function's slot, read from the top
-//! level's frame, not a capture; top-level code's is the `Load` any read
-//! is.
+//! its input is an [`IrKind::Top`] of the function's slot, of kind `Fn`,
+//! read from the top level's frame, not a capture; top-level code's is the
+//! `Load` any read is.
 //!
 //! A record block's fields become `Store`s to their slots, as `let`s do, so
 //! that later items can read them, and its result is a `MakeRecord` whose
@@ -113,7 +113,30 @@
 //! cannot change the field's slot, so the order cannot be observed. A
 //! dotted field stores back into its field's one slot. Each record block's
 //! field is loaded for its record once, from the slot its first definition
-//! declared.
+//! declared. That is so only in inner blocks: the fields of the input's
+//! outermost block are cells, below.
+//!
+//! The top-level fields of an input (see the checker's "Top-level
+//! fields") are *cells*, one slot of the top level's frame for each node of
+//! the tree of their paths, which the checker gives
+//! ([`crate::check::Resolution::field_cells`]), each written once. Before
+//! each item of the outermost block, and after the last, the cells whose
+//! point is there are stored, in the order of
+//! [`crate::check::Resolution::field_schedule`], dependencies first
+//! (`Lowerer::store_cells`): a leaf's cell gets its initialiser's value, an
+//! interior node's the `MakeRecord` of `Load`s of its children's cells in
+//! the order of their first items (`Lowerer::assemble`), and a `def`'s
+//! cell is its function's slot, stored as a top-level function's is. A
+//! field item lowers to nothing at its own line; no `UpdateField` builds a
+//! top-level root item by item, so a root of N dotted items costs N stores.
+//! A reference to a field, the longest declared prefix of a `NAME.f.g`
+//! chain, is a `Load` of its cell from top-level code and an
+//! [`IrKind::Top`] of it, of the cell's kind, from a function or `lazy` of
+//! the input, followed by `Field`s for the segments beyond the prefix. The
+//! record of the input is a `MakeRecord` of `Load`s of the roots' cells and
+//! of the slots of the soft fields that nothing overrides, in order of first
+//! definition; a top-level spread stores nothing for a name that is a
+//! top-level declaration.
 //!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. `===`
@@ -263,9 +286,27 @@ use crate::ast::{
     UnaryOp, path_span, symbol_span,
 };
 use crate::check::{
-    AwaitMark, Builtin, Checked, JumpTarget, MadeAt, PathResolution, Resolution, Slot, Types,
-    VarRef,
+    AwaitMark, Builtin, Checked, FieldSchedule, JumpTarget, MadeAt, PathResolution, Resolution,
+    Slot, Types, VarRef,
 };
+use crate::mentions::{self, FieldNode};
+
+/// How a field of a record block is loaded: its slot, the kind of its value
+/// and the span of its definition.
+type FieldLoad = (Slot, ValueKind, Span);
+
+/// What an item of the outermost block contributes to the record of the
+/// input as a top-level field (see `Lowerer::root_field`).
+enum RootField {
+    /// It is not an item the tree of fields took: lowered as any field.
+    Other,
+    /// A dotted item that is not the first under its root, which defines
+    /// nothing more.
+    Extends,
+    /// The first item of its root: the root's name and how it is loaded,
+    /// from the root's cell.
+    First(Name, FieldLoad),
+}
 use crate::diagnostic::InternalError;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField,
@@ -327,6 +368,7 @@ pub fn lower(
         layouts: HashMap::new(),
         layout_names: Vec::new(),
         record_loads: Vec::new(),
+        next_cell: 0,
         shapes: HashMap::new(),
         shape_pending: Vec::new(),
         lazy_shapes: HashMap::new(),
@@ -382,6 +424,10 @@ struct Lowerer<'a> {
     /// loaded, beside its name in `layout_names`: its slot, the kind of its
     /// value and the span of its definition.
     record_loads: Vec<(Slot, ValueKind, Span)>,
+    /// How many nodes of the schedule of the input's top-level fields
+    /// ([`FieldSchedule`]) have had their cells stored: the next one to
+    /// store is at that index of its order.
+    next_cell: usize,
     /// The shape already made for each record and list type.
     shapes: HashMap<TyId, ShapeId>,
     /// Reused as the work list of record and list types whose shapes have
@@ -522,7 +568,15 @@ impl Lowerer<'_> {
             // A record block's final expression is a statement.
             let is_result = !is_record && index + 1 == items.len();
             let item = self.ast.item(id);
+            if is_root {
+                self.store_cells(index)?;
+            }
             if is_root && self.is_stored_elsewhere(id) {
+                self.store_top_closures(Some(id))?;
+                continue;
+            }
+            if is_root && self.is_cell_item(index) {
+                // Its leaf was stored at its point, at this item or before.
                 self.store_top_closures(Some(id))?;
                 continue;
             }
@@ -574,6 +628,9 @@ impl Lowerer<'_> {
                 self.store_top_closures(Some(id))?;
             }
         }
+        if is_root {
+            self.store_cells(items.len())?;
+        }
         let result = match result {
             Some(result) => result,
             None if kind != ValueKind::Record => {
@@ -582,7 +639,7 @@ impl Lowerer<'_> {
                     span,
                 });
             }
-            None if is_record => self.make_record(items, span)?,
+            None if is_record => self.make_record(items, is_root, span)?,
             None => self.builder.alloc(IrKind::Empty, span),
         };
         let items = self.builder.push_item_list(&self.item_stack[base..]);
@@ -621,6 +678,109 @@ impl Lowerer<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the item at `position` of the root block is a top-level
+    /// field item whose leaf has a cell of its own: it then lowers to
+    /// nothing where it is written, its `Store` being placed at its point by
+    /// [`Lowerer::store_cells`]. A `def` is not one: its cell is its
+    /// function's slot, stored as a top-level function's is.
+    fn is_cell_item(&self, position: usize) -> bool {
+        let tree = &self.resolution.field_schedule().tree;
+        tree.item_leaf
+            .get(position)
+            .copied()
+            .flatten()
+            .and_then(|node| tree.nodes.get(node as usize))
+            .and_then(|node| node.leaf)
+            .is_some_and(|leaf| mentions::top_level_function(self.ast, leaf.item).is_none())
+    }
+
+    /// Pushes, as items of the root block, the `Store`s of the cells of the
+    /// top-level field nodes whose point is at or before the item at
+    /// `point` (the number of items for after the last), in the order the
+    /// schedule computes them, each once (see [Cells](crate::ir#cells)): a
+    /// leaf's initialiser, or the record of an interior node's children,
+    /// loaded from their cells in the order of their first items.
+    fn store_cells(&mut self, point: usize) -> Result<(), InternalError> {
+        let resolution = self.resolution;
+        let FieldSchedule { tree, schedule } = resolution.field_schedule();
+        let root = self.ast.items(self.ast.root());
+        while let Some(&index) = schedule.order.get(self.next_cell) {
+            let at = schedule
+                .point
+                .get(index as usize)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if at > point {
+                break;
+            }
+            self.next_cell += 1;
+            let slot = resolution.field_cells().get(index as usize).copied();
+            let (Some(node), Some(slot)) = (tree.nodes.get(index as usize), slot) else {
+                continue;
+            };
+            if slot == Slot::NONE {
+                continue;
+            }
+            let value = match node.leaf {
+                Some(leaf) if mentions::top_level_function(self.ast, leaf.item).is_some() => {
+                    continue;
+                }
+                Some(leaf) => self.lower_expr(leaf.value)?,
+                None => self.assemble(node, root)?,
+            };
+            let span = self.node_span(node, root);
+            let store = self.builder.alloc(IrKind::Store(slot, value), span);
+            self.item_stack.push(store);
+        }
+        Ok(())
+    }
+
+    /// The `MakeRecord` of the interior node `node` of the tree of the
+    /// input's top-level fields, whose root block's items are `root`: a
+    /// `Load` of each child's cell, at its name, in the order of their
+    /// first items, a leaf's of the kind of its initialiser and an interior
+    /// node's as a record.
+    fn assemble(&mut self, node: &FieldNode, root: &[ItemId]) -> Result<IrId, InternalError> {
+        let resolution = self.resolution;
+        let tree = &resolution.field_schedule().tree;
+        self.layout_names.clear();
+        self.record_loads.clear();
+        for &child in &node.children {
+            let (Some(child_node), Some(&slot)) = (
+                tree.nodes.get(child as usize),
+                resolution.field_cells().get(child as usize),
+            ) else {
+                continue;
+            };
+            let kind = match child_node.leaf {
+                Some(leaf) => self.kind(leaf.value)?,
+                None => ValueKind::Record,
+            };
+            let span = self.node_span(child_node, root);
+            self.define_field(child_node.name, (slot, kind, span), false);
+        }
+        let base = self.item_stack.len();
+        for &(slot, kind, field_span) in &self.record_loads {
+            let load = self.builder.alloc(IrKind::Load(slot, kind), field_span);
+            self.item_stack.push(load);
+        }
+        let layout = self.layout();
+        let values = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let span = self.node_span(node, root);
+        Ok(self
+            .builder
+            .alloc(IrKind::MakeRecord { layout, values }, span))
+    }
+
+    /// The span of the first item at or under `node`, a node of the tree of
+    /// the input's top-level fields, whose root block's items are `root`:
+    /// where its cell's `Store` and its loads are shown.
+    fn node_span(&self, node: &FieldNode, root: &[ItemId]) -> Span {
+        root.get(node.first)
+            .map_or(Span::new(0, 0), |&id| self.ast.item(id).span)
     }
 
     /// Lowers the declaration `id`, a `let`, a field or a `:=`, to the
@@ -981,13 +1141,18 @@ impl Lowerer<'_> {
                 span: operand_span,
             })?;
         let slots = resolution.spread_slots(id);
-        if slots.len() != fields.len() || slots.contains(&Slot::NONE) {
+        if slots.len() != fields.len() {
             return Err(InternalError {
                 message: "a spread's fields have no slots",
                 span,
             });
         }
+        // A field whose name is a top-level field of the input has no slot:
+        // the spread writes nothing for it, whichever is written first.
         for (&(name, ty), &slot) in fields.iter().zip(slots) {
+            if slot == Slot::NONE {
+                continue;
+            }
             let kind = table.value_kind(ty).ok_or(InternalError {
                 message: "a type with no values survived type checking",
                 span: operand_span,
@@ -1014,7 +1179,18 @@ impl Lowerer<'_> {
     /// makes a field that may be defined again, the names defined so far
     /// are searched for the one being defined only from the block's first
     /// spread on.
-    fn make_record(&mut self, items: &[ItemId], span: Span) -> Result<IrId, InternalError> {
+    ///
+    /// In the root block (`is_root`), a top-level field is loaded from the
+    /// cell of its root (see [Cells](crate::ir#cells)), at the first item
+    /// under that root, and a spread's field that a top-level declaration
+    /// of its name overrides, below it or above, takes the declaration's
+    /// load.
+    fn make_record(
+        &mut self,
+        items: &[ItemId],
+        is_root: bool,
+        span: Span,
+    ) -> Result<IrId, InternalError> {
         let (table, resolution) = (self.table, self.resolution);
         self.layout_names.clear();
         self.record_loads.clear();
@@ -1044,12 +1220,27 @@ impl Lowerer<'_> {
                             message: "a type with no values survived type checking",
                             span: operand_span,
                         })?;
+                        // A top-level declaration of the name stands
+                        // wherever it is: the spread wrote no slot for it.
+                        if slot == Slot::NONE && self.layout_names.contains(&name) {
+                            continue;
+                        }
                         self.define_field(name, (slot, kind, operand_span), spread);
                     }
                     continue;
                 }
                 _ => continue,
             };
+            if is_root && mentions::top_level_function(self.ast, id).is_none() {
+                match self.root_field(id)? {
+                    RootField::Other => {}
+                    RootField::Extends => continue,
+                    RootField::First(name, load) => {
+                        self.define_field(name, load, spread);
+                        continue;
+                    }
+                }
+            }
             let (kind, field) = match self.ast.path(path) {
                 [field] => (self.kind(value)?, field),
                 // A later definition of an open field extends it.
@@ -1076,6 +1267,46 @@ impl Lowerer<'_> {
         Ok(self
             .builder
             .alloc(IrKind::MakeRecord { layout, values }, span))
+    }
+
+    /// The field of the record of the input that the root item `id` defines,
+    /// as a [`RootField`].
+    fn root_field(&self, id: ItemId) -> Result<RootField, InternalError> {
+        let resolution = self.resolution;
+        let tree = &resolution.field_schedule().tree;
+        let root = self.ast.items(self.ast.root());
+        let Some(position) = root.iter().position(|&item| item == id) else {
+            return Ok(RootField::Other);
+        };
+        let Some(mut at) = tree.item_leaf.get(position).copied().flatten() else {
+            return Ok(RootField::Other);
+        };
+        let leaf = at;
+        while let Some(parent) = tree.nodes.get(at as usize).and_then(|node| node.parent) {
+            at = parent;
+        }
+        let (Some(node), Some(&slot)) = (
+            tree.nodes.get(at as usize),
+            resolution.field_cells().get(at as usize),
+        ) else {
+            return Ok(RootField::Other);
+        };
+        if node.first != position {
+            return Ok(RootField::Extends);
+        }
+        let kind = match (leaf == at, node.leaf) {
+            (true, Some(leaf)) => self.kind(leaf.value)?,
+            _ => ValueKind::Record,
+        };
+        // Shown at the root's name in its first item, as a field's load is.
+        let span = root
+            .get(node.first)
+            .and_then(|&first| match self.ast.item(first).kind {
+                ItemKind::Field { path, .. } => self.ast.path(path).first().map(|s| s.span),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.node_span(node, root));
+        Ok(RootField::First(node.name, (slot, kind, span)))
     }
 
     /// Adds the field `name` to the record being built by
@@ -1218,11 +1449,11 @@ impl Lowerer<'_> {
                 _,
             ) => self.lower_use_or_function(id, kind)?,
             (ExprKind::Block { items, label }, _) => self.lower_block(id, (items, label), kind)?,
-            (ExprKind::Field { expr: record, name }, _) => IrKind::Field {
-                record: self.lower_operand(record, ValueKind::Record)?,
-                name,
-                kind,
-            },
+            // A reference to a node of the tree of the input's top-level
+            // fields reads the node's cell (see [Cells](crate::ir#cells)).
+            (ExprKind::Field { expr: record, name }, _) => {
+                self.lower_field_access(id, (record, name), kind)?
+            }
             (ExprKind::Index { expr: list, index }, _) => IrKind::Index {
                 list: self.lower_operand(list, ValueKind::List)?,
                 index: self.lower_operand(index, ValueKind::Int)?,
@@ -1262,6 +1493,26 @@ impl Lowerer<'_> {
             }
         };
         Ok(self.builder.alloc(lowered, span))
+    }
+
+    /// Lowers the field access `id`, `record.name`, of kind `kind`: a read
+    /// of a cell if the checker resolved it to a node of the tree of the
+    /// input's top-level fields (see [Cells](crate::ir#cells)), and an
+    /// ordinary `Field` of the lowered record otherwise.
+    fn lower_field_access(
+        &mut self,
+        id: ExprId,
+        (record, name): (ExprId, Name),
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        Ok(match read(self.resolution.expr_var(id), kind) {
+            Some(cell) => cell,
+            None => IrKind::Field {
+                record: self.lower_operand(record, ValueKind::Record)?,
+                name,
+                kind,
+            },
+        })
     }
 
     /// Lowers the block `id`, whose items are `items` and whose label, if
@@ -2311,7 +2562,7 @@ const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
     match var {
         VarRef::Local(slot) if slot.get() != Slot::NONE.get() => Some(IrKind::Load(slot, kind)),
         VarRef::Capture(index) => Some(IrKind::LoadCapture(index, kind)),
-        VarRef::Fn(slot) => Some(IrKind::Fn(slot)),
+        VarRef::Fn(slot) => Some(IrKind::Top(slot, kind)),
         VarRef::Callee => Some(IrKind::LoadCallee),
         VarRef::Local(_) | VarRef::Builtin(_) | VarRef::None => None,
     }
@@ -2833,34 +3084,33 @@ mod tests {
 
     #[test]
     fn a_merged_field_updates_its_slot() {
-        // The first definition builds from nothing; later ones update the
-        // slot, reading into the records that exist, and creating the rest.
-        // The field is loaded once for the record.
+        // Each leaf is stored in its cell at its own line; each interior node
+        // is assembled from its children's cells after its last child, the
+        // root last. The field is loaded once for the record, from its root's
+        // cell.
         assert_eq!(
             dump("a.x = 1\na.y.z = 2\na.y.w = 3"),
             "(block @0..27\n\
+             \x20 (store x#1 @0..7\n\
+             \x20   (int 1 @6..7))\n\
+             \x20 (store z#3 @8..17\n\
+             \x20   (int 2 @16..17))\n\
+             \x20 (store w#4 @18..27\n\
+             \x20   (int 3 @26..27))\n\
+             \x20 (store y#2 @8..17\n\
+             \x20   (make-record [z w] @8..17\n\
+             \x20     (load z#3 @8..17)\n\
+             \x20     (load w#4 @18..27)))\n\
              \x20 (store a#0 @0..7\n\
-             \x20   (update-field x @0..3\n\
-             \x20     (empty @0..1)\n\
-             \x20     (int 1 @6..7)))\n\
-             \x20 (store a#0 @8..17\n\
-             \x20   (update-field y @8..11\n\
-             \x20     (load a#0 @8..9)\n\
-             \x20     (update-field z @8..13\n\
-             \x20       (empty @8..11)\n\
-             \x20       (int 2 @16..17))))\n\
-             \x20 (store a#0 @18..27\n\
-             \x20   (update-field y @18..21\n\
-             \x20     (load a#0 @18..19)\n\
-             \x20     (update-field w @18..23\n\
-             \x20       (field y @18..21\n\
-             \x20         (load a#0 @18..19))\n\
-             \x20       (int 3 @26..27))))\n\
+             \x20   (make-record [x y] @0..7\n\
+             \x20     (load x#1 @0..7)\n\
+             \x20     (load y#2 @8..17)))\n\
              \x20 (make-record [a] @0..27\n\
              \x20   (load a#0 @0..1)))"
         );
-        // The name of every update is recorded for the evaluator.
-        let ast = parse_text("a.x = 1\na.\"y z\".w = 2");
+        // The name of every update of an inner block's dotted field is
+        // recorded for the evaluator.
+        let ast = parse_text("r = { a.x = 1\na.\"y z\".w = 2 }");
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
         let ir = lower(&ast, &checked, &types, 0).unwrap();
@@ -4159,34 +4409,32 @@ mod tests {
     fn a_spread_stores_its_operand_once_and_each_field_by_name() {
         // The operand is held in the item's own slot, which no variable
         // owns, and each field of its static type, in the type's order, is
-        // read from it into the field's slot. An override stores into the
-        // same slot, and the field keeps its place in the record, loaded as
-        // the definition that stands.
+        // read from it into the field's slot. A top-level field of the
+        // input, `a`, has its own slot from the start, which the spread
+        // does not write; the field keeps the place the spread gave it in
+        // the record, loaded as the definition that stands.
         let text = "let r = { a = 1; b = 2 }\n...r\na = \"s\"";
         assert_eq!(
             dump(text),
             "(block @0..37\n\
-             \x20 (store r#0 @0..24\n\
+             \x20 (store r#1 @0..24\n\
              \x20   (block @8..24\n\
-             \x20     (store r#0 @10..15\n\
+             \x20     (store r#1 @10..15\n\
              \x20       (int 1 @14..15))\n\
-             \x20     (store a#1 @17..22\n\
+             \x20     (store b#2 @17..22\n\
              \x20       (int 2 @21..22))\n\
              \x20     (make-record [a b] @8..24\n\
-             \x20       (load r#0 @10..11)\n\
-             \x20       (load a#1 @17..18))))\n\
+             \x20       (load r#1 @10..11)\n\
+             \x20       (load b#2 @17..18))))\n\
              \x20 (store ?#3 @25..29\n\
-             \x20   (load r#0 @28..29))\n\
-             \x20 (store a#1 @25..29\n\
-             \x20   (field a @28..29\n\
-             \x20     (load ?#3 @28..29)))\n\
+             \x20   (load r#1 @28..29))\n\
              \x20 (store b#2 @25..29\n\
              \x20   (field b @28..29\n\
              \x20     (load ?#3 @28..29)))\n\
-             \x20 (store a#1 @30..37\n\
+             \x20 (store a#0 @30..37\n\
              \x20   (str \"s\" @34..37))\n\
              \x20 (make-record [a b] @0..37\n\
-             \x20   (load a#1 @30..31)\n\
+             \x20   (load a#0 @30..31)\n\
              \x20   (load b#2 @28..29)))"
         );
         let ir = lower_text(text);
@@ -4197,7 +4445,7 @@ mod tests {
         assert_eq!(
             loads,
             vec![
-                IrKind::Load(Slot::new(1), ValueKind::String),
+                IrKind::Load(Slot::new(0), ValueKind::String),
                 IrKind::Load(Slot::new(2), ValueKind::Int)
             ]
         );
@@ -4810,6 +5058,67 @@ mod tests {
         );
         assert_eq!(normalised("  (fn top even#12 @51..55)"), "  (fn top even#");
         assert_ne!(decided("let k = 1\nx = k"), decided("x = k\nlet k = 1"));
+    }
+
+    /// Asserts that `parts`, joined by newlines in the order given and in
+    /// the reverse order, check to the same type, warnings and errors,
+    /// whose messages it returns with the type.
+    fn checks_order_free(parts: &[&str]) -> (String, Vec<String>) {
+        let forward = parts.join("\n");
+        let backward: Vec<&str> = parts.iter().rev().copied().collect();
+        let backward = backward.join("\n");
+        let (shown, messages, _) = decided(&forward);
+        let (again, also, _) = decided(&backward);
+        assert_eq!(
+            (&shown, &messages),
+            (&again, &also),
+            "{forward}\n----\n{backward}"
+        );
+        (shown, messages)
+    }
+
+    #[test]
+    fn top_level_fields_do_not_depend_on_order() {
+        // Valid programs: the same type and, normalised, the same IR.
+        let (shown, messages, _) = order_free(&[
+            "com.x.app.deps = [com.x.lib]",
+            "com.x.app.name = \"app-{version}\"",
+            "com.x.lib.name = \"lib\"",
+            "version = describe(2)",
+            "fn describe(n: Int): String { \"v{n}\" }",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(shown.contains("version: String"), "{shown}");
+        for parts in [
+            &["a.b = 1", "c = a.b + a.d", "a.d = 2"][..],
+            &["x = f()", "def f(): Int { y }", "y = 3"][..],
+            &["s = lazy { t }", "t.u = 1", "t.v = [t.u]"][..],
+        ] {
+            let (_, messages, _) = order_free(parts);
+            assert!(messages.is_empty(), "{parts:?}: {messages:?}");
+        }
+        for (parts, expected) in [
+            (
+                &["a = f()", "fn f(): Int { a }"][..],
+                "Error: `a` depends on itself",
+            ),
+            (
+                &["a.b = 1", "a.b = 2"][..],
+                "Error: field `a.b` is defined twice",
+            ),
+            (
+                &["a = 1", "let a = 2"][..],
+                "Error: `a` is a field of this file",
+            ),
+            (&["...{a = {b = 1}}", "a.c = 2"][..], ""),
+        ] {
+            let (_, messages) = checks_order_free(parts);
+            assert_eq!(messages.len(), 1, "{parts:?}: {messages:?}");
+            assert!(
+                expected.is_empty() || messages.first().map(String::as_str) == Some(expected),
+                "{parts:?}: {messages:?}"
+            );
+        }
     }
 
     #[test]

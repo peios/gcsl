@@ -127,13 +127,15 @@
 //! first slots are its parameters. A [`IrKind::LoadCapture`] reads one of
 //! the values the closure being run captured, and a [`IrKind::LoadCallee`]
 //! yields that closure itself, which is how a function refers to itself
-//! without capturing itself. A [`IrKind::Fn`] reads a slot of the top
+//! without capturing itself. A [`IrKind::Top`] reads a slot of the top
 //! level's frame, which is at the bottom of the value stack however deep
 //! the call it runs in: it is how a function or `lazy` refers to a
 //! top-level function of its own input (see the checker's "Top-level
 //! functions"), so that two of them can refer to each other, which copies
-//! could not do. From top-level code the same function is a plain
-//! [`IrKind::Load`].
+//! could not do, and to the cell of a top-level field of its input (see
+//! the checker's "Top-level fields"), so that a closure never waits for a
+//! field to be computed before it is made. From top-level code the same
+//! function or cell is a plain [`IrKind::Load`].
 //!
 //! The closure of a top-level function is stored into its slot where the
 //! checker says it is made ([`crate::check::MadeAt`]): before the input's
@@ -158,6 +160,24 @@
 //! children that `IrKind::children` lists, an update counting two levels
 //! more for each step of its path. Lowering computes them once, after
 //! building the nodes; the evaluator only adds and compares.
+//!
+//! # Cells
+//!
+//! Every node of the tree of an input's top-level fields has a *cell*, a
+//! slot of the top level's frame written once, at the node's *point*:
+//! before the item of the outermost block the checker's schedule names,
+//! dependencies first, or after the last item. A leaf's cell holds its
+//! initialiser's value; an interior node's, the [`IrKind::MakeRecord`] of
+//! its children's cells, in the order of their first items. The record of
+//! the input is made from the cells of the roots. [`IrKind::UpdateField`]
+//! is used only for the dotted fields of inner blocks: a top-level dotted
+//! field never rebuilds its root item by item. A read of a cell is a
+//! [`IrKind::Load`] from top-level code and an [`IrKind::Top`] of the
+//! cell's kind from a function or `lazy`; the schedule is static, so the
+//! store always comes first, and a [`IrKind::Top`] that finds its slot not
+//! yet written as a kind other than a record's (whose empty slot is a valid
+//! `{}`) is an internal error, not a panic. The dumps show each cell's store
+//! where its point is, and a `top` read of it by the cell's name.
 //!
 //! # Futures
 //!
@@ -956,12 +976,16 @@ pub enum IrKind {
         /// Lowering sets it once every node is built.
         depth: u16,
     },
-    /// Reads a top-level function of the input, by its slot in the top
-    /// level's frame, which is at the bottom of the value stack (frame base
-    /// 0) however deep the call it runs in: how a function or `lazy` refers
-    /// to a top-level function of its own input, never by a capture. Always
-    /// a function. Last, so that adding it numbered no other kind anew.
-    Fn(Slot),
+    /// Reads a top-level declaration of the input, a function or the cell
+    /// of a top-level field, as a value of the given kind, by its slot in
+    /// the top level's frame, which is at the bottom of the value stack
+    /// (frame base 0) however deep the call it runs in: how a function or
+    /// `lazy` refers to a top-level declaration of its own input, never by
+    /// a capture. Of kind `Fn` it is slice 23's read of a top-level
+    /// function, shown as `fn` in a dump; of any other kind, a field's
+    /// cell, shown as `top`. Last, so that adding it numbered no other kind
+    /// anew.
+    Top(Slot, ValueKind),
 }
 
 // A call's depth is a `u16` (see `IrKind::Call`), which keeps `IrNode` at
@@ -1009,7 +1033,7 @@ impl IrKind {
             | IrKind::Empty
             | IrKind::Load(..)
             | IrKind::LoadCapture(..)
-            | IrKind::Fn(_)
+            | IrKind::Top(..)
             | IrKind::LoadCallee => (None, &[], NONE),
             IrKind::IntNeg(operand)
             | IrKind::FloatNeg(operand)
@@ -1135,7 +1159,7 @@ impl IrKind {
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
             | IrKind::LoadCapture(..)
-            | IrKind::Fn(_)
+            | IrKind::Top(..)
             | IrKind::LoadCallee
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
@@ -1234,7 +1258,8 @@ impl IrKind {
             IrKind::Call { .. } => "call",
             IrKind::Arg { .. } => "arg",
             IrKind::LoadCapture(..) => "load-capture",
-            IrKind::Fn(_) => "fn",
+            IrKind::Top(_, ValueKind::Fn) => "fn",
+            IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
             IrKind::MakeFuture { .. } => "make-future",
             IrKind::Await { .. } => "await",
@@ -1322,7 +1347,7 @@ impl IrNode {
             | IrKind::Call { .. }
             | IrKind::Arg { .. }
             | IrKind::LoadCapture(..)
-            | IrKind::Fn(_)
+            | IrKind::Top(..)
             | IrKind::LoadCallee
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
@@ -1739,8 +1764,9 @@ impl Ir {
                 | IrKind::LoadCapture(_, kind)
                 | IrKind::Await { kind, .. }
                 | IrKind::As { kind, .. }
-                | IrKind::Catch { kind, .. } => kind,
-                IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Fn(_) => ValueKind::Fn,
+                | IrKind::Catch { kind, .. }
+                | IrKind::Top(_, kind) => kind,
+                IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
                 IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
         }
@@ -2379,7 +2405,7 @@ impl Pretty<'_> {
             IrKind::Load(slot, _) | IrKind::Store(slot, _) => self.slot(f, slot)?,
             // A slot of the top level's frame, whatever function it is in,
             // so named by the top level's slot names.
-            IrKind::Fn(slot) => match self.ir.slot_names.get(slot.index()) {
+            IrKind::Top(slot, _) => match self.ir.slot_names.get(slot.index()) {
                 Some(&name) => write!(f, " top {}{slot}", FieldName(self.names.get(name)))?,
                 None => write!(f, " top ?{slot}")?,
             },

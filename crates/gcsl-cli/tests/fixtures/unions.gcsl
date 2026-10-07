@@ -12,7 +12,9 @@ let label: Int | String = if len(ports) > 2 { "many" } else { len(ports) }
 let first = (services[0].port as Int) + 1
 # Total equality compares two values of one union type.
 let same = services[0].port === services[1].port
-ports = ports
-label = label
-first = first
-same = same
+{
+  ports = ports
+  label = label
+  first = first
+  same = same
+}

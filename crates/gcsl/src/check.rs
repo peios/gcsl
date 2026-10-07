@@ -132,6 +132,18 @@
 //! extension, the types of the segments along its path are interned again,
 //! from the leaf outwards.
 //!
+//! All of this, the binding that grows and the slot that holds the record
+//! built so far, is how a dotted field of an INNER block works. At the top
+//! level of an input the rules above are kept, in either order of the two
+//! items, but the paths are order-free: each node of the tree is a cell of
+//! its own, a reference means the longest declared prefix of its path, and
+//! a root is assembled once from its children's cells, not item by item
+//! (see [Top-level fields](#top-level-fields)). So `a.b = 1; c = a; a.d =
+//! 2` gives `c` the whole `a`, `{b = 1; d = 2}`. The types of the open
+//! nodes above a top-level leaf are interned once, children first, when the
+//! input's last item is checked (`Checker::settle_top_nodes`), so that a
+//! root of N dotted items costs N steps, not N^2.
+//!
 //! In a record block checked against an expected record type, a dotted
 //! field's value is checked against the type the expected type has at the
 //! value's full path, as a field's value is against its field's type, if it
@@ -196,6 +208,18 @@
 //!   fields are still defined, so that their uses do not cascade, and the
 //!   block's record is erroneous.
 //! - A field item after a field item is "defined twice", as ever.
+//!
+//! At the top level of an input it is different, since a top-level field or
+//! `def` is declared in the whole input (see [Top-level
+//! fields](#top-level-fields)): it overrides a spread's field of its name
+//! whether the spread is above it or below it, so a spread below one is no
+//! longer "defined twice". The spread defines nothing and writes no slot
+//! for a name that is a top-level declaration of the input, so the
+//! declaration's cell is never overwritten, whichever is computed first;
+//! where the spread comes first, the field keeps the place the spread gave
+//! it in the record. A dotted root of a spread's name is "field `a` is
+//! already defined" in either order: below the spread at the path, as
+//! before, and above it at the spread's operand.
 //!
 //! An overridden field keeps its place in the record, where it was first
 //! defined, and its one slot, which every definition of it writes, as every
@@ -536,9 +560,12 @@
 //! A *top-level function* of an input is a named function item (`fn f`)
 //! or a `def` that is directly an item of the input's outermost block;
 //! nothing inside a nested block, a loop body, a labelled block, a function
-//! or a `lazy` is one. Everything else is ordered as described above: `let`,
-//! `let mut`, fields, spreads, `:=`, statements, and every `fn` or `def`
-//! that is not at the top level of an input.
+//! or a `lazy` is one. The input's top-level fields are order-free too (see
+//! [Top-level fields](#top-level-fields)); together with its top-level
+//! functions they are its *top-level declarations*. Everything else is
+//! ordered as described above: `let`, `let mut`, spreads, `:=`, statements,
+//! every field of an inner block, and every `fn` or `def` that is not at
+//! the top level of an input.
 //!
 //! **Names.** A top-level function's name is in scope in its whole input,
 //! above its declaration as well as below, and inside every function and
@@ -564,9 +591,10 @@
 //! is made, as any function does. A top-level variable declared below it
 //! is "undefined variable" inside it, with a label on that declaration,
 //! "`k` is declared here, below the function". What is new is only how one
-//! top-level function refers to another of its input: through the top
-//! level's frame, by [`VarRef::Fn`], never by a capture. That is what lets
-//! two functions refer to each other.
+//! top-level function refers to another of its input, or to a top-level
+//! field of it: through the top level's frame, by [`VarRef::Fn`], never by
+//! a capture. That is what lets two functions refer to each other, and a
+//! closure never wait for a field.
 //!
 //! **Mentions.** What follows is decided from one relation, found from the
 //! tree before the input is checked (see [`crate::mentions`]): an item or
@@ -657,6 +685,110 @@
 //! The "this is never run" warning neither starts at nor counts a
 //! top-level function, since its closure may be made before the item that
 //! never completes.
+//!
+//! # Top-level fields
+//!
+//! A field declared directly at the top level of an input, plain (`a = e`),
+//! quoted (`"a b" = e`), dotted (`a.b.c = e`) or a `def`, is a *top-level
+//! field*, and, like a top-level function, it is visible in the whole input.
+//!
+//! **The tree.** The top-level field items form a tree by their paths
+//! ([`crate::mentions::FieldTree`], built before the walk): each item is a
+//! *leaf*, and every proper prefix of a leaf's path an *interior* node, the
+//! record of its children in the order of their first items. Every node has
+//! a *cell*, a slot of the top level's frame written once: a root's is its
+//! binding's slot, declared as the input starts, after the top-level
+//! functions (`Checker::declare_field_cells`; a `def`'s is its function's),
+//! and every other node's is a slot after those that no name finds. The
+//! rules of [Dotted fields](#dotted-fields) that keep a leaf from also
+//! being interior hold in either order of the two items.
+//!
+//! **References.** A *reference* to a top-level field is `NAME`, `NAME.f`,
+//! `NAME.f.g`, ..., a variable and a chain of field accesses directly on
+//! it, where `NAME` resolves to a top-level field root of this input. It
+//! means the longest declared prefix of its path, a leaf or an interior
+//! node, whose type it has (`Checker::field_reference`); the segments after
+//! that prefix are ordinary field accesses. So `com.x.lib` reads only what
+//! is under `com.x.lib`, not all of `com`. Anything else (`(com).x`,
+//! `f(com).x`) means the whole root.
+//!
+//! **Names.** A field root's name follows the rules for a top-level
+//! function's: it hides an earlier input's binding of the name, and
+//! overrides a soft field of the name from a spread of this input, above it
+//! or below (see [Spreads and soft
+//! assignment](#spreads-and-soft-assignment)); a top-level `let`, `let
+//! mut`, `:=` or dotted `let` of the name is "`a` is a field of this file",
+//! with the field's first item labelled "declared here"; a top-level
+//! function of the name is "`a` is a function of this file" at the field.
+//!
+//! **What an initialiser sees.** As a function body does: the variables of
+//! the input's top level declared above the field's own item, everything of
+//! earlier inputs, and every top-level declaration. A read inside a function
+//! expression or a `lazy` the initialiser builds counts as the
+//! initialiser's. A `let` below the field is "undefined variable", labelled
+//! "`k` is declared here, below the field", with the note "a field's
+//! initialiser sees the variables declared above it".
+//!
+//! **Points.** Each node has a *point*, the item of the outermost block
+//! before which its cell is computed ([`crate::mentions::Schedule`]). An
+//! ordered item (anything that is not a top-level declaration) *needs* every
+//! top-level declaration it mentions and what those need: a leaf what its
+//! initialiser mentions, an interior node its children, a function what its
+//! body mentions. A leaf's point is the earliest of its own item and the
+//! points of what needs it, directly or through functions; an interior
+//! node's is the earliest of the item after its last child's and the points
+//! of what needs it. A function's closure keeps its own rule ([When a
+//! function may be used](#when-a-function-may-be-used)) and never pulls a
+//! field earlier: a closure reads fields when it runs. Before each item,
+//! the nodes whose point it is are computed, dependencies first, otherwise
+//! in source order; after the last item, the rest. So a field nothing
+//! mentions earlier is computed at its own line, and one mentioned earlier
+//! just before the first item that needs it; the effects of its initialiser
+//! happen there, which may be above its line. A field computed before its
+//! own item is not code that runs at its line: the "this is never run"
+//! warning neither starts at nor counts it; one computed at its own item is
+//! warned about and counted as any item.
+//!
+//! **When a field may be used.** A leaf may be computed at a point only if
+//! what it reads is bound by then, as a function may be used only once what
+//! it copies is bound. Whatever needs, at its point, a leaf that cannot be
+//! computed by then (one that reads a top-level variable bound at or after
+//! that point, or a mutable variable, which makes the leaf computed at its
+//! own item with the value the variable has there, or, through the chain, a
+//! function or leaf that is not ready) is "`a.c` cannot be used here yet",
+//! at the mention, with the chain of [When a function may be
+//! used](#when-a-function-may-be-used) and "has" for the steps from an
+//! interior node to what it holds: "`com` has `com.x.app.name`, and
+//! `com.x.app.name` reads `version`, which is bound here". The rules for a
+//! name declared, or a spread, between an early use and the declaration
+//! apply to leaves as to functions. `Checker::check_uses` skips the search
+//! for a reason when nothing a mention needs is ever blocked
+//! (`Checker::closure_ready`), so a chain of N fields costs N steps.
+//!
+//! **Cycles.** Mutual recursion between functions is fine, but a cycle of
+//! "needs" through a leaf or an interior node is "`a` depends on itself",
+//! at the first item of the cycle's leaf earliest in the source, labelled
+//! along the cycle ("`a` uses `b` here", ...), once per cycle, with the
+//! note "a field cannot be computed from itself, even through a function"
+//! (`Checker::report_cycles`, from [`crate::mentions::Mentions::cycles`]).
+//! The nodes on a cycle are erroneous for their users. The rule asks what
+//! is mentioned, not what is called, and a mention inside a `lazy` or a
+//! function expression the initialiser only builds counts, so `steps = lazy
+//! { run(steps.name) }` is an error: a function that reads the field is the
+//! way to write it. It is conservative in another way too: the first
+//! segment of a dotted field of an inner block counts as a mention of the
+//! top-level root of that name, so `a.c = { a.b = 1 }` is a cycle.
+//!
+//! **Types: initialisers are checked when they are needed.** A field has no
+//! declared type, which is why a cycle through one is an error rather than
+//! a conservative view. Each leaf's initialiser is checked exactly once
+//! (`Checker::compute_fields`, walking the schedule's order with no
+//! recursion): before the first item that needs it, after the
+//! declarations it needs, or after the last item, with the top-level scope
+//! cut to the bindings above whichever is higher, that item or the field's
+//! own, as a body checked early is (see [Top-level
+//! functions](#top-level-functions)). An interior node's type is the record
+//! of its children's types. A reference has its node's type.
 //!
 //! # Futures
 //!
@@ -1791,7 +1923,12 @@
 //! soft one, writes the field's one slot. The top-level functions of an
 //! input take its first slots, in source order, before the walk starts
 //! (see [Top-level functions](#top-level-functions)); a `def` among them is
-//! a field whose slot is the function's. A spread's operand is held in the next free slot,
+//! a field whose slot is the function's. The input's top-level field roots
+//! take the slots after them, and every other node of the tree of its
+//! top-level fields a slot after those, its cell, which no name finds (see
+//! [Top-level fields](#top-level-fields)); so a scope's next free slot is
+//! not always its bindings' count, and [`Scope`] records it. A spread's
+//! operand is held in the next free slot,
 //! which counts towards the frame size but stays free (see [Spreads and
 //! soft assignment](#spreads-and-soft-assignment)). An `if` that narrows
 //! takes the next free slot for the value its test writes, which both
@@ -1818,6 +1955,15 @@
 //! earlier input's functions keep reading their own input's slots, which no
 //! later input writes. Nothing about top-level functions is kept in the
 //! [`Scope`] beyond their bindings.
+//!
+//! The same holds of top-level fields. Every cell slot of an input, a root's
+//! or another node's, is committed with the input: the scope's next free
+//! slot is past the last of them, so no later input reuses one, and a
+//! closure or a future of the input reads its cells by slot for as long as
+//! it exists. A failed input's cells are forgotten with it, as its other
+//! slots are. A later input sees an earlier input's field root as a field
+//! of its type, whole, as before this order-free model; `a.c = 2` in a later
+//! input declares that input's own `a`.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1829,7 +1975,7 @@ use crate::ast::{
     TypeExprId, TypeExprKind, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
-use crate::mentions::{self, Mentions};
+use crate::mentions::{self, FieldTree, Mentions, Need, Schedule};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
@@ -2198,6 +2344,14 @@ pub struct Resolution {
     /// Each top-level function of the input, by its item, in source order,
     /// with where its closure is made.
     top_functions: Vec<(ItemId, MadeAt)>,
+    /// The cell of each node of the input's tree of top-level fields
+    /// ([`Mentions::tree`]), by its index there: the slot of the top level's
+    /// frame that holds its value. A root's is its binding's slot, a `def`'s
+    /// its function's; the others are slots no name finds.
+    field_cells: Vec<Slot>,
+    /// The tree of the input's top-level fields and when each node is
+    /// computed (see [Top-level fields](#top-level-fields)).
+    field_schedule: FieldSchedule,
     /// The number of slots the top level's frame needs.
     frame_size: u32,
     /// For each slot of the top level's frame, the name of the last
@@ -2322,6 +2476,21 @@ impl Resolution {
     #[must_use]
     pub fn top_functions(&self) -> &[(ItemId, MadeAt)] {
         &self.top_functions
+    }
+
+    /// The cell of each node of the input's tree of top-level fields, by
+    /// its index in [`FieldSchedule::tree`]: the slot of the top level's
+    /// frame its value is stored in, once, at its point.
+    #[must_use]
+    pub fn field_cells(&self) -> &[Slot] {
+        &self.field_cells
+    }
+
+    /// The tree of the input's top-level fields and when each node is
+    /// computed: what lowering stores in each cell, and before which item.
+    #[must_use]
+    pub fn field_schedule(&self) -> &FieldSchedule {
+        &self.field_schedule
     }
 
     /// The slot each field of the spread item `id`'s operand is stored in,
@@ -2455,6 +2624,8 @@ impl Resolution {
             item_paths: vec![PathResolution::NONE; items],
             path_awaits: Vec::new(),
             top_functions: Vec::new(),
+            field_cells: Vec::new(),
+            field_schedule: FieldSchedule::default(),
             frame_size: 0,
             slot_names: Vec::new(),
             functions: Vec::new(),
@@ -2642,6 +2813,57 @@ fn root_declares(ast: &Ast, id: ItemId) -> Option<Name> {
     ast.path(path).first().and_then(PathSegment::name)
 }
 
+/// The tree of an input's top-level fields and when each of its nodes is
+/// computed: what the checker found from [`Mentions`] and lowering stores
+/// the cells by (see [Top-level fields](#top-level-fields)).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldSchedule {
+    /// The tree of the input's top-level fields.
+    pub tree: FieldTree,
+    /// The point of each node, and the order the nodes are computed in.
+    pub schedule: Schedule,
+}
+
+/// What the checker knows of one node of the tree of the input's top-level
+/// fields (see [Top-level fields](#top-level-fields)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FieldCell {
+    /// The slot of the top level's frame that holds its value.
+    slot: Slot,
+    /// For a root, the index in `bindings` of the binding of its name,
+    /// declared as the input starts.
+    binding: Option<usize>,
+    /// Its type, once its initialiser is checked (a leaf) or its children
+    /// are (an interior node); a reference to it before that, which only a
+    /// cycle makes, is erroneous.
+    ty: Option<TyId>,
+    /// Once a leaf is checked, the position among the outermost block's
+    /// items of the first item before which it can be computed: `0` if
+    /// it reads nothing that stops it, its own item's if it reads a mutable
+    /// variable, `usize::MAX` if it read a name it cannot see yet or is on a
+    /// cycle (see [Top-level fields](#top-level-fields)).
+    ready: usize,
+    /// Why a leaf cannot be computed before `ready`, if it reads something
+    /// that stops it; `None` on a cycle, which is reported once.
+    blocker: Option<Blocker>,
+    /// Whether it is on a cycle through fields, already reported: it is
+    /// erroneous for its users.
+    cyclic: bool,
+}
+
+impl FieldCell {
+    /// A node's cell before the input is walked: no slot, binding or type
+    /// yet, and nothing known that stops it.
+    const NEW: Self = Self {
+        slot: Slot::NONE,
+        binding: None,
+        ty: None,
+        ready: 0,
+        blocker: None,
+        cyclic: false,
+    };
+}
+
 /// Where the check of a top-level function's body is (see [Top-level
 /// functions](#top-level-functions)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2688,7 +2910,7 @@ struct TopFn {
 
 /// Why a top-level function does not exist before some item: what it
 /// reads, and where that is bound.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Blocker {
     /// The name it reads.
     name: Name,
@@ -3134,14 +3356,21 @@ enum Definition {
 /// The variables of an outermost scope, with their slots and types: what a
 /// [`crate::session::Session`] carries from one input to the next.
 ///
-/// Only a [`Checker`] produces a non-empty scope. Its bindings occupy slots
-/// `0..n` in declaration order, since the outermost block's declarations are
-/// the first to take slots and no block is left open around them; the
-/// definitions of a field that overrides a soft one share the field's slot,
-/// so `n` may be less than the number of bindings.
+/// Only a [`Checker`] produces a non-empty scope. Its slots are `0..n`, `n`
+/// being its first free slot, which it keeps explicitly (`slot_names`) since
+/// not every slot is a binding's: the outermost block's declarations are the
+/// first to take slots and no block is left open around them, and a slot
+/// that no name finds, such as a cell of a top-level dotted field, is
+/// committed with them. The bindings occupy their slots in declaration
+/// order; the definitions of a field that overrides a soft one share the
+/// field's slot, so `n` is not the number of bindings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scope {
     bindings: Vec<Binding>,
+    /// The name each slot `0..n` shows in a dump, `n` being the first slot
+    /// the next input may take: the last binding in it, or for a slot no
+    /// binding owns, what the checker named it.
+    slot_names: Vec<Name>,
     /// For each binding, if it was initialised directly with a function
     /// expression, which of that function's parameters are present because
     /// its body measures them: what the call-site form of the
@@ -3263,6 +3492,25 @@ pub struct Checker<'a> {
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
+    /// The cell of each node of the input's tree of top-level fields, by
+    /// its index in `mentions.tree` (see [Top-level
+    /// fields](#top-level-fields)).
+    field_cells: Vec<FieldCell>,
+    /// For each node of the graph of what needs what (`Checker::need_index`),
+    /// once known: the latest item before which something it needs, itself
+    /// included, cannot be had (`Checker::closure_ready`), 0 if nothing it
+    /// needs is ever blocked. Lets `Checker::check_uses` skip the search for
+    /// a reason in the common case, so a chain of N fields costs N steps.
+    closure_ready: Vec<Option<usize>>,
+    /// When each node of the tree is computed.
+    schedule: Schedule,
+    /// How far `schedule.order` has been checked: the nodes before this
+    /// index in it are.
+    scheduled: usize,
+    /// The end of the bindings of the input's top-level declarations in
+    /// `bindings`: from `top_start`, those of its top-level functions, then
+    /// those of its top-level field roots that are not `def`s.
+    top_end: usize,
     /// The input's top-level functions, indexed as in `mentions`.
     top_fns: Vec<TopFn>,
     /// The index in `bindings` of the first top-level function's binding:
@@ -3273,6 +3521,12 @@ pub struct Checker<'a> {
     top_copies: Vec<Vec<usize>>,
     /// The top-level function whose body is being checked, if one is.
     checking_top: Option<usize>,
+    /// The leaf of the tree of top-level fields whose initialiser is being
+    /// checked, if one is (see [Top-level fields](#top-level-fields)).
+    checking_leaf: Option<u32>,
+    /// The top-level functions on a cycle through fields, already reported:
+    /// erroneous for their users, as an erroneous function is.
+    cyclic_fns: Vec<u32>,
     /// While a top-level function's body is checked before the walk has
     /// reached it: the positions among the outermost block's items of the
     /// item being checked and of the function's declaration. A read of a
@@ -3316,6 +3570,14 @@ pub struct Checker<'a> {
     /// The highest `next_slot` reached.
     frame_size: u32,
     slot_names: Vec<Name>,
+    /// The first slot past the outermost block's slots that no binding
+    /// owns, such as the cells of the input's top-level fields, which a
+    /// session commits with the input: the [`Scope`]'s first free slot is
+    /// at least this.
+    top_slots_end: u32,
+    /// The last top-level item reported as "`a` is a field of this file",
+    /// whose `:=` is then not reported again as a rebind of a field.
+    field_clash: Option<ItemId>,
     builtin_types: BuiltinTypes,
     /// The name `Future`, which applied to a type is a future of it, if the
     /// program mentions it.
@@ -3390,15 +3652,10 @@ impl<'a> Checker<'a> {
     #[must_use]
     pub fn with_scope(ast: &'a Ast, scope: Scope, types: &'a mut TypeTable) -> Self {
         let names = ast.names();
-        // The scope's bindings occupy exactly slots `0..n`, in declaration
-        // order, each slot named by the last binding in it.
-        let mut slot_names: Vec<Name> = Vec::with_capacity(scope.bindings.len());
-        for binding in &scope.bindings {
-            match slot_names.get_mut(binding.slot.index()) {
-                Some(entry) => *entry = binding.name,
-                None => slot_names.push(binding.name),
-            }
-        }
+        // The scope's slots are exactly `0..n`, each named as it was when
+        // the scope was made; some, such as a dotted field's cells, belong
+        // to no binding.
+        let slot_names = scope.slot_names;
         let next_slot = u32::try_from(slot_names.len()).unwrap_or(u32::MAX);
         let never = types.never();
         Self {
@@ -3428,9 +3685,16 @@ impl<'a> Checker<'a> {
             bindings: scope.bindings,
             scope_measured: scope.measured,
             mentions: Mentions::default(),
+            field_cells: Vec::new(),
+            closure_ready: Vec::new(),
+            schedule: Schedule::default(),
+            scheduled: 0,
+            top_end: 0,
             top_fns: Vec::new(),
             top_copies: Vec::new(),
             checking_top: None,
+            checking_leaf: None,
+            cyclic_fns: Vec::new(),
             early: None,
             root_position: 0,
             top_start: 0,
@@ -3447,6 +3711,8 @@ impl<'a> Checker<'a> {
             next_slot,
             frame_size: next_slot,
             slot_names,
+            top_slots_end: next_slot,
+            field_clash: None,
             builtin_types: [
                 (names.lookup("Int"), TyId::INT),
                 (names.lookup("Float"), TyId::FLOAT),
@@ -3509,6 +3775,7 @@ impl<'a> Checker<'a> {
             };
             return Err(vec![error.into()]);
         }
+        let scope_slot_names = self.scope_slot_names();
         // What the call-site form of the implicit-await error needs to know
         // of this input's functions in a later input, whose tree is gone.
         let mut measured = self.scope_measured;
@@ -3540,6 +3807,11 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|top| (top.item, top.made))
             .collect();
+        let field_cells = self.field_cells.iter().map(|cell| cell.slot).collect();
+        let field_schedule = FieldSchedule {
+            tree: std::mem::take(&mut self.mentions.tree),
+            schedule: std::mem::take(&mut self.schedule),
+        };
         let checked = Checked {
             types: Types::new(self.expr_types),
             resolution: Resolution {
@@ -3551,6 +3823,8 @@ impl<'a> Checker<'a> {
                 item_paths: self.item_paths,
                 path_awaits: self.path_awaits,
                 top_functions,
+                field_cells,
+                field_schedule,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
                 functions: self.fn_resolutions,
@@ -3566,7 +3840,11 @@ impl<'a> Checker<'a> {
         warnings.sort_by_key(|warning| warning.span.start);
         Ok(CheckOutput {
             checked,
-            scope: Scope { bindings, measured },
+            scope: Scope {
+                bindings,
+                slot_names: scope_slot_names,
+                measured,
+            },
             ty,
             warnings,
         })
@@ -3628,6 +3906,7 @@ impl<'a> Checker<'a> {
             let item = *self.ast.item(id);
             if root {
                 self.root_position = index;
+                self.compute_fields(index);
                 if self.reach_top_fn(id) {
                     continue;
                 }
@@ -3635,7 +3914,11 @@ impl<'a> Checker<'a> {
                 self.check_uses(index);
                 self.check_clash(id);
             }
-            if let (Some(leaves), false) = (leaves, warned) {
+            // A top-level field computed before its own item, because an
+            // item above needed it, does not run here: it is neither warned
+            // about nor counted as never completing.
+            let early = root && self.computed_early(index);
+            if let (Some(leaves), false, false) = (leaves, warned, early) {
                 self.warnings.push(
                     Diagnostic::warning("this is never run", item.span)
                         .with_context(leaves, "this always leaves the block"),
@@ -3657,7 +3940,7 @@ impl<'a> Checker<'a> {
                 ItemKind::Field { path, value, .. } => {
                     self.check_field(id, path, value, expecting);
                 }
-                ItemKind::Spread(value) => self.check_spread_item(id, value),
+                ItemKind::Spread(value) => self.check_spread_item(id, value, root),
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -3693,12 +3976,15 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            if leaves.is_none() && self.never_completes(id, item.kind) {
+            if leaves.is_none() && !early && self.never_completes(id, item.kind) {
                 leaves = Some(item.span);
             }
         }
         if root {
+            self.root_position = items.len();
+            self.compute_fields(items.len());
             self.check_remaining_bodies();
+            self.settle_top_nodes();
         }
         match first_field {
             Some(_) => self.record_type(expecting),
@@ -3976,6 +4262,12 @@ impl<'a> Checker<'a> {
                 .block_field(name)
                 .filter(|&index| self.fields[index].spread.is_some()),
         };
+        // A top-level field of the input: its leaf was computed at its
+        // point, and its root declared as the input started.
+        if let Some(ty) = self.computed_value(value) {
+            self.reach_top_field(id, (name, name_span), ty, soft);
+            return;
+        }
         let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
         self.name_callee(segments, value);
         let ty = match expected {
@@ -4042,6 +4334,44 @@ impl<'a> Checker<'a> {
         field.spread = None;
     }
 
+    /// When the walk reaches the item `id` of a top-level field whose path
+    /// is the single name `name`, written at `name_span`, and whose value
+    /// has the type `ty`, computed at its point: gives the item its root's
+    /// cell and adds the field to the record of the input, or makes the
+    /// soft field `soft` of its name hard, keeping its place. Nothing is
+    /// declared: the root's binding was, as the input started.
+    fn reach_top_field(
+        &mut self,
+        id: ItemId,
+        (name, name_span): (Name, Span),
+        ty: TyId,
+        soft: Option<usize>,
+    ) {
+        let slot = self
+            .mentions
+            .tree
+            .root(name)
+            .and_then(|root| self.field_cells.get(root as usize))
+            .map_or(Slot::NONE, |cell| cell.slot);
+        self.item_slots[id.index()] = slot;
+        match soft {
+            Some(index) => {
+                let field = &mut self.fields[index];
+                (field.ty, field.slot, field.name_span) = (ty, slot, name_span);
+                field.spread = None;
+            }
+            None => self.fields.push(FieldDecl {
+                name,
+                name_span,
+                ty,
+                slot,
+                open: None,
+                spread: None,
+                rejected: false,
+            }),
+        }
+    }
+
     /// The index in `fields` of the innermost block's field named `name`,
     /// by its first declaration, if it has one.
     fn block_field(&self, name: Name) -> Option<usize> {
@@ -4067,7 +4397,7 @@ impl<'a> Checker<'a> {
     /// record erroneous. The item's own slot, which holds the operand's
     /// value while its fields are read, is the next free slot once its
     /// fields are declared, and is left free.
-    fn check_spread_item(&mut self, id: ItemId, value: ExprId) {
+    fn check_spread_item(&mut self, id: ItemId, value: ExprId, top: bool) {
         let found = self.check_expr(value);
         let found = self.settle(value, found);
         let ty = self.measure(value, found);
@@ -4114,6 +4444,13 @@ impl<'a> Checker<'a> {
             let Some(&(name, _, ty)) = self.sorted_fields.get(at) else {
                 continue;
             };
+            // A top-level declaration of the input overrides the spread's
+            // field whichever is written first: the spread defines nothing
+            // and writes no slot for its name. A spread above it holds the
+            // name's place in the record for it, as a soft field would.
+            if top && self.spread_over_top_field((name, ty), (value, operand)) {
+                continue;
+            }
             let slot = match self.block_field(name) {
                 None => {
                     let slot = self.declare_binding(name, ty, Some(item_span), BindingKind::Field);
@@ -4250,7 +4587,10 @@ impl<'a> Checker<'a> {
             self.expected_at(expecting, segments, existing)
                 .map(|ty| (expecting, ty))
         });
+        // A top-level field's leaf was computed at its point.
+        let computed = self.computed_value(value);
         let leaf_ty = match expected {
+            _ if computed.is_some() => computed.unwrap_or(TyId::ERROR),
             Some((expecting, expected)) => {
                 let found =
                     self.check_expr_expecting(value, expected, expecting.context, expecting.why);
@@ -4271,19 +4611,26 @@ impl<'a> Checker<'a> {
         };
         let parent = self.add_path_nodes(parent, segments, existing.max(1));
         // `parent` is now the leaf. Its type is the value's, and the type of
-        // each node above it changes.
+        // each node above it changes: at once in an inner block, whose later
+        // items see the record built so far, and once the block ends for a
+        // top-level field, whose readers see its cells instead
+        // (`Checker::settle_top_nodes`), so that a root of N dotted items
+        // costs N steps, not N^2.
         self.nodes[parent as usize].ty = leaf_ty;
-        let mut node = self.nodes[parent as usize].parent;
-        while node != NO_NODE {
-            let ty = self.node_type(node);
-            let entry = &mut self.nodes[node as usize];
-            entry.ty = ty;
-            node = entry.parent;
+        let top_root = computed.and_then(|_| self.top_root_cell(first_name));
+        if top_root.is_none() {
+            let mut node = self.nodes[parent as usize].parent;
+            while node != NO_NODE {
+                let ty = self.node_type(node);
+                let entry = &mut self.nodes[node as usize];
+                entry.ty = ty;
+                node = entry.parent;
+            }
         }
         let ty = self.nodes[root as usize].ty;
         match attach {
             None => {
-                self.declare(first_name, ty, id, BindingKind::Field);
+                let binding = self.open_binding(top_root, (first_name, ty), id);
                 self.fields.push(FieldDecl {
                     name: first_name,
                     name_span: first.span,
@@ -4291,7 +4638,7 @@ impl<'a> Checker<'a> {
                     slot: self.item_slots[id.index()],
                     open: Some(OpenField {
                         node: root,
-                        binding: self.bindings.len() - 1,
+                        binding,
                     }),
                     spread: None,
                     rejected: false,
@@ -4300,7 +4647,10 @@ impl<'a> Checker<'a> {
             Some((index, open, _, existing)) => {
                 self.fields[index].ty = ty;
                 let binding = &mut self.bindings[open.binding];
-                binding.ty = ty;
+                // A top-level root's binding has the whole root's type.
+                if top_root.is_none() {
+                    binding.ty = ty;
+                }
                 self.item_slots[id.index()] = binding.slot;
                 // The field is in this block, so in the current frame. The
                 // record a dotted field extends is one its block is building,
@@ -4498,6 +4848,28 @@ impl<'a> Checker<'a> {
         };
         self.sorted_fields.truncate(base);
         ty
+    }
+
+    /// Once the input's outermost block has had its last item: gives every
+    /// open node the record of its children's types, children first, and
+    /// every open field its root's type. A top-level dotted item leaves the
+    /// nodes above its leaf as they were (see `Checker::check_dotted_field`),
+    /// and this settles them in one pass over the arena, whose nodes come
+    /// after their parents.
+    fn settle_top_nodes(&mut self) {
+        for node in (0..self.nodes.len()).rev() {
+            if self.nodes[node].kind == NodeKind::Open {
+                let ty = self.node_type(u32::try_from(node).unwrap_or(NO_NODE));
+                self.nodes[node].ty = ty;
+            }
+        }
+        for index in 0..self.fields.len() {
+            if let Some(open) = self.fields[index].open
+                && let Some(node) = self.nodes.get(open.node as usize)
+            {
+                self.fields[index].ty = node.ty;
+            }
+        }
     }
 
     /// Checks `value` with no expected type, settling an untyped integer to
@@ -4796,6 +5168,13 @@ impl<'a> Checker<'a> {
         // The binding being rebound, with its index in `bindings`, once the
         // `:=` rules pass.
         let target = match self.lookup(name) {
+            // A top-level field of this input, already reported at the item
+            // as a field of the file.
+            Some((_, binding))
+                if binding.kind == BindingKind::Field && self.field_clash == Some(id) =>
+            {
+                None
+            }
             Some((_, binding)) if binding.kind == BindingKind::Field => {
                 let mut error = Diagnostic::error(
                     format!("cannot rebind `{text}`: it is a field, not a variable"),
@@ -5405,8 +5784,11 @@ impl<'a> Checker<'a> {
             return;
         };
         let base = self.path_types.len();
-        let mut found = self.lookup(name);
-        let mut failed = leaf_ty == TyId::ERROR;
+        // A dotted `let` of a top-level field's name has been reported as
+        // "`a` is a field of this file"; the field is not what it updates.
+        let clash = self.field_clash == Some(id);
+        let mut found = if clash { None } else { self.lookup(name) };
+        let mut failed = leaf_ty == TyId::ERROR || clash;
         if let Some((index, old)) = found {
             // An erroneous variable has been reported already.
             failed |= old.ty == TyId::ERROR || self.walk_path(segments, (old.ty, index)).is_none();
@@ -5581,6 +5963,442 @@ impl<'a> Checker<'a> {
             });
         }
         self.top_copies = vec![Vec::new(); self.top_fns.len()];
+        self.declare_field_cells();
+        self.closure_ready = vec![None; self.mentions.tree.nodes.len() + self.top_fns.len()];
+    }
+
+    /// As the input starts, after its top-level functions: declares the
+    /// root of every top-level field that is not a `def` (a `def`'s is its
+    /// function's binding), in order of first item, with no type yet, and
+    /// gives every other node of the tree a slot of its own after them,
+    /// which no name finds (see [Top-level fields](#top-level-fields)).
+    /// Finds when each node is computed.
+    fn declare_field_cells(&mut self) {
+        self.schedule = self.mentions.schedule();
+        self.scheduled = 0;
+        let count = self.mentions.tree.nodes.len();
+        self.field_cells = Vec::with_capacity(count);
+        let root_items = self.ast.items(self.ast.root());
+        for index in 0..count {
+            let Some(node) = self.mentions.tree.nodes.get(index) else {
+                break;
+            };
+            let (name, parent, first) = (node.name, node.parent, node.first);
+            let def = node
+                .leaf
+                .and_then(|leaf| self.top_fns.iter().find(|top| top.item == leaf.item))
+                .map(|top| top.binding);
+            let cell = match (parent, def) {
+                (_, Some(binding)) => FieldCell {
+                    slot: self.bindings.get(binding).map_or(Slot::NONE, |b| b.slot),
+                    binding: Some(binding),
+                    ..FieldCell::NEW
+                },
+                (None, None) => {
+                    let span = root_items.get(first).map(|&item| self.ast.item(item).span);
+                    let binding = self.bindings.len();
+                    let slot = self.declare_binding(name, TyId::ERROR, span, BindingKind::Field);
+                    FieldCell {
+                        slot,
+                        binding: Some(binding),
+                        ..FieldCell::NEW
+                    }
+                }
+                (Some(_), None) => FieldCell::NEW,
+            };
+            self.field_cells.push(cell);
+        }
+        self.top_end = self.bindings.len();
+        self.report_cycles();
+        // The cells of the nodes that are not roots, after the roots'.
+        for index in 0..count {
+            let named = self
+                .mentions
+                .tree
+                .nodes
+                .get(index)
+                .is_some_and(|node| node.parent.is_none());
+            if named {
+                continue;
+            }
+            let slot = Slot(self.next_slot);
+            self.next_slot = self.next_slot.saturating_add(1);
+            self.frame_size = self.frame_size.max(self.next_slot);
+            let name = self.mentions.tree.nodes.get(index).map(|node| node.name);
+            if let Some(name) = name {
+                self.slot_names.push(name);
+            }
+            if let Some(cell) = self.field_cells.get_mut(index) {
+                cell.slot = slot;
+            }
+        }
+        self.top_slots_end = self.top_slots_end.max(self.next_slot);
+    }
+
+    /// Reports each cycle through the tree of top-level fields, once: "`a`
+    /// depends on itself", at the item of the cycle's leaf that is first in
+    /// the source, with a label on each mention along the cycle back to it
+    /// (an interior node has its children, which it does not mention, so
+    /// that step has none), and marks every node on it erroneous for its
+    /// users (see [Top-level fields](#top-level-fields)).
+    fn report_cycles(&mut self) {
+        self.cyclic_fns.clear();
+        for cycle in self.mentions.cycles() {
+            for &member in &cycle {
+                match member {
+                    Need::Field(node) => {
+                        if let Some(cell) = self.field_cells.get_mut(node as usize) {
+                            cell.cyclic = true;
+                            cell.ready = usize::MAX;
+                        }
+                    }
+                    Need::Function(function) => self.cyclic_fns.push(function),
+                }
+            }
+            let leaf = cycle
+                .iter()
+                .filter_map(|&member| match member {
+                    Need::Field(node) => self
+                        .mentions
+                        .tree
+                        .nodes
+                        .get(node as usize)
+                        .and_then(|entry| entry.leaf)
+                        .map(|leaf| (node, leaf)),
+                    Need::Function(_) => None,
+                })
+                .min_by_key(|&(_, leaf)| leaf.position);
+            let Some((start, leaf)) = leaf else {
+                continue;
+            };
+            let start = Need::Field(start);
+            // Breadth first inside the cycle, back to its start.
+            let count = self.mentions.tree.nodes.len() + self.top_fns.len();
+            let mut parent: Vec<Option<(Need, Option<Span>)>> = vec![None; count];
+            let (mut queue, mut head) = (vec![start], 0);
+            let mut back = None;
+            while let Some(&need) = queue.get(head) {
+                head += 1;
+                for (next, at) in self.mentions.needs(need) {
+                    if !cycle.contains(&next) {
+                        continue;
+                    }
+                    if next == start {
+                        back = Some((need, at));
+                        break;
+                    }
+                    if let Some(entry) = parent.get_mut(self.need_index(next))
+                        && entry.is_none()
+                    {
+                        *entry = Some((need, at));
+                        queue.push(next);
+                    }
+                }
+                if back.is_some() {
+                    break;
+                }
+            }
+            // The steps from the start round to it, in order.
+            let mut steps = Vec::new();
+            let mut edge = back.map(|(from, at)| (from, start, at));
+            while let Some((from, to, at)) = edge {
+                steps.push((from, to, at));
+                edge = (from != start)
+                    .then(|| parent.get(self.need_index(from)).copied().flatten())
+                    .flatten()
+                    .map(|(up, at)| (up, from, at));
+            }
+            steps.reverse();
+            let text = self.need_text(start);
+            let mut error = Diagnostic::error(
+                format!("`{text}` depends on itself"),
+                self.name_span(leaf.item),
+            )
+            .with_note("a field cannot be computed from itself, even through a function");
+            for (from, to, at) in steps {
+                if let Some(at) = at {
+                    let label = format!(
+                        "`{}` uses `{}` here",
+                        self.need_text(from),
+                        self.need_text(to)
+                    );
+                    error = error.with_context(at, label);
+                }
+            }
+            self.errors.push(error);
+        }
+    }
+
+    /// Before the walk checks the item at `position` of the outermost block
+    /// (or, with the number of items, after the last): computes every node
+    /// of the tree of top-level fields whose point is there or earlier and
+    /// that is not computed yet, in the order of the schedule, which puts
+    /// what a node needs first. A leaf's initialiser is checked here,
+    /// exactly once, after the bodies of the functions it mentions, in the
+    /// view of the top level the walk has reached, which is the bindings
+    /// above whichever is higher, the point or the leaf's own item; an
+    /// interior node's type is the record of its children's. The walk is
+    /// driven by the schedule, never by a reference, so it does not nest.
+    fn compute_fields(&mut self, position: usize) {
+        while let Some(&node) = self.schedule.order.get(self.scheduled) {
+            let point = self
+                .schedule
+                .point
+                .get(node as usize)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if point > position {
+                break;
+            }
+            self.scheduled += 1;
+            self.compute_field(node);
+        }
+    }
+
+    /// Computes the type of the node `node` of the tree of top-level fields
+    /// (see [`Checker::compute_fields`]) and gives it to its root's binding.
+    fn compute_field(&mut self, node: u32) {
+        let Some(entry) = self.mentions.tree.nodes.get(node as usize) else {
+            return;
+        };
+        let (leaf, children) = (entry.leaf, entry.children.clone());
+        let Some(cell) = self.field_cells.get(node as usize).copied() else {
+            return;
+        };
+        let ty = match leaf {
+            // A `def`: its function's binding has its type, which its
+            // group's check settles, when something mentions it or after
+            // the last item, as for any top-level function. Its body is
+            // not checked here: it may read fields computed after this
+            // point, since a closure reads them when it runs, not when
+            // it is made.
+            Some(leaf) if self.top_fns.iter().any(|top| top.item == leaf.item) => {
+                if let Some(cell) = self.field_cells.get_mut(node as usize) {
+                    cell.ty = Some(TyId::ERROR);
+                }
+                return;
+            }
+            Some(leaf) => {
+                self.check_mentioned(leaf.position);
+                let ItemKind::Field { path, .. } = self.ast.item(leaf.item).kind else {
+                    return;
+                };
+                let segments = self.ast.path(path);
+                // Checked at an item above its own, it reads nothing the
+                // top level declares between the two, as a function body
+                // checked early does not.
+                let early = (self.root_position < leaf.position)
+                    .then_some((self.root_position, leaf.position));
+                (self.early, self.checking_leaf) = (early, Some(node));
+                self.name_callee(segments, leaf.value);
+                let ty = self.check_alone(leaf.value);
+                self.callee_name = None;
+                (self.early, self.checking_leaf) = (None, None);
+                let function = self.direct_function(segments, leaf.value);
+                if let Some(binding) = cell.binding.and_then(|b| self.bindings.get_mut(b)) {
+                    binding.function = function;
+                }
+                if let Some(cell) = self.field_cells.get_mut(node as usize) {
+                    let blocked = cell
+                        .blocker
+                        .is_some_and(|blocker| blocker.kind != BlockerKind::Mutable);
+                    if blocked || cell.cyclic {
+                        cell.ready = usize::MAX;
+                    }
+                }
+                if cell.cyclic { TyId::ERROR } else { ty }
+            }
+            None => {
+                let mut erroneous = false;
+                let mut fields = Vec::with_capacity(children.len());
+                for child in children {
+                    let ty = self
+                        .field_cells
+                        .get(child as usize)
+                        .and_then(|cell| cell.ty)
+                        .unwrap_or(TyId::ERROR);
+                    erroneous |= ty == TyId::ERROR;
+                    if let Some(name) = self.mentions.tree.nodes.get(child as usize) {
+                        fields.push((name.name, ty));
+                    }
+                }
+                if erroneous || cell.cyclic {
+                    TyId::ERROR
+                } else {
+                    self.types.record(fields)
+                }
+            }
+        };
+        if let Some(cell) = self.field_cells.get_mut(node as usize) {
+            cell.ty = Some(ty);
+        }
+        if let Some(binding) = cell.binding.and_then(|b| self.bindings.get_mut(b)) {
+            binding.ty = ty;
+        }
+    }
+
+    /// The type a field item's value `value` was given when its leaf was
+    /// computed, if it is a top-level field's (see
+    /// [`Checker::compute_fields`]): the walk does not check it again.
+    fn computed_value(&self, value: ExprId) -> Option<TyId> {
+        if !self.functions.is_empty() {
+            return None;
+        }
+        let node = self
+            .mentions
+            .tree
+            .item_leaf
+            .get(self.root_position)
+            .copied()
+            .flatten()?;
+        let entry = self.mentions.tree.nodes.get(node as usize)?;
+        if entry.leaf.is_none_or(|leaf| leaf.value != value) {
+            return None;
+        }
+        self.field_cells.get(node as usize)?.ty
+    }
+
+    /// The type of a reference to a top-level field of the input, `id`,
+    /// if it is one: a variable naming a field root that nothing shadows,
+    /// or a chain of field accesses directly on one, which means the
+    /// longest prefix of its path the tree declares (see [Top-level
+    /// fields](#top-level-fields)). The accesses beyond that prefix are
+    /// left to the caller as ordinary accesses: this answers only for the
+    /// expression that names the node, recording where its value is read.
+    fn field_reference(&mut self, id: ExprId) -> Option<TyId> {
+        let (node, at) = self.mentions.tree.reference(self.ast, id)?;
+        if at != id {
+            return None;
+        }
+        let root = self.root_of(node);
+        let binding = self.field_cells.get(root as usize)?.binding?;
+        let mut base = id;
+        while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
+            base = expr;
+        }
+        let ExprKind::Name(name) = self.ast.get(base).kind else {
+            return None;
+        };
+        let (index, found) = self.lookup(name)?;
+        if index != binding || node == root {
+            return None;
+        }
+        let cell = self.field_cells.get(node as usize).copied()?;
+        let root_source = self.resolve(index, found);
+        let source = match root_source {
+            VarRef::Fn(_) => VarRef::Fn(cell.slot),
+            _ => VarRef::Local(cell.slot),
+        };
+        // The reference reads the node's cell; its variable, the root's.
+        self.expr_vars[id.index()] = source;
+        self.expr_vars[base.index()] = root_source;
+        let ty = cell.ty.unwrap_or(TyId::ERROR);
+        // The prefixes inside the reference are not read: each is typed as
+        // the record of the path below it, down to the node.
+        let mut at = id;
+        let mut inner_ty = ty;
+        while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
+            inner_ty = if inner_ty == TyId::ERROR {
+                TyId::ERROR
+            } else {
+                self.types.record([(name, inner_ty)])
+            };
+            self.expr_types[expr.index()] = inner_ty;
+            at = expr;
+        }
+        Some(ty)
+    }
+
+    /// For a field `name` of type `ty` that a top-level spread of the
+    /// operand `value`, written at `operand`, defines: if `name` is a
+    /// top-level field of the input, defines nothing and writes no slot,
+    /// holding the name's place in the record if nothing has it yet, and
+    /// returns `true`.
+    fn spread_over_top_field(
+        &mut self,
+        (name, ty): (Name, TyId),
+        (value, operand): (ExprId, Span),
+    ) -> bool {
+        let Some(slot) = self.top_declaration_slot(name) else {
+            return false;
+        };
+        // A soft field's name as a dotted root is "already defined" in
+        // either order: here the dotted paths came first.
+        let tree = &self.mentions.tree;
+        if let Some(root) = tree
+            .root(name)
+            .and_then(|root| tree.nodes.get(root as usize))
+            && root.leaf.is_none()
+            && let Some(&first) = self.ast.items(self.ast.root()).get(root.first)
+            && self.ast.item(first).span.start < operand.start
+        {
+            let text = self.ast.names().get(name);
+            self.errors.push(
+                Diagnostic::error(format!("field `{text}` is already defined"), operand)
+                    .with_context(self.name_span(first), "first defined here"),
+            );
+        }
+        if self.block_field(name).is_none() {
+            self.fields.push(FieldDecl {
+                name,
+                name_span: operand,
+                ty,
+                slot,
+                open: None,
+                spread: Some(value),
+                rejected: false,
+            });
+        }
+        self.spread_slots.push(Slot::NONE);
+        true
+    }
+
+    /// The cell of the input's top-level field named `name`, a `def`
+    /// included, if there is one. A private `fn` is not a field: a spread
+    /// still defines the record's field of its name (slice 23).
+    fn top_declaration_slot(&self, name: Name) -> Option<Slot> {
+        let root = self.mentions.tree.root(name)?;
+        self.field_cells.get(root as usize).map(|cell| cell.slot)
+    }
+
+    /// The binding of the field `name` of type `ty` that the dotted item
+    /// `id` opens: the top-level root's, `top_root`, declared as the input
+    /// started, whose cell the item takes, or a new one.
+    fn open_binding(
+        &mut self,
+        top_root: Option<(usize, Slot)>,
+        (name, ty): (Name, TyId),
+        id: ItemId,
+    ) -> usize {
+        if let Some((binding, slot)) = top_root {
+            self.item_slots[id.index()] = slot;
+            return binding;
+        }
+        self.declare(name, ty, id, BindingKind::Field);
+        self.bindings.len() - 1
+    }
+
+    /// The binding and cell of the input's top-level field root `name`,
+    /// declared as the input started, if it is one and not a `def`.
+    fn top_root_cell(&self, name: Name) -> Option<(usize, Slot)> {
+        let node = self.mentions.tree.root(name)?;
+        let cell = self.field_cells.get(node as usize)?;
+        Some((cell.binding?, cell.slot))
+    }
+
+    /// The root of the node `node` of the tree of top-level fields.
+    fn root_of(&self, node: u32) -> u32 {
+        let mut at = node;
+        while let Some(parent) = self
+            .mentions
+            .tree
+            .nodes
+            .get(at as usize)
+            .and_then(|entry| entry.parent)
+        {
+            at = parent;
+        }
+        at
     }
 
     /// The type `function`'s parameters and return type declare, as its
@@ -5717,6 +6535,7 @@ impl<'a> Checker<'a> {
             .find(|top| top.name == name)
             .map(|top| top.item)
         else {
+            self.check_field_clash(id, name);
             return;
         };
         let field = |item: ItemId| matches!(self.ast.item(item).kind, ItemKind::Field { .. });
@@ -5737,95 +6556,325 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Before the walk checks the top-level item at `position` in the
-    /// outermost block, once the bodies it needs are checked: "`f` cannot
-    /// be used here yet" for each top-level function it mentions that
-    /// needs a function that does not exist before the item (see [When a
-    /// function may be used](#when-a-function-may-be-used)).
-    fn check_uses(&mut self, position: usize) {
-        let (Some(mentioned), Some(spans)) = (
-            self.mentions.items.get(position),
-            self.mentions.spans.get(position),
-        ) else {
+    /// The names of the slots a later input of a session must not take, the
+    /// [`Scope`]'s: every binding's slot and every slot below
+    /// `top_slots_end`, each named by the last binding in it, or as the
+    /// checker named it. A slot that no binding owns must have been named in
+    /// `slot_names` for the scope to cover it.
+    fn scope_slot_names(&self) -> Vec<Name> {
+        let top_end = self
+            .bindings
+            .iter()
+            .map(|binding| binding.slot.index().saturating_add(1))
+            .chain(std::iter::once(self.top_slots_end as usize))
+            .max()
+            .unwrap_or_default();
+        let mut names = self.slot_names.clone();
+        names.truncate(top_end);
+        for binding in &self.bindings {
+            if let Some(entry) = names.get_mut(binding.slot.index()) {
+                *entry = binding.name;
+            }
+        }
+        names
+    }
+
+    /// Before the walk checks the top-level item `id`, a `let`, `let mut`,
+    /// field or `:=` declaring or rebinding `name`, which no top-level
+    /// function has: "`a` is a field of this file" if it is not a field item
+    /// and `name` is the root of a top-level field of the input (see
+    /// [Top-level fields](#top-level-fields)), labelled on the field's first
+    /// item, wherever it is. Field items of one root are the dotted-field
+    /// rules' to judge.
+    fn check_field_clash(&mut self, id: ItemId, name: Name) {
+        if matches!(self.ast.item(id).kind, ItemKind::Field { .. }) {
+            return;
+        }
+        let tree = &self.mentions.tree;
+        let Some(first) = tree
+            .root(name)
+            .and_then(|root| tree.nodes.get(root as usize))
+            .and_then(|root| self.ast.items(self.ast.root()).get(root.first))
+            .copied()
+        else {
             return;
         };
-        let errors: Vec<Diagnostic> = mentioned
-            .iter()
-            .zip(spans)
-            .filter_map(|(&function, &span)| self.not_ready(function as usize, position, span))
+        let text = self.ast.names().get(name);
+        self.field_clash = Some(id);
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{text}` is a field of this file"),
+                self.name_span(id),
+            )
+            .with_context(self.name_span(first), "declared here")
+            .with_note(
+                "a field declared at the top level is visible in the whole file, so its name \
+                 cannot also be a variable",
+            ),
+        );
+    }
+
+    /// Before the walk checks the top-level item at `position` in the
+    /// outermost block, once the bodies it needs are checked: "`f` cannot
+    /// be used here yet" for each top-level function or field it mentions
+    /// that needs a function that does not exist, or a leaf that cannot be
+    /// computed, before the item (see [When a function may be
+    /// used](#when-a-function-may-be-used) and [Top-level
+    /// fields](#top-level-fields)). A field item is held to it only when its
+    /// leaf is computed at its own item: one computed earlier is the item's
+    /// that needed it.
+    fn check_uses(&mut self, position: usize) {
+        if self.computed_early(position) {
+            return;
+        }
+        let at = |list: &[Vec<u32>], spans: &[Vec<Span>]| {
+            let list = list.get(position).map_or(&[][..], Vec::as_slice);
+            let spans = spans.get(position).map_or(&[][..], Vec::as_slice);
+            list.iter()
+                .copied()
+                .zip(spans.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        let mut mentioned: Vec<(Need, Span)> = at(&self.mentions.items, &self.mentions.spans)
+            .into_iter()
+            .map(|(function, span)| (Need::Function(function), span))
+            .chain(
+                at(&self.mentions.fields, &self.mentions.field_spans)
+                    .into_iter()
+                    .map(|(node, span)| (Need::Field(node), span)),
+            )
             .collect();
+        mentioned.sort_by_key(|&(_, span)| span.start);
+        let mut errors = Vec::new();
+        for (need, span) in mentioned {
+            if self.closure_ready(need) > position
+                && let Some(error) = self.not_ready(need, position, span)
+            {
+                errors.push(error);
+            }
+        }
         self.errors.extend(errors);
     }
 
+    /// The latest item before which something `start` needs (itself, or
+    /// what it mentions or has, and so on, not through a node on a cycle)
+    /// cannot be had, 0 if nothing it needs is ever blocked; remembered in
+    /// `closure_ready`. Everything `start` needs is checked by the time the
+    /// walk reaches an item that mentions it, so the answer never changes.
+    /// The search reuses what earlier searches found, so each item of a
+    /// chain of fields adds one step; only a mention that may be an error
+    /// is searched in full, by `Checker::not_ready`.
+    fn closure_ready(&mut self, start: Need) -> usize {
+        let index = self.need_index(start);
+        if let Some(&Some(known)) = self.closure_ready.get(index) {
+            return known;
+        }
+        let mut seen = HashSet::from([index]);
+        let mut stack = vec![start];
+        let mut latest = 0;
+        while let Some(need) = stack.pop() {
+            let at = self.need_index(need);
+            if at != index
+                && let Some(&Some(known)) = self.closure_ready.get(at)
+            {
+                latest = latest.max(known);
+                continue;
+            }
+            let (ready, blocked) = match need {
+                Need::Function(function) => self
+                    .top_fns
+                    .get(function as usize)
+                    .map_or((0, false), |top| (top.ready, top.blocker.is_some())),
+                Need::Field(node) => self
+                    .field_cells
+                    .get(node as usize)
+                    .map_or((0, false), |cell| (cell.ready, cell.blocker.is_some())),
+            };
+            if self.on_cycle(need) {
+                continue;
+            }
+            if blocked {
+                latest = latest.max(ready);
+            }
+            for (next, _) in self.mentions.needs(need) {
+                if seen.insert(self.need_index(next)) {
+                    stack.push(next);
+                }
+            }
+        }
+        if let Some(entry) = self.closure_ready.get_mut(index) {
+            *entry = Some(latest);
+        }
+        latest
+    }
+
+    /// Whether the item at `position` of the outermost block is a top-level
+    /// field whose leaf is computed before its own item.
+    fn computed_early(&self, position: usize) -> bool {
+        self.mentions
+            .tree
+            .item_leaf
+            .get(position)
+            .copied()
+            .flatten()
+            .and_then(|leaf| self.schedule.point.get(leaf as usize))
+            .is_some_and(|&point| point < position)
+    }
+
+    /// The index of `need` among the nodes of the graph of what needs what:
+    /// the field nodes, then the top-level functions.
+    fn need_index(&self, need: Need) -> usize {
+        match need {
+            Need::Field(node) => node as usize,
+            Need::Function(function) => self.mentions.tree.nodes.len() + function as usize,
+        }
+    }
+
+    /// The name of `need` in a diagnostic: a function's name, or a field
+    /// node's full path.
+    fn need_text(&self, need: Need) -> String {
+        let names = self.ast.names();
+        match need {
+            Need::Function(function) => self
+                .top_fns
+                .get(function as usize)
+                .map_or_else(String::new, |top| names.get(top.name).to_string()),
+            Need::Field(node) => {
+                let path: Vec<&str> = self
+                    .mentions
+                    .tree
+                    .path(node)
+                    .into_iter()
+                    .map(|name| names.get(name))
+                    .collect();
+                path.join(".")
+            }
+        }
+    }
+
+    /// Why `need` cannot be had before the item at `position`, if it
+    /// cannot: a function whose closure is not made by then, or a leaf
+    /// that cannot be computed by then. A node on a cycle, already
+    /// reported, is not reported again.
+    fn blocker_of(&self, need: Need, position: usize) -> Option<Blocker> {
+        let (ready, blocker) = match need {
+            Need::Function(function) => {
+                let top = self.top_fns.get(function as usize)?;
+                (top.ready, top.blocker)
+            }
+            Need::Field(node) => {
+                let cell = self.field_cells.get(node as usize)?;
+                (cell.ready, cell.blocker)
+            }
+        };
+        blocker.filter(|_| ready > position && !self.on_cycle(need))
+    }
+
+    /// Whether `need` is on a cycle through fields, already reported.
+    fn on_cycle(&self, need: Need) -> bool {
+        match need {
+            Need::Field(node) => self
+                .field_cells
+                .get(node as usize)
+                .is_some_and(|cell| cell.cyclic),
+            Need::Function(function) => self.cyclic_fns.contains(&function),
+        }
+    }
+
     /// The error for a mention at `span`, by the item at `position`, of the
-    /// top-level function `start`, if a function it needs (itself, or one
-    /// it mentions, and so on) does not exist before the item: the reason
-    /// first in source order, with the chain of uses that leads to it.
-    fn not_ready(&self, start: usize, position: usize, span: Span) -> Option<Diagnostic> {
-        // Breadth first, so the chain to each function is a shortest one.
-        let mut parent = vec![usize::MAX; self.top_fns.len()];
-        *parent.get_mut(start)? = start;
+    /// top-level function or field node `start`, if something it needs
+    /// (itself, or what it mentions or has, and so on) does not exist
+    /// before the item: the reason first in source order, with the chain of
+    /// uses that leads to it.
+    fn not_ready(&self, start: Need, position: usize, span: Span) -> Option<Diagnostic> {
+        // Breadth first, so the chain to each node is a shortest one.
+        let count = self.mentions.tree.nodes.len() + self.top_fns.len();
+        let mut parent: Vec<Option<(Need, bool)>> = vec![None; count];
+        *parent.get_mut(self.need_index(start))? = Some((start, false));
         let (mut queue, mut head) = (vec![start], 0);
-        let mut culprit: Option<(usize, Blocker)> = None;
-        while let Some(&function) = queue.get(head) {
+        let mut culprit: Option<(Need, Blocker)> = None;
+        while let Some(&need) = queue.get(head) {
             head += 1;
-            let top = self.top_fns.get(function)?;
-            if top.ready > position
-                && let Some(blocker) = top.blocker
+            if let Some(blocker) = self.blocker_of(need, position)
                 && culprit.is_none_or(|(_, first)| blocker.span.start < first.span.start)
             {
-                culprit = Some((function, blocker));
+                culprit = Some((need, blocker));
             }
-            let position = self.mentions.functions.get(function)?.position;
-            for &callee in self.mentions.items.get(position)? {
-                if let Some(entry) = parent.get_mut(callee as usize)
-                    && *entry == usize::MAX
+            if self.on_cycle(need) {
+                continue;
+            }
+            for (next, at) in self.mentions.needs(need) {
+                if let Some(entry) = parent.get_mut(self.need_index(next))
+                    && entry.is_none()
                 {
-                    *entry = function;
-                    queue.push(callee as usize);
+                    *entry = Some((need, at.is_none()));
+                    queue.push(next);
                 }
             }
         }
         let (culprit, blocker) = culprit?;
-        let mut chain = vec![culprit];
-        while let Some(&last) = chain.last()
+        // The chain from `start`, each step with whether it is a "has":
+        // a run of those is said once, from its first node to its last.
+        let mut chain = vec![(culprit, false)];
+        while let Some(&(last, _)) = chain.last()
             && last != start
         {
-            chain.push(*parent.get(last)?);
+            let (up, has) = (*parent.get(self.need_index(last))?)?;
+            if let Some(entry) = chain.last_mut() {
+                entry.1 = has;
+            }
+            chain.push((up, false));
         }
         chain.reverse();
-        let names = self.ast.names();
-        let text = |function: usize| {
-            self.top_fns
-                .get(function)
-                .map_or("", |top| names.get(top.name))
-        };
-        let uses = match chain.as_slice() {
-            [only] => format!("`{}`", text(*only)),
-            [first, second, .., last] if chain.len() > 3 => format!(
-                "`{}` uses `{}`, ..., and `{}`",
-                text(*first),
-                text(*second),
-                text(*last)
-            ),
-            [.., last] => {
-                let steps: Vec<String> = chain
-                    .windows(2)
-                    .map(|pair| format!("`{}` uses `{}`", text(pair[0]), text(pair[1])))
-                    .collect();
-                format!("{}, and `{}`", steps.join(", "), text(*last))
+        // Each step's verb now belongs to the node it leaves.
+        let mut steps: Vec<(Need, bool)> = Vec::with_capacity(chain.len());
+        for window in chain.windows(2) {
+            let ((from, _), (_, has)) = (window[0], window[1]);
+            steps.push((from, has));
+        }
+        let mut collapsed: Vec<(Need, bool)> = Vec::with_capacity(steps.len());
+        for (from, has) in steps {
+            if has && collapsed.last().is_some_and(|&(_, previous)| previous) {
+                continue;
             }
-            [] => return None,
-        };
-        let read = names.get(blocker.name);
-        let (label, note) = match blocker.kind {
-            BlockerKind::Bound => (
-                format!("{uses} reads `{read}`, which is bound here"),
-                "a function can be used once every variable it reads is bound",
+            collapsed.push((from, has));
+        }
+        let text = |need: Need| self.need_text(need);
+        let verb = |has: bool| if has { "has" } else { "uses" };
+        let uses = match collapsed.as_slice() {
+            [] => format!("`{}`", text(culprit)),
+            [(first, has), (second, _), ..] if collapsed.len() > 2 => format!(
+                "`{}` {} `{}`, ..., and `{}`",
+                text(*first),
+                verb(*has),
+                text(*second),
+                text(culprit)
             ),
+            _ => {
+                let mut said: Vec<String> = Vec::with_capacity(collapsed.len());
+                for (index, &(from, has)) in collapsed.iter().enumerate() {
+                    let to = collapsed.get(index + 1).map_or(culprit, |&(to, _)| to);
+                    said.push(format!("`{}` {} `{}`", text(from), verb(has), text(to)));
+                }
+                format!("{}, and `{}`", said.join(", "), text(culprit))
+            }
+        };
+        let read = self.ast.names().get(blocker.name);
+        let field = matches!(culprit, Need::Field(_));
+        let bound = if field {
+            "a field can be computed once every variable it reads is bound"
+        } else {
+            "a function can be used once every variable it reads is bound"
+        };
+        let (label, note) = match blocker.kind {
+            BlockerKind::Bound => (format!("{uses} reads `{read}`, which is bound here"), bound),
             BlockerKind::Spread => (
                 format!("{uses} reads `{read}`, which this spread may define"),
-                "a function can be used once every variable it reads is bound",
+                bound,
+            ),
+            BlockerKind::Mutable if field => (
+                format!("{uses} reads the mutable variable `{read}`, so it is computed here"),
+                "a field that reads a mutable variable is computed where it is written",
             ),
             BlockerKind::Mutable => (
                 format!("{uses} reads the mutable variable `{read}`, so it exists from here"),
@@ -5880,43 +6929,76 @@ impl<'a> Checker<'a> {
     /// member inside the group sees its declared type; once the group is
     /// checked, every member's binding has the type its body gives it and
     /// its function, as a function declared above its users' has.
+    ///
+    /// The walk keeps its own stack of the groups being entered, each with
+    /// the callee groups still to visit, so that a long chain of functions
+    /// does not recurse on the native stack.
     fn check_group(&mut self, group: u32) {
-        let Some(members) = self.mentions.groups.get(group as usize).cloned() else {
-            return;
-        };
+        let mut work: Vec<(u32, Vec<u32>, usize)> = Vec::new();
+        if let Some(callees) = self.enter_group(group) {
+            work.push((group, callees, 0));
+        }
+        while let Some((group, callees, next)) = work.last_mut() {
+            if let Some(&callee) = callees.get(*next) {
+                *next += 1;
+                if let Some(callees) = self.enter_group(callee) {
+                    work.push((callee, callees, 0));
+                }
+                continue;
+            }
+            let group = *group;
+            work.pop();
+            self.finish_group(group);
+        }
+    }
+
+    /// Starts checking the group `group`, if none of its members' bodies is
+    /// checked or being checked: marks them as being checked and returns
+    /// the other groups its members mention, in the order they mention
+    /// them, which must be checked first.
+    fn enter_group(&mut self, group: u32) -> Option<Vec<u32>> {
+        let members = self.mentions.groups.get(group as usize)?.clone();
         if members.iter().any(|&member| {
             self.top_fns
                 .get(member as usize)
                 .is_none_or(|top| top.state != BodyState::Unchecked)
         }) {
-            return;
+            return None;
         }
+        let mut callee_groups = Vec::new();
         for &member in &members {
             if let Some(top) = self.top_fns.get_mut(member as usize) {
                 top.state = BodyState::Checking;
             }
-        }
-        for &member in &members {
             let position = self
                 .mentions
                 .functions
                 .get(member as usize)
                 .map_or(usize::MAX, |top| top.position);
-            let callees = self
+            for &callee in self
                 .mentions
                 .items
                 .get(position)
-                .cloned()
-                .unwrap_or_default();
-            for callee in callees {
+                .map_or(&[][..], Vec::as_slice)
+            {
                 match self.mentions.group_of.get(callee as usize) {
                     Some(&callee_group) if callee_group != group => {
-                        self.check_group(callee_group);
+                        callee_groups.push(callee_group);
                     }
                     _ => {}
                 }
             }
         }
+        Some(callee_groups)
+    }
+
+    /// Checks the bodies of the group `group`, whose callee groups are
+    /// checked, members in source order, and gives each member's binding
+    /// the type and function its body gives it.
+    fn finish_group(&mut self, group: u32) {
+        let Some(members) = self.mentions.groups.get(group as usize).cloned() else {
+            return;
+        };
         for &member in &members {
             self.check_top_body(member as usize);
         }
@@ -5950,7 +7032,7 @@ impl<'a> Checker<'a> {
         let cut = top
             .cut
             .unwrap_or(self.bindings.len())
-            .max(self.top_start + self.top_fns.len())
+            .max(self.top_end)
             .min(self.bindings.len());
         let own = self
             .mentions
@@ -6121,9 +7203,9 @@ impl<'a> Checker<'a> {
             .rev()
             .find(|(_, binding)| binding.name == name)
             .map(|(index, &binding)| (index, binding))?;
-        // A top-level function shadows a soft field of its name that a
-        // spread of the top level defines, wherever it is read.
-        let top_end = self.top_start + self.top_fns.len();
+        // A top-level function or field shadows a soft field of its name
+        // that a spread of the top level defines, wherever it is read.
+        let top_end = self.top_end;
         let root_end = self
             .functions
             .first()
@@ -6134,12 +7216,11 @@ impl<'a> Checker<'a> {
             .unwrap_or(self.bindings.len());
         if binding.kind == BindingKind::Field
             && (top_end..root_end).contains(&index)
-            && let Some(top) = self.top_fns.iter().find(|top| top.name == name)
+            && let Some(top) = (self.top_start..top_end)
+                .rev()
+                .find(|&top| self.bindings.get(top).is_some_and(|b| b.name == name))
         {
-            return self
-                .bindings
-                .get(top.binding)
-                .map(|&binding| (top.binding, binding));
+            return self.bindings.get(top).map(|&binding| (top, binding));
         }
         Some((index, binding))
     }
@@ -6150,9 +7231,9 @@ impl<'a> Checker<'a> {
     /// which this adds to every function between the binding's home and
     /// the current one that lacks it (see the module documentation).
     fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
-        // A top-level function of this input is read through the top
-        // level's frame from any function, never captured.
-        if (self.top_start..self.top_start + self.top_fns.len()).contains(&index) {
+        // A top-level function or field of this input is read through the
+        // top level's frame from any function, never captured.
+        if (self.top_start..self.top_end).contains(&index) {
             return if self.functions.is_empty() {
                 VarRef::Local(binding.slot)
             } else {
@@ -7485,8 +8566,19 @@ impl<'a> Checker<'a> {
                 None => self.check_block(items, None),
             },
             ExprKind::Field { expr: record, name } => {
-                let record_ty = self.check_expr(record);
-                self.field_access(id, (record, record_ty), name)
+                // A reference to a node of the tree of the input's top-level
+                // fields below its root reads that node's cell.
+                let reference = if self.mentions.tree.nodes.is_empty() {
+                    None
+                } else {
+                    self.field_reference(id)
+                };
+                if let Some(ty) = reference {
+                    ty
+                } else {
+                    let record_ty = self.check_expr(record);
+                    self.field_access(id, (record, record_ty), name)
+                }
             }
             ExprKind::Ascribe { expr: inner, ty } => {
                 let expected = self.resolve_type(ty, Bareness::Present);
@@ -9858,6 +10950,9 @@ impl<'a> Checker<'a> {
             return (TyId::ERROR, None);
         }
         if let Some((index, binding)) = found {
+            if binding.kind == BindingKind::Mutable {
+                self.leaf_reads_mutable(index, binding.name);
+            }
             self.expr_vars[id.index()] = self.resolve(index, binding);
             return (binding.ty, binding.callback);
         }
@@ -9872,19 +10967,32 @@ impl<'a> Checker<'a> {
                 "names may contain `-`, so `x-1` is one name; write `x - 1` for subtraction",
             );
         }
-        // Inside a function, a name the top level declares further down.
-        if !self.functions.is_empty()
+        // Inside a function, or a top-level field's initialiser, a name the
+        // top level declares further down.
+        let field = self.checking_leaf.is_some();
+        if (field || !self.functions.is_empty())
             && let Some(below) = self.ast.items(self.ast.root()).iter().find(|&&item| {
                 self.ast.item(item).span.start > span.start
                     && root_declares(self.ast, item) == Some(name)
             })
         {
+            let (what, note) = if field {
+                (
+                    "field",
+                    "a field's initialiser sees the variables declared above it",
+                )
+            } else {
+                (
+                    "function",
+                    "a function sees the variables declared above it",
+                )
+            };
             error = error
                 .with_context(
                     self.ast.item(*below).span,
-                    format!("`{text}` is declared here, below the function"),
+                    format!("`{text}` is declared here, below the {what}"),
                 )
-                .with_note("a function sees the variables declared above it");
+                .with_note(note);
         }
         self.errors.push(error);
         (TyId::ERROR, None)
@@ -9898,14 +11006,17 @@ impl<'a> Checker<'a> {
     /// earlier input. If so, it records the first such read as why the
     /// function cannot be used yet, and the read is not resolved.
     fn reads_between(&mut self, name: Name, found: Option<(usize, Binding)>) -> bool {
-        let (Some((from, to)), Some(top)) = (self.early, self.checking_top) else {
+        let Some((from, to)) = self.early else {
             return false;
         };
+        if self.checking_top.is_none() && self.checking_leaf.is_none() {
+            return false;
+        }
         let inner = self
             .functions
             .first()
             .map_or(usize::MAX, |function| function.bindings_start);
-        let top_range = self.top_start..self.top_start + self.top_fns.len();
+        let top_range = self.top_start..self.top_end;
         match found {
             Some((index, _)) if index >= inner || top_range.contains(&index) => return false,
             None if self.builtin(name).is_some() => return false,
@@ -9926,12 +11037,54 @@ impl<'a> Checker<'a> {
         }) else {
             return false;
         };
-        if let Some(top) = self.top_fns.get_mut(top)
-            && top.blocker.is_none()
+        let blocker = Some(Blocker { name, span, kind });
+        if let Some(top) = self.checking_top.and_then(|top| self.top_fns.get_mut(top)) {
+            top.blocker = top.blocker.or(blocker);
+        } else if let Some(cell) = self
+            .checking_leaf
+            .and_then(|node| self.field_cells.get_mut(node as usize))
         {
-            top.blocker = Some(Blocker { name, span, kind });
+            cell.blocker = cell.blocker.or(blocker);
         }
         true
+    }
+
+    /// While a top-level leaf's initialiser is checked (see
+    /// `checking_leaf`): records a read of the mutable variable `name`, the
+    /// binding `index`, if it is one of this input's top level, as what
+    /// makes the leaf be computed at its own item and no earlier (see
+    /// [Top-level fields](#top-level-fields)).
+    fn leaf_reads_mutable(&mut self, index: usize, name: Name) {
+        let Some(node) = self.checking_leaf else {
+            return;
+        };
+        let inner = self
+            .functions
+            .first()
+            .map_or(usize::MAX, |function| function.bindings_start);
+        if !(self.top_end..inner).contains(&index) {
+            return;
+        }
+        let Some(leaf) = self
+            .mentions
+            .tree
+            .nodes
+            .get(node as usize)
+            .and_then(|entry| entry.leaf)
+        else {
+            return;
+        };
+        let span = self.ast.item(leaf.item).span;
+        if let Some(cell) = self.field_cells.get_mut(node as usize)
+            && cell.blocker.is_none()
+        {
+            cell.ready = leaf.position;
+            cell.blocker = Some(Blocker {
+                name,
+                span,
+                kind: BlockerKind::Mutable,
+            });
+        }
     }
 
     /// Types `+`, `-` and `*`: both operands must end up the same numeric
@@ -12909,19 +14062,20 @@ mod tests {
         let ast = parse_text("let a = 1\nlet r = { x = 2; let t = x; y = t }\nb = a");
         let resolution = check(&ast, &mut TypeTable::new()).unwrap().0.resolution;
         let items = ast.items(ast.root());
-        assert_eq!(resolution.item_slot(items[0]), Slot(0));
-        // The block's field, variable and field take slots 1 to 3; `r`,
-        // declared after its initialiser, reuses slot 1, and the file's
-        // field `b` takes slot 2.
-        assert_eq!(resolution.item_slot(items[1]), Slot(1));
-        assert_eq!(resolution.item_slot(items[2]), Slot(2));
-        assert_eq!(resolution.frame_size(), 4);
+        // The file's field `b`, a top-level field, is declared as the input
+        // starts, in slot 0.
+        assert_eq!(resolution.item_slot(items[2]), Slot(0));
+        assert_eq!(resolution.item_slot(items[0]), Slot(1));
+        // The block's field, variable and field take slots 2 to 4; `r`,
+        // declared after its initialiser, reuses slot 2.
+        assert_eq!(resolution.item_slot(items[1]), Slot(2));
+        assert_eq!(resolution.frame_size(), 5);
         let names: Vec<&str> = resolution
             .slot_names()
             .iter()
             .map(|&name| ast.names().get(name))
             .collect();
-        assert_eq!(names, vec!["a", "r", "b", "y"]);
+        assert_eq!(names, vec!["b", "a", "r", "t", "y"]);
     }
 
     #[test]
@@ -13589,10 +14743,11 @@ mod tests {
             messages("{ x = 1; y = { x := 2 } }"),
             vec!["cannot rebind `x`: it is a field, not a variable"]
         );
-        // A field declared with a quoted name is the same name.
+        // A field declared with a quoted name is the same name. At the top
+        // level, the field is a field of the file, which `:=` cannot name.
         assert_eq!(
             messages("\"x\" = 1\nx := 2"),
-            vec!["cannot rebind `x`: it is a field, not a variable"]
+            vec!["`x` is a field of this file"]
         );
         // The rejected rebind still declares a variable, so uses do not
         // cascade.
@@ -14033,7 +15188,9 @@ mod tests {
         let items = ast.items(ast.root());
         let slots: Vec<Slot> = items.iter().map(|&id| resolution.item_slot(id)).collect();
         assert_eq!(slots, vec![Slot(0), Slot(1), Slot(0), Slot(0)]);
-        assert_eq!(resolution.frame_size(), 2);
+        // And each node below the roots has a cell of its own: `a.x`,
+        // `a.y`, `a.z` and `a.z.w`, after the roots.
+        assert_eq!(resolution.frame_size(), 6);
         // The first definition builds from nothing; each later one updates
         // the field's slot, through as many segments as exist.
         let paths: Vec<PathResolution> = items.iter().map(|&id| resolution.item_path(id)).collect();
@@ -19164,6 +20321,26 @@ mod tests {
             file_type("r = { def f(): Int { 1 }; g = f() }"),
             "{r: {f: fn(): Int, g: Int}}"
         );
+        // Above a field its body reads: the body is checked when something
+        // mentions the function, or after the last item, not at the
+        // field's point, since a closure reads the field when it runs.
+        assert_eq!(
+            file_type("def f(): Int { v }\nv = 3"),
+            "{f: fn(): Int, v: Int}"
+        );
+        assert_eq!(
+            file_type("def f(): Int { v.a }\nlet k = 1\nv.a = k\nx = f()"),
+            "{f: fn(): Int, v: {a: Int}, x: Int}"
+        );
+        assert_eq!(
+            messages("x = f()\ndef f(): Int { v }\nlet k = 1\nv = k"),
+            ["`f` cannot be used here yet"]
+        );
+        // A dotted `let` of a field's name is reported once.
+        assert_eq!(
+            messages("let z.w = 1\nz = 3"),
+            ["`z` is a field of this file"]
+        );
         // Its body sees its own name as the function being called.
         assert_eq!(
             file_type("def down(n: Int): Int { if n == 0 { 0 } else { down(n - 1) } }"),
@@ -19428,12 +20605,11 @@ mod tests {
                  `r.a := 2` | {BOUND}"
             )]
         );
+        // A top-level field is order-free: `g` reads `r.a` through the top
+        // level's frame, and `r.a` is computed before `x`.
         assert_eq!(
-            explained("x = g()\nr.a = 2\nfn g(): Int { r.a }"),
-            vec![format!(
-                "`g` cannot be used here yet at `g` | `g` reads `r`, which is bound here at \
-                 `r.a = 2` | {BOUND}"
-            )]
+            file_type("x = g()\nr.a = 2\nfn g(): Int { r.a }"),
+            "{r: {a: Int}, x: Int}"
         );
         // A spread between may define any name.
         assert_eq!(
@@ -19488,6 +20664,231 @@ mod tests {
             file_type("fn f(): Int { 1 }\nx = { let f = \"s\"; = f }"),
             "{x: String}"
         );
+    }
+
+    #[test]
+    fn a_top_level_field_cannot_also_be_a_variable() {
+        const NOTE: &str = "a field declared at the top level is visible in the whole file, \
+                            so its name cannot also be a variable";
+        for text in [
+            "a = 1\nlet a = 2",
+            "let a = 2\na = 1",
+            "a.b = 1\nlet mut a = 2",
+            "let mut a = 2\na.b = 1",
+            "let mut x = 1\na = 1\na := 2",
+            "a.b = 1\nlet a.c = 2",
+        ] {
+            let found = explained(text);
+            assert_eq!(
+                found.first(),
+                Some(&format!(
+                    "`a` is a field of this file at `a` | declared here at `a` | {NOTE}"
+                )),
+                "{text}"
+            );
+        }
+        // A function and a field of one name: the function's error, at the
+        // field, in either order.
+        for text in ["a = 1\nfn a(): Int { 1 }", "fn a(): Int { 1 }\na.b = 1"] {
+            assert_eq!(
+                messages(text).first().map(String::as_str),
+                Some("`a` is a function of this file"),
+                "{text}"
+            );
+        }
+        // Inner blocks still shadow.
+        assert_eq!(
+            file_type("a = 1\nx = { let a = \"s\"; = a }"),
+            "{a: Int, x: String}"
+        );
+    }
+
+    #[test]
+    fn top_level_fields_are_visible_throughout_the_input() {
+        let summary = "let major = 2\ncom.x.app.deps = [com.x.lib]\ncom.x.app.name = \
+                       \"app-{version}\"\ncom.x.lib.name = \"lib\"\nversion = describe(major)\n\
+                       fn describe(n: Int): String { \"v{n}\" }";
+        assert_eq!(
+            file_type(summary),
+            "{com: {x: {app: {deps: List<{name: String}>, name: String}, lib: {name: String}}}, \
+             version: String}"
+        );
+        // A field used above its declaration, from every kind of item and
+        // position: allowed, since it reads nothing that stops it.
+        for text in [
+            "let x = y\ny = 1",
+            "x = y\ny = 1",
+            "{ let z = y }\ny = 1",
+            "...r\nr = {a = 1}",
+            "let x = lazy { y }\ny = 1",
+            "let f = fn(): Int { y }\ny = 1",
+            "let s = \"{y}\"\ny = 1",
+            "let l = [1, 2]\nlet e = l[y]\ny = 0",
+            "let mut m = 0\nm := y\ny = 1",
+            "let l = for i in [y] { i }\ny = 1",
+            "let l = for let i = y; i < y; i := i + y { i }\ny = 1",
+            "let x = g(v = y)\nfn g(v: Int): Int { v }\ny = 1",
+            "let x = g() { y }\nfn g(v: Int): Int { v }\ny = 1",
+            // A leaf by its path while a sibling is not ready yet.
+            "x = a.b\na.b = 1\nlet k = 2\na.c = k",
+        ] {
+            // `file_type` fails on an error.
+            assert!(file_type(text).starts_with('{'), "{text}");
+        }
+        // Types of a root, a prefix, a leaf and an access beyond a leaf.
+        assert_eq!(
+            file_type("w = r\nx = r.q\ny = r.q.k\nz = r.q.k.m\nr.q.k = {m = 1}"),
+            "{r: {q: {k: {m: Int}}}, w: {q: {k: {m: Int}}}, x: {k: {m: Int}}, y: {m: Int}, z: \
+             Int}"
+        );
+        // A `def` as a leaf.
+        assert_eq!(
+            file_type("x = f()\ndef f(): Int { 1 }"),
+            "{f: fn(): Int, x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_field_used_before_it_can_be_computed_is_an_error() {
+        const FIELD: &str = "a field can be computed once every variable it reads is bound";
+        const FUNCTION: &str = "a function can be used once every variable it reads is bound";
+        let cases = [
+            (
+                "x = a\na.b = 1\nlet k = 2\na.c = k",
+                format!(
+                    "`a` cannot be used here yet at `a` | `a` has `a.c`, and `a.c` reads `k`, \
+                     which is bound here at `let k = 2` | {FIELD}"
+                ),
+            ),
+            (
+                "x = v\nlet k = 1\nv = k",
+                format!(
+                    "`v` cannot be used here yet at `v` | `v` reads `k`, which is bound here \
+                     at `let k = 1` | {FIELD}"
+                ),
+            ),
+            (
+                "let mut n = 1\nx = v\nv = n",
+                "`v` cannot be used here yet at `v` | `v` reads the mutable variable `n`, so it \
+                 is computed here at `v = n` | a field that reads a mutable variable is \
+                 computed where it is written"
+                    .to_string(),
+            ),
+            (
+                "x = v\nlet k = 1\nv = f()\nfn f(): Int { k }",
+                format!(
+                    "`v` cannot be used here yet at `v` | `v` uses `f`, and `f` reads `k`, \
+                     which is bound here at `let k = 1` | {FUNCTION}"
+                ),
+            ),
+            (
+                "x = g()\nlet k = 1\nv = k\nfn g(): Int { v }",
+                format!(
+                    "`g` cannot be used here yet at `g` | `g` uses `v`, and `v` reads `k`, \
+                     which is bound here at `let k = 1` | {FIELD}"
+                ),
+            ),
+            (
+                "x = v\n...{q = 1}\nv = q",
+                format!(
+                    "`v` cannot be used here yet at `v` | `v` reads `q`, which this spread may \
+                     define at `...{{q = 1}}` | {FIELD}"
+                ),
+            ),
+            (
+                "let k = 1\nx = v\nlet k = 2\nv = k",
+                format!(
+                    "`v` cannot be used here yet at `v` | `v` reads `k`, which is bound here \
+                     at `let k = 2` | {FIELD}"
+                ),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(explained(text), vec![expected], "{text}");
+        }
+        // Below the field: undefined, with the new label.
+        assert_eq!(
+            explained("v = k\nlet k = 1"),
+            vec![
+                "undefined variable `k` at `k` | `k` is declared here, below the field at `let \
+                 k = 1` | a field's initialiser sees the variables declared above it"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cycle_through_a_field_is_an_error() {
+        const NOTE: &str = "a field cannot be computed from itself, even through a function";
+        let cases = [
+            (
+                "a = b\nb = a",
+                vec!["`a` uses `b` here at `b`", "`b` uses `a` here at `a`"],
+            ),
+            (
+                "a = f()\nfn f(): Int { a }",
+                vec!["`a` uses `f` here at `f`", "`f` uses `a` here at `a`"],
+            ),
+            (
+                "a = f()\ndef f(): Int { a }",
+                vec!["`a` uses `f` here at `f`", "`f` uses `a` here at `a`"],
+            ),
+            ("s = lazy { s }", vec!["`s` uses `s` here at `s`"]),
+            (
+                "a = b\nb = c\nc = a",
+                vec![
+                    "`a` uses `b` here at `b`",
+                    "`b` uses `c` here at `c`",
+                    "`c` uses `a` here at `a`",
+                ],
+            ),
+        ];
+        for (text, labels) in cases {
+            let found = explained(text);
+            let first = text.split(' ').next().unwrap_or("");
+            let expected = format!(
+                "`{first}` depends on itself at `{first}` | {} | {NOTE}",
+                labels.join(" | ")
+            );
+            assert_eq!(found, vec![expected], "{text}");
+        }
+        // Through an interior node: one error, at the leaf.
+        let found = messages("a.b = a\nx = 1");
+        assert_eq!(found, vec!["`a.b` depends on itself".to_string()]);
+        // A cycle of functions alone is fine.
+        assert_eq!(
+            file_type("fn f(): Int { g() }\nfn g(): Int { f() }\nx = f()"),
+            "{x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_spread_and_a_top_level_field_agree_in_either_order() {
+        for text in ["...{a = 1}\na = \"s\"", "a = \"s\"\n...{a = 1}"] {
+            assert_eq!(file_type(text), "{a: String}", "{text}");
+        }
+        for text in [
+            "...{a = 1}\ndef a(): Int { 2 }",
+            "def a(): Int { 2 }\n...{a = 1}",
+        ] {
+            assert_eq!(file_type(text), "{a: fn(): Int}", "{text}");
+        }
+        // A soft field as a dotted root, a leaf under a leaf, a leaf twice:
+        // errors in either order.
+        for (first, second) in [
+            ("...{a = {b = 1}}", "a.c = 2"),
+            ("a.b = 1", "a.b.c = 2"),
+            ("a.b = 1", "a.b = 2"),
+            ("a = 1", "a.b = 2"),
+        ] {
+            for text in [format!("{first}\n{second}"), format!("{second}\n{first}")] {
+                assert_eq!(messages(&text).len(), 1, "{text}: {:?}", messages(&text));
+            }
+        }
+        // Quoted names.
+        for text in ["\"a\" = 1\nb = a", "b = a\n\"a\" = 1"] {
+            assert_eq!(file_type(text).len(), "{a: Int, b: Int}".len(), "{text}");
+        }
     }
 
     #[test]
@@ -19599,10 +21000,12 @@ mod tests {
         // operand is held in the next free slot, which it leaves free.
         let text = "let r = { a = 1; b = 2 }\n...r\na = \"s\"\nlet c = 3";
         let (ast, resolution) = resolved(text);
+        // `a`, a top-level field, has slot 0 from the start of the input,
+        // and the spread writes nothing for it.
         let items = ast.items(ast.root());
         assert_eq!(resolution.item_slot(items[1]), Slot(3));
-        assert_eq!(resolution.spread_slots(items[1]), &[Slot(1), Slot(2)]);
-        assert_eq!(resolution.item_slot(items[2]), Slot(1));
+        assert_eq!(resolution.spread_slots(items[1]), &[Slot::NONE, Slot(2)]);
+        assert_eq!(resolution.item_slot(items[2]), Slot(0));
         assert!(resolution.spread_slots(items[2]).is_empty());
         assert_eq!(resolution.item_slot(items[3]), Slot(3));
         assert_eq!(resolution.frame_size(), 4);
@@ -19942,8 +21345,9 @@ mod tests {
         };
         let first = parse_with("...{ a = 1; b = 2 }\na = \"s\"", &mut names);
         let scope = Checker::new(&first, &mut types).check().unwrap().scope;
-        // Three bindings, in two slots.
-        assert_eq!(scope.len(), 3);
+        // Two bindings, in two slots: the top-level field `a`, declared as
+        // the input starts, and `b`; the spread defines nothing for `a`.
+        assert_eq!(scope.len(), 2);
         let second = parse_with("let c = a", &mut names);
         let output = Checker::with_scope(&second, scope, &mut types)
             .check()
@@ -22416,6 +23820,23 @@ mod tests {
                 "{body}: {found:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_top_level_field_computed_early_is_not_code_that_is_never_run() {
+        // Computed at its own line, a field after an item that never
+        // completes is warned about, as any item is.
+        let text = "let x = for { }\ny = 1";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].span, at(text, "y = 1"));
+        // Computed before an earlier item, it is neither warned about nor
+        // counted: the warning starts at the next item that runs there.
+        let text = "let a = y\nlet x = for { }\ny = 1\nlet z = 2";
+        let found = warnings(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].span, at(text, "let z = 2"));
+        assert_eq!(warnings("let a = y\nlet x = for { }\ny = 1"), vec![]);
     }
 
     #[test]

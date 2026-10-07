@@ -1,0 +1,16 @@
+# The fields of the top level may be written in any order.
+let major = 2
+# A field is computed just before the first item that needs it: `version`
+# before `com.x.app.name`, `com.x.lib` before `com.x.app.deps`.
+com.x.app.deps = [com.x.lib]
+com.x.app.name = "app-{version}"
+com.x.lib.name = "lib"
+version = describe(major)
+fn describe(n: Int): String { "v{n}" }
+# A function reads a field of its input through the top level's frame.
+fn tag(): String { com.x.lib.name }
+# A dotted root read between its items is the whole root.
+part.a = 1
+whole = part
+part.b = 2
+label = tag()

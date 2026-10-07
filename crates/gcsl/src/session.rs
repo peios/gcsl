@@ -71,6 +71,18 @@
 //! declarations take slots above the scope's, so a pair of mutually
 //! recursive functions keeps calling each other after a later input
 //! declares one of their names again.
+//!
+//! Top-level fields are in any order within an input too, each computed at
+//! its point (see the checker's "Top-level fields"), and each node of the
+//! tree of their paths has a cell, a slot of the top level's frame. Every
+//! cell slot is committed with its input, a root's and an interior node's
+//! or a leaf's alike, although only a root's is a binding a name finds: the
+//! scope's next free slot ([`crate::check::Scope`]) is past the last of
+//! them, so no later input reuses one, and a closure or a future of the
+//! input that reads a cell through the frame finds it there for as long as
+//! the session lasts. A failed input's cells are forgotten with its other
+//! slots. A later input sees an earlier input's field root whole, as a
+//! field of its type, and `a.c = 2` in a later input declares its own `a`.
 
 use std::mem;
 use std::rc::Rc;
@@ -583,6 +595,52 @@ mod tests {
         assert_eq!(session.scope, scope);
         assert_eq!(messages(&mut session, "f"), vec!["undefined variable `f`"]);
         assert_eq!(value(&mut session, "odd(4)"), Value::Bool(true));
+    }
+
+    #[test]
+    fn top_level_fields_across_inputs() {
+        let mut session = Session::new();
+        value(
+            &mut session,
+            "com.x.app = com.x.lib.name + \"!\"\ncom.x.lib.name = \"lib\"\n\
+             def get(): String { com.x.lib.name }",
+        );
+        // The frame is a slot for the root `com`, one for `get`, and a cell
+        // for each of `com.x`, `com.x.app`, `com.x.lib` and `com.x.lib.name`.
+        assert_eq!(session.frame.len(), 6);
+        // A later input reads the earlier input's root, a leaf by its path,
+        // and its `def`, which reads the leaf's cell through the frame.
+        assert_eq!(
+            value(&mut session, "com").to_string(),
+            "{x = {app = \"lib!\"; lib = {name = \"lib\"}}}"
+        );
+        assert_eq!(
+            value_type(&session),
+            "{x: {app: String, lib: {name: String}}}"
+        );
+        assert_eq!(
+            value(&mut session, "com.x.lib.name"),
+            Value::Str("lib".into())
+        );
+        assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
+        // The cells are committed with their input: later variables take
+        // other slots, and the `def` still reads its own input's cell.
+        value(&mut session, "let p = 1\nlet q = 2\nlet r = 3\nlet s = 4");
+        assert_eq!(session.frame.len(), 10);
+        assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
+        // A dotted field of a later input declares that input's own root.
+        value(&mut session, "com.y = 1");
+        assert_eq!(value(&mut session, "com").to_string(), "{y = 1}");
+        assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
+        // A failed input leaves the session as it was, its cells forgotten.
+        let scope = session.scope.clone();
+        assert_eq!(
+            messages(&mut session, "t.b = t.a // 0\nt.a = 1"),
+            vec!["division by zero"]
+        );
+        assert_eq!(session.scope, scope);
+        assert_eq!(messages(&mut session, "t"), vec!["undefined variable `t`"]);
+        assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
     }
 
     #[test]

@@ -309,10 +309,15 @@
 //! which the closure keeps alive: two allocations. `LoadCapture` reads the
 //! running closure's captures, and `LoadCallee` yields the running closure
 //! itself, which the evaluator holds while it runs, so a recursive function
-//! refers to itself without holding itself. `Fn` reads a slot of the top
+//! refers to itself without holding itself. `Top` reads a slot of the top
 //! level's frame, at base 0 of the value stack, from whatever frame it is
-//! evaluated in: a top-level function of the input, which another
-//! function or a `lazy` refers to there rather than by a capture. Every
+//! evaluated in: a top-level function of the input, or the cell of one of
+//! its top-level fields, which another function or a `lazy` refers to there
+//! rather than by a capture. A cell is written once, at its point, which
+//! the schedule puts before every read; a `Top` that finds a cell of a kind
+//! other than a record's (`Record`, `Mixed` or `Deferred`, whose unwritten
+//! `Empty` is a valid `{}`) not yet written is an internal error diagnostic,
+//! as a slot with no closure is for a function. Every
 //! call, memoised call, future and await of a run, and every input of a
 //! session, shares the one value stack whose bottom is the top level's
 //! frame, which is what makes base 0 that frame. The checker sees to it
@@ -794,7 +799,8 @@ impl Evaluator<'_> {
             } => self.update_field((record, name, value), node),
             IrKind::Update { .. } => self.update(node),
             IrKind::LoadCapture(index, _) => self.capture_value(index, node),
-            IrKind::Fn(slot) => self.top_function_value(slot, node),
+            IrKind::Top(slot, ValueKind::Fn) => self.top_function_value(slot, node),
+            IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
             IrKind::Call {
                 callee,
@@ -940,6 +946,40 @@ impl Evaluator<'_> {
     #[inline(never)]
     fn top_function_value(&self, slot: Slot, node: &IrNode) -> Flow<Value> {
         self.top_function(slot, node).map(Value::Fn)
+    }
+
+    /// A copy of the value in the cell `slot` of the top level's frame, of
+    /// kind `kind`, for the `Top` `node`: a top-level field read from inside
+    /// a function or `lazy` of its input. A cell not computed yet holds
+    /// `Value::Empty`, which is a valid `{}`; read as anything that cannot be
+    /// `{}`, that is an internal error, which the checker's schedule rules
+    /// out (see [`crate::check`]).
+    fn top_value(&self, slot: Slot, kind: ValueKind, node: &IrNode) -> Flow<Value> {
+        match self.stack.get(slot.index()) {
+            Some(Value::Empty)
+                if !matches!(
+                    kind,
+                    ValueKind::Record | ValueKind::Mixed | ValueKind::Deferred
+                ) =>
+            {
+                Err(not_computed(node).into())
+            }
+            Some(value) => Ok(value.clone()),
+            None => Err(not_computed(node).into()),
+        }
+    }
+
+    /// The value in the cell `slot` of the top level's frame, read by the
+    /// `Top` `node` as `extract` accepts it, as [`Evaluator::slot_as`] reads
+    /// a slot of the current frame.
+    fn top_as<T>(&self, slot: Slot, node: &IrNode, extract: Extract<T>) -> Flow<T> {
+        if mixed(node) {
+            return mistyped(node, MIXED);
+        }
+        match self.stack.get(slot.index()) {
+            Some(value) => extract(value, node),
+            None => Err(not_computed(node).into()),
+        }
     }
 
     /// The closure of the top-level function in `slot`, as
@@ -1645,7 +1685,7 @@ impl Evaluator<'_> {
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
             IrKind::LoadCallee => self.callee(node),
-            IrKind::Fn(slot) => self.top_function(slot, node),
+            IrKind::Top(slot, _) => self.top_function(slot, node),
             IrKind::MakeClosure { function, captures } => self.make_closure(function, captures),
             IrKind::Block { items, result } => {
                 self.items(items)?;
@@ -2137,6 +2177,7 @@ impl Evaluator<'_> {
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
+            IrKind::Top(slot, _) => self.top_as(slot, node, as_int),
             IrKind::Call {
                 callee,
                 args,
@@ -2207,10 +2248,9 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where an Int was expected")
             }
-            IrKind::MakeClosure { .. }
-            | IrKind::LoadCallee
-            | IrKind::Fn(_)
-            | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where an Int was expected")
+            }
         }
     }
 
@@ -2291,6 +2331,7 @@ impl Evaluator<'_> {
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_float),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_float),
+            IrKind::Top(slot, _) => self.top_as(slot, node, as_float),
             IrKind::Call {
                 callee,
                 args,
@@ -2360,10 +2401,9 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Float was expected")
             }
-            IrKind::MakeClosure { .. }
-            | IrKind::LoadCallee
-            | IrKind::Fn(_)
-            | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a Float was expected")
+            }
         }
     }
 
@@ -2410,6 +2450,7 @@ impl Evaluator<'_> {
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_bool),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_bool),
+            IrKind::Top(slot, _) => self.top_as(slot, node, as_bool),
             IrKind::Call {
                 callee,
                 args,
@@ -2474,10 +2515,9 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Bool was expected")
             }
-            IrKind::MakeClosure { .. }
-            | IrKind::LoadCallee
-            | IrKind::Fn(_)
-            | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a Bool was expected")
+            }
         }
     }
 
@@ -2573,6 +2613,7 @@ impl Evaluator<'_> {
             }
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_string),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_string),
+            IrKind::Top(slot, _) => self.top_as(slot, node, as_string),
             IrKind::Call {
                 callee,
                 args,
@@ -2642,10 +2683,9 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a String was expected")
             }
-            IrKind::MakeClosure { .. }
-            | IrKind::LoadCallee
-            | IrKind::Fn(_)
-            | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a String was expected")
+            }
         }
     }
 
@@ -2674,6 +2714,7 @@ impl Evaluator<'_> {
             IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_record),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_record),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_record),
+            IrKind::Top(slot, _) => self.top_as(slot, node, as_record),
             IrKind::Call {
                 callee,
                 args,
@@ -2746,10 +2787,9 @@ impl Evaluator<'_> {
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
-            IrKind::MakeClosure { .. }
-            | IrKind::LoadCallee
-            | IrKind::Fn(_)
-            | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
+            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
+                mistyped(node, "function node where a record was expected")
+            }
         }
     }
 
@@ -3624,7 +3664,20 @@ fn internal(message: &'static str, span: Span) -> Diagnostic {
     crate::diagnostic::InternalError { message, span }.into()
 }
 
-/// The internal error for the [`IrKind::Fn`] `node`, whose slot holds no
+/// The internal error for the `Top` `node` of a field's cell, read before
+/// its point: the checker's schedule computes every cell before code that
+/// reads it runs (see [`crate::check`]), so this is a bug, reported rather
+/// than panicked on.
+#[cold]
+#[inline(never)]
+fn not_computed(node: &IrNode) -> Diagnostic {
+    internal(
+        "read of a top-level field whose cell is not computed yet",
+        node.span,
+    )
+}
+
+/// The internal error for the [`IrKind::Top`] `node`, whose slot holds no
 /// closure: the checker lets no code run before the closure it reads is
 /// made (see [`crate::check`]), so this is a bug, reported rather than
 /// panicked on. Out of line, off the path of the read that succeeds.
@@ -3835,6 +3888,7 @@ const fn mixed(node: &IrNode) -> bool {
         node.kind,
         IrKind::Load(_, ValueKind::Mixed)
             | IrKind::LoadCapture(_, ValueKind::Mixed)
+            | IrKind::Top(_, ValueKind::Mixed)
             | IrKind::Field {
                 kind: ValueKind::Mixed,
                 ..
@@ -4051,7 +4105,192 @@ mod tests {
         let ast = parse(&tokens, names, strings, &source).unwrap();
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
-        Rc::new(lower(&ast, &checked, &types, 0).unwrap())
+        let ir = Rc::new(lower(&ast, &checked, &types, 0).unwrap());
+        assert_cells_scheduled(&ir, checked.resolution.field_cells(), text);
+        ir
+    }
+
+    /// Asserts the static schedule of the cells of `ir`'s top-level fields
+    /// (`cells`): walking the top-level block's items in order, every cell
+    /// is stored before any item that `Load`s it, and before the first item
+    /// that loads or makes a function whose body, or the body of a function
+    /// it reads in turn, reads the cell through the frame (`Top`). A cell
+    /// read before its point holds `Value::Empty`, a valid `{}`, so a
+    /// scheduling bug would otherwise go unseen. Iterative throughout.
+    fn assert_cells_scheduled(ir: &Ir, cells: &[Slot], text: &str) {
+        let cell = |slot: Slot| cells.contains(&slot) && slot != Slot::NONE;
+        // What each node reads: the cells it loads or reads through the
+        // frame, the functions it makes, and the top-level slots it reads
+        // through the frame as functions.
+        let reads = |root: IrId, top_level: bool| {
+            let (mut loads, mut fns, mut tops) = (Vec::new(), Vec::new(), Vec::new());
+            let mut stack = vec![root];
+            while let Some(id) = stack.pop() {
+                match ir.get(id).kind {
+                    IrKind::Load(slot, _) if top_level => loads.push(slot),
+                    IrKind::Top(slot, _) => tops.push(slot),
+                    IrKind::MakeClosure { function, .. } | IrKind::MakeFuture { function, .. } => {
+                        fns.push(function);
+                    }
+                    _ => {}
+                }
+                stack.extend(ir.children(id));
+            }
+            (loads, fns, tops)
+        };
+        // The slots a function's closure lives in, by the top-level `Store`
+        // of its `MakeClosure`, so that a `Top` of a function is followed.
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            return;
+        };
+        let items = ir.items(items);
+        let mut closure_at: Vec<(Slot, FnId)> = Vec::new();
+        for &item in items {
+            if let IrKind::Store(slot, value) = ir.get(item).kind
+                && let IrKind::MakeClosure { function, .. } = ir.get(value).kind
+            {
+                closure_at.push((slot, function));
+            }
+        }
+        let mut stored: Vec<Slot> = Vec::new();
+        for &item in items {
+            let (loads, fns, tops) = reads(item, true);
+            let mut needed: Vec<Slot> = loads;
+            // Functions this item reaches, followed through frame reads.
+            let mut work: Vec<FnId> = fns;
+            work.extend(
+                closure_at
+                    .iter()
+                    .filter(|(s, _)| needed.contains(s) || tops.contains(s))
+                    .map(|&(_, f)| f),
+            );
+            // Making a top-level function's closure mentions nothing: its
+            // body reads cells when it runs, not when it is made.
+            if closure_at.iter().any(|&(slot, _)| {
+                matches!(ir.get(item).kind, IrKind::Store(stored, _) if stored == slot)
+            }) {
+                work.clear();
+            }
+            let mut seen: Vec<FnId> = Vec::new();
+            while let Some(function) = work.pop() {
+                if seen.contains(&function) {
+                    continue;
+                }
+                seen.push(function);
+                let (_, inner, frame) = reads(ir.function(function).body, false);
+                work.extend(inner);
+                work.extend(
+                    closure_at
+                        .iter()
+                        .filter(|(s, _)| frame.contains(s))
+                        .map(|&(_, f)| f),
+                );
+                needed.extend(frame);
+            }
+            for slot in needed.into_iter().filter(|&slot| cell(slot)) {
+                assert!(
+                    stored.contains(&slot),
+                    "{text}: cell {slot} read before its store"
+                );
+            }
+            if let IrKind::Store(slot, _) = ir.get(item).kind
+                && cell(slot)
+            {
+                stored.push(slot);
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_fields_are_computed_at_their_points() {
+        let last = |text: &str| format!("{:?}", fields(text).last().cloned());
+        let int = |value: i64| format!("{:?}", Some(Value::Int(value)));
+        // A dotted root read between its items is the whole root.
+        assert_eq!(last("a.b = 1\nc = a\na.d = 2\nr = c.d"), int(2));
+        assert_eq!(last("a.b = 1\nc = a.b + a.d\na.d = 2"), int(3));
+        // A field used above its line, by a `let` and through a function.
+        assert_eq!(
+            last("let x = y + 1\ny = g()\nfn g(): Int { 41 }\nr = x"),
+            int(42)
+        );
+        assert_eq!(
+            last("let x = f()\nfn f(): Int { k.v }\nk.v = 5\nr = x"),
+            int(5)
+        );
+        // A function reads a field through the frame before and after it.
+        assert_eq!(
+            last("fn f(): Int { n }\nlet x = f()\nn = 3\nlet y = f()\nr = x + y"),
+            int(6)
+        );
+        // A `lazy` reads a field declared below it.
+        assert_eq!(last("let l = lazy { m * 2 }\nm = 4\nr = await l"), int(8));
+    }
+
+    #[test]
+    fn the_fields_of_a_package_may_be_written_in_any_order() {
+        let text = "let major = 2\ncom.x.app.deps = [com.x.lib]\n\
+                    com.x.app.name = \"app-{version}\"\ncom.x.lib.name = \"lib\"\n\
+                    version = describe(major)\nfn describe(n: Int): String { \"v{n}\" }";
+        assert_eq!(
+            run(text).unwrap().to_string(),
+            "{com = {x = {app = {deps = [{name = \"lib\"}]; name = \"app-v2\"}; \
+             lib = {name = \"lib\"}}}; version = \"v2\"}"
+        );
+    }
+
+    #[test]
+    fn long_chains_of_fields_need_no_deep_recursion() {
+        // The first item needs the whole chain, written below it, and each
+        // dotted field reads the one before it: neither recurses per field.
+        let count = 3000;
+        let plain = (1..count).map(|index| format!("x{index} = x{} + 1\n", index + 1));
+        let dotted = (2..=count).map(|index| format!("a.f{index} = a.f{} + 1\n", index - 1));
+        let text: String = std::iter::once("total = x1\n".to_string())
+            .chain(plain)
+            .chain([format!("x{count} = 0\na.f1 = 1\n")])
+            .chain(dotted)
+            .chain(["last = a.f3000".to_string()])
+            .collect();
+        let value = run(&text).unwrap().to_string();
+        assert!(value.starts_with("{total = 2999; "), "{}", &value[..40]);
+        assert!(value.ends_with("last = 3000}"), "{value}");
+    }
+
+    #[test]
+    fn a_top_level_field_is_computed_once_with_its_effects_at_its_point() {
+        // Mentioned by several items above it, a field is stored once.
+        let text = "let a = x + 1\nlet b = x * 2\nlet c = { x }\nx = 5\nr = a + b + c";
+        assert_eq!(fields(text), vec![Value::Int(5), Value::Int(21)]);
+        let ir = compile(text);
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("{text}: the top level is not a block");
+        };
+        let stores = ir
+            .items(items)
+            .iter()
+            .filter(|&&item| {
+                matches!(ir.get(item).kind, IrKind::Store(_, value)
+                    if matches!(ir.get(value).kind, IrKind::IntConst(5)))
+            })
+            .count();
+        assert_eq!(stores, 1, "{text}");
+        // A field that reads a mutable variable is computed at its own line,
+        // with the value the variable has there.
+        assert_eq!(
+            fields("let mut t = 1\nf = t\nt := t + 1\ng = t\nr = f * 10 + g"),
+            vec![Value::Int(1), Value::Int(2), Value::Int(12)]
+        );
+        // A field's effects happen where it is computed: before the first
+        // item that needs it, here above an item that would fail first if
+        // the field were computed at its own line; through an impure
+        // function too.
+        let index = run("[1][5]").unwrap_err().message;
+        for text in [
+            "let a = b\nlet c = 1 // 0\nb = [1][5]",
+            "let a = b\nlet c = 1 // 0\nb = get()\nfn get() -> Int { [1][5] }",
+        ] {
+            assert_eq!(run(text).unwrap_err().message, index, "{text}");
+        }
     }
 
     fn boolean(text: &str) -> bool {
