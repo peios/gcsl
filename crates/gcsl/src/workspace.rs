@@ -1,5 +1,5 @@
 //! A workspace: the files of a directory tree, each directory's files
-//! sharing one scope.
+//! sharing one scope, and every file's dotted paths merged into one view.
 //!
 //! A *workspace* is the directory tree under a directory that holds a file
 //! named `workspace.gcsl`; finding it and reading its files is the CLI's,
@@ -17,17 +17,74 @@
 //! *contributors*), so dotted paths merge across files. A file sees its own
 //! private names (`let`, `let mut`, `fn`), the tree of its own directory,
 //! and the trees of the directories above it, up to the root; never a
-//! sibling's or a subdirectory's. A reference means its longest declared
-//! prefix in the merged tree of its directory chain, never in the file's
+//! sibling's or a subdirectory's, but by an import. A reference means its
+//! longest declared prefix in the file's view (below), never in the file's
 //! own tree alone: [`crate::mentions::Mentions::resolve`] is given a
 //! [`FileScope`], whose numbering keeps the file's own nodes and functions
-//! as [`crate::mentions::find`] numbers them and puts every other file's
+//! as [`crate::mentions::find`] numbers them and puts every other node
 //! after them.
 //!
-//! One leaf path declared in two files, a leaf under a leaf or over an
-//! interior node of another file, and a root name declared both in a
-//! directory and in a directory above are errors, found while the trees
-//! are merged ([`scan`]).
+//! One leaf path declared in two files of a directory, and a leaf under a
+//! leaf or over an interior node of another file of it, are errors, found
+//! while the directory's tree is merged ([`scan`]).
+//!
+//! # The view of a file
+//!
+//! Dotted paths always merge. Every file has a *view*: one tree, merged
+//! node by node from its *sources*, the tree of its own directory, the
+//! tree of each directory above it up to the root, the tree of each
+//! `import * from PATH` it has (a directory's merged tree or a file's own
+//! tree), and each member import's node at its bound name. An interior
+//! node and an interior node of one name merge, their children merged in
+//! turn; a leaf (a `def` among them) and anything else of one name is a
+//! conflict, except that one cell reached twice is one node (`*` from the
+//! file's own directory, from a directory above, from one directory twice,
+//! or a file's part of a node also reached whole): merging is idempotent.
+//! A whole import (`import PATH [as NAME]`) is not merged: it is a name of
+//! its own (see [Imports](#imports)), and one named like a root of the
+//! view is still an error.
+//!
+//! Only what several sources have is stored ([`File::view`]): a node one
+//! source alone has is that source's node, read as it always was, so a
+//! view costs what its overlaps cost, the largest source of each level
+//! only looked up in. A node several sources have is a [`ViewNode`] of
+//! [`Scan::views`], its parts the sources' nodes, root directory first,
+//! the order its children are in (by first definition, each part in its own
+//! order); its children several parts have are view nodes too, and a child
+//! one part has is that part's child. The file's [`FileScope`] answers a
+//! root by the view's node of that name if several sources have it, else
+//! the root of the one directory of its chain or the one import that has
+//! it; a child of a view node likewise, a child of any other node in that
+//! node's own tree. So a leaf of the view is always one cell, of one file,
+//! and an interior node of it is either a node of one source, read from its
+//! cell as before, or a view node, assembled by the file itself.
+//!
+//! A view node with a leaf of the file under it is numbered among the
+//! file's own field nodes ([`crate::mentions::Mentions::views`]): read
+//! whole, it is a node of the file's schedule under slice 24's rule for an
+//! interior node, computed at the earlier of "after its last child of the
+//! file" and its first mention, the other sources' children computed
+//! already, since the file needs their owners. Any other view node is a
+//! [`Target::View`], read whole as a record the file assembles as it starts,
+//! as an imported record is. Reading a view node whole needs every owner of
+//! every leaf under it, in whichever directory or import, but never makes a
+//! file need itself; only an import that reaches the file's own nodes by
+//! another path (a member renamed, `import com as c from app` inside
+//! `app/`) is "`app/main.gcsl` needs itself", as through a whole import.
+//! The view is the file's alone: the directory tree committed for the
+//! files after it is unchanged, and a file's own record is still built
+//! from its own cells only.
+//!
+//! The scan finds every conflict of every view before any file is
+//! checked, once per pair however many views have it, reported at the
+//! later of the two sources in the order: the file's own directory first,
+//! then each directory upward, then its imports in source order. Two
+//! leaves are "field `com.x.lib.name` is defined in two files", "defined
+//! here" at both; a leaf and an interior node, "field `com.x` is already
+//! defined", the earlier side's whole definition labelled. An import's side
+//! is labelled "imported here" at its `*` or member, with an excerpt of the
+//! imported definition, "defined here"; a directory above the file's own
+//! among the two adds the note "one is in a directory above".
 //!
 //! # Order
 //!
@@ -97,40 +154,50 @@
 //! An imported name is an [`Alias`] of the file ([`File::aliases`]), naming
 //! a [`Target`]: a directory's merged tree without its subdirectories, a
 //! file's own tree (or, for a value file, its value), or a root of either
-//! (`import x from lib`, and each root of `import * from lib`). It is a
-//! private top-level name of its file: in scope throughout it, shadowed by
-//! nearer names, never in its tree or record, never seen by another file;
-//! one clashing with another top-level name of the file, or with a root of
-//! its directory chain, is an error found by the scan. The aliases are a
-//! lookup of the [`FileScope`] apart from the merged trees
-//! ([`FileScope::alias`]), so a reference through one means its longest
-//! declared prefix in the target's tree, as every reference does: the
-//! numbers past the merged nodes are targets ([`FileScope::target`]).
+//! (`import x from lib`, and each root of `import * from lib`). A whole
+//! import (`import lib`, `import lib.x as f`) is a private top-level name
+//! of its file: in scope throughout it, shadowed by nearer names, never in
+//! its tree or record, never seen by another file; one clashing with
+//! another top-level name of the file, with a member or `*` root of it, or
+//! with a root of its directory chain, is an error found by the scan. A
+//! member and a root of a `*` merge into the file's view instead ([The
+//! view of a file](#the-view-of-a-file)), private to the file too, and
+//! clash only with a whole import or a top-level `fn`, `let`, `let mut` or
+//! `:=` of their name. `import * from` a value file is "a value file has
+//! no members to import". The aliases are a lookup of the [`FileScope`]
+//! apart from the merged trees ([`FileScope::alias`]), so a reference
+//! through one means its longest declared prefix in the target's tree, as
+//! every reference does: the numbers past the merged nodes are targets
+//! ([`FileScope::target`]).
 //!
 //! The needs through an import are per leaf ([`Scan::target_files`]): a
 //! leaf, a `def` or an interior node needs the files that own it, a file
-//! read whole needs that file, and a directory read whole needs every file
-//! of it. A reach into a node the file itself owns or contributes to, its
-//! own file or directory read whole, and a whole read of a directory one of
-//! whose files needs this one, are the one-file form of the cycle error,
-//! "`app.gcsl` needs itself"; files importing each other are the cycle
-//! error of [Order](#order).
+//! read whole needs that file, a directory read whole needs every file of
+//! it, and a view node read whole every owner of every leaf under it. A
+//! reach through an import into a node the file itself owns or contributes
+//! to, its own file or directory read whole through a whole import, and a
+//! whole read of a directory one of whose files needs this one, are the
+//! one-file form of the cycle error, "`app.gcsl` needs itself"; files
+//! importing each other are the cycle error of [Order](#order).
 //!
 //! A reference that ends on a cell reads that cell's slot: a `def`'s is its
 //! function's slot, since the merged node of a `def` is never written. A
-//! record read whole (a directory, a file, or a file's part of a shared
-//! node) is assembled by the importing file, once, into a private slot of
-//! its own, before its first item ([`crate::check#imports`]). A value file
-//! that some file imports has a cell of its own after the merged nodes
-//! ([`Scan::value_slot`]), which the file stores its result into as the
-//! last node of its top-level block.
+//! record read whole (a directory, a file, a file's part of a shared node,
+//! or a view node without a leaf of the file under it) is assembled by the
+//! reading file, once, into a private slot of its own, before its first
+//! item ([`crate::check#imports`]). A value file that some file imports has
+//! a cell of its own after the merged nodes ([`Scan::value_slot`]), which
+//! the file stores its result into as the last node of its top-level
+//! block.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::mem;
 
 use crate::Outcome;
 use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
+#[cfg(test)]
+use crate::check::ViewRecord;
 use crate::check::{CheckOutput, Checker, Scope, Slot, Types};
 use crate::diagnostic::Diagnostic;
 use crate::eval::MemoTables;
@@ -163,7 +230,7 @@ pub struct File {
     /// holds only the committed declarations of these (see [`check`]).
     pub spelled: Vec<Name>,
     /// Its declarations and what each of its items mentions, resolved
-    /// against its directory chain ([`FileScope`]).
+    /// against its view ([`FileScope`]).
     pub mentions: Mentions,
     /// For each node of its own field tree, the merged node of its path.
     pub global: Vec<u32>,
@@ -172,9 +239,12 @@ pub struct File {
     pub functions: Vec<u32>,
     /// The names it imports, in source order (a `*` gives one per root).
     pub aliases: Vec<Alias>,
+    /// Its view: the nodes several of its sources have, merged.
+    pub view: View,
     /// When its field nodes are computed: its own nodes that another file
     /// computes (shared interior nodes it is not the last contributor of)
-    /// are not in it.
+    /// are not in it; the nodes of its view with a leaf of it under them
+    /// are, if it reads them whole ([`Mentions::views`]).
     pub schedule: Schedule,
 }
 
@@ -235,6 +305,10 @@ pub enum Target {
     },
     /// A merged node, a cell of the workspace, reached through an import.
     Node(u32),
+    /// A node of a file's view that several sources have and no leaf of
+    /// the file is under, by its index in [`Scan::views`]: read whole, the
+    /// record its file assembles of every source's children.
+    View(u32),
 }
 
 /// A name a file imports.
@@ -249,6 +323,85 @@ pub struct Alias {
     pub item: ItemId,
     /// What it names.
     pub target: Target,
+    /// Whether it is a whole import (`import PATH`, `import PATH as NAME`),
+    /// a name of its own; a member or a root of a `*` is merged into the
+    /// file's view instead.
+    pub whole: bool,
+}
+
+/// One source's node at a node of a file's view (see the module
+/// documentation, "The view of a file").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewPart {
+    /// The source, root directory first: the directories of the file's
+    /// chain from the root (0) down to its own, then its imported members
+    /// and `*` roots, by their index in [`File::aliases`] after those.
+    pub source: u32,
+    /// The node: a merged node, or a file's part of one.
+    pub target: Target,
+    /// Whether it is a node of a directory of the file's chain, reached by
+    /// its own path (an import of such a node at its own path is the same
+    /// cell, merged into it).
+    pub chain: bool,
+}
+
+impl ViewPart {
+    /// The merged node `node` of the directory of the file's chain at
+    /// position `source`.
+    const fn chain(source: u32, node: u32) -> Self {
+        Self {
+            source,
+            target: Target::Node(node),
+            chain: true,
+        }
+    }
+}
+
+/// A node of a file's view that several sources have, the same cell
+/// reached twice taken once (see the module documentation, "The view of a
+/// file").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewNode {
+    /// Its last segment.
+    pub name: Name,
+    /// The view node it is a child of, by its index in [`Scan::views`];
+    /// `None` for a root of the view.
+    pub parent: Option<u32>,
+    /// The file whose view it is of.
+    pub file: u32,
+    /// What it merges, root directory first, each an interior node.
+    pub parts: Vec<ViewPart>,
+    /// The file's own node of its path, when a leaf of the file is under
+    /// it: it is then a node of the file's schedule.
+    pub own: Option<u32>,
+}
+
+/// What a file's view makes of a name that several sources have at one
+/// node: a node of the view, or the one node left once the same cell
+/// reached twice is taken once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Merged {
+    /// A node of the view, by its index in [`Scan::views`].
+    View(u32),
+    /// A single node.
+    One(ViewPart),
+}
+
+/// A file's view: its nodes that several sources have (see the module
+/// documentation, "The view of a file").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct View {
+    /// Where its nodes start in [`Scan::views`].
+    pub start: u32,
+    /// The number of its nodes with a leaf of the file under them, which
+    /// come first.
+    pub own: u32,
+    /// Where its nodes end in [`Scan::views`].
+    pub end: u32,
+    /// What it makes of each name several sources have, by the node it is
+    /// under ([`ROOT`] for a root, else its index in [`Scan::views`]) and
+    /// the name.
+    merged: HashMap<(u32, Name), Merged>,
 }
 
 /// The scanned workspace: what [`scan`] finds before anything is checked.
@@ -263,6 +416,9 @@ pub struct Scan {
     pub nodes: Vec<Node>,
     /// The top-level functions of every file.
     pub functions: Vec<Function>,
+    /// The nodes of every file's view that several sources have, each
+    /// file's together ([`File::view`]).
+    pub views: Vec<ViewNode>,
     /// For each file, the files it needs, each once, in index order.
     pub needs: Vec<Vec<u32>>,
     /// The files in the order they are checked and run.
@@ -271,6 +427,8 @@ pub struct Scan {
     pub names: Names,
     /// The nodes by directory, parent ([`ROOT`] for a root) and name.
     by_name: HashMap<(u32, u32, Name), u32>,
+    /// The roots of each directory's tree, by directory, in order.
+    roots: Vec<Vec<u32>>,
     /// The `def`s by directory and name, as indices in `functions`.
     defs: HashMap<(u32, Name), u32>,
     /// The position of each file in `order`.
@@ -341,10 +499,11 @@ impl Scan {
 
     /// The number of `target` among every target of the workspace: the
     /// directories, then the files, then the files' own nodes, then the
-    /// merged nodes.
+    /// merged nodes, then the views' nodes.
     fn target_number(&self, target: Target) -> u32 {
         let (dirs, files) = (count(self.dirs.len()), count(self.files.len()));
         let parts = self.parts();
+        let nodes = dirs.saturating_add(files).saturating_add(parts);
         match target {
             Target::Dir(dir) => dir,
             Target::File(file) => dirs.saturating_add(file),
@@ -354,10 +513,10 @@ impl Scan {
                     .saturating_add(base)
                     .saturating_add(node)
             }
-            Target::Node(node) => dirs
-                .saturating_add(files)
-                .saturating_add(parts)
-                .saturating_add(node),
+            Target::Node(node) => nodes.saturating_add(node),
+            Target::View(view) => nodes
+                .saturating_add(count(self.nodes.len()))
+                .saturating_add(view),
         }
     }
 
@@ -380,7 +539,10 @@ impl Scan {
                 node: rest.checked_sub(base)?,
             });
         };
-        ((node as usize) < self.nodes.len()).then_some(Target::Node(node))
+        let Some(view) = node.checked_sub(count(self.nodes.len())) else {
+            return Some(Target::Node(node));
+        };
+        ((view as usize) < self.views.len()).then_some(Target::View(view))
     }
 
     /// The slot of the cell of the value of `file`, a value file some file
@@ -450,7 +612,76 @@ impl Scan {
                     .get(&(dir, node, name))
                     .map(|&n| Target::Node(n))
             }
+            Target::View(view) => match self.view_child(view, name)? {
+                Merged::View(child) => Some(Target::View(child)),
+                Merged::One(part) => Some(part.target),
+            },
         }
+    }
+
+    /// The child named `name` of the view node `view`: a view node of its
+    /// own when several of its parts have one, else the one part's child.
+    fn view_child(&self, view: u32, name: Name) -> Option<Merged> {
+        let node = self.views.get(view as usize)?;
+        let file = self.files.get(node.file as usize)?;
+        if let Some(&merged) = file.view.merged.get(&(view, name)) {
+            return Some(merged);
+        }
+        node.parts.iter().find_map(|part| {
+            let target = self.target_child(part.target, name)?;
+            Some(Merged::One(ViewPart { target, ..*part }))
+        })
+    }
+
+    /// The names of the children of the view node `view`, in the view's
+    /// order: by first definition, its parts root directory first, each in
+    /// its own order.
+    fn view_names(&self, view: u32) -> Vec<Name> {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        let parts = self.views.get(view as usize).map_or(&[][..], |v| &v.parts);
+        for part in parts {
+            for name in self.child_names(part.target) {
+                if seen.insert(name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// The names of the children of `target`, a merged node or a file's
+    /// part of one, in its order.
+    fn child_names(&self, target: Target) -> Vec<Name> {
+        match target {
+            Target::Node(node) => self.nodes.get(node as usize).map_or_else(Vec::new, |n| {
+                n.children
+                    .iter()
+                    .filter_map(|&c| self.nodes.get(c as usize).map(|c| c.name))
+                    .collect()
+            }),
+            Target::Part { file, node } => self
+                .files
+                .get(file as usize)
+                .and_then(|f| {
+                    let tree = &f.mentions.tree;
+                    let children = &tree.nodes.get(node as usize)?.children;
+                    Some(
+                        children
+                            .iter()
+                            .filter_map(|&c| tree.nodes.get(c as usize).map(|n| n.name))
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default(),
+            Target::View(view) => self.view_names(view),
+            Target::Dir(_) | Target::File(_) => target_roots(self, target),
+        }
+    }
+
+    /// The files with a leaf at or under the part `part` of a view node.
+    fn part_owners(&self, part: ViewPart) -> Vec<u32> {
+        self.target_files(part.target)
     }
 
     /// The merged node `merged` as a node of `file`'s own tree: the merged
@@ -475,7 +706,8 @@ impl Scan {
 
     /// The files a reference through an import to `target` needs: every
     /// file of a directory, the file of a file or a part, a merged node's
-    /// leaf's file or its contributors.
+    /// leaf's file or its contributors, every owner of every part of a view
+    /// node.
     #[must_use]
     pub fn target_files(&self, target: Target) -> Vec<u32> {
         match target {
@@ -489,6 +721,16 @@ impl Scan {
                 n.leaf
                     .map_or_else(|| n.contributors.clone(), |leaf| vec![leaf])
             }),
+            Target::View(view) => {
+                let parts = self.views.get(view as usize).map_or(&[][..], |v| &v.parts);
+                let mut files: Vec<u32> = parts
+                    .iter()
+                    .flat_map(|&part| self.part_owners(part))
+                    .collect();
+                files.sort_unstable();
+                files.dedup();
+                files
+            }
         }
     }
 
@@ -511,7 +753,30 @@ impl Scan {
                 .and_then(|f| f.global.get(node as usize))
                 .map_or_else(String::new, |&merged| self.show(merged)),
             Target::Node(node) => self.show(node),
+            Target::View(view) => self.show_view(view),
         }
+    }
+
+    /// The name of the top-level function `function`.
+    fn show_function(&self, function: Function) -> String {
+        self.files
+            .get(function.file as usize)
+            .and_then(|file| file.mentions.functions.get(function.index as usize))
+            .map_or_else(String::new, |top| self.names.get(top.name).to_owned())
+    }
+
+    /// The dotted path in its file's view of the view node `view`.
+    fn show_view(&self, view: u32) -> String {
+        let mut names = Vec::new();
+        let mut at = Some(view);
+        while let Some(index) = at
+            && let Some(entry) = self.views.get(index as usize)
+        {
+            names.push(self.names.get(entry.name));
+            at = entry.parent;
+        }
+        names.reverse();
+        names.join(".")
     }
 
     /// The dotted path of the merged node `node`.
@@ -529,11 +794,16 @@ impl Scan {
     }
 }
 
-/// The scope a file's references are resolved in: the merged trees of its
-/// directory chain, and the `def`s there, numbered as
-/// [`crate::mentions::Resolve`] asks: the file's own nodes and functions
-/// first, by their own numbers, and every other one at the count of the
-/// file's own plus its index in [`Scan::nodes`] or [`Scan::functions`].
+/// The scope a file's references are resolved in: its view, the merged
+/// trees of its directory chain and what it imports (see the module
+/// documentation, "The view of a file"), and the `def`s of its chain,
+/// numbered as [`crate::mentions::Resolve`] asks. The file's own field
+/// nodes come first, by their own numbers, then the nodes of its view with
+/// a leaf of the file under them ([`Mentions::views`]), then every merged
+/// node at its index in [`Scan::nodes`] after those, then every target an
+/// import or the view reaches (a [`Target::View`] among them); its own
+/// functions come first, then every other one at its index in
+/// [`Scan::functions`] after them.
 #[derive(Debug)]
 pub struct FileScope<'a> {
     /// The workspace.
@@ -546,8 +816,11 @@ pub struct FileScope<'a> {
     global: &'a [u32],
     /// The file's own node of each merged node it has one of.
     local: HashMap<u32, u32>,
-    /// What each name the file imports names.
+    /// What each name the file imports names; of a name several sources
+    /// have, the view's node says.
     aliases: HashMap<Name, Target>,
+    /// The file's view.
+    view: &'a View,
 }
 
 impl<'a> FileScope<'a> {
@@ -565,21 +838,30 @@ impl<'a> FileScope<'a> {
             global: &file.global,
             local,
             aliases: file.aliases.iter().map(|a| (a.name, a.target)).collect(),
+            view: &file.view,
         }
     }
 
-    /// Where the numbers of targets reached through imports start: after
-    /// the file's own nodes and the merged nodes.
+    /// Where the numbers of the merged nodes start: after the file's own
+    /// nodes and its view's own nodes.
+    fn merged_start(&self) -> u32 {
+        count(self.global.len()).saturating_add(self.view.own)
+    }
+
+    /// Where the numbers of targets reached through imports or the view
+    /// start: after the merged nodes.
     fn targets_start(&self) -> u32 {
-        count(self.global.len()).saturating_add(count(self.scan.nodes.len()))
+        self.merged_start()
+            .saturating_add(count(self.scan.nodes.len()))
     }
 
     /// What the scope's number `node` is when it is reached through an
-    /// import, `None` for the file's own nodes and the merged nodes of its
-    /// directory chain ([`FileScope::merged`]). A reference through an
-    /// import resolves to one of these, and so does a mention of it in
-    /// [`Mentions::foreign`]; a [`Target::Node`] is a cell like any merged
-    /// node, read by its slot.
+    /// import or a node of the view without a leaf of the file under it,
+    /// `None` for the file's own nodes, its view's own nodes and the merged
+    /// nodes of its directory chain ([`FileScope::merged`]). A reference
+    /// through an import resolves to one of these, and so does a mention of
+    /// it in [`Mentions::foreign`]; a [`Target::Node`] is a cell like any
+    /// merged node, read by its slot.
     #[must_use]
     pub fn target(&self, node: u32) -> Option<Target> {
         self.scan.target_of(node.checked_sub(self.targets_start())?)
@@ -591,8 +873,32 @@ impl<'a> FileScope<'a> {
         self.aliases.get(&name).copied()
     }
 
+    /// Whether a reference to the root `name` reads through the file's
+    /// view rather than a binding: when the root is imported, or several
+    /// sources have it. A root of the file's own or of one directory of its
+    /// chain alone is read through its binding, as before imports.
+    #[must_use]
+    pub fn reads_through(&self, name: Name) -> bool {
+        self.root(name)
+            .is_some_and(|node| node >= count(self.global.len()) && self.merged(node).is_none())
+    }
+
+    /// The index in [`Scan::views`] of the scope's number `node`, if it is
+    /// a node of the view with a leaf of the file under it.
+    #[must_use]
+    pub fn own_view(&self, node: u32) -> Option<u32> {
+        let at = node.checked_sub(count(self.global.len()))?;
+        (at < self.view.own).then(|| self.view.start.saturating_add(at))
+    }
+
     /// The scope's number of `target`.
     fn target_number(&self, target: Target) -> u32 {
+        if let Target::View(view) = target
+            && let Some(at) = view.checked_sub(self.view.start)
+            && at < self.view.own
+        {
+            return count(self.global.len()).saturating_add(at);
+        }
         self.targets_start()
             .saturating_add(self.scan.target_number(target))
     }
@@ -602,16 +908,50 @@ impl<'a> FileScope<'a> {
         self.local
             .get(&node)
             .copied()
-            .unwrap_or_else(|| count(self.global.len()).saturating_add(node))
+            .unwrap_or_else(|| self.merged_start().saturating_add(node))
     }
 
-    /// The merged node of the scope's number `node`.
+    /// The scope's number of what the view makes of a name.
+    fn merged_number(&self, merged: Merged) -> u32 {
+        match merged {
+            Merged::View(view) => self.target_number(Target::View(view)),
+            Merged::One(ViewPart {
+                target: Target::Node(node),
+                chain: true,
+                ..
+            }) => self.number(node),
+            Merged::One(part) => self.target_number(part.target),
+        }
+    }
+
+    /// The merged node of the scope's number `node`, if it is one of the
+    /// file's own nodes or a merged node of its directory chain.
     #[must_use]
     pub fn merged(&self, node: u32) -> Option<u32> {
-        match node.checked_sub(count(self.global.len())) {
-            Some(other) => (node < self.targets_start()).then_some(other),
-            None => self.global.get(node as usize).copied(),
+        if let Some(own) = self.global.get(node as usize) {
+            return Some(*own);
         }
+        let other = node.checked_sub(self.merged_start())?;
+        (node < self.targets_start()).then_some(other)
+    }
+
+    /// The children of the view node `node` (a scope's number), each with
+    /// its name and its scope's number, in the view's order: by first
+    /// definition, its sources root directory first.
+    #[must_use]
+    pub fn view_children(&self, node: u32) -> Vec<(Name, u32)> {
+        let view = match self.own_view(node) {
+            Some(view) => view,
+            None => match self.target(node) {
+                Some(Target::View(view)) => view,
+                _ => return Vec::new(),
+            },
+        };
+        self.scan
+            .view_names(view)
+            .into_iter()
+            .filter_map(|name| Some((name, self.child(node, name)?)))
+            .collect()
     }
 
     /// The function of [`Scan::functions`] of the scope's number
@@ -624,6 +964,9 @@ impl<'a> FileScope<'a> {
 
 impl Resolve for FileScope<'_> {
     fn root(&self, name: Name) -> Option<u32> {
+        if let Some(&merged) = self.view.merged.get(&(ROOT, name)) {
+            return Some(self.merged_number(merged));
+        }
         self.scan
             .chain(self.dir)
             .find_map(|dir| self.scan.by_name.get(&(dir, ROOT, name)))
@@ -632,6 +975,13 @@ impl Resolve for FileScope<'_> {
     }
 
     fn child(&self, node: u32, name: Name) -> Option<u32> {
+        let view = self.own_view(node).or(match self.target(node) {
+            Some(Target::View(view)) => Some(view),
+            _ => None,
+        });
+        if let Some(view) = view {
+            return Some(self.merged_number(self.scan.view_child(view, name)?));
+        }
         if let Some(target) = self.target(node) {
             let child = self.scan.target_child(target, name)?;
             return Some(self.target_number(child));
@@ -654,7 +1004,7 @@ impl Resolve for FileScope<'_> {
     }
 
     fn own(&self) -> (u32, u32) {
-        (count(self.global.len()), count(self.own.len()))
+        (self.merged_start(), count(self.own.len()))
     }
 }
 
@@ -671,16 +1021,17 @@ fn parent_path(path: &str) -> &str {
 }
 
 /// Scans the workspace whose files are `sources`, named by their paths
-/// relative to the root: parses every file, merges each directory's trees,
-/// resolves every file's references against its directory chain, and
-/// finds the order and each file's schedule (see the module
+/// relative to the root: parses every file, merges each directory's trees
+/// and each file's view, resolves every file's references against its
+/// view, and finds the order and each file's schedule (see the module
 /// documentation).
 ///
 /// # Errors
 ///
 /// Every syntax error of every file; else every conflict between files'
-/// declarations; else every cycle of files that need each other. Each
-/// names its file in [`Diagnostic::input`], its index in path order.
+/// declarations in a directory; else every conflict of every file's view;
+/// else every cycle of files that need each other. Each names its file in
+/// [`Diagnostic::input`], its index in path order.
 pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
     scan_with(sources, &[])
 }
@@ -691,9 +1042,10 @@ pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
 ///
 /// # Errors
 ///
-/// As [`scan`]; with the conflicts, every import that names nothing or
-/// clashes with a name of its file or directory chain, and with the cycles,
-/// every reference through an import that reaches back into its own file.
+/// As [`scan`]; before the view's conflicts, every import that names
+/// nothing or clashes with a name of its file or directory chain, and with
+/// the cycles, every reference through an import that reaches back into
+/// its own file.
 pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<Diagnostic>> {
     let mut sorted: Vec<&SourceFile> = sources.iter().collect();
     sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
@@ -702,10 +1054,12 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
         dirs: Vec::new(),
         nodes: Vec::new(),
         functions: Vec::new(),
+        views: Vec::new(),
         needs: Vec::new(),
         order: Vec::new(),
         names: Names::new(),
         by_name: HashMap::new(),
+        roots: Vec::new(),
         defs: HashMap::new(),
         rank: Vec::new(),
         part_base: Vec::new(),
@@ -732,16 +1086,17 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
             global: Vec::new(),
             functions: Vec::new(),
             aliases: Vec::new(),
+            view: View::default(),
             schedule: Schedule::default(),
         });
     }
     if !errors.is_empty() {
         return Err(errors);
     }
+    scan.roots = vec![Vec::new(); scan.dirs.len()];
     for file in 0..count(scan.files.len()) {
         merge(&mut scan, file, &mut errors);
     }
-    roots_above(&scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -759,28 +1114,12 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
     if !errors.is_empty() {
         return Err(errors);
     }
-    value_cells(&mut scan);
-    for index in 0..scan.files.len() {
-        let mut mentions = scan
-            .files
-            .get_mut(index)
-            .map(|file| mem::take(&mut file.mentions))
-            .unwrap_or_default();
-        if let Some(file) = scan.files.get(index) {
-            let (functions, tree) = (
-                mem::take(&mut mentions.functions),
-                mem::take(&mut mentions.tree),
-            );
-            let mut scope = FileScope::new(&scan, file);
-            scope.own = &functions;
-            mentions.resolve(&file.ast, &scope);
-            mentions.functions = functions;
-            mentions.tree = tree;
-        }
-        if let Some(file) = scan.files.get_mut(index) {
-            file.mentions = mentions;
-        }
+    views(&mut scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
     }
+    value_cells(&mut scan);
+    resolve(&mut scan);
     let mentioned = find_needs(&mut scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
@@ -793,6 +1132,31 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
     scan.rank = scan.ranks();
     schedule(&mut scan);
     Ok(scan)
+}
+
+/// Resolves every file's references against its view ([`FileScope`]).
+fn resolve(scan: &mut Scan) {
+    for index in 0..scan.files.len() {
+        let mut mentions = scan
+            .files
+            .get_mut(index)
+            .map(|file| mem::take(&mut file.mentions))
+            .unwrap_or_default();
+        if let Some(file) = scan.files.get(index) {
+            let (functions, tree) = (
+                mem::take(&mut mentions.functions),
+                mem::take(&mut mentions.tree),
+            );
+            let mut scope = FileScope::new(scan, file);
+            scope.own = &functions;
+            mentions.resolve(&file.ast, &scope);
+            mentions.functions = functions;
+            mentions.tree = tree;
+        }
+        if let Some(file) = scan.files.get_mut(index) {
+            file.mentions = mentions;
+        }
+    }
 }
 
 /// Lexes and parses `source`, interning into `names`; the tree's own table
@@ -894,6 +1258,8 @@ fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
             scan.by_name.insert(key, merged);
             if let Some(up) = scan.nodes.get_mut(parent as usize) {
                 up.children.push(merged);
+            } else if let Some(roots) = scan.roots.get_mut(dir as usize) {
+                roots.push(merged);
             }
             merged
         };
@@ -974,34 +1340,453 @@ fn conflict(scan: &Scan, input: u32, own: u32, existing: u32) -> Option<Diagnost
     None
 }
 
-/// Reports each root of a directory's tree that is also a root of a
-/// directory above it.
-fn roots_above(scan: &Scan, errors: &mut Vec<Diagnostic>) {
-    for (index, node) in (0u32..).zip(&scan.nodes) {
-        if node.parent.is_some() {
+/// One source of a level of a file's view as it is merged: what the
+/// source has at that level.
+#[derive(Clone, Copy, Debug)]
+enum Level {
+    /// The roots of a directory of the file's chain, with the source's
+    /// position ([`ViewPart::source`]).
+    Dir(u32, u32),
+    /// An imported member or root of a `*`: its bound name and its node.
+    Alias(Name, ViewPart),
+    /// The children of a part of a node of the view.
+    Of(ViewPart),
+}
+
+/// A conflict found merging a file's view: the view node it is under
+/// ([`ROOT`] for a root, else a view node by its index among the file's),
+/// its name, and the parts, at least one a leaf.
+type Conflict = (u32, Name, Vec<ViewPart>);
+
+/// A file's view as [`file_view`] finds it: its nodes, numbered from 0,
+/// what the merge made of each name several sources have, and the
+/// conflicts.
+type FileView = (Vec<ViewNode>, HashMap<(u32, Name), Merged>, Vec<Conflict>);
+
+/// What identifies one side of a conflict, so that a conflict seen from
+/// several files' views is reported once: its node, and for an import the
+/// importing file and where the import binds it.
+type Side = (Target, Option<(u32, u32)>);
+
+impl Scan {
+    /// The number of names `level` has.
+    fn level_size(&self, level: Level) -> usize {
+        match level {
+            Level::Dir(dir, _) => self.roots.get(dir as usize).map_or(0, Vec::len),
+            Level::Alias(..) => 1,
+            Level::Of(part) => match part.target {
+                Target::Node(node) => self
+                    .nodes
+                    .get(node as usize)
+                    .map_or(0, |n| n.children.len()),
+                Target::Part { file, node } => self
+                    .files
+                    .get(file as usize)
+                    .and_then(|f| f.mentions.tree.nodes.get(node as usize))
+                    .map_or(0, |n| n.children.len()),
+                _ => 0,
+            },
+        }
+    }
+
+    /// Each name `level` has, with its node, in the source's order.
+    fn level_entries(&self, level: Level) -> Vec<(Name, ViewPart)> {
+        match level {
+            Level::Dir(dir, source) => {
+                let roots = self.roots.get(dir as usize).map_or(&[][..], Vec::as_slice);
+                roots
+                    .iter()
+                    .filter_map(|&root| {
+                        let name = self.nodes.get(root as usize)?.name;
+                        Some((name, ViewPart::chain(source, root)))
+                    })
+                    .collect()
+            }
+            Level::Alias(name, part) => vec![(name, part)],
+            Level::Of(part) => self
+                .child_names(part.target)
+                .into_iter()
+                .filter_map(|name| Some((name, self.level_lookup(level, name)?)))
+                .collect(),
+        }
+    }
+
+    /// The node `level` has of the name `name`, if any.
+    fn level_lookup(&self, level: Level, name: Name) -> Option<ViewPart> {
+        match level {
+            Level::Dir(dir, source) => self
+                .by_name
+                .get(&(dir, ROOT, name))
+                .map(|&root| ViewPart::chain(source, root)),
+            Level::Alias(bound, part) => (bound == name).then_some(part),
+            Level::Of(part) => Some(ViewPart {
+                target: self.target_child(part.target, name)?,
+                ..part
+            }),
+        }
+    }
+
+    /// Each name that more than one of `levels`, the sources of one node of
+    /// a view, have, with their nodes, sources root directory first. The
+    /// largest source is never walked, only looked up in, so that a level
+    /// costs the size of the others.
+    fn overlaps(&self, levels: &[Level]) -> Vec<(Name, Vec<ViewPart>)> {
+        if levels.len() < 2 {
+            return Vec::new();
+        }
+        let largest = (0..levels.len())
+            .max_by_key(|&at| levels.get(at).map_or(0, |&level| self.level_size(level)));
+        let mut found: HashMap<Name, Vec<ViewPart>> = HashMap::new();
+        let mut order = Vec::new();
+        for (at, &level) in levels.iter().enumerate() {
+            if Some(at) == largest {
+                continue;
+            }
+            for (name, part) in self.level_entries(level) {
+                found
+                    .entry(name)
+                    .or_insert_with(|| {
+                        order.push(name);
+                        Vec::new()
+                    })
+                    .push(part);
+            }
+        }
+        let largest = largest.and_then(|at| levels.get(at)).copied();
+        let mut overlapping = Vec::new();
+        for name in order {
+            let Some(mut parts) = found.remove(&name) else {
+                continue;
+            };
+            if let Some(level) = largest
+                && let Some(part) = self.level_lookup(level, name)
+            {
+                parts.push(part);
+            }
+            if parts.len() > 1 {
+                parts.sort_by_key(|part| part.source);
+                overlapping.push((name, parts));
+            }
+        }
+        overlapping
+    }
+
+    /// `parts`, the nodes several sources have at one name, with the same
+    /// cell reached twice taken once: a node met again, and a file's part
+    /// of a merged node also met whole. Merging is idempotent.
+    fn same_cells(&self, parts: &[ViewPart]) -> Vec<ViewPart> {
+        let whole = |part: &ViewPart| match part.target {
+            Target::Part { file, node } => self
+                .files
+                .get(file as usize)
+                .and_then(|f| f.global.get(node as usize))
+                .is_some_and(|&merged| {
+                    parts
+                        .iter()
+                        .any(|other| other.target == Target::Node(merged))
+                }),
+            _ => false,
+        };
+        let mut kept: Vec<ViewPart> = Vec::with_capacity(parts.len());
+        for part in parts {
+            if !kept.iter().any(|k| k.target == part.target) && !whole(part) {
+                kept.push(*part);
+            }
+        }
+        kept
+    }
+
+    /// Whether `target` is a leaf: a merged node declared by an item.
+    fn is_leaf(&self, target: Target) -> bool {
+        matches!(target, Target::Node(node)
+            if self.nodes.get(node as usize).is_some_and(|n| n.leaf.is_some()))
+    }
+
+    /// The file that declares the first leaf at or under `target`, a merged
+    /// node or a file's part of one, and the spans of that leaf's path and
+    /// whole item.
+    fn part_spans(&self, target: Target) -> Option<(u32, Span, Span)> {
+        let (file, own) = match target {
+            Target::Node(node) => {
+                let entry = self.nodes.get(node as usize)?;
+                let file = entry.leaf.or_else(|| entry.contributors.first().copied())?;
+                let own = self
+                    .files
+                    .get(file as usize)?
+                    .global
+                    .iter()
+                    .position(|&g| g == node)?;
+                (file, count(own))
+            }
+            Target::Part { file, node } => (file, node),
+            _ => return None,
+        };
+        let (path, item) = first_leaf(self.files.get(file as usize)?, own)?;
+        Some((file, path, item))
+    }
+}
+
+/// Finds every file's view (see the module documentation, "The view of a
+/// file"): the nodes several of its sources have, merged, into
+/// [`Scan::views`] and [`File::view`]. Reports each conflict, two sources
+/// with a leaf and anything else of one path, once per pair however many
+/// files' views it is in.
+fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
+    let mut reported: HashSet<(Side, Side)> = HashSet::new();
+    let mut found = Vec::with_capacity(scan.files.len());
+    for index in 0..count(scan.files.len()) {
+        let (mut nodes, merged, conflicts) = file_view(scan, index);
+        for (parent, name, parts) in conflicts {
+            report_conflicts(
+                scan,
+                index,
+                &nodes,
+                (parent, name, &parts),
+                &mut reported,
+                errors,
+            );
+        }
+        // Its own nodes first, each after its parent as before: a node with
+        // a leaf of the file under it has only such nodes above it.
+        let start = count(scan.views.len());
+        let mut renumbered = vec![0u32; nodes.len()];
+        let mut at = start;
+        for own in [true, false] {
+            for (local, node) in nodes.iter().enumerate() {
+                if node.own.is_some() == own
+                    && let Some(entry) = renumbered.get_mut(local)
+                {
+                    *entry = at;
+                    at = at.saturating_add(1);
+                }
+            }
+        }
+        let own = count(nodes.iter().filter(|node| node.own.is_some()).count());
+        let global = |local: u32| renumbered.get(local as usize).copied().unwrap_or(ROOT);
+        for node in &mut nodes {
+            node.parent = node.parent.map(global);
+        }
+        let mut ordered: Vec<Option<ViewNode>> = vec![None; nodes.len()];
+        for (local, node) in nodes.into_iter().enumerate() {
+            let slot = global(count(local)).saturating_sub(start);
+            if let Some(entry) = ordered.get_mut(slot as usize) {
+                *entry = Some(node);
+            }
+        }
+        scan.views.extend(ordered.into_iter().flatten());
+        let merged = merged
+            .into_iter()
+            .map(|((parent, name), value)| {
+                let parent = if parent == ROOT { ROOT } else { global(parent) };
+                let value = match value {
+                    Merged::View(local) => Merged::View(global(local)),
+                    one @ Merged::One(_) => one,
+                };
+                ((parent, name), value)
+            })
+            .collect();
+        found.push(View {
+            start,
+            own,
+            end: count(scan.views.len()),
+            merged,
+        });
+    }
+    for (file, view) in scan.files.iter_mut().zip(found) {
+        file.view = view;
+    }
+}
+
+/// The view of file `index`: its view nodes, numbered from 0 in the order
+/// found, each a parent before its children; what the merge made of each
+/// name several sources have, by parent (a local number or [`ROOT`]); and
+/// the conflicts.
+fn file_view(scan: &Scan, index: u32) -> FileView {
+    let (mut nodes, mut merged, mut conflicts) = (Vec::new(), HashMap::new(), Vec::new());
+    let Some(file) = scan.files.get(index as usize) else {
+        return (nodes, merged, conflicts);
+    };
+    let mut chain: Vec<u32> = scan.chain(file.dir).collect();
+    chain.reverse();
+    let depth = count(chain.len());
+    let mut levels: Vec<Level> = (0u32..)
+        .zip(&chain)
+        .map(|(source, &dir)| Level::Dir(dir, source))
+        .collect();
+    for (at, alias) in (0u32..).zip(&file.aliases) {
+        if !alias.whole {
+            let part = ViewPart {
+                source: depth.saturating_add(at),
+                target: alias.target,
+                chain: false,
+            };
+            levels.push(Level::Alias(alias.name, part));
+        }
+    }
+    let local: HashMap<u32, u32> = (0u32..)
+        .zip(&file.global)
+        .map(|(own, &global)| (global, own))
+        .collect();
+    let mut stack = vec![(ROOT, levels)];
+    while let Some((parent, levels)) = stack.pop() {
+        for (name, parts) in scan.overlaps(&levels) {
+            let parts = scan.same_cells(&parts);
+            if let [one] = parts.as_slice() {
+                merged.insert((parent, name), Merged::One(*one));
+                continue;
+            }
+            if parts.iter().any(|part| scan.is_leaf(part.target)) {
+                conflicts.push((parent, name, parts));
+                continue;
+            }
+            let own = parts.iter().find_map(|part| match part.target {
+                Target::Node(node) if part.chain => scan
+                    .nodes
+                    .get(node as usize)
+                    .filter(|n| n.contributors.contains(&index))
+                    .and_then(|_| local.get(&node).copied()),
+                _ => None,
+            });
+            let view = count(nodes.len());
+            nodes.push(ViewNode {
+                name,
+                parent: (parent != ROOT).then_some(parent),
+                file: index,
+                parts: parts.clone(),
+                own,
+            });
+            merged.insert((parent, name), Merged::View(view));
+            stack.push((view, parts.into_iter().map(Level::Of).collect()));
+        }
+    }
+    (nodes, merged, conflicts)
+}
+
+/// Reports the conflict `conflict` of file `index`'s view, whose view
+/// nodes so far are `nodes`: each part, in the order the sources are
+/// reported in (its own directory, then each directory upward, then its
+/// imports in source order), against the first before it that it conflicts
+/// with, once per pair (`reported`), at the later of the two.
+fn report_conflicts(
+    scan: &Scan,
+    index: u32,
+    nodes: &[ViewNode],
+    (parent, name, parts): (u32, Name, &[ViewPart]),
+    reported: &mut HashSet<(Side, Side)>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let Some(file) = scan.files.get(index as usize) else {
+        return;
+    };
+    let depth = count(scan.chain(file.dir).count());
+    // Its own directory first (the last of the chain), then upward, then
+    // the imports.
+    let rank = |part: &ViewPart| {
+        if part.chain {
+            depth.saturating_sub(1).saturating_sub(part.source)
+        } else {
+            part.source
+        }
+    };
+    let mut parts = parts.to_vec();
+    parts.sort_by_key(rank);
+    let mut path = Vec::new();
+    let mut at = (parent != ROOT).then_some(parent);
+    while let Some(view) = at
+        && let Some(node) = nodes.get(view as usize)
+    {
+        path.push(scan.names.get(node.name));
+        at = node.parent;
+    }
+    path.reverse();
+    path.push(scan.names.get(name));
+    let shown = path.join(".");
+    for (later_at, later) in parts.iter().enumerate() {
+        let earlier = parts
+            .get(..later_at)
+            .into_iter()
+            .flatten()
+            .find(|earlier| scan.is_leaf(earlier.target) || scan.is_leaf(later.target));
+        let Some(earlier) = earlier else { continue };
+        let side = |part: &ViewPart| -> Side {
+            let import = (!part.chain).then(|| {
+                let alias = part.source.saturating_sub(depth);
+                let start = file.aliases.get(alias as usize).map_or(0, |a| a.span.start);
+                (index, start)
+            });
+            (part.target, import)
+        };
+        if !reported.insert((side(later), side(earlier))) {
             continue;
         }
-        let above = scan
-            .chain(node.dir)
-            .skip(1)
-            .find_map(|dir| scan.by_name.get(&(dir, ROOT, node.name)));
-        let Some(&above) = above else { continue };
-        let spans = |merged: u32| {
-            let first = *scan.nodes.get(merged as usize)?.contributors.first()?;
-            let file = scan.files.get(first as usize)?;
-            let own = file.global.iter().position(|&g| g == merged).map(count)?;
-            Some((first, first_leaf(file, own)?.0))
-        };
-        let (Some((file, here)), Some((other, there))) = (spans(index), spans(above)) else {
-            continue;
-        };
-        let name = scan.names.get(node.name);
-        errors.push(
-            Diagnostic::error(format!("`{name}` is declared in the directory above"), here)
-                .with_label("declared here")
-                .with_context_in(other, there, "declared in the directory above")
-                .in_input(file),
-        );
+        if let Some(error) = conflict_between(scan, index, &shown, (*later, *earlier), depth) {
+            errors.push(error);
+        }
+    }
+}
+
+/// The conflict at the view path `shown` of file `index` (whose chain has
+/// `depth` directories) between the later part and the earlier one: two
+/// leaves, "defined in two files", or a leaf and an interior node, "already
+/// defined", at the later, labelled as the module documentation says.
+fn conflict_between(
+    scan: &Scan,
+    index: u32,
+    shown: &str,
+    (later, earlier): (ViewPart, ViewPart),
+    depth: u32,
+) -> Option<Diagnostic> {
+    let file = scan.files.get(index as usize)?;
+    let leaves = scan.is_leaf(later.target) && scan.is_leaf(earlier.target);
+    let message = if leaves {
+        format!("field `{shown}` is defined in two files")
+    } else {
+        format!("field `{shown}` is already defined")
+    };
+    let imported_at = |part: &ViewPart| {
+        file.aliases
+            .get(part.source.saturating_sub(depth) as usize)
+            .map(|alias| alias.span)
+    };
+    let (later_file, later_path, _) = scan.part_spans(later.target)?;
+    let (earlier_file, earlier_path, earlier_item) = scan.part_spans(earlier.target)?;
+    let mut error = if later.chain {
+        let error = Diagnostic::error(message, later_path).in_input(later_file);
+        if leaves {
+            error.with_label("defined here")
+        } else {
+            error
+        }
+    } else {
+        let error = Diagnostic::error(message, imported_at(&later)?)
+            .with_label("imported here")
+            .in_input(index);
+        context_in(error, later_file, later_path, "defined here")
+    };
+    if !earlier.chain {
+        error = context_in(error, index, imported_at(&earlier)?, "imported here");
+    }
+    let earlier_span = if leaves { earlier_path } else { earlier_item };
+    error = context_in(error, earlier_file, earlier_span, "defined here");
+    // A directory above the file's own is one side.
+    let own_dir = depth.saturating_sub(1);
+    if [later, earlier]
+        .iter()
+        .any(|part| part.chain && part.source != own_dir)
+    {
+        error = error.with_note("one is in a directory above");
+    }
+    Some(error)
+}
+
+/// `error` with the label `text` at `span` of file `input`: a label of the
+/// primary span's own file when it is that file, else an excerpt of its
+/// own.
+fn context_in(error: Diagnostic, input: u32, span: Span, text: &str) -> Diagnostic {
+    if error.input == Some(input) {
+        error.with_context(span, text)
+    } else {
+        error.with_context_in(input, span, text)
     }
 }
 
@@ -1150,14 +1935,7 @@ fn value_cells(scan: &mut Scan) {
             Target::File(file) => Some(file),
             _ => None,
         })
-        .filter(|&file| {
-            scan.files.get(file as usize).is_some_and(|f| {
-                f.ast
-                    .items(f.ast.root())
-                    .last()
-                    .is_some_and(|&item| matches!(f.ast.item(item).kind, ItemKind::Result(_)))
-            })
-        })
+        .filter(|&file| scan.files.get(file as usize).is_some_and(is_value_file))
         .collect();
     imported.sort_unstable();
     imported.dedup();
@@ -1169,6 +1947,14 @@ fn value_cells(scan: &mut Scan) {
         let name = scan.names.intern(stem);
         scan.values.push((file, name));
     }
+}
+
+/// Whether `file` is a value file: its outermost block ends in a result.
+fn is_value_file(file: &File) -> bool {
+    file.ast
+        .items(file.ast.root())
+        .last()
+        .is_some_and(|&item| matches!(file.ast.item(item).kind, ItemKind::Result(_)))
 }
 
 /// What directory `dir` holds, as a "no module" note lists it: its
@@ -1221,6 +2007,7 @@ fn members(
                     span,
                     item,
                     target,
+                    whole: true,
                 });
             }
         }
@@ -1235,6 +2022,7 @@ fn members(
                                 span: bound.span,
                                 item,
                                 target: child,
+                                whole: false,
                             }),
                             None => errors.push(Diagnostic::error(
                                 format!(
@@ -1247,6 +2035,15 @@ fn members(
                         }
                     }
                     ImportMember::All(star) => {
+                        if let Target::File(of) = target
+                            && scan.files.get(of as usize).is_some_and(is_value_file)
+                        {
+                            errors.push(Diagnostic::error(
+                                "a value file has no members to import",
+                                star,
+                            ));
+                            continue;
+                        }
                         for root in target_roots(scan, target) {
                             if let Some(child) = scan.target_child(target, root) {
                                 aliases.push(Alias {
@@ -1254,6 +2051,7 @@ fn members(
                                     span: star,
                                     item,
                                     target: child,
+                                    whole: false,
                                 });
                             }
                         }
@@ -1281,32 +2079,35 @@ fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
                 .filter_map(|&root| f.mentions.tree.nodes.get(root as usize).map(|n| n.name))
                 .collect()
         }),
-        Target::Part { .. } | Target::Node(_) => Vec::new(),
+        Target::Part { .. } | Target::Node(_) | Target::View(_) => Vec::new(),
     }
 }
 
 /// Reports each name of `aliases`, the imports of file `index`, that
-/// clashes with another import, a top-level `fn`, `let`, `let mut`, `:=` or
-/// field root of the file, or a root of its directory chain.
+/// clashes: a whole import with another import, a top-level `fn`, `let`,
+/// `let mut`, `:=` or field root of the file, or a root of its directory
+/// chain; a member or a root of a `*`, which merges into the file's view
+/// with the file's fields, its directory chain and the other members, with
+/// a whole import or a top-level `fn`, `let`, `let mut` or `:=`.
 fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnostic>) {
     let Some(file) = scan.files.get(index as usize) else {
         return;
     };
     let ast = &file.ast;
-    // The file's own top-level names, first declaration of each.
-    let mut declared: Vec<(Name, Span)> = Vec::new();
+    // The file's own top-level names, first declaration of each, and
+    // whether it is a field's.
+    let mut declared: Vec<(Name, Span, bool)> = Vec::new();
     for &item in ast.items(ast.root()) {
-        let (ItemKind::Let { path, .. }
-        | ItemKind::Rebind { path, .. }
-        | ItemKind::Field { path, .. }) = ast.item(item).kind
-        else {
-            continue;
+        let (field, path) = match ast.item(item).kind {
+            ItemKind::Let { path, .. } | ItemKind::Rebind { path, .. } => (false, path),
+            ItemKind::Field { path, .. } => (true, path),
+            _ => continue,
         };
         if let Some(first) = ast.path(path).first()
             && let Some(name) = first.name()
-            && !declared.iter().any(|&(n, _)| n == name)
+            && !declared.iter().any(|&(n, _, f)| n == name && f == field)
         {
-            declared.push((name, first.span));
+            declared.push((name, first.span, field));
         }
     }
     let star = |alias: &Alias| {
@@ -1320,13 +2121,18 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
         let shown = scan.names.get(alias.name);
         let earlier = aliases
             .get(..position)
-            .and_then(|before| before.iter().find(|a| a.name == alias.name))
+            .and_then(|before| {
+                before
+                    .iter()
+                    .find(|a| a.name == alias.name && (alias.whole || a.whole))
+            })
             .map(|a| (a.span, "imported here"));
         let other = earlier.or_else(|| {
             declared
                 .iter()
-                .find(|&&(n, _)| n == alias.name)
-                .map(|&(_, span)| (span, "declared here"))
+                .filter(|&&(n, _, field)| n == alias.name && (alias.whole || !field))
+                .min_by_key(|&&(_, span, _)| span.start)
+                .map(|&(_, span, _)| (span, "declared here"))
         });
         if let Some((span, label)) = other {
             let message = format!("`{shown}` is imported in this file");
@@ -1340,7 +2146,7 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
         let above = scan
             .chain(file.dir)
             .find_map(|dir| scan.by_name.get(&(dir, ROOT, alias.name)));
-        if above.is_some() {
+        if alias.whole && above.is_some() {
             errors.push(Diagnostic::error(
                 format!("`{shown}` is a field of this directory"),
                 alias.span,
@@ -1418,6 +2224,26 @@ fn whole_reads_needing_back(
     }
 }
 
+/// The files a whole read by file `index` of its view node `view` needs:
+/// every owner of every leaf under it, in whichever directory or import,
+/// but `index` itself, whose own leaves are computed in its block; with the
+/// node of an import that reaches into `index`, if one does, which is a
+/// cycle of one file, as a reach through a whole import is.
+fn view_owners(scan: &Scan, index: u32, view: u32) -> (Vec<u32>, Option<Target>) {
+    let mut owners = Vec::new();
+    let mut reached = None;
+    let parts = scan.views.get(view as usize).map_or(&[][..], |v| &v.parts);
+    for &part in parts {
+        let files = scan.part_owners(part);
+        if !part.chain && files.contains(&index) {
+            reached.get_or_insert(part.target);
+        } else {
+            owners.extend(files.into_iter().filter(|&file| file != index));
+        }
+    }
+    (owners, reached)
+}
+
 /// Fills [`Scan::needs`], and returns for each file the first mention, in
 /// source order, of a declaration of each file it needs, with what it
 /// shows.
@@ -1440,24 +2266,34 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
                 *entry = (span, shown());
             }
         };
-        let own_nodes = count(file.global.len());
-        let own_functions = count(file.functions.len());
         for (position, fields) in file.mentions.fields.iter().enumerate() {
             let spans = file.mentions.field_spans.get(position);
             let foreign = file.mentions.foreign.get(position).into_iter().flatten();
-            let own = fields
-                .iter()
-                .zip(spans.into_iter().flatten())
-                .filter_map(|(&n, &span)| Some((*file.global.get(n as usize)?, span)));
-            let mut nodes: Vec<(u32, Span)> = own.collect();
+            let mut nodes: Vec<(u32, Span)> = Vec::new();
+            // The nodes of the view it reads whole, each with the reference.
+            let mut views: Vec<(u32, Span)> = Vec::new();
+            for (&n, &span) in fields.iter().zip(spans.into_iter().flatten()) {
+                if let Some(&global) = file.global.get(n as usize) {
+                    nodes.push((global, span));
+                } else if let Some(view) = scope.own_view(n) {
+                    views.push((view, span));
+                }
+            }
             for &(need, span) in foreign {
                 match need {
                     // Through an import: what it reaches needs its files,
                     // and reaching into this file is a cycle of one file.
                     Need::Field(n) => {
-                        let Some(target) = scope.target(n) else {
-                            nodes.push((n.saturating_sub(own_nodes), span));
-                            continue;
+                        let target = match scope.target(n) {
+                            None => {
+                                nodes.extend(scope.merged(n).map(|merged| (merged, span)));
+                                continue;
+                            }
+                            Some(Target::View(view)) => {
+                                views.push((view, span));
+                                continue;
+                            }
+                            Some(target) => target,
                         };
                         let owners = scan.target_files(target);
                         if owners.contains(&index) {
@@ -1475,31 +2311,30 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
                         }
                     }
                     Need::Function(f) => {
-                        let id = f.saturating_sub(own_functions);
-                        if let Some(function) = scan.functions.get(id as usize) {
-                            let owner = function.file;
-                            let name = scan
-                                .files
-                                .get(owner as usize)
-                                .and_then(|o| o.mentions.functions.get(function.index as usize))
-                                .map(|t| t.name);
-                            record(owner, span, &|| {
-                                name.map_or_else(String::new, |n| scan.names.get(n).to_owned())
-                            });
+                        if let Some(function) = scope
+                            .foreign_function(f)
+                            .and_then(|id| scan.functions.get(id as usize))
+                        {
+                            record(function.file, span, &|| scan.show_function(*function));
                         }
                     }
                 }
             }
             for (merged, span) in nodes {
-                let Some(node) = scan.nodes.get(merged as usize) else {
-                    continue;
-                };
-                let owners = node
-                    .leaf
-                    .as_ref()
-                    .map_or(node.contributors.as_slice(), std::slice::from_ref);
-                for &owner in owners {
+                for owner in scan.target_files(Target::Node(merged)) {
                     record(owner, span, &|| scan.show(merged));
+                }
+            }
+            for (view, span) in views {
+                let (owners, reached) = view_owners(scan, index, view);
+                if let Some(target) = reached
+                    && !itself
+                {
+                    itself = true;
+                    errors.push(needs_itself(scan, index, target, span));
+                }
+                for owner in owners {
+                    record(owner, span, &|| scan.show_view(view));
                 }
             }
         }
@@ -1602,12 +2437,25 @@ fn order(needs: &[Vec<u32>]) -> Vec<u32> {
 }
 
 /// Finds each file's schedule, its shared interior nodes that a later
-/// file in the order computes left out.
+/// file in the order computes left out, and the nodes of its view with a
+/// leaf of the file under them that it reads whole in: those mentioned and
+/// the view nodes under them, each needing its own children (see
+/// [`Mentions::views`]).
 fn schedule(scan: &mut Scan) {
+    let edges: Vec<(Vec<mentions::ViewNode>, Vec<bool>)> = scan
+        .files
+        .iter()
+        .map(|file| view_edges(scan, file))
+        .collect();
+    let mut needs = Vec::with_capacity(edges.len());
+    for (file, (views, needed)) in scan.files.iter_mut().zip(edges) {
+        file.mentions.views = views;
+        needs.push(needed);
+    }
     let rank = &scan.rank;
     let mut schedules = Vec::with_capacity(scan.files.len());
-    for (index, file) in (0u32..).zip(&scan.files) {
-        let done: Vec<bool> = file
+    for ((index, file), needed) in (0u32..).zip(&scan.files).zip(needs) {
+        let mut done: Vec<bool> = file
             .global
             .iter()
             .map(|&merged| {
@@ -1621,11 +2469,74 @@ fn schedule(scan: &mut Scan) {
                 })
             })
             .collect();
+        done.extend(needed.iter().map(|&needed| !needed));
         schedules.push(file.mentions.schedule_except(&done));
     }
     for (file, schedule) in scan.files.iter_mut().zip(schedules) {
         file.schedule = schedule;
     }
+}
+
+/// The nodes of `file`'s view with a leaf of the file under them, as the
+/// nodes of its graph of what needs what ([`Mentions::views`]), placed by
+/// the file's own node of their path, with whether the file reads each
+/// whole: those it mentions, and the view nodes under them. Only those
+/// have their children, the file's own nodes or such view nodes, as edges:
+/// finding every one's would cost every file of a directory the children of
+/// its directory's nodes, which a whole read costs only the file that
+/// reads them.
+fn view_edges(scan: &Scan, file: &File) -> (Vec<mentions::ViewNode>, Vec<bool>) {
+    let scope = FileScope::new(scan, file);
+    let own = count(file.global.len());
+    let start = file.view.start;
+    let nodes = scan
+        .views
+        .get(start as usize..start.saturating_add(file.view.own) as usize)
+        .unwrap_or_default();
+    let mut views: Vec<mentions::ViewNode> = nodes
+        .iter()
+        .map(|node| {
+            let tree = node
+                .own
+                .and_then(|own| file.mentions.tree.nodes.get(own as usize));
+            mentions::ViewNode {
+                name: node.name,
+                parent: node
+                    .parent
+                    .map(|parent| own.saturating_add(parent.saturating_sub(start))),
+                children: Vec::new(),
+                first: tree.map_or(0, |tree| tree.first),
+                last: tree.map_or(0, |tree| tree.last),
+            }
+        })
+        .collect();
+    let mut needed = vec![false; views.len()];
+    let mut stack: Vec<u32> = file
+        .mentions
+        .fields
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&n| scope.own_view(n).is_some())
+        .collect();
+    while let Some(number) = stack.pop() {
+        let at = number.saturating_sub(own) as usize;
+        if needed.get(at) != Some(&false) {
+            continue;
+        }
+        let children: Vec<u32> = scope
+            .view_children(number)
+            .into_iter()
+            .map(|(_, child)| child)
+            .filter(|&child| child < scope.merged_start())
+            .collect();
+        stack.extend(children.iter().filter(|&&c| scope.own_view(c).is_some()));
+        if let (Some(seen), Some(view)) = (needed.get_mut(at), views.get_mut(at)) {
+            *seen = true;
+            view.children = children;
+        }
+    }
+    (views, needed)
 }
 
 /// What the checker knows of the workspace while it checks one of its
@@ -1709,26 +2620,12 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The fields of the record of `target`, a directory, a file or a part
-    /// read whole through an import: each child's name and target, in the
-    /// order of the directory's or the file's tree.
+    /// The fields of the record of `target`, a directory, a file, a part or
+    /// a view node read whole: each child's name and target, in the order of
+    /// the directory's or the file's tree, or the view's.
     pub(crate) fn target_fields(&self, target: Target) -> Vec<(Name, Target)> {
         let names = match target {
-            Target::Part { file, node } => self
-                .scan
-                .files
-                .get(file as usize)
-                .and_then(|f| {
-                    let tree = &f.mentions.tree;
-                    let children = &tree.nodes.get(node as usize)?.children;
-                    Some(
-                        children
-                            .iter()
-                            .filter_map(|&c| tree.nodes.get(c as usize).map(|n| n.name))
-                            .collect(),
-                    )
-                })
-                .unwrap_or_default(),
+            Target::Part { .. } | Target::View(_) => self.scan.child_names(target),
             other => target_roots(self.scan, other),
         };
         names
@@ -1738,7 +2635,7 @@ impl<'a> Context<'a> {
     }
 
     /// A name for the slot of the record of `target`: the name the file
-    /// imports it as, or a part's last name.
+    /// imports it as, or a part's or a view node's last name.
     pub(crate) fn target_name(&self, target: Target) -> Option<Name> {
         if let Some(alias) = self.file.aliases.iter().find(|a| a.target == target) {
             return Some(alias.name);
@@ -1750,8 +2647,16 @@ impl<'a> Context<'a> {
                 .get(file as usize)
                 .and_then(|f| f.mentions.tree.nodes.get(node as usize))
                 .map(|n| n.name),
+            Target::View(view) => self.scan.views.get(view as usize).map(|v| v.name),
             _ => self.file.aliases.first().map(|a| a.name),
         }
+    }
+
+    /// Whether a reference in the file may read through its view rather
+    /// than a binding: it imports something, or several of its sources
+    /// share a node (see [`FileScope::reads_through`]).
+    pub(crate) fn has_view(&self) -> bool {
+        !self.file.aliases.is_empty() || self.file.view.end > self.file.view.start
     }
 
     /// The file being checked.
@@ -1849,6 +2754,11 @@ pub struct Workspace {
     /// owner.
     #[cfg(test)]
     cell_slots: Vec<Slot>,
+    /// Each file's records of the nodes of its view with a leaf of it under
+    /// them, by input number: kept for the tests' check that each reads
+    /// only cells stored before it.
+    #[cfg(test)]
+    view_records: Vec<Vec<ViewRecord>>,
 }
 
 /// Scans, checks and lowers the workspace of `sources`, each with its
@@ -1886,6 +2796,8 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
     // The files whose check failed, or that need one that did: those are
     // not checked, since their errors would follow from the first.
     let mut failed = vec![false; scan.files.len()];
+    #[cfg(test)]
+    let mut view_records: Vec<Vec<ViewRecord>> = vec![Vec::new(); scan.files.len()];
     for index in scan.order.clone() {
         if blocked(&scan, &mut failed, index) {
             continue;
@@ -1911,14 +2823,12 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
             Some(Ok((_, output))) => computed_cells(&scan, index, output),
             _ => Vec::new(),
         };
-        let keep = |name: Name| {
-            file.mentions.tree.root(name).is_some_and(|root| {
-                let global = file.global.get(root as usize).copied();
-                global.and_then(|global| scan.computed_by(global)) == Some(index)
-            }) || file.mentions.functions.iter().any(|top| {
-                top.name == name && matches!(file.ast.item(top.item).kind, ItemKind::Field { .. })
-            })
-        };
+        let keep = |name: Name| commits(&scan, index, name);
+        #[cfg(test)]
+        if let Some(Ok((_, output))) = &compiled {
+            let records = output.checked.resolution.view_records();
+            set(&mut view_records, index, records.to_vec());
+        }
         let result = match compiled {
             Some(Ok((ir, output))) => {
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
@@ -1932,11 +2842,8 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
                 // once a file has failed, so the files checked after it
                 // need only the merged nodes' slots kept apart from theirs.
                 slot_names = scan.cell_names();
-                match failed_check {
-                    Some(Err(errors)) => Err(errors),
-                    // Every file of the order is a file of the workspace.
-                    _ => Err(Vec::new()),
-                }
+                // Every file of the order is a file of the workspace.
+                Err(failed_check.and_then(Result::err).unwrap_or_default())
             }
         };
         if let Some(file) = scan.files.get_mut(index as usize) {
@@ -1980,6 +2887,23 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
         types,
         #[cfg(test)]
         cell_slots,
+        #[cfg(test)]
+        view_records,
+    })
+}
+
+/// Whether file `index` commits its declaration `name` for the files
+/// checked after it: a root it computes, being its last contributor, or a
+/// `def`.
+fn commits(scan: &Scan, index: u32, name: Name) -> bool {
+    let Some(file) = scan.files.get(index as usize) else {
+        return false;
+    };
+    file.mentions.tree.root(name).is_some_and(|root| {
+        let global = file.global.get(root as usize).copied();
+        global.and_then(|global| scan.computed_by(global)) == Some(index)
+    }) || file.mentions.functions.iter().any(|top| {
+        top.name == name && matches!(file.ast.item(top.item).kind, ItemKind::Field { .. })
     })
 }
 
@@ -2335,12 +3259,14 @@ mod tests {
             error(&[("a.gcsl", "def f(): Int { 1 }"), ("b.gcsl", "f = 2")]).0,
             "field `f` is defined in two files"
         );
+        // A root of a directory above merges; the same leaf in both is a
+        // conflict, reported at the directory above.
         assert_eq!(
             error(&[("a.gcsl", "version = 1"), ("sub/b.gcsl", "version = 2")]),
             (
-                "`version` is declared in the directory above".to_owned(),
-                Some(1),
-                vec![Some(0)]
+                "field `version` is defined in two files".to_owned(),
+                Some(0),
+                vec![Some(1)]
             )
         );
     }
@@ -2384,6 +3310,7 @@ mod tests {
         };
         let mut workspace = check(&sources).map_err(shown)?;
         assert_imports_stored(&workspace);
+        assert_assemblies_stored(&workspace);
         let index = workspace.file(path).unwrap();
         let outcome = workspace.run(index).map_err(shown)?;
         Ok(outcome.value.to_string())
@@ -2436,6 +3363,94 @@ mod tests {
                     file.path,
                     scan.show_target(target)
                 );
+            }
+        }
+    }
+
+    /// The slots the top-level block of file `file` of `workspace` stores,
+    /// in order.
+    fn top_stores(workspace: &Workspace, file: u32) -> Vec<Slot> {
+        let Some(Some(ir)) = workspace.irs.get(file as usize) else {
+            return Vec::new();
+        };
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            return Vec::new();
+        };
+        ir.items(items)
+            .iter()
+            .filter_map(|&item| match ir.get(item).kind {
+                IrKind::Store(slot, _) => Some(slot),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Asserts that every record a file of `workspace` assembles of a node
+    /// of its view with a leaf of the file under it reads only cells stored
+    /// before it: the file's own by an earlier node of its top-level block,
+    /// every other one by the top-level block of a file it needs, which runs
+    /// whole before it. And that every record any file assembles at its top
+    /// level (an interior node's, a shared node's, an imported one) reads
+    /// only cells stored earlier in its block or by a file earlier in the
+    /// order: slice 25's shared nodes read the cells of the files that
+    /// contribute to them, which come earlier but need not be needed. A cell
+    /// nobody stored first would read as `{}`.
+    fn assert_assemblies_stored(workspace: &Workspace) {
+        let scan = &workspace.scan;
+        for (index, file) in (0u32..).zip(&scan.files) {
+            let own = top_stores(workspace, index);
+            let needed: Vec<Slot> = scan
+                .needed(index)
+                .into_iter()
+                .filter(|&other| other != index)
+                .flat_map(|other| top_stores(workspace, other))
+                .collect();
+            let rank = scan.order.iter().position(|&f| f == index).unwrap_or(0);
+            let earlier: Vec<Slot> = scan.order[..rank]
+                .iter()
+                .flat_map(|&other| top_stores(workspace, other))
+                .collect();
+            let records = workspace.view_records.get(index as usize);
+            for (slot, _, fields) in records.into_iter().flatten() {
+                let Some(at) = own.iter().position(|s| s == slot) else {
+                    let path = &file.path;
+                    assert_eq!(*slot, Slot::NONE, "{path}: a view record is not stored");
+                    continue;
+                };
+                for &(name, cell, _) in fields {
+                    assert!(
+                        own[..at].contains(&cell) || needed.contains(&cell),
+                        "{}: the view record in {slot:?} reads `{}` from {cell:?}, stored by \
+                         nothing before it",
+                        file.path,
+                        scan.names.get(name)
+                    );
+                }
+            }
+            let Some(Some(ir)) = workspace.irs.get(index as usize) else {
+                continue;
+            };
+            let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+                continue;
+            };
+            let mut stored: Vec<Slot> = Vec::new();
+            for &item in ir.items(items) {
+                let IrKind::Store(slot, value) = ir.get(item).kind else {
+                    continue;
+                };
+                if let IrKind::MakeRecord { values, .. } = ir.get(value).kind {
+                    for &field in ir.items(values) {
+                        if let IrKind::Load(cell, _) = ir.get(field).kind {
+                            assert!(
+                                stored.contains(&cell) || earlier.contains(&cell),
+                                "{}: a record stored in {slot:?} reads {cell:?}, stored by \
+                                 nothing before it",
+                                file.path
+                            );
+                        }
+                    }
+                }
+                stored.push(slot);
             }
         }
     }
@@ -2937,13 +3952,20 @@ mod tests {
             ("import lib\nfn lib(): Int { 1 }", imported),
             ("import lib\nlet lib = 1", imported),
             ("import lib\nlib.a = 1", imported),
-            ("import com from lib\ncom.a = 1", imported),
-            ("import * from lib\ncom.a = 1", imported),
             ("import tools as version", "is a field of this directory"),
             ("import x from lib.x", "has no `x`"),
         ] {
             files[0].1 = text;
             assert!(noted(&files, &[]).0.ends_with(message), "{text}");
+        }
+        // A member or a `*` root merges with the file's own root of its
+        // name.
+        for text in [
+            "import com from lib\ncom.a = 1",
+            "import * from lib\ncom.a = 1",
+        ] {
+            files[0].1 = text;
+            assert!(ws(&files).is_ok(), "{text}");
         }
         files[0].1 = "import * from lib\na = com.x.lib.name";
         assert!(ws(&files).is_ok());
@@ -3241,5 +4263,772 @@ p24 = w.com"#;
             record.sort();
             assert_eq!(record, ["a = 7", "b = 4"], "{main}");
         }
+    }
+
+    /// The files of the merging summary (slice 27), in path order: `pkgs/`
+    /// is the root.
+    const MERGE: [(&str, &str); 5] = [
+        (
+            "app/main.gcsl",
+            "import * from lib\ncom.x.app.deps = [com.x.lib, com.y.lib]\n\
+             com.x.app.base = com.base.name",
+        ),
+        ("app/vendor/v.gcsl", "com.vendor.thing = 1\nall = com"),
+        ("lib/x.gcsl", "com.x.lib.name = \"lib\""),
+        ("lib/y.gcsl", "com.y.lib.name = \"ylib\""),
+        ("workspace.gcsl", "com.base.name = \"base\""),
+    ];
+
+    /// The single error of scanning `files`, shown: its message and file,
+    /// its label, each other label's file and text, and its notes.
+    fn shown_error(files: &[(&str, &str)]) -> String {
+        let errors = ws(files).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
+        paths.sort_unstable();
+        let path = |input: Option<u32>| {
+            input
+                .and_then(|i| paths.get(i as usize))
+                .copied()
+                .unwrap_or("?")
+        };
+        let error = &errors[0];
+        let mut parts = vec![format!("{} at {}", error.message, path(error.input))];
+        if let Some(label) = &error.label {
+            parts[0] = format!("{} ({label})", parts[0]);
+        }
+        for label in &error.labels {
+            let file = path(label.input.or(error.input));
+            parts.push(format!("{file}: {}", label.text));
+        }
+        for note in &error.notes {
+            parts.push(format!("note: {note}"));
+        }
+        parts.join("; ")
+    }
+
+    /// The checked workspace of `files`.
+    fn checked(files: &[(&str, &str)]) -> Workspace {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        check(&sources).unwrap()
+    }
+
+    /// Whether the first item of the top-level block of the file at `path`
+    /// of `workspace` stores a record: one assembled as the file starts.
+    fn assembled_first(workspace: &Workspace, path: &str) -> bool {
+        let index = workspace.file(path).unwrap();
+        let ir = workspace.irs[index as usize].as_ref().unwrap();
+        let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
+            panic!("expected a block")
+        };
+        let first = ir.items(items)[0];
+        matches!(ir.get(first).kind, IrKind::Store(_, value)
+            if matches!(ir.get(value).kind, IrKind::MakeRecord { .. }))
+    }
+
+    #[test]
+    fn the_merging_summary_runs_both_files() {
+        assert_eq!(
+            value(&MERGE, "app/main.gcsl"),
+            "{com = {x = {app = {deps = [{name = \"lib\"}, {name = \"ylib\"}]; \
+             base = \"base\"}}}}"
+        );
+        // `all` has the root's part, `app/`'s and v's own, root directory
+        // first, but not `lib/`'s, which v does not import.
+        assert_eq!(
+            value(&MERGE, "app/vendor/v.gcsl"),
+            "{com = {vendor = {thing = 1}}; all = {base = {name = \"base\"}; \
+             x = {app = {deps = [{name = \"lib\"}, {name = \"ylib\"}]; base = \"base\"}}; \
+             vendor = {thing = 1}}}"
+        );
+        // v owns a leaf of `com`: its view's `com` is a node of its own
+        // schedule, after its own child and before `all`.
+        let scan = ws(&MERGE).unwrap();
+        let v = &scan.files[1];
+        assert_eq!((v.view.own, v.view.end - v.view.start), (1, 1));
+        let number = count(v.global.len());
+        assert!(v.schedule.order.contains(&number));
+        assert_eq!(v.schedule.point[number as usize], 1);
+        // main reads no node of its view whole: nothing is assembled.
+        let main = &scan.files[0];
+        let own = count(main.global.len());
+        assert!(main.schedule.order.iter().all(|&n| n < own));
+        // Its `com` is the root's, `app/`'s and `lib/`'s, root first.
+        let com = &scan.views[main.view.start as usize];
+        let sources: Vec<u32> = com.parts.iter().map(|p| p.source).collect();
+        assert_eq!(sources, [0, 1, 2]);
+        // v's type of `all` is the record of the merged children.
+        let mut workspace = checked(&MERGE);
+        let dump = workspace.dump_types(1).unwrap();
+        assert!(
+            dump.contains(
+                "(name com : {base: {name: String}, vendor: {thing: Int}, x: {app: {base: \
+                 String, deps: List<{name: String}>}}}"
+            ),
+            "{dump}"
+        );
+    }
+
+    /// [`POSITIONS`] through a merged node: `com` is the file's own and
+    /// `lib/`'s, imported with `*`, and `com.x.lib.r` is `lib/`'s leaf, read
+    /// from every kind of position; `com` is read whole too (a node of the
+    /// file's schedule, the file owning `com.x.app.name`), and a function
+    /// out of that record called. A `def` is a root, never a leaf under
+    /// `com`: `com.x.lib.f` is a field holding one, and `twice` itself is
+    /// called through the `*`.
+    const MERGED_POSITIONS: &str = r#"import * from lib
+fn get(config: {a: Int}): Int { config.a }
+fn wrap(v: {a: Int}, w: {a: Int}): Int { v.a + w.a }
+let xs = for i in 0..50 { i }
+let mut m = { a = 0 }
+m := com.x.lib.r
+let mut k = 0
+let mut t = 0
+let lz = lazy com.x.lib.r
+let lw = lazy com
+let g = fn(): {a: Int} { com.x.lib.r }
+let gw = fn(): Int { let w = com; = w.x.lib.f(com.x.lib.r.a) }
+def outer(): {inner: fn(): Int} {
+  def inner(): Int {
+    let w = com
+    = com.x.lib.r.a + w.x.lib.r.a
+  }
+}
+let w = com
+com.x.app.name = "app"
+p01 = "{com.x.lib.r}"
+p02 = xs[com.x.lib.r.a]
+p03 = m
+p04 = for v in [com.x.lib.r] { v.a }
+p05 = for v in [1] if com.x.lib.r.a == 42 { v }
+p06 = for let i = com.x.lib.r.a; i < com.x.lib.r.a + 1; i := i + com.x.lib.r.a { i }
+p07 = for k < com.x.lib.r.a { k := k + 50; com.x.lib.r }
+p08 = len(do { t := t + 1; t } for t < com.x.lib.r.a)
+p09 = true and com.x.lib.r.a == 42
+p10 = com.x.lib.r is {a: Int}
+p11 = (com.x.lib.r as {a: Int}).a
+p12 = for v in [1, 2] { if v == 1 { continue com.x.lib.r }; break com.x.lib.r }
+p13 = get(config = com.x.lib.r)
+p14 = wrap(com.x.lib.r) { ...com.x.lib.r }
+p15 = { ...com.x.lib.r }
+p16 = len(0..com.x.lib.r.a)
+p17 = [com.x.lib.r]
+p18 = outer().inner()
+p19 = (await lz).a + (await lw).x.lib.r.a
+p20 = g()
+p21 = { let q = com.x.lib.r; = q }
+p22 = w.x.lib.f(w.x.lib.r.a)
+p23 = gw()
+p24 = twice(21)
+p25 = com
+p26 = com.x"#;
+
+    #[test]
+    fn a_merged_node_is_read_from_every_position() {
+        let files = [
+            ("app/main.gcsl", MERGED_POSITIONS),
+            (
+                "lib/x.gcsl",
+                "let base = 40\ncom.x.lib.r = { a = base + 2 }\ncom.x.lib.f = twice\n\
+                 def twice(n: Int): Int { n * 2 }",
+            ),
+            ("workspace.gcsl", ""),
+        ];
+        let lib = "lib = {r = {a = 42}; f = fn(n: Int): Int}";
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            format!(
+                "{{outer = fn(): {{inner: fn(): Int}}; com = {{x = {{app = {{name = \"app\"}}}}}}; \
+                 p01 = \"{{{{a = 42}}}}\"; p02 = 42; p03 = {{a = 42}}; p04 = [42]; p05 = [1]; \
+                 p06 = [42]; p07 = [{{a = 42}}]; p08 = 42; p09 = true; p10 = true; p11 = 42; \
+                 p12 = [{{a = 42}}, {{a = 42}}]; p13 = 42; p14 = 84; p15 = {{a = 42}}; \
+                 p16 = 42; p17 = [{{a = 42}}]; p18 = 84; p19 = 84; p20 = {{a = 42}}; \
+                 p21 = {{a = 42}}; p22 = 84; p23 = 84; p24 = 42; \
+                 p25 = {{x = {{app = {{name = \"app\"}}; {lib}}}}}; \
+                 p26 = {{app = {{name = \"app\"}}; {lib}}}}}"
+            )
+        );
+    }
+
+    #[test]
+    fn star_and_member_imports_merge_with_the_files_own_root() {
+        let lib = [
+            ("lib/x.gcsl", "com.x.lib.name = \"x\""),
+            ("lib/y.gcsl", "com.y.lib.name = \"y\""),
+            ("workspace.gcsl", ""),
+        ];
+        // A directory's tree, a file's own tree, and a member, each with an
+        // own `com`: the import side's children after the file's own.
+        for (main, all) in [
+            (
+                "import * from lib\ncom.app = 1\nall = com",
+                "{app = 1; x = {lib = {name = \"x\"}}; y = {lib = {name = \"y\"}}}",
+            ),
+            (
+                "import * from lib.y\ncom.app = 1\nall = com",
+                "{app = 1; y = {lib = {name = \"y\"}}}",
+            ),
+            (
+                "import com from lib\ncom.app = 1\nall = com",
+                "{app = 1; x = {lib = {name = \"x\"}}; y = {lib = {name = \"y\"}}}",
+            ),
+        ] {
+            let mut files = lib.to_vec();
+            files.push(("app/main.gcsl", main));
+            assert_eq!(
+                value(&files, "app/main.gcsl"),
+                format!("{{com = {{app = 1}}; all = {all}}}"),
+                "{main}"
+            );
+        }
+        // A member that is a leaf, and one that is a `def`.
+        let mut files = lib.to_vec();
+        files.push(("lib/z.gcsl", "n = 1\ndef twice(k: Int): Int { k * 2 }"));
+        files.push((
+            "app/main.gcsl",
+            "import n, twice from lib\nm = twice(n + 1)",
+        ));
+        assert_eq!(value(&files, "app/main.gcsl"), "{m = 4}");
+    }
+
+    #[test]
+    fn a_subdirectory_merges_under_a_root_above_two_levels_deep() {
+        let files = [
+            ("workspace.gcsl", "com.a = 1"),
+            ("x/b.gcsl", "com.b = 2"),
+            ("x/y/c.gcsl", "com.c = 3\nall = com\nb = com.b"),
+        ];
+        assert_eq!(
+            value(&files, "x/y/c.gcsl"),
+            "{com = {c = 3}; all = {a = 1; b = 2; c = 3}; b = 2}"
+        );
+        assert_eq!(value(&files, "x/b.gcsl"), "{com = {b = 2}}");
+    }
+
+    /// A whole read of each kind of node of the view: who assembles it, and
+    /// when, with its contents and their order.
+    #[test]
+    fn a_view_node_read_whole_of_each_kind() {
+        // One directory's tree, without an import: slice 25's rule, the
+        // last contributor's schedule; the view has no node of its own.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "com.one = 1"),
+            ("b.gcsl", "com.two = 2\nall = com"),
+        ];
+        let scan = ws(&files).unwrap();
+        assert!(scan.views.is_empty());
+        assert_eq!(
+            value(&files, "b.gcsl"),
+            "{com = {two = 2}; all = {one = 1; two = 2}}"
+        );
+        // Across directories, with no leaf of the reading file: assembled
+        // as the file starts, the root directory's part first.
+        let files = [
+            ("workspace.gcsl", "com.a = 1"),
+            ("sub/b.gcsl", "com.b = 2"),
+            ("sub/c.gcsl", "x = 0\nall = com"),
+        ];
+        assert_eq!(value(&files, "sub/c.gcsl"), "{x = 0; all = {a = 1; b = 2}}");
+        assert!(assembled_first(&checked(&files), "sub/c.gcsl"));
+        // Across directories, with a leaf of the reading file: a node of
+        // its schedule, after its own leaf, so not first.
+        let files = [
+            ("workspace.gcsl", "com.a = 1"),
+            ("sub/b.gcsl", "com.b = 2\nall = com"),
+        ];
+        assert_eq!(
+            value(&files, "sub/b.gcsl"),
+            "{com = {b = 2}; all = {a = 1; b = 2}}"
+        );
+        assert!(!assembled_first(&checked(&files), "sub/b.gcsl"));
+        // Across imports only, with no leaf of the reading file: as the
+        // file starts, in the imports' source order.
+        let files = [
+            (
+                "app/main.gcsl",
+                "import * from tools\nimport * from lib\nall = com",
+            ),
+            ("lib/x.gcsl", "com.x = 1"),
+            ("tools/t.gcsl", "com.t = 2"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "app/main.gcsl"), "{all = {t = 2; x = 1}}");
+        assert!(assembled_first(&checked(&files), "app/main.gcsl"));
+        // Mixed: a directory above, the file's own directory, an import and
+        // a leaf of the file, two levels of the view merged; `com.x` is
+        // read whole too, and a part of it alone.
+        let files = [
+            (
+                "app/main.gcsl",
+                "import * from lib\ncom.x.app = 1\nall = com\nx = com.x",
+            ),
+            ("app/other.gcsl", "com.other = 2"),
+            ("lib/x.gcsl", "com.x.lib = 3"),
+            ("workspace.gcsl", "com.x.root = 4\ncom.base = 5"),
+        ];
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{com = {x = {app = 1}}; all = {x = {root = 4; app = 1; lib = 3}; base = 5; \
+             other = 2}; x = {root = 4; app = 1; lib = 3}}"
+        );
+        let scan = ws(&files).unwrap();
+        let main = &scan.files[0];
+        // `com` and `com.x`, both with a leaf of main under them.
+        assert_eq!((main.view.own, main.view.end - main.view.start), (2, 2));
+    }
+
+    #[test]
+    fn the_needs_of_a_view_node_are_per_leaf() {
+        let base = [
+            ("workspace.gcsl", ""),
+            ("bad.gcsl", "def bad(): Int { [1][5] }\ncom.bad.v = bad()"),
+            ("ok.gcsl", "com.ok.v = 1"),
+        ];
+        // A leaf read alone needs its own file only: `bad.gcsl` never runs.
+        let mut files = base.to_vec();
+        files.push(("app/main.gcsl", "com.app.v = 2\na = com.ok.v"));
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{com = {app = {v = 2}}; a = 1}"
+        );
+        // Read whole, every owner of every leaf runs, `bad.gcsl` too.
+        files.pop();
+        files.push(("app/main.gcsl", "com.app.v = 2\na = com"));
+        assert_eq!(messages(&files, "app/main.gcsl"), ["index out of range"]);
+        files.pop();
+        files.push(("app/main.gcsl", "a = com"));
+        assert_eq!(messages(&files, "app/main.gcsl"), ["index out of range"]);
+    }
+
+    #[test]
+    fn conflicts_across_directories() {
+        let above = "one is in a directory above";
+        // Two leaves, at the directory above, whichever path is first.
+        assert_eq!(
+            shown_error(&[("a.gcsl", "version = 1"), ("sub/b.gcsl", "version = 2")]),
+            format!(
+                "field `version` is defined in two files at a.gcsl (defined here); \
+                 sub/b.gcsl: defined here; note: {above}"
+            )
+        );
+        assert_eq!(
+            shown_error(&[("z.gcsl", "version = 1"), ("a/b.gcsl", "version = 2")]),
+            format!(
+                "field `version` is defined in two files at z.gcsl (defined here); \
+                 a/b.gcsl: defined here; note: {above}"
+            )
+        );
+        // A whole value extended by a path below, and the other way.
+        let defined = format!(
+            "field `com` is already defined at a.gcsl; sub/b.gcsl: defined here; note: {above}"
+        );
+        assert_eq!(
+            shown_error(&[("a.gcsl", "com = 1"), ("sub/b.gcsl", "com.x = 2")]),
+            defined
+        );
+        assert_eq!(
+            shown_error(&[("a.gcsl", "com.x = 1"), ("sub/b.gcsl", "com = 2")]),
+            defined
+        );
+        // A `def` is a leaf: with a field, either way, and with a `def`.
+        for (a, b) in [
+            ("def f(): Int { 1 }", "f = 2"),
+            ("f = 2", "def f(): Int { 1 }"),
+            ("def f(): Int { 1 }", "def f(): Int { 2 }"),
+        ] {
+            assert_eq!(
+                shown_error(&[("a.gcsl", a), ("sub/b.gcsl", b)]),
+                format!(
+                    "field `f` is defined in two files at a.gcsl (defined here); \
+                     sub/b.gcsl: defined here; note: {above}"
+                ),
+                "{a} / {b}"
+            );
+        }
+        // Once per pair, however many files' views have it.
+        assert_eq!(
+            ws(&[
+                ("a.gcsl", "version = 1"),
+                ("sub/b.gcsl", "version = 2"),
+                ("sub/c.gcsl", "x = 1"),
+                ("sub/d/e.gcsl", "y = 1"),
+            ])
+            .unwrap_err()
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn conflicts_through_imports() {
+        let lib = [
+            ("lib/x.gcsl", "com.x.lib.name = \"x\""),
+            ("workspace.gcsl", ""),
+        ];
+        let with = |main: &'static str, more: &[(&'static str, &'static str)]| {
+            let mut files = lib.to_vec();
+            files.push(("app/main.gcsl", main));
+            files.extend_from_slice(more);
+            shown_error(&files)
+        };
+        // Two leaves, an own leaf and an imported interior node, and an own
+        // interior node and an imported leaf: at the import.
+        assert_eq!(
+            with("import * from lib\ncom.x.lib.name = \"own\"", &[]),
+            "field `com.x.lib.name` is defined in two files at app/main.gcsl (imported here); \
+             lib/x.gcsl: defined here; app/main.gcsl: defined here"
+        );
+        assert_eq!(
+            with("import * from lib\ncom.x.lib = 1", &[]),
+            "field `com.x.lib` is already defined at app/main.gcsl (imported here); \
+             lib/x.gcsl: defined here; app/main.gcsl: defined here"
+        );
+        assert_eq!(
+            with("import * from lib\ncom.x.lib.name.deep = 1", &[]),
+            "field `com.x.lib.name` is already defined at app/main.gcsl (imported here); \
+             lib/x.gcsl: defined here; app/main.gcsl: defined here"
+        );
+        // A member whose bound name is a plain root of the file, a leaf and
+        // an interior node of it.
+        let version = [("lib/v.gcsl", "version = 1")];
+        assert_eq!(
+            with("import version from lib\nversion = 2", &version),
+            "field `version` is defined in two files at app/main.gcsl (imported here); \
+             lib/v.gcsl: defined here; app/main.gcsl: defined here"
+        );
+        assert_eq!(
+            with("import version from lib\nversion.minor = 2", &version),
+            "field `version` is already defined at app/main.gcsl (imported here); \
+             lib/v.gcsl: defined here; app/main.gcsl: defined here"
+        );
+        // Against a directory above the file (not above `lib/`), and
+        // between two imports, at the later.
+        let mut files = lib.to_vec();
+        files.push(("app/sub/main.gcsl", "import * from lib"));
+        files.push(("app/up.gcsl", "com.x.lib.name = \"up\""));
+        assert_eq!(
+            shown_error(&files),
+            "field `com.x.lib.name` is defined in two files at app/sub/main.gcsl (imported \
+             here); lib/x.gcsl: defined here; app/up.gcsl: defined here; note: one is in a \
+             directory above"
+        );
+        assert_eq!(
+            with(
+                "import * from lib\nimport * from tools",
+                &[("tools/t.gcsl", "com.x.lib.name = \"t\"")]
+            ),
+            "field `com.x.lib.name` is defined in two files at app/main.gcsl (imported here); \
+             tools/t.gcsl: defined here; app/main.gcsl: imported here; lib/x.gcsl: defined here"
+        );
+    }
+
+    #[test]
+    fn a_view_is_the_files_own() {
+        // b does not see what a imported with `*`, nor its own directory's
+        // tree `lib/`'s part.
+        let mut files = vec![
+            ("app/a.gcsl", "import * from lib\nx = com.lib.v"),
+            ("lib/l.gcsl", "com.lib.v = 1"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "app/a.gcsl"), "{x = 1}");
+        files.push(("app/b.gcsl", "y = com.lib.v"));
+        assert_eq!(messages(&files, "app/b.gcsl"), ["undefined variable `com`"]);
+        files.pop();
+        files.push(("app/b.gcsl", "com.app.v = 2\ny = com.lib.v"));
+        assert_eq!(
+            messages(&files, "app/b.gcsl"),
+            ["no field `lib` in `{app: {v: Int}}`"]
+        );
+    }
+
+    #[test]
+    fn star_from_a_value_file_is_an_error() {
+        let files = [
+            ("app/main.gcsl", "import * from tools.build"),
+            ("tools/build.gcsl", "= 1"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "a value file has no members to import at app/main.gcsl"
+        );
+    }
+
+    #[test]
+    fn a_whole_import_still_clashes_with_a_root_of_the_view() {
+        let files = |main: &'static str| {
+            vec![
+                ("app/main.gcsl", main),
+                ("lib/x.gcsl", "com.x = 1"),
+                ("tools/t.gcsl", "t = 1"),
+                ("workspace.gcsl", ""),
+            ]
+        };
+        for main in [
+            "import * from lib\nimport tools as com",
+            "import tools as com\nimport * from lib",
+            "import tools as com\ncom.y = 1",
+        ] {
+            assert!(
+                shown_error(&files(main)).starts_with("`com` is imported in this file"),
+                "{main}"
+            );
+        }
+    }
+
+    #[test]
+    fn merging_the_same_cell_twice_is_idempotent() {
+        let lib = [("lib/x.gcsl", "com.x.lib.name = 1"), ("workspace.gcsl", "")];
+        // `*` from one directory twice.
+        let mut files = lib.to_vec();
+        files.push((
+            "app/main.gcsl",
+            "import * from lib\nimport * from lib\na = com.x.lib.name\nall = com",
+        ));
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{a = 1; all = {x = {lib = {name = 1}}}}"
+        );
+        assert!(ws(&files).unwrap().views.is_empty());
+        // `*` from the file's own directory (`app` inside `app/`), from a
+        // file of it, and from a directory above, with its own leaves.
+        for main in [
+            "import * from app\ncom.main.v = 1\nall = com",
+            "import * from app.other\ncom.main.v = 1\nall = com",
+            "import * from app.main\ncom.main.v = 1\nall = com",
+            "import com from app\ncom.main.v = 1\nall = com",
+        ] {
+            let mut files = lib.to_vec();
+            files.push(("app/main.gcsl", main));
+            files.push(("app/other.gcsl", "com.other.v = 2"));
+            assert_eq!(
+                value(&files, "app/main.gcsl"),
+                "{com = {main = {v = 1}}; all = {main = {v = 1}; other = {v = 2}}}",
+                "{main}"
+            );
+            assert!(ws(&files).unwrap().views.is_empty(), "{main}");
+        }
+        let mut files = lib.to_vec();
+        files.push((
+            "app/sub/main.gcsl",
+            "import * from app\ncom.sub = 1\nall = com",
+        ));
+        files.push(("app/other.gcsl", "com.other = 2"));
+        assert_eq!(
+            value(&files, "app/sub/main.gcsl"),
+            "{com = {sub = 1}; all = {other = 2; sub = 1}}"
+        );
+    }
+
+    /// A member of the file's own directory bound by another name is not
+    /// the same cell at the same path: reaching the file's own nodes through
+    /// it is still the one-file cycle, as through a whole import.
+    #[test]
+    fn a_renamed_member_reaching_the_files_own_nodes_needs_itself() {
+        let files = [
+            (
+                "app/main.gcsl",
+                "import com as c from app\ncom.x = 1\ny = c.x",
+            ),
+            ("workspace.gcsl", ""),
+        ];
+        assert!(shown_error(&files).starts_with(
+            "`app/main.gcsl` needs itself at app/main.gcsl (`com.x` is computed when this \
+             file runs)"
+        ));
+    }
+
+    #[test]
+    fn an_importing_files_items_merge_in_any_order() {
+        let lines = [
+            "import * from lib",
+            "com.x.app.a = com.x.lib.name + b",
+            "b = 2",
+            "all = com.x",
+        ];
+        let reversed: Vec<&str> = lines.iter().rev().copied().collect();
+        let orders = (0..lines.len())
+            .map(|start| {
+                let mut rotated = lines.to_vec();
+                rotated.rotate_left(start);
+                rotated
+            })
+            .chain([reversed]);
+        for order in orders {
+            let main = order.join("\n");
+            let files = [
+                ("app/main.gcsl", main.as_str()),
+                ("lib/x.gcsl", "com.x.lib.name = 1"),
+                ("workspace.gcsl", ""),
+            ];
+            let shown = value(&files, "app/main.gcsl");
+            for field in [
+                "com = {x = {app = {a = 3}}}",
+                "b = 2",
+                "all = {app = {a = 3}; lib = {name = 1}}",
+            ] {
+                assert!(shown.contains(field), "{main}: {shown}");
+            }
+        }
+    }
+
+    /// The time to check a workspace of `count` sibling directories of the
+    /// root, each with one file of ten leaves under the root's `com`, each
+    /// reading one leaf of the root's file through the merged `com`, and to
+    /// run the last: linear in `count`. Run with `cargo test --release --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark, not a test"]
+    fn benchmark_sibling_directories_merging() {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut report = String::new();
+        for count in [50_u32, 100, 200, 400, 800] {
+            let mut sources = vec![
+                SourceFile::new(
+                    "workspace.gcsl",
+                    (0..10).fold(String::new(), |mut text, leaf| {
+                        writeln!(text, "com.base.l{leaf} = {leaf}").unwrap();
+                        text
+                    }),
+                )
+                .unwrap(),
+            ];
+            for dir in 0..count {
+                let mut text = format!("com.d{dir}.l0 = com.base.l3 + 1\n");
+                for leaf in 1..10 {
+                    writeln!(text, "com.d{dir}.l{leaf} = com.d{dir}.l{} + 1", leaf - 1).unwrap();
+                }
+                sources.push(SourceFile::new(format!("d{dir:04}/f.gcsl"), text).unwrap());
+            }
+            let start = std::time::Instant::now();
+            scan(&sources).unwrap();
+            let scanned = start.elapsed();
+            let start = std::time::Instant::now();
+            let mut workspace = check(&sources).unwrap();
+            let checked = start.elapsed();
+            let last = workspace
+                .file(&format!("d{:04}/f.gcsl", count - 1))
+                .unwrap();
+            let outcome = workspace.run(last).unwrap();
+            let total = start.elapsed();
+            assert!(format!("{}", outcome.value).contains("l9 = 13"));
+            writeln!(
+                report,
+                "{count} directories: scan {scanned:?}; check {checked:?}, check and run {total:?}"
+            )
+            .unwrap();
+        }
+        std::io::stdout().write_all(report.as_bytes()).unwrap();
+    }
+
+    /// [`benchmark_sibling_directories_merging`] with every file in one
+    /// directory below the root: each file's view merges the root's `com`
+    /// with the directory's, which has every file's part, so a file's view
+    /// must not cost the size of its directory's tree. Linear in `count`.
+    /// Run with `cargo test --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark, not a test"]
+    fn benchmark_one_directory_merging_with_the_root() {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut report = String::new();
+        for count in [50_u32, 100, 200, 400, 800] {
+            let mut sources = vec![
+                SourceFile::new(
+                    "workspace.gcsl",
+                    (0..10).fold(String::new(), |mut text, leaf| {
+                        writeln!(text, "com.base.l{leaf} = {leaf}").unwrap();
+                        text
+                    }),
+                )
+                .unwrap(),
+            ];
+            for file in 0..count {
+                let mut text = format!("com.f{file}.l0 = com.base.l3 + 1\n");
+                for leaf in 1..10 {
+                    let before = leaf - 1;
+                    writeln!(text, "com.f{file}.l{leaf} = com.f{file}.l{before} + 1").unwrap();
+                }
+                sources.push(SourceFile::new(format!("app/f{file:04}.gcsl"), text).unwrap());
+            }
+            let start = std::time::Instant::now();
+            scan(&sources).unwrap();
+            let scanned = start.elapsed();
+            let start = std::time::Instant::now();
+            let mut workspace = check(&sources).unwrap();
+            let checked = start.elapsed();
+            let last = workspace
+                .file(&format!("app/f{:04}.gcsl", count - 1))
+                .unwrap();
+            let outcome = workspace.run(last).unwrap();
+            let total = start.elapsed();
+            assert!(format!("{}", outcome.value).contains("l9 = 13"));
+            writeln!(
+                report,
+                "{count} files: scan {scanned:?}; check {checked:?}, check and run {total:?}"
+            )
+            .unwrap();
+        }
+        std::io::stdout().write_all(report.as_bytes()).unwrap();
+    }
+
+    /// The cost of a file's view in a chain of `depth` directories, each
+    /// below the one before and with one file of ten leaves under `com`,
+    /// each reading a leaf of the directory above through the merged `com`:
+    /// a file's view merges every directory above it, so the time per file
+    /// grows with its depth. Run with `cargo test --release -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "a benchmark, not a test"]
+    fn benchmark_a_deep_chain_of_directories() {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut report = String::new();
+        for depth in [10_u32, 25, 50, 100] {
+            let mut path = String::new();
+            let mut sources = Vec::new();
+            for level in 0..depth {
+                let mut text = if level == 0 {
+                    String::from("com.d0.l0 = 0\n")
+                } else {
+                    format!("com.d{level}.l0 = com.d{}.l9 + 1\n", level - 1)
+                };
+                for leaf in 1..10 {
+                    let before = leaf - 1;
+                    writeln!(text, "com.d{level}.l{leaf} = com.d{level}.l{before} + 1").unwrap();
+                }
+                let name = if level == 0 {
+                    String::from("workspace.gcsl")
+                } else {
+                    write!(path, "d{level}/").unwrap();
+                    format!("{path}f.gcsl")
+                };
+                sources.push(SourceFile::new(name, text).unwrap());
+            }
+            let start = std::time::Instant::now();
+            scan(&sources).unwrap();
+            let scanned = start.elapsed();
+            let start = std::time::Instant::now();
+            let mut workspace = check(&sources).unwrap();
+            let checked = start.elapsed();
+            let last = workspace.file(&format!("{path}f.gcsl")).unwrap();
+            let outcome = workspace.run(last).unwrap();
+            let total = start.elapsed();
+            assert!(format!("{}", outcome.value).contains(&format!("l9 = {}", depth * 10 - 1)));
+            let per_file = total / depth;
+            writeln!(
+                report,
+                "{depth} deep: scan {scanned:?}; check {checked:?}, check and run {total:?}, \
+                 {per_file:?} a file"
+            )
+            .unwrap();
+        }
+        std::io::stdout().write_all(report.as_bytes()).unwrap();
     }
 }

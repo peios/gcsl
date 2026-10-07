@@ -26,8 +26,10 @@
 //! a sequence of inputs that share their variables, as the REPL needs. A
 //! [`workspace::Workspace`] performs them on the files of a directory tree,
 //! each directory's files sharing one scope of fields and `def`s, and each
-//! file reaching the rest of the tree by `import`, checking every file and
-//! running the one asked for after the files it needs. An `import` outside
+//! file reaching the rest of the tree by `import`, its dotted paths merged
+//! with its directory's, the directories' above it and what it imports
+//! with `*` or by member into one view, checking every file and running
+//! the one asked for after the files it needs. An `import` outside
 //! a workspace, in [`run`] or a [`Session`], is an error. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
 //! [`SourceFile`], and so is every warning, which does not stop a program

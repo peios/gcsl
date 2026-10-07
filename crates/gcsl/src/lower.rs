@@ -146,11 +146,16 @@
 //! as a member, a path or a field of a record read whole, is of its
 //! function's slot, which its file stores; never of its merged node's
 //! slot, which nothing writes. Each record the file reads whole through an
-//! import (a directory, a file, or a file's part of a shared node) is
-//! stored into the file's own private slot for it before its first item,
-//! nested records first, each the `MakeRecord` of `Load`s of its fields'
-//! cells, which the files that own them have written, having run before
-//! this one (`Lowerer::store_imported_records`). A value file that another
+//! import or its view (a directory, a file, a file's part of a shared
+//! node, a node of its view without a leaf of the file under it) is stored
+//! into the file's own private slot for it before its first item, nested
+//! records first, each the `MakeRecord` of `Load`s of its fields' cells,
+//! which the files that own them have written, having run before this one
+//! (`Lowerer::store_imported_records`). A node of its view with a leaf of
+//! the file under it, read whole, is stored at its point in the schedule
+//! instead, as an interior node's cell is, the `MakeRecord` of `Load`s of
+//! its children's cells in the view's order, the file's own stored before
+//! it ([`crate::check::Resolution::view_record`]). A value file that another
 //! file imports stores its result into its value's cell as the last node
 //! of its top-level block, and the block's result is a `Load` of that cell.
 //!
@@ -731,7 +736,9 @@ impl Lowerer<'_> {
     /// `point` (the number of items for after the last), in the order the
     /// schedule computes them, each once (see [Cells](crate::ir#cells)): a
     /// leaf's initialiser, or the record of an interior node's children,
-    /// loaded from their cells in the order of their first items.
+    /// loaded from their cells in the order of their first items; for a
+    /// node of a workspace file's view, the record of its children in the
+    /// view's order, if the file reads it whole.
     fn store_cells(&mut self, point: usize) -> Result<(), InternalError> {
         let resolution = self.resolution;
         let FieldSchedule { tree, schedule } = resolution.field_schedule();
@@ -746,6 +753,15 @@ impl Lowerer<'_> {
                 break;
             }
             self.next_cell += 1;
+            if let Some((slot, first, fields)) = resolution.view_record(index) {
+                if *slot != Slot::NONE {
+                    let span = root
+                        .get(*first)
+                        .map_or_else(|| self.ast.root_span(), |&item| self.ast.item(item).span);
+                    self.store_record(*slot, fields, span);
+                }
+                continue;
+            }
             let slot = resolution.field_cells().get(index as usize).copied();
             let (Some(node), Some(slot)) = (tree.nodes.get(index as usize), slot) else {
                 continue;
@@ -776,26 +792,35 @@ impl Lowerer<'_> {
     fn store_imported_records(&mut self, span: Span) {
         let resolution = self.resolution;
         for (slot, fields) in resolution.imported_records() {
-            self.layout_names.clear();
-            self.record_loads.clear();
-            for &(name, cell, ty) in fields {
-                let kind = self.table.value_kind(ty).unwrap_or(ValueKind::Record);
-                self.define_field(name, (cell, kind, span), false);
-            }
-            let base = self.item_stack.len();
-            for &(cell, kind, field_span) in &self.record_loads {
-                let load = self.builder.alloc(IrKind::Load(cell, kind), field_span);
-                self.item_stack.push(load);
-            }
-            let layout = self.layout();
-            let values = self.builder.push_item_list(&self.item_stack[base..]);
-            self.item_stack.truncate(base);
-            let record = self
-                .builder
-                .alloc(IrKind::MakeRecord { layout, values }, span);
-            let store = self.builder.alloc(IrKind::Store(*slot, record), span);
-            self.item_stack.push(store);
+            self.store_record(*slot, fields, span);
         }
+    }
+
+    /// Pushes, as an item of the root block, the `Store` into `slot` of
+    /// the `MakeRecord` of `fields`, a `Load` of each one's cell at its
+    /// name, of the kind of its type, shown at `span`: a record a file of a
+    /// workspace assembles of other files' cells, and of its own computed
+    /// before it (see [Imports](crate::check#imports)).
+    fn store_record(&mut self, slot: Slot, fields: &[(Name, Slot, TyId)], span: Span) {
+        self.layout_names.clear();
+        self.record_loads.clear();
+        for &(name, cell, ty) in fields {
+            let kind = self.table.value_kind(ty).unwrap_or(ValueKind::Record);
+            self.define_field(name, (cell, kind, span), false);
+        }
+        let base = self.item_stack.len();
+        for &(cell, kind, field_span) in &self.record_loads {
+            let load = self.builder.alloc(IrKind::Load(cell, kind), field_span);
+            self.item_stack.push(load);
+        }
+        let layout = self.layout();
+        let values = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let record = self
+            .builder
+            .alloc(IrKind::MakeRecord { layout, values }, span);
+        let store = self.builder.alloc(IrKind::Store(slot, record), span);
+        self.item_stack.push(store);
     }
 
     /// In a file of a workspace, after its last item: stores, children

@@ -1975,18 +1975,22 @@
 //! directory above (only their declarations of names the file spells, which
 //! are all it can look up, so that checking stays linear in the files),
 //! but with what the scan found: the file's mentions are
-//! resolved against the merged trees of its directory chain, and a context
-//! gives every cell of the workspace its slot (its node's index among the
-//! workspace's nodes, slots below every private one) and, once the file
-//! that computes it is checked, its type. A cell of another file is read as
-//! a cell of this file is: a load of its slot at the top level, and inside
-//! a function or a `lazy` a read of the top level's frame, never a capture,
-//! since it is written before this file runs. Only a root has a binding,
-//! committed to its directory's scope once the last file contributing to
-//! it is checked (its type is whole only then), and every `def` has one,
-//! so calls of another file's `def` are checked as calls of an earlier
-//! function. An interior node shared with other files has their children
-//! in its type. The file's own leaves are as in [Top-level
+//! resolved against its view (the merged trees of its directory chain and
+//! what it imports, see [`crate::workspace`], "The view of a file"), and a
+//! context gives every cell of the workspace its slot (its node's index
+//! among the workspace's nodes, slots below every private one) and, once
+//! the file that computes it is checked, its type. A cell of another file
+//! is read as a cell of this file is: a load of its slot at the top level,
+//! and inside a function or a `lazy` a read of the top level's frame, never
+//! a capture, since it is written before this file runs. Only a root has a
+//! binding, committed to its directory's scope once the last file
+//! contributing to it is checked (its type is whole only then), and every
+//! `def` has one, so calls of another file's `def` are checked as calls of
+//! an earlier function. A root that several sources of the file's view
+//! have (`com` in a directory and the directory above) is never read
+//! through a binding: it is a node of the view (see [Imports](#imports)).
+//! An interior node shared with other files of the directory has their
+//! children in its type. The file's own leaves are as in [Top-level
 //! fields](#top-level-fields).
 //!
 //! What a file declares privately (`let`, `let mut`, `fn`, and the soft
@@ -2016,29 +2020,41 @@
 //! import, with the input's other errors. In a workspace the item itself
 //! checks nothing.
 //!
-//! An imported name has no binding. A name the scope does not bind nearer
-//! (a parameter, a local `let`, anything but the top level, shadows it)
-//! and that the file's [`crate::workspace::FileScope`] knows as an alias is
-//! a reference, resolved like a reference to a field: to the longest prefix
-//! the target declares, the accesses after it ordinary ones. An import
-//! shadows a builtin of its name, as a `let` does. What the prefix reaches
-//! decides what is read, always a cell, so never a capture: a load of its
-//! slot at the top level, a read of the top level's frame inside a function
-//! or a `lazy`.
+//! An imported name, and a root of the file's view that several sources
+//! have, has no binding. A name the scope does not bind nearer (a
+//! parameter, a local `let`, anything but the top level, shadows it) and
+//! that the file's [`crate::workspace::FileScope`] reads through its view
+//! ([`crate::workspace::FileScope::reads_through`]) is a reference,
+//! resolved like a reference to a field: to the longest prefix the view
+//! declares, the accesses after it ordinary ones. An import shadows a
+//! builtin of its name, as a `let` does. What the prefix reaches decides
+//! what is read, always a cell, so never a capture: a load of its slot at
+//! the top level, a read of the top level's frame inside a function or a
+//! `lazy`.
 //!
 //! - A node of a directory's tree is read from its cell, its type the
 //!   cell's. A `def`'s cell is its function's slot (the merged node of a
 //!   `def` is never written), and its type the function's.
 //! - A value file's value is read from the cell the file stores it in, its
 //!   type the file's.
-//! - A directory, a file, or a file's part of a shared node, read whole, is
-//!   a record the importing file assembles itself: before the walk, the
-//!   checker gives each such target the file's mentions reach a private
+//! - A directory, a file, a file's part of a shared node, or a node of the
+//!   view that several sources have and no leaf of the file is under, read
+//!   whole, is a record the reading file assembles itself: before the walk,
+//!   the checker gives each such target the file's mentions reach a private
 //!   top-level slot of its own (nested parts first), with the record type
-//!   of its roots, each a cell's slot and type as above; lowering builds
-//!   them before the file's first item. Where a reference is checked the
-//!   record is only looked up, never allocated, so that no such slot is
-//!   taken from a function's frame.
+//!   of its roots or children, each a cell's slot and type as above;
+//!   lowering builds them before the file's first item. Where a reference
+//!   is checked the record is only looked up, never allocated, so that no
+//!   such slot is taken from a function's frame.
+//! - A node of the view that several sources have and a leaf of the file
+//!   is under is one of the file's field nodes, numbered after its tree's
+//!   ([`crate::mentions::Mentions::views`]): it has a private slot, and,
+//!   read whole, it is computed at its point in the file's schedule as an
+//!   interior node is (`Checker::compute_view`), its type the record of its
+//!   children in the view's order (root directory first), the file's own
+//!   as computed by then and every other one another file's cell or a
+//!   record assembled as the file started. Its readiness and cycles are an
+//!   interior node's: "`com` has `com.b.v`, and ...".
 //!
 //! A call of a `def` reached through an import (`f(x)` after `import f
 //! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
@@ -2408,6 +2424,13 @@ type ImportedRecords = Vec<ImportedRecord>;
 /// private slot, and the name, cell and type of each of its fields.
 pub type ImportedRecord = (Slot, Vec<(Name, Slot, TyId)>);
 
+/// A record a file of a workspace assembles of a node of its view with a
+/// leaf of the file under it, as a node of its schedule: its private slot
+/// ([`Slot::NONE`] if the file never reads it whole), the position of the
+/// first item of the file under it, and the name, cell and type of each of
+/// its fields, in the view's order.
+pub type ViewRecord = (Slot, usize, Vec<(Name, Slot, TyId)>);
+
 /// Where every variable of an [`Ast`] is stored, what every function's
 /// frame and captures are, and which parameter every argument fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2465,6 +2488,11 @@ pub struct Resolution {
     /// starts and the name, cell and type of each field, nested records
     /// before the records that hold them (see [Imports](#imports)).
     imported_records: ImportedRecords,
+    /// For a file of a workspace, the record of each node of its view with
+    /// a leaf of the file under it, by its index among them ([`Mentions::views`]):
+    /// stored at its point in the schedule, after its own children, if the
+    /// file reads it whole (see [Imports](#imports)).
+    view_records: Vec<ViewRecord>,
     /// For a value file of a workspace that another file imports, the cell
     /// its result is stored in as its block ends; [`Slot::NONE`] otherwise.
     value_cell: Slot,
@@ -2631,6 +2659,24 @@ impl Resolution {
         &self.imported_records
     }
 
+    /// For a file of a workspace, the record of the node of its view with a
+    /// leaf of the file under it numbered `node` among the field nodes
+    /// (after its tree's), if it is one: stored at the node's point (see
+    /// [Imports](#imports)).
+    #[must_use]
+    pub fn view_record(&self, node: u32) -> Option<&ViewRecord> {
+        let at = (node as usize).checked_sub(self.field_schedule.tree.nodes.len())?;
+        self.view_records.get(at)
+    }
+
+    /// Every record of [`Resolution::view_record`], by the view node's
+    /// index among the file's nodes of its view with a leaf of it under
+    /// them.
+    #[cfg(test)]
+    pub(crate) fn view_records(&self) -> &[ViewRecord] {
+        &self.view_records
+    }
+
     /// The cell the input's result is stored in as its block ends, if it is
     /// a value file of a workspace that another file imports; else
     /// [`Slot::NONE`].
@@ -2781,6 +2827,7 @@ impl Resolution {
             own_records: Vec::new(),
             shared_children: Vec::new(),
             imported_records: Vec::new(),
+            view_records: Vec::new(),
             value_cell: Slot::NONE,
             field_schedule: FieldSchedule::default(),
             frame_size: 0,
@@ -2985,7 +3032,9 @@ pub struct FieldSchedule {
 }
 
 /// What the checker knows of one node of the tree of the input's top-level
-/// fields (see [Top-level fields](#top-level-fields)).
+/// fields (see [Top-level fields](#top-level-fields)), or, in a workspace,
+/// of one node of the file's view numbered after them (see
+/// [Imports](#imports)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FieldCell {
     /// The slot of the top level's frame that holds its value.
@@ -3732,6 +3781,10 @@ pub struct Checker<'a> {
     /// The target of each of `imported_records`, by its index there, with
     /// the record's type.
     imported_targets: Vec<(Target, TyId)>,
+    /// See [`Resolution::view_record`]: the record of each node of the
+    /// file's view with a leaf of the file under it, by its index among
+    /// them.
+    view_records: Vec<ViewRecord>,
     /// See [`Resolution::value_cell`].
     value_cell: Slot,
     /// For each node of the input's tree that is a shared interior node of
@@ -3951,6 +4004,7 @@ impl<'a> Checker<'a> {
             imported_callees: HashMap::new(),
             imported_records: Vec::new(),
             imported_targets: Vec::new(),
+            view_records: Vec::new(),
             value_cell: Slot::NONE,
             own_records: Vec::new(),
             field_cells: Vec::new(),
@@ -4063,7 +4117,13 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|top| (top.item, top.made))
             .collect();
-        let field_cells = self.field_cells.iter().map(|cell| cell.slot).collect();
+        // The tree's cells: the view's are in `view_records`.
+        let field_cells = self
+            .field_cells
+            .iter()
+            .take(self.mentions.tree.nodes.len())
+            .map(|cell| cell.slot)
+            .collect();
         let field_schedule = FieldSchedule {
             tree: std::mem::take(&mut self.mentions.tree),
             schedule: std::mem::take(&mut self.schedule),
@@ -4083,6 +4143,7 @@ impl<'a> Checker<'a> {
                 own_records: self.own_records,
                 shared_children,
                 imported_records: self.imported_records,
+                view_records: self.view_records,
                 value_cell: self.value_cell,
                 field_schedule,
                 frame_size: self.frame_size,
@@ -6248,7 +6309,7 @@ impl<'a> Checker<'a> {
         }
         self.top_copies = vec![Vec::new(); self.top_fns.len()];
         self.declare_field_cells();
-        self.closure_ready = vec![None; self.mentions.tree.nodes.len() + self.top_fns.len()];
+        self.closure_ready = vec![None; self.mentions.node_count() + self.top_fns.len()];
     }
 
     /// As the input starts, after its top-level functions: declares the
@@ -6352,7 +6413,8 @@ impl<'a> Checker<'a> {
     /// found them; empty outside a workspace (see [Directory
     /// scope](#directory-scope)).
     fn cell_tables(&self) -> (Vec<TyId>, SharedChildren) {
-        let types = self.field_cells.iter();
+        let tree = self.mentions.tree.nodes.len();
+        let types = self.field_cells.iter().take(tree);
         // A `def`'s cell is its function's binding, typed as it is.
         let types = types
             .map(|cell| {
@@ -6365,7 +6427,7 @@ impl<'a> Checker<'a> {
         let Some(workspace) = self.workspace else {
             return (types, Vec::new());
         };
-        let shared = (0..self.field_cells.len())
+        let shared = (0..tree)
             .map(|node| {
                 let node = u32::try_from(node).unwrap_or(u32::MAX);
                 let children = workspace.merged_children(node).into_iter();
@@ -6448,6 +6510,31 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // The nodes of the file's view with a leaf of the file under them:
+        // a private slot each for the record the file assembles, if it
+        // reads it whole (see [Imports](#imports)).
+        self.view_records = self
+            .mentions
+            .views
+            .iter()
+            .map(|view| (Slot::NONE, view.first, Vec::new()))
+            .collect();
+        for at in 0..self.mentions.views.len() {
+            let number = count + at;
+            let scheduled = self
+                .schedule
+                .point
+                .get(number)
+                .is_some_and(|&point| point != usize::MAX);
+            let mut cell = FieldCell::NEW;
+            if scheduled && let Some(view) = self.mentions.views.get(at) {
+                cell.slot = Slot(self.next_slot);
+                self.next_slot = self.next_slot.saturating_add(1);
+                self.frame_size = self.frame_size.max(self.next_slot);
+                self.slot_names.push(view.name);
+            }
+            self.field_cells.push(cell);
+        }
         self.top_end = self.bindings.len();
         self.report_cycles();
         self.declare_imports(workspace);
@@ -6463,7 +6550,7 @@ impl<'a> Checker<'a> {
             self.value_cell = cell;
             self.frame_size = self.frame_size.max(cell.0.saturating_add(1));
         }
-        let reached: Vec<Target> = self
+        let mut reached: Vec<Target> = self
             .mentions
             .foreign
             .iter()
@@ -6473,6 +6560,25 @@ impl<'a> Checker<'a> {
                 Need::Function(_) => None,
             })
             .collect();
+        // The records under the view's nodes this file assembles at their
+        // points are assembled as it starts, as an imported record is.
+        let tree = self.mentions.tree.nodes.len();
+        for at in 0..self.mentions.views.len() {
+            let number = u32::try_from(tree + at).unwrap_or(u32::MAX);
+            if self
+                .field_cells
+                .get(tree + at)
+                .is_some_and(|cell| cell.slot != Slot::NONE)
+            {
+                reached.extend(
+                    workspace
+                        .scope
+                        .view_children(number)
+                        .into_iter()
+                        .filter_map(|(_, child)| workspace.scope.target(child)),
+                );
+            }
+        }
         for target in reached {
             self.imported_record(workspace, target);
         }
@@ -6603,19 +6709,7 @@ impl<'a> Checker<'a> {
                 (workspace.cell_slot(global), workspace.cell_type(global))
             }
         };
-        self.read_import(id, slot);
-        self.expr_vars[base.index()] = self.expr_vars[id.index()];
-        let mut at = id;
-        let mut inner_ty = ty;
-        while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
-            inner_ty = if inner_ty == TyId::ERROR {
-                TyId::ERROR
-            } else {
-                self.types.record([(name, inner_ty)])
-            };
-            self.expr_types[expr.index()] = inner_ty;
-            at = expr;
-        }
+        self.read_cell(id, base, slot, ty);
         Some(ty)
     }
 
@@ -6685,7 +6779,7 @@ impl<'a> Checker<'a> {
             };
             let start = Need::Field(start);
             // Breadth first inside the cycle, back to its start.
-            let count = self.mentions.tree.nodes.len() + self.top_fns.len();
+            let count = self.mentions.node_count() + self.top_fns.len();
             let mut parent: Vec<Option<(Need, Option<Span>)>> = vec![None; count];
             let (mut queue, mut head) = (vec![start], 0);
             let mut back = None;
@@ -6771,6 +6865,7 @@ impl<'a> Checker<'a> {
     /// (see [`Checker::compute_fields`]) and gives it to its root's binding.
     fn compute_field(&mut self, node: u32) {
         let Some(entry) = self.mentions.tree.nodes.get(node as usize) else {
+            self.compute_view(node);
             return;
         };
         let (leaf, children) = (entry.leaf, entry.children.clone());
@@ -6857,6 +6952,100 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Computes the type of the node `node` of the file's view with a leaf
+    /// of the file under it (numbered after the tree's nodes), the record
+    /// of its children in the view's order, and the record lowering
+    /// assembles at its point: each child's cell and type, the file's own
+    /// nodes and view nodes as computed by now (the schedule puts them
+    /// first), every other one another file's cell or a record the file
+    /// assembled as it started (see [Imports](#imports)).
+    fn compute_view(&mut self, node: u32) {
+        let Some(workspace) = self.workspace else {
+            return;
+        };
+        let tree = self.mentions.tree.nodes.len();
+        let mut fields = Vec::new();
+        let mut erroneous = false;
+        for (name, child) in workspace.scope.view_children(node) {
+            let (slot, ty) = if let Some(cell) = self.field_cells.get(child as usize) {
+                (cell.slot, cell.ty.unwrap_or(TyId::ERROR))
+            } else if let Some(target) = workspace.scope.target(child) {
+                self.import_cell(workspace, target)
+                    .unwrap_or((Slot::NONE, TyId::ERROR))
+            } else if let Some(global) = workspace.scope.merged(child) {
+                (workspace.cell_slot(global), workspace.cell_type(global))
+            } else {
+                (Slot::NONE, TyId::ERROR)
+            };
+            erroneous |= ty == TyId::ERROR || slot == Slot::NONE;
+            fields.push((name, slot, ty));
+        }
+        let cyclic = self
+            .field_cells
+            .get(node as usize)
+            .is_some_and(|cell| cell.cyclic);
+        let ty = if erroneous || cyclic {
+            TyId::ERROR
+        } else {
+            self.types
+                .record(fields.iter().map(|&(name, _, ty)| (name, ty)))
+        };
+        if let Some(cell) = self.field_cells.get_mut(node as usize) {
+            cell.ty = Some(ty);
+        }
+        if let Some(record) = (node as usize)
+            .checked_sub(tree)
+            .and_then(|at| self.view_records.get_mut(at))
+            && let Some(cell) = self.field_cells.get(node as usize)
+        {
+            record.0 = cell.slot;
+            record.2 = fields;
+        }
+    }
+
+    /// The type of the reference `id` to `node`, a node of the file's view
+    /// with a leaf of the file under it, if `id` is a path through its root
+    /// that nothing of this file shadows: read from the private slot the
+    /// file assembles it into at its point (see [Imports](#imports)).
+    fn view_reference(&mut self, node: u32, id: ExprId) -> Option<TyId> {
+        let mut base = id;
+        while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
+            base = expr;
+        }
+        let ExprKind::Name(name) = self.ast.get(base).kind else {
+            return None;
+        };
+        let shadowed = self
+            .lookup(name)
+            .is_some_and(|(index, _)| index >= self.top_end);
+        if shadowed {
+            return None;
+        }
+        let cell = self.field_cells.get(node as usize).copied()?;
+        let ty = cell.ty.unwrap_or(TyId::ERROR);
+        self.read_cell(id, base, cell.slot, ty);
+        Some(ty)
+    }
+
+    /// Records that the reference `id`, a path whose variable is `base`,
+    /// reads the cell `slot` of type `ty`, as a reference through an import
+    /// does: each prefix inside it typed as the record of the path below it.
+    fn read_cell(&mut self, id: ExprId, base: ExprId, slot: Slot, ty: TyId) {
+        self.read_import(id, slot);
+        self.expr_vars[base.index()] = self.expr_vars[id.index()];
+        let mut at = id;
+        let mut inner_ty = ty;
+        while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
+            inner_ty = if inner_ty == TyId::ERROR {
+                TyId::ERROR
+            } else {
+                self.types.record([(name, inner_ty)])
+            };
+            self.expr_types[expr.index()] = inner_ty;
+            at = expr;
+        }
+    }
+
     /// The type a field item's value `value` was given when its leaf was
     /// computed, if it is a top-level field's (see
     /// [`Checker::compute_fields`]): the walk does not check it again.
@@ -6896,6 +7085,9 @@ impl<'a> Checker<'a> {
         if let Some(workspace) = self.workspace
             && node as usize >= self.mentions.tree.nodes.len()
         {
+            if (node as usize) < self.mentions.node_count() {
+                return self.view_reference(node, id);
+            }
             return self.foreign_reference(workspace, node, id);
         }
         let root = self.root_of(node);
@@ -7355,7 +7547,7 @@ impl<'a> Checker<'a> {
     fn need_index(&self, need: Need) -> usize {
         match need {
             Need::Field(node) => node as usize,
-            Need::Function(function) => self.mentions.tree.nodes.len() + function as usize,
+            Need::Function(function) => self.mentions.node_count() + function as usize,
         }
     }
 
@@ -7371,7 +7563,6 @@ impl<'a> Checker<'a> {
             Need::Field(node) => {
                 let path: Vec<&str> = self
                     .mentions
-                    .tree
                     .path(node)
                     .into_iter()
                     .map(|name| names.get(name))
@@ -7417,7 +7608,7 @@ impl<'a> Checker<'a> {
     /// uses that leads to it.
     fn not_ready(&self, start: Need, position: usize, span: Span) -> Option<Diagnostic> {
         // Breadth first, so the chain to each node is a shortest one.
-        let count = self.mentions.tree.nodes.len() + self.top_fns.len();
+        let count = self.mentions.node_count() + self.top_fns.len();
         let mut parent: Vec<Option<(Need, bool)>> = vec![None; count];
         *parent.get_mut(self.need_index(start))? = Some((start, false));
         let (mut queue, mut head) = (vec![start], 0);
@@ -9201,7 +9392,7 @@ impl<'a> Checker<'a> {
             ExprKind::Field { expr: record, name } => {
                 // A reference to a node of the tree of the input's top-level
                 // fields below its root reads that node's cell.
-                let imports = self.workspace.is_some_and(|w| !w.file().aliases.is_empty());
+                let imports = self.workspace.is_some_and(Context::has_view);
                 let reference = if self.mentions.tree.nodes.is_empty() && !imports {
                     None
                 } else {
@@ -11600,9 +11791,11 @@ impl<'a> Checker<'a> {
         if self.early.is_some() && self.reads_between(name, found) {
             return (TyId::ERROR, None);
         }
-        // An imported name nothing nearer shadows (see [Imports](#imports)).
+        // An imported name, or a root several sources of the file's view
+        // have, that nothing nearer shadows (see [Imports](#imports)).
         if let Some(workspace) = self.workspace
-            && workspace.scope.alias(name).is_some()
+            && workspace.has_view()
+            && workspace.scope.reads_through(name)
             && found.is_none_or(|(index, _)| index < self.top_end)
             && let Some(ty) = self.field_reference(id)
         {

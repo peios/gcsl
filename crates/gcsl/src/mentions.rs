@@ -83,16 +83,20 @@
 //! here: it has no expression to walk and adds nothing to the tree, so a
 //! file's own tree and record never hold an imported name. The names are
 //! the [`Resolve`] scope's. In a workspace that scope
-//! ([`crate::workspace::FileScope`]) finds an imported name as a root after
-//! the declarations of the directory chain, with which the scan has
-//! already made sure it shares no name, and each root of a `*` import as a
-//! name of its own; a single file has no scope with imports, and the
-//! checker rejects its `import`s. A reference through an imported name is
-//! then resolved as any reference is, to the longest prefix the scope
-//! declares, now in the tree of what the import names, and the same
-//! shadowing applies: a parameter or a nearer `let` of the name hides the
-//! import. Such a reference is another file's node, so it is a mention in
-//! [`Mentions::foreign`], never a need of this file's schedule.
+//! ([`crate::workspace::FileScope`]) is the file's view: the file's tree
+//! merged with its directory chain's and with each member and root of a
+//! `*` it imports, a whole import a root of its own, with which the scan
+//! has already made sure nothing shares a name; a single file has no scope
+//! with imports, and the checker rejects its `import`s. A reference through
+//! an imported name is then resolved as any reference is, to the longest
+//! prefix the scope declares, and the same shadowing applies: a parameter
+//! or a nearer `let` of the name hides the import. Such a reference is
+//! another file's node, so it is a mention in [`Mentions::foreign`], never
+//! a need of this file's schedule, unless it is a node of the view that
+//! other sources share and that has a leaf of the file under it: those the
+//! scope numbers among the file's own nodes, after its tree's
+//! ([`Mentions::views`]), and they are scheduled as interior nodes, each
+//! needing its children of the file.
 
 use std::collections::HashMap;
 use std::mem;
@@ -138,6 +142,33 @@ pub struct Mentions {
     /// or above this input's own counts, each once, in source order of its
     /// first mention, with where. Always empty for an input alone.
     pub foreign: Vec<Vec<(Need, Span)>>,
+    /// In a workspace, the nodes of the file's view that other sources
+    /// share and that have a leaf of the file under them (see
+    /// [`crate::workspace`], "The view of a file"): field nodes numbered
+    /// after the tree's, `tree.nodes.len() + index`, each needing its
+    /// children as an interior node does. Set by the workspace before the
+    /// schedule is found; always empty for an input alone.
+    pub views: Vec<ViewNode>,
+}
+
+/// A node of a file's view that other sources share and that has a leaf of
+/// the file under it: an interior node of the graph [`Mentions::schedule`]
+/// walks, though not of the file's own tree (see [`Mentions::views`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewNode {
+    /// Its last segment.
+    pub name: Name,
+    /// The view node it is a child of, by its field node number; `None` for
+    /// a root.
+    pub parent: Option<u32>,
+    /// Its children that are field nodes of the file (its own tree's nodes
+    /// and other view nodes), by number, in the view's order; its other
+    /// children are other files' cells, computed before the file runs.
+    pub children: Vec<u32>,
+    /// The position of the first item at or under it of the file.
+    pub first: usize,
+    /// The position of the last item at or under it of the file.
+    pub last: usize,
 }
 
 /// The tree of an input's top-level fields (see the module documentation).
@@ -560,6 +591,39 @@ pub enum Need {
 }
 
 impl Mentions {
+    /// The number of field nodes of the graph: the tree's, then the view's
+    /// ([`Mentions::views`]).
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.tree.nodes.len() + self.views.len()
+    }
+
+    /// The names of the path of the field node `node`, a node of the tree
+    /// or of the view, from its root.
+    #[must_use]
+    pub fn path(&self, node: u32) -> Vec<Name> {
+        let Some(view) = (node as usize).checked_sub(self.tree.nodes.len()) else {
+            return self.tree.path(node);
+        };
+        let mut names = Vec::new();
+        let mut at = self.views.get(view);
+        while let Some(entry) = at {
+            names.push(entry.name);
+            at = entry.parent.and_then(|parent| {
+                let index = (parent as usize).checked_sub(self.tree.nodes.len())?;
+                self.views.get(index)
+            });
+        }
+        names.reverse();
+        names
+    }
+
+    /// The view node of the field node number `node`, if it is one.
+    fn view(&self, node: u32) -> Option<&ViewNode> {
+        self.views
+            .get((node as usize).checked_sub(self.tree.nodes.len())?)
+    }
+
     /// The points of the field nodes, and the order they are computed in.
     ///
     /// Before each item that is not a top-level declaration, the nodes it
@@ -587,6 +651,7 @@ impl Mentions {
     #[must_use]
     pub fn schedule_except(&self, done: &[bool]) -> Schedule {
         let nodes = &self.tree.nodes;
+        let fields = self.node_count();
         let count = self.items.len();
         let mut is_function = vec![false; count];
         for function in &self.functions {
@@ -597,19 +662,26 @@ impl Mentions {
         let mut state = Scheduler {
             mentions: self,
             is_function,
-            point: vec![usize::MAX; nodes.len()],
-            visited: vec![false; nodes.len() + self.functions.len()],
-            order: Vec::with_capacity(nodes.len()),
+            point: vec![usize::MAX; fields],
+            visited: vec![false; fields + self.functions.len()],
+            order: Vec::with_capacity(fields),
         };
         for (seen, &marked) in state.visited.iter_mut().zip(done) {
             *seen = marked;
         }
-        // The interior nodes by the position after their last item.
+        // The interior nodes, the view's among them, by the position after
+        // their last item.
         let mut interior_at: Vec<Vec<u32>> = vec![Vec::new(); count + 1];
-        for (index, node) in nodes.iter().enumerate() {
-            if node.leaf.is_none()
-                && let Some(at) = interior_at.get_mut(node.last.saturating_add(1).min(count))
-            {
+        let tree_lasts = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.leaf.is_none())
+            .map(|(index, node)| (node.last, index));
+        let view_lasts = (nodes.len()..)
+            .zip(&self.views)
+            .map(|(index, view)| (view.last, index));
+        for (last, index) in tree_lasts.chain(view_lasts) {
+            if let Some(at) = interior_at.get_mut(last.saturating_add(1).min(count)) {
                 at.push(index_u32(index));
             }
         }
@@ -627,7 +699,7 @@ impl Mentions {
                 None => {}
             }
         }
-        for node in 0..nodes.len() {
+        for node in 0..fields {
             state.visit(Need::Field(index_u32(node)), count);
         }
         Schedule {
@@ -643,7 +715,7 @@ impl Mentions {
     /// order. Mutual recursion between functions alone is not one.
     #[must_use]
     pub fn cycles(&self) -> Vec<Vec<Need>> {
-        let fields = self.tree.nodes.len();
+        let fields = self.node_count();
         let scheduler = Scheduler {
             mentions: self,
             is_function: {
@@ -725,7 +797,11 @@ impl Mentions {
                 }) => {
                     return children.iter().map(|&n| (Need::Field(n), None)).collect();
                 }
-                _ => None,
+                Some(_) => None,
+                None => {
+                    let children = self.view(node).map_or(&[][..], |view| &view.children);
+                    return children.iter().map(|&n| (Need::Field(n), None)).collect();
+                }
             },
         };
         let Some(position) = position else {
@@ -786,7 +862,9 @@ impl Scheduler<'_> {
                     }
                 }
                 Some(entry) => entry.children.iter().map(|&n| Need::Field(n)).collect(),
-                None => Vec::new(),
+                None => mentions.view(node).map_or_else(Vec::new, |view| {
+                    view.children.iter().map(|&n| Need::Field(n)).collect()
+                }),
             },
         }
     }
@@ -795,7 +873,7 @@ impl Scheduler<'_> {
     fn index(&self, need: Need) -> usize {
         match need {
             Need::Field(node) => node as usize,
-            Need::Function(function) => self.mentions.tree.nodes.len() + function as usize,
+            Need::Function(function) => self.mentions.node_count() + function as usize,
         }
     }
 

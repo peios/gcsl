@@ -2162,6 +2162,81 @@ fn dumps_of_an_importing_file() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The merging summary: dotted paths merge across a directory boundary and
+/// an import, each file reading its own view; `all` in `v.gcsl` has the
+/// root's part, `app/`'s and its own, root directory first, not `lib/`'s.
+#[test]
+fn run_merges_dotted_paths_across_directories_and_imports() {
+    for (file, value) in [
+        (
+            "app/main",
+            "{com = {x = {app = {deps = [{name = \"lib\"}, {name = \"ylib\"}]; base = \
+             \"base\"}}}}\n",
+        ),
+        (
+            "app/vendor/v",
+            "{com = {vendor = {thing = 1}}; all = {base = {name = \"base\"}; x = {app = {deps = \
+             [{name = \"lib\"}, {name = \"ylib\"}]; base = \"base\"}}; vendor = {thing = 1}}}\n",
+        ),
+    ] {
+        let output = gcsl(&["run", &format!("tests/fixtures/ws_merge/{file}.gcsl")]);
+        assert_eq!(stdout(&output), value, "{file}");
+        assert_eq!(stderr(&output), "", "{file}");
+        assert_eq!(output.status.code(), Some(0), "{file}");
+    }
+}
+
+/// One leaf in a directory and in a directory above: a conflict, reported
+/// at the directory above, with the note.
+#[test]
+fn run_renders_a_conflict_across_a_directory_boundary() {
+    let output = gcsl(&["run", "tests/fixtures/ws_merge/conflict_above/sub/b.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: field `version` is defined in two files\n\
+         \x20--> tests/fixtures/ws_merge/conflict_above/workspace.gcsl:1:1\n\
+         \x20 |\n\
+         1 | version = \"1\"\n\
+         \x20 | ^^^^^^^ defined here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_merge/conflict_above/sub/b.gcsl:1:1\n\
+         \x20 |\n\
+         1 | version = \"2\"\n\
+         \x20 | ------- defined here\n\
+         \x20 |\n\
+         \x20 = note: one is in a directory above\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// One leaf of the file and of a file it imports with `*`: a conflict at
+/// the import, with the imported definition's excerpt.
+#[test]
+fn run_renders_a_conflict_through_an_import() {
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_merge/conflict_import/app/main.gcsl",
+    ]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: field `com.x.lib.name` is defined in two files\n\
+         \x20--> tests/fixtures/ws_merge/conflict_import/app/main.gcsl:1:8\n\
+         \x20 |\n\
+         1 | import * from lib\n\
+         \x20 |        ^ imported here\n\
+         2 | com.x.lib.name = \"app\"\n\
+         \x20 | -------------- defined here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_merge/conflict_import/lib/x.gcsl:1:1\n\
+         \x20 |\n\
+         1 | com.x.lib.name = \"lib\"\n\
+         \x20 | -------------- defined here\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
 /// A file outside any workspace runs alone, as before workspaces existed,
 /// even with workspaces in the directories beside it.
 #[test]
