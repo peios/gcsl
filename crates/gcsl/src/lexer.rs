@@ -220,6 +220,9 @@ pub enum TokenKind {
     Fn,
     /// The keyword `def`, which begins a public function item.
     Def,
+    /// The keyword `import`, which begins an import item of a file's
+    /// outermost block.
+    Import,
     /// The keyword `lazy`, which defers the expression after it.
     Lazy,
     /// The keyword `await`, which awaits the value after it.
@@ -347,6 +350,7 @@ impl TokenKind {
             TokenKind::Not => Some("not"),
             TokenKind::Fn => Some("fn"),
             TokenKind::Def => Some("def"),
+            TokenKind::Import => Some("import"),
             TokenKind::Lazy => Some("lazy"),
             TokenKind::Await => Some("await"),
             TokenKind::For => Some("for"),
@@ -417,6 +421,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "not" => TokenKind::Not,
         "fn" => TokenKind::Fn,
         "def" => TokenKind::Def,
+        "import" => TokenKind::Import,
         "lazy" => TokenKind::Lazy,
         "await" => TokenKind::Await,
         "for" => TokenKind::For,
@@ -1790,6 +1795,15 @@ mod tests {
     }
 
     #[test]
+    fn import_is_a_keyword_and_from_is_not() {
+        assert_eq!(
+            show("import imports from"),
+            ["Import", "Ident(imports)", "Ident(from)", "Eof"]
+        );
+        assert_eq!(TokenKind::Import.symbol(), Some("import"));
+    }
+
+    #[test]
     fn is_and_as_are_keywords_only_as_whole_words() {
         assert_eq!(
             show("x is Int as is-x as-x isa asy Is As"),
@@ -2536,7 +2550,7 @@ mod tests {
         }
         for text in [
             "", "1x", "a b", "a-", "-a", "a--b", "é", "let", "if", "else", "true", "false", "and",
-            "or", "not", "a.b", "fn", "def", "lazy", "await", "a|b",
+            "or", "not", "a.b", "fn", "def", "import", "lazy", "await", "a|b",
         ] {
             assert!(!is_identifier(text), "{text}");
         }

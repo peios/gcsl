@@ -346,6 +346,16 @@ mod tests {
     }
 
     #[test]
+    fn an_import_in_a_session_needs_a_workspace() {
+        let mut session = Session::new();
+        assert_eq!(
+            messages(&mut session, "import lib"),
+            vec!["`import` needs a workspace: no `workspace.gcsl` above this file"]
+        );
+        assert_eq!(value(&mut session, "1 + 1"), Value::Int(2));
+    }
+
+    #[test]
     fn three_inputs_share_a_variable() {
         let mut session = Session::new();
         assert_eq!(value(&mut session, "let x = 1"), Value::Empty);

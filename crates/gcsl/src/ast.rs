@@ -21,6 +21,10 @@
 //! [`Ast::param_tys`], and the elements of list literals, [`Ast::elements`];
 //! and the details of function expressions and `for` expressions have
 //! arenas of their own (see [Functions](#functions) and [Lists](#lists)).
+//! So do import items, [`Ast::import_decl`]: an [`ItemKind::Import`] holds
+//! only its [`ImportId`], so that an [`Item`] stays 36 bytes; the path is
+//! in the path pool and the members of a `from` import in a pool of their
+//! own, [`Ast::import_members`].
 //!
 //! # Lists
 //!
@@ -267,6 +271,103 @@ impl ForId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Index of an import item's [`ImportDecl`] in the import arena of the
+/// [`Ast`] (or [`AstBuilder`]) that allocated it. Like [`ExprId`], only
+/// meaningful for that arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImportId(u32);
+
+impl ImportId {
+    /// The id as an index into the arena and into side tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A name written in an import item, with where it is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImportName {
+    /// The name.
+    pub name: Name,
+    /// Where the name is written.
+    pub span: Span,
+}
+
+/// One member of `import MEMBER, ... from PATH`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImportMember {
+    /// `NAME` or `NAME as ALIAS`: the root `NAME` of what the path names,
+    /// bound as `ALIAS` if one is given, else as `NAME`.
+    Named {
+        /// The root imported.
+        name: ImportName,
+        /// The name it is bound as, if written with `as`.
+        alias: Option<ImportName>,
+    },
+    /// `*`, written at the span: every root of what the path names, each
+    /// bound as itself.
+    All(Span),
+}
+
+impl ImportMember {
+    /// The name the member binds, or `None` for `*`.
+    #[must_use]
+    pub const fn bound(&self) -> Option<ImportName> {
+        match *self {
+            ImportMember::Named { name, alias } => match alias {
+                Some(alias) => Some(alias),
+                None => Some(name),
+            },
+            ImportMember::All(_) => None,
+        }
+    }
+
+    /// Where the member is written: its name through its alias, or the
+    /// `*`.
+    #[must_use]
+    pub const fn span(&self) -> Span {
+        match *self {
+            ImportMember::Named { name, alias } => match alias {
+                Some(alias) => name.span.join(alias.span),
+                None => name.span,
+            },
+            ImportMember::All(span) => span,
+        }
+    }
+}
+
+/// The members of one `from` import: a contiguous range of the member pool
+/// of the [`Ast`] that allocated it, never empty. Resolve it with
+/// [`Ast::import_members`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImportMemberRange {
+    start: u32,
+    len: u32,
+}
+
+/// What an import item binds, [`ImportDecl::form`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImportForm {
+    /// `import PATH` or `import PATH as NAME`: what the path names, bound
+    /// as `NAME` if one is given, else as the path's last segment.
+    Whole(Option<ImportName>),
+    /// `import MEMBER, ... from PATH`: members of what the path names.
+    Members(ImportMemberRange),
+}
+
+/// An import item (see the parser's [Imports](crate::parser#imports)):
+/// held in the [`Ast`]'s import arena; the item is an [`ItemKind::Import`]
+/// with its [`ImportId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImportDecl {
+    /// The module path: one or more name segments, absolute from the
+    /// workspace root, never an index segment.
+    pub path: PathRange,
+    /// What the import binds.
+    pub form: ImportForm,
 }
 
 /// A loop: a `for` expression of any form, or a `do` loop (see
@@ -1174,11 +1275,17 @@ pub enum ItemKind {
     /// leaves the innermost function or `lazy`, or with a label, the block
     /// or loop it names, which evaluates to the value, `{}` without one.
     Return(Jump),
+    /// `import PATH`, `import PATH as NAME` or `import MEMBER, ... from
+    /// PATH`: binds private names of the file to what the path names, in
+    /// the import arena (see [`Ast::import_decl`]). Only ever an item of a
+    /// file's outermost block. It has no expression.
+    Import(ImportId),
 }
 
 impl ItemKind {
     /// The expression the item holds, if it has one: every item's but a
-    /// `break`'s, `continue`'s or `return`'s without a value.
+    /// `break`'s, `continue`'s or `return`'s without a value, and an
+    /// import's.
     #[must_use]
     pub const fn value(self) -> Option<ExprId> {
         match self {
@@ -1189,6 +1296,7 @@ impl ItemKind {
             | ItemKind::Result(value)
             | ItemKind::Expr(value) => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
+            ItemKind::Import(_) => None,
         }
     }
 }
@@ -1285,6 +1393,8 @@ pub struct AstBuilder {
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
+    imports: Vec<ImportDecl>,
+    import_members: Vec<ImportMember>,
 }
 
 impl AstBuilder {
@@ -1370,6 +1480,25 @@ impl AstBuilder {
         PathRange {
             start,
             len: next_id(segments.len()),
+        }
+    }
+
+    /// Adds the import item `decl` to the import arena and returns its id,
+    /// which its [`ItemKind::Import`] then carries.
+    pub fn push_import(&mut self, decl: ImportDecl) -> ImportId {
+        let id = ImportId(next_id(self.imports.len()));
+        self.imports.push(decl);
+        id
+    }
+
+    /// Appends `members` to the import-member pool as one `from` import's
+    /// members and returns their range.
+    pub fn push_import_members(&mut self, members: &[ImportMember]) -> ImportMemberRange {
+        let start = next_id(self.import_members.len());
+        self.import_members.extend_from_slice(members);
+        ImportMemberRange {
+            start,
+            len: next_id(members.len()),
         }
     }
 
@@ -1504,6 +1633,8 @@ impl AstBuilder {
             elements: self.elements,
             fors: self.fors,
             labels: self.labels,
+            imports: self.imports,
+            import_members: self.import_members,
             root,
             names,
             strings,
@@ -1529,6 +1660,8 @@ pub struct Ast {
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
+    imports: Vec<ImportDecl>,
+    import_members: Vec<ImportMember>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -1644,6 +1777,27 @@ impl Ast {
     #[must_use]
     pub fn for_count(&self) -> usize {
         self.fors.len()
+    }
+
+    /// Returns the import item `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn import_decl(&self, id: ImportId) -> &ImportDecl {
+        &self.imports[id.index()]
+    }
+
+    /// Returns the members of a `from` import.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn import_members(&self, range: ImportMemberRange) -> &[ImportMember] {
+        let start = range.start as usize;
+        &self.import_members[start..start + range.len as usize]
     }
 
     /// Returns the label of a labelled block, `id`.
@@ -2035,6 +2189,43 @@ impl<A: Annotate> Pretty<'_, A> {
         Ok(())
     }
 
+    /// Writes an import item as it is written, without its span.
+    fn import(&self, f: &mut fmt::Formatter<'_>, decl: &ImportDecl) -> fmt::Result {
+        let ast = self.ast;
+        let name = |name: ImportName| ast.names().get(name.name);
+        f.write_str("import ")?;
+        let path = ast.show_path(ast.path(decl.path));
+        match decl.form {
+            ImportForm::Whole(alias) => {
+                write!(f, "{path}")?;
+                if let Some(alias) = alias {
+                    write!(f, " as {}", name(alias))?;
+                }
+            }
+            ImportForm::Members(range) => {
+                for (index, member) in ast.import_members(range).iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match *member {
+                        ImportMember::Named {
+                            name: imported,
+                            alias,
+                        } => {
+                            f.write_str(name(imported))?;
+                            if let Some(alias) = alias {
+                                write!(f, " as {}", name(alias))?;
+                            }
+                        }
+                        ImportMember::All(_) => f.write_str("*")?,
+                    }
+                }
+                write!(f, " from {path}")?;
+            }
+        }
+        Ok(())
+    }
+
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
         let ast = self.ast;
@@ -2091,6 +2282,10 @@ impl<A: Annotate> Pretty<'_, A> {
                     _ => "continue",
                 };
                 return self.jump(f, (keyword, jump), item.span, depth);
+            }
+            ItemKind::Import(id) => {
+                self.import(f, ast.import_decl(id))?;
+                return write!(f, " @{})", item.span);
             }
         };
         writeln!(f, " @{}", item.span)?;

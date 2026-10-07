@@ -138,6 +138,22 @@
 //! definition; a top-level spread stores nothing for a name that is a
 //! top-level declaration.
 //!
+//! In a workspace, an `import` lowers to nothing where it stands (see the
+//! checker's [Imports](crate::check#imports)). A reference through an
+//! imported name is lowered as a reference to the node it reaches is: a
+//! `Load` of the cell from top-level code, an [`IrKind::Top`] of it from a
+//! function or a `lazy`. Every read of a `def` reached through an import,
+//! as a member, a path or a field of a record read whole, is of its
+//! function's slot, which its file stores; never of its merged node's
+//! slot, which nothing writes. Each record the file reads whole through an
+//! import (a directory, a file, or a file's part of a shared node) is
+//! stored into the file's own private slot for it before its first item,
+//! nested records first, each the `MakeRecord` of `Load`s of its fields'
+//! cells, which the files that own them have written, having run before
+//! this one (`Lowerer::store_imported_records`). A value file that another
+//! file imports stores its result into its value's cell as the last node
+//! of its top-level block, and the block's result is a `Load` of that cell.
+//!
 //! Comparisons are specialised by their operands' kind, and an `if` keeps
 //! the empty else block the parser gave it if the source had none. `===`
 //! and `!==` lower exactly as `==` and `!=` on every kind but records and
@@ -520,7 +536,8 @@ impl Lowerer<'_> {
                 ItemKind::Let { .. }
                 | ItemKind::Rebind { .. }
                 | ItemKind::Field { .. }
-                | ItemKind::Spread(_),
+                | ItemKind::Spread(_)
+                | ItemKind::Import(_),
             )
             | None => Ok(ValueKind::Record),
         }
@@ -562,6 +579,7 @@ impl Lowerer<'_> {
         let mut result = None;
         let is_root = body == self.ast.root();
         if is_root {
+            self.store_imported_records(span);
             self.store_top_closures(None)?;
         }
         for (index, &id) in items.iter().enumerate() {
@@ -586,6 +604,9 @@ impl Lowerer<'_> {
                     self.item_stack.push(store);
                 }
                 ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
+                // An import computes nothing at its point: what it names
+                // is read where it is mentioned.
+                ItemKind::Import(_) => {}
                 ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                     let node = self.lower_jump(id, jump)?;
                     if is_result {
@@ -632,7 +653,7 @@ impl Lowerer<'_> {
             self.store_cells(items.len())?;
             self.store_own_records()?;
         }
-        let result = match result {
+        let mut result = match result {
             Some(result) => result,
             None if kind != ValueKind::Record => {
                 return Err(InternalError {
@@ -643,6 +664,14 @@ impl Lowerer<'_> {
             None if is_record => self.make_record(items, is_root, span)?,
             None => self.builder.alloc(IrKind::Empty, span),
         };
+        // An imported value file's value is a cell: stored as the block
+        // ends, the last item of the top level (see [Imports](crate::check#imports)).
+        let value_cell = self.resolution.value_cell();
+        if is_root && value_cell != Slot::NONE {
+            let store = self.builder.alloc(IrKind::Store(value_cell, result), span);
+            self.item_stack.push(store);
+            result = self.builder.alloc(IrKind::Load(value_cell, kind), span);
+        }
         let items = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(IrKind::Block { items, result })
@@ -736,6 +765,37 @@ impl Lowerer<'_> {
             self.item_stack.push(store);
         }
         Ok(())
+    }
+
+    /// In a file of a workspace, before its first item: stores each record
+    /// it reads whole through an import into its private slot, nested
+    /// records first, each a `MakeRecord` of `Load`s of the fields' cells,
+    /// which the files that own them, run before this one, have written (a
+    /// `def`'s cell being its function's slot; see
+    /// [Imports](crate::check#imports)).
+    fn store_imported_records(&mut self, span: Span) {
+        let resolution = self.resolution;
+        for (slot, fields) in resolution.imported_records() {
+            self.layout_names.clear();
+            self.record_loads.clear();
+            for &(name, cell, ty) in fields {
+                let kind = self.table.value_kind(ty).unwrap_or(ValueKind::Record);
+                self.define_field(name, (cell, kind, span), false);
+            }
+            let base = self.item_stack.len();
+            for &(cell, kind, field_span) in &self.record_loads {
+                let load = self.builder.alloc(IrKind::Load(cell, kind), field_span);
+                self.item_stack.push(load);
+            }
+            let layout = self.layout();
+            let values = self.builder.push_item_list(&self.item_stack[base..]);
+            self.item_stack.truncate(base);
+            let record = self
+                .builder
+                .alloc(IrKind::MakeRecord { layout, values }, span);
+            let store = self.builder.alloc(IrKind::Store(*slot, record), span);
+            self.item_stack.push(store);
+        }
     }
 
     /// In a file of a workspace, after its last item: stores, children

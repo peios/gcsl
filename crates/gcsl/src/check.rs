@@ -2003,6 +2003,47 @@
 //! runs as a whole first. Readiness ("cannot be used here yet") is within
 //! a file only. Effects follow: every effect of a needed file happens
 //! before the first of the file that needs it.
+//!
+//! # Imports
+//!
+//! An `import` names a node of another part of the workspace (see
+//! [`crate::workspace`], "Imports"), and the scan has resolved it, and
+//! reported its clashes ("`lib` is imported in this file", "`version` is a
+//! field of this directory"), before any file is checked. Outside a
+//! workspace, in a single file or a REPL input, there is nothing for a path
+//! to name: the checker knows it has no workspace context and reports
+//! "`import` needs a workspace: no `workspace.gcsl` above this file" at the
+//! import, with the input's other errors. In a workspace the item itself
+//! checks nothing.
+//!
+//! An imported name has no binding. A name the scope does not bind nearer
+//! (a parameter, a local `let`, anything but the top level, shadows it)
+//! and that the file's [`crate::workspace::FileScope`] knows as an alias is
+//! a reference, resolved like a reference to a field: to the longest prefix
+//! the target declares, the accesses after it ordinary ones. An import
+//! shadows a builtin of its name, as a `let` does. What the prefix reaches
+//! decides what is read, always a cell, so never a capture: a load of its
+//! slot at the top level, a read of the top level's frame inside a function
+//! or a `lazy`.
+//!
+//! - A node of a directory's tree is read from its cell, its type the
+//!   cell's. A `def`'s cell is its function's slot (the merged node of a
+//!   `def` is never written), and its type the function's.
+//! - A value file's value is read from the cell the file stores it in, its
+//!   type the file's.
+//! - A directory, a file, or a file's part of a shared node, read whole, is
+//!   a record the importing file assembles itself: before the walk, the
+//!   checker gives each such target the file's mentions reach a private
+//!   top-level slot of its own (nested parts first), with the record type
+//!   of its roots, each a cell's slot and type as above; lowering builds
+//!   them before the file's first item. Where a reference is checked the
+//!   record is only looked up, never allocated, so that no such slot is
+//!   taken from a function's frame.
+//!
+//! A call of a `def` reached through an import (`f(x)` after `import f
+//! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
+//! whose measured parameters the workspace carries, so its call-site
+//! diagnostics are those of a `def` of the directory.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2020,7 +2061,7 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::ValueKind;
-use crate::workspace::Context;
+use crate::workspace::{Context, Target};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
@@ -2359,6 +2400,14 @@ pub struct TestResolution {
 /// [Directory scope](#directory-scope)).
 type SharedChildren = Vec<Vec<(Name, Slot, TyId)>>;
 
+/// The records a file of a workspace reads whole through its imports: each
+/// one's slot and fields (see [`Resolution::imported_records`]).
+type ImportedRecords = Vec<ImportedRecord>;
+
+/// A record a file of a workspace reads whole through an import: its
+/// private slot, and the name, cell and type of each of its fields.
+pub type ImportedRecord = (Slot, Vec<(Name, Slot, TyId)>);
+
 /// Where every variable of an [`Ast`] is stored, what every function's
 /// frame and captures are, and which parameter every argument fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2410,6 +2459,15 @@ pub struct Resolution {
     /// node's assembly reads besides its own children. Empty outside a
     /// workspace.
     shared_children: SharedChildren,
+    /// For a file of a workspace, the records it reads whole through its
+    /// imports (a directory's, a file's own, a file's part of a shared
+    /// node), each with the private slot it is assembled into as the file
+    /// starts and the name, cell and type of each field, nested records
+    /// before the records that hold them (see [Imports](#imports)).
+    imported_records: ImportedRecords,
+    /// For a value file of a workspace that another file imports, the cell
+    /// its result is stored in as its block ends; [`Slot::NONE`] otherwise.
+    value_cell: Slot,
     /// The tree of the input's top-level fields and when each node is
     /// computed (see [Top-level fields](#top-level-fields)).
     field_schedule: FieldSchedule,
@@ -2564,6 +2622,23 @@ impl Resolution {
         &self.field_cells
     }
 
+    /// The records the input, a file of a workspace, reads whole through
+    /// its imports, assembled as it starts: each one's private slot and the
+    /// name, cell and type of each of its fields, nested records first (see
+    /// [Imports](#imports)).
+    #[must_use]
+    pub fn imported_records(&self) -> &[ImportedRecord] {
+        &self.imported_records
+    }
+
+    /// The cell the input's result is stored in as its block ends, if it is
+    /// a value file of a workspace that another file imports; else
+    /// [`Slot::NONE`].
+    #[must_use]
+    pub const fn value_cell(&self) -> Slot {
+        self.value_cell
+    }
+
     /// The tree of the input's top-level fields and when each node is
     /// computed: what lowering stores in each cell, and before which item.
     #[must_use]
@@ -2705,6 +2780,8 @@ impl Resolution {
             field_cells: Vec::new(),
             own_records: Vec::new(),
             shared_children: Vec::new(),
+            imported_records: Vec::new(),
+            value_cell: Slot::NONE,
             field_schedule: FieldSchedule::default(),
             frame_size: 0,
             slot_names: Vec::new(),
@@ -2788,7 +2865,7 @@ pub struct CheckOutput {
     /// or `{}`.
     pub ty: TyId,
     /// The type of the cell of each node of the input's tree of top-level
-    /// fields, by its index there; `Error` for a `def`'s.
+    /// fields, by its index there; a `def`'s is its function's type.
     pub cell_types: Vec<TyId>,
     /// The warnings found, in source order.
     pub warnings: Vec<Diagnostic>,
@@ -3120,6 +3197,10 @@ enum KnownCallee {
     /// `Checker::bindings`, which is also its index in
     /// `Checker::scope_measured`.
     Earlier(usize),
+    /// A `def` of another file reached through an import, by its merged
+    /// node in the workspace (see [Imports](#imports)), whose measured
+    /// parameters the workspace context carries.
+    Imported(u32),
 }
 
 /// One value a function captures.
@@ -3543,6 +3624,19 @@ impl Scope {
     pub(crate) fn into_slot_names(self) -> Vec<Name> {
         self.slot_names
     }
+
+    /// Which parameters of the function bound at `slot` are present
+    /// because its body measures them, if the binding there was initialised
+    /// directly with a function expression: what a call of an imported
+    /// `def` needs (see [Imports](#imports)).
+    pub(crate) fn measured_at(&self, slot: Slot) -> Option<&[bool]> {
+        self.bindings
+            .iter()
+            .zip(&self.measured)
+            .rev()
+            .find(|(binding, _)| binding.slot == slot)
+            .and_then(|(_, measured)| measured.as_deref())
+    }
 }
 
 /// Type-checks and resolves `ast` as a file, starting from an empty scope,
@@ -3628,6 +3722,18 @@ pub struct Checker<'a> {
     /// The workspace the input is a file of, if it is one (see [Directory
     /// scope](#directory-scope)).
     workspace: Option<&'a Context<'a>>,
+    /// Each reference through an import to a merged node, with the node:
+    /// a call of one is of a known callee if it is a `def`'s (see
+    /// [`KnownCallee::Imported`]).
+    imported_callees: HashMap<ExprId, u32>,
+    /// The records the file reads whole through its imports, each with its
+    /// private slot and fields (see [`Resolution::imported_records`]).
+    imported_records: ImportedRecords,
+    /// The target of each of `imported_records`, by its index there, with
+    /// the record's type.
+    imported_targets: Vec<(Target, TyId)>,
+    /// See [`Resolution::value_cell`].
+    value_cell: Slot,
     /// For each node of the input's tree that is a shared interior node of
     /// its directory, the private slot its own record is stored in, for the
     /// input's value; [`Slot::NONE`] for any other node.
@@ -3842,6 +3948,10 @@ impl<'a> Checker<'a> {
             scope_measured: scope.measured,
             mentions: Mentions::default(),
             workspace: None,
+            imported_callees: HashMap::new(),
+            imported_records: Vec::new(),
+            imported_targets: Vec::new(),
+            value_cell: Slot::NONE,
             own_records: Vec::new(),
             field_cells: Vec::new(),
             closure_ready: Vec::new(),
@@ -3972,6 +4082,8 @@ impl<'a> Checker<'a> {
                 field_cells,
                 own_records: self.own_records,
                 shared_children,
+                imported_records: self.imported_records,
+                value_cell: self.value_cell,
                 field_schedule,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
@@ -4090,6 +4202,7 @@ impl<'a> Checker<'a> {
                     self.check_field(id, path, value, expecting);
                 }
                 ItemKind::Spread(value) => self.check_spread_item(id, value, root),
+                ItemKind::Import(_) => self.check_import(item.span),
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -4211,6 +4324,22 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Checks an import item, spanning `span` (see the parser's
+    /// [Imports](crate::parser#imports)).
+    /// Outside a workspace (a single file, a REPL input) there is nothing
+    /// for its path to name, which is an error at the import, reported
+    /// here with the input's other errors. In a workspace the scan has
+    /// resolved it, and its names are read where they are used (see
+    /// [Imports](#imports)): the item itself checks nothing.
+    fn check_import(&mut self, span: Span) {
+        if self.workspace.is_none() {
+            self.errors.push(Diagnostic::error(
+                "`import` needs a workspace: no `workspace.gcsl` above this file",
+                span,
+            ));
+        }
+    }
+
     /// Whether the item `id`, of `kind`, checked, never completes, so that
     /// no item after it in its block runs: a `break`, a `continue` or a
     /// `return`, but one that is an error and so has nothing to leave for,
@@ -4225,7 +4354,7 @@ impl<'a> Checker<'a> {
             | ItemKind::Result(value)
             | ItemKind::Let { value, .. }
             | ItemKind::Rebind { value, .. } => self.expr_types[value.index()] == self.never,
-            ItemKind::Field { .. } | ItemKind::Spread(_) => false,
+            ItemKind::Field { .. } | ItemKind::Spread(_) | ItemKind::Import(_) => false,
         }
     }
 
@@ -6224,7 +6353,15 @@ impl<'a> Checker<'a> {
     /// scope](#directory-scope)).
     fn cell_tables(&self) -> (Vec<TyId>, SharedChildren) {
         let types = self.field_cells.iter();
-        let types = types.map(|cell| cell.ty.unwrap_or(TyId::ERROR)).collect();
+        // A `def`'s cell is its function's binding, typed as it is.
+        let types = types
+            .map(|cell| {
+                cell.ty
+                    .filter(|&ty| ty != TyId::ERROR)
+                    .or_else(|| Some(self.bindings.get(cell.binding?)?.ty))
+                    .unwrap_or(TyId::ERROR)
+            })
+            .collect();
         let Some(workspace) = self.workspace else {
             return (types, Vec::new());
         };
@@ -6313,7 +6450,115 @@ impl<'a> Checker<'a> {
         }
         self.top_end = self.bindings.len();
         self.report_cycles();
+        self.declare_imports(workspace);
         self.top_slots_end = self.top_slots_end.max(self.next_slot);
+    }
+
+    /// The cells of the file's imports (see [Imports](#imports)): its
+    /// result's cell if it is a value file another file imports, and a
+    /// private slot for each record it reads whole through an import, from
+    /// the targets its mentions reach.
+    fn declare_imports(&mut self, workspace: &'a Context<'a>) {
+        if let Some(cell) = workspace.value_slot() {
+            self.value_cell = cell;
+            self.frame_size = self.frame_size.max(cell.0.saturating_add(1));
+        }
+        let reached: Vec<Target> = self
+            .mentions
+            .foreign
+            .iter()
+            .flatten()
+            .filter_map(|&(need, _)| match need {
+                Need::Field(node) => workspace.scope.target(node),
+                Need::Function(_) => None,
+            })
+            .collect();
+        for target in reached {
+            self.imported_record(workspace, target);
+        }
+    }
+
+    /// The private slot and type of the record of `target`, read whole
+    /// through an import, allocated with its nested records the first time
+    /// (see [Imports](#imports)); `None` for a target that is a cell.
+    fn imported_record(
+        &mut self,
+        workspace: &'a Context<'a>,
+        target: Target,
+    ) -> Option<(Slot, TyId)> {
+        if matches!(target, Target::Node(_)) || workspace.value_of(target).is_some() {
+            return None;
+        }
+        if let Some(at) = self.imported_targets.iter().position(|&(t, _)| t == target) {
+            let slot = self.imported_records.get(at)?.0;
+            let ty = self.imported_targets.get(at)?.1;
+            return Some((slot, ty));
+        }
+        let mut fields = Vec::new();
+        let mut erroneous = false;
+        for (name, child) in workspace.target_fields(target) {
+            let (slot, ty) = match child {
+                Target::Node(node) => (workspace.cell_slot(node), workspace.cell_type(node)),
+                part => self
+                    .imported_record(workspace, part)
+                    .unwrap_or((Slot::NONE, TyId::ERROR)),
+            };
+            erroneous |= ty == TyId::ERROR || slot == Slot::NONE;
+            fields.push((name, slot, ty));
+        }
+        let ty = if erroneous {
+            TyId::ERROR
+        } else {
+            self.types
+                .record(fields.iter().map(|&(name, _, ty)| (name, ty)))
+        };
+        // Every slot is named, so that `slot_names` stays aligned with the
+        // slots. A record is only reached through an import of this file,
+        // so a name is always found; without one, no slot is taken and the
+        // reference is left unresolved rather than misnaming later slots.
+        let first = fields.first().map(|&(name, _, _)| name);
+        let name = workspace.target_name(target).or(first)?;
+        let slot = Slot(self.next_slot);
+        self.next_slot = self.next_slot.saturating_add(1);
+        self.frame_size = self.frame_size.max(self.next_slot);
+        self.slot_names.push(name);
+        self.imported_records.push((slot, fields));
+        self.imported_targets.push((target, ty));
+        Some((slot, ty))
+    }
+
+    /// The cell a reference through an import to `target` reads, and its
+    /// type: a merged node's cell (a `def`'s is its function's slot), an
+    /// imported value file's value, or the record the file assembles of a
+    /// directory, a file or a part (see [Imports](#imports)). A record is
+    /// only looked up here, never allocated: [`Self::declare_imports`]
+    /// allocated one, among the top-level slots, for every whole read the
+    /// file's mentions reach, before the walk; allocating one here, inside
+    /// a function, would take a slot of the function's frame.
+    fn import_cell(&self, workspace: &'a Context<'a>, target: Target) -> Option<(Slot, TyId)> {
+        if let Target::Node(node) = target {
+            return Some((workspace.cell_slot(node), workspace.cell_type(node)));
+        }
+        if let Some(cell) = workspace.value_of(target) {
+            return Some((Slot::at(cell), workspace.cell_type(cell)));
+        }
+        let at = self
+            .imported_targets
+            .iter()
+            .position(|&(t, _)| t == target)?;
+        let slot = self.imported_records.get(at)?.0;
+        let ty = self.imported_targets.get(at)?.1;
+        Some((slot, ty))
+    }
+
+    /// Records that the expression `id`, a reference through an import,
+    /// reads `slot`: a `Load` at the top level, a `Top` inside a function.
+    fn read_import(&mut self, id: ExprId, slot: Slot) {
+        self.expr_vars[id.index()] = if self.functions.is_empty() {
+            VarRef::Local(slot)
+        } else {
+            VarRef::Fn(slot)
+        };
     }
 
     /// The type of the reference `id` to `node`, a node of another file of
@@ -6328,7 +6573,6 @@ impl<'a> Checker<'a> {
         node: u32,
         id: ExprId,
     ) -> Option<TyId> {
-        let global = workspace.scope.merged(node)?;
         let mut base = id;
         while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
             base = expr;
@@ -6339,18 +6583,28 @@ impl<'a> Checker<'a> {
         let shadowed = self
             .lookup(name)
             .is_some_and(|(index, _)| index >= self.top_end);
-        if shadowed || base == id {
+        if shadowed {
             return None;
         }
-        let slot = Slot(global);
-        let source = if self.functions.is_empty() {
-            VarRef::Local(slot)
-        } else {
-            VarRef::Fn(slot)
+        // Through an import, a root alone too, which has no binding (see
+        // [Imports](#imports)).
+        let (slot, ty) = match workspace.scope.target(node) {
+            Some(target) => {
+                if let Target::Node(merged) = target {
+                    self.imported_callees.insert(id, merged);
+                }
+                self.import_cell(workspace, target)?
+            }
+            None if base == id => return None,
+            None => {
+                // A `def`'s cell is its function's slot, and now typed as
+                // its function, so never its merged node's unwritten one.
+                let global = workspace.scope.merged(node)?;
+                (workspace.cell_slot(global), workspace.cell_type(global))
+            }
         };
-        self.expr_vars[id.index()] = source;
-        self.expr_vars[base.index()] = source;
-        let ty = workspace.cell_type(global);
+        self.read_import(id, slot);
+        self.expr_vars[base.index()] = self.expr_vars[id.index()];
         let mut at = id;
         let mut inner_ty = ty;
         while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
@@ -8947,7 +9201,8 @@ impl<'a> Checker<'a> {
             ExprKind::Field { expr: record, name } => {
                 // A reference to a node of the tree of the input's top-level
                 // fields below its root reads that node's cell.
-                let reference = if self.mentions.tree.nodes.is_empty() {
+                let imports = self.workspace.is_some_and(|w| !w.file().aliases.is_empty());
+                let reference = if self.mentions.tree.nodes.is_empty() && !imports {
                     None
                 } else {
                     self.field_reference(id)
@@ -10412,6 +10667,12 @@ impl<'a> Checker<'a> {
     /// expression of this input, or declared by an earlier session input
     /// (whose measured parameters the scope carries).
     fn known_callee(&self, callee: ExprId) -> Option<KnownCallee> {
+        if let Some(&node) = self.imported_callees.get(&callee) {
+            let measured = self
+                .workspace
+                .and_then(|workspace| workspace.measured(node));
+            return measured.map(|_| KnownCallee::Imported(node));
+        }
         let ExprKind::Name(name) = self.ast.get(callee).kind else {
             return None;
         };
@@ -10440,7 +10701,7 @@ impl<'a> Checker<'a> {
                 self.argument_site(known, param, (call, callee)),
                 Some((function, param)),
             ),
-            Some(known @ KnownCallee::Earlier(_)) => {
+            Some(known @ (KnownCallee::Earlier(_) | KnownCallee::Imported(_))) => {
                 (self.argument_site(known, param, (call, callee)), None)
             }
             None => (AwaitSite::Implicit, None),
@@ -10484,6 +10745,17 @@ impl<'a> Checker<'a> {
                     .scope_measured
                     .get(index)
                     .and_then(Option::as_ref)
+                    .and_then(|measured| measured.get(param).copied());
+                if measured == Some(true) {
+                    argument(None)
+                } else {
+                    AwaitSite::Implicit
+                }
+            }
+            KnownCallee::Imported(node) => {
+                let measured = self
+                    .workspace
+                    .and_then(|workspace| workspace.measured(node))
                     .and_then(|measured| measured.get(param).copied());
                 if measured == Some(true) {
                     argument(None)
@@ -11327,6 +11599,14 @@ impl<'a> Checker<'a> {
         let found = self.lookup(name);
         if self.early.is_some() && self.reads_between(name, found) {
             return (TyId::ERROR, None);
+        }
+        // An imported name nothing nearer shadows (see [Imports](#imports)).
+        if let Some(workspace) = self.workspace
+            && workspace.scope.alias(name).is_some()
+            && found.is_none_or(|(index, _)| index < self.top_end)
+            && let Some(ty) = self.field_reference(id)
+        {
+            return (ty, None);
         }
         if let Some((index, binding)) = found {
             if binding.kind == BindingKind::Mutable {
@@ -12489,7 +12769,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Expr(_)
             | ItemKind::Break(_)
             | ItemKind::Continue(_)
-            | ItemKind::Return(_) => {}
+            | ItemKind::Return(_)
+            | ItemKind::Import(_) => {}
         }
     }
 
@@ -13355,7 +13636,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Spread(_)
             | ItemKind::Break(_)
             | ItemKind::Continue(_)
-            | ItemKind::Return(_) => {}
+            | ItemKind::Return(_)
+            | ItemKind::Import(_) => {}
         }
     }
 
@@ -13764,6 +14046,21 @@ mod tests {
         ] {
             assert_eq!(messages(text), vec!["cannot floor-divide Float"], "{text}");
         }
+    }
+
+    #[test]
+    fn an_import_outside_a_workspace_is_an_error_with_the_files_others() {
+        // At the import, whatever its form, alongside the file's other
+        // errors.
+        let message = "`import` needs a workspace: no `workspace.gcsl` above this file";
+        assert_eq!(
+            errors("x = 1 + true\nimport a.b as c"),
+            vec![
+                ("cannot add Int and Bool".to_owned(), Span::new(6, 7)),
+                (message.to_owned(), Span::new(13, 28)),
+            ]
+        );
+        assert_eq!(messages("import x, * from lib"), vec![message]);
     }
 
     #[test]
@@ -14362,7 +14659,10 @@ mod tests {
                 | ItemKind::Expr(value) => {
                     visit(ast, value, out);
                 }
-                ItemKind::Break(_) | ItemKind::Continue(_) | ItemKind::Return(_) => {}
+                ItemKind::Break(_)
+                | ItemKind::Continue(_)
+                | ItemKind::Return(_)
+                | ItemKind::Import(_) => {}
             }
         }
     }

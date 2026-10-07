@@ -13,6 +13,14 @@
 //! directory, `FILE` by the path given. The dumps are `FILE`'s alone: its
 //! tokens and syntax tree as a file's, its types and IR as checked and
 //! lowered in the workspace.
+//!
+//! The directories left out as nested workspaces are passed to the
+//! library too, by their paths relative to the root
+//! ([`gcsl::workspace::check_with`]): an `import` of a path into one is "no
+//! module", and only this module knows why, so that the error's note can
+//! say "`vendor/` is a workspace of its own". An `import` in a file that is
+//! not in a workspace is an error of that file, reported by the checker
+//! with its other errors.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -292,15 +300,24 @@ struct Unreadable {
     error: io::Error,
 }
 
+/// What [`workspace_files`] finds: the files, each with its path relative to
+/// the root and its full path, and the directories left out as workspaces
+/// of their own.
+type Found = (Vec<(String, PathBuf)>, Vec<String>);
+
 /// The files of the workspace under `root`, each with its path relative to
 /// `root`, `/` separated, in path order, byte by byte: every `.gcsl` file
 /// below it, except those whose name, or a directory's on the way, starts
 /// with `.`, and those under a directory holding its own `workspace.gcsl`,
 /// which is a workspace of its own. Names that are not UTF-8 are skipped,
 /// and so is a directory that is a symbolic link, which could lead back
-/// into the tree; a file that is one is read as any file.
-fn workspace_files(root: &Path) -> Result<Vec<(String, PathBuf)>, Unreadable> {
+/// into the tree; a file that is one is read as any file. With them, the
+/// directories left out as workspaces of their own, relative to `root`
+/// without a trailing `/`, in path order: the workspace is told of them so
+/// that an import of one says why it finds nothing.
+fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
     let mut files = Vec::new();
+    let mut nested = Vec::new();
     let mut dirs = vec![(String::new(), root.to_path_buf())];
     while let Some((prefix, dir)) = dirs.pop() {
         let unreadable = |error| Unreadable {
@@ -316,7 +333,12 @@ fn workspace_files(root: &Path) -> Result<Vec<(String, PathBuf)>, Unreadable> {
             let path = entry.path();
             if path.is_dir() {
                 let linked = entry.file_type().is_ok_and(|kind| kind.is_symlink());
-                if !linked && !path.join(WORKSPACE).is_file() {
+                if linked {
+                    continue;
+                }
+                if path.join(WORKSPACE).is_file() {
+                    nested.push(format!("{prefix}{name}"));
+                } else {
                     dirs.push((format!("{prefix}{name}/"), path));
                 }
             } else if path.extension().and_then(OsStr::to_str) == Some("gcsl") {
@@ -325,7 +347,8 @@ fn workspace_files(root: &Path) -> Result<Vec<(String, PathBuf)>, Unreadable> {
         }
     }
     files.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-    Ok(files)
+    nested.sort_unstable();
+    Ok((files, nested))
 }
 
 /// How `path`, a full path, is shown: relative to the current directory
@@ -346,8 +369,8 @@ fn shown(path: &Path) -> PathBuf {
 /// and its diagnostics are shown with its path from the current directory
 /// (`file`'s as it was given).
 fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str) -> ExitCode {
-    let paths = match workspace_files(root) {
-        Ok(paths) => paths,
+    let (paths, nested) = match workspace_files(root) {
+        Ok(found) => found,
         Err(Unreadable { path, error }) => {
             let path = shown(&path);
             output::error(format_args!("cannot read {}: {error}", path.display()));
@@ -388,7 +411,7 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
-    match execute_workspace(args, file, &sources, &shown_sources, index) {
+    match execute_workspace(args, file, &sources, &shown_sources, &nested, index) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Program(diagnostics)) => {
             output::diagnostics_in(&shown_sources, file, &diagnostics);
@@ -402,12 +425,14 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
 /// tokens and the syntax tree are `file`'s alone; the types and the IR are
 /// `file`'s, file `index`, as checked in the workspace; the value is
 /// `file`'s own, after the files it needs have run. Warnings are the whole
-/// workspace's, shown against `shown`.
+/// workspace's, shown against `shown`. `nested` are the directories left
+/// out as workspaces of their own.
 fn execute_workspace(
     args: &RunArgs,
     file: &SourceFile,
     sources: &[SourceFile],
     shown: &[SourceFile],
+    nested: &[String],
     index: u32,
 ) -> Result<(), Failure> {
     let last = args.last_dump();
@@ -415,7 +440,7 @@ fn execute_workspace(
     if (args.dump_tokens || args.dump_ast) && syntax(args, file, &mut out)?.is_none() {
         return Ok(out.flush()?);
     }
-    let mut workspace = workspace::check(sources).map_err(Failure::Program)?;
+    let mut workspace = workspace::check_with(sources, nested).map_err(Failure::Program)?;
     if args.dump_types {
         writeln!(out, "{}", workspace.dump_types(index).unwrap_or_default())?;
     }

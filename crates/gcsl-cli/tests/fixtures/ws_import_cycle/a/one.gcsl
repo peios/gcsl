@@ -1,0 +1,3 @@
+import b.two
+first = 1
+uses = two.second

@@ -76,6 +76,23 @@
 //! checker reports. Both are found from the tree alone, before checking;
 //! whether a leaf can be computed at its point (what it reads is bound by
 //! then) is the checker's question.
+//!
+//! # Imports
+//!
+//! An `import` declares private top-level names of its file, but nothing
+//! here: it has no expression to walk and adds nothing to the tree, so a
+//! file's own tree and record never hold an imported name. The names are
+//! the [`Resolve`] scope's. In a workspace that scope
+//! ([`crate::workspace::FileScope`]) finds an imported name as a root after
+//! the declarations of the directory chain, with which the scan has
+//! already made sure it shares no name, and each root of a `*` import as a
+//! name of its own; a single file has no scope with imports, and the
+//! checker rejects its `import`s. A reference through an imported name is
+//! then resolved as any reference is, to the longest prefix the scope
+//! declares, now in the tree of what the import names, and the same
+//! shadowing applies: a parameter or a nearer `let` of the name hides the
+//! import. Such a reference is another file's node, so it is a mention in
+//! [`Mentions::foreign`], never a need of this file's schedule.
 
 use std::collections::HashMap;
 use std::mem;
@@ -1040,6 +1057,12 @@ impl Walker<'_> {
                     self.expr(value);
                 }
             }
+            // An import has no expression to walk. The names it binds are
+            // the scope's: a workspace's resolves them ([`Resolve::root`]
+            // finds an imported name after the declarations of the
+            // directory chain, with which it cannot share a name), and a
+            // reference through one is a mention of what it names.
+            ItemKind::Import(_) => {}
         }
     }
 

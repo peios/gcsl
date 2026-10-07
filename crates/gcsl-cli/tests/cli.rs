@@ -63,6 +63,34 @@ fn runtime_error_is_rendered_to_stderr_with_exit_code_1() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+#[test]
+fn an_import_outside_a_workspace_is_an_error() {
+    let output = gcsl(&["run", "tests/fixtures/import_outside.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `import` needs a workspace: no `workspace.gcsl` above this file\n\
+         \x20--> tests/fixtures/import_outside.gcsl:2:1\n\
+         \x20 |\n\
+         2 | import lib\n\
+         \x20 | ^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn an_import_in_the_repl_is_an_error() {
+    let output = repl("import lib\n1 + 1\n");
+    assert_eq!(stdout(&output), "2 : Int\n");
+    assert!(
+        stderr(&output).starts_with(
+            "error: `import` needs a workspace: no `workspace.gcsl` above this file\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// Colour is only used on a terminal, and tests run through pipes, so this
 /// is the plain path; `NO_COLOR` set is the other way to get it.
 #[test]
@@ -2038,6 +2066,99 @@ fn dumps_in_a_workspace_are_the_files_alone() {
     let ir = stdout(&output);
     assert!(ir.contains("(load lib#7 @49..58)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The imports summary: `app/main.gcsl` reads `lib/`'s leaves, a member of
+/// it, a file of it and a value file of `tools/`, each through its alias;
+/// the imported files run alone as they would without the importer.
+#[test]
+fn run_follows_imports_across_directories() {
+    for (file, value) in [
+        (
+            "app/main",
+            "{com = {x = {app = {deps = [{name = \"lib-1.2\"}, {name = \"ylib\"}]; tool = \
+             \"build-1.2\"; all = \"ylib\"}}}}\n",
+        ),
+        ("lib/x", "{com = {x = {lib = {name = \"lib-1.2\"}}}}\n"),
+        ("tools/build", "build-1.2\n"),
+    ] {
+        let output = gcsl(&["run", &format!("tests/fixtures/ws_imports/{file}.gcsl")]);
+        assert_eq!(stdout(&output), value, "{file}");
+        assert_eq!(stderr(&output), "", "{file}");
+        assert_eq!(output.status.code(), Some(0), "{file}");
+    }
+}
+
+/// A path into a nested workspace is no module of this one, and the note
+/// says why: the CLI tells the scan which directories it left out.
+#[test]
+fn run_renders_no_module_with_its_note() {
+    let output = gcsl(&["run", "tests/fixtures/ws_no_module/app.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: no module `vendor.pkg`\n\
+         \x20--> tests/fixtures/ws_no_module/app.gcsl:1:8\n\
+         \x20 |\n\
+         1 | import vendor.pkg\n\
+         \x20 |        ^^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: `vendor/` is a workspace of its own\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// Two files of two directories that import each other need each other.
+#[test]
+fn run_renders_an_import_cycle() {
+    let output = gcsl(&["run", "tests/fixtures/ws_import_cycle/a/one.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `a/one.gcsl` and `b/two.gcsl` need each other\n\
+         \x20--> tests/fixtures/ws_import_cycle/a/one.gcsl:3:8\n\
+         \x20 |\n\
+         3 | uses = two.second\n\
+         \x20 |        ^^^^^^^^^^ `a/one.gcsl` uses `second` here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_import_cycle/b/two.gcsl:2:10\n\
+         \x20 |\n\
+         2 | second = one.first\n\
+         \x20 |          --------- `b/two.gcsl` uses `first` here\n\
+         \x20 |\n\
+         \x20 = note: a file runs as a whole before a file that needs it, so two files cannot \
+         need each other\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// The dumps of an importing file print its imports as written, type each
+/// reference through an alias as the node it reaches, and load the cells
+/// of the files that own them.
+#[test]
+fn dumps_of_an_importing_file() {
+    let path = "tests/fixtures/ws_imports/app/main.gcsl";
+    let output = gcsl(&["run", path, "--dump-ast"]);
+    assert!(stdout(&output).starts_with(
+        "(file\n  (import lib @0..10)\n  (import tools.build as builder @11..40)\n  \
+         (import com as libs from lib @41..68)\n  (import lib.y @69..81)\n"
+    ));
+    let output = gcsl(&["run", path, "--dump-types"]);
+    let types = stdout(&output);
+    assert!(
+        types.contains("(name builder : String @144..151)"),
+        "{types}"
+    );
+    assert!(
+        types.contains("(name libs : {y: {lib: {name: String}}} @115..119)"),
+        "{types}"
+    );
+    let output = gcsl(&["run", path, "--dump-ir"]);
+    let ir = stdout(&output);
+    assert!(ir.contains("(load build#14 @144..151)"), "{ir}");
+    assert!(!ir.contains("store version"), "{ir}");
+    assert!(!ir.contains("store name"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
 }
 

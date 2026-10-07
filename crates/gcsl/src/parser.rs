@@ -8,7 +8,8 @@
 //! `let PATH (: TYPE)? = EXPR`, `let mut NAME (: TYPE)? = EXPR`, `PATH :=
 //! EXPR`, a field `PATH = EXPR`, `= EXPR`, a spread `...EXPR`, a named
 //! function `fn NAME(...) ...`, a `break`, a `continue` or a `return` (see
-//! [Loops](#loops)), or an expression. After an item the next
+//! [Loops](#loops)), an expression, or, in a file's body only, an `import`
+//! (see [Imports](#imports)). After an item the next
 //! token must be a separator or the end of the body; anything else is
 //! "expected end of item".
 //!
@@ -45,6 +46,38 @@
 //! followed by a single identifier: a string or a dotted path is an error
 //! at it, and so is anything else. `def` is a keyword, so anywhere else,
 //! as a name or an expression, it is reported as any keyword is there.
+//!
+//! # Imports
+//!
+//! An import is an item of a file's outermost body only:
+//!
+//! ```text
+//! IMPORT = "import" PATH ("as" NAME)?
+//!        | "import" MEMBER ("," MEMBER)* "from" PATH
+//! MEMBER = NAME ("as" NAME)? | "*"
+//! PATH   = NAME ("." NAME)*
+//! ```
+//!
+//! (see [`ItemKind::Import`] and [`ImportDecl`]). `import` is a keyword. `as`
+//! was already one, for narrowing (`x as Int`), and is the same token here.
+//! `from` is contextual: it is the keyword wherever it stands in an import
+//! item, its first token after `import` included, and a name everywhere
+//! else, so a module or a member called `from` cannot be imported (`import
+//! from as f` is "expected a path after `from`"). The two forms are told
+//! apart after the first path or member and its `as`: a `,` or `from` next
+//! makes it a member list.
+//!
+//! An `import` that starts an item of any other body, a block's, a
+//! function's or a `lazy`'s, is "`import` is only allowed at the top level
+//! of a file"; anywhere else it is reported as any keyword is. A path
+//! segment that is a string (`import "github.com/x"`), or any other token
+//! after a `.`, is "a module path is names separated by `.`"; any other
+//! token where a path starts is "expected a module path after `import`" or
+//! "expected a path after `from`". A dotted member (`import a.b, c from p`)
+//! is "a name imported with `from` is a single name". `*` without `from`
+//! is "`import *` needs `from` and a path", and a second `*` in one list "`*`
+//! is imported more than once". Whether the path names anything is the
+//! workspace's business, and outside a workspace the checker's.
 //!
 //! # Paths
 //!
@@ -473,9 +506,9 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
-    FnDecl, ForDecl, ForHead, Item, ItemId, ItemKind, ItemRange, Jump, Label, Param, ParamTy,
-    PathRange, PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp,
-    path_span,
+    FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId,
+    ItemKind, ItemRange, Jump, Label, Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart,
+    TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -528,6 +561,15 @@ const MISSING_RETURN_TYPE: &str =
 /// by `Parser::parse_item` before any expression is parsed, so it never
 /// reaches this.)
 const MISPLACED_SPREAD: &str = "`...` is only allowed in a list or at the start of an item";
+
+/// The error for an `import` item anywhere but in a file's outermost body.
+const MISPLACED_IMPORT: &str = "`import` is only allowed at the top level of a file";
+
+/// The error for a module path segment that is not a name.
+const MODULE_PATH: &str = "a module path is names separated by `.`";
+
+/// The error for a dotted member of a `from` import.
+const SINGLE_MEMBER: &str = "a name imported with `from` is a single name";
 
 /// The error for a `mut` anywhere but directly after `let`.
 const MISPLACED_MUT: &str = "`mut` is only allowed after `let`";
@@ -780,7 +822,13 @@ impl Parser<'_> {
                 }
                 _ => {}
             }
-            let (item, item_height) = self.parse_item()?;
+            let (item, item_height) = match (token.kind, open) {
+                (TokenKind::Import, None) => (self.parse_import(token)?, 0),
+                (TokenKind::Import, Some(_)) => {
+                    return Err(self.error(MISPLACED_IMPORT, token.span));
+                }
+                _ => self.parse_item()?,
+            };
             self.item_stack.push(item);
             height = height.max(item_height);
             self.expect_end_of_item()?;
@@ -1101,6 +1149,226 @@ impl Parser<'_> {
             }
         };
         self.finish_item(keyword, (kind, value), 0, shape)
+    }
+
+    /// Parses an import item of the file's body, starting at its keyword,
+    /// `keyword` (see [Imports](#imports)).
+    fn parse_import(&mut self, keyword: Token) -> ParseResult<ItemId> {
+        self.advance();
+        let first = self.peek();
+        let mut members = Vec::new();
+        if first.kind == TokenKind::Star {
+            self.advance();
+            members.push(ImportMember::All(first.span));
+        } else {
+            let mut end = keyword.span;
+            if self.is_from(first) {
+                self.advance();
+                return Err(self.expected_path_after_from());
+            }
+            let base = self.path.len();
+            let path_span = self.parse_module_path(first, "after `import`")?;
+            end = end.join(path_span);
+            let alias = self.parse_import_alias(&mut end)?;
+            let next = self.peek();
+            if next.kind != TokenKind::Comma && !self.is_from(next) {
+                let path = self.builder.push_path(&self.path[base..]);
+                self.path.truncate(base);
+                let decl = ImportDecl {
+                    path,
+                    form: ImportForm::Whole(alias),
+                };
+                return Ok(self.finish_import(decl, keyword.span.join(end)));
+            }
+            let segments = &self.path[base..];
+            let first_segment = segments.first().copied();
+            let dotted = segments.len() > 1;
+            self.path.truncate(base);
+            if dotted {
+                return Err(self.error(SINGLE_MEMBER, path_span));
+            }
+            if let Some(PathSegment {
+                kind: SegmentKind::Name(name),
+                span,
+            }) = first_segment
+            {
+                members.push(ImportMember::Named {
+                    name: ImportName { name, span },
+                    alias,
+                });
+            }
+        }
+        self.parse_import_members(&mut members)?;
+        let path_start = self.peek();
+        let names_a_path = matches!(
+            path_start.kind,
+            TokenKind::Ident(_) | TokenKind::Str(_) | TokenKind::StrStart(_)
+        );
+        if !names_a_path || self.is_from(path_start) {
+            return Err(self.expected_path_after_from());
+        }
+        let base = self.path.len();
+        let path_span = self.parse_module_path(path_start, "after `from`")?;
+        let path = self.builder.push_path(&self.path[base..]);
+        self.path.truncate(base);
+        let range = self.builder.push_import_members(&members);
+        let decl = ImportDecl {
+            path,
+            form: ImportForm::Members(range),
+        };
+        Ok(self.finish_import(decl, keyword.span.join(path_span)))
+    }
+
+    /// Reads the rest of a `from` import's member list after its first
+    /// member, which is in `members`, through its `from`, adding each.
+    fn parse_import_members(&mut self, members: &mut Vec<ImportMember>) -> ParseResult<()> {
+        loop {
+            let next = self.peek();
+            if self.is_from(next) {
+                self.advance();
+                return Ok(());
+            }
+            if next.kind != TokenKind::Comma {
+                if let Some(star) = members.iter().find_map(|member| match member {
+                    ImportMember::All(span) => Some(*span),
+                    ImportMember::Named { .. } => None,
+                }) {
+                    return Err(self.error("`import *` needs `from` and a path", star));
+                }
+                let found = self.describe(next);
+                return Err(self.error(format!("expected `,` or `from`, found {found}"), next.span));
+            }
+            self.advance();
+            let member = self.peek();
+            if member.kind == TokenKind::Star {
+                self.advance();
+                if members.iter().any(|m| matches!(m, ImportMember::All(_))) {
+                    return Err(self.error("`*` is imported more than once", member.span));
+                }
+                members.push(ImportMember::All(member.span));
+                continue;
+            }
+            let TokenKind::Ident(name) = member.kind else {
+                let found = self.describe(member);
+                return Err(self.error(
+                    format!("expected a name to import after `,`, found {found}"),
+                    member.span,
+                ));
+            };
+            if self.is_from(member) {
+                let found = self.describe(member);
+                return Err(self.error(
+                    format!("expected a name to import after `,`, found {found}"),
+                    member.span,
+                ));
+            }
+            if self.peek_at(1).kind == TokenKind::Dot {
+                let base = self.path.len();
+                let span = self.parse_module_path(member, "after `,`")?;
+                self.path.truncate(base);
+                return Err(self.error(SINGLE_MEMBER, span));
+            }
+            self.advance();
+            let mut member_end = member.span;
+            let alias = self.parse_import_alias(&mut member_end)?;
+            members.push(ImportMember::Named {
+                name: ImportName {
+                    name,
+                    span: member.span,
+                },
+                alias,
+            });
+        }
+    }
+
+    /// Reads a module path, `NAME ("." NAME)*`, starting at `first`, which
+    /// is the next token, onto the path stack (the caller moves or
+    /// discards it). Returns the span it covers. `after` says where it is,
+    /// for the error when `first` is not a name.
+    fn parse_module_path(&mut self, first: Token, after: &str) -> ParseResult<Span> {
+        let mut token = first;
+        let mut span = first.span;
+        let mut leading = true;
+        loop {
+            let name = match token.kind {
+                TokenKind::Ident(name) if !self.is_from(token) => name,
+                TokenKind::Str(_) | TokenKind::StrStart(_) => {
+                    return Err(self.error(MODULE_PATH, token.span));
+                }
+                _ if leading => {
+                    let found = self.describe(token);
+                    return Err(self.error(
+                        format!("expected a module path {after}, found {found}"),
+                        token.span,
+                    ));
+                }
+                _ => return Err(self.error(MODULE_PATH, token.span)),
+            };
+            self.advance();
+            span = span.join(token.span);
+            self.path.push(PathSegment {
+                kind: SegmentKind::Name(name),
+                span: token.span,
+            });
+            if self.peek().kind != TokenKind::Dot {
+                return Ok(span);
+            }
+            self.advance();
+            token = self.peek();
+            leading = false;
+        }
+    }
+
+    /// Reads `as NAME` after an import's path or member, if the next token
+    /// is `as`, widening `end` to cover it.
+    fn parse_import_alias(&mut self, end: &mut Span) -> ParseResult<Option<ImportName>> {
+        if self.peek().kind != TokenKind::As {
+            return Ok(None);
+        }
+        self.advance();
+        let token = self.peek();
+        match token.kind {
+            TokenKind::Ident(name) if !self.is_from(token) => {
+                self.advance();
+                *end = end.join(token.span);
+                Ok(Some(ImportName {
+                    name,
+                    span: token.span,
+                }))
+            }
+            _ => {
+                let found = self.describe(token);
+                Err(self.error(
+                    format!("expected a name after `as`, found {found}"),
+                    token.span,
+                ))
+            }
+        }
+    }
+
+    /// Whether `token` is the identifier `from`, which is the keyword
+    /// wherever it appears in an import item.
+    fn is_from(&self, token: Token) -> bool {
+        matches!(token.kind, TokenKind::Ident(name) if self.names.get(name) == "from")
+    }
+
+    /// Reports "expected a path after `from`" at the next token.
+    fn expected_path_after_from(&mut self) -> Reported {
+        let token = self.peek();
+        let found = self.describe(token);
+        self.error(
+            format!("expected a path after `from`, found {found}"),
+            token.span,
+        )
+    }
+
+    /// Allocates the import item `decl`, spanning `span`.
+    fn finish_import(&mut self, decl: ImportDecl, span: Span) -> ItemId {
+        let id = self.builder.push_import(decl);
+        self.builder.alloc_item(Item {
+            kind: ItemKind::Import(id),
+            span,
+        })
     }
 
     /// Allocates the item of `kind`, starting at `token` and ending with its
@@ -1938,6 +2206,7 @@ impl Parser<'_> {
             | TokenKind::DotDotEq
             | TokenKind::Let
             | TokenKind::Def
+            | TokenKind::Import
             | TokenKind::Colon
             | TokenKind::ColonEq
             | TokenKind::Arrow
@@ -2873,6 +3142,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::Not
         | TokenKind::Fn
         | TokenKind::Def
+        | TokenKind::Import
         | TokenKind::Lazy
         | TokenKind::Await
         | TokenKind::For
@@ -2955,7 +3225,7 @@ fn error_span(token: Token) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::ItemKind;
+    use crate::ast::{ImportId, ItemKind};
     use crate::lexer::tokenize;
     use crate::strings::FieldName;
 
@@ -3064,6 +3334,37 @@ mod tests {
                 expr(ast, value, out);
             }
             ItemKind::Expr(value) => expr(ast, value, out),
+            ItemKind::Import(import) => import_shape(ast, import, out),
+        }
+    }
+
+    /// An import item as it is written.
+    fn import_shape(ast: &Ast, import: ImportId, out: &mut String) {
+        let name = |name: ImportName| ast.names().get(name.name).to_owned();
+        let as_alias = |alias: Option<ImportName>| alias.map(|a| format!(" as {}", name(a)));
+        let decl = ast.import_decl(import);
+        let path = ast.show_path(ast.path(decl.path)).to_string();
+        out.push_str("import ");
+        match decl.form {
+            ImportForm::Whole(alias) => {
+                out.push_str(&path);
+                out.push_str(&as_alias(alias).unwrap_or_default());
+            }
+            ImportForm::Members(range) => {
+                let members: Vec<String> = ast
+                    .import_members(range)
+                    .iter()
+                    .map(|member| match *member {
+                        ImportMember::Named { name: n, alias } => {
+                            name(n) + &as_alias(alias).unwrap_or_default()
+                        }
+                        ImportMember::All(_) => "*".to_owned(),
+                    })
+                    .collect();
+                out.push_str(&members.join(", "));
+                out.push_str(" from ");
+                out.push_str(&path);
+            }
         }
     }
 
@@ -7762,5 +8063,121 @@ mod tests {
             Some(Span::new(1, 3))
         );
         assert_eq!(ast.items(items).len(), 1);
+    }
+
+    #[test]
+    fn every_import_form_prints_as_written() {
+        for text in [
+            "import lib",
+            "import tools.build",
+            "import tools.build as builder",
+            "import com from lib",
+            "import com as libs from lib",
+            "import a, b as c, * from lib.sub",
+            "import * from lib",
+            "import *, a from lib",
+            "import lib; x = 1; import lib.y as y",
+        ] {
+            assert_eq!(shape(text), text, "{text}");
+        }
+        // `from` is a name everywhere outside an import.
+        assert_eq!(shape("from = 1; x = from"), "from = 1; x = from");
+    }
+
+    #[test]
+    fn an_import_item_spans_its_keyword_through_its_path_or_alias() {
+        let ast = parse_text("import a.b as c").unwrap();
+        let &[id] = ast.items(ast.root()) else {
+            panic!("expected one item");
+        };
+        assert_eq!(ast.item(id).span, Span::new(0, 15));
+        let ast = parse_text("import x, * from a.b").unwrap();
+        let &[id] = ast.items(ast.root()) else {
+            panic!("expected one item");
+        };
+        assert_eq!(ast.item(id).span, Span::new(0, 20));
+        let ItemKind::Import(import) = ast.item(id).kind else {
+            panic!("expected an import");
+        };
+        assert_eq!(import.index(), 0);
+    }
+
+    #[test]
+    fn import_is_a_keyword() {
+        assert_eq!(
+            message("import = 1"),
+            "expected a module path after `import`, found `=`"
+        );
+        assert_eq!(message("x = import"), "expected expression, found `import`");
+        assert_eq!(message("let import = 1"), "expected a name after `let`");
+    }
+
+    #[test]
+    fn import_only_at_the_top_level_of_a_file() {
+        let text = "x = { import a }";
+        assert_eq!(error(text), (MISPLACED_IMPORT.to_owned(), Span::new(6, 12)));
+        assert_eq!(message("fn f(): Int { import a }"), MISPLACED_IMPORT);
+        assert_eq!(message("def f(): Int { import a }"), MISPLACED_IMPORT);
+        assert_eq!(message("x = lazy { import a }"), MISPLACED_IMPORT);
+        assert_eq!(message("for i in [1] { import a }"), MISPLACED_IMPORT);
+    }
+
+    #[test]
+    fn import_path_errors() {
+        assert_eq!(
+            error("import \"github.com/x\""),
+            (MODULE_PATH.to_owned(), Span::new(7, 21))
+        );
+        assert_eq!(message("import a.\"b\""), MODULE_PATH);
+        assert_eq!(message("import a.1"), MODULE_PATH);
+        assert_eq!(message("import x from \"lib\""), MODULE_PATH);
+        assert_eq!(
+            message("import from as f"),
+            "expected a path after `from`, found `as`"
+        );
+        assert_eq!(
+            message("import x from"),
+            "expected a path after `from`, found end of input"
+        );
+        assert_eq!(
+            message("import x from from"),
+            "expected a path after `from`, found `from`"
+        );
+        assert_eq!(
+            message("import a as"),
+            "expected a name after `as`, found end of input"
+        );
+    }
+
+    #[test]
+    fn import_member_errors() {
+        assert_eq!(
+            error("import a.b, c from p"),
+            (SINGLE_MEMBER.to_owned(), Span::new(7, 10))
+        );
+        assert_eq!(
+            error("import c, a.b from p"),
+            (SINGLE_MEMBER.to_owned(), Span::new(10, 13))
+        );
+        assert_eq!(message("import a.b from p"), SINGLE_MEMBER);
+        assert_eq!(
+            error("import *"),
+            (
+                "`import *` needs `from` and a path".to_owned(),
+                Span::new(7, 8)
+            )
+        );
+        assert_eq!(message("import a, *"), "`import *` needs `from` and a path");
+        assert_eq!(
+            error("import *, a, * from p"),
+            (
+                "`*` is imported more than once".to_owned(),
+                Span::new(13, 14)
+            )
+        );
+        assert_eq!(
+            message("import a, b c"),
+            "expected `,` or `from`, found `c`"
+        );
     }
 }

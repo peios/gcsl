@@ -1,0 +1,7 @@
+import lib
+import tools.build as builder
+import com as libs from lib
+import lib.y
+com.x.app.deps = [lib.com.x.lib, libs.y.lib]
+com.x.app.tool = builder
+com.x.app.all = y.com.y.lib.name
