@@ -21,7 +21,7 @@
 
 use std::fmt;
 
-use annotate_snippets::{AnnotationKind, Level, Snippet};
+use annotate_snippets::{AnnotationKind, Group, Level, Snippet};
 
 use crate::source::{SourceFile, Span};
 
@@ -62,6 +62,11 @@ pub struct Label {
     /// The text shown next to the underline. Short: a type, a value, a
     /// few words. No trailing full stop.
     pub text: String,
+    /// The input whose source `span` refers to, when it is not the
+    /// diagnostic's own ([`Diagnostic::input`]): set on a label of a
+    /// workspace diagnostic that points into another file (see
+    /// [`crate::workspace`]). `None` means the diagnostic's own input.
+    pub input: Option<u32>,
 }
 
 /// A message about a region of source text.
@@ -126,7 +131,28 @@ impl Diagnostic {
         self.labels.push(Label {
             span,
             text: text.into(),
+            input: None,
         });
+        self
+    }
+
+    /// Adds a secondary span of the input `input`'s source with its text,
+    /// returning the modified diagnostic (see [`Label::input`]).
+    #[must_use]
+    pub fn with_context_in(mut self, input: u32, span: Span, text: impl Into<String>) -> Self {
+        self.labels.push(Label {
+            span,
+            text: text.into(),
+            input: Some(input),
+        });
+        self
+    }
+
+    /// Sets the input whose source the primary span refers to, returning
+    /// the modified diagnostic (see [`Diagnostic::input`]).
+    #[must_use]
+    pub fn in_input(mut self, input: u32) -> Self {
+        self.input = Some(input);
         self
     }
 
@@ -142,13 +168,6 @@ impl Diagnostic {
     #[must_use]
     pub fn render(&self, source: &SourceFile) -> String {
         Renderer::plain().render(self, source)
-    }
-
-    /// The first and last byte offsets any of the diagnostic's spans touch.
-    fn extent(&self) -> Span {
-        self.labels
-            .iter()
-            .fold(self.span, |extent, label| extent.join(label.span))
     }
 }
 
@@ -201,33 +220,75 @@ impl Renderer {
     /// ends in a newline.
     #[must_use]
     pub fn render(&self, diagnostic: &Diagnostic, source: &SourceFile) -> String {
-        let excerpt = source.excerpt(diagnostic.extent());
-        // Annotation ranges are relative to the excerpt, not the file.
-        let relative = |span: Span| {
-            let start = span.start.saturating_sub(excerpt.span.start) as usize;
-            let end = span.end.saturating_sub(excerpt.span.start) as usize;
-            start..end
-        };
-        let mut snippet = Snippet::source(source.slice(excerpt.span))
-            .path(source.name())
-            .line_start(excerpt.first_line as usize)
-            .annotation(
-                AnnotationKind::Primary
-                    .span(relative(diagnostic.span))
-                    .label(diagnostic.label.as_deref()),
-            );
+        self.render_in(diagnostic, |_| source)
+    }
+
+    /// Renders one diagnostic whose spans may refer to several inputs'
+    /// sources: `source_of` gives the source of an input as
+    /// [`Diagnostic::input`] names it. The primary span and the labels of
+    /// its input make the first excerpt; the labels of each other input
+    /// ([`Label::input`]) make one more excerpt each, against that input's
+    /// source, in the order they first appear. The result ends in a
+    /// newline.
+    #[must_use]
+    pub fn render_in<'a>(
+        &self,
+        diagnostic: &Diagnostic,
+        source_of: impl Fn(Option<u32>) -> &'a SourceFile,
+    ) -> String {
+        let own = diagnostic.input;
+        let label_input = |label: &Label| label.input.or(own);
+        let mut inputs = vec![own];
         for label in &diagnostic.labels {
-            snippet = snippet.annotation(
-                AnnotationKind::Context
-                    .span(relative(label.span))
-                    .label(label.text.as_str()),
-            );
+            if !inputs.contains(&label_input(label)) {
+                inputs.push(label_input(label));
+            }
         }
-        let mut group = diagnostic
-            .severity
-            .level()
-            .primary_title(diagnostic.message.as_str())
-            .element(snippet);
+        let mut group = Group::with_title(
+            diagnostic
+                .severity
+                .level()
+                .primary_title(diagnostic.message.as_str()),
+        );
+        for &input in &inputs {
+            let source = source_of(input);
+            let labels = diagnostic
+                .labels
+                .iter()
+                .filter(|label| label_input(label) == input);
+            let primary = (input == own).then_some(diagnostic.span);
+            let extent = labels
+                .clone()
+                .map(|label| label.span)
+                .chain(primary)
+                .reduce(Span::join)
+                .unwrap_or(diagnostic.span);
+            let excerpt = source.excerpt(extent);
+            // Annotation ranges are relative to the excerpt, not the file.
+            let relative = |span: Span| {
+                let start = span.start.saturating_sub(excerpt.span.start) as usize;
+                let end = span.end.saturating_sub(excerpt.span.start) as usize;
+                start..end
+            };
+            let mut snippet = Snippet::source(source.slice(excerpt.span))
+                .path(source.name())
+                .line_start(excerpt.first_line as usize);
+            if let Some(span) = primary {
+                snippet = snippet.annotation(
+                    AnnotationKind::Primary
+                        .span(relative(span))
+                        .label(diagnostic.label.as_deref()),
+                );
+            }
+            for label in labels {
+                snippet = snippet.annotation(
+                    AnnotationKind::Context
+                        .span(relative(label.span))
+                        .label(label.text.as_str()),
+                );
+            }
+            group = group.element(snippet);
+        }
         for note in &diagnostic.notes {
             group = group.element(Level::NOTE.message(note.as_str()));
         }
@@ -329,6 +390,35 @@ mod tests {
              \x20 | -------- ^ --- Float\n\
              \x20 | |\n\
              \x20 | Int\n"
+        );
+    }
+
+    #[test]
+    fn renders_labels_of_other_inputs_against_their_sources() {
+        let sources = [
+            SourceFile::new("a.gcsl", "x = 1").unwrap(),
+            SourceFile::new("b.gcsl", "x = 2").unwrap(),
+        ];
+        let diagnostic = Diagnostic::error("field `x` is defined in two files", Span::new(0, 1))
+            .in_input(1)
+            .with_context(Span::new(0, 1), "defined here")
+            .with_context_in(0, Span::new(0, 1), "defined here");
+        let source_of = |input: Option<u32>| &sources[input.unwrap_or(0) as usize];
+        let text = Renderer::plain().render_in(&diagnostic, source_of);
+        assert_eq!(
+            text,
+            "error: field `x` is defined in two files\n\
+             \x20--> b.gcsl:1:1\n\
+             \x20 |\n\
+             1 | x = 2\n\
+             \x20 | ^\n\
+             \x20 | |\n\
+             \x20 | defined here\n\
+             \x20 |\n\
+             \x20::: a.gcsl:1:1\n\
+             \x20 |\n\
+             1 | x = 1\n\
+             \x20 | - defined here\n"
         );
     }
 

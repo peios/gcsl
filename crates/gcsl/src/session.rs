@@ -83,6 +83,21 @@
 //! the session lasts. A failed input's cells are forgotten with its other
 //! slots. A later input sees an earlier input's field root whole, as a
 //! field of its type, and `a.c = 2` in a later input declares its own `a`.
+//!
+//! # Workspaces
+//!
+//! A [`crate::workspace::Workspace`] is driven like a session: its files
+//! are inputs, in its order, on one frame with one memo table, each named
+//! by its [`crate::Diagnostic::input`], lowered by `lower_checked` and run
+//! by `run_input`, the functions of this module [`Session::eval`] uses
+//! too. It differs in what it commits and when: a session commits an
+//! input's whole scope
+//! after the input has run, while a workspace commits a file's
+//! declarations (its field roots and `def`s, not its `let`s and `fn`s)
+//! once the file is checked, checks every file before any runs, and then
+//! runs only the files the file asked for needs. Its cells' slots are
+//! allocated for every file before the first is checked, below every
+//! private slot.
 
 use std::mem;
 use std::rc::Rc;
@@ -204,13 +219,8 @@ impl Session {
         let compiled = compile(&ast, self.scope.clone(), &mut self.types, input);
         self.names = ast.into_names();
         let (ir, output) = compiled?;
-        let ir = Rc::new(ir);
-        let frame_size = ir.frame_size() as usize;
-        if self.frame.len() < frame_size {
-            self.frame.resize(frame_size, Value::Empty);
-        }
         let committed = self.committed_mutables();
-        match eval::eval_with(&ir, &mut self.frame, &mut self.memo) {
+        match run_input(ir, &mut self.frame, &mut self.memo) {
             Ok(value) => {
                 self.scope = output.scope;
                 self.value_type = output.ty;
@@ -269,10 +279,38 @@ fn compile(
     input: u32,
 ) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
     let output = Checker::with_scope(ast, scope, types).check()?;
+    lower_checked(ast, output, types, input)
+}
+
+/// Lowers `ast`, input number `input` of a session or a workspace, which
+/// the checker's `output` is of, returning the IR with the output. Shared
+/// by [`Session`] and [`crate::workspace`], which check differently.
+pub(crate) fn lower_checked(
+    ast: &Ast,
+    output: CheckOutput,
+    types: &TypeTable,
+    input: u32,
+) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
     match lower::lower(ast, &output.checked, types, input) {
         Ok(ir) => Ok((ir, output)),
         Err(error) => Err(diagnostic::merge(vec![error.into()], output.warnings)),
     }
+}
+
+/// Runs `ir`, an input of a session or a workspace, on `frame`, the top
+/// level's frame of every input so far, grown to the input's size, with
+/// `memo`, the memo tables of every input.
+pub(crate) fn run_input(
+    ir: Ir,
+    frame: &mut Vec<Value>,
+    memo: &mut MemoTables,
+) -> Result<Value, Diagnostic> {
+    let ir = Rc::new(ir);
+    let frame_size = ir.frame_size() as usize;
+    if frame.len() < frame_size {
+        frame.resize(frame_size, Value::Empty);
+    }
+    eval::eval_with(&ir, frame, memo)
 }
 
 #[cfg(test)]

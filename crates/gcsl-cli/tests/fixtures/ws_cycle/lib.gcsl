@@ -1,0 +1,2 @@
+com.x.lib.name = "lib"
+com.x.lib.users = [com.x.app.name]

@@ -1,0 +1,2 @@
+version = "1.2"
+def tagged(n: String): String { "{n}-{version}" }

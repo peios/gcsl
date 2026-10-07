@@ -1,0 +1,2 @@
+com.x.app.name = "app"
+com.x.app.deps = [com.x.lib]

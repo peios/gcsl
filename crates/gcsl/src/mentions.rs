@@ -78,6 +78,7 @@
 //! then) is the checker's question.
 
 use std::collections::HashMap;
+use std::mem;
 
 use crate::ast::{
     Ast, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
@@ -114,6 +115,12 @@ pub struct Mentions {
     /// Parallel to `fields`: where each item first mentions each node, the
     /// span of the reference's longest declared prefix.
     pub field_spans: Vec<Vec<Span>>,
+    /// For each item of the outermost block, by its position among them,
+    /// what it mentions that is not this input's own: the functions and
+    /// field nodes of the scope [`Mentions::resolve`] was given numbered at
+    /// or above this input's own counts, each once, in source order of its
+    /// first mention, with where. Always empty for an input alone.
+    pub foreign: Vec<Vec<(Need, Span)>>,
 }
 
 /// The tree of an input's top-level fields (see the module documentation).
@@ -278,6 +285,38 @@ impl FieldTree {
     /// shadowed where it is read is the caller's to know.
     #[must_use]
     pub fn reference(&self, ast: &Ast, id: ExprId) -> Option<(u32, ExprId)> {
+        Own {
+            tree: self,
+            functions: &[],
+        }
+        .reference(ast, id)
+    }
+}
+
+/// What the names of an input's declarations mean where its references are
+/// resolved: its own tree and functions for an input alone ([`Own`]), the
+/// merged trees of its directory and the directories above in a workspace
+/// (see [`crate::workspace`]). Node and function numbers are the scope's:
+/// [`Mentions::resolve`] keeps those below the input's own counts as its
+/// own and sets the rest apart ([`Mentions::foreign`]).
+pub trait Resolve {
+    /// The field node that is the root named `name`, if any.
+    fn root(&self, name: Name) -> Option<u32>;
+
+    /// The child of the field node `node` named `name`, if it has one.
+    fn child(&self, node: u32, name: Name) -> Option<u32>;
+
+    /// The top-level function named `name`, if any.
+    fn function(&self, name: Name) -> Option<u32>;
+
+    /// The number of the input's own field nodes and of its own top-level
+    /// functions: the scope's numbers below them are the input's own.
+    fn own(&self) -> (u32, u32);
+
+    /// What the expression `id` refers to, if it is a reference to a
+    /// top-level field, as [`FieldTree::reference`] says, by this scope's
+    /// nodes.
+    fn reference(&self, ast: &Ast, id: ExprId) -> Option<(u32, ExprId)> {
         // The accesses, outermost first, then the base.
         let mut chain = Vec::new();
         let mut base = id;
@@ -300,6 +339,39 @@ impl FieldTree {
     }
 }
 
+/// The scope of an input alone: its own field tree and top-level functions.
+#[derive(Clone, Copy, Debug)]
+pub struct Own<'a> {
+    /// The input's field tree.
+    pub tree: &'a FieldTree,
+    /// The input's top-level functions.
+    pub functions: &'a [TopLevel],
+}
+
+impl Resolve for Own<'_> {
+    fn root(&self, name: Name) -> Option<u32> {
+        self.tree.root(name)
+    }
+
+    fn child(&self, node: u32, name: Name) -> Option<u32> {
+        self.tree.child(node, name)
+    }
+
+    fn function(&self, name: Name) -> Option<u32> {
+        self.functions
+            .iter()
+            .position(|f| f.name == name)
+            .map(index_u32)
+    }
+
+    fn own(&self) -> (u32, u32) {
+        (
+            index_u32(self.tree.nodes.len()),
+            index_u32(self.functions.len()),
+        )
+    }
+}
+
 /// One top-level function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopLevel {
@@ -319,6 +391,29 @@ pub struct TopLevel {
 /// its items mentions, and the groups (see the module documentation).
 #[must_use]
 pub fn find(ast: &Ast) -> Mentions {
+    let mut mentions = scan(ast);
+    let (functions, tree) = (
+        mem::take(&mut mentions.functions),
+        mem::take(&mut mentions.tree),
+    );
+    mentions.resolve(
+        ast,
+        &Own {
+            tree: &tree,
+            functions: &functions,
+        },
+    );
+    mentions.functions = functions;
+    mentions.tree = tree;
+    mentions
+}
+
+/// The declarations of `ast`'s outermost block, its top-level functions and
+/// its field tree, with nothing resolved yet: the first half of [`find`]. A
+/// workspace merges the trees of its files before it resolves any of them
+/// ([`Mentions::resolve`]).
+#[must_use]
+pub fn scan(ast: &Ast) -> Mentions {
     let root = ast.items(ast.root());
     let mut functions = Vec::new();
     for (position, &id) in root.iter().enumerate() {
@@ -333,50 +428,96 @@ pub fn find(ast: &Ast) -> Mentions {
         }
     }
     let tree = FieldTree::build(ast, root);
-    let mut walker = Walker {
-        ast,
-        functions: &functions,
-        tree: &tree,
-        shadows: Vec::new(),
-        found: Vec::new(),
-        found_fields: Vec::new(),
-    };
-    let mut items = Vec::with_capacity(root.len());
-    let mut spans = Vec::with_capacity(root.len());
-    let mut fields = Vec::with_capacity(root.len());
-    let mut field_spans = Vec::with_capacity(root.len());
-    for &id in root {
-        // A top-level item's own declaration shadows nothing for the items
-        // after it: the names of the top level that clash with a function's
-        // or a field's are errors of their own.
-        walker.found.clear();
-        walker.found_fields.clear();
-        walker.shadows.clear();
-        walker.top_item(id);
-        let (found, at) = first_of_each(std::mem::take(&mut walker.found));
-        items.push(found);
-        spans.push(at);
-        let (found, at) = first_of_each(std::mem::take(&mut walker.found_fields));
-        fields.push(found);
-        field_spans.push(at);
-    }
-    let edges: Vec<&[u32]> = root
-        .iter()
-        .zip(&items)
-        .filter(|&(&id, _)| top_level_function(ast, id).is_some())
-        .map(|(_, found)| found.as_slice())
-        .collect();
-    let (groups, group_of) = components(&edges);
     Mentions {
         functions,
-        items,
-        spans,
-        groups,
-        group_of,
         tree,
-        fields,
-        field_spans,
+        ..Mentions::default()
     }
+}
+
+impl Mentions {
+    /// Resolves the references of `ast`, the tree [`scan`] found these
+    /// declarations in, against `scope`, and finds what each item mentions
+    /// and the groups: the second half of [`find`]. A function or node
+    /// number of `scope` below the count of this input's own is its own;
+    /// the rest are kept apart, in [`Mentions::foreign`], and nothing else
+    /// here (the groups, the schedule, the cycles, [`Mentions::needs`])
+    /// sees them.
+    pub fn resolve(&mut self, ast: &Ast, scope: &dyn Resolve) {
+        let root = ast.items(ast.root());
+        let (own_nodes, own_functions) = scope.own();
+        let mut walker = Walker {
+            ast,
+            scope,
+            shadows: Vec::new(),
+            found: Vec::new(),
+            found_fields: Vec::new(),
+        };
+        let mut items = Vec::with_capacity(root.len());
+        let mut spans = Vec::with_capacity(root.len());
+        let mut fields = Vec::with_capacity(root.len());
+        let mut field_spans = Vec::with_capacity(root.len());
+        let mut foreign = Vec::with_capacity(root.len());
+        for &id in root {
+            // A top-level item's own declaration shadows nothing for the
+            // items after it: the names of the top level that clash with a
+            // function's or a field's are errors of their own.
+            walker.found.clear();
+            walker.found_fields.clear();
+            walker.shadows.clear();
+            walker.top_item(id);
+            let mut others = Vec::new();
+            let (found, at) = first_of_each(std::mem::take(&mut walker.found));
+            let (found, at) = split_own(found, at, own_functions, |f, span| {
+                others.push((Need::Function(f), span));
+            });
+            items.push(found);
+            spans.push(at);
+            let (found, at) = first_of_each(std::mem::take(&mut walker.found_fields));
+            let (found, at) = split_own(found, at, own_nodes, |n, span| {
+                others.push((Need::Field(n), span));
+            });
+            fields.push(found);
+            field_spans.push(at);
+            others.sort_by_key(|&(_, span)| span.start);
+            foreign.push(others);
+        }
+        let edges: Vec<&[u32]> = root
+            .iter()
+            .zip(&items)
+            .filter(|&(&id, _)| top_level_function(ast, id).is_some())
+            .map(|(_, found)| found.as_slice())
+            .collect();
+        (self.groups, self.group_of) = components(&edges);
+        self.items = items;
+        self.spans = spans;
+        self.fields = fields;
+        self.field_spans = field_spans;
+        self.foreign = foreign;
+    }
+}
+
+/// Splits `found`, with its spans, into the targets below `own`, returned,
+/// and the rest, given to `other`.
+fn split_own(
+    found: Vec<u32>,
+    at: Vec<Span>,
+    own: u32,
+    mut other: impl FnMut(u32, Span),
+) -> (Vec<u32>, Vec<Span>) {
+    let mut kept = (
+        Vec::with_capacity(found.len()),
+        Vec::with_capacity(at.len()),
+    );
+    for (target, span) in found.into_iter().zip(at) {
+        if target < own {
+            kept.0.push(target);
+            kept.1.push(span);
+        } else {
+            other(target, span);
+        }
+    }
+    kept
 }
 
 /// When each top-level field node is computed (see the checker's module
@@ -418,6 +559,16 @@ impl Mentions {
     /// skipped.
     #[must_use]
     pub fn schedule(&self) -> Schedule {
+        self.schedule_except(&[])
+    }
+
+    /// [`Mentions::schedule`], with the field nodes marked in `done` (by
+    /// index; a node past its end is not marked) computed elsewhere: they
+    /// are never scheduled (their point stays `usize::MAX`) and a walk
+    /// stops at them, as at a node already computed. A workspace marks a
+    /// file's nodes that another file computes (see [`crate::workspace`]).
+    #[must_use]
+    pub fn schedule_except(&self, done: &[bool]) -> Schedule {
         let nodes = &self.tree.nodes;
         let count = self.items.len();
         let mut is_function = vec![false; count];
@@ -433,6 +584,9 @@ impl Mentions {
             visited: vec![false; nodes.len() + self.functions.len()],
             order: Vec::with_capacity(nodes.len()),
         };
+        for (seen, &marked) in state.visited.iter_mut().zip(done) {
+            *seen = marked;
+        }
         // The interior nodes by the position after their last item.
         let mut interior_at: Vec<Vec<u32>> = vec![Vec::new(); count + 1];
         for (index, node) in nodes.iter().enumerate() {
@@ -694,7 +848,7 @@ pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Name, ExprId, FnId)>
 /// The strongly connected components of the graph whose node `n` has an
 /// edge to each node of `edges[n]`, callee first, with each node's
 /// component.
-fn components(edges: &[&[u32]]) -> (Vec<Vec<u32>>, Vec<u32>) {
+pub(crate) fn components(edges: &[&[u32]]) -> (Vec<Vec<u32>>, Vec<u32>) {
     /// Tarjan's state for one node: its visit index and low link, while it
     /// is on the stack.
     #[derive(Clone, Copy)]
@@ -777,9 +931,8 @@ fn index_u32(index: usize) -> u32 {
 /// Walks a tree for the mentions of the top-level functions.
 struct Walker<'a> {
     ast: &'a Ast,
-    functions: &'a [TopLevel],
-    /// The input's top-level fields.
-    tree: &'a FieldTree,
+    /// What the names of the declarations mean.
+    scope: &'a dyn Resolve,
     /// The names declared where the walk is, innermost last.
     shadows: Vec<Name>,
     /// The functions mentioned so far, each with where, possibly repeated.
@@ -797,7 +950,7 @@ impl Walker<'_> {
             return;
         }
         self.function_name(name, span);
-        if let Some(root) = self.tree.root(name) {
+        if let Some(root) = self.scope.root(name) {
             self.found_fields.push((root, span));
         }
     }
@@ -808,8 +961,8 @@ impl Walker<'_> {
         if self.shadows.contains(&name) {
             return;
         }
-        if let Some(index) = self.functions.iter().position(|f| f.name == name) {
-            self.found.push((index_u32(index), span));
+        if let Some(index) = self.scope.function(name) {
+            self.found.push((index, span));
         }
     }
 
@@ -843,7 +996,7 @@ impl Walker<'_> {
         match ast.get(base).kind {
             ExprKind::Name(name) if !self.shadows.contains(&name) => {
                 self.function_name(name, ast.get(base).span);
-                if let Some((node, at)) = self.tree.reference(ast, id) {
+                if let Some((node, at)) = self.scope.reference(ast, id) {
                     self.found_fields.push((node, ast.get(at).span));
                 }
             }

@@ -43,6 +43,29 @@ pub fn diagnostics_from<'a>(
     let _ = stderr.write_all(text.as_bytes());
 }
 
+/// Renders `diagnostics` to stderr as [`diagnostics`] does, for a
+/// workspace: each part of a diagnostic against the source of the input it
+/// names, `sources` being indexed by input number, or against `fallback`
+/// when it names none.
+///
+/// A failure to write to stderr is ignored: there is nowhere left to report
+/// it.
+pub fn diagnostics_in(sources: &[SourceFile], fallback: &SourceFile, diagnostics: &[Diagnostic]) {
+    let renderer = renderer();
+    let source_of = |input: Option<u32>| {
+        input
+            .and_then(|input| sources.get(input as usize))
+            .unwrap_or(fallback)
+    };
+    let text = diagnostics
+        .iter()
+        .map(|diagnostic| renderer.render_in(diagnostic, source_of))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(text.as_bytes());
+}
+
 /// Styled output when stderr is a terminal and colour has not been disabled
 /// through the `NO_COLOR` convention (any non-empty value disables it).
 fn renderer() -> Renderer {

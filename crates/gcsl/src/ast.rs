@@ -1762,6 +1762,13 @@ impl Ast {
         self.names
     }
 
+    /// Lends the tree `names` in place of its own, returning those. A
+    /// workspace (see [`crate::workspace`]) keeps one table for all its
+    /// files and lends it to each file's tree while that file is checked.
+    pub fn replace_names(&mut self, names: Names) -> Names {
+        std::mem::replace(&mut self.names, names)
+    }
+
     /// The text of the tree's string literals.
     #[must_use]
     pub fn strings(&self) -> &Strings {

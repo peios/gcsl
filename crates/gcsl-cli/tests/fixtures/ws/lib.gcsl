@@ -1,0 +1,2 @@
+com.x.lib.name = tagged("lib")
+com.x.lib.src = "lib-{version}.tar"

@@ -1,0 +1,1 @@
+def pick(list: List<Int>, at: Int): Int { list[at] }

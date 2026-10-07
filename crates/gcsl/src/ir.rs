@@ -238,6 +238,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::mem;
 use std::rc::Rc;
 
 use crate::ast::FnId;
@@ -1636,6 +1637,14 @@ impl Ir {
     #[must_use]
     pub fn frame_size(&self) -> u32 {
         self.frame_size
+    }
+
+    /// Replaces the names of the root frame's slots, which only
+    /// [`Ir::pretty`] reads, with `slot_names`, returning the old ones: a
+    /// workspace keeps one table for every file's program rather than a
+    /// copy of the whole frame's in each (see [`crate::workspace`]).
+    pub(crate) fn replace_slot_names(&mut self, slot_names: Vec<Name>) -> Vec<Name> {
+        mem::replace(&mut self.slot_names, slot_names)
     }
 
     /// Returns function `id`.

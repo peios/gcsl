@@ -23,7 +23,10 @@
 //!    futures made from it, to a [`Value`].
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
-//! a sequence of inputs that share their variables, as the REPL needs. Every
+//! a sequence of inputs that share their variables, as the REPL needs. A
+//! [`workspace::Workspace`] performs them on the files of a directory tree,
+//! each directory's files sharing one scope of fields and `def`s, checking
+//! every file and running the one asked for after the files it needs. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
 //! [`SourceFile`], and so is every warning, which does not stop a program
 //! from running and is returned with its value in an [`Outcome`]. The
@@ -55,6 +58,7 @@ pub mod source;
 pub mod strings;
 pub mod types;
 pub mod value;
+pub mod workspace;
 
 use std::rc::Rc;
 

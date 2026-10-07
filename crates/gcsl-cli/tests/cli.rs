@@ -1899,6 +1899,159 @@ fn return_errors_are_rendered() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// Each file of a workspace prints its own value: its own fields, with the
+/// directory's declarations and those of the directories above in scope.
+/// The nested workspace and the names starting with `.` are not files of
+/// `ws`: `.hidden/bad.gcsl` does not parse, and both they and the nested
+/// workspace declare `version` again, which would be errors.
+#[test]
+fn run_runs_a_file_of_a_workspace() {
+    for (file, value) in [
+        (
+            "app",
+            "{com = {x = {app = {name = \"app-1.2\"; deps = [{name = \"lib-1.2\"; src = \
+             \"lib-1.2.tar\"}]}}}}\n",
+        ),
+        (
+            "common",
+            "{version = \"1.2\"; tagged = fn(n: String): String}\n",
+        ),
+        (
+            "lib",
+            "{com = {x = {lib = {name = \"lib-1.2\"; src = \"lib-1.2.tar\"}}}}\n",
+        ),
+        ("workspace", ""),
+        (
+            "sub/tool",
+            "{tool = \"tool-1.2\"; uses = \"lib-1.2.tar\"}\n",
+        ),
+        ("nested/inner", "{inner = \"nested\"}\n"),
+        ("nested/workspace", "{version = \"nested\"}\n"),
+    ] {
+        let output = gcsl(&["run", &format!("tests/fixtures/ws/{file}.gcsl")]);
+        assert_eq!(stdout(&output), value, "{file}");
+        assert_eq!(stderr(&output), "", "{file}");
+        assert_eq!(output.status.code(), Some(0), "{file}");
+    }
+}
+
+#[test]
+fn run_renders_a_workspace_conflict_with_both_files() {
+    let output = gcsl(&["run", "tests/fixtures/ws_conflict/app.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: field `com.x.lib.name` is defined in two files\n\
+         \x20--> tests/fixtures/ws_conflict/lib.gcsl:1:1\n\
+         \x20 |\n\
+         1 | com.x.lib.name = \"lib\"\n\
+         \x20 | ^^^^^^^^^^^^^^ defined here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_conflict/app.gcsl:1:1\n\
+         \x20 |\n\
+         1 | com.x.lib.name = \"app\"\n\
+         \x20 | -------------- defined here\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn run_renders_files_that_need_each_other() {
+    let output = gcsl(&["run", "tests/fixtures/ws_cycle/lib.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `app.gcsl` and `lib.gcsl` need each other\n\
+         \x20--> tests/fixtures/ws_cycle/app.gcsl:2:19\n\
+         \x20 |\n\
+         2 | com.x.app.deps = [com.x.lib]\n\
+         \x20 |                   ^^^^^^^^^ `app.gcsl` uses `com.x.lib` here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_cycle/lib.gcsl:2:20\n\
+         \x20 |\n\
+         2 | com.x.lib.users = [com.x.app.name]\n\
+         \x20 |                    -------------- `lib.gcsl` uses `com.x.app.name` here\n\
+         \x20 |\n\
+         \x20 = note: a file runs as a whole before a file that needs it, so two files cannot \
+         need each other\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A file does not see the declarations of a directory below it, and its
+/// error stops the run of every file of the workspace, the file below
+/// included.
+#[test]
+fn run_hides_a_subdirectorys_declarations_from_the_directory_above() {
+    for path in [
+        "tests/fixtures/ws_below/top.gcsl",
+        "tests/fixtures/ws_below/sub/inner.gcsl",
+    ] {
+        let output = gcsl(&["run", path]);
+        assert_eq!(stdout(&output), "", "{path}");
+        assert_eq!(
+            stderr(&output),
+            "error: undefined variable `count`\n\
+             \x20--> tests/fixtures/ws_below/top.gcsl:1:9\n\
+             \x20 |\n\
+             1 | total = count + 1\n\
+             \x20 |         ^^^^^\n",
+            "{path}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{path}");
+    }
+}
+
+/// A runtime error in a function of another file is rendered against that
+/// file.
+#[test]
+fn run_renders_a_runtime_error_in_another_files_function() {
+    let output = gcsl(&["run", "tests/fixtures/ws_closure/app.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: index out of range\n\
+         \x20--> tests/fixtures/ws_closure/lib.gcsl:1:43\n\
+         \x20 |\n\
+         1 | def pick(list: List<Int>, at: Int): Int { list[at] }\n\
+         \x20 |                                           ^^^^^^^^ the index is 2, and the list \
+         has 2 elements\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// The dumps are the file's alone: its tokens and tree, and its types and
+/// IR as checked in the workspace, where `tagged` and `com.x.lib` are
+/// another file's.
+#[test]
+fn dumps_in_a_workspace_are_the_files_alone() {
+    let path = "tests/fixtures/ws/app.gcsl";
+    let output = gcsl(&["run", path, "--dump-tokens"]);
+    assert!(stdout(&output).starts_with("Ident(com) @0..3\n"));
+    assert!(!stdout(&output).contains("version"));
+    let output = gcsl(&["run", path, "--dump-ast"]);
+    assert!(stdout(&output).starts_with("(file\n  (field com.x.app.name @0..30\n"));
+    let output = gcsl(&["run", path, "--dump-types"]);
+    assert!(stdout(&output).contains("(name tagged : fn(n: String): String @17..23)"));
+    assert!(!stdout(&output).contains("version"));
+    let output = gcsl(&["run", path, "--dump-ir"]);
+    let ir = stdout(&output);
+    assert!(ir.contains("(load lib#7 @49..58)"), "{ir}");
+    assert!(!ir.contains("store version"), "{ir}");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// A file outside any workspace runs alone, as before workspaces existed,
+/// even with workspaces in the directories beside it.
+#[test]
+fn run_outside_a_workspace_is_unchanged() {
+    let output = gcsl(&["run", "tests/fixtures/ok.gcsl"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/type_error.gcsl"]);
+    assert!(stderr(&output).contains(" --> tests/fixtures/type_error.gcsl:2:8\n"));
+    assert!(!stderr(&output).contains(":::"));
+}
+
 #[test]
 fn repl_evaluates_each_line() {
     let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");

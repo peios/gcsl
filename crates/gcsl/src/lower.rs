@@ -630,6 +630,7 @@ impl Lowerer<'_> {
         }
         if is_root {
             self.store_cells(items.len())?;
+            self.store_own_records()?;
         }
         let result = match result {
             Some(result) => result,
@@ -728,8 +729,30 @@ impl Lowerer<'_> {
                     continue;
                 }
                 Some(leaf) => self.lower_expr(leaf.value)?,
-                None => self.assemble(node, root)?,
+                None => self.assemble(node, index, root, false)?,
             };
+            let span = self.node_span(node, root);
+            let store = self.builder.alloc(IrKind::Store(slot, value), span);
+            self.item_stack.push(store);
+        }
+        Ok(())
+    }
+
+    /// In a file of a workspace, after its last item: stores, children
+    /// first, the file's own record of each node it shares with other
+    /// files, which its value holds in place of the shared node's cell,
+    /// whose value has the other files' parts (see [Directory
+    /// scope](crate::check#directory-scope)).
+    fn store_own_records(&mut self) -> Result<(), InternalError> {
+        let resolution = self.resolution;
+        let tree = &resolution.field_schedule().tree;
+        let root = self.ast.items(self.ast.root());
+        for (index, &slot) in resolution.own_records().iter().enumerate().rev() {
+            let Some(node) = tree.nodes.get(index).filter(|_| slot != Slot::NONE) else {
+                continue;
+            };
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            let value = self.assemble(node, index, root, true)?;
             let span = self.node_span(node, root);
             let store = self.builder.alloc(IrKind::Store(slot, value), span);
             self.item_stack.push(store);
@@ -741,13 +764,44 @@ impl Lowerer<'_> {
     /// input's top-level fields, whose root block's items are `root`: a
     /// `Load` of each child's cell, at its name, in the order of their
     /// first items, a leaf's of the kind of its initialiser and an interior
-    /// node's as a record.
-    fn assemble(&mut self, node: &FieldNode, root: &[ItemId]) -> Result<IrId, InternalError> {
+    /// node's as a record. The node is `index` of the tree. In a file of a
+    /// workspace, a node shared with other files has their children too,
+    /// after its own, unless `own`, which builds the file's own record of
+    /// it, from its own children's own records (see [Directory
+    /// scope](crate::check#directory-scope)).
+    fn assemble(
+        &mut self,
+        node: &FieldNode,
+        index: u32,
+        root: &[ItemId],
+        own: bool,
+    ) -> Result<IrId, InternalError> {
         let resolution = self.resolution;
         let tree = &resolution.field_schedule().tree;
         self.layout_names.clear();
         self.record_loads.clear();
-        for &child in &node.children {
+        let shared = resolution.shared_children(index);
+        let merged = !own && !shared.is_empty();
+        // A shared node's children of other files, in the merged node's
+        // order, its own among them.
+        if merged {
+            let span = self.node_span(node, root);
+            for &(name, slot, ty) in shared {
+                let leaf = node
+                    .children
+                    .iter()
+                    .filter_map(|&child| tree.nodes.get(child as usize))
+                    .find(|child| child.name == name)
+                    .map(|child| child.leaf);
+                let kind = match leaf {
+                    Some(Some(leaf)) => self.kind(leaf.value)?,
+                    Some(None) => ValueKind::Record,
+                    None => self.table.value_kind(ty).unwrap_or(ValueKind::Record),
+                };
+                self.define_field(name, (slot, kind, span), false);
+            }
+        }
+        for &child in node.children.iter().filter(|_| !merged) {
             let (Some(child_node), Some(&slot)) = (
                 tree.nodes.get(child as usize),
                 resolution.field_cells().get(child as usize),
@@ -757,6 +811,10 @@ impl Lowerer<'_> {
             let kind = match child_node.leaf {
                 Some(leaf) => self.kind(leaf.value)?,
                 None => ValueKind::Record,
+            };
+            let slot = match resolution.own_records().get(child as usize) {
+                Some(&own_slot) if own && own_slot != Slot::NONE => own_slot,
+                _ => slot,
             };
             let span = self.node_span(child_node, root);
             self.define_field(child_node.name, (slot, kind, span), false);
@@ -1294,6 +1352,12 @@ impl Lowerer<'_> {
         if node.first != position {
             return Ok(RootField::Extends);
         }
+        // A root shared with other files of a workspace: the file's own
+        // record of it.
+        let slot = match resolution.own_records().get(at as usize) {
+            Some(&own) if own != Slot::NONE => own,
+            _ => slot,
+        };
         let kind = match (leaf == at, node.leaf) {
             (true, Some(leaf)) => self.kind(leaf.value)?,
             _ => ValueKind::Record,

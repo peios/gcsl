@@ -747,7 +747,9 @@
 //! happen there, which may be above its line. A field computed before its
 //! own item is not code that runs at its line: the "this is never run"
 //! warning neither starts at nor counts it; one computed at its own item is
-//! warned about and counted as any item.
+//! warned about and counted as any item. Between the files of a workspace,
+//! the order is by file: a file's effects all happen before the first
+//! effect of a file that needs it ([Directory scope](#directory-scope)).
 //!
 //! **When a field may be used.** A leaf may be computed at a point only if
 //! what it reads is bound by then, as a function may be used only once what
@@ -1964,6 +1966,43 @@
 //! slots are. A later input sees an earlier input's field root as a field
 //! of its type, whole, as before this order-free model; `a.c = 2` in a later
 //! input declares that input's own `a`.
+//!
+//! # Directory scope
+//!
+//! The files of a [`crate::workspace`] are checked as the inputs of a
+//! session are, in the workspace's order, each by `Checker::in_workspace`
+//! from a scope joined from the scopes of its directory and of each
+//! directory above (only their declarations of names the file spells, which
+//! are all it can look up, so that checking stays linear in the files),
+//! but with what the scan found: the file's mentions are
+//! resolved against the merged trees of its directory chain, and a context
+//! gives every cell of the workspace its slot (its node's index among the
+//! workspace's nodes, slots below every private one) and, once the file
+//! that computes it is checked, its type. A cell of another file is read as
+//! a cell of this file is: a load of its slot at the top level, and inside
+//! a function or a `lazy` a read of the top level's frame, never a capture,
+//! since it is written before this file runs. Only a root has a binding,
+//! committed to its directory's scope once the last file contributing to
+//! it is checked (its type is whole only then), and every `def` has one,
+//! so calls of another file's `def` are checked as calls of an earlier
+//! function. An interior node shared with other files has their children
+//! in its type. The file's own leaves are as in [Top-level
+//! fields](#top-level-fields).
+//!
+//! What a file declares privately (`let`, `let mut`, `fn`, and the soft
+//! fields of its spreads) is not committed: later files are checked from a
+//! scope without those bindings, though their slots stay taken, since the
+//! file's closures read them. A top-level `let`, `let mut`, `:=`, dotted
+//! `let` or `fn` of a name that is a root of its directory's tree or of a
+//! directory above, declared in another file, is "`a` is a field of this
+//! directory", labelled on the declaration; within a file, "`a` is a field
+//! of this file" stands as it was.
+//!
+//! A file is checked after every file it needs, so their cells' types are
+//! known; there is nothing to be ready across files, since a needed file
+//! runs as a whole first. Readiness ("cannot be used here yet") is within
+//! a file only. Effects follow: every effect of a needed file happens
+//! before the first of the file that needs it.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1975,12 +2014,13 @@ use crate::ast::{
     TypeExprId, TypeExprKind, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
-use crate::mentions::{self, FieldTree, Mentions, Need, Schedule};
+use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::ValueKind;
+use crate::workspace::Context;
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
 ///
@@ -2054,6 +2094,12 @@ impl Slot {
     /// The absence of a slot, in [`Resolution`] entries for nodes that are
     /// not variables.
     pub const NONE: Slot = Slot(u32::MAX);
+
+    /// The slot `index`: in a workspace, a merged node's cell is the slot
+    /// of its index (see [Directory scope](#directory-scope)).
+    pub(crate) const fn at(index: u32) -> Slot {
+        Slot(index)
+    }
 
     /// The slot numbered `number`. Slots are normally assigned by the
     /// checker; this is for building IR by hand in tests.
@@ -2308,6 +2354,11 @@ pub struct TestResolution {
     pub target: Box<str>,
 }
 
+/// For each node of a workspace file's tree, the children that other
+/// files declare under it, each with its name, cell and type (see
+/// [Directory scope](#directory-scope)).
+type SharedChildren = Vec<Vec<(Name, Slot, TyId)>>;
+
 /// Where every variable of an [`Ast`] is stored, what every function's
 /// frame and captures are, and which parameter every argument fills.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2349,6 +2400,16 @@ pub struct Resolution {
     /// frame that holds its value. A root's is its binding's slot, a `def`'s
     /// its function's; the others are slots no name finds.
     field_cells: Vec<Slot>,
+    /// For a file of a workspace, the private slot of the file's own record
+    /// of each node it shares with another file, by its index in the tree;
+    /// [`Slot::NONE`] for any other node, and empty outside a workspace
+    /// (see [Directory scope](#directory-scope)).
+    own_records: Vec<Slot>,
+    /// For a file of a workspace, the children of each node of its tree
+    /// that other files declare, with their cells and types: what the
+    /// node's assembly reads besides its own children. Empty outside a
+    /// workspace.
+    shared_children: SharedChildren,
     /// The tree of the input's top-level fields and when each node is
     /// computed (see [Top-level fields](#top-level-fields)).
     field_schedule: FieldSchedule,
@@ -2476,6 +2537,23 @@ impl Resolution {
     #[must_use]
     pub fn top_functions(&self) -> &[(ItemId, MadeAt)] {
         &self.top_functions
+    }
+
+    /// For a file of a workspace, the private slot of the file's own record
+    /// of each node of its tree it shares with another file, by the node's
+    /// index; [`Slot::NONE`] for the others.
+    #[must_use]
+    pub fn own_records(&self) -> &[Slot] {
+        &self.own_records
+    }
+
+    /// For a file of a workspace, the children of the node `node` of its
+    /// tree that other files declare, with their cells and types.
+    #[must_use]
+    pub fn shared_children(&self, node: u32) -> &[(Name, Slot, TyId)] {
+        self.shared_children
+            .get(node as usize)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The cell of each node of the input's tree of top-level fields, by
@@ -2625,6 +2703,8 @@ impl Resolution {
             path_awaits: Vec::new(),
             top_functions: Vec::new(),
             field_cells: Vec::new(),
+            own_records: Vec::new(),
+            shared_children: Vec::new(),
             field_schedule: FieldSchedule::default(),
             frame_size: 0,
             slot_names: Vec::new(),
@@ -2707,6 +2787,9 @@ pub struct CheckOutput {
     /// The type of the body's value: its result's, the record of its fields,
     /// or `{}`.
     pub ty: TyId,
+    /// The type of the cell of each node of the input's tree of top-level
+    /// fields, by its index there; `Error` for a `def`'s.
+    pub cell_types: Vec<TyId>,
     /// The warnings found, in source order.
     pub warnings: Vec<Diagnostic>,
 }
@@ -3410,6 +3493,56 @@ impl Scope {
             .filter(|binding| binding.kind == BindingKind::Mutable)
             .map(|binding| binding.slot)
     }
+
+    /// A scope with the variables of each of `parts` in turn that its
+    /// indices pick, in their order, whose first free slot is
+    /// `slot_names.len()`, its slots named by `slot_names`: what a file of a
+    /// workspace is checked from, the declarations of its directory chain
+    /// of the names it spells (see [Directory scope](#directory-scope)).
+    pub(crate) fn joined<'s>(
+        parts: impl Iterator<Item = (&'s Scope, Vec<usize>)>,
+        slot_names: Vec<Name>,
+    ) -> Self {
+        let mut scope = Self {
+            slot_names,
+            ..Self::default()
+        };
+        for (part, picked) in parts {
+            for index in picked {
+                if let (Some(&binding), Some(measured)) =
+                    (part.bindings.get(index), part.measured.get(index))
+                {
+                    scope.bindings.push(binding);
+                    scope.measured.push(measured.clone());
+                }
+            }
+        }
+        scope
+    }
+
+    /// The name of each of the scope's variables, in declaration order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = Name> + '_ {
+        self.bindings.iter().map(|binding| binding.name)
+    }
+
+    /// Adds the variables of `from` after its first `start` whose names
+    /// `keep` accepts, without their slots' names: a file's declarations,
+    /// committed to its directory's scope.
+    pub(crate) fn commit(&mut self, from: &Scope, start: usize, keep: impl Fn(Name) -> bool) {
+        let bindings = from.bindings.iter().zip(&from.measured).skip(start);
+        for (binding, measured) in bindings {
+            if keep(binding.name) {
+                self.bindings.push(*binding);
+                self.measured.push(measured.clone());
+            }
+        }
+    }
+
+    /// The names of the scope's slots, `0..n`, `n` being its first free
+    /// slot.
+    pub(crate) fn into_slot_names(self) -> Vec<Name> {
+        self.slot_names
+    }
 }
 
 /// Type-checks and resolves `ast` as a file, starting from an empty scope,
@@ -3492,6 +3625,13 @@ pub struct Checker<'a> {
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
+    /// The workspace the input is a file of, if it is one (see [Directory
+    /// scope](#directory-scope)).
+    workspace: Option<&'a Context<'a>>,
+    /// For each node of the input's tree that is a shared interior node of
+    /// its directory, the private slot its own record is stored in, for the
+    /// input's value; [`Slot::NONE`] for any other node.
+    own_records: Vec<Slot>,
     /// The cell of each node of the input's tree of top-level fields, by
     /// its index in `mentions.tree` (see [Top-level
     /// fields](#top-level-fields)).
@@ -3645,6 +3785,22 @@ impl<'a> Checker<'a> {
         Self::with_scope(ast, Scope::new(), types)
     }
 
+    /// A checker for `ast`, a file of the workspace `workspace`, checked
+    /// from `scope`, the declarations of its directory chain that earlier
+    /// files committed (see [Directory scope](#directory-scope)).
+    #[must_use]
+    pub(crate) fn in_workspace(
+        ast: &'a Ast,
+        scope: Scope,
+        types: &'a mut TypeTable,
+        workspace: &'a Context<'a>,
+    ) -> Self {
+        Self {
+            workspace: Some(workspace),
+            ..Self::with_scope(ast, scope, types)
+        }
+    }
+
     /// A checker for `ast` whose outermost block starts with the variables
     /// of `scope` already declared. `scope` must come from checking earlier
     /// input interned into the same [`crate::names::Names`] as `ast` and the
@@ -3685,6 +3841,8 @@ impl<'a> Checker<'a> {
             bindings: scope.bindings,
             scope_measured: scope.measured,
             mentions: Mentions::default(),
+            workspace: None,
+            own_records: Vec::new(),
             field_cells: Vec::new(),
             closure_ready: Vec::new(),
             schedule: Schedule::default(),
@@ -3776,20 +3934,8 @@ impl<'a> Checker<'a> {
             return Err(vec![error.into()]);
         }
         let scope_slot_names = self.scope_slot_names();
-        // What the call-site form of the implicit-await error needs to know
-        // of this input's functions in a later input, whose tree is gone.
-        let mut measured = self.scope_measured;
-        for binding in self.bindings.get(measured.len()..).unwrap_or_default() {
-            measured.push(binding.function.and_then(|function| {
-                self.fn_resolutions.get(function.index()).map(|resolution| {
-                    resolution
-                        .param_demands
-                        .iter()
-                        .map(Option::is_some)
-                        .collect()
-                })
-            }));
-        }
+        let (cell_types, shared_children) = self.cell_tables();
+        let measured = self.measured();
         // Spans and function ids are meaningless for a later input, which
         // has its own source and tree.
         let bindings = self
@@ -3824,6 +3970,8 @@ impl<'a> Checker<'a> {
                 path_awaits: self.path_awaits,
                 top_functions,
                 field_cells,
+                own_records: self.own_records,
+                shared_children,
                 field_schedule,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
@@ -3846,6 +3994,7 @@ impl<'a> Checker<'a> {
                 measured,
             },
             ty,
+            cell_types,
             warnings,
         })
     }
@@ -5935,7 +6084,10 @@ impl<'a> Checker<'a> {
     /// top-level functions take its first slots and come first among its
     /// bindings (see [Top-level functions](#top-level-functions)).
     fn declare_top_fns(&mut self) {
-        self.mentions = mentions::find(self.ast);
+        self.mentions = match self.workspace {
+            Some(workspace) => workspace.file().mentions.clone(),
+            None => mentions::find(self.ast),
+        };
         self.top_start = self.bindings.len();
         for index in 0..self.mentions.functions.len() {
             let Some(&top) = self.mentions.functions.get(index) else {
@@ -5948,6 +6100,9 @@ impl<'a> Checker<'a> {
             let ty = self.declared_type(top.function);
             let binding = self.bindings.len();
             let span = self.ast.item(top.item).span;
+            if kind == BindingKind::Variable {
+                self.check_directory_clash(top.item, top.name);
+            }
             self.declare_binding(top.name, ty, Some(span), kind);
             self.top_fns.push(TopFn {
                 item: top.item,
@@ -5974,9 +6129,16 @@ impl<'a> Checker<'a> {
     /// which no name finds (see [Top-level fields](#top-level-fields)).
     /// Finds when each node is computed.
     fn declare_field_cells(&mut self) {
-        self.schedule = self.mentions.schedule();
+        self.schedule = match self.workspace {
+            Some(workspace) => workspace.file().schedule.clone(),
+            None => self.mentions.schedule(),
+        };
         self.scheduled = 0;
         let count = self.mentions.tree.nodes.len();
+        if let Some(workspace) = self.workspace {
+            self.declare_workspace_cells(workspace);
+            return;
+        }
         self.field_cells = Vec::with_capacity(count);
         let root_items = self.ast.items(self.ast.root());
         for index in 0..count {
@@ -6033,6 +6195,202 @@ impl<'a> Checker<'a> {
             }
         }
         self.top_slots_end = self.top_slots_end.max(self.next_slot);
+    }
+
+    /// As the check ends: what the call-site form of the implicit-await
+    /// error needs to know of this input's functions in a later input,
+    /// whose tree is gone, for every binding of the outermost scope.
+    fn measured(&mut self) -> Vec<Option<Box<[bool]>>> {
+        let mut measured = std::mem::take(&mut self.scope_measured);
+        for binding in self.bindings.get(measured.len()..).unwrap_or_default() {
+            measured.push(binding.function.and_then(|function| {
+                self.fn_resolutions.get(function.index()).map(|resolution| {
+                    resolution
+                        .param_demands
+                        .iter()
+                        .map(Option::is_some)
+                        .collect()
+                })
+            }));
+        }
+        measured
+    }
+
+    /// As the check ends: the type of each node's cell (`Error` for a
+    /// `def`'s), and, for a file of a workspace, the children of each node
+    /// of its tree that it shares with other files, in the merged node's
+    /// order, with their cells and types, its own children's as this check
+    /// found them; empty outside a workspace (see [Directory
+    /// scope](#directory-scope)).
+    fn cell_tables(&self) -> (Vec<TyId>, SharedChildren) {
+        let types = self.field_cells.iter();
+        let types = types.map(|cell| cell.ty.unwrap_or(TyId::ERROR)).collect();
+        let Some(workspace) = self.workspace else {
+            return (types, Vec::new());
+        };
+        let shared = (0..self.field_cells.len())
+            .map(|node| {
+                let node = u32::try_from(node).unwrap_or(u32::MAX);
+                let children = workspace.merged_children(node).into_iter();
+                children
+                    .map(|(name, own, slot, ty)| match own {
+                        Some(own) => self
+                            .field_cells
+                            .get(own as usize)
+                            .map_or((name, slot, TyId::ERROR), |cell| {
+                                (name, cell.slot, cell.ty.unwrap_or(TyId::ERROR))
+                            }),
+                        None => (name, slot, ty),
+                    })
+                    .collect()
+            })
+            .collect();
+        (types, shared)
+    }
+
+    /// [`Checker::declare_field_cells`] for a file of a workspace: each
+    /// node's cell is the slot of its merged node, allocated by the
+    /// workspace, a `def`'s excepted (its function's binding's); each root
+    /// that is not a `def` is bound in its cell; and each node shared with
+    /// another file takes a private slot for the file's own record of it
+    /// (see [Directory scope](#directory-scope)).
+    fn declare_workspace_cells(&mut self, workspace: &'a Context<'a>) {
+        let count = self.mentions.tree.nodes.len();
+        let file = workspace.file();
+        self.field_cells = Vec::with_capacity(count);
+        self.own_records = vec![Slot::NONE; count];
+        let root_items = self.ast.items(self.ast.root());
+        for index in 0..count {
+            let Some(node) = self.mentions.tree.nodes.get(index) else {
+                break;
+            };
+            let (name, parent, first) = (node.name, node.parent, node.first);
+            let global = file.global.get(index).copied().unwrap_or(u32::MAX);
+            let slot = Slot(global);
+            let def = node
+                .leaf
+                .and_then(|leaf| self.top_fns.iter().find(|top| top.item == leaf.item))
+                .map(|top| top.binding);
+            let cell = match (parent, def) {
+                (_, Some(binding)) => FieldCell {
+                    slot: self.bindings.get(binding).map_or(Slot::NONE, |b| b.slot),
+                    binding: Some(binding),
+                    ..FieldCell::NEW
+                },
+                (None, None) => {
+                    let binding = self.bindings.len();
+                    self.bind(Binding {
+                        name,
+                        slot,
+                        ty: TyId::ERROR,
+                        declared: root_items.get(first).map(|&item| self.ast.item(item).span),
+                        kind: BindingKind::Field,
+                        function: None,
+                        callback: None,
+                    });
+                    FieldCell {
+                        slot,
+                        binding: Some(binding),
+                        ..FieldCell::NEW
+                    }
+                }
+                (Some(_), None) => FieldCell {
+                    slot,
+                    ..FieldCell::NEW
+                },
+            };
+            self.frame_size = self.frame_size.max(global.saturating_add(1));
+            self.field_cells.push(cell);
+            if workspace.shared(global) {
+                let own = Slot(self.next_slot);
+                self.next_slot = self.next_slot.saturating_add(1);
+                self.frame_size = self.frame_size.max(self.next_slot);
+                self.slot_names.push(name);
+                if let Some(entry) = self.own_records.get_mut(index) {
+                    *entry = own;
+                }
+            }
+        }
+        self.top_end = self.bindings.len();
+        self.report_cycles();
+        self.top_slots_end = self.top_slots_end.max(self.next_slot);
+    }
+
+    /// The type of the reference `id` to `node`, a node of another file of
+    /// the workspace in the numbering of the file's scope, if `id` is a path
+    /// through its root that nothing of this file shadows: read from the
+    /// node's slot as a cell of this file is, the other file having been
+    /// checked and run before this one. A root alone is read through its
+    /// committed binding, as a variable of an earlier input is.
+    fn foreign_reference(
+        &mut self,
+        workspace: &'a Context<'a>,
+        node: u32,
+        id: ExprId,
+    ) -> Option<TyId> {
+        let global = workspace.scope.merged(node)?;
+        let mut base = id;
+        while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
+            base = expr;
+        }
+        let ExprKind::Name(name) = self.ast.get(base).kind else {
+            return None;
+        };
+        let shadowed = self
+            .lookup(name)
+            .is_some_and(|(index, _)| index >= self.top_end);
+        if shadowed || base == id {
+            return None;
+        }
+        let slot = Slot(global);
+        let source = if self.functions.is_empty() {
+            VarRef::Local(slot)
+        } else {
+            VarRef::Fn(slot)
+        };
+        self.expr_vars[id.index()] = source;
+        self.expr_vars[base.index()] = source;
+        let ty = workspace.cell_type(global);
+        let mut at = id;
+        let mut inner_ty = ty;
+        while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
+            inner_ty = if inner_ty == TyId::ERROR {
+                TyId::ERROR
+            } else {
+                self.types.record([(name, inner_ty)])
+            };
+            self.expr_types[expr.index()] = inner_ty;
+            at = expr;
+        }
+        Some(ty)
+    }
+
+    /// Before the walk checks the top-level item `id`, a `let`, `let mut`,
+    /// `:=` or private `fn` declaring `name`, which is not the root of a
+    /// field of this file: "`a` is a field of this directory" if `name` is
+    /// a declaration of another file of the directory or of a directory
+    /// above (see [Directory scope](#directory-scope)).
+    fn check_directory_clash(&mut self, id: ItemId, name: Name) {
+        let Some(workspace) = self.workspace else {
+            return;
+        };
+        // A root of this file is the clash of one file, its own errors'.
+        if workspace.scope.root(name).is_none() || self.mentions.tree.root(name).is_some() {
+            return;
+        }
+        let text = self.ast.names().get(name);
+        self.field_clash = Some(id);
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{text}` is a field of this directory"),
+                self.name_span(id),
+            )
+            .with_note(
+                "a field or `def` declared at the top level of a file is visible in every \
+                 file of its directory and of the directories below it, so its name cannot \
+                 also be a variable",
+            ),
+        );
     }
 
     /// Reports each cycle through the tree of top-level fields, once: "`a`
@@ -6222,6 +6580,14 @@ impl<'a> Checker<'a> {
                         fields.push((name.name, ty));
                     }
                 }
+                // A shared node's children of other files, computed before
+                // this file is checked (see [Directory scope](#directory-scope)).
+                if let Some(workspace) = self.workspace {
+                    for (name, _, ty) in workspace.foreign_children(node) {
+                        erroneous |= ty == TyId::ERROR;
+                        fields.push((name, ty));
+                    }
+                }
                 if erroneous || cell.cyclic {
                     TyId::ERROR
                 } else {
@@ -6266,9 +6632,17 @@ impl<'a> Checker<'a> {
     /// left to the caller as ordinary accesses: this answers only for the
     /// expression that names the node, recording where its value is read.
     fn field_reference(&mut self, id: ExprId) -> Option<TyId> {
-        let (node, at) = self.mentions.tree.reference(self.ast, id)?;
+        let (node, at) = match self.workspace {
+            Some(workspace) => workspace.scope.reference(self.ast, id)?,
+            None => self.mentions.tree.reference(self.ast, id)?,
+        };
         if at != id {
             return None;
+        }
+        if let Some(workspace) = self.workspace
+            && node as usize >= self.mentions.tree.nodes.len()
+        {
+            return self.foreign_reference(workspace, node, id);
         }
         let root = self.root_of(node);
         let binding = self.field_cells.get(root as usize)?.binding?;
@@ -6597,6 +6971,7 @@ impl<'a> Checker<'a> {
             .and_then(|root| self.ast.items(self.ast.root()).get(root.first))
             .copied()
         else {
+            self.check_directory_clash(id, name);
             return;
         };
         let text = self.ast.names().get(name);
@@ -7233,7 +7608,11 @@ impl<'a> Checker<'a> {
     fn resolve(&mut self, index: usize, binding: Binding) -> VarRef {
         // A top-level function or field of this input is read through the
         // top level's frame from any function, never captured.
-        if (self.top_start..self.top_end).contains(&index) {
+        // So is a declaration of another file of a workspace, from its
+        // directory chain: the scope a file is checked from holds nothing
+        // else (see [Directory scope](#directory-scope)).
+        let committed = self.workspace.is_some() && index < self.top_start;
+        if committed || (self.top_start..self.top_end).contains(&index) {
             return if self.functions.is_empty() {
                 VarRef::Local(binding.slot)
             } else {
