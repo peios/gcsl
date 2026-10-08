@@ -108,8 +108,15 @@
 //! standard library as a lone file is, its own cells taking the slots after
 //! the scope's (`crate::workspace::check_input`), and checked as a
 //! session's input, which reads the scope's variables as before. An
-//! `import` binds its names in its own input only, as in a file; it is not
-//! a `let`, and a later input imports again. A later input declaring `len`
+//! `import` of an input persists for later inputs, as its `let`s, `fn`s and
+//! `def`s do: what the input imports, whole, as a member or by `*`, is kept
+//! once it has run, apart from the scope, since an imported name has no
+//! binding, and every later input inherits it as an import of its own that
+//! follows its own `import`s (`crate::workspace::check_input`). A later
+//! input's own import of the name, or its declaration of it, shadows it, as
+//! inputs shadow earlier names, and it is no longer kept; an import shadows
+//! an earlier input's variable of its name in turn. A failed input's
+//! imports are forgotten with it. A later input declaring `len`
 //! shadows the prelude's as inputs shadow earlier inputs' names, and an
 //! earlier input's alias of `len` stays `len`. A failed input never
 //! forgets the standard library, which no input changes.
@@ -129,6 +136,7 @@
 //! allocated for every file before the first is checked, below every
 //! private slot.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::Outcome;
@@ -138,11 +146,11 @@ use crate::diagnostic::{self, Diagnostic};
 use crate::eval::{self, MemoTables};
 use crate::ir::Ir;
 use crate::lower;
-use crate::names::Names;
+use crate::names::{Name, Names};
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
 use crate::value::Value;
-use crate::workspace::{self, Standard};
+use crate::workspace::{self, Alias, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
 /// documentation.
@@ -163,6 +171,10 @@ pub struct Session {
     /// which every input is checked; or, should it have failed, which is a
     /// bug, its diagnostics, which every input then fails with.
     standard: Result<Rc<Standard>, Vec<Diagnostic>>,
+    /// The imports of the committed inputs that no later one has shadowed,
+    /// which the next input inherits (see [The standard
+    /// library](#the-standard-library)).
+    imports: Vec<Alias>,
 }
 
 impl Default for Session {
@@ -188,6 +200,7 @@ impl Session {
                 sources,
                 memo: started.memo,
                 standard: Ok(Rc::new(started.standard)),
+                imports: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -198,6 +211,7 @@ impl Session {
                 sources,
                 memo: MemoTables::new(),
                 standard: Err(diagnostics),
+                imports: Vec::new(),
             },
         }
     }
@@ -263,9 +277,9 @@ impl Session {
         // The names are lent to the scan and given back whatever happens;
         // the input's tree, and its string table, which lowering copies
         // what the IR needs out of, are dropped once it is lowered.
-        let (ir, output) = workspace::check_input(
+        let (ir, output, mut imports) = workspace::check_input(
             &standard,
-            source,
+            (source, &self.imports),
             (&mut self.names, &mut self.types),
             self.scope.clone(),
             input,
@@ -273,6 +287,11 @@ impl Session {
         let committed = self.committed_mutables();
         match run_input(ir, &mut self.frame, &mut self.memo) {
             Ok(value) => {
+                // A name the input bound that its scan could not see, as a
+                // spread's, shadows an import of it too.
+                let declared: HashSet<Name> = output.scope.names().skip(self.scope.len()).collect();
+                imports.retain(|alias| !declared.contains(&alias.name));
+                self.imports = imports;
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());
@@ -433,7 +452,7 @@ mod tests {
         assert_eq!(value(&mut session, "half(int(7.9))"), Value::Float(3.5));
         assert_eq!(value_type(&session), "Float");
         // `builtins` and the prelude by name, in the input that imports
-        // them.
+        // them and the later ones.
         assert_eq!(
             value(&mut session, "import builtins\nbuiltins.len([1])"),
             Value::Int(1)
@@ -445,10 +464,7 @@ mod tests {
             ),
             Value::Int(2)
         );
-        assert_eq!(
-            messages(&mut session, "builtins.len([1])"),
-            ["undefined variable `builtins`"]
-        );
+        assert_eq!(value(&mut session, "builtins.len([1])"), Value::Int(1));
         // An alias of `len` crosses inputs, as an alias of an alias does.
         value(&mut session, "let l = len");
         value(&mut session, "m = l");
@@ -486,6 +502,126 @@ mod tests {
         assert_eq!(inputs, [Some(0), None]);
         let prelude = session.source(0).unwrap();
         assert_eq!(prelude.slice(error.labels[0].span), "len");
+    }
+
+    #[test]
+    fn a_whole_import_persists_for_later_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "import builtins");
+        assert_eq!(value(&mut session, "builtins.float(1)"), Value::Float(1.0));
+        assert_eq!(value_type(&session), "Float");
+        value(&mut session, "import builtins as b\nimport prelude");
+        assert_eq!(value(&mut session, "b.int(2.5)"), Value::Int(2));
+        assert_eq!(value(&mut session, "prelude.half(3)"), Value::Float(1.5));
+        // Read from a function of a later input, and still after it.
+        value(&mut session, "fn size(xs: Int[]): Int { builtins.len(xs) }");
+        assert_eq!(value(&mut session, "size([1, 2, 3])"), Value::Int(3));
+        assert_eq!(value(&mut session, "builtins.len([1])"), Value::Int(1));
+        // The alias rule holds of it as of the input's own import.
+        assert_eq!(
+            messages(&mut session, "[builtins.len]"),
+            ["`len` is a built-in function and cannot be used as a value yet"]
+        );
+    }
+
+    #[test]
+    fn a_member_import_persists_for_later_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "import len as count from prelude");
+        assert_eq!(value(&mut session, "count([1, 2, 3])"), Value::Int(3));
+        value(&mut session, "import float, int as truncate from builtins");
+        assert_eq!(value(&mut session, "float(2)"), Value::Float(2.0));
+        assert_eq!(value(&mut session, "truncate(-2.5)"), Value::Int(-2));
+        // An alias of it in a later input is `len` still.
+        value(&mut session, "let c = count");
+        assert_eq!(value(&mut session, "c([1]) + count([2, 3])"), Value::Int(3));
+    }
+
+    #[test]
+    fn a_star_import_persists_for_later_inputs() {
+        let mut session = Session::new();
+        value(&mut session, "import * from builtins");
+        assert_eq!(value(&mut session, "int(2.5) + len([1])"), Value::Int(3));
+        value(&mut session, "import * from prelude");
+        assert_eq!(value(&mut session, "half(3)"), Value::Float(1.5));
+        // A later input's field of one of its names shadows it, with no
+        // conflict, as it would the implicit prelude's.
+        value(&mut session, "len = 5");
+        assert_eq!(value(&mut session, "len * 2"), Value::Int(10));
+        assert_eq!(value(&mut session, "half(1)"), Value::Float(0.5));
+    }
+
+    #[test]
+    fn an_import_and_a_later_declaration_shadow_each_other() {
+        let mut session = Session::new();
+        // A later `let` shadows an import from its point on, in its own
+        // input and after it, as it would an earlier input's variable.
+        value(&mut session, "import len as count from prelude");
+        assert_eq!(
+            value(&mut session, "let x = count([1])\nlet count = 5\nx + count"),
+            Value::Int(6)
+        );
+        assert_eq!(value(&mut session, "count + 1"), Value::Int(6));
+        value(&mut session, "import builtins");
+        assert_eq!(
+            value(
+                &mut session,
+                "let n = builtins.int(2.5)\nlet builtins = 0\nn + builtins"
+            ),
+            Value::Int(2)
+        );
+        assert_eq!(value(&mut session, "builtins"), Value::Int(0));
+        // A nearer `let` hides it only where it is in scope.
+        value(&mut session, "import int from builtins");
+        assert_eq!(value(&mut session, "{ let int = 3; int }"), Value::Int(3));
+        assert_eq!(value(&mut session, "int(2.5)"), Value::Int(2));
+        // A later import shadows a `let`, in its own input and after it.
+        value(&mut session, "let size = 5");
+        assert_eq!(
+            value(
+                &mut session,
+                "import len as size from prelude\nsize([1, 2])"
+            ),
+            Value::Int(2)
+        );
+        assert_eq!(value(&mut session, "size([1])"), Value::Int(1));
+        // And a later import an earlier one.
+        value(&mut session, "import int as conv from builtins");
+        value(&mut session, "import float as conv from builtins");
+        assert_eq!(value(&mut session, "conv(2)"), Value::Float(2.0));
+        // A `fn`, a field and a spread's name shadow it too.
+        value(&mut session, "import builtins");
+        value(&mut session, "fn builtins(): Int { 7 }");
+        assert_eq!(value(&mut session, "builtins()"), Value::Int(7));
+        value(&mut session, "import int from builtins");
+        value(&mut session, "int = \"field\"");
+        assert_eq!(value(&mut session, "int"), Value::Str("field".into()));
+        value(&mut session, "import float from builtins");
+        value(&mut session, "...{ float = 4 }");
+        assert_eq!(value(&mut session, "float + 1"), Value::Int(5));
+    }
+
+    #[test]
+    fn a_failed_input_forgets_its_imports() {
+        let mut session = Session::new();
+        // One that fails to check, and one that fails as it runs.
+        assert_eq!(
+            messages(&mut session, "import builtins\n1 + true"),
+            ["cannot add Int and Bool"]
+        );
+        assert_eq!(
+            messages(&mut session, "builtins.len([1])"),
+            ["undefined variable `builtins`"]
+        );
+        assert!(eval(&mut session, "import builtins\n1 // 0").is_err());
+        assert_eq!(
+            messages(&mut session, "builtins.len([1])"),
+            ["undefined variable `builtins`"]
+        );
+        // And a failed input's declaration shadows nothing.
+        value(&mut session, "import builtins");
+        assert!(eval(&mut session, "let builtins = 1\n1 // 0").is_err());
+        assert_eq!(value(&mut session, "builtins.len([1])"), Value::Int(1));
     }
 
     #[test]

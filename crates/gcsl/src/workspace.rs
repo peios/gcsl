@@ -247,7 +247,9 @@
 //! "`lib` is not a built-in or standard module, and there is no
 //! `workspace.gcsl` above this file", with the file's other errors. A
 //! session's input is scanned so too (`check_input`), though a session is
-//! not a workspace (see [`crate::session`]).
+//! not a workspace (see [`crate::session`]); it inherits the imports of the
+//! session's earlier inputs, after its own and before the implicit prelude,
+//! but for each it imports again or declares at its top level.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -424,9 +426,12 @@ pub struct Alias {
     /// The name bound.
     pub name: Name,
     /// Where it is bound: the alias, the member, the `*`, or the path's
-    /// last segment.
+    /// last segment; nowhere (`0..0`) for the implicit `import * from
+    /// prelude` and for an import a session's input inherits from an
+    /// earlier input, whose source is not this one.
     pub span: Span,
-    /// The `import` item; `None` for the implicit `import * from prelude`.
+    /// The `import` item; `None` for the implicit `import * from prelude`,
+    /// and for an import a session's input inherits from an earlier input.
     pub item: Option<ItemId>,
     /// What it names.
     pub target: Target,
@@ -438,6 +443,10 @@ pub struct Alias {
     /// yields to every other source and binding of its name (see the module
     /// documentation, "The standard library").
     pub implicit: bool,
+    /// Whether a session's input inherits it from an earlier input, which
+    /// the input's declarations shadow and which clashes with nothing (see
+    /// [`inherit_imports`]).
+    pub inherited: bool,
 }
 
 /// One source's node at a node of a file's view (see the module
@@ -1009,6 +1018,9 @@ pub struct FileScope<'a> {
     /// The names only the implicit `import * from prelude` binds, which
     /// yield to any binding of the file ([`FileScope::yields`]).
     implicit: Vec<Name>,
+    /// The names of the imports a session's input inherits from earlier
+    /// inputs ([`FileScope::inherited`]).
+    inherited: Vec<Name>,
     /// The file's view.
     view: &'a View,
 }
@@ -1034,8 +1046,23 @@ impl<'a> FileScope<'a> {
                 .filter(|a| a.implicit)
                 .map(|a| a.name)
                 .collect(),
+            inherited: file
+                .aliases
+                .iter()
+                .filter(|a| a.inherited)
+                .map(|a| a.name)
+                .collect(),
             view: &file.view,
         }
+    }
+
+    /// Whether the root `name` is one an import a session's input inherits
+    /// from an earlier input binds, which a top-level `let` of the input
+    /// shadows from its point on, as it would an earlier input's variable,
+    /// and clashes with nothing (see [`inherit_imports`]).
+    #[must_use]
+    pub fn inherited(&self, name: Name) -> bool {
+        self.inherited.contains(&name)
     }
 
     /// Whether the root `name` is one only the implicit `import * from
@@ -1270,8 +1297,10 @@ enum Placing<'a> {
     /// the directories left out as workspaces of their own.
     Workspace(&'a [String]),
     /// One file outside any workspace, a lone file or a session's input, in
-    /// the root directory by the last part of its name.
-    Lone,
+    /// the root directory by the last part of its name, with the imports of
+    /// the session's earlier inputs it inherits (see [`inherit_imports`]),
+    /// none for a lone file.
+    Lone(&'a [Alias]),
 }
 
 /// [`scan_with`] of `sources` placed as `placing` says, interning into
@@ -1300,7 +1329,7 @@ fn scan_into(
         standard: 0,
         standard_dir: 0,
         builtins_dir: 0,
-        lone: matches!(placing, Placing::Lone),
+        lone: matches!(placing, Placing::Lone(_)),
         relocation: None,
     };
     match scan_files(&mut scan, sources, placing) {
@@ -1330,7 +1359,7 @@ fn scan_files(
         .chain(sorted.iter().zip(&user_dirs).map(|(&source, &dir)| {
             let path = match placing {
                 Placing::Workspace(_) => source.name(),
-                Placing::Lone => source.name().rsplit('/').next().unwrap_or(""),
+                Placing::Lone(_) => source.name().rsplit('/').next().unwrap_or(""),
             };
             (source, dir, path)
         }));
@@ -1368,11 +1397,11 @@ fn scan_files(
             start
         })
         .collect();
-    let nested = match placing {
-        Placing::Workspace(nested) => nested,
-        Placing::Lone => &[],
+    let (nested, inherited) = match placing {
+        Placing::Workspace(nested) => (nested, &[][..]),
+        Placing::Lone(inherited) => (&[][..], inherited),
     };
-    imports(scan, &dirs, nested, &mut errors);
+    imports(scan, &dirs, (nested, inherited), &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -1414,7 +1443,7 @@ fn place_dirs(
             Placing::Workspace(_) => {
                 intern_dir(&mut scan.dirs, &mut dirs, parent_path(source.name()))
             }
-            Placing::Lone => 0,
+            Placing::Lone(_) => 0,
         })
         .collect();
     for path in [STANDARD_DIR, BUILTINS] {
@@ -2174,11 +2203,13 @@ struct Modules<'a> {
 /// path that names nothing, each directory and file of one name (once per
 /// pair, at the first import naming it), each member that is not a root,
 /// and each imported name that clashes with a name of its file or a root of
-/// its directory chain.
+/// its directory chain. `nested` are the directories that are workspaces of
+/// their own, and `inherited` the imports of a session's earlier inputs,
+/// which a session's input, the scan's one file of its own, inherits.
 fn imports(
     scan: &mut Scan,
     dirs: &HashMap<String, u32>,
-    nested: &[String],
+    (nested, inherited): (&[String], &[Alias]),
     errors: &mut Vec<Diagnostic>,
 ) {
     let modules = Modules {
@@ -2217,6 +2248,9 @@ fn imports(
                 &mut own_errors,
             );
         }
+        if index >= scan.standard {
+            inherit_imports(file, inherited, &mut aliases);
+        }
         implicit_prelude(scan, index, &mut aliases);
         clashes(scan, index, &aliases, &mut own_errors);
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
@@ -2224,6 +2258,45 @@ fn imports(
     }
     for (file, aliases) in scan.files.iter_mut().zip(found) {
         file.aliases = aliases;
+    }
+}
+
+/// Adds to `aliases`, the imports of `file`, a session's input, each of
+/// `inherited`, the imports of the session's earlier inputs, that the input
+/// neither imports again nor declares in the whole of its top level (by a
+/// `fn`, field or `def` whose path starts with its name, or a `:=` of it,
+/// which means the variable of its name): a name of an earlier input is
+/// shadowed by a later input's, whether it was imported or declared (see
+/// [`crate::session`]). A `let` shadows one only from its point on, as it
+/// does an earlier input's variable: the checker reads an inherited import
+/// through the view until a binding of its name is found
+/// ([`FileScope::inherited`]). They follow the input's own imports, before
+/// the implicit prelude, which yields to them, and clash with nothing.
+fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Vec<Alias>) {
+    if inherited.is_empty() {
+        return;
+    }
+    let ast = &file.ast;
+    let declared: HashSet<Name> = ast
+        .items(ast.root())
+        .iter()
+        .filter_map(|&item| match ast.item(item).kind {
+            ItemKind::Let {
+                path,
+                function: true,
+                ..
+            }
+            | ItemKind::Rebind { path, .. }
+            | ItemKind::Field { path, .. } => ast.path(path).first().and_then(PathSegment::name),
+            _ => None,
+        })
+        .collect();
+    let own = aliases.len();
+    for alias in inherited {
+        let imported = aliases.iter().take(own).any(|a| a.name == alias.name);
+        if !imported && !declared.contains(&alias.name) {
+            aliases.push(*alias);
+        }
     }
 }
 
@@ -2264,6 +2337,7 @@ fn implicit_prelude(scan: &Scan, index: u32, aliases: &mut Vec<Alias>) {
                 target,
                 whole: false,
                 implicit: true,
+                inherited: false,
             });
         }
     }
@@ -2436,6 +2510,7 @@ fn members(
                     target,
                     whole: true,
                     implicit: false,
+                    inherited: false,
                 });
             }
         }
@@ -2452,6 +2527,7 @@ fn members(
                                 target: child,
                                 whole: false,
                                 implicit: false,
+                                inherited: false,
                             }),
                             None => errors.push(Diagnostic::error(
                                 format!(
@@ -2482,6 +2558,7 @@ fn members(
                                     target: child,
                                     whole: false,
                                     implicit: false,
+                                    inherited: false,
                                 });
                             }
                         }
@@ -2518,13 +2595,19 @@ fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
 /// `let mut`, `:=` or field root of the file, or a root of its directory
 /// chain; a member or a root of a `*`, which merges into the file's view
 /// with the file's fields, its directory chain and the other members, with
-/// a whole import or a top-level `fn`, `let`, `let mut` or `:=`.
+/// a whole import or a top-level `fn`, `let`, `let mut` or `:=`. The
+/// implicit prelude's aliases and those a session's input inherits clash
+/// with nothing.
 fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnostic>) {
     let Some(file) = scan.files.get(index as usize) else {
         return;
     };
-    // The implicit `import * from prelude` alone clashes with nothing.
-    if aliases.iter().all(|alias| alias.implicit) {
+    // The implicit `import * from prelude` and the imports a session's input
+    // inherits alone clash with nothing.
+    if aliases
+        .iter()
+        .all(|alias| alias.implicit || alias.inherited)
+    {
         return;
     }
     let ast = &file.ast;
@@ -2554,9 +2637,10 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
     };
     // The implicit `import * from prelude` clashes with nothing: its names
     // yield to every other (see the module documentation, "The standard
-    // library").
+    // library"). Nor does an inherited import, which the input's
+    // declarations shadow ([`inherit_imports`]).
     for (position, alias) in aliases.iter().enumerate() {
-        if alias.implicit {
+        if alias.implicit || alias.inherited {
             continue;
         }
         let shown = scan.names.get(alias.name);
@@ -3285,7 +3369,7 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
 pub fn check_lone(source: &SourceFile) -> Result<Workspace, Vec<Diagnostic>> {
     check_scan(scan_into(
         std::slice::from_ref(source),
-        Placing::Lone,
+        Placing::Lone(&[]),
         &mut Names::new(),
     )?)
 }
@@ -3780,45 +3864,53 @@ pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
 /// view; its cells, after the standard library's, take the slots after the
 /// scope's ([`Scan::slot`]), and its check is a session input's, which
 /// reads the scope's variables as a session's input does (see
-/// [`crate::session`]). Its diagnostics name it as the input being run,
+/// [`crate::session`]). It inherits `imports`, those of the session's
+/// earlier inputs, as the imports of its own that follow its `import`s
+/// ([`inherit_imports`]). Its diagnostics name it as the input being run,
 /// with no input number; a label in a standard file names that file's.
+/// Returns, with its IR and its check's output, the imports it has, its own
+/// and those it inherited and did not shadow, each with no item or span of
+/// this input's: what a later input inherits, once it has run.
 ///
 /// # Errors
 ///
 /// The diagnostics of the scan, the check or the lowering.
 pub(crate) fn check_input(
     standard: &Standard,
-    source: &SourceFile,
+    (source, imports): (&SourceFile, &[Alias]),
     (names, types): (&mut Names, &mut TypeTable),
     scope: Scope,
     input: u32,
-) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
-    check_input_then(
+) -> Result<(Ir, CheckOutput, Vec<Alias>), Vec<Diagnostic>> {
+    let (lowered, imports) = check_input_then(
         standard,
-        source,
+        (source, imports),
         (names, types),
         scope,
         |ast, checked, types| {
             checked.and_then(|output| session::lower_checked(ast, output, types, input))
         },
-    )?
+    )?;
+    let (ir, output) = lowered?;
+    Ok((ir, output, imports))
 }
 
 /// [`check_input`] up to its check, whose outcome `then` is given with the
 /// input's tree, its names in it, and the types: what lowering is done by,
-/// or a test looks at.
+/// or a test looks at. Returns what `then` does, with the input's imports
+/// as [`check_input`] does.
 ///
 /// # Errors
 ///
 /// The diagnostics of the scan.
 fn check_input_then<R>(
     standard: &Standard,
-    source: &SourceFile,
+    (source, imports): (&SourceFile, &[Alias]),
     (names, types): (&mut Names, &mut TypeTable),
     scope: Scope,
     then: impl FnOnce(&Ast, Result<CheckOutput, Vec<Diagnostic>>, &mut TypeTable) -> R,
-) -> Result<R, Vec<Diagnostic>> {
-    let mut scan = scan_into(std::slice::from_ref(source), Placing::Lone, names)
+) -> Result<(R, Vec<Alias>), Vec<Diagnostic>> {
+    let mut scan = scan_into(std::slice::from_ref(source), Placing::Lone(imports), names)
         .map_err(|errors| being_run(errors, count(crate::STANDARD.len())))?;
     let index = scan.standard;
     // The input's cells, but its `def`s', take the slots past the scope's,
@@ -3863,10 +3955,17 @@ fn check_input_then<R>(
         let checked = Checker::in_workspace(&file.ast, scope, types, &context).check();
         Some(then(&file.ast, checked, types))
     });
+    let mut imports = Vec::new();
     if let Some(file) = scan.files.get_mut(index as usize) {
         *names = file.ast.replace_names(Names::new());
+        imports.extend(file.aliases.iter().filter(|a| !a.implicit).map(|a| Alias {
+            span: Span::new(0, 0),
+            item: None,
+            inherited: true,
+            ..*a
+        }));
     }
-    finished.ok_or_else(Vec::new)
+    finished.map(|r| (r, imports)).ok_or_else(Vec::new)
 }
 
 /// For the tests of the other modules, which check a text alone: `text`
@@ -3884,13 +3983,13 @@ pub(crate) fn check_beside_prelude(
     let scope = Scope::of_slots(started.slot_names);
     let checked = check_input_then(
         &started.standard,
-        &source,
+        (&source, &[]),
         (&mut names, &mut types),
         scope,
         |ast, checked, _| (ast.clone(), checked),
     );
     match checked {
-        Ok((ast, checked)) => (ast, types, checked),
+        Ok(((ast, checked), _)) => (ast, types, checked),
         Err(errors) => panic!("{text}: {errors:?}"),
     }
 }
@@ -4601,7 +4700,7 @@ mod tests {
             let start = std::time::Instant::now();
             let scanned = scan_into(
                 std::slice::from_ref(&source),
-                Placing::Lone,
+                Placing::Lone(&[]),
                 &mut Names::new(),
             )
             .unwrap();

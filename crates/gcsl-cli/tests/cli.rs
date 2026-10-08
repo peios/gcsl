@@ -2352,6 +2352,37 @@ fn repl_has_the_standard_library() {
 }
 
 #[test]
+fn repl_keeps_imports_across_lines() {
+    let output = repl(
+        "import builtins\n\
+         builtins.float(1)\n\
+         import len as count from prelude\n\
+         count([1, 2])\n\
+         import * from builtins\n\
+         int(2.5)\n\
+         let count = 5\n\
+         count\n\
+         import zzz; import half as h from prelude\n\
+         h(1)\n",
+    );
+    assert_eq!(stdout(&output), "1.0 : Float\n2 : Int\n2 : Int\n5 : Int\n");
+    assert!(
+        stderr(&output).starts_with(
+            "error: `zzz` is not a built-in or standard module, and there is no \
+             `workspace.gcsl` above this file\n"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("error: undefined variable `h`\n"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn repl_evaluates_each_line() {
     let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");
     assert_eq!(stdout(&output), "3 : Int\n3.5 : Float\n-0.0 : Float\n");

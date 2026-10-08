@@ -2084,7 +2084,12 @@
 //! `import * from prelude` binds yields instead to any binding of its name
 //! ([`crate::workspace::FileScope::yields`]): a top-level `let` or `fn`, or
 //! an earlier session input's variable, shadows it, and no clash is
-//! reported ("`len` is a field of this directory" is not). What the prefix
+//! reported ("`len` is a field of this directory" is not). An import a
+//! session's input inherits from an earlier input
+//! ([`crate::workspace::FileScope::inherited`]) is shadowed as an earlier
+//! input's variable is, with no clash reported: by the input's top-level
+//! `fn`, field, `def` or `:=` of its name in the whole input (the scan
+//! drops it), and by a top-level `let` from its point on. What the prefix
 //! reaches decides
 //! what is read, always a cell, so never a capture: a load of its slot at
 //! the top level, a read of the top level's frame inside a function or a
@@ -6931,10 +6936,12 @@ impl<'a> Checker<'a> {
             return;
         };
         // A root of this file is the clash of one file, its own errors'; a
-        // name of the implicit prelude yields to the declaration silently.
+        // name of the implicit prelude, or of an import a session's input
+        // inherits, yields to the declaration silently.
         if workspace.scope.root(name).is_none()
             || self.mentions.tree.root(name).is_some()
             || workspace.scope.yields(name)
+            || workspace.scope.inherited(name)
         {
             return;
         }
