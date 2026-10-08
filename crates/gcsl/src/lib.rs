@@ -14,7 +14,8 @@
 //!    both tables from then on.
 //! 3. [`check::check`]: types for every expression, interned into a
 //!    [`TypeTable`] the caller owns, and a storage slot for every variable,
-//!    in the side tables of a [`check::Checked`]; and any warnings.
+//!    in the side tables of a [`check::Checked`]; and any warnings. Alone,
+//!    with no standard library, it knows no name a file does not declare.
 //! 4. [`lower::lower`]: AST and tables to a type-specialised [`ir::Ir`],
 //!    which holds its own copies of the string literals and record layouts
 //!    it uses, and the code of every function and `lazy`, with an explicit
@@ -29,8 +30,17 @@
 //! file reaching the rest of the tree by `import`, its dotted paths merged
 //! with its directory's, the directories' above it and what it imports
 //! with `*` or by member into one view, checking every file and running
-//! the one asked for after the files it needs. An `import` outside
-//! a workspace, in [`run`] or a [`Session`], is an error. Every
+//! the one asked for after the files it needs.
+//!
+//! Every one of them has the standard library: the `builtins` module, the
+//! built-in functions implemented in Rust (`len`, `int`, `float`), and the
+//! standard files, the `.gcsl` files of the repository's `stdlib/`
+//! directory compiled in ([`STANDARD`]), each a module importable by its
+//! bare name from any file; and every file and input begins as if with
+//! `import * from prelude`, whose names its own declarations shadow
+//! silently (see [`workspace`], "The standard library"). A file run alone
+//! ([`run`]) is a workspace of one directory beside it, and an `import` of
+//! anything else there, or in a [`Session`], is an error. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
 //! [`SourceFile`], and so is every warning, which does not stop a program
 //! from running and is returned with its value in an [`Outcome`]. The
@@ -63,8 +73,6 @@ pub mod strings;
 pub mod types;
 pub mod value;
 pub mod workspace;
-
-use std::rc::Rc;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use session::Session;
@@ -159,24 +167,32 @@ pub struct Outcome {
     pub warnings: Vec<Diagnostic>,
 }
 
-/// Runs every stage on `source` as a file and returns the value of its body
-/// with any warnings.
+/// The standard library: the `.gcsl` files of the repository's `stdlib/`
+/// directory, compiled in, each with its stem, by which it is imported
+/// (`import prelude`), in path order. Written by hand, one entry per file;
+/// a test checks that it and the directory agree. Every scan begins with
+/// them (see [`workspace`], "The standard library"), named
+/// `<stdlib>/STEM.gcsl` ([`workspace::standard_sources`]).
+pub const STANDARD: [(&str, &str); 1] = [("prelude", include_str!("../../../stdlib/prelude.gcsl"))];
+
+/// Runs every stage on `source` as a file outside any workspace, beside the
+/// standard library ([`workspace::check_lone`]), and returns the value of
+/// its body with any warnings.
 ///
 /// # Errors
 ///
 /// Returns the diagnostics of the first stage that fails: one for a lexical,
 /// syntax or runtime error, and every type error found by the checker. Any
 /// warnings found before the failure are among them, all in source order.
+/// The file's diagnostics name no input; one of a standard file, which is a
+/// bug, names its input number, its index in [`STANDARD`].
 pub fn run(source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
-    let (tokens, names, strings) = lexer::tokenize(source).map_err(|error| vec![error])?;
-    let ast = parser::parse(&tokens, names, strings, source).map_err(|error| vec![error])?;
-    let mut types = TypeTable::new();
-    let (checked, warnings) = check::check(&ast, &mut types)?;
-    let value = lower::lower(&ast, &checked, &types, 0)
-        .map_err(Diagnostic::from)
-        .and_then(|ir| eval::eval(&Rc::new(ir)));
-    match value {
-        Ok(value) => Ok(Outcome { value, warnings }),
-        Err(error) => Err(diagnostic::merge(vec![error], warnings)),
-    }
+    let index = u32::try_from(STANDARD.len()).unwrap_or(u32::MAX);
+    let being_run = |diagnostics| workspace::being_run(diagnostics, index);
+    let mut workspace = workspace::check_lone(source).map_err(being_run)?;
+    let outcome = workspace.run(index).map_err(being_run)?;
+    Ok(Outcome {
+        value: outcome.value,
+        warnings: being_run(outcome.warnings),
+    })
 }

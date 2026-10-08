@@ -20,12 +20,22 @@
 //! reference, so a future stored in two places is one future, run at most
 //! once. Its state changes behind a [`RefCell`], which is only ever
 //! borrowed briefly by the evaluator, never across running the body.
+//!
+//! A built-in function, a member of the `builtins` module, is a value of
+//! its own kind, [`Value::Builtin`]: the [`Builtin`] it is, unboxed, with
+//! no code or captures, since it is implemented in Rust. It is a function
+//! ([`ValueKind::Fn`]): a call of it through a value, a parameter say, is
+//! applied by the evaluator (see [`crate::eval`]). It shows as its type, or
+//! as `builtin len` for one whose typing is special, and two compare equal
+//! when they are the same built-in, which no program can ask, since the
+//! checker rejects comparing functions.
 
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::FnId;
+use crate::check::Builtin;
 use crate::ir::Ir;
 use crate::names::Name;
 use crate::strings::{FieldName, Quoted};
@@ -618,6 +628,12 @@ pub enum Value {
     Fn(Rc<Closure>),
     /// A future: a deferred computation, run by its first await.
     Future(Rc<Future>),
+    /// A built-in function, a member of the `builtins` module: a function
+    /// implemented in Rust, with nothing captured. It is of kind
+    /// [`ValueKind::Fn`], as a closure is, and compares by which built-in
+    /// it is. Only the driver of a workspace makes one, writing each into
+    /// its cell as it lays out the frame (see [`crate::workspace`]).
+    Builtin(Builtin),
 }
 
 impl Value {
@@ -631,7 +647,7 @@ impl Value {
             Value::Str(_) => ValueKind::String,
             Value::Empty | Value::Record(_) => ValueKind::Record,
             Value::List(_) => ValueKind::List,
-            Value::Fn(_) => ValueKind::Fn,
+            Value::Fn(_) | Value::Builtin(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
         }
     }
@@ -704,7 +720,10 @@ impl Value {
 ///
 /// A function shows as its type, `fn(x: Int): Int`, in both forms, since it
 /// has no source form of its own to show, and so does a future, as
-/// `Future<Int>`, whether it has run or not: showing it never awaits it.
+/// `Future<Int>`, whether it has run or not: showing it never awaits it. A
+/// built-in function shows as its type too, `fn(x: Float): Int`; one whose
+/// typing is special has no type to show, and shows as `builtin len` (see
+/// [`Builtin::display`]).
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -713,6 +732,7 @@ impl fmt::Display for Value {
             Value::Str(text) => f.write_str(text),
             Value::Empty => f.write_str("{}"),
             Value::Fn(closure) => f.write_str(closure.display()),
+            Value::Builtin(builtin) => f.write_str(builtin.display()),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;
@@ -1105,6 +1125,28 @@ mod tests {
         // The IR outlives every closure made from it only as long as they
         // hold it.
         assert_eq!(Rc::strong_count(&code), 1);
+    }
+
+    #[test]
+    fn a_built_in_function_is_a_function_value() {
+        let int = Value::Builtin(Builtin::Int);
+        assert_eq!(size_of::<Value>(), 24);
+        assert_eq!(int.kind(), ValueKind::Fn);
+        // Shown as its type, or for one whose typing is special, which has
+        // none, as what it is.
+        assert_eq!(int.to_string(), "fn(x: Float): Int");
+        assert_eq!(int.repr().to_string(), "fn(x: Float): Int");
+        assert_eq!(
+            Value::Builtin(Builtin::Float).to_string(),
+            "fn(x: Int): Float"
+        );
+        assert_eq!(Value::Builtin(Builtin::Len).to_string(), "builtin len");
+        // Equal when the same built-in.
+        assert_eq!(int, Value::Builtin(Builtin::Int));
+        assert_ne!(int, Value::Builtin(Builtin::Float));
+        let mut names = Names::new();
+        let record = record(&layout(&mut names, &["f"]), vec![int]);
+        assert_eq!(record.to_string(), "{f = fn(x: Float): Int}");
     }
 
     #[test]

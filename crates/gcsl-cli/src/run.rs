@@ -14,29 +14,33 @@
 //! tokens and syntax tree as a file's, its types and IR as checked and
 //! lowered in the workspace.
 //!
+//! A file run alone is checked and run as the workspace of one directory
+//! holding just it ([`gcsl::workspace::check_lone`]), and its dumps are
+//! its own as a workspace file's are. Either way the standard library is
+//! there, its files the first inputs ([`gcsl::workspace::standard_sources`]):
+//! a diagnostic of a standard file, or a part of one in it, is rendered
+//! against its source, named `<stdlib>/prelude.gcsl`.
+//!
 //! The directories left out as nested workspaces are passed to the
 //! library too, by their paths relative to the root
 //! ([`gcsl::workspace::check_with`]): an `import` of a path into one is "no
 //! module", and only this module knows why, so that the error's note can
-//! say "`vendor/` is a workspace of its own". An `import` in a file that is
-//! not in a workspace is an error of that file, reported by the checker
-//! with its other errors.
+//! say "`vendor/` is a workspace of its own". An `import` of anything but
+//! the standard library in a file that is not in a workspace is an error of
+//! that file, reported by the checker with its other errors.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::rc::Rc;
 
 use clap::Args;
 use gcsl::ast::Ast;
 use gcsl::lexer::TokenKind;
 use gcsl::strings::Quoted;
-use gcsl::{
-    Diagnostic, SourceFile, TypeTable, Value, check, diagnostic, eval, lexer, lower, parser,
-    workspace,
-};
+use gcsl::workspace::{self, Workspace};
+use gcsl::{Diagnostic, SourceFile, Value, lexer, parser};
 
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
@@ -130,12 +134,19 @@ pub fn main(args: &RunArgs) -> ExitCode {
     }
 }
 
-/// Runs `source` alone, as a file outside any workspace.
+/// Runs `source` alone, as a file outside any workspace: the workspace of
+/// one directory holding just it, beside the standard library
+/// ([`gcsl::workspace::check_lone`]). Its diagnostics are shown against it,
+/// and a standard file's against that file, named `<stdlib>/prelude.gcsl`.
 fn run_alone(args: &RunArgs, source: &SourceFile) -> ExitCode {
-    match execute(args, source) {
+    let mut shown = workspace::standard_sources();
+    let index = u32::try_from(shown.len()).unwrap_or(u32::MAX);
+    shown.push(source.clone());
+    let check = || workspace::check_lone(source);
+    match execute_workspace(args, source, check, &shown, index) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Program(diagnostics)) => {
-            output::diagnostics(source, &diagnostics);
+            output::diagnostics_in(&shown, source, &diagnostics);
             ExitCode::from(EXIT_PROGRAM_ERROR)
         }
         Err(failure) => exit_for(failure),
@@ -152,51 +163,6 @@ fn exit_for(failure: Failure) -> ExitCode {
             ExitCode::from(EXIT_USAGE_OR_IO)
         }
     }
-}
-
-/// Runs the pipeline, printing each requested dump and stopping after the
-/// last one; with no dumps, prints the value, as text, unless it is `{}`.
-///
-/// Warnings go to stderr once the run has succeeded (after the dumps, or
-/// before the value). If a later stage fails, they are returned with its
-/// error instead, to be printed together in source order.
-fn execute(args: &RunArgs, source: &SourceFile) -> Result<(), Failure> {
-    let last = args.last_dump();
-    let mut out = io::stdout().lock();
-    let Some(ast) = syntax(args, source, &mut out)? else {
-        return Ok(out.flush()?);
-    };
-
-    let mut types = TypeTable::new();
-    let (checked, warnings) = check::check(&ast, &mut types).map_err(Failure::Program)?;
-    if args.dump_types {
-        let annotation = checked.types.annotation(&types, ast.names());
-        writeln!(out, "{}", ast.pretty_with(&annotation))?;
-    }
-    if last == Some(Stage::Types) {
-        output::diagnostics(source, &warnings);
-        return Ok(out.flush()?);
-    }
-
-    let ir = match lower::lower(&ast, &checked, &types, 0) {
-        Ok(ir) => Rc::new(ir),
-        Err(error) => return Err(with_warnings(error.into(), warnings)),
-    };
-    if args.dump_ir {
-        writeln!(out, "{}", ir.pretty(ast.names()))?;
-    }
-    if last == Some(Stage::Ir) {
-        output::diagnostics(source, &warnings);
-        return Ok(out.flush()?);
-    }
-
-    let value = match eval::eval(&ir) {
-        Ok(value) => value,
-        Err(error) => return Err(with_warnings(error, warnings)),
-    };
-    output::diagnostics(source, &warnings);
-    print_value(&value, &mut out)?;
-    Ok(out.flush()?)
 }
 
 /// Prints `value` as text, unless it is `{}`. A string prints as its text,
@@ -250,12 +216,6 @@ fn syntax(
         writeln!(out, "{}", ast.pretty())?;
     }
     Ok((last != Some(Stage::Ast)).then_some(ast))
-}
-
-/// The failure of a stage after the checker: its `error`, with the
-/// `warnings` the checker found, in source order.
-fn with_warnings(error: Diagnostic, warnings: Vec<Diagnostic>) -> Failure {
-    Failure::Program(diagnostic::merge(vec![error], warnings))
 }
 
 /// The name of the file that makes its directory a workspace's root.
@@ -378,7 +338,9 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         }
     };
     let mut sources = Vec::new();
-    let mut shown_sources = Vec::new();
+    // Indexed by input number: the standard files take the first.
+    let mut shown_sources = workspace::standard_sources();
+    let standard = shown_sources.len();
     for (name, path) in &paths {
         let (shown_name, text) = if name == relative {
             (file.name().to_owned(), file.text().to_owned())
@@ -407,11 +369,12 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         }
     }
     let index = paths.iter().position(|(name, _)| name == relative);
-    let Some(index) = index.and_then(|index| u32::try_from(index).ok()) else {
+    let Some(index) = index.and_then(|index| u32::try_from(standard + index).ok()) else {
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
-    match execute_workspace(args, file, &sources, &shown_sources, &nested, index) {
+    let check = || workspace::check_with(&sources, &nested);
+    match execute_workspace(args, file, check, &shown_sources, index) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Program(diagnostics)) => {
             output::diagnostics_in(&shown_sources, file, &diagnostics);
@@ -421,18 +384,21 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
     }
 }
 
-/// Runs the workspace of `sources` as [`execute`] runs one file: the
-/// tokens and the syntax tree are `file`'s alone; the types and the IR are
-/// `file`'s, file `index`, as checked in the workspace; the value is
-/// `file`'s own, after the files it needs have run. Warnings are the whole
-/// workspace's, shown against `shown`. `nested` are the directories left
-/// out as workspaces of their own.
+/// Runs the pipeline on the workspace `check` checks, printing each
+/// requested dump and stopping after the last one; with no dumps, prints
+/// `file`'s value, as text, unless it is `{}`. The tokens and the syntax
+/// tree are `file`'s alone; the types and the IR are `file`'s, file
+/// `index`, as checked in the workspace, its own block only; the value is
+/// `file`'s own, after the files it needs, and the standard files, have
+/// run. Warnings are the whole workspace's, shown against `shown`, indexed
+/// by input number, once the run has succeeded (after the dumps, or before
+/// the value); if a later stage fails, they are returned with its error
+/// instead, to be printed together.
 fn execute_workspace(
     args: &RunArgs,
     file: &SourceFile,
-    sources: &[SourceFile],
+    check: impl FnOnce() -> Result<Workspace, Vec<Diagnostic>>,
     shown: &[SourceFile],
-    nested: &[String],
     index: u32,
 ) -> Result<(), Failure> {
     let last = args.last_dump();
@@ -440,7 +406,7 @@ fn execute_workspace(
     if (args.dump_tokens || args.dump_ast) && syntax(args, file, &mut out)?.is_none() {
         return Ok(out.flush()?);
     }
-    let mut workspace = workspace::check_with(sources, nested).map_err(Failure::Program)?;
+    let mut workspace = check().map_err(Failure::Program)?;
     if args.dump_types {
         writeln!(out, "{}", workspace.dump_types(index).unwrap_or_default())?;
     }

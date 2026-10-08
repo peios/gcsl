@@ -22,7 +22,10 @@ const PROMPT: &str = "> ";
 /// [`Value::repr`]) and the type the checker gave it, nothing if its value
 /// is `{}` (as for a `let`), or its diagnostics; a line with errors changes
 /// nothing. A line's warnings go to stderr before its value. A runtime error
-/// inside a function an earlier line defined is shown against that line.
+/// inside a function an earlier line defined is shown against that line,
+/// and a part of a diagnostic in the standard library, which the session
+/// runs before the first line, against its file (`<stdlib>/prelude.gcsl`).
+/// The prelude's names, `len` among them, are every line's.
 /// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
@@ -82,10 +85,11 @@ fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
         }
         Err(diagnostics) => {
             // A diagnostic from a function of an earlier line refers to
-            // that line's source.
-            output::diagnostics_from(&diagnostics, |diagnostic| {
-                diagnostic
-                    .input
+            // that line's source, and a part of one in the standard library
+            // to the standard file's, `<stdlib>/prelude.gcsl`, the
+            // session's first inputs.
+            output::diagnostics_from(&diagnostics, |input| {
+                input
                     .and_then(|input| session.source(input))
                     .unwrap_or(&source)
             });

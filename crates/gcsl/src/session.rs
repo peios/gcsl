@@ -14,19 +14,21 @@
 //!   input is the same [`TyId`] in the next, and the types of the variables
 //!   carried over stay meaningful;
 //! - the checker's outermost [`Scope`]: each top-level variable with its
-//!   slot, its type and whether it is mutable, from which
-//!   [`Checker::with_scope`] checks the next input exactly as if it
+//!   slot, its type and whether it is mutable, from which the checker
+//!   ([`crate::check::Checker`]) checks the next input exactly as if it
 //!   continued the same block;
 //! - the value stack, whose bottom is the top level's frame, holding each
 //!   top-level variable's value in its slot, and which calls grow and
 //!   shrink back while an input runs;
 //! - the type of the last successful input's value, for showing it;
 //! - the source of every committed input, in order: input `n` is the `n`th
-//!   to succeed, counting from 0, and each input is lowered with its
-//!   number. A closure or a future outlives the input that made it, keeping
-//!   its code alive, and when one made by an earlier input fails, its
-//!   diagnostic names that input (see [`crate::Diagnostic::input`]), whose
-//!   source [`Session::source`] returns for rendering it. A future that
+//!   to succeed, counting from 0, the standard files first (see [The
+//!   standard library](#the-standard-library)), and each input is lowered
+//!   with its number. A closure or a future outlives the input that made
+//!   it, keeping its code alive, and when one made by an earlier input
+//!   fails, its diagnostic names that input (see
+//!   [`crate::Diagnostic::input`]), whose source [`Session::source`]
+//!   returns for rendering it. A future that
 //!   fails is left unrun, so a later input that awaits it runs it again;
 //! - the [`MemoTables`] of every memoised (`->>`) closure any input has
 //!   called, from lists of arguments to what the closure returned, so that
@@ -84,6 +86,34 @@
 //! slots. A later input sees an earlier input's field root whole, as a
 //! field of its type, and `a.c = 2` in a later input declares its own `a`.
 //!
+//! # The standard library
+//!
+//! A session is not a workspace: its inputs share their `let`s, which the
+//! files of a workspace never do. But it has the standard library, which
+//! it runs once, as it starts ([`Session::new`]), through the driver of a
+//! workspace that has no file of its own ([`crate::workspace`], "The
+//! standard library"), into its own names, types, frame and memo tables:
+//! the built-in functions' cells are the first slots of its frame and the
+//! standard files' cells and slots the next, its scope's first free slot
+//! past them all; the standard files are its first inputs, so its own
+//! first input is number 1, and [`Session::source`] of a standard file is
+//! its source, named `<stdlib>/prelude.gcsl`, which a diagnostic of one, or
+//! a label in one, is rendered against. Should that fail, which is a bug,
+//! every input fails with its diagnostics.
+//!
+//! Every input is then checked and run as before, from the session's
+//! scope, with two additions to its context: the prelude's declarations as
+//! the yielding last source of its view, and `builtins` and the standard
+//! modules importable by name. To have them, an input is scanned beside the
+//! standard library as a lone file is, its own cells taking the slots after
+//! the scope's (`crate::workspace::check_input`), and checked as a
+//! session's input, which reads the scope's variables as before. An
+//! `import` binds its names in its own input only, as in a file; it is not
+//! a `let`, and a later input imports again. A later input declaring `len`
+//! shadows the prelude's as inputs shadow earlier inputs' names, and an
+//! earlier input's alias of `len` stays `len`. A failed input never
+//! forgets the standard library, which no input changes.
+//!
 //! # Workspaces
 //!
 //! A [`crate::workspace::Workspace`] is driven like a session: its files
@@ -99,22 +129,20 @@
 //! allocated for every file before the first is checked, below every
 //! private slot.
 
-use std::mem;
 use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::Ast;
-use crate::check::{CheckOutput, Checker, Scope};
+use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
 use crate::eval::{self, MemoTables};
 use crate::ir::Ir;
-use crate::lexer;
 use crate::lower;
 use crate::names::Names;
-use crate::parser;
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
 use crate::value::Value;
+use crate::workspace::{self, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
 /// documentation.
@@ -126,10 +154,15 @@ pub struct Session {
     /// The value stack; its bottom is the top level's frame.
     frame: Vec<Value>,
     value_type: TyId,
-    /// The source of each committed input, indexed by its number.
+    /// The source of each committed input, indexed by its number: the
+    /// standard files first.
     sources: Vec<SourceFile>,
     /// The memo tables of every memoised closure called by any input.
     memo: MemoTables,
+    /// The standard library as it ran when the session started, beside
+    /// which every input is checked; or, should it have failed, which is a
+    /// bug, its diagnostics, which every input then fails with.
+    standard: Result<Rc<Standard>, Vec<Diagnostic>>,
 }
 
 impl Default for Session {
@@ -139,17 +172,33 @@ impl Default for Session {
 }
 
 impl Session {
-    /// A session with no variables.
+    /// A session with no variables of its own, which has run the standard
+    /// library: the standard files are its first inputs, its first slots
+    /// their cells (see the module documentation).
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            names: Names::new(),
-            types: TypeTable::new(),
-            scope: Scope::new(),
-            frame: Vec::new(),
-            value_type: TyId::EMPTY,
-            sources: Vec::new(),
-            memo: MemoTables::new(),
+        let sources = workspace::standard_sources();
+        match workspace::start() {
+            Ok(started) => Self {
+                names: started.names,
+                types: started.types,
+                scope: Scope::of_slots(started.slot_names),
+                frame: started.frame,
+                value_type: TyId::EMPTY,
+                sources,
+                memo: started.memo,
+                standard: Ok(Rc::new(started.standard)),
+            },
+            Err(diagnostics) => Self {
+                names: Names::new(),
+                types: TypeTable::new(),
+                scope: Scope::new(),
+                frame: Vec::new(),
+                value_type: TyId::EMPTY,
+                sources,
+                memo: MemoTables::new(),
+                standard: Err(diagnostics),
+            },
         }
     }
 
@@ -206,19 +255,21 @@ impl Session {
     /// Runs `source`, committing its scope only on success. On failure the
     /// caller must forget the names it interned.
     fn eval_uncommitted(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
-        let (tokens, mut strings) =
-            lexer::tokenize_with(source, &mut self.names).map_err(|error| vec![error])?;
-        let (builder, root) = parser::parse_parts(&tokens, source, &mut self.names, &mut strings)
-            .map_err(|error| vec![error])?;
-        // The tree owns the names while it lives; take them back before
-        // anything can fail. The string table belongs to this input alone:
-        // lowering copies what the IR needs out of it, and it is dropped
-        // with the tree.
-        let ast = builder.finish(root, mem::take(&mut self.names), strings);
+        let standard = match &self.standard {
+            Ok(standard) => Rc::clone(standard),
+            Err(diagnostics) => return Err(diagnostics.clone()),
+        };
         let input = u32::try_from(self.sources.len()).unwrap_or(u32::MAX);
-        let compiled = compile(&ast, self.scope.clone(), &mut self.types, input);
-        self.names = ast.into_names();
-        let (ir, output) = compiled?;
+        // The names are lent to the scan and given back whatever happens;
+        // the input's tree, and its string table, which lowering copies
+        // what the IR needs out of, are dropped once it is lowered.
+        let (ir, output) = workspace::check_input(
+            &standard,
+            source,
+            (&mut self.names, &mut self.types),
+            self.scope.clone(),
+            input,
+        )?;
         let committed = self.committed_mutables();
         match run_input(ir, &mut self.frame, &mut self.memo) {
             Ok(value) => {
@@ -268,20 +319,6 @@ impl Session {
     }
 }
 
-/// Checks and lowers `ast`, session input number `input`, in the context
-/// of `scope`, interning types into `types`, returning the IR and the
-/// checker's output: the scope extended by the input's top-level
-/// declarations, the value's type and the warnings.
-fn compile(
-    ast: &Ast,
-    scope: Scope,
-    types: &mut TypeTable,
-    input: u32,
-) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
-    let output = Checker::with_scope(ast, scope, types).check()?;
-    lower_checked(ast, output, types, input)
-}
-
 /// Lowers `ast`, input number `input` of a session or a workspace, which
 /// the checker's `output` is of, returning the IR with the output. Shared
 /// by [`Session`] and [`crate::workspace`], which check differently.
@@ -316,6 +353,7 @@ pub(crate) fn run_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::check::Builtin;
     use crate::diagnostic::Severity;
 
     fn eval(session: &mut Session, text: &str) -> Result<Outcome, Vec<Diagnostic>> {
@@ -337,6 +375,18 @@ mod tests {
             .collect()
     }
 
+    /// The number of the first input of a session's own: the standard
+    /// files take the numbers before it.
+    fn first() -> u32 {
+        u32::try_from(crate::STANDARD.len()).unwrap()
+    }
+
+    /// The number of slots of the frame the standard library takes, the
+    /// first, before any input of a session's own.
+    fn standard_slots() -> usize {
+        Session::new().frame.len()
+    }
+
     /// The type of the last successful input's value, as shown.
     fn value_type(session: &Session) -> String {
         session
@@ -350,9 +400,92 @@ mod tests {
         let mut session = Session::new();
         assert_eq!(
             messages(&mut session, "import lib"),
-            vec!["`import` needs a workspace: no `workspace.gcsl` above this file"]
+            vec![
+                "`lib` is not a built-in or standard module, and there is no `workspace.gcsl` \
+                 above this file"
+            ]
         );
         assert_eq!(value(&mut session, "1 + 1"), Value::Int(2));
+    }
+
+    #[test]
+    fn a_session_runs_the_standard_library_first() {
+        let mut session = Session::new();
+        // The standard files are its first inputs, and the built-in
+        // functions' cells its first slots, written as the frame was laid
+        // out.
+        assert_eq!(first(), 1);
+        assert_eq!(
+            session.source(0).map(SourceFile::name),
+            Some("<stdlib>/prelude.gcsl")
+        );
+        assert!(session.source(first()).is_none());
+        assert_eq!(
+            &session.frame[..3],
+            &[
+                Value::Builtin(Builtin::Len),
+                Value::Builtin(Builtin::Int),
+                Value::Builtin(Builtin::Float)
+            ]
+        );
+        // The prelude's names on the first input.
+        assert_eq!(value(&mut session, "len([1, 2, 3])"), Value::Int(3));
+        assert_eq!(value(&mut session, "half(int(7.9))"), Value::Float(3.5));
+        assert_eq!(value_type(&session), "Float");
+        // `builtins` and the prelude by name, in the input that imports
+        // them.
+        assert_eq!(
+            value(&mut session, "import builtins\nbuiltins.len([1])"),
+            Value::Int(1)
+        );
+        assert_eq!(
+            value(
+                &mut session,
+                "import len as count from prelude\ncount([1, 2])"
+            ),
+            Value::Int(2)
+        );
+        assert_eq!(
+            messages(&mut session, "builtins.len([1])"),
+            ["undefined variable `builtins`"]
+        );
+        // An alias of `len` crosses inputs, as an alias of an alias does.
+        value(&mut session, "let l = len");
+        value(&mut session, "m = l");
+        assert_eq!(value(&mut session, "m([1, 2]) + l([1])"), Value::Int(3));
+        assert_eq!(value_type(&session), "Int");
+        assert_eq!(
+            messages(&mut session, "[m]"),
+            ["`len` is a built-in function and cannot be used as a value yet"]
+        );
+        // A failed input never forgets the standard library.
+        assert_eq!(
+            messages(&mut session, "let bad = 1 + true"),
+            ["cannot add Int and Bool"]
+        );
+        assert_eq!(value(&mut session, "len([1])"), Value::Int(1));
+        // A later input declaring `len` shadows it, as inputs shadow
+        // earlier inputs' names.
+        value(&mut session, "let len = 10");
+        assert_eq!(value(&mut session, "len + 1"), Value::Int(11));
+        value(&mut session, "fn len(): Int { 20 }");
+        assert_eq!(value(&mut session, "len()"), Value::Int(20));
+        // But an earlier input's alias still is `len`.
+        assert_eq!(value(&mut session, "l([1, 2, 3])"), Value::Int(3));
+    }
+
+    #[test]
+    fn a_conflict_with_the_prelude_names_its_file() {
+        let mut session = Session::new();
+        let diagnostics = eval(&mut session, "import * from prelude\nlen = 3").unwrap_err();
+        assert_eq!(diagnostics.len(), 1);
+        let error = &diagnostics[0];
+        assert_eq!(error.message, "field `len` is defined in two files");
+        assert_eq!(error.input, None);
+        let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
+        assert_eq!(inputs, [Some(0), None]);
+        let prelude = session.source(0).unwrap();
+        assert_eq!(prelude.slice(error.labels[0].span), "len");
     }
 
     #[test]
@@ -440,16 +573,17 @@ mod tests {
     #[test]
     fn the_frame_grows_as_needed() {
         let mut session = Session::new();
+        let base = standard_slots();
         value(&mut session, "let a = 1");
-        assert_eq!(session.frame.len(), 1);
+        assert_eq!(session.frame.len(), base + 1);
         value(&mut session, "{ let t = 1; let u = 2; let v = 3 }");
         // After each input, the stack is its top level's frame: the
         // temporaries' slots are gone, and reused by later variables, but
         // the capacity stays.
-        assert_eq!(session.frame.len(), 4);
+        assert_eq!(session.frame.len(), base + 4);
         value(&mut session, "let b = 2");
-        assert_eq!(session.frame.len(), 2);
-        assert!(session.frame.capacity() >= 4);
+        assert_eq!(session.frame.len(), base + 2);
+        assert!(session.frame.capacity() >= base + 4);
         assert_eq!(value(&mut session, "a + b"), Value::Int(3));
     }
 
@@ -620,7 +754,7 @@ mod tests {
         let odd = "fn odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
         value(&mut session, &format!("let a = 1\n{odd}\n{even}"));
         // The frame is the input's variables plus a slot for each function.
-        assert_eq!(session.frame.len(), 3);
+        assert_eq!(session.frame.len(), standard_slots() + 3);
         // A later input calls the earlier input's mutually recursive pair.
         assert_eq!(value(&mut session, "even(10)"), Value::Bool(true));
         // Declaring one of them again leaves the earlier pair calling each
@@ -655,7 +789,7 @@ mod tests {
         );
         // The frame is a slot for the root `com`, one for `get`, and a cell
         // for each of `com.x`, `com.x.app`, `com.x.lib` and `com.x.lib.name`.
-        assert_eq!(session.frame.len(), 6);
+        assert_eq!(session.frame.len(), standard_slots() + 6);
         // A later input reads the earlier input's root, a leaf by its path,
         // and its `def`, which reads the leaf's cell through the frame.
         assert_eq!(
@@ -674,7 +808,7 @@ mod tests {
         // The cells are committed with their input: later variables take
         // other slots, and the `def` still reads its own input's cell.
         value(&mut session, "let p = 1\nlet q = 2\nlet r = 3\nlet s = 4");
-        assert_eq!(session.frame.len(), 10);
+        assert_eq!(session.frame.len(), standard_slots() + 10);
         assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
         // A dotted field of a later input declares that input's own root.
         value(&mut session, "com.y = 1");
@@ -694,22 +828,26 @@ mod tests {
     #[test]
     fn an_error_in_a_function_of_an_earlier_input_names_that_input() {
         let mut session = Session::new();
-        let first = "fn div(a: Int, b: Int): Int { a // b }";
-        value(&mut session, first);
+        let first_text = "fn div(a: Int, b: Int): Int { a // b }";
+        value(&mut session, first_text);
         value(&mut session, "let unrelated = 1");
-        // Input 2 fails at runtime inside input 0's function.
+        // Input 2 fails at runtime inside input 0's function (counting from
+        // the session's own first input, after the standard files').
         let diagnostics = eval(&mut session, "div(1, 0)").unwrap_err();
         assert_eq!(diagnostics.len(), 1);
         let diagnostic = &diagnostics[0];
         assert_eq!(diagnostic.message, "division by zero");
-        assert_eq!(diagnostic.input, Some(0));
-        let source = session.source(0).unwrap();
-        assert_eq!(source.text(), first);
+        assert_eq!(diagnostic.input, Some(first()));
+        let source = session.source(first()).unwrap();
+        assert_eq!(source.text(), first_text);
         assert_eq!(source.slice(diagnostic.span), "//");
-        assert_eq!(session.source(1).unwrap().text(), "let unrelated = 1");
+        assert_eq!(
+            session.source(first() + 1).unwrap().text(),
+            "let unrelated = 1"
+        );
         // The failed input takes no number, and the one being run has none
         // yet.
-        assert!(session.source(2).is_none());
+        assert!(session.source(first() + 2).is_none());
         // An error in the input being run names no input, even from inside
         // a closure of its own called by a function of an earlier input.
         value(&mut session, "fn call(f: fn(): Int): Int { f() }");
@@ -719,9 +857,9 @@ mod tests {
         // called by input 3's `bad`, called by input 2's `call`.
         value(&mut session, "fn bad(): Int { div(1, 0) }");
         let diagnostics = eval(&mut session, "call(bad)").unwrap_err();
-        assert_eq!(diagnostics[0].input, Some(0));
+        assert_eq!(diagnostics[0].input, Some(first()));
         let diagnostics = eval(&mut session, "bad()").unwrap_err();
-        assert_eq!(diagnostics[0].input, Some(0));
+        assert_eq!(diagnostics[0].input, Some(first()));
         // A file names no input: everything in it is input 0.
         let file = SourceFile::new("f.gcsl", "fn f(): Int { 1 // 0 }\nf()").unwrap();
         assert_eq!(crate::run(&file).unwrap_err()[0].input, None);
@@ -733,7 +871,7 @@ mod tests {
         value(&mut session, "let r = { a = 20 }");
         value(&mut session, "let f = lazy r.a + 1");
         // The future holds a copy of the record until it has run.
-        let Value::Record(record) = session.frame[0].clone() else {
+        let Value::Record(record) = session.frame[standard_slots()].clone() else {
             panic!("expected a record");
         };
         assert_eq!(Rc::strong_count(&record), 3);
@@ -750,8 +888,8 @@ mod tests {
     #[test]
     fn a_failing_future_names_its_input_and_runs_again() {
         let mut session = Session::new();
-        let first = "let bad = lazy 1 // 0";
-        value(&mut session, first);
+        let first_text = "let bad = lazy 1 // 0";
+        value(&mut session, first_text);
         // Awaited by a later input, it fails in the input that made it,
         // whose source the spans refer to; there is no await of that input
         // to label.
@@ -760,8 +898,11 @@ mod tests {
             assert_eq!(diagnostics.len(), 1);
             let diagnostic = &diagnostics[0];
             assert_eq!(diagnostic.message, "division by zero");
-            assert_eq!(diagnostic.input, Some(0));
-            assert_eq!(session.source(0).unwrap().slice(diagnostic.span), "//");
+            assert_eq!(diagnostic.input, Some(first()));
+            assert_eq!(
+                session.source(first()).unwrap().slice(diagnostic.span),
+                "//"
+            );
             assert!(
                 diagnostic
                     .labels
@@ -837,13 +978,16 @@ mod tests {
     #[test]
     fn a_memoised_call_that_fails_runs_again_in_a_later_input() {
         let mut session = Session::new();
-        let first = "fn d(x: Int) ->> Int { 10 // x }";
-        value(&mut session, first);
+        let first_text = "fn d(x: Int) ->> Int { 10 // x }";
+        value(&mut session, first_text);
         for _ in 0..2 {
             let diagnostics = eval(&mut session, "d(0)").unwrap_err();
             assert_eq!(diagnostics[0].message, "division by zero");
             // In the body, which ran again.
-            assert_eq!(session.source(0).unwrap().slice(diagnostics[0].span), "//");
+            assert_eq!(
+                session.source(first()).unwrap().slice(diagnostics[0].span),
+                "//"
+            );
             assert_eq!(session.memo.running_count(), 0);
         }
         assert_eq!(value(&mut session, "d(5)"), Value::Int(2));
@@ -856,8 +1000,11 @@ mod tests {
             let diagnostics = eval(&mut session, "r(0)").unwrap_err();
             let diagnostic = &diagnostics[0];
             assert_eq!(diagnostic.message, "this call depends on its own result");
-            assert_eq!(diagnostic.input, Some(2));
-            assert_eq!(session.source(2).unwrap().slice(diagnostic.span), "r(0)");
+            assert_eq!(diagnostic.input, Some(first() + 2));
+            assert_eq!(
+                session.source(first() + 2).unwrap().slice(diagnostic.span),
+                "r(0)"
+            );
             // The call running it is of the input being run, and the
             // error's spans are of the function's: it is not labelled.
             assert!(diagnostic.labels.is_empty());
@@ -985,7 +1132,7 @@ mod tests {
         // that input.
         let diagnostics = eval(&mut session, "total([])").unwrap_err();
         assert_eq!(diagnostics[0].message, "index out of range");
-        assert_eq!(diagnostics[0].input, Some(5));
+        assert_eq!(diagnostics[0].input, Some(first() + 5));
         // `len` is in every input's scope, and shadowed as any name.
         value(&mut session, "let len = 5");
         assert_eq!(value(&mut session, "len"), Value::Int(5));
@@ -1037,7 +1184,7 @@ mod tests {
         );
         let diagnostics = eval(&mut session, "inverses([1, 0])").unwrap_err();
         assert_eq!(diagnostics[0].message, "division by zero");
-        assert_eq!(diagnostics[0].input, Some(6));
+        assert_eq!(diagnostics[0].input, Some(first() + 6));
         // A unit-like statement.
         assert_eq!(
             value(&mut session, "for x in xs { }\n[]\nlen(xs)"),
@@ -1055,7 +1202,7 @@ mod tests {
         value(&mut session, "{ { total := total + 1 } }");
         assert_eq!(value(&mut session, "total"), Value::Int(13));
         assert_eq!(value_type(&session), "Int");
-        assert_eq!(session.frame.len(), 1);
+        assert_eq!(session.frame.len(), standard_slots() + 1);
         // A function or a `lazy` of a later input cannot rebind it, and
         // there is no declaration to point at.
         let diagnostics =

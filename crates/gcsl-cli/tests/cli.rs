@@ -69,7 +69,8 @@ fn an_import_outside_a_workspace_is_an_error() {
     assert_eq!(stdout(&output), "");
     assert_eq!(
         stderr(&output),
-        "error: `import` needs a workspace: no `workspace.gcsl` above this file\n\
+        "error: `lib` is not a built-in or standard module, and there is no \
+         `workspace.gcsl` above this file\n\
          \x20--> tests/fixtures/import_outside.gcsl:2:1\n\
          \x20 |\n\
          2 | import lib\n\
@@ -84,7 +85,8 @@ fn an_import_in_the_repl_is_an_error() {
     assert_eq!(stdout(&output), "2 : Int\n");
     assert!(
         stderr(&output).starts_with(
-            "error: `import` needs a workspace: no `workspace.gcsl` above this file\n"
+            "error: `lib` is not a built-in or standard module, and there is no \
+             `workspace.gcsl` above this file\n"
         ),
         "{}",
         stderr(&output)
@@ -243,11 +245,11 @@ fn dump_ir_shows_strings_and_ifs() {
     assert_eq!(
         stdout(&output),
         "(block @0..36\n\
-         \x20 (store who#0 @0..17\n\
+         \x20 (store who#8 @0..17\n\
          \x20   (str \"world\" @10..17))\n\
          \x20 (interp @18..36\n\
          \x20   (str \"hello,\\t\" @18..36)\n\
-         \x20   (load who#0 @28..31)\n\
+         \x20   (load who#8 @28..31)\n\
          \x20   (str \"!\\n\" @18..36)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
@@ -286,25 +288,25 @@ fn dump_ir_shows_updates() {
     assert_eq!(
         stdout(&output),
         "(block @39..122\n\
-         \x20 (store host#2 @39..64\n\
+         \x20 (store host#8 @39..64\n\
          \x20   (str \"localhost\" @53..64))\n\
-         \x20 (store port#3 @65..83\n\
+         \x20 (store port#9 @65..83\n\
          \x20   (int 8080 @79..83))\n\
-         \x20 (store name#1 @84..96\n\
+         \x20 (store name#10 @84..96\n\
          \x20   (str \"api\" @91..96))\n\
-         \x20 (store enabled#5 @97..122\n\
+         \x20 (store enabled#12 @97..122\n\
          \x20   (bool true @118..122))\n\
-         \x20 (store tls#4 @97..122\n\
+         \x20 (store tls#11 @97..122\n\
          \x20   (make-record [enabled] @97..122\n\
-         \x20     (load enabled#5 @97..122)))\n\
-         \x20 (store server#0 @39..64\n\
+         \x20     (load enabled#12 @97..122)))\n\
+         \x20 (store server#7 @39..64\n\
          \x20   (make-record [host port tls] @39..64\n\
-         \x20     (load host#2 @39..64)\n\
-         \x20     (load port#3 @65..83)\n\
-         \x20     (load tls#4 @97..122)))\n\
+         \x20     (load host#8 @39..64)\n\
+         \x20     (load port#9 @65..83)\n\
+         \x20     (load tls#11 @97..122)))\n\
          \x20 (make-record [server name] @39..122\n\
-         \x20   (load server#0 @39..45)\n\
-         \x20   (load name#1 @84..88)))\n"
+         \x20   (load server#7 @39..45)\n\
+         \x20   (load name#10 @84..88)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -353,9 +355,9 @@ fn dumps_show_functions_and_calls() {
     let ir = stdout(&output);
     assert!(
         ir.contains(
-            "  (store at#5 @254..301\n\
+            "  (store at#13 @254..301\n\
              \x20   (make-closure #2 @263..301\n\
-             \x20     (load base#4 @263..301)))\n"
+             \x20     (load base#12 @263..301)))\n"
         ),
         "{ir}"
     );
@@ -594,12 +596,12 @@ fn dumps_show_lists() {
          \x20     (int 22 @446..448)\n\
          \x20     (await @450..458\n\
          \x20       (index @450..458\n\
-         \x20         (load found#8 @450..455)\n\
+         \x20         (load found#16 @450..455)\n\
          \x20         (int 0 @456..457)))\n",
         "\n    (list-len @478..487\n\
-         \x20     (load open#9 @482..486)))\n",
+         \x20     (load open#17 @482..486)))\n",
         "\n      (await *! @524..529\n\
-         \x20       (load found#8 @524..529))\n",
+         \x20       (load found#16 @524..529))\n",
         "\n    (list-eq == * @539..563\n",
         "\n    (make-list @575..643\n\
          \x20     (spread @576..611\n",
@@ -681,23 +683,23 @@ fn dumps_show_fors_and_ranges() {
     for node in [
         // A `for` shows its variable's slot, named, as every slot is, by
         // the last variable stored in it.
-        "\n    (for ports#6 @213..248\n\
+        "\n    (for ports#14 @213..248\n\
          \x20     (range @222..235\n\
          \x20       (int 0 @222..223)\n\
          \x20       (list-len @225..235\n",
-        "\n    (for webs#7 if @310..354\n\
-         \x20     (load hosts#5 @322..327)\n\
+        "\n    (for webs#15 if @310..354\n\
+         \x20     (load hosts#13 @322..327)\n\
          \x20     (str-cmp != @331..345\n",
         // The statement of `{}`s discards its body's values; the statement
         // of futures builds its list, and awaits it deeply.
-        "\n  (for-each checks#8 @426..459\n\
-         \x20   (load webs#7 @438..442)\n",
+        "\n  (for-each checks#16 @426..459\n\
+         \x20   (load webs#15 @438..442)\n",
         "\n  (await *! @524..562\n\
-         \x20   (for checks#8 @524..562\n",
-        "\n    (for checks#8 @596..621\n\
-         \x20     (load ports#6 @605..610)\n\
+         \x20   (for checks#16 @524..562\n",
+        "\n    (for checks#16 @596..621\n\
+         \x20     (load ports#14 @605..610)\n\
          \x20     (await @611..621\n",
-        "\n    (for i#9 @678..702\n\
+        "\n    (for i#17 @678..702\n\
          \x20     (range-inclusive @687..692\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
@@ -801,24 +803,24 @@ fn dumps_show_mutable_variables() {
     for node in [
         // A rebind in a `for`'s body, and in an `if` in it, stores into the
         // variable's one slot.
-        "\n  (store total#7 @159..176\n\
+        "\n  (store total#15 @159..176\n\
          \x20   (int 0 @175..176))\n",
         "\n    (block @299..366\n\
-         \x20     (store total#7 @303..324\n\
+         \x20     (store total#15 @303..324\n\
          \x20       (int-add @312..324\n\
-         \x20         (load total#7 @312..317)\n",
+         \x20         (load total#15 @312..317)\n",
         "\n        (block @348..364\n\
-         \x20         (store slowest#8 @350..362\n\
-         \x20           (load conf#9 @361..362))\n",
+         \x20         (store slowest#16 @350..362\n\
+         \x20           (load conf#17 @361..362))\n",
         // The guard reads the slot the body writes.
         "\n      (int-cmp >= @621..635\n\
-         \x20       (load budget#10 @621..627)\n",
-        "\n        (store budget#10 @638..661\n",
+         \x20       (load budget#18 @621..627)\n",
+        "\n        (store budget#18 @638..661\n",
         // The closure copies the variable when it is made.
-        "\n  (store report#12 @721..753\n\
+        "\n  (store report#20 @721..753\n\
          \x20   (make-closure #0 @734..753\n\
-         \x20     (load total#7 @734..753)))\n\
-         \x20 (store total#7 @754..764\n",
+         \x20     (load total#15 @734..753)))\n\
+         \x20 (store total#15 @754..764\n",
         // A function's own variable, in its own frame.
         "\n      (block @823..841\n\
          \x20       (store sum#1 @825..839\n",
@@ -940,7 +942,7 @@ fn dumps_show_loops_and_their_stops() {
         // A header's items before the condition run once, in a block
         // around the loop; those after it are the loop's last parts.
         "\n    (block @306..363\n\
-         \x20     (store costs#2 @310..319\n",
+         \x20     (store costs#10 @310..319\n",
         "\n      (loop @306..363\n",
         // `for { }` tests `true`.
         "\n    (loop @692..753\n\
@@ -1043,10 +1045,10 @@ fn dumps_show_unions_tests_and_narrowing() {
     for node in [
         // The test looks at the kind alone, and writes the slot the
         // branches read, which a later variable takes once it is free.
-        "(is int first#4 @324..332\n\
-         \x20           (load label#3 @324..325))\n\
+        "(is int first#12 @324..332\n\
+         \x20           (load label#11 @324..325))\n\
          \x20         (block @333..338\n\
-         \x20           (load first#4 @335..336))\n",
+         \x20           (load first#12 @335..336))\n",
         "(as int @612..635\n",
         "(value-same === @708..745\n",
     ] {
@@ -1155,17 +1157,17 @@ fn dumps_show_element_updates() {
     for node in [
         // One update for the whole path: its value, its list and its
         // positions, and its steps.
-        "\n  (store hosts#0 @247..266\n\
+        "\n  (store hosts#8 @247..266\n\
          \x20   (update [].up @247..258\n\
          \x20     (bool true @262..266)\n\
-         \x20     (load hosts#0 @247..252)\n\
+         \x20     (load hosts#8 @247..252)\n\
          \x20     (int 0 @253..254)))\n",
-        "\n      (store hosts#0 @364..406\n\
+        "\n      (store hosts#8 @364..406\n\
          \x20       (update [].ports[] @364..381\n\
          \x20         (int-add @385..406\n",
         "\n            (update [][] @497..507\n",
         // The value, which rebinds `r`, comes before the read of `r`.
-        "\n  (store r#4 @735..778\n\
+        "\n  (store r#12 @735..778\n\
          \x20   (update .a @735..738\n\
          \x20     (block @742..778\n",
     ] {
@@ -1269,21 +1271,21 @@ fn dumps_show_spreads() {
     // The operand is stored once, in a slot of its own, and each field is
     // read from it by name into the field's slot; the override stores into
     // the same slot, and the field keeps its place.
-    let node = "\n      (store url#3 @176..187\n\
-                \x20       (load defaults#0 @179..187))\n\
-                \x20     (store conf#1 @176..187\n\
+    let node = "\n      (store url#11 @176..187\n\
+                \x20       (load defaults#8 @179..187))\n\
+                \x20     (store conf#9 @176..187\n\
                 \x20       (field host @179..187\n\
-                \x20         (load url#3 @179..187)))\n\
-                \x20     (store port#2 @176..187\n\
+                \x20         (load url#11 @179..187)))\n\
+                \x20     (store port#10 @176..187\n\
                 \x20       (field port @179..187\n\
-                \x20         (load url#3 @179..187)))\n\
-                \x20     (store port#2 @190..201\n\
+                \x20         (load url#11 @179..187)))\n\
+                \x20     (store port#10 @190..201\n\
                 \x20       (int 8080 @197..201))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     let node = "\n      (make-record [host port url] @172..227\n\
-                \x20       (load conf#1 @179..187)\n\
-                \x20       (load port#2 @190..194)\n\
-                \x20       (load url#3 @204..207))))\n";
+                \x20       (load conf#9 @179..187)\n\
+                \x20       (load port#10 @190..194)\n\
+                \x20       (load url#11 @204..207))))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -1416,13 +1418,13 @@ fn dumps_show_record_types_and_record_ir() {
     assert_eq!(
         stdout(&output),
         "(block @32..45\n\
-         \x20 (store x#0 @32..37\n\
+         \x20 (store x#7 @32..37\n\
          \x20   (int 1 @36..37))\n\
-         \x20 (store y#1 @38..45\n\
+         \x20 (store y#8 @38..45\n\
          \x20   (str \"a\" @42..45))\n\
          \x20 (make-record [x y] @32..45\n\
-         \x20   (load x#0 @32..33)\n\
-         \x20   (load y#1 @38..39)))\n"
+         \x20   (load x#7 @32..33)\n\
+         \x20   (load y#8 @38..39)))\n"
     );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
@@ -1451,11 +1453,11 @@ fn dumps_show_names_and_slots() {
          Newline @32..33\n\
          Eof @32..32\n\
          (block @0..32\n\
-         \x20 (store count#0 @0..13\n\
+         \x20 (store count#8 @0..13\n\
          \x20   (int 1 @12..13))\n\
-         \x20 (store count#1 @14..32\n\
+         \x20 (store count#9 @14..32\n\
          \x20   (int-add @23..32\n\
-         \x20     (load count#0 @23..28)\n\
+         \x20     (load count#8 @23..28)\n\
          \x20     (int 1 @31..32)))\n\
          \x20 (empty @0..32))\n"
     );
@@ -1706,22 +1708,22 @@ fn dumps_show_top_level_functions_and_where_they_are_made() {
         // Those that copy nothing are made as the input starts, in their
         // own slots, the first of the input's.
         "(block @123..726\n\
-         \x20 (store describe#0 @156..225\n\
+         \x20 (store describe#14 @156..225\n\
          \x20   (make-closure #0 @156..225))\n\
-         \x20 (store even#1 @226..290\n",
+         \x20 (store even#15 @226..290\n",
         // One that copies `rate` just after `rate` is bound.
-        "\n  (store rate#11 @494..506\n\
+        "\n  (store rate#20 @494..506\n\
          \x20   (int 3 @505..506))\n\
-         \x20 (store scale#4 @525..559\n\
+         \x20 (store scale#18 @525..559\n\
          \x20   (make-closure #4 @525..559\n\
-         \x20     (load rate#11 @525..559)))\n\
-         \x20 (store scaled#8 @507..524\n",
+         \x20     (load rate#20 @525..559)))\n\
+         \x20 (store scaled#10 @507..524\n",
         // One that copies a mutable variable where it is written.
-        "\n  (store counted#5 @643..670\n\
+        "\n  (store counted#19 @643..670\n\
          \x20   (make-closure #5 @643..670\n",
         // A function reads another of the top level from the top level's
         // frame, not by a capture.
-        "\n        (fn top even#1 @190..194)\n",
+        "\n        (fn top even#15 @190..194)\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -1779,32 +1781,32 @@ fn dumps_show_the_cells_of_top_level_fields_and_their_points() {
     for node in [
         // `com.x.lib.name` and the interior node `com.x.lib` are computed
         // before `com.x.app.deps`, the first item that needs them.
-        "\n  (store name#12 @273..295\n",
-        "\n  (store lib#11 @273..295\n\
+        "\n  (store name#13 @273..295\n",
+        "\n  (store lib#12 @273..295\n\
          \x20   (make-record [name] @273..295\n\
-         \x20     (load name#12 @273..295)))\n\
-         \x20 (store deps#9 @211..239\n\
+         \x20     (load name#13 @273..295)))\n\
+         \x20 (store deps#10 @211..239\n\
          \x20   (make-list @228..239\n\
-         \x20     (load lib#11 @229..238)))\n\
-         \x20 (store version#3 @296..321\n",
+         \x20     (load lib#12 @229..238)))\n\
+         \x20 (store version#14 @296..321\n",
         // An interior node is assembled from its children's cells once all
         // of them are computed.
-        "\n  (store app#8 @211..239\n\
+        "\n  (store app#9 @211..239\n\
          \x20   (make-record [deps name] @211..239\n\
-         \x20     (load deps#9 @211..239)\n\
-         \x20     (load name#10 @240..272)))\n",
+         \x20     (load deps#10 @211..239)\n\
+         \x20     (load name#11 @240..272)))\n",
         // A root read between its items is computed whole, before the read.
-        "\n  (store part#4 @526..536\n\
+        "\n  (store part#15 @526..536\n\
          \x20   (make-record [a b] @526..536\n\
-         \x20     (load a#13 @526..536)\n\
-         \x20     (load b#14 @550..560)))\n\
-         \x20 (store whole#5 @537..549\n",
+         \x20     (load a#16 @526..536)\n\
+         \x20     (load b#18 @550..560)))\n\
+         \x20 (store whole#17 @537..549\n",
         // The record of the input is made from the roots' cells.
         "\n  (make-record [com version part whole label] @59..574\n\
-         \x20   (load com#2 @211..214)\n",
+         \x20   (load com#7 @211..214)\n",
         // A function reads a cell from the top level's frame, not by a
         // capture.
-        "\n    (top top name#12 @451..465))",
+        "\n    (top top name#13 @451..465))",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -1887,7 +1889,7 @@ fn dumps_show_returns_and_their_catches() {
         "(catch 0 @384..436\n",
         "(return 0 @403..423\n",
         "\n    (catch 1 @532..582\n\
-         \x20     (for hit#6 @532..582\n",
+         \x20     (for hit#14 @532..582\n",
         // A loop that cannot end collects nothing.
         "\n    (catch 2 @692..759\n\
          \x20     (loop-each @692..759\n",
@@ -2064,7 +2066,7 @@ fn dumps_in_a_workspace_are_the_files_alone() {
     assert!(!stdout(&output).contains("version"));
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load lib#7 @49..58)"), "{ir}");
+    assert!(ir.contains("(load lib#14 @49..58)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -2156,7 +2158,7 @@ fn dumps_of_an_importing_file() {
     );
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load build#14 @144..151)"), "{ir}");
+    assert!(ir.contains("(load build#21 @144..151)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert!(!ir.contains("store name"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -2246,6 +2248,107 @@ fn run_outside_a_workspace_is_unchanged() {
     let output = gcsl(&["run", "tests/fixtures/type_error.gcsl"]);
     assert!(stderr(&output).contains(" --> tests/fixtures/type_error.gcsl:2:8\n"));
     assert!(!stderr(&output).contains(":::"));
+}
+
+/// The standard library's summary: the prelude's names, and `builtins` and
+/// the prelude imported by name, in a lone file and in a workspace, whose
+/// root's `half` shadows the prelude's.
+#[test]
+fn run_has_the_standard_library_alone_and_in_a_workspace() {
+    let output = gcsl(&["run", "tests/fixtures/standard.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{xs = [1, 2, 3]; n = 3; h = 1.5; same = true; c = 3}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/ws_standard/app/main.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{xs = [1, 2, 3]; n = 3; h = 1.5; same = true; c = 3; i = 2}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    // The dumps are the file's own: a call of `len` is the length of its
+    // list; the prelude's `half` is read from its cell.
+    let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-ir"]);
+    let ir = stdout(&output);
+    assert!(
+        ir.contains("  (store n#8 @87..98\n    (list-len @91..98\n      (load xs#7 @95..97)))\n"),
+        "{ir}"
+    );
+    assert!(ir.contains("(load half#12 @103..107)"), "{ir}");
+    assert!(!ir.contains("store len"), "{ir}");
+    let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-types"]);
+    let types = stdout(&output);
+    assert!(
+        types.contains("(name count : fn(List<Int>): Int @193..198)"),
+        "{types}"
+    );
+}
+
+/// A special built-in used as a value, and a conflict with the prelude,
+/// whose definition is shown in `<stdlib>/prelude.gcsl`.
+#[test]
+fn run_renders_the_alias_rule_and_the_prelude() {
+    let output = gcsl(&["run", "tests/fixtures/builtin_value.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `len` is a built-in function and cannot be used as a value yet\n\
+         \x20--> tests/fixtures/builtin_value.gcsl:1:10\n\
+         \x20 |\n\
+         1 | sizes = [len]\n\
+         \x20 |          ^^^\n\
+         \x20 |\n\
+         \x20 = note: a built-in function with a type for any list cannot be written as a type \
+         yet; call it, or bind it to a name\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl(&["run", "tests/fixtures/prelude_conflict.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: field `len` is defined in two files\n\
+         \x20 --> tests/fixtures/prelude_conflict.gcsl:1:8\n\
+         \x20  |\n\
+         \x201 | import * from prelude\n\
+         \x20  |        ^ imported here\n\
+         \x202 | len = 3\n\
+         \x20  | --- defined here\n\
+         \x20  |\n\
+         \x20 ::: <stdlib>/prelude.gcsl:14:1\n\
+         \x20  |\n\
+         14 | len = builtins.len\n\
+         \x20  | --- defined here\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn repl_has_the_standard_library() {
+    let output = repl(
+        "len([1, 2])\n\
+         let l = len\n\
+         l([1])\n\
+         import builtins; builtins.int(2.5)\n\
+         len\n\
+         let len = 3\n\
+         len\n",
+    );
+    assert_eq!(stdout(&output), "2 : Int\n1 : Int\n2 : Int\n3 : Int\n");
+    assert_eq!(
+        stderr(&output),
+        "error: `len` is a built-in function and cannot be used as a value yet\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | len\n\
+         \x20 | ^^^\n\
+         \x20 |\n\
+         \x20 = note: a built-in function with a type for any list cannot be written as a type \
+         yet; call it, or bind it to a name\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
 }
 
 #[test]

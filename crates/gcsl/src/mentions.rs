@@ -86,8 +86,13 @@
 //! ([`crate::workspace::FileScope`]) is the file's view: the file's tree
 //! merged with its directory chain's and with each member and root of a
 //! `*` it imports, a whole import a root of its own, with which the scan
-//! has already made sure nothing shares a name; a single file has no scope
-//! with imports, and the checker rejects its `import`s. A reference through
+//! has already made sure nothing shares a name, and the implicit `import *
+//! from prelude`'s roots; a lone file and a session's input are scanned as
+//! a workspace's file, beside the standard library, and only a file found
+//! with [`find`], with no scope of imports, has none (its checker rejects
+//! its `import`s). The over-approximation holds here too: a name the
+//! prelude binds that a top-level `let` or `fn` of the file shadows is
+//! still a mention of the prelude's node. A reference through
 //! an imported name is then resolved as any reference is, to the longest
 //! prefix the scope declares, and the same shadowing applies: a parameter
 //! or a nearer `let` of the name hides the import. Such a reference is

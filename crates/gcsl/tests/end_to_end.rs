@@ -784,7 +784,6 @@ fn every_stage_handles_maximum_list_depth() {
             ),
             (&spreads, |shown| shown == "[1]", false),
             (&annotated, |shown| shown == "true", false),
-            (&lengths, |shown| shown == "1", false),
             (&awaited, deep, false),
         ] {
             let (tokens, names, strings) = gcsl::lexer::tokenize(file).unwrap();
@@ -801,6 +800,9 @@ fn every_stage_handles_maximum_list_depth() {
                 assert!(!ir.pretty(ast.names()).to_string().is_empty());
             }
         }
+        // `len` is the prelude's, which a file run alone has.
+        let shown = gcsl::run(&lengths).unwrap().value.to_string();
+        assert_eq!(shown, "1");
         // Showing the deepest list's type.
         let mut session = Session::new();
         session.eval(&source(&literal)).unwrap();

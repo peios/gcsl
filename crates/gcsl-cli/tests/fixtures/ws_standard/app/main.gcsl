@@ -1,0 +1,10 @@
+# The prelude's names, and `builtins` and the prelude imported by name.
+xs = [1, 2, 3]
+n = len(xs)
+h = half * 3.0
+import builtins
+same = builtins.len(xs) == n
+import len as count from prelude
+c = count(xs)
+import int from builtins
+i = int(2.9)

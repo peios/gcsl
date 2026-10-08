@@ -176,6 +176,18 @@
 //! ([`TypeTable::is_unit_like`]), so a statement of it is no unused value,
 //! and its kind is [`ValueKind::Never`], the kind of no value.
 //!
+//! # Built-in functions
+//!
+//! TEMPORARY (alias rule): a built-in function whose typing is special
+//! (see [`crate::check::Builtin`]), `len`, has no type a function type can
+//! hold until built-in functions get real polymorphic types (R11 of
+//! `docs/INFERENCE_REQS.md`). Its value has an opaque type of its own,
+//! [`TyKind::Builtin`], shown `builtin len`, which cannot be written in
+//! source: a subtype of itself only, holding no future, a function as far
+//! as equality goes ([`TypeTable::contains_fn`]), and of kind
+//! [`ValueKind::Fn`]. The checker lets it stand only where the alias rule
+//! does, so no other type ever holds it ([`TypeTable::special_builtin`]).
+//!
 //! # Provisional types
 //!
 //! A pure function's bare parameter is present if the function's body
@@ -221,6 +233,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::{Effect, FnId};
+use crate::check::Builtin;
 use crate::names::{Name, Names};
 use crate::strings::FieldName;
 use crate::value::ValueKind;
@@ -315,6 +328,12 @@ pub enum TyKind {
     /// block that ends with a `break`: no value has it. See
     /// [Never](#never).
     Never,
+    /// TEMPORARY (alias rule): the opaque type of a built-in function whose
+    /// typing is special, `builtin len`, which no type expression can
+    /// write, until built-in functions get real polymorphic types (R11 of
+    /// `docs/INFERENCE_REQS.md`). See [Built-in
+    /// functions](#built-in-functions).
+    Builtin(Builtin),
 }
 
 /// The fields of a record type.
@@ -502,7 +521,8 @@ impl TypeTable {
             | TyKind::String
             | TyKind::UntypedInt
             | TyKind::Error
-            | TyKind::Never => false,
+            | TyKind::Never
+            | TyKind::Builtin(_) => false,
         };
         self.provisional.push(provisional);
         self.kinds.push(kind.clone());
@@ -527,6 +547,60 @@ impl TypeTable {
     #[must_use]
     pub fn is_never(&self, id: TyId) -> bool {
         matches!(self.kinds.get(id.index()), Some(TyKind::Never))
+    }
+
+    /// TEMPORARY (alias rule): the id of the opaque type of `builtin`, a
+    /// built-in function whose typing is special, adding it to the table if
+    /// it is new (see [Built-in functions](#built-in-functions)); replaced
+    /// by its polymorphic type (R11 of `docs/INFERENCE_REQS.md`).
+    pub fn builtin(&mut self, builtin: Builtin) -> TyId {
+        self.intern(TyKind::Builtin(builtin))
+    }
+
+    /// TEMPORARY (alias rule): whether `id` is the opaque type of a
+    /// built-in function whose typing is special (R11 of
+    /// `docs/INFERENCE_REQS.md`).
+    #[must_use]
+    pub fn is_builtin(&self, id: TyId) -> bool {
+        matches!(self.kinds.get(id.index()), Some(TyKind::Builtin(_)))
+    }
+
+    /// TEMPORARY (alias rule): the built-in function whose opaque type `id`
+    /// is, or that a record, list, future, union or function type `id`
+    /// holds at any depth: a type no value of which may stand where the
+    /// alias rule does not let one (see [Built-in
+    /// functions](#built-in-functions); R11 of `docs/INFERENCE_REQS.md`).
+    /// `None` for every other type.
+    ///
+    /// Recurses once per level of nesting.
+    #[must_use]
+    pub fn special_builtin(&self, id: TyId) -> Option<Builtin> {
+        match self.kinds.get(id.index())? {
+            TyKind::Builtin(builtin) => Some(*builtin),
+            TyKind::Record(record) => record
+                .fields
+                .iter()
+                .find_map(|&(_, field)| self.special_builtin(field)),
+            TyKind::Fn(sig) => sig
+                .params
+                .iter()
+                .find_map(|&(_, param)| self.special_builtin(param))
+                .or_else(|| self.special_builtin(sig.ret)),
+            TyKind::Future(inner)
+            | TyKind::Either(inner)
+            | TyKind::List(inner)
+            | TyKind::Provisional { inner, .. } => self.special_builtin(*inner),
+            TyKind::Union(members) => members
+                .iter()
+                .find_map(|&member| self.special_builtin(member)),
+            TyKind::Int
+            | TyKind::Float
+            | TyKind::Bool
+            | TyKind::String
+            | TyKind::UntypedInt
+            | TyKind::Error
+            | TyKind::Never => None,
+        }
     }
 
     /// Returns the id of the record type with `fields`, in any order, adding
@@ -605,7 +679,8 @@ impl TypeTable {
         }
     }
 
-    /// Whether `id` is a function type, or a record type with a field of a
+    /// Whether `id` is a function type (or the opaque type of a special
+    /// built-in function, which is one too), or a record type with a field of a
     /// type that is or contains one, or a list type whose element type is or
     /// contains one, at any depth, looking through futures, unions and
     /// provisional types: a type whose values cannot be compared, since
@@ -616,7 +691,9 @@ impl TypeTable {
     #[must_use]
     pub fn contains_fn(&self, id: TyId) -> bool {
         match self.kinds.get(id.index()) {
-            Some(TyKind::Fn(_)) => true,
+            // TEMPORARY (alias rule): a special built-in's opaque type is a
+            // function's (R11 of `docs/INFERENCE_REQS.md`).
+            Some(TyKind::Fn(_) | TyKind::Builtin(_)) => true,
             Some(TyKind::Record(record)) => record
                 .fields
                 .iter()
@@ -819,7 +896,8 @@ impl TypeTable {
             | TyKind::String
             | TyKind::UntypedInt
             | TyKind::Error
-            | TyKind::Never => id,
+            | TyKind::Never
+            | TyKind::Builtin(_) => id,
         }
     }
 
@@ -1451,7 +1529,9 @@ impl TypeTable {
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) => Some(ValueKind::Record),
             TyKind::List(_) => Some(ValueKind::List),
-            TyKind::Fn(_) => Some(ValueKind::Fn),
+            // TEMPORARY (alias rule): a special built-in's opaque type is a
+            // function's kind (R11 of `docs/INFERENCE_REQS.md`).
+            TyKind::Fn(_) | TyKind::Builtin(_) => Some(ValueKind::Fn),
             TyKind::Future(_) | TyKind::Either(_) => Some(ValueKind::Deferred),
             TyKind::Union(members) => {
                 let mut kinds = members.iter().map(|&member| self.value_kind(member));
@@ -1727,6 +1807,9 @@ impl fmt::Display for Display<'_> {
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
+            // TEMPORARY (alias rule): the opaque type of a special
+            // built-in (R11 of `docs/INFERENCE_REQS.md`).
+            TyKind::Builtin(builtin) => write!(f, "builtin {}", builtin.name()),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
             TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
             TyKind::Provisional { inner, .. } => {
@@ -2286,6 +2369,29 @@ mod tests {
         let with_unary = table.record([(a, unary), (b, TyId::INT)]);
         let with_either = table.record([(a, arities), (b, TyId::INT)]);
         assert_eq!(table.join(with_nullary, with_unary), (with_either, true));
+    }
+
+    #[test]
+    fn a_special_built_in_has_an_opaque_type() {
+        let mut table = TypeTable::new();
+        let mut names = Names::new();
+        let field = names.intern("f");
+        let len = table.builtin(Builtin::Len);
+        assert_eq!(table.builtin(Builtin::Len), len);
+        assert_eq!(table.display(len, &names).to_string(), "builtin len");
+        assert_eq!(table.value_kind(len), Some(ValueKind::Fn));
+        assert!(table.is_builtin(len));
+        assert!(table.contains_fn(len));
+        assert!(table.is_subtype(len, len));
+        assert!(!table.is_subtype(len, TyId::INT));
+        // Found wherever a type holds it, and nowhere else.
+        let list = table.list(len);
+        let record = table.record([(field, list)]);
+        assert_eq!(table.special_builtin(record), Some(Builtin::Len));
+        assert!(!table.is_builtin(record));
+        assert_eq!(table.special_builtin(TyId::INT), None);
+        let function = table.fn_type([(None, TyId::INT)], TyId::FLOAT, Effect::Pure);
+        assert_eq!(table.special_builtin(function), None);
     }
 
     #[test]

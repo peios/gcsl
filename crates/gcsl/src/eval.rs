@@ -337,6 +337,21 @@
 //! or a capture index. `call` keeps only the closure, its frame's base and
 //! the new evaluator across the body's evaluation.
 //!
+//! The callee of a `Call` may instead be a built-in function, a
+//! [`Value::Builtin`]: an ordinary one (`int`, `float`) is a value of a
+//! function type that a variable, a parameter or a field may hold, so the
+//! `function` walker yields a closure or a built-in, and a call of a
+//! built-in applies it, its arguments evaluated in order as a closure's
+//! are, with no frame: `int` truncates its `Float` toward zero, failing
+//! with "integer overflow" when that is no `Int` (an infinity, or beyond
+//! `i64`) or "cannot truncate NaN to an Int"; `float` gives the nearest
+//! `Float`. This is the one place a node does not say what it does, since
+//! no node could know which function a value is. A built-in whose typing
+//! is special is never called through a value: the checker makes every
+//! call of one its own node (`ListLen`). A built-in's cell holds it from
+//! before the first input runs (see [`crate::workspace`]); `Top` reads it
+//! as it reads a function's slot.
+//!
 //! Calls nest on the Rust stack, one `call` and a few walker frames per
 //! GCSL call, and so does every level of expression nesting between a
 //! frame's body and a call in it; GCSL does not eliminate tail calls. So
@@ -538,7 +553,7 @@ use std::num::NonZeroI64;
 use std::rc::{Rc, Weak};
 
 use crate::ast::FnId;
-use crate::check::Slot;
+use crate::check::{Builtin, Slot};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
@@ -578,7 +593,9 @@ const FOR_RESERVE: usize = 16_777_216;
 /// # Errors
 ///
 /// Returns a runtime error at the failing operator's span: "integer
-/// overflow" for `Int` arithmetic that leaves the range of `i64`, and
+/// overflow" for `Int` arithmetic that leaves the range of `i64`, and at a
+/// call's for `int` of a `Float` whose truncation does, or "cannot truncate
+/// NaN to an Int" for NaN; and
 /// "division by zero" for `//` or `%` by zero; at an index's span, or at
 /// the path of an update up to its index segment, "index out of range" for
 /// a position outside its list; at a range's span,
@@ -741,6 +758,16 @@ enum StopKind {
 
 /// What evaluating a node gives: its value, or why there is none.
 type Flow<T> = Result<T, Unwind>;
+
+/// What a call calls, as the function walker finds it ([`Evaluator::function`]):
+/// a closure, or a built-in function called through a value of its function
+/// type, which [`Evaluator::call_builtin`] applies.
+enum Callee {
+    /// A closure.
+    Closure(Rc<Closure>),
+    /// A built-in function.
+    Builtin(Builtin),
+}
 
 /// The state of one frame's evaluation: the top level's, or a call's.
 struct Evaluator<'a> {
@@ -939,13 +966,16 @@ impl Evaluator<'_> {
 
     /// The closure of the top-level function in `slot` of the top level's
     /// frame, which is at the bottom of the value stack (frame base 0), for
-    /// the `Fn` `node`. A slot that holds no closure is an internal error:
-    /// the checker's rule on when a function may be used means it never
-    /// happens. Never inlined, so that the frames of the recursive walkers
-    /// that read one stay small.
+    /// the `Fn` `node`, or the built-in function a cell there holds. A slot
+    /// that holds neither is an internal error: the checker's rule on when a
+    /// function may be used means it never happens. Never inlined, so that
+    /// the frames of the recursive walkers that read one stay small.
     #[inline(never)]
     fn top_function_value(&self, slot: Slot, node: &IrNode) -> Flow<Value> {
-        self.top_function(slot, node).map(Value::Fn)
+        match self.top_function(slot, node)? {
+            Callee::Closure(closure) => Ok(Value::Fn(closure)),
+            Callee::Builtin(builtin) => Ok(Value::Builtin(builtin)),
+        }
     }
 
     /// A copy of the value in the cell `slot` of the top level's frame, of
@@ -982,15 +1012,19 @@ impl Evaluator<'_> {
         }
     }
 
-    /// The closure of the top-level function in `slot`, as
-    /// [`Evaluator::top_function_value`] gives it as a value.
+    /// The closure of the top-level function in `slot`, or the built-in
+    /// function in that cell, as [`Evaluator::top_function_value`] gives it
+    /// as a value.
     /// Inlined where a callee is evaluated, as a capture's read is, so that
     /// a call through it costs no more than one through a capture; the
     /// error, which the checker rules out, is out of line.
     #[inline]
-    fn top_function(&self, slot: Slot, node: &IrNode) -> Flow<Rc<Closure>> {
+    fn top_function(&self, slot: Slot, node: &IrNode) -> Flow<Callee> {
         match self.stack.get(slot.index()) {
-            Some(Value::Fn(closure)) => Ok(Rc::clone(closure)),
+            Some(Value::Fn(closure)) => Ok(Callee::Closure(Rc::clone(closure))),
+            // A cell of the top level holding a built-in function: the
+            // prelude's `int`, say, read from inside a function.
+            Some(&Value::Builtin(builtin)) => Ok(Callee::Builtin(builtin)),
             _ => Err(not_made(node).into()),
         }
     }
@@ -1412,7 +1446,10 @@ impl Evaluator<'_> {
     /// and returns the body's value; or, if the callee is a closure of a
     /// memoised function, hands the call to [`Evaluator::memo_call`].
     fn call(&mut self, (callee, args, depth): (IrId, IrRange, u16), node: &IrNode) -> Flow<Value> {
-        let closure = self.function(callee)?;
+        let closure = match self.function(callee)? {
+            Callee::Closure(closure) => closure,
+            Callee::Builtin(builtin) => return self.call_builtin(builtin, args, node),
+        };
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
         };
@@ -1451,6 +1488,49 @@ impl Evaluator<'_> {
                 Err(error.into())
             }
             result => result.map_err(Unwind::from),
+        }
+    }
+
+    /// Evaluates the `Call` `node` of the built-in function `builtin` with
+    /// the arguments `args`: a call through a value of its function type (a
+    /// parameter, a variable, the prelude's `int`), the one call whose node
+    /// cannot say what it calls. The arguments are evaluated in order, as a
+    /// closure's are, and the built-in applied to its one parameter's: `int`
+    /// truncates its `Float` toward zero, failing with "integer overflow"
+    /// when that is not an `Int` (an infinity, or beyond `i64`) and "cannot
+    /// truncate NaN to an Int" for NaN; `float` gives the `Float` nearest its
+    /// `Int`. A built-in whose typing is special is never called through a
+    /// value (the checker lowers each call of one to its own node, `len`'s
+    /// to a `ListLen`), so reaching one here is an internal error.
+    #[inline(never)]
+    fn call_builtin(&mut self, builtin: Builtin, args: IrRange, node: &IrNode) -> Flow<Value> {
+        let mut argument = None;
+        for &arg in self.ir.items(args) {
+            let arg = self.ir.get(arg);
+            let IrKind::Arg { param, value } = arg.kind else {
+                return mistyped(arg, "a call's argument is not an argument");
+            };
+            let span = self.ir.get(value).span;
+            let value = self.value(value)?;
+            if param == 0 {
+                argument = Some((value, span));
+            }
+        }
+        match (builtin, argument) {
+            (Builtin::Int, Some((Value::Float(x), span))) => match float_to_int(x) {
+                Some(truncated) => Ok(Value::Int(truncated)),
+                None if x.is_nan() => {
+                    Err(Diagnostic::error("cannot truncate NaN to an Int", node.span).into())
+                }
+                None => Err(Diagnostic::error(OVERFLOW, node.span)
+                    .with_context(span, Value::Float(x).to_string())
+                    .into()),
+            },
+            (Builtin::Float, Some((Value::Int(x), _))) => Ok(Value::Float(int_to_float(x))),
+            _ => mistyped(
+                node,
+                "a built-in function called through a value with an argument of another kind",
+            ),
         }
     }
 
@@ -1649,8 +1729,11 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Evaluates a function-typed node to its closure.
-    fn function(&mut self, id: IrId) -> Flow<Rc<Closure>> {
+    /// Evaluates a function-typed node to what a call of it calls: a
+    /// closure, or a built-in function, a value of the `builtins` module
+    /// called through a value of its function type (see
+    /// [`Evaluator::call_builtin`]).
+    fn function(&mut self, id: IrId) -> Flow<Callee> {
         let node = self.ir.get(id);
         match node.kind {
             IrKind::Load(_, ValueKind::Deferred)
@@ -1668,25 +1751,16 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_FUNCTION),
-            IrKind::Await { .. } => self.await_as(node, |value| match value {
-                Value::Fn(closure) => Some(closure),
-                _ => None,
-            }),
-            IrKind::As { .. } => self.narrow_as(node, |value| match value {
-                Value::Fn(closure) => Some(closure),
-                _ => None,
-            }),
-            IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, |value| match value {
-                    Value::Fn(closure) => Some(closure),
-                    _ => None,
-                })
-            }
+            IrKind::Await { .. } => self.await_as(node, into_callee),
+            IrKind::As { .. } => self.narrow_as(node, into_callee),
+            IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_callee),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_function),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_function),
-            IrKind::LoadCallee => self.callee(node),
+            IrKind::LoadCallee => self.callee(node).map(Callee::Closure),
             IrKind::Top(slot, _) => self.top_function(slot, node),
-            IrKind::MakeClosure { function, captures } => self.make_closure(function, captures),
+            IrKind::MakeClosure { function, captures } => {
+                self.make_closure(function, captures).map(Callee::Closure)
+            }
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.function(result)
@@ -1695,30 +1769,19 @@ impl Evaluator<'_> {
                 let branch = self.branch(cond, then, else_)?;
                 self.function(branch)
             }
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, |value| match value {
-                    Value::Fn(closure) => Some(closure),
-                    _ => None,
-                })
-            }
+            IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_callee),
             IrKind::Call {
                 callee,
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, |value| match value {
-                Value::Fn(closure) => Some(closure),
-                _ => None,
-            }),
+            } => self.call_as((callee, args, depth), node, into_callee),
             IrKind::Break { .. }
             | IrKind::Continue { .. }
             | IrKind::Return { .. }
             | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => self.stopping(node, |value| match value {
-                Value::Fn(closure) => Some(closure),
-                _ => None,
-            }),
+            | IrKind::Loop { .. } => self.stopping(node, into_callee),
             _ => mistyped(node, "a node of another kind where a function was expected"),
         }
     }
@@ -2948,6 +3011,7 @@ impl Evaluator<'_> {
             | Value::Str(_)
             | Value::List(_)
             | Value::Fn(_)
+            | Value::Builtin(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }
@@ -3600,7 +3664,8 @@ fn key_hash(key: &[Value]) -> u64 {
 }
 
 /// Feeds `value` to `state`, consistently with key equality: a float's
-/// zeros alike, a function and a future by address, a record, `depth`
+/// zeros alike, a function and a future by address, a built-in function by
+/// which it is, a record, `depth`
 /// levels deep, as the sum of its fields' hashes, which does not depend on
 /// their order, since total equality compares fields by name, and a list,
 /// `depth` levels deep, as its elements in order, since total equality
@@ -3652,6 +3717,10 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
         Value::Fn(closure) => {
             state.write_u8(6);
             Rc::as_ptr(closure).hash(state);
+        }
+        Value::Builtin(builtin) => {
+            state.write_u8(9);
+            builtin.hash(state);
         }
         Value::Future(future) => {
             state.write_u8(7);
@@ -4013,7 +4082,7 @@ const fn described(value: &Value) -> &'static str {
         Value::Str(_) => "a String",
         Value::Empty | Value::Record(_) => "a record",
         Value::List(_) => "a list",
-        Value::Fn(_) => "a function",
+        Value::Fn(_) | Value::Builtin(_) => "a function",
         Value::Future(_) => "a future",
     }
 }
@@ -4068,13 +4137,39 @@ fn into_record(value: Value) -> Option<Value> {
         _ => None,
     }
 }
-/// A new reference to the closure in `value`, read by the load or capture
-/// read `node`.
-fn as_function(value: &Value, node: &IrNode) -> Flow<Rc<Closure>> {
+/// What a call of `value`, read by the load or capture read `node`, calls:
+/// a new reference to the closure it is, or the built-in function.
+fn as_function(value: &Value, node: &IrNode) -> Flow<Callee> {
     match value {
-        Value::Fn(closure) => Ok(Rc::clone(closure)),
+        Value::Fn(closure) => Ok(Callee::Closure(Rc::clone(closure))),
+        &Value::Builtin(builtin) => Ok(Callee::Builtin(builtin)),
         _ => mistyped(node, "function load from a slot holding another type"),
     }
+}
+
+/// What a call of `value` calls, if it is a function: what the function
+/// walker extracts from an element read by an index, an awaited value, a
+/// field or a call's result.
+fn into_callee(value: Value) -> Option<Callee> {
+    match value {
+        Value::Fn(closure) => Some(Callee::Closure(closure)),
+        Value::Builtin(builtin) => Some(Callee::Builtin(builtin)),
+        _ => None,
+    }
+}
+
+/// `x` truncated toward zero, the value of `int(x)`; `None` when that is not
+/// an `Int`: `x` is NaN, infinite, or beyond the range of `i64`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the truncated value is checked to be within the range of i64 first"
+)]
+fn float_to_int(x: f64) -> Option<i64> {
+    // -2^63 and 2^63, both exactly representable.
+    const LOW: f64 = -9_223_372_036_854_775_808.0;
+    const HIGH: f64 = 9_223_372_036_854_775_808.0;
+    let truncated = x.trunc();
+    (LOW..HIGH).contains(&truncated).then_some(truncated as i64)
 }
 
 /// Fails with the internal error `message` at `node`: a node of a type its
@@ -4105,6 +4200,21 @@ mod tests {
         let ast = parse(&tokens, names, strings, &source).unwrap();
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
+        let ir = Rc::new(lower(&ast, &checked, &types, 0).unwrap());
+        assert_cells_scheduled(&ir, checked.resolution.field_cells(), text);
+        ir
+    }
+
+    /// As [`compile`], but checking `text` as a lone file is, beside the
+    /// standard library, so that the prelude's names, `len` among them, are
+    /// its: what the tests of `len` compile with. Its frame's first slots
+    /// are the standard library's, which a run of it alone leaves `{}`: a
+    /// call of `len` never reads its cell.
+    fn compile_prelude(text: &str) -> Rc<Ir> {
+        let (ast, types, output) = crate::workspace::check_beside_prelude(text);
+        let checked = output
+            .unwrap_or_else(|errors| panic!("{text}: {errors:?}"))
+            .checked;
         let ir = Rc::new(lower(&ast, &checked, &types, 0).unwrap());
         assert_cells_scheduled(&ir, checked.resolution.field_cells(), text);
         ir
@@ -4315,7 +4425,7 @@ mod tests {
     }
 
     fn run(text: &str) -> Result<Value, Diagnostic> {
-        eval(&compile(text))
+        eval(&compile_prelude(text))
     }
 
     fn int(text: &str) -> i64 {
@@ -8690,7 +8800,7 @@ mod tests {
         // A `continue` in an argument, after the callee's frame has grown,
         // and a `break` out of a deep nest of blocks: the stack is the top
         // level's frame again.
-        let ir = compile(
+        let ir = compile_prelude(
             "fn f(a: Int, b: Int): Int { a + b }\n\
              let v = for x in [1, 2, 3] { if x == 2 { 0 } else { f(x, { { { if x == 3 { break }; continue } } }) } }\n\
              len(v)",

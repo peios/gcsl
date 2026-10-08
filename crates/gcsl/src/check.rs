@@ -1861,24 +1861,73 @@
 //!
 //! # Built-in functions
 //!
-//! A [`Builtin`] is a name of a scope outside the outermost one, present in
-//! every program and session: a `let`, a parameter or a field of the same
-//! name shadows it as any outer binding is shadowed, and `:=` never finds
-//! it. The table of built-ins gives each its name, its parameters' names
-//! and its [`Effect`]; `len(list)`, the number of elements of a list, is the
-//! only one yet. A call of one, whose callee is exactly the name, binds its
+//! The built-in functions are the members of the `builtins` module, a
+//! module implemented in Rust (see [`crate::workspace`], "The standard
+//! library"): `len`, `int` and `float`, each a [`Builtin`], with its name,
+//! its parameters' names, its [`Effect`] (every one is pure) and its
+//! [`Typing`]. The checker knows no name of one: a file has them as it has
+//! any other module's members, by an import, or by the prelude, which
+//! binds `len`, `int` and `float` to them and which every file and session
+//! input imports implicitly, as the last and yielding source of its view.
+//! A file that declares its own `len` (a field, a `def`, a `let`, a `fn`)
+//! shadows the prelude's, and loses the built-in there. The cell of each is
+//! a slot of the frame the driver writes before anything runs, its value a
+//! [`crate::Value::Builtin`], its type each one's, as the workspace's
+//! context gives every cell's.
+//!
+//! An ORDINARY built-in ([`Typing::Ordinary`]), `int` (`fn(x: Float):
+//! Int`, truncation toward zero) or `float` (`fn(x: Int): Float`), has a
+//! function type the type table can hold, and is a value of that type like
+//! any function: passed, stored, called through a variable or a parameter,
+//! and a call of it is a call like any other, typed by its type, binding
+//! its arguments by its parameters' names, lowered to a `Call` (see
+//! [`crate::eval`], which applies a built-in it finds called). Like any
+//! function it has no equality: `int === int` is "cannot compare
+//! functions".
+//!
+//! A SPECIAL built-in ([`Typing::Special`]), `len`, is typed call by call
+//! by the checker, since it is generic: `len(list)`'s argument is measured
+//! at the top, its elements not at all, and must be a list ("`len` takes a
+//! list, found T"), and the call is an `Int`. A call of one binds its
 //! arguments by position or by the table's names, with the errors of any
-//! call's arguments (`Checker::bind_builtin_arguments`), and is then typed
-//! by the checker, since a built-in is generic: `len`'s argument is
-//! measured at the top, its elements not at all, and must be a list ("`len`
-//! takes a list, found T"), and the call is an `Int`. The callee resolves
-//! to [`VarRef::Builtin`] and has the function type of this call, and
-//! lowering makes the call the built-in's own node. Calling a built-in that
-//! is not pure from a pure function is an error, as for any function; `len`
-//! is pure. A built-in is not a value, for now: any other use of its name,
-//! `(len)(xs)` included, is "`len` is a built-in function and cannot be used
-//! as a value yet" (`Checker::builtin_value_error`, the one place that says
-//! so).
+//! call's arguments (`Checker::bind_builtin_arguments`); its callee then
+//! resolves to [`VarRef::Builtin`] and has the function type of this call,
+//! and lowering makes the call the built-in's own node, `ListLen`, never
+//! reading the callee. Calling a built-in that is not pure from a pure
+//! function is an error, as for any function.
+//!
+//! ## The alias rule, temporary
+//!
+//! TEMPORARY (alias rule): a special built-in has no type the table can
+//! hold, so until the inference engine gives built-in functions real
+//! polymorphic types (R11 and R3 of `docs/INFERENCE_REQS.md`), its value
+//! has an opaque type of its own, [`TyKind::Builtin`], shown `builtin len`,
+//! which no type expression can write, so that no annotation, parameter
+//! type, field type or result type accepts it. A reference whose type is
+//! it may stand in two places only (`Checker::alias_site`): the callee of
+//! a call, which is then typed by the built-in's rule as above, and the
+//! whole initialiser of a top-level field or a top-level `let` of one name,
+//! neither annotated nor mutable (`len = builtins.len`, `let l = len`, `m =
+//! l`), which makes that name an *alias* of the built-in, of the same
+//! opaque type. A member or `*` import of one is an alias of the same kind,
+//! the cell it names being of that type. The type is the alias's identity:
+//! it is what every boundary already carries, the type of a cell another
+//! file reads ([`crate::workspace`]'s cell types), of a root committed to
+//! a directory's scope, of a session's [`Scope`] binding, of an import's
+//! target, so a call through an alias is typed and lowered as a call of the
+//! built-in in any file or session input. Any other reference to one, or
+//! to a record holding one (`builtins` or the prelude read whole), is "`len`
+//! is a built-in function and cannot be used as a value yet", with the note
+//! "a built-in function with a type for any list cannot be written as a
+//! type yet; call it, or bind it to a name" (`Checker::builtin_use`, the
+//! one place that says so): an argument, a list element, a field of an
+//! inner record, a function's result, an operand of `==` or `===`, an `is`,
+//! an `as`, an ascription, a `let` in a block, a `let mut`, a rebind, a
+//! branch, a dotted field, a callee in parentheses. What replaces it: a
+//! polymorphic type for `len` (`fn<T>(list: List<T>): Int`), with which
+//! `len` is a value like `int`, its calls ordinary calls, and the opaque
+//! type, `alias_site`, `builtin_use` and the special path of
+//! `Checker::check_call` go.
 //!
 //! # Scopes
 //!
@@ -1978,8 +2027,10 @@
 //! resolved against its view (the merged trees of its directory chain and
 //! what it imports, see [`crate::workspace`], "The view of a file"), and a
 //! context gives every cell of the workspace its slot (its node's index
-//! among the workspace's nodes, slots below every private one) and, once
-//! the file that computes it is checked, its type. A cell of another file
+//! among the workspace's nodes, slots below every private one, the
+//! built-in functions' the first; a session's input's own cells take the
+//! slots after the session's instead) and, once the file that computes it
+//! is checked, its type. A cell of another file
 //! is read as a cell of this file is: a load of its slot at the top level,
 //! and inside a function or a `lazy` a read of the top level's frame, never
 //! a capture, since it is written before this file runs. Only a root has a
@@ -2010,15 +2061,18 @@
 //!
 //! # Imports
 //!
-//! An `import` names a node of another part of the workspace (see
-//! [`crate::workspace`], "Imports"), and the scan has resolved it, and
-//! reported its clashes ("`lib` is imported in this file", "`version` is a
-//! field of this directory"), before any file is checked. Outside a
-//! workspace, in a single file or a REPL input, there is nothing for a path
-//! to name: the checker knows it has no workspace context and reports
-//! "`import` needs a workspace: no `workspace.gcsl` above this file" at the
-//! import, with the input's other errors. In a workspace the item itself
-//! checks nothing.
+//! An `import` names a node of another part of the workspace, or a module
+//! of the standard library (see [`crate::workspace`], "Imports" and "The
+//! standard library"), and the scan has resolved it, and reported its
+//! clashes ("`lib` is imported in this file", "`version` is a field of this
+//! directory"), before any file is checked. A lone file and a REPL input
+//! are checked beside the standard library, with no workspace: a path of
+//! anything else names nothing, and the checker, which knows its context is
+//! a lone one, reports "`lib` is not a built-in or standard module, and
+//! there is no `workspace.gcsl` above this file" at the import, with the
+//! input's other errors. A file checked with no context at all ([`check`])
+//! has nothing to import: "`import` needs a workspace: no `workspace.gcsl`
+//! above this file". Otherwise the item itself checks nothing.
 //!
 //! An imported name, and a root of the file's view that several sources
 //! have, has no binding. A name the scope does not bind nearer (a
@@ -2026,8 +2080,12 @@
 //! that the file's [`crate::workspace::FileScope`] reads through its view
 //! ([`crate::workspace::FileScope::reads_through`]) is a reference,
 //! resolved like a reference to a field: to the longest prefix the view
-//! declares, the accesses after it ordinary ones. An import shadows a
-//! builtin of its name, as a `let` does. What the prefix reaches decides
+//! declares, the accesses after it ordinary ones. A name only the implicit
+//! `import * from prelude` binds yields instead to any binding of its name
+//! ([`crate::workspace::FileScope::yields`]): a top-level `let` or `fn`, or
+//! an earlier session input's variable, shadows it, and no clash is
+//! reported ("`len` is a field of this directory" is not). What the prefix
+//! reaches decides
 //! what is read, always a cell, so never a capture: a load of its slot at
 //! the top level, a read of the top level's frame inside a function or a
 //! `lazy`.
@@ -2059,7 +2117,15 @@
 //! A call of a `def` reached through an import (`f(x)` after `import f
 //! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
 //! whose measured parameters the workspace carries, so its call-site
-//! diagnostics are those of a `def` of the directory.
+//! diagnostics are those of a `def` of the directory; the prelude's `half`
+//! is such a `def`.
+//!
+//! A session's input is checked beside the standard library as a lone file
+//! is, from the session's scope ([`crate::workspace`]'s context marks it a
+//! session's): the variables of earlier inputs are read as a session's
+//! input reads them, captured by a function that reads one, rather than
+//! through the top level's frame as a directory's committed declarations
+//! are.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2199,32 +2265,64 @@ pub enum VarRef {
     Fn(Slot),
     /// The closure being called: a function's reference to itself.
     Callee,
-    /// A built-in function, which is not a value: only the callee of a call
-    /// of it resolves to one, and lowering makes the call the built-in's
-    /// own node.
+    /// TEMPORARY (alias rule): a built-in function whose typing is special,
+    /// called: only the callee of a call of it, or of an alias of it,
+    /// resolves to one, and lowering makes the call the built-in's own node.
+    /// Replaced by an ordinary call when it gets a polymorphic type (R11 of
+    /// `docs/INFERENCE_REQS.md`).
     Builtin(Builtin),
     /// Nothing: the expression or item is not a variable use.
     None,
 }
 
-/// A built-in function: a name of a scope outside the outermost one,
-/// present in every program and session, which a call types afresh each
-/// time. See the module documentation.
+/// A built-in function: a member of the `builtins` module, implemented in
+/// Rust, whose value is a [`crate::Value::Builtin`]. See the module
+/// documentation, [Built-in functions](#built-in-functions).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Builtin {
-    /// `len(list)`: the number of elements of a list, an `Int`.
+    /// `len(list)`: the number of elements of a list, an `Int`. Its typing
+    /// is special.
     Len,
+    /// `int(x: Float): Int`: `x` truncated toward zero.
+    Int,
+    /// `float(x: Int): Float`: the `Float` nearest `x`.
+    Float,
+}
+
+/// How a built-in function is typed (see [Built-in
+/// functions](#built-in-functions)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Typing {
+    /// By a function type the type table can hold, a pure function of one
+    /// parameter, named as [`Builtin::params`] says: its value is a value
+    /// of that type, and a call of it is a call like any other.
+    Ordinary {
+        /// The parameter's type.
+        param: TyId,
+        /// The result's type.
+        result: TyId,
+    },
+    /// TEMPORARY (alias rule): call by call, by the checker's rule for it,
+    /// since no function type the table can hold is its type (`len`: a
+    /// `List<T>` for any `T` to `Int`); its value has an opaque type of its
+    /// own, [`TyKind::Builtin`]. To be replaced by a real polymorphic type
+    /// (R11 of `docs/INFERENCE_REQS.md`).
+    Special,
 }
 
 impl Builtin {
-    /// Every built-in function, in the order a scope lists them.
-    pub const ALL: [Builtin; 1] = [Builtin::Len];
+    /// Every built-in function, in the order of the `builtins` module, which
+    /// is also the order of their cells, the first slots of a workspace's
+    /// frame (see [`crate::workspace`]).
+    pub const ALL: [Builtin; 3] = [Builtin::Len, Builtin::Int, Builtin::Float];
 
-    /// The name it is called by.
+    /// The name of its member of the `builtins` module.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Builtin::Len => "len",
+            Builtin::Int => "int",
+            Builtin::Float => "float",
         }
     }
 
@@ -2233,21 +2331,61 @@ impl Builtin {
     pub const fn params(self) -> &'static [&'static str] {
         match self {
             Builtin::Len => &["list"],
+            Builtin::Int | Builtin::Float => &["x"],
         }
     }
 
     /// What it may do: only a pure one may be called from a pure function.
+    /// Every built-in function is pure.
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
-            Builtin::Len => Effect::Pure,
+            Builtin::Len | Builtin::Int | Builtin::Float => Effect::Pure,
         }
     }
 
-    /// A call of it, as the note on a use of it as a value shows one.
-    const fn example(self) -> &'static str {
+    /// How it is typed.
+    #[must_use]
+    pub const fn typing(self) -> Typing {
         match self {
-            Builtin::Len => "len(xs)",
+            Builtin::Len => Typing::Special,
+            Builtin::Int => Typing::Ordinary {
+                param: TyId::FLOAT,
+                result: TyId::INT,
+            },
+            Builtin::Float => Typing::Ordinary {
+                param: TyId::INT,
+                result: TyId::FLOAT,
+            },
+        }
+    }
+
+    /// How its value is shown: as its type, `fn(x: Float): Int`, for an
+    /// ordinary one, as any function is; as `builtin len` for a special one.
+    #[must_use]
+    pub const fn display(self) -> &'static str {
+        match self {
+            Builtin::Len => "builtin len",
+            Builtin::Int => "fn(x: Float): Int",
+            Builtin::Float => "fn(x: Int): Float",
+        }
+    }
+
+    /// The type of its value, interned into `types`, its parameter's name
+    /// into `names`: its function type for an ordinary one, the opaque type
+    /// of a special one.
+    pub(crate) fn ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        match self.typing() {
+            Typing::Ordinary { param, result } => {
+                let params = self
+                    .params()
+                    .iter()
+                    .map(|&text| (Some(names.intern(text)), param));
+                types.fn_type(params, result, self.effect())
+            }
+            // TEMPORARY (alias rule): the opaque type, until a polymorphic
+            // one (R11 of `docs/INFERENCE_REQS.md`).
+            Typing::Special => types.builtin(self),
         }
     }
 }
@@ -3674,23 +3812,49 @@ impl Scope {
         self.slot_names
     }
 
-    /// Which parameters of the function bound at `slot` are present
-    /// because its body measures them, if the binding there was initialised
-    /// directly with a function expression: what a call of an imported
-    /// `def` needs (see [Imports](#imports)).
-    pub(crate) fn measured_at(&self, slot: Slot) -> Option<&[bool]> {
+    /// The scope's first free slot.
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slot_names.len()
+    }
+
+    /// The scope with no variables whose slots `0..n` are named by `names`:
+    /// what a session's first input is checked from, the standard
+    /// library's slots taken (see [`crate::session`]).
+    pub(crate) fn of_slots(names: Vec<Name>) -> Self {
+        Self {
+            slot_names: names,
+            ..Self::default()
+        }
+    }
+
+    /// The scope with slots named by `names` added after its own: the cells
+    /// of a session's input, which its check finds taken (see
+    /// [`crate::workspace::check_input`]).
+    pub(crate) fn with_slots(mut self, names: impl IntoIterator<Item = Name>) -> Self {
+        self.slot_names.extend(names);
+        self
+    }
+
+    /// For each slot bound, which parameters of the function its latest
+    /// binding holds are present because its body measures them, if that
+    /// binding was initialised directly with a function expression: what a
+    /// call of an imported `def` needs (see [Imports](#imports)). One map
+    /// for every slot, so that a file's cells are looked up in it in
+    /// constant time each.
+    pub(crate) fn measured_by_slot(&self) -> HashMap<Slot, Option<&[bool]>> {
         self.bindings
             .iter()
             .zip(&self.measured)
-            .rev()
-            .find(|(binding, _)| binding.slot == slot)
-            .and_then(|(_, measured)| measured.as_deref())
+            .map(|(binding, measured)| (binding.slot, measured.as_deref()))
+            .collect()
     }
 }
 
 /// Type-checks and resolves `ast` as a file, starting from an empty scope,
 /// interning its types into `types`. On success, returns the tables and the
-/// warnings found, in source order.
+/// warnings found, in source order. The file is checked with no standard
+/// library: it knows no name it does not declare, `len` among them, and
+/// imports nothing; [`crate::run`] checks a file beside it.
 ///
 /// # Errors
 ///
@@ -3887,9 +4051,13 @@ pub struct Checker<'a> {
     /// The name `List`, which applied to a type is a list of it, if the
     /// program mentions it.
     list_name: Option<Name>,
-    /// The built-in functions, each with its name, if the program mentions
-    /// it.
-    builtins: [(Option<Name>, Builtin); Builtin::ALL.len()],
+    /// TEMPORARY (alias rule): the expression that may be a reference to a
+    /// built-in function whose typing is special while it is checked: the
+    /// callee of the call being checked, or the initialiser of the
+    /// top-level field or `let` of one name being checked (see
+    /// [`Checker::builtin_use`]). Replaced when built-in functions get real
+    /// polymorphic types (R11 of `docs/INFERENCE_REQS.md`).
+    alias_site: Option<ExprId>,
     /// Reused for the types of the elements of the list literals being
     /// checked, innermost literal's last: a stack, as `sorted_fields` is.
     element_types: Vec<TyId>,
@@ -4044,7 +4212,7 @@ impl<'a> Checker<'a> {
             future_name: names.lookup("Future"),
             present_name: names.lookup("Present"),
             list_name: names.lookup("List"),
-            builtins: Builtin::ALL.map(|builtin| (names.lookup(builtin.name()), builtin)),
+            alias_site: None,
             element_types: Vec::new(),
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
@@ -4257,13 +4425,24 @@ impl<'a> Checker<'a> {
                     value,
                     mutable,
                     ..
-                } => self.check_let(id, path, ty, (value, mutable)),
+                } => {
+                    // TEMPORARY (alias rule): a top-level `let` of one name,
+                    // neither annotated nor mutable, may bind a built-in
+                    // function whose typing is special (R11 of
+                    // `docs/INFERENCE_REQS.md`).
+                    let alias = root && !mutable && ty.is_none() && self.ast.path(path).len() == 1;
+                    let outer = alias.then(|| self.alias_site.replace(value));
+                    self.check_let(id, path, ty, (value, mutable));
+                    if let Some(outer) = outer {
+                        self.alias_site = outer;
+                    }
+                }
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
                 ItemKind::Field { path, value, .. } => {
                     self.check_field(id, path, value, expecting);
                 }
                 ItemKind::Spread(value) => self.check_spread_item(id, value, root),
-                ItemKind::Import(_) => self.check_import(item.span),
+                ItemKind::Import(_) => self.check_import(id, item.span),
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -4385,20 +4564,46 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Checks an import item, spanning `span` (see the parser's
-    /// [Imports](crate::parser#imports)).
-    /// Outside a workspace (a single file, a REPL input) there is nothing
-    /// for its path to name, which is an error at the import, reported
-    /// here with the input's other errors. In a workspace the scan has
-    /// resolved it, and its names are read where they are used (see
-    /// [Imports](#imports)): the item itself checks nothing.
-    fn check_import(&mut self, span: Span) {
-        if self.workspace.is_none() {
+    /// Checks the import item `id`, spanning `span` (see the parser's
+    /// [Imports](crate::parser#imports)). Checked with no workspace at all,
+    /// as [`check`] checks a file alone, there is nothing for its path to
+    /// name, which is an error at the import, reported here with the
+    /// input's other errors. A lone file and a session's input are checked
+    /// beside the standard library, whose modules the scan has resolved; a
+    /// path of anything else is the error, "`lib` is not a built-in or
+    /// standard module, and there is no `workspace.gcsl` above this file".
+    /// In a workspace the scan has resolved it, and its names are read
+    /// where they are used (see [Imports](#imports)): the item itself
+    /// checks nothing.
+    fn check_import(&mut self, id: ItemId, span: Span) {
+        let Some(workspace) = self.workspace else {
             self.errors.push(Diagnostic::error(
                 "`import` needs a workspace: no `workspace.gcsl` above this file",
                 span,
             ));
+            return;
+        };
+        if !workspace.needs_workspace(id) {
+            return;
         }
+        let ItemKind::Import(decl) = self.ast.item(id).kind else {
+            return;
+        };
+        let names = self.ast.names();
+        let path: Vec<&str> = self
+            .ast
+            .path(self.ast.import_decl(decl).path)
+            .iter()
+            .filter_map(|segment| Some(names.get(segment.name()?)))
+            .collect();
+        self.errors.push(Diagnostic::error(
+            format!(
+                "`{}` is not a built-in or standard module, and there is no `workspace.gcsl` \
+                 above this file",
+                path.join(".")
+            ),
+            span,
+        ));
     }
 
     /// Whether the item `id`, of `kind`, checked, never completes, so that
@@ -6465,7 +6670,7 @@ impl<'a> Checker<'a> {
             };
             let (name, parent, first) = (node.name, node.parent, node.first);
             let global = file.global.get(index).copied().unwrap_or(u32::MAX);
-            let slot = Slot(global);
+            let slot = workspace.slot(global);
             let def = node
                 .leaf
                 .and_then(|leaf| self.top_fns.iter().find(|top| top.item == leaf.item))
@@ -6498,7 +6703,10 @@ impl<'a> Checker<'a> {
                     ..FieldCell::NEW
                 },
             };
-            self.frame_size = self.frame_size.max(global.saturating_add(1));
+            // A session's input's `def` takes no slot of its own.
+            if slot != Slot::NONE {
+                self.frame_size = self.frame_size.max(slot.0.saturating_add(1));
+            }
             self.field_cells.push(cell);
             if workspace.shared(global) {
                 let own = Slot(self.next_slot);
@@ -6646,7 +6854,7 @@ impl<'a> Checker<'a> {
             return Some((workspace.cell_slot(node), workspace.cell_type(node)));
         }
         if let Some(cell) = workspace.value_of(target) {
-            return Some((Slot::at(cell), workspace.cell_type(cell)));
+            return Some((workspace.slot(cell), workspace.cell_type(cell)));
         }
         let at = self
             .imported_targets
@@ -6722,8 +6930,12 @@ impl<'a> Checker<'a> {
         let Some(workspace) = self.workspace else {
             return;
         };
-        // A root of this file is the clash of one file, its own errors'.
-        if workspace.scope.root(name).is_none() || self.mentions.tree.root(name).is_some() {
+        // A root of this file is the clash of one file, its own errors'; a
+        // name of the implicit prelude yields to the declaration silently.
+        if workspace.scope.root(name).is_none()
+            || self.mentions.tree.root(name).is_some()
+            || workspace.scope.yields(name)
+        {
             return;
         }
         let text = self.ast.names().get(name);
@@ -6898,7 +7110,14 @@ impl<'a> Checker<'a> {
                     .then_some((self.root_position, leaf.position));
                 (self.early, self.checking_leaf) = (early, Some(node));
                 self.name_callee(segments, leaf.value);
+                // TEMPORARY (alias rule): a top-level field of one name may
+                // bind a built-in function whose typing is special (R11 of
+                // `docs/INFERENCE_REQS.md`).
+                let outer = (segments.len() == 1).then(|| self.alias_site.replace(leaf.value));
                 let ty = self.check_alone(leaf.value);
+                if let Some(outer) = outer {
+                    self.alias_site = outer;
+                }
                 self.callee_name = None;
                 (self.early, self.checking_leaf) = (None, None);
                 let function = self.direct_function(segments, leaf.value);
@@ -8055,8 +8274,10 @@ impl<'a> Checker<'a> {
         // top level's frame from any function, never captured.
         // So is a declaration of another file of a workspace, from its
         // directory chain: the scope a file is checked from holds nothing
-        // else (see [Directory scope](#directory-scope)).
-        let committed = self.workspace.is_some() && index < self.top_start;
+        // else (see [Directory scope](#directory-scope)). A session's input
+        // is checked beside the standard library as a file is, but its
+        // scope is the session's, read as a session's input reads it.
+        let committed = self.workspace.is_some_and(|w| !w.session()) && index < self.top_start;
         if committed || (self.top_start..self.top_end).contains(&index) {
             return if self.functions.is_empty() {
                 VarRef::Local(binding.slot)
@@ -9399,7 +9620,7 @@ impl<'a> Checker<'a> {
                     self.field_reference(id)
                 };
                 if let Some(ty) = reference {
-                    ty
+                    self.builtin_use(id, ty, expr.span)
                 } else {
                     let record_ty = self.check_expr(record);
                     self.field_access(id, (record, record_ty), name)
@@ -10422,10 +10643,15 @@ impl<'a> Checker<'a> {
     /// records what it gives each position (see
     /// [`Checker::record_argument`]), and is not a use of it as a value.
     fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
-        if let Some(builtin) = self.builtin_callee(callee) {
+        // TEMPORARY (alias rule): the callee of a call may be a built-in
+        // whose typing is special, or an alias of one (see R11 of
+        // `docs/INFERENCE_REQS.md`); the call is then typed by its rule.
+        let outer = self.alias_site.replace(callee);
+        let (callee_ty, callback) = self.check_callee(callee);
+        self.alias_site = outer;
+        if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
         }
-        let (callee_ty, callback) = self.check_callee(callee);
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
             // A callee of type `Never` is never there to call.
@@ -10475,34 +10701,19 @@ impl<'a> Checker<'a> {
         if erroneous { TyId::ERROR } else { sig.ret }
     }
 
-    /// The built-in function that `callee`, the callee of a call, names, if
-    /// it is exactly a name, not in parentheses, that no binding in scope
-    /// has and a built-in has.
-    fn builtin_callee(&self, callee: ExprId) -> Option<Builtin> {
-        let ExprKind::Name(name) = self.ast.get(callee).kind else {
-            return None;
-        };
-        // The name first, so that a call of anything else searches its
-        // scope only once, as it does without built-ins.
-        let builtin = self.builtin(name)?;
-        self.lookup(name).is_none().then_some(builtin)
-    }
-
-    /// The built-in function named `name`, if there is one.
-    fn builtin(&self, name: Name) -> Option<Builtin> {
-        self.builtins
-            .iter()
-            .find(|&&(builtin, _)| builtin == Some(name))
-            .map(|&(_, builtin)| builtin)
-    }
-
-    /// Types the call `id` of the built-in function `builtin`, the callee
-    /// `callee`, with the arguments `args` (see the module documentation):
-    /// the arguments are bound to the built-in's parameters as a function's
-    /// are (see [`Checker::bind_builtin_arguments`]), and then typed as the
-    /// built-in says, each built-in its own way. The callee's type is the
-    /// function type the built-in has at this call. Calling a built-in that
-    /// is not pure from a pure function is an error, as for any function.
+    /// TEMPORARY (alias rule): types the call `id` of the built-in function
+    /// `builtin`, whose typing is special, the callee `callee` (a reference
+    /// to it or to an alias of it, already checked), with the arguments
+    /// `args` (see the module documentation): the arguments are bound to the
+    /// built-in's parameters as a function's are (see
+    /// [`Checker::bind_builtin_arguments`]), and then typed as the built-in
+    /// says, each built-in its own way. The callee's type is the function
+    /// type the built-in has at this call, and it resolves to
+    /// [`VarRef::Builtin`], so that lowering makes the call the built-in's
+    /// own node without reading the callee. Calling a built-in that is not
+    /// pure from a pure function is an error, as for any function. Replaced
+    /// by an ordinary call when built-in functions get real polymorphic
+    /// types (R11 of `docs/INFERENCE_REQS.md`).
     fn check_builtin_call(
         &mut self,
         id: ExprId,
@@ -10523,8 +10734,10 @@ impl<'a> Checker<'a> {
                 .collect()
         };
         self.filled.truncate(base);
-        let ty = match (builtin, bound.as_slice()) {
-            (Builtin::Len, &[list]) if !erroneous => self.check_len(callee, list),
+        let ty = match (builtin.typing(), bound.as_slice()) {
+            (Typing::Special, &[list]) if builtin == Builtin::Len && !erroneous => {
+                self.check_len(callee, list)
+            }
             _ => {
                 // Every argument is checked, whatever goes wrong.
                 for &arg in &bound {
@@ -10553,8 +10766,10 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    /// Types the call of `len`, the callee `callee`, whose argument is
-    /// `list`: the argument is used as its bits at the top (see
+    /// TEMPORARY (alias rule): `len`'s rule, until its polymorphic type (R11
+    /// of `docs/INFERENCE_REQS.md`). Types the call of `len`, the callee
+    /// `callee`, whose argument is `list`: the argument is used as its bits
+    /// at the top (see
     /// [`Checker::measure`]), its elements not at all, and must be a list,
     /// or a union of lists, "`len` takes a list, found T". The call is an
     /// `Int`, and the callee a pure function from that type to `Int`;
@@ -10708,18 +10923,35 @@ impl<'a> Checker<'a> {
         erroneous
     }
 
-    /// Reports a use of the built-in function `builtin`, at `span`, other
-    /// than as the callee of a call, and returns `Error`: a built-in is not
-    /// a value, for now. (The one place this restriction is made, so that
-    /// lifting it is one change.)
-    fn builtin_value_error(&mut self, builtin: Builtin, span: Span) -> TyId {
+    /// TEMPORARY (alias rule): the type of the reference `id`, spanning
+    /// `span`, of type `ty`: `ty`, unless it is the opaque type of a
+    /// built-in function whose typing is special, or holds one (a record
+    /// read whole with an alias of one among its fields), and `id` is not
+    /// where the alias rule lets one stand ([`Checker::alias_site`]: the
+    /// callee of a call, or the whole initialiser of a top-level field or
+    /// `let` of one name). Then it is "`len` is a built-in function and
+    /// cannot be used as a value yet", reported here, the one place the
+    /// restriction is made, and `Error`. Replaced, with the opaque type,
+    /// when built-in functions get real polymorphic types (R11 of
+    /// `docs/INFERENCE_REQS.md`).
+    fn builtin_use(&mut self, id: ExprId, ty: TyId, span: Span) -> TyId {
+        let Some(builtin) = self.types.special_builtin(ty) else {
+            return ty;
+        };
+        let alias = self.alias_site == Some(id) && self.types.is_builtin(ty);
+        if alias {
+            return ty;
+        }
         let name = builtin.name();
         self.errors.push(
             Diagnostic::error(
                 format!("`{name}` is a built-in function and cannot be used as a value yet"),
                 span,
             )
-            .with_note(format!("call it, as in `{}`", builtin.example())),
+            .with_note(
+                "a built-in function with a type for any list cannot be written as a type yet; \
+                 call it, or bind it to a name",
+            ),
         );
         TyId::ERROR
     }
@@ -11792,25 +12024,21 @@ impl<'a> Checker<'a> {
             return (TyId::ERROR, None);
         }
         // An imported name, or a root several sources of the file's view
-        // have, that nothing nearer shadows (see [Imports](#imports)).
+        // have, that nothing nearer shadows (see [Imports](#imports)); a
+        // name of the implicit prelude only if no binding at all has it.
         if let Some(workspace) = self.workspace
-            && workspace.has_view()
+            && found.is_none_or(|(index, _)| index < self.top_end && !workspace.scope.yields(name))
             && workspace.scope.reads_through(name)
-            && found.is_none_or(|(index, _)| index < self.top_end)
             && let Some(ty) = self.field_reference(id)
         {
-            return (ty, None);
+            return (self.builtin_use(id, ty, span), None);
         }
         if let Some((index, binding)) = found {
             if binding.kind == BindingKind::Mutable {
                 self.leaf_reads_mutable(index, binding.name);
             }
             self.expr_vars[id.index()] = self.resolve(index, binding);
-            return (binding.ty, binding.callback);
-        }
-        // The callee of a call of a built-in is checked apart.
-        if let Some(builtin) = self.builtin(name) {
-            return (self.builtin_value_error(builtin, span), None);
+            return (self.builtin_use(id, binding.ty, span), binding.callback);
         }
         let text = self.ast.names().get(name);
         let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span);
@@ -11871,7 +12099,6 @@ impl<'a> Checker<'a> {
         let top_range = self.top_start..self.top_end;
         match found {
             Some((index, _)) if index >= inner || top_range.contains(&index) => return false,
-            None if self.builtin(name).is_some() => return false,
             _ => {}
         }
         let mutable = found.is_some_and(|(_, binding)| binding.kind == BindingKind::Mutable);
@@ -13848,7 +14075,9 @@ impl<'a> Checker<'a> {
             | TyKind::Future(_)
             | TyKind::Either(_)
             | TyKind::Union(_)
-            | TyKind::Provisional { .. } => {
+            | TyKind::Provisional { .. }
+            // TEMPORARY (alias rule): R11 of `docs/INFERENCE_REQS.md`.
+            | TyKind::Builtin(_) => {
                 format!("`{shown}`")
             }
             TyKind::Int
@@ -14003,19 +14232,29 @@ mod tests {
         (ast, types, output)
     }
 
+    /// Checks `text` as a lone file is, beside the standard library, so
+    /// that the prelude's names, `len` among them, are its: what the
+    /// helpers that look only at types and diagnostics check with.
+    fn check_prelude(text: &str) -> (Ast, TypeTable, Result<CheckOutput, Vec<Diagnostic>>) {
+        crate::workspace::check_beside_prelude(text)
+    }
+
+    /// The number of slots the standard library takes, the first: where a
+    /// text checked by [`check_prelude`] starts its own.
+    fn standard_slots() -> u32 {
+        let (_, _, output) = check_prelude("");
+        u32::try_from(output.unwrap().scope.into_slot_names().len()).unwrap()
+    }
+
     /// The type of the file's result.
     fn result_type(text: &str) -> TyId {
-        let ast = parse_text(text);
-        check(&ast, &mut TypeTable::new())
-            .unwrap()
-            .0
-            .types
-            .get(result_expr(&ast))
+        let (ast, _, output) = check_prelude(text);
+        output.unwrap().checked.types.get(result_expr(&ast))
     }
 
     /// The type of the file's result, as shown to users.
     fn shown_result(text: &str) -> String {
-        let (ast, types, output) = check_text(text);
+        let (ast, types, output) = check_prelude(text);
         let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
         let ty = output.checked.types.get(result_expr(&ast));
         types.display(ty, ast.names()).to_string()
@@ -14023,20 +14262,21 @@ mod tests {
 
     /// The type of the file's value, as shown to users.
     fn file_type(text: &str) -> String {
-        let (ast, types, output) = check_text(text);
+        let (ast, types, output) = check_prelude(text);
         let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
         types.display(output.ty, ast.names()).to_string()
     }
 
     fn diagnostics(text: &str) -> Vec<Diagnostic> {
-        check(&parse_text(text), &mut TypeTable::new()).unwrap_err()
+        check_prelude(text).2.unwrap_err()
     }
 
     /// The warnings of a check that must succeed.
     fn warnings(text: &str) -> Vec<Diagnostic> {
-        check(&parse_text(text), &mut TypeTable::new())
+        check_prelude(text)
+            .2
             .unwrap_or_else(|errors| panic!("{text}: {errors:?}"))
-            .1
+            .warnings
     }
 
     fn errors(text: &str) -> Vec<(String, Span)> {
@@ -14052,11 +14292,7 @@ mod tests {
 
     /// Every node's type in allocation order (children before parents).
     fn all_types(text: &str) -> Vec<TyId> {
-        check(&parse_text(text), &mut TypeTable::new())
-            .unwrap()
-            .0
-            .types
-            .types
+        check_prelude(text).2.unwrap().checked.types.types
     }
 
     /// The labels of a diagnostic as `(span, text)` pairs.
@@ -14245,15 +14481,26 @@ mod tests {
     fn an_import_outside_a_workspace_is_an_error_with_the_files_others() {
         // At the import, whatever its form, alongside the file's other
         // errors.
-        let message = "`import` needs a workspace: no `workspace.gcsl` above this file";
+        let message = |path: &str| {
+            format!(
+                "`{path}` is not a built-in or standard module, and there is no \
+                 `workspace.gcsl` above this file"
+            )
+        };
         assert_eq!(
             errors("x = 1 + true\nimport a.b as c"),
             vec![
                 ("cannot add Int and Bool".to_owned(), Span::new(6, 7)),
-                (message.to_owned(), Span::new(13, 28)),
+                (message("a.b"), Span::new(13, 28)),
             ]
         );
-        assert_eq!(messages("import x, * from lib"), vec![message]);
+        assert_eq!(messages("import x, * from lib"), vec![message("lib")]);
+        // Checked with no workspace at all, there is nothing to import.
+        let (_, _, output) = check_text("import lib");
+        assert_eq!(
+            output.unwrap_err()[0].message,
+            "`import` needs a workspace: no `workspace.gcsl` above this file"
+        );
     }
 
     #[test]
@@ -17694,7 +17941,9 @@ mod tests {
     /// Every expression of `text`, which must check, that is awaited where
     /// it is used, as its source text and its mark, in allocation order.
     fn marks(text: &str) -> Vec<(&str, AwaitMark)> {
-        let (ast, resolution) = resolved(text);
+        let (ast, _, output) = check_prelude(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        let resolution = output.checked.resolution;
         ast.expr_ids()
             .filter_map(|id| match resolution.await_of(id) {
                 AwaitMark::None => None,
@@ -19514,7 +19763,7 @@ mod tests {
     /// The type of the expression of `text`, which must check, that spans
     /// `span`, as shown.
     fn type_at(text: &str, span: Span) -> String {
-        let (ast, types, output) = check_text(text);
+        let (ast, types, output) = check_prelude(text);
         let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
         let id = ast
             .expr_ids()
@@ -20824,7 +21073,7 @@ mod tests {
             "let xs: Int[] = ([])\nxs",
         ] {
             assert!(
-                check(&parse_text(text), &mut TypeTable::new()).is_ok(),
+                check_prelude(text).2.is_ok(),
                 "{text}: {:?}",
                 diagnostics(text)
             );
@@ -21004,7 +21253,8 @@ mod tests {
         // Its callee has the function type of the call.
         let text = "len([1])";
         assert_eq!(type_at(text, at(text, "len")), "fn(List<Int>): Int");
-        let (ast, resolution) = resolved(text);
+        let (ast, _, output) = check_prelude(text);
+        let resolution = output.unwrap().checked.resolution;
         let callee = ast
             .expr_ids()
             .find(|&id| ast.get(id).span == at(text, "len"))
@@ -21038,7 +21288,7 @@ mod tests {
     fn a_built_in_is_not_a_value_yet() {
         for (text, span) in [
             ("len", Span::new(0, 3)),
-            ("let f = len", Span::new(8, 11)),
+            ("let mut f = len", Span::new(12, 15)),
             ("(len)([1])", Span::new(1, 4)),
             ("\"{len}\"", Span::new(2, 5)),
         ] {
@@ -21049,8 +21299,105 @@ mod tests {
                 "`len` is a built-in function and cannot be used as a value yet"
             );
             assert_eq!(found[0].span, span, "{text}");
-            assert_eq!(found[0].notes, vec!["call it, as in `len(xs)`"]);
+            assert_eq!(
+                found[0].notes,
+                vec![
+                    "a built-in function with a type for any list cannot be written as a type \
+                     yet; call it, or bind it to a name"
+                ]
+            );
         }
+    }
+
+    #[test]
+    fn the_alias_rule_lets_a_special_built_in_stand_only_where_it_says() {
+        const NOT_A_VALUE: &str = "`len` is a built-in function and cannot be used as a value yet";
+        // Every other use is the error, at the reference: an argument, a
+        // list element, a field of an inner record, a function's result,
+        // an operand of `==` and `===`, an `is`, an `as`, an ascription, a
+        // `let` that is not a top-level one of one name, a branch, a
+        // `lazy`, a rebind, a dotted field and a record read whole.
+        for (text, needle) in [
+            ("fn f(g: Int): Int { g }\nx = f(len)", "len)"),
+            ("x = [len]", "len]"),
+            ("x = { inner = len }", "len }"),
+            ("fn h(): Int { len }", "len }"),
+            ("x = len == 1", "len =="),
+            ("x = 1 === len", "len"),
+            ("x = len is Int", "len is"),
+            ("x = len as Int", "len as"),
+            ("x = len : Int", "len :"),
+            ("x = { let l = len; 1 }", "len;"),
+            ("let mut l = len", "len"),
+            ("let l: fn(xs: Int[]): Int = len", "len"),
+            ("x = if true { len } else { len }", "len }"),
+            ("x = lazy len", "len"),
+            ("let l = len\nl := len", "len"),
+            ("com.l = len", "len"),
+            ("let l = len\nx = [l]", "l]"),
+            ("l = len\nx = { l }", "l }"),
+        ] {
+            let found = diagnostics(text);
+            assert!(!found.is_empty(), "{text}");
+            assert!(
+                found.iter().all(|error| error.message == NOT_A_VALUE),
+                "{text}: {found:?}"
+            );
+            let start = u32::try_from(text.rfind(needle).unwrap()).unwrap();
+            assert!(
+                found.iter().any(|error| error.span.start == start),
+                "{text}: {found:?}"
+            );
+        }
+        // Where it may: the callee of a call, and the whole initialiser of
+        // a top-level field or `let` of one name, each then an alias, of
+        // the opaque type, called by its rule.
+        assert_eq!(file_type("l = len\nn = l([1])"), "{l: builtin len, n: Int}");
+        assert_eq!(
+            file_type("let l = len\nm = l\nn = m([1])"),
+            "{m: builtin len, n: Int}"
+        );
+        assert_eq!(shown_result("let l = len\nlet m = l\nm([[1]])"), "Int");
+        assert_eq!(
+            messages("let l = len\nn = l(1)"),
+            ["`len` takes a list, found Int"]
+        );
+        // Through `builtins`, a path to its cell, never the record whole.
+        assert_eq!(shown_result("import builtins\nbuiltins.len([1])"), "Int");
+        assert_eq!(
+            shown_result("import builtins\nlet l = builtins.len\nl([1])"),
+            "Int"
+        );
+        assert_eq!(messages("import builtins\nlet b = builtins"), [NOT_A_VALUE]);
+    }
+
+    #[test]
+    fn int_and_float_have_function_types() {
+        assert_eq!(shown_result("int"), "fn(x: Float): Int");
+        assert_eq!(shown_result("float"), "fn(x: Int): Float");
+        assert_eq!(shown_result("int(2.5)"), "Int");
+        assert_eq!(shown_result("float(x = 2)"), "Float");
+        assert_eq!(shown_result("half(1)"), "Float");
+        assert_eq!(
+            shown_result("import builtins\nbuiltins.int"),
+            "fn(x: Float): Int"
+        );
+        assert_eq!(
+            file_type("i = int\nf = [float]"),
+            "{f: List<fn(x: Int): Float>, i: fn(x: Float): Int}"
+        );
+        // Called as any function is: an integer literal adapts to `Float`.
+        assert_eq!(shown_result("int(1)"), "Int");
+        assert_eq!(messages("int(1 // 1)"), ["mismatched types"]);
+        assert_eq!(messages("float(1.5)"), ["mismatched types"]);
+        // No equality, as for any function.
+        assert_eq!(messages("int === int"), ["cannot compare functions"]);
+        assert_eq!(messages("int == int"), ["cannot compare functions"]);
+        // Pure: a pure function may call them.
+        assert_eq!(
+            type_of_f("fn f(x: Int): Int { int(float(x) * 1.5) }"),
+            "fn(x: Int): Int"
+        );
     }
 
     #[test]
@@ -24093,15 +24440,18 @@ mod tests {
         let text = "let v: Int | String = 1\nif v is Int { v + 1 } else { len([v]) }";
         assert_eq!(type_at(text, nth(text, "v", 2)), "Int");
         assert_eq!(type_at(text, nth(text, "v", 3)), "String");
-        // The branches read a slot of their own, which the test writes.
-        let (ast, resolution) = resolved(text);
+        // The branches read a slot of their own, which the test writes,
+        // after the standard library's.
+        let (ast, _, output) = check_prelude(text);
+        let resolution = output.unwrap().checked.resolution;
         let uses = uses(&ast, &resolution, "v");
+        let base = standard_slots();
         assert_eq!(
             uses,
             vec![
-                VarRef::Local(Slot(0)),
-                VarRef::Local(Slot(1)),
-                VarRef::Local(Slot(1))
+                VarRef::Local(Slot(base)),
+                VarRef::Local(Slot(base + 1)),
+                VarRef::Local(Slot(base + 1))
             ]
         );
         // `else if` narrows the remainder in turn.
@@ -24208,9 +24558,7 @@ mod tests {
 
     /// The diagnostics of `text`, or none if it checks.
     fn diagnostics_or_none(text: &str) -> Vec<Diagnostic> {
-        check(&parse_text(text), &mut TypeTable::new())
-            .err()
-            .unwrap_or_default()
+        check_prelude(text).2.err().unwrap_or_default()
     }
 
     // ----- Loops, `break`, `continue`, labels and Never -----
@@ -24582,7 +24930,7 @@ mod tests {
     fn never_is_the_type_of_what_never_completes() {
         // The type of the last item of the body of a loop, given as `body`.
         let in_loop = |body: &str| {
-            let (ast, types, output) = check_text(&format!("let v = for x in [1] {{ {body} }}"));
+            let (ast, types, output) = check_prelude(&format!("let v = for x in [1] {{ {body} }}"));
             let output = output.unwrap_or_else(|errors| panic!("{body}: {errors:?}"));
             let ExprKind::For(id) = ast.get(result_expr_of_let(&ast)).kind else {
                 panic!("{body}: expected a loop");

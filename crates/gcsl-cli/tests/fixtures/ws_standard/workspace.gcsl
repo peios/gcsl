@@ -1,0 +1,2 @@
+# A field of the root shadows the prelude's `half` in every file below.
+half = 0.5

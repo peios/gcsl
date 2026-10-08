@@ -100,7 +100,9 @@
 //!
 //! Every node of every directory tree is one cell of the workspace's one
 //! frame, and its slot is its index in [`Scan::nodes`]: slots `0..` the
-//! number of nodes are the workspace's cells, and every other slot (a
+//! number of nodes are the workspace's cells, the built-in functions' the
+//! first and the standard files' the next (see [The standard
+//! library](#the-standard-library)), and every other slot (a
 //! file's private names, its temporaries) is allocated from there up by
 //! the checker, as it allocates from the first free slot of a session's
 //! scope. A file's own field node shares the slot of the merged node of
@@ -119,7 +121,8 @@
 //! [`check`] scans the workspace and then checks and lowers every file in
 //! the order, as the inputs of a [`crate::Session`]: one table of names, of
 //! types and of slots, each file's diagnostics named by its input number,
-//! its index in path order ([`Diagnostic::input`]). After a file is
+//! its index among the files, the standard files first and the workspace's
+//! after them in path order ([`Diagnostic::input`]). After a file is
 //! checked, its declarations are committed to its directory's scope for
 //! the files after it; its private names (`let`, `let mut`, `fn`) are not,
 //! though their slots stay taken. The scope is committed after the check,
@@ -189,6 +192,62 @@
 //! a cell of its own after the merged nodes ([`Scan::value_slot`]), which
 //! the file stores its result into as the last node of its top-level
 //! block.
+//!
+//! # The standard library
+//!
+//! Two kinds of module are not files of the workspace. `builtins` is a
+//! module implemented in Rust, a record of the built-in functions
+//! ([`Builtin`]): `len`, `int` and `float`. The *standard files* are the
+//! `.gcsl` files of the repository's `stdlib/` directory, compiled in
+//! ([`crate::STANDARD`], [`standard_sources`]): today only
+//! `prelude.gcsl`. Each is importable by a bare name, `import builtins`,
+//! `import len from builtins`, `import * from prelude`, from any file; the
+//! names are reserved roots of the path namespace, and a file or directory
+//! at the workspace's root named like one of them is an error of the scan,
+//! "`builtins` is the name of a built-in module", "`prelude` is the name of
+//! a standard module", reported at the start of the file, or of the first
+//! file under the directory. A path of more than one segment never names
+//! one, and a file or directory below the root has a path of its own.
+//!
+//! Every scan holds them. The standard files are its first files, so they
+//! take the first input numbers, each named `<stdlib>/STEM.gcsl`
+//! ([`STANDARD_DIR`]), in a directory of their own with no directory
+//! above: one directory scope among themselves, a standard file seeing the
+//! other standard files' declarations and nothing of the workspace, and
+//! nothing of the workspace seeing theirs but by an import. They are
+//! checked and run with the workspace's files, before them in the order
+//! (they need no file of the workspace), on the same frame and memo
+//! tables; every run runs them first ([`Scan::needed`]). An error in one is
+//! reported like any other, and is a bug. The `builtins` module is a
+//! directory of its own too, with no file: its tree is one root leaf per
+//! built-in function, nodes `0..` of [`Scan::nodes`] in the order of
+//! [`Builtin::ALL`], so their cells are the first slots of the frame, which
+//! the driver writes, each a [`Value::Builtin`], as it lays the frame out,
+//! before any file runs ([`check_with`]). No file computes them, and none
+//! needs another for them. Their types are each built-in's: its function
+//! type, or for one whose typing is special the opaque type of the alias
+//! rule (see [`crate::check`], "Built-in functions").
+//!
+//! Every file but `prelude.gcsl` itself, the standard files included,
+//! begins as if with `import * from prelude`, as the last source of its
+//! view, after its directory chain and its own imports: an *implicit*
+//! member alias for each root of the prelude ([`Alias::implicit`]), except
+//! each that any earlier source has (a root of its directory chain, its
+//! own declarations among them, or a name it imports), which is dropped,
+//! shadowed silently rather than a conflict. Its names are invisible to the
+//! clash family: an implicit alias clashes with nothing, and a name it
+//! binds yields to any binding of the file of its name, a top-level `let`
+//! or `fn` included ([`FileScope::yields`]). An explicit `import * from
+//! prelude` is an ordinary `*`, and conflicts as one.
+//!
+//! A file outside any workspace (`gcsl run` of a lone file, [`check_lone`])
+//! is checked and run as a workspace of one directory holding just it,
+//! beside the standard library: it may import `builtins` and the standard
+//! files, and an import of anything else is the checker's error,
+//! "`lib` is not a built-in or standard module, and there is no
+//! `workspace.gcsl` above this file", with the file's other errors. A
+//! session's input is scanned so too (`check_input`), though a session is
+//! not a workspace (see [`crate::session`]).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -198,7 +257,7 @@ use crate::Outcome;
 use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
 #[cfg(test)]
 use crate::check::ViewRecord;
-use crate::check::{CheckOutput, Checker, Scope, Slot, Types};
+use crate::check::{Builtin, CheckOutput, Checker, Scope, Slot, Types};
 use crate::diagnostic::Diagnostic;
 use crate::eval::MemoTables;
 use crate::ir::Ir;
@@ -213,6 +272,34 @@ use crate::value::Value;
 
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
 const ROOT: u32 = u32::MAX;
+
+/// The path of the standard library's directory, which no path of a
+/// workspace can name, `<` being in no name: each standard file is
+/// `<stdlib>/STEM.gcsl`, which is how a diagnostic of one names it.
+pub const STANDARD_DIR: &str = "<stdlib>";
+
+/// The name of the module of built-in functions.
+const BUILTINS: &str = "builtins";
+
+/// The standard files ([`crate::STANDARD`]) as the sources every scan
+/// begins with, in their order, each named `<stdlib>/STEM.gcsl`: what a
+/// caller renders a diagnostic of a standard file against.
+#[must_use]
+pub fn standard_sources() -> Vec<SourceFile> {
+    crate::STANDARD
+        .iter()
+        .filter_map(|&(stem, text)| {
+            SourceFile::new(format!("{STANDARD_DIR}/{stem}.gcsl"), text).ok()
+        })
+        .collect()
+}
+
+/// The values of the cells of the built-in functions, the first slots of a
+/// frame, in the order of [`Builtin::ALL`]: what the driver writes as it
+/// lays the frame out, before any file runs.
+fn builtin_cells() -> Vec<Value> {
+    Builtin::ALL.into_iter().map(Value::Builtin).collect()
+}
 
 /// One file of a workspace, scanned.
 #[derive(Debug)]
@@ -246,6 +333,26 @@ pub struct File {
     /// are not in it; the nodes of its view with a leaf of it under them
     /// are, if it reads them whole ([`Mentions::views`]).
     pub schedule: Schedule,
+}
+
+impl File {
+    /// The file at `path` in directory `dir`, parsed to `ast`, spelling
+    /// `spelled`, with its declarations found and nothing else yet.
+    fn new(path: &str, dir: u32, ast: Ast, spelled: Vec<Name>) -> Self {
+        let mentions = mentions::scan(&ast);
+        Self {
+            path: path.to_owned(),
+            dir,
+            ast,
+            spelled,
+            mentions,
+            global: Vec::new(),
+            functions: Vec::new(),
+            aliases: Vec::new(),
+            view: View::default(),
+            schedule: Schedule::default(),
+        }
+    }
 }
 
 /// A directory of a workspace.
@@ -319,14 +426,18 @@ pub struct Alias {
     /// Where it is bound: the alias, the member, the `*`, or the path's
     /// last segment.
     pub span: Span,
-    /// The `import` item.
-    pub item: ItemId,
+    /// The `import` item; `None` for the implicit `import * from prelude`.
+    pub item: Option<ItemId>,
     /// What it names.
     pub target: Target,
     /// Whether it is a whole import (`import PATH`, `import PATH as NAME`),
     /// a name of its own; a member or a root of a `*` is merged into the
     /// file's view instead.
     pub whole: bool,
+    /// Whether it is a root of the implicit `import * from prelude`, which
+    /// yields to every other source and binding of its name (see the module
+    /// documentation, "The standard library").
+    pub implicit: bool,
 }
 
 /// One source's node at a node of a file's view (see the module
@@ -440,6 +551,23 @@ pub struct Scan {
     /// cell and its name (the file's stem), in path order. Their slots
     /// follow the merged nodes'.
     values: Vec<(u32, Name)>,
+    /// The number of standard files, which are files `0..standard` (see
+    /// the module documentation, "The standard library").
+    standard: u32,
+    /// The standard library's directory.
+    standard_dir: u32,
+    /// The directory of the `builtins` module, whose nodes are the first
+    /// [`Builtin::ALL`]`.len()` of `nodes`.
+    builtins_dir: u32,
+    /// Whether the files given are one file outside any workspace (a lone
+    /// file, a session's input), whose imports of anything but `builtins`
+    /// and the standard files the checker reports.
+    lone: bool,
+    /// For a session's input ([`check_input`]): the number of cells of the
+    /// standard library, which keep their slots, and the slot of each cell
+    /// after them, past the slots of the session's earlier inputs (see
+    /// [`Scan::slot`]).
+    relocation: Option<(u32, Vec<Slot>)>,
 }
 
 impl Scan {
@@ -450,12 +578,14 @@ impl Scan {
         })
     }
 
-    /// The files `file` needs, transitively, with `file`, in the order:
-    /// the files to run to run `file`.
+    /// The files `file` needs, transitively, with `file` and the standard
+    /// files, which every run runs, in the order: the files to run to run
+    /// `file`.
     #[must_use]
     pub fn needed(&self, file: u32) -> Vec<u32> {
         let mut wanted = vec![false; self.files.len()];
-        let mut stack = vec![file];
+        let mut stack: Vec<u32> = (0..self.standard).collect();
+        stack.push(file);
         while let Some(at) = stack.pop() {
             if let Some(seen) = wanted.get_mut(at as usize)
                 && !*seen
@@ -550,7 +680,64 @@ impl Scan {
     /// it ([`Target::File`] of a value file). `None` for any other file.
     #[must_use]
     pub fn value_slot(&self, file: u32) -> Option<Slot> {
-        self.value_cell(file).map(Slot::at)
+        self.value_cell(file).map(|cell| self.slot(cell))
+    }
+
+    /// The slot of the cell numbered `cell` ([`Scan::cells`]): its number;
+    /// in a session's input (`check_input`), the cells after the standard
+    /// library's take the slots after the session's instead, in order, but
+    /// a `def`'s, which is never written, which takes none
+    /// ([`Slot::NONE`]), as a `def` of a session's input never did.
+    #[must_use]
+    pub fn slot(&self, cell: u32) -> Slot {
+        match &self.relocation {
+            Some((from, slots)) if cell >= *from => slots
+                .get((cell - from) as usize)
+                .copied()
+                .unwrap_or(Slot::NONE),
+            _ => Slot::at(cell),
+        }
+    }
+
+    /// Whether the merged node `node` is a `def`'s, whose cell is its
+    /// function's slot and never written itself.
+    fn is_def(&self, node: u32) -> bool {
+        self.nodes.get(node as usize).is_some_and(|entry| {
+            entry.parent.is_none()
+                && entry.leaf.is_some_and(|file| {
+                    self.defs
+                        .get(&(entry.dir, entry.name))
+                        .and_then(|&id| self.functions.get(id as usize))
+                        .is_some_and(|function| function.file == file)
+                })
+        })
+    }
+
+    /// The built-in function whose cell is the merged node `node`, if it is
+    /// one: the first nodes are the `builtins` module's.
+    #[must_use]
+    pub fn builtin(&self, node: u32) -> Option<Builtin> {
+        Builtin::ALL.get(node as usize).copied()
+    }
+
+    /// The number of standard files: files `0..` this are the standard
+    /// library's (see the module documentation, "The standard library").
+    #[must_use]
+    pub fn standard(&self) -> u32 {
+        self.standard
+    }
+
+    /// The standard file whose stem is `stem`, if there is one.
+    fn standard_file(&self, stem: &str) -> Option<u32> {
+        (0..self.standard).find(|&file| {
+            self.files.get(file as usize).is_some_and(|f| {
+                f.path
+                    .strip_prefix(STANDARD_DIR)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .and_then(|rest| rest.strip_suffix(".gcsl"))
+                    == Some(stem)
+            })
+        })
     }
 
     /// The number of the cell of the value of `file`, a value file some
@@ -819,6 +1006,9 @@ pub struct FileScope<'a> {
     /// What each name the file imports names; of a name several sources
     /// have, the view's node says.
     aliases: HashMap<Name, Target>,
+    /// The names only the implicit `import * from prelude` binds, which
+    /// yield to any binding of the file ([`FileScope::yields`]).
+    implicit: Vec<Name>,
     /// The file's view.
     view: &'a View,
 }
@@ -838,8 +1028,23 @@ impl<'a> FileScope<'a> {
             global: &file.global,
             local,
             aliases: file.aliases.iter().map(|a| (a.name, a.target)).collect(),
+            implicit: file
+                .aliases
+                .iter()
+                .filter(|a| a.implicit)
+                .map(|a| a.name)
+                .collect(),
             view: &file.view,
         }
+    }
+
+    /// Whether the root `name` is one only the implicit `import * from
+    /// prelude` binds, which yields to any binding of the file of its name,
+    /// a top-level `let` or `fn` included, and clashes with none (see the
+    /// module documentation, "The standard library").
+    #[must_use]
+    pub fn yields(&self, name: Name) -> bool {
+        self.implicit.contains(&name)
     }
 
     /// Where the numbers of the merged nodes start: after the file's own
@@ -879,6 +1084,11 @@ impl<'a> FileScope<'a> {
     /// chain alone is read through its binding, as before imports.
     #[must_use]
     pub fn reads_through(&self, name: Name) -> bool {
+        // Only an imported name or a root of the view can: two lookups
+        // settle most names, without the walk of the directory chain.
+        if !self.aliases.contains_key(&name) && !self.view.merged.contains_key(&(ROOT, name)) {
+            return false;
+        }
         self.root(name)
             .is_some_and(|node| node >= count(self.global.len()) && self.merged(node).is_none())
     }
@@ -1021,17 +1231,19 @@ fn parent_path(path: &str) -> &str {
 }
 
 /// Scans the workspace whose files are `sources`, named by their paths
-/// relative to the root: parses every file, merges each directory's trees
-/// and each file's view, resolves every file's references against its
-/// view, and finds the order and each file's schedule (see the module
-/// documentation).
+/// relative to the root, beside the standard library: parses every file,
+/// merges each directory's trees and each file's view, resolves every
+/// file's references against its view, and finds the order and each file's
+/// schedule (see the module documentation). The standard files are files
+/// `0..` [`Scan::standard`], and the workspace's follow them in path order.
 ///
 /// # Errors
 ///
-/// Every syntax error of every file; else every conflict between files'
-/// declarations in a directory; else every conflict of every file's view;
-/// else every cycle of files that need each other. Each names its file in
-/// [`Diagnostic::input`], its index in path order.
+/// Every syntax error of every file; else every file or directory of the
+/// root named like a module of the standard library; else every conflict
+/// between files' declarations in a directory; else every conflict of
+/// every file's view; else every cycle of files that need each other. Each
+/// names its file in [`Diagnostic::input`], its index among the files.
 pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
     scan_with(sources, &[])
 }
@@ -1047,55 +1259,101 @@ pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
 /// the cycles, every reference through an import that reaches back into
 /// its own file.
 pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<Diagnostic>> {
-    let mut sorted: Vec<&SourceFile> = sources.iter().collect();
-    sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
+    scan_into(sources, Placing::Workspace(nested), &mut Names::new())
+}
+
+/// Where the files a scan is given are placed (see the module
+/// documentation, "The standard library").
+#[derive(Clone, Copy, Debug)]
+enum Placing<'a> {
+    /// The files of a workspace, by their paths relative to its root, with
+    /// the directories left out as workspaces of their own.
+    Workspace(&'a [String]),
+    /// One file outside any workspace, a lone file or a session's input, in
+    /// the root directory by the last part of its name.
+    Lone,
+}
+
+/// [`scan_with`] of `sources` placed as `placing` says, interning into
+/// `names`, which the scan holds once it succeeds ([`Scan::names`]) and
+/// which are given back to `names` if it fails.
+fn scan_into(
+    sources: &[SourceFile],
+    placing: Placing,
+    names: &mut Names,
+) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
-        files: Vec::with_capacity(sorted.len()),
+        files: Vec::with_capacity(sources.len() + crate::STANDARD.len()),
         dirs: Vec::new(),
         nodes: Vec::new(),
         functions: Vec::new(),
         views: Vec::new(),
         needs: Vec::new(),
         order: Vec::new(),
-        names: Names::new(),
+        names: mem::take(names),
         by_name: HashMap::new(),
         roots: Vec::new(),
         defs: HashMap::new(),
         rank: Vec::new(),
         part_base: Vec::new(),
         values: Vec::new(),
+        standard: 0,
+        standard_dir: 0,
+        builtins_dir: 0,
+        lone: matches!(placing, Placing::Lone),
+        relocation: None,
     };
-    let mut dirs: HashMap<String, u32> = HashMap::new();
+    match scan_files(&mut scan, sources, placing) {
+        Ok(()) => Ok(scan),
+        Err(errors) => {
+            *names = mem::take(&mut scan.names);
+            Err(errors)
+        }
+    }
+}
+
+/// Fills `scan`, empty but for its names, with the standard library and
+/// `sources` placed as `placing` says (see [`scan_with`]).
+fn scan_files(
+    scan: &mut Scan,
+    sources: &[SourceFile],
+    placing: Placing,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut sorted: Vec<&SourceFile> = sources.iter().collect();
+    sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
+    let standard = standard_sources();
+    scan.standard = count(standard.len());
+    let (dirs, user_dirs) = place_dirs(scan, &sorted, placing);
+    let placed = standard
+        .iter()
+        .map(|source| (source, scan.standard_dir, source.name()))
+        .chain(sorted.iter().zip(&user_dirs).map(|(&source, &dir)| {
+            let path = match placing {
+                Placing::Workspace(_) => source.name(),
+                Placing::Lone => source.name().rsplit('/').next().unwrap_or(""),
+            };
+            (source, dir, path)
+        }));
     let mut errors = Vec::new();
-    for (index, source) in (0u32..).zip(sorted) {
-        let (ast, spelled) = match parse(source, &mut scan.names) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                errors.push(error.in_input(index));
-                continue;
-            }
-        };
-        let dir = intern_dir(&mut scan.dirs, &mut dirs, parent_path(source.name()));
-        let mentions = mentions::scan(&ast);
-        scan.files.push(File {
-            path: source.name().to_owned(),
-            dir,
-            ast,
-            spelled,
-            mentions,
-            global: Vec::new(),
-            functions: Vec::new(),
-            aliases: Vec::new(),
-            view: View::default(),
-            schedule: Schedule::default(),
-        });
+    for (index, (source, dir, path)) in (0u32..).zip(placed) {
+        match parse(source, &mut scan.names) {
+            Ok((ast, spelled)) => scan.files.push(File::new(path, dir, ast, spelled)),
+            Err(error) => errors.push(error.in_input(index)),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    if matches!(placing, Placing::Workspace(_)) {
+        reserved(scan, &mut errors);
     }
     if !errors.is_empty() {
         return Err(errors);
     }
     scan.roots = vec![Vec::new(); scan.dirs.len()];
+    builtin_nodes(scan);
     for file in 0..count(scan.files.len()) {
-        merge(&mut scan, file, &mut errors);
+        merge(scan, file, &mut errors);
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -1110,28 +1368,121 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
             start
         })
         .collect();
-    imports(&mut scan, &dirs, nested, &mut errors);
+    let nested = match placing {
+        Placing::Workspace(nested) => nested,
+        Placing::Lone => &[],
+    };
+    imports(scan, &dirs, nested, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
-    views(&mut scan, &mut errors);
+    views(scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
-    value_cells(&mut scan);
-    resolve(&mut scan);
-    let mentioned = find_needs(&mut scan, &mut errors);
+    value_cells(scan);
+    resolve(scan);
+    let mentioned = find_needs(scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
-    report_cycles(&scan, &mentioned, &mut errors);
+    report_cycles(scan, &mentioned, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
     scan.order = order(&scan.needs);
     scan.rank = scan.ranks();
-    schedule(&mut scan);
-    Ok(scan)
+    schedule(scan);
+    Ok(())
+}
+
+/// Adds the directories of `scan`: the workspace's in path order, the root
+/// first, as its files are, `sorted`, placed as `placing` says (a lone
+/// file's is the root); then the standard library's and the `builtins`
+/// module's, with no directory above, apart from the workspace's tree.
+/// Returns the workspace's directories by path, and each file's.
+fn place_dirs(
+    scan: &mut Scan,
+    sorted: &[&SourceFile],
+    placing: Placing,
+) -> (HashMap<String, u32>, Vec<u32>) {
+    let mut dirs: HashMap<String, u32> = HashMap::new();
+    intern_dir(&mut scan.dirs, &mut dirs, "");
+    let user_dirs: Vec<u32> = sorted
+        .iter()
+        .map(|source| match placing {
+            Placing::Workspace(_) => {
+                intern_dir(&mut scan.dirs, &mut dirs, parent_path(source.name()))
+            }
+            Placing::Lone => 0,
+        })
+        .collect();
+    for path in [STANDARD_DIR, BUILTINS] {
+        let dir = count(scan.dirs.len());
+        scan.dirs.push(Dir {
+            path: path.to_owned(),
+            parent: None,
+        });
+        if path == STANDARD_DIR {
+            scan.standard_dir = dir;
+        } else {
+            scan.builtins_dir = dir;
+        }
+    }
+    (dirs, user_dirs)
+}
+
+/// Adds the nodes of the `builtins` module's tree, a root leaf for each
+/// built-in function in the order of [`Builtin::ALL`], before any file's:
+/// they are nodes `0..`, so their cells are the first slots of the frame.
+/// No file owns or contributes to them.
+fn builtin_nodes(scan: &mut Scan) {
+    let dir = scan.builtins_dir;
+    for builtin in Builtin::ALL {
+        let name = scan.names.intern(builtin.name());
+        let node = count(scan.nodes.len());
+        scan.nodes.push(Node {
+            name,
+            parent: None,
+            children: Vec::new(),
+            dir,
+            leaf: None,
+            contributors: Vec::new(),
+        });
+        scan.by_name.insert((dir, ROOT, name), node);
+        if let Some(roots) = scan.roots.get_mut(dir as usize) {
+            roots.push(node);
+        }
+    }
+}
+
+/// Reports each file or directory of the workspace's root named like a
+/// module of the standard library, the names it reserves: "`builtins` is
+/// the name of a built-in module", "`prelude` is the name of a standard
+/// module", once per name, at the start of the first file that has it (the
+/// file, or the first file under the directory), in path order.
+fn reserved(scan: &Scan, errors: &mut Vec<Diagnostic>) {
+    let mut reported: Vec<&str> = Vec::new();
+    for (index, file) in (0u32..).zip(&scan.files).skip(scan.standard as usize) {
+        let first = file.path.split('/').next().unwrap_or("");
+        let name = if file.path.contains('/') {
+            first
+        } else {
+            first.strip_suffix(".gcsl").unwrap_or(first)
+        };
+        let message = if name == BUILTINS {
+            format!("`{name}` is the name of a built-in module")
+        } else if scan.standard_file(name).is_some() {
+            format!("`{name}` is the name of a standard module")
+        } else {
+            continue;
+        };
+        if reported.contains(&name) {
+            continue;
+        }
+        reported.push(name);
+        errors.push(Diagnostic::error(message, Span::new(0, 0)).in_input(index));
+    }
 }
 
 /// Resolves every file's references against its view ([`FileScope`]).
@@ -1496,10 +1847,12 @@ impl Scan {
         kept
     }
 
-    /// Whether `target` is a leaf: a merged node declared by an item.
+    /// Whether `target` is a leaf: a merged node declared by an item, or a
+    /// built-in function's.
     fn is_leaf(&self, target: Target) -> bool {
         matches!(target, Target::Node(node)
-            if self.nodes.get(node as usize).is_some_and(|n| n.leaf.is_some()))
+            if self.nodes.get(node as usize).is_some_and(|n| n.leaf.is_some())
+                || self.builtin(node).is_some())
     }
 
     /// The file that declares the first leaf at or under `target`, a merged
@@ -1748,9 +2101,14 @@ fn conflict_between(
             .get(part.source.saturating_sub(depth) as usize)
             .map(|alias| alias.span)
     };
-    let (later_file, later_path, _) = scan.part_spans(later.target)?;
-    let (earlier_file, earlier_path, earlier_item) = scan.part_spans(earlier.target)?;
+    // A built-in function's side, which only an import reaches, has no
+    // definition to show: a note says what it is instead.
+    let builtin = |part: &ViewPart| match part.target {
+        Target::Node(node) => scan.builtin(node),
+        _ => None,
+    };
     let mut error = if later.chain {
+        let (later_file, later_path, _) = scan.part_spans(later.target)?;
         let error = Diagnostic::error(message, later_path).in_input(later_file);
         if leaves {
             error.with_label("defined here")
@@ -1761,13 +2119,25 @@ fn conflict_between(
         let error = Diagnostic::error(message, imported_at(&later)?)
             .with_label("imported here")
             .in_input(index);
-        context_in(error, later_file, later_path, "defined here")
+        match scan.part_spans(later.target) {
+            Some((later_file, later_path, _)) => {
+                context_in(error, later_file, later_path, "defined here")
+            }
+            None => error,
+        }
     };
     if !earlier.chain {
         error = context_in(error, index, imported_at(&earlier)?, "imported here");
     }
-    let earlier_span = if leaves { earlier_path } else { earlier_item };
-    error = context_in(error, earlier_file, earlier_span, "defined here");
+    if let Some((earlier_file, earlier_path, earlier_item)) = scan.part_spans(earlier.target) {
+        let earlier_span = if leaves { earlier_path } else { earlier_item };
+        error = context_in(error, earlier_file, earlier_span, "defined here");
+    }
+    for part in [later, earlier] {
+        if let Some(builtin) = builtin(&part) {
+            error = error.with_note(format!("`{}` is a built-in function", builtin.name()));
+        }
+    }
     // A directory above the file's own is one side.
     let own_dir = depth.saturating_sub(1);
     if [later, earlier]
@@ -1847,6 +2217,7 @@ fn imports(
                 &mut own_errors,
             );
         }
+        implicit_prelude(scan, index, &mut aliases);
         clashes(scan, index, &aliases, &mut own_errors);
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
         found.push(aliases);
@@ -1856,8 +2227,53 @@ fn imports(
     }
 }
 
+/// Adds to `aliases`, the imports of file `index`, the implicit `import *
+/// from prelude` of every file but the prelude itself: an implicit member
+/// alias for each root of the prelude that no earlier source of the file's
+/// view has, neither a root of its directory chain (its own declarations
+/// among them) nor a name it imports; each that one has is dropped, shadowed
+/// silently (see the module documentation, "The standard library").
+fn implicit_prelude(scan: &Scan, index: u32, aliases: &mut Vec<Alias>) {
+    let Some(prelude) = scan.standard_file("prelude") else {
+        return;
+    };
+    let Some(file) = scan.files.get(index as usize) else {
+        return;
+    };
+    if index == prelude {
+        return;
+    }
+    let explicit = aliases.len();
+    for root in target_roots(scan, Target::File(prelude)) {
+        let shadowed = scan
+            .chain(file.dir)
+            .any(|dir| scan.by_name.contains_key(&(dir, ROOT, root)))
+            || aliases
+                .get(..explicit)
+                .into_iter()
+                .flatten()
+                .any(|a| a.name == root);
+        if shadowed {
+            continue;
+        }
+        if let Some(target) = scan.target_child(Target::File(prelude), root) {
+            aliases.push(Alias {
+                name: root,
+                span: Span::new(0, 0),
+                item: None,
+                target,
+                whole: false,
+                implicit: true,
+            });
+        }
+    }
+}
+
 /// What the module path `path` names, or the error that it names nothing
-/// (`None` for a directory and file of one name already reported).
+/// (`None` for a directory and file of one name already reported, and for
+/// any path of a lone file but the standard library's, which the checker
+/// reports). A single segment naming the `builtins` module or a standard
+/// file names it, before anything of the workspace.
 fn module(
     scan: &Scan,
     modules: &Modules,
@@ -1872,6 +2288,17 @@ fn module(
         .iter()
         .filter_map(|segment| Some(scan.names.get(segment.name()?)))
         .collect();
+    if let [only] = shown.as_slice() {
+        if *only == BUILTINS {
+            return Ok(Target::Dir(scan.builtins_dir));
+        }
+        if let Some(file) = scan.standard_file(only) {
+            return Ok(Target::File(file));
+        }
+    }
+    if scan.lone {
+        return Err(None);
+    }
     let mut at = String::new();
     for (position, name) in shown.iter().enumerate() {
         let candidate = if at.is_empty() {
@@ -2005,9 +2432,10 @@ fn members(
                 aliases.push(Alias {
                     name,
                     span,
-                    item,
+                    item: Some(item),
                     target,
                     whole: true,
+                    implicit: false,
                 });
             }
         }
@@ -2020,9 +2448,10 @@ fn members(
                             Some(child) => aliases.push(Alias {
                                 name: bound.name,
                                 span: bound.span,
-                                item,
+                                item: Some(item),
                                 target: child,
                                 whole: false,
+                                implicit: false,
                             }),
                             None => errors.push(Diagnostic::error(
                                 format!(
@@ -2049,9 +2478,10 @@ fn members(
                                 aliases.push(Alias {
                                     name: root,
                                     span: star,
-                                    item,
+                                    item: Some(item),
                                     target: child,
                                     whole: false,
+                                    implicit: false,
                                 });
                             }
                         }
@@ -2093,10 +2523,15 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
     let Some(file) = scan.files.get(index as usize) else {
         return;
     };
+    // The implicit `import * from prelude` alone clashes with nothing.
+    if aliases.iter().all(|alias| alias.implicit) {
+        return;
+    }
     let ast = &file.ast;
     // The file's own top-level names, first declaration of each, and
     // whether it is a field's.
     let mut declared: Vec<(Name, Span, bool)> = Vec::new();
+    let mut seen: HashSet<(Name, bool)> = HashSet::new();
     for &item in ast.items(ast.root()) {
         let (field, path) = match ast.item(item).kind {
             ItemKind::Let { path, .. } | ItemKind::Rebind { path, .. } => (false, path),
@@ -2105,26 +2540,32 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
         };
         if let Some(first) = ast.path(path).first()
             && let Some(name) = first.name()
-            && !declared.iter().any(|&(n, _, f)| n == name && f == field)
+            && seen.insert((name, field))
         {
             declared.push((name, first.span, field));
         }
     }
     let star = |alias: &Alias| {
-        let ItemKind::Import(id) = ast.item(alias.item).kind else {
+        let Some(ItemKind::Import(id)) = alias.item.map(|item| ast.item(item).kind) else {
             return false;
         };
         matches!(ast.import_decl(id).form, ImportForm::Members(range)
             if ast.import_members(range).iter().any(|m| m == &ImportMember::All(alias.span)))
     };
+    // The implicit `import * from prelude` clashes with nothing: its names
+    // yield to every other (see the module documentation, "The standard
+    // library").
     for (position, alias) in aliases.iter().enumerate() {
+        if alias.implicit {
+            continue;
+        }
         let shown = scan.names.get(alias.name);
         let earlier = aliases
             .get(..position)
             .and_then(|before| {
                 before
                     .iter()
-                    .find(|a| a.name == alias.name && (alias.whole || a.whole))
+                    .find(|a| !a.implicit && a.name == alias.name && (alias.whole || a.whole))
             })
             .map(|a| (a.span, "imported here"));
         let other = earlier.or_else(|| {
@@ -2562,6 +3003,11 @@ pub(crate) struct Context<'a> {
     /// its file is checked: what a call of it through an import needs for
     /// the call-site form of the implicit-await error.
     cell_measured: &'a [Option<Box<[bool]>>],
+    /// Whether the file is a session's input, whose scope is the session's:
+    /// its variables are read as a session's input reads them, captured
+    /// by a function, not read through the top level's frame as a
+    /// directory's committed declarations are (see [`check_input`]).
+    session: bool,
 }
 
 /// What a [`Context`] reads cells by: the slot each cell is read from, and
@@ -2585,7 +3031,27 @@ impl<'a> Context<'a> {
             cell_types,
             cell_slots,
             cell_measured,
+            session: false,
         })
+    }
+
+    /// Whether the file is a session's input (see [`Context::session`]'s
+    /// field).
+    pub(crate) fn session(&self) -> bool {
+        self.session
+    }
+
+    /// Whether the import item `item` of a lone file, or of a session's
+    /// input, names nothing it can: a path of anything but `builtins` and
+    /// the standard files, which the checker reports as needing a
+    /// workspace (see the module documentation, "The standard library").
+    pub(crate) fn needs_workspace(&self, item: ItemId) -> bool {
+        self.scan.lone && !self.file.aliases.iter().any(|a| a.item == Some(item))
+    }
+
+    /// The slot of the cell numbered `cell` (see [`Scan::slot`]).
+    pub(crate) fn slot(&self, cell: u32) -> Slot {
+        self.scan.slot(cell)
     }
 
     /// Which parameters of the `def` whose merged node is `node` its body
@@ -2601,7 +3067,7 @@ impl<'a> Context<'a> {
         self.cell_slots
             .get(node as usize)
             .copied()
-            .unwrap_or(Slot::at(node))
+            .unwrap_or_else(|| self.scan.slot(node))
     }
 
     /// The cell the file's result is stored in, if it is a value file some
@@ -2652,11 +3118,17 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Whether a reference in the file may read through its view rather
-    /// than a binding: it imports something, or several of its sources
-    /// share a node (see [`FileScope::reads_through`]).
+    /// Whether a field access in the file may read through its view rather
+    /// than a binding: it imports something that has children, or several
+    /// of its sources share a node (see [`FileScope::reads_through`]). The
+    /// implicit `import * from prelude` of leaves alone does not count: a
+    /// field access on a leaf reads the leaf's value.
     pub(crate) fn has_view(&self) -> bool {
-        !self.file.aliases.is_empty() || self.file.view.end > self.file.view.start
+        self.file
+            .aliases
+            .iter()
+            .any(|a| !a.implicit || !self.scan.is_leaf(a.target))
+            || self.file.view.end > self.file.view.start
     }
 
     /// The file being checked.
@@ -2713,7 +3185,12 @@ impl<'a> Context<'a> {
             .filter_map(|&child| {
                 let entry = self.scan.nodes.get(child as usize)?;
                 let own = self.scope.local.get(&child).copied();
-                Some((entry.name, own, Slot::at(child), self.cell_type(child)))
+                Some((
+                    entry.name,
+                    own,
+                    self.scan.slot(child),
+                    self.cell_type(child),
+                ))
             })
             .collect()
     }
@@ -2748,12 +3225,22 @@ pub struct Workspace {
     /// keeping none (a copy of the whole frame's in each would make the
     /// workspace's memory quadratic in its files).
     slot_names: Vec<Name>,
+    /// For each file, by input number, the number of slots it committed,
+    /// and the names of its slots past them, its temporaries', which a later
+    /// file may take and name otherwise in `slot_names`: what
+    /// [`Workspace::dump_ir`] names them by.
+    slot_tails: Vec<(usize, Vec<Name>)>,
+    /// The type of each cell, by its number, as its file's check found it:
+    /// what a session's inputs read the standard library's cells as.
+    cell_types: Vec<TyId>,
     /// The slot each cell is read from, by merged node: its own, or for a
-    /// `def` its function's (see [`Context::cell_slot`]). Kept for the
-    /// tests' check that every cell an import reaches is stored by its
-    /// owner.
-    #[cfg(test)]
+    /// `def` its function's (see [`Context::cell_slot`]). Kept for a
+    /// session's inputs, and for the tests' check that every cell an import
+    /// reaches is stored by its owner.
     cell_slots: Vec<Slot>,
+    /// For each cell that is a `def`'s, which parameters its body measures
+    /// (see [`Context::measured`]), kept for a session's inputs.
+    cell_measured: Vec<Option<Box<[bool]>>>,
     /// Each file's records of the nodes of its view with a leaf of it under
     /// them, by input number: kept for the tests' check that each reads
     /// only cells stored before it.
@@ -2781,15 +3268,67 @@ pub fn check(sources: &[SourceFile]) -> Result<Workspace, Vec<Diagnostic>> {
 ///
 /// As [`check`].
 pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace, Vec<Diagnostic>> {
-    let mut scan = scan_with(sources, nested)?;
+    check_scan(scan_with(sources, nested)?)
+}
+
+/// Scans, checks and lowers `source`, a file outside any workspace (`gcsl
+/// run` of a lone file), as the workspace of one directory holding just
+/// it, beside the standard library (see the module documentation, "The
+/// standard library"): it is file [`Scan::standard`], after the standard
+/// files.
+///
+/// # Errors
+///
+/// As [`check`]; an import of anything but `builtins` and the standard
+/// files is the checker's error, "`lib` is not a built-in or standard
+/// module, and there is no `workspace.gcsl` above this file".
+pub fn check_lone(source: &SourceFile) -> Result<Workspace, Vec<Diagnostic>> {
+    check_scan(scan_into(
+        std::slice::from_ref(source),
+        Placing::Lone,
+        &mut Names::new(),
+    )?)
+}
+
+/// The tables of the cells of `scan` before any file is checked: each
+/// one's type, `Error` but for the built-in functions', the first
+/// ([`builtin_nodes`]), each built-in's (see [`Builtin::ty`]), interned
+/// into `types` with `names`; each one's slot; and no `def`'s measured
+/// parameters.
+fn cell_tables(scan: &Scan, types: &mut TypeTable, names: &mut Names) -> CellTables {
+    let mut cell_types = vec![TyId::ERROR; scan.cells()];
+    for (cell, builtin) in cell_types.iter_mut().zip(Builtin::ALL) {
+        *cell = builtin.ty(types, names);
+    }
+    let cell_slots = (0..count(scan.cells()))
+        .map(|cell| scan.slot(cell))
+        .collect();
+    (cell_types, cell_slots, vec![None; scan.cells()])
+}
+
+/// Takes the names of the slots of `ir`, a file's: its slots' names are the
+/// workspace's (see [`Workspace::dump_ir`]), but for those of its
+/// temporaries past the `committed` slots it committed, which a later file
+/// may take and name otherwise, which are kept, with `committed`.
+fn own_slot_names(ir: &mut Ir, committed: usize) -> (usize, Vec<Name>) {
+    let own = ir.replace_slot_names(Vec::new());
+    (committed, own.get(committed..).unwrap_or_default().to_vec())
+}
+
+/// The tables of a workspace's cells, by number: each one's type, the slot
+/// it is read from, and for a `def`'s which parameters its body measures.
+type CellTables = (Vec<TyId>, Vec<Slot>, Vec<Option<Box<[bool]>>>);
+
+/// Checks and lowers every file of `scan` in the order (see [`check`]).
+fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     let mut names = mem::take(&mut scan.names);
     let mut types = TypeTable::new();
-    let mut cell_types = vec![TyId::ERROR; scan.cells()];
-    let mut cell_slots: Vec<Slot> = (0..count(scan.cells())).map(Slot::at).collect();
-    let mut cell_measured: Vec<Option<Box<[bool]>>> = vec![None; scan.cells()];
+    let (mut cell_types, mut cell_slots, mut cell_measured) =
+        cell_tables(&scan, &mut types, &mut names);
     let mut slot_names: Vec<Name> = scan.cell_names();
     let mut scopes = vec![Committed::default(); scan.dirs.len()];
     let mut irs: Vec<Option<Ir>> = (0..scan.files.len()).map(|_| None).collect();
+    let mut tails: Vec<(usize, Vec<Name>)> = vec![(0, Vec::new()); scan.files.len()];
     let mut checked: Vec<Option<Types>> = (0..scan.files.len()).map(|_| None).collect();
     let mut warnings = vec![Vec::new(); scan.files.len()];
     let mut errors = Vec::new();
@@ -2856,8 +3395,7 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
         }
         match result {
             Ok((mut ir, file_types, found)) => {
-                // Its slots' names are the workspace's (see `slot_names`).
-                ir.replace_slot_names(Vec::new());
+                set(&mut tails, index, own_slot_names(&mut ir, slot_names.len()));
                 set(&mut irs, index, Some(ir));
                 set(&mut checked, index, Some(file_types));
                 set(&mut warnings, index, in_file(found, index));
@@ -2881,12 +3419,16 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
         irs,
         checked,
         warnings: warnings.into_iter().flatten().collect(),
-        frame: Vec::new(),
+        // The driver writes the built-in functions' cells, the first slots,
+        // as it lays the frame out, before any file runs.
+        frame: builtin_cells(),
         slot_names,
+        slot_tails: tails,
         memo: MemoTables::new(),
         types,
-        #[cfg(test)]
+        cell_types,
         cell_slots,
+        cell_measured,
         #[cfg(test)]
         view_records,
     })
@@ -2968,18 +3510,23 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
     let file = scan.files.get(index as usize);
     let global = file.map_or(&[][..], |file| &file.global);
     let slots = output.checked.resolution.field_cells();
+    let measured_by_slot = output.scope.measured_by_slot();
     let mut cells = Vec::new();
     for (own, (&global, &ty)) in global.iter().zip(&output.cell_types).enumerate() {
         if scan.computed_by(global) == Some(index) {
             // A `def`'s cell is read from its function's slot.
-            let slot = slots.get(own).copied().unwrap_or(Slot::at(global));
-            let measured = output.scope.measured_at(slot).map(Box::from);
+            let slot = slots.get(own).copied().unwrap_or_else(|| scan.slot(global));
+            let measured = measured_by_slot
+                .get(&slot)
+                .copied()
+                .flatten()
+                .map(Box::from);
             cells.push((global, slot, ty, measured));
         }
     }
     // An imported value file's value is a cell of the workspace.
     if let Some(cell) = scan.value_cell(index) {
-        cells.push((cell, Slot::at(cell), output.ty, None));
+        cells.push((cell, scan.slot(cell), output.ty, None));
     }
     cells
 }
@@ -3075,15 +3622,25 @@ impl Workspace {
     #[must_use]
     pub fn dump_ir(&mut self, index: u32) -> Option<String> {
         let ir = self.irs.get_mut(index as usize)?.as_mut()?;
-        // Lent the names of every slot, of which its frame is a prefix.
-        ir.replace_slot_names(mem::take(&mut self.slot_names));
+        // The names of the slots it committed, of which its frame is a
+        // prefix, then its own temporaries'.
+        let (committed, tail) = self.slot_tails.get(index as usize)?;
+        let mut names = self
+            .slot_names
+            .get(..*committed)
+            .unwrap_or_default()
+            .to_vec();
+        names.extend_from_slice(tail);
+        ir.replace_slot_names(names);
         let dump = ir.pretty(&self.scan.names).to_string();
-        self.slot_names = ir.replace_slot_names(Vec::new());
+        ir.replace_slot_names(Vec::new());
         Some(dump)
     }
 
-    /// Runs file `index` and, before it, every file it needs that has not
-    /// run, in the order, and returns its own value: its result, or the
+    /// Runs file `index` and, before it, the standard files and every file
+    /// it needs that has not run, in the order ([`Scan::needed`]), on the
+    /// frame whose first cells the driver wrote with the built-in
+    /// functions, and returns its own value: its result, or the
     /// record of its own fields, with the warnings of the whole workspace.
     ///
     /// # Errors
@@ -3115,6 +3672,226 @@ impl Workspace {
                 .unwrap_or(Value::Empty),
             warnings: self.warnings.clone(),
         })
+    }
+}
+
+/// `diagnostics` of the file `index` of a scan of one file beside the
+/// standard library, as the diagnostics of the input being run name it: by
+/// no input, as a label in it does, a label in a standard file keeping that
+/// file's number, which is its input number in a session too.
+#[must_use]
+pub fn being_run(mut diagnostics: Vec<Diagnostic>, index: u32) -> Vec<Diagnostic> {
+    for diagnostic in &mut diagnostics {
+        if diagnostic.input == Some(index) {
+            diagnostic.input = None;
+        }
+        for label in &mut diagnostic.labels {
+            if label.input == Some(index) {
+                label.input = None;
+            }
+        }
+    }
+    diagnostics
+}
+
+/// The standard library as a session ran it once, as it started: what each
+/// of its inputs is scanned and checked beside ([`check_input`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Standard {
+    /// The number of its cells, the built-in functions' and the standard
+    /// files' nodes, which are the first nodes of every scan, an input's
+    /// after them. (A standard file that is a value file has no cell of its
+    /// value here; none is.)
+    cells: u32,
+    /// The type of each of its cells.
+    cell_types: Vec<TyId>,
+    /// The slot each of its cells is read from: its own, or for a `def` its
+    /// function's.
+    cell_slots: Vec<Slot>,
+    /// For each of its cells that is a `def`'s, which parameters its body
+    /// measures.
+    cell_measured: Vec<Option<Box<[bool]>>>,
+}
+
+/// What a session continues from once it has run the standard library
+/// ([`start`]): the standard library's cells, and the names, types, frame,
+/// memo tables and names of slots of the run. (The standard library has
+/// no warnings to keep.)
+#[derive(Debug)]
+pub(crate) struct Started {
+    /// The standard library's cells.
+    pub(crate) standard: Standard,
+    /// The names interned.
+    pub(crate) names: Names,
+    /// The types interned.
+    pub(crate) types: TypeTable,
+    /// The top level's frame, the standard library's cells and slots
+    /// written.
+    pub(crate) frame: Vec<Value>,
+    /// The memo tables of the run.
+    pub(crate) memo: MemoTables,
+    /// The name of each slot of the frame.
+    pub(crate) slot_names: Vec<Name>,
+}
+
+/// Checks and runs the standard library as a session starts: through the
+/// driver of a workspace with no file of its own, the built-in functions'
+/// cells written as the frame is laid out and every standard file run.
+///
+/// # Errors
+///
+/// The diagnostics of the standard library, which are a bug.
+pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
+    let mut workspace = check_with(&[], &[])?;
+    for file in 0..workspace.scan.standard {
+        workspace.run(file)?;
+    }
+    let Workspace {
+        scan,
+        frame,
+        memo,
+        types,
+        slot_names,
+        cell_types,
+        cell_slots,
+        cell_measured,
+        ..
+    } = workspace;
+    Ok(Started {
+        standard: Standard {
+            cells: count(scan.cells()),
+            cell_types,
+            cell_slots,
+            cell_measured,
+        },
+        names: scan.names,
+        types,
+        frame,
+        memo,
+        slot_names,
+    })
+}
+
+/// Checks and lowers `source`, session input number `input`, beside the
+/// standard library `standard`, from `scope`, the session's: scanned as a
+/// lone file is ([`check_lone`]), its names interned into `names` and its
+/// types into `types`, so that it may import `builtins` and the standard
+/// files and has the prelude's names as the yielding last source of its
+/// view; its cells, after the standard library's, take the slots after the
+/// scope's ([`Scan::slot`]), and its check is a session input's, which
+/// reads the scope's variables as a session's input does (see
+/// [`crate::session`]). Its diagnostics name it as the input being run,
+/// with no input number; a label in a standard file names that file's.
+///
+/// # Errors
+///
+/// The diagnostics of the scan, the check or the lowering.
+pub(crate) fn check_input(
+    standard: &Standard,
+    source: &SourceFile,
+    (names, types): (&mut Names, &mut TypeTable),
+    scope: Scope,
+    input: u32,
+) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
+    check_input_then(
+        standard,
+        source,
+        (names, types),
+        scope,
+        |ast, checked, types| {
+            checked.and_then(|output| session::lower_checked(ast, output, types, input))
+        },
+    )?
+}
+
+/// [`check_input`] up to its check, whose outcome `then` is given with the
+/// input's tree, its names in it, and the types: what lowering is done by,
+/// or a test looks at.
+///
+/// # Errors
+///
+/// The diagnostics of the scan.
+fn check_input_then<R>(
+    standard: &Standard,
+    source: &SourceFile,
+    (names, types): (&mut Names, &mut TypeTable),
+    scope: Scope,
+    then: impl FnOnce(&Ast, Result<CheckOutput, Vec<Diagnostic>>, &mut TypeTable) -> R,
+) -> Result<R, Vec<Diagnostic>> {
+    let mut scan = scan_into(std::slice::from_ref(source), Placing::Lone, names)
+        .map_err(|errors| being_run(errors, count(crate::STANDARD.len())))?;
+    let index = scan.standard;
+    // The input's cells, but its `def`s', take the slots past the scope's,
+    // in order.
+    let cells = scan.cells();
+    let cell_names = scan.cell_names();
+    let mut next = count(scope.slot_count());
+    let mut taken = Vec::new();
+    let relocated = (standard.cells..count(cells))
+        .map(|cell| {
+            if scan.is_def(cell) {
+                return Slot::NONE;
+            }
+            if let Some(&name) = cell_names.get(cell as usize) {
+                taken.push(name);
+            }
+            next = next.saturating_add(1);
+            Slot::at(next - 1)
+        })
+        .collect();
+    scan.relocation = Some((standard.cells, relocated));
+    let mut cell_types = standard.cell_types.clone();
+    cell_types.resize(cells, TyId::ERROR);
+    let mut cell_slots = standard.cell_slots.clone();
+    cell_slots.extend((count(cell_slots.len())..count(cells)).map(|cell| scan.slot(cell)));
+    let mut cell_measured = standard.cell_measured.clone();
+    cell_measured.resize(cells, None);
+    let scope = scope.with_slots(taken);
+    let file_names = mem::take(&mut scan.names);
+    let Some(file) = scan.files.get_mut(index as usize) else {
+        *names = file_names;
+        return Err(Vec::new());
+    };
+    file.ast.replace_names(file_names);
+    let finished = scan.files.get(index as usize).and_then(|file| {
+        let reads = (&cell_slots[..], &cell_measured[..]);
+        let context = Context::new(&scan, index, &cell_types, reads)?;
+        let context = Context {
+            session: true,
+            ..context
+        };
+        let checked = Checker::in_workspace(&file.ast, scope, types, &context).check();
+        Some(then(&file.ast, checked, types))
+    });
+    if let Some(file) = scan.files.get_mut(index as usize) {
+        *names = file.ast.replace_names(Names::new());
+    }
+    finished.ok_or_else(Vec::new)
+}
+
+/// For the tests of the other modules, which check a text alone: `text`
+/// checked as a session's first input is, beside the standard library, so
+/// that the prelude's names, `len` among them, are its, with the tree it
+/// was parsed to, which holds every name, and the types. Its top-level
+/// slots come after the standard library's.
+#[cfg(test)]
+pub(crate) fn check_beside_prelude(
+    text: &str,
+) -> (Ast, TypeTable, Result<CheckOutput, Vec<Diagnostic>>) {
+    let started = start().unwrap();
+    let (mut names, mut types) = (started.names, started.types);
+    let source = SourceFile::new("test.gcsl", text).unwrap();
+    let scope = Scope::of_slots(started.slot_names);
+    let checked = check_input_then(
+        &started.standard,
+        &source,
+        (&mut names, &mut types),
+        scope,
+        |ast, checked, _| (ast.clone(), checked),
+    );
+    match checked {
+        Ok((ast, checked)) => (ast, types, checked),
+        Err(errors) => panic!("{text}: {errors:?}"),
     }
 }
 
@@ -3166,19 +3943,25 @@ mod tests {
         let paths: Vec<&str> = scan.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
             paths,
-            ["app.gcsl", "common.gcsl", "lib.gcsl", "workspace.gcsl"]
+            [
+                "<stdlib>/prelude.gcsl",
+                "app.gcsl",
+                "common.gcsl",
+                "lib.gcsl",
+                "workspace.gcsl"
+            ]
         );
-        assert_eq!(scan.needs, [vec![1, 2], vec![], vec![1], vec![]]);
-        assert_eq!(scan.order, [1, 2, 0, 3]);
-        assert_eq!(scan.needed(0), [1, 2, 0]);
-        assert_eq!(scan.needed(2), [1, 2]);
-        assert_eq!(scan.needed(3), [3]);
+        assert_eq!(scan.needs, [vec![], vec![2, 3], vec![], vec![2], vec![]]);
+        assert_eq!(scan.order, [0, 2, 3, 1, 4]);
+        assert_eq!(scan.needed(1), [0, 2, 3, 1]);
+        assert_eq!(scan.needed(3), [0, 2, 3]);
+        assert_eq!(scan.needed(4), [0, 4]);
     }
 
     #[test]
     fn a_reference_means_its_prefix_in_the_merged_tree() {
         let scan = ws(&SUMMARY).unwrap();
-        let app = &scan.files[0];
+        let app = &scan.files[1];
         // `com.x.lib` in app's second item is lib's interior node, not
         // app's own `com.x`.
         let foreign = &app.mentions.foreign[1];
@@ -3188,19 +3971,19 @@ mod tests {
         };
         let merged = FileScope::new(&scan, app).merged(node).unwrap();
         assert_eq!(scan.show(merged), "com.x.lib");
-        assert_eq!(scan.nodes[merged as usize].contributors, [2]);
+        assert_eq!(scan.nodes[merged as usize].contributors, [3]);
     }
 
     #[test]
     fn dotted_paths_merge_and_the_last_contributor_assembles() {
         let scan = ws(&[("a.gcsl", "com.a = 1"), ("b.gcsl", "all = com\ncom.b = 2")]).unwrap();
-        assert_eq!(scan.order, [0, 1]);
-        let com = scan.by_name[&(0, ROOT, scan.files[0].mentions.tree.nodes[0].name)];
-        assert_eq!(scan.nodes[com as usize].contributors, [0, 1]);
-        assert_eq!(scan.computed_by(com), Some(1));
+        assert_eq!(scan.order, [0, 1, 2]);
+        let com = scan.by_name[&(0, ROOT, scan.files[1].mentions.tree.nodes[0].name)];
+        assert_eq!(scan.nodes[com as usize].contributors, [1, 2]);
+        assert_eq!(scan.computed_by(com), Some(2));
         // a leaves `com` out; b computes it before its first mention.
-        assert!(!scan.files[0].schedule.order.contains(&0));
-        let b = &scan.files[1];
+        assert!(!scan.files[1].schedule.order.contains(&0));
+        let b = &scan.files[2];
         let local = b.global.iter().position(|&g| g == com).unwrap();
         assert!(b.schedule.order.contains(&count(local)));
         assert_eq!(b.schedule.point[local], 0);
@@ -3214,27 +3997,27 @@ mod tests {
             ("c.gcsl", "all = com"),
         ])
         .unwrap();
-        assert_eq!(scan.needs, [vec![], vec![], vec![0, 1]]);
+        assert_eq!(scan.needs, [vec![], vec![], vec![], vec![1, 2]]);
         // b, the last contributor, assembles `com` after its last child.
-        let b = &scan.files[1];
+        let b = &scan.files[2];
         assert_eq!(b.schedule.point[0], 1);
-        assert!(!scan.files[0].schedule.order.contains(&0));
+        assert!(!scan.files[1].schedule.order.contains(&0));
     }
 
     #[test]
     fn a_def_of_one_file_called_from_another_is_a_need() {
         let scan = ws(&[("a.gcsl", "def f(): Int { 1 }"), ("b.gcsl", "x = f()")]).unwrap();
-        assert_eq!(scan.needs, [vec![], vec![0]]);
+        assert_eq!(scan.needs, [vec![], vec![], vec![1]]);
     }
 
     #[test]
     fn siblings_and_subdirectories_are_hidden() {
         let scan = ws(&[("x/a.gcsl", "v = 1"), ("y/b.gcsl", "w = v")]).unwrap();
-        assert_eq!(scan.needs, [vec![], vec![]]);
+        assert_eq!(scan.needs, [vec![], vec![], vec![]]);
         let scan = ws(&[("a.gcsl", "w = v"), ("sub/b.gcsl", "v = 1")]).unwrap();
-        assert_eq!(scan.needs, [vec![], vec![]]);
+        assert_eq!(scan.needs, [vec![], vec![], vec![]]);
         let scan = ws(&[("a.gcsl", "v = 1"), ("sub/b.gcsl", "w = v")]).unwrap();
-        assert_eq!(scan.needs, [vec![], vec![0]]);
+        assert_eq!(scan.needs, [vec![], vec![], vec![1]]);
     }
 
     #[test]
@@ -3243,8 +4026,8 @@ mod tests {
             error(&[("a.gcsl", "x.y = 1"), ("b.gcsl", "x.y = 2")]),
             (
                 "field `x.y` is defined in two files".to_owned(),
-                Some(1),
-                vec![Some(0)]
+                Some(2),
+                vec![Some(1)]
             )
         );
         assert_eq!(
@@ -3265,8 +4048,8 @@ mod tests {
             error(&[("a.gcsl", "version = 1"), ("sub/b.gcsl", "version = 2")]),
             (
                 "field `version` is defined in two files".to_owned(),
-                Some(0),
-                vec![Some(1)]
+                Some(1),
+                vec![Some(2)]
             )
         );
     }
@@ -3275,23 +4058,23 @@ mod tests {
     fn files_that_need_each_other() {
         let (message, input, labels) = error(&[("a.gcsl", "p = q"), ("b.gcsl", "q = p")]);
         assert_eq!(message, "`a.gcsl` and `b.gcsl` need each other");
-        assert_eq!((input, labels), (Some(0), vec![Some(1)]));
+        assert_eq!((input, labels), (Some(1), vec![Some(2)]));
         let (message, _, labels) = error(&[
             ("a.gcsl", "p = q"),
             ("b.gcsl", "q = r"),
             ("c.gcsl", "r = p"),
         ]);
         assert_eq!(message, "`a.gcsl`, `b.gcsl` and `c.gcsl` need each other");
-        assert_eq!(labels, [Some(1), Some(2)]);
+        assert_eq!(labels, [Some(2), Some(3)]);
     }
 
     #[test]
     fn path_order_breaks_ties_and_errors_name_their_file() {
         let scan = ws(&[("b.gcsl", "x = 1"), ("a.gcsl", "y = 2")]).unwrap();
-        assert_eq!(scan.order, [0, 1]);
-        assert_eq!(scan.files[0].path, "a.gcsl");
+        assert_eq!(scan.order, [0, 1, 2]);
+        assert_eq!(scan.files[1].path, "a.gcsl");
         let errors = ws(&[("a.gcsl", "x = 1"), ("b.gcsl", "y = (")]).unwrap_err();
-        assert_eq!(errors[0].input, Some(1));
+        assert_eq!(errors[0].input, Some(2));
     }
 
     /// Checks the workspace of `files` and runs the file at `path`,
@@ -3316,13 +4099,38 @@ mod tests {
         Ok(outcome.value.to_string())
     }
 
+    /// Asserts that the driver wrote the cell of every built-in function
+    /// as it laid the frame out, before any file runs: a `Value::Builtin`,
+    /// never `Value::Empty`, which would read as a record-kinded `{}` that
+    /// nothing else can see. Returns their slots, which no file stores.
+    fn assert_builtins_written(workspace: &Workspace) -> Vec<Slot> {
+        Builtin::ALL
+            .into_iter()
+            .zip(0u32..)
+            .map(|(builtin, node)| {
+                let slot = workspace.cell_slots[node as usize];
+                assert_eq!(workspace.scan.builtin(node), Some(builtin));
+                assert_eq!(
+                    workspace.frame.get(slot.index()),
+                    Some(&Value::Builtin(builtin)),
+                    "the cell of `{}` is not written by the driver",
+                    builtin.name()
+                );
+                slot
+            })
+            .collect()
+    }
+
     /// Asserts that every cell an import of `workspace` reaches, directly
     /// or as a field of a record read whole, is stored by a node of its
     /// owner's top-level block: slice 24's schedule test sees one file
-    /// only, and a cell no owner writes would read as `{}`.
+    /// only, and a cell no owner writes would read as `{}`. A built-in
+    /// function's cell has no owner: the driver wrote it before any file
+    /// ran ([`assert_builtins_written`]).
     fn assert_imports_stored(workspace: &Workspace) {
         let scan = &workspace.scan;
         let types = vec![TyId::ERROR; scan.cells()];
+        let builtins = assert_builtins_written(workspace);
         for (index, file) in (0u32..).zip(&scan.files) {
             let reads = (&workspace.cell_slots[..], &[][..]);
             let context = Context::new(scan, index, &types, reads).unwrap();
@@ -3345,6 +4153,9 @@ mod tests {
                     pending.extend(context.target_fields(target).into_iter().map(|(_, t)| t));
                     continue;
                 };
+                if builtins.contains(&slot) {
+                    continue;
+                }
                 let owners = scan.target_files(target);
                 let stored = owners.iter().any(|&owner| {
                     let Some(Some(ir)) = workspace.irs.get(owner as usize) else {
@@ -3394,9 +4205,12 @@ mod tests {
     /// only cells stored earlier in its block or by a file earlier in the
     /// order: slice 25's shared nodes read the cells of the files that
     /// contribute to them, which come earlier but need not be needed. A cell
-    /// nobody stored first would read as `{}`.
+    /// nobody stored first would read as `{}`. A built-in function's cell
+    /// counts as stored before any file: the driver wrote it as it laid the
+    /// frame out ([`assert_builtins_written`]).
     fn assert_assemblies_stored(workspace: &Workspace) {
         let scan = &workspace.scan;
+        let builtins = assert_builtins_written(workspace);
         for (index, file) in (0u32..).zip(&scan.files) {
             let own = top_stores(workspace, index);
             let needed: Vec<Slot> = scan
@@ -3404,11 +4218,13 @@ mod tests {
                 .into_iter()
                 .filter(|&other| other != index)
                 .flat_map(|other| top_stores(workspace, other))
+                .chain(builtins.iter().copied())
                 .collect();
             let rank = scan.order.iter().position(|&f| f == index).unwrap_or(0);
             let earlier: Vec<Slot> = scan.order[..rank]
                 .iter()
                 .flat_map(|&other| top_stores(workspace, other))
+                .chain(builtins.iter().copied())
                 .collect();
             let records = workspace.view_records.get(index as usize);
             for (slot, _, fields) in records.into_iter().flatten() {
@@ -3677,17 +4493,18 @@ mod tests {
             ("b.gcsl", "y = x"),
         ];
         let errors = run_file(&files, "b.gcsl").unwrap_err();
-        // `a.gcsl` is input 0: the error names it, and `b.gcsl` never ran.
+        // `a.gcsl` is input 1, after the prelude: the error names it, and
+        // `b.gcsl` never ran.
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].1, Some(0));
+        assert_eq!(errors[0].1, Some(1));
         let erroneous = [
             ("workspace.gcsl", ""),
             ("a.gcsl", "x = 1"),
             ("z.gcsl", "y = 1 + \"\""),
         ];
         let errors = run_file(&erroneous, "a.gcsl").unwrap_err();
-        // The error is `z.gcsl`'s, input 2.
-        assert!(errors.iter().all(|error| error.1 == Some(2)), "{errors:?}");
+        // The error is `z.gcsl`'s, input 3.
+        assert!(errors.iter().all(|error| error.1 == Some(3)), "{errors:?}");
         // Every failing file is reported, in path order; a file that needs
         // one that failed is not checked.
         let erroneous = [
@@ -3698,7 +4515,7 @@ mod tests {
         ];
         let errors = run_file(&erroneous, "workspace.gcsl").unwrap_err();
         let inputs: Vec<_> = errors.iter().map(|error| error.1).collect();
-        assert_eq!(inputs, [Some(0), Some(2)], "{errors:?}");
+        assert_eq!(inputs, [Some(1), Some(3)], "{errors:?}");
         // A closure of another file names that file when it fails.
         let files = [
             ("workspace.gcsl", ""),
@@ -3707,7 +4524,7 @@ mod tests {
         ];
         let errors = run_file(&files, "b.gcsl").unwrap_err();
         assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].1, Some(0), "{errors:?}");
+        assert_eq!(errors[0].1, Some(1), "{errors:?}");
     }
 
     /// The time to check a workspace of `count` files of ten fields each,
@@ -3740,13 +4557,66 @@ mod tests {
             let start = std::time::Instant::now();
             let mut workspace = check(&sources).unwrap();
             let checked = start.elapsed();
-            let outcome = workspace.run(count - 1).unwrap();
+            let last = workspace.file(&format!("f{:04}.gcsl", count - 1)).unwrap();
+            let outcome = workspace.run(last).unwrap();
             let total = start.elapsed();
             let last = format!("{}", outcome.value);
             assert!(last.contains(&format!("= {}", count * 10)), "{last}");
             writeln!(
                 report,
                 "{count} files: scan {scanned:?}; check {checked:?}, check and run {total:?}"
+            )
+            .unwrap();
+        }
+        std::io::stdout().write_all(report.as_bytes()).unwrap();
+    }
+
+    /// The time to check and run a lone file of `count` fields, each reading
+    /// the one before, beside the standard library ([`check_lone`]), against
+    /// checking, lowering and running it alone as [`crate::check::check`]
+    /// does, with no standard library: what the prelude and the path of a
+    /// workspace cost a lone file. Run with `cargo test --release --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark, not a test"]
+    fn benchmark_a_lone_file_beside_the_prelude() {
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+        let mut report = String::new();
+        for count in [1_u32, 1000, 2000, 4000, 8000] {
+            let mut text = String::from("f0 = 1\n");
+            for field in 1..count {
+                writeln!(text, "f{field} = f{} + 1", field - 1).unwrap();
+            }
+            let source = SourceFile::new("lone.gcsl", text).unwrap();
+            let start = std::time::Instant::now();
+            let (tokens, names, strings) = lexer::tokenize(&source).unwrap();
+            let ast = parser::parse(&tokens, names, strings, &source).unwrap();
+            let mut types = TypeTable::new();
+            let (checked, _) = crate::check::check(&ast, &mut types).unwrap();
+            let ir = std::rc::Rc::new(crate::lower::lower(&ast, &checked, &types, 0).unwrap());
+            let alone = crate::eval::eval(&ir).unwrap();
+            let bare = start.elapsed();
+            // Its scan and its check, apart.
+            let start = std::time::Instant::now();
+            let scanned = scan_into(
+                std::slice::from_ref(&source),
+                Placing::Lone,
+                &mut Names::new(),
+            )
+            .unwrap();
+            let scanning = start.elapsed();
+            let start = std::time::Instant::now();
+            check_scan(scanned).unwrap();
+            let checking = start.elapsed();
+            let start = std::time::Instant::now();
+            let lone = crate::run(&source).unwrap().value;
+            let beside = start.elapsed();
+            assert_eq!(alone.to_string(), lone.to_string());
+            writeln!(
+                report,
+                "{count} fields: alone {bare:?}; beside the standard library {beside:?} \
+                 (scan {scanning:?}, check {checking:?})"
             )
             .unwrap();
         }
@@ -3784,7 +4654,10 @@ mod tests {
             let start = std::time::Instant::now();
             let mut workspace = check(&sources).unwrap();
             let checked = start.elapsed();
-            let outcome = workspace.run(count - 1).unwrap();
+            let last = workspace
+                .file(&format!("d{:04}/f.gcsl", count - 1))
+                .unwrap();
+            let outcome = workspace.run(last).unwrap();
             let total = start.elapsed();
             let last = format!("{}", outcome.value);
             assert!(last.contains(&format!("= {}", count * 10)), "{last}");
@@ -3832,10 +4705,12 @@ mod tests {
     #[test]
     fn imports_resolve_to_their_targets() {
         let scan = ws(&IMPORTS).unwrap();
-        let main = &scan.files[0];
+        let main = &scan.files[1];
+        // Its own imports; the implicit prelude's names follow them.
         let named: Vec<(&str, Target)> = main
             .aliases
             .iter()
+            .filter(|a| !a.implicit)
             .map(|a| (scan.names.get(a.name), a.target))
             .collect();
         let lib = scan.dirs.iter().position(|d| d.path == "lib").unwrap();
@@ -3844,17 +4719,17 @@ mod tests {
             named,
             [
                 ("lib", Target::Dir(count(lib))),
-                ("builder", Target::File(4)),
+                ("builder", Target::File(5)),
                 ("libs", Target::Node(com)),
-                ("y", Target::File(3)),
+                ("y", Target::File(4)),
             ]
         );
         // Needs per leaf: x, y and build, each through an import; `common`
         // only through them.
-        assert_eq!(scan.needs[0], [2, 3, 4]);
-        assert_eq!(scan.needed(0), [1, 2, 3, 4, 0]);
-        assert_eq!(scan.value_slot(4), Some(Slot::at(count(scan.nodes.len()))));
-        assert_eq!(scan.value_slot(1), None);
+        assert_eq!(scan.needs[1], [3, 4, 5]);
+        assert_eq!(scan.needed(1), [0, 2, 3, 4, 5, 1]);
+        assert_eq!(scan.value_slot(5), Some(Slot::at(count(scan.nodes.len()))));
+        assert_eq!(scan.value_slot(2), None);
     }
 
     #[test]
@@ -3864,11 +4739,11 @@ mod tests {
         let scan = ws(&files).unwrap();
         // `lib.com.x.lib.name` is x's leaf; `y` whole is y; nothing reads
         // `tools`, so it needs nothing.
-        assert_eq!(scan.needs[0], [2, 3]);
+        assert_eq!(scan.needs[1], [3, 4]);
         files[0].1 = "import lib\na = lib";
-        assert_eq!(ws(&files).unwrap().needs[0], [2, 3]);
+        assert_eq!(ws(&files).unwrap().needs[1], [3, 4]);
         files[0].1 = "import lib\na = lib.com.y";
-        assert_eq!(ws(&files).unwrap().needs[0], [3]);
+        assert_eq!(ws(&files).unwrap().needs[1], [4]);
     }
 
     #[test]
@@ -3876,7 +4751,7 @@ mod tests {
         let mut files = IMPORTS.to_vec();
         files[0].1 = "import lib.y\na = y.com\nb = y.com.y";
         let scan = ws(&files).unwrap();
-        let main = &scan.files[0];
+        let main = &scan.files[1];
         let scope = FileScope::new(&scan, main);
         let targets: Vec<Target> = main
             .mentions
@@ -3891,7 +4766,7 @@ mod tests {
         // `com` of `lib/` is shared with x: y's part of it. `com.y` is y's
         // alone: the merged node.
         assert!(
-            matches!(targets[0], Target::Part { file: 3, .. }),
+            matches!(targets[0], Target::Part { file: 4, .. }),
             "{targets:?}"
         );
         assert!(matches!(targets[1], Target::Node(_)), "{targets:?}");
@@ -4286,9 +5161,13 @@ p24 = w.com"#;
         assert_eq!(errors.len(), 1, "{errors:?}");
         let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
         paths.sort_unstable();
+        // The standard files take the first input numbers.
+        let standard = standard_sources();
+        let mut all: Vec<&str> = standard.iter().map(SourceFile::name).collect();
+        all.extend(paths);
         let path = |input: Option<u32>| {
             input
-                .and_then(|i| paths.get(i as usize))
+                .and_then(|i| all.get(i as usize))
                 .copied()
                 .unwrap_or("?")
         };
@@ -4347,13 +5226,13 @@ p24 = w.com"#;
         // v owns a leaf of `com`: its view's `com` is a node of its own
         // schedule, after its own child and before `all`.
         let scan = ws(&MERGE).unwrap();
-        let v = &scan.files[1];
+        let v = &scan.files[2];
         assert_eq!((v.view.own, v.view.end - v.view.start), (1, 1));
         let number = count(v.global.len());
         assert!(v.schedule.order.contains(&number));
         assert_eq!(v.schedule.point[number as usize], 1);
         // main reads no node of its view whole: nothing is assembled.
-        let main = &scan.files[0];
+        let main = &scan.files[1];
         let own = count(main.global.len());
         assert!(main.schedule.order.iter().all(|&n| n < own));
         // Its `com` is the root's, `app/`'s and `lib/`'s, root first.
@@ -4362,7 +5241,7 @@ p24 = w.com"#;
         assert_eq!(sources, [0, 1, 2]);
         // v's type of `all` is the record of the merged children.
         let mut workspace = checked(&MERGE);
-        let dump = workspace.dump_types(1).unwrap();
+        let dump = workspace.dump_types(2).unwrap();
         assert!(
             dump.contains(
                 "(name com : {base: {name: String}, vendor: {thing: Int}, x: {app: {base: \
@@ -4576,7 +5455,7 @@ p26 = com.x"#;
              other = 2}; x = {root = 4; app = 1; lib = 3}}"
         );
         let scan = ws(&files).unwrap();
-        let main = &scan.files[0];
+        let main = &scan.files[1];
         // `com` and `com.x`, both with a leaf of main under them.
         assert_eq!((main.view.own, main.view.end - main.view.start), (2, 2));
     }
@@ -5030,5 +5909,341 @@ p26 = com.x"#;
             .unwrap();
         }
         std::io::stdout().write_all(report.as_bytes()).unwrap();
+    }
+
+    // ----- The standard library -----
+
+    /// The summary of slice 28: the prelude's names, `builtins` and the
+    /// prelude imported by name.
+    const STANDARD_SUMMARY: &str = "xs = [1, 2, 3]\n\
+                                    n = len(xs)\n\
+                                    h = half(n)\n\
+                                    import builtins\n\
+                                    same = builtins.len(xs) == n\n\
+                                    import len as count from prelude\n\
+                                    c = count(xs)";
+
+    /// The value of `text` run as a lone file, beside the standard library,
+    /// or the messages of its diagnostics.
+    fn lone(text: &str) -> Result<String, Vec<String>> {
+        let source = SourceFile::new("lone.gcsl", text).unwrap();
+        crate::run(&source)
+            .map(|outcome| outcome.value.to_string())
+            .map_err(|errors| errors.into_iter().map(|e| e.message).collect())
+    }
+
+    #[test]
+    fn the_standard_summary_runs_in_a_workspace_and_alone() {
+        let expected = "{xs = [1, 2, 3]; n = 3; h = 1.5; same = true; c = 3}";
+        let files = [("workspace.gcsl", ""), ("app/main.gcsl", STANDARD_SUMMARY)];
+        assert_eq!(value(&files, "app/main.gcsl"), expected);
+        assert_eq!(lone(STANDARD_SUMMARY).unwrap(), expected);
+        // The standard files are the first files, by input number, in a
+        // directory of their own.
+        let scan = ws(&files).unwrap();
+        assert_eq!(scan.standard(), 1);
+        assert_eq!(scan.files[0].path, "<stdlib>/prelude.gcsl");
+        assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
+        assert_eq!(scan.order[0], 0);
+        // The built-in functions' cells are the first.
+        let builtins: Vec<Option<Builtin>> = (0..4).map(|node| scan.builtin(node)).collect();
+        assert_eq!(
+            builtins,
+            [
+                Some(Builtin::Len),
+                Some(Builtin::Int),
+                Some(Builtin::Float),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn len_is_reached_by_every_road() {
+        for text in [
+            "n = len([1, 2])",
+            "import len from builtins\nn = len([1, 2])",
+            "import builtins\nn = builtins.len([1, 2])",
+            "import * from builtins\nn = len([1, 2])",
+            "import prelude\nn = prelude.len([1, 2])",
+            "let l = len\nn = l([1, 2])",
+            "let l = len\nlet m = l\nn = m([1, 2])",
+            "l = len\nn = l([1, 2])",
+            "import len as count from prelude\nlet l = count\nn = l([1, 2])",
+            "import builtins\nl = builtins.len\nn = l([1, 2])",
+        ] {
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            let shown = value(&files, "main.gcsl");
+            assert!(shown.contains("n = 2"), "{text}: {shown}");
+            assert!(lone(text).unwrap().contains("n = 2"), "{text}");
+        }
+        // An alias of `len` is of its opaque type; the callee of a call of
+        // it has the function type of the call.
+        let mut workspace =
+            checked(&[("workspace.gcsl", ""), ("main.gcsl", "l = len\nn = l([1])")]);
+        let index = workspace.file("main.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(dump.contains("(name len : builtin len @4..7)"), "{dump}");
+        assert!(
+            dump.contains("(name l : fn(List<Int>): Int @12..13)"),
+            "{dump}"
+        );
+    }
+
+    #[test]
+    fn an_alias_of_len_crosses_files_directories_and_imports() {
+        // A field of the root's, a member import's alias of an alias in
+        // another directory, and a `let` of that in a third file.
+        let files = [
+            ("workspace.gcsl", "measure = len"),
+            (
+                "lib/a.gcsl",
+                "import len as count from prelude\nsize = count",
+            ),
+            (
+                "app/main.gcsl",
+                "import size from lib\nlet l = size\nn = l([1, 2]) + measure([1])\n\
+                 def twice(v: Int[]): Int { l(v) + size(v) }",
+            ),
+            ("app/other.gcsl", "m = measure([1, 2, 3]) + twice([1])"),
+        ];
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{n = 3; twice = fn(v: List<Int>): Int}"
+        );
+        assert_eq!(value(&files, "app/other.gcsl"), "{m = 5}");
+        assert_eq!(value(&files, "lib/a.gcsl"), "{size = builtin len}");
+        // Read whole, a record holding one is a use of it as a value.
+        let mut whole = files.to_vec();
+        whole.push(("app/whole.gcsl", "import lib\nall = lib"));
+        assert_eq!(
+            messages(&whole, "app/whole.gcsl"),
+            ["`len` is a built-in function and cannot be used as a value yet"]
+        );
+    }
+
+    #[test]
+    fn int_and_float_are_values_of_their_function_types() {
+        for (text, expected) in [
+            ("= int(2.7)", "2"),
+            ("= int(-2.7)", "-2"),
+            ("= int(x = 9.99)", "9"),
+            ("= float(3)", "3.0"),
+            ("= float(-3)", "-3.0"),
+            ("= int", "fn(x: Float): Int"),
+            ("import builtins\n= builtins.float", "fn(x: Int): Float"),
+            ("import int from builtins\n= int(1.5)", "1"),
+            // Passed, stored and called through a variable.
+            ("let i = int\n= i(-0.5)", "0"),
+            (
+                "fn apply(f: fn(x: Float): Int, v: Float): Int { f(v) }\n= apply(int, 7.5)",
+                "7",
+            ),
+            ("let fs = [float, float]\n= fs[1](2)", "2.0"),
+            ("let r = { f = float }\n= r.f(4)", "4.0"),
+            ("let mut f = int\nf := int\n= f(3.5)", "3"),
+            ("= half(3)", "1.5"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // Truncation toward zero fails when the result is no `Int`.
+        for (text, message) in [
+            ("= int(1e300)", "integer overflow"),
+            ("= int(-1e300)", "integer overflow"),
+            ("= int(1.0 / 0.0)", "integer overflow"),
+            ("= int(0.0 / 0.0)", "cannot truncate NaN to an Int"),
+            ("let i = int\n= i(1e300)", "integer overflow"),
+        ] {
+            assert_eq!(lone(text).unwrap_err(), [message], "{text}");
+        }
+        assert_eq!(
+            lone("= int(9223372036854774784.0)").unwrap(),
+            "9223372036854774784"
+        );
+        assert_eq!(
+            lone("= int(-9223372036854775808.0)").unwrap(),
+            "-9223372036854775808"
+        );
+        // Functions have no equality, built-in ones included.
+        assert_eq!(
+            lone("= int === int").unwrap_err(),
+            ["cannot compare functions"]
+        );
+    }
+
+    #[test]
+    fn a_file_s_own_names_shadow_the_prelude_s_silently() {
+        // A field, a `def`, a `let` and a `fn`: no clash, and the built-in
+        // is gone there.
+        for (text, expected) in [
+            ("len = 1\nn = len + 1", "{len = 1; n = 2}"),
+            (
+                "def len(v: Int[]): Int { v[0] + 41 }\nn = len([1])",
+                "{len = fn(v: List<Int>): Int; n = 42}",
+            ),
+            ("let len = 5\nn = len", "{n = 5}"),
+            ("fn len(): Int { 7 }\nn = len()", "{n = 7}"),
+            ("let int = 2\nn = int * 3", "{n = 6}"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // A `let` shadows from its item on, as it always has.
+        assert_eq!(
+            lone("n = len([1])\nlet len = 5\nm = len").unwrap(),
+            "{n = 1; m = 5}"
+        );
+        // A field of the directory, or of a directory above, shadows it in
+        // every file of the directory, and an explicit import does too.
+        let files = [
+            ("workspace.gcsl", "len = 3"),
+            ("sub/a.gcsl", "n = len + 1"),
+            ("sub/b.gcsl", "import int from builtins\nm = len + int(1.5)"),
+        ];
+        assert_eq!(value(&files, "sub/a.gcsl"), "{n = 4}");
+        assert_eq!(value(&files, "sub/b.gcsl"), "{m = 4}");
+        // Nothing of the implicit import is an alias the scan knows of.
+        let scan = ws(&[("workspace.gcsl", ""), ("main.gcsl", "len = 1")]).unwrap();
+        let names: Vec<&str> = scan.files[2]
+            .aliases
+            .iter()
+            .map(|alias| scan.names.get(alias.name))
+            .collect();
+        assert_eq!(names, ["int", "float", "half"]);
+        assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
+        assert!(scan.files[0].aliases.iter().all(|alias| !alias.implicit));
+    }
+
+    #[test]
+    fn an_explicit_star_from_the_prelude_conflicts_as_any() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "import * from prelude\nlen = 3"),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `len` is defined in two files at main.gcsl (imported here); \
+             <stdlib>/prelude.gcsl: defined here; main.gcsl: defined here"
+        );
+        // The same for the `builtins` module, whose side has no definition.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "import * from builtins\nlen = 3"),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `len` is defined in two files at main.gcsl (imported here); \
+             main.gcsl: defined here; note: `len` is a built-in function"
+        );
+        // An explicit import of the prelude's name and the implicit one are
+        // one cell: no conflict.
+        assert_eq!(
+            lone("import * from prelude\nn = len([1, 2])").unwrap(),
+            "{n = 2}"
+        );
+        // A `let` of an imported name is the clash it always was.
+        assert_eq!(
+            lone("import len from prelude\nlet len = 1").unwrap_err(),
+            ["`len` is imported in this file"]
+        );
+    }
+
+    #[test]
+    fn the_standard_modules_names_are_reserved() {
+        for (files, message, input) in [
+            (
+                &[("workspace.gcsl", ""), ("prelude.gcsl", "x = 1")][..],
+                "`prelude` is the name of a standard module",
+                Some(1),
+            ),
+            (
+                &[("builtins/a.gcsl", "x = 1"), ("workspace.gcsl", "")][..],
+                "`builtins` is the name of a built-in module",
+                Some(1),
+            ),
+            (
+                &[("builtins.gcsl", ""), ("workspace.gcsl", "")][..],
+                "`builtins` is the name of a built-in module",
+                Some(1),
+            ),
+        ] {
+            assert_eq!(
+                error(files),
+                (message.to_owned(), input, vec![]),
+                "{files:?}"
+            );
+        }
+        // Below the root, a name of a path of its own.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/prelude.gcsl", "x = 1"),
+            ("main.gcsl", "import lib.prelude\nn = prelude.x + len([1])"),
+        ];
+        assert_eq!(value(&files, "main.gcsl"), "{n = 2}");
+        // A path of more than one segment never names a standard module.
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "import prelude.len")];
+        assert_eq!(error(&files).0, "no module `prelude.len`");
+    }
+
+    #[test]
+    fn a_lone_file_imports_only_the_standard_library() {
+        assert_eq!(
+            lone("import nothing").unwrap_err(),
+            [
+                "`nothing` is not a built-in or standard module, and there is no \
+                 `workspace.gcsl` above this file"
+            ]
+        );
+        assert_eq!(
+            lone("x = 1 + true\nimport a from c.d").unwrap_err(),
+            [
+                "cannot add Int and Bool",
+                "`c.d` is not a built-in or standard module, and there is no \
+                 `workspace.gcsl` above this file"
+            ]
+        );
+        assert_eq!(lone("import builtins\n= builtins.len([1])").unwrap(), "1");
+        assert_eq!(lone("import prelude\n= prelude.half(1)").unwrap(), "0.5");
+        // Its diagnostics name no input; a standard file's names its own.
+        let source = SourceFile::new("lone.gcsl", "x = 1 + true").unwrap();
+        assert_eq!(crate::run(&source).unwrap_err()[0].input, None);
+        let source = SourceFile::new("lone.gcsl", "import * from prelude\nlen = 1").unwrap();
+        let error = &crate::run(&source).unwrap_err()[0];
+        assert_eq!(error.input, None);
+        let inputs: Vec<Option<u32>> = error.labels.iter().map(|l| l.input).collect();
+        assert_eq!(inputs, [Some(0), None]);
+    }
+
+    #[test]
+    fn the_table_of_standard_files_is_the_stdlib_directory() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../stdlib");
+        let mut found: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "gcsl"))
+            .map(|path| {
+                let stem = path.file_stem().unwrap().to_str().unwrap().to_owned();
+                (stem, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect();
+        found.sort();
+        let table: Vec<(String, String)> = crate::STANDARD
+            .iter()
+            .map(|&(stem, text)| (stem.to_owned(), text.to_owned()))
+            .collect();
+        assert_eq!(table, found);
+        // Each is a standard file, in path order, named under `<stdlib>/`.
+        let names: Vec<String> = standard_sources()
+            .iter()
+            .map(|source| source.name().to_owned())
+            .collect();
+        let expected: Vec<String> = found
+            .iter()
+            .map(|(stem, _)| format!("<stdlib>/{stem}.gcsl"))
+            .collect();
+        assert_eq!(names, expected);
     }
 }

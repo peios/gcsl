@@ -170,10 +170,14 @@
 //!
 //! A list literal lowers to a `MakeList` of its elements' expressions, in
 //! source order, a spread's operand wrapped in a `Spread`, and an index to
-//! an `Index` of the element's kind. A call of a built-in function, whose
-//! callee the checker resolved to [`VarRef::Builtin`], lowers to the
-//! built-in's own node, of its arguments as the checker bound them: `len`
-//! to a `ListLen` of its list. A range lowers to a `Range` of its bounds,
+//! an `Index` of the element's kind. A call of a built-in function whose
+//! typing is special, whose callee the checker resolved to
+//! [`VarRef::Builtin`] (the name of `len`, or an alias of it: see the
+//! checker's "The alias rule, temporary"), lowers to the built-in's own
+//! node, of its arguments as the checker bound them, the callee never read:
+//! `len` to a `ListLen` of its list. A call of an ordinary built-in
+//! function (`int`, `float`) is a `Call` of its callee, a read of its cell,
+//! as a call of any function value is. A range lowers to a `Range` of its bounds,
 //! flagged if it is inclusive, and a `for` to a `For` on the slot the
 //! checker gave its variable (see [`crate::check::Resolution::for_slot`]),
 //! whose parts are its iterable, its guard, if it has one, and its body,
@@ -2004,9 +2008,12 @@ impl Lowerer<'_> {
         Ok(captures)
     }
 
-    /// Lowers the call spanning `span` of the built-in function `builtin`
-    /// with the arguments `args`, of kind `kind`, to the built-in's own
-    /// node: `len` to a `ListLen` of its list.
+    /// TEMPORARY (alias rule): lowers the call spanning `span` of the
+    /// built-in function `builtin`, whose typing is special, with the
+    /// arguments `args`, of kind `kind`, to the built-in's own node: `len` to
+    /// a `ListLen` of its list. (With a polymorphic type for `len`, R11 of
+    /// `docs/INFERENCE_REQS.md`, a call of it is an ordinary call, or this
+    /// stays as a specialisation of a known callee.)
     fn lower_builtin(
         &mut self,
         builtin: Builtin,
@@ -2021,6 +2028,11 @@ impl Lowerer<'_> {
             }
             Builtin::Len => Err(InternalError {
                 message: "a call of `len` typed as something other than an Int",
+                span,
+            }),
+            // An ordinary built-in is called as any function value is.
+            Builtin::Int | Builtin::Float => Err(InternalError {
+                message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),
         }
@@ -2770,6 +2782,23 @@ mod tests {
         let mut types = TypeTable::new();
         let (checked, _) = check(&ast, &mut types).unwrap();
         let ir = lower(&ast, &checked, &types, 0).unwrap();
+        ir.pretty(ast.names()).to_string()
+    }
+
+    /// As [`lower_text`], but checking `text` as a lone file is, beside the
+    /// standard library, so that the prelude's names, `len` among them, are
+    /// its: what the tests of `len` lower with. Its slots come after the
+    /// standard library's.
+    fn lower_prelude(text: &str) -> (Ast, Ir) {
+        let (ast, types, output) = crate::workspace::check_beside_prelude(text);
+        let checked = output.unwrap().checked;
+        let ir = lower(&ast, &checked, &types, 0).unwrap();
+        (ast, ir)
+    }
+
+    /// As [`dump`], with [`lower_prelude`].
+    fn dump_prelude(text: &str) -> String {
+        let (ast, ir) = lower_prelude(text);
         ir.pretty(ast.names()).to_string()
     }
 
@@ -4452,16 +4481,16 @@ mod tests {
     #[test]
     fn len_lowers_to_the_length_of_its_list() {
         assert_eq!(
-            dump("len(list = [1])"),
+            dump_prelude("len(list = [1])"),
             "(block @0..15\n\
              \x20 (list-len @0..15\n\
              \x20   (make-list @11..14\n\
              \x20     (int 1 @12..13))))"
         );
-        let ir = lower_text("len([1])");
+        let (_, ir) = lower_prelude("len([1])");
         assert_eq!(ir.kind_of(result_of(&ir)), ValueKind::Int);
         // Its list is awaited if it may be a future.
-        let shown = dump("let xs = lazy [1]\nlen(xs)");
+        let shown = dump_prelude("let xs = lazy [1]\nlen(xs)");
         assert!(
             shown.contains("(list-len @18..25\n    (await @22..24\n"),
             "{shown}"
@@ -5132,9 +5161,28 @@ mod tests {
     /// names of a record's fields sorted, and the lines sorted, so that
     /// neither slots nor item order count.
     fn decided(text: &str) -> (String, Vec<String>, Vec<String>) {
-        let ast = parse_text(text);
-        let mut types = TypeTable::new();
-        let output = match crate::check::Checker::new(&ast, &mut types).check() {
+        decided_by(text, |text| {
+            let ast = parse_text(text);
+            let mut types = TypeTable::new();
+            let output = crate::check::Checker::new(&ast, &mut types).check();
+            (ast, types, output)
+        })
+    }
+
+    /// What a check of a text gives: its tree, its types, and the outcome.
+    type CheckedText = (
+        Ast,
+        TypeTable,
+        Result<crate::check::CheckOutput, Vec<crate::diagnostic::Diagnostic>>,
+    );
+
+    /// As [`decided`], `text` checked by `check`.
+    fn decided_by(
+        text: &str,
+        check: fn(&str) -> CheckedText,
+    ) -> (String, Vec<String>, Vec<String>) {
+        let (ast, types, output) = check(text);
+        let output = match output {
             Ok(output) => output,
             Err(diagnostics) => {
                 let mut messages: Vec<String> = diagnostics
@@ -5195,6 +5243,52 @@ mod tests {
         let first = decided(&forward);
         assert_eq!(first, decided(&backward), "{forward}\n----\n{backward}");
         first
+    }
+
+    /// As [`order_free`], each order checked as a lone file is, beside the
+    /// standard library, so that the prelude's names are its.
+    fn order_free_beside_prelude(parts: &[&str]) -> (String, Vec<String>, Vec<String>) {
+        let forward = parts.join("\n");
+        let backward: Vec<&str> = parts.iter().rev().copied().collect();
+        let backward = backward.join("\n");
+        let check = crate::workspace::check_beside_prelude;
+        let first = decided_by(&forward, check);
+        assert_eq!(
+            first,
+            decided_by(&backward, check),
+            "{forward}\n----\n{backward}"
+        );
+        first
+    }
+
+    #[test]
+    fn the_prelude_s_names_do_not_depend_on_order() {
+        // Its names read anywhere, shadowed or not, as the items fall.
+        let (shown, messages, lines) = order_free_beside_prelude(&[
+            "n = len(xs) + count(xs)",
+            "xs = [1, 2, 3]",
+            "fn count(v: Int[]): Int { len(v) }",
+            "h = half(n)",
+            "def float(x: Int): Float { if x > 0 { 0.5 } else { 1.5 } }",
+            "f = float(2)",
+            "i = int(2.5)",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(
+            shown,
+            "{f: Float, float: fn(x: Int): Float, h: Float, i: Int, n: Int, xs: List<Int>}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("list-len")),
+            "{lines:?}"
+        );
+        // The file's own `float` shadows the prelude's silently: it is 0.5.
+        let text = "def float(x: Int): Float { if x > 0 { 0.5 } else { 1.5 } }\nf = float(2)";
+        let f = crate::run(&SourceFile::new("t.gcsl", text).unwrap());
+        assert_eq!(
+            f.unwrap().value.to_string(),
+            "{float = fn(x: Int): Float; f = 0.5}"
+        );
     }
 
     #[test]

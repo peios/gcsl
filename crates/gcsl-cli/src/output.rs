@@ -26,17 +26,18 @@ pub fn diagnostics(source: &SourceFile, diagnostics: &[Diagnostic]) {
     let _ = stderr.write_all(renderer().render_all(diagnostics, source).as_bytes());
 }
 
-/// Renders `diagnostics` to stderr as [`diagnostics`] does, each against
-/// the source `source_of` gives for it, for diagnostics that do not all
-/// refer to one source.
+/// Renders `diagnostics` to stderr as [`diagnostics`] does, each part of a
+/// diagnostic against the source `source_of` gives for the input it names
+/// (`None` for none), for diagnostics that do not all refer to one source:
+/// a REPL line's, an earlier line's, or a standard file's.
 pub fn diagnostics_from<'a>(
     diagnostics: &[Diagnostic],
-    source_of: impl Fn(&Diagnostic) -> &'a SourceFile,
+    source_of: impl Fn(Option<u32>) -> &'a SourceFile,
 ) {
     let renderer = renderer();
     let text = diagnostics
         .iter()
-        .map(|diagnostic| renderer.render(diagnostic, source_of(diagnostic)))
+        .map(|diagnostic| renderer.render_in(diagnostic, &source_of))
         .collect::<Vec<_>>()
         .join("\n");
     let mut stderr = io::stderr().lock();

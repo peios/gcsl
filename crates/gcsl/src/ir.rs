@@ -63,8 +63,14 @@
 //! list node for a spread element; the node says whether it has any spread,
 //! so that one without is built at its known length. An index is an
 //! [`IrKind::Index`], of the kind of the element read, like a field access.
-//! A built-in function's call lowers to a node of its own, specialised as
-//! any operator is: `len` to [`IrKind::ListLen`].
+//! A call of a built-in function whose typing is special lowers to a node
+//! of its own, specialised as any operator is: `len`'s to
+//! [`IrKind::ListLen`]. An ordinary built-in function (`int`, `float`) is a
+//! value of a function type, which a name or a parameter may hold as well
+//! as any closure, so a call of it is an [`IrKind::Call`] like any other:
+//! no node of its own could be chosen without knowing which function a
+//! value is, and the evaluator applies it when its callee turns out to be
+//! one (see [`crate::eval`], "Calls"). No node is added for them.
 //!
 //! A range, `..` or `..=`, is an [`IrKind::Range`] of its two `Int`
 //! bounds, a list node. A `for` is an [`IrKind::For`]: the slot
