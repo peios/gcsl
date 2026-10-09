@@ -25,10 +25,15 @@
 //! its own kind, [`Value::Builtin`]: the [`Builtin`] it is, unboxed, with
 //! no code or captures, since it is implemented in Rust. It is a function
 //! ([`ValueKind::Fn`]): a call of it through a value, a parameter say, is
-//! applied by the evaluator (see [`crate::eval`]). It shows as its type, or
-//! as `builtin len` for one whose typing is special, and two compare equal
-//! when they are the same built-in, which no program can ask, since the
-//! checker rejects comparing functions.
+//! applied by the evaluator (see [`crate::eval`]). It shows as its type, as
+//! the type table shows it (`fn(argv: List<String>) -> {status: Int,
+//! stderr: String, stdout: String}` for `exec`, its record's fields by
+//! name, and `fn(message: String): Never` for `panic`), or as `builtin len`
+//! for one whose typing is special, and two compare equal when they are the
+//! same built-in, which no program can ask, since the checker rejects
+//! comparing functions. The record `exec` returns is an ordinary
+//! [`Record`], whose [`Layout`] (`status`, `stdout`, `stderr`, in that
+//! order) the driver of a run builds once and every such record shares.
 
 use std::cell::RefCell;
 use std::fmt;
@@ -721,9 +726,9 @@ impl Value {
 /// A function shows as its type, `fn(x: Int): Int`, in both forms, since it
 /// has no source form of its own to show, and so does a future, as
 /// `Future<Int>`, whether it has run or not: showing it never awaits it. A
-/// built-in function shows as its type too, `fn(x: Float): Int`; one whose
-/// typing is special has no type to show, and shows as `builtin len` (see
-/// [`Builtin::display`]).
+/// built-in function shows as its type too, `fn(x: Float): Int`, as the
+/// type table shows it; one whose typing is special has no type to show,
+/// and shows as `builtin len` (see [`Builtin::display`]).
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1147,6 +1152,22 @@ mod tests {
         let mut names = Names::new();
         let record = record(&layout(&mut names, &["f"]), vec![int]);
         assert_eq!(record.to_string(), "{f = fn(x: Float): Int}");
+    }
+
+    #[test]
+    fn exec_and_panic_show_as_their_types() {
+        let exec = Value::Builtin(Builtin::Exec);
+        assert_eq!(exec.kind(), ValueKind::Fn);
+        assert_eq!(
+            exec.to_string(),
+            "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+        );
+        assert_eq!(exec.repr().to_string(), exec.to_string());
+        assert_eq!(
+            Value::Builtin(Builtin::Panic).to_string(),
+            "fn(message: String): Never"
+        );
+        assert_ne!(exec, Value::Builtin(Builtin::Panic));
     }
 
     #[test]

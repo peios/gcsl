@@ -1,0 +1,4 @@
+# A pure function whose field is a step that runs a program when awaited.
+def pkg(name: String): { build: Future<String> } {
+    { build = lazy { sh("echo make {name}") } }
+}

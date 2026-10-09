@@ -1863,11 +1863,12 @@
 //!
 //! The built-in functions are the members of the `builtins` module, a
 //! module implemented in Rust (see [`crate::workspace`], "The standard
-//! library"): `len`, `int` and `float`, each a [`Builtin`], with its name,
-//! its parameters' names, its [`Effect`] (every one is pure) and its
-//! [`Typing`]. The checker knows no name of one: a file has them as it has
-//! any other module's members, by an import, or by the prelude, which
-//! binds `len`, `int` and `float` to them and which every file and session
+//! library"): `len`, `int`, `float`, `exec` and `panic`, each a
+//! [`Builtin`], with its name, its parameters' names, its [`Effect`]
+//! (`exec` is impure, every other one pure) and its [`Typing`]. The checker
+//! knows no name of one: a file has them as it has any other module's
+//! members, by an import, or by the prelude, which binds `len`, `int`,
+//! `float`, `exec` and `panic` to them and which every file and session
 //! input imports implicitly, as the last and yielding source of its view.
 //! A file that declares its own `len` (a field, a `def`, a `let`, a `fn`)
 //! shadows the prelude's, and loses the built-in there. The cell of each is
@@ -1875,15 +1876,31 @@
 //! [`crate::Value::Builtin`], its type each one's, as the workspace's
 //! context gives every cell's.
 //!
-//! An ORDINARY built-in ([`Typing::Ordinary`]), `int` (`fn(x: Float):
-//! Int`, truncation toward zero) or `float` (`fn(x: Int): Float`), has a
-//! function type the type table can hold, and is a value of that type like
-//! any function: passed, stored, called through a variable or a parameter,
-//! and a call of it is a call like any other, typed by its type, binding
-//! its arguments by its parameters' names, lowered to a `Call` (see
-//! [`crate::eval`], which applies a built-in it finds called). Like any
-//! function it has no equality: `int === int` is "cannot compare
-//! functions".
+//! An ORDINARY built-in ([`Typing::Ordinary`]) has a function type the type
+//! table can hold, of any parameters, result and effect, which
+//! [`Builtin::ty`] interns with the table in hand (its parameters' and its
+//! result's names into the run's names): `int` (`fn(x: Float): Int`,
+//! truncation toward zero), `float` (`fn(x: Int): Float`), `exec`
+//! (`fn(argv: List<String>) -> {status: Int, stderr: String, stdout:
+//! String}`, which runs a program) and `panic` (`fn(message: String):
+//! Never`, which ends the run with a runtime error of the program's own
+//! wording). It is a value of that type like any function: passed, stored,
+//! called through a variable or a parameter, and a call of it is a call
+//! like any other, typed by its type, binding its arguments by position or
+//! by its parameters' names, awaiting a future argument as any call
+//! does, lowered to a `Call` (see [`crate::eval`], which applies a built-in
+//! it finds called). So a call of `exec` from a pure function is "cannot
+//! call an impure function from a pure function", as for any impure
+//! function, and from a `lazy`, an impure or memoised function or the top
+//! level it is fine. Like any function it has no equality: `int === int` is
+//! "cannot compare functions".
+//!
+//! A call of `panic` is of type `Never`, its result type, as a `break` is:
+//! `if c { panic("x") } else { 1 }` is an `Int`, an `if` whose branch
+//! panics needs no `else`, and what follows a panicking statement is never
+//! run (see [Never](#never)). `panic` fits a parameter of type `fn(String):
+//! Int`, since `Never` is a subtype of every result. `Never` is shown in its
+//! type although no annotation can write it.
 //!
 //! A SPECIAL built-in ([`Typing::Special`]), `len`, is typed call by call
 //! by the checker, since it is generic: `len(list)`'s argument is measured
@@ -2292,21 +2309,24 @@ pub enum Builtin {
     Int,
     /// `float(x: Int): Float`: the `Float` nearest `x`.
     Float,
+    /// `exec(argv: List<String>) -> {status: Int, stderr: String, stdout:
+    /// String}`: runs the program `argv[0]` with the arguments `argv[1..]`
+    /// and reports what it did (see [`crate::eval`]). Impure.
+    Exec,
+    /// `panic(message: String): Never`: ends the run with the runtime error
+    /// `message`, at the call.
+    Panic,
 }
 
 /// How a built-in function is typed (see [Built-in
 /// functions](#built-in-functions)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Typing {
-    /// By a function type the type table can hold, a pure function of one
-    /// parameter, named as [`Builtin::params`] says: its value is a value
-    /// of that type, and a call of it is a call like any other.
-    Ordinary {
-        /// The parameter's type.
-        param: TyId,
-        /// The result's type.
-        result: TyId,
-    },
+    /// By a function type the type table can hold, of any parameters, named
+    /// as [`Builtin::params`] says, any result and any effect, which
+    /// [`Builtin::ty`] interns, the table in hand: its value is a value of
+    /// that type, and a call of it is a call like any other.
+    Ordinary,
     /// TEMPORARY (alias rule): call by call, by the checker's rule for it,
     /// since no function type the table can hold is its type (`len`: a
     /// `List<T>` for any `T` to `Int`); its value has an opaque type of its
@@ -2319,7 +2339,22 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 3] = [Builtin::Len, Builtin::Int, Builtin::Float];
+    pub const ALL: [Builtin; 5] = [
+        Builtin::Len,
+        Builtin::Int,
+        Builtin::Float,
+        Builtin::Exec,
+        Builtin::Panic,
+    ];
+
+    /// The most parameters any built-in function has: what a call of one
+    /// collects its arguments into (see [`crate::eval`]).
+    pub const MAX_PARAMS: usize = 1;
+
+    /// The names of the fields of what `exec` returns, in the order of the
+    /// record it builds: its exit status, its standard output and its
+    /// standard error.
+    pub const EXEC_FIELDS: [&'static str; 3] = ["status", "stdout", "stderr"];
 
     /// The name of its member of the `builtins` module.
     #[must_use]
@@ -2328,24 +2363,32 @@ impl Builtin {
             Builtin::Len => "len",
             Builtin::Int => "int",
             Builtin::Float => "float",
+            Builtin::Exec => "exec",
+            Builtin::Panic => "panic",
         }
     }
 
     /// The names of its parameters, in order, which named arguments match.
+    /// None has more than [`Builtin::MAX_PARAMS`].
     #[must_use]
     pub const fn params(self) -> &'static [&'static str] {
         match self {
             Builtin::Len => &["list"],
             Builtin::Int | Builtin::Float => &["x"],
+            Builtin::Exec => &["argv"],
+            Builtin::Panic => &["message"],
         }
     }
 
     /// What it may do: only a pure one may be called from a pure function.
-    /// Every built-in function is pure.
+    /// `exec`, which runs a program, is impure; every other built-in
+    /// function is pure, `panic` included, which ends the run as a division
+    /// by zero does.
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
-            Builtin::Len | Builtin::Int | Builtin::Float => Effect::Pure,
+            Builtin::Exec => Effect::Impure,
+            Builtin::Len | Builtin::Int | Builtin::Float | Builtin::Panic => Effect::Pure,
         }
     }
 
@@ -2354,44 +2397,58 @@ impl Builtin {
     pub const fn typing(self) -> Typing {
         match self {
             Builtin::Len => Typing::Special,
-            Builtin::Int => Typing::Ordinary {
-                param: TyId::FLOAT,
-                result: TyId::INT,
-            },
-            Builtin::Float => Typing::Ordinary {
-                param: TyId::INT,
-                result: TyId::FLOAT,
-            },
+            Builtin::Int | Builtin::Float | Builtin::Exec | Builtin::Panic => Typing::Ordinary,
         }
     }
 
     /// How its value is shown: as its type, `fn(x: Float): Int`, for an
-    /// ordinary one, as any function is; as `builtin len` for a special one.
+    /// ordinary one, as any function is, and as the type table shows that
+    /// type (a record's fields by name, `panic`'s result `Never`, which no
+    /// annotation can write); as `builtin len` for a special one.
     #[must_use]
     pub const fn display(self) -> &'static str {
         match self {
             Builtin::Len => "builtin len",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
+            Builtin::Exec => {
+                "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+            }
+            Builtin::Panic => "fn(message: String): Never",
         }
     }
 
-    /// The type of its value, interned into `types`, its parameter's name
-    /// into `names`: its function type for an ordinary one, the opaque type
-    /// of a special one.
+    /// The type of its value, interned into `types`, the names of its
+    /// parameters, and of the fields of its result, into `names`: for an
+    /// ordinary one its function type, its parameters' types and its result
+    /// built here, with its [`Builtin::effect`]; the opaque type of a
+    /// special one.
     pub(crate) fn ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
-        match self.typing() {
-            Typing::Ordinary { param, result } => {
-                let params = self
-                    .params()
-                    .iter()
-                    .map(|&text| (Some(names.intern(text)), param));
-                types.fn_type(params, result, self.effect())
+        // Each parameter's type, in the order of `params`, and the result's.
+        let (param_types, result): ([TyId; Builtin::MAX_PARAMS], TyId) = match self {
+            Builtin::Int => ([TyId::FLOAT], TyId::INT),
+            Builtin::Float => ([TyId::INT], TyId::FLOAT),
+            Builtin::Exec => {
+                let argv = types.list(TyId::STRING);
+                let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
+                let result = types.record([
+                    (status, TyId::INT),
+                    (stdout, TyId::STRING),
+                    (stderr, TyId::STRING),
+                ]);
+                ([argv], result)
             }
+            Builtin::Panic => ([TyId::STRING], types.never()),
             // TEMPORARY (alias rule): the opaque type, until a polymorphic
             // one (R11 of `docs/INFERENCE_REQS.md`).
-            Typing::Special => types.builtin(self),
-        }
+            Builtin::Len => return types.builtin(self),
+        };
+        let params = self
+            .params()
+            .iter()
+            .zip(param_types)
+            .map(|(&text, ty)| (Some(names.intern(text)), ty));
+        types.fn_type(params, result, self.effect())
     }
 }
 
@@ -21404,6 +21461,214 @@ mod tests {
         assert_eq!(
             type_of_f("fn f(x: Int): Int { int(float(x) * 1.5) }"),
             "fn(x: Int): Int"
+        );
+    }
+
+    /// The type `exec` returns, as the type table shows it.
+    const EXEC_RESULT: &str = "{status: Int, stderr: String, stdout: String}";
+
+    #[test]
+    fn exec_and_panic_have_function_types() {
+        assert_eq!(
+            shown_result("exec"),
+            "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
+        );
+        assert_eq!(shown_result("panic"), "fn(message: String): Never");
+        assert_eq!(
+            shown_result("import builtins\nbuiltins.exec"),
+            shown_result("exec")
+        );
+        // The summary of slice 29.
+        assert_eq!(
+            file_type(
+                "r = exec([\"ls\", \"-1\", \"src\"])\n\
+                 lines = r.stdout\n\
+                 ok = r.status == 0\n\
+                 out = sh(\"git rev-parse HEAD\")"
+            ),
+            format!("{{lines: String, ok: Bool, out: String, r: {EXEC_RESULT}}}")
+        );
+        assert_eq!(
+            type_of_f(
+                "fn f(name: String): { build: Future<String> } { { build = lazy { sh(\"make {name}\") } } }"
+            ),
+            "fn(name: String | Future<String>): {build: Future<String>}"
+        );
+        assert_eq!(
+            type_of_f("fn f(n: Int): Int {\nif n < 0 { panic(\"negative size {n}\") }\nn\n}"),
+            "fn(n: Int): Int"
+        );
+        // Arguments bind by position or by name, as any call's.
+        assert_eq!(shown_result("exec(argv = [\"true\"])"), EXEC_RESULT);
+        assert_eq!(shown_result("panic(message = \"no\")"), "Never");
+        assert_eq!(messages("exec([1])"), ["mismatched types"]);
+        assert_eq!(messages("exec(\"true\")"), ["mismatched types"]);
+        assert_eq!(messages("panic(1)"), ["mismatched types"]);
+        assert_eq!(
+            messages("exec(args = [\"true\"])"),
+            ["unknown argument `args`", "missing argument `argv`"]
+        );
+        assert_eq!(messages("panic()"), ["expected 1 argument, found 0"]);
+        // A value of the built-in's type: the display of each ordinary
+        // built-in is the type table's, so that the two never drift.
+        let mut types = TypeTable::new();
+        let mut names = Names::new();
+        for builtin in Builtin::ALL {
+            let ty = builtin.ty(&mut types, &mut names);
+            let shown = types.display(ty, &names).to_string();
+            match builtin.typing() {
+                Typing::Ordinary => assert_eq!(builtin.display(), shown),
+                Typing::Special => assert_eq!(builtin.display(), "builtin len"),
+            }
+            assert!(builtin.params().len() <= Builtin::MAX_PARAMS);
+        }
+    }
+
+    #[test]
+    fn exec_is_impure_and_called_as_any_impure_function() {
+        // From a pure function, the existing error.
+        let text = "fn f(): Int { exec([\"true\"]).status }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot call an impure function from a pure function"
+        );
+        assert_eq!(found[0].span, at(text, "exec([\"true\"])"));
+        assert_eq!(
+            labels(&found[0])[0],
+            (
+                at(text, "exec"),
+                "this is fn(argv: List<String>) -> {status: Int, stderr: String, stdout: \
+                 String}"
+            )
+        );
+        // Through a variable or a parameter, the same.
+        assert_eq!(
+            messages("let e = exec\nfn f(): Int { e([\"true\"]).status }"),
+            ["cannot call an impure function from a pure function"]
+        );
+        // From a `lazy` in a pure function, an impure or memoised function,
+        // and the top level, it is fine.
+        assert_eq!(
+            type_of_f("fn f(): Future<Int> { lazy { exec([\"true\"]).status } }"),
+            "fn(): Future<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f() -> Int { exec([\"true\"]).status }"),
+            "fn() -> Int"
+        );
+        assert_eq!(
+            type_of_f("fn f(a: String) ->> String { exec([a]).stdout }"),
+            "fn(a: String) ->> String"
+        );
+        assert_eq!(shown_result("exec([\"true\"]).status"), "Int");
+        // As a value: passed, stored, called through a variable; it has no
+        // equality, as no function has. Its parameter is a present list, so
+        // it fits a written impure function type whose parameter says
+        // `Present`, as an impure function declared so does, and not one
+        // whose bare parameter may be a future.
+        let pick = "fn pick(f: fn(argv: Present<List<String>>) -> {status: Int}): \
+                    fn(Present<List<String>>) -> {status: Int} { f }\n";
+        assert_eq!(
+            shown_result(&format!("{pick}let e = pick(exec)\ne([\"true\"]).status")),
+            "Int | Future<Int>"
+        );
+        assert_eq!(
+            messages("fn pick(f: fn(argv: List<String>) -> {status: Int}): Int { 1 }\npick(exec)"),
+            ["mismatched types"]
+        );
+        assert_eq!(
+            shown_result("let r = { e = exec }\nlet e = r.e\ne([\"true\"]).stdout"),
+            "String"
+        );
+        assert_eq!(messages("exec === exec"), ["cannot compare functions"]);
+        assert_eq!(messages("panic === panic"), ["cannot compare functions"]);
+    }
+
+    #[test]
+    fn exec_awaits_a_future_argument_as_any_call_does() {
+        // At the top level and in an impure function, a future list is
+        // awaited at the top, as an argument of any function whose
+        // parameter is a present `List<String>`.
+        assert_eq!(
+            marks("let xs = lazy [\"true\"]\nexec(xs)"),
+            vec![("xs", AwaitMark::Top)]
+        );
+        assert_eq!(
+            marks("fn f(xs: Future<List<String>>) -> Int { exec(xs).status }"),
+            vec![("xs", AwaitMark::Top)]
+        );
+        // A list of futures is awaited deeply, as for any parameter of a
+        // present `List<String>`.
+        assert_eq!(
+            marks("let xs = [lazy \"true\"]\nexec(xs)"),
+            vec![("xs", AwaitMark::Deep)]
+        );
+        // In a pure function, the call is the purity error, and so is the
+        // await, as for any call.
+        assert_eq!(
+            messages("fn f(xs: Future<List<String>>): Int { exec(xs).status }"),
+            [
+                "cannot call an impure function from a pure function",
+                "cannot use a value that may be a future in a pure function"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_of_panic_is_of_type_never() {
+        assert_eq!(shown_result("panic(\"x\")"), "Never");
+        assert_eq!(
+            shown_result("let c = true\nif c { panic(\"x\") } else { 1 }"),
+            "Int"
+        );
+        assert_eq!(
+            shown_result("let c = true\nif c { 1 } else { panic(\"x\") }"),
+            "Int"
+        );
+        // An `if` whose branch panics needs no `else`.
+        assert_eq!(
+            type_of_f("fn f(c: Bool): Int {\nif c { panic(\"x\") }\n1\n}"),
+            "fn(c: Bool): Int"
+        );
+        // A `let` of it and a statement of it are fine; what follows is
+        // never run, which is a warning, not an error.
+        for text in ["let x = panic(\"no\")\n1", "panic(\"no\")\n1"] {
+            let found = warnings(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(found[0].message, "this is never run", "{text}");
+        }
+        assert!(warnings("let x = panic(\"no\")").is_empty());
+        assert!(warnings("panic(\"no\")").is_empty());
+        // `panic` fits a parameter of type `fn(String): Int`, since `Never`
+        // fits every result.
+        assert_eq!(
+            shown_result("fn apply(f: fn(String): Int): Int { f(\"a\") }\napply(panic)"),
+            "Int"
+        );
+        assert_eq!(
+            shown_result("let p = panic\nlet fs: List<fn(m: String): Int> = [p]\nfs"),
+            "List<fn(m: String): Int>"
+        );
+        // Pure: a pure function may call it.
+        assert_eq!(
+            type_of_f("fn f(s: String): Int { panic(s) }"),
+            "fn(s: String): Int"
+        );
+    }
+
+    #[test]
+    fn exec_panic_and_sh_are_shadowed_as_any_prelude_name() {
+        assert_eq!(file_type("exec = 1\nn = exec + 1"), "{exec: Int, n: Int}");
+        assert_eq!(
+            file_type("def sh(n: Int): Int { n * 2 }\nx = sh(2)"),
+            "{sh: fn(n: Int): Int, x: Int}"
+        );
+        assert_eq!(shown_result("let panic = \"no\"\npanic"), "String");
+        assert_eq!(
+            shown_result("fn panic(m: String): Int { 0 }\npanic(\"x\")"),
+            "Int"
         );
     }
 

@@ -92,7 +92,9 @@
 //! files of a workspace never do. But it has the standard library, which
 //! it runs once, as it starts ([`Session::new`]), through the driver of a
 //! workspace that has no file of its own ([`crate::workspace`], "The
-//! standard library"), into its own names, types, frame and memo tables:
+//! standard library"), into its own names, types, frame and memo tables,
+//! keeping the layout of the records `exec` returns that the run built, for
+//! every input (see [`crate::eval`], "The built-in functions"):
 //! the built-in functions' cells are the first slots of its frame and the
 //! standard files' cells and slots the next, its scope's first free slot
 //! past them all; the standard files are its first inputs, so its own
@@ -149,7 +151,7 @@ use crate::lower;
 use crate::names::{Name, Names};
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
-use crate::value::Value;
+use crate::value::{Layout, Value};
 use crate::workspace::{self, Alias, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
@@ -167,6 +169,10 @@ pub struct Session {
     sources: Vec<SourceFile>,
     /// The memo tables of every memoised closure called by any input.
     memo: MemoTables,
+    /// The layout of the record `exec` returns, built once as the session
+    /// started, for every input; `None` only if the standard library
+    /// failed, when no input runs.
+    exec_result: Option<Rc<Layout>>,
     /// The standard library as it ran when the session started, beside
     /// which every input is checked; or, should it have failed, which is a
     /// bug, its diagnostics, which every input then fails with.
@@ -199,6 +205,7 @@ impl Session {
                 value_type: TyId::EMPTY,
                 sources,
                 memo: started.memo,
+                exec_result: Some(started.exec_result),
                 standard: Ok(Rc::new(started.standard)),
                 imports: Vec::new(),
             },
@@ -210,6 +217,7 @@ impl Session {
                 value_type: TyId::EMPTY,
                 sources,
                 memo: MemoTables::new(),
+                exec_result: None,
                 standard: Err(diagnostics),
                 imports: Vec::new(),
             },
@@ -285,7 +293,8 @@ impl Session {
             input,
         )?;
         let committed = self.committed_mutables();
-        match run_input(ir, &mut self.frame, &mut self.memo) {
+        let context = (&mut self.memo, self.exec_result.as_ref());
+        match run_input(ir, &mut self.frame, context) {
             Ok(value) => {
                 // A name the input bound that its scan could not see, as a
                 // spread's, shadows an import of it too.
@@ -355,18 +364,20 @@ pub(crate) fn lower_checked(
 
 /// Runs `ir`, an input of a session or a workspace, on `frame`, the top
 /// level's frame of every input so far, grown to the input's size, with
-/// `memo`, the memo tables of every input.
+/// `memo`, the memo tables of every input, and `exec_result`, the layout
+/// of what `exec` returns, built once for every input (see
+/// [`eval::eval_with`]).
 pub(crate) fn run_input(
     ir: Ir,
     frame: &mut Vec<Value>,
-    memo: &mut MemoTables,
+    (memo, exec_result): (&mut MemoTables, Option<&Rc<Layout>>),
 ) -> Result<Value, Diagnostic> {
     let ir = Rc::new(ir);
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    eval::eval_with(&ir, frame, memo)
+    eval::eval_with(&ir, frame, memo, exec_result)
 }
 
 #[cfg(test)]
@@ -1558,5 +1569,64 @@ mod tests {
         assert_eq!(failed[0].severity, Severity::Error);
         assert_eq!(value(&mut session, "v"), Value::Int(5));
         assert_eq!(messages(&mut session, "n"), vec!["undefined variable `n`"]);
+    }
+
+    #[test]
+    fn a_session_runs_exec_panic_and_sh() {
+        let mut session = Session::new();
+        // The five built-in functions' cells are its first slots.
+        assert_eq!(
+            &session.frame[..5],
+            Builtin::ALL.map(Value::Builtin).as_slice()
+        );
+        // On the first input, and on later ones, through a variable.
+        let shown = |value: Value| value.to_string();
+        assert_eq!(
+            shown(value(&mut session, "exec([\"echo\", \"hi\"])")),
+            "{status = 0; stdout = \"hi\\n\"; stderr = \"\"}"
+        );
+        assert_eq!(
+            value_type(&session),
+            "{status: Int, stderr: String, stdout: String}"
+        );
+        value(&mut session, "let r = exec([\"cat\"])");
+        value(&mut session, "let e = exec");
+        assert_eq!(
+            value(&mut session, "e([\"sh\", \"-c\", \"exit 4\"]).status"),
+            Value::Int(4)
+        );
+        assert_eq!(value(&mut session, "r.stdout"), Value::Str("".into()));
+        assert_eq!(
+            value(&mut session, "sh(\"echo s\")"),
+            Value::Str("s\n".into())
+        );
+        // Every record `exec` builds, in any input, has the session's one
+        // layout.
+        let Value::Record(record) = value(&mut session, "e([\"true\"])") else {
+            panic!("expected a record");
+        };
+        let layout = Rc::clone(session.exec_result.as_ref().unwrap());
+        assert!(Rc::ptr_eq(&record.layout, &layout));
+        let Value::Record(earlier) = value(&mut session, "r") else {
+            panic!("expected a record");
+        };
+        assert!(Rc::ptr_eq(&earlier.layout, &layout));
+        // A panic fails its input, which the session forgets; a failing `sh`
+        // is the prelude's panic, input 0.
+        assert_eq!(messages(&mut session, "let x = panic(\"stop\")"), ["stop"]);
+        assert_eq!(messages(&mut session, "x"), ["undefined variable `x`"]);
+        let failed = eval(&mut session, "sh(\"exit 3\")").unwrap_err();
+        assert_eq!(failed[0].message, "`exit 3` exited with status 3: ");
+        assert_eq!(failed[0].input, Some(0));
+        assert_eq!(
+            value(&mut session, "exec([\"true\"]).status"),
+            Value::Int(0)
+        );
+        // A later input shadows them as any earlier name.
+        value(&mut session, "let exec = 2");
+        assert_eq!(
+            value(&mut session, "exec + e([\"true\"]).status"),
+            Value::Int(2)
+        );
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! A *workspace* is the directory tree under a directory that holds a file
 //! named `workspace.gcsl`; finding it and reading its files is the CLI's,
-//! and this module performs no I/O: it is given the files as
+//! and this module reads no file: it is given the files as
 //! [`SourceFile`]s named by their paths relative to the root, `/`
 //! separated, and answers with diagnostics or values.
 //!
@@ -197,10 +197,11 @@
 //!
 //! Two kinds of module are not files of the workspace. `builtins` is a
 //! module implemented in Rust, a record of the built-in functions
-//! ([`Builtin`]): `len`, `int` and `float`. The *standard files* are the
-//! `.gcsl` files of the repository's `stdlib/` directory, compiled in
-//! ([`crate::STANDARD`], [`standard_sources`]): today only
-//! `prelude.gcsl`. Each is importable by a bare name, `import builtins`,
+//! ([`Builtin`]): `len`, `int`, `float`, `exec` and `panic`. The *standard
+//! files* are the `.gcsl` files of the repository's `stdlib/` directory,
+//! compiled in ([`crate::STANDARD`], [`standard_sources`]): today only
+//! `prelude.gcsl`, which binds the built-in functions and `sh`. Each is
+//! importable by a bare name, `import builtins`,
 //! `import len from builtins`, `import * from prelude`, from any file; the
 //! names are reserved roots of the path namespace, and a file or directory
 //! at the workspace's root named like one of them is an error of the scan,
@@ -226,7 +227,13 @@
 //! before any file runs ([`check_with`]). No file computes them, and none
 //! needs another for them. Their types are each built-in's: its function
 //! type, or for one whose typing is special the opaque type of the alias
-//! rule (see [`crate::check`], "Built-in functions").
+//! rule (see [`crate::check`], "Built-in functions"). As it lays the frame
+//! out, the driver also builds the one layout of the records `exec`
+//! returns (`exec_layout`), its field names interned in the run's names,
+//! and gives it to every file it runs, beside the memo tables, so that
+//! every such record in the run shares it (see [`crate::eval`], "The
+//! built-in functions"); a session gets it with the rest of the standard
+//! library's run.
 //!
 //! Every file but `prelude.gcsl` itself, the standard files included,
 //! begins as if with `import * from prelude`, as the last source of its
@@ -254,6 +261,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::mem;
+use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
@@ -270,7 +278,7 @@ use crate::parser;
 use crate::session;
 use crate::source::{SourceFile, Span};
 use crate::types::{TyId, TypeTable};
-use crate::value::Value;
+use crate::value::{Layout, Value};
 
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
 const ROOT: u32 = u32::MAX;
@@ -301,6 +309,25 @@ pub fn standard_sources() -> Vec<SourceFile> {
 /// lays the frame out, before any file runs.
 fn builtin_cells() -> Vec<Value> {
     Builtin::ALL.into_iter().map(Value::Builtin).collect()
+}
+
+/// The layout of the record `exec` returns, its fields
+/// ([`Builtin::EXEC_FIELDS`]) interned into `names`, the run's, as the
+/// checker interns them for `exec`'s type, so that `r.status` reads it:
+/// built once per run as the frame is laid out, and shared by every record
+/// `exec` builds in the run, whatever file, input or function calls it (see
+/// [`crate::eval`]).
+fn exec_layout(names: &mut Names) -> Rc<Layout> {
+    Rc::new(Layout {
+        names: Builtin::EXEC_FIELDS
+            .iter()
+            .map(|text| names.intern(text))
+            .collect(),
+        texts: Builtin::EXEC_FIELDS
+            .iter()
+            .map(|&text| Box::from(text))
+            .collect(),
+    })
 }
 
 /// One file of a workspace, scanned.
@@ -3302,6 +3329,9 @@ pub struct Workspace {
     frame: Vec<Value>,
     /// The memo tables of every memoised closure.
     memo: MemoTables,
+    /// The layout of the record `exec` returns, built once for the run as
+    /// the frame is laid out ([`exec_layout`]).
+    exec_result: Rc<Layout>,
     /// The table the files' types are interned into.
     types: TypeTable,
     /// The name of every slot of the frame, the last variable's in it, for
@@ -3499,6 +3529,8 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     scan.names = names;
     Ok(Workspace {
         values: vec![Value::Empty; scan.files.len()],
+        // Built before `scan` moves; its names are interned already.
+        exec_result: exec_layout(&mut scan.names),
         scan,
         irs,
         checked,
@@ -3736,7 +3768,8 @@ impl Workspace {
             let Some(ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
                 continue;
             };
-            match session::run_input(ir, &mut self.frame, &mut self.memo) {
+            let context = (&mut self.memo, Some(&self.exec_result));
+            match session::run_input(ir, &mut self.frame, context) {
                 Ok(value) => {
                     if let Some(entry) = self.values.get_mut(at as usize) {
                         *entry = value;
@@ -3814,6 +3847,8 @@ pub(crate) struct Started {
     pub(crate) frame: Vec<Value>,
     /// The memo tables of the run.
     pub(crate) memo: MemoTables,
+    /// The layout of the record `exec` returns, built once for the run.
+    pub(crate) exec_result: Rc<Layout>,
     /// The name of each slot of the frame.
     pub(crate) slot_names: Vec<Name>,
 }
@@ -3834,6 +3869,7 @@ pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
         scan,
         frame,
         memo,
+        exec_result,
         types,
         slot_names,
         cell_types,
@@ -3852,6 +3888,7 @@ pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
         types,
         frame,
         memo,
+        exec_result,
         slot_names,
     })
 }
@@ -6045,13 +6082,15 @@ p26 = com.x"#;
         assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
         assert_eq!(scan.order[0], 0);
         // The built-in functions' cells are the first.
-        let builtins: Vec<Option<Builtin>> = (0..4).map(|node| scan.builtin(node)).collect();
+        let builtins: Vec<Option<Builtin>> = (0..6).map(|node| scan.builtin(node)).collect();
         assert_eq!(
             builtins,
             [
                 Some(Builtin::Len),
                 Some(Builtin::Int),
                 Some(Builtin::Float),
+                Some(Builtin::Exec),
+                Some(Builtin::Panic),
                 None
             ]
         );
@@ -6211,7 +6250,7 @@ p26 = com.x"#;
             .iter()
             .map(|alias| scan.names.get(alias.name))
             .collect();
-        assert_eq!(names, ["int", "float", "half"]);
+        assert_eq!(names, ["int", "float", "half", "exec", "panic", "sh"]);
         assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
         assert!(scan.files[0].aliases.iter().all(|alias| !alias.implicit));
     }
@@ -6344,5 +6383,309 @@ p26 = com.x"#;
             .map(|(stem, _)| format!("<stdlib>/{stem}.gcsl"))
             .collect();
         assert_eq!(names, expected);
+    }
+
+    // ----- `exec`, `panic` and `sh` -----
+
+    /// The summary of slice 29, its `ls` of a directory every machine has.
+    const SHELL_SUMMARY: &str = "r = exec([\"ls\", \"-1d\", \"/\"])\n\
+                                 lines = r.stdout\n\
+                                 ok = r.status == 0\n\
+                                 out = sh(\"echo hi\")\n\
+                                 fn pkg(name: String): { build: Future<String> } {\n\
+                                     { build = lazy { sh(\"echo make {name}\") } }\n\
+                                 }\n\
+                                 built = await pkg(\"lib\").build\n\
+                                 fn guard(n: Int): Int {\n\
+                                     if n < 0 { panic(\"negative size {n}\") }\n\
+                                     n\n\
+                                 }\n\
+                                 size = guard(3)";
+
+    /// The one diagnostic of running `text` as a lone file.
+    fn lone_error(text: &str) -> Diagnostic {
+        let source = SourceFile::new("lone.gcsl", text).unwrap();
+        let mut errors = crate::run(&source).unwrap_err();
+        assert_eq!(errors.len(), 1, "{text}: {errors:?}");
+        errors.remove(0)
+    }
+
+    #[test]
+    fn the_shell_summary_runs_in_a_workspace_and_alone() {
+        let expected = "{r = {status = 0; stdout = \"/\\n\"; stderr = \"\"}; lines = \"/\\n\"; \
+                        ok = true; out = \"hi\\n\"; built = \"make lib\\n\"; size = 3}";
+        assert_eq!(lone(SHELL_SUMMARY).unwrap(), expected);
+        let files = [("workspace.gcsl", ""), ("app/main.gcsl", SHELL_SUMMARY)];
+        assert_eq!(value(&files, "app/main.gcsl"), expected);
+        assert_eq!(
+            lone_error("fn guard(n: Int): Int {\nif n < 0 { panic(\"negative size {n}\") }\nn\n}\n= guard(-2)")
+                .message,
+            "negative size -2"
+        );
+    }
+
+    #[test]
+    fn exec_reports_what_its_program_did() {
+        for (text, expected) in [
+            (
+                "= exec([\"true\"])",
+                "{status = 0; stdout = \"\"; stderr = \"\"}",
+            ),
+            (
+                "= exec([\"false\"])",
+                "{status = 1; stdout = \"\"; stderr = \"\"}",
+            ),
+            (
+                "= exec([\"sh\", \"-c\", \"echo out; echo err >&2; exit 3\"])",
+                "{status = 3; stdout = \"out\\n\"; stderr = \"err\\n\"}",
+            ),
+            // A non-zero status is data, never an error.
+            ("= exec([\"false\"]).status != 0", "true"),
+            // Killed by a signal: 128 plus its number.
+            ("= exec([\"sh\", \"-c\", \"kill -9 $$\"]).status", "137"),
+            // Its standard input is the null device: `cat` ends at once.
+            (
+                "= exec([\"cat\"])",
+                "{status = 0; stdout = \"\"; stderr = \"\"}",
+            ),
+            // Invalid UTF-8 is replaced.
+            (
+                "= exec([\"sh\", \"-c\", \"printf '\\\\377ok'\"]).stdout",
+                "\u{FFFD}ok",
+            ),
+            // The arguments are passed as they are, with no shell.
+            (
+                "= exec([\"printf\", \"%s|\", \"a b\", \"$HOME\", \"*\"]).stdout",
+                "a b|$HOME|*|",
+            ),
+            // Named, through a variable, a field, a `->` function.
+            ("= exec(argv = [\"echo\", \"n\"]).stdout", "n\n"),
+            ("let e = exec\n= e([\"echo\", \"v\"]).stdout", "v\n"),
+            (
+                "let r = { run = exec }\n= r.run([\"echo\", \"f\"]).stdout",
+                "f\n",
+            ),
+            (
+                "fn run(a: String) -> String { exec([\"echo\", a]).stdout }\n= run(\"i\")",
+                "i\n",
+            ),
+            (
+                "fn pick(f: fn(argv: Present<List<String>>) -> {status: Int}): \
+                 fn(Present<List<String>>) -> {status: Int} { f }\n\
+                 = pick(exec)([\"false\"]).status",
+                "1",
+            ),
+            (
+                "import exec as run from builtins\n= run([\"true\"]).status",
+                "0",
+            ),
+            // A future argument is awaited, as any call's.
+            (
+                "let xs = lazy [\"echo\", \"later\"]\n= exec(xs).stdout",
+                "later\n",
+            ),
+            (
+                "let xs = [lazy \"echo\", \"deep\"]\n= exec(xs).stdout",
+                "deep\n",
+            ),
+            // The value shows as its type.
+            (
+                "= exec",
+                "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}",
+            ),
+            ("= panic", "fn(message: String): Never"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn exec_fails_only_when_its_program_cannot_run() {
+        let text = "let none: List<String> = []\nr = exec(none)";
+        let error = lone_error(text);
+        assert_eq!(error.message, "`exec` needs a program to run");
+        assert_eq!(error.span, Span::new(32, 42));
+        assert!(error.notes.is_empty());
+        let text = "r = exec([\"gcsl-no-such-program-slice-29\", \"x\"])";
+        let error = lone_error(text);
+        assert_eq!(error.message, "cannot run `gcsl-no-such-program-slice-29`");
+        assert_eq!(error.span, Span::new(4, 48));
+        assert_eq!(error.notes, ["No such file or directory (os error 2)"]);
+        assert_eq!(error.input, None);
+        // A directory is not a program.
+        let error = lone_error("r = exec([\"/\"])");
+        assert_eq!(error.message, "cannot run `/`");
+        assert_eq!(error.notes, ["Permission denied (os error 13)"]);
+    }
+
+    #[test]
+    fn panic_ends_the_run_with_its_message_at_the_call() {
+        let text = "x = 1\ny = panic(\"x\")";
+        let error = lone_error(text);
+        assert_eq!(error.message, "x");
+        assert_eq!(error.span, Span::new(10, 20));
+        assert!(error.labels.is_empty() && error.notes.is_empty());
+        assert_eq!(lone_error("panic(\"one\\ntwo\")").message, "one\ntwo");
+        // Wherever it stands, whichever walker meets it: a statement, a
+        // `let`, a branch, an operand of each kind, an element, a field, an
+        // argument, a callee, an interpolation, a function's result, a
+        // `lazy`, a loop.
+        for text in [
+            "panic(\"p\")",
+            "let x = panic(\"p\")",
+            "let c = true\nx = if c { panic(\"p\") } else { 1 }",
+            "x = 1 + panic(\"p\")",
+            "x = 1.5 * panic(\"p\")",
+            "x = true and panic(\"p\")",
+            "x = \"a\" + panic(\"p\")",
+            "x = \"a{panic(\"p\")}\"",
+            "x = [1, panic(\"p\")]",
+            "x = len(panic(\"p\"))",
+            "x = { a = panic(\"p\") }",
+            "let r: {a: Int} = panic(\"p\")",
+            "x = float(panic(\"p\"))",
+            "x = panic(\"p\")(1)",
+            "fn f(n: Int): Int { if n > 0 { panic(\"p\") }\nn }\nx = f(1)",
+            "fn f(): String { panic(\"p\") }\nx = f() + \"!\"",
+            "x = await lazy panic(\"p\")",
+            "x = for i in [1] { panic(\"p\") }",
+            "def f(n: Int) ->> Int { panic(\"p\") }\nx = f(1)",
+            // As a value of a parameter of type `fn(String): Int`.
+            "fn apply(f: fn(String): Int): Int { f(\"p\") }\nx = apply(panic)",
+            "let p = panic\nx = p(\"p\")",
+        ] {
+            assert_eq!(lone_error(text).message, "p", "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(messages(&files, "main.gcsl"), ["p"], "{text}");
+        }
+        // What follows a panic never runs.
+        assert_eq!(
+            lone_error("let c = true\nif c { panic(\"first\") }\n= 1 // 0").message,
+            "first"
+        );
+        // A message of the program's own wording, built at runtime.
+        assert_eq!(
+            lone_error("let n = 3\n= panic(\"{n} is {n * 2 // 2}\")").message,
+            "3 is 3"
+        );
+    }
+
+    #[test]
+    fn sh_returns_its_output_or_panics_in_the_prelude() {
+        assert_eq!(lone("= sh(\"echo hi\")").unwrap(), "hi\n");
+        assert_eq!(lone("= sh(\"printf hi\")").unwrap(), "hi");
+        // The panic is the prelude's, located in it: input 0.
+        let error = lone_error("x = sh(\"echo nope >&2; exit 2\")");
+        assert_eq!(
+            error.message,
+            "`echo nope >&2; exit 2` exited with status 2: nope\n"
+        );
+        assert_eq!(error.input, Some(0));
+        let prelude = crate::STANDARD[0].1;
+        let at = u32::try_from(prelude.find("panic(\"`").unwrap()).unwrap();
+        assert_eq!(error.span.start, at);
+        // With no standard error, the message ends in ": ".
+        assert_eq!(
+            lone_error("x = sh(\"exit 2\")").message,
+            "`exit 2` exited with status 2: "
+        );
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "x = sh(\"exit 2\")")];
+        assert_eq!(
+            run_file(&files, "main.gcsl").unwrap_err(),
+            [("`exit 2` exited with status 2: ".to_owned(), Some(0))]
+        );
+    }
+
+    #[test]
+    fn a_memoised_function_around_exec_runs_its_program_once() {
+        let path = std::env::temp_dir().join(format!("gcsl-slice-29-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let count = || std::fs::read_to_string(path).map_or(0, |text| text.lines().count());
+        let _ = std::fs::remove_file(path);
+        let memo = format!(
+            "fn mark(p: String) ->> Int {{ exec([\"sh\", \"-c\", \"echo x >> \" + p]).status }}\n\
+             = [mark(\"{path}\"), mark(\"{path}\")]"
+        );
+        assert_eq!(lone(&memo).unwrap(), "[0, 0]");
+        assert_eq!(count(), 1);
+        // An impure function that is not memoised runs it each time.
+        let impure = memo.replace("->>", "->");
+        assert_eq!(lone(&impure).unwrap(), "[0, 0]");
+        assert_eq!(count(), 3);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exec_panic_and_sh_are_shadowed_silently() {
+        for (text, expected) in [
+            ("exec = 1\nn = exec + 1", "{exec = 1; n = 2}"),
+            ("let panic = \"no\"\nn = panic", "{n = \"no\"}"),
+            (
+                "def sh(n: Int): Int { n * 2 }\nn = sh(2)",
+                "{sh = fn(n: Int): Int; n = 4}",
+            ),
+            (
+                "fn panic(m: String): Int { 7 }\nn = panic(\"x\")",
+                "{n = 7}",
+            ),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn every_record_exec_builds_shares_the_runs_one_layout() {
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "ra = exec([\"true\"])\n\
+                 def run() -> {status: Int, stdout: String, stderr: String} { exec([\"true\"]) }",
+            ),
+            (
+                "b.gcsl",
+                "rb = exec([\"false\"])\nlet e = exec\ns = e([\"true\"])\nt = run()",
+            ),
+        ];
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let mut workspace = check(&sources).unwrap();
+        // The driver wrote the five built-in functions' cells.
+        assert_eq!(assert_builtins_written(&workspace).len(), 5);
+        let a = workspace.file("a.gcsl").unwrap();
+        let b = workspace.file("b.gcsl").unwrap();
+        let first = workspace.run(a).unwrap().value;
+        let second = workspace.run(b).unwrap().value;
+        let layout = |value: &Value, field: &str| {
+            let Value::Record(record) = value else {
+                panic!("not a record: {value}");
+            };
+            let name = workspace.scan.names.lookup(field).unwrap();
+            let Some(Value::Record(result)) = record.get(name) else {
+                panic!("no record {field} in {value}");
+            };
+            Rc::clone(&result.layout)
+        };
+        for (value, field) in [
+            (&first, "ra"),
+            (&second, "rb"),
+            (&second, "s"),
+            (&second, "t"),
+        ] {
+            assert!(
+                Rc::ptr_eq(&layout(value, field), &workspace.exec_result),
+                "{field} of {value}"
+            );
+        }
+        assert_eq!(
+            &*workspace.exec_result.texts,
+            ["status", "stdout", "stderr"].map(Box::from)
+        );
     }
 }

@@ -1,0 +1,3 @@
+import pkg from tools.steps
+built = await pkg("app").build
+status = exec(["false"]).status

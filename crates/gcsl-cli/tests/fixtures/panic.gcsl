@@ -1,0 +1,5 @@
+fn guard(n: Int): Int {
+    if n < 0 { panic("negative size {n}") }
+    n
+}
+size = guard(-2)

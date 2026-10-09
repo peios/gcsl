@@ -241,9 +241,13 @@
 //! after it never run, and are lowered only so that the functions in them
 //! have their code, their nodes left out of the tree. A loop whose iterable
 //! or first condition is `Never` lowers so too, to the items before its
-//! condition and the iterable or condition. A load, field access, index or
-//! call of type `Never` that no operand makes so is lowered as it is, of
-//! kind `Never`: it is only ever in code that does not run.
+//! condition and the iterable or condition. A load, field access or index
+//! of type `Never` that no operand makes so is lowered as it is, of kind
+//! `Never`: it is only ever in code that does not run. So is a call of type
+//! `Never` that no operand makes so, which does run when its callee's
+//! result is `Never`, a call of `panic`: a `Call` of kind `Never`, whose
+//! callee and arguments are evaluated as any call's and which always
+//! unwinds, with the panic's error (see [`crate::eval`]).
 //!
 //! A `lazy` lowers like a function expression: its body, any expression,
 //! into the function table, as code of [`FnKind::Future`], and the
@@ -2031,7 +2035,7 @@ impl Lowerer<'_> {
                 span,
             }),
             // An ordinary built-in is called as any function value is.
-            Builtin::Int | Builtin::Float => Err(InternalError {
+            Builtin::Int | Builtin::Float | Builtin::Exec | Builtin::Panic => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),
@@ -4495,6 +4499,44 @@ mod tests {
             shown.contains("(list-len @18..25\n    (await @22..24\n"),
             "{shown}"
         );
+    }
+
+    #[test]
+    fn exec_and_panic_lower_to_calls() {
+        // Ordinary built-ins: a `Call` of the value of their cell.
+        let (_, ir) = lower_prelude("exec([\"true\"])");
+        let call = result_of(&ir);
+        let IrKind::Call { kind, .. } = ir.get(call).kind else {
+            panic!("not a call: {:?}", ir.get(call));
+        };
+        assert_eq!(kind, ValueKind::Record);
+        // A call of `panic` is a `Call` of kind `Never`, lowered as it is:
+        // no operand of it is `Never`.
+        for text in ["panic(\"x\")", "let s = \"x\"\npanic(s)"] {
+            let (_, ir) = lower_prelude(text);
+            let call = result_of_last(&ir);
+            let IrKind::Call { kind, .. } = ir.get(call).kind else {
+                panic!("{text}: not a call: {:?}", ir.get(call));
+            };
+            assert_eq!(kind, ValueKind::Never, "{text}");
+            assert_eq!(ir.kind_of(call), ValueKind::Never, "{text}");
+        }
+        // As a branch, it leaves the `if` the other branch's kind.
+        let (_, ir) = lower_prelude("let c = true\nif c { panic(\"x\") } else { 1 }");
+        assert_eq!(ir.kind_of(result_of_last(&ir)), ValueKind::Int);
+        let shown = dump_prelude("let c = true\nif c { panic(\"x\") } else { 1 }");
+        assert!(
+            shown.contains("(block @18..32\n      (call @20..30\n        (load panic#"),
+            "{shown}"
+        );
+    }
+
+    /// The result of the root block of `ir`, whatever items come before it.
+    fn result_of_last(ir: &Ir) -> IrId {
+        let IrKind::Block { result, .. } = ir.get(ir.root()).kind else {
+            panic!("the root is not a block: {:?}", ir.get(ir.root()));
+        };
+        result
     }
 
     #[test]

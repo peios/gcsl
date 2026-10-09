@@ -7,8 +7,8 @@
 //! hold their own `workspace.gcsl`, which are workspaces of their own),
 //! the whole workspace is checked, and `FILE` runs after the files it
 //! needs; its own value is printed, with the warnings of every file.
-//! Finding and reading the files is this module's: the library performs
-//! no I/O. Each file is given to the library by its path relative to the
+//! Finding and reading the files is this module's: the library reads no
+//! file. Each file is given to the library by its path relative to the
 //! root, and its diagnostics name it by its path from the current
 //! directory, `FILE` by the path given. The dumps are `FILE`'s alone: its
 //! tokens and syntax tree as a file's, its types and IR as checked and
@@ -19,7 +19,12 @@
 //! its own as a workspace file's are. Either way the standard library is
 //! there, its files the first inputs ([`gcsl::workspace::standard_sources`]):
 //! a diagnostic of a standard file, or a part of one in it, is rendered
-//! against its source, named `<stdlib>/prelude.gcsl`.
+//! against its source, named `<stdlib>/prelude.gcsl`. So is the panic of a
+//! failing `sh`, which is the prelude's. A program a file runs with `exec`
+//! or `sh` has `gcsl`'s working directory and environment and the null
+//! device as its standard input, and its output is captured into the
+//! value, never shown; a `panic`, like any runtime error, is rendered to
+//! stderr with exit code 1.
 //!
 //! The directories left out as nested workspaces are passed to the
 //! library too, by their paths relative to the root

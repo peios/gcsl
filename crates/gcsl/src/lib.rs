@@ -33,18 +33,24 @@
 //! the one asked for after the files it needs.
 //!
 //! Every one of them has the standard library: the `builtins` module, the
-//! built-in functions implemented in Rust (`len`, `int`, `float`), and the
-//! standard files, the `.gcsl` files of the repository's `stdlib/`
-//! directory compiled in ([`STANDARD`]), each a module importable by its
-//! bare name from any file; and every file and input begins as if with
-//! `import * from prelude`, whose names its own declarations shadow
-//! silently (see [`workspace`], "The standard library"). A file run alone
-//! ([`run`]) is a workspace of one directory beside it, and an `import` of
-//! anything else there, or in a [`Session`], is an error. Every
+//! built-in functions implemented in Rust (`len`, `int`, `float`, `exec`,
+//! `panic`), and the standard files, the `.gcsl` files of the repository's
+//! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
+//! by its bare name from any file; and every file and input begins as if
+//! with `import * from prelude`, whose names its own declarations shadow
+//! silently (see [`workspace`], "The standard library"). The prelude binds
+//! the built-in functions, and `sh`, written in GCSL on `exec` and `panic`,
+//! which runs a shell command and panics unless it succeeds. A file run
+//! alone ([`run`]) is a workspace of one directory beside it, and an
+//! `import` of anything else there, or in a [`Session`], is an error. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
 //! [`SourceFile`], and so is every warning, which does not stop a program
-//! from running and is returned with its value in an [`Outcome`]. The
-//! library performs no I/O and never prints.
+//! from running and is returned with its value in an [`Outcome`]; a call of
+//! `panic` is a runtime error of the program's own wording. The library
+//! never prints and reads no file; the one thing it does outside itself is
+//! what a program asks of `exec`, which runs a program, its output
+//! captured, its standard input the null device (see [`eval`], "The
+//! built-in functions").
 
 #![warn(
     clippy::unwrap_used,

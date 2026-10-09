@@ -25,7 +25,10 @@ const PROMPT: &str = "> ";
 /// inside a function an earlier line defined is shown against that line,
 /// and a part of a diagnostic in the standard library, which the session
 /// runs before the first line, against its file (`<stdlib>/prelude.gcsl`).
-/// The prelude's names, `len` among them, are every line's.
+/// The prelude's names, `len`, `exec` and `sh` among them, are every
+/// line's. A program a line runs with `exec` or `sh` reads the null device,
+/// never the REPL's own standard input, so the next line is still the
+/// REPL's; a `panic` is a runtime error of the line, which changes nothing.
 /// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {

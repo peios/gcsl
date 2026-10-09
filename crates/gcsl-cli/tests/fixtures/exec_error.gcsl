@@ -1,0 +1,2 @@
+let none: List<String> = []
+r = exec(none)

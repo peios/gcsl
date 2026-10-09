@@ -1,17 +1,34 @@
 # The prelude: a module of GCSL's standard library, compiled into every
 # build, that every file, every REPL input and every other standard file
-# begins as if with `import * from prelude`. A declaration of a file, its
-# directories or its own imports shadows a name of it silently.
-#
-# `len`, `int` and `float` are the built-in functions of the `builtins`
-# module, bound here so that every file has them. The binding of `len` is
-# the ALIAS RULE's, which is TEMPORARY: `len` has no type a GCSL type can
-# write yet, so a name bound directly to it is that built-in, called by the
-# checker's rule for it. It is to be replaced when built-in functions get
-# real polymorphic types (R11 and R3 of docs/INFERENCE_REQS.md).
+# begins as if with `import * from prelude`; a declaration of a file, its
+# directories or its own imports shadows a name of it silently. It binds the
+# built-in functions of the `builtins` module, so that every file has them.
+# The binding of `len` is the ALIAS RULE's, which is TEMPORARY: `len` has no
+# type a GCSL type can write yet, so a name bound directly to it is that
+# built-in, called by the checker's rule (to be replaced when built-ins get
+# real polymorphic types, R11 and R3 of docs/INFERENCE_REQS.md). `int`,
+# `float`, `exec` and `panic` are ordinary: values of their function types.
+# `sh` runs a shell command with `exec`, and panics unless it succeeds.
 import builtins
 
 len = builtins.len
 int = builtins.int
 float = builtins.float
 def half(n: Int): Float { float(n) / 2.0 }
+
+# `exec(argv)` runs the program `argv[0]` with the arguments `argv[1..]` and
+# returns `{status, stdout, stderr}`; `panic(message)` ends the run with the
+# runtime error `message`. Both are ordinary built-ins, not the alias rule's.
+exec = builtins.exec
+panic = builtins.panic
+
+# Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
+# trailing newline included; panics, with the script, its exit status and
+# its standard error, unless it exits with status 0.
+def sh(script: String) -> String {
+    let result = exec(["/bin/sh", "-c", script])
+    if result.status != 0 {
+        panic("`{script}` exited with status {result.status}: {result.stderr}")
+    }
+    result.stdout
+}

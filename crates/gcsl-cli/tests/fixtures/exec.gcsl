@@ -1,0 +1,3 @@
+# `exec` runs a program and reports what it did; `sh` runs a shell command.
+r = exec(["sh", "-c", "echo out; echo err >&2; exit 3"])
+out = sh("echo hi")

@@ -338,19 +338,18 @@
 //! the new evaluator across the body's evaluation.
 //!
 //! The callee of a `Call` may instead be a built-in function, a
-//! [`Value::Builtin`]: an ordinary one (`int`, `float`) is a value of a
-//! function type that a variable, a parameter or a field may hold, so the
-//! `function` walker yields a closure or a built-in, and a call of a
-//! built-in applies it, its arguments evaluated in order as a closure's
-//! are, with no frame: `int` truncates its `Float` toward zero, failing
-//! with "integer overflow" when that is no `Int` (an infinity, or beyond
-//! `i64`) or "cannot truncate NaN to an Int"; `float` gives the nearest
-//! `Float`. This is the one place a node does not say what it does, since
-//! no node could know which function a value is. A built-in whose typing
-//! is special is never called through a value: the checker makes every
-//! call of one its own node (`ListLen`). A built-in's cell holds it from
-//! before the first input runs (see [`crate::workspace`]); `Top` reads it
-//! as it reads a function's slot.
+//! [`Value::Builtin`]: an ordinary one (`int`, `float`, `exec`, `panic`) is
+//! a value of a function type that a variable, a parameter or a field may
+//! hold, so the `function` walker yields a closure or a built-in, and a
+//! call of a built-in applies it, its arguments evaluated in order as a
+//! closure's are, each collected by the index of the parameter it fills,
+//! with no frame (see [The built-in functions](#the-built-in-functions)).
+//! This is the one place a node does not say what it does, since no node
+//! could know which function a value is. A built-in whose typing is special
+//! is never called through a value: the checker makes every call of one its
+//! own node (`ListLen`). A built-in's cell holds it from before the first
+//! input runs (see [`crate::workspace`]); `Top` reads it as it reads a
+//! function's slot.
 //!
 //! Calls nest on the Rust stack, one `call` and a few walker frames per
 //! GCSL call, and so does every level of expression nesting between a
@@ -444,6 +443,50 @@
 //! nothing, so applying several shapes awaits nothing twice; but a future
 //! in a field that the value's own type hides, which another member's
 //! shape lists, is awaited too.
+//!
+//! # The built-in functions
+//!
+//! A call of an ordinary built-in function applies it to its arguments:
+//!
+//! - `int(x)` truncates its `Float` toward zero, failing with "integer
+//!   overflow" when that is no `Int` (an infinity, or beyond `i64`), the
+//!   operand labelled with its value, or "cannot truncate NaN to an Int";
+//! - `float(x)` gives the `Float` nearest its `Int`;
+//! - `exec(argv)` runs a program, the one thing GCSL does outside itself,
+//!   and reports what it did. It runs `argv[0]`, found through `PATH` as
+//!   the OS finds it (a name with a `/` is a path), with the arguments
+//!   `argv[1..]`, each passed as it is, with no shell involved
+//!   ([`std::process::Command`]). The program's standard input is the null
+//!   device (`Stdio::null()`, not a closed descriptor), so it never reads
+//!   what `gcsl`'s own standard input holds, a REPL's next line say; its
+//!   standard output and standard error are captured whole, nothing of
+//!   them shown as it runs; its working directory and environment are the
+//!   `gcsl` process's. The call returns once the program has exited, with
+//!   a record of the fields `status`, `stdout` and `stderr`, in that
+//!   order: its exit status, or 128 plus the number of the signal that
+//!   killed it, the shell's convention (`kill -9` gives 137); and its
+//!   standard output and standard error decoded as UTF-8, each invalid
+//!   sequence replaced by U+FFFD. A non-zero status is data, never an
+//!   error. The record's layout is built once per run, by the driver that
+//!   lays out the frame, its field names interned in the run's names, and
+//!   shared by every record `exec` builds in the run, from whatever input
+//!   or function calls it, since a call through a value is a plain `Call`
+//!   that no node or IR could prepare it for; it reaches every frame
+//!   beside the memo tables (see [`eval_with`]). `exec` fails only when its
+//!   program cannot run at all: "`exec` needs a program to run" for an
+//!   empty `argv`, and "cannot run `name`" for a program that cannot be
+//!   started, noting the OS's reason, as in "No such file or directory (os
+//!   error 2)". Both are at the call, and end the run as every runtime
+//!   error does. A memoised function around `exec` runs its program once
+//!   for each distinct list of arguments, as its body runs once.
+//! - `panic(message)` fails with the runtime error `message`, its own
+//!   wording, at the call, with no label or note, ending the run as every
+//!   runtime error does. A call of it is of kind `Never` (see
+//!   [`crate::ir`]): every walker evaluates it as any call, through
+//!   `Evaluator::call`, which then never returns a value, so no typed
+//!   walker reaches for a value of its kind. A panic inside a function is
+//!   reported where it happens, as any runtime error is: one in the
+//!   prelude's `sh` is located in `<stdlib>/prelude.gcsl`.
 //!
 //! # Memoised functions
 //!
@@ -550,6 +593,8 @@ use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
 use std::num::NonZeroI64;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Command, Stdio};
 use std::rc::{Rc, Weak};
 
 use crate::ast::FnId;
@@ -607,7 +652,12 @@ const FOR_RESERVE: usize = 16_777_216;
 /// future's body is reported where it happens, as one inside a function
 /// is. A call of a memoised function that is running with the same
 /// arguments further up the stack is "this call depends on its own result",
-/// at the call. `Float` arithmetic never fails.
+/// at the call. At a call's span: a call of `exec` with an empty list is
+/// "`exec` needs a program to run", and one whose program cannot be started
+/// "cannot run `name`", with the OS's reason as a note; a call of `panic`
+/// is its message (see [The built-in functions](#the-built-in-functions)).
+/// `Float` arithmetic never fails. A run through this function has no
+/// standard library, and so no `exec` to call.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
     // The top level's frame; calls grow the stack beyond it.
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
@@ -621,7 +671,7 @@ pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
 ///
 /// As [`eval_with`].
 pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
-    eval_with(ir, stack, &mut MemoTables::new())
+    eval_with(ir, stack, &mut MemoTables::new(), None)
 }
 
 /// Evaluates `ir` to a value with an existing `stack`, which must hold at
@@ -637,6 +687,11 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
 /// later evaluation's calls need not allocate it again. The tables hold no
 /// running call on return.
 ///
+/// `exec_result` is the layout of the record `exec` returns, which the
+/// driver of the run built once, its field names interned in the run's
+/// names (see [The built-in functions](#the-built-in-functions)): `None`
+/// for a run without the standard library, which has no `exec` to call.
+///
 /// # Errors
 ///
 /// As [`eval`]; and an internal error if `stack` is too small.
@@ -644,6 +699,7 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
+    exec_result: Option<&Rc<Layout>>,
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
@@ -660,6 +716,7 @@ pub fn eval_with(
         captures: &[],
         callee: None,
         memo,
+        exec_result,
         levels: 0,
     }
     .value(root);
@@ -783,6 +840,9 @@ struct Evaluator<'a> {
     callee: Option<&'a Rc<Closure>>,
     /// The execution context's memo tables, shared by every frame.
     memo: &'a mut MemoTables,
+    /// The layout of the record `exec` returns, built once per run and
+    /// shared by every frame; `None` in a run without the standard library.
+    exec_result: Option<&'a Rc<Layout>>,
     /// The levels of nesting the enclosing frames have consumed where this
     /// frame's body starts: 0 at the top level. See the module
     /// documentation.
@@ -1396,6 +1456,7 @@ impl Evaluator<'_> {
             captures: &captures,
             callee: None,
             memo: self.memo,
+            exec_result: self.exec_result,
             levels: entering,
         }
         .value(code.body);
@@ -1476,6 +1537,7 @@ impl Evaluator<'_> {
             captures: &closure.captures,
             callee: Some(&closure),
             memo: self.memo,
+            exec_result: self.exec_result,
             levels: entering,
         }
         .value(code.body);
@@ -1495,16 +1557,20 @@ impl Evaluator<'_> {
     /// the arguments `args`: a call through a value of its function type (a
     /// parameter, a variable, the prelude's `int`), the one call whose node
     /// cannot say what it calls. The arguments are evaluated in order, as a
-    /// closure's are, and the built-in applied to its one parameter's: `int`
-    /// truncates its `Float` toward zero, failing with "integer overflow"
-    /// when that is not an `Int` (an infinity, or beyond `i64`) and "cannot
-    /// truncate NaN to an Int" for NaN; `float` gives the `Float` nearest its
-    /// `Int`. A built-in whose typing is special is never called through a
-    /// value (the checker lowers each call of one to its own node, `len`'s
+    /// closure's are, each collected by the index of the parameter it
+    /// fills, and the built-in applied to them (see [The built-in
+    /// functions](#the-built-in-functions)): `int` truncates its `Float`
+    /// toward zero, failing with "integer overflow" when that is not an
+    /// `Int` (an infinity, or beyond `i64`) and "cannot truncate NaN to an
+    /// Int" for NaN; `float` gives the `Float` nearest its `Int`; `exec`
+    /// runs its program ([`exec`]); and `panic` fails with its message, at
+    /// the call. A built-in whose typing is special is never called through
+    /// a value (the checker lowers each call of one to its own node, `len`'s
     /// to a `ListLen`), so reaching one here is an internal error.
     #[inline(never)]
     fn call_builtin(&mut self, builtin: Builtin, args: IrRange, node: &IrNode) -> Flow<Value> {
-        let mut argument = None;
+        // Each parameter's argument, with its span, by the parameter's index.
+        let mut arguments: [Option<(Value, Span)>; Builtin::MAX_PARAMS] = Default::default();
         for &arg in self.ir.items(args) {
             let arg = self.ir.get(arg);
             let IrKind::Arg { param, value } = arg.kind else {
@@ -1512,11 +1578,13 @@ impl Evaluator<'_> {
             };
             let span = self.ir.get(value).span;
             let value = self.value(value)?;
-            if param == 0 {
-                argument = Some((value, span));
-            }
+            let Some(entry) = arguments.get_mut(param as usize) else {
+                return mistyped(arg, "an argument for a parameter the built-in lacks");
+            };
+            *entry = Some((value, span));
         }
-        match (builtin, argument) {
+        let [first] = arguments;
+        match (builtin, first) {
             (Builtin::Int, Some((Value::Float(x), span))) => match float_to_int(x) {
                 Some(truncated) => Ok(Value::Int(truncated)),
                 None if x.is_nan() => {
@@ -1527,6 +1595,10 @@ impl Evaluator<'_> {
                     .into()),
             },
             (Builtin::Float, Some((Value::Int(x), _))) => Ok(Value::Float(int_to_float(x))),
+            (Builtin::Exec, Some((Value::List(words), _))) => exec(&words, self.exec_result, node),
+            (Builtin::Panic, Some((Value::Str(message), _))) => {
+                Err(Diagnostic::error(&*message, node.span).into())
+            }
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -1562,6 +1634,7 @@ impl Evaluator<'_> {
             captures: &closure.captures,
             callee: Some(closure),
             memo: self.memo,
+            exec_result: self.exec_result,
             levels: entering,
         }
         .value(code.body);
@@ -4172,6 +4245,67 @@ fn float_to_int(x: f64) -> Option<i64> {
     (LOW..HIGH).contains(&truncated).then_some(truncated as i64)
 }
 
+/// Runs the program `argv` names, for the call `node` of `exec`, and
+/// returns what it did as a record of the layout `exec_result` (see [The
+/// built-in functions](#the-built-in-functions)): `argv[0]` found through
+/// `PATH` as the OS finds it and given the arguments `argv[1..]`, with no
+/// shell, its standard input the null device, its standard output and
+/// standard error captured whole, its working directory and environment
+/// this process's; once it has exited, its exit status, or 128 plus the
+/// number of the signal that killed it, and its output decoded as UTF-8,
+/// each invalid sequence replaced by U+FFFD. Fails with "`exec` needs a
+/// program to run" for an empty `argv`, and with "cannot run `name`",
+/// noting the OS's own reason, for a program that cannot be started. A
+/// run without the standard library has no `exec` layout, nor any `exec`
+/// to call, so `exec_result` being `None` is an internal error, as is an
+/// element of `argv` that is not a string, which the checker rules out.
+#[inline(never)]
+fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Value> {
+    let Some(layout) = exec_result else {
+        return mistyped(node, "`exec` called in a run without its result's layout");
+    };
+    let Some((program, arguments)) = argv.values().split_first() else {
+        return Err(Diagnostic::error("`exec` needs a program to run", node.span).into());
+    };
+    let Value::Str(program) = program else {
+        return mistyped(node, "a program of `exec` that is not a string");
+    };
+    let mut command = Command::new(&**program);
+    for argument in arguments {
+        let Value::Str(argument) = argument else {
+            return mistyped(node, "an argument of `exec` that is not a string");
+        };
+        command.arg(&**argument);
+    }
+    let output = match command.stdin(Stdio::null()).output() {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(
+                Diagnostic::error(format!("cannot run `{program}`"), node.span)
+                    .with_note(error.to_string())
+                    .into(),
+            );
+        }
+    };
+    let status = match (output.status.code(), output.status.signal()) {
+        (Some(code), _) => i64::from(code),
+        (None, Some(signal)) => 128 + i64::from(signal),
+        // A program `output` waited for has exited or been killed.
+        (None, None) => {
+            return mistyped(node, "a program ended neither by exiting nor by a signal");
+        }
+    };
+    let text = |bytes: &[u8]| Value::Str(Rc::from(String::from_utf8_lossy(bytes).as_ref()));
+    Ok(Value::Record(Rc::new(Record {
+        layout: Rc::clone(layout),
+        values: Box::new([
+            Value::Int(status),
+            text(&output.stdout),
+            text(&output.stderr),
+        ]),
+    })))
+}
+
 /// Fails with the internal error `message` at `node`: a node of a type its
 /// walker does not handle. Returned directly by the walkers' error arms, so
 /// that they hold no temporary for it (see the note on `Evaluator`).
@@ -5845,6 +5979,7 @@ mod tests {
             captures: &[],
             callee: None,
             memo: &mut MemoTables::new(),
+            exec_result: None,
             levels: 0,
         }
         .value(ir.root())
@@ -6755,7 +6890,7 @@ mod tests {
     fn run_with(text: &str, memo: &mut MemoTables) -> Result<Value, Diagnostic> {
         let ir = compile(text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        eval_with(&ir, &mut stack, memo)
+        eval_with(&ir, &mut stack, memo, None)
     }
 
     /// The values of the fields of the record that `text` evaluates to, in
@@ -7178,7 +7313,7 @@ mod tests {
         let ir = compile(text);
         let mut frame = vec![Value::Empty; ir.frame_size() as usize];
         let mut memo = MemoTables::new();
-        eval_with(&ir, &mut frame, &mut memo).unwrap();
+        eval_with(&ir, &mut frame, &mut memo, None).unwrap();
         // `make`, a top-level function, has slot 0, and `r` slot 1.
         let Value::Record(record) = frame[1].clone() else {
             panic!("expected a record");
@@ -7202,7 +7337,7 @@ mod tests {
         );
         let ir = compile(&text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo).unwrap() else {
+        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo, None).unwrap() else {
             panic!("expected a record");
         };
         // The running call's table survived the sweeps its body caused, and

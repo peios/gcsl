@@ -118,7 +118,10 @@
 //! that does not run, but for a loop that cannot end, a `for { ... }` no
 //! `break` is for, which runs and never yields: its node is a `Loop` that
 //! collects nothing, of kind [`ValueKind::Record`] as a node, though what
-//! stands where it is may be of any kind, and every walker runs it.
+//! stands where it is may be of any kind, and every walker runs it; and
+//! for a call of a function whose result is `Never`, `panic`'s, which runs
+//! and always unwinds with an error: a `Call` of kind `Never`, which every
+//! walker evaluates as it does any call.
 //!
 //! # Functions
 //!
