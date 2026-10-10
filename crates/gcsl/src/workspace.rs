@@ -406,8 +406,16 @@
 //! or two def-types are declared of one path, "def-type `package` is
 //! declared 2 times in the workspace", each at the first in path then
 //! source order, labelled "also defined here" (or "also declared here") at
-//! each other. Neither is an error of the language, which allows one path
-//! in two sibling directories: the workspace checks and runs regardless.
+//! each other. A definition whose path lies under another's of its
+//! def-type anywhere in the workspace, `app.core` under `app`, whether in
+//! sibling directories or in one through `#[shadowable]`, is a duplicate
+//! too: "`package app.core` lies under another `package` definition", one
+//! error for each definition under one or more others, at it, labelled
+//! "`app` is defined here" at each definition above it; a definition both
+//! defined twice and under another has both errors. None of these is an
+//! error of the language, which allows one path in two sibling directories:
+//! the workspace checks and runs regardless. A path above definitions that
+//! is none itself is no duplicate, but names no definition to invoke.
 //!
 //! [`Workspace::invoke`] calls the definition as `DT PATH()` would be
 //! called from a file of the definition's directory. What it asks for may
@@ -6031,16 +6039,20 @@ impl RequestError {
         }
     }
 
-    /// The notes that follow the message: what there is to ask for instead.
+    /// The notes that follow the message: what there is to ask for instead,
+    /// "the def-types are `build`, `package`", or with one, "the only
+    /// def-type is `package`", and so "its definitions are `a`, `b`" and
+    /// "its only definition is `a`".
     #[must_use]
     pub fn notes(&self) -> Vec<String> {
         match self {
             RequestError::NoDefType { def_types, .. } if def_types.is_empty() => {
                 vec!["this workspace declares no def-types".to_owned()]
             }
-            RequestError::NoDefType { def_types, .. } => {
-                vec![format!("the def-types are {}", quoted_list(def_types))]
-            }
+            RequestError::NoDefType { def_types, .. } => match &def_types[..] {
+                [only] => vec![format!("the only def-type is `{only}`")],
+                _ => vec![format!("the def-types are {}", quoted_list(def_types))],
+            },
             RequestError::NoDefinition { definitions, .. }
             | RequestError::NotADefinition { definitions, .. }
                 if definitions.is_empty() =>
@@ -6048,9 +6060,10 @@ impl RequestError {
                 vec!["it has no definitions".to_owned()]
             }
             RequestError::NoDefinition { definitions, .. }
-            | RequestError::NotADefinition { definitions, .. } => {
-                vec![format!("its definitions are {}", quoted_list(definitions))]
-            }
+            | RequestError::NotADefinition { definitions, .. } => match &definitions[..] {
+                [only] => vec![format!("its only definition is `{only}`")],
+                _ => vec![format!("its definitions are {}", quoted_list(definitions))],
+            },
             RequestError::TakesParameters { .. } => Vec::new(),
         }
     }
@@ -6111,14 +6124,19 @@ impl Workspace {
     /// times in the workspace", and each path of which two def-types or
     /// more are declared, "def-type `package` is declared 2 times in the
     /// workspace", at the first in path then source order, labelled "also
-    /// defined here", or "also declared here", at each other, in path order
-    /// of their files, then in source order. Neither is an error of the
-    /// language: the workspace checks and runs regardless.
+    /// defined here", or "also declared here", at each other; and one error
+    /// for each definition whose path lies under another's of its def-type
+    /// anywhere in the workspace, "`package app.core` lies under another
+    /// `package` definition", at it, labelled "`app` is defined here" at
+    /// each definition above it; all in path order of their files, then in
+    /// source order, with the workspace's warnings, as [`Workspace::run`]
+    /// returns its errors. None is an error of the language: the workspace
+    /// checks and runs regardless.
     pub fn def_types(&self) -> Result<Vec<DefType>, Vec<Diagnostic>> {
         let found = self.found_def_types();
         let duplicates = duplicates(&found);
         if !duplicates.is_empty() {
-            return Err(duplicates);
+            return Err(merge_files(duplicates, self.warnings.clone()));
         }
         Ok(found.into_iter().map(|found| found.listed).collect())
     }
@@ -6136,18 +6154,20 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// In this order: the duplicates [`Workspace::def_types`] fails with;
-    /// no def-type of path `def_type`, no definition of it of path `path`,
-    /// or `path` above some, or a def-type with invocation parameters, each
-    /// a [`RequestError`]; and the runtime error of a file that runs or of
-    /// the call, as [`Workspace::run`] returns it, a part of it in the call
-    /// itself, which has no source, located at the definition's path,
-    /// labelled "invoked here".
+    /// In this order: the duplicates [`Workspace::def_types`] fails with,
+    /// definitions under others among them, with the warnings; no def-type of path
+    /// `def_type`, no definition of it of path `path`, or `path` above some,
+    /// or a def-type with invocation parameters, each a [`RequestError`];
+    /// and the runtime error of a file that runs or of the call, as
+    /// [`Workspace::run`] returns it, a part of it in the call itself,
+    /// which has no source, located at the definition's path, labelled
+    /// "invoked here".
     pub fn invoke(&mut self, def_type: &str, path: &str) -> Result<Outcome, InvokeError> {
         let mut found = self.found_def_types();
         let duplicates = duplicates(&found);
         if !duplicates.is_empty() {
-            return Err(InvokeError::Diagnostics(duplicates));
+            let errors = merge_files(duplicates, self.warnings.clone());
+            return Err(InvokeError::Diagnostics(errors));
         }
         let Some(at) = found.iter().position(|found| found.listed.path == def_type) else {
             let mut def_types: Vec<String> = found.into_iter().map(|f| f.listed.path).collect();
@@ -6181,6 +6201,8 @@ impl Workspace {
         let (Some(def_type_cell), Some(definition_cell)) = cells else {
             // A definition a later one of another path shadows in its own
             // directory, which is in no tree: no source can reach it either.
+            // The later one lies above or under it, so the duplicates have
+            // failed already; kept for safety.
             return Err(missing());
         };
         // The files a reference to the definition needs, each run whole.
@@ -6374,11 +6396,9 @@ fn missing_definition(listed: &DefType, path: &str) -> RequestError {
         .map(|definition| definition.path.clone())
         .collect();
     definitions.sort_unstable();
-    let above = definitions.iter().any(|definition| {
-        definition
-            .strip_prefix(path)
-            .is_some_and(|rest| rest.starts_with('.'))
-    });
+    let above = definitions
+        .iter()
+        .any(|definition| lies_under(definition, path));
     let (def_type, path) = (listed.path.clone(), path.to_owned());
     if above {
         RequestError::NotADefinition {
@@ -6396,9 +6416,10 @@ fn missing_definition(listed: &DefType, path: &str) -> RequestError {
 }
 
 /// The duplicates among `found` (see [`Workspace::def_types`]): an error for
-/// each path of which two def-types or more are declared, and for each path
-/// of which a def-type has two definitions or more, in path then source
-/// order of the first.
+/// each path of which two def-types or more are declared, for each path of
+/// which a def-type has two definitions or more, and for each definition
+/// that lies under another of its def-type ([`overlaps`]), in path then
+/// source order of the first, or of the definition below.
 fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     let declared = found.iter().map(|found| {
@@ -6433,9 +6454,51 @@ fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
                 "a definition invoked by name must be the only one of its path in the workspace",
             ));
         }
+        errors.extend(overlaps(&found.listed));
     }
     errors.sort_by_key(|error| (error.input, error.span.start));
     errors
+}
+
+/// The errors of the definitions made with the def-type `listed` that lie
+/// under others of it (see [`Workspace::def_types`]): for each definition
+/// whose path is below another's, `app.core` below `app`, "`package
+/// app.core` lies under another `package` definition", at it, labelled
+/// "`app` is defined here" at each definition above it, in the order of
+/// `listed`'s.
+fn overlaps(listed: &DefType) -> Vec<Diagnostic> {
+    let definitions = &listed.definitions;
+    let def_type = &listed.path;
+    let mut errors = Vec::new();
+    for definition in definitions {
+        let mut above = definitions
+            .iter()
+            .filter(|other| lies_under(&definition.path, &other.path))
+            .peekable();
+        if above.peek().is_none() {
+            continue;
+        }
+        let path = &definition.path;
+        let mut error = Diagnostic::error(
+            format!("`{def_type} {path}` lies under another `{def_type}` definition"),
+            definition.span,
+        )
+        .in_input(definition.file)
+        .with_note("a definition invoked by name must not lie under another in the workspace");
+        for other in above {
+            let text = format!("`{}` is defined here", other.path);
+            error = error.with_context_in(other.file, other.span, text);
+        }
+        errors.push(error);
+    }
+    errors
+}
+
+/// Whether the path `path` lies under the path `above`, its segments
+/// following all of `above`'s: `app.core` under `app`, but not `apple`.
+fn lies_under(path: &str, above: &str) -> bool {
+    path.strip_prefix(above)
+        .is_some_and(|rest| rest.starts_with('.'))
 }
 
 /// A declaration of a path by [`duplicates`]: its path, its file and where.
@@ -13078,6 +13141,133 @@ p26 = com.x"#;
     }
 
     #[test]
+    fn a_definition_under_another_fails_every_invocation() {
+        let note = "note: a definition invoked by name must not lie under another in the \
+                    workspace";
+        // In two sibling directories, which see neither the other: invoking
+        // another definition, `apple`, which lies under nothing, fails, and
+        // so does the listing.
+        let siblings = [
+            PACKAGE,
+            ("a/x.gcsl", "def package app() { \"a\" }"),
+            (
+                "b/y.gcsl",
+                "def package app.core() { \"b\" }\ny = package app.core()",
+            ),
+            ("c/z.gcsl", "def package apple() { \"c\" }"),
+        ];
+        let under = format!(
+            "`package app.core` lies under another `package` definition at b/y.gcsl; \
+             a/x.gcsl: `app` is defined here; {note}"
+        );
+        assert_eq!(
+            invoke_errors(&siblings, "package", "apple"),
+            [under.as_str()]
+        );
+        assert_eq!(listing_errors(&siblings), [under.as_str()]);
+        // An ordinary run allows them, and runs.
+        assert_eq!(rooted_text(&siblings, "b/y.gcsl"), "{y = \"app.core b\"}");
+        // In one directory, through `#[shadowable]`.
+        let shadowed = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "#[shadowable] def package app.core() { \"core\" }\n\
+                 def package app() { \"app\" }\n\
+                 y = package app()",
+            ),
+        ];
+        assert_eq!(
+            listing_errors(&shadowed),
+            [format!(
+                "`package app.core` lies under another `package` definition at a.gcsl; \
+                 a.gcsl: `app` is defined here; {note}"
+            )]
+        );
+        assert_eq!(rooted_text(&shadowed, "a.gcsl"), "{y = \"app app\"}");
+        // Three levels: `a.b` lies under one, `a.b.c` under two, labelled in
+        // path then source order.
+        let levels = [
+            PACKAGE,
+            ("a/one.gcsl", "def package a.b.c() { \"c\" }"),
+            ("b/two.gcsl", "def package a.b() { \"b\" }"),
+            ("c/three.gcsl", "def package a() { \"a\" }"),
+        ];
+        assert_eq!(
+            listing_errors(&levels),
+            [
+                format!(
+                    "`package a.b.c` lies under another `package` definition at a/one.gcsl; \
+                     b/two.gcsl: `a.b` is defined here; c/three.gcsl: `a` is defined here; \
+                     {note}"
+                ),
+                format!(
+                    "`package a.b` lies under another `package` definition at b/two.gcsl; \
+                     c/three.gcsl: `a` is defined here; {note}"
+                ),
+            ]
+        );
+        // Definitions of other def-types do not overlap: `build a.b.c` lies
+        // under no `package` definition.
+        let other = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { f() }\n\
+                 #[def_type]\n\
+                 def build(name: String, f: fn(): String): String { f() }",
+            ),
+            ("a/one.gcsl", "def build a.b.c() { \"c\" }"),
+            levels[2],
+            levels[3],
+        ];
+        assert_eq!(
+            listing_errors(&other),
+            [format!(
+                "`package a.b` lies under another `package` definition at b/two.gcsl; \
+                 c/three.gcsl: `a` is defined here; {note}"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_definition_both_duplicated_and_under_another_has_both_errors() {
+        let defined = "note: a definition invoked by name must be the only one of its path \
+                       in the workspace";
+        let note = "note: a definition invoked by name must not lie under another in the \
+                    workspace";
+        // `app` twice, and `app.core` twice under it: each `app.core` lies
+        // under both `app`s.
+        let files = [
+            PACKAGE,
+            ("a/x.gcsl", "def package app() { \"a\" }"),
+            ("b/y.gcsl", "def package app.core() { \"b\" }"),
+            ("c/z.gcsl", "def package app.core() { \"c\" }"),
+            ("d/w.gcsl", "def package app() { \"d\" }"),
+        ];
+        let under = |at: &str| {
+            format!(
+                "`package app.core` lies under another `package` definition at {at}; \
+                 a/x.gcsl: `app` is defined here; d/w.gcsl: `app` is defined here; {note}"
+            )
+        };
+        let expected = [
+            format!(
+                "`package app` is defined 2 times in the workspace at a/x.gcsl; \
+                 d/w.gcsl: also defined here; {defined}"
+            ),
+            format!(
+                "`package app.core` is defined 2 times in the workspace at b/y.gcsl; \
+                 c/z.gcsl: also defined here; {defined}"
+            ),
+            under("b/y.gcsl"),
+            under("c/z.gcsl"),
+        ];
+        assert_eq!(listing_errors(&files), expected);
+        assert_eq!(invoke_errors(&files, "package", "app"), expected);
+    }
+
+    #[test]
     fn what_cannot_be_invoked_is_a_request_error() {
         let files = [
             BUILD,
@@ -13140,20 +13330,27 @@ p26 = com.x"#;
         // Before parameters, the path.
         assert_eq!(
             request_error(&files, "build", "y"),
-            "`build` has no definition `y`; note: its definitions are `x`"
+            "`build` has no definition `y`; note: its only definition is `x`"
         );
         // A path that is a definition's, and above another's, in a sibling
-        // directory, is the definition.
+        // directory: the one below lies under it, and neither is invoked.
+        let under = "`package app.core` lies under another `package` definition";
+        let note = "note: a definition invoked by name must not lie under another in the \
+                    workspace";
         let files = [
             PACKAGE,
             ("a/x.gcsl", "def package app() { \"a\" }"),
             ("b/y.gcsl", "def package app.core() { \"b\" }"),
         ];
-        assert_eq!(invoked_text(&files, "package", "app"), "app a");
-        assert_eq!(invoked_text(&files, "package", "app.core"), "app.core b");
+        let siblings = format!("{under} at b/y.gcsl; a/x.gcsl: `app` is defined here; {note}");
+        assert_eq!(invoke_errors(&files, "package", "app"), [siblings.as_str()]);
+        assert_eq!(
+            invoke_errors(&files, "package", "app.core"),
+            [siblings.as_str()]
+        );
         // A `#[shadowable]` definition that one of another path, above it,
-        // shadows in its own directory is in no tree: found, but no source
-        // can reach it, and neither can an invocation.
+        // shadows in its own directory, which is in no tree: found, and the
+        // one below.
         let files = [
             PACKAGE,
             (
@@ -13162,11 +13359,52 @@ p26 = com.x"#;
                  def package app() { \"app\" }",
             ),
         ];
+        let shadowed = format!("{under} at a.gcsl; a.gcsl: `app` is defined here; {note}");
         assert_eq!(
-            request_error(&files, "package", "app.core"),
-            "`package` has no definition `app.core`; note: its definitions are `app`, `app.core`"
+            invoke_errors(&files, "package", "app.core"),
+            [shadowed.as_str()]
         );
-        assert_eq!(invoked_text(&files, "package", "app"), "app app");
+        assert_eq!(invoke_errors(&files, "package", "app"), [shadowed.as_str()]);
+    }
+
+    #[test]
+    fn a_request_error_names_the_only_one_there_is() {
+        let files = [
+            PACKAGE,
+            ("lib/defs.gcsl", "def package dev.peios.a() { \"a\" }"),
+        ];
+        assert_eq!(
+            request_error(&files, "pkg", "x"),
+            "no def-type `pkg`; note: the only def-type is `package`"
+        );
+        assert_eq!(
+            request_error(&files, "package", "dev.peios.nope"),
+            "`package` has no definition `dev.peios.nope`; \
+             note: its only definition is `dev.peios.a`"
+        );
+        assert_eq!(
+            request_error(&files, "package", "dev.peios"),
+            "`dev.peios` is not a `package` definition; \
+             note: its only definition is `dev.peios.a`"
+        );
+        // Two or more are listed, as `what_cannot_be_invoked_is_a_request_error`
+        // shows with more.
+        let files = [
+            BUILD,
+            ("lib/defs.gcsl", PACKAGE.1),
+            (
+                "lib/more.gcsl",
+                "def package a() { \"a\" }\ndef package b() { \"b\" }",
+            ),
+        ];
+        assert_eq!(
+            request_error(&files, "pkg", "x"),
+            "no def-type `pkg`; note: the def-types are `build`, `package`"
+        );
+        assert_eq!(
+            request_error(&files, "package", "c"),
+            "`package` has no definition `c`; note: its definitions are `a`, `b`"
+        );
     }
 
     #[test]
