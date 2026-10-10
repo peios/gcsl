@@ -1,0 +1,2 @@
+# `fileroot`'s members are read through the module, imported whole.
+import this from fileroot

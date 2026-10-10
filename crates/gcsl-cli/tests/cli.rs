@@ -2658,6 +2658,97 @@ fn repl_has_attributes_of_its_own() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The canonical path of this crate's directory, which the `fileroot`
+/// tests' paths start with, whatever directory they run from.
+fn crate_dir() -> String {
+    std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A workspace whose library works on its callers' paths, run from another
+/// working directory than the workspace's, and from inside it: the paths are
+/// the same, absolute, the caller's directory and the workspace's root.
+#[test]
+fn fileroot_paths_do_not_depend_on_the_working_directory() {
+    let expected = "{a = \"<dir>/tests/fixtures/ws_fileroot/pkg/usr -> \
+                    <dir>/tests/fixtures/ws_fileroot/dist\"; \
+                    b = \"<dir>/tests/fixtures/ws_fileroot/pkg/usr -> \
+                    <dir>/tests/fixtures/ws_fileroot/dist\"; \
+                    here = \"<dir>/tests/fixtures/ws_fileroot/pkg\"; \
+                    root = \"<dir>/tests/fixtures/ws_fileroot\"}\n";
+    let dir = crate_dir();
+    for (cwd, file) in [
+        ("tests", "fixtures/ws_fileroot/pkg/test.gcsl"),
+        ("tests/fixtures/ws_fileroot/pkg", "test.gcsl"),
+        ("tests/fixtures/ws_fileroot/_lib", "../pkg/test.gcsl"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+            .args(["run", file])
+            .current_dir(format!("{}/{cwd}", env!("CARGO_MANIFEST_DIR")))
+            .output()
+            .unwrap();
+        assert_eq!(stderr(&output), "", "{cwd}");
+        assert_eq!(stdout(&output).replace(&dir, "<dir>"), expected, "{cwd}");
+        assert_eq!(output.status.code(), Some(0));
+    }
+    // A lone file is the workspace of its own directory.
+    let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        .args(["run", "fixtures/lone_fileroot.gcsl"])
+        .current_dir(format!("{}/tests", env!("CARGO_MANIFEST_DIR")))
+        .output()
+        .unwrap();
+    assert_eq!(
+        stdout(&output).replace(&dir, "<dir>"),
+        "{here = \"<dir>/tests/fixtures\"; root = \"<dir>/tests/fixtures\"}\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The REPL's inputs are in its working directory.
+#[test]
+fn repl_inputs_are_in_the_working_directory() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        .current_dir(format!("{}/tests", env!("CARGO_MANIFEST_DIR")))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"import fileroot\nfileroot.workspace\nfileroot.caller\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        stdout(&output).replace(&crate_dir(), "<dir>"),
+        "\"<dir>/tests\" : String\n\"<dir>/tests\" : String\n"
+    );
+    assert_eq!(stderr(&output), "");
+}
+
+/// A use of `fileroot` but a read of its members, rendered.
+#[test]
+fn fileroot_errors_are_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/fileroot_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `fileroot`'s members are read as `fileroot.this`\n\
+         \x20--> tests/fixtures/fileroot_error.gcsl:2:8\n\
+         \x20 |\n\
+         2 | import this from fileroot\n\
+         \x20 |        ^^^^\n\
+         \x20 |\n\
+         \x20 = note: import the module whole, `import fileroot`, and read each member through it\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
 #[test]
 fn repl_evaluates_each_line() {
     let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");

@@ -5,7 +5,9 @@
 //! named `workspace.gcsl`; finding it and reading its files is the CLI's,
 //! and this module reads no file: it is given the files as
 //! [`SourceFile`]s named by their paths relative to the root, `/`
-//! separated, and answers with diagnostics or values.
+//! separated, with the root's absolute path, which only the `fileroot`
+//! module tells (see [The standard library](#the-standard-library)), and
+//! answers with diagnostics or values.
 //!
 //! # Directory scope
 //!
@@ -263,22 +265,24 @@
 //!
 //! # The standard library
 //!
-//! Two kinds of module are not files of the workspace. `builtins` is a
-//! module implemented in Rust, a record of the built-in functions
-//! ([`Builtin`]): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
-//! `starts_with`, `ends_with` and `trim`. The *standard files* are the
+//! Two kinds of module are not files of the workspace. `builtins` and
+//! `fileroot` are modules implemented in Rust: `builtins` a record of the
+//! built-in functions ([`Builtin`]): `len`, `int`, `float`, `exec`,
+//! `panic`, `split`, `join`, `starts_with`, `ends_with` and `trim`;
+//! `fileroot` where files are (below). The *standard files* are the
 //! `.gcsl` files of the repository's `stdlib/` directory, compiled in
 //! ([`crate::STANDARD`]): `path.gcsl`, lexical operations on paths, and
 //! `prelude.gcsl`, which binds the built-in functions and `sh`. Each is
 //! importable by a bare name, `import builtins`, `import len from
-//! builtins`, `import * from prelude`, `import path`, from any file; the
-//! names are reserved roots of the path namespace, and a file or directory
-//! at the workspace's root named like one of them is an error of the scan,
-//! "`builtins` is the name of a built-in module", "`prelude` is the name of
-//! a standard module" (and so for `path`), reported at the start of the
-//! file, or of the first file under the directory, whether or not any file
-//! imports it. A path of more than one segment never names one, and a file
-//! or directory below the root has a path of its own.
+//! builtins`, `import fileroot`, `import * from prelude`, `import path`,
+//! from any file; the names are reserved roots of the path namespace, and
+//! a file or directory at the workspace's root named like one of them is
+//! an error of the scan, "`builtins` is the name of a built-in module" (and
+//! so for `fileroot`), "`prelude` is the name of a standard module" (and so
+//! for `path`), reported at the start of the file, or of the first file
+//! under the directory, whether or not any file imports it. A path of more
+//! than one segment never names one, and a file or directory below the
+//! root has a path of its own.
 //!
 //! EACH STANDARD FILE IS A DIRECTORY SCOPE OF ITS OWN, a directory with no
 //! directory above, whose path is [`STANDARD_DIR`]: it sees its own
@@ -340,6 +344,46 @@
 //! built-in functions"); a session gets it with the rest of the standard
 //! library's run.
 //!
+//! The `fileroot` module has no file, no cell and no value: it is a target
+//! of its own ([`Target::Fileroot`]), which only a whole import names,
+//! `import fileroot` or `import fileroot as fr`, in a workspace's file, a
+//! lone file or a session's input, and whose four members are read only as
+//! `fileroot.NAME` through that name (each a target too, numbered after the
+//! view's nodes, so that a reference resolves to it as to any member, and
+//! mentions it, needing no file): `fileroot.this`, the directory of the
+//! file the expression is written in; `fileroot.workspace`, the root;
+//! `fileroot.caller`, the directory of the file whose code made the call
+//! the running function runs for; and `fileroot.helper()`, after which the
+//! running function's calls pass its own caller on (see [`crate::eval`],
+//! "Callers and helpers", and the checker's "Imports"). A member or `*`
+//! import of it is "`fileroot`'s members are read as `fileroot.caller`",
+//! naming the member imported, `caller` for a `*`, and an import of a
+//! name it lacks "`fileroot` has no `nope`". The scan looks the members'
+//! names up, never interning them, once the files are parsed
+//! (`Scan::fileroot_names`), since the names are lent to each file as it
+//! is checked.
+//!
+//! Every path `fileroot` gives is absolute, without a trailing `/` (but `/`
+//! itself), and is what the driver resolved for the files: the caller of
+//! [`check_with_standard`] gives the workspace's root, which the CLI found
+//! above the canonical path of the file it runs (`fs::canonicalize`, once,
+//! so that it is canonical too), and [`check_lone_with_standard`] the lone
+//! file's directory, which the CLI takes from the file's canonical path; a
+//! session's root is the process's working directory as it starts,
+//! canonical ([`working_directory`]), which [`check`], [`check_with`],
+//! [`check_lone`] and [`crate::run`], told none, take too. Once a scan has
+//! parsed its files, the driver *locates* them (`Scan::locate`): it builds
+//! the run's table of directories, the root first, always, at index 0, then
+//! each other directory with a file, once, by its absolute path, the root
+//! joined to its path relative to the root, the standard files' `<stdlib>`
+//! once; each file's `fileroot.this` is its directory's, the standard files'
+//! `<stdlib>`, which nothing should rely on, and its `fileroot.workspace`
+//! the root (a session's input: its root, which is both). The checker
+//! gives each file's code its directory's index ([`crate::check::Place`],
+//! [`crate::ir::Ir::dir`]), and every run its table, which
+//! `fileroot.caller` reads. A session's inputs are each in its root, at
+//! index 0 of the table its start built, which no input extends.
+//!
 //! Every file whose first items do not include `#![no_prelude]`, the
 //! standard files included, and every session's input, begins as if with
 //! `#[shadowable] import * from prelude`: the parse gives its tree the
@@ -382,7 +426,7 @@ use crate::Outcome;
 use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
 #[cfg(test)]
 use crate::check::ViewRecord;
-use crate::check::{Builtin, CheckOutput, Checker, Scope, Slot, Types};
+use crate::check::{Builtin, CheckOutput, Checker, Fileroot, Place, Scope, Slot, Types};
 use crate::diagnostic::Diagnostic;
 use crate::eval::MemoTables;
 use crate::ir::Ir;
@@ -631,6 +675,11 @@ pub enum Target {
     /// the file is under, by its index in [`Scan::views`]: read whole, the
     /// record its file assembles of every source's children.
     View(u32),
+    /// The `fileroot` module (`None`), which only a whole import names, or
+    /// one of its members, reached through it: no cell and no file, its
+    /// members read as `fileroot.NAME` only, each as the checker makes it
+    /// (see [The standard library](#the-standard-library)).
+    Fileroot(Option<Fileroot>),
 }
 
 /// A name a file imports.
@@ -790,6 +839,11 @@ pub struct Scan {
     /// The directory of the `builtins` module, whose nodes are the first
     /// [`Builtin::ALL`]`.len()` of `nodes`.
     builtins_dir: u32,
+    /// The name of each member of the `fileroot` module, in the order of
+    /// [`Fileroot::ALL`], if some file spells it: looked up, never interned,
+    /// once the files are parsed, since the names are lent to each file as
+    /// it is checked, while its references are resolved.
+    fileroot_names: [Option<Name>; 4],
     /// Whether the files given are one file outside any workspace (a lone
     /// file, a session's input), whose imports of anything but `builtins`
     /// and the standard files the checker reports.
@@ -799,6 +853,13 @@ pub struct Scan {
     /// after them, past the slots of the session's earlier inputs (see
     /// [`Scan::slot`]).
     relocation: Option<(u32, Vec<Slot>)>,
+    /// The run's table of directories, the root's first ([`Scan::locate`]),
+    /// by which the code of each file names its directory: what
+    /// `fileroot.caller` reads (see [`crate::eval`], "Callers and
+    /// helpers"). Empty until the scan is located.
+    dir_texts: Vec<Rc<str>>,
+    /// Each file's directory, by its index in `dir_texts`, by input number.
+    file_dirs: Vec<u32>,
 }
 
 impl Scan {
@@ -861,7 +922,8 @@ impl Scan {
 
     /// The number of `target` among every target of the workspace: the
     /// directories, then the files, then the files' own nodes, then the
-    /// merged nodes, then the views' nodes.
+    /// merged nodes, then the views' nodes, then the `fileroot` module and
+    /// its members, in the order of [`Fileroot::ALL`].
     fn target_number(&self, target: Target) -> u32 {
         let (dirs, files) = (count(self.dirs.len()), count(self.files.len()));
         let parts = self.parts();
@@ -879,11 +941,32 @@ impl Scan {
             Target::View(view) => nodes
                 .saturating_add(count(self.nodes.len()))
                 .saturating_add(view),
+            Target::Fileroot(member) => self
+                .fileroot_number()
+                .saturating_add(member.map_or(0, |member| member.index() + 1)),
         }
+    }
+
+    /// The number of the `fileroot` module among every target, after the
+    /// views' nodes; its members' follow it (see [`Scan::target_number`]).
+    fn fileroot_number(&self) -> u32 {
+        let (dirs, files) = (count(self.dirs.len()), count(self.files.len()));
+        dirs.saturating_add(files)
+            .saturating_add(self.parts())
+            .saturating_add(count(self.nodes.len()))
+            .saturating_add(count(self.views.len()))
     }
 
     /// The target of number `number` (see [`Scan::target_number`]).
     fn target_of(&self, number: u32) -> Option<Target> {
+        if let Some(at) = number.checked_sub(self.fileroot_number()) {
+            return match at.checked_sub(1) {
+                None => Some(Target::Fileroot(None)),
+                Some(member) => Fileroot::ALL
+                    .get(member as usize)
+                    .map(|&member| Target::Fileroot(Some(member))),
+            };
+        }
         let (dirs, files) = (count(self.dirs.len()), count(self.files.len()));
         let Some(rest) = number.checked_sub(dirs) else {
             return Some(Target::Dir(number));
@@ -973,6 +1056,77 @@ impl Scan {
         })
     }
 
+    /// Locates the files at `root`, the absolute path of the workspace's
+    /// root directory, canonical and without a trailing `/` (but `/`
+    /// itself), for the `fileroot` module (see the module documentation,
+    /// "The standard library"): builds the run's table of directories,
+    /// [`Scan::dir_texts`], and each file's index in it. The root is first,
+    /// always, so that its index is 0 in every run, as a session's inputs,
+    /// each in its root, need; then each other directory with a file, once,
+    /// in the order of [`Scan::dirs`], each by its absolute path, its path
+    /// relative to the root joined to `root` with a `/` (no other after a
+    /// `root` of `/`); the standard files' `<stdlib>` once, as its own
+    /// path, though each standard file is a directory of its own.
+    fn locate(&mut self, root: &str) {
+        let mut texts: Vec<Rc<str>> = vec![Rc::from(root)];
+        let mut found: HashMap<Rc<str>, u32> = HashMap::new();
+        found.insert(Rc::from(root), 0);
+        // The index of each directory of the scan, once it has one; the
+        // root, dir 0 (`place_dirs` interns it first), has the first.
+        let mut indices: Vec<Option<u32>> = vec![None; self.dirs.len()];
+        if let Some(entry) = indices.first_mut() {
+            *entry = Some(0);
+        }
+        let mut file_dirs = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            if let Some(&Some(at)) = indices.get(file.dir as usize) {
+                file_dirs.push(at);
+                continue;
+            }
+            let path = self
+                .dirs
+                .get(file.dir as usize)
+                .map_or("", |d| d.path.as_str());
+            let text: Rc<str> = if path.is_empty() {
+                Rc::from(root)
+            } else if path == STANDARD_DIR {
+                Rc::from(path)
+            } else if root.ends_with('/') {
+                Rc::from(format!("{root}{path}"))
+            } else {
+                Rc::from(format!("{root}/{path}"))
+            };
+            let at = *found.entry(Rc::clone(&text)).or_insert_with(|| {
+                texts.push(text);
+                count(texts.len() - 1)
+            });
+            if let Some(entry) = indices.get_mut(file.dir as usize) {
+                *entry = Some(at);
+            }
+            file_dirs.push(at);
+        }
+        self.dir_texts = texts;
+        self.file_dirs = file_dirs;
+    }
+
+    /// Where file `index` is, as [`Scan::locate`] found it: its directory's
+    /// index in the run's table, which is its `fileroot.this`, and the
+    /// root's, its `fileroot.workspace`. Directory 0 and empty texts for a
+    /// scan not located, which no run has.
+    fn place(&self, index: u32) -> Place {
+        let dir = self.file_dirs.get(index as usize).copied().unwrap_or(0);
+        let text = |at: u32| {
+            self.dir_texts
+                .get(at as usize)
+                .map_or_else(|| Rc::from(""), Rc::clone)
+        };
+        Place {
+            dir,
+            this: text(dir),
+            workspace: text(0),
+        }
+    }
+
     /// The number of the cell of the value of `file`, a value file some
     /// file imports, among the workspace's cells ([`Scan::cells`]): after
     /// the merged nodes. Like a merged node's, its slot is [`Slot::at`] its
@@ -1036,6 +1190,12 @@ impl Scan {
                 Merged::View(child) => Some(Target::View(child)),
                 Merged::One(part) => Some(part.target),
             },
+            Target::Fileroot(None) => Fileroot::ALL
+                .into_iter()
+                .zip(self.fileroot_names)
+                .find(|&(_, named)| named == Some(name))
+                .map(|(member, _)| Target::Fileroot(Some(member))),
+            Target::Fileroot(Some(_)) => None,
         }
     }
 
@@ -1095,7 +1255,7 @@ impl Scan {
                 })
                 .unwrap_or_default(),
             Target::View(view) => self.view_names(view),
-            Target::Dir(_) | Target::File(_) => target_roots(self, target),
+            Target::Dir(_) | Target::File(_) | Target::Fileroot(_) => target_roots(self, target),
         }
     }
 
@@ -1127,10 +1287,11 @@ impl Scan {
     /// The files a reference through an import to `target` needs: every
     /// file of a directory, the file of a file or a part, a merged node's
     /// leaf's file or its contributors, every owner of every part of a view
-    /// node.
+    /// node; none for the `fileroot` module, which no file computes.
     #[must_use]
     pub fn target_files(&self, target: Target) -> Vec<u32> {
         match target {
+            Target::Fileroot(_) => Vec::new(),
             Target::Dir(dir) => (0u32..)
                 .zip(&self.files)
                 .filter(|(_, file)| file.dir == dir)
@@ -1155,10 +1316,12 @@ impl Scan {
     }
 
     /// How `target` is shown in a diagnostic: a directory's or a file's
-    /// module path, a node's dotted path.
+    /// module path, a node's dotted path, `fileroot` or `fileroot.caller`.
     fn show_target(&self, target: Target) -> String {
         let module = |path: &str| path.trim_end_matches(".gcsl").replace('/', ".");
         match target {
+            Target::Fileroot(None) => Fileroot::MODULE.to_owned(),
+            Target::Fileroot(Some(member)) => format!("{}.{}", Fileroot::MODULE, member.name()),
             Target::Dir(dir) => self
                 .dirs
                 .get(dir as usize)
@@ -1580,8 +1743,11 @@ fn scan_into(
         values: Vec::new(),
         standard: 0,
         builtins_dir: 0,
+        fileroot_names: [None; 4],
         lone: matches!(placing, Placing::Lone(..)),
         relocation: None,
+        dir_texts: Vec::new(),
+        file_dirs: Vec::new(),
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
@@ -1606,6 +1772,7 @@ fn scan_files(
     sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
     let (standard, parsed) = parse_files(scan, &sorted, library, loaded)?;
     scan.standard = count(standard.len());
+    scan.fileroot_names = Fileroot::ALL.map(|member| scan.names.lookup(member.name()));
     let (dirs, user_dirs) = place_dirs(scan, &sorted, placing);
     // Each standard file is a directory of its own, with no directory
     // above: a scope of its own, apart from the workspace's tree and from
@@ -1846,9 +2013,10 @@ fn builtin_nodes(scan: &mut Scan) {
 
 /// Reports each file or directory of the workspace's root named like a
 /// module of the standard library, the names it reserves: "`builtins` is
-/// the name of a built-in module", "`prelude` is the name of a standard
-/// module", once per name, at the start of the first file that has it (the
-/// file, or the first file under the directory), in path order. Every
+/// the name of a built-in module" (and so for `fileroot`), "`prelude` is
+/// the name of a standard module", once per name, at the start of the first
+/// file that has it (the file, or the first file under the directory), in
+/// path order. Every
 /// standard file of `library` reserves its stem, whether the scan loads it
 /// or not.
 fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnostic>) {
@@ -1860,7 +2028,7 @@ fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnostic>) {
         } else {
             first.strip_suffix(".gcsl").unwrap_or(first)
         };
-        let message = if name == BUILTINS {
+        let message = if name == BUILTINS || name == Fileroot::MODULE {
             format!("`{name}` is the name of a built-in module")
         } else if library.find(name).is_some() {
             format!("`{name}` is the name of a standard module")
@@ -2377,7 +2545,7 @@ impl Scan {
                 .views
                 .get(view as usize)
                 .is_some_and(|v| v.parts.iter().all(|&part| self.part_shadowable(part))),
-            Target::Dir(_) | Target::File(_) => false,
+            Target::Dir(_) | Target::File(_) | Target::Fileroot(_) => false,
         }
     }
 
@@ -3098,8 +3266,8 @@ fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Vec<Alias>) {
 /// What the module path `path` names, or the error that it names nothing
 /// (`None` for a directory and file of one name already reported, and for
 /// any path of a lone file but the standard library's, which the checker
-/// reports). A single segment naming the `builtins` module or a standard
-/// file names it, before anything of the workspace.
+/// reports). A single segment naming the `builtins` module, the `fileroot`
+/// module or a standard file names it, before anything of the workspace.
 fn module(
     scan: &Scan,
     modules: &Modules,
@@ -3117,6 +3285,9 @@ fn module(
     if let [only] = shown.as_slice() {
         if *only == BUILTINS {
             return Ok(Target::Dir(scan.builtins_dir));
+        }
+        if *only == Fileroot::MODULE {
+            return Ok(Target::Fileroot(None));
         }
         if let Some(file) = scan.standard_file(only) {
             return Ok(Target::File(file));
@@ -3268,6 +3439,11 @@ fn members(
                 });
             }
         }
+        ImportForm::Members(range) if target == Target::Fileroot(None) => {
+            for member in file.ast.import_members(range) {
+                errors.push(fileroot_member_import(scan, *member));
+            }
+        }
         ImportForm::Members(range) => {
             for member in file.ast.import_members(range) {
                 match *member {
@@ -3323,6 +3499,38 @@ fn members(
     }
 }
 
+/// The error of `member`, a member or the `*` of an import from the
+/// `fileroot` module, whose members are read as `fileroot.NAME` only, after
+/// a whole import of it (see the module documentation, "The standard
+/// library"): "`fileroot`'s members are read as `fileroot.caller`", naming
+/// the member imported, `caller` for a `*`; or, for a name that is no
+/// member, "`fileroot` has no `nope`", as for any module.
+fn fileroot_member_import(scan: &Scan, member: ImportMember) -> Diagnostic {
+    let (read_as, at) = match member {
+        ImportMember::Named { name, .. } => {
+            let text = scan.names.get(name.name);
+            let Some(read_as) = Fileroot::named(text) else {
+                return Diagnostic::error(
+                    format!("`{}` has no `{text}`", Fileroot::MODULE),
+                    name.span,
+                )
+                .with_note(crate::check::FILEROOT_MEMBERS);
+            };
+            (read_as, name.span)
+        }
+        ImportMember::All(star) => (Fileroot::Caller, star),
+    };
+    Diagnostic::error(
+        format!(
+            "`{module}`'s members are read as `{module}.{}`",
+            read_as.name(),
+            module = Fileroot::MODULE
+        ),
+        at,
+    )
+    .with_note("import the module whole, `import fileroot`, and read each member through it")
+}
+
 /// The names of the roots of `target`, a directory or a file, in order.
 fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
     match target {
@@ -3340,7 +3548,7 @@ fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
                 .filter_map(|&root| f.mentions.tree.nodes.get(root as usize).map(|n| n.name))
                 .collect()
         }),
-        Target::Part { .. } | Target::Node(_) | Target::View(_) => Vec::new(),
+        Target::Part { .. } | Target::Node(_) | Target::View(_) | Target::Fileroot(_) => Vec::new(),
     }
 }
 
@@ -3872,6 +4080,10 @@ pub(crate) struct Context<'a> {
     /// by a function, not read through the top level's frame as a
     /// directory's committed declarations are (see [`check_input`]).
     session: bool,
+    /// Where the file is, as the driver resolved it: its directory's index
+    /// in the run's table, and what `fileroot.this` and `fileroot.workspace`
+    /// are in it (see the module documentation, "The standard library").
+    place: Place,
 }
 
 /// What a [`Context`] reads cells by: the slot each cell is read from, and
@@ -3879,7 +4091,8 @@ pub(crate) struct Context<'a> {
 type CellReads<'a> = (&'a [Slot], &'a [Option<Box<[bool]>>]);
 
 impl<'a> Context<'a> {
-    /// The context of file `index` of `scan`.
+    /// The context of file `index` of `scan`, where the scan located it
+    /// ([`Scan::place`]).
     fn new(
         scan: &'a Scan,
         index: u32,
@@ -3896,6 +4109,7 @@ impl<'a> Context<'a> {
             cell_slots,
             cell_measured,
             session: false,
+            place: scan.place(index),
         })
     }
 
@@ -3903,6 +4117,11 @@ impl<'a> Context<'a> {
     /// field).
     pub(crate) fn session(&self) -> bool {
         self.session
+    }
+
+    /// Where the file is (see [`Context::place`]'s field).
+    pub(crate) fn place(&self) -> &Place {
+        &self.place
     }
 
     /// Whether the import item `item` of a lone file, or of a session's
@@ -4129,13 +4348,15 @@ pub fn check(sources: &[SourceFile]) -> Result<Workspace, Vec<Diagnostic>> {
 }
 
 /// [`check`], told the directories left out of the workspace as
-/// workspaces of their own (see [`scan_with`]).
+/// workspaces of their own (see [`scan_with`]). Its root, for the
+/// `fileroot` module, is the process's working directory, as a session's
+/// is ([`working_directory`]); [`check_with_standard`] is told it.
 ///
 /// # Errors
 ///
 /// As [`check`].
 pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace, Vec<Diagnostic>> {
-    check_with_standard(sources, nested).1
+    check_with_standard(sources, nested, &working_directory()).1
 }
 
 /// [`check_with`], with the standard files it loaded as sources, each named
@@ -4143,12 +4364,31 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
 /// succeeds or fails: the sources the diagnostics of the standard files
 /// name by input number, the workspace's files' numbers coming after them.
 /// Only the prelude and the standard files some file imports are loaded,
-/// so the number of the first file of the workspace is their number.
+/// so the number of the first file of the workspace is their number. `root`
+/// is the absolute path of the workspace's root directory, canonical and
+/// without a trailing `/` (but `/` itself), which every directory of its
+/// files is found from, for the `fileroot` module (see the module
+/// documentation, "The standard library").
 pub fn check_with_standard(
     sources: &[SourceFile],
     nested: &[String],
+    root: &str,
 ) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
-    check_in((sources, Placing::Workspace(nested)), Library::NEEDED)
+    check_in((sources, Placing::Workspace(nested)), Library::NEEDED, root)
+}
+
+/// The process's working directory, canonical (symbolic links resolved),
+/// as an absolute path without a trailing `/` (but `/` itself): the root a
+/// session's inputs are in ([`crate::Session::new`]), and that of a
+/// workspace or a lone file checked by an entry point that is given none
+/// ([`check`], [`check_with`], [`check_lone`], [`crate::run`]). `/` if it
+/// cannot be found, as when it has been removed; a path that is not UTF-8
+/// is taken lossily, each invalid sequence replaced by U+FFFD.
+#[must_use]
+pub fn working_directory() -> String {
+    std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map_or_else(|_| "/".to_owned(), |dir| dir.to_string_lossy().into_owned())
 }
 
 /// Scans, checks and lowers `source`, a file outside any workspace (`gcsl
@@ -4163,37 +4403,44 @@ pub fn check_with_standard(
 /// files is the checker's error, "`lib` is not a built-in or standard
 /// module, and there is no `workspace.gcsl` above this file".
 pub fn check_lone(source: &SourceFile) -> Result<Workspace, Vec<Diagnostic>> {
-    check_lone_with_standard(source).1
+    check_lone_with_standard(source, &working_directory()).1
 }
 
 /// [`check_lone`], with the standard files it loaded as sources, as
 /// [`check_with_standard`] gives them: the file's input number is their
-/// number.
+/// number. `dir` is the absolute path of the file's directory, canonical
+/// and without a trailing `/` (but `/` itself), which is the root of the
+/// workspace of one directory it is checked as, for the `fileroot` module;
+/// [`check_lone`] takes the working directory.
 pub fn check_lone_with_standard(
     source: &SourceFile,
+    dir: &str,
 ) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
-    let (loaded, checked) = check_lone_loading(source);
+    let (loaded, checked) = check_lone_loading(source, dir);
     (Library::NEEDED.sources(&loaded), checked)
 }
 
-/// [`check_lone`], with the indices in [`crate::STANDARD`] of the standard
-/// files it loaded, which are its first files: what [`crate::run`] numbers
-/// the file by, with no source made of them.
+/// [`check_lone_with_standard`], with the indices in [`crate::STANDARD`] of
+/// the standard files it loaded, which are its first files: what
+/// [`crate::run`] numbers the file by, with no source made of them.
 pub(crate) fn check_lone_loading(
     source: &SourceFile,
+    dir: &str,
 ) -> (Vec<usize>, Result<Workspace, Vec<Diagnostic>>) {
     let sources = std::slice::from_ref(source);
-    check_loading((sources, Placing::Lone(&[], false)), Library::NEEDED)
+    check_loading((sources, Placing::Lone(&[], false)), Library::NEEDED, dir)
 }
 
 /// Scans `sources` placed as `placing` says, beside `library`, and checks
-/// and lowers every file, as [`check_with`] does; with the standard files
-/// the scan loaded, as [`check_with_standard`] gives them.
+/// and lowers every file, as [`check_with`] does, the root being `root`;
+/// with the standard files the scan loaded, as [`check_with_standard`]
+/// gives them.
 fn check_in(
     placed: (&[SourceFile], Placing),
     library: Library,
+    root: &str,
 ) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
-    let (loaded, checked) = check_loading(placed, library);
+    let (loaded, checked) = check_loading(placed, library, root);
     (library.sources(&loaded), checked)
 }
 
@@ -4202,9 +4449,14 @@ fn check_in(
 fn check_loading(
     placed: (&[SourceFile], Placing),
     library: Library,
+    root: &str,
 ) -> (Vec<usize>, Result<Workspace, Vec<Diagnostic>>) {
     let mut loaded = Vec::new();
-    let checked = scan_into(placed, library, &mut Names::new(), &mut loaded).and_then(check_scan);
+    let checked =
+        scan_into(placed, library, &mut Names::new(), &mut loaded).and_then(|mut scan| {
+            scan.locate(root);
+            check_scan(scan)
+        });
     (loaded, checked)
 }
 
@@ -4237,7 +4489,8 @@ fn own_slot_names(ir: &mut Ir, committed: usize) -> (usize, Vec<Name>) {
 /// it is read from, and for a `def`'s which parameters its body measures.
 type CellTables = (Vec<TyId>, Vec<Slot>, Vec<Option<Box<[bool]>>>);
 
-/// Checks and lowers every file of `scan` in the order (see [`check`]).
+/// Checks and lowers every file of `scan` in the order (see [`check`]), each
+/// where the scan located it ([`Scan::locate`]).
 fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     let mut names = mem::take(&mut scan.names);
     let mut types = TypeTable::new();
@@ -4573,7 +4826,11 @@ impl Workspace {
             let Some(ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
                 continue;
             };
-            let context = (&mut self.memo, Some(&self.exec_result));
+            let context = (
+                &mut self.memo,
+                Some(&self.exec_result),
+                &self.scan.dir_texts[..],
+            );
             match session::run_input(ir, &mut self.frame, context) {
                 Ok(value) => {
                     if let Some(entry) = self.values.get_mut(at as usize) {
@@ -4634,6 +4891,13 @@ pub(crate) struct Standard {
     /// For each of its cells that is a `def`'s, which parameters its body
     /// measures.
     cell_measured: Vec<Option<Box<[bool]>>>,
+    /// The table of the directories of the run ([`Scan::locate`]): the
+    /// session's root, the working directory it started in, first, at index
+    /// 0, where every input is, both its `fileroot.this` and its
+    /// `fileroot.workspace`, and the standard files' `<stdlib>` after it.
+    /// Every input's code names its directory by it, the root's, and its run
+    /// reads it, so no input needs it extended.
+    pub(crate) dirs: Vec<Rc<str>>,
 }
 
 /// What a session continues from once it has run the standard library
@@ -4660,15 +4924,16 @@ pub(crate) struct Started {
 }
 
 /// Checks and runs the standard library as a session starts: through the
-/// driver of a workspace with no file of its own that loads every standard
-/// file, each a scope of its own, the built-in functions' cells written as
-/// the frame is laid out and every standard file run.
+/// driver of a workspace with no file of its own, whose root is `root`, the
+/// session's, that loads every standard file, each a scope of its own, the
+/// built-in functions' cells written as the frame is laid out and every
+/// standard file run.
 ///
 /// # Errors
 ///
 /// The diagnostics of the standard library, which are a bug.
-pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
-    let mut workspace = check_loading((&[], Placing::Workspace(&[])), Library::EVERY).1?;
+pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
+    let mut workspace = check_loading((&[], Placing::Workspace(&[])), Library::EVERY, root).1?;
     for file in 0..workspace.scan.standard {
         workspace.run(file)?;
     }
@@ -4690,6 +4955,7 @@ pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
             cell_types,
             cell_slots,
             cell_measured,
+            dirs: scan.dir_texts,
         },
         names: scan.names,
         types,
@@ -4760,6 +5026,8 @@ fn check_input_then<R>(
     let placed = (std::slice::from_ref(source), Placing::Lone(imports, true));
     let mut scan = scan_into(placed, Library::EVERY, names, &mut loaded)
         .map_err(|errors| being_run(errors, count(loaded.len())))?;
+    // In the session's root, as its start located the standard files.
+    scan.locate(standard.dirs.first().map_or("/", |root| root));
     let index = scan.standard;
     // The input's cells, but its `def`s', take the slots past the scope's,
     // in order.
@@ -4825,7 +5093,7 @@ fn check_input_then<R>(
 pub(crate) fn check_beside_prelude(
     text: &str,
 ) -> (Ast, TypeTable, Result<CheckOutput, Vec<Diagnostic>>) {
-    let started = start().unwrap();
+    let started = start("/").unwrap();
     let (mut names, mut types) = (started.names, started.types);
     let source = SourceFile::new("test.gcsl", text).unwrap();
     let scope = Scope::of_slots(started.slot_names);
@@ -7566,7 +7834,7 @@ p26 = com.x"#;
             table,
             every: false,
         };
-        let (standard, checked) = check_in((&sources, Placing::Workspace(&[])), library);
+        let (standard, checked) = check_in((&sources, Placing::Workspace(&[])), library, "/");
         let names = standard.iter().map(|s| s.name().to_owned()).collect();
         (names, checked)
     }
@@ -7814,7 +8082,7 @@ p26 = com.x"#;
         assert_eq!(workspace.frame.len(), bare.frame.len());
         // A lone file too: the prelude is input 0, the file the next.
         let source = SourceFile::new("lone.gcsl", "n = len([1])").unwrap();
-        let (standard, checked) = check_lone_with_standard(&source);
+        let (standard, checked) = check_lone_with_standard(&source, "/");
         assert_eq!(standard.len(), 1);
         assert_eq!(checked.unwrap().file("lone.gcsl"), Some(1));
     }
@@ -8571,7 +8839,7 @@ p26 = com.x"#;
 
     #[test]
     fn an_input_cannot_turn_the_prelude_off() {
-        let started = start().unwrap();
+        let started = start("/").unwrap();
         let (mut names, mut types) = (started.names, started.types);
         let source = SourceFile::new("input", "#![no_prelude]\nx = 1").unwrap();
         let errors = check_input(
@@ -8593,6 +8861,567 @@ p26 = com.x"#;
                 Span::new(0, 14),
                 None
             )]
+        );
+    }
+
+    /// The root the `fileroot` tests' workspaces are located at: a path in
+    /// the scratch directory, which nothing reads, since the library reads
+    /// no file.
+    const SCRATCH: &str = "/scratch/fileroot";
+
+    /// The library of the `fileroot` summary, `_lib/ppk.gcsl`, with what the
+    /// other tests call besides: `commit`, `wrapped` (a helper), `twice`
+    /// (a helper of a helper), `here` (`this` in a `def`), `caller` (the
+    /// caller of a `def` of the library), `mid` (`helper()` between two
+    /// calls), closures made in the library, and a step made in it.
+    const PPK: &str = "import path\nimport fileroot\n\
+        def commit(content: String, output: String) -> String {\n\
+            let content = path.join(fileroot.caller, content)\n\
+            let output = path.join(fileroot.workspace, output)\n\
+            \"{content} {output}\"\n\
+        }\n\
+        def wrapped(content: String) -> String {\n\
+            fileroot.helper()\n\
+            commit(content, \"dist\")\n\
+        }\n\
+        def twice(content: String) -> String {\n\
+            fileroot.helper()\n\
+            wrapped(content)\n\
+        }\n\
+        def here(): String { fileroot.this }\n\
+        def caller(): String { fileroot.caller }\n\
+        def mid(): {before: String, after: String} {\n\
+            let first = caller()\n\
+            fileroot.helper()\n\
+            let second = caller()\n\
+            { before = first; after = second }\n\
+        }\n\
+        def reader(): fn(): String { fn(): String { fileroot.caller } }\n\
+        def calling(): fn(): String { fn(): String { caller() } }\n\
+        def call(f: fn(): String): String { f() }\n\
+        def step(): {s: Future<String>} { s = lazy { fileroot.caller } }\n\
+        def force(f: Future<String>) -> String { await f }";
+
+    /// The workspace of `files`, each a path and a text, located at
+    /// [`SCRATCH`], checked.
+    fn rooted(files: &[(&str, &str)]) -> Result<Workspace, Vec<Diagnostic>> {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        check_with_standard(&sources, &[], SCRATCH).1
+    }
+
+    /// The value of the file at `path` of the workspace of `files` located
+    /// at [`SCRATCH`].
+    fn rooted_value(files: &[(&str, &str)], path: &str) -> Value {
+        let mut workspace = rooted(files).unwrap_or_else(|errors| panic!("{path}: {errors:?}"));
+        assert_imports_stored(&workspace);
+        assert_assemblies_stored(&workspace);
+        let index = workspace.file(path).unwrap();
+        match workspace.run(index) {
+            Ok(outcome) => outcome.value,
+            Err(errors) => panic!("{path}: {errors:?}"),
+        }
+    }
+
+    /// [`rooted_value`] shown, [`SCRATCH`] shown as `<root>`.
+    fn rooted_text(files: &[(&str, &str)], path: &str) -> String {
+        rooted_value(files, path)
+            .to_string()
+            .replace(SCRATCH, "<root>")
+    }
+
+    /// The messages of the diagnostics of checking the workspace of `files`
+    /// located at [`SCRATCH`].
+    fn rooted_messages(files: &[(&str, &str)]) -> Vec<String> {
+        match rooted(files) {
+            Ok(_) => panic!("{files:?}: no error"),
+            Err(errors) => errors.into_iter().map(|error| error.message).collect(),
+        }
+    }
+
+    #[test]
+    fn the_fileroot_summary_runs_in_a_workspace() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("_lib/ppk.gcsl", PPK),
+            (
+                "pkg/test.gcsl",
+                "import _lib.ppk\nimport fileroot\n\
+                 a = ppk.commit(\"usr\", \"dist\")\n\
+                 b = ppk.wrapped(\"usr\")\n\
+                 here = fileroot.this",
+            ),
+        ];
+        // The paths are absolute, from the root the driver was given.
+        assert_eq!(
+            rooted_value(&files, "pkg/test.gcsl").to_string(),
+            "{a = \"/scratch/fileroot/pkg/usr /scratch/fileroot/dist\"; \
+             b = \"/scratch/fileroot/pkg/usr /scratch/fileroot/dist\"; \
+             here = \"/scratch/fileroot/pkg\"}"
+        );
+        // `this` and `workspace` are constants of the file, `caller` and
+        // `helper()` nodes of their own, and each file's code carries its
+        // directory, by its index in the run's table, the root's first.
+        let mut workspace = rooted(&files).unwrap();
+        let (test, lib) = (
+            workspace.file("pkg/test.gcsl").unwrap(),
+            workspace.file("_lib/ppk.gcsl").unwrap(),
+        );
+        let test_ir = workspace.dump_ir(test).unwrap();
+        assert!(
+            test_ir.contains("(store here#") && test_ir.contains("(str \"/scratch/fileroot/pkg\""),
+            "{test_ir}"
+        );
+        let lib_ir = workspace.dump_ir(lib).unwrap();
+        assert!(lib_ir.contains("(caller @"), "{lib_ir}");
+        assert!(lib_ir.contains("(helper @"), "{lib_ir}");
+        assert!(lib_ir.contains("(str \"/scratch/fileroot\" @"), "{lib_ir}");
+        let dirs: Vec<&str> = workspace.scan.dir_texts.iter().map(|d| &**d).collect();
+        assert_eq!(dirs[0], SCRATCH);
+        for (file, dir) in [
+            (test, "/scratch/fileroot/pkg"),
+            (lib, "/scratch/fileroot/_lib"),
+        ] {
+            let ir = workspace.irs[file as usize].as_ref().unwrap();
+            assert_eq!(dirs[ir.dir() as usize], dir);
+        }
+        // The same, run from a file of the root itself.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("_lib/ppk.gcsl", PPK),
+            (
+                "top.gcsl",
+                "import _lib.ppk\na = ppk.commit(\"usr\", \"dist\")",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "top.gcsl"),
+            "{a = \"<root>/usr <root>/dist\"}"
+        );
+    }
+
+    #[test]
+    fn this_and_caller_through_calls_and_helpers() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("_lib/ppk.gcsl", PPK),
+            (
+                "pkg/test.gcsl",
+                "import _lib.ppk\nimport fileroot\n\
+                 top = fileroot.caller\n\
+                 this = fileroot.this\n\
+                 lib = ppk.here()\n\
+                 deep = ppk.caller()\n\
+                 one = ppk.wrapped(\"usr\")\n\
+                 two = ppk.twice(\"usr\")\n\
+                 mid = ppk.mid()\n\
+                 fn mine(): String { fileroot.caller }\n\
+                 own = mine()",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "pkg/test.gcsl"),
+            "{top = \"<root>/pkg\"; this = \"<root>/pkg\"; lib = \"<root>/_lib\"; \
+             deep = \"<root>/pkg\"; one = \"<root>/pkg/usr <root>/dist\"; \
+             two = \"<root>/pkg/usr <root>/dist\"; \
+             mid = {before = \"<root>/_lib\"; after = \"<root>/pkg\"}; own = \"<root>/pkg\"}"
+        );
+    }
+
+    #[test]
+    fn closures_and_lazies_carry_their_files() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("_lib/ppk.gcsl", PPK),
+            (
+                "pkg/make.gcsl",
+                "import _lib.ppk\nimport fileroot\n\
+                 fn mine(): String { fileroot.caller }\n\
+                 reads = ppk.reader()()\n\
+                 calls = ppk.calling()()\n\
+                 passed = ppk.call(mine)\n\
+                 made = ppk.step()\n\
+                 written = lazy { ppk.caller() }",
+            ),
+            (
+                "other/await.gcsl",
+                "import pkg.make\nimport _lib.ppk\n\
+                 made = await make.made.s\n\
+                 written = await make.written\n\
+                 forced = ppk.force(ppk.step().s)",
+            ),
+        ];
+        // A closure of the library called from `pkg` has `pkg` as its
+        // caller, and calls with `_lib`, its code's; a closure of `pkg`
+        // called by the library has `_lib`.
+        let made = rooted_text(&files, "pkg/make.gcsl");
+        assert!(
+            made.starts_with(
+                "{reads = \"<root>/pkg\"; calls = \"<root>/_lib\"; passed = \"<root>/_lib\""
+            ),
+            "{made}"
+        );
+        // A `lazy` runs as if where it was written, with the caller of the
+        // frame that made it, whoever awaits it.
+        assert_eq!(
+            rooted_text(&files, "other/await.gcsl"),
+            "{made = \"<root>/pkg\"; written = \"<root>/pkg\"; forced = \"<root>/other\"}"
+        );
+    }
+
+    #[test]
+    fn the_workspace_is_the_root_wherever_the_file_is() {
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a/b/c.gcsl",
+                "import fileroot\nws = fileroot.workspace\nhere = fileroot.this",
+            ),
+        ];
+        assert_eq!(
+            rooted_value(&files, "a/b/c.gcsl").to_string(),
+            "{ws = \"/scratch/fileroot\"; here = \"/scratch/fileroot/a/b\"}"
+        );
+        // A lone file is the workspace of its own directory, as the driver
+        // was told it.
+        let source = SourceFile::new(
+            "lone.gcsl",
+            "import fileroot as fr\nws = fr.workspace\nhere = fr.this\ntop = fr.caller",
+        )
+        .unwrap();
+        let (_, checked) = check_lone_with_standard(&source, "/scratch/alone");
+        let mut workspace = checked.unwrap();
+        let index = workspace.file("lone.gcsl").unwrap();
+        assert_eq!(
+            workspace.run(index).unwrap().value.to_string(),
+            "{ws = \"/scratch/alone\"; here = \"/scratch/alone\"; top = \"/scratch/alone\"}"
+        );
+        // A root of `/` takes no second `/`.
+        let source =
+            SourceFile::new("lone.gcsl", "import fileroot\nws = fileroot.workspace").unwrap();
+        let (_, checked) = check_lone_with_standard(&source, "/");
+        let mut workspace = checked.unwrap();
+        let index = workspace.file("lone.gcsl").unwrap();
+        assert_eq!(
+            workspace.run(index).unwrap().value.to_string(),
+            "{ws = \"/\"}"
+        );
+        let files = [
+            ("workspace.gcsl", ""),
+            ("sub/a.gcsl", "import fileroot\nh = fileroot.this"),
+        ];
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let mut workspace = check_with_standard(&sources, &[], "/").1.unwrap();
+        let index = workspace.file("sub/a.gcsl").unwrap();
+        assert_eq!(
+            workspace.run(index).unwrap().value.to_string(),
+            "{h = \"/sub\"}"
+        );
+    }
+
+    #[test]
+    fn this_in_a_standard_file_is_the_standard_directory() {
+        let table = [
+            (
+                "here",
+                "import fileroot\nwhere = fileroot.this\ndef call(): String { fileroot.caller }",
+            ),
+            prelude_entry(),
+        ];
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "app/main.gcsl",
+                "import here\nw = here.where\nc = here.call()",
+            ),
+        ];
+        let (_, value) = value_beside(&table, &files, "app/main.gcsl");
+        assert_eq!(value, "{w = \"<stdlib>\"; c = \"/app\"}");
+    }
+
+    #[test]
+    fn fileroot_is_read_only_as_its_members() {
+        let with = |text: &str| rooted_messages(&[("workspace.gcsl", ""), ("a.gcsl", text)]);
+        let read_as =
+            |member: &str| format!("`fileroot`'s members are read as `fileroot.{member}`");
+        assert_eq!(with("import caller from fileroot"), [read_as("caller")]);
+        assert_eq!(with("import this as t from fileroot"), [read_as("this")]);
+        assert_eq!(with("import * from fileroot"), [read_as("caller")]);
+        assert_eq!(
+            with("import nope from fileroot"),
+            ["`fileroot` has no `nope`"]
+        );
+        assert_eq!(with("import fileroot\nx = fileroot"), [read_as("caller")]);
+        assert_eq!(
+            with("import fileroot as fr\nx = fr"),
+            ["`fr`'s members are read as `fr.caller`"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = (fileroot).this"),
+            [read_as("caller")]
+        );
+        assert_eq!(
+            with("import fileroot\nx = fileroot.helper"),
+            ["`fileroot.helper` is not a value"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = (fileroot.helper)()"),
+            ["`fileroot.helper` is not a value"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = fileroot.helper(1)"),
+            ["expected 0 arguments, found 1"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = fileroot.this(1)"),
+            ["cannot call a value of type String"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = fileroot.nope"),
+            ["`fileroot` has no `nope`"]
+        );
+        assert_eq!(
+            with("import fileroot\nx = fileroot.caller.x"),
+            ["cannot access field `x` of String"]
+        );
+        // Not imported, it is no name; a nearer binding shadows it.
+        assert_eq!(with("x = fileroot.this"), ["undefined variable `fileroot`"]);
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "import fileroot\nfn f(fileroot: {this: Int}): Int { fileroot.this }\nx = f({ this = 1 })",
+            ),
+        ];
+        assert_eq!(rooted_text(&files, "a.gcsl"), "{x = 1}");
+        // `helper()` is pure, and does nothing at the top level.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("_lib/ppk.gcsl", PPK),
+            (
+                "a.gcsl",
+                "import fileroot\nimport _lib.ppk\nfileroot.helper()\nx = ppk.caller()\n\
+                 fn pure(): String { fileroot.helper()\nfileroot.caller }\ny = pure()",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "a.gcsl"),
+            "{x = \"<root>\"; y = \"<root>\"}"
+        );
+    }
+
+    #[test]
+    fn fileroot_is_a_reserved_name() {
+        for files in [
+            &[("workspace.gcsl", ""), ("fileroot.gcsl", "x = 1")][..],
+            &[("fileroot/a.gcsl", "x = 1"), ("workspace.gcsl", "")][..],
+        ] {
+            assert_eq!(
+                error(files),
+                (
+                    "`fileroot` is the name of a built-in module".to_owned(),
+                    Some(1),
+                    vec![]
+                ),
+                "{files:?}"
+            );
+        }
+    }
+
+    /// The library of the memoisation tests: `reads`, which reads its
+    /// caller; `plain`, which does not; `outer`, a helper whose callee reads
+    /// the caller it passes on; `outer_hit`, a helper whose memoised callee,
+    /// `reads`, may be found; `awaits`, which reads its caller in a `lazy`
+    /// it awaits while it runs; `again`, which calls itself with its own
+    /// arguments, from its own file, once it has read a caller of another;
+    /// and four that return a step: `step`, whose `lazy` reads its caller,
+    /// `plain_step`, whose does not, `helped`, whose is made after
+    /// `fileroot.helper()` and calls `inner`, `nested`, whose makes a `lazy`
+    /// that reads it, and `fn_step`, whose makes a function that reads its
+    /// own.
+    const MEMO_LIB: &str = "import fileroot\n\
+        def reads(x: Int) ->> {c: String} { c = fileroot.caller }\n\
+        def plain(x: Int) ->> {v: Int} { v = x }\n\
+        def inner(): String { fileroot.caller }\n\
+        def outer(x: Int) ->> {c: String} {\n\
+            fileroot.helper()\n\
+            c = inner()\n\
+        }\n\
+        def outer_hit(x: Int) ->> {c: String} {\n\
+            fileroot.helper()\n\
+            reads(x)\n\
+        }\n\
+        def awaits(x: Int) ->> {c: String} {\n\
+            let made = lazy { fileroot.caller }\n\
+            c = await made\n\
+        }\n\
+        def again(x: Int) ->> String {\n\
+            let c = fileroot.caller\n\
+            if c == fileroot.this { c } else { again(x) + \" \" + c }\n\
+        }\n\
+        def step(x: Int) ->> {s: Future<String>} { s = lazy { fileroot.caller } }\n\
+        def plain_step(x: Int) ->> {s: Future<Int>} { s = lazy { x + 1 } }\n\
+        def helped(x: Int) ->> {s: Future<String>} {\n\
+            fileroot.helper()\n\
+            s = lazy { inner() }\n\
+        }\n\
+        def nested(x: Int) ->> {s: Future<String>} { s = lazy { await lazy { fileroot.caller } } }\n\
+        def fn_step(x: Int) ->> {s: Future<fn(): String>} { s = lazy { fn(): String { fileroot.caller } } }";
+
+    /// Whether the values of the fields of `record` at `a` and `b` are one
+    /// record: one run of the memoised function that made both.
+    fn one_run(record: &Value, (a, b): (usize, usize)) -> bool {
+        let Value::Record(record) = record else {
+            panic!("expected a record, got {record}");
+        };
+        match (record.values.get(a), record.values.get(b)) {
+            (Some(Value::Record(a)), Some(Value::Record(b))) => Rc::ptr_eq(a, b),
+            other => panic!("expected records, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_memoised_call_depends_on_the_caller_it_reads() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/m.gcsl", MEMO_LIB),
+            (
+                "p/a.gcsl",
+                "import lib.m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
+            ),
+            (
+                "p/b.gcsl",
+                "import lib.m\nrb = m.reads(1)\nvb = m.plain(1)\nob = m.outer(1)\nwb = m.awaits(1)",
+            ),
+            (
+                "q/c.gcsl",
+                "import lib.m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
+            ),
+            (
+                "z/all.gcsl",
+                "import p.a\nimport p.b\nimport q.c\n\
+                 ra = a.r\nrb = b.rb\nrc = c.r\n\
+                 va = a.v\nvb = b.vb\nvc = c.v\n\
+                 oa = a.o\nob = b.ob\noc = c.o\n\
+                 wa = a.w\nwb = b.wb\nwc = c.w",
+            ),
+        ];
+        let all = rooted_value(&files, "z/all.gcsl");
+        assert_eq!(
+            all.to_string().replace(SCRATCH, "<root>"),
+            "{ra = {c = \"<root>/p\"}; rb = {c = \"<root>/p\"}; rc = {c = \"<root>/q\"}; \
+             va = {v = 1}; vb = {v = 1}; vc = {v = 1}; \
+             oa = {c = \"<root>/p\"}; ob = {c = \"<root>/p\"}; oc = {c = \"<root>/q\"}; \
+             wa = {c = \"<root>/p\"}; wb = {c = \"<root>/p\"}; wc = {c = \"<root>/q\"}}"
+        );
+        // A `lazy` it awaits while it runs reads its caller as it would.
+        assert!(one_run(&all, (9, 10)));
+        assert!(!one_run(&all, (9, 11)));
+        // Reading the caller: one run for two files of one directory, whose
+        // callers are equal, and another for another directory.
+        assert!(one_run(&all, (0, 1)));
+        assert!(!one_run(&all, (0, 2)));
+        // Not reading it: one run from every directory.
+        assert!(one_run(&all, (3, 4)));
+        assert!(one_run(&all, (3, 5)));
+        // A helper whose callee reads the caller it passed on depends on it.
+        assert!(one_run(&all, (6, 7)));
+        assert!(!one_run(&all, (6, 8)));
+    }
+
+    #[test]
+    fn a_memoised_call_found_passes_its_dependencies_on() {
+        // In `p`, `outer_hit(1)` finds `reads(1)`, which read `p`, as `first`
+        // ran it: `outer_hit`'s entry depends on the caller through the hit,
+        // so `q` runs it again rather than finding `p`'s.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/m.gcsl", MEMO_LIB),
+            (
+                "p/a.gcsl",
+                "import lib.m\nfirst = m.reads(1)\nhit = m.outer_hit(len([first]))",
+            ),
+            ("q/c.gcsl", "import lib.m\nhit = m.outer_hit(1)"),
+            (
+                "z/all.gcsl",
+                "import p.a\nimport q.c\nfirst = a.first\nhit = a.hit\nother = c.hit",
+            ),
+        ];
+        let all = rooted_value(&files, "z/all.gcsl");
+        assert_eq!(
+            all.to_string().replace(SCRATCH, "<root>"),
+            "{first = {c = \"<root>/p\"}; hit = {c = \"<root>/p\"}; other = {c = \"<root>/q\"}}"
+        );
+        // `p`'s `outer_hit` found the entry `first` made.
+        assert!(one_run(&all, (0, 1)));
+        assert!(!one_run(&all, (1, 2)));
+    }
+
+    #[test]
+    fn a_step_that_can_read_its_caller_is_a_dependency_of_its_maker() {
+        // Each step is awaited after the memoised call that made it has
+        // returned, in a third directory.
+        let made = "import lib.m\nst = m.step(1)\nps = m.plain_step(1)\n\
+                    hs = m.helped(1)\nns = m.nested(1)\nfs = m.fn_step(1)";
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/m.gcsl", MEMO_LIB),
+            ("p/a.gcsl", made),
+            ("q/c.gcsl", made),
+            (
+                "z/all.gcsl",
+                "import p.a\nimport q.c\n\
+                 sa = await a.st.s\nsc = await c.st.s\n\
+                 pa = a.ps\npc = c.ps\n\
+                 ha = await a.hs.s\nhc = await c.hs.s\n\
+                 na = await a.ns.s\nnc = await c.ns.s\n\
+                 fa = a.fs\nfc = c.fs",
+            ),
+        ];
+        let all = rooted_value(&files, "z/all.gcsl");
+        let Value::Record(record) = &all else {
+            panic!("expected a record, got {all}");
+        };
+        let shown: Vec<String> = record
+            .values
+            .iter()
+            .map(|value| value.to_string().replace(SCRATCH, "<root>"))
+            .collect();
+        // A step reading its caller: one run of its maker for each
+        // directory, each step reading its own, as the maker's caller.
+        assert_eq!(shown[0], "<root>/p");
+        assert_eq!(shown[1], "<root>/q");
+        // A step that cannot read it: one run from every directory.
+        assert!(one_run(&all, (2, 3)));
+        // Made after `fileroot.helper()`, its calls pass the caller on.
+        assert_eq!(shown[4], "<root>/p");
+        assert_eq!(shown[5], "<root>/q");
+        // A step making a step that reads it.
+        assert_eq!(shown[6], "<root>/p");
+        assert_eq!(shown[7], "<root>/q");
+        // A function a step makes reads its own caller, not the step's: one
+        // run from every directory.
+        assert!(one_run(&all, (8, 9)));
+    }
+
+    #[test]
+    fn a_running_memoised_call_is_found_as_a_lookup_finds_it() {
+        // `again(1)` from `p` has read `p` when it calls `again(1)` from
+        // `lib`: the running entry depends on `p`, so the call from `lib` is
+        // not the call depending on its own result, and runs.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/m.gcsl", MEMO_LIB),
+            ("p/a.gcsl", "import lib.m\nr = m.again(1)"),
+        ];
+        assert_eq!(
+            rooted_text(&files, "p/a.gcsl"),
+            "{r = \"<root>/lib <root>/p\"}"
         );
     }
 }

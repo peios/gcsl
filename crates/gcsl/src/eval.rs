@@ -504,11 +504,59 @@
 //! These five are pure and fail only as said; none has a limit of its own
 //! on the length of a string.
 //!
+//! # Callers and helpers
+//!
+//! The `fileroot` module (see [`crate::workspace`], "The standard library")
+//! tells code where files are. Two of its members are constants that
+//! lowering makes `StrConst`s: `fileroot.this`, the directory of the file
+//! the expression is written in, and `fileroot.workspace`, the root of the
+//! run's workspace. The other two are the evaluator's.
+//!
+//! Every frame, a call's, an await's running a future's body, and the top
+//! level's, has a *caller*: the directory of the file whose code made the
+//! call it runs for, by its index in the run's table of directories, which
+//! the driver built and every frame shares (each file's code names its own
+//! directory by it, [`Ir::dir`]), and a *helper flag*, false as it starts.
+//! A call of a closure (a `def`, a `fn`, a memoised function, a function
+//! value, whatever its callee's code) gives its callee, as the callee's
+//! caller, the calling frame's own caller if the calling frame's helper
+//! flag is set, and otherwise the directory of the file the calling code is
+//! of, the IR the calling frame runs (a closure runs its code's IR, so a
+//! closure of `_lib/ppk.gcsl` passes `_lib` on wherever it is called). A
+//! built-in function is no frame, and changes nothing. A top level's caller
+//! is its own file's directory, as its `fileroot.this` is. A caller has an
+//! *origin*, a number from a counter of [`MemoTables`], new for each caller
+//! set from a file and shared by every frame it is passed on to, which is
+//! what the memoisation of [Memoised functions](#memoised-functions)
+//! follows. It is given only when it is needed: to a memoised call's
+//! frame, and to a frame as it passes its caller on to a callee or a future
+//! it makes; until then a frame's is none (`NO_ORIGIN`), which no running
+//! memoised call can share. So a plain call sets a small index, a flag and
+//! no origin, and costs one comparison more.
+//!
+//! - `fileroot.caller` (`IrKind::Caller`) yields the text of the frame's
+//!   caller, from the table, a reference-count increment, after recording
+//!   it as an ambient input of the running memoised calls it can affect.
+//! - `fileroot.helper()` (`IrKind::Helper`) sets the frame's helper flag,
+//!   for the rest of the frame: the calls it made before are unaffected,
+//!   and every call it makes after passes its own caller on, so a library
+//!   function that works on its caller's paths calls `fileroot.helper()`
+//!   before calling another that does. It is `{}`. At a top level it does
+//!   nothing: the top level's caller is its own file's directory, which it
+//!   would pass on anyway.
+//! - A `lazy` runs as if where it was written: the future captures, when
+//!   it is made, the making frame's caller, helper flag and origin
+//!   ([`crate::value::Future`]), and its body runs with them, whoever awaits
+//!   it, so a step `lazy { ppk.commit(...) }` written in `test.gcsl` and
+//!   awaited by a build driver elsewhere calls `commit` with `test.gcsl`'s
+//!   directory.
+//!
 //! # Memoised functions
 //!
 //! A function declared with `->>` is lowered to code of [`FnKind::Memo`],
 //! and each of its closures runs its body at most once per distinct list of
-//! arguments. Memoisation belongs to the closure, not to the call site: a
+//! arguments, and of the values of the ambient inputs it reads (below).
+//! Memoisation belongs to the closure, not to the call site: a
 //! call decides by the callee's code, one branch per call, whatever the
 //! static type of the callee (a memoised closure held as a `fn(Present<Int>)
 //! -> Int`, or passed to another function as a callback, is still
@@ -591,6 +639,51 @@
 //!   before the error goes on, so that a later call, in a later input of a
 //!   session, runs the body again.
 //!
+//! An entry is found only if, besides its key, every ambient input it
+//! recorded has the same value for the call (below); a running entry's are
+//! those recorded so far, so the check that a call depends on its own result
+//! keys as the lookup does.
+//!
+//! **Ambient inputs.** A memoised call's result may depend on more than its
+//! arguments: on an *ambient input*, a value the call reads without taking
+//! it as an argument. Captures are by value and fields immutable, so today
+//! the one ambient input is the caller, `fileroot.caller` (see [Callers and
+//! helpers](#callers-and-helpers)), but the mechanism is general: an entry
+//! records its *dependencies*, each a kind of input with the value read
+//! (`Ambient`), comparing values, so that two files of one directory, whose
+//! callers are equal, share entries. A read of `fileroot.caller` in a frame
+//! records the caller as a dependency of every running memoised call whose
+//! result it can affect: the reading frame's own, and while the caller was
+//! passed on by helpers, each one up that chain whose caller it is, as far
+//! as the frame whose caller was set from its calling code's file, which is
+//! a constant to the frames above it, which therefore do not depend on it.
+//! That chain is the running calls of the reading frame's caller's
+//! *origin*: [`MemoTables`] keeps the running memoised calls on a stack,
+//! each with its caller's origin, and a read adds its dependency to each
+//! entry of the reader's origin, once. A call then looks up only entries
+//! whose dependencies its own caller, known before the body runs, holds; a
+//! call that finds one passes the entry's dependencies on up the chain, as
+//! a read would, if its callee would have shared its frame's origin, the
+//! frame having run `fileroot.helper()`. A memoised function that never
+//! reads the caller, itself or through a callee it passed its caller on to,
+//! records nothing, and is found from every file.
+//!
+//! A future captures its maker's caller (see [Callers and
+//! helpers](#callers-and-helpers)), so a result holding one whose body will
+//! read it depends on that caller even if the future is awaited only after
+//! the call that made it has returned, when nothing of it runs. So making a
+//! future is itself a read of the making frame's caller, recorded as any
+//! read is, when the body can read the caller it captures: when lowering
+//! marked its `lazy` (`MakeFuture`'s `reads_caller`), its body, but for the
+//! bodies of the functions it makes, whose callers are their own, reading
+//! `fileroot.caller`, calling `fileroot.helper()` or making a `lazy` so
+//! marked; or when the making frame's helper flag is set, so that the
+//! body's calls pass the captured caller on to callees that may read it. A
+//! future neither marked nor made after `fileroot.helper()` records
+//! nothing, so a memoised function returning one is found from every file.
+//! A marked future read when awaited, while its maker runs, records its
+//! read again, which changes nothing.
+//!
 //! The lookup and the recording are helpers of `Evaluator::memo_call`, so
 //! that its frame, on the recursion path of a memoised recursion, holds
 //! little across the body.
@@ -626,7 +719,8 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::ValueTest;
 use crate::value::{
-    Begin, Closure, Future, FutureState, Layout, List, Record, Value, ValueKind, int_to_float,
+    Begin, Caller, Closure, Future, FutureState, Layout, List, Record, Value, ValueKind,
+    int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
@@ -687,7 +781,7 @@ pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
 ///
 /// As [`eval_with`].
 pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
-    eval_with(ir, stack, &mut MemoTables::new(), None)
+    eval_with(ir, stack, &mut MemoTables::new(), (None, &[]))
 }
 
 /// Evaluates `ir` to a value with an existing `stack`, which must hold at
@@ -707,6 +801,10 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
 /// driver of the run built once, its field names interned in the run's
 /// names (see [The built-in functions](#the-built-in-functions)): `None`
 /// for a run without the standard library, which has no `exec` to call.
+/// `dirs` is the run's table of directories, which the driver built, by
+/// which the code of each file names its directory ([`Ir::dir`]): what
+/// `fileroot.caller` reads (see [Callers and helpers](#callers-and-helpers)).
+/// The top level's caller is its own file's directory.
 ///
 /// # Errors
 ///
@@ -715,7 +813,7 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
-    exec_result: Option<&Rc<Layout>>,
+    (exec_result, dirs): (Option<&Rc<Layout>>, &[Rc<str>]),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
@@ -725,6 +823,12 @@ pub fn eval_with(
             ir.get(root).span,
         ));
     }
+    let caller = Caller {
+        dir: ir.dir(),
+        helper: false,
+        origin: NO_ORIGIN,
+    };
+    let shared = Shared { exec_result, dirs };
     let result = Evaluator {
         ir,
         stack,
@@ -732,7 +836,8 @@ pub fn eval_with(
         captures: &[],
         callee: None,
         memo,
-        exec_result,
+        shared: &shared,
+        caller,
         levels: 0,
     }
     .value(root);
@@ -842,6 +947,20 @@ enum Callee {
     Builtin(Builtin),
 }
 
+/// What every frame of an evaluation shares besides the value stack and the
+/// memo tables, which the driver of the run built once (see [`eval_with`]).
+#[derive(Clone, Copy, Debug)]
+struct Shared<'a> {
+    /// The layout of the record `exec` returns; `None` in a run without
+    /// the standard library.
+    exec_result: Option<&'a Rc<Layout>>,
+    /// The run's table of directories, by which a caller names its
+    /// directory (see [Callers and helpers](#callers-and-helpers)); empty in
+    /// a run with no workspace's context, whose code cannot read
+    /// `fileroot.caller`.
+    dirs: &'a [Rc<str>],
+}
+
 /// The state of one frame's evaluation: the top level's, or a call's.
 struct Evaluator<'a> {
     /// The IR being run: the program's, or the running closure's.
@@ -856,9 +975,12 @@ struct Evaluator<'a> {
     callee: Option<&'a Rc<Closure>>,
     /// The execution context's memo tables, shared by every frame.
     memo: &'a mut MemoTables,
-    /// The layout of the record `exec` returns, built once per run and
-    /// shared by every frame; `None` in a run without the standard library.
-    exec_result: Option<&'a Rc<Layout>>,
+    /// What the run's driver built once for every frame, by one reference,
+    /// so that a call's frame grows by no more than one.
+    shared: &'a Shared<'a>,
+    /// This frame's caller, its helper flag, and the caller's origin (see
+    /// [Callers and helpers](#callers-and-helpers)).
+    caller: Caller,
     /// The levels of nesting the enclosing frames have consumed where this
     /// frame's body starts: 0 at the top level. See the module
     /// documentation.
@@ -911,7 +1033,11 @@ impl Evaluator<'_> {
                 depth,
                 ..
             } => self.call((callee, args, depth), node),
-            IrKind::MakeFuture { function, captures } => self.make_future(function, captures),
+            IrKind::MakeFuture {
+                function,
+                captures,
+                reads_caller,
+            } => self.make_future(function, captures, reads_caller),
             IrKind::Await { .. } => self.await_node(node),
             IrKind::As { .. } => self.narrow_node(node),
             IrKind::Arg { .. } => mistyped(node, "an argument outside a call"),
@@ -958,7 +1084,10 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) => self.string(id).map(Value::Str),
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Caller => {
+                self.string(id).map(Value::Str)
+            }
+            IrKind::Helper => self.record(id),
             // Directly rather than through `string`: an interpolation
             // evaluates its parts through `value`, so interpolations nested
             // in each other then recurse two frames per level, not three.
@@ -1113,6 +1242,68 @@ impl Evaluator<'_> {
             .ok_or_else(|| internal("load of the callee outside a function", node.span).into())
     }
 
+    /// Evaluates the `Caller` `node`, `fileroot.caller`: the text of this
+    /// frame's caller, from the run's table, after recording it as an
+    /// ambient dependency of every running memoised call of its origin (see
+    /// [Callers and helpers](#callers-and-helpers)). A caller outside the
+    /// table, which the driver never gives, is an internal error.
+    #[inline(never)]
+    fn caller_text(&mut self, node: &IrNode) -> Flow<Rc<str>> {
+        // An origin not given yet is no running memoised call's.
+        if self.caller.origin != NO_ORIGIN {
+            self.memo
+                .depend(self.caller.origin, Ambient::Caller(self.caller.dir));
+        }
+        self.shared
+            .dirs
+            .get(self.caller.dir as usize)
+            .map(Rc::clone)
+            .ok_or_else(|| internal("a caller outside the run's directories", node.span).into())
+    }
+
+    /// This frame's caller, its origin given now if it had none, as it must
+    /// be before another frame shares it: a callee it passes its caller on
+    /// to, or a future it makes (see [Callers and
+    /// helpers](#callers-and-helpers)).
+    fn shared_caller(&mut self) -> Caller {
+        if self.caller.origin == NO_ORIGIN {
+            self.caller.origin = self.memo.new_origin();
+        }
+        self.caller
+    }
+
+    /// Evaluates `node`, an `Empty` or a `Helper`, both `{}`: a `Helper`,
+    /// `fileroot.helper()`, first sets this frame's helper flag, so that the
+    /// calls it makes from now on pass its own caller on (see [Callers and
+    /// helpers](#callers-and-helpers)).
+    fn empty(&mut self, node: &IrNode) -> Value {
+        if matches!(node.kind, IrKind::Helper) {
+            self.caller.helper = true;
+        }
+        Value::Empty
+    }
+
+    /// The caller a call this frame makes gives its callee (see [Callers and
+    /// helpers](#callers-and-helpers)): this frame's own, sharing its
+    /// origin, given now if it had none, once `fileroot.helper()` has run in
+    /// it; else the directory of the file this frame's code is of, with no
+    /// origin yet, which the callee is given only if it needs one. The
+    /// callee's helper flag is false.
+    fn callee_caller(&mut self) -> Caller {
+        if self.caller.helper {
+            Caller {
+                helper: false,
+                ..self.shared_caller()
+            }
+        } else {
+            Caller {
+                dir: self.ir.dir(),
+                helper: false,
+                origin: NO_ORIGIN,
+            }
+        }
+    }
+
     /// Builds a closure of `function` capturing the values of `captures`,
     /// read in this frame: one allocation for the captured values, sized
     /// exactly (none if there are none), and one for the closure, which
@@ -1133,17 +1324,34 @@ impl Evaluator<'_> {
     /// Builds a future of `function` capturing the values of `captures`,
     /// read in this frame, as [`Evaluator::make_closure`] builds a closure:
     /// one allocation for the captured values and one for the future, which
-    /// shares the IR. Nothing is run.
-    fn make_future(&mut self, function: FnId, captures: IrRange) -> Flow<Value> {
+    /// shares the IR. Nothing is run. The future captures this frame's
+    /// caller, helper flag and origin, which its body runs with (see
+    /// [Callers and helpers](#callers-and-helpers)). Making it is a read of
+    /// this frame's caller, recorded on the running memoised calls of its
+    /// origin, if the body can read the caller it captures (`reads_caller`,
+    /// the `lazy`'s mark) or this frame's helper flag is set, so that its
+    /// body's calls pass that caller on (see [Memoised
+    /// functions](#memoised-functions), "Ambient inputs").
+    fn make_future(
+        &mut self,
+        function: FnId,
+        captures: IrRange,
+        reads_caller: bool,
+    ) -> Flow<Value> {
         let items = self.ir.items(captures);
         let mut values = Vec::with_capacity(items.len());
         for &item in items {
             values.push(self.value(item)?);
         }
-        Ok(Value::Future(Rc::new(Future::new(
+        let made = self.shared_caller();
+        if reads_caller || made.helper {
+            self.memo.depend(made.origin, Ambient::Caller(made.dir));
+        }
+        Ok(Value::Future(Rc::new(Future::made_by(
             Rc::clone(self.ir),
             function,
             values.into_boxed_slice(),
+            made,
         ))))
     }
 
@@ -1465,6 +1673,8 @@ impl Evaluator<'_> {
         let base = self.stack.len();
         self.stack
             .resize(base + code.frame_size as usize, Value::Empty);
+        // The body runs as if where it was written, with the caller, the
+        // helper flag and the origin of the frame that made the future.
         let result = Evaluator {
             ir: &future.code,
             stack: self.stack,
@@ -1472,7 +1682,8 @@ impl Evaluator<'_> {
             captures: &captures,
             callee: None,
             memo: self.memo,
-            exec_result: self.exec_result,
+            shared: self.shared,
+            caller: future.made,
             levels: entering,
         }
         .value(code.body);
@@ -1546,6 +1757,7 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        let passed = self.callee_caller();
         let result = Evaluator {
             ir: &closure.code,
             stack: self.stack,
@@ -1553,7 +1765,8 @@ impl Evaluator<'_> {
             captures: &closure.captures,
             callee: Some(&closure),
             memo: self.memo,
-            exec_result: self.exec_result,
+            shared: self.shared,
+            caller: passed,
             levels: entering,
         }
         .value(code.body);
@@ -1615,7 +1828,7 @@ impl Evaluator<'_> {
             },
             (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
             (Builtin::Exec, Some((Value::List(words), _)), None) => {
-                exec(&words, self.exec_result, node)
+                exec(&words, self.shared.exec_result, node)
             }
             (Builtin::Panic, Some((Value::Str(message), _)), None) => {
                 Err(Diagnostic::error(&*message, node.span).into())
@@ -1656,11 +1869,12 @@ impl Evaluator<'_> {
         node: &IrNode,
     ) -> Flow<Value> {
         let base = self.stack.len();
-        let (mark, entering) = match self.memo_begin((closure, code), (args, depth), node)? {
-            MemoBegin::Found(value) => return Ok(value),
-            MemoBegin::Started(mark) => (Some(mark), mark.entering),
-            MemoBegin::Unkeyed(entering) => (None, entering),
-        };
+        let (mark, entering, caller) =
+            match self.memo_begin((closure, code), (args, depth), node)? {
+                MemoBegin::Found(value) => return Ok(value),
+                MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
+                MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
+            };
         let result = Evaluator {
             ir: &closure.code,
             stack: self.stack,
@@ -1668,11 +1882,16 @@ impl Evaluator<'_> {
             captures: &closure.captures,
             callee: Some(closure),
             memo: self.memo,
-            exec_result: self.exec_result,
+            shared: self.shared,
+            caller,
             levels: entering,
         }
         .value(code.body);
         self.stack.truncate(base);
+        // The call is no longer running: nothing more depends on it.
+        if mark.is_some() {
+            self.memo.running.pop();
+        }
         // A `return` for the function is its value, which `memo_end` then
         // records as any, here, inside the running entry; no other stop
         // leaves its body: the checker sees to it.
@@ -1686,13 +1905,18 @@ impl Evaluator<'_> {
     /// Begins the memoised call `node` of `closure`, whose code is `code`,
     /// at depth `depth` in this frame's body: grows the stack by the
     /// callee's frame, evaluates the arguments `args` into it, and looks
-    /// them up in the closure's memo table, allocating nothing. If the
-    /// closure has returned for equal arguments, the stack is truncated
-    /// back and that value found. Otherwise, if it is running with equal
-    /// arguments, or its body would take the nesting past the budget, the
-    /// stack is truncated back and the error returned; and if neither, the
-    /// arguments are recorded as running, the one allocation of the call's
-    /// memoisation, and the frame is left for the body.
+    /// them up in the closure's memo table, with the caller the call gives
+    /// its callee (see [Callers and helpers](#callers-and-helpers)),
+    /// allocating nothing. If the closure has returned for equal arguments
+    /// and an equal value of every ambient input its entry recorded, the
+    /// stack is truncated back and that value found, the entry's
+    /// dependencies passed on to the running calls of this frame's origin
+    /// if the callee would have shared it. Otherwise, if it is running so,
+    /// or its body would take the nesting past the budget, the stack is
+    /// truncated back and the error returned; and if neither, the arguments
+    /// are recorded as running, the one allocation of the call's
+    /// memoisation, the call is pushed on the running calls, and the frame
+    /// is left for the body.
     fn memo_begin(
         &mut self,
         (closure, code): (&Rc<Closure>, &FnCode),
@@ -1709,12 +1933,17 @@ impl Evaluator<'_> {
             self.stack.truncate(base);
             return Err(unwind);
         }
+        let caller = self.callee_caller();
         let params = base..base + code.param_count as usize;
         let Some(key) = self.stack.get(params.clone()) else {
             self.stack.truncate(base);
             return mistyped(node, "a call's parameters lie outside its frame");
         };
-        let hash = match self.memo.lookup(closure, key) {
+        // A callee that would share this frame's origin passes a hit's
+        // dependencies on to the running calls of that origin, as a read
+        // in it would.
+        let inherited = self.caller.helper;
+        let hash = match self.memo.lookup(closure, key, (caller, inherited)) {
             Lookup::Missing(hash) => hash,
             Lookup::Done(value) => {
                 self.stack.truncate(base);
@@ -1734,13 +1963,30 @@ impl Evaluator<'_> {
         // Arguments that equal nothing, themselves included, as those
         // holding NaN, would make an entry no call could find.
         if !key_eq(key, key) {
-            return Ok(MemoBegin::Unkeyed(entering));
+            return Ok(MemoBegin::Unkeyed(entering, caller));
         }
+        // A running call has an origin, by which the reads it depends on
+        // find it.
+        let caller = if caller.origin == NO_ORIGIN {
+            Caller {
+                origin: self.memo.new_origin(),
+                ..caller
+            }
+        } else {
+            caller
+        };
         let key = self.memo.start(closure, hash, key);
+        self.memo.running.push(Running {
+            closure: Rc::as_ptr(closure),
+            hash,
+            key,
+            origin: caller.origin,
+        });
         Ok(MemoBegin::Started(Mark {
             hash,
             key,
             entering,
+            caller,
         }))
     }
 
@@ -2399,13 +2645,14 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where an Int was expected")
             }
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
-            | IrKind::UpdateField { .. } => mistyped(node, "record node where an Int was expected"),
+            | IrKind::UpdateField { .. }
+            | IrKind::Helper => mistyped(node, "record node where an Int was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where an Int was expected"),
             // A loop that discards its values is `{}`, but only ever a
             // statement, or a loop that cannot end, which `stopping` runs.
@@ -2552,15 +2799,14 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a Float was expected")
             }
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
-            | IrKind::UpdateField { .. } => {
-                mistyped(node, "record node where a Float was expected")
-            }
+            | IrKind::UpdateField { .. }
+            | IrKind::Helper => mistyped(node, "record node where a Float was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Float was expected"),
             IrKind::Break { .. }
             | IrKind::Continue { .. }
@@ -2668,13 +2914,14 @@ impl Evaluator<'_> {
             | IrKind::FloatMul(_)
             | IrKind::FloatDiv(_)
             | IrKind::IntToFloat(_) => mistyped(node, "Float node where a Bool was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a Bool was expected")
             }
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
-            | IrKind::UpdateField { .. } => mistyped(node, "record node where a Bool was expected"),
+            | IrKind::UpdateField { .. }
+            | IrKind::Helper => mistyped(node, "record node where a Bool was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a Bool was expected"),
             IrKind::Break { .. }
             | IrKind::Continue { .. }
@@ -2800,6 +3047,7 @@ impl Evaluator<'_> {
             }
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
+            IrKind::Caller => self.caller_text(node),
             IrKind::Field { record, name, .. } => {
                 self.field_as((record, name), node, Value::into_string)
             }
@@ -2840,9 +3088,8 @@ impl Evaluator<'_> {
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
-            | IrKind::UpdateField { .. } => {
-                mistyped(node, "record node where a String was expected")
-            }
+            | IrKind::UpdateField { .. }
+            | IrKind::Helper => mistyped(node, "record node where a String was expected"),
             IrKind::Update { .. } => mistyped(node, "update node where a String was expected"),
             IrKind::Break { .. }
             | IrKind::Continue { .. }
@@ -2863,7 +3110,7 @@ impl Evaluator<'_> {
     fn record(&mut self, id: IrId) -> Flow<Value> {
         let node = self.ir.get(id);
         match node.kind {
-            IrKind::Empty => Ok(Value::Empty),
+            IrKind::Empty | IrKind::Helper => Ok(self.empty(node)),
             IrKind::Load(_, ValueKind::Deferred)
             | IrKind::LoadCapture(_, ValueKind::Deferred)
             | IrKind::Field {
@@ -2945,7 +3192,7 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => {
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a record was expected")
             }
             IrKind::For { .. } | IrKind::Loop { .. } => self.record_loop(node),
@@ -3421,6 +3668,56 @@ pub struct MemoTables {
     /// The number of checkpoints taken: every entry records the one it was
     /// made after (see [`MemoTables::checkpoint`]).
     generation: u64,
+    /// The last origin given to a caller (see [Callers and
+    /// helpers](#callers-and-helpers)): each is new, 0 being no frame's.
+    origins: u64,
+    /// The memoised calls running, outermost first, each with the origin of
+    /// its caller: those an ambient input read is a dependency of (see
+    /// [Memoised functions](#memoised-functions), "Ambient inputs"). Empty
+    /// between evaluations.
+    running: Vec<Running>,
+}
+
+/// The origin of a caller that has none yet (see [Callers and
+/// helpers](#callers-and-helpers)): a frame whose caller was set from a file
+/// is given one only when another frame shares it, or when it is a memoised
+/// call's, since no running memoised call can share a caller nothing has
+/// shared. [`MemoTables`] never gives it.
+const NO_ORIGIN: u64 = 0;
+
+/// A memoised call that is running, on [`MemoTables`]'s stack of them: its
+/// entry, by its closure, its arguments' hash and the address of its stored
+/// key, as [`Mark`] finds it, and the origin of its caller.
+#[derive(Clone, Copy, Debug)]
+struct Running {
+    /// The address of the closure, which finds its table.
+    closure: *const Closure,
+    /// The hash of the arguments.
+    hash: u64,
+    /// The address of the stored key, which finds the entry.
+    key: *const Value,
+    /// The origin of the call's caller.
+    origin: u64,
+}
+
+/// An ambient input of a memoised call (see [Memoised
+/// functions](#memoised-functions), "Ambient inputs"): a kind of input the
+/// call does not take as an argument but may read, with the value it read.
+/// Today the caller is the only one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Ambient {
+    /// `fileroot.caller`: the caller's directory, by its index in the run's
+    /// table, which is its value: two files of one directory have one.
+    Caller(u32),
+}
+
+impl Ambient {
+    /// Whether a call whose caller is `caller` has this value of the input.
+    fn holds(self, caller: Caller) -> bool {
+        match self {
+            Ambient::Caller(dir) => dir == caller.dir,
+        }
+    }
 }
 
 /// A point in the life of [`MemoTables`], to which
@@ -3442,6 +3739,44 @@ impl MemoTables {
             tables: HashMap::new(),
             threshold: MIN_SWEEP_THRESHOLD,
             generation: 0,
+            origins: 0,
+            running: Vec::new(),
+        }
+    }
+
+    /// A new origin, for a caller set from its calling code's file (see
+    /// [Callers and helpers](#callers-and-helpers)): no frame had it before.
+    fn new_origin(&mut self) -> u64 {
+        self.origins = self.origins.wrapping_add(1);
+        self.origins
+    }
+
+    /// Records `ambient`, an ambient input a frame of origin `origin` read,
+    /// as a dependency of every running memoised call of that origin, once
+    /// each (see [Memoised functions](#memoised-functions), "Ambient
+    /// inputs"): those whose caller the reading frame's is, passed on by
+    /// helpers from the first of them, whose caller was set from a file.
+    /// With no memoised call running, nothing is looked up.
+    fn depend(&mut self, origin: u64, ambient: Ambient) {
+        for running in &self.running {
+            if running.origin != origin {
+                continue;
+            }
+            let entry = self
+                .tables
+                .get_mut(&running.closure)
+                .and_then(|table| table.buckets.get_mut(&running.hash))
+                .and_then(|bucket| {
+                    bucket
+                        .entries_mut()
+                        .iter_mut()
+                        .find(|entry| entry.key.as_ptr() == running.key)
+                });
+            if let Some(entry) = entry
+                && !entry.deps.contains(&ambient)
+            {
+                entry.deps = entry.deps.iter().copied().chain([ambient]).collect();
+            }
         }
     }
 
@@ -3487,10 +3822,21 @@ impl MemoTables {
     }
 
     /// Looks `key`, a call's arguments in parameter order, up in
-    /// `closure`'s table, by key equality (see [Memoised
-    /// functions](#memoised-functions)), without allocating. Marks a running
-    /// entry found as re-entered, for the error's label.
-    fn lookup(&mut self, closure: &Rc<Closure>, key: &[Value]) -> Lookup {
+    /// `closure`'s table, for a call whose caller is `caller`: an entry
+    /// matches if its key is equal by key equality (see [Memoised
+    /// functions](#memoised-functions)) and the call has the value each of
+    /// its dependencies recorded ("Ambient inputs" there), a running
+    /// entry's those recorded so far; without allocating. Marks a running
+    /// entry found as re-entered, for the error's label. A value found
+    /// passes the entry's dependencies on to the running calls of
+    /// `caller`'s origin if `inherited`, the caller passed on by a helper,
+    /// as a read would, which allocates a copy of them if there are any.
+    fn lookup(
+        &mut self,
+        closure: &Rc<Closure>,
+        key: &[Value],
+        (caller, inherited): (Caller, bool),
+    ) -> Lookup {
         let hash = key_hash(key);
         let Some(bucket) = self
             .tables
@@ -3499,20 +3845,30 @@ impl MemoTables {
         else {
             return Lookup::Missing(hash);
         };
-        let Some(entry) = bucket
-            .entries_mut()
-            .iter_mut()
-            .find(|entry| key_eq(&entry.key, key))
-        else {
+        let Some(entry) = bucket.entries_mut().iter_mut().find(|entry| {
+            key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller))
+        }) else {
             return Lookup::Missing(hash);
         };
-        match &mut entry.state {
-            EntryState::Done(value) => Lookup::Done(value.clone()),
+        let (value, passed) = match &mut entry.state {
+            EntryState::Done(value) => {
+                // Copied only when they are passed on, which allocates.
+                let passed = if inherited {
+                    entry.deps.to_vec()
+                } else {
+                    Vec::new()
+                };
+                (value.clone(), passed)
+            }
             EntryState::Running { reentered } => {
                 *reentered = true;
-                Lookup::Running
+                return Lookup::Running;
             }
+        };
+        for dep in passed {
+            self.depend(caller.origin, dep);
         }
+        Lookup::Done(value)
     }
 
     /// Records `key`, whose hash is `hash`, as running in `closure`'s
@@ -3534,6 +3890,7 @@ impl MemoTables {
         let entry = Entry {
             key,
             state: EntryState::Running { reentered: false },
+            deps: Box::default(),
             generation: self.generation,
         };
         match table.buckets.entry(hash) {
@@ -3672,13 +4029,18 @@ impl Bucket {
 }
 
 /// A memoised call: the arguments it was made with, and what it returned
-/// or that it is running.
+/// or that it is running, with the ambient inputs it depends on.
 #[derive(Clone, Debug)]
 struct Entry {
     /// The arguments, in parameter order.
     key: Box<[Value]>,
     /// Whether the call is running or has returned, and what.
     state: EntryState,
+    /// The ambient inputs the call depends on, each with the value it read,
+    /// once each (see [Memoised functions](#memoised-functions), "Ambient
+    /// inputs"): empty, and allocating nothing, for a call that reads none,
+    /// and copied afresh for each new one, which is rare.
+    deps: Box<[Ambient]>,
     /// The checkpoint the entry was made after (see
     /// [`MemoTables::checkpoint`]).
     generation: u64,
@@ -3714,8 +4076,8 @@ enum MemoBegin {
     /// The call is recorded as running and its frame is on the stack.
     Started(Mark),
     /// The arguments equal nothing, so the call is not recorded: its frame
-    /// is on the stack, and its body runs at this nesting.
-    Unkeyed(usize),
+    /// is on the stack, and its body runs at this nesting, with this caller.
+    Unkeyed(usize, Caller),
 }
 
 /// A running memoised call, as [`MemoTables::start`] recorded it.
@@ -3727,6 +4089,9 @@ struct Mark {
     key: *const Value,
     /// The nesting at which the body runs (see the module documentation).
     entering: usize,
+    /// The caller the body runs with (see [Callers and
+    /// helpers](#callers-and-helpers)).
+    caller: Caller,
 }
 
 /// The hasher of a memo table's buckets, whose keys are hashes already: it
@@ -6058,7 +6423,11 @@ mod tests {
             captures: &[],
             callee: None,
             memo: &mut MemoTables::new(),
-            exec_result: None,
+            shared: &Shared {
+                exec_result: None,
+                dirs: &[],
+            },
+            caller: Caller::default(),
             levels: 0,
         }
         .value(ir.root())
@@ -6600,7 +6969,7 @@ mod tests {
             slot_names: Box::default(),
         }];
         builder.measure(root, &mut functions);
-        let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, 0));
+        let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, (0, 0)));
         let future = Rc::new(Future::new(Rc::clone(&ir), FnId::new(0), Box::default()));
         // The future captures itself.
         assert!(
@@ -6969,7 +7338,7 @@ mod tests {
     fn run_with(text: &str, memo: &mut MemoTables) -> Result<Value, Diagnostic> {
         let ir = compile(text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        eval_with(&ir, &mut stack, memo, None)
+        eval_with(&ir, &mut stack, memo, (None, &[]))
     }
 
     /// The values of the fields of the record that `text` evaluates to, in
@@ -7392,7 +7761,7 @@ mod tests {
         let ir = compile(text);
         let mut frame = vec![Value::Empty; ir.frame_size() as usize];
         let mut memo = MemoTables::new();
-        eval_with(&ir, &mut frame, &mut memo, None).unwrap();
+        eval_with(&ir, &mut frame, &mut memo, (None, &[])).unwrap();
         // `make`, a top-level function, has slot 0, and `r` slot 1.
         let Value::Record(record) = frame[1].clone() else {
             panic!("expected a record");
@@ -7416,7 +7785,8 @@ mod tests {
         );
         let ir = compile(&text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo, None).unwrap() else {
+        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo, (None, &[])).unwrap()
+        else {
             panic!("expected a record");
         };
         // The running call's table survived the sweeps its body caused, and

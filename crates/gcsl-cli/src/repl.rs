@@ -28,8 +28,10 @@ const PROMPT: &str = "> ";
 /// (`<stdlib>/prelude.gcsl` say). The prelude's names, `len`, `exec`,
 /// `split`, `join` and `sh` among them, are every line's (a line marked
 /// `#![no_prelude]` is an error: a line is no file), and a line may
-/// `import path`. A program a line runs with `exec` or `sh` reads the null
-/// device, never the REPL's own standard input, so the next line is still
+/// `import path`, or `import fileroot`, every line being in the working
+/// directory the REPL started in, its `fileroot.this` and its
+/// `fileroot.workspace`. A program a line runs with `exec` or `sh` reads the
+/// null device, never the REPL's own standard input, so the next line is still
 /// the REPL's; a `panic` is a runtime error of the line, which changes
 /// nothing.
 /// Ctrl-C discards the current line. History lasts for the session only.

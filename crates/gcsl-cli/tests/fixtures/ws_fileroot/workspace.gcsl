@@ -1,0 +1,3 @@
+# A workspace whose library works on its callers' paths, after the
+# `fileroot` summary: run from any working directory, its paths are the
+# same.

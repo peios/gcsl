@@ -1,0 +1,5 @@
+# A lone file is the workspace of its own directory.
+import fileroot
+
+here = fileroot.this
+root = fileroot.workspace

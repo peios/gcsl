@@ -2198,6 +2198,27 @@
 //! diagnostics are those of a `def` of the directory; the prelude's `half`
 //! is such a `def`.
 //!
+//! The `fileroot` module (see [`crate::workspace`], "The standard library")
+//! is no record: a reference through its whole import resolves, as any
+//! does, to the longest prefix it declares, a member or the module itself
+//! ([`crate::workspace::Target::Fileroot`]), and is typed by
+//! `Checker::fileroot_reference`, resolving to [`VarRef::Fileroot`], which
+//! lowering makes the member's own node. `fileroot.this`,
+//! `fileroot.workspace` and `fileroot.caller` are each a `String`;
+//! `fileroot.helper`, only as the callee of a call (not in parentheses), is
+//! a pure function of nothing to `{}`, so `fileroot.helper()` may be called
+//! from any function and at the top level, and its arguments are bound as
+//! any function's ("expected 0 arguments, found 1"). The module's own name
+//! is typed `{}`, which nothing reads. Every other use is an error, naming
+//! the module by the name the file imports it as: the module read whole,
+//! "`fileroot`'s members are read as `fileroot.caller`"; `helper` not
+//! called, "`fileroot.helper` is not a value"; a name it lacks, "`fileroot`
+//! has no `nope`" (`Checker::fileroot_lacks`); and a member used as what it
+//! is not, the error any `String` gets, as `fileroot.this(1)`'s "cannot
+//! call a value of type String". A nearer binding of the name shadows the
+//! import, as it shadows any. The checker records the file's place, given
+//! by the workspace's context ([`Place`]), in the resolution, for lowering.
+//!
 //! A session's input is checked beside the standard library as a lone file
 //! is, from the session's scope ([`crate::workspace`]'s context marks it a
 //! session's): the variables of earlier inputs are read as a session's
@@ -2207,6 +2228,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::rc::Rc;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
@@ -2349,8 +2371,93 @@ pub enum VarRef {
     /// Replaced by an ordinary call when it gets a polymorphic type (R11 of
     /// `docs/INFERENCE_REQS.md`).
     Builtin(Builtin),
+    /// A member of the `fileroot` module, read as `fileroot.NAME` (see
+    /// [Imports](#imports)): the field access that reads `this`,
+    /// `workspace` or `caller`, and the callee of a call of `helper`, which
+    /// lowering makes the member's own node, never reading the module.
+    Fileroot(Fileroot),
     /// Nothing: the expression or item is not a variable use.
     None,
+}
+
+/// A member of the `fileroot` module, implemented in Rust: where files are
+/// (see [Imports](#imports) and [`crate::eval`], "Callers and helpers").
+/// The module has no value and no cells: each member is read only as
+/// `fileroot.NAME`, through a whole import of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fileroot {
+    /// `fileroot.this: String`: the directory of the file the expression is
+    /// written in, a constant of the file.
+    This,
+    /// `fileroot.workspace: String`: the root directory of the workspace, a
+    /// constant of the run.
+    Workspace,
+    /// `fileroot.caller: String`: the directory of the file whose code made
+    /// the call the running function is running for, read at runtime.
+    Caller,
+    /// `fileroot.helper(): {}`: from the point it runs until its function
+    /// returns, the calls the function makes pass its own caller on.
+    Helper,
+}
+
+impl Fileroot {
+    /// Every member, in the order of their numbers among a file's scope's
+    /// targets (see [`crate::workspace::Target::Fileroot`]).
+    pub const ALL: [Fileroot; 4] = [
+        Fileroot::This,
+        Fileroot::Workspace,
+        Fileroot::Caller,
+        Fileroot::Helper,
+    ];
+
+    /// The name of the module.
+    pub const MODULE: &'static str = "fileroot";
+
+    /// Its name, as `fileroot.NAME` reads it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Fileroot::This => "this",
+            Fileroot::Workspace => "workspace",
+            Fileroot::Caller => "caller",
+            Fileroot::Helper => "helper",
+        }
+    }
+
+    /// The member named `text`, if one is.
+    #[must_use]
+    pub fn named(text: &str) -> Option<Fileroot> {
+        Fileroot::ALL
+            .into_iter()
+            .find(|member| member.name() == text)
+    }
+
+    /// Its index in [`Fileroot::ALL`].
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        match self {
+            Fileroot::This => 0,
+            Fileroot::Workspace => 1,
+            Fileroot::Caller => 2,
+            Fileroot::Helper => 3,
+        }
+    }
+}
+
+/// Where a file is, as the driver of its run resolved it, for the `fileroot`
+/// module (see [`crate::workspace`], "The standard library"): its directory
+/// by its index in the run's table of directories, which the code lowered
+/// from it carries ([`crate::ir::Ir::dir`]), and the texts of
+/// `fileroot.this` and `fileroot.workspace`, which lowering makes constants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Place {
+    /// The index of the file's directory in the run's table of directories.
+    pub dir: u32,
+    /// The absolute path of the file's directory: `fileroot.this`.
+    pub this: Rc<str>,
+    /// The absolute path of the workspace's root directory:
+    /// `fileroot.workspace`.
+    pub workspace: Rc<str>,
 }
 
 /// A built-in function: a member of the `builtins` module, implemented in
@@ -2811,6 +2918,11 @@ pub struct Resolution {
     /// For a value file of a workspace that another file imports, the cell
     /// its result is stored in as its block ends; [`Slot::NONE`] otherwise.
     value_cell: Slot,
+    /// Where the input is, as its run's driver resolved it: what its code
+    /// carries and what `fileroot.this` and `fileroot.workspace` are in it;
+    /// the default, directory 0 and empty texts, outside a workspace's
+    /// context, where nothing can import `fileroot`.
+    place: Place,
     /// The tree of the input's top-level fields and when each node is
     /// computed (see [Top-level fields](#top-level-fields)).
     field_schedule: FieldSchedule,
@@ -3000,6 +3112,14 @@ impl Resolution {
         self.value_cell
     }
 
+    /// Where the input is: the index of its directory in its run's table,
+    /// which its code carries, and the texts `fileroot.this` and
+    /// `fileroot.workspace` lower to in it.
+    #[must_use]
+    pub fn place(&self) -> &Place {
+        &self.place
+    }
+
     /// The tree of the input's top-level fields and when each node is
     /// computed: what lowering stores in each cell, and before which item.
     #[must_use]
@@ -3144,6 +3264,7 @@ impl Resolution {
             imported_records: Vec::new(),
             view_records: Vec::new(),
             value_cell: Slot::NONE,
+            place: Place::default(),
             field_schedule: FieldSchedule::default(),
             frame_size: 0,
             slot_names: Vec::new(),
@@ -4246,6 +4367,10 @@ pub struct Checker<'a> {
     /// [`Checker::builtin_use`]). Replaced when built-in functions get real
     /// polymorphic types (R11 of `docs/INFERENCE_REQS.md`).
     alias_site: Option<ExprId>,
+    /// The callee of the call being checked, while it is checked: where
+    /// `fileroot.helper` may stand, which is called and never a value (see
+    /// [Imports](#imports)).
+    call_site: Option<ExprId>,
     /// Reused for the types of the elements of the list literals being
     /// checked, innermost literal's last: a stack, as `sorted_fields` is.
     element_types: Vec<TyId>,
@@ -4403,6 +4528,7 @@ impl<'a> Checker<'a> {
             present_name: names.lookup("Present"),
             list_name: names.lookup("List"),
             alias_site: None,
+            call_site: None,
             element_types: Vec::new(),
             sorted_fields: Vec::new(),
             nodes: Vec::new(),
@@ -4495,6 +4621,10 @@ impl<'a> Checker<'a> {
                 imported_records: self.imported_records,
                 view_records: self.view_records,
                 value_cell: self.value_cell,
+                place: self
+                    .workspace
+                    .map(|workspace| workspace.place().clone())
+                    .unwrap_or_default(),
                 field_schedule,
                 frame_size: self.frame_size,
                 slot_names: self.slot_names,
@@ -7108,13 +7238,16 @@ impl<'a> Checker<'a> {
 
     /// The private slot and type of the record of `target`, read whole
     /// through an import, allocated with its nested records the first time
-    /// (see [Imports](#imports)); `None` for a target that is a cell.
+    /// (see [Imports](#imports)); `None` for a target that is a cell, and
+    /// for the `fileroot` module and its members, which have no record.
     fn imported_record(
         &mut self,
         workspace: &'a Context<'a>,
         target: Target,
     ) -> Option<(Slot, TyId)> {
-        if matches!(target, Target::Node(_)) || workspace.value_of(target).is_some() {
+        if matches!(target, Target::Node(_) | Target::Fileroot(_))
+            || workspace.value_of(target).is_some()
+        {
             return None;
         }
         if let Some(at) = self.imported_targets.iter().position(|&(t, _)| t == target) {
@@ -7217,6 +7350,9 @@ impl<'a> Checker<'a> {
         // Through an import, a root alone too, which has no binding (see
         // [Imports](#imports)).
         let (slot, ty) = match workspace.scope.target(node) {
+            Some(Target::Fileroot(member)) => {
+                return Some(self.fileroot_reference(id, (base, name), member));
+            }
             Some(target) => {
                 if let Target::Node(merged) = target {
                     self.imported_callees.insert(id, merged);
@@ -7239,6 +7375,96 @@ impl<'a> Checker<'a> {
         };
         self.read_cell(id, base, slot, ty);
         Some(ty)
+    }
+
+    /// The type of the reference `id`, through `base`, the name `name` that
+    /// a whole import of the `fileroot` module binds, to the module's member
+    /// `member`, or to the module itself (`None`), as nothing nearer shadows
+    /// the name (see [Imports](#imports)): `String` for `this`, `workspace`
+    /// and `caller`, which lowering makes a constant or a read of the
+    /// running frame's caller; for `helper` as the callee of a call
+    /// (`call_site`), a pure function of nothing to `{}`, to which the
+    /// call's arguments are bound as any function's. The module read whole
+    /// is "`fileroot`'s members are read as `fileroot.caller`", and `helper`
+    /// anywhere but as a callee "`fileroot.helper` is not a value", each
+    /// naming the module by the name the file imports it as. The module's
+    /// own name has no value: it is typed `{}`, which nothing reads.
+    fn fileroot_reference(
+        &mut self,
+        id: ExprId,
+        (base, name): (ExprId, Name),
+        member: Option<Fileroot>,
+    ) -> TyId {
+        let written = self.ast.names().get(name).to_owned();
+        let span = self.ast.get(id).span;
+        self.expr_types[base.index()] = TyId::EMPTY;
+        match member {
+            None => {
+                self.errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "`{written}`'s members are read as `{written}.{}`",
+                            Fileroot::Caller.name()
+                        ),
+                        span,
+                    )
+                    .with_note(FILEROOT_MEMBERS),
+                );
+                TyId::ERROR
+            }
+            Some(Fileroot::Helper) if self.call_site == Some(id) => {
+                self.expr_vars[id.index()] = VarRef::Fileroot(Fileroot::Helper);
+                let none: [(Option<Name>, TyId); 0] = [];
+                self.types.fn_type(none, TyId::EMPTY, Effect::Pure)
+            }
+            Some(Fileroot::Helper) => {
+                let helper = Fileroot::Helper.name();
+                self.errors.push(
+                    Diagnostic::error(format!("`{written}.{helper}` is not a value"), span)
+                        .with_note(format!(
+                            "it is only ever called, as `{written}.{helper}()`, which makes the \
+                             calls after it pass on this function's caller"
+                        )),
+                );
+                TyId::ERROR
+            }
+            Some(member) => {
+                self.expr_vars[id.index()] = VarRef::Fileroot(member);
+                TyId::STRING
+            }
+        }
+    }
+
+    /// The type of the field access `id`, `record.name`, if `record` is a
+    /// name that a whole import of the `fileroot` module binds, which
+    /// nothing nearer shadows, and `name` is none of its members: the error
+    /// "`fileroot` has no `nope`", naming the module as the file imports it,
+    /// for any field the module lacks (a member reaches
+    /// [`Checker::fileroot_reference`] instead).
+    fn fileroot_lacks(&mut self, id: ExprId, record: ExprId, name: Name) -> Option<TyId> {
+        let workspace = self.workspace?;
+        let ExprKind::Name(module) = self.ast.get(record).kind else {
+            return None;
+        };
+        let (node, at) = workspace.scope.reference(self.ast, record)?;
+        if at != record
+            || workspace.scope.target(node) != Some(Target::Fileroot(None))
+            || self
+                .lookup(module)
+                .is_some_and(|(index, _)| index >= self.top_end)
+        {
+            return None;
+        }
+        let names = self.ast.names();
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{}` has no `{}`", names.get(module), names.get(name)),
+                self.ast.get(id).span,
+            )
+            .with_note(FILEROOT_MEMBERS),
+        );
+        self.expr_types[record.index()] = TyId::EMPTY;
+        Some(TyId::ERROR)
     }
 
     /// Before the walk checks the top-level item `id`, a `let`, `let mut`,
@@ -9953,6 +10179,8 @@ impl<'a> Checker<'a> {
                 };
                 if let Some(ty) = reference {
                     self.builtin_use(id, ty, expr.span)
+                } else if let Some(ty) = self.fileroot_lacks(id, record, name) {
+                    ty
                 } else {
                     let record_ty = self.check_expr(record);
                     self.field_access(id, (record, record_ty), name)
@@ -10979,8 +11207,9 @@ impl<'a> Checker<'a> {
         // whose typing is special, or an alias of one (see R11 of
         // `docs/INFERENCE_REQS.md`); the call is then typed by its rule.
         let outer = self.alias_site.replace(callee);
+        let outer_call = self.call_site.replace(callee);
         let (callee_ty, callback) = self.check_callee(callee);
-        self.alias_site = outer;
+        (self.alias_site, self.call_site) = (outer, outer_call);
         if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
         }
@@ -14548,6 +14777,11 @@ const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can se
 /// The label on a pure function's marker, where it does something only an
 /// impure function may.
 const PURE_CONTEXT: &str = "this function is pure, declared with `:`";
+
+/// The note on a use of the `fileroot` module other than a read of one of
+/// its members.
+pub(crate) const FILEROOT_MEMBERS: &str =
+    "`fileroot` has the members `this`, `workspace` and `caller`, each a String, and `helper()`";
 
 /// The error for an explicit `await`, whose keyword is at `keyword`, in a
 /// pure function whose marker is at `marker`.

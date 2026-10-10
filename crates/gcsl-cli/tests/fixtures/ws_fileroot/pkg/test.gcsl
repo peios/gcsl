@@ -1,0 +1,7 @@
+import _lib.ppk
+import fileroot
+
+a = ppk.commit("usr", "dist")
+b = ppk.wrapped("usr")
+here = fileroot.this
+root = fileroot.workspace

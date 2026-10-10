@@ -47,7 +47,17 @@
 //! functions, and `sh`, written
 //! in GCSL on `exec` and `panic`, which runs a shell command and panics
 //! unless it succeeds; `path` (`import path`) joins, normalises and takes
-//! apart paths, lexically, in GCSL on the string built-ins. A workspace or
+//! apart paths, lexically, in GCSL on the string built-ins. The `fileroot`
+//! module (`import fileroot`), implemented in Rust, tells code where files
+//! are, as absolute paths: `fileroot.this`, the directory of the file the
+//! code is written in, `fileroot.workspace`, the workspace's root, and
+//! `fileroot.caller`, the directory of the file whose code called the
+//! running function, which `fileroot.helper()` makes a function pass on to
+//! the functions it calls; a memoised function that reads its caller is
+//! memoised by it too (see [`eval`], "Callers and helpers"). A workspace's
+//! root, or a lone file's directory, is given by whoever runs it (the CLI
+//! canonicalises it), and a [`Session`]'s, and that of [`run`] and the
+//! entry points told none, is the working directory. A workspace or
 //! a lone file loads only the standard files it needs, the prelude and
 //! those its files import; a [`Session`] loads them all. A file run
 //! alone ([`run`]) is a workspace of one directory beside it, and an
@@ -59,7 +69,8 @@
 //! never prints and reads no file; the one thing it does outside itself is
 //! what a program asks of `exec`, which runs a program, its output
 //! captured, its standard input the null device (see [`eval`], "The
-//! built-in functions").
+//! built-in functions"), besides asking the process for its working
+//! directory, canonical, where it is given no root.
 
 #![warn(
     clippy::unwrap_used,
@@ -207,9 +218,12 @@ pub const STANDARD: [(&str, &str); 2] = [
 /// warnings found before the failure are among them, all in source order.
 /// The file's diagnostics name no input; one of a standard file, which is a
 /// bug, names its input number, its index among the standard files the run
-/// loaded ([`workspace::check_lone_with_standard`]).
+/// loaded ([`workspace::check_lone_with_standard`]). The file is taken to
+/// be in the process's working directory, its `fileroot.this` and
+/// `fileroot.workspace` ([`workspace::working_directory`]).
 pub fn run(source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
-    let (loaded, checked) = workspace::check_lone_loading(source);
+    let dir = workspace::working_directory();
+    let (loaded, checked) = workspace::check_lone_loading(source, &dir);
     let index = u32::try_from(loaded.len()).unwrap_or(u32::MAX);
     let being_run = |diagnostics| workspace::being_run(diagnostics, index);
     let mut workspace = checked.map_err(being_run)?;

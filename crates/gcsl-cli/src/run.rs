@@ -35,6 +35,16 @@
 //! value, never shown; a `panic`, like any runtime error, is rendered to
 //! stderr with exit code 1.
 //!
+//! The library is also given where the files are, for the `fileroot`
+//! module (`import fileroot`): a workspace's root, which `find_workspace`
+//! found above the file's canonical path (`fs::canonicalize`, once, so the
+//! root is canonical too), or a lone file's directory, the parent of its
+//! canonical path, the working directory if that cannot be found; a path
+//! that is not UTF-8 is given lossily. So `fileroot.this`,
+//! `fileroot.workspace` and `fileroot.caller` are absolute paths, the same
+//! whatever directory `gcsl` runs in, though `exec` still runs its programs
+//! in `gcsl`'s working directory.
+//!
 //! The directories left out as nested workspaces are passed to the
 //! library too, by their paths relative to the root
 //! ([`gcsl::workspace::check_with_standard`]): an `import` of a path into
@@ -150,12 +160,27 @@ pub fn main(args: &RunArgs) -> ExitCode {
 
 /// Runs `source` alone, as a file outside any workspace: the workspace of
 /// one directory holding just it, beside the standard library
-/// ([`gcsl::workspace::check_lone_with_standard`]). Its diagnostics are
-/// shown against it, and a standard file's against that file, named
-/// `<stdlib>/prelude.gcsl` say.
+/// ([`gcsl::workspace::check_lone_with_standard`]), whose root, for the
+/// `fileroot` module, is the file's directory ([`file_dir`]). Its
+/// diagnostics are shown against it, and a standard file's against that
+/// file, named `<stdlib>/prelude.gcsl` say.
 fn run_alone(args: &RunArgs, source: &SourceFile) -> ExitCode {
-    let check = || workspace::check_lone_with_standard(source);
+    let dir = file_dir(&args.file);
+    let check = || workspace::check_lone_with_standard(source, &dir);
     execute_workspace(args, source, check, (vec![source.clone()], 0))
+}
+
+/// The directory of `file`, the file given, as the library takes a lone
+/// file's directory: absolute and canonical, symbolic links resolved
+/// ([`fs::canonicalize`] of the file, then its parent), without a trailing
+/// `/` but for `/` itself, and lossily if it is not UTF-8. The working
+/// directory, canonical, when the file's cannot be found, as for a file
+/// that is no file on disk.
+fn file_dir(file: &Path) -> String {
+    fs::canonicalize(file)
+        .ok()
+        .and_then(|file| file.parent().map(|dir| dir.to_string_lossy().into_owned()))
+        .unwrap_or_else(workspace::working_directory)
 }
 
 /// The exit code of a failure to write the output, after reporting it, or
@@ -384,7 +409,10 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
-    let check = || workspace::check_with_standard(&sources, &nested);
+    // The root is canonical: `find_workspace` found it above the file's
+    // canonical path.
+    let root = root.to_string_lossy();
+    let check = || workspace::check_with_standard(&sources, &nested, &root);
     execute_workspace(args, file, check, (shown_sources, position))
 }
 

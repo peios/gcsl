@@ -396,17 +396,53 @@ pub struct Future {
     /// Where the future is in its life. Borrowed only briefly, and never
     /// across running the body.
     state: RefCell<FutureState>,
+    /// The caller, the helper flag and the origin of the frame that made
+    /// the future, which its body runs with, whoever awaits it (see
+    /// [`crate::eval`], "Callers and helpers").
+    pub(crate) made: Caller,
+}
+
+/// What a running frame has of its caller (see [`crate::eval`], "Callers
+/// and helpers"), and what a `lazy` captures of the frame that makes it:
+/// the caller, the directory of the file whose code made the call the frame
+/// runs for, by its index in the run's table of directories; whether
+/// `fileroot.helper()` has run in the frame, so that the calls it makes pass
+/// its caller on; and the caller's *origin*, a number its run gives the
+/// frame whose caller was set from its calling code's file once it is
+/// needed, which every frame it passed the caller on to, through helpers
+/// and `lazy`s, shares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Caller {
+    /// The caller's directory, by its index in the run's table.
+    pub(crate) dir: u32,
+    /// Whether `fileroot.helper()` has run in the frame.
+    pub(crate) helper: bool,
+    /// The caller's origin; 0 until one is needed, which no frame shares.
+    pub(crate) origin: u64,
 }
 
 impl Future {
     /// A future of `function` of `code`, not yet run, holding the values
-    /// its body captured.
+    /// its body captured, made by a frame of caller 0, the root of its
+    /// run's table of directories, and an origin no frame has.
     #[must_use]
     pub fn new(code: Rc<Ir>, function: FnId, captures: Box<[Value]>) -> Self {
+        Self::made_by(code, function, captures, Caller::default())
+    }
+
+    /// [`Future::new`], made by a frame whose caller, helper flag and
+    /// origin are `made`, which its body runs with.
+    pub(crate) fn made_by(
+        code: Rc<Ir>,
+        function: FnId,
+        captures: Box<[Value]>,
+        made: Caller,
+    ) -> Self {
         Self {
             code,
             function,
             state: RefCell::new(FutureState::Pending(captures)),
+            made,
         }
     }
 
@@ -1043,7 +1079,7 @@ mod tests {
             display: Box::from(display),
             slot_names: Box::default(),
         };
-        Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], 0))
+        Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], (0, 0)))
     }
 
     fn closure(code: &Rc<Ir>, captures: Vec<Value>) -> Value {

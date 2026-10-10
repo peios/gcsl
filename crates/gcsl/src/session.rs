@@ -137,6 +137,17 @@
 //! earlier input's alias of `len` stays `len`. A failed input never
 //! forgets the standard library, which no input changes.
 //!
+//! A session's root, for the `fileroot` module, is the process's working
+//! directory when [`Session::new`] runs, canonical
+//! ([`crate::workspace::working_directory`]), which the standard library's
+//! run is located at: it is index 0 of the table of directories that run
+//! built, which the session keeps for every input's run. Every input is in
+//! it: an input's `fileroot.this`, `fileroot.workspace`, and its top
+//! level's `fileroot.caller`, are the working directory, and a function of
+//! an earlier input called from a later one has it as its caller too. A
+//! later change of the working directory changes nothing; nor does an
+//! input, so the table is never extended.
+//!
 //! # Workspaces
 //!
 //! A [`crate::workspace::Workspace`] is driven like a session: its files
@@ -207,10 +218,12 @@ impl Session {
     /// A session with no variables of its own, which has run the standard
     /// library, every standard file of it: the standard files are its first
     /// inputs, its first slots their cells (see the module documentation).
+    /// Its root, where every input is, is the process's working directory
+    /// now ([`crate::workspace::working_directory`]).
     #[must_use]
     pub fn new() -> Self {
         let sources = workspace::standard_sources();
-        match workspace::start() {
+        match workspace::start(&workspace::working_directory()) {
             Ok(started) => Self {
                 names: started.names,
                 types: started.types,
@@ -307,7 +320,11 @@ impl Session {
             input,
         )?;
         let committed = self.committed_mutables();
-        let context = (&mut self.memo, self.exec_result.as_ref());
+        let context = (
+            &mut self.memo,
+            self.exec_result.as_ref(),
+            &standard.dirs[..],
+        );
         match run_input(ir, &mut self.frame, context) {
             Ok(value) => {
                 // A name the input bound that its scan could not see, as a
@@ -378,20 +395,21 @@ pub(crate) fn lower_checked(
 
 /// Runs `ir`, an input of a session or a workspace, on `frame`, the top
 /// level's frame of every input so far, grown to the input's size, with
-/// `memo`, the memo tables of every input, and `exec_result`, the layout
-/// of what `exec` returns, built once for every input (see
+/// `memo`, the memo tables of every input, `exec_result`, the layout of
+/// what `exec` returns, built once for every input, and `dirs`, the table
+/// of the run's directories that its code names its own by (see
 /// [`eval::eval_with`]).
 pub(crate) fn run_input(
     ir: Ir,
     frame: &mut Vec<Value>,
-    (memo, exec_result): (&mut MemoTables, Option<&Rc<Layout>>),
+    (memo, exec_result, dirs): (&mut MemoTables, Option<&Rc<Layout>>, &[Rc<str>]),
 ) -> Result<Value, Diagnostic> {
     let ir = Rc::new(ir);
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    eval::eval_with(&ir, frame, memo, exec_result)
+    eval::eval_with(&ir, frame, memo, (exec_result, dirs))
 }
 
 #[cfg(test)]
@@ -1723,6 +1741,48 @@ mod tests {
         assert_eq!(
             messages(&mut session, "len([1])"),
             ["cannot call a value of type `{x: Int}`"]
+        );
+    }
+
+    #[test]
+    fn a_session_is_in_its_working_directory() {
+        let mut session = Session::new();
+        let root = Value::Str(workspace::working_directory().into());
+        assert!(
+            matches!(&root, Value::Str(text) if text.starts_with('/')),
+            "{root}"
+        );
+        // Every input is in the working directory the session started in,
+        // its workspace and its directory.
+        value(&mut session, "import fileroot");
+        assert_eq!(value(&mut session, "fileroot.workspace"), root);
+        assert_eq!(value(&mut session, "fileroot.this"), root);
+        assert_eq!(value(&mut session, "fileroot.caller"), root);
+        // A function of an earlier input, called from a later one, through
+        // the import the later input inherits.
+        value(&mut session, "fn f(): String { fileroot.caller }");
+        assert_eq!(value(&mut session, "f()"), root);
+        value(&mut session, "fn g(): String { fileroot.helper()\nf() }");
+        assert_eq!(value(&mut session, "g()"), root);
+        // A memoised function reading the caller, called twice, runs once.
+        value(
+            &mut session,
+            "fn m(x: Int) ->> {c: String} { c = fileroot.caller }",
+        );
+        value(&mut session, "a = m(1)\nb = m(1)");
+        let (Value::Record(a), Value::Record(b)) =
+            (value(&mut session, "a"), value(&mut session, "b"))
+        else {
+            panic!("expected records");
+        };
+        assert!(Rc::ptr_eq(&a, &b));
+        assert_eq!(
+            messages(&mut session, "import caller from fileroot"),
+            ["`fileroot`'s members are read as `fileroot.caller`"]
+        );
+        assert_eq!(
+            messages(&mut session, "x = fileroot"),
+            ["`fileroot`'s members are read as `fileroot.caller`"]
         );
     }
 }

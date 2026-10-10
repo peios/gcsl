@@ -182,7 +182,20 @@
 //! node, of its arguments as the checker bound them, the callee never read:
 //! `len` to a `ListLen` of its list. A call of an ordinary built-in
 //! function (`int`, `float`) is a `Call` of its callee, a read of its cell,
-//! as a call of any function value is. A range lowers to a `Range` of its bounds,
+//! as a call of any function value is. A member of the `fileroot` module,
+//! which the checker resolved to [`VarRef::Fileroot`], lowers to a node of
+//! its own, never reading the module: `fileroot.this` and
+//! `fileroot.workspace` to a `StrConst` of the file's place as the checker
+//! recorded it ([`crate::check::Resolution::place`]), constants of the file
+//! and of the run, `fileroot.caller` to a `Caller`, and a call of
+//! `fileroot.helper` to a `Helper` (see [`crate::eval`], "Callers and
+//! helpers"); and the program carries the index of its file's directory in
+//! the run's table ([`Ir::dir`]). A `lazy` whose body reads
+//! `fileroot.caller`, calls `fileroot.helper()` or makes a `lazy` so marked,
+//! the bodies of the functions it makes not counting, lowers to a
+//! `MakeFuture` marked `reads_caller`, whose making the memoisation counts
+//! as a read of the caller (see [`crate::eval`], "Memoised functions"). A
+//! range lowers to a `Range` of its bounds,
 //! flagged if it is inclusive, and a `for` to a `For` on the slot the
 //! checker gave its variable (see [`crate::check::Resolution::for_slot`]),
 //! whose parts are its iterable, its guard, if it has one, and its body,
@@ -320,8 +333,8 @@ use crate::ast::{
     UnaryOp, path_span, symbol_span,
 };
 use crate::check::{
-    AwaitMark, Builtin, Checked, FieldSchedule, JumpTarget, MadeAt, PathResolution, Resolution,
-    Slot, Types, VarRef,
+    AwaitMark, Builtin, Checked, FieldSchedule, Fileroot, JumpTarget, MadeAt, PathResolution,
+    Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
 
@@ -411,6 +424,7 @@ pub fn lower(
         loops: Vec::new(),
         catches: Vec::new(),
         next_catch: 0,
+        reads_caller: Vec::new(),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -432,7 +446,7 @@ pub fn lower(
         root,
         (resolution.frame_size(), resolution.slot_names().to_vec()),
         functions,
-        input,
+        (input, resolution.place().dir),
     ))
 }
 
@@ -489,6 +503,13 @@ struct Lowerer<'a> {
     /// The number of the next catch: one more than the last given, so that
     /// no two catches of the program share one.
     next_catch: u32,
+    /// For each function or `lazy` body being lowered, innermost last,
+    /// whether it can read the caller it runs with: it reads
+    /// `fileroot.caller`, calls `fileroot.helper()`, or makes a `lazy` that
+    /// can, a nested function's body not counting. Only a `lazy`'s is kept,
+    /// as its `MakeFuture`'s mark (see [`IrKind::MakeFuture`]); empty at the
+    /// top level, where nothing is kept.
+    reads_caller: Vec<bool>,
 }
 
 impl Lowerer<'_> {
@@ -1731,6 +1752,9 @@ impl Lowerer<'_> {
         (record, name): (ExprId, Name),
         kind: ValueKind,
     ) -> Result<IrKind, InternalError> {
+        if let VarRef::Fileroot(member) = self.resolution.expr_var(id) {
+            return self.lower_fileroot(member, kind, self.ast.get(id).span);
+        }
         Ok(match read(self.resolution.expr_var(id), kind) {
             Some(cell) => cell,
             None => IrKind::Field {
@@ -1739,6 +1763,42 @@ impl Lowerer<'_> {
                 kind,
             },
         })
+    }
+
+    /// Lowers the read of `member` of the `fileroot` module spanning `span`,
+    /// of kind `kind`, a `String`'s (see the checker's "Imports"):
+    /// `fileroot.this` and `fileroot.workspace` to a `StrConst` of the
+    /// file's place, which the checker resolved, constants of the file and
+    /// of the run; `fileroot.caller` to a `Caller`, read where it runs. Any
+    /// other is an internal error: `helper` is only ever called, and lowered
+    /// as its call ([`Lowerer::lower_use_or_function`]).
+    fn lower_fileroot(
+        &mut self,
+        member: Fileroot,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrKind, InternalError> {
+        let place = self.resolution.place();
+        match (member, kind) {
+            (Fileroot::This, ValueKind::String) => {
+                Ok(IrKind::StrConst(self.builder.push_string(&place.this)))
+            }
+            (Fileroot::Workspace, ValueKind::String) => {
+                Ok(IrKind::StrConst(self.builder.push_string(&place.workspace)))
+            }
+            (Fileroot::Caller, ValueKind::String) => {
+                self.read_caller();
+                Ok(IrKind::Caller)
+            }
+            (Fileroot::Helper, _) => Err(InternalError {
+                message: "`fileroot.helper` read as a value",
+                span,
+            }),
+            _ => Err(InternalError {
+                message: "a member of `fileroot` typed as something other than a String",
+                span,
+            }),
+        }
     }
 
     /// Lowers the block `id`, whose items are `items` and whose label, if
@@ -1818,7 +1878,7 @@ impl Lowerer<'_> {
             ExprKind::Call { callee, args } => {
                 let values = self.ast.args(args).iter().map(|arg| arg.value);
                 match self.resolution.expr_var(callee) {
-                    VarRef::Builtin(_) => values.collect(),
+                    VarRef::Builtin(_) | VarRef::Fileroot(_) => values.collect(),
                     _ => std::iter::once(callee).chain(values).collect(),
                 }
             }
@@ -1964,6 +2024,18 @@ impl Lowerer<'_> {
             }),
             (ExprKind::Call { callee, args }, _) => match self.resolution.expr_var(callee) {
                 VarRef::Builtin(builtin) => self.lower_builtin(builtin, args, kind, expr.span),
+                // `fileroot.helper()`, which takes no argument, is its own
+                // node, never reading its callee; the calls after it pass on
+                // the caller the body runs with.
+                VarRef::Fileroot(Fileroot::Helper) if kind == ValueKind::Record => {
+                    self.read_caller();
+                    Ok(IrKind::Helper)
+                }
+                VarRef::Fileroot(_) => Err(InternalError {
+                    message: "a call of a member of `fileroot` other than `helper`, or of a kind \
+                              other than a record's",
+                    span: expr.span,
+                }),
                 _ => Ok(IrKind::Call {
                     callee: self.lower_operand(callee, ValueKind::Fn)?,
                     args: self.lower_args(args, expr.span)?,
@@ -1993,16 +2065,42 @@ impl Lowerer<'_> {
             Effect::Memo => FnKind::Memo,
             Effect::Pure | Effect::Impure => FnKind::Function,
         };
-        let captures = self.lower_function(id, function, kind)?;
-        Ok(IrKind::MakeClosure { function, captures })
+        // A function's caller is its callers' file, whatever the frame that
+        // makes it: what its body reads of the caller is no `lazy`'s.
+        self.reads_caller.push(false);
+        let captures = self.lower_function(id, function, kind);
+        self.reads_caller.pop();
+        Ok(IrKind::MakeClosure {
+            function,
+            captures: captures?,
+        })
     }
 
     /// Lowers the `lazy` `id`, whose body is function `function`: the body
     /// into the function table, and the expression to the `MakeFuture` that
-    /// captures, in the current frame, what the checker found it captures.
+    /// captures, in the current frame, what the checker found it captures,
+    /// marked if the body can read the caller it captures (see
+    /// [`IrKind::MakeFuture`]), which marks the body around it too.
     fn lower_lazy(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
-        let captures = self.lower_function(id, function, FnKind::Future)?;
-        Ok(IrKind::MakeFuture { function, captures })
+        self.reads_caller.push(false);
+        let captures = self.lower_function(id, function, FnKind::Future);
+        let reads_caller = self.reads_caller.pop().unwrap_or(false);
+        if reads_caller {
+            self.read_caller();
+        }
+        Ok(IrKind::MakeFuture {
+            function,
+            captures: captures?,
+            reads_caller,
+        })
+    }
+
+    /// Notes that the function or `lazy` body being lowered can read the
+    /// caller it runs with (see [`Lowerer::reads_caller`]'s field).
+    fn read_caller(&mut self) {
+        if let Some(reads) = self.reads_caller.last_mut() {
+            *reads = true;
+        }
     }
 
     /// Lowers the body of function `function`, of kind `kind`, the function
@@ -2806,7 +2904,7 @@ const fn read(var: VarRef, kind: ValueKind) -> Option<IrKind> {
         VarRef::Capture(index) => Some(IrKind::LoadCapture(index, kind)),
         VarRef::Fn(slot) => Some(IrKind::Top(slot, kind)),
         VarRef::Callee => Some(IrKind::LoadCallee),
-        VarRef::Local(_) | VarRef::Builtin(_) | VarRef::None => None,
+        VarRef::Local(_) | VarRef::Builtin(_) | VarRef::Fileroot(_) | VarRef::None => None,
     }
 }
 
@@ -3934,7 +4032,10 @@ mod tests {
         let IrKind::Block { result, .. } = ir.get(ir.function(FnId::new(1)).body).kind else {
             panic!("expected a block");
         };
-        let IrKind::MakeFuture { function, captures } = ir.get(result).kind else {
+        let IrKind::MakeFuture {
+            function, captures, ..
+        } = ir.get(result).kind
+        else {
             panic!("expected a future");
         };
         assert_eq!(function, FnId::new(0));

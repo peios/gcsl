@@ -1,0 +1,16 @@
+import path
+import fileroot
+
+# `content` is relative to the directory of the caller's file, `output` to
+# the workspace's root.
+def commit(content: String, output: String) -> String {
+    let content = path.join(fileroot.caller, content)
+    let output = path.join(fileroot.workspace, output)
+    "{content} -> {output}"
+}
+
+# Calls after `fileroot.helper()` pass this function's caller on.
+def wrapped(content: String) -> String {
+    fileroot.helper()
+    commit(content, "dist")
+}

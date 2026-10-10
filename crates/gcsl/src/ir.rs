@@ -159,6 +159,17 @@
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
 //! value is passed as.
 //!
+//! A program carries the directory of the file it was lowered from, by its
+//! index in its run's table of directories ([`Ir::dir`]), which every call
+//! its code makes, a closure's or a future's of it included, passes on as
+//! the callee's caller, but after `fileroot.helper()`. The `fileroot`
+//! module's members that are not constants are nodes of their own:
+//! [`IrKind::Caller`], `fileroot.caller`, a `String` read from the running
+//! frame, and [`IrKind::Helper`], `fileroot.helper()`, `{}`, which sets the
+//! running frame's helper flag (see [`crate::eval`], "Callers and
+//! helpers"); `fileroot.this` and `fileroot.workspace` are
+//! [`IrKind::StrConst`]s.
+//!
 //! Calls nest on the Rust stack, so the evaluator keeps them within a
 //! budget of nesting levels, [`crate::MAX_DEPTH`], which they share with
 //! expressions (see [`crate::CALL_LEVELS`]). For it, every
@@ -960,6 +971,17 @@ pub enum IrKind {
     LoadCapture(u32, ValueKind),
     /// Yields the closure being run: a function's reference to itself.
     LoadCallee,
+    /// `fileroot.caller`: yields the text of the running frame's caller, the
+    /// directory of the file whose code made the call the frame runs for,
+    /// and records it as a dependency of the memoised calls it can affect
+    /// (see [`crate::eval`], "Callers and helpers"). Of kind
+    /// [`ValueKind::String`].
+    Caller,
+    /// `fileroot.helper()`: sets the running frame's helper flag, so that
+    /// every call it makes after this one passes its own caller on; `{}`,
+    /// of kind [`ValueKind::Record`] (see [`crate::eval`], "Callers and
+    /// helpers").
+    Helper,
     /// Builds a future of function `function` of the IR, a `lazy`'s body,
     /// capturing the values of `captures` as [`IrKind::MakeClosure`] does.
     /// Of kind [`ValueKind::Deferred`].
@@ -968,6 +990,12 @@ pub enum IrKind {
         function: FnId,
         /// What it captures.
         captures: IrRange,
+        /// Whether the body can read the caller the future captures: it
+        /// reads `fileroot.caller`, calls `fileroot.helper()`, or makes a
+        /// `lazy` so marked, a nested function's body not counting. Making
+        /// a marked future is a read of the making frame's caller (see
+        /// [`crate::eval`], "Memoised functions").
+        reads_caller: bool,
     },
     /// Evaluates `value`, a node of any kind, awaits it fully if it is a
     /// future, running its body if it has not run, and then, unless
@@ -1044,7 +1072,9 @@ impl IrKind {
             | IrKind::Load(..)
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
-            | IrKind::LoadCallee => (None, &[], NONE),
+            | IrKind::LoadCallee
+            | IrKind::Caller
+            | IrKind::Helper => (None, &[], NONE),
             IrKind::IntNeg(operand)
             | IrKind::FloatNeg(operand)
             | IrKind::IntToFloat(operand)
@@ -1171,6 +1201,8 @@ impl IrKind {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Caller
+            | IrKind::Helper
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
             | IrKind::MakeList { .. }
@@ -1271,6 +1303,8 @@ impl IrKind {
             IrKind::Top(_, ValueKind::Fn) => "fn",
             IrKind::Top(..) => "top",
             IrKind::LoadCallee => "load-callee",
+            IrKind::Caller => "caller",
+            IrKind::Helper => "helper",
             IrKind::MakeFuture { .. } => "make-future",
             IrKind::Await { .. } => "await",
         }
@@ -1359,6 +1393,8 @@ impl IrNode {
             | IrKind::LoadCapture(..)
             | IrKind::Top(..)
             | IrKind::LoadCallee
+            | IrKind::Caller
+            | IrKind::Helper
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
             | IrKind::Is { .. }
@@ -1448,6 +1484,9 @@ pub struct Ir {
     slot_names: Vec<Name>,
     /// The session input the program was lowered from; 0 for a file.
     input: u32,
+    /// The directory of the file the program was lowered from, by its index
+    /// in its run's table of directories (see [`Ir::dir`]).
+    dir: u32,
 }
 
 impl Ir {
@@ -1687,6 +1726,17 @@ impl Ir {
         self.input
     }
 
+    /// The directory of the file the program was lowered from, by its index
+    /// in its run's table of directories, which the driver built
+    /// ([`crate::check::Place::dir`]): what a call made by its code, or by a
+    /// closure or a future of it, passes on as its callee's caller (see
+    /// [`crate::eval`], "Callers and helpers"). 0, the root's, for a
+    /// program lowered with no workspace's context.
+    #[must_use]
+    pub fn dir(&self) -> u32 {
+        self.dir
+    }
+
     /// The kind of value node `id` produces: [`ValueKind::Deferred`] for a
     /// `MakeFuture` and for a load, capture, field access, index or call of
     /// a value that may be a future, and never for an `Await`;
@@ -1744,7 +1794,9 @@ impl Ir {
                 | IrKind::And(_)
                 | IrKind::Or(_)
                 | IrKind::Not(_) => ValueKind::Bool,
-                IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) => ValueKind::String,
+                IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
+                    ValueKind::String
+                }
                 IrKind::IntConst(_)
                 | IrKind::IntNeg(_)
                 | IrKind::IntAdd(_)
@@ -1772,6 +1824,7 @@ impl Ir {
                 | IrKind::Store(..)
                 | IrKind::MakeRecord { .. }
                 | IrKind::UpdateField { .. }
+                | IrKind::Helper
                 | IrKind::For { collect: false, .. }
                 | IrKind::Loop { collect: false, .. } => ValueKind::Record,
                 IrKind::Load(_, kind)
@@ -2062,7 +2115,7 @@ impl IrBuilder {
     #[cfg(test)]
     pub(crate) fn finish(mut self, root: IrId, frame_size: u32, slot_names: Vec<Name>) -> Ir {
         self.measure(root, &mut []);
-        self.finish_program(root, (frame_size, slot_names), Vec::new(), 0)
+        self.finish_program(root, (frame_size, slot_names), Vec::new(), (0, 0))
     }
 
     /// Gives every [`IrKind::Call`], [`IrKind::Await`] and
@@ -2157,13 +2210,14 @@ impl IrBuilder {
     /// Finishes the program whose root is `root`, whose root frame has
     /// `frame_size` slots named by `slot_names`, whose functions are
     /// `functions`, indexed by [`FnId`], and which was lowered from session
-    /// input `input`.
+    /// input `input`, a file in the directory of index `dir` in its run's
+    /// table of directories.
     pub(crate) fn finish_program(
         self,
         root: IrId,
         (frame_size, slot_names): (u32, Vec<Name>),
         functions: Vec<FnCode>,
-        input: u32,
+        (input, dir): (u32, u32),
     ) -> Ir {
         Ir {
             nodes: self.nodes,
@@ -2184,6 +2238,7 @@ impl IrBuilder {
             frame_size,
             slot_names,
             input,
+            dir,
         }
     }
 }
