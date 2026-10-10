@@ -155,7 +155,15 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "gcsl",
+ "gcsl-disk",
  "rustyline",
+]
+
+[[package]]
+name = "gcsl-disk"
+version = "0.1.0"
+dependencies = [
+ "gcsl",
 ]
 
 [[package]]

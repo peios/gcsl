@@ -1,8 +1,9 @@
 //! `gcsl`: the command-line interface to the GCSL language.
 //!
 //! With no arguments it starts a REPL; `gcsl run FILE` runs a file. All
-//! language work is done by the `gcsl` library; this crate only reads input,
-//! prints output and chooses exit codes.
+//! language work is done by the `gcsl` library, and finding and reading a
+//! workspace's files by the `gcsl-disk` crate, which `pekit` shares; this
+//! crate only reads its input, prints output and chooses exit codes.
 
 #![warn(
     clippy::unwrap_used,

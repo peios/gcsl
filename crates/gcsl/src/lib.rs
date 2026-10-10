@@ -41,6 +41,12 @@
 //! trees under a key no source can write, so definitions merge, conflict
 //! and are shadowed as dotted `def`s are, through directories and `*`
 //! imports (see [`check`], "Def-types", and [`workspace`], "Def-types").
+//! A checked workspace lists its def-types with their definitions, and
+//! invokes a definition by the def-type's name and its path, given as text,
+//! as if `DT PATH()` were called from the definition's directory, for a
+//! program that turns def-types into commands, as `pekit` does (see
+//! [`workspace`], "Def-types by name"); finding and reading a workspace's
+//! files for it is the `gcsl-disk` crate's.
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A

@@ -7,9 +7,11 @@
 //! hold their own `workspace.gcsl`, which are workspaces of their own),
 //! the whole workspace is checked, and `FILE` runs after the files it
 //! needs; its own value is printed, with the warnings of every file.
-//! Finding and reading the files is this module's: the library reads no
-//! file. Each file is given to the library by its path relative to the
-//! root, and its diagnostics name it by its path from the current
+//! Finding and reading the files is the `gcsl-disk` crate's, which `pekit`
+//! shares ([`gcsl_disk::find_workspace`], [`gcsl_disk::read_workspace`]):
+//! the library reads no file. `FILE` is read once, here, and given to the
+//! reading as read. Each file is given to the library by its path relative
+//! to the root, and its diagnostics name it by its path from the current
 //! directory, `FILE` by the path given. The dumps are `FILE`'s alone: its
 //! tokens and syntax tree as a file's, its attributes among them
 //! (`Attribute(shadowable)` and `InnerAttribute(no_prelude)` tokens,
@@ -51,11 +53,12 @@
 //! stderr with exit code 1.
 //!
 //! The library is also given where the files are, for the `fileroot`
-//! module (`import fileroot`): a workspace's root, which `find_workspace`
-//! found above the file's canonical path (`fs::canonicalize`, once, so the
-//! root is canonical too), or a lone file's directory, the parent of its
-//! canonical path, the working directory if that cannot be found; a path
-//! that is not UTF-8 is given lossily. So `fileroot.this`,
+//! module (`import fileroot`): a workspace's root, which
+//! [`gcsl_disk::find_workspace`] found above the file's canonical path
+//! (`fs::canonicalize`, once, so the root is canonical too), or a lone
+//! file's directory, the parent of its canonical path, the working
+//! directory if that cannot be found; a path that is not UTF-8 is given
+//! lossily. So `fileroot.this`,
 //! `fileroot.workspace` and `fileroot.caller` are absolute paths, the same
 //! whatever directory `gcsl` runs in, though `exec` still runs its programs
 //! in `gcsl`'s working directory.
@@ -63,15 +66,15 @@
 //! The directories left out as nested workspaces are passed to the
 //! library too, by their paths relative to the root
 //! ([`gcsl::workspace::check_with_standard`]): an `import` of a path into
-//! one is "no module", and only this module knows why, so that the error's
-//! note can say "`vendor/` is a workspace of its own". An `import` of
-//! anything but the standard library in a file that is not in a workspace
-//! is an error of that file, reported by the checker with its other errors.
+//! one is "no module", and only the reading of the files knows why, so that
+//! the error's note can say "`vendor/` is a workspace of its own". An
+//! `import` of anything but the standard library in a file that is not in a
+//! workspace is an error of that file, reported by the checker with its
+//! other errors.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
@@ -80,6 +83,7 @@ use gcsl::lexer::TokenKind;
 use gcsl::strings::Quoted;
 use gcsl::workspace::{self, Workspace};
 use gcsl::{Diagnostic, SourceFile, Value, lexer, parser};
+use gcsl_disk::{Sources, find_workspace};
 
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
@@ -270,165 +274,37 @@ fn syntax(
     Ok((last != Some(Stage::Ast)).then_some(ast))
 }
 
-/// The name of the file that makes its directory a workspace's root.
-const WORKSPACE: &str = "workspace.gcsl";
-
-/// The root of the workspace `file` is a file of, and `file`'s path
-/// relative to it, `/` separated: the nearest directory above `file`
-/// holding a `workspace.gcsl`.
-///
-/// `None` when there is none, and also when `file` is not one of the
-/// workspace's files (a name starting with `.` on the way, or not a
-/// `.gcsl` file), or its path cannot be followed or is not UTF-8: such a
-/// file runs alone, as a file outside any workspace does.
-fn find_workspace(file: &Path) -> Option<(PathBuf, String)> {
-    let file = fs::canonicalize(file).ok()?;
-    let root = file
-        .parent()?
-        .ancestors()
-        .find(|dir| dir.join(WORKSPACE).is_file())?;
-    let mut parts = Vec::new();
-    for part in file.strip_prefix(root).ok()?.components() {
-        let Component::Normal(part) = part else {
-            return None;
-        };
-        let part = part.to_str()?;
-        if part.starts_with('.') {
-            return None;
-        }
-        parts.push(part);
-    }
-    if file.extension().and_then(OsStr::to_str) != Some("gcsl") {
-        return None;
-    }
-    Some((root.to_path_buf(), parts.join("/")))
-}
-
-/// A file of a workspace that could not be listed or read.
-struct Unreadable {
-    /// The path of the file or directory.
-    path: PathBuf,
-    /// Why it could not be read.
-    error: io::Error,
-}
-
-/// What [`workspace_files`] finds: the files, each with its path relative to
-/// the root and its full path, and the directories left out as workspaces
-/// of their own.
-type Found = (Vec<(String, PathBuf)>, Vec<String>);
-
-/// The files of the workspace under `root`, each with its path relative to
-/// `root`, `/` separated, in path order, byte by byte: every `.gcsl` file
-/// below it, except those whose name, or a directory's on the way, starts
-/// with `.`, and those under a directory holding its own `workspace.gcsl`,
-/// which is a workspace of its own. Names that are not UTF-8 are skipped,
-/// and so is a directory that is a symbolic link, which could lead back
-/// into the tree; a file that is one is read as any file. With them, the
-/// directories left out as workspaces of their own, relative to `root`
-/// without a trailing `/`, in path order: the workspace is told of them so
-/// that an import of one says why it finds nothing.
-fn workspace_files(root: &Path) -> Result<Found, Unreadable> {
-    let mut files = Vec::new();
-    let mut nested = Vec::new();
-    let mut dirs = vec![(String::new(), root.to_path_buf())];
-    while let Some((prefix, dir)) = dirs.pop() {
-        let unreadable = |error| Unreadable {
-            path: dir.clone(),
-            error,
-        };
-        for entry in fs::read_dir(&dir).map_err(unreadable)? {
-            let entry = entry.map_err(unreadable)?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str().filter(|name| !name.starts_with('.')) else {
-                continue;
-            };
-            let path = entry.path();
-            if path.is_dir() {
-                let linked = entry.file_type().is_ok_and(|kind| kind.is_symlink());
-                if linked {
-                    continue;
-                }
-                if path.join(WORKSPACE).is_file() {
-                    nested.push(format!("{prefix}{name}"));
-                } else {
-                    dirs.push((format!("{prefix}{name}/"), path));
-                }
-            } else if path.extension().and_then(OsStr::to_str) == Some("gcsl") {
-                files.push((format!("{prefix}{name}"), path));
-            }
-        }
-    }
-    files.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
-    nested.sort_unstable();
-    Ok((files, nested))
-}
-
-/// How `path`, a full path, is shown: relative to the current directory
-/// when it is under it, else in full.
-fn shown(path: &Path) -> PathBuf {
-    std::env::current_dir()
-        .and_then(fs::canonicalize)
-        .ok()
-        .and_then(|cwd| path.strip_prefix(cwd).ok().map(Path::to_path_buf))
-        .unwrap_or_else(|| path.to_path_buf())
-}
-
 /// Runs `gcsl run` on `file`, the file given, read, whose path relative to
-/// the workspace `root` is `relative`: reads the workspace's files, then
-/// checks the workspace and runs `file` in it.
+/// the workspace `root` is `relative`: reads the workspace's files
+/// ([`gcsl_disk::read_workspace`], `file` not read again), then checks the
+/// workspace and runs `file` in it.
 ///
 /// Each file is given to the workspace by its path relative to the root,
 /// and its diagnostics are shown with its path from the current directory
 /// (`file`'s as it was given).
 fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str) -> ExitCode {
-    let (paths, nested) = match workspace_files(root) {
-        Ok(found) => found,
-        Err(Unreadable { path, error }) => {
-            let path = shown(&path);
-            output::error(format_args!("cannot read {}: {error}", path.display()));
+    let sources = match gcsl_disk::read_workspace(root, Some((relative, file))) {
+        Ok(sources) => sources,
+        Err(error) => {
+            output::error(error);
             return ExitCode::from(EXIT_USAGE_OR_IO);
         }
     };
-    let mut sources = Vec::new();
-    // In path order, as the workspace numbers its files after the standard
-    // files it loads.
-    let mut shown_sources = Vec::new();
-    for (name, path) in &paths {
-        let (shown_name, text) = if name == relative {
-            (file.name().to_owned(), file.text().to_owned())
-        } else {
-            let shown_name = shown(path).display().to_string();
-            match fs::read_to_string(path) {
-                Ok(text) => (shown_name, text),
-                Err(error) => {
-                    output::error(format_args!("cannot read {shown_name}: {error}"));
-                    return ExitCode::from(EXIT_USAGE_OR_IO);
-                }
-            }
-        };
-        match (
-            SourceFile::new(name.clone(), text.clone()),
-            SourceFile::new(shown_name.clone(), text),
-        ) {
-            (Ok(source), Ok(shown_source)) => {
-                sources.push(source);
-                shown_sources.push(shown_source);
-            }
-            (Err(error), _) | (_, Err(error)) => {
-                output::error(format_args!("cannot load {shown_name}: {error}"));
-                return ExitCode::from(EXIT_USAGE_OR_IO);
-            }
-        }
-    }
-    let Some(position) = paths.iter().position(|(name, _)| name == relative) else {
+    let Some(position) = sources.given else {
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
     // The root is canonical: `find_workspace` found it above the file's
     // canonical path.
     let root = root.to_string_lossy();
-    let check = || workspace::check_with_standard(&sources, &nested, &root);
-    execute_workspace(args, file, check, (shown_sources, position))
+    let Sources {
+        relative: files,
+        shown,
+        nested,
+        ..
+    } = sources;
+    let check = || workspace::check_with_standard(&files, &nested, &root);
+    execute_workspace(args, file, check, (shown, position))
 }
 
 /// What checking a workspace gives: the standard files it loaded, its

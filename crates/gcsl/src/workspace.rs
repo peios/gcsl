@@ -384,6 +384,57 @@
 //! definition's file, and its `DT` the def-type's, and a definition's `DT`
 //! makes its file need the def-type's.
 //!
+//! # Def-types by name
+//!
+//! A program that turns def-types into commands (`pekit package
+//! dev.peios.testpkg`) asks a checked workspace for its def-types and
+//! invokes one of their definitions by name, as text; nothing here is
+//! written in any source, and nothing of it changes what a file, a run or a
+//! dump does. [`Workspace::def_types`] lists every `def` marked
+//! `#[def_type]` of the workspace's own files (not the standard files'),
+//! each by its path as declared ([`DefType`]), with every definition made
+//! with it ([`Definition`]): found by a search of every file, whichever
+//! views see it, so a definition in a directory the root does not see is
+//! found, and one a later one shadows too; grouped by the def-type its `DT`
+//! names, its namespace's key (see [Def-types](#def-types)), whatever
+//! import or alias names it, so `def pkg x()` after `import package as pkg
+//! from lib` is `package`'s `x`; each by its path as it writes it; all in
+//! path order of their files, then in source order. Invoking by name needs
+//! a name to mean one thing, so the listing fails, and every invocation
+//! with it, if a def-type has two definitions of one path anywhere in the
+//! workspace, "`package dev.peios.x` is defined 2 times in the workspace",
+//! or two def-types are declared of one path, "def-type `package` is
+//! declared 2 times in the workspace", each at the first in path then
+//! source order, labelled "also defined here" (or "also declared here") at
+//! each other. Neither is an error of the language, which allows one path
+//! in two sibling directories: the workspace checks and runs regardless.
+//!
+//! [`Workspace::invoke`] calls the definition as `DT PATH()` would be
+//! called from a file of the definition's directory. What it asks for may
+//! name nothing: no def-type of the name, no definition of the path, a path
+//! above definitions, or a def-type with invocation parameters, which
+//! cannot be given yet; each is a [`RequestError`], an error of no source.
+//! Then the definition's file and the def-type's run as a reference to the
+//! definition needs them to, each as a whole, with the files they need,
+//! unless they have run, as for [`Workspace::run`], and the call is made:
+//! an input of its own, built rather than parsed, `<def-type>("PATH",
+//! <definition>)` as its result, whose two names no source can write are
+//! bound, in a scope of the workspace's slots, as fields of the def-type's
+//! cell and the definition's (the slots of their closures), with their
+//! types. It is checked as an input of no workspace, so that it looks
+//! nothing up in any file's view and needs no alias, placed in the
+//! definition's directory, so that the def-type's caller (`fileroot.caller`)
+//! is that directory, as for a call written there, and the definition's is
+//! what the def-type makes it; lowered with an input number after every
+//! file's, and run on the workspace's frame and memo tables. It takes no
+//! cell and commits nothing, so it changes nothing any file sees, and
+//! invoked again it is made and run again, a call like any other, the files
+//! not running again. Every diagnostic it returns names a file of the
+//! workspace or a standard file: the call has no source, so a diagnostic or
+//! a label located in it ("call nested too deeply" at the call, for a
+//! def-type's body nested within a few levels of the limit) is located at
+//! the definition's path in its file instead, labelled "invoked here".
+//!
 //! # The standard library
 //!
 //! Two kinds of module are not files of the workspace. `builtins` and
@@ -545,8 +596,9 @@ use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::{
-    self, Ast, DefTypeId, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment,
-    TypeExprId, TypeLink, TypeStore, TypeStoreMark,
+    self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, Expr, ExprKind, ImportDecl, ImportForm,
+    ImportMember, Item, ItemId, ItemKind, PathSegment, TypeExprId, TypeLink, TypeStore,
+    TypeStoreMark,
 };
 #[cfg(test)]
 use crate::check::ViewRecord;
@@ -563,6 +615,7 @@ use crate::names::{self, Name, Names};
 use crate::parser;
 use crate::session;
 use crate::source::{SourceFile, Span};
+use crate::strings::Strings;
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, Value};
 
@@ -5819,6 +5872,24 @@ impl Workspace {
     /// The runtime error of the first file that fails, naming its file,
     /// with the workspace's warnings.
     pub fn run(&mut self, index: u32) -> Result<Outcome, Vec<Diagnostic>> {
+        self.run_needed(index)?;
+        Ok(Outcome {
+            value: self
+                .values
+                .get(index as usize)
+                .cloned()
+                .unwrap_or(Value::Empty),
+            warnings: self.warnings.clone(),
+        })
+    }
+
+    /// Runs file `index` and every file it needs, as [`Workspace::run`]
+    /// does, but those that have run already, keeping each one's value.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::run`].
+    fn run_needed(&mut self, index: u32) -> Result<(), Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
             let Some(ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
                 continue;
@@ -5840,15 +5911,640 @@ impl Workspace {
                 }
             }
         }
-        Ok(Outcome {
-            value: self
-                .values
-                .get(index as usize)
-                .cloned()
-                .unwrap_or(Value::Empty),
-            warnings: self.warnings.clone(),
-        })
+        Ok(())
     }
+}
+
+/// A def-type of a workspace, as [`Workspace::def_types`] lists it: a `def`
+/// marked `#[def_type]` of one of the workspace's files, with every
+/// definition made with it (see the module documentation, "Def-types by
+/// name").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefType {
+    /// Its path, as it is declared: `package`, or `t.package` for a `def`
+    /// named by a dotted path. It is invoked by it.
+    pub path: String,
+    /// The input number of its file.
+    pub file: u32,
+    /// Where its name, its whole path, is written in its file.
+    pub span: Span,
+    /// Every definition made with it, in path order of their files, then in
+    /// source order: none if it has none.
+    pub definitions: Vec<Definition>,
+}
+
+/// A definition made with a def-type, `def package dev.peios.testpkg() {
+/// ... }`, as [`Workspace::def_types`] lists it (see the module
+/// documentation, "Def-types by name").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Definition {
+    /// Its path, as the definition writes it: `dev.peios.testpkg`. It is
+    /// invoked by it.
+    pub path: String,
+    /// The input number of its file.
+    pub file: u32,
+    /// Where its path is written in its file.
+    pub span: Span,
+}
+
+/// Why [`Workspace::invoke`] could not invoke a definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvokeError {
+    /// What the workspace's files say: the duplicates that
+    /// [`Workspace::def_types`] fails with, or the runtime error of a file
+    /// that ran or of the call, with the workspace's warnings, as
+    /// [`Workspace::run`] returns them. Each names its file, a standard
+    /// file or one of the workspace's.
+    Diagnostics(Vec<Diagnostic>),
+    /// What was asked for names nothing that can be invoked: an error of no
+    /// source, which is shown as a line and its notes.
+    Request(RequestError),
+}
+
+/// A def-type and a definition asked for by name that cannot be invoked
+/// (see the module documentation, "Def-types by name"): an error of no
+/// source, so no [`Diagnostic`], which needs a span. Shown, it is its message,
+/// [`RequestError::message`], which its notes follow,
+/// [`RequestError::notes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// No def-type of the workspace is of the name asked for: "no def-type
+    /// `pkg`".
+    NoDefType {
+        /// The name asked for.
+        name: String,
+        /// The paths of the workspace's def-types, sorted.
+        def_types: Vec<String>,
+    },
+    /// The def-type has no definition of the path asked for: "`package`
+    /// has no definition `dev.peios.nope`".
+    NoDefinition {
+        /// The def-type's path.
+        def_type: String,
+        /// The path asked for.
+        path: String,
+        /// The paths of the def-type's definitions, sorted.
+        definitions: Vec<String>,
+    },
+    /// The path asked for is a prefix of the paths of definitions of the
+    /// def-type, none of which it is: "`dev.peios` is not a `package`
+    /// definition".
+    NotADefinition {
+        /// The def-type's path.
+        def_type: String,
+        /// The path asked for.
+        path: String,
+        /// The paths of the def-type's definitions, sorted.
+        definitions: Vec<String>,
+    },
+    /// The def-type takes invocation parameters, which cannot be given by
+    /// name yet: "`build` takes parameters of its own (`target`), which
+    /// cannot be given here yet".
+    TakesParameters {
+        /// The def-type's path.
+        def_type: String,
+        /// The names of its invocation parameters, as it declares them, in
+        /// order.
+        parameters: Vec<String>,
+    },
+}
+
+impl RequestError {
+    /// The line that says what is wrong, without a trailing full stop.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            RequestError::NoDefType { name, .. } => format!("no def-type `{name}`"),
+            RequestError::NoDefinition { def_type, path, .. } => {
+                format!("`{def_type}` has no definition `{path}`")
+            }
+            RequestError::NotADefinition { def_type, path, .. } => {
+                format!("`{path}` is not a `{def_type}` definition")
+            }
+            RequestError::TakesParameters {
+                def_type,
+                parameters,
+            } => format!(
+                "`{def_type}` takes parameters of its own ({}), which cannot be given here yet",
+                quoted_list(parameters)
+            ),
+        }
+    }
+
+    /// The notes that follow the message: what there is to ask for instead.
+    #[must_use]
+    pub fn notes(&self) -> Vec<String> {
+        match self {
+            RequestError::NoDefType { def_types, .. } if def_types.is_empty() => {
+                vec!["this workspace declares no def-types".to_owned()]
+            }
+            RequestError::NoDefType { def_types, .. } => {
+                vec![format!("the def-types are {}", quoted_list(def_types))]
+            }
+            RequestError::NoDefinition { definitions, .. }
+            | RequestError::NotADefinition { definitions, .. }
+                if definitions.is_empty() =>
+            {
+                vec!["it has no definitions".to_owned()]
+            }
+            RequestError::NoDefinition { definitions, .. }
+            | RequestError::NotADefinition { definitions, .. } => {
+                vec![format!("its definitions are {}", quoted_list(definitions))]
+            }
+            RequestError::TakesParameters { .. } => Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+/// `items`, each in backquotes, joined by `, `.
+fn quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| format!("`{item}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A def-type as [`Workspace::def_types`] finds it, with what invoking one
+/// of its definitions needs besides: its item, and the item of each of its
+/// definitions, in the order of `listed`'s.
+#[derive(Debug)]
+struct FoundDefType {
+    /// The def-type as it is listed.
+    listed: DefType,
+    /// Its `def`'s item.
+    item: ItemId,
+    /// The item of each of its definitions.
+    items: Vec<ItemId>,
+}
+
+/// The name, no source can write it, that the call invoking a definition by
+/// name reads the def-type by (see [Def-types by name](#def-types-by-name)).
+const INVOKED_DEF_TYPE: &str = "<def-type>";
+
+/// The name, no source can write it, that the call invoking a definition by
+/// name reads the definition by.
+const INVOKED_DEFINITION: &str = "<definition>";
+
+impl Workspace {
+    /// Every def-type of the workspace's own files, the standard files'
+    /// aside, with every definition made with it, a def-type with none
+    /// included, in path order of their files, then in source order (see
+    /// the module documentation, "Def-types by name"). A definition is
+    /// found in whichever file it is, whichever files see it, and listed
+    /// under the def-type its `DT` names, through whatever import or alias,
+    /// by its path as it writes it; a `#[shadowable]` one that a later one
+    /// shadows is found too.
+    ///
+    /// # Errors
+    ///
+    /// One error for each path of which a def-type has two definitions or
+    /// more anywhere in the workspace, "`package dev.peios.x` is defined 2
+    /// times in the workspace", and each path of which two def-types or
+    /// more are declared, "def-type `package` is declared 2 times in the
+    /// workspace", at the first in path then source order, labelled "also
+    /// defined here", or "also declared here", at each other, in path order
+    /// of their files, then in source order. Neither is an error of the
+    /// language: the workspace checks and runs regardless.
+    pub fn def_types(&self) -> Result<Vec<DefType>, Vec<Diagnostic>> {
+        let found = self.found_def_types();
+        let duplicates = duplicates(&found);
+        if !duplicates.is_empty() {
+            return Err(duplicates);
+        }
+        Ok(found.into_iter().map(|found| found.listed).collect())
+    }
+
+    /// Invokes the definition of path `path` made with the def-type of path
+    /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`), as
+    /// if `DT PATH()` were called from a file of the definition's directory
+    /// (see the module documentation, "Def-types by name"): the
+    /// definition's file and the def-type's run first, each as a whole, with
+    /// the files they need, unless they have run, and then the def-type is
+    /// called with the definition's path and the definition, its caller the
+    /// directory of the definition's file. Returns the value the def-type
+    /// returns, with the warnings of the whole workspace. Invoked again, the
+    /// call runs again.
+    ///
+    /// # Errors
+    ///
+    /// In this order: the duplicates [`Workspace::def_types`] fails with;
+    /// no def-type of path `def_type`, no definition of it of path `path`,
+    /// or `path` above some, or a def-type with invocation parameters, each
+    /// a [`RequestError`]; and the runtime error of a file that runs or of
+    /// the call, as [`Workspace::run`] returns it, a part of it in the call
+    /// itself, which has no source, located at the definition's path,
+    /// labelled "invoked here".
+    pub fn invoke(&mut self, def_type: &str, path: &str) -> Result<Outcome, InvokeError> {
+        let mut found = self.found_def_types();
+        let duplicates = duplicates(&found);
+        if !duplicates.is_empty() {
+            return Err(InvokeError::Diagnostics(duplicates));
+        }
+        let Some(at) = found.iter().position(|found| found.listed.path == def_type) else {
+            let mut def_types: Vec<String> = found.into_iter().map(|f| f.listed.path).collect();
+            def_types.sort_unstable();
+            return Err(InvokeError::Request(RequestError::NoDefType {
+                name: def_type.to_owned(),
+                def_types,
+            }));
+        };
+        let found = found.swap_remove(at);
+        let missing = || InvokeError::Request(missing_definition(&found.listed, path));
+        let definitions = &found.listed.definitions;
+        let at = definitions.iter().position(|d| d.path == path);
+        let (Some(definition), Some(&item)) = (
+            at.and_then(|at| definitions.get(at)),
+            at.and_then(|at| found.items.get(at)),
+        ) else {
+            return Err(missing());
+        };
+        let parameters = self.invocation_parameters(&found);
+        if !parameters.is_empty() {
+            return Err(InvokeError::Request(RequestError::TakesParameters {
+                def_type: found.listed.path.clone(),
+                parameters,
+            }));
+        }
+        let cells = (
+            self.leaf_cell(found.listed.file, found.item),
+            self.leaf_cell(definition.file, item),
+        );
+        let (Some(def_type_cell), Some(definition_cell)) = cells else {
+            // A definition a later one of another path shadows in its own
+            // directory, which is in no tree: no source can reach it either.
+            return Err(missing());
+        };
+        // The files a reference to the definition needs, each run whole.
+        self.run_needed(definition.file)
+            .map_err(InvokeError::Diagnostics)?;
+        self.run_needed(found.listed.file)
+            .map_err(InvokeError::Diagnostics)?;
+        self.call_definition(definition, (def_type_cell, definition_cell))
+    }
+
+    /// Every def-type of the workspace's own files, with its definitions,
+    /// as [`Workspace::def_types`] lists them, duplicates and all.
+    fn found_def_types(&self) -> Vec<FoundDefType> {
+        let names = &self.scan.names;
+        let text = |segments: &[PathSegment]| {
+            segments
+                .iter()
+                .filter_map(PathSegment::name)
+                .map(|name| names.get(name))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let span = |segments: &[PathSegment]| match (segments.first(), segments.last()) {
+            (Some(first), Some(last)) => first.span.join(last.span),
+            _ => Span::new(0, 0),
+        };
+        let mut found = Vec::new();
+        let mut by_key: HashMap<String, usize> = HashMap::new();
+        // Each definition, by its namespace's key: the def-type it is made
+        // with may be declared in a file after its own.
+        let mut definitions: Vec<(Name, Definition, ItemId)> = Vec::new();
+        let files = (0u32..).zip(&self.scan.files);
+        for (index, file) in files.skip(self.scan.standard as usize) {
+            let ast = &file.ast;
+            for &item in ast.items(ast.root()) {
+                match ast.item(item).kind {
+                    ItemKind::Field {
+                        path,
+                        function: true,
+                        ..
+                    } if ast.is_def_type(item) => {
+                        let segments = ast.path(path);
+                        let path = text(segments);
+                        let number = u32::try_from(item.index()).unwrap_or(u32::MAX);
+                        // Its namespace's key, as the scan made it (see
+                        // [Def-types](#def-types)).
+                        let key = names::namespace_key(&path, index, number);
+                        by_key.insert(key, found.len());
+                        found.push(FoundDefType {
+                            listed: DefType {
+                                path,
+                                file: index,
+                                span: span(segments),
+                                definitions: Vec::new(),
+                            },
+                            item,
+                            items: Vec::new(),
+                        });
+                    }
+                    ItemKind::DefTypeDef { def, .. } => {
+                        let def = ast.def_type(def);
+                        // Every definition of a workspace that checked has
+                        // its def-type's key.
+                        let Some(key) = def.key else {
+                            continue;
+                        };
+                        let segments = ast.path(def.path);
+                        let definition = Definition {
+                            path: text(segments),
+                            file: index,
+                            span: span(segments),
+                        };
+                        definitions.push((key, definition, item));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (key, definition, item) in definitions {
+            let at = by_key.get(names.get(key)).copied();
+            if let Some(def_type) = at.and_then(|at| found.get_mut(at)) {
+                def_type.listed.definitions.push(definition);
+                def_type.items.push(item);
+            }
+        }
+        found
+    }
+
+    /// The names of the invocation parameters of the def-type `found`, its
+    /// parameters after its second, as it declares them.
+    fn invocation_parameters(&self, found: &FoundDefType) -> Vec<String> {
+        let Some(file) = self.scan.files.get(found.listed.file as usize) else {
+            return Vec::new();
+        };
+        let ast = &file.ast;
+        let ItemKind::Field { value, .. } = ast.item(found.item).kind else {
+            return Vec::new();
+        };
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            return Vec::new();
+        };
+        let params = ast.params(ast.fn_decl(function).params);
+        params
+            .get(2..)
+            .unwrap_or_default()
+            .iter()
+            .map(|param| self.scan.names.get(param.name).to_owned())
+            .collect()
+    }
+
+    /// The cell of the leaf the item `item` of file `index` declares, a
+    /// `def` or a definition: the slot it is read from, its function's, and
+    /// its type, once its file is checked; `None` if the item is a leaf of
+    /// no tree, a later declaration shadowing it in its own directory.
+    fn leaf_cell(&self, index: u32, item: ItemId) -> Option<(Slot, TyId)> {
+        let file = self.scan.files.get(index as usize)?;
+        let position = file
+            .ast
+            .items(file.ast.root())
+            .iter()
+            .position(|&at| at == item)?;
+        let own = (*file.mentions.tree.item_leaf.get(position)?)?;
+        let node = *file.global.get(own as usize)?;
+        Some((
+            *self.cell_slots.get(node as usize)?,
+            *self.cell_types.get(node as usize)?,
+        ))
+    }
+
+    /// Calls the def-type whose cell is `def_type` with the path of
+    /// `definition` and the definition, whose cell is `definition_cell`,
+    /// their files run: the input `<def-type>("PATH", <definition>)`, its
+    /// names no source can write bound to the two cells, checked from the
+    /// workspace's slots, as an input of no workspace, and lowered as one
+    /// placed in the definition's directory, its caller, numbered after
+    /// every file (see [Def-types by name](#def-types-by-name)).
+    fn call_definition(
+        &mut self,
+        definition: &Definition,
+        (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
+    ) -> Result<Outcome, InvokeError> {
+        let call = count(self.scan.files.len());
+        let at = (definition.file, definition.span);
+        let mut names = mem::take(&mut self.scan.names);
+        let bound = (
+            names.intern(INVOKED_DEF_TYPE),
+            names.intern(INVOKED_DEFINITION),
+        );
+        let ast = invocation(names, &definition.path, bound, at.1);
+        let scope = Scope::of_slots(self.slot_names.clone()).with_fields([
+            (bound.0, def_type.0, def_type.1),
+            (bound.1, definition_cell.0, definition_cell.1),
+        ]);
+        let place = self.scan.place(definition.file);
+        let lowered = Checker::with_scope(&ast, scope, &mut self.types)
+            .check()
+            .and_then(|mut output| {
+                output.checked.resolution.set_place(place);
+                session::lower_checked(&ast, output, &self.types, call)
+            });
+        let mut ast = ast;
+        self.scan.names = ast.replace_names(Names::new());
+        let (ir, output) = lowered.map_err(|errors| {
+            let errors = invoked_here(errors, call, at);
+            InvokeError::Diagnostics(merge_files(errors, self.warnings.clone()))
+        })?;
+        let context = (
+            &mut self.memo,
+            Some(&self.exec_result),
+            &self.scan.dir_texts[..],
+        );
+        let mut warnings = self.warnings.clone();
+        warnings.extend(invoked_here(output.warnings, call, at));
+        match session::run_input(ir, &mut self.frame, context) {
+            Ok(value) => Ok(Outcome { value, warnings }),
+            Err(error) => {
+                let errors = invoked_here(vec![error], call, at);
+                Err(InvokeError::Diagnostics(merge_files(errors, warnings)))
+            }
+        }
+    }
+}
+
+/// The error of `path`, which no definition made with the def-type `listed`
+/// has: "`dev.peios` is not a `package` definition" if it is above some of
+/// them, else "`package` has no definition `dev.peios.nope`".
+fn missing_definition(listed: &DefType, path: &str) -> RequestError {
+    let mut definitions: Vec<String> = listed
+        .definitions
+        .iter()
+        .map(|definition| definition.path.clone())
+        .collect();
+    definitions.sort_unstable();
+    let above = definitions.iter().any(|definition| {
+        definition
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with('.'))
+    });
+    let (def_type, path) = (listed.path.clone(), path.to_owned());
+    if above {
+        RequestError::NotADefinition {
+            def_type,
+            path,
+            definitions,
+        }
+    } else {
+        RequestError::NoDefinition {
+            def_type,
+            path,
+            definitions,
+        }
+    }
+}
+
+/// The duplicates among `found` (see [`Workspace::def_types`]): an error for
+/// each path of which two def-types or more are declared, and for each path
+/// of which a def-type has two definitions or more, in path then source
+/// order of the first.
+fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    let declared = found.iter().map(|found| {
+        (
+            found.listed.path.as_str(),
+            found.listed.file,
+            found.listed.span,
+        )
+    });
+    for group in groups(declared) {
+        errors.extend(duplicate(
+            &group,
+            |path, times| format!("def-type `{path}` is declared {times} times in the workspace"),
+            "also declared here",
+            "a def-type invoked by name must be the only one of its name in the workspace",
+        ));
+    }
+    for found in found {
+        let defined = found
+            .listed
+            .definitions
+            .iter()
+            .map(|definition| (definition.path.as_str(), definition.file, definition.span));
+        let def_type = &found.listed.path;
+        for group in groups(defined) {
+            errors.extend(duplicate(
+                &group,
+                |path, times| {
+                    format!("`{def_type} {path}` is defined {times} times in the workspace")
+                },
+                "also defined here",
+                "a definition invoked by name must be the only one of its path in the workspace",
+            ));
+        }
+    }
+    errors.sort_by_key(|error| (error.input, error.span.start));
+    errors
+}
+
+/// A declaration of a path by [`duplicates`]: its path, its file and where.
+type Declared<'a> = (&'a str, u32, Span);
+
+/// `declared`, grouped by path, each group in the order of `declared`, the
+/// groups in the order of their first.
+fn groups<'a>(declared: impl Iterator<Item = Declared<'a>>) -> Vec<Vec<Declared<'a>>> {
+    let mut groups: Vec<Vec<Declared<'a>>> = Vec::new();
+    let mut by_path: HashMap<&str, usize> = HashMap::new();
+    for entry in declared {
+        let at = *by_path.entry(entry.0).or_insert(groups.len());
+        match groups.get_mut(at) {
+            Some(group) => group.push(entry),
+            None => groups.push(vec![entry]),
+        }
+    }
+    groups
+}
+
+/// The error of `group`, the declarations of one path, if there are two or
+/// more: `message` of the path and their number, at the first, labelled
+/// `label` at each other, with `note`.
+fn duplicate(
+    group: &[Declared],
+    message: impl Fn(&str, usize) -> String,
+    label: &str,
+    note: &str,
+) -> Option<Diagnostic> {
+    let ([(path, file, span), rest @ ..], true) = (group, group.len() > 1) else {
+        return None;
+    };
+    let mut error = Diagnostic::error(message(path, group.len()), *span)
+        .in_input(*file)
+        .with_note(note);
+    for &(_, file, span) in rest {
+        error = error.with_context_in(file, span, label);
+    }
+    Some(error)
+}
+
+/// The tree of the input of the call that invokes a definition by name
+/// (see [Def-types by name](#def-types-by-name)), its names `names`:
+/// `<def-type>("PATH", <definition>)`, its result, the two names those of
+/// `bound`, each node at `span`.
+fn invocation(names: Names, path: &str, bound: (Name, Name), span: Span) -> Ast {
+    let mut builder = AstBuilder::with_capacity(4);
+    let mut strings = Strings::new();
+    let callee = builder.alloc(Expr {
+        kind: ExprKind::Name(bound.0),
+        span,
+    });
+    let name = builder.alloc(Expr {
+        kind: ExprKind::Str(strings.push(path)),
+        span,
+    });
+    let definition = builder.alloc(Expr {
+        kind: ExprKind::Name(bound.1),
+        span,
+    });
+    let args = builder.push_args(&[
+        Arg {
+            kind: ArgKind::Positional,
+            value: name,
+        },
+        Arg {
+            kind: ArgKind::Positional,
+            value: definition,
+        },
+    ]);
+    let call = builder.alloc(Expr {
+        kind: ExprKind::Call { callee, args },
+        span,
+    });
+    let item = builder.alloc_item(Item {
+        kind: ItemKind::Result(call),
+        span,
+    });
+    let root = builder.push_item_list(&[item]);
+    builder.finish(root, names, strings)
+}
+
+/// `diagnostics` of the call that invokes a definition by name, input
+/// number `call`, as its caller can show them: the call has no source, so
+/// every diagnostic and label located in it, of input `call` or of no input,
+/// is located instead at `at`, the definition's path in its file, labelled
+/// "invoked here" (see [Def-types by name](#def-types-by-name)).
+fn invoked_here(
+    mut diagnostics: Vec<Diagnostic>,
+    call: u32,
+    (file, span): (u32, Span),
+) -> Vec<Diagnostic> {
+    const INVOKED: &str = "invoked here";
+    for diagnostic in &mut diagnostics {
+        let own = diagnostic.input.is_none_or(|input| input == call);
+        for label in &mut diagnostic.labels {
+            if label.input.map_or(own, |input| input == call) {
+                label.input = Some(file);
+                label.span = span;
+                INVOKED.clone_into(&mut label.text);
+            }
+        }
+        if own {
+            diagnostic.input = Some(file);
+            diagnostic.span = span;
+            diagnostic.label = Some(INVOKED.to_owned());
+        }
+    }
+    diagnostics
 }
 
 /// `diagnostics` of the file `index` of a scan of one file beside the
@@ -11996,5 +12692,612 @@ p26 = com.x"#;
             dump.contains("(def-type-ref build x : fn(mode: String): String @25..32)"),
             "{dump}"
         );
+    }
+
+    /// Jack's `/home/jack/projects/peios/newpkgs` as it is written, but for
+    /// `&` written as a spread and the commas of the package's block as
+    /// newlines, as in [`JACKS_PACKAGE`], with no line invoking the package:
+    /// `ppk.commit` stubbed by a module of the test's own, which returns its
+    /// arguments, the content joined to its caller's directory as the real
+    /// one joins it.
+    const NEWPKGS: [(&str, &str); 3] = [
+        JACKS_PACKAGE[0],
+        (
+            "_lib/ppk.gcsl",
+            "import path\n\
+             import fileroot\n\
+             def commit(name: String, version: String, arch: String, content: String) -> String {\n\
+             \x20   let content = path.join(fileroot.caller, content)\n\
+             \x20   \"{name} {version} {arch} {content}\"\n\
+             }",
+        ),
+        (
+            "dev.peios.testpkg/test.gcsl",
+            "def package dev.peios.testpkg() {\n\
+             \x20   version = \"0.1.0\"\n\
+             \x20   arch = \"x86_64\"\n\
+             \x20   content = \"usr\"\n\
+             }\n",
+        ),
+    ];
+
+    /// Checks the workspace of `files`, located at [`SCRATCH`], and invokes
+    /// the definition `path` of the def-type `def_type` in it.
+    fn invoke(files: &[(&str, &str)], def_type: &str, path: &str) -> Result<Value, InvokeError> {
+        let mut workspace = rooted(files).unwrap_or_else(|errors| panic!("{errors:?}"));
+        workspace
+            .invoke(def_type, path)
+            .map(|outcome| outcome.value)
+    }
+
+    /// [`invoke`]'s value shown, [`SCRATCH`] shown as `<root>`.
+    fn invoked_text(files: &[(&str, &str)], def_type: &str, path: &str) -> String {
+        match invoke(files, def_type, path) {
+            Ok(value) => value.to_string().replace(SCRATCH, "<root>"),
+            Err(error) => panic!("{def_type} {path}: {error:?}"),
+        }
+    }
+
+    /// The request error of invoking `path` of `def_type` in the workspace
+    /// of `files`: its message and its notes, joined by `; `.
+    fn request_error(files: &[(&str, &str)], def_type: &str, path: &str) -> String {
+        match invoke(files, def_type, path) {
+            Err(InvokeError::Request(error)) => {
+                let mut parts = vec![error.message()];
+                parts.extend(
+                    error
+                        .notes()
+                        .into_iter()
+                        .map(|note| format!("note: {note}")),
+                );
+                assert_eq!(error.to_string(), error.message());
+                parts.join("; ")
+            }
+            other => panic!("{def_type} {path}: {other:?}"),
+        }
+    }
+
+    /// The diagnostics invoking `path` of `def_type` in the workspace of
+    /// `files` fails with, each shown as [`check_errors`] shows them.
+    fn invoke_errors(files: &[(&str, &str)], def_type: &str, path: &str) -> Vec<String> {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let (standard, checked) = check_with_standard(&sources, &[], SCRATCH);
+        let errors = match checked.unwrap().invoke(def_type, path) {
+            Err(InvokeError::Diagnostics(errors)) => errors,
+            other => panic!("{def_type} {path}: {other:?}"),
+        };
+        let mut all: Vec<&str> = standard.iter().map(SourceFile::name).collect();
+        let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
+        paths.sort_unstable();
+        all.extend(paths);
+        shown_errors(&errors, &all)
+    }
+
+    /// `errors`, each shown with its labels and notes, joined by `; `, its
+    /// input and each label's by its path in `all`, by input number.
+    fn shown_errors(errors: &[Diagnostic], all: &[&str]) -> Vec<String> {
+        let path = |input: Option<u32>| {
+            input
+                .and_then(|i| all.get(i as usize))
+                .copied()
+                .unwrap_or("?")
+        };
+        errors
+            .iter()
+            .map(|error| {
+                let mut parts = vec![format!("{} at {}", error.message, path(error.input))];
+                if let Some(label) = &error.label {
+                    parts[0] = format!("{} ({label})", parts[0]);
+                }
+                for label in &error.labels {
+                    let at = path(label.input.or(error.input));
+                    parts.push(format!("{at}: {}", label.text));
+                }
+                parts.extend(error.notes.iter().map(|note| format!("note: {note}")));
+                parts.join("; ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn jacks_package_is_invoked_by_name() {
+        // The record the def-type returns; the stub given the package's
+        // directory as the content's base, through `fileroot.helper()`.
+        assert_eq!(
+            invoked_text(&NEWPKGS, "package", "dev.peios.testpkg"),
+            "{pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
+             name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 \
+             <root>/dev.peios.testpkg/usr\"}"
+        );
+        // Listed: the def-type, its file and the span of its name, and the
+        // definition, its file and the span of its path.
+        let workspace = rooted(&NEWPKGS).unwrap();
+        let listed = workspace.def_types().unwrap();
+        let root = workspace.file("workspace.gcsl").unwrap();
+        let package = workspace.file("dev.peios.testpkg/test.gcsl").unwrap();
+        let name = count(NEWPKGS[0].1.find("def package(").unwrap() + 4);
+        assert_eq!(
+            listed,
+            [DefType {
+                path: "package".to_owned(),
+                file: root,
+                span: Span::new(name, name + 7),
+                definitions: vec![Definition {
+                    path: "dev.peios.testpkg".to_owned(),
+                    file: package,
+                    span: Span::new(12, 29),
+                }],
+            }]
+        );
+    }
+
+    /// The paths of the def-types `workspace` lists, each with the paths
+    /// and files of its definitions: `package: a.one in a/one.gcsl`.
+    fn listed(workspace: &Workspace, files: &[(&str, &str)]) -> Vec<String> {
+        let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
+        paths.sort_unstable();
+        let standard = workspace.scan.standard as usize;
+        let path = |file: u32| paths[file as usize - standard];
+        workspace
+            .def_types()
+            .unwrap()
+            .iter()
+            .map(|def_type| {
+                let definitions: Vec<String> = def_type
+                    .definitions
+                    .iter()
+                    .map(|definition| format!("{} in {}", definition.path, path(definition.file)))
+                    .collect();
+                format!(
+                    "{} in {}: {}",
+                    def_type.path,
+                    path(def_type.file),
+                    definitions.join(", ")
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_definition_is_listed_under_the_def_type_it_names() {
+        // Definitions in two sibling directories, which the root sees
+        // neither of; one through an alias of its def-type, listed by its
+        // path as written; a def-type with none; two def-types of the root
+        // with definitions; and a dotted def-type.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def build(name: String, f: fn(): String): String { \"built {f()}\" }\n\
+                 #[def_type]\n\
+                 def test(name: String, f: fn(): String): String { \"tested {f()}\" }",
+            ),
+            (
+                "lib/types.gcsl",
+                "#[def_type]\n\
+                 def package(name: String, f: fn(): String) -> String { \"{name}: {f()}\" }\n\
+                 #[def_type]\n\
+                 def unused(name: String, f: fn(): Int): Int { f() }\n\
+                 #[def_type]\n\
+                 def kinds.tool(name: String, f: fn(): String): String { f() }",
+            ),
+            (
+                "a/one.gcsl",
+                "import * from lib.types\n\
+                 def package a.one() { \"one\" }\n\
+                 def build a.one() { \"a\" }\n\
+                 def kinds.tool hammer() { \"hit\" }",
+            ),
+            (
+                "b/two.gcsl",
+                "import package as pkg from lib.types\n\
+                 def pkg b.two() { \"two\" }\n\
+                 def test b.two() { \"b\" }",
+            ),
+        ];
+        let workspace = rooted(&files).unwrap();
+        assert_eq!(
+            listed(&workspace, &files),
+            [
+                "package in lib/types.gcsl: a.one in a/one.gcsl, b.two in b/two.gcsl",
+                "unused in lib/types.gcsl: ",
+                "kinds.tool in lib/types.gcsl: hammer in a/one.gcsl",
+                "build in workspace.gcsl: a.one in a/one.gcsl",
+                "test in workspace.gcsl: b.two in b/two.gcsl",
+            ]
+        );
+        // The dotted def-type's name is its whole path.
+        let tool = &workspace.def_types().unwrap()[2];
+        let text = files[1].1;
+        let at = count(text.find("kinds.tool").unwrap());
+        assert_eq!(tool.span, Span::new(at, at + 10));
+        // Each is invoked by its def-type's path and its own.
+        assert_eq!(invoked_text(&files, "package", "a.one"), "a.one: one");
+        assert_eq!(invoked_text(&files, "package", "b.two"), "b.two: two");
+        assert_eq!(invoked_text(&files, "build", "a.one"), "built a");
+        assert_eq!(invoked_text(&files, "test", "b.two"), "tested b");
+        assert_eq!(invoked_text(&files, "kinds.tool", "hammer"), "hit");
+    }
+
+    /// The paths of the files of the workspace of `files`, by input number,
+    /// the standard files `standard` first.
+    fn all_paths<'a>(standard: &'a [SourceFile], files: &[(&'a str, &str)]) -> Vec<&'a str> {
+        let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
+        paths.sort_unstable();
+        let mut all: Vec<&str> = standard.iter().map(SourceFile::name).collect();
+        all.extend(paths);
+        all
+    }
+
+    /// The errors [`Workspace::def_types`] fails with in the workspace of
+    /// `files`, each shown as [`shown_errors`] shows it.
+    fn listing_errors(files: &[(&str, &str)]) -> Vec<String> {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let (standard, checked) = check_with_standard(&sources, &[], SCRATCH);
+        let errors = checked.unwrap().def_types().unwrap_err();
+        shown_errors(&errors, &all_paths(&standard, files))
+    }
+
+    /// A def-type of the root, for the tests of duplicates.
+    const PACKAGE: (&str, &str) = (
+        "workspace.gcsl",
+        "#[def_type]\ndef package(name: String, f: fn(): String): String { \"{name} {f()}\" }",
+    );
+
+    #[test]
+    fn two_definitions_of_one_path_fail_every_invocation() {
+        let defined = "note: a definition invoked by name must be the only one of its path \
+                       in the workspace";
+        // In two sibling directories, which see neither the other: invoking
+        // another definition, unique, fails, and so does the listing.
+        let siblings = [
+            PACKAGE,
+            ("a/x.gcsl", "def package dup() { \"a\" }"),
+            ("b/y.gcsl", "def package dup() { \"b\" }"),
+            (
+                "c/z.gcsl",
+                "def package other() { \"c\" }\nz = package other()",
+            ),
+        ];
+        let twice = format!(
+            "`package dup` is defined 2 times in the workspace at a/x.gcsl; \
+             b/y.gcsl: also defined here; {defined}"
+        );
+        assert_eq!(
+            invoke_errors(&siblings, "package", "other"),
+            [twice.as_str()]
+        );
+        assert_eq!(listing_errors(&siblings), [twice.as_str()]);
+        // An ordinary run allows them, and runs.
+        assert_eq!(rooted_text(&siblings, "c/z.gcsl"), "{z = \"other c\"}");
+        assert_eq!(rooted_text(&siblings, "a/x.gcsl"), "{}");
+        // Three, each place labelled.
+        let mut thrice = siblings.to_vec();
+        thrice.push(("d/w.gcsl", "def package dup() { \"d\" }"));
+        assert_eq!(
+            invoke_errors(&thrice, "package", "dup"),
+            [format!(
+                "`package dup` is defined 3 times in the workspace at a/x.gcsl; \
+                 b/y.gcsl: also defined here; d/w.gcsl: also defined here; {defined}"
+            )]
+        );
+        // A `#[shadowable]` one of the root, shadowed in a directory below:
+        // both are found, the first in path order first.
+        let shadowed = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+                 #[shadowable] def package dup() { \"root\" }",
+            ),
+            (
+                "sub/s.gcsl",
+                "def package dup() { \"sub\" }\ny = package dup()",
+            ),
+        ];
+        assert_eq!(
+            invoke_errors(&shadowed, "package", "dup"),
+            [format!(
+                "`package dup` is defined 2 times in the workspace at sub/s.gcsl; \
+                 workspace.gcsl: also defined here; {defined}"
+            )]
+        );
+        assert_eq!(rooted_text(&shadowed, "sub/s.gcsl"), "{y = \"dup sub\"}");
+        // And one shadowed in its own file, which is in no tree.
+        let own = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "#[shadowable] def package dup() { \"one\" }\n\
+                 def package dup() { \"two\" }\n\
+                 y = package dup()",
+            ),
+        ];
+        assert_eq!(
+            invoke_errors(&own, "package", "dup"),
+            [format!(
+                "`package dup` is defined 2 times in the workspace at a.gcsl; \
+                 a.gcsl: also defined here; {defined}"
+            )]
+        );
+        assert_eq!(rooted_text(&own, "a.gcsl"), "{y = \"dup two\"}");
+    }
+
+    #[test]
+    fn two_def_types_of_one_path_fail_every_invocation() {
+        let declared = "note: a def-type invoked by name must be the only one of its name \
+                        in the workspace";
+        let def_type = "#[def_type]\n\
+                        def package(name: String, f: fn(): String): String { f() }";
+        // In two sibling directories.
+        let siblings = [
+            ("workspace.gcsl", ""),
+            ("a/x.gcsl", def_type),
+            ("b/y.gcsl", def_type),
+            (
+                "c/z.gcsl",
+                "#[def_type]\ndef other(name: String, f: fn(): Int): Int { f() }",
+            ),
+            ("c/w.gcsl", "def other one() { 1 }\nw = other one()"),
+        ];
+        let twice = format!(
+            "def-type `package` is declared 2 times in the workspace at a/x.gcsl; \
+             b/y.gcsl: also declared here; {declared}"
+        );
+        assert_eq!(invoke_errors(&siblings, "other", "one"), [twice.as_str()]);
+        assert_eq!(listing_errors(&siblings), [twice.as_str()]);
+        assert_eq!(rooted_text(&siblings, "c/w.gcsl"), "{w = 1}");
+        // A `#[shadowable]` one and the one that shadows it.
+        let shadowed = [(
+            "workspace.gcsl",
+            "#[shadowable]\n\
+             #[def_type]\n\
+             def package(name: String, f: fn(): String): String { \"first\" }\n\
+             #[def_type]\n\
+             def package(name: String, f: fn(): String): String { f() }\n\
+             def package x() { \"x\" }\n\
+             y = package x()",
+        )];
+        assert_eq!(
+            invoke_errors(&shadowed, "package", "x"),
+            [format!(
+                "def-type `package` is declared 2 times in the workspace at workspace.gcsl; \
+                 workspace.gcsl: also declared here; {declared}"
+            )]
+        );
+        assert_eq!(
+            rooted_text(&shadowed, "workspace.gcsl"),
+            "{package = fn(name: String | Future<String>, f: fn(): String): String; y = \"x\"}"
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_invoked_is_a_request_error() {
+        let files = [
+            BUILD,
+            ("app.gcsl", "def build x(t) { t }"),
+            (
+                "lib/defs.gcsl",
+                "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { f() }\n\
+                 #[def_type]\n\
+                 def empty(name: String, f: fn(): String): String { f() }\n\
+                 #[def_type]\n\
+                 def deploy(name: String, f: fn(): String, target: String, mode: String): String { f() }\n\
+                 def package dev.peios.b() { \"b\" }\n\
+                 def package dev.peios.a() { \"a\" }\n\
+                 def deploy site() { \"s\" }",
+            ),
+        ];
+        assert_eq!(
+            request_error(&files, "pkg", "x"),
+            "no def-type `pkg`; note: the def-types are `build`, `deploy`, `empty`, `package`"
+        );
+        assert_eq!(
+            request_error(&[("workspace.gcsl", "x = 1")], "pkg", "x"),
+            "no def-type `pkg`; note: this workspace declares no def-types"
+        );
+        assert_eq!(
+            request_error(&files, "package", "dev.peios.nope"),
+            "`package` has no definition `dev.peios.nope`; \
+             note: its definitions are `dev.peios.a`, `dev.peios.b`"
+        );
+        assert_eq!(
+            request_error(&files, "empty", "x"),
+            "`empty` has no definition `x`; note: it has no definitions"
+        );
+        assert_eq!(
+            request_error(&files, "package", "dev.peios"),
+            "`dev.peios` is not a `package` definition; \
+             note: its definitions are `dev.peios.a`, `dev.peios.b`"
+        );
+        assert_eq!(
+            request_error(&files, "package", "dev"),
+            "`dev` is not a `package` definition; \
+             note: its definitions are `dev.peios.a`, `dev.peios.b`"
+        );
+        // A prefix of a name is no path above it.
+        assert_eq!(
+            request_error(&files, "package", "dev.pei"),
+            "`package` has no definition `dev.pei`; \
+             note: its definitions are `dev.peios.a`, `dev.peios.b`"
+        );
+        assert_eq!(
+            request_error(&files, "build", "x"),
+            "`build` takes parameters of its own (`mode`), which cannot be given here yet"
+        );
+        assert_eq!(
+            request_error(&files, "deploy", "site"),
+            "`deploy` takes parameters of its own (`target`, `mode`), which cannot be given \
+             here yet"
+        );
+        // Before parameters, the path.
+        assert_eq!(
+            request_error(&files, "build", "y"),
+            "`build` has no definition `y`; note: its definitions are `x`"
+        );
+        // A path that is a definition's, and above another's, in a sibling
+        // directory, is the definition.
+        let files = [
+            PACKAGE,
+            ("a/x.gcsl", "def package app() { \"a\" }"),
+            ("b/y.gcsl", "def package app.core() { \"b\" }"),
+        ];
+        assert_eq!(invoked_text(&files, "package", "app"), "app a");
+        assert_eq!(invoked_text(&files, "package", "app.core"), "app.core b");
+        // A `#[shadowable]` definition that one of another path, above it,
+        // shadows in its own directory is in no tree: found, but no source
+        // can reach it, and neither can an invocation.
+        let files = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "#[shadowable] def package app.core() { \"core\" }\n\
+                 def package app() { \"app\" }",
+            ),
+        ];
+        assert_eq!(
+            request_error(&files, "package", "app.core"),
+            "`package` has no definition `app.core`; note: its definitions are `app`, `app.core`"
+        );
+        assert_eq!(invoked_text(&files, "package", "app"), "app app");
+    }
+
+    #[test]
+    fn an_invoked_definition_is_called_as_from_its_directory() {
+        // The def-type's caller is the definition's directory; without
+        // `fileroot.helper()` in the def-type, the definition's is the
+        // def-type's file's directory, as for any call.
+        let files = [
+            (
+                "workspace.gcsl",
+                "import fileroot\n\
+                 #[def_type]\n\
+                 def where(name: String, f: fn() -> String) -> { called: String, defined: String } {\n\
+                 \x20   called = fileroot.caller\n\
+                 \x20   defined = f()\n\
+                 }",
+            ),
+            (
+                "pkg/deep/p.gcsl",
+                "import fileroot\ndef where x() { fileroot.caller }",
+            ),
+        ];
+        assert_eq!(
+            invoked_text(&files, "where", "x"),
+            "{called = \"<root>/pkg/deep\"; defined = \"<root>\"}"
+        );
+    }
+
+    #[test]
+    fn invoking_runs_the_files_once_and_the_call_each_time() {
+        // A log the definition's file writes to as it runs, and each call of
+        // the impure def-type, and of the memoised one, once for its
+        // arguments.
+        let dir = std::env::temp_dir().join(format!("gcsl-invoke-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log").display().to_string();
+        let def_types = format!(
+            "#[def_type]\n\
+             def logged(name: String, f: fn(): String) -> String {{\n\
+             \x20   let out = sh(\"echo {{name}} >> {log}\")\n\
+             \x20   \"{{out}}{{f()}}\"\n\
+             }}\n\
+             #[def_type]\n\
+             def cached(name: String, f: fn(): String) ->> String {{\n\
+             \x20   let out = sh(\"echo cached {{name}} >> {log}\")\n\
+             \x20   \"{{out}}{{f()}}\"\n\
+             }}\n\
+             #[def_type]\n\
+             def pure(name: String, f: fn(): String): String {{ \"pure {{f()}}\" }}"
+        );
+        let package = format!(
+            "x = sh(\"echo file >> {log}\")\n\
+             def logged p() {{ \"l\" }}\n\
+             def cached p() {{ \"c\" }}\n\
+             def pure p() {{ \"p\" }}"
+        );
+        let files = [
+            ("workspace.gcsl", def_types.as_str()),
+            ("pkg/p.gcsl", package.as_str()),
+        ];
+        let mut workspace = rooted(&files).unwrap();
+        let mut invoke =
+            |def_type: &str| workspace.invoke(def_type, "p").unwrap().value.to_string();
+        for _ in 0..2 {
+            assert_eq!(invoke("logged"), "l");
+            assert_eq!(invoke("cached"), "c");
+            assert_eq!(invoke("pure"), "pure p");
+        }
+        let written = std::fs::read_to_string(&log).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(written, "file\np\ncached p\np\n");
+    }
+
+    #[test]
+    fn a_runtime_error_of_an_invoked_definition_names_its_file() {
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef run(name: String, f: fn() -> String) -> String { f() }",
+            ),
+            ("pkg/p.gcsl", "def run p() { panic(\"boom\") }"),
+        ];
+        assert_eq!(invoke_errors(&files, "run", "p"), ["boom at pkg/p.gcsl"]);
+        // A file that runs first fails as `run` reports it.
+        let files = [
+            files[0],
+            ("pkg/p.gcsl", "def run p() { \"p\" }\nx = [1][3]"),
+        ];
+        assert_eq!(
+            invoke_errors(&files, "run", "p"),
+            ["index out of range at pkg/p.gcsl (the index is 3, and the list has 1 element)"]
+        );
+    }
+
+    #[test]
+    fn an_error_of_the_call_itself_is_at_the_definition_s_path() {
+        // A def-type whose body is nested so deeply that a call of it from
+        // a top level, as the invocation is, takes the nesting past the
+        // limit: "call nested too deeply", at the call, which has no source.
+        let depth = crate::MAX_DEPTH - 4;
+        let body = format!("1{}", " + 1".repeat(depth - 1));
+        let def_type =
+            format!("#[def_type]\ndef deep(name: String, f: fn(): Int): Int {{ {body} }}");
+        let (shown, errors) = std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(move || {
+                let files = [
+                    ("workspace.gcsl", def_type.as_str()),
+                    ("pkg/p.gcsl", "def deep p() { 1 }"),
+                ];
+                let shown = invoke_errors(&files, "deep", "p");
+                let mut workspace = rooted(&files).unwrap();
+                let Err(InvokeError::Diagnostics(errors)) = workspace.invoke("deep", "p") else {
+                    panic!("no error");
+                };
+                (shown, errors)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            shown,
+            [
+                "call nested too deeply: the limit is 10000 levels of nesting, calls included \
+                 at pkg/p.gcsl (invoked here); note: every level of expression nesting around \
+                 a call counts, and so does the body of the function called; GCSL does not \
+                 eliminate tail calls, so recursion this deep is not supported"
+            ]
+        );
+        // At the definition's path, `p`, with nothing elsewhere.
+        assert_eq!(errors[0].span, Span::new(9, 10));
+        assert!(errors[0].labels.is_empty());
     }
 }

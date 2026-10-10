@@ -3364,6 +3364,14 @@ impl Resolution {
         &self.place
     }
 
+    /// Places the input at `place`: what an input checked with no
+    /// workspace, which knows no place of its own, is given by a driver that
+    /// runs it in one, as the call a workspace makes to invoke a definition
+    /// by name (see [`crate::workspace`], "Def-types by name").
+    pub(crate) fn set_place(&mut self, place: Place) {
+        self.place = place;
+    }
+
     /// The tree of the input's top-level fields and when each node is
     /// computed: what lowering stores in each cell, and before which item.
     #[must_use]
@@ -4418,6 +4426,30 @@ impl Scope {
     /// [`crate::workspace::check_input`]).
     pub(crate) fn with_slots(mut self, names: impl IntoIterator<Item = Name>) -> Self {
         self.slot_names.extend(names);
+        self
+    }
+
+    /// The scope with `fields` added after its own variables, each a
+    /// field of a name, read from a slot the scope's slots already include,
+    /// with a type: cells of a workspace, under names no source can write,
+    /// which the call a workspace makes to invoke a definition by name reads
+    /// (see [`crate::workspace`], "Def-types by name").
+    pub(crate) fn with_fields(
+        mut self,
+        fields: impl IntoIterator<Item = (Name, Slot, TyId)>,
+    ) -> Self {
+        for (name, slot, ty) in fields {
+            self.bindings.push(Binding {
+                name,
+                slot,
+                ty,
+                declared: None,
+                kind: BindingKind::Field,
+                function: None,
+                callback: None,
+            });
+            self.measured.push(None);
+        }
         self
     }
 
