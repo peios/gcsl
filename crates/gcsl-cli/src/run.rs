@@ -11,13 +11,17 @@
 //! file. Each file is given to the library by its path relative to the
 //! root, and its diagnostics name it by its path from the current
 //! directory, `FILE` by the path given. The dumps are `FILE`'s alone: its
-//! tokens and syntax tree as a file's, its types and IR as checked and
-//! lowered in the workspace.
+//! tokens and syntax tree as a file's, its attributes among them
+//! (`Attribute(shadowable)` and `InnerAttribute(no_prelude)` tokens,
+//! `#[shadowable]` before an item and `#![no_prelude]` after `file` in the
+//! tree), its types and IR as checked and lowered in the workspace, which
+//! show nothing of the implicit import of the prelude a file has.
 //!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its
 //! dumps are its own as a workspace file's are. Either way the standard
-//! library is there: the prelude, and each standard module a file imports
+//! library is there: the prelude (but in a file marked `#![no_prelude]`),
+//! and each standard module a file imports
 //! (`import path`), its files the first inputs, which the check says only
 //! once it has scanned the files
 //! ([`gcsl::workspace::check_with_standard`]), so the sources diagnostics
@@ -188,12 +192,19 @@ fn syntax(
     let (tokens, names, strings) = lexer::tokenize(source)?;
     if args.dump_tokens {
         // Names by their text and string pieces by their quoted text, as in
-        // `Ident(x)`, `Label(outer)` and `StrStart("a\n")`.
+        // `Ident(x)`, `Label(outer)`, `Attribute(shadowable)` and
+        // `StrStart("a\n")`.
         for token in &tokens {
             let span = token.span;
             match token.kind {
                 TokenKind::Ident(name) => writeln!(out, "Ident({}) @{span}", names.get(name))?,
                 TokenKind::Label(name) => writeln!(out, "Label({}) @{span}", names.get(name))?,
+                TokenKind::Attribute(name) => {
+                    writeln!(out, "Attribute({}) @{span}", names.get(name))?;
+                }
+                TokenKind::InnerAttribute(name) => {
+                    writeln!(out, "InnerAttribute({}) @{span}", names.get(name))?;
+                }
                 TokenKind::Str(id) => writeln!(out, "Str({}) @{span}", Quoted(strings.get(id)))?,
                 TokenKind::StrStart(id) => {
                     writeln!(out, "StrStart({}) @{span}", Quoted(strings.get(id)))?;

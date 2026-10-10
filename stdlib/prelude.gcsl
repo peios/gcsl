@@ -1,8 +1,9 @@
-# The prelude: a module of GCSL's standard library, compiled into every
-# build, that every file, every REPL input and every other standard file
-# begins as if with `import * from prelude`; a declaration of a file, its
-# directories or its own imports shadows a name of it silently. It binds the
-# built-in functions of the `builtins` module, so that every file has them.
+#![no_prelude]
+# The prelude, a standard module compiled into every build: every file, REPL
+# input and other standard file without `#![no_prelude]` (as this one is, not
+# to import itself) begins as if with `#[shadowable] import * from prelude`, so
+# any declaration or import of one of its names, or a path below one, shadows
+# it silently. It binds the built-in functions of `builtins` for every file.
 # The binding of `len` is the ALIAS RULE's, which is TEMPORARY: `len` has no
 # type a GCSL type can write yet, so a name bound directly to it is that
 # built-in, called by the checker's rule (to be replaced when built-ins get

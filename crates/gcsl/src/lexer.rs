@@ -1,7 +1,8 @@
 //! The lexer: source text to a vector of tokens.
 //!
 //! A hand-written pass over the source bytes. Spaces, tabs, `\r` and
-//! comments (`#` to end of line) are skipped. Each `\n` becomes a
+//! comments (`#` to end of line, but an attribute, below) are skipped. Each
+//! `\n` becomes a
 //! [`TokenKind::Newline`] token, because newlines separate items, except
 //! where the innermost open bracket is a `(` or a `[`, or an
 //! interpolation's `{`: the lexer keeps a stack of the open brackets, and
@@ -78,6 +79,23 @@
 //! operand, and an error when it directly follows an operand, where `a-b`
 //! and `a - b` would be too easily confused. A `]` ends an operand, as a `)`
 //! does, and a `[` starts one, as a `(` does.
+//!
+//! # Attributes
+//!
+//! A `#` directly followed by `[`, or by `![`, then optional spaces or
+//! tabs, an identifier (scanned by the rule for identifiers), optional
+//! spaces or tabs and `]`, is an *attribute*, one token holding its name,
+//! interned as an identifier is: `#[NAME]` an outer one,
+//! [`TokenKind::Attribute`], which applies to the item after it, and
+//! `#![NAME]` an inner one, [`TokenKind::InnerAttribute`], which applies to
+//! the whole file (see the parser's [Attributes](crate::parser#attributes)).
+//! Every other `#` starts a comment to the end of its line, as it always
+//! has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so is `#
+//! [x]`, with a space, and `#[x y]`, `#[` alone or `#[1]`, which are not of
+//! the shape. The scan of a string literal's interpolations (see [String
+//! literals](#string-literals)) tells the two apart by the same rule
+//! (`attribute_at`), so the lexer and the scan always agree on where a
+//! comment ends.
 //!
 //! # String literals
 //!
@@ -244,6 +262,12 @@ pub enum TokenKind {
     /// `'outer`, holding the name, interned as an identifier is (a
     /// keyword's spelling included, since the `'` makes it no keyword).
     Label(Name),
+    /// An outer attribute, `#[NAME]`, holding its name (see
+    /// [Attributes](#attributes)): it applies to the item after it.
+    Attribute(Name),
+    /// An inner attribute, `#![NAME]`, holding its name (see
+    /// [Attributes](#attributes)): it applies to the whole file.
+    InnerAttribute(Name),
     /// The keyword `in`, between a `for`'s variable and what it iterates
     /// over.
     In,
@@ -401,6 +425,8 @@ impl TokenKind {
             | TokenKind::StrEnd(_)
             | TokenKind::Ident(_)
             | TokenKind::Label(_)
+            | TokenKind::Attribute(_)
+            | TokenKind::InnerAttribute(_)
             | TokenKind::Newline
             | TokenKind::Eof => None,
         }
@@ -742,6 +768,8 @@ impl<'a> Lexer<'a> {
             b'0'..=b'9' => self.number(start)?,
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.identifier(start),
             b'\'' => self.label(start)?,
+            // `skip_trivia` only stops at a `#` that starts an attribute.
+            b'#' => self.attribute(start)?,
             _ => self.operator(start)?,
         };
         self.last_end = self.pos;
@@ -860,6 +888,8 @@ impl<'a> Lexer<'a> {
             match byte {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b'\n' if newlines_are_trivia => self.pos += 1,
+                // An attribute is a token (see [Attributes](#attributes)).
+                b'#' if attribute_at(self.bytes, self.pos).is_some() => break,
                 // Skip to the newline, which is then either skipped or
                 // emitted like any other.
                 b'#' => self.pos = end_of_line(self.bytes, self.pos),
@@ -891,6 +921,25 @@ impl<'a> Lexer<'a> {
         self.pos = identifier_end(self.bytes, start + 1);
         let text = &self.text[start + 1..self.pos];
         Ok(TokenKind::Label(self.names.intern(text)))
+    }
+
+    /// Lexes the attribute starting at `start`, which holds a `#` that
+    /// `skip_trivia` found starts one (see [Attributes](#attributes)): an
+    /// [`TokenKind::Attribute`] or an [`TokenKind::InnerAttribute`], its name
+    /// interned as an identifier's is.
+    fn attribute(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
+        let Some((inner, (from, to), end)) = attribute_at(self.bytes, start) else {
+            return Err(self.unexpected_character());
+        };
+        let name = self
+            .names
+            .intern(self.text.get(from..to).unwrap_or_default());
+        self.pos = end;
+        Ok(if inner {
+            TokenKind::InnerAttribute(name)
+        } else {
+            TokenKind::Attribute(name)
+        })
     }
 
     /// Classifies a `-` at `start` that is not part of an identifier or a
@@ -1235,7 +1284,8 @@ impl<'a> Lexer<'a> {
                     measure.line(self.bytes, pos, None);
                     pos + 1
                 }
-                b'#' => end_of_line(self.bytes, pos),
+                b'#' => attribute_at(self.bytes, pos)
+                    .map_or_else(|| end_of_line(self.bytes, pos), |(_, _, end)| end),
                 b'{' => {
                     depth += 1;
                     pos + 1
@@ -1523,6 +1573,28 @@ fn end_of_line(bytes: &[u8], from: usize) -> usize {
         .map_or(bytes.len(), |offset| from + offset)
 }
 
+/// The attribute written at `from` (see [Attributes](#attributes)), if the
+/// `#` there starts one rather than a comment: whether it is an inner one,
+/// `#![`, where its name starts and ends, and the offset just after its
+/// `]`. Shared by the lexer and the scan, so they always agree.
+fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), usize)> {
+    if bytes.get(from) != Some(&b'#') {
+        return None;
+    }
+    let inner = bytes.get(from + 1) == Some(&b'!');
+    let open = from + 1 + usize::from(inner);
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let start = open + 1 + whitespace_len(bytes, open + 1);
+    if !matches!(bytes.get(start), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_')) {
+        return None;
+    }
+    let end = identifier_end(bytes, start);
+    let close = end + whitespace_len(bytes, end);
+    (bytes.get(close) == Some(&b']')).then_some((inner, (start, end), close + 1))
+}
+
 /// The number of spaces and tabs starting at `from`.
 fn whitespace_len(bytes: &[u8], from: usize) -> usize {
     bytes
@@ -1656,6 +1728,10 @@ mod tests {
             .iter()
             .map(|token| match token.kind {
                 TokenKind::Ident(name) => format!("Ident({})", names.get(name)),
+                TokenKind::Attribute(name) => format!("Attribute({})", names.get(name)),
+                TokenKind::InnerAttribute(name) => {
+                    format!("InnerAttribute({})", names.get(name))
+                }
                 TokenKind::Str(id) => format!("Str({})", Quoted(strings.get(id))),
                 TokenKind::StrStart(id) => format!("StrStart({})", Quoted(strings.get(id))),
                 TokenKind::StrMid(id) => format!("StrMid({})", Quoted(strings.get(id))),
@@ -2043,6 +2119,57 @@ mod tests {
             show("# leading\n1 # one\r\n+ # plus\n2 #"),
             vec![
                 "Newline", "Int(1)", "Newline", "Plus", "Newline", "Int(2)", "Eof"
+            ]
+        );
+    }
+
+    #[test]
+    fn attributes_are_tokens_and_every_other_hash_a_comment() {
+        assert_eq!(
+            show("#![no_prelude]\n#[shadowable] a = 1\n#[ shadowable\t]"),
+            vec![
+                "InnerAttribute(no_prelude)",
+                "Newline",
+                "Attribute(shadowable)",
+                "Ident(a)",
+                "Eq",
+                "Int(1)",
+                "Newline",
+                "Attribute(shadowable)",
+                "Eof"
+            ]
+        );
+        assert_eq!(spans("#[shadowable] a"), vec![(0, 13), (14, 15), (15, 15)]);
+        // A shebang, a `#` with a space before its `[`, and anything not of
+        // the shape, are comments to the end of the line.
+        for comment in [
+            "#!/usr/bin/env gcsl",
+            "# [x]",
+            "#! [x]",
+            "#[x y]",
+            "#[1]",
+            "#[",
+            "#[x",
+            "#[]",
+            "#!x",
+        ] {
+            let text = format!("{comment} a\n1");
+            assert_eq!(show(&text), vec!["Newline", "Int(1)", "Eof"], "{comment}");
+        }
+        // An attribute inside an interpolation is skipped by the scan as the
+        // lexer lexes it, not as a comment to the end of the line.
+        assert_eq!(
+            show("\"{ {#[a] x = 1} }\""),
+            vec![
+                "StrStart(\"\")",
+                "LBrace",
+                "Attribute(a)",
+                "Ident(x)",
+                "Eq",
+                "Int(1)",
+                "RBrace",
+                "StrEnd(\"\")",
+                "Eof"
             ]
         );
     }

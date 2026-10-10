@@ -41,6 +41,29 @@
 //! path, a leaf under a leaf, a leaf over an interior node) is left out of
 //! the tree, whatever the order of the two items: the checker reports it.
 //!
+//! # Shadowed declarations
+//!
+//! A field item marked `#[shadowable]` (see the parser's
+//! [Attributes](crate::parser#attributes)) may be shadowed by a later one
+//! that overlaps it (see [`crate::workspace`], "Shadowable declarations"):
+//! its leaf is shadowable ([`FieldLeaf::shadowable`]), and so is a node all
+//! of whose leaves are ([`FieldNode::shadowable`]). Before the tree is
+//! built, the declarations are swept in source order ([`Sweep`],
+//! [`shadowed_items`]): each leaf path is declared after the earlier ones,
+//! and one that overlaps earlier leaves (the same path, a prefix of it, or a
+//! path under it) all of which are shadowable shadows every one of them; one
+//! that overlaps a leaf that is not is what it always was, left out here
+//! and reported by the checker, and shadows nothing. A shadowed item is in
+//! no tree ([`FieldTree::shadowed`]), and so the last of a run of shadowable
+//! declarations is the leaf for the whole input, a read above it included;
+//! a `def` among them is no top-level function either. It is still an item:
+//! its references are found as any item's are, but it needs nothing and
+//! nothing needs it, so the schedule passes it by, as it does a top-level
+//! function, and the checker checks it apart, as it is written (see the
+//! checker's "Shadowed declarations"). A workspace sweeps the declarations
+//! of every file of a directory together, and gives each file its shadowed
+//! items ([`scan_except`]).
+//!
 //! A *reference* to a top-level field is a variable naming a root, with a
 //! chain of field accesses directly on it, `a`, `a.b`, `a.b.c`: it means the
 //! longest prefix of its path that the tree declares, a leaf or an interior
@@ -86,8 +109,10 @@
 //! ([`crate::workspace::FileScope`]) is the file's view: the file's tree
 //! merged with its directory chain's and with each member and root of a
 //! `*` it imports, a whole import a root of its own, with which the scan
-//! has already made sure nothing shares a name, and the implicit `import *
-//! from prelude`'s roots; a lone file and a session's input are scanned as
+//! has already made sure nothing shares a name, and the implicit
+//! `#[shadowable] import * from prelude`'s roots, but those a declaration
+//! shadows (see [`crate::workspace`], "Shadowable declarations"); a lone
+//! file and a session's input are scanned as
 //! a workspace's file, beside the standard library, and only a file found
 //! with [`find`], with no scope of imports, has none (its checker rejects
 //! its `import`s). The over-approximation holds here too: a name the
@@ -154,6 +179,11 @@ pub struct Mentions {
     /// children as an interior node does. Set by the workspace before the
     /// schedule is found; always empty for an input alone.
     pub views: Vec<ViewNode>,
+    /// For each item of the outermost block, by its position, whether a
+    /// later declaration shadows it (see [Shadowed
+    /// declarations](#shadowed-declarations)), as the tree has it too
+    /// ([`FieldTree::shadowed`]).
+    pub shadowed: Vec<bool>,
 }
 
 /// A node of a file's view that other sources share and that has a leaf of
@@ -188,6 +218,10 @@ pub struct FieldTree {
     /// For each item of the outermost block, by its position, the node it
     /// is the leaf of, if it is a field item the tree took.
     pub item_leaf: Vec<Option<u32>>,
+    /// For each item of the outermost block, by its position, whether it is
+    /// a field item a later declaration shadows, which the tree did not take
+    /// (see [Shadowed declarations](#shadowed-declarations)).
+    pub shadowed: Vec<bool>,
     /// Each node by its parent (`u32::MAX` for a root) and its name.
     by_name: HashMap<(u32, Name), u32>,
 }
@@ -207,6 +241,10 @@ pub struct FieldNode {
     pub last: usize,
     /// Its item, if it is a leaf; `None` for an interior node.
     pub leaf: Option<FieldLeaf>,
+    /// Whether it is shadowable: a leaf whose item is marked so, or an
+    /// interior node all of whose leaves are (see [Shadowed
+    /// declarations](#shadowed-declarations)).
+    pub shadowable: bool,
 }
 
 /// The item of a leaf of a [`FieldTree`].
@@ -218,20 +256,28 @@ pub struct FieldLeaf {
     pub position: usize,
     /// Its initialiser.
     pub value: ExprId,
+    /// Whether the item is marked `#[shadowable]`.
+    pub shadowable: bool,
 }
 
 impl FieldTree {
     /// The tree of the field items of `root`, the items of an outermost
-    /// block.
-    fn build(ast: &Ast, root: &[ItemId]) -> Self {
+    /// block, but those `shadowed` marks (by position).
+    fn build(ast: &Ast, root: &[ItemId], shadowed: &[bool]) -> Self {
         let mut tree = Self {
             item_leaf: vec![None; root.len()],
+            shadowed: (0..root.len())
+                .map(|position| shadowed.get(position).copied().unwrap_or(false))
+                .collect(),
             ..Self::default()
         };
         for (position, &id) in root.iter().enumerate() {
             let ItemKind::Field { path, value, .. } = ast.item(id).kind else {
                 continue;
             };
+            if tree.shadowed.get(position) == Some(&true) {
+                continue;
+            }
             let names: Option<Vec<Name>> = ast.path(path).iter().map(PathSegment::name).collect();
             let Some(names) = names else { continue };
             if tree.accepts(&names) {
@@ -241,11 +287,26 @@ impl FieldTree {
                         item: id,
                         position,
                         value,
+                        shadowable: ast.is_shadowable(id),
                     });
                 }
                 if let Some(entry) = tree.item_leaf.get_mut(position) {
                     *entry = Some(node);
                 }
+            }
+        }
+        // A child comes after its parent, so the children are known first.
+        for index in (0..tree.nodes.len()).rev() {
+            let shadowable = tree.nodes.get(index).is_some_and(|node| match node.leaf {
+                Some(leaf) => leaf.shadowable,
+                None => node.children.iter().all(|&child| {
+                    tree.nodes
+                        .get(child as usize)
+                        .is_some_and(|child| child.shadowable)
+                }),
+            });
+            if let Some(node) = tree.nodes.get_mut(index) {
+                node.shadowable = shadowable;
             }
         }
         tree
@@ -287,6 +348,7 @@ impl FieldTree {
                     first: position,
                     last: position,
                     leaf: None,
+                    shadowable: false,
                 });
                 self.by_name.insert((parent, name), node);
                 match self.nodes.get_mut(parent as usize) {
@@ -467,9 +529,24 @@ pub fn find(ast: &Ast) -> Mentions {
 /// ([`Mentions::resolve`]).
 #[must_use]
 pub fn scan(ast: &Ast) -> Mentions {
+    scan_except(ast, &shadowed_items(ast))
+}
+
+/// [`scan`], with the items of the outermost block that `shadowed` marks
+/// (by position) shadowed, as a workspace finds them among the files of a
+/// directory (see [Shadowed declarations](#shadowed-declarations)): in no
+/// tree, and no top-level function.
+#[must_use]
+pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
     let root = ast.items(ast.root());
+    let shadowed: Vec<bool> = (0..root.len())
+        .map(|position| shadowed.get(position).copied().unwrap_or(false))
+        .collect();
     let mut functions = Vec::new();
     for (position, &id) in root.iter().enumerate() {
+        if shadowed.get(position) == Some(&true) {
+            continue;
+        }
         if let Some((name, expr, function)) = top_level_function(ast, id) {
             functions.push(TopLevel {
                 item: id,
@@ -480,11 +557,198 @@ pub fn scan(ast: &Ast) -> Mentions {
             });
         }
     }
-    let tree = FieldTree::build(ast, root);
+    let tree = FieldTree::build(ast, root, &shadowed);
     Mentions {
         functions,
         tree,
+        shadowed,
         ..Mentions::default()
+    }
+}
+
+/// The field items of `ast`'s outermost block that a later one shadows (see
+/// [Shadowed declarations](#shadowed-declarations)), by position: those
+/// its declarations, swept in source order, shadow.
+#[must_use]
+pub fn shadowed_items(ast: &Ast) -> Vec<bool> {
+    let mut shadowed = vec![false; ast.items(ast.root()).len()];
+    // Only a marked declaration is ever shadowed.
+    if !ast.marks_any() {
+        return shadowed;
+    }
+    let mut sweep = Sweep::new();
+    for (position, names, shadowable) in declarations(ast) {
+        for killed in sweep
+            .declare(&names, position, shadowable)
+            .unwrap_or_default()
+        {
+            if let Some(entry) = shadowed.get_mut(killed) {
+                *entry = true;
+            }
+        }
+    }
+    shadowed
+}
+
+/// The declarations of `ast`'s outermost block that a later one may shadow
+/// or be shadowed by, in source order: each field item's (a `def`'s
+/// included) position, the names of its path, and whether it is marked
+/// `#[shadowable]`.
+pub fn declarations(ast: &Ast) -> impl Iterator<Item = (usize, Vec<Name>, bool)> + '_ {
+    ast.items(ast.root())
+        .iter()
+        .enumerate()
+        .filter_map(|(position, &id)| {
+            let ItemKind::Field { path, .. } = ast.item(id).kind else {
+                return None;
+            };
+            let names: Option<Vec<Name>> = ast.path(path).iter().map(PathSegment::name).collect();
+            Some((position, names?, ast.is_shadowable(id)))
+        })
+}
+
+/// Leaf declarations swept in one order, each declared after those before
+/// it, to find which shadows which (see [Shadowed
+/// declarations](#shadowed-declarations)): the declarations of one input,
+/// or of every file of a directory (see [`crate::workspace`]), each known by
+/// its key `K`. A trie of their paths, holding only the leaves that stand.
+#[derive(Clone, Debug)]
+pub struct Sweep<K> {
+    /// The nodes; a node of no leaf that stands is removed from `by_name`.
+    nodes: Vec<SweepNode<K>>,
+    /// Each node that stands by its parent (`u32::MAX` for a root) and its
+    /// name.
+    by_name: HashMap<(u32, Name), u32>,
+}
+
+/// One node of a [`Sweep`].
+#[derive(Clone, Debug)]
+struct SweepNode<K> {
+    /// Its last segment.
+    name: Name,
+    /// The leaf declared at it that stands, with whether it is shadowable.
+    leaf: Option<(K, bool)>,
+    /// Its children that stand.
+    children: Vec<u32>,
+}
+
+impl<K: Copy> Default for Sweep<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Copy> Sweep<K> {
+    /// No declaration yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            by_name: HashMap::new(),
+        }
+    }
+
+    /// Declares the leaf `key` of the path `names`, shadowable or not, after
+    /// every leaf declared so far. It overlaps each leaf that stands at its
+    /// path, at a prefix of it or under it: if every one of those is
+    /// shadowable, it shadows them all, and returns their keys; if one is
+    /// not, it is the conflict it always was, which others report, and it is
+    /// not declared (`None`).
+    pub fn declare(&mut self, names: &[Name], key: K, shadowable: bool) -> Option<Vec<K>> {
+        let mut parent = u32::MAX;
+        let mut walked = 0;
+        let mut above = None;
+        for &name in names {
+            let Some(&node) = self.by_name.get(&(parent, name)) else {
+                break;
+            };
+            parent = node;
+            walked += 1;
+            if self
+                .nodes
+                .get(node as usize)
+                .is_some_and(|n| n.leaf.is_some())
+            {
+                above = Some(node);
+                break;
+            }
+        }
+        // The leaves it overlaps: one at its path or a prefix of it, or every
+        // one under its path, if its path is a node already.
+        let overlapped: Vec<(K, bool)> = match above {
+            Some(node) => self
+                .nodes
+                .get(node as usize)
+                .and_then(|n| n.leaf)
+                .into_iter()
+                .collect(),
+            None if walked == names.len() && parent != u32::MAX => self.leaves_under(parent),
+            None => Vec::new(),
+        };
+        if overlapped.iter().any(|&(_, marked)| !marked) {
+            return None;
+        }
+        match above {
+            Some(node) => {
+                if let Some(entry) = self.nodes.get_mut(node as usize) {
+                    entry.leaf = None;
+                }
+            }
+            None if !overlapped.is_empty() => self.remove_under(parent),
+            None => {}
+        }
+        for &name in names.get(walked..).unwrap_or_default() {
+            let node = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
+            self.nodes.push(SweepNode {
+                name,
+                leaf: None,
+                children: Vec::new(),
+            });
+            self.by_name.insert((parent, name), node);
+            if let Some(up) = self.nodes.get_mut(parent as usize) {
+                up.children.push(node);
+            }
+            parent = node;
+        }
+        if let Some(entry) = self.nodes.get_mut(parent as usize) {
+            entry.leaf = Some((key, shadowable));
+        }
+        Some(overlapped.into_iter().map(|(key, _)| key).collect())
+    }
+
+    /// The leaves that stand under the node `node`.
+    fn leaves_under(&self, node: u32) -> Vec<(K, bool)> {
+        let mut leaves = Vec::new();
+        let mut stack = vec![node];
+        while let Some(at) = stack.pop() {
+            let Some(entry) = self.nodes.get(at as usize) else {
+                continue;
+            };
+            leaves.extend(entry.leaf);
+            stack.extend(entry.children.iter().rev());
+        }
+        leaves
+    }
+
+    /// Removes every node under the node `node`, whose leaves are shadowed.
+    fn remove_under(&mut self, node: u32) {
+        let mut stack: Vec<(u32, u32)> = self
+            .nodes
+            .get_mut(node as usize)
+            .map(|entry| mem::take(&mut entry.children))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| (node, child))
+            .collect();
+        while let Some((parent, at)) = stack.pop() {
+            let Some(entry) = self.nodes.get_mut(at as usize) else {
+                continue;
+            };
+            entry.leaf = None;
+            let name = entry.name;
+            stack.extend(mem::take(&mut entry.children).into_iter().map(|c| (at, c)));
+            self.by_name.remove(&(parent, name));
+        }
     }
 }
 
@@ -535,11 +799,15 @@ impl Mentions {
             others.sort_by_key(|&(_, span)| span.start);
             foreign.push(others);
         }
+        // A shadowed `def` is no top-level function.
         let edges: Vec<&[u32]> = root
             .iter()
             .zip(&items)
-            .filter(|&(&id, _)| top_level_function(ast, id).is_some())
-            .map(|(_, found)| found.as_slice())
+            .enumerate()
+            .filter(|&(position, (&id, _))| {
+                top_level_function(ast, id).is_some() && self.shadowed.get(position) != Some(&true)
+            })
+            .map(|(_, (_, found))| found.as_slice())
             .collect();
         (self.groups, self.group_of) = components(&edges);
         self.items = items;
@@ -696,6 +964,9 @@ impl Mentions {
             }
             match self.tree.item_leaf.get(position).copied().flatten() {
                 Some(leaf) => state.visit(Need::Field(leaf), position),
+                // A shadowed declaration needs nothing (see [Shadowed
+                // declarations](#shadowed-declarations)).
+                None if self.shadowed.get(position) == Some(&true) => {}
                 None if state.is_function.get(position) == Some(&false) => {
                     for need in self.needs_of_item(position) {
                         state.visit(need, position);

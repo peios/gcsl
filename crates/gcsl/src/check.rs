@@ -583,8 +583,10 @@
 //! is declared twice", at the second (two `def`s, or a `def` and a field,
 //! are the field defined twice); a top-level `let`, `let mut`, field or
 //! `:=` whose name, or its path's first segment, is a top-level function's
-//! is "`f` is a function of this file". In inner blocks a name shadows as
-//! it always has.
+//! is "`f` is a function of this file", but a field all of whose leaves
+//! are `#[shadowable]`, which a `fn` of its name shadows in the whole input
+//! (see [Shadowed declarations](#shadowed-declarations)). In inner blocks a
+//! name shadows as it always has.
 //!
 //! **What a function sees.** A function sees the variables and fields
 //! declared above its own declaration and copies the ones it uses when it
@@ -720,6 +722,10 @@
 //! mut`, `:=` or dotted `let` of the name is "`a` is a field of this file",
 //! with the field's first item labelled "declared here"; a top-level
 //! function of the name is "`a` is a function of this file" at the field.
+//! A root all of whose leaves are `#[shadowable]` is shadowed instead,
+//! silently, by a `let` (a dotted one too) from its item on and by a `fn`
+//! in the whole input (see [Shadowed
+//! declarations](#shadowed-declarations)).
 //!
 //! **What an initialiser sees.** As a function body does: the variables of
 //! the input's top level declared above the field's own item, everything of
@@ -791,6 +797,35 @@
 //! own, as a body checked early is (see [Top-level
 //! functions](#top-level-functions)). An interior node's type is the record
 //! of its children's types. A reference has its node's type.
+//!
+//! # Shadowed declarations
+//!
+//! A top-level field or `def` marked `#[shadowable]` may be shadowed by a
+//! later one it overlaps, in this input or, in a workspace, in a later
+//! file of its directory (see [`crate::workspace`], "Shadowable
+//! declarations", and [`crate::mentions`], "Shadowed declarations"). The
+//! one that stands is the leaf for the whole input, a read above it
+//! included, so it cannot read the one it shadows (`#[shadowable] a = 1`
+//! then `a = a + 1` is "`a` depends on itself"). A shadowed declaration is
+//! in no tree and no top-level function: the walk passes it by
+//! (`Checker::set_aside_shadowed`) and, once the walk is done, checks its
+//! value as it is written (`Checker::check_shadowed_items`), declaring
+//! nothing, in the view of the top level above its own item, as a body
+//! checked late is, a `def`'s function seeing itself by its name. So its
+//! own errors are reported. It needs nothing, so what it alone would read
+//! may not be computed, or checked, before it: a cell of a file this one
+//! does not otherwise need has no type yet, and a record of an import only
+//! it reads whole is not assembled; each is erroneous for it, which
+//! suppresses the errors that would depend on it. It is never lowered (its
+//! functions have code that does nothing, since none is made), so its
+//! erroneous types break nothing ([`Checker::check`]'s last check exempts
+//! its expressions). A top-level `let` or `fn` of the name of a field all
+//! of whose leaves are shadowable shadows it in this input, silently: the
+//! `let` from its item on, as it does any variable, the `fn` in the whole
+//! input, its binding declared after the field roots'
+//! (`Checker::declare_shadowing_fns`). The field is still a field of the
+//! input's record and, in a workspace, of its directory, which commits
+//! only fields ([`Scope`]'s `commit`): a `let` or `fn` is the file's own.
 //!
 //! # Futures
 //!
@@ -1870,8 +1905,10 @@
 //! The checker knows no name of one: a file has them as it has any other
 //! module's members, by an import, or by the prelude, which binds each of
 //! them to its own name and which every file and session input imports
-//! implicitly, as the last and yielding source of its view.
-//! A file that declares its own `len` (a field, a `def`, a `let`, a `fn`)
+//! implicitly, `#[shadowable]` and first of all in its view's order, but a
+//! file marked `#![no_prelude]` (see [`crate::workspace`], "Shadowable
+//! declarations"). A file that declares its own `len` (a field, a `def`, a
+//! `let`, a `fn`, or a path below it, `len.x`)
 //! shadows the prelude's, and loses the built-in there. The cell of each is
 //! a slot of the frame the driver writes before anything runs, its value a
 //! [`crate::Value::Builtin`], its type each one's, as the workspace's
@@ -2077,8 +2114,11 @@
 //! file's closures read them. A top-level `let`, `let mut`, `:=`, dotted
 //! `let` or `fn` of a name that is a root of its directory's tree or of a
 //! directory above, declared in another file, is "`a` is a field of this
-//! directory", labelled on the declaration; within a file, "`a` is a field
-//! of this file" stands as it was.
+//! directory", labelled on the declaration, unless what the file's view has
+//! of the name is shadowable, which it then shadows silently
+//! ([`crate::workspace::FileScope::yields`]); within a file, "`a` is a field
+//! of this file" stands as it was, but for a shadowable root (see [Shadowed
+//! declarations](#shadowed-declarations)).
 //!
 //! A file is checked after every file it needs, so their cells' types are
 //! known; there is nothing to be ready across files, since a needed file
@@ -2107,11 +2147,17 @@
 //! that the file's [`crate::workspace::FileScope`] reads through its view
 //! ([`crate::workspace::FileScope::reads_through`]) is a reference,
 //! resolved like a reference to a field: to the longest prefix the view
-//! declares, the accesses after it ordinary ones. A name only the implicit
-//! `import * from prelude` binds yields instead to any binding of its name
-//! ([`crate::workspace::FileScope::yields`]): a top-level `let` or `fn`, or
-//! an earlier session input's variable, shadows it, and no clash is
-//! reported ("`len` is a field of this directory" is not). An import a
+//! declares, the accesses after it ordinary ones. A name the view has as
+//! something shadowable (the implicit `#[shadowable] import * from
+//! prelude`'s names among them, see [`crate::workspace`], "Shadowable
+//! declarations") yields instead to a binding of its name that is not a
+//! declaration of the view's own order
+//! ([`crate::workspace::FileScope::yields`],
+//! `Checker::binding_shadows_view`): a top-level `let` or `fn` of the file,
+//! or an earlier session input's variable, shadows it, and no clash is
+//! reported ("`len` is a field of this directory" is not); a field root of
+//! the file or one its directory chain committed is what the view says it
+//! is. An import a
 //! session's input inherits from an earlier input
 //! ([`crate::workspace::FileScope::inherited`]) is shadowed as an earlier
 //! input's variable is, with no clash reported: by the input's top-level
@@ -3924,13 +3970,16 @@ impl Scope {
         self.bindings.iter().map(|binding| binding.name)
     }
 
-    /// Adds the variables of `from` after its first `start` whose names
-    /// `keep` accepts, without their slots' names: a file's declarations,
-    /// committed to its directory's scope.
+    /// Adds the fields of `from` after its first `start` whose names `keep`
+    /// accepts, without their slots' names: a file's declarations, committed
+    /// to its directory's scope. A variable is never one, even of such a
+    /// name: a top-level `let` or `fn` that shadows a shadowable field of its
+    /// file is the file's alone (see [Shadowed
+    /// declarations](#shadowed-declarations)).
     pub(crate) fn commit(&mut self, from: &Scope, start: usize, keep: impl Fn(Name) -> bool) {
         let bindings = from.bindings.iter().zip(&from.measured).skip(start);
         for (binding, measured) in bindings {
-            if keep(binding.name) {
+            if binding.kind == BindingKind::Field && keep(binding.name) {
                 self.bindings.push(*binding);
                 self.measured.push(measured.clone());
             }
@@ -4172,6 +4221,14 @@ pub struct Checker<'a> {
     /// The last top-level item reported as "`a` is a field of this file",
     /// whose `:=` is then not reported again as a rebind of a field.
     field_clash: Option<ItemId>,
+    /// The top-level items a later declaration shadows, each with the
+    /// number of bindings declared when the walk passed it: checked after
+    /// the last item, as written, in the view of the top level above them
+    /// (see [Shadowed declarations](#shadowed-declarations)).
+    shadowed_items: Vec<(ItemId, usize)>,
+    /// Whether a shadowed declaration is being checked, whose reads of
+    /// records it alone would need are erroneous.
+    checking_shadowed: bool,
     builtin_types: BuiltinTypes,
     /// The name `Future`, which applied to a type is a future of it, if the
     /// program mentions it.
@@ -4334,6 +4391,8 @@ impl<'a> Checker<'a> {
             slot_names,
             top_slots_end: next_slot,
             field_clash: None,
+            shadowed_items: Vec::new(),
+            checking_shadowed: false,
             builtin_types: [
                 (names.lookup("Int"), TyId::INT),
                 (names.lookup("Float"), TyId::FLOAT),
@@ -4380,15 +4439,7 @@ impl<'a> Checker<'a> {
         if !self.errors.is_empty() {
             return Err(diagnostic::merge(self.errors, self.warnings));
         }
-        let types = &*self.types;
-        let unsettled = |ty: TyId| types.contains_provisional(ty, None);
-        if self.expr_types.iter().any(|&ty| {
-            unsettled(ty) || matches!(types.kind(ty), TyKind::Error | TyKind::UntypedInt)
-        }) || self
-            .fn_resolutions
-            .iter()
-            .any(|function| function.captures.iter().any(|&(_, ty)| unsettled(ty)))
-        {
+        if !self.settled() {
             let error = InternalError {
                 message: "a type table entry is untyped, erroneous or provisional after a \
                           successful check",
@@ -4471,6 +4522,31 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// Whether, after a check that found no error, every expression has a
+    /// type that is neither untyped, erroneous nor provisional, and every
+    /// function's captures are settled: the invariant lowering relies on.
+    /// A shadowed declaration's expressions are never lowered, and may read
+    /// cells no file this one needs computes, whose types are erroneous
+    /// (see [Shadowed declarations](#shadowed-declarations)): they are
+    /// exempt.
+    fn settled(&self) -> bool {
+        let shadowed = self.shadowed_exprs();
+        let types = &*self.types;
+        let unsettled = |ty: TyId| types.contains_provisional(ty, None);
+        let lowered = |at: usize| {
+            !shadowed
+                .iter()
+                .any(|&(first, last)| (first..=last).contains(&at))
+        };
+        !self.expr_types.iter().enumerate().any(|(at, &ty)| {
+            lowered(at)
+                && (unsettled(ty) || matches!(types.kind(ty), TyKind::Error | TyKind::UntypedInt))
+        }) && !self
+            .fn_resolutions
+            .iter()
+            .any(|function| function.captures.iter().any(|&(_, ty)| unsettled(ty)))
+    }
+
     /// Checks a nested block's body in a scope of its own, returning its
     /// type. With `expecting`, the block is a record block checked against
     /// an expected record type.
@@ -4528,7 +4604,7 @@ impl<'a> Checker<'a> {
             if root {
                 self.root_position = index;
                 self.compute_fields(index);
-                if self.reach_top_fn(id) {
+                if self.set_aside_shadowed(index, id) || self.reach_top_fn(id) {
                     continue;
                 }
                 self.check_mentioned(index);
@@ -4614,15 +4690,74 @@ impl<'a> Checker<'a> {
             }
         }
         if root {
-            self.root_position = items.len();
-            self.compute_fields(items.len());
-            self.check_remaining_bodies();
-            self.settle_top_nodes();
+            self.finish_top_level(items.len());
         }
         match first_field {
             Some(_) => self.record_type(expecting),
             None => result,
         }
+    }
+
+    /// After the walk of the outermost block, whose items are `count`:
+    /// computes the top-level fields left, checks the bodies left, settles
+    /// the types of the open nodes, and checks the shadowed declarations.
+    fn finish_top_level(&mut self, count: usize) {
+        self.root_position = count;
+        self.compute_fields(count);
+        self.check_remaining_bodies();
+        self.settle_top_nodes();
+        self.check_shadowed_items();
+    }
+
+    /// When the walk of the outermost block reaches its item `id`, at
+    /// `position`: if a later declaration shadows it, sets it aside, with
+    /// the bindings declared so far, to be checked once the walk is done
+    /// ([`Checker::check_shadowed_items`]), and returns `true`.
+    fn set_aside_shadowed(&mut self, position: usize, id: ItemId) -> bool {
+        let shadowed = self.mentions.shadowed.get(position) == Some(&true);
+        if shadowed {
+            self.shadowed_items.push((id, self.bindings.len()));
+        }
+        shadowed
+    }
+
+    /// After the walk of the outermost block: checks each shadowed
+    /// declaration's value as it is written, in the view of the top level
+    /// above its own item, as a body checked late is (see [Shadowed
+    /// declarations](#shadowed-declarations)), declaring nothing.
+    fn check_shadowed_items(&mut self) {
+        let ast = self.ast;
+        for (id, cut) in std::mem::take(&mut self.shadowed_items) {
+            let ItemKind::Field { path, value, .. } = ast.item(id).kind else {
+                continue;
+            };
+            let cut = cut.max(self.top_end).min(self.bindings.len());
+            let below = self.bindings.split_off(cut);
+            let outer = std::mem::replace(&mut self.checking_shadowed, true);
+            self.name_callee(ast.path(path), value);
+            self.check_alone(value);
+            self.callee_name = None;
+            self.checking_shadowed = outer;
+            self.bindings.extend(below);
+        }
+    }
+
+    /// The expressions of the outermost block's shadowed declarations, as
+    /// ranges of ids: never lowered, they may hold erroneous types without
+    /// an error, where they read a cell no file they need computes.
+    fn shadowed_exprs(&self) -> Vec<(usize, usize)> {
+        let root = self.ast.items(self.ast.root());
+        root.iter()
+            .enumerate()
+            .filter(|&(position, _)| self.mentions.shadowed.get(position) == Some(&true))
+            .filter_map(|(_, &id)| match self.ast.item(id).kind {
+                ItemKind::Field { value, .. } => {
+                    let first = self.ast.subtree(value).next()?;
+                    Some((first.index(), value.index()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Checks the placement of the result item spanning `span`, `= VALUE`,
@@ -6623,13 +6758,21 @@ impl<'a> Checker<'a> {
                 ItemKind::Field { .. } => BindingKind::Field,
                 _ => BindingKind::Variable,
             };
-            let ty = self.declared_type(top.function);
-            let binding = self.bindings.len();
             let span = self.ast.item(top.item).span;
             if kind == BindingKind::Variable {
                 self.check_directory_clash(top.item, top.name);
             }
-            self.declare_binding(top.name, ty, Some(span), kind);
+            // A `fn` named like a shadowable field root of the input
+            // shadows it in the whole input: its binding is declared after
+            // the roots' (`Checker::declare_shadowing_fns`).
+            let binding = if kind == BindingKind::Variable && self.shadowable_root(top.name) {
+                usize::MAX
+            } else {
+                let ty = self.declared_type(top.function);
+                let binding = self.bindings.len();
+                self.declare_binding(top.name, ty, Some(span), kind);
+                binding
+            };
             self.top_fns.push(TopFn {
                 item: top.item,
                 expr: top.expr,
@@ -6646,6 +6789,39 @@ impl<'a> Checker<'a> {
         self.top_copies = vec![Vec::new(); self.top_fns.len()];
         self.declare_field_cells();
         self.closure_ready = vec![None; self.mentions.node_count() + self.top_fns.len()];
+    }
+
+    /// Whether `name` is the root of a top-level field of the input all of
+    /// whose leaves are marked `#[shadowable]`, which a top-level `let` or
+    /// `fn` of the input shadows silently (see [Shadowed
+    /// declarations](#shadowed-declarations)).
+    fn shadowable_root(&self, name: Name) -> bool {
+        let tree = &self.mentions.tree;
+        tree.root(name)
+            .and_then(|root| tree.nodes.get(root as usize))
+            .is_some_and(|root| root.shadowable)
+    }
+
+    /// As the input starts, once its field roots are declared: declares each
+    /// top-level `fn` named like a shadowable field root of the input
+    /// ([`Checker::shadowable_root`]), so that its binding, later than the
+    /// root's, is the one its name finds in the whole input.
+    fn declare_shadowing_fns(&mut self) {
+        for index in 0..self.top_fns.len() {
+            let Some(top) = self.top_fns.get(index).copied() else {
+                continue;
+            };
+            if top.binding != usize::MAX {
+                continue;
+            }
+            let ty = self.declared_type(top.function);
+            let binding = self.bindings.len();
+            let span = self.ast.item(top.item).span;
+            self.declare_binding(top.name, ty, Some(span), BindingKind::Variable);
+            if let Some(entry) = self.top_fns.get_mut(index) {
+                entry.binding = binding;
+            }
+        }
     }
 
     /// As the input starts, after its top-level functions: declares the
@@ -6696,6 +6872,7 @@ impl<'a> Checker<'a> {
             };
             self.field_cells.push(cell);
         }
+        self.declare_shadowing_fns();
         self.top_end = self.bindings.len();
         self.report_cycles();
         // The cells of the nodes that are not roots, after the roots'.
@@ -6874,6 +7051,7 @@ impl<'a> Checker<'a> {
             }
             self.field_cells.push(cell);
         }
+        self.declare_shadowing_fns();
         self.top_end = self.bindings.len();
         self.report_cycles();
         self.declare_imports(workspace);
@@ -6889,11 +7067,16 @@ impl<'a> Checker<'a> {
             self.value_cell = cell;
             self.frame_size = self.frame_size.max(cell.0.saturating_add(1));
         }
+        // A shadowed declaration's reads are not assembled for it (see
+        // [Shadowed declarations](#shadowed-declarations)).
+        let shadowed = &self.mentions.shadowed;
         let mut reached: Vec<Target> = self
             .mentions
             .foreign
             .iter()
-            .flatten()
+            .enumerate()
+            .filter(|&(position, _)| shadowed.get(position) != Some(&true))
+            .flat_map(|(_, foreign)| foreign)
             .filter_map(|&(need, _)| match need {
                 Need::Field(node) => workspace.scope.target(node),
                 Need::Function(_) => None,
@@ -7038,7 +7221,13 @@ impl<'a> Checker<'a> {
                 if let Target::Node(merged) = target {
                     self.imported_callees.insert(id, merged);
                 }
-                self.import_cell(workspace, target)?
+                match self.import_cell(workspace, target) {
+                    Some(cell) => cell,
+                    // A record only a shadowed declaration reads is not
+                    // assembled: erroneous for it, which is never run.
+                    None if self.checking_shadowed => (Slot::NONE, TyId::ERROR),
+                    None => return None,
+                }
             }
             None if base == id => return None,
             None => {
@@ -7714,6 +7903,11 @@ impl<'a> Checker<'a> {
         if field(id) && field(function) {
             return;
         }
+        // A `fn` shadows a shadowable field silently, in the whole input
+        // (see [Shadowed declarations](#shadowed-declarations)).
+        if field(id) && self.shadowable_root(name) {
+            return;
+        }
         let text = self.ast.names().get(name);
         self.errors.push(
             Diagnostic::error(
@@ -7760,6 +7954,11 @@ impl<'a> Checker<'a> {
     /// rules' to judge.
     fn check_field_clash(&mut self, id: ItemId, name: Name) {
         if matches!(self.ast.item(id).kind, ItemKind::Field { .. }) {
+            return;
+        }
+        // A `let` shadows a shadowable field silently, from its item on
+        // (see [Shadowed declarations](#shadowed-declarations)).
+        if matches!(self.ast.item(id).kind, ItemKind::Let { .. }) && self.shadowable_root(name) {
             return;
         }
         let tree = &self.mentions.tree;
@@ -12148,6 +12347,29 @@ impl<'a> Checker<'a> {
         (ty, callback)
     }
 
+    /// Whether `binding`, at `index` among the top level's bindings, the
+    /// latest of `name`, is read rather than what the file's view has of
+    /// `name` (see [Imports](#imports)): only when what the view has is
+    /// shadowable, and the binding is one the clash family lets shadow it, a
+    /// top-level `fn` of the file or an earlier session input's variable. A
+    /// field root of the file, or one its directory chain committed, is a
+    /// declaration of the view's own order, which the view has decided.
+    fn binding_shadows_view(
+        &self,
+        workspace: &Context<'_>,
+        (index, binding): (usize, Binding),
+        name: Name,
+    ) -> bool {
+        if !workspace.scope.yields(name) {
+            return false;
+        }
+        if index >= self.top_start {
+            binding.kind != BindingKind::Field
+        } else {
+            workspace.session()
+        }
+    }
+
     /// As [`Checker::check_name`], but recording nothing of a callback
     /// parameter: returns the type, and the index in `callbacks` of the
     /// callback parameter the name's binding is, if it is one.
@@ -12158,10 +12380,14 @@ impl<'a> Checker<'a> {
         }
         // An imported name, or a root several sources of the file's view
         // have, that nothing nearer shadows (see [Imports](#imports)); a
-        // name of the implicit prelude only if no binding at all has it.
+        // shadowable one, the implicit prelude's among them, only if no
+        // binding of the file's own or of an earlier input has it.
         if let Some(workspace) = self.workspace
-            && found.is_none_or(|(index, _)| index < self.top_end && !workspace.scope.yields(name))
             && workspace.scope.reads_through(name)
+            && found.is_none_or(|(index, binding)| {
+                index < self.top_end
+                    && !self.binding_shadows_view(workspace, (index, binding), name)
+            })
             && let Some(ty) = self.field_reference(id)
         {
             return (self.builtin_use(id, ty, span), None);

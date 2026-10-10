@@ -38,9 +38,13 @@
 //! `trim`), and the standard files, the `.gcsl` files of the repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
 //! by its bare name from any file and each a scope of its own; and every
-//! file and input begins as if with `import * from prelude`, whose names
-//! its own declarations shadow silently (see [`workspace`], "The standard
-//! library"). The prelude binds the built-in functions, and `sh`, written
+//! file and input begins as if with `#[shadowable] import * from prelude`,
+//! whose names its own declarations shadow silently, unless the file is
+//! marked `#![no_prelude]` (see [`workspace`], "The standard library" and
+//! "Shadowable declarations"). A declaration or an import marked
+//! `#[shadowable]` may be shadowed so by a later one of its name, in one
+//! static order of the workspace. The prelude binds the built-in
+//! functions, and `sh`, written
 //! in GCSL on `exec` and `panic`, which runs a shell command and panics
 //! unless it succeeds; `path` (`import path`) joins, normalises and takes
 //! apart paths, lexically, in GCSL on the string built-ins. A workspace or

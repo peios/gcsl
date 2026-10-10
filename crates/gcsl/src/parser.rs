@@ -47,6 +47,43 @@
 //! at it, and so is anything else. `def` is a keyword, so anywhere else,
 //! as a name or an expression, it is reported as any keyword is there.
 //!
+//! # Attributes
+//!
+//! An *attribute* is a token of its own (see the lexer's
+//! [Attributes](crate::lexer#attributes)): `#[NAME]` an outer one, which
+//! applies to the item after it, and `#![NAME]` an inner one, which applies
+//! to the whole file. There are two names, and no arguments:
+//!
+//! - `#[shadowable]` marks a top-level field (a dotted one included), a
+//!   `def` or an `import` of any form, as one a later declaration of its
+//!   name may shadow (see [`crate::workspace`], "Shadowable declarations"),
+//!   recorded in the tree's side table ([`Ast::is_shadowable`]). It applies
+//!   to the next item, on its line or a later one, comments and blank lines
+//!   between being skipped as any separators are.
+//! - `#![no_prelude]` marks the file as one without the implicit `import *
+//!   from prelude` ([`Ast::no_prelude`]). It must come before the file's
+//!   first item, comments and blank lines alone before it.
+//!
+//! The errors, each at the attribute: an unknown name is "unknown attribute
+//! `NAME`"; `#![shadowable]` is "`shadowable` applies to a declaration:
+//! write `#[shadowable]`" and `#[no_prelude]` "`no_prelude` applies to the
+//! whole file: write `#![no_prelude]`"; one written twice on one item is
+//! "`#[shadowable]` is written twice", and twice on the file "`#![no_prelude]`
+//! is written twice", each at the second; `#![no_prelude]` anywhere but
+//! before the file's first item (after an item or an outer attribute, or in
+//! a block) is "`#![no_prelude]` must come before anything else in the
+//! file"; `#[shadowable]` before anything but a top-level field, `def` or
+//! `import` (a `let`, `let mut`, `fn`, `:=`, a spread, a result, an
+//! expression, a `break`, `continue` or `return`, or any item of an inner
+//! block or of a `for` header) is "`#[shadowable]` applies only to a file's
+//! top-level fields, `def`s and imports", with the note "a `let` or `fn`
+//! already shadows" before a `let`, a `let mut` or a `fn`; and one with no
+//! item after it, at the end of its body, is "`#[shadowable]` is not
+//! followed by anything". An attribute where an expression or a type
+//! starts, or after an item on its line, is reported as any token is there.
+//! Whether a session's input may be marked `#![no_prelude]` is the
+//! workspace's to say: the parser does not know what it parses.
+//!
 //! # Imports
 //!
 //! An import is an item of a file's outermost body only:
@@ -565,6 +602,24 @@ const MISPLACED_SPREAD: &str = "`...` is only allowed in a list or at the start 
 /// The error for an `import` item anywhere but in a file's outermost body.
 const MISPLACED_IMPORT: &str = "`import` is only allowed at the top level of a file";
 
+/// The name of the outer attribute that marks a declaration shadowable.
+const SHADOWABLE: &str = "shadowable";
+
+/// The name of the inner attribute that turns the implicit prelude off.
+const NO_PRELUDE: &str = "no_prelude";
+
+/// The error for `#[shadowable]` before anything but a top-level field,
+/// `def` or `import`.
+const MISPLACED_SHADOWABLE: &str =
+    "`#[shadowable]` applies only to a file's top-level fields, `def`s and imports";
+
+/// The note on [`MISPLACED_SHADOWABLE`] before a `let`, `let mut` or `fn`.
+const LET_SHADOWS_NOTE: &str = "a `let` or `fn` already shadows";
+
+/// The error for `#![no_prelude]` anywhere but before the file's first
+/// item.
+const MISPLACED_NO_PRELUDE: &str = "`#![no_prelude]` must come before anything else in the file";
+
 /// The error for a module path segment that is not a name.
 const MODULE_PATH: &str = "a module path is names separated by `.`";
 
@@ -805,11 +860,33 @@ impl Parser<'_> {
     fn parse_body(&mut self, open: Option<Span>) -> ParseResult<(ItemRange, u32)> {
         let base = self.item_stack.len();
         let mut height = 0;
+        // The outer attribute waiting for the item it applies to.
+        let mut pending: Option<Span> = None;
         loop {
             self.skip_separators();
             let token = self.peek();
+            match token.kind {
+                TokenKind::Attribute(name) => {
+                    self.outer_attribute(token, name, &mut pending)?;
+                    continue;
+                }
+                TokenKind::InnerAttribute(name) => {
+                    let first =
+                        open.is_none() && self.item_stack.len() == base && pending.is_none();
+                    self.inner_attribute(token, name, first)?;
+                    continue;
+                }
+                _ => {}
+            }
             match (token.kind, open) {
-                (TokenKind::Eof, None) | (TokenKind::RBrace, Some(_)) => break,
+                (TokenKind::Eof, None) | (TokenKind::RBrace, Some(_)) => {
+                    if let Some(attribute) = pending {
+                        return Err(
+                            self.error("`#[shadowable]` is not followed by anything", attribute)
+                        );
+                    }
+                    break;
+                }
                 (TokenKind::Eof, Some(open)) => {
                     let found = self.describe(token);
                     return Err(self.report(
@@ -829,6 +906,9 @@ impl Parser<'_> {
                 }
                 _ => self.parse_item()?,
             };
+            if let Some(attribute) = pending.take() {
+                self.attach_shadowable(attribute, item, open.is_none())?;
+            }
             self.item_stack.push(item);
             height = height.max(item_height);
             self.expect_end_of_item()?;
@@ -836,6 +916,85 @@ impl Parser<'_> {
         let range = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok((range, height))
+    }
+
+    /// Takes the outer attribute `token`, named `name`, at the start of an
+    /// item of a body, as the attribute of the item after it, `pending` (see
+    /// [Attributes](#attributes)): only `#[shadowable]` is one, once.
+    fn outer_attribute(
+        &mut self,
+        token: Token,
+        name: Name,
+        pending: &mut Option<Span>,
+    ) -> ParseResult<()> {
+        let text = self.names.get(name).to_owned();
+        match text.as_str() {
+            SHADOWABLE if pending.is_some() => {
+                Err(self.error("`#[shadowable]` is written twice", token.span))
+            }
+            SHADOWABLE => {
+                *pending = Some(token.span);
+                self.advance();
+                Ok(())
+            }
+            _ => Err(self.misplaced_attribute(token)),
+        }
+    }
+
+    /// Takes the inner attribute `token`, named `name`, at the start of an
+    /// item of a body, as the file's, if it is `first`: before the file's
+    /// first item and any outer attribute (see [Attributes](#attributes)).
+    fn inner_attribute(&mut self, token: Token, name: Name, first: bool) -> ParseResult<()> {
+        if self.names.get(name) != NO_PRELUDE || !first {
+            return Err(self.misplaced_attribute(token));
+        }
+        if self.builder.no_prelude().is_some() {
+            return Err(self.error("`#![no_prelude]` is written twice", token.span));
+        }
+        self.builder.set_no_prelude(token.span);
+        self.advance();
+        Ok(())
+    }
+
+    /// Reports the attribute `token` where it cannot be: by its name, an
+    /// unknown one, one of the other kind, or, where it is, one that is not
+    /// allowed there (see [Attributes](#attributes)).
+    fn misplaced_attribute(&mut self, token: Token) -> Reported {
+        let (inner, name) = match token.kind {
+            TokenKind::Attribute(name) => (false, name),
+            TokenKind::InnerAttribute(name) => (true, name),
+            _ => return self.error("expected an attribute", token.span),
+        };
+        let text = self.names.get(name).to_owned();
+        let message = match (text.as_str(), inner) {
+            (SHADOWABLE, true) => {
+                "`shadowable` applies to a declaration: write `#[shadowable]`".to_owned()
+            }
+            (NO_PRELUDE, false) => {
+                "`no_prelude` applies to the whole file: write `#![no_prelude]`".to_owned()
+            }
+            (SHADOWABLE, false) => MISPLACED_SHADOWABLE.to_owned(),
+            (NO_PRELUDE, true) => MISPLACED_NO_PRELUDE.to_owned(),
+            _ => format!("unknown attribute `{text}`"),
+        };
+        self.error(message, token.span)
+    }
+
+    /// Marks `item`, an item of a body that is the file's if `top`, with the
+    /// `#[shadowable]` written at `attribute` before it, if it is a
+    /// top-level field, `def` or `import`; else the error that it is not one
+    /// (see [Attributes](#attributes)).
+    fn attach_shadowable(&mut self, attribute: Span, item: ItemId, top: bool) -> ParseResult<()> {
+        let kind = self.builder.item(item).kind;
+        if top && matches!(kind, ItemKind::Field { .. } | ItemKind::Import(_)) {
+            self.builder.mark_shadowable(item);
+            return Ok(());
+        }
+        let mut error = Diagnostic::error(MISPLACED_SHADOWABLE, attribute);
+        if matches!(kind, ItemKind::Let { .. }) {
+            error = error.with_note(LET_SHADOWS_NOTE);
+        }
+        Err(self.report(error))
     }
 
     /// Parses one item. Returns it and its height: the taller of its
@@ -2221,6 +2380,8 @@ impl Parser<'_> {
             | TokenKind::Dot
             | TokenKind::Comma
             | TokenKind::Pipe
+            | TokenKind::Attribute(_)
+            | TokenKind::InnerAttribute(_)
             | TokenKind::Newline
             | TokenKind::Eof => {
                 let found = self.describe(token);
@@ -2780,6 +2941,13 @@ impl Parser<'_> {
         loop {
             let start = self.pos;
             let token = self.peek();
+            // An attribute applies to no part of a header.
+            if matches!(
+                token.kind,
+                TokenKind::Attribute(_) | TokenKind::InnerAttribute(_)
+            ) {
+                return Err(self.misplaced_attribute(token));
+            }
             if token.kind == TokenKind::Let || self.starts_path_item() {
                 let (item, height) = self.parse_header_item(token, cond.is_some())?;
                 self.item_stack.push(item);
@@ -3133,6 +3301,8 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::StrMid(_)
         | TokenKind::StrEnd(_)
         | TokenKind::Ident(_)
+        | TokenKind::Attribute(_)
+        | TokenKind::InnerAttribute(_)
         | TokenKind::Let
         | TokenKind::Mut
         | TokenKind::If
@@ -8178,6 +8348,148 @@ mod tests {
         assert_eq!(
             message("import a, b c"),
             "expected `,` or `from`, found `c`"
+        );
+    }
+
+    /// The items of `text`'s body marked `#[shadowable]`, by position, and
+    /// whether the file is marked `#![no_prelude]`.
+    fn attributes(text: &str) -> (Vec<usize>, Option<Span>) {
+        let ast = parse_text(text).unwrap();
+        let marked = ast
+            .items(ast.root())
+            .iter()
+            .enumerate()
+            .filter(|&(_, &item)| ast.is_shadowable(item))
+            .map(|(position, _)| position)
+            .collect();
+        (marked, ast.no_prelude())
+    }
+
+    #[test]
+    fn attributes_mark_items_and_the_file() {
+        // On its item's line or a line before it, comments and blank lines
+        // between; a field, a dotted field, a `def` and an import of each
+        // form.
+        let text = "# a comment\n\n#![no_prelude]\n#[shadowable] a = 1\nb = 2\n#[shadowable]\n\n\
+                    # between\nc.d = 3\n#[shadowable] def f(): Int { 1 }\n\
+                    #[shadowable] import x\n#[shadowable] import * from y\n\
+                    #[shadowable] import z as w\n";
+        assert_eq!(
+            attributes(text),
+            (vec![0, 2, 3, 4, 5, 6], Some(Span::new(13, 27)))
+        );
+        assert_eq!(attributes("a = 1"), (vec![], None));
+        // The printer shows them.
+        assert_eq!(
+            parse_text("#![no_prelude]\n#[shadowable] a = 1\nb = 2")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file #![no_prelude]\n  #[shadowable] (field a @29..34\n    (int 1 @33..34))\n  \
+             (field b @35..40\n    (int 2 @39..40)))"
+        );
+    }
+
+    #[test]
+    fn misplaced_and_unknown_attributes_are_errors() {
+        let placed = MISPLACED_SHADOWABLE.to_owned();
+        assert_eq!(
+            error("#[sorted] a = 1"),
+            ("unknown attribute `sorted`".to_owned(), Span::new(0, 9))
+        );
+        assert_eq!(
+            error("#![sorted]"),
+            ("unknown attribute `sorted`".to_owned(), Span::new(0, 10))
+        );
+        assert_eq!(
+            error("#![shadowable]\na = 1"),
+            (
+                "`shadowable` applies to a declaration: write `#[shadowable]`".to_owned(),
+                Span::new(0, 14)
+            )
+        );
+        assert_eq!(
+            error("#[no_prelude]\na = 1"),
+            (
+                "`no_prelude` applies to the whole file: write `#![no_prelude]`".to_owned(),
+                Span::new(0, 13)
+            )
+        );
+        assert_eq!(
+            error("#[shadowable] #[shadowable] a = 1"),
+            (
+                "`#[shadowable]` is written twice".to_owned(),
+                Span::new(14, 27)
+            )
+        );
+        assert_eq!(
+            error("#![no_prelude]\n#![no_prelude]"),
+            (
+                "`#![no_prelude]` is written twice".to_owned(),
+                Span::new(15, 29)
+            )
+        );
+        for (text, at) in [
+            ("a = 1\n#![no_prelude]", Span::new(6, 20)),
+            ("#[shadowable]\n#![no_prelude]\na = 1", Span::new(14, 28)),
+            ("a = { #![no_prelude] }", Span::new(6, 20)),
+        ] {
+            assert_eq!(error(text), (MISPLACED_NO_PRELUDE.to_owned(), at), "{text}");
+        }
+        // Before a `let`, a `let mut` or a `fn`, with the note.
+        for text in [
+            "#[shadowable] let a = 1",
+            "#[shadowable] let mut a = 1",
+            "#[shadowable] fn f(): Int { 1 }",
+        ] {
+            let diagnostic = parse_text(text).unwrap_err();
+            assert_eq!(
+                (diagnostic.message.as_str(), diagnostic.span),
+                (MISPLACED_SHADOWABLE, Span::new(0, 13)),
+                "{text}"
+            );
+            assert_eq!(
+                diagnostic.notes,
+                vec![LET_SHADOWS_NOTE.to_owned()],
+                "{text}"
+            );
+        }
+        // Before a `:=`, an expression, a spread, a result or a `break`, or
+        // in an inner block or a `for` header, without it.
+        for (text, at) in [
+            ("let a = 1\n#[shadowable] a := 2", Span::new(10, 23)),
+            ("#[shadowable] f()", Span::new(0, 13)),
+            ("#[shadowable] ...{}", Span::new(0, 13)),
+            ("#[shadowable] = 1", Span::new(0, 13)),
+            ("x = { #[shadowable] a = 1 }", Span::new(6, 19)),
+            ("x = { #[shadowable] let a = 1; = a }", Span::new(6, 19)),
+            ("for #[shadowable] let i = 0; i < 1; {}", Span::new(4, 17)),
+        ] {
+            let diagnostic = parse_text(text).unwrap_err();
+            assert_eq!(
+                (diagnostic.message.clone(), diagnostic.span),
+                (placed.clone(), at),
+                "{text}"
+            );
+            let note = text.contains("let a = 1;");
+            assert_eq!(diagnostic.notes.is_empty(), !note, "{text}");
+        }
+        // With nothing after it.
+        for (text, at) in [
+            ("a = 1\n#[shadowable]", Span::new(6, 19)),
+            ("#[shadowable]\n# a comment\n", Span::new(0, 13)),
+            ("x = { a = 1; #[shadowable] }", Span::new(13, 26)),
+        ] {
+            assert_eq!(
+                error(text),
+                ("`#[shadowable]` is not followed by anything".to_owned(), at),
+                "{text}"
+            );
+        }
+        // Where an expression starts, as any token is.
+        assert_eq!(
+            message("a = #[shadowable] 1"),
+            "expected expression, found `#[shadowable]`"
         );
     }
 }

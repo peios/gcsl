@@ -1,0 +1,3 @@
+#[shadowable]
+arch = "x86_64"
+#[shadowable] jobs = 4

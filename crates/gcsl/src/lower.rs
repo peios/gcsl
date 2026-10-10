@@ -33,6 +33,11 @@
 //! its arguments in source order, each with the parameter the checker bound
 //! it to.
 //!
+//! A declaration a later one shadows (see [`crate::mentions`], "Shadowed
+//! declarations") lowers to nothing and is in no record: it is never run.
+//! Its function expressions and `lazy`s are never made, but the function
+//! table has an entry for every one, so each has code that does nothing.
+//!
 //! A top-level function's closure is a `Store` of its `MakeClosure` into
 //! the function's slot, placed where the checker says the closure is made
 //! ([`crate::check::Resolution::top_functions`]): before the outermost
@@ -411,8 +416,9 @@ pub fn lower(
     let kind = lowerer.body_kind(root)?;
     let kind = lowerer.lower_body(root, root_span, kind)?;
     let root = lowerer.builder.alloc(kind, root_span);
+    lowerer.stub_shadowed_functions(root_span);
     // Every function expression is reachable from the root, so each has
-    // been lowered.
+    // been lowered, but those of a shadowed declaration, stubbed.
     let mut functions = lowerer
         .functions
         .into_iter()
@@ -602,6 +608,11 @@ impl Lowerer<'_> {
             if is_root {
                 self.store_cells(index)?;
             }
+            // A shadowed declaration is never run (see
+            // [`crate::mentions`], "Shadowed declarations").
+            if is_root && self.is_shadowed(index) {
+                continue;
+            }
             if is_root && self.is_stored_elsewhere(id) {
                 self.store_top_closures(Some(id))?;
                 continue;
@@ -688,6 +699,61 @@ impl Lowerer<'_> {
         let items = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(IrKind::Block { items, result })
+    }
+
+    /// Gives each function expression and `lazy` of the root block's
+    /// shadowed declarations, which lower to nothing and so are never made
+    /// (see [`crate::mentions`], "Shadowed declarations"), code that does
+    /// nothing, at `span`: the function table has an entry for every one.
+    fn stub_shadowed_functions(&mut self, span: Span) {
+        let ast = self.ast;
+        let root = ast.items(ast.root());
+        for (position, &id) in root.iter().enumerate() {
+            let ItemKind::Field { value, .. } = ast.item(id).kind else {
+                continue;
+            };
+            if !self.is_shadowed(position) {
+                continue;
+            }
+            for expr in ast.subtree(value) {
+                let (function, kind) = match ast.get(expr).kind {
+                    ExprKind::Fn(function) => match ast.fn_decl(function).effect {
+                        Effect::Memo => (function, FnKind::Memo),
+                        Effect::Pure | Effect::Impure => (function, FnKind::Function),
+                    },
+                    ExprKind::Lazy(function) => (function, FnKind::Future),
+                    _ => continue,
+                };
+                let params = u32::try_from(ast.params(ast.fn_decl(function).params).len())
+                    .unwrap_or(u32::MAX);
+                let body = self.builder.alloc(IrKind::Empty, span);
+                if let Some(entry @ None) = self.functions.get_mut(function.index()) {
+                    *entry = Some(FnCode {
+                        body,
+                        kind,
+                        frame_size: params,
+                        param_count: params,
+                        capture_count: 0,
+                        height: 1,
+                        name: None,
+                        display: Box::from(""),
+                        slot_names: Box::from([]),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Whether the item at `position` of the root block is a declaration a
+    /// later one shadows, which lowers to nothing and is in no record.
+    fn is_shadowed(&self, position: usize) -> bool {
+        self.resolution
+            .field_schedule()
+            .tree
+            .shadowed
+            .get(position)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Whether the root item `id` is a top-level function whose closure is
@@ -1346,7 +1412,10 @@ impl Lowerer<'_> {
         self.layout_names.clear();
         self.record_loads.clear();
         let mut spread = false;
-        for &id in items {
+        for (position, &id) in items.iter().enumerate() {
+            if is_root && self.is_shadowed(position) {
+                continue;
+            }
             let (path, value) = match self.ast.item(id).kind {
                 ItemKind::Field { path, value, .. } => (path, value),
                 ItemKind::Spread(operand) => {
@@ -5339,6 +5408,32 @@ mod tests {
             f.unwrap().value.to_string(),
             "{float = fn(x: Int): Float; f = 0.5}"
         );
+    }
+
+    #[test]
+    fn reads_of_shadowing_declarations_do_not_depend_on_order() {
+        // A read above, below or in a function sees the last of a run of
+        // shadowable declarations, each run kept in its order as one part.
+        let (shown, messages, lines) = order_free(&[
+            "x = a + 1",
+            "#[shadowable] a = 1\na = 2",
+            "fn get(): Int { a }",
+            "y = get()",
+            "#[shadowable] d = {j = 4}\nd.j = 8",
+            "z = d.j",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(shown, "{a: Int, d: {j: Int}, x: Int, y: Int, z: Int}");
+        // The shadowed declarations are lowered to nothing: no `4`.
+        assert!(
+            !lines.iter().any(|line| line.contains("int 4")),
+            "{lines:?}"
+        );
+        // And beside the prelude, whose names a dotted root shadows.
+        let (shown, messages, _) =
+            order_free_beside_prelude(&["n = len.x", "len.x = 1", "m = trim(\" a \")"]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert_eq!(shown, "{len: {x: Int}, m: String, n: Int}");
     }
 
     #[test]

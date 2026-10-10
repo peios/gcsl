@@ -109,9 +109,16 @@
 //! diagnostics.
 //!
 //! Every input is then checked and run as before, from the session's
-//! scope, with two additions to its context: the prelude's declarations as
-//! the yielding last source of its view, and `builtins` and the standard
-//! modules importable by name. To have them, an input is scanned beside
+//! scope, with two additions to its context: the prelude's declarations,
+//! through its implicit `#[shadowable] import * from prelude`, first of all
+//! in its view's order, which anything of their names shadows (see
+//! [`crate::workspace`], "Shadowable declarations"), and `builtins` and the
+//! standard modules importable by name. An input is no file, and cannot
+//! turn the prelude off: one marked `#![no_prelude]` is "`#![no_prelude]`
+//! applies only to a file". Its `#[shadowable]` marks are accepted, and are
+//! a file's within the input, but change nothing between inputs, since a
+//! later input shadows an earlier one's names already. To have them, an
+//! input is scanned beside
 //! every standard file as a lone file is beside those it needs, so that
 //! the standard files' cells are numbered as they were when the session
 //! started, its own cells taking the slots after the scope's
@@ -1681,6 +1688,41 @@ mod tests {
         assert_eq!(
             value(&mut session, "path.join(\"a\", \".\")"),
             Value::Str("a".into())
+        );
+    }
+
+    #[test]
+    fn an_input_has_the_prelude_and_its_attributes() {
+        let mut session = Session::new();
+        // An input is no file: it cannot turn the prelude off.
+        let failed = eval(&mut session, "#![no_prelude]\nx = 1").unwrap_err();
+        let shown: Vec<(&str, u32, u32)> = failed
+            .iter()
+            .map(|error| (error.message.as_str(), error.span.start, error.span.end))
+            .collect();
+        assert_eq!(shown, [("`#![no_prelude]` applies only to a file", 0, 14)]);
+        assert_eq!(value(&mut session, "len([1])"), Value::Int(1));
+        // `#[shadowable]` changes nothing between inputs, which shadow the
+        // earlier inputs' names already; within one, it is as in a file.
+        value(&mut session, "#[shadowable] a = 1");
+        value(&mut session, "a = 2");
+        assert_eq!(value(&mut session, "a"), Value::Int(2));
+        value(&mut session, "b = 1");
+        value(&mut session, "#[shadowable] b = 3");
+        assert_eq!(value(&mut session, "b"), Value::Int(3));
+        value(&mut session, "x = c\n#[shadowable] c = 1\nc = 4");
+        assert_eq!(value(&mut session, "x + c"), Value::Int(8));
+        // The attribute errors are a file's.
+        assert_eq!(
+            messages(&mut session, "#[shadowable] let d = 1"),
+            ["`#[shadowable]` applies only to a file's top-level fields, `def`s and imports"]
+        );
+        // A dotted root of a prelude name shadows it, as before.
+        value(&mut session, "len.x = 1");
+        assert_eq!(value(&mut session, "len.x"), Value::Int(1));
+        assert_eq!(
+            messages(&mut session, "len([1])"),
+            ["cannot call a value of type `{x: Int}`"]
         );
     }
 }

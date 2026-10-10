@@ -26,7 +26,8 @@ const PROMPT: &str = "> ";
 /// and a part of a diagnostic in the standard library, every file of which
 /// the session runs before the first line, against its file
 /// (`<stdlib>/prelude.gcsl` say). The prelude's names, `len`, `exec`,
-/// `split`, `join` and `sh` among them, are every line's, and a line may
+/// `split`, `join` and `sh` among them, are every line's (a line marked
+/// `#![no_prelude]` is an error: a line is no file), and a line may
 /// `import path`. A program a line runs with `exec` or `sh` reads the null
 /// device, never the REPL's own standard input, so the next line is still
 /// the REPL's; a `panic` is a runtime error of the line, which changes

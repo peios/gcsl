@@ -1,0 +1,3 @@
+#!/usr/bin/env gcsl
+# [this] is a comment
+#[shadowable] let jobs = 4

@@ -131,6 +131,22 @@
 //! runtime if it is not one; each holds its expression and its type, as an
 //! ascription does (see [`crate::check`]).
 //!
+//! # Attributes
+//!
+//! An item of a file's outermost block may be marked `#[shadowable]` (see
+//! the parser's [Attributes](crate::parser#attributes)), and the file
+//! itself `#![no_prelude]`. Neither fits in an [`Item`], which stays 36
+//! bytes: the marked items are kept in a side table of the tree
+//! ([`Ast::is_shadowable`]), and the file's attribute as the span it is
+//! written at ([`Ast::no_prelude`]). A workspace gives every file whose
+//! tree has no `#![no_prelude]` an *implicit* `#[shadowable] import * from
+//! prelude` ([`Ast::add_implicit_import`]): an import item of the tree's
+//! arenas, written nowhere (its spans are `0..0`), which is not among the
+//! items of the file's body, so that no item's position, span or line moves,
+//! and which the workspace takes as the first of the file's imports
+//! ([`Ast::implicit_import`]; see [`crate::workspace`]). The printer shows
+//! the attributes as written and nothing of the implicit import.
+//!
 //! An [`Ast`] is built through an [`AstBuilder`]: nodes are allocated
 //! children-first, and the builder is finished once the root is known, so an
 //! `Ast` always has a valid root. The `Ast` also owns the [`Names`] table its
@@ -1395,6 +1411,8 @@ pub struct AstBuilder {
     labels: Vec<Label>,
     imports: Vec<ImportDecl>,
     import_members: Vec<ImportMember>,
+    shadowable: Vec<ItemId>,
+    no_prelude: Option<Span>,
 }
 
 impl AstBuilder {
@@ -1572,6 +1590,27 @@ impl AstBuilder {
         }
     }
 
+    /// Marks the item `id` `#[shadowable]` (see [Attributes](#attributes)).
+    pub fn mark_shadowable(&mut self, id: ItemId) {
+        let at = self.shadowable.partition_point(|&marked| marked.0 < id.0);
+        if self.shadowable.get(at) != Some(&id) {
+            self.shadowable.insert(at, id);
+        }
+    }
+
+    /// Records that the file is marked `#![no_prelude]`, written at `span`
+    /// (see [Attributes](#attributes)).
+    pub fn set_no_prelude(&mut self, span: Span) {
+        self.no_prelude = Some(span);
+    }
+
+    /// Where the file's `#![no_prelude]` is written, if it is marked so
+    /// already.
+    #[must_use]
+    pub fn no_prelude(&self) -> Option<Span> {
+        self.no_prelude
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -1635,6 +1674,9 @@ impl AstBuilder {
             labels: self.labels,
             imports: self.imports,
             import_members: self.import_members,
+            shadowable: self.shadowable,
+            no_prelude: self.no_prelude,
+            implicit_import: None,
             root,
             names,
             strings,
@@ -1662,6 +1704,13 @@ pub struct Ast {
     labels: Vec<Label>,
     imports: Vec<ImportDecl>,
     import_members: Vec<ImportMember>,
+    /// The items marked `#[shadowable]`, in id order.
+    shadowable: Vec<ItemId>,
+    /// Where the file's `#![no_prelude]` is written, if it has one.
+    no_prelude: Option<Span>,
+    /// The implicit `#[shadowable] import * from prelude`, if a workspace
+    /// gave the file one.
+    implicit_import: Option<ItemId>,
     root: ItemRange,
     names: Names,
     strings: Strings,
@@ -1891,6 +1940,75 @@ impl Ast {
     #[must_use]
     pub fn root(&self) -> ItemRange {
         self.root
+    }
+
+    /// Whether the item `id` is marked `#[shadowable]`, the implicit import
+    /// included (see [Attributes](#attributes)).
+    #[must_use]
+    pub fn is_shadowable(&self, id: ItemId) -> bool {
+        self.shadowable
+            .binary_search_by_key(&id.0, |marked| marked.0)
+            .is_ok()
+    }
+
+    /// Whether an item of the file's own is marked `#[shadowable]`, the
+    /// implicit import aside: without one, nothing of the file is shadowed.
+    #[must_use]
+    pub fn marks_any(&self) -> bool {
+        self.shadowable
+            .iter()
+            .any(|&marked| Some(marked) != self.implicit_import)
+    }
+
+    /// Where the file's `#![no_prelude]` is written, if it is marked so.
+    #[must_use]
+    pub fn no_prelude(&self) -> Option<Span> {
+        self.no_prelude
+    }
+
+    /// The implicit `#[shadowable] import * from prelude` a workspace gave
+    /// the file, if it has one (see [Attributes](#attributes)).
+    #[must_use]
+    pub fn implicit_import(&self) -> Option<ItemId> {
+        self.implicit_import
+    }
+
+    /// Gives the file its implicit `#[shadowable] import * from prelude`,
+    /// `prelude` being the name of the prelude's stem: an import item of the
+    /// tree written nowhere, kept apart from the file's body (see
+    /// [Attributes](#attributes)). Does nothing to a file marked
+    /// `#![no_prelude]` or given one already.
+    pub fn add_implicit_import(&mut self, prelude: Name) {
+        if self.no_prelude.is_some() || self.implicit_import.is_some() {
+            return;
+        }
+        let nowhere = Span::new(0, 0);
+        let path_start = next_id(self.paths.len());
+        self.paths.push(PathSegment {
+            kind: SegmentKind::Name(prelude),
+            span: nowhere,
+        });
+        let members_start = next_id(self.import_members.len());
+        self.import_members.push(ImportMember::All(nowhere));
+        let import = ImportId(next_id(self.imports.len()));
+        self.imports.push(ImportDecl {
+            path: PathRange {
+                start: path_start,
+                len: 1,
+            },
+            form: ImportForm::Members(ImportMemberRange {
+                start: members_start,
+                len: 1,
+            }),
+        });
+        let item = ItemId(next_id(self.items.len()));
+        self.items.push(Item {
+            kind: ItemKind::Import(import),
+            span: nowhere,
+        });
+        self.implicit_import = Some(item);
+        let at = self.shadowable.partition_point(|&marked| marked.0 < item.0);
+        self.shadowable.insert(at, item);
     }
 
     /// The span of the file's body: from its first item to its last, or an
@@ -2173,8 +2291,12 @@ impl Annotate for NoAnnotation {
 /// span) and expressions as their nodes. `(if ...)` is followed by its
 /// condition, its block and its else branch, which for an `if` without
 /// `else` is the parser's empty block. Operators print as their symbol,
-/// except negation, `(neg ...)`. The file has no span. There is no trailing
-/// newline.
+/// except negation, `(neg ...)`. The file has no span. An item marked
+/// `#[shadowable]` is preceded by the attribute, as in `#[shadowable] (field
+/// arch ...)`, and a file marked `#![no_prelude]` has it after `file`, as in
+/// `(file #![no_prelude] ...)`; the implicit import a workspace gives a
+/// file is not printed (see [Attributes](crate::ast#attributes)). There is
+/// no trailing newline.
 pub struct Pretty<'a, A> {
     ast: &'a Ast,
     annotation: &'a A,
@@ -2229,7 +2351,12 @@ impl<A: Annotate> Pretty<'_, A> {
     fn item(&self, f: &mut fmt::Formatter<'_>, id: ItemId, depth: usize) -> fmt::Result {
         let item = self.ast.item(id);
         let ast = self.ast;
-        write!(f, "{:indent$}(", "", indent = depth * 2)?;
+        let marked = if ast.is_shadowable(id) {
+            "#[shadowable] "
+        } else {
+            ""
+        };
+        write!(f, "{:indent$}{marked}(", "", indent = depth * 2)?;
         let value = match item.kind {
             ItemKind::Let {
                 path,
@@ -2676,6 +2803,9 @@ impl<A: Annotate> Pretty<'_, A> {
 impl<A: Annotate> fmt::Display for Pretty<'_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("(file")?;
+        if self.ast.no_prelude.is_some() {
+            f.write_str(" #![no_prelude]")?;
+        }
         self.items(f, self.ast.root, 1)?;
         f.write_str(")")
     }

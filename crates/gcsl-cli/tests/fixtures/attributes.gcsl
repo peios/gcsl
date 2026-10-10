@@ -1,0 +1,5 @@
+#![no_prelude]
+import len from builtins
+#[shadowable] jobs = 4
+jobs = 8
+n = len([jobs])

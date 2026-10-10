@@ -2317,9 +2317,9 @@ fn run_renders_the_alias_rule_and_the_prelude() {
          \x202 | len = 3\n\
          \x20  | --- defined here\n\
          \x20  |\n\
-         \x20 ::: <stdlib>/prelude.gcsl:16:1\n\
+         \x20 ::: <stdlib>/prelude.gcsl:17:1\n\
          \x20  |\n\
-         16 | len = builtins.len\n\
+         17 | len = builtins.len\n\
          \x20  | --- defined here\n"
     );
     assert_eq!(output.status.code(), Some(1));
@@ -2440,9 +2440,9 @@ fn a_failing_sh_is_rendered_in_the_prelude() {
     assert_eq!(
         stderr(&output),
         "error: `echo nope >&2; exit 2` exited with status 2: nope\n\
-         \x20 --> <stdlib>/prelude.gcsl:43:9\n\
+         \x20 --> <stdlib>/prelude.gcsl:44:9\n\
          \x20  |\n\
-         43 |         panic(\"`{script}` exited with status {result.status}: {trim(result.stderr)}\")\n\
+         44 |         panic(\"`{script}` exited with status {result.status}: {trim(result.stderr)}\")\n\
          \x20  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(1));
@@ -2567,6 +2567,93 @@ fn repl_runs_programs_and_reads_its_next_line() {
          \x20 |\n\
          1 | panic(\"no\")\n\
          \x20 | ^^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The summary of slice 31: a default marked `#[shadowable]`, shadowed by a
+/// file importing it, which the file it is declared in still has.
+#[test]
+fn run_shadows_a_shadowable_default() {
+    let output = gcsl(&["run", "tests/fixtures/ws_shadowable/pkg/build.gcsl"]);
+    assert_eq!(stdout(&output), "{arch = \"aarch64\"; j = 4}\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/ws_shadowable/_lib/defaults.gcsl"]);
+    assert_eq!(stdout(&output), "{arch = \"x86_64\"; jobs = 4}\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// An attribute error, after a shebang and a comment that looks like an
+/// attribute but is not one, rendered at the attribute.
+#[test]
+fn run_renders_an_attribute_error() {
+    let output = gcsl(&["run", "tests/fixtures/attribute_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `#[shadowable]` applies only to a file's top-level fields, `def`s and imports\n\
+         \x20--> tests/fixtures/attribute_error.gcsl:3:1\n\
+         \x20 |\n\
+         3 | #[shadowable] let jobs = 4\n\
+         \x20 | ^^^^^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a `let` or `fn` already shadows\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `#![no_prelude]` and `#[shadowable]` run, and the dumps show them.
+#[test]
+fn run_dumps_attributes() {
+    let output = gcsl(&["run", "tests/fixtures/attributes.gcsl"]);
+    assert_eq!(stdout(&output), "{jobs = 8; n = 1}\n");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/attributes.gcsl", "--dump-ast"]);
+    assert_eq!(
+        stdout(&output),
+        "(file #![no_prelude]\n\
+         \x20 (import len from builtins @15..39)\n\
+         \x20 #[shadowable] (field jobs @54..62\n\
+         \x20   (int 4 @61..62))\n\
+         \x20 (field jobs @63..71\n\
+         \x20   (int 8 @70..71))\n\
+         \x20 (field n @72..87\n\
+         \x20   (call @76..87\n\
+         \x20     (name len @76..79)\n\
+         \x20     (list @80..86\n\
+         \x20       (name jobs @81..85)))))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/attributes.gcsl", "--dump-tokens"]);
+    assert!(
+        stdout(&output).starts_with("InnerAttribute(no_prelude) @0..14\nNewline @14..15\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("\nAttribute(shadowable) @40..53\n"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// The REPL: an input cannot turn the prelude off, and `#[shadowable]`
+/// changes nothing between inputs.
+#[test]
+fn repl_has_attributes_of_its_own() {
+    let output = repl("#![no_prelude]\n#[shadowable] a = 1\na = 2\na\n");
+    assert_eq!(
+        stdout(&output),
+        "{a = 1} : {a: Int}\n{a = 2} : {a: Int}\n2 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: `#![no_prelude]` applies only to a file\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | #![no_prelude]\n\
+         \x20 | ^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

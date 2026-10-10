@@ -26,7 +26,10 @@
 //!
 //! One leaf path declared in two files of a directory, and a leaf under a
 //! leaf or over an interior node of another file of it, are errors, found
-//! while the directory's tree is merged ([`scan`]).
+//! while the directory's tree is merged ([`scan`]), unless the earlier is
+//! shadowable (see [Shadowable declarations](#shadowable-declarations)):
+//! the directory's tree has the winner of each leaf, which every file of
+//! the directory sees.
 //!
 //! # The view of a file
 //!
@@ -39,10 +42,13 @@
 //! turn; a leaf (a `def` among them) and anything else of one name is a
 //! conflict, except that one cell reached twice is one node (`*` from the
 //! file's own directory, from a directory above, from one directory twice,
-//! or a file's part of a node also reached whole): merging is idempotent.
-//! A whole import (`import PATH [as NAME]`) is not merged: it is a name of
-//! its own (see [Imports](#imports)), and one named like a root of the
-//! view is still an error.
+//! or a file's part of a node also reached whole): merging is idempotent;
+//! and except that a leaf shadows what it overlaps, or is shadowed, when
+//! the earlier of the two is shadowable (see [Shadowable
+//! declarations](#shadowable-declarations)). A whole import (`import PATH
+//! [as NAME]`) is not merged: it is a name of its own (see
+//! [Imports](#imports)), and one named like a root of the view is still an
+//! error, but for a root that is shadowable, which it shadows.
 //!
 //! Only what several sources have is stored ([`File::view`]): a node one
 //! source alone has is that source's node, read as it always was, so a
@@ -85,6 +91,68 @@
 //! is labelled "imported here" at its `*` or member, with an excerpt of the
 //! imported definition, "defined here"; a directory above the file's own
 //! among the two adds the note "one is in a directory above".
+//!
+//! # Shadowable declarations
+//!
+//! A top-level field (a dotted one or a `def` included) or an `import` of
+//! any form may be marked `#[shadowable]` (see the parser's
+//! [Attributes](crate::parser#attributes)): it may then be shadowed by a
+//! later declaration of its name. A LEAF is *shadowable* if its declaration
+//! is marked ([`crate::mentions::FieldLeaf::shadowable`],
+//! [`Node::shadowable`]), if it reaches a view through a marked import
+//! ([`File::marked`], [`ViewPart::marked`]), or if it was shadowable where
+//! it was declared: the mark travels with the leaf through directory merges
+//! and imports. A node is shadowable when all its leaves are.
+//!
+//! Every declaration and import reaching a file's view has a place in one
+//! STATIC order, the same for every reader: the implicit import of the
+//! prelude (below) first of all; then the directories from the root down to
+//! the file's own; within one directory, its files in path order, each top
+//! to bottom; and a file's imports at their lines in it, among its own
+//! declarations, though they take part in its view only (`Rank`). A later
+//! declaration shadows every earlier one it OVERLAPS (at its path, at a
+//! prefix of it, or under it) if every one of those is shadowable, and
+//! conflicts as before if one is not; two interior nodes do not overlap at
+//! their own name, and merge. So a plain leaf is shadowed by nothing, of
+//! shadowable ones the last stands, and a declaration whose path is above
+//! or below a shadowable one replaces it whole: `#[shadowable] d = {j = 4;
+//! k = 5}` then `d.j = 8` is `d = {j = 8}`, a record written whole being no
+//! tree (defaults meant to be overridden field by field are written dotted,
+//! `#[shadowable] d.j = 4`); `#[shadowable] a.x = 1` then `a.y = 2` do not
+//! overlap, and merge. Of one cell reached both through a marked import and
+//! plainly (`import * from prelude` written, beside the implicit one), the
+//! plain one stands, and conflicts as any import does.
+//!
+//! SHADOWING IS PER VIEW. Within one directory the files' declarations are
+//! swept together in the order before its tree is merged (`shadow`, with
+//! [`crate::mentions::Sweep`]; within one file, [`crate::mentions::scan`]):
+//! a declaration beaten there, in its own directory's tree, is in no tree,
+//! a leaf of nothing: its file's mentions are found without it, nothing
+//! reads it, it is never run, and it takes no part in cycles or needs, but
+//! it is still checked as written (see the checker's "Shadowed
+//! declarations"), its reads of cells it alone would need seeing them as
+//! erroneous. So within one file the last declaration is the leaf for the
+//! whole file, a read above it included, and a shadowing declaration
+//! cannot read what it shadows (`#[shadowable] a = 1` then `a = a + 1` is
+//! "`a` depends on itself"). A declaration beaten only in SOME views, by
+//! an inner directory's declaration or by a file's own later import, which
+//! is private, stays its directory's leaf and runs for the views that
+//! still see it: only the view where it is beaten has the winner, the
+//! view's node of its name being the winner's alone ([`Merged::One`],
+//! `shadow_parts`), and a file's own record still has its own cells. A
+//! member or `*` import gone from a view is no alias of its file
+//! ([`File::aliases`]). An interior node of the file's own directory with
+//! leaves both before and after an import of the file that overlaps it
+//! would stand only in part, which a view cannot hold: that is the conflict,
+//! conservatively.
+//!
+//! The clash family ignores what is shadowable: a member or `*` import
+//! that is clashes with nothing, a whole import named like a shadowable
+//! root takes its name in the view silently, and in the file that declares
+//! it a top-level `let` (from its item on) or `fn` (in the whole file) of
+//! the name of a shadowable root is read in its place, as it was of the
+//! prelude's names (see [`FileScope::yields`] and the checker's
+//! "Imports").
 //!
 //! # Order
 //!
@@ -214,8 +282,8 @@
 //!
 //! EACH STANDARD FILE IS A DIRECTORY SCOPE OF ITS OWN, a directory with no
 //! directory above, whose path is [`STANDARD_DIR`]: it sees its own
-//! declarations, the prelude's through its implicit `import * from
-//! prelude` (below; yielding, as for any file), and what it imports, by
+//! declarations, the prelude's through its implicit `#[shadowable] import *
+//! from prelude` (below, as for any file), and what it imports, by
 //! bare name, `builtins` and the other standard files; nothing else of the
 //! standard library and nothing of the workspace, and nothing of the
 //! workspace sees its declarations but by an import. So two standard files
@@ -272,16 +340,19 @@
 //! built-in functions"); a session gets it with the rest of the standard
 //! library's run.
 //!
-//! Every file but `prelude.gcsl` itself, the standard files included,
-//! begins as if with `import * from prelude`, as the last source of its
-//! view, after its directory chain and its own imports: an *implicit*
-//! member alias for each root of the prelude ([`Alias::implicit`]), except
-//! each that any earlier source has (a root of its directory chain, its
-//! own declarations among them, or a name it imports), which is dropped,
-//! shadowed silently rather than a conflict. Its names are invisible to the
-//! clash family: an implicit alias clashes with nothing, and a name it
-//! binds yields to any binding of the file of its name, a top-level `let`
-//! or `fn` included ([`FileScope::yields`]). An explicit `import * from
+//! Every file whose first items do not include `#![no_prelude]`, the
+//! standard files included, and every session's input, begins as if with
+//! `#[shadowable] import * from prelude`: the parse gives its tree the
+//! import, an item written nowhere and kept apart from its body
+//! ([`Ast::implicit_import`]), so that no span or line moves; the scan
+//! takes it first of all in the static order (see [Shadowable
+//! declarations](#shadowable-declarations)), its aliases last among the
+//! file's ([`Alias::implicit`]), so that the others keep their numbers. So
+//! any declaration or import of one of its names, or of a path below one,
+//! shadows the prelude's silently, wherever it is, and the clash family
+//! ignores them; the aliases of those it shadows are gone from the file.
+//! `prelude.gcsl` is marked `#![no_prelude]` itself, and a file so marked
+//! has no prelude name but those it imports. An explicit `import * from
 //! prelude` is an ordinary `*`, and conflicts as one.
 //!
 //! A file outside any workspace (`gcsl run` of a lone file, [`check_lone`])
@@ -295,8 +366,12 @@
 //! [`crate::session`]), beside every standard file, as the session loaded
 //! them when it started, so that their cells are numbered as they were
 //! there; it inherits the imports of the session's earlier inputs, after
-//! its own and before the implicit prelude, but for each it imports again
-//! or declares at its top level.
+//! its own, last in the static order, but for each it imports again or
+//! declares at its top level. An input is no file: one marked
+//! `#![no_prelude]` is "`#![no_prelude]` applies only to a file"
+//! (`no_prelude_in_input`). Its `#[shadowable]` marks are a file's within
+//! it, and change nothing between inputs, a later one shadowing an earlier
+//! one's names already.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -312,7 +387,7 @@ use crate::diagnostic::Diagnostic;
 use crate::eval::MemoTables;
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
-use crate::mentions::{self, Mentions, Need, Resolve, Schedule};
+use crate::mentions::{self, Mentions, Need, Resolve, Schedule, Sweep};
 use crate::names::{Name, Names};
 use crate::parser;
 use crate::session;
@@ -445,7 +520,10 @@ pub struct File {
     /// For each of its own top-level functions, its index in
     /// [`Scan::functions`].
     pub functions: Vec<u32>,
-    /// The names it imports, in source order (a `*` gives one per root).
+    /// The names it imports, in source order (a `*` gives one per root),
+    /// then those a session's input inherits, then the implicit prelude's;
+    /// but a member or `*` import that something shadows, gone from its
+    /// view (see the module documentation, "Shadowable declarations").
     pub aliases: Vec<Alias>,
     /// Its view: the nodes several of its sources have, merged.
     pub view: View,
@@ -457,6 +535,17 @@ pub struct File {
 }
 
 impl File {
+    /// Whether `alias`, one of the file's, is imported by an import marked
+    /// `#[shadowable]` (the implicit one of the prelude among them), which
+    /// makes every leaf it brings shadowable (see the module documentation,
+    /// "Shadowable declarations"); an import a session's input inherits is
+    /// not, which only the input's declarations shadow
+    /// ([`inherit_imports`]).
+    #[must_use]
+    pub fn marked(&self, alias: &Alias) -> bool {
+        alias.item.is_some_and(|item| self.ast.is_shadowable(item))
+    }
+
     /// The file at `path` in directory `dir`, parsed to `ast`, spelling
     /// `spelled`, with its declarations found and nothing else yet.
     fn new(path: &str, dir: u32, ast: Ast, spelled: Vec<Name>) -> Self {
@@ -501,6 +590,11 @@ pub struct Node {
     pub leaf: Option<u32>,
     /// The files with a leaf at or under it, in path order.
     pub contributors: Vec<u32>,
+    /// Whether it is shadowable: a leaf whose declaration is marked
+    /// `#[shadowable]`, or an interior node all of whose leaves are (see the
+    /// module documentation, "Shadowable declarations"). A built-in
+    /// function's is not.
+    pub shadowable: bool,
 }
 
 /// A top-level function of a file of the workspace.
@@ -549,18 +643,21 @@ pub struct Alias {
     /// prelude` and for an import a session's input inherits from an
     /// earlier input, whose source is not this one.
     pub span: Span,
-    /// The `import` item; `None` for the implicit `import * from prelude`,
-    /// and for an import a session's input inherits from an earlier input.
+    /// The `import` item (the implicit one, [`Ast::implicit_import`],
+    /// included); `None` for an import a session's input inherits from an
+    /// earlier input.
     pub item: Option<ItemId>,
     /// What it names.
     pub target: Target,
     /// Whether it is a whole import (`import PATH`, `import PATH as NAME`),
     /// a name of its own; a member or a root of a `*` is merged into the
-    /// file's view instead.
+    /// file's view instead. Whether its import is marked `#[shadowable]`,
+    /// which makes every leaf it brings shadowable, its file's tree says
+    /// ([`File::marked`]).
     pub whole: bool,
-    /// Whether it is a root of the implicit `import * from prelude`, which
-    /// yields to every other source and binding of its name (see the module
-    /// documentation, "The standard library").
+    /// Whether it is a root of the implicit `#[shadowable] import * from
+    /// prelude`, first of all in the static order (see the module
+    /// documentation, "Shadowable declarations").
     pub implicit: bool,
     /// Whether a session's input inherits it from an earlier input, which
     /// the input's declarations shadow and which clashes with nothing (see
@@ -582,6 +679,12 @@ pub struct ViewPart {
     /// its own path (an import of such a node at its own path is the same
     /// cell, merged into it).
     pub chain: bool,
+    /// Whether it is reached through an import marked `#[shadowable]`,
+    /// which makes every leaf at or under it shadowable whatever its
+    /// declaration says (see the module documentation, "Shadowable
+    /// declarations"). Of one cell reached several ways, it is marked only
+    /// if every way is.
+    pub marked: bool,
 }
 
 impl ViewPart {
@@ -592,6 +695,7 @@ impl ViewPart {
             source,
             target: Target::Node(node),
             chain: true,
+            marked: false,
         }
     }
 }
@@ -1135,9 +1239,9 @@ pub struct FileScope<'a> {
     /// What each name the file imports names; of a name several sources
     /// have, the view's node says.
     aliases: HashMap<Name, Target>,
-    /// The names only the implicit `import * from prelude` binds, which
-    /// yield to any binding of the file ([`FileScope::yields`]).
-    implicit: Vec<Name>,
+    /// The names an import binds that is shadowable, the implicit `import *
+    /// from prelude`'s among them ([`FileScope::yields`]).
+    shadowable: Vec<Name>,
     /// The names of the imports a session's input inherits from earlier
     /// inputs ([`FileScope::inherited`]).
     inherited: Vec<Name>,
@@ -1160,10 +1264,10 @@ impl<'a> FileScope<'a> {
             global: &file.global,
             local,
             aliases: file.aliases.iter().map(|a| (a.name, a.target)).collect(),
-            implicit: file
+            shadowable: file
                 .aliases
                 .iter()
-                .filter(|a| a.implicit)
+                .filter(|a| file.marked(a) || (!a.whole && scan.target_shadowable(a.target)))
                 .map(|a| a.name)
                 .collect(),
             inherited: file
@@ -1185,13 +1289,28 @@ impl<'a> FileScope<'a> {
         self.inherited.contains(&name)
     }
 
-    /// Whether the root `name` is one only the implicit `import * from
-    /// prelude` binds, which yields to any binding of the file of its name,
-    /// a top-level `let` or `fn` included, and clashes with none (see the
-    /// module documentation, "The standard library").
+    /// Whether what the root `name` means in the file's view is shadowable
+    /// (see the module documentation, "Shadowable declarations"): the
+    /// prelude's names that nothing else has among them. A binding the file
+    /// declares of its own of the name, a top-level `let` or `fn`, shadows
+    /// it, as an earlier session input's variable does, and the clash family
+    /// ignores it.
     #[must_use]
     pub fn yields(&self, name: Name) -> bool {
-        self.implicit.contains(&name)
+        if let Some(&merged) = self.view.merged.get(&(ROOT, name)) {
+            return match merged {
+                Merged::One(part) => self.scan.part_shadowable(part),
+                Merged::View(view) => self.scan.target_shadowable(Target::View(view)),
+            };
+        }
+        if let Some(&node) = self
+            .scan
+            .chain(self.dir)
+            .find_map(|dir| self.scan.by_name.get(&(dir, ROOT, name)))
+        {
+            return self.scan.target_shadowable(Target::Node(node));
+        }
+        self.shadowable.contains(&name)
     }
 
     /// Where the numbers of the merged nodes start: after the file's own
@@ -1426,8 +1545,9 @@ enum Placing<'a> {
     /// One file outside any workspace, a lone file or a session's input, in
     /// the root directory by the last part of its name, with the imports of
     /// the session's earlier inputs it inherits (see [`inherit_imports`]),
-    /// none for a lone file.
-    Lone(&'a [Alias]),
+    /// none for a lone file, and whether it is a session's input, which
+    /// cannot be marked `#![no_prelude]` ([`no_prelude_in_input`]).
+    Lone(&'a [Alias], bool),
 }
 
 /// [`scan_with`] of `sources` placed as `placing` says, beside `library`,
@@ -1460,7 +1580,7 @@ fn scan_into(
         values: Vec::new(),
         standard: 0,
         builtins_dir: 0,
-        lone: matches!(placing, Placing::Lone(_)),
+        lone: matches!(placing, Placing::Lone(..)),
         relocation: None,
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
@@ -1508,17 +1628,20 @@ fn scan_files(
     for ((source, &dir), (ast, spelled)) in sorted.iter().zip(&user_dirs).zip(parsed) {
         let path = match placing {
             Placing::Workspace(_) => source.name(),
-            Placing::Lone(_) => source.name().rsplit('/').next().unwrap_or(""),
+            Placing::Lone(..) => source.name().rsplit('/').next().unwrap_or(""),
         };
         scan.files.push(File::new(path, dir, ast, spelled));
     }
     let mut errors = Vec::new();
-    if matches!(placing, Placing::Workspace(_)) {
-        reserved(scan, library, &mut errors);
+    match placing {
+        Placing::Workspace(_) => reserved(scan, library, &mut errors),
+        Placing::Lone(_, true) => no_prelude_in_input(scan, &mut errors),
+        Placing::Lone(_, false) => {}
     }
     if !errors.is_empty() {
         return Err(errors);
     }
+    shadow(scan);
     scan.roots = vec![Vec::new(); scan.dirs.len()];
     builtin_nodes(scan);
     for file in 0..count(scan.files.len()) {
@@ -1527,6 +1650,7 @@ fn scan_files(
     if !errors.is_empty() {
         return Err(errors);
     }
+    shadowable_nodes(scan);
     let mut base = 0u32;
     scan.part_base = scan
         .files
@@ -1539,7 +1663,7 @@ fn scan_files(
         .collect();
     let (nested, inherited) = match placing {
         Placing::Workspace(nested) => (nested, &[][..]),
-        Placing::Lone(inherited) => (&[][..], inherited),
+        Placing::Lone(inherited, _) => (&[][..], inherited),
     };
     imports(scan, &dirs, (nested, inherited), &mut errors);
     if !errors.is_empty() {
@@ -1689,7 +1813,7 @@ fn place_dirs(
             Placing::Workspace(_) => {
                 intern_dir(&mut scan.dirs, &mut dirs, parent_path(source.name()))
             }
-            Placing::Lone(_) => 0,
+            Placing::Lone(..) => 0,
         })
         .collect();
     (dirs, user_dirs)
@@ -1711,6 +1835,7 @@ fn builtin_nodes(scan: &mut Scan) {
             dir,
             leaf: None,
             contributors: Vec::new(),
+            shadowable: false,
         });
         scan.by_name.insert((dir, ROOT, name), node);
         if let Some(roots) = scan.roots.get_mut(dir as usize) {
@@ -1747,6 +1872,94 @@ fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnostic>) {
         }
         reported.push(name);
         errors.push(Diagnostic::error(message, Span::new(0, 0)).in_input(index));
+    }
+}
+
+/// Reports the `#![no_prelude]` of a session's input, the scan's one file
+/// after the standard files: "`#![no_prelude]` applies only to a file", at
+/// the attribute, since an input is no file and always has the prelude.
+fn no_prelude_in_input(scan: &Scan, errors: &mut Vec<Diagnostic>) {
+    for (index, file) in (0u32..).zip(&scan.files).skip(scan.standard as usize) {
+        if let Some(span) = file.ast.no_prelude() {
+            errors.push(
+                Diagnostic::error("`#![no_prelude]` applies only to a file", span).in_input(index),
+            );
+        }
+    }
+}
+
+/// Sweeps the declarations of the files of each directory together, in the
+/// static order (path order, then each file's source order), and gives each
+/// file whose declarations a later one shadows, in it or in a later file of
+/// its directory, its mentions found again without them (see the module
+/// documentation, "Shadowable declarations"): a declaration beaten within
+/// its own directory's tree is in no tree, and is not a leaf of anything.
+/// Each file's own sweep, [`mentions::scan`], found those a later one of its
+/// own shadows already; only those a later file shadows are new.
+fn shadow(scan: &mut Scan) {
+    // Only a marked declaration is ever shadowed: a directory none of whose
+    // files marks one is not swept.
+    let marked: HashSet<u32> = scan
+        .files
+        .iter()
+        .filter(|file| file.ast.marks_any())
+        .map(|file| file.dir)
+        .collect();
+    if marked.is_empty() {
+        return;
+    }
+    let mut sweeps: HashMap<u32, Sweep<(u32, usize)>> = HashMap::new();
+    let mut shadowed: Vec<Option<Vec<bool>>> = vec![None; scan.files.len()];
+    for (index, file) in (0u32..).zip(&scan.files) {
+        if !marked.contains(&file.dir) {
+            continue;
+        }
+        let sweep = sweeps.entry(file.dir).or_default();
+        for (position, names, shadowable) in mentions::declarations(&file.ast) {
+            let killed = sweep.declare(&names, (index, position), shadowable);
+            for (owner, at) in killed.unwrap_or_default() {
+                let Some(known) = scan.files.get(owner as usize) else {
+                    continue;
+                };
+                if known.mentions.shadowed.get(at) == Some(&true) {
+                    continue;
+                }
+                let Some(entry) = shadowed.get_mut(owner as usize) else {
+                    continue;
+                };
+                let entry = entry.get_or_insert_with(|| known.mentions.shadowed.clone());
+                if let Some(flag) = entry.get_mut(at) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+    for (file, shadowed) in scan.files.iter_mut().zip(shadowed) {
+        if let Some(shadowed) = shadowed {
+            file.mentions = mentions::scan_except(&file.ast, &shadowed);
+        }
+    }
+}
+
+/// Marks each interior node of every directory's merged tree shadowable if
+/// all its leaves are (a leaf is marked as it is merged): a child comes
+/// after its parent in [`Scan::nodes`], so its mark is known first.
+fn shadowable_nodes(scan: &mut Scan) {
+    for index in (0..scan.nodes.len()).rev() {
+        let Some(node) = scan.nodes.get(index) else {
+            continue;
+        };
+        if node.leaf.is_some() || node.children.is_empty() {
+            continue;
+        }
+        let shadowable = node.children.iter().all(|&child| {
+            scan.nodes
+                .get(child as usize)
+                .is_some_and(|child| child.shadowable)
+        });
+        if let Some(node) = scan.nodes.get_mut(index) {
+            node.shadowable = shadowable;
+        }
     }
 }
 
@@ -1794,6 +2007,12 @@ fn parse(source: &SourceFile, names: &mut Names) -> Result<(Ast, Vec<Name>), Dia
     spelled.dedup();
     let mut ast = builder.finish(root, mem::take(names), strings);
     *names = ast.replace_names(Names::new());
+    // Every file but one marked `#![no_prelude]` has the implicit
+    // `#[shadowable] import * from prelude` (see "Shadowable
+    // declarations").
+    if ast.no_prelude().is_none() {
+        ast.add_implicit_import(names.intern(PRELUDE));
+    }
     Ok((ast, spelled))
 }
 
@@ -1870,6 +2089,7 @@ fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
                 dir,
                 leaf: None,
                 contributors: Vec::new(),
+                shadowable: false,
             });
             scan.by_name.insert(key, merged);
             if let Some(up) = scan.nodes.get_mut(parent as usize) {
@@ -1882,6 +2102,7 @@ fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
         if let Some(target) = scan.nodes.get_mut(merged as usize) {
             if node.leaf.is_some() && target.leaf.is_none() && target.children.is_empty() {
                 target.leaf = Some(file);
+                target.shadowable = node.shadowable;
             }
             if target.contributors.last() != Some(&file) {
                 target.contributors.push(file);
@@ -1975,9 +2196,15 @@ enum Level {
 type Conflict = (u32, Name, Vec<ViewPart>);
 
 /// A file's view as [`file_view`] finds it: its nodes, numbered from 0,
-/// what the merge made of each name several sources have, and the
-/// conflicts.
-type FileView = (Vec<ViewNode>, HashMap<(u32, Name), Merged>, Vec<Conflict>);
+/// what the merge made of each name several sources have, the conflicts,
+/// and the imports gone from it, by their indices among the file's
+/// aliases.
+type FileView = (
+    Vec<ViewNode>,
+    HashMap<(u32, Name), Merged>,
+    Vec<Conflict>,
+    Vec<u32>,
+);
 
 /// What identifies one side of a conflict, so that a conflict seen from
 /// several files' views is reported once: its node, and for an import the
@@ -2089,27 +2316,89 @@ impl Scan {
 
     /// `parts`, the nodes several sources have at one name, with the same
     /// cell reached twice taken once: a node met again, and a file's part
-    /// of a merged node also met whole. Merging is idempotent.
+    /// of a merged node also met whole. Merging is idempotent. A cell
+    /// reached both through a `#[shadowable]` import and plainly is the
+    /// plain one, which stands (see the module documentation, "Shadowable
+    /// declarations"): of two reachings of one node, the one kept is the
+    /// first but for a marked one met again plainly, which the plain one
+    /// replaces, its place in the order with it; and the node a file's part
+    /// is met as whole is marked only if the part is too.
     fn same_cells(&self, parts: &[ViewPart]) -> Vec<ViewPart> {
         let whole = |part: &ViewPart| match part.target {
             Target::Part { file, node } => self
                 .files
                 .get(file as usize)
                 .and_then(|f| f.global.get(node as usize))
-                .is_some_and(|&merged| {
-                    parts
-                        .iter()
-                        .any(|other| other.target == Target::Node(merged))
-                }),
-            _ => false,
+                .copied(),
+            _ => None,
         };
         let mut kept: Vec<ViewPart> = Vec::with_capacity(parts.len());
         for part in parts {
-            if !kept.iter().any(|k| k.target == part.target) && !whole(part) {
-                kept.push(*part);
+            if let Some(same) = kept.iter_mut().find(|k| k.target == part.target) {
+                if same.marked && !part.marked {
+                    *same = *part;
+                }
+                continue;
+            }
+            if let Some(merged) = whole(part)
+                && parts
+                    .iter()
+                    .any(|other| other.target == Target::Node(merged))
+            {
+                continue;
+            }
+            kept.push(*part);
+        }
+        // A part met whole too leaves its plainness to the whole node.
+        for part in parts {
+            if !part.marked
+                && let Some(merged) = whole(part)
+                && let Some(node) = kept.iter_mut().find(|k| k.target == Target::Node(merged))
+            {
+                node.marked = false;
             }
         }
         kept
+    }
+
+    /// Whether `target` is shadowable as its declarations say: a merged
+    /// node or a file's part of one all of whose leaves are marked
+    /// `#[shadowable]` (see the module documentation, "Shadowable
+    /// declarations").
+    fn target_shadowable(&self, target: Target) -> bool {
+        match target {
+            Target::Node(node) => self.nodes.get(node as usize).is_some_and(|n| n.shadowable),
+            Target::Part { file, node } => self
+                .files
+                .get(file as usize)
+                .and_then(|f| f.mentions.tree.nodes.get(node as usize))
+                .is_some_and(|n| n.shadowable),
+            Target::View(view) => self
+                .views
+                .get(view as usize)
+                .is_some_and(|v| v.parts.iter().all(|&part| self.part_shadowable(part))),
+            Target::Dir(_) | Target::File(_) => false,
+        }
+    }
+
+    /// Whether the part `part` of a node of a file's view is shadowable:
+    /// reached through a `#[shadowable]` import, or shadowable as its
+    /// declarations say.
+    fn part_shadowable(&self, part: ViewPart) -> bool {
+        part.marked || self.target_shadowable(part.target)
+    }
+
+    /// The position among its file's items of the item declaring the leaf
+    /// `node`, a merged node whose leaf is file `owner`'s.
+    fn leaf_position(&self, owner: u32, node: u32) -> u32 {
+        self.files
+            .get(owner as usize)
+            .and_then(|file| {
+                let own = file.global.iter().position(|&g| g == node)?;
+                let leaf = file.mentions.tree.nodes.get(own)?.leaf?;
+                Some(count(leaf.position))
+            })
+            .unwrap_or(0)
     }
 
     /// Whether `target` is a leaf: a merged node declared by an item, or a
@@ -2146,14 +2435,18 @@ impl Scan {
 
 /// Finds every file's view (see the module documentation, "The view of a
 /// file"): the nodes several of its sources have, merged, into
-/// [`Scan::views`] and [`File::view`]. Reports each conflict, two sources
-/// with a leaf and anything else of one path, once per pair however many
-/// files' views it is in.
+/// [`Scan::views`] and [`File::view`], each leaf shadowing what it overlaps
+/// or shadowed by it as the static order says (see the module
+/// documentation, "Shadowable declarations"), and the imports something
+/// shadows taken from [`File::aliases`]. Reports each conflict, two
+/// sources with a leaf and anything else of one path neither of which
+/// shadows the other, once per pair however many files' views it is in.
 fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     let mut reported: HashSet<(Side, Side)> = HashSet::new();
     let mut found = Vec::with_capacity(scan.files.len());
+    let mut gone_from = Vec::with_capacity(scan.files.len());
     for index in 0..count(scan.files.len()) {
-        let (mut nodes, merged, conflicts) = file_view(scan, index);
+        let (mut nodes, mut merged, conflicts, gone) = file_view(scan, index);
         for (parent, name, parts) in conflicts {
             report_conflicts(
                 scan,
@@ -2164,6 +2457,30 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 errors,
             );
         }
+        // The imports gone from the view are no aliases of the file: the
+        // others are renumbered.
+        if !gone.is_empty() {
+            let depth = scan
+                .files
+                .get(index as usize)
+                .map_or(0, |file| count(scan.chain(file.dir).count()));
+            let renumber = |part: &mut ViewPart| {
+                if !part.chain {
+                    let at = part.source.saturating_sub(depth);
+                    let before = count(gone.partition_point(|&g| g < at));
+                    part.source = part.source.saturating_sub(before);
+                }
+            };
+            for node in &mut nodes {
+                node.parts.iter_mut().for_each(renumber);
+            }
+            for value in merged.values_mut() {
+                if let Merged::One(part) = value {
+                    renumber(part);
+                }
+            }
+        }
+        gone_from.push(gone);
         // Its own nodes first, each after its parent as before: a node with
         // a leaf of the file under it has only such nodes above it.
         let start = count(scan.views.len());
@@ -2210,23 +2527,230 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             merged,
         });
     }
-    for (file, view) in scan.files.iter_mut().zip(found) {
+    for ((file, view), gone) in scan.files.iter_mut().zip(found).zip(gone_from) {
         file.view = view;
+        if !gone.is_empty() {
+            let aliases = mem::take(&mut file.aliases);
+            file.aliases = (0u32..)
+                .zip(aliases)
+                .filter(|(at, _)| gone.binary_search(at).is_err())
+                .map(|(_, alias)| alias)
+                .collect();
+        }
+    }
+}
+
+/// A place in the static order of the declarations and imports reaching a
+/// file's view (see the module documentation, "Shadowable declarations"),
+/// as a key: the implicit prelude's roots `(0, 0, 0)`; then a directory
+/// above the file's own, `(1, its position in the chain from the root, 0)`;
+/// then a declaration of the file's own directory, or an import of the
+/// file, `(2, its file, its position among its file's items)`; then an
+/// import a session's input inherits, `(3, its index, 0)`.
+type Rank = (u8, u32, u32);
+
+/// The static order of the parts of one file's view (see the module
+/// documentation, "Shadowable declarations").
+struct Order<'a> {
+    /// The workspace.
+    scan: &'a Scan,
+    /// The file.
+    file: &'a File,
+    /// Its index.
+    index: u32,
+    /// The number of directories of its chain.
+    depth: u32,
+}
+
+impl<'a> Order<'a> {
+    /// The order of the view of `file`, file `index` of `scan`, whose chain
+    /// has `depth` directories.
+    const fn new(scan: &'a Scan, (file, index): (&'a File, u32), depth: u32) -> Self {
+        Self {
+            scan,
+            file,
+            index,
+            depth,
+        }
+    }
+
+    /// The position among the file's items of its item `item`; found only
+    /// where a leaf meets an import, which is rare.
+    fn position(&self, item: ItemId) -> u32 {
+        let items = self.file.ast.items(self.file.ast.root());
+        count(items.iter().position(|&at| at == item).unwrap_or(0))
+    }
+
+    /// The earliest and the latest place of the declarations of `part`: an
+    /// import's place, a directory above's, or the places of the leaves at
+    /// or under a node of the file's own directory, which may come before
+    /// and after the file's imports.
+    fn ranks(&self, part: ViewPart) -> (Rank, Rank) {
+        if !part.chain {
+            let at = part.source.saturating_sub(self.depth);
+            let rank = match self.file.aliases.get(at as usize) {
+                Some(alias) if alias.implicit => (0, 0, 0),
+                Some(alias) if !alias.inherited => {
+                    let position = alias.item.map_or(0, |item| self.position(item));
+                    (2, self.index, position)
+                }
+                _ => (3, at, 0),
+            };
+            return (rank, rank);
+        }
+        if part.source.saturating_add(1) < self.depth {
+            let rank = (1, part.source, 0);
+            return (rank, rank);
+        }
+        let Target::Node(node) = part.target else {
+            return ((2, 0, 0), (2, 0, 0));
+        };
+        let (mut earliest, mut latest): (Option<Rank>, Option<Rank>) = (None, None);
+        let mut stack = vec![node];
+        while let Some(at) = stack.pop() {
+            let Some(entry) = self.scan.nodes.get(at as usize) else {
+                continue;
+            };
+            if let Some(owner) = entry.leaf {
+                let rank = (2, owner, self.scan.leaf_position(owner, at));
+                earliest = Some(earliest.map_or(rank, |known| known.min(rank)));
+                latest = Some(latest.map_or(rank, |known| known.max(rank)));
+            }
+            stack.extend(&entry.children);
+        }
+        (earliest.unwrap_or((2, 0, 0)), latest.unwrap_or((2, 0, 0)))
+    }
+}
+
+/// Of `parts`, the nodes several sources have at one name of a file's
+/// view, at least one of them a leaf: those that stand once each, in the
+/// static order `order`, has shadowed every earlier one it overlaps (a
+/// leaf overlaps every other part; two interior nodes do not, at this
+/// name), which it may only if every one of those is shadowable (see the
+/// module documentation, "Shadowable declarations"), in source order, with
+/// those shadowed; or, when one overlaps one that is not, the parts that
+/// conflict, as they always did, those shadowed before it left out. An
+/// interior node of the file's own directory with leaves both before and
+/// after a leaf of another source, an import of the file, would stand only
+/// in part, which a view cannot hold: that is the conflict, conservatively.
+fn shadow_parts(
+    scan: &Scan,
+    order: &Order,
+    parts: &[ViewPart],
+) -> Result<(Vec<ViewPart>, Vec<ViewPart>), Vec<ViewPart>> {
+    let mut ranked: Vec<(Rank, Rank, ViewPart)> = parts
+        .iter()
+        .map(|&part| {
+            let (earliest, latest) = order.ranks(part);
+            (earliest, latest, part)
+        })
+        .collect();
+    ranked.sort_by_key(|&(earliest, _, part)| (earliest, part.source));
+    let interleaved = ranked.iter().any(|&(at, _, leaf)| {
+        scan.is_leaf(leaf.target)
+            && ranked.iter().any(|&(earliest, latest, other)| {
+                !scan.is_leaf(other.target) && earliest < at && at < latest
+            })
+    });
+    if interleaved {
+        // The implicit prelude's, first of all, is shadowed whatever the
+        // rest does.
+        return Err(ranked
+            .iter()
+            .filter(|&&(earliest, _, _)| earliest.0 != 0)
+            .map(|&(_, _, part)| part)
+            .collect());
+    }
+    let mut live: Vec<ViewPart> = Vec::with_capacity(parts.len());
+    let mut gone: Vec<ViewPart> = Vec::new();
+    for (_, _, part) in ranked {
+        let overlaps =
+            scan.is_leaf(part.target) || live.iter().any(|stands| scan.is_leaf(stands.target));
+        if live.is_empty() || !overlaps {
+            live.push(part);
+        } else if live.iter().all(|&stands| scan.part_shadowable(stands)) {
+            gone.append(&mut live);
+            live.push(part);
+        } else {
+            return Err(parts
+                .iter()
+                .filter(|part| !gone.contains(part))
+                .copied()
+                .collect());
+        }
+    }
+    live.sort_by_key(|part| part.source);
+    Ok((live, gone))
+}
+
+/// Lets each whole import of `file` (`import PATH [as NAME]`), whose chain
+/// has `depth` directories, take its name in the view, `merged` (by
+/// parent, [`ROOT`] for a root, and name), from whatever the view has of
+/// it there, if that is shadowable (see the module documentation,
+/// "Shadowable declarations"): a root of the directory chain, a member or
+/// `*` import, or a node of the view, `nodes` being the view's so far. One
+/// of a name that is not is the clash [`clashes`] reports. Each member or
+/// `*` import it shadows is added to `gone`, by its index among the file's
+/// aliases.
+fn whole_imports_shadow(
+    scan: &Scan,
+    (file, depth): (&File, u32),
+    (nodes, merged): (&[ViewNode], &mut HashMap<(u32, Name), Merged>),
+    gone: &mut Vec<u32>,
+) {
+    for (at, alias) in (0u32..).zip(&file.aliases) {
+        if !alias.whole {
+            continue;
+        }
+        let shadowable = match merged.get(&(ROOT, alias.name)) {
+            Some(&Merged::One(part)) => Some(scan.part_shadowable(part)),
+            Some(&Merged::View(view)) => nodes
+                .get(view as usize)
+                .map(|node| node.parts.iter().all(|&part| scan.part_shadowable(part))),
+            None => scan
+                .chain(file.dir)
+                .find_map(|dir| scan.by_name.get(&(dir, ROOT, alias.name)))
+                .map(|&node| scan.target_shadowable(Target::Node(node)))
+                .or_else(|| {
+                    file.aliases
+                        .iter()
+                        .find(|other| !other.whole && other.name == alias.name)
+                        .map(|other| file.marked(other) || scan.target_shadowable(other.target))
+                }),
+        };
+        if shadowable == Some(true) {
+            let part = ViewPart {
+                source: depth.saturating_add(at),
+                target: alias.target,
+                chain: false,
+                marked: false,
+            };
+            merged.insert((ROOT, alias.name), Merged::One(part));
+            gone.extend(
+                (0u32..)
+                    .zip(&file.aliases)
+                    .filter(|(_, other)| !other.whole && other.name == alias.name)
+                    .map(|(other, _)| other),
+            );
+        }
     }
 }
 
 /// The view of file `index`: its view nodes, numbered from 0 in the order
 /// found, each a parent before its children; what the merge made of each
-/// name several sources have, by parent (a local number or [`ROOT`]); and
-/// the conflicts.
+/// name several sources have, by parent (a local number or [`ROOT`]); the
+/// conflicts; and the member and `*` imports of the file that something
+/// shadows, gone from the view, by their indices among its aliases.
 fn file_view(scan: &Scan, index: u32) -> FileView {
     let (mut nodes, mut merged, mut conflicts) = (Vec::new(), HashMap::new(), Vec::new());
+    let mut gone: Vec<u32> = Vec::new();
     let Some(file) = scan.files.get(index as usize) else {
-        return (nodes, merged, conflicts);
+        return (nodes, merged, conflicts, gone);
     };
     let mut chain: Vec<u32> = scan.chain(file.dir).collect();
     chain.reverse();
     let depth = count(chain.len());
+    let order = Order::new(scan, (file, index), depth);
     let mut levels: Vec<Level> = (0u32..)
         .zip(&chain)
         .map(|(source, &dir)| Level::Dir(dir, source))
@@ -2237,6 +2761,7 @@ fn file_view(scan: &Scan, index: u32) -> FileView {
                 source: depth.saturating_add(at),
                 target: alias.target,
                 chain: false,
+                marked: file.marked(alias),
             };
             levels.push(Level::Alias(alias.name, part));
         }
@@ -2247,14 +2772,41 @@ fn file_view(scan: &Scan, index: u32) -> FileView {
         .collect();
     let mut stack = vec![(ROOT, levels)];
     while let Some((parent, levels)) = stack.pop() {
-        for (name, parts) in scan.overlaps(&levels) {
-            let parts = scan.same_cells(&parts);
+        for (name, all) in scan.overlaps(&levels) {
+            let parts = scan.same_cells(&all);
+            // A leaf among them shadows, or is shadowed by, what it
+            // overlaps, or conflicts with it.
+            let (parts, shadowed) =
+                if parts.len() > 1 && parts.iter().any(|part| scan.is_leaf(part.target)) {
+                    match shadow_parts(scan, &order, &parts) {
+                        Ok(stands) => stands,
+                        Err(conflicting) => {
+                            conflicts.push((parent, name, conflicting));
+                            continue;
+                        }
+                    }
+                } else {
+                    (parts, Vec::new())
+                };
+            // The imports gone from the view at a root: those shadowed, and
+            // a marked one whose cell a plain one reaches too.
+            if parent == ROOT {
+                let replaced = all.iter().filter(|part| {
+                    part.marked
+                        && parts
+                            .iter()
+                            .any(|kept| kept.target == part.target && kept.source != part.source)
+                });
+                gone.extend(
+                    shadowed
+                        .iter()
+                        .chain(replaced)
+                        .filter(|part| !part.chain)
+                        .map(|part| part.source.saturating_sub(depth)),
+                );
+            }
             if let [one] = parts.as_slice() {
                 merged.insert((parent, name), Merged::One(*one));
-                continue;
-            }
-            if parts.iter().any(|part| scan.is_leaf(part.target)) {
-                conflicts.push((parent, name, parts));
                 continue;
             }
             let own = parts.iter().find_map(|part| match part.target {
@@ -2277,7 +2829,10 @@ fn file_view(scan: &Scan, index: u32) -> FileView {
             stack.push((view, parts.into_iter().map(Level::Of).collect()));
         }
     }
-    (nodes, merged, conflicts)
+    whole_imports_shadow(scan, (file, depth), (&nodes, &mut merged), &mut gone);
+    gone.sort_unstable();
+    gone.dedup();
+    (nodes, merged, conflicts, gone)
 }
 
 /// Reports the conflict `conflict` of file `index`'s view, whose view
@@ -2441,7 +2996,10 @@ struct Modules<'a> {
 /// and each imported name that clashes with a name of its file or a root of
 /// its directory chain. `nested` are the directories that are workspaces of
 /// their own, and `inherited` the imports of a session's earlier inputs,
-/// which a session's input, the scan's one file of its own, inherits.
+/// which a session's input, the scan's one file of its own, inherits. A
+/// file's implicit import of the prelude ([`Ast::implicit_import`]) is
+/// resolved last, its aliases after every other, though it is first in the
+/// static order; with no prelude loaded (a test's table), it binds nothing.
 fn imports(
     scan: &mut Scan,
     dirs: &HashMap<String, u32>,
@@ -2458,36 +3016,35 @@ fn imports(
     };
     let mut both: Vec<String> = Vec::new();
     let mut found = Vec::with_capacity(scan.files.len());
+    // The prelude is loaded by every scan, but for a test's table without
+    // one: then the implicit import binds nothing.
+    let prelude = scan.standard_file(PRELUDE).is_some();
     for (index, file) in (0u32..).zip(&scan.files) {
         let mut aliases = Vec::new();
         let mut own_errors = Vec::new();
-        for &item in file.ast.items(file.ast.root()) {
+        let mut import = |item: ItemId, aliases: &mut Vec<Alias>| {
             let ItemKind::Import(id) = file.ast.item(item).kind else {
-                continue;
+                return;
             };
             let decl = file.ast.import_decl(id);
             let path = file.ast.path(decl.path);
-            let target = match module(scan, &modules, path, &mut both) {
-                Ok(target) => target,
-                Err(error) => {
-                    own_errors.extend(error);
-                    continue;
-                }
-            };
-            members(
-                scan,
-                file,
-                item,
-                decl,
-                target,
-                &mut aliases,
-                &mut own_errors,
-            );
+            match module(scan, &modules, path, &mut both) {
+                Ok(target) => members(scan, file, item, decl, target, aliases, &mut own_errors),
+                Err(error) => own_errors.extend(error),
+            }
+        };
+        for &item in file.ast.items(file.ast.root()) {
+            import(item, &mut aliases);
         }
         if index >= scan.standard {
             inherit_imports(file, inherited, &mut aliases);
         }
-        implicit_prelude(scan, index, &mut aliases);
+        // The implicit `import * from prelude` is first of all in the
+        // static order whatever its place among the aliases, which is last,
+        // so that every other keeps its number.
+        if let Some(item) = file.ast.implicit_import().filter(|_| prelude) {
+            import(item, &mut aliases);
+        }
         clashes(scan, index, &aliases, &mut own_errors);
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
         found.push(aliases);
@@ -2507,7 +3064,9 @@ fn imports(
 /// does an earlier input's variable: the checker reads an inherited import
 /// through the view until a binding of its name is found
 /// ([`FileScope::inherited`]). They follow the input's own imports, before
-/// the implicit prelude, which yields to them, and clash with nothing.
+/// the implicit prelude's aliases but last in the static order (see the
+/// module documentation, "Shadowable declarations"), so they shadow the
+/// prelude's names, and they clash with nothing.
 fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Vec<Alias>) {
     if inherited.is_empty() {
         return;
@@ -2532,49 +3091,6 @@ fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Vec<Alias>) {
         let imported = aliases.iter().take(own).any(|a| a.name == alias.name);
         if !imported && !declared.contains(&alias.name) {
             aliases.push(*alias);
-        }
-    }
-}
-
-/// Adds to `aliases`, the imports of file `index`, the implicit `import *
-/// from prelude` of every file but the prelude itself: an implicit member
-/// alias for each root of the prelude that no earlier source of the file's
-/// view has, neither a root of its directory chain (its own declarations
-/// among them) nor a name it imports; each that one has is dropped, shadowed
-/// silently (see the module documentation, "The standard library").
-fn implicit_prelude(scan: &Scan, index: u32, aliases: &mut Vec<Alias>) {
-    let Some(prelude) = scan.standard_file("prelude") else {
-        return;
-    };
-    let Some(file) = scan.files.get(index as usize) else {
-        return;
-    };
-    if index == prelude {
-        return;
-    }
-    let explicit = aliases.len();
-    for root in target_roots(scan, Target::File(prelude)) {
-        let shadowed = scan
-            .chain(file.dir)
-            .any(|dir| scan.by_name.contains_key(&(dir, ROOT, root)))
-            || aliases
-                .get(..explicit)
-                .into_iter()
-                .flatten()
-                .any(|a| a.name == root);
-        if shadowed {
-            continue;
-        }
-        if let Some(target) = scan.target_child(Target::File(prelude), root) {
-            aliases.push(Alias {
-                name: root,
-                span: Span::new(0, 0),
-                item: None,
-                target,
-                whole: false,
-                implicit: true,
-                inherited: false,
-            });
         }
     }
 }
@@ -2721,7 +3237,8 @@ fn contents(scan: &Scan, dir: Option<u32>) -> String {
 }
 
 /// Binds the names the import `item` of `file`, `decl`, makes of `target`,
-/// what its path names, into `aliases`.
+/// what its path names, into `aliases`, each implicit if the item is the
+/// implicit import of the prelude.
 fn members(
     scan: &Scan,
     file: &File,
@@ -2732,6 +3249,7 @@ fn members(
     errors: &mut Vec<Diagnostic>,
 ) {
     let path = file.ast.path(decl.path);
+    let implicit = file.ast.implicit_import() == Some(item);
     match decl.form {
         ImportForm::Whole(alias) => {
             let bound = alias.map(|a| (a.name, a.span)).or_else(|| {
@@ -2745,7 +3263,7 @@ fn members(
                     item: Some(item),
                     target,
                     whole: true,
-                    implicit: false,
+                    implicit,
                     inherited: false,
                 });
             }
@@ -2762,7 +3280,7 @@ fn members(
                                 item: Some(item),
                                 target: child,
                                 whole: false,
-                                implicit: false,
+                                implicit,
                                 inherited: false,
                             }),
                             None => errors.push(Diagnostic::error(
@@ -2793,7 +3311,7 @@ fn members(
                                     item: Some(item),
                                     target: child,
                                     whole: false,
-                                    implicit: false,
+                                    implicit,
                                     inherited: false,
                                 });
                             }
@@ -2831,34 +3349,50 @@ fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
 /// `let mut`, `:=` or field root of the file, or a root of its directory
 /// chain; a member or a root of a `*`, which merges into the file's view
 /// with the file's fields, its directory chain and the other members, with
-/// a whole import or a top-level `fn`, `let`, `let mut` or `:=`. The
-/// implicit prelude's aliases and those a session's input inherits clash
-/// with nothing.
+/// a whole import or a top-level `fn`, `let`, `let mut` or `:=`. The clash
+/// family ignores what is shadowable (see the module documentation,
+/// "Shadowable declarations"): an alias that is (the implicit prelude's
+/// among them), and those a session's input inherits, clash with nothing,
+/// and a whole import named like a field root of the file or of its
+/// directory chain all of whose leaves are shadowable shadows it silently
+/// ([`whole_imports_shadow`]).
 fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnostic>) {
     let Some(file) = scan.files.get(index as usize) else {
         return;
     };
-    // The implicit `import * from prelude` and the imports a session's input
-    // inherits alone clash with nothing.
-    if aliases
-        .iter()
-        .all(|alias| alias.implicit || alias.inherited)
-    {
+    // Whether an alias clashes with nothing: inherited, or shadowable, by
+    // its import's mark or, for a member, by what it brings.
+    let quiet = |alias: &Alias| {
+        alias.inherited
+            || file.marked(alias)
+            || (!alias.whole && scan.target_shadowable(alias.target))
+    };
+    if aliases.iter().all(quiet) {
         return;
     }
     let ast = &file.ast;
+    let tree = &file.mentions.tree;
     // The file's own top-level names, first declaration of each, and
-    // whether it is a field's.
+    // whether it is a field's, but a field root all of whose leaves are
+    // shadowable, and a declaration a later one shadows.
     let mut declared: Vec<(Name, Span, bool)> = Vec::new();
     let mut seen: HashSet<(Name, bool)> = HashSet::new();
-    for &item in ast.items(ast.root()) {
+    for (position, &item) in ast.items(ast.root()).iter().enumerate() {
         let (field, path) = match ast.item(item).kind {
             ItemKind::Let { path, .. } | ItemKind::Rebind { path, .. } => (false, path),
             ItemKind::Field { path, .. } => (true, path),
             _ => continue,
         };
+        if file.mentions.shadowed.get(position) == Some(&true) {
+            continue;
+        }
         if let Some(first) = ast.path(path).first()
             && let Some(name) = first.name()
+            && !(field
+                && tree
+                    .root(name)
+                    .and_then(|root| tree.nodes.get(root as usize))
+                    .is_some_and(|root| root.shadowable))
             && seen.insert((name, field))
         {
             declared.push((name, first.span, field));
@@ -2871,12 +3405,12 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
         matches!(ast.import_decl(id).form, ImportForm::Members(range)
             if ast.import_members(range).iter().any(|m| m == &ImportMember::All(alias.span)))
     };
-    // The implicit `import * from prelude` clashes with nothing: its names
-    // yield to every other (see the module documentation, "The standard
-    // library"). Nor does an inherited import, which the input's
+    // A shadowable import clashes with nothing: its names yield to every
+    // declaration of theirs (see the module documentation, "Shadowable
+    // declarations"). Nor does an inherited import, which the input's
     // declarations shadow ([`inherit_imports`]).
     for (position, alias) in aliases.iter().enumerate() {
-        if alias.implicit || alias.inherited {
+        if quiet(alias) {
             continue;
         }
         let shown = scan.names.get(alias.name);
@@ -2885,7 +3419,7 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
             .and_then(|before| {
                 before
                     .iter()
-                    .find(|a| !a.implicit && a.name == alias.name && (alias.whole || a.whole))
+                    .find(|a| !quiet(a) && a.name == alias.name && (alias.whole || a.whole))
             })
             .map(|a| (a.span, "imported here"));
         let other = earlier.or_else(|| {
@@ -2907,7 +3441,7 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
         let above = scan
             .chain(file.dir)
             .find_map(|dir| scan.by_name.get(&(dir, ROOT, alias.name)));
-        if alias.whole && above.is_some() {
+        if alias.whole && above.is_some_and(|&node| !scan.target_shadowable(Target::Node(node))) {
             errors.push(Diagnostic::error(
                 format!("`{shown}` is a field of this directory"),
                 alias.span,
@@ -3005,6 +3539,19 @@ fn view_owners(scan: &Scan, index: u32, view: u32) -> (Vec<u32>, Option<Target>)
     (owners, reached)
 }
 
+/// The field nodes each item of `file`'s outermost block mentions, with its
+/// position, but a shadowed declaration's, which needs nothing and reads
+/// nothing whole computed for it (see the module documentation,
+/// "Shadowable declarations").
+fn needing_items(file: &File) -> impl Iterator<Item = (usize, &Vec<u32>)> {
+    let shadowed = &file.mentions.shadowed;
+    file.mentions
+        .fields
+        .iter()
+        .enumerate()
+        .filter(move |&(position, _)| shadowed.get(position) != Some(&true))
+}
+
 /// Fills [`Scan::needs`], and returns for each file the first mention, in
 /// source order, of a declaration of each file it needs, with what it
 /// shows.
@@ -3027,7 +3574,7 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
                 *entry = (span, shown());
             }
         };
-        for (position, fields) in file.mentions.fields.iter().enumerate() {
+        for (position, fields) in needing_items(file) {
             let spans = file.mentions.field_spans.get(position);
             let foreign = file.mentions.foreign.get(position).into_iter().flatten();
             let mut nodes: Vec<(u32, Span)> = Vec::new();
@@ -3272,11 +3819,8 @@ fn view_edges(scan: &Scan, file: &File) -> (Vec<mentions::ViewNode>, Vec<bool>) 
         })
         .collect();
     let mut needed = vec![false; views.len()];
-    let mut stack: Vec<u32> = file
-        .mentions
-        .fields
-        .iter()
-        .flatten()
+    let mut stack: Vec<u32> = needing_items(file)
+        .flat_map(|(_, fields)| fields)
         .copied()
         .filter(|&n| scope.own_view(n).is_some())
         .collect();
@@ -3639,7 +4183,7 @@ pub(crate) fn check_lone_loading(
     source: &SourceFile,
 ) -> (Vec<usize>, Result<Workspace, Vec<Diagnostic>>) {
     let sources = std::slice::from_ref(source);
-    check_loading((sources, Placing::Lone(&[])), Library::NEEDED)
+    check_loading((sources, Placing::Lone(&[], false)), Library::NEEDED)
 }
 
 /// Scans `sources` placed as `placing` says, beside `library`, and checks
@@ -4213,7 +4757,7 @@ fn check_input_then<R>(
     // Every standard file, as the session's start loaded them, so that its
     // cells are numbered as they were there.
     let mut loaded = Vec::new();
-    let placed = (std::slice::from_ref(source), Placing::Lone(imports));
+    let placed = (std::slice::from_ref(source), Placing::Lone(imports, true));
     let mut scan = scan_into(placed, Library::EVERY, names, &mut loaded)
         .map_err(|errors| being_run(errors, count(loaded.len())))?;
     let index = scan.standard;
@@ -5003,7 +5547,7 @@ mod tests {
             // Its scan and its check, apart.
             let start = std::time::Instant::now();
             let scanned = scan_into(
-                (std::slice::from_ref(&source), Placing::Lone(&[])),
+                (std::slice::from_ref(&source), Placing::Lone(&[], false)),
                 Library::NEEDED,
                 &mut Names::new(),
                 &mut Vec::new(),
@@ -7493,5 +8037,562 @@ p26 = com.x"#;
         );
         // Its result is still the raw standard output.
         assert_eq!(lone("= sh(\"printf ' a\\\\n'\")").unwrap(), " a\n");
+    }
+
+    /// The files of the summary of slice 31, in path order.
+    const DEFAULTS: [(&str, &str); 3] = [
+        (
+            "_lib/defaults.gcsl",
+            "#[shadowable]\narch = \"x86_64\"\n#[shadowable] jobs = 4",
+        ),
+        (
+            "pkg/build.gcsl",
+            "import * from _lib.defaults\narch = \"aarch64\"          # shadows the default\n\
+             j = jobs                   # 4",
+        ),
+        ("workspace.gcsl", ""),
+    ];
+
+    #[test]
+    fn the_shadowable_summary_runs() {
+        assert_eq!(
+            value(&DEFAULTS, "pkg/build.gcsl"),
+            "{arch = \"aarch64\"; j = 4}"
+        );
+        assert_eq!(
+            value(&DEFAULTS, "_lib/defaults.gcsl"),
+            "{arch = \"x86_64\"; jobs = 4}"
+        );
+        // The implicit prelude is the file's too, and a name of it is
+        // shadowed by a declaration as before.
+        let mut files = DEFAULTS.to_vec();
+        files[1].1 = "import * from _lib.defaults\narch = \"aarch64\"\nn = len([jobs])\n\
+                      trim = 3";
+        assert_eq!(
+            value(&files, "pkg/build.gcsl"),
+            "{arch = \"aarch64\"; n = 1; trim = 3}"
+        );
+        // Without its mark, the import's `arch` conflicts, as it always has.
+        files[0].1 = "arch = \"x86_64\"\n#[shadowable] jobs = 4";
+        assert_eq!(
+            shown_error(&files),
+            "field `arch` is defined in two files at pkg/build.gcsl (imported here); \
+             _lib/defaults.gcsl: defined here; pkg/build.gcsl: defined here"
+        );
+    }
+
+    #[test]
+    fn within_one_file_the_last_declaration_wins_for_the_whole_file() {
+        for (text, expected) in [
+            // A read above it sees it too.
+            (
+                "x = a\n#[shadowable] a = 1\na = 2\ny = a",
+                "{x = 2; a = 2; y = 2}",
+            ),
+            // The last of several shadowable ones.
+            (
+                "#[shadowable] a = 1\n#[shadowable] a = 2\nx = a\n#[shadowable] a = 3",
+                "{x = 3; a = 3}",
+            ),
+            // A `def` by a field, and a field by a `def`: the winner's type.
+            (
+                "#[shadowable] def f(): Int { 1 }\nf = 2\nx = f + 1",
+                "{f = 2; x = 3}",
+            ),
+            (
+                "#[shadowable] f = 2\ndef f(n: Int): Int { n + 1 }\nx = f(1)",
+                "{f = fn(n: Int): Int; x = 2}",
+            ),
+            // A function reads the winner too.
+            (
+                "fn get(): Int { a }\n#[shadowable] a = 1\na = 5\nx = get()",
+                "{a = 5; x = 5}",
+            ),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // A shadowing declaration cannot read the value it shadows.
+        assert_eq!(
+            lone("#[shadowable] a = 1\na = a + 1").unwrap_err(),
+            ["`a` depends on itself"]
+        );
+        // A plain one is shadowed by nothing, and a plain one followed by a
+        // shadowable one is the conflict it always was.
+        for text in ["a = 1\na = 2", "a = 1\n#[shadowable] a = 2"] {
+            assert_eq!(
+                lone(text).unwrap_err(),
+                ["field `a` is defined twice"],
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shadowed_declaration_is_checked_but_never_run() {
+        // Its own errors are reported.
+        assert_eq!(
+            lone("#[shadowable] a = 1 + \"x\"\na = 2").unwrap_err(),
+            ["cannot add Int and String"]
+        );
+        // It runs nothing.
+        assert_eq!(
+            lone("#[shadowable] a = panic(\"never\")\na = 2").unwrap(),
+            "{a = 2}"
+        );
+        // It needs nothing: here it alone reads `lib/x.gcsl`, which is not
+        // run, and whose cell it sees as erroneous, without an error.
+        let files = [
+            (
+                "a.gcsl",
+                "import * from lib.x\n#[shadowable] arch = thing + 1\narch = 2",
+            ),
+            ("lib/x.gcsl", "thing = panic(\"never run\")"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "a.gcsl"), "{arch = 2}");
+        let scan = ws(&files).unwrap();
+        let a = scan.files.iter().position(|f| f.path == "a.gcsl").unwrap();
+        assert!(scan.needs[a].is_empty(), "{:?}", scan.needs[a]);
+        // Nor is it in a cycle.
+        assert_eq!(
+            lone("#[shadowable] a = b\nb = a\na = 1").unwrap(),
+            "{b = 1; a = 1}"
+        );
+    }
+
+    #[test]
+    fn across_the_files_of_a_directory_in_path_order() {
+        let files = [
+            ("a.gcsl", "#[shadowable] arch = \"x86_64\"\nmine = arch"),
+            ("b.gcsl", "arch = \"aarch64\""),
+            ("c.gcsl", "got = arch"),
+            ("workspace.gcsl", ""),
+        ];
+        // Every file of the directory agrees, the shadowed one included,
+        // whose record no longer has it.
+        assert_eq!(value(&files, "c.gcsl"), "{got = \"aarch64\"}");
+        assert_eq!(value(&files, "a.gcsl"), "{mine = \"aarch64\"}");
+        assert_eq!(value(&files, "b.gcsl"), "{arch = \"aarch64\"}");
+        // The reverse conflicts.
+        let files = [
+            ("a.gcsl", "arch = \"x86_64\""),
+            ("b.gcsl", "#[shadowable] arch = \"aarch64\""),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `arch` is defined in two files at b.gcsl (defined here); \
+             a.gcsl: defined here"
+        );
+    }
+
+    #[test]
+    fn an_inner_directory_shadows_an_outer_one() {
+        let files = [
+            ("other.gcsl", "got = arch"),
+            ("sub/s.gcsl", "arch = \"aarch64\"\nmine = arch"),
+            ("sub/t.gcsl", "seen = arch"),
+            ("workspace.gcsl", "#[shadowable] arch = \"x86_64\""),
+        ];
+        assert_eq!(value(&files, "other.gcsl"), "{got = \"x86_64\"}");
+        assert_eq!(
+            value(&files, "sub/s.gcsl"),
+            "{arch = \"aarch64\"; mine = \"aarch64\"}"
+        );
+        assert_eq!(value(&files, "sub/t.gcsl"), "{seen = \"aarch64\"}");
+        // The reverse conflicts, with its note, reported as ever at the
+        // later of the two in the order of conflicts (the file's own
+        // directory first, then upward).
+        let files = [
+            ("sub/s.gcsl", "#[shadowable] arch = \"aarch64\""),
+            ("workspace.gcsl", "arch = \"x86_64\""),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `arch` is defined in two files at workspace.gcsl (defined here); \
+             sub/s.gcsl: defined here; note: one is in a directory above"
+        );
+    }
+
+    #[test]
+    fn an_import_and_a_field_shadow_in_their_order() {
+        // A field after an import of a shadowable leaf: the field wins.
+        let mut files = DEFAULTS.to_vec();
+        files[1].1 = "import arch from _lib.defaults\narch = \"own\"\ngot = arch";
+        assert_eq!(
+            value(&files, "pkg/build.gcsl"),
+            "{arch = \"own\"; got = \"own\"}"
+        );
+        // An import after a shadowable field: the import wins in this
+        // file's view, which is its own; the field is still its
+        // directory's, which the other files of the directory see.
+        let files = [
+            ("lib/defs.gcsl", "arch = \"lib\""),
+            (
+                "pkg/a.gcsl",
+                "#[shadowable] arch = \"own\"\nimport arch from lib.defs\ngot = arch",
+            ),
+            ("pkg/b.gcsl", "seen = arch"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            value(&files, "pkg/a.gcsl"),
+            "{arch = \"own\"; got = \"lib\"}"
+        );
+        assert_eq!(value(&files, "pkg/b.gcsl"), "{seen = \"own\"}");
+        // A plain field before the import conflicts, as it always has.
+        let files = [
+            ("lib/defs.gcsl", "arch = \"lib\""),
+            ("pkg/a.gcsl", "arch = \"own\"\nimport arch from lib.defs"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `arch` is defined in two files at pkg/a.gcsl (imported here); \
+             lib/defs.gcsl: defined here; pkg/a.gcsl: defined here"
+        );
+    }
+
+    #[test]
+    fn a_marked_import_brings_shadowable_leaves() {
+        let files = [
+            (
+                "a/a.gcsl",
+                "#[shadowable] import * from lib.defs\narch = \"own\"\nj = jobs",
+            ),
+            (
+                "b/b.gcsl",
+                "#[shadowable] import arch, jobs as n from lib.defs\narch = 1\nn = 3",
+            ),
+            ("lib/defs.gcsl", "arch = \"lib\"\njobs = 2"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "a/a.gcsl"), "{arch = \"own\"; j = 2}");
+        assert_eq!(value(&files, "b/b.gcsl"), "{arch = 1; n = 3}");
+        // Unmarked, the same is the conflict it always was.
+        let files = [
+            ("a/a.gcsl", "import * from lib.defs\narch = \"own\""),
+            ("lib/defs.gcsl", "arch = \"lib\""),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            shown_error(&files),
+            "field `arch` is defined in two files at a/a.gcsl (imported here); \
+             lib/defs.gcsl: defined here; a/a.gcsl: defined here"
+        );
+        // A `let` or a `fn` of its name shadows it silently, from its item
+        // on, or in the whole file.
+        let files = [
+            ("lib/defs.gcsl", "arch = \"lib\"\njobs = 2"),
+            (
+                "pkg/a.gcsl",
+                "#[shadowable] import * from lib.defs\nbefore = arch\nlet arch = 1\n\
+                 after = arch\nfn jobs(): Int { 9 }\nj = jobs()",
+            ),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            value(&files, "pkg/a.gcsl"),
+            "{before = \"lib\"; after = 1; j = 9}"
+        );
+    }
+
+    #[test]
+    fn shadowability_travels_with_a_leaf() {
+        // Through `*` from a file, a member, a directory's merged tree and
+        // a directory above.
+        let files = [
+            ("_lib/defaults.gcsl", "#[shadowable] arch = \"x86_64\""),
+            ("_lib/more.gcsl", "jobs = 4"),
+            ("a/a.gcsl", "import * from _lib.defaults\narch = \"a\""),
+            ("b/b.gcsl", "import arch from _lib.defaults\narch = \"b\""),
+            ("c/c.gcsl", "import * from _lib\narch = \"c\"\nj = jobs"),
+            ("d/d.gcsl", "import _lib\narch = \"d\"\nx = _lib.arch"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "a/a.gcsl"), "{arch = \"a\"}");
+        assert_eq!(value(&files, "b/b.gcsl"), "{arch = \"b\"}");
+        assert_eq!(value(&files, "c/c.gcsl"), "{arch = \"c\"; j = 4}");
+        assert_eq!(value(&files, "d/d.gcsl"), "{arch = \"d\"; x = \"x86_64\"}");
+        // And to the directories below its own, which see it in the
+        // directory's merged tree.
+        let files = [
+            ("e/e.gcsl", "#[shadowable] arch = \"e\"\ny = arch"),
+            ("e/f/f.gcsl", "arch = \"f\"\nz = arch"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "e/f/f.gcsl"), "{arch = \"f\"; z = \"f\"}");
+        assert_eq!(value(&files, "e/e.gcsl"), "{arch = \"e\"; y = \"e\"}");
+    }
+
+    #[test]
+    fn dotted_leaves_are_shadowed_leaf_by_leaf() {
+        // Two files of one directory: the later leaf wins, the others of
+        // the node merge as before.
+        let files = [
+            ("a.gcsl", "#[shadowable] com.x.port = 1\ncom.x.host = \"h\""),
+            ("b.gcsl", "com.x.port = 2"),
+            ("c.gcsl", "all = com"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            value(&files, "c.gcsl"),
+            "{all = {x = {host = \"h\"; port = 2}}}"
+        );
+        // Through an import.
+        let files = [
+            (
+                "lib/defs.gcsl",
+                "#[shadowable] com.x.port = 1\ncom.x.host = \"h\"",
+            ),
+            (
+                "pkg/a.gcsl",
+                "import * from lib.defs\ncom.x.port = 2\nall = com",
+            ),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(
+            value(&files, "pkg/a.gcsl"),
+            "{com = {x = {port = 2}}; all = {x = {port = 2; host = \"h\"}}}"
+        );
+    }
+
+    #[test]
+    fn a_declaration_overlapping_shadowable_ones_shadows_them_all() {
+        for (text, expected) in [
+            // At, above and below its path.
+            ("#[shadowable] a.x = 1\na = {z = 3}", "{a = {z = 3}}"),
+            ("#[shadowable] d = {j = 4; k = 5}\nd.j = 8", "{d = {j = 8}}"),
+            (
+                "#[shadowable] a.x.y = 1\n#[shadowable] a.w = 2\na.x = 3",
+                "{a = {w = 2; x = 3}}",
+            ),
+            // Not overlapping: they merge as before.
+            ("#[shadowable] a.x = 1\na.y = 2", "{a = {x = 1; y = 2}}"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // If one it overlaps is not shadowable, the conflict as today.
+        assert_eq!(
+            lone("#[shadowable] a.x = 1\na.y = 2\na = {}").unwrap_err(),
+            ["field `a` is defined twice"]
+        );
+        assert_eq!(
+            lone("d = {j = 4}\nd.j = 8").unwrap_err(),
+            ["field `d` is already defined"]
+        );
+        // Across files and directories, as within one.
+        let files = [
+            ("a.gcsl", "#[shadowable] d = {j = 4; k = 5}"),
+            ("b.gcsl", "d.j = 8"),
+            ("c.gcsl", "got = d"),
+            ("sub/s.gcsl", "a = 1\nseen = d"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "c.gcsl"), "{got = {j = 8}}");
+        assert_eq!(value(&files, "sub/s.gcsl"), "{a = 1; seen = {j = 8}}");
+        let files = [
+            ("sub/s.gcsl", "a = {z = 3}\ngot = a"),
+            ("workspace.gcsl", "#[shadowable] a.x = 1\nseen = a"),
+        ];
+        assert_eq!(value(&files, "sub/s.gcsl"), "{a = {z = 3}; got = {z = 3}}");
+        assert_eq!(
+            value(&files, "workspace.gcsl"),
+            "{a = {x = 1}; seen = {x = 1}}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_root_shadows_the_prelude_s_name_as_before() {
+        // The five cases the old rule's drop by root name shadowed: each
+        // is its result before this slice.
+        assert_eq!(
+            lone("len.x = 1\ny = len").unwrap(),
+            "{len = {x = 1}; y = {x = 1}}"
+        );
+        let files = [
+            ("app/main.gcsl", "import * from lib.a\ny = len"),
+            ("lib/a.gcsl", "len.x = 1"),
+            ("workspace.gcsl", "x = 1"),
+        ];
+        assert_eq!(value(&files, "app/main.gcsl"), "{y = {x = 1}}");
+        let files = [
+            ("app/main.gcsl", "s = join\nn = len([1, 2])"),
+            ("workspace.gcsl", "join.sep = \",\""),
+        ];
+        assert_eq!(value(&files, "app/main.gcsl"), "{s = {sep = \",\"}; n = 2}");
+        let files = [
+            ("a.gcsl", "len.x = 1"),
+            ("b.gcsl", "y = len\nparts = split(\"a,b\", \",\")"),
+            ("workspace.gcsl", "x = 1"),
+        ];
+        assert_eq!(
+            value(&files, "b.gcsl"),
+            "{y = {x = 1}; parts = [\"a\", \"b\"]}"
+        );
+        // (The REPL's is `crate::session`'s.) An explicit import is plain,
+        // and still conflicts.
+        assert_eq!(
+            lone("import * from prelude\nlen.x = 1").unwrap_err(),
+            ["field `len` is already defined"]
+        );
+    }
+
+    #[test]
+    fn no_prelude_turns_the_implicit_import_off() {
+        assert_eq!(
+            lone("#![no_prelude]\nn = len([1])").unwrap_err(),
+            ["undefined variable `len`"]
+        );
+        assert_eq!(
+            lone("# a comment\n#![no_prelude]\nimport len from builtins\nn = len([1])").unwrap(),
+            "{n = 1}"
+        );
+        let files = [
+            ("main.gcsl", "#![no_prelude]\nn = trim(\" a \")"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(messages(&files, "main.gcsl"), ["undefined variable `trim`"]);
+        // The prelude has it, and so no import of its own; every other
+        // file, the standard ones included, has the implicit one.
+        let scan = ws(&[("workspace.gcsl", ""), ("main.gcsl", "import path")]).unwrap();
+        let prelude = scan.standard_file(PRELUDE).unwrap();
+        let path = scan.standard_file("path").unwrap();
+        let files = &scan.files;
+        assert!(files[prelude as usize].ast.no_prelude().is_some());
+        assert!(files[prelude as usize].ast.implicit_import().is_none());
+        assert!(files[prelude as usize].aliases.iter().all(|a| !a.implicit));
+        for file in [path, 2, 3] {
+            let file = &files[file as usize];
+            assert!(file.ast.implicit_import().is_some(), "{}", file.path);
+            assert!(file.aliases.iter().any(|a| a.implicit), "{}", file.path);
+        }
+    }
+
+    #[test]
+    fn the_clash_family_ignores_shadowable_leaves() {
+        // A `let`, a `fn`, a `def`, a field or a whole import of the name
+        // of a shadowable field of a directory above shadows it silently.
+        let files = [
+            ("a/a.gcsl", "let port = 5\nn = port"),
+            ("b/b.gcsl", "fn port(): Int { 7 }\nn = port()"),
+            ("c/c.gcsl", "def port(): Int { 8 }\nn = port()"),
+            ("d/d.gcsl", "import lib.port\nn = port.x"),
+            ("e/e.gcsl", "port = 6\nn = port"),
+            ("lib/port.gcsl", "x = 9"),
+            ("workspace.gcsl", "#[shadowable] port = 1"),
+        ];
+        assert_eq!(value(&files, "a/a.gcsl"), "{n = 5}");
+        assert_eq!(value(&files, "b/b.gcsl"), "{n = 7}");
+        assert_eq!(value(&files, "c/c.gcsl"), "{port = fn(): Int; n = 8}");
+        assert_eq!(value(&files, "d/d.gcsl"), "{n = 9}");
+        assert_eq!(value(&files, "e/e.gcsl"), "{port = 6; n = 6}");
+        // Within one file, a `let` from its item on and a `fn` in the whole
+        // file; the field is still the file's.
+        assert_eq!(
+            lone("#[shadowable] a = 1\nx = a\nlet a = 2\ny = a").unwrap(),
+            "{a = 1; x = 1; y = 2}"
+        );
+        assert_eq!(
+            lone("x = a()\n#[shadowable] a = 1\nfn a(): Int { 3 }").unwrap(),
+            "{x = 3; a = 1}"
+        );
+        // Plain, they clash as they always have.
+        let files = [
+            ("sub/a.gcsl", "let port = 5"),
+            ("workspace.gcsl", "port = 1"),
+        ];
+        assert_eq!(
+            shown_checked_error(&files),
+            "`port` is a field of this directory"
+        );
+        assert_eq!(
+            lone("a = 1\nlet a = 2").unwrap_err(),
+            ["`a` is a field of this file"]
+        );
+    }
+
+    #[test]
+    fn a_declaration_a_later_file_shadows_is_still_checked_and_its_file_s() {
+        // Its own error, against its own file.
+        let sources: Vec<SourceFile> = [
+            ("a.gcsl", "#[shadowable] arch = 1 + \"x\""),
+            ("b.gcsl", "arch = 2"),
+            ("workspace.gcsl", ""),
+        ]
+        .iter()
+        .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+        .collect();
+        let errors = check(&sources).unwrap_err();
+        let scan = ws(&[("a.gcsl", ""), ("workspace.gcsl", "")]).unwrap();
+        let a = scan.files.iter().position(|f| f.path == "a.gcsl").unwrap();
+        let shown: Vec<(&str, Option<u32>)> = errors
+            .iter()
+            .map(|e| (e.message.as_str(), e.input))
+            .collect();
+        assert_eq!(shown, [("cannot add Int and String", Some(count(a)))]);
+        // A `let` that shadows a file's own shadowable field is the file's
+        // alone: the directory has the field.
+        let files = [
+            ("a.gcsl", "#[shadowable] a = 1\nlet a = 2\nmine = a"),
+            ("b.gcsl", "x = a"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "b.gcsl"), "{x = 1}");
+        assert_eq!(value(&files, "a.gcsl"), "{a = 1; mine = 2}");
+        // A `fn` shadows a dotted shadowable root of its file in the whole
+        // file; the root is still its field, and its directory's.
+        let files = [
+            (
+                "a.gcsl",
+                "#[shadowable] a.x = 1\nfn a(): Int { 3 }\nb = a()",
+            ),
+            ("c.gcsl", "y = a.x"),
+            ("workspace.gcsl", ""),
+        ];
+        assert_eq!(value(&files, "a.gcsl"), "{a = {x = 1}; b = 3}");
+        assert_eq!(value(&files, "c.gcsl"), "{y = 1}");
+    }
+
+    /// The messages of the errors of checking `files`, joined.
+    fn shown_checked_error(files: &[(&str, &str)]) -> String {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let errors = check(&sources).unwrap_err();
+        let shown: Vec<String> = errors.into_iter().map(|e| e.message).collect();
+        shown.join("; ")
+    }
+
+    #[test]
+    fn an_input_cannot_turn_the_prelude_off() {
+        let started = start().unwrap();
+        let (mut names, mut types) = (started.names, started.types);
+        let source = SourceFile::new("input", "#![no_prelude]\nx = 1").unwrap();
+        let errors = check_input(
+            &started.standard,
+            (&source, &[]),
+            (&mut names, &mut types),
+            Scope::of_slots(started.slot_names),
+            2,
+        )
+        .unwrap_err();
+        let shown: Vec<(String, Span, Option<u32>)> = errors
+            .into_iter()
+            .map(|e| (e.message, e.span, e.input))
+            .collect();
+        assert_eq!(
+            shown,
+            [(
+                "`#![no_prelude]` applies only to a file".to_owned(),
+                Span::new(0, 14),
+                None
+            )]
+        );
     }
 }
