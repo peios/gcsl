@@ -15,7 +15,12 @@
 //! (`Attribute(shadowable)` and `InnerAttribute(no_prelude)` tokens,
 //! `#[shadowable]` before an item and `#![no_prelude]` after `file` in the
 //! tree), its types and IR as checked and lowered in the workspace, which
-//! show nothing of the implicit import of the prelude a file has.
+//! show nothing of the implicit import of the prelude a file has. A `type`
+//! item dumps as `(type NAME TYPE @..)`, and `--dump-types` adds what it
+//! stands for, `(type NAME TYPE = EXPANSION @..)`; every type, a declared
+//! type's name or a record type with spreads among them, dumps as it is
+//! written, its expansion only in the types it gives expressions. A
+//! `type` has no IR.
 //!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its

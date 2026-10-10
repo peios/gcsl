@@ -131,6 +131,40 @@
 //! runtime if it is not one; each holds its expression and its type, as an
 //! ascription does (see [`crate::check`]).
 //!
+//! # Types
+//!
+//! A `type` item, `type NAME = TYPE` ([`ItemKind::Type`]), declares a type,
+//! an alias of `TYPE`, in the file's namespace of types, apart from its
+//! variables and fields. Its name is read only in a type position, written
+//! bare, `PackageDef`, or qualified through an import, `t.PackageDef`, a
+//! [`TypeExprKind::Path`] in the path pool. A record type may spread
+//! another, `{...PackageDef, name: String}`: an entry of its fields with no
+//! name ([`FieldTy`]). A field item may be annotated, `x: Int = 1`, as a
+//! `let` may: the annotation is in its [`ItemKind::Field`], and an [`Item`]
+//! is still 36 bytes.
+//!
+//! The type expressions of a tree are a [`TypeArena`]. Before a file is
+//! checked, a workspace *expands* its types ([`Ast::expand_types`]): each
+//! name of a declared type becomes what the type's definition is, as if the
+//! definition were written there, its nodes copied into the tree's arena,
+//! after the parsed ones, out of a [`TypeStore`], which holds every
+//! declaration's definition apart from its file's tree, each *settled*: its
+//! names of other declarations made what they define, its spreads merged.
+//! And each record type with spreads becomes the record type of its merged
+//! fields. A spread's fields are SOFT, as value spread's are: a later field
+//! of one's name replaces it, and so does a later spread's; a spread's field
+//! of the name of a field written before the spread is a problem, and so is
+//! a spread of a type that is not a record type. What the expansion finds
+//! wrong it keeps as the tree's problems ([`TypeProblem`],
+//! [`Ast::type_problems`]), by node, for the checker to report where it
+//! resolves the node; and what each node it changed was written as, for the
+//! printer ([`Ast::written_type`]). So the checker sees the expanded types,
+//! and the printer the written ones. The checker knows the copies apart
+//! ([`Ast::is_definition_copy`]), since what is wrong in one is its own
+//! file's to report. A copy is made once per tree and declaration, and a
+//! definition used twice shares its nodes, so a tree's type expressions may
+//! share children; the parser's are still allocated children first.
+//!
 //! # Attributes
 //!
 //! An item of a file's outermost block may be marked `#[shadowable]` (see
@@ -153,9 +187,12 @@
 //! identifiers were interned into and the [`Strings`] table holding the text
 //! of its string literals.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::MAX_DEPTH;
+use crate::diagnostic::Diagnostic;
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted, StrId, Strings};
@@ -784,14 +821,16 @@ impl fmt::Display for PathDisplay<'_> {
     }
 }
 
-/// One field of a record type expression, `NAME: TYPE`.
+/// One entry of a record type expression: a field, `NAME: TYPE`, or a
+/// spread, `...TYPE`, whose fields join the record type (see
+/// [Types](#types)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FieldTy {
-    /// The field's name, plain or quoted in source.
-    pub name: Name,
-    /// Where the name is written.
+    /// The field's name, plain or quoted in source; `None` for a spread.
+    pub name: Option<Name>,
+    /// Where the name is written, or a spread's `...`.
     pub span: Span,
-    /// The field's type.
+    /// The field's type, or the type a spread spreads.
     pub ty: TypeExprId,
 }
 
@@ -1245,16 +1284,20 @@ pub enum ItemKind {
         /// ...`, rather than as `let NAME = fn(...) ...`.
         function: bool,
     },
-    /// `PATH = EXPR`, as in `x = 1`, `"quoted name" = 1` or `a.b = 1`:
-    /// declares a field of the record its block evaluates to, named by the
-    /// path's first segment, which is also a name in scope for the block's
-    /// later items. A dotted path declares or extends a field that is a
-    /// record built by such paths. A public function item, `def NAME(...)
-    /// ...`, is one of these too: the field `NAME`, whose value is the
-    /// function expression, with `function` set.
+    /// `PATH = EXPR` or `PATH: TYPE = EXPR`, as in `x = 1`, `"quoted name"
+    /// = 1`, `a.b = 1` or `x: Int = 1`: declares a field of the record its
+    /// block evaluates to, named by the path's first segment, which is also
+    /// a name in scope for the block's later items. A dotted path declares
+    /// or extends a field that is a record built by such paths, and an
+    /// annotation then applies to the path's last segment, as for a `let`.
+    /// A public function item, `def NAME(...) ...`, is one of these too: the
+    /// field `NAME`, without an annotation, whose value is the function
+    /// expression, with `function` set.
     Field {
         /// The field's name, then any further segments.
         path: PathRange,
+        /// The annotated type, if any.
+        ty: Option<TypeExprId>,
         /// The field's value, or the value at the end of the path.
         value: ExprId,
         /// Whether it was written as a public function item, `def NAME(...)
@@ -1296,12 +1339,23 @@ pub enum ItemKind {
     /// the import arena (see [`Ast::import_decl`]). Only ever an item of a
     /// file's outermost block. It has no expression.
     Import(ImportId),
+    /// `type NAME = TYPE`: declares `NAME` in the file's namespace of types,
+    /// an alias of `TYPE` (see [Types](#types)). Only ever an item of a
+    /// file's outermost block. It has no expression.
+    Type {
+        /// The name declared, always an identifier.
+        name: Name,
+        /// Where the name is written.
+        name_span: Span,
+        /// The type it stands for.
+        ty: TypeExprId,
+    },
 }
 
 impl ItemKind {
     /// The expression the item holds, if it has one: every item's but a
-    /// `break`'s, `continue`'s or `return`'s without a value, and an
-    /// import's.
+    /// `break`'s, `continue`'s or `return`'s without a value, an import's
+    /// and a `type`'s.
     #[must_use]
     pub const fn value(self) -> Option<ExprId> {
         match self {
@@ -1312,7 +1366,7 @@ impl ItemKind {
             | ItemKind::Result(value)
             | ItemKind::Expr(value) => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
-            ItemKind::Import(_) => None,
+            ItemKind::Import(_) | ItemKind::Type { .. } => None,
         }
     }
 }
@@ -1332,10 +1386,15 @@ pub struct Item {
 /// What a [`TypeExpr`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TypeExprKind {
-    /// A type written as a name, such as `Int`.
+    /// A type written as a name, such as `Int`, or the name of a declared
+    /// type, such as `PackageDef`.
     Named(Name),
-    /// A record type, `{x: Int, "a b": String}`: its fields in source
-    /// order. Repeated names are allowed here and reported by the checker.
+    /// A qualified type name, `t.PackageDef`: two or more names separated by
+    /// `.`, in the path pool (see [Types](#types)).
+    Path(PathRange),
+    /// A record type, `{x: Int, "a b": String}` or `{...T, x: Int}`: its
+    /// fields and spreads in source order. Repeated names are allowed here
+    /// and reported by the checker.
     Record(FieldTyRange),
     /// A function type, `fn(Int, name: String): Bool`, `fn(Int) ->> Int` or
     /// `fn() -> Int`.
@@ -1371,6 +1430,14 @@ pub enum TypeExprKind {
         /// Where the `|` is written.
         bar: Span,
     },
+    /// The definition of the declared type numbered so in a [`TypeStore`],
+    /// which a type expression there refers to by name. Never in a tree.
+    Ref(u32),
+    /// A type that names nothing it can, put in place of a written one by
+    /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
+    /// if it is this one's to report, is among the tree's problems
+    /// ([`Ast::type_problems`]). Never written.
+    Invalid,
 }
 
 /// A type as written in source, in an annotation or an ascription.
@@ -1380,6 +1447,568 @@ pub struct TypeExpr {
     pub kind: TypeExprKind,
     /// The source it covers.
     pub span: Span,
+}
+
+/// The type expressions of a tree, or of a [`TypeStore`]: the nodes, in an
+/// arena indexed by [`TypeExprId`], with the fields of record types and the
+/// parameters of function types each in a pool of their own.
+#[derive(Clone, Debug, Default)]
+pub struct TypeArena {
+    exprs: Vec<TypeExpr>,
+    fields: Vec<FieldTy>,
+    params: Vec<ParamTy>,
+}
+
+impl TypeArena {
+    /// Adds `ty` to the arena and returns its id.
+    fn alloc(&mut self, ty: TypeExpr) -> TypeExprId {
+        let id = TypeExprId(next_id(self.exprs.len()));
+        self.exprs.push(ty);
+        id
+    }
+
+    /// Appends `fields` to the field pool as one record type's and returns
+    /// their range.
+    fn push_fields(&mut self, fields: &[FieldTy]) -> FieldTyRange {
+        let start = next_id(self.fields.len());
+        self.fields.extend_from_slice(fields);
+        FieldTyRange {
+            start,
+            len: next_id(fields.len()),
+        }
+    }
+
+    /// Appends `params` to the parameter pool as one function type's and
+    /// returns their range.
+    fn push_params(&mut self, params: &[ParamTy]) -> ParamTyRange {
+        let start = next_id(self.params.len());
+        self.params.extend_from_slice(params);
+        ParamTyRange {
+            start,
+            len: next_id(params.len()),
+        }
+    }
+
+    /// The node `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is not a node of the arena.
+    fn get(&self, id: TypeExprId) -> &TypeExpr {
+        &self.exprs[id.index()]
+    }
+
+    /// The kind of the node `id`, [`TypeExprKind::Invalid`] if the arena has
+    /// no such node.
+    fn kind(&self, id: TypeExprId) -> TypeExprKind {
+        self.exprs
+            .get(id.index())
+            .map_or(TypeExprKind::Invalid, |ty| ty.kind)
+    }
+
+    /// Makes the node `id` one of kind `kind`, keeping its span.
+    fn set_kind(&mut self, id: TypeExprId, kind: TypeExprKind) {
+        if let Some(entry) = self.exprs.get_mut(id.index()) {
+            entry.kind = kind;
+        }
+    }
+
+    /// The fields of the record type whose fields are `range`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not of the arena.
+    fn fields(&self, range: FieldTyRange) -> &[FieldTy] {
+        let start = range.start as usize;
+        &self.fields[start..start + range.len as usize]
+    }
+
+    /// The parameters of the function type whose parameters are `range`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not of the arena.
+    fn params(&self, range: ParamTyRange) -> &[ParamTy] {
+        let start = range.start as usize;
+        &self.params[start..start + range.len as usize]
+    }
+
+    /// The number of nodes.
+    fn len(&self) -> usize {
+        self.exprs.len()
+    }
+
+    /// The ids of the nodes from number `start` on, in order.
+    fn ids_from(&self, start: usize) -> impl Iterator<Item = TypeExprId> + use<> {
+        (next_id(start)..next_id(self.exprs.len())).map(TypeExprId)
+    }
+
+    /// Copies the node `root` of `from`, and every node under it, into this
+    /// arena, children first, and returns the copy of `root`: a node `memo`
+    /// has a copy of already is that copy, shared, and every node copied is
+    /// added to it; a node `replace` gives a kind is a node of that kind, of
+    /// its span, with nothing under it; every other node is a node of its
+    /// kind and span, its children copied. A qualified name `replace` gives
+    /// no kind is [`TypeExprKind::Invalid`], its path being of `from`'s tree.
+    /// Recurses once per level of nesting under `root`.
+    fn copy(
+        &mut self,
+        from: &TypeArena,
+        root: TypeExprId,
+        memo: &mut HashMap<TypeExprId, TypeExprId>,
+        replace: &dyn Fn(TypeExprId) -> Option<TypeExprKind>,
+    ) -> TypeExprId {
+        if let Some(&copied) = memo.get(&root) {
+            return copied;
+        }
+        let TypeExpr { kind, span } = from.exprs.get(root.index()).copied().unwrap_or(TypeExpr {
+            kind: TypeExprKind::Invalid,
+            span: Span::new(0, 0),
+        });
+        let kind = match replace(root) {
+            Some(kind) => kind,
+            None => match kind {
+                TypeExprKind::Record(range) => {
+                    let fields: Vec<FieldTy> = from
+                        .fields(range)
+                        .iter()
+                        .map(|field| FieldTy {
+                            ty: self.copy(from, field.ty, memo, replace),
+                            ..*field
+                        })
+                        .collect();
+                    TypeExprKind::Record(self.push_fields(&fields))
+                }
+                TypeExprKind::Fn {
+                    params,
+                    ret,
+                    effect,
+                } => {
+                    let params: Vec<ParamTy> = from
+                        .params(params)
+                        .iter()
+                        .map(|param| ParamTy {
+                            ty: self.copy(from, param.ty, memo, replace),
+                            ..*param
+                        })
+                        .collect();
+                    let ret = self.copy(from, ret, memo, replace);
+                    TypeExprKind::Fn {
+                        params: self.push_params(&params),
+                        ret,
+                        effect,
+                    }
+                }
+                TypeExprKind::Applied { name, span, arg } => TypeExprKind::Applied {
+                    name,
+                    span,
+                    arg: self.copy(from, arg, memo, replace),
+                },
+                TypeExprKind::List(element) => {
+                    TypeExprKind::List(self.copy(from, element, memo, replace))
+                }
+                TypeExprKind::Union { lhs, rhs, bar } => {
+                    let lhs = self.copy(from, lhs, memo, replace);
+                    let rhs = self.copy(from, rhs, memo, replace);
+                    TypeExprKind::Union { lhs, rhs, bar }
+                }
+                TypeExprKind::Path(_) => TypeExprKind::Invalid,
+                kind @ (TypeExprKind::Named(_) | TypeExprKind::Ref(_) | TypeExprKind::Invalid) => {
+                    kind
+                }
+            },
+        };
+        let id = self.alloc(TypeExpr { kind, span });
+        memo.insert(root, id);
+        id
+    }
+
+    /// The height of the node `id` as it is now, its children's being in
+    /// `heights` by id: 1 for one with no children (1 too for a child
+    /// `heights` lacks), one more than its tallest child otherwise.
+    fn height(&self, id: TypeExprId, heights: &[u32]) -> u32 {
+        self.children(id)
+            .iter()
+            .map(|child| heights.get(child.index()).copied().unwrap_or(1))
+            .max()
+            .map_or(1, |tallest| tallest.saturating_add(1))
+    }
+
+    /// The children of the node `id`, as they are now: a record type's
+    /// fields' types, a function type's parameters' and return type, an
+    /// applied or list type's argument, a union's sides.
+    fn children(&self, id: TypeExprId) -> Vec<TypeExprId> {
+        match self.kind(id) {
+            TypeExprKind::Record(range) => self.fields(range).iter().map(|f| f.ty).collect(),
+            TypeExprKind::Fn { params, ret, .. } => self
+                .params(params)
+                .iter()
+                .map(|p| p.ty)
+                .chain([ret])
+                .collect(),
+            TypeExprKind::Applied { arg, .. } | TypeExprKind::List(arg) => vec![arg],
+            TypeExprKind::Union { lhs, rhs, .. } => vec![lhs, rhs],
+            TypeExprKind::Named(_)
+            | TypeExprKind::Path(_)
+            | TypeExprKind::Ref(_)
+            | TypeExprKind::Invalid => Vec::new(),
+        }
+    }
+
+    /// Merges the spreads of the record type `id` into its fields, as value
+    /// spread merges a record block's (see [Types](#types)): a spread's
+    /// fields join the record SOFT; a later field of a soft field's name
+    /// replaces it, and so does a later spread's; a spread's field of the
+    /// name of a field written before it is the problem
+    /// [`TypeProblem::Replaces`], once for the spread, the field written
+    /// before standing. A spread of anything but a record type is
+    /// [`TypeProblem::NotRecord`], or, of an erroneous type,
+    /// [`TypeProblem::Erroneous`], and spreads nothing. Two fields written of
+    /// one name are both kept, for the checker to report; a spread of a
+    /// record type with two of one name spreads the first, the later being
+    /// [`TypeProblem::Repeated`]. The node becomes
+    /// the record type of the merged fields; one without a spread is left
+    /// as it is. Returns the problems, in source order. A spread's operand
+    /// must have its own spreads merged already.
+    fn merge_record(&mut self, id: TypeExprId) -> Vec<TypeProblem> {
+        let TypeExprKind::Record(range) = self.kind(id) else {
+            return Vec::new();
+        };
+        let written = self.fields(range);
+        if written.iter().all(|field| field.name.is_some()) {
+            return Vec::new();
+        }
+        let written = written.to_vec();
+        let mut merged: Vec<(FieldTy, bool)> = Vec::with_capacity(written.len());
+        let mut at: HashMap<Name, usize> = HashMap::new();
+        let mut problems = Vec::new();
+        // Whether the field merged at an index is soft.
+        let soft = |merged: &[(FieldTy, bool)], index: usize| {
+            merged.get(index).is_some_and(|&(_, soft)| soft)
+        };
+        for entry in written {
+            if let Some(name) = entry.name {
+                match at.get(&name).copied() {
+                    Some(index) if soft(&merged, index) => {
+                        if let Some(slot) = merged.get_mut(index) {
+                            *slot = (entry, false);
+                        }
+                    }
+                    _ => {
+                        at.entry(name).or_insert(merged.len());
+                        merged.push((entry, false));
+                    }
+                }
+                continue;
+            }
+            let operand = entry.ty;
+            let spread = match self.kind(operand) {
+                TypeExprKind::Record(spread) => spread,
+                TypeExprKind::Invalid => {
+                    problems.push(TypeProblem::Erroneous);
+                    continue;
+                }
+                _ => {
+                    problems.push(TypeProblem::NotRecord(operand));
+                    continue;
+                }
+            };
+            // The first field written before the spread, and the number of
+            // others.
+            let mut replaced: Option<(Name, TypeExprId, Span)> = None;
+            let mut others = 0_u32;
+            // The names the spread has given so far: one it gives twice, a
+            // record type written in place with a name twice, is the
+            // repeated-name error it is anywhere else, the later dropped.
+            let mut given: HashSet<Name> = HashSet::new();
+            for field in self.fields(spread) {
+                let Some(name) = field.name else {
+                    continue;
+                };
+                if !given.insert(name) {
+                    problems.push(TypeProblem::Repeated {
+                        name,
+                        at: field.span,
+                    });
+                    continue;
+                }
+                match at.get(&name).copied() {
+                    Some(index) if soft(&merged, index) => {
+                        if let Some(slot) = merged.get_mut(index) {
+                            *slot = (*field, true);
+                        }
+                    }
+                    Some(index) => match replaced {
+                        None => {
+                            let first = merged.get(index).map_or(entry.span, |(hard, _)| hard.span);
+                            replaced = Some((name, field.ty, first));
+                        }
+                        Some(_) => others = others.saturating_add(1),
+                    },
+                    None => {
+                        at.insert(name, merged.len());
+                        merged.push((*field, true));
+                    }
+                }
+            }
+            if let Some((name, ty, first)) = replaced {
+                problems.push(TypeProblem::Replaces {
+                    operand,
+                    name,
+                    ty,
+                    first,
+                    others,
+                });
+            }
+        }
+        let fields: Vec<FieldTy> = merged.into_iter().map(|(field, _)| field).collect();
+        let range = self.push_fields(&fields);
+        self.set_kind(id, TypeExprKind::Record(range));
+        problems
+    }
+}
+
+/// What the expansion of a tree's types ([`Ast::expand_types`]) found
+/// wrong with one of its type expressions, for the checker to report where
+/// it resolves it (see [Types](#types)).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeProblem {
+    /// The type names nothing it can: the error, as it is reported. The
+    /// node is [`TypeExprKind::Invalid`].
+    Unresolved(Diagnostic),
+    /// The record type spreads the type `operand`, which is not a record
+    /// type: "cannot spread type T: it is not a record type", at the
+    /// operand.
+    NotRecord(TypeExprId),
+    /// The record type spreads the type `operand`, which has a field
+    /// `name`, of type `ty`, that the record type writes before the spread,
+    /// its name at `first`, and `others` more such fields: "field `x` is
+    /// defined twice", at the operand.
+    Replaces {
+        /// The type spread.
+        operand: TypeExprId,
+        /// The first field it has that is written before it.
+        name: Name,
+        /// The type it has that field of.
+        ty: TypeExprId,
+        /// Where the field written before it is.
+        first: Span,
+        /// How many more such fields it has.
+        others: u32,
+    },
+    /// The record type spreads a type that is erroneous, whose error is
+    /// reported where it is written: the record type is erroneous too.
+    Erroneous,
+    /// The record type spreads a record type written in place that has the
+    /// field `name` twice, the later at `at`: "field `x` appears twice in
+    /// this type", at the later, as anywhere else.
+    Repeated {
+        /// The name written twice.
+        name: Name,
+        /// Where it is written the second time.
+        at: Span,
+    },
+}
+
+/// What a type expression of a tree that reads a declared type by its name
+/// names, as the workspace resolves it in the tree's file (see
+/// [`crate::workspace`], "Types"), for [`Ast::expand_types`] and
+/// [`TypeStore::declare`]. A name of no declared type has none: a built-in
+/// type, or an unknown one, which the checker reports.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeLink {
+    /// The declaration numbered so in the [`TypeStore`].
+    Decl(u32),
+    /// Nothing it can: the error.
+    Error(Diagnostic),
+}
+
+/// Where a [`TypeStore`] was, to put it back there ([`TypeStore::mark`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeStoreMark {
+    exprs: usize,
+    fields: usize,
+    params: usize,
+    decls: usize,
+}
+
+/// The definitions of declared types, apart from any tree, so that a tree
+/// can be given the definition of a type another file declares, as if it
+/// were written there (see [Types](#types)): each declaration's definition
+/// copied out of its file's tree, each name of another declared type in it
+/// a [`TypeExprKind::Ref`], until it is settled ([`TypeStore::settle`]),
+/// after which it refers to nothing and holds no spread. A workspace's scan
+/// has one; a session keeps one, its inputs' declarations after each
+/// other's.
+#[derive(Clone, Debug, Default)]
+pub struct TypeStore {
+    arena: TypeArena,
+    /// The height of each node, once its declaration is settled: 1 for a
+    /// name, one more than its tallest child otherwise.
+    heights: Vec<u32>,
+    /// Each declaration's definition: the number of its first node, and its
+    /// root, every node from the first to the root being its own.
+    decls: Vec<(u32, TypeExprId)>,
+}
+
+impl TypeStore {
+    /// An empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The number of declarations.
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        next_id(self.decls.len())
+    }
+
+    /// Whether the store has no declaration.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.decls.is_empty()
+    }
+
+    /// Where the store is now.
+    #[must_use]
+    pub fn mark(&self) -> TypeStoreMark {
+        TypeStoreMark {
+            exprs: self.arena.exprs.len(),
+            fields: self.arena.fields.len(),
+            params: self.arena.params.len(),
+            decls: self.decls.len(),
+        }
+    }
+
+    /// Forgets everything added since `mark`.
+    pub fn truncate(&mut self, mark: TypeStoreMark) {
+        self.arena.exprs.truncate(mark.exprs);
+        self.arena.fields.truncate(mark.fields);
+        self.arena.params.truncate(mark.params);
+        self.heights.truncate(mark.exprs);
+        self.decls.truncate(mark.decls);
+    }
+
+    /// Adds the declarations numbered from the store's length on, `count`
+    /// of them, each defined as nothing yet, to be defined by
+    /// [`TypeStore::declare`] in any order. Returns the first's number.
+    pub fn reserve(&mut self, count: usize) -> u32 {
+        let first = self.len();
+        let nothing = TypeExprId(u32::MAX);
+        self.decls
+            .extend(std::iter::repeat_n((u32::MAX, nothing), count));
+        first
+    }
+
+    /// Defines the declaration `decl` as the type expression `root` of
+    /// `ast`, copied out of it, with each node `links` has an entry for (by
+    /// id, in order) a [`TypeExprKind::Ref`] to the declaration it names, or
+    /// [`TypeExprKind::Invalid`] if it names none it can. Spreads are
+    /// copied as they are written, until it is settled.
+    pub fn declare(
+        &mut self,
+        decl: u32,
+        (ast, root): (&Ast, TypeExprId),
+        links: &[(TypeExprId, TypeLink)],
+    ) {
+        let first = next_id(self.arena.len());
+        let replace = |id: TypeExprId| {
+            let at = links.binary_search_by_key(&id.0, |&(at, _)| at.0).ok()?;
+            Some(match links.get(at).map(|(_, link)| link) {
+                Some(TypeLink::Decl(decl)) => TypeExprKind::Ref(*decl),
+                _ => TypeExprKind::Invalid,
+            })
+        };
+        let copied = self
+            .arena
+            .copy(&ast.types, root, &mut HashMap::new(), &replace);
+        self.heights.resize(self.arena.len(), 1);
+        if let Some(entry) = self.decls.get_mut(decl as usize) {
+            *entry = (first, copied);
+        }
+    }
+
+    /// The declarations the definition of `decl` refers to by name, each
+    /// with where, in its own nodes' order: the edges of a cycle of types.
+    #[must_use]
+    pub fn refs(&self, decl: u32) -> Vec<(u32, Span)> {
+        let Some(&(first, root)) = self.decls.get(decl as usize) else {
+            return Vec::new();
+        };
+        (first..=root.0)
+            .filter_map(|at| {
+                let ty = self.arena.exprs.get(at as usize)?;
+                match ty.kind {
+                    TypeExprKind::Ref(to) => Some((to, ty.span)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Settles the declaration `decl`, every declaration it refers to being
+    /// settled already, or it being on a cycle of types (`cyclic`): each
+    /// reference to another becomes what that one's definition is, shared,
+    /// and each record type its spreads merged, its own nodes taken in
+    /// order, children first (see [Types](#types)). It is erroneous, its
+    /// definition then [`TypeExprKind::Invalid`] alone, if it is on a cycle,
+    /// if a spread of it has a problem, or if it would be nested more than
+    /// [`MAX_DEPTH`] levels deep; whatever is wrong is reported where it is
+    /// written, in its file. A reference to an erroneous one is erroneous.
+    pub fn settle(&mut self, decl: u32, cyclic: bool) {
+        let Some(&(first, root)) = self.decls.get(decl as usize) else {
+            return;
+        };
+        let mut erroneous = cyclic;
+        for id in self
+            .arena
+            .ids_from(first as usize)
+            .take_while(|&id| id.0 <= root.0)
+        {
+            if erroneous {
+                break;
+            }
+            match self.arena.kind(id) {
+                TypeExprKind::Ref(to) => {
+                    let target = self.root(to);
+                    let kind = target.map_or(TypeExprKind::Invalid, |at| self.arena.kind(at));
+                    self.arena.set_kind(id, kind);
+                    let height = target
+                        .and_then(|at| self.heights.get(at.index()))
+                        .copied()
+                        .unwrap_or(1);
+                    if let Some(entry) = self.heights.get_mut(id.index()) {
+                        *entry = height;
+                    }
+                    continue;
+                }
+                TypeExprKind::Record(_) => {
+                    erroneous |= !self.arena.merge_record(id).is_empty();
+                }
+                _ => {}
+            }
+            let height = self.arena.height(id, &self.heights);
+            erroneous |= height as usize > MAX_DEPTH;
+            if let Some(entry) = self.heights.get_mut(id.index()) {
+                *entry = height;
+            }
+        }
+        if erroneous {
+            self.arena.set_kind(root, TypeExprKind::Invalid);
+            if let Some(entry) = self.heights.get_mut(root.index()) {
+                *entry = 1;
+            }
+        }
+    }
+
+    /// The root of the definition of `decl`, if it is defined.
+    fn root(&self, decl: u32) -> Option<TypeExprId> {
+        self.decls
+            .get(decl as usize)
+            .map(|&(_, root)| root)
+            .filter(|root| root.index() < self.arena.len())
+    }
 }
 
 /// Converts an arena length to the next id, saturating past `u32::MAX`.
@@ -1399,13 +2028,11 @@ pub struct AstBuilder {
     items: Vec<Item>,
     item_lists: Vec<ItemId>,
     parts: Vec<StrPart>,
-    type_exprs: Vec<TypeExpr>,
-    field_tys: Vec<FieldTy>,
+    types: TypeArena,
     paths: Vec<PathSegment>,
     fns: Vec<FnDecl>,
     params: Vec<Param>,
     args: Vec<Arg>,
-    param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
@@ -1452,9 +2079,7 @@ impl AstBuilder {
 
     /// Adds `ty` to the type arena and returns its id.
     pub fn alloc_type(&mut self, ty: TypeExpr) -> TypeExprId {
-        let id = TypeExprId(next_id(self.type_exprs.len()));
-        self.type_exprs.push(ty);
-        id
+        self.types.alloc(ty)
     }
 
     /// Appends `items` to the item-list pool as one list and returns its
@@ -1482,12 +2107,7 @@ impl AstBuilder {
     /// Appends `fields` to the field-type pool as one record type's fields
     /// and returns their range.
     pub fn push_field_tys(&mut self, fields: &[FieldTy]) -> FieldTyRange {
-        let start = next_id(self.field_tys.len());
-        self.field_tys.extend_from_slice(fields);
-        FieldTyRange {
-            start,
-            len: next_id(fields.len()),
-        }
+        self.types.push_fields(fields)
     }
 
     /// Appends `segments` to the path pool as one path and returns its
@@ -1571,12 +2191,7 @@ impl AstBuilder {
     /// Appends `params` to the parameter-type pool as one function type's
     /// parameters and returns their range.
     pub fn push_param_tys(&mut self, params: &[ParamTy]) -> ParamTyRange {
-        let start = next_id(self.param_tys.len());
-        self.param_tys.extend_from_slice(params);
-        ParamTyRange {
-            start,
-            len: next_id(params.len()),
-        }
+        self.types.push_params(params)
     }
 
     /// Appends `elements` to the element pool as one list literal's
@@ -1638,7 +2253,7 @@ impl AstBuilder {
     /// Panics if `id` was not allocated by this builder.
     #[must_use]
     pub fn type_expr(&self, id: TypeExprId) -> &TypeExpr {
-        &self.type_exprs[id.index()]
+        self.types.get(id)
     }
 
     /// Returns the items of the list `range`, in source order.
@@ -1662,13 +2277,11 @@ impl AstBuilder {
             items: self.items,
             item_lists: self.item_lists,
             parts: self.parts,
-            type_exprs: self.type_exprs,
-            field_tys: self.field_tys,
+            types: self.types,
             paths: self.paths,
             fns: self.fns,
             params: self.params,
             args: self.args,
-            param_tys: self.param_tys,
             elements: self.elements,
             fors: self.fors,
             labels: self.labels,
@@ -1677,6 +2290,7 @@ impl AstBuilder {
             shadowable: self.shadowable,
             no_prelude: self.no_prelude,
             implicit_import: None,
+            expansion: Expansion::default(),
             root,
             names,
             strings,
@@ -1692,13 +2306,11 @@ pub struct Ast {
     items: Vec<Item>,
     item_lists: Vec<ItemId>,
     parts: Vec<StrPart>,
-    type_exprs: Vec<TypeExpr>,
-    field_tys: Vec<FieldTy>,
+    types: TypeArena,
     paths: Vec<PathSegment>,
     fns: Vec<FnDecl>,
     params: Vec<Param>,
     args: Vec<Arg>,
-    param_tys: Vec<ParamTy>,
     elements: Vec<Element>,
     fors: Vec<ForDecl>,
     labels: Vec<Label>,
@@ -1711,9 +2323,25 @@ pub struct Ast {
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
     /// gave the file one.
     implicit_import: Option<ItemId>,
+    /// What the expansion of its types did to the tree.
+    expansion: Expansion,
     root: ItemRange,
     names: Names,
     strings: Strings,
+}
+
+/// What the expansion of a tree's types did to it ([`Ast::expand_types`]).
+#[derive(Clone, Debug, Default)]
+struct Expansion {
+    /// The number of type expressions the parser made, once the tree is
+    /// expanded: every one after them is a copy of a declared type's
+    /// definition. `None` until then.
+    parsed: Option<u32>,
+    /// Each type expression the expansion made into another, with its kind
+    /// as written, by id.
+    written: Vec<(TypeExprId, TypeExprKind)>,
+    /// The problems it found, by id.
+    problems: Vec<(TypeExprId, TypeProblem)>,
 }
 
 impl Ast {
@@ -1767,7 +2395,74 @@ impl Ast {
     /// Panics if `id` does not belong to this tree.
     #[must_use]
     pub fn type_expr(&self, id: TypeExprId) -> &TypeExpr {
-        &self.type_exprs[id.index()]
+        self.types.get(id)
+    }
+
+    /// The kind the type expression `id` is written as: its kind, unless
+    /// the expansion of the tree's types made it into another ([`Ast::
+    /// expand_types`]), as an alias's name into its definition, which the
+    /// printer does not show.
+    #[must_use]
+    pub fn written_type(&self, id: TypeExprId) -> TypeExprKind {
+        self.rewritten(id).unwrap_or_else(|| self.types.kind(id))
+    }
+
+    /// The kind the type expression `id` is written as, if the expansion of
+    /// the tree's types made it into another.
+    fn rewritten(&self, id: TypeExprId) -> Option<TypeExprKind> {
+        let written = &self.expansion.written;
+        let at = written.binary_search_by_key(&id.0, |&(at, _)| at.0).ok()?;
+        written.get(at).map(|&(_, kind)| kind)
+    }
+
+    /// Whether the type expression `id` is a node of a copy of a declared
+    /// type's definition that the expansion of the tree's types added
+    /// ([`Ast::expand_types`]), one that no parse made: never changed once
+    /// made, and shared by every use of the definition in the tree.
+    #[must_use]
+    pub fn is_copied(&self, id: TypeExprId) -> bool {
+        self.expansion.parsed.is_some_and(|parsed| id.0 >= parsed)
+    }
+
+    /// Whether the type expression `id` stands for a declared type's
+    /// definition, which the type's own file checks: a copy of one that the
+    /// expansion of the tree's types added ([`Ast::is_copied`]), or a name
+    /// of a declared type, written bare or qualified, that it made into one
+    /// ([`Ast::expand_types`]).
+    #[must_use]
+    pub fn is_definition_copy(&self, id: TypeExprId) -> bool {
+        let Some(parsed) = self.expansion.parsed else {
+            return false;
+        };
+        id.0 >= parsed
+            || matches!(
+                self.rewritten(id),
+                Some(TypeExprKind::Named(_) | TypeExprKind::Path(_) | TypeExprKind::Applied { .. })
+            )
+    }
+
+    /// The problems the expansion of the tree's types found with the type
+    /// expression `id`, in source order, for the checker to report where it
+    /// resolves it.
+    pub fn type_problems(&self, id: TypeExprId) -> impl Iterator<Item = &TypeProblem> {
+        let problems = &self.expansion.problems;
+        let start = problems.partition_point(|&(at, _)| at.0 < id.0);
+        problems
+            .get(start..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(move |&&(at, _)| at == id)
+            .map(|(_, problem)| problem)
+    }
+
+    /// The ids of the type expressions the parser made, in order, children
+    /// first: not the copies the expansion of the tree's types adds.
+    pub fn type_ids(&self) -> impl Iterator<Item = TypeExprId> + use<> {
+        let parsed = self
+            .expansion
+            .parsed
+            .unwrap_or_else(|| next_id(self.types.len()));
+        (0..parsed).map(TypeExprId)
     }
 
     /// Returns the fields of the record type expression `range`, in source
@@ -1778,8 +2473,7 @@ impl Ast {
     /// Panics if `range` does not belong to this tree.
     #[must_use]
     pub fn field_tys(&self, range: FieldTyRange) -> &[FieldTy] {
-        let start = range.start as usize;
-        &self.field_tys[start..start + range.len as usize]
+        self.types.fields(range)
     }
 
     /// Returns the segments of the path `range`, in source order. A path
@@ -1909,8 +2603,7 @@ impl Ast {
     /// Panics if `range` does not belong to this tree.
     #[must_use]
     pub fn param_tys(&self, range: ParamTyRange) -> &[ParamTy] {
-        let start = range.start as usize;
-        &self.param_tys[start..start + range.len as usize]
+        self.types.params(range)
     }
 
     /// Returns the elements of the list literal whose elements are `range`,
@@ -2009,6 +2702,108 @@ impl Ast {
         self.implicit_import = Some(item);
         let at = self.shadowable.partition_point(|&marked| marked.0 < item.0);
         self.shadowable.insert(at, item);
+    }
+
+    /// Expands the tree's types, once (see [Types](#types)). Every type
+    /// expression the parser made is taken in order, children first, as it
+    /// made them:
+    ///
+    /// - one that `links` (by id, in order) has a declaration for, a name
+    ///   of a declared type, written bare or qualified, becomes what that
+    ///   declaration's settled definition in `store` is, its nodes copied
+    ///   into the tree's arena after the parsed ones, each once, shared by
+    ///   every use; or [`TypeExprKind::Invalid`] if the declaration is
+    ///   erroneous, which its own file reports;
+    /// - one that `links` has an error for becomes `Invalid`, with the
+    ///   problem [`TypeProblem::Unresolved`];
+    /// - a record type with spreads becomes the record type of its merged
+    ///   fields (see [`TypeArena::merge_record`]), with its problems;
+    /// - one that would then be nested more than [`MAX_DEPTH`] levels deep
+    ///   becomes `Invalid`, with the problem "expression nested too
+    ///   deeply" at it.
+    ///
+    /// The kind each was written as is kept for the printer
+    /// ([`Ast::written_type`]). A tree with no link and no spread is only
+    /// noted as expanded.
+    pub fn expand_types(&mut self, store: &TypeStore, links: &[(TypeExprId, TypeLink)]) {
+        if self.expansion.parsed.is_some() {
+            return;
+        }
+        let parsed = self.types.len();
+        self.expansion.parsed = Some(next_id(parsed));
+        if links.is_empty() && self.types.fields.iter().all(|field| field.name.is_some()) {
+            return;
+        }
+        // The height of each node, by id: the parsed ones' as they are
+        // taken, the copies' as they are made.
+        let mut heights: Vec<u32> = vec![1; parsed];
+        let mut memo = HashMap::new();
+        let mut written = Vec::new();
+        let mut problems = Vec::new();
+        for id in self.types.ids_from(0).take(parsed) {
+            let kind = self.types.kind(id);
+            let link = links
+                .binary_search_by_key(&id.0, |&(at, _)| at.0)
+                .ok()
+                .and_then(|at| links.get(at))
+                .map(|(_, link)| link);
+            match link {
+                Some(TypeLink::Decl(decl)) => {
+                    let definition = store
+                        .root(*decl)
+                        .filter(|&root| store.arena.kind(root) != TypeExprKind::Invalid);
+                    let expanded = match definition {
+                        Some(root) => {
+                            let start = self.types.len();
+                            let copy = self.types.copy(&store.arena, root, &mut memo, &|_| None);
+                            // The copies are children first, so each one's
+                            // height follows from its children's.
+                            for new in self.types.ids_from(start) {
+                                let height = self.types.height(new, &heights);
+                                heights.push(height);
+                            }
+                            self.types.kind(copy)
+                        }
+                        None => TypeExprKind::Invalid,
+                    };
+                    self.types.set_kind(id, expanded);
+                    written.push((id, kind));
+                }
+                Some(TypeLink::Error(error)) => {
+                    self.types.set_kind(id, TypeExprKind::Invalid);
+                    written.push((id, kind));
+                    problems.push((id, TypeProblem::Unresolved(error.clone())));
+                }
+                None => {
+                    let found = self.types.merge_record(id);
+                    if self.types.kind(id) != kind {
+                        written.push((id, kind));
+                    }
+                    problems.extend(found.into_iter().map(|problem| (id, problem)));
+                }
+            }
+            let mut height = self.types.height(id, &heights);
+            if height as usize > MAX_DEPTH {
+                let span = self.types.get(id).span;
+                if written.last().map(|&(at, _)| at) != Some(id) {
+                    written.push((id, kind));
+                }
+                self.types.set_kind(id, TypeExprKind::Invalid);
+                problems.push((
+                    id,
+                    TypeProblem::Unresolved(Diagnostic::error(
+                        "expression nested too deeply",
+                        span,
+                    )),
+                ));
+                height = 1;
+            }
+            if let Some(entry) = heights.get_mut(id.index()) {
+                *entry = height;
+            }
+        }
+        self.expansion.written = written;
+        self.expansion.problems = problems;
     }
 
     /// The span of the file's body: from its first item to its last, or an
@@ -2217,6 +3012,17 @@ pub trait Annotate {
     ///
     /// Propagates errors from the formatter.
     fn annotate(&self, id: ExprId, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+
+    /// Writes the annotation for the `type` item `item`, after its type as
+    /// written, including any leading space: by default, nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the formatter.
+    fn annotate_type(&self, item: ItemId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (item, f);
+        Ok(())
+    }
 }
 
 /// The empty annotation used by [`Ast::pretty`].
@@ -2242,7 +3048,7 @@ impl Annotate for NoAnnotation {
 /// ```
 ///
 /// Items print as `(let x ...)`, `(let x : Type ...)`, `(let mut x ...)`,
-/// `(let mut x : Type ...)`, `(field x ...)`,
+/// `(let mut x : Type ...)`, `(field x ...)`, `(field x : Type ...)`,
 /// `(rebind x ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`,
 /// followed by their span and their expression, a dotted path in full, as
 /// in `(let a.b.c ...)`, and an index segment as it is written, as in
@@ -2251,8 +3057,13 @@ impl Annotate for NoAnnotation {
 /// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
 /// field accesses as `(. x ...)` followed by their record expression. A
 /// field name, or a path segment, that is not a plain identifier is quoted,
-/// as in `(field "a b" ...)`. Types print as written, a record type's fields
-/// in source order: `{x: Int, "a b": {}}`, `fn(x: Int) -> String`. A function
+/// as in `(field "a b" ...)`. Types print as written, whatever the
+/// expansion of the tree's types made of them ([`Ast::written_type`]), a
+/// record type's fields and spreads in source order: `{x: Int, "a b": {}}`,
+/// `{...PackageDef, name: String}`, `fn(x: Int) -> String`, and a qualified
+/// name as its path, `t.PackageDef`. A `type` item prints as `(type NAME
+/// TYPE @0..20)`, with the annotation's [`Annotate::annotate_type`] after
+/// its type, which `--dump-types` makes its expansion. A function
 /// expression prints as `(fn ...)` followed by `(params (x Int) (y String))`,
 /// `(ret pure Int)`, `(ret memo Int)` or `(ret impure Int)`, and its body; a
 /// call as
@@ -2379,11 +3190,16 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ItemKind::Field {
                 path,
+                ty,
                 value,
                 function,
             } => {
                 let keyword = if function { "def" } else { "field" };
                 write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?;
+                if let Some(ty) = ty {
+                    f.write_str(" : ")?;
+                    self.type_expr(f, ty)?;
+                }
                 value
             }
             ItemKind::Rebind { path, value } => {
@@ -2412,6 +3228,12 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             ItemKind::Import(id) => {
                 self.import(f, ast.import_decl(id))?;
+                return write!(f, " @{})", item.span);
+            }
+            ItemKind::Type { name, ty, .. } => {
+                write!(f, "type {} ", ast.names().get(name))?;
+                self.type_expr(f, ty)?;
+                self.annotation.annotate_type(id, f)?;
                 return write!(f, " @{})", item.span);
             }
         };
@@ -2458,18 +3280,24 @@ impl<A: Annotate> Pretty<'_, A> {
         }
     }
 
-    /// Writes a type expression as it is written in source.
+    /// Writes a type expression as it is written in source: as the parser
+    /// made it, whatever the expansion of the tree's types made of it
+    /// ([`Ast::written_type`]).
     fn type_expr(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
         let names = self.ast.names();
-        match self.ast.type_expr(id).kind {
+        match self.ast.written_type(id) {
             TypeExprKind::Named(name) => f.write_str(names.get(name)),
+            TypeExprKind::Path(path) => write!(f, "{}", self.ast.show_path(self.ast.path(path))),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;
                 for (index, field) in self.ast.field_tys(fields).iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{}: ", FieldName(names.get(field.name)))?;
+                    match field.name {
+                        Some(name) => write!(f, "{}: ", FieldName(names.get(name)))?,
+                        None => f.write_str("...")?,
+                    }
                     self.type_expr(f, field.ty)?;
                 }
                 f.write_str("}")
@@ -2506,7 +3334,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 // The `[]` would belong to a function type's return type,
                 // and bind tighter than a union's `|`.
                 if matches!(
-                    self.ast.type_expr(element).kind,
+                    self.ast.written_type(element),
                     TypeExprKind::Fn { .. } | TypeExprKind::Union { .. }
                 ) {
                     f.write_str("(")?;
@@ -2517,6 +3345,9 @@ impl<A: Annotate> Pretty<'_, A> {
                     f.write_str("[]")
                 }
             }
+            // Never written: the store's references and the expansion's
+            // errors are kept apart from what a tree prints.
+            TypeExprKind::Ref(_) | TypeExprKind::Invalid => f.write_str("<invalid>"),
         }
     }
 
@@ -2524,7 +3355,7 @@ impl<A: Annotate> Pretty<'_, A> {
     /// if it is a function type, whose return type would otherwise take
     /// what follows.
     fn union_member(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
-        if matches!(self.ast.type_expr(id).kind, TypeExprKind::Fn { .. }) {
+        if matches!(self.ast.written_type(id), TypeExprKind::Fn { .. }) {
             f.write_str("(")?;
             self.type_expr(f, id)?;
             f.write_str(")")
@@ -3169,6 +4000,7 @@ mod tests {
             },
             ItemKind::Field {
                 path: dotted,
+                ty: None,
                 value: one,
                 function: false,
             },

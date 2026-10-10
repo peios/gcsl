@@ -45,7 +45,11 @@
 //! An `r` directly followed by `"` begins a raw string literal; anywhere
 //! else it is an ordinary identifier. `Future` and `Present` are not
 //! keywords: they are ordinary
-//! identifiers, which only the checker gives a meaning, in types.
+//! identifiers, which only the checker gives a meaning, in types. Nor is
+//! `type`: it is an identifier here, which the parser takes as the start of
+//! a `type` item only where an item starts and an identifier follows it on
+//! its line (see the parser's [Types](crate::parser#types)), so a variable
+//! or field may still be named `type`.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
 //! followed by anything else a third, and likewise `!==` and `!=`, `<=` and

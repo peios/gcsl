@@ -6,10 +6,11 @@
 //! items separated by newlines or `;` (`Parser::parse_body`). Runs of
 //! separators, and so blank and comment-only lines, are skipped. An item is
 //! `let PATH (: TYPE)? = EXPR`, `let mut NAME (: TYPE)? = EXPR`, `PATH :=
-//! EXPR`, a field `PATH = EXPR`, `= EXPR`, a spread `...EXPR`, a named
-//! function `fn NAME(...) ...`, a `break`, a `continue` or a `return` (see
-//! [Loops](#loops)), an expression, or, in a file's body only, an `import`
-//! (see [Imports](#imports)). After an item the next
+//! EXPR`, a field `PATH (: TYPE)? = EXPR`, `= EXPR`, a spread `...EXPR`, a
+//! named function `fn NAME(...) ...`, a `break`, a `continue` or a `return`
+//! (see [Loops](#loops)), an expression, or, in a file's body only, an
+//! `import` (see [Imports](#imports)) or a `type` (see [Types](#types)).
+//! After an item the next
 //! token must be a separator or the end of the body; anything else is
 //! "expected end of item".
 //!
@@ -73,9 +74,10 @@
 //! before the file's first item (after an item or an outer attribute, or in
 //! a block) is "`#![no_prelude]` must come before anything else in the
 //! file"; `#[shadowable]` before anything but a top-level field, `def` or
-//! `import` (a `let`, `let mut`, `fn`, `:=`, a spread, a result, an
-//! expression, a `break`, `continue` or `return`, or any item of an inner
-//! block or of a `for` header) is "`#[shadowable]` applies only to a file's
+//! `import` (a `let`, `let mut`, `fn`, `:=`, a `type`, a spread, a result,
+//! an expression, a `break`, `continue` or `return`, or any item of an
+//! inner block or of a `for` header) is "`#[shadowable]` applies only to a
+//! file's
 //! top-level fields, `def`s and imports", with the note "a `let` or `fn`
 //! already shadows" before a `let`, a `let mut` or a `fn`; and one with no
 //! item after it, at the end of its body, is "`#[shadowable]` is not
@@ -153,6 +155,23 @@
 //! between them are then parsed as the position, so an item starting with
 //! an index is looked through twice.
 //!
+//! A field item may be annotated, `PATH: TYPE = EXPR`, as a `let` may
+//! ([`ItemKind::Field`]'s `ty`): the lookahead then finds `:` after the
+//! path, and then, before the item can end (`Parser::annotated`), an `=`
+//! outside any brackets, after the type. Without that `=` the item is the
+//! expression it always was, the path's ascription: `x : Int` alone, a
+//! block's `{ x : Int }`, or `x : Int` followed on the next line by `y =
+//! 2`. The item ends, for the lookahead, at a `;`, a `:=`, a closing
+//! bracket it is inside, the end of input, or a newline outside brackets
+//! but after `:`, `|`, `<`, `->` or `->>`, after which the type goes on, as
+//! a type itself does (newlines inside a record type's braces and a
+//! function type's parentheses are skipped as the type is). An annotation
+//! must be followed by
+//! `=`, "expected `=` after the field's type" otherwise, and a `:=` is never
+//! annotated. A quoted name may be annotated as a plain one, `"a b": Int =
+//! 1`, and on a dotted path the annotation applies to the last segment, as
+//! for a `let`. A `def` is not annotated: it has its signature.
+//!
 //! Only a `:=` path may have index segments: a `let` path with one, `let
 //! xs[0] = 1`, is "a `let` path cannot index a list", and a field's, `xs[0]
 //! = 1`, "a field's path cannot index a list", each at the first index's
@@ -188,14 +207,24 @@
 //!
 //! # Types
 //!
-//! A type is a name, such as `Int`, a name applied to a type argument, such
+//! A type is a name, such as `Int`, a qualified name, `t.PackageDef`, a
+//! name applied to a type argument, such
 //! as `Future<Int>` or `List<Int>`, a record type, a function type, a type
 //! in parentheses, a list type written `T[]`, or a union of types. A
-//! record type is `{` then `}`, or `NAME: TYPE` entries separated by `,`,
+//! qualified name is an identifier directly followed by `.`, and then
+//! identifiers separated by `.` ("expected a type's name after `.`"
+//! otherwise), a [`TypeExprKind::Path`]; what it names is the workspace's
+//! business (see [`crate::workspace`], "Types"). So `x : Int.y`, which was
+//! the field access `(x : Int).y` and could only be an error, is now the
+//! ascription of a qualified name. A
+//! record type is `{` then `}`, or entries separated by `,`, each `NAME:
+//! TYPE` or a spread, `...TYPE`, whose fields join the record type,
 //! with an optional trailing `,`, then `}`. The lexer does not know it is
 //! in a type, so it emits the newlines inside the braces, and the parser
 //! skips them all: a record type may span lines freely. Repeated field names
-//! are left to the checker. A function type is `fn`, `(`, parameter types
+//! are left to the checker, and the merging of spreads to the expansion of
+//! the file's types (see [`crate::ast`], "Types"). A function type is
+//! `fn`, `(`, parameter types
 //! separated by `,` with an optional trailing `,`, `)`, the marker `:`,
 //! `->>` or `->`, and the return type; a parameter type is `NAME: TYPE`,
 //! recognised
@@ -223,6 +252,22 @@
 //! checker rejects. A `[` after a type is this postfix only if a `]`
 //! follows it directly; in `fn(): Int[]` it belongs to the return type,
 //! which is parsed first.
+//!
+//! A `type` item, `type NAME = TYPE` ([`ItemKind::Type`]), declares a type
+//! (`Parser::parse_type_item`), its name a single identifier, newlines
+//! skipped after its `=`. `type` is no keyword of the lexer: it is
+//! contextual, a `type` item's start only where an item starts and an
+//! identifier follows it on its line (`Parser::starts_type_item`), which no
+//! item could before, so every program that parsed parses as it did, and a
+//! variable or field may still be named `type` (`type = 1`, `let type =
+//! 2`, `type.x = 3`, `type: Int = 4`). A `type` item is an item of a file's
+//! outermost body only: anywhere else, a block's, a function's or a
+//! `lazy`'s, it is "`type` is declared only at the top level of a file", at
+//! the `type`. Type parameters, `type Box<T> = ...`, are "a `type` takes no
+//! type parameters", at the `<`; anything else after the name is "expected
+//! `=` after the type's name". `#[shadowable]` before one is the error it is
+//! before anything but a field, a `def` or an import. Whether a name is
+//! some built-in type's, or declared twice, is the checker's business.
 //!
 //! # Functions and calls
 //!
@@ -602,6 +647,15 @@ const MISPLACED_SPREAD: &str = "`...` is only allowed in a list or at the start 
 /// The error for an `import` item anywhere but in a file's outermost body.
 const MISPLACED_IMPORT: &str = "`import` is only allowed at the top level of a file";
 
+/// The contextual keyword that begins a `type` item.
+const TYPE: &str = "type";
+
+/// The error for a `type` item anywhere but in a file's outermost body.
+const MISPLACED_TYPE: &str = "`type` is declared only at the top level of a file";
+
+/// The error for type parameters after a `type` item's name, at their `<`.
+const TYPE_PARAMETERS: &str = "a `type` takes no type parameters";
+
 /// The name of the outer attribute that marks a declaration shadowable.
 const SHADOWABLE: &str = "shadowable";
 
@@ -904,6 +958,12 @@ impl Parser<'_> {
                 (TokenKind::Import, Some(_)) => {
                     return Err(self.error(MISPLACED_IMPORT, token.span));
                 }
+                _ if self.starts_type_item() => {
+                    if open.is_some() {
+                        return Err(self.error(MISPLACED_TYPE, token.span));
+                    }
+                    self.parse_type_item(token)?
+                }
                 _ => self.parse_item()?,
             };
             if let Some(attribute) = pending.take() {
@@ -1016,8 +1076,6 @@ impl Parser<'_> {
             let note = self.starts_field(1).then_some(MUT_FIELD_NOTE);
             return Err(self.misplaced_mut(token, note));
         }
-        // The shape of the item's path, if it has one.
-        let mut shape = PathShape::SINGLE;
         let (kind, value) = match token.kind {
             TokenKind::Let => {
                 let (kind, value, ty_height, path_shape) = self.parse_let(token)?;
@@ -1040,9 +1098,8 @@ impl Parser<'_> {
                 (ItemKind::Spread(value), value)
             }
             _ if self.starts_path_item() => {
-                let (kind, value, path) = self.parse_path_item()?;
-                shape = path;
-                (kind, value)
+                let (kind, value, path, ty_height) = self.parse_path_item()?;
+                return self.finish_item(token, (kind, value), ty_height, path);
             }
             _ => {
                 let expr = self.parse_expr(0)?;
@@ -1058,7 +1115,7 @@ impl Parser<'_> {
                 return Err(self.not_a_path(expr, operator, rebind));
             }
         };
-        self.finish_item(token, (kind, value), 0, shape)
+        self.finish_item(token, (kind, value), 0, PathShape::SINGLE)
     }
 
     /// Parses a `let` item, `let PATH (: TYPE)? = EXPR` or `let mut NAME (:
@@ -1183,7 +1240,8 @@ impl Parser<'_> {
     /// Whether the current token begins a field item or a rebind whose
     /// path is written as one: a name or a plain string literal, then `.`
     /// and a name or `[`, anything and the matching `]` as many times as
-    /// they follow, and then `=` or `:=`. Such an item is read by
+    /// they follow, and then `=` or `:=`, or `:` and an annotation followed
+    /// by `=` ([`Parser::annotated`]). Such an item is read by
     /// [`Parser::parse_path_item`]; any other item that turns out to be
     /// followed by `=` or `:=` is not a path (see [`Parser::not_a_path`]).
     /// The tokens between brackets are only counted here, and parsed as
@@ -1191,7 +1249,57 @@ impl Parser<'_> {
     /// through twice.
     fn starts_path_item(&self) -> bool {
         self.path_end(0, true)
-            .is_some_and(|end| matches!(self.peek_at(end).kind, TokenKind::Eq | TokenKind::ColonEq))
+            .is_some_and(|end| match self.peek_at(end).kind {
+                TokenKind::Eq | TokenKind::ColonEq => true,
+                TokenKind::Colon => self.annotated(end + 1),
+                _ => false,
+            })
+    }
+
+    /// Whether the tokens from `ahead` places after the current one, which
+    /// follow a path and its `:`, are an annotation followed by the `=` of
+    /// an annotated field, rather than the type of an ascription (see
+    /// [Paths](#paths)): an `=` comes before the item can end, outside any
+    /// brackets. The item ends at a `;`, a `:=`, a closing bracket that
+    /// opened before it or the end of input, or a newline outside brackets
+    /// that does not follow `:`, `|`, `<`, `->` or `->>`, after which a
+    /// type goes on. The tokens are only counted here.
+    fn annotated(&self, ahead: usize) -> bool {
+        let mut depth = 0_usize;
+        let mut previous = TokenKind::Colon;
+        for at in ahead.. {
+            let kind = self.peek_at(at).kind;
+            match kind {
+                TokenKind::Eq if depth == 0 => return true,
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    let Some(outer) = depth.checked_sub(1) else {
+                        return false;
+                    };
+                    depth = outer;
+                }
+                TokenKind::Newline if depth > 0 => continue,
+                TokenKind::Newline => {
+                    let goes_on = matches!(
+                        previous,
+                        TokenKind::Colon
+                            | TokenKind::Pipe
+                            | TokenKind::Lt
+                            | TokenKind::Arrow
+                            | TokenKind::MemoArrow
+                    );
+                    if goes_on {
+                        continue;
+                    }
+                    return false;
+                }
+                TokenKind::Semi | TokenKind::ColonEq if depth == 0 => return false,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            previous = kind;
+        }
+        false
     }
 
     /// How many places after the current token the tokens from `ahead`
@@ -1295,6 +1403,7 @@ impl Parser<'_> {
         let kind = if keyword.kind == TokenKind::Def {
             ItemKind::Field {
                 path,
+                ty: None,
                 value,
                 function: true,
             }
@@ -1376,6 +1485,53 @@ impl Parser<'_> {
             form: ImportForm::Members(range),
         };
         Ok(self.finish_import(decl, keyword.span.join(path_span)))
+    }
+
+    /// Whether the current token begins a `type` item: the identifier
+    /// `type`, the contextual keyword, directly followed on its line by an
+    /// identifier (see [Types](#types)).
+    fn starts_type_item(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Ident(name) if self.names.get(name) == TYPE)
+            && matches!(self.peek_at(1).kind, TokenKind::Ident(_))
+    }
+
+    /// Parses a `type` item of the file's body, `type NAME = TYPE`,
+    /// starting at its `type`, `keyword`, which [`Parser::starts_type_item`]
+    /// has found to be followed by an identifier. Returns it and its height,
+    /// its type's. Type parameters, `type Box<T> = ...`, are an error at
+    /// their `<`.
+    fn parse_type_item(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        let name_token = self.peek();
+        let TokenKind::Ident(name) = name_token.kind else {
+            return Err(self.error("expected the type's name after `type`", name_token.span));
+        };
+        self.advance();
+        let eq = self.peek();
+        match eq.kind {
+            TokenKind::Eq => {}
+            TokenKind::Lt => return Err(self.error(TYPE_PARAMETERS, eq.span)),
+            _ => {
+                let found = self.describe(eq);
+                return Err(self.error(
+                    format!("expected `=` after the type's name, found {found}"),
+                    error_span(eq),
+                ));
+            }
+        }
+        self.advance();
+        self.skip_newlines();
+        let (ty, height) = self.parse_type()?;
+        let span = Span::join(keyword.span, self.type_span(ty));
+        let item = self.builder.alloc_item(Item {
+            kind: ItemKind::Type {
+                name,
+                name_span: name_token.span,
+                ty,
+            },
+            span,
+        });
+        Ok((item, height))
     }
 
     /// Reads the rest of a `from` import's member list after its first
@@ -1606,22 +1762,40 @@ impl Parser<'_> {
         Ok(self.finish_path(base))
     }
 
-    /// Parses a field item, `PATH = EXPR`, or a rebind, `PATH := EXPR`,
-    /// whose tokens [`Parser::starts_path_item`] has found to begin with a
-    /// path, starting at the path's first segment. Returns its kind, its
-    /// value and its path's shape.
+    /// Parses a field item, `PATH = EXPR` or `PATH: TYPE = EXPR`, or a
+    /// rebind, `PATH := EXPR`, whose tokens [`Parser::starts_path_item`] has
+    /// found to begin with a path, starting at the path's first segment.
+    /// Returns its kind, its value, its path's shape and its annotation's
+    /// height (0 if it has none).
     ///
     /// The path's first segment is checked after the rest of the path is
     /// read, as when the path was read back from an expression: a field's
     /// name may be a plain string literal but not a raw one, and a
     /// variable's must be an identifier. Only a rebind's path may have index
     /// segments: a field's is reported at the first, "a field's path cannot
-    /// index a list", with a note writing the path as a `:=`.
-    fn parse_path_item(&mut self) -> ParseResult<(ItemKind, ExprId, PathShape)> {
+    /// index a list", with a note writing the path as a `:=`. An annotation
+    /// is followed by `=`: "expected `=` after the field's type" otherwise.
+    fn parse_path_item(&mut self) -> ParseResult<(ItemKind, ExprId, PathShape, u32)> {
         let first = self.peek();
         self.advance();
         let base = self.path.len();
         let positions = self.parse_segments()?;
+        let (ty, ty_height) = if self.peek().kind == TokenKind::Colon {
+            self.advance();
+            self.skip_newlines();
+            let (ty, height) = self.parse_type()?;
+            let eq = self.peek();
+            if eq.kind != TokenKind::Eq {
+                let found = self.describe(eq);
+                return Err(self.error(
+                    format!("expected `=` after the field's type, found {found}"),
+                    error_span(eq),
+                ));
+            }
+            (Some(ty), height)
+        } else {
+            (None, 0)
+        };
         let operator = self.peek();
         let rebind = operator.kind == TokenKind::ColonEq;
         let name = match first.kind {
@@ -1656,11 +1830,12 @@ impl Parser<'_> {
         } else {
             ItemKind::Field {
                 path,
+                ty,
                 value,
                 function: false,
             }
         };
-        Ok((kind, value, shape))
+        Ok((kind, value, shape, ty_height))
     }
 
     /// Parses the segments of a path after its first, onto `path`, while
@@ -1887,6 +2062,7 @@ impl Parser<'_> {
                 self.depth -= 1;
                 applied
             }
+            TokenKind::Ident(_) if self.peek_at(1).kind == TokenKind::Dot => self.parse_type_path(),
             TokenKind::Ident(name) => {
                 self.advance();
                 let id = self.builder.alloc_type(TypeExpr {
@@ -1919,6 +2095,38 @@ impl Parser<'_> {
             TokenKind::Mut => Err(self.misplaced_mut(token, None)),
             _ => Err(self.error("expected a type", error_span(token))),
         }
+    }
+
+    /// Parses a qualified type name, `a.b` or `a.b.c`, starting at its first
+    /// name, an identifier directly followed by `.`: identifiers separated by
+    /// `.`, each `.` followed by an identifier ("expected a type's name after
+    /// `.`" otherwise). Returns it, a leaf one level tall.
+    fn parse_type_path(&mut self) -> ParseResult<(TypeExprId, u32)> {
+        let base = self.path.len();
+        let mut token = self.peek();
+        loop {
+            let TokenKind::Ident(name) = token.kind else {
+                self.path.truncate(base);
+                return Err(self.error("expected a type's name after `.`", error_span(token)));
+            };
+            self.advance();
+            self.path.push(PathSegment {
+                kind: SegmentKind::Name(name),
+                span: token.span,
+            });
+            if self.peek().kind != TokenKind::Dot {
+                break;
+            }
+            self.advance();
+            token = self.peek();
+        }
+        let span = path_span(self.path.get(base..).unwrap_or_default());
+        let (path, _) = self.finish_path(base);
+        let id = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Path(path),
+            span,
+        });
+        Ok((id, LEAF_HEIGHT))
     }
 
     /// Parses a parenthesised type, starting at its `(`: the `(`, newlines,
@@ -2108,16 +2316,26 @@ impl Parser<'_> {
                 self.advance();
                 break token;
             }
-            let Some(name) = self.field_name()? else {
-                return Err(self.error("expected a field name in record type", error_span(token)));
+            // A spread, `...TYPE`.
+            let name = if token.kind == TokenKind::DotDotDot {
+                self.advance();
+                self.skip_newlines();
+                None
+            } else {
+                let Some(name) = self.field_name()? else {
+                    return Err(
+                        self.error("expected a field name in record type", error_span(token))
+                    );
+                };
+                self.skip_newlines();
+                let colon = self.peek();
+                if colon.kind != TokenKind::Colon {
+                    return Err(self.error("expected `:` after field name", error_span(colon)));
+                }
+                self.advance();
+                self.skip_newlines();
+                Some(name)
             };
-            self.skip_newlines();
-            let colon = self.peek();
-            if colon.kind != TokenKind::Colon {
-                return Err(self.error("expected `:` after field name", error_span(colon)));
-            }
-            self.advance();
-            self.skip_newlines();
             let (ty, height) = self.parse_type()?;
             tallest = tallest.max(height);
             self.field_ty_stack.push(FieldTy {
@@ -3005,8 +3223,8 @@ impl Parser<'_> {
             let (kind, value, ty_height, shape) = self.parse_let(token)?;
             self.finish_item(token, (kind, value), ty_height, shape)?
         } else {
-            let (kind, value, shape) = self.parse_path_item()?;
-            self.finish_item(token, (kind, value), 0, shape)?
+            let (kind, value, shape, ty_height) = self.parse_path_item()?;
+            self.finish_item(token, (kind, value), ty_height, shape)?
         };
         let Item { kind, span } = *self.builder.item(item);
         match kind {
@@ -3460,6 +3678,7 @@ mod tests {
                 path,
                 value,
                 function: true,
+                ..
             } => {
                 // As written: the keyword, the name, then the function
                 // expression from its `(` on.
@@ -3490,8 +3709,14 @@ mod tests {
                 out.push_str(" := ");
                 expr(ast, value, out);
             }
-            ItemKind::Field { path, value, .. } => {
+            ItemKind::Field {
+                path, ty, value, ..
+            } => {
                 path_shape(ast, path, out);
+                if let Some(ty) = ty {
+                    out.push_str(": ");
+                    type_name(ast, ty, out);
+                }
                 out.push_str(" = ");
                 expr(ast, value, out);
             }
@@ -3505,6 +3730,12 @@ mod tests {
             }
             ItemKind::Expr(value) => expr(ast, value, out),
             ItemKind::Import(import) => import_shape(ast, import, out),
+            ItemKind::Type { name, ty, .. } => {
+                out.push_str("type ");
+                out.push_str(ast.names().get(name));
+                out.push_str(" = ");
+                type_name(ast, ty, out);
+            }
         }
     }
 
@@ -3561,18 +3792,25 @@ mod tests {
     fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
         match ast.type_expr(id).kind {
             TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
+            TypeExprKind::Path(path) => out.push_str(&ast.show_path(ast.path(path)).to_string()),
             TypeExprKind::Record(fields) => {
                 out.push('{');
                 for (index, field) in ast.field_tys(fields).iter().enumerate() {
                     if index > 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(&FieldName(ast.names().get(field.name)).to_string());
-                    out.push_str(": ");
+                    match field.name {
+                        Some(name) => {
+                            out.push_str(&FieldName(ast.names().get(name)).to_string());
+                            out.push_str(": ");
+                        }
+                        None => out.push_str("..."),
+                    }
                     type_name(ast, field.ty, out);
                 }
                 out.push('}');
             }
+            TypeExprKind::Ref(_) | TypeExprKind::Invalid => out.push('?'),
             TypeExprKind::Fn {
                 params,
                 ret,
@@ -5124,7 +5362,7 @@ mod tests {
         assert_eq!(error("(a).b = 1"), found_eq(6));
         assert_eq!(error("(a.b) = 1"), found_eq(6));
         assert_eq!(error("-a.b = 1"), found_eq(5));
-        assert_eq!(error("a.b : Int = 1"), found_eq(10));
+        assert_eq!(error("(a).b : Int = 1"), found_eq(12));
         assert_eq!(error("{ x = 1 }.x = 1"), found_eq(12));
         assert_eq!(error("1.x = 1"), found_eq(4));
         assert_eq!(
@@ -5300,7 +5538,7 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].span, Span::new(5, 6));
         assert_eq!(fields[1].span, Span::new(13, 16));
-        assert_eq!(ast.names().get(fields[1].name), "b");
+        assert_eq!(fields[1].name.map(|name| ast.names().get(name)), Some("b"));
         assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(18, 20));
     }
 
@@ -5665,6 +5903,7 @@ mod tests {
         let item = ast.item(ast.items(ast.root())[0]);
         let ItemKind::Field {
             path,
+            ty: None,
             value,
             function: true,
         } = item.kind
@@ -8490,6 +8729,135 @@ mod tests {
         assert_eq!(
             message("a = #[shadowable] 1"),
             "expected expression, found `#[shadowable]`"
+        );
+    }
+
+    #[test]
+    fn type_items_parse_and_print_back() {
+        assert_eq!(shape("type N = Int"), "type N = Int");
+        assert_eq!(
+            shape("type P = {\n  version: String,\n  arch: String,\n}"),
+            "type P = {version: String, arch: String}"
+        );
+        assert_eq!(
+            shape("type Package = { ...PackageDef, name: String }"),
+            "type Package = {...PackageDef, name: String}"
+        );
+        assert_eq!(
+            shape("type Q = {...t.P, ...{a: Int}}"),
+            "type Q = {...t.P, ...{a: Int}}"
+        );
+        assert_eq!(
+            shape("type Steps =\n  List<fn() -> String>"),
+            "type Steps = List<fn() -> String>"
+        );
+        // A qualified name in any type position.
+        assert_eq!(
+            shape("x : a.b.T; fn f(p: t.P): t.Q { p }"),
+            "(x : a.b.T); fn f(p: t.P): t.Q {p}"
+        );
+        let ast = parse_text("type P = {a: Int}").unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        assert_eq!(item.span, Span::new(0, 17));
+        let ItemKind::Type { name_span, .. } = item.kind else {
+            panic!("expected a type item");
+        };
+        assert_eq!(name_span, Span::new(5, 6));
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n  (type P {a: Int} @0..17))"
+        );
+    }
+
+    #[test]
+    fn type_is_a_contextual_keyword() {
+        // Only `type` followed on its line by an identifier, at the start
+        // of an item, begins a `type` item: everywhere else it is a name,
+        // as it was.
+        assert_eq!(shape("type = 1"), "type = 1");
+        assert_eq!(shape("let type = 1; type"), "let type = 1; type");
+        assert_eq!(shape("type.x = 1"), "type.x = 1");
+        assert_eq!(shape("a = { type = 1 }.type"), "a = ({type = 1} . type)");
+        assert_eq!(
+            shape("fn f(type: Int): Int { type }"),
+            "fn f(type: Int): Int {type}"
+        );
+        assert_eq!(shape("type\nFoo"), "type; Foo");
+        assert_eq!(shape("type: Int = 1"), "type: Int = 1");
+    }
+
+    #[test]
+    fn type_item_errors() {
+        for (text, at) in [
+            ("x = { type T = Int }", Span::new(6, 10)),
+            ("fn f(): Int { type T = Int; 1 }", Span::new(14, 18)),
+            ("for { type T = Int }", Span::new(6, 10)),
+        ] {
+            assert_eq!(error(text), (MISPLACED_TYPE.to_owned(), at), "{text}");
+        }
+        assert_eq!(
+            error("type Box<T> = {v: T}"),
+            (TYPE_PARAMETERS.to_owned(), Span::new(8, 9))
+        );
+        assert_eq!(
+            error("type T Int"),
+            (
+                "expected `=` after the type's name, found `Int`".to_owned(),
+                Span::new(7, 10)
+            )
+        );
+        assert_eq!(
+            error("#[shadowable] type T = Int"),
+            (MISPLACED_SHADOWABLE.to_owned(), Span::new(0, 13))
+        );
+        assert_eq!(
+            error("x : t."),
+            (
+                "expected a type's name after `.`".to_owned(),
+                Span::new(6, 6)
+            )
+        );
+        assert_eq!(
+            error("type T = {...}"),
+            ("expected a type".to_owned(), Span::new(13, 14))
+        );
+    }
+
+    #[test]
+    fn annotated_fields_parse() {
+        assert_eq!(shape("x: Int = 1"), "x: Int = 1");
+        assert_eq!(shape("a.b: Int | String = 1"), "a.b: (Int | String) = 1");
+        assert_eq!(shape("\"a b\": Float = 2"), "\"a b\": Float = 2");
+        assert_eq!(
+            shape("x: {\n  a: Int,\n} = { a = 1 }"),
+            "x: {a: Int} = {a = 1}"
+        );
+        assert_eq!(shape("x:\n  Int = 1"), "x: Int = 1");
+        assert_eq!(shape("x: Int |\n  String = 1"), "x: (Int | String) = 1");
+        assert_eq!(shape("{ x: Int = 1 }"), "{x: Int = 1}");
+        // Ascriptions as they were: a block's result, a statement, an item
+        // ending before an `=` on the next line.
+        assert_eq!(shape("{ x : Int }"), "{(x : Int)}");
+        assert_eq!(shape("x : {}"), "(x : {})");
+        assert_eq!(shape("x : Int\ny = 2"), "(x : Int); y = 2");
+        assert_eq!(shape("x : Int { a = 1 }"), "(x : Int)(){a = 1}");
+        // An annotation is followed by `=`; a rebind is not annotated.
+        assert_eq!(
+            error("x: Int := 1"),
+            (
+                "expected end of item, found `:=`".to_owned(),
+                Span::new(7, 9)
+            )
+        );
+        // The annotation counts towards the item's height, as a `let`'s.
+        let ast = parse_text("a.b: Int = 1").unwrap();
+        let ItemKind::Field { ty: Some(ty), .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an annotated field");
+        };
+        assert_eq!(ast.type_expr(ty).span, Span::new(5, 8));
+        assert_eq!(
+            ast.pretty().to_string(),
+            "(file\n  (field a.b : Int @0..12\n    (int 1 @11..12)))"
         );
     }
 }

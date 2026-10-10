@@ -61,6 +61,16 @@
 //! punctuation: "cannot add Int and `{}`". Labels show every type plainly:
 //! "expected {x: Int}, found Int".
 //!
+//! A type may also be written as the name of a declared type, `type
+//! PackageDef = {...}`, bare or qualified through an import (`t.PackageDef`),
+//! and a record type may spread one, `{...PackageDef, name: String}` (see
+//! [Type declarations](#type-declarations)). A declared type is a
+//! STRUCTURAL ALIAS: it is its definition, not a new type, so two aliases of
+//! one record type are one type, a record of the right fields is a
+//! `PackageDef` with no ceremony, and a type is shown as what it stands for,
+//! never by the name of an alias of it: an error about a `PackageDef` shows
+//! the record type.
+//!
 //! # Records
 //!
 //! A block with at least one field or spread item is a *record block*. Its
@@ -86,6 +96,27 @@
 //! error, and a field item the type lacks is a *warning*, since nothing with
 //! the expected type can see it. Warnings are collected apart from errors
 //! and returned with a successful check.
+//!
+//! A field item may be annotated, `PATH: TYPE = EXPR`, in any block, the
+//! top level included, exactly as `let PATH: TYPE = EXPR` is for a `let`
+//! (`Checker::annotated_value`): the annotation is resolved with every bare
+//! type present, the value is checked against it as an annotated `let`'s
+//! is (a literal adapting, a record block field by field, a value awaited
+//! to fit where it may be, subject to the purity rule, a pure function's
+//! parameter measured), and the field's type IS the annotation's, not the
+//! value's narrower type; on a dotted path the annotation applies to the
+//! last segment, and the segments above it are built from it as from any
+//! leaf; a quoted name is annotated as a plain one. A top-level field's
+//! annotated type is its leaf's, which every reader sees, an item above it
+//! and another file alike (see [Top-level fields](#top-level-fields)). A
+//! top-level field that is annotated is never an alias of a built-in
+//! function (see [Built-in functions](#built-in-functions)), as an
+//! annotated `let` is never one. In a record block checked against an
+//! expected record type, an annotated field has its annotation's type,
+//! which must be a subtype of the expected field's, "mismatched types" at
+//! the annotation otherwise, and one the expected type lacks is warned
+//! about as any field it lacks is. A `def` is not annotated: it has its
+//! signature.
 //!
 //! # Dotted fields
 //!
@@ -251,6 +282,65 @@
 //! and one that fits takes the expected type, as a field item's does. A
 //! soft field the expected type lacks is not warned about, since spreading
 //! a wider record is normal. Missing fields are reported as ever.
+//!
+//! # Type declarations
+//!
+//! `type NAME = TYPE`, an item of a file's top level, declares a type in
+//! the file's namespace of types, which is not its variables': a type and
+//! a field, `def`, `let` or `fn` of one name coexist, a type's name being
+//! read only in a type position. Types are order-free, public as `def`s
+//! are, and importable; which file's declaration a name or a qualified name
+//! names is the workspace's to say (see [`crate::workspace`], "Types"), and
+//! it is said before any file is checked: the workspace *expands* every
+//! file's types first ([`Ast::expand_types`]), so that each name of a
+//! declared type, wherever it is written (an annotation, an ascription, a
+//! parameter, a function type, another `type`), is what the type's
+//! definition is, as if the definition were written there, and each record
+//! type with spreads is the record of its merged fields. The checker
+//! resolves the expanded types with the rules above, unchanged, and knows
+//! no type's name: so bareness applies where an alias is used, as if its
+//! definition were written there (`type N = Int` used as an impure
+//! function's bare parameter is `Int | Future<Int>` there, and used as a
+//! pure one's is inferred), a union with an alias of `Future<Int>` among its
+//! members is a union with a `Future` member, an alias of a function type
+//! is a callback parameter, and an impure function's result written as an
+//! alias of a record type is inferred field by field.
+//!
+//! A spread in a record type, `{...PackageDef, name: String}`, merges as
+//! value spread does (see [Spreads and soft
+//! assignment](#spreads-and-soft-assignment)): the spread's fields are soft,
+//! a later field of one's name overrides it (its type may differ), a later
+//! spread overrides a soft one, a field written twice is "field `x` appears
+//! twice in this type", and a spread's field of a field written before it
+//! is "field `x` is defined twice", at the type spread, labelled "`x` is a
+//! field of this, of type T" and "first defined here", with the note "a
+//! spread cannot replace a field defined before it; put the spread first"
+//! (`Checker::spread_problems`). Only a record type may be spread, written
+//! so or named: anything else is "cannot spread type T: it is not a record
+//! type", at it, `T` shown as what it stands for.
+//!
+//! What is wrong in a declaration's definition is reported once, where it
+//! is written: the workspace checks every file's `type` items before any
+//! file is checked ([`check_types`], `Checker::type_items`), since a file
+//! may use a type of a file checked after it; there a name of a built-in
+//! type is "`Int` is a built-in type", and a second `type` of one name in
+//! one file "type `Foo` is declared twice", labelled "first declared here".
+//! A copy of a definition in another file, or in its own (a use of the
+//! type), is resolved quietly (`Checker::resolve_quietly`), once per mode
+//! however many uses share it: if anything in it is wrong it is `Error`,
+//! reported nowhere here, and the check fails *quietly*, with no error of
+//! its own (a file's `type` items are resolved quietly too, in its own
+//! check). So a type whose definition has an error is erroneous wherever it
+//! is used, and reports once. A name that names nothing it can (an unknown
+//! qualified name, a module's name, a declared type applied to a type
+//! argument, a type nested too deeply once expanded) is reported where it
+//! is written, from the problems the expansion kept ([`Ast::type_problems`]).
+//! Checked alone, as [`check`] checks a file, with no workspace to expand
+//! its types, a file knows no declared type: each of its names is "unknown
+//! type", and a spread an internal error. A `type` item has no existence at
+//! runtime: it is never run, nor warned about as never run, and lowers to
+//! nothing; `--dump-types` shows each with its expansion
+//! ([`Types::declared`]).
 //!
 //! # Dotted `let` and `:=`
 //!
@@ -789,8 +879,10 @@
 //!
 //! **Types: initialisers are checked when they are needed.** A field has no
 //! declared type, which is why a cycle through one is an error rather than
-//! a conservative view. Each leaf's initialiser is checked exactly once
-//! (`Checker::compute_fields`, walking the schedule's order with no
+//! a conservative view. (An annotated field has one, its annotation, which
+//! is its type; a cycle through one is an error all the same.) Each leaf's
+//! initialiser is checked exactly once, against its annotation if it has
+//! one (`Checker::compute_fields`, walking the schedule's order with no
 //! recursion): before the first item that needs it, after the
 //! declarations it needs, or after the last item, with the top-level scope
 //! cut to the bindings above whichever is higher, that item or the field's
@@ -2234,7 +2326,7 @@ use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
     ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
     ItemRange, Jump, Label, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
-    TypeExprId, TypeExprKind, UnaryOp, path_span, symbol_span,
+    TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -2254,12 +2346,28 @@ use crate::workspace::{Context, Target};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Types {
     types: Vec<TyId>,
+    /// The type each `type` item of the tree stands for, by item, in
+    /// source order (see [Type declarations](#type-declarations)).
+    declared: Vec<(ItemId, TyId)>,
 }
 
 impl Types {
     /// Wraps a raw table. Only the checker (and tests) build tables.
     pub(crate) fn new(types: Vec<TyId>) -> Self {
-        Self { types }
+        Self {
+            types,
+            declared: Vec::new(),
+        }
+    }
+
+    /// The type the `type` item `item` stands for, its expansion, if it is
+    /// one the check resolved.
+    #[must_use]
+    pub fn declared(&self, item: ItemId) -> Option<TyId> {
+        self.declared
+            .iter()
+            .find(|&&(at, _)| at == item)
+            .map(|&(_, ty)| ty)
     }
 
     /// The type of expression `id`.
@@ -2306,6 +2414,15 @@ impl Annotate for TypeAnnotation<'_> {
             " : {}",
             self.table.display(self.types.get(id), self.names)
         )
+    }
+
+    /// Writes ` = Type` after a `type` item's type as written: its
+    /// expansion, the type it stands for.
+    fn annotate_type(&self, item: ItemId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.types.declared(item) {
+            Some(ty) => write!(f, " = {}", self.table.display(ty, self.names)),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3405,9 +3522,23 @@ enum BindingKind {
     Narrowed,
 }
 
+/// How the checker resolves the copies of declared types' definitions in a
+/// file (see [Type declarations](#type-declarations)).
+#[derive(Clone, Copy, Debug, Default)]
+struct Quiet {
+    /// Whether a copy of a declared type's definition, or a type of a file
+    /// a workspace checked the `type` items of already, is being resolved:
+    /// its errors are reported where it is written, not here.
+    types: bool,
+    /// Whether a type was erroneous with nothing of this file's to report,
+    /// its error being reported where it is written: the check fails then,
+    /// with no error of its own if it has none.
+    failed: bool,
+}
+
 /// What a bare type written in a type expression means: see the module
 /// documentation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Bareness {
     /// A bare type is present: `Int` is `Int`.
     Present,
@@ -4172,6 +4303,25 @@ pub fn check(
         .map(|output| (output.checked, output.warnings))
 }
 
+/// Checks the `type` items of `ast`, a file of a workspace whose types are
+/// expanded ([`Ast::expand_types`]), interning types into `types`: what is
+/// wrong in each declaration, reported once, here, before any file is
+/// checked, since a file may use a type of a file checked after it (see
+/// [Type declarations](#type-declarations)). Returns the errors, none for a
+/// file with no `type` item.
+pub(crate) fn check_types(ast: &Ast, types: &mut TypeTable) -> Vec<Diagnostic> {
+    let mut checker = Checker::new(ast, types);
+    checker.type_items();
+    checker.errors
+}
+
+/// The names of the built-in types: those of [`BuiltinTypes`], and the
+/// type constructors, `List`, `Future` and `Present`. A `type` may not be
+/// named like one: "`Int` is a built-in type".
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 7] = [
+    "Int", "Float", "Bool", "String", "List", "Future", "Present",
+];
+
 /// The type names every program can use, as `(name, type)` pairs. A name
 /// the program never mentions has no [`Name`].
 type BuiltinTypes = [(Option<Name>, TyId); 4];
@@ -4413,6 +4563,14 @@ pub struct Checker<'a> {
     callback_positions: Vec<CallbackPosition>,
     /// See [`Resolution::test_of`].
     tests: HashMap<ExprId, TestResolution>,
+    /// Whether types are being resolved quietly, and whether one was
+    /// erroneous with nothing to report here.
+    quiet: Quiet,
+    /// The type of each `type` item of the file, for `--dump-types`.
+    declared_types: Vec<(ItemId, TyId)>,
+    /// What each node of a copy of a declared type's definition denotes in
+    /// each mode it has been resolved in (see [`Checker::resolve_type`]).
+    copies: HashMap<(TypeExprId, Bareness), TyId>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -4539,6 +4697,9 @@ impl<'a> Checker<'a> {
             callbacks: Vec::new(),
             callback_positions: Vec::new(),
             tests: HashMap::new(),
+            quiet: Quiet::default(),
+            declared_types: Vec::new(),
+            copies: HashMap::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -4553,6 +4714,11 @@ impl<'a> Checker<'a> {
     /// As [`check`].
     pub fn check(mut self) -> Result<CheckOutput, Vec<Diagnostic>> {
         let root = self.ast.root();
+        // A workspace has checked the file's `type` items already, before
+        // any file's check ([`check_types`]): they are resolved quietly.
+        let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
+        self.type_items();
+        self.quiet.types = quiet;
         self.declare_top_fns();
         let ty = self.check_body(root, None);
         // Finalisation: an integer result with no context defaults to Int.
@@ -4562,7 +4728,7 @@ impl<'a> Checker<'a> {
         } else {
             ty
         };
-        if !self.errors.is_empty() {
+        if !self.errors.is_empty() || self.quiet.failed {
             return Err(diagnostic::merge(self.errors, self.warnings));
         }
         if !self.settled() {
@@ -4605,7 +4771,10 @@ impl<'a> Checker<'a> {
             schedule: std::mem::take(&mut self.schedule),
         };
         let checked = Checked {
-            types: Types::new(self.expr_types),
+            types: Types {
+                declared: self.declared_types,
+                ..Types::new(self.expr_types)
+            },
             resolution: Resolution {
                 expr_vars: self.expr_vars,
                 awaits: self.awaits,
@@ -4742,9 +4911,9 @@ impl<'a> Checker<'a> {
                 self.check_clash(id);
             }
             // A top-level field computed before its own item, because an
-            // item above needed it, does not run here: it is neither warned
-            // about nor counted as never completing.
-            let early = root && self.computed_early(index);
+            // item above needed it, does not run here, nor does a `type`:
+            // neither is warned about nor counted as never completing.
+            let early = root && self.runs_elsewhere(index, item.kind);
             if let (Some(leaves), false, false) = (leaves, warned, early) {
                 self.warnings.push(
                     Diagnostic::warning("this is never run", item.span)
@@ -4775,11 +4944,14 @@ impl<'a> Checker<'a> {
                     }
                 }
                 ItemKind::Rebind { path, value } => self.check_rebind(id, path, value),
-                ItemKind::Field { path, value, .. } => {
-                    self.check_field(id, path, value, expecting);
+                ItemKind::Field {
+                    path, ty, value, ..
+                } => {
+                    self.check_field(id, path, (ty, value), expecting);
                 }
                 ItemKind::Spread(value) => self.check_spread_item(id, value, root),
                 ItemKind::Import(_) => self.check_import(id, item.span),
+                ItemKind::Type { .. } => {}
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -4858,14 +5030,17 @@ impl<'a> Checker<'a> {
     fn check_shadowed_items(&mut self) {
         let ast = self.ast;
         for (id, cut) in std::mem::take(&mut self.shadowed_items) {
-            let ItemKind::Field { path, value, .. } = ast.item(id).kind else {
+            let ItemKind::Field {
+                path, ty, value, ..
+            } = ast.item(id).kind
+            else {
                 continue;
             };
             let cut = cut.max(self.top_end).min(self.bindings.len());
             let below = self.bindings.split_off(cut);
             let outer = std::mem::replace(&mut self.checking_shadowed, true);
             self.name_callee(ast.path(path), value);
-            self.check_alone(value);
+            self.annotated_value(ty, value);
             self.callee_name = None;
             self.checking_shadowed = outer;
             self.bindings.extend(below);
@@ -5002,6 +5177,64 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    /// Resolves the file's `type` items, each's type with every bare type
+    /// present, recording what each stands for (see [Type
+    /// declarations](#type-declarations)): reporting what is wrong in each,
+    /// with "`Int` is a built-in type" for one named like a built-in type
+    /// ([`BUILTIN_TYPE_NAMES`]) and "type `Foo` is declared twice" at a
+    /// second of one name, labelled "first declared here", unless resolving
+    /// quietly, as a workspace's check of a file does, the workspace having
+    /// checked them first ([`check_types`]).
+    fn type_items(&mut self) {
+        let ast = self.ast;
+        let mut declared: Vec<(Name, Span)> = Vec::new();
+        for &id in ast.items(ast.root()) {
+            let ItemKind::Type {
+                name,
+                name_span,
+                ty,
+            } = ast.item(id).kind
+            else {
+                continue;
+            };
+            let text = ast.names().get(name);
+            let first = declared
+                .iter()
+                .find(|&&(earlier, _)| earlier == name)
+                .map(|&(_, span)| span);
+            let error = if BUILTIN_TYPE_NAMES.contains(&text) {
+                Some(Diagnostic::error(
+                    format!("`{text}` is a built-in type"),
+                    name_span,
+                ))
+            } else if let Some(first) = first {
+                Some(
+                    Diagnostic::error(format!("type `{text}` is declared twice"), name_span)
+                        .with_context(first, "first declared here"),
+                )
+            } else {
+                declared.push((name, name_span));
+                None
+            };
+            if let Some(error) = error {
+                if self.quiet.types {
+                    self.quiet.failed = true;
+                } else {
+                    self.errors.push(error);
+                }
+            }
+            let errors = self.errors.len();
+            let resolved = self.resolve_type(ty, Bareness::Present);
+            if self.quiet.types && self.errors.len() > errors {
+                self.errors.truncate(errors);
+                self.quiet.failed = true;
+            }
+            if resolved != TyId::ERROR {
+                self.declared_types.push((id, resolved));
+            }
+        }
+    }
+
     /// Whether the item `id`, of `kind`, checked, never completes, so that
     /// no item after it in its block runs: a `break`, a `continue` or a
     /// `return`, but one that is an error and so has nothing to leave for,
@@ -5016,7 +5249,10 @@ impl<'a> Checker<'a> {
             | ItemKind::Result(value)
             | ItemKind::Let { value, .. }
             | ItemKind::Rebind { value, .. } => self.expr_types[value.index()] == self.never,
-            ItemKind::Field { .. } | ItemKind::Spread(_) | ItemKind::Import(_) => false,
+            ItemKind::Field { .. }
+            | ItemKind::Spread(_)
+            | ItemKind::Import(_)
+            | ItemKind::Type { .. } => false,
         }
     }
 
@@ -5175,17 +5411,19 @@ impl<'a> Checker<'a> {
     /// field's type and then has it, and one the type lacks is a warning.
     /// A single name that is a soft field of the block overrides it (see
     /// the module documentation): the field keeps its place and its slot,
-    /// is hard from then on, and the name is bound anew.
+    /// is hard from then on, and the name is bound anew. An annotated field,
+    /// `PATH: TYPE = VALUE`, is checked against its annotation, as an
+    /// annotated `let` is, and has its type (see [Records](#records)).
     fn check_field(
         &mut self,
         id: ItemId,
         path: PathRange,
-        value: ExprId,
+        (annotation, value): (Option<TypeExprId>, ExprId),
         expecting: Option<Expecting<'_>>,
     ) {
         let segments = self.ast.path(path);
         let [field] = segments else {
-            self.check_dotted_field(id, segments, value, expecting);
+            self.check_dotted_field(id, segments, (annotation, value), expecting);
             return;
         };
         // A field's path's segments are all names.
@@ -5211,6 +5449,14 @@ impl<'a> Checker<'a> {
         let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
         self.name_callee(segments, value);
         let ty = match expected {
+            _ if annotation.is_some() => {
+                let ty = self.annotated_value(annotation, value);
+                if let Some((expecting, expected)) = expected {
+                    let named = (name, name_span);
+                    self.annotated_against(annotation, ty, (expecting, expected), named);
+                }
+                ty
+            }
             Some((expecting, Some(expected))) => {
                 let found =
                     self.check_expr_expecting(value, expected, expecting.context, expecting.why);
@@ -5272,6 +5518,110 @@ impl<'a> Checker<'a> {
         field.ty = ty;
         field.name_span = name_span;
         field.spread = None;
+    }
+
+    /// The type of the leaf of a dotted field item of an inner block, whose
+    /// value is `value`, annotated `annotation` if it is, and whose last
+    /// segment is `last`, its block checked against an expected record type
+    /// that has the type `expected` at the item's path if it does: the
+    /// annotation's, which applies to the last segment, as a dotted `let`'s
+    /// does, the value checked against it ([`Checker::annotated_value`]);
+    /// else the expected type, the value checked against it; else the
+    /// value's.
+    fn dotted_leaf(
+        &mut self,
+        (annotation, value): (Option<TypeExprId>, ExprId),
+        expected: Option<(Expecting<'_>, TyId)>,
+        last: Option<&PathSegment>,
+    ) -> TyId {
+        if annotation.is_some() {
+            let ty = self.annotated_value(annotation, value);
+            if let (Some((expecting, expected)), Some(last)) = (expected, last)
+                && let Some(name) = last.name()
+            {
+                let named = (name, last.span);
+                self.annotated_against(annotation, ty, (expecting, Some(expected)), named);
+            }
+            return ty;
+        }
+        let Some((expecting, expected)) = expected else {
+            return self.check_alone(value);
+        };
+        let found = self.check_expr_expecting(value, expected, expecting.context, expecting.why);
+        if found == TyId::ERROR {
+            TyId::ERROR
+        } else {
+            expected
+        }
+    }
+
+    /// Checks `value`, the value of a field annotated `annotation`, against
+    /// the annotation exactly as an annotated `let`'s value is checked
+    /// against its own ([`Checker::check_let`]): the annotation resolved
+    /// with every bare type present, the value checked against it, a
+    /// literal adapting, a record block field by field, and a value that
+    /// fits once awaited awaited, subject to the purity rule, a parameter
+    /// of a pure function being measured. Returns the field's type: the
+    /// annotation's, not the value's, or `Error`. Without an annotation, the
+    /// value checked on its own, and its type.
+    fn annotated_value(&mut self, annotation: Option<TypeExprId>, value: ExprId) -> TyId {
+        let Some(annotation) = annotation else {
+            return self.check_alone(value);
+        };
+        let expected = self.resolve_type(annotation, Bareness::Present);
+        let context = self.ast.type_expr(annotation).span;
+        let found = self.check_expr_expecting(
+            value,
+            expected,
+            context,
+            "expected because of this annotation",
+        );
+        if found == TyId::ERROR {
+            TyId::ERROR
+        } else {
+            expected
+        }
+    }
+
+    /// Where a field annotated `annotation`, and so of type `ty`, is an item
+    /// of a record block checked against an expected record type,
+    /// `expecting`, whose type for the field is `expected`, if it has one:
+    /// a field whose type is not a subtype of that is "mismatched types",
+    /// at the annotation, and one the expected type lacks, `name` written
+    /// at `name_span`, is the warning that any field it lacks is.
+    fn annotated_against(
+        &mut self,
+        annotation: Option<TypeExprId>,
+        ty: TyId,
+        (expecting, expected): (Expecting<'_>, Option<TyId>),
+        (name, name_span): (Name, Span),
+    ) {
+        let Some(annotation) = annotation else {
+            return;
+        };
+        let Some(expected) = expected else {
+            let text = FieldName(self.ast.names().get(name)).to_string();
+            let record = self.in_message(expecting.ty);
+            self.warnings.push(
+                Diagnostic::warning(format!("field `{text}` is not in {record}"), name_span)
+                    .with_context(expecting.context, expecting.why)
+                    .with_note(EXTRA_FIELD_NOTE),
+            );
+            return;
+        };
+        if ty == TyId::ERROR || expected == TyId::ERROR || self.types.is_subtype(ty, expected) {
+            return;
+        }
+        let label = format!(
+            "expected {}, found {}",
+            self.in_label(expected),
+            self.in_label(ty)
+        );
+        self.errors.push(
+            Diagnostic::error("mismatched types", self.ast.type_expr(annotation).span)
+                .with_label(label)
+                .with_context(expecting.context, expecting.why),
+        );
     }
 
     /// When the walk reaches the item `id` of a top-level field whose path
@@ -5456,14 +5806,7 @@ impl<'a> Checker<'a> {
         others: usize,
     ) {
         let text = FieldName(self.ast.names().get(name)).to_string();
-        let also = match others {
-            0 => String::new(),
-            1 => " (it also has 1 other field defined before it)".to_owned(),
-            others => format!(" (it also has {others} other fields defined before it)"),
-        };
-        let note = format!(
-            "a spread cannot replace a field defined before it; put the spread first{also}"
-        );
+        let note = spread_first_note(others);
         let label = format!("`{text}` is a field of this, of type {}", self.in_label(ty));
         self.errors.push(
             Diagnostic::error(format!("field `{text}` is defined twice"), operand)
@@ -5481,7 +5824,7 @@ impl<'a> Checker<'a> {
         &mut self,
         id: ItemId,
         segments: &[PathSegment],
-        value: ExprId,
+        (annotation, value): (Option<TypeExprId>, ExprId),
         expecting: Option<Expecting<'_>>,
     ) {
         // A field's path's segments are all names.
@@ -5529,18 +5872,9 @@ impl<'a> Checker<'a> {
         });
         // A top-level field's leaf was computed at its point.
         let computed = self.computed_value(value);
-        let leaf_ty = match expected {
-            _ if computed.is_some() => computed.unwrap_or(TyId::ERROR),
-            Some((expecting, expected)) => {
-                let found =
-                    self.check_expr_expecting(value, expected, expecting.context, expecting.why);
-                if found == TyId::ERROR {
-                    TyId::ERROR
-                } else {
-                    expected
-                }
-            }
-            None => self.check_alone(value),
+        let leaf_ty = match computed {
+            Some(ty) => ty,
+            None => self.dotted_leaf((annotation, value), expected, segments.last()),
         };
         // The new nodes, from the first segment that does not exist yet.
         let (parent, root) = if let Some((_, open, node, _)) = attach {
@@ -7647,7 +7981,12 @@ impl<'a> Checker<'a> {
             }
             Some(leaf) => {
                 self.check_mentioned(leaf.position);
-                let ItemKind::Field { path, .. } = self.ast.item(leaf.item).kind else {
+                let ItemKind::Field {
+                    path,
+                    ty: annotation,
+                    ..
+                } = self.ast.item(leaf.item).kind
+                else {
                     return;
                 };
                 let segments = self.ast.path(path);
@@ -7658,11 +7997,14 @@ impl<'a> Checker<'a> {
                     .then_some((self.root_position, leaf.position));
                 (self.early, self.checking_leaf) = (early, Some(node));
                 self.name_callee(segments, leaf.value);
-                // TEMPORARY (alias rule): a top-level field of one name may
-                // bind a built-in function whose typing is special (R11 of
-                // `docs/INFERENCE_REQS.md`).
-                let outer = (segments.len() == 1).then(|| self.alias_site.replace(leaf.value));
-                let ty = self.check_alone(leaf.value);
+                // TEMPORARY (alias rule): a top-level field of one name,
+                // not annotated, may bind a built-in function whose typing
+                // is special (R11 of `docs/INFERENCE_REQS.md`).
+                let alias = segments.len() == 1 && annotation.is_none();
+                let outer = alias.then(|| self.alias_site.replace(leaf.value));
+                // An annotated leaf has its annotation's type, which is what
+                // every reader sees, in this file or another.
+                let ty = self.annotated_value(annotation, leaf.value);
                 if let Some(outer) = outer {
                     self.alias_site = outer;
                 }
@@ -8306,6 +8648,14 @@ impl<'a> Checker<'a> {
         latest
     }
 
+    /// Whether the item at `position` of the outermost block, of `kind`,
+    /// does not run where it is written: a top-level field whose leaf is
+    /// computed before its own item ([`Checker::computed_early`]), or a
+    /// `type`, which never runs.
+    fn runs_elsewhere(&self, position: usize, kind: ItemKind) -> bool {
+        matches!(kind, ItemKind::Type { .. }) || self.computed_early(position)
+    }
+
     /// Whether the item at `position` of the outermost block is a top-level
     /// field whose leaf is computed before its own item.
     fn computed_early(&self, position: usize) -> bool {
@@ -8893,7 +9243,144 @@ impl<'a> Checker<'a> {
     /// that appears twice, or a function type with a parameter or return
     /// type that is erroneous, or an applied type or a union that is not
     /// one of those accepted, or contains one that is erroneous.
+    ///
+    /// A type the expansion of the file's types made (see [Type
+    /// declarations](#type-declarations)) is resolved as it was made: one
+    /// that names nothing it can is `Error`, its problem reported; a copy of
+    /// a declared type's definition is resolved with nothing reported, its
+    /// own file's check having reported what is wrong in it, and is `Error`
+    /// if anything is; a record type with spreads is the record type of its
+    /// merged fields, or `Error`, its spreads' problems reported.
     fn resolve_type(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
+        if self.ast.type_expr(id).kind == TypeExprKind::Invalid {
+            return self.invalid_type(id);
+        }
+        // A copy of a definition is resolved once in each mode, however
+        // many uses share it, so that a type built from others costs what
+        // its definition does, not what its expansion would, written out.
+        if self.ast.is_copied(id) {
+            if let Some(&resolved) = self.copies.get(&(id, mode)) {
+                self.quiet.failed |= resolved == TyId::ERROR;
+                return resolved;
+            }
+            let resolved = self.resolve_quietly(id, mode);
+            self.copies.insert((id, mode), resolved);
+            return resolved;
+        }
+        if !self.quiet.types && self.ast.is_definition_copy(id) {
+            return self.resolve_quietly(id, mode);
+        }
+        self.resolve_written(id, mode)
+    }
+
+    /// The type the type expression `id`, a copy of a declared type's
+    /// definition or a name made one, denotes in `mode`, resolved with
+    /// nothing reported (see [`Checker::resolve_type`]): `Error` if
+    /// anything would be, the check then failing quietly.
+    fn resolve_quietly(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
+        let outer = std::mem::replace(&mut self.quiet.types, true);
+        let errors = self.errors.len();
+        let resolved = self.resolve_written(id, mode);
+        self.quiet.types = outer;
+        if self.errors.len() > errors {
+            self.errors.truncate(errors);
+            self.quiet.failed = true;
+            return TyId::ERROR;
+        }
+        resolved
+    }
+
+    /// The type `Error` of the type expression `id`, which names nothing it
+    /// can ([`TypeExprKind::Invalid`]): its problem, if it is this file's to
+    /// report, reported; a check with nothing to report for it fails
+    /// quietly (see [Type declarations](#type-declarations)).
+    fn invalid_type(&mut self, id: TypeExprId) -> TyId {
+        let ast = self.ast;
+        let mut reported = false;
+        if !self.quiet.types {
+            for problem in ast.type_problems(id) {
+                if let TypeProblem::Unresolved(error) = problem {
+                    self.errors.push(error.clone());
+                    reported = true;
+                }
+            }
+        }
+        self.quiet.failed |= !reported;
+        TyId::ERROR
+    }
+
+    /// Reports the problems the expansion of the file's types found with
+    /// the spreads of the record type `id` (see [Type
+    /// declarations](#type-declarations)), unless resolving quietly, and
+    /// returns whether it has any, which make it erroneous: a spread of a
+    /// type that is not a record type, "cannot spread type T: it is not a
+    /// record type", at the type spread, which is resolved here, being in
+    /// none of the record's fields, so that its own errors are reported
+    /// instead if it has any; a spread of a field of a field written before
+    /// it, "field `x` is defined twice", as for a value's spread; and a
+    /// spread of a record type written in place with a name twice, "field
+    /// `x` appears twice in this type", at the later, as anywhere else.
+    fn spread_problems(&mut self, id: TypeExprId) -> bool {
+        let ast = self.ast;
+        let mut any = false;
+        for problem in ast.type_problems(id) {
+            any = true;
+            let reported = self.errors.len();
+            match *problem {
+                TypeProblem::NotRecord(operand) => {
+                    let ty = self.resolve_type(operand, Bareness::Present);
+                    if ty != TyId::ERROR && !self.quiet.types {
+                        let shown = self.in_message(ty);
+                        self.errors.push(Diagnostic::error(
+                            format!("cannot spread type {shown}: it is not a record type"),
+                            ast.type_expr(operand).span,
+                        ));
+                    }
+                }
+                TypeProblem::Replaces {
+                    operand,
+                    name,
+                    ty,
+                    first,
+                    others,
+                } => {
+                    let ty = self.resolve_type(ty, Bareness::Present);
+                    if !self.quiet.types {
+                        let text = FieldName(ast.names().get(name)).to_string();
+                        let note = spread_first_note(others as usize);
+                        let label =
+                            format!("`{text}` is a field of this, of type {}", self.in_label(ty));
+                        self.errors.push(
+                            Diagnostic::error(
+                                format!("field `{text}` is defined twice"),
+                                ast.type_expr(operand).span,
+                            )
+                            .with_label(label)
+                            .with_context(first, "first defined here")
+                            .with_note(note),
+                        );
+                    }
+                }
+                TypeProblem::Repeated { name, at } => {
+                    if !self.quiet.types {
+                        let text = FieldName(ast.names().get(name));
+                        self.errors.push(Diagnostic::error(
+                            format!("field `{text}` appears twice in this type"),
+                            at,
+                        ));
+                    }
+                }
+                TypeProblem::Unresolved(_) | TypeProblem::Erroneous => {}
+            }
+            self.quiet.failed |= self.errors.len() == reported;
+        }
+        any
+    }
+
+    /// The type a type expression denotes, as [`Checker::resolve_type`]
+    /// gives it, once it is known to be neither one that names nothing nor
+    /// a copy of a declared type's definition to resolve quietly.
+    fn resolve_written(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
         let ty = *self.ast.type_expr(id);
         match ty.kind {
             TypeExprKind::Named(name) => {
@@ -8918,48 +9405,7 @@ impl<'a> Checker<'a> {
                 self.resolve_applied((name, span), arg, mode)
             }
             TypeExprKind::Union { bar, .. } => self.resolve_union(id, bar, mode),
-            TypeExprKind::Record(range) => {
-                let fields = self.ast.field_tys(range);
-                let base = self.sorted_fields.len();
-                let mut erroneous = false;
-                for (index, field) in fields.iter().enumerate() {
-                    // Resolving a nested record type uses `sorted_fields`
-                    // above this one's entries and truncates back.
-                    let field_ty = self.resolve_type(field.ty, mode);
-                    erroneous |= field_ty == TyId::ERROR;
-                    self.sorted_fields
-                        .push((field.name, position(index), field_ty));
-                }
-                let sorted = self.sorted_fields.get_mut(base..).unwrap_or_default();
-                sorted.sort_unstable_by_key(|&(name, index, _)| (name, index));
-                // Every appearance of a name after its first is reported.
-                let mut previous = None;
-                for &(name, index, _) in &*sorted {
-                    if previous.replace(name) != Some(name) {
-                        continue;
-                    }
-                    let Some(repeat) = fields.get(index as usize) else {
-                        continue;
-                    };
-                    let text = self.ast.names().get(name);
-                    self.errors.push(Diagnostic::error(
-                        format!("field `{}` appears twice in this type", FieldName(text)),
-                        repeat.span,
-                    ));
-                    erroneous = true;
-                }
-                let resolved = if erroneous {
-                    TyId::ERROR
-                } else {
-                    let sorted = self.sorted_fields.get(base..).unwrap_or_default();
-                    let record = self
-                        .types
-                        .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
-                    self.bare(record, mode)
-                };
-                self.sorted_fields.truncate(base);
-                resolved
-            }
+            TypeExprKind::Record(range) => self.resolve_record(id, range, mode),
             TypeExprKind::Fn {
                 params,
                 ret,
@@ -8979,7 +9425,91 @@ impl<'a> Checker<'a> {
                 self.fn_params.truncate(base);
                 resolved
             }
+            // A qualified name is made what it names by the expansion of
+            // the file's types; checked alone, a file names no module.
+            TypeExprKind::Path(path) => {
+                let shown = self.ast.show_path(self.ast.path(path)).to_string();
+                self.errors.push(Diagnostic::error(
+                    format!("unknown type `{shown}`"),
+                    ty.span,
+                ));
+                TyId::ERROR
+            }
+            TypeExprKind::Ref(_) => {
+                self.errors.push(
+                    InternalError {
+                        message: "a reference to a declared type is in a tree",
+                        span: ty.span,
+                    }
+                    .into(),
+                );
+                TyId::ERROR
+            }
+            TypeExprKind::Invalid => self.invalid_type(id),
         }
+    }
+
+    /// The type the record type `id`, whose fields are `range`, denotes in
+    /// `mode` (see [`Checker::resolve_type`]): the record of its fields'
+    /// types, each resolved in `mode` too, written bare in `mode`; or
+    /// `Error` if a field's type is erroneous, a name appears twice, "field
+    /// `x` appears twice in this type", reported at each appearance after
+    /// its first, or a spread of it had a problem
+    /// ([`Checker::spread_problems`]).
+    fn resolve_record(&mut self, id: TypeExprId, range: FieldTyRange, mode: Bareness) -> TyId {
+        let fields = self.ast.field_tys(range);
+        let base = self.sorted_fields.len();
+        let mut erroneous = false;
+        for (index, field) in fields.iter().enumerate() {
+            // A spread is merged into the fields by the expansion of the
+            // file's types, which a workspace does before checking a file.
+            let Some(name) = field.name else {
+                self.errors.push(
+                    InternalError {
+                        message: "a spread in a record type was not expanded",
+                        span: field.span,
+                    }
+                    .into(),
+                );
+                erroneous = true;
+                continue;
+            };
+            // Resolving a nested record type uses `sorted_fields` above this
+            // one's entries and truncates back.
+            let field_ty = self.resolve_type(field.ty, mode);
+            erroneous |= field_ty == TyId::ERROR;
+            self.sorted_fields.push((name, position(index), field_ty));
+        }
+        erroneous |= self.spread_problems(id);
+        let sorted = self.sorted_fields.get_mut(base..).unwrap_or_default();
+        sorted.sort_unstable_by_key(|&(name, index, _)| (name, index));
+        // Every appearance of a name after its first is reported.
+        let mut previous = None;
+        for &(name, index, _) in &*sorted {
+            if previous.replace(name) != Some(name) {
+                continue;
+            }
+            let Some(repeat) = fields.get(index as usize) else {
+                continue;
+            };
+            let text = self.ast.names().get(name);
+            self.errors.push(Diagnostic::error(
+                format!("field `{}` appears twice in this type", FieldName(text)),
+                repeat.span,
+            ));
+            erroneous = true;
+        }
+        let resolved = if erroneous {
+            TyId::ERROR
+        } else {
+            let sorted = self.sorted_fields.get(base..).unwrap_or_default();
+            let record = self
+                .types
+                .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
+            self.bare(record, mode)
+        };
+        self.sorted_fields.truncate(base);
+        resolved
     }
 
     /// The type the union written as `id`, whose last `|` is at `bar`,
@@ -9108,10 +9638,13 @@ impl<'a> Checker<'a> {
     /// function type, which say what they are.
     fn is_bare(&self, ty: TypeExprId) -> bool {
         match self.ast.type_expr(ty).kind {
-            TypeExprKind::Named(_) | TypeExprKind::Record(_) | TypeExprKind::List(_) => true,
+            TypeExprKind::Named(_)
+            | TypeExprKind::Path(_)
+            | TypeExprKind::Record(_)
+            | TypeExprKind::List(_) => true,
             TypeExprKind::Applied { name, .. } => Some(name) == self.list_name,
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
-            TypeExprKind::Fn { .. } => false,
+            TypeExprKind::Fn { .. } | TypeExprKind::Ref(_) | TypeExprKind::Invalid => false,
         }
     }
 
@@ -10798,8 +11331,13 @@ impl<'a> Checker<'a> {
                 (None, Some(arg))
             }
             // They say what they are, a function type at its own position
-            // included.
-            TypeExprKind::Applied { .. } | TypeExprKind::Union { .. } | TypeExprKind::Fn { .. } => {
+            // included; and a type that names nothing is erroneous.
+            TypeExprKind::Applied { .. }
+            | TypeExprKind::Union { .. }
+            | TypeExprKind::Fn { .. }
+            | TypeExprKind::Path(_)
+            | TypeExprKind::Ref(_)
+            | TypeExprKind::Invalid => {
                 return declared;
             }
         };
@@ -10872,12 +11410,16 @@ impl<'a> Checker<'a> {
         let written = ast.field_tys(fields);
         let base = self.sorted_fields.len();
         for (index, field) in written.iter().enumerate() {
-            let Some(declared) = self.types.field(present, field.name) else {
+            // The expansion of the file's types leaves no spread: a type
+            // with one resolves to `Error`, which is not inferred.
+            let Some(name) = field.name else {
+                continue;
+            };
+            let Some(declared) = self.types.field(present, name) else {
                 self.sorted_fields.truncate(base);
                 return None;
             };
-            self.sorted_fields
-                .push((field.name, position(index), declared));
+            self.sorted_fields.push((name, position(index), declared));
         }
         // Inferring a nested record type uses `sorted_fields` above `end` and
         // truncates back.
@@ -13778,7 +14320,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Break(_)
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
-            | ItemKind::Import(_) => {}
+            | ItemKind::Import(_)
+            | ItemKind::Type { .. } => {}
         }
     }
 
@@ -14645,7 +15188,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Break(_)
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
-            | ItemKind::Import(_) => {}
+            | ItemKind::Import(_)
+            | ItemKind::Type { .. } => {}
         }
     }
 
@@ -14782,6 +15326,18 @@ const PURE_CONTEXT: &str = "this function is pure, declared with `:`";
 /// its members.
 pub(crate) const FILEROOT_MEMBERS: &str =
     "`fileroot` has the members `this`, `workspace` and `caller`, each a String, and `helper()`";
+
+/// The note on "field `x` is defined twice" for a spread, of a value or of
+/// a type, with a field of the name of one defined before it and `others`
+/// more such fields.
+fn spread_first_note(others: usize) -> String {
+    let also = match others {
+        0 => String::new(),
+        1 => " (it also has 1 other field defined before it)".to_owned(),
+        others => format!(" (it also has {others} other fields defined before it)"),
+    };
+    format!("a spread cannot replace a field defined before it; put the spread first{also}")
+}
 
 /// The error for an explicit `await`, whose keyword is at `keyword`, in a
 /// pure function whose marker is at `marker`.
@@ -15695,7 +16251,8 @@ mod tests {
                 ItemKind::Break(_)
                 | ItemKind::Continue(_)
                 | ItemKind::Return(_)
-                | ItemKind::Import(_) => {}
+                | ItemKind::Import(_)
+                | ItemKind::Type { .. } => {}
             }
         }
     }

@@ -2658,6 +2658,124 @@ fn repl_has_attributes_of_its_own() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The types summary: named record types, one built from another by
+/// spread, read qualified, imported by member, and seen through the
+/// directory chain, with an annotated field.
+#[test]
+fn run_uses_declared_types() {
+    let output = gcsl(&["run", "tests/fixtures/ws_types/pkg/app.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{p = {version = \"1\"; arch = \"x\"; content = \"usr\"; name = \"n\"}; steps = []; \
+         n = \"hello\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/ws_types/workspace.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{make = fn(name: String, f: fn(): {arch: String, content: String, version: String}): \
+         {pkg: {arch: String, content: String, name: String, version: String}}; \
+         built = {pkg = {arch = \"x\"; content = \"usr\"; version = \"1\"; name = \"hello\"}}}\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// A cycle of types across two files, rendered at the first in path order,
+/// labelled at each step in its own file.
+#[test]
+fn run_renders_a_cycle_of_types() {
+    let output = gcsl(&["run", "tests/fixtures/ws_types_error/sub/node.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: type `Node` refers to itself\n\
+         \x20--> tests/fixtures/ws_types_error/node.gcsl:1:6\n\
+         \x20 |\n\
+         1 | type Node = { ...Tree, depth: Int }\n\
+         \x20 |      ^^^^        ---- `Node` uses `Tree` here\n\
+         \x20 |\n\
+         \x20::: tests/fixtures/ws_types_error/workspace.gcsl:1:40\n\
+         \x20 |\n\
+         1 | type Tree = { name: String, kids: List<Node> }\n\
+         \x20 |                                        ---- `Tree` uses `Node` here\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `--dump-ast` shows `type` items as written; `--dump-types` shows each
+/// with its expansion, and every use of a type as written.
+#[test]
+fn dumps_show_types() {
+    let types = "tests/fixtures/ws_types/_lib/types.gcsl";
+    let output = gcsl(&["run", types, "--dump-ast"]);
+    assert_eq!(
+        stdout(&output),
+        "(file\n\
+         \x20 (type PackageDef {version: String, arch: String, content: String} @0..81)\n\
+         \x20 (type Package {...PackageDef, name: String} @82..128))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", types, "--dump-types"]);
+    assert_eq!(
+        stdout(&output),
+        "(file\n\
+         \x20 (type PackageDef {version: String, arch: String, content: String} = \
+         {arch: String, content: String, version: String} @0..81)\n\
+         \x20 (type Package {...PackageDef, name: String} = \
+         {arch: String, content: String, name: String, version: String} @82..128))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let app = "tests/fixtures/ws_types/pkg/app.gcsl";
+    let output = gcsl(&["run", app, "--dump-types"]);
+    assert!(
+        stdout(&output).starts_with(
+            "(file\n\
+             \x20 (import Package from _lib.types @0..30)\n\
+             \x20 (field p : Package @31..102\n\
+             \x20   (block : {arch: String, content: String, name: String, version: String} \
+             @44..102\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains(
+            "\n  (field steps : Steps @103..120\n    (list : List<fn() -> String | \
+             Future<String>> @118..120))\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// The REPL: a line may declare a type, which later lines see, and a later
+/// line's declaration of its name shadows it.
+#[test]
+fn repl_keeps_types_across_lines() {
+    let output = repl(
+        "type Point = {x: Int, y: Int}\n\
+         let p: Point = { x = 1; y = 2 }\n\
+         p\n\
+         type Point = {x: Int}\n\
+         p2: Point = { x = 3 }\n\
+         type Box<T> = {v: T}\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{x = 1; y = 2} : {x: Int, y: Int}\n{p2 = {x = 3}} : {p2: {x: Int}}\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: a `type` takes no type parameters\n\
+         \x20--> <repl>:1:9\n\
+         \x20 |\n\
+         1 | type Box<T> = {v: T}\n\
+         \x20 |         ^\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// The canonical path of this crate's directory, which the `fileroot`
 /// tests' paths start with, whatever directory they run from.
 fn crate_dir() -> String {

@@ -127,13 +127,30 @@
 //! scope numbers among the file's own nodes, after its tree's
 //! ([`Mentions::views`]), and they are scheduled as interior nodes, each
 //! needing its children of the file.
+//!
+//! # Types
+//!
+//! A `type` item declares a name in the input's namespace of types, which
+//! is not its variables': like a top-level function's, the name is the
+//! whole input's, above and below the item, so the scan lists the input's
+//! `type` items ([`Mentions::types`], [`TypeDecl`]) as it does its
+//! functions, and a workspace merges them across files apart from the
+//! field tree (see [`crate::workspace`], "Types"). A type is no
+//! declaration of the field tree, and nothing here mentions one: a type has
+//! no value, so it is never computed, needs nothing and is needed by
+//! nothing, and a file reading another's types does not need that file. A
+//! name read in a type position is no variable: the walk reads no type
+//! expression, and a variable, field or `def` named like a type is unrelated
+//! to it. The reads of types by name, in annotations, ascriptions,
+//! parameters, function types and `type` items alike, are listed apart
+//! ([`type_reads`]), for the workspace to resolve and expand.
 
 use std::collections::HashMap;
 use std::mem;
 
 use crate::ast::{
     Ast, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
-    PathSegment, SegmentKind, StrPart,
+    PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -184,6 +201,37 @@ pub struct Mentions {
     /// declarations](#shadowed-declarations)), as the tree has it too
     /// ([`FieldTree::shadowed`]).
     pub shadowed: Vec<bool>,
+    /// The input's `type` declarations, in source order (see
+    /// [Types](#types)).
+    pub types: Vec<TypeDecl>,
+}
+
+/// A `type` item of an input's outermost block (see [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeDecl {
+    /// The name it declares.
+    pub name: Name,
+    /// Where the name is written.
+    pub span: Span,
+    /// The item.
+    pub item: ItemId,
+    /// The item's position among the outermost block's items.
+    pub position: usize,
+    /// The type it stands for.
+    pub ty: TypeExprId,
+}
+
+/// A read of a type by its name, in a type expression of a tree
+/// ([`type_reads`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeRead {
+    /// A name, written bare: a built-in type's, a declared type's, a
+    /// module's or nothing's.
+    Named(Name),
+    /// A qualified name, its path in the tree's path pool.
+    Path(PathRange),
+    /// A name applied to a type argument, `NAME<TYPE>`.
+    Applied(Name),
 }
 
 /// A node of a file's view that other sources share and that has a leaf of
@@ -558,12 +606,51 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
         }
     }
     let tree = FieldTree::build(ast, root, &shadowed);
+    let types = (0_usize..)
+        .zip(root)
+        .filter_map(|(position, &item)| match ast.item(item).kind {
+            ItemKind::Type {
+                name,
+                name_span,
+                ty,
+            } => Some(TypeDecl {
+                name,
+                span: name_span,
+                item,
+                position,
+                ty,
+            }),
+            _ => None,
+        })
+        .collect();
     Mentions {
         functions,
         tree,
         shadowed,
+        types,
         ..Mentions::default()
     }
+}
+
+/// Every type expression of `ast` that reads a type by its name, in order
+/// (by id), as it is written (see [Types](#types)): a name written bare, a
+/// qualified name and a name applied to a type argument, in annotations,
+/// ascriptions, parameters, function types and `type` items alike. Which
+/// are of declared types, and which of those it can name, is the
+/// workspace's to say.
+#[must_use]
+pub fn type_reads(ast: &Ast) -> Vec<(TypeExprId, TypeRead)> {
+    ast.type_ids()
+        .filter_map(|id| {
+            let read = match ast.written_type(id) {
+                TypeExprKind::Named(name) => TypeRead::Named(name),
+                TypeExprKind::Path(path) => TypeRead::Path(path),
+                TypeExprKind::Applied { name, .. } => TypeRead::Applied(name),
+                _ => return None,
+            };
+            Some((id, read))
+        })
+        .collect()
 }
 
 /// The field items of `ast`'s outermost block that a later one shadows (see
@@ -1208,6 +1295,7 @@ pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Name, ExprId, FnId)>
             path,
             value,
             function: true,
+            ..
         } => match (ast.path(path), ast.get(value).kind) {
             ([single], ExprKind::Fn(function)) => Some((single.name()?, value, function)),
             _ => None,
@@ -1415,8 +1503,11 @@ impl Walker<'_> {
             // the scope's: a workspace's resolves them ([`Resolve::root`]
             // finds an imported name after the declarations of the
             // directory chain, with which it cannot share a name), and a
-            // reference through one is a mention of what it names.
-            ItemKind::Import(_) => {}
+            // reference through one is a mention of what it names. A `type`
+            // has no expression either, and declares no variable: its name
+            // is a type's, read only in type positions (see
+            // [Types](#types)).
+            ItemKind::Import(_) | ItemKind::Type { .. } => {}
         }
     }
 

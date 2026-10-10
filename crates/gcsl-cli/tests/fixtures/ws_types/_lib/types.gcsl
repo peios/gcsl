@@ -1,0 +1,6 @@
+type PackageDef = {
+    version: String,
+    arch: String,
+    content: String,
+}
+type Package = { ...PackageDef, name: String }

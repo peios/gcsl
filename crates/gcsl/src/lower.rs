@@ -577,7 +577,8 @@ impl Lowerer<'_> {
                 | ItemKind::Rebind { .. }
                 | ItemKind::Field { .. }
                 | ItemKind::Spread(_)
-                | ItemKind::Import(_),
+                | ItemKind::Import(_)
+                | ItemKind::Type { .. },
             )
             | None => Ok(ValueKind::Record),
         }
@@ -650,8 +651,9 @@ impl Lowerer<'_> {
                 }
                 ItemKind::Spread(value) => self.lower_spread(id, value, item.span)?,
                 // An import computes nothing at its point: what it names
-                // is read where it is mentioned.
-                ItemKind::Import(_) => {}
+                // is read where it is mentioned. Nor does a `type`, which
+                // has no existence at runtime.
+                ItemKind::Import(_) | ItemKind::Type { .. } => {}
                 ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                     let node = self.lower_jump(id, jump)?;
                     if is_result {

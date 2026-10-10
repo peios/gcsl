@@ -1,0 +1,6 @@
+import _lib.types as t
+type Steps = List<fn() -> String>
+def make(name: String, f: fn(): t.PackageDef): { pkg: t.Package } {
+    pkg: t.Package = { ...f(); name = name }
+}
+built = make("hello", fn(): t.PackageDef { version = "1"; arch = "x"; content = "usr" })

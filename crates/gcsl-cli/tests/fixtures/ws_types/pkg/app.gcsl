@@ -1,0 +1,4 @@
+import Package from _lib.types
+p: Package = { version = "1"; arch = "x"; content = "usr"; name = "n" }
+steps: Steps = []
+n = built.pkg.name

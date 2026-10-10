@@ -263,6 +263,72 @@
 //! the file stores its result into as the last node of its top-level
 //! block.
 //!
+//! # Types
+//!
+//! A `type` item declares a name in its file's namespace of types, apart
+//! from its fields and variables (see the checker's "Type declarations").
+//! In their own namespace types follow the rules fields follow for
+//! directories, views, imports and conflicts, but they are no part of the
+//! field trees, whose nodes are cells: a type has no cell, no slot and no
+//! IR, needs nothing and is needed by nothing, so a file reading another's
+//! types does not need it and types play no part in the order. So the scan
+//! keeps them apart, flat, a type's name being one identifier, with the
+//! field machinery's order of sources, conflict texts and labels:
+//!
+//! - Every file's declarations ([`Scan::types`], [`File::types`], found by
+//!   [`crate::mentions`]), but one named like a built-in type, and a second
+//!   of one name in one file, which the checker reports. A directory's
+//!   types are its files' ([`declare_types`]): one name declared in two
+//!   files of it is "type `Foo` is declared in two files", labelled
+//!   "declared here" at both, as two leaves of one path are.
+//! - A member import of a module's type binds it (`import PackageDef from
+//!   lib.types`), and of a name that is both a type and a root binds both;
+//!   `*` binds every type of the module, besides its roots ([`members`],
+//!   [`File::type_imports`]). A directory's types are its files', a file's
+//!   its own. `*` from a value file is still an error, but its types may be
+//!   imported by member or read qualified.
+//! - Each file's view of types ([`File::type_view`], [`type_views`]) merges
+//!   its own directory's types, each directory's upward and its imported
+//!   types, in that order, the order fields' views report their conflicts
+//!   in; and, for a session's input, those it inherits from the earlier
+//!   inputs, last, which anything shadows. One declaration reached twice is
+//!   one type. Two of one name are "type `Foo` is declared in two files",
+//!   once per pair, at the later source, labelled "declared here" at each
+//!   declaration and "imported here" at each import, with the note "one is
+//!   in a directory above" when one is. Types are never shadowable: a
+//!   `#[shadowable]` import brings them as plain types, and the prelude
+//!   declares none. A type imported as a built-in type's name is "`Int` is a
+//!   built-in type".
+//! - A qualified name, `t.PackageDef` ([`Scan::qualified_type`]), names
+//!   through a whole import of the file (`import lib.types as t`) a type of
+//!   the module it names: "`t` has no type `Foo`", with a note listing its
+//!   types, if it has none of that name; "unknown type `a.b`" if `a` is no
+//!   module the file imports whole; and "`t.Foo` is a type, not a module"
+//!   for a path that goes on after a type. A module's name written as a
+//!   type, `t`, is "`t` is a module, not a type", and a type applied to a
+//!   type argument "type `Foo` takes no type argument" ([`Scan::type_links`]).
+//!
+//! Then the types are defined and the files' trees expanded
+//! ([`define_types`]): each declaration's definition is copied into the
+//! scan's [`TypeStore`], each name in it of another declared type a
+//! reference to it, as the declaring file's view resolves it; the
+//! references are a graph, whose cycles are each "type `A` refers to
+//! itself", at the first declaration of the cycle in path then source
+//! order, labelled at each step ("`B` uses `A` here", in `B`'s file);
+//! every declaration is settled, those it refers to first, a reference
+//! made what it refers to and a spread merged, one on a cycle, with a
+//! spread's problem or nested deeper than [`crate::MAX_DEPTH`] once
+//! expanded erroneous; and each file's tree is expanded
+//! ([`Ast::expand_types`]): each name of a declared type in it made a copy
+//! of the definition, as if written there, each record type with spreads
+//! the record of its merged fields. A session keeps its store, each input's
+//! declarations after the earlier inputs' ([`check_input`]). The checker
+//! then sees no declared type's name; before any file is checked, the
+//! driver checks every file's `type` items ([`check_type_items`]), since a
+//! file may use a type of a file checked after it, so that what is wrong in
+//! a definition is reported once, where it is written, and every file using
+//! it fails quietly (see the checker's "Type declarations").
+//!
 //! # The standard library
 //!
 //! Two kinds of module are not files of the workspace. `builtins` and
@@ -423,15 +489,21 @@ use std::mem;
 use std::rc::Rc;
 
 use crate::Outcome;
-use crate::ast::{Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment};
+use crate::ast::{
+    Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment, TypeExprId, TypeLink,
+    TypeStore,
+};
 #[cfg(test)]
 use crate::check::ViewRecord;
-use crate::check::{Builtin, CheckOutput, Checker, Fileroot, Place, Scope, Slot, Types};
-use crate::diagnostic::Diagnostic;
+use crate::check::{
+    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, Place, Scope, Slot, Types,
+    check_types,
+};
+use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::eval::MemoTables;
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
-use crate::mentions::{self, Mentions, Need, Resolve, Schedule, Sweep};
+use crate::mentions::{self, Mentions, Need, Resolve, Schedule, Sweep, TypeRead};
 use crate::names::{Name, Names};
 use crate::parser;
 use crate::session;
@@ -576,6 +648,14 @@ pub struct File {
     /// are not in it; the nodes of its view with a leaf of it under them
     /// are, if it reads them whole ([`Mentions::views`]).
     pub schedule: Schedule,
+    /// Its own `type` declarations, by their indices in [`Scan::types`], in
+    /// source order (see [Types](#types)).
+    pub types: Vec<u32>,
+    /// The types it imports by member or `*`, in source order.
+    pub type_imports: Vec<TypeImport>,
+    /// Its view of types: the declaration each name of a type names in it,
+    /// by its number in [`Scan::type_store`].
+    pub type_view: HashMap<Name, u32>,
 }
 
 impl File {
@@ -605,8 +685,39 @@ impl File {
             aliases: Vec::new(),
             view: View::default(),
             schedule: Schedule::default(),
+            types: Vec::new(),
+            type_imports: Vec::new(),
+            type_view: HashMap::new(),
         }
     }
+}
+
+/// A `type` declaration of a file of a scan (see [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeclaredType {
+    /// Its file.
+    pub file: u32,
+    /// Its `type` item.
+    pub item: ItemId,
+    /// The name it declares.
+    pub name: Name,
+    /// Where the name is written.
+    pub span: Span,
+    /// The type it stands for, in its file's tree.
+    pub ty: TypeExprId,
+}
+
+/// A type a file imports by member, `import NAME from PATH`, or by `*`
+/// (see [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeImport {
+    /// The name it is bound as.
+    pub name: Name,
+    /// Where it is bound: the member, the name it is imported as, or the
+    /// `*`.
+    pub span: Span,
+    /// Its declaration, by its index in [`Scan::types`].
+    pub decl: u32,
 }
 
 /// A directory of a workspace.
@@ -860,6 +971,23 @@ pub struct Scan {
     dir_texts: Vec<Rc<str>>,
     /// Each file's directory, by its index in `dir_texts`, by input number.
     file_dirs: Vec<u32>,
+    /// The `type` declarations of every file, in path order, each file's in
+    /// source order: but one named like a built-in type, and a second of
+    /// one name in one file, which the checker reports (see [Types](#types)).
+    pub types: Vec<DeclaredType>,
+    /// The types of each directory, by its index: its files' declarations,
+    /// as indices in `types`, in order, the first of each name.
+    dir_types: Vec<Vec<u32>>,
+    /// The definitions of the types: each of `types` is the declaration
+    /// numbered `type_base` more than its index. A session's input's scan
+    /// has the session's, its earlier inputs' declarations first.
+    pub type_store: TypeStore,
+    /// The number in `type_store` of the first of `types`.
+    type_base: u32,
+    /// The types a session's input inherits from the earlier inputs, each
+    /// with its declaration's number in `type_store`: the last source of its
+    /// view, shadowed by anything (see [`crate::session`]).
+    inherited_types: Vec<(Name, u32)>,
 }
 
 impl Scan {
@@ -1719,12 +1847,32 @@ enum Placing<'a> {
 /// indices in the library's table of the standard files it loads, which
 /// are files `0..` [`Scan::standard`], are left in `loaded` whether it
 /// succeeds or fails, so that a caller can render a diagnostic of any file
-/// against its source (see [`check_with_standard`]).
+/// against its source (see [`check_with_standard`]). Its types are its own
+/// ([`scan_into_with`]).
 fn scan_into(
-    (sources, placing): (&[SourceFile], Placing),
+    placed: (&[SourceFile], Placing),
     library: Library,
     names: &mut Names,
     loaded: &mut Vec<usize>,
+) -> Result<Scan, Vec<Diagnostic>> {
+    scan_into_with(
+        placed,
+        library,
+        (names, loaded),
+        (&mut TypeStore::new(), &[]),
+    )
+}
+
+/// [`scan_into`], the files' types defined after those of `store`, which
+/// the scan holds once it succeeds ([`Scan::type_store`]) and which is given
+/// back to `store` if it fails, and with `inherited`, the types a session's
+/// input inherits from the earlier inputs, each with its declaration's
+/// number in `store` (see [Types](#types)).
+fn scan_into_with(
+    (sources, placing): (&[SourceFile], Placing),
+    library: Library,
+    (names, loaded): (&mut Names, &mut Vec<usize>),
+    (store, inherited): (&mut TypeStore, &[(Name, u32)]),
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
         files: Vec::with_capacity(sources.len() + library.table.len()),
@@ -1748,11 +1896,17 @@ fn scan_into(
         relocation: None,
         dir_texts: Vec::new(),
         file_dirs: Vec::new(),
+        types: Vec::new(),
+        dir_types: Vec::new(),
+        type_store: mem::take(store),
+        type_base: 0,
+        inherited_types: inherited.to_vec(),
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
         Err(errors) => {
             *names = mem::take(&mut scan.names);
+            *store = mem::take(&mut scan.type_store);
             Err(errors)
         }
     }
@@ -1814,6 +1968,7 @@ fn scan_files(
     for file in 0..count(scan.files.len()) {
         merge(scan, file, &mut errors);
     }
+    declare_types(scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -1837,6 +1992,14 @@ fn scan_files(
         return Err(errors);
     }
     views(scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    type_views(scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    define_types(scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -3189,20 +3352,21 @@ fn imports(
     let prelude = scan.standard_file(PRELUDE).is_some();
     for (index, file) in (0u32..).zip(&scan.files) {
         let mut aliases = Vec::new();
+        let mut types = Vec::new();
         let mut own_errors = Vec::new();
-        let mut import = |item: ItemId, aliases: &mut Vec<Alias>| {
+        let mut import = |item: ItemId, bound: (&mut Vec<Alias>, &mut Vec<TypeImport>)| {
             let ItemKind::Import(id) = file.ast.item(item).kind else {
                 return;
             };
             let decl = file.ast.import_decl(id);
             let path = file.ast.path(decl.path);
             match module(scan, &modules, path, &mut both) {
-                Ok(target) => members(scan, file, item, decl, target, aliases, &mut own_errors),
+                Ok(target) => members(scan, (file, item, decl), target, bound, &mut own_errors),
                 Err(error) => own_errors.extend(error),
             }
         };
         for &item in file.ast.items(file.ast.root()) {
-            import(item, &mut aliases);
+            import(item, (&mut aliases, &mut types));
         }
         if index >= scan.standard {
             inherit_imports(file, inherited, &mut aliases);
@@ -3211,14 +3375,15 @@ fn imports(
         // static order whatever its place among the aliases, which is last,
         // so that every other keeps its number.
         if let Some(item) = file.ast.implicit_import().filter(|_| prelude) {
-            import(item, &mut aliases);
+            import(item, (&mut aliases, &mut types));
         }
         clashes(scan, index, &aliases, &mut own_errors);
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
-        found.push(aliases);
+        found.push((aliases, types));
     }
-    for (file, aliases) in scan.files.iter_mut().zip(found) {
+    for (file, (aliases, types)) in scan.files.iter_mut().zip(found) {
         file.aliases = aliases;
+        file.type_imports = types;
     }
 }
 
@@ -3409,14 +3574,14 @@ fn contents(scan: &Scan, dir: Option<u32>) -> String {
 
 /// Binds the names the import `item` of `file`, `decl`, makes of `target`,
 /// what its path names, into `aliases`, each implicit if the item is the
-/// implicit import of the prelude.
+/// implicit import of the prelude, and the types it imports, by member or
+/// `*`, into `types` (see [Types](#types)): a member that is both a root
+/// and a type binds both, and one that is neither is "`lib` has no `x`".
 fn members(
     scan: &Scan,
-    file: &File,
-    item: ItemId,
-    decl: &ImportDecl,
+    (file, item, decl): (&File, ItemId, &ImportDecl),
     target: Target,
-    aliases: &mut Vec<Alias>,
+    (aliases, types): (&mut Vec<Alias>, &mut Vec<TypeImport>),
     errors: &mut Vec<Diagnostic>,
 ) {
     let path = file.ast.path(decl.path);
@@ -3449,8 +3614,10 @@ fn members(
                 match *member {
                     ImportMember::Named { name, alias } => {
                         let bound = alias.unwrap_or(name);
-                        match scan.target_child(target, name.name) {
-                            Some(child) => aliases.push(Alias {
+                        let child = scan.target_child(target, name.name);
+                        let ty = scan.target_type(target, name.name);
+                        if let Some(child) = child {
+                            aliases.push(Alias {
                                 name: bound.name,
                                 span: bound.span,
                                 item: Some(item),
@@ -3458,15 +3625,24 @@ fn members(
                                 whole: false,
                                 implicit,
                                 inherited: false,
-                            }),
-                            None => errors.push(Diagnostic::error(
+                            });
+                        }
+                        if let Some(decl) = ty {
+                            types.push(TypeImport {
+                                name: bound.name,
+                                span: bound.span,
+                                decl,
+                            });
+                        }
+                        if child.is_none() && ty.is_none() {
+                            errors.push(Diagnostic::error(
                                 format!(
                                     "`{}` has no `{}`",
                                     scan.show_target(target),
                                     scan.names.get(name.name)
                                 ),
                                 name.span,
-                            )),
+                            ));
                         }
                     }
                     ImportMember::All(star) => {
@@ -3489,6 +3665,15 @@ fn members(
                                     whole: false,
                                     implicit,
                                     inherited: false,
+                                });
+                            }
+                        }
+                        for decl in scan.target_types(target) {
+                            if let Some(name) = scan.type_name(decl) {
+                                types.push(TypeImport {
+                                    name,
+                                    span: star,
+                                    decl,
                                 });
                             }
                         }
@@ -3550,6 +3735,448 @@ fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
         }),
         Target::Part { .. } | Target::Node(_) | Target::View(_) | Target::Fileroot(_) => Vec::new(),
     }
+}
+
+impl Scan {
+    /// The types of `target`, a directory or a file, as indices in
+    /// [`Scan::types`], in order: a directory's, each the first of its name
+    /// among its files', and a file's own. Any other target has none.
+    fn target_types(&self, target: Target) -> Vec<u32> {
+        match target {
+            Target::Dir(dir) => self.dir_types.get(dir as usize).cloned(),
+            Target::File(file) => self.files.get(file as usize).map(|f| f.types.clone()),
+            Target::Part { .. } | Target::Node(_) | Target::View(_) | Target::Fileroot(_) => None,
+        }
+        .unwrap_or_default()
+    }
+
+    /// The type of `target` named `name`, as an index in [`Scan::types`],
+    /// if it has one ([`Scan::target_types`]).
+    fn target_type(&self, target: Target, name: Name) -> Option<u32> {
+        self.target_types(target)
+            .into_iter()
+            .find(|&decl| self.type_name(decl) == Some(name))
+    }
+
+    /// The name the type `decl`, an index in [`Scan::types`], declares.
+    fn type_name(&self, decl: u32) -> Option<Name> {
+        self.types.get(decl as usize).map(|declared| declared.name)
+    }
+
+    /// The name of the type `decl`, an index in [`Scan::types`], as text.
+    fn show_type(&self, decl: u32) -> &str {
+        self.type_name(decl).map_or("", |name| self.names.get(name))
+    }
+
+    /// What each type expression of file `index` that reads a type by its
+    /// name names in it, in order (see [Types](#types)): a name of a type of
+    /// its view, that type's declaration, by its number in
+    /// [`Scan::type_store`]; a qualified name, the type it names through a
+    /// whole import, or the error that it names none
+    /// ([`Scan::qualified_type`]); a name of a type applied to a type
+    /// argument, "type `Foo` takes no type argument"; a name of a module the
+    /// file imports whole that names no type, "`t` is a module, not a type".
+    /// A name of no type, a built-in type's or an unknown one, has none:
+    /// the checker reads it.
+    fn type_links(&self, index: u32) -> Vec<(TypeExprId, TypeLink)> {
+        let Some(file) = self.files.get(index as usize) else {
+            return Vec::new();
+        };
+        let mut links = Vec::new();
+        for (id, read) in mentions::type_reads(&file.ast) {
+            let span = file.ast.type_expr(id).span;
+            let link = match read {
+                TypeRead::Named(name) => match file.type_view.get(&name) {
+                    Some(&decl) => TypeLink::Decl(decl),
+                    None if file.aliases.iter().any(|a| a.whole && a.name == name) => {
+                        let text = self.names.get(name);
+                        TypeLink::Error(Diagnostic::error(
+                            format!("`{text}` is a module, not a type"),
+                            span,
+                        ))
+                    }
+                    None => continue,
+                },
+                TypeRead::Applied(name) => {
+                    if !file.type_view.contains_key(&name) {
+                        continue;
+                    }
+                    let text = self.names.get(name);
+                    TypeLink::Error(Diagnostic::error(
+                        format!("type `{text}` takes no type argument"),
+                        span,
+                    ))
+                }
+                TypeRead::Path(path) => self.qualified_type(file, file.ast.path(path), span),
+            };
+            links.push((id, link));
+        }
+        links
+    }
+
+    /// What the qualified type name `path`, written at `span` in `file`,
+    /// names (see [Types](#types)): its first name must be a module the
+    /// file imports whole (`import lib.types as t`), and its second a type
+    /// of that module, and its last; a path of nothing else is resolved as a
+    /// value's reference through an import is, the module's type named by
+    /// the name after it. Otherwise the error: "unknown type `a.b`" for a
+    /// first name that is no module the file imports, "`t` has no type
+    /// `Foo`" with a note listing the module's types, and "`t.Foo` is a
+    /// type, not a module" for a path that goes on after a type.
+    fn qualified_type(&self, file: &File, path: &[PathSegment], span: Span) -> TypeLink {
+        let names: Vec<Name> = path.iter().filter_map(PathSegment::name).collect();
+        let shown = |count: usize| -> String {
+            names
+                .iter()
+                .take(count)
+                .map(|&name| self.names.get(name))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let error = |message: String| TypeLink::Error(Diagnostic::error(message, span));
+        let (Some(&first), Some(&second)) = (names.first(), names.get(1)) else {
+            return error(format!("unknown type `{}`", shown(names.len())));
+        };
+        let Some(alias) = file.aliases.iter().find(|a| a.whole && a.name == first) else {
+            return error(format!("unknown type `{}`", shown(names.len())));
+        };
+        match self.target_type(alias.target, second) {
+            Some(decl) if names.len() == 2 => TypeLink::Decl(self.type_base.saturating_add(decl)),
+            Some(_) => error(format!("`{}` is a type, not a module", shown(2))),
+            None => {
+                let module = self.names.get(first);
+                let listed: Vec<String> = self
+                    .target_types(alias.target)
+                    .iter()
+                    .map(|&decl| format!("`{}`", self.show_type(decl)))
+                    .collect();
+                let note = if listed.is_empty() {
+                    format!("`{module}` has no types")
+                } else {
+                    format!("`{module}` has the types {}", listed.join(", "))
+                };
+                TypeLink::Error(
+                    Diagnostic::error(
+                        format!("`{module}` has no type `{}`", self.names.get(second)),
+                        span,
+                    )
+                    .with_note(note),
+                )
+            }
+        }
+    }
+}
+
+/// Finds every `type` declaration of the scan's files ([`Scan::types`],
+/// [`File::types`]) and each directory's types, and gives each its number
+/// in the scan's store, after the declarations it holds already (a
+/// session's earlier inputs'). A name declared in two files of one
+/// directory is "type `Foo` is declared in two files", at the later in path
+/// order, labelled "declared here" there and at the earlier, as two leaves
+/// of one path are. A declaration named like a built-in type, and a second
+/// of one name in one file, are left out, for the checker to report
+/// ([`crate::check::check_types`]).
+fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
+    let mut types: Vec<DeclaredType> = Vec::new();
+    let mut own: Vec<Vec<u32>> = Vec::with_capacity(scan.files.len());
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let mut mine: Vec<u32> = Vec::new();
+        let mut seen: HashSet<Name> = HashSet::new();
+        for decl in &file.mentions.types {
+            let builtin = BUILTIN_TYPE_NAMES.contains(&scan.names.get(decl.name));
+            if builtin || !seen.insert(decl.name) {
+                continue;
+            }
+            mine.push(count(types.len()));
+            types.push(DeclaredType {
+                file: index,
+                item: decl.item,
+                name: decl.name,
+                span: decl.span,
+                ty: decl.ty,
+            });
+        }
+        own.push(mine);
+    }
+    let mut dir_types: Vec<Vec<u32>> = vec![Vec::new(); scan.dirs.len()];
+    let mut first: HashMap<(u32, Name), u32> = HashMap::new();
+    for (at, decl) in (0u32..).zip(&types) {
+        let Some(dir) = scan.files.get(decl.file as usize).map(|file| file.dir) else {
+            continue;
+        };
+        match first
+            .get(&(dir, decl.name))
+            .and_then(|&e| types.get(e as usize))
+        {
+            None => {
+                first.insert((dir, decl.name), at);
+                if let Some(list) = dir_types.get_mut(dir as usize) {
+                    list.push(at);
+                }
+            }
+            Some(earlier) => {
+                let shown = scan.names.get(decl.name);
+                errors.push(
+                    Diagnostic::error(
+                        format!("type `{shown}` is declared in two files"),
+                        decl.span,
+                    )
+                    .with_label("declared here")
+                    .with_context_in(earlier.file, earlier.span, "declared here")
+                    .in_input(decl.file),
+                );
+            }
+        }
+    }
+    for (file, mine) in scan.files.iter_mut().zip(own) {
+        file.types = mine;
+    }
+    scan.type_base = scan.type_store.reserve(types.len());
+    scan.types = types;
+    scan.dir_types = dir_types;
+}
+
+/// Where one name of a file's view of types comes from, as [`type_views`]
+/// meets it: its declaration, by its index in [`Scan::types`], and whether
+/// it reaches the view through an import, written at a span of the file,
+/// or from a directory of the file's chain, a directory above its own
+/// (`above`) or its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypeSource {
+    /// The declaration.
+    decl: u32,
+    /// Where the file imports it, if it does.
+    import: Option<Span>,
+    /// Whether it is a type of a directory above the file's own.
+    above: bool,
+}
+
+/// Gives each file its view of types ([`File::type_view`]; see
+/// [Types](#types)), merged from its sources, in the order fields' views
+/// report conflicts in: its own directory's types, then each directory's
+/// upward, then the types it imports, in source order; and, for a
+/// session's input, the types it inherits from the earlier inputs, last,
+/// shadowed by anything. One declaration reached twice is one type. Two
+/// declarations of one name are "type `Foo` is declared in two files", as
+/// two leaves of one path are, once per pair however many views have it,
+/// at the later source, labelled "declared here" at each declaration and
+/// "imported here" at each import, with the note "one is in a directory
+/// above" when one is. A type imported under a built-in type's name is
+/// "`Int` is a built-in type", at the import.
+fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
+    type Side = (u32, Option<(u32, u32)>);
+    let mut reported: HashSet<(Side, Side)> = HashSet::new();
+    let mut found = Vec::with_capacity(scan.files.len());
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let mut sources: Vec<(Name, TypeSource)> = Vec::new();
+        for (position, dir) in scan.chain(file.dir).enumerate() {
+            for &decl in scan.dir_types.get(dir as usize).into_iter().flatten() {
+                if let Some(name) = scan.type_name(decl) {
+                    let source = TypeSource {
+                        decl,
+                        import: None,
+                        above: position > 0,
+                    };
+                    sources.push((name, source));
+                }
+            }
+        }
+        for import in &file.type_imports {
+            let source = TypeSource {
+                decl: import.decl,
+                import: Some(import.span),
+                above: false,
+            };
+            sources.push((import.name, source));
+        }
+        let mut view: HashMap<Name, TypeSource> = HashMap::new();
+        for (name, source) in sources {
+            if let Some(at) = source.import
+                && BUILTIN_TYPE_NAMES.contains(&scan.names.get(name))
+            {
+                let text = scan.names.get(name);
+                errors.push(
+                    Diagnostic::error(format!("`{text}` is a built-in type"), at).in_input(index),
+                );
+                continue;
+            }
+            match view.get(&name) {
+                None => {
+                    view.insert(name, source);
+                }
+                Some(earlier) if earlier.decl == source.decl => {}
+                Some(&earlier) => {
+                    let side = |s: TypeSource| (s.decl, s.import.map(|span| (index, span.start)));
+                    if reported.insert((side(source), side(earlier)))
+                        && let Some(error) = type_conflict(scan, index, name, (source, earlier))
+                    {
+                        errors.push(error);
+                    }
+                }
+            }
+        }
+        let mut numbered: HashMap<Name, u32> = view
+            .into_iter()
+            .map(|(name, source)| (name, scan.type_base.saturating_add(source.decl)))
+            .collect();
+        if index >= scan.standard {
+            for &(name, decl) in &scan.inherited_types {
+                numbered.entry(name).or_insert(decl);
+            }
+        }
+        found.push(numbered);
+    }
+    for (file, view) in scan.files.iter_mut().zip(found) {
+        file.type_view = view;
+    }
+}
+
+/// The conflict in file `index`'s view of types of the type `name` between
+/// the later source and the earlier one (see [`type_views`]).
+fn type_conflict(
+    scan: &Scan,
+    index: u32,
+    name: Name,
+    (later, earlier): (TypeSource, TypeSource),
+) -> Option<Diagnostic> {
+    let later_decl = scan.types.get(later.decl as usize)?;
+    let earlier_decl = scan.types.get(earlier.decl as usize)?;
+    let message = format!("type `{}` is declared in two files", scan.names.get(name));
+    let mut error = match later.import {
+        None => Diagnostic::error(message, later_decl.span)
+            .with_label("declared here")
+            .in_input(later_decl.file),
+        Some(at) => context_in(
+            Diagnostic::error(message, at)
+                .with_label("imported here")
+                .in_input(index),
+            later_decl.file,
+            later_decl.span,
+            "declared here",
+        ),
+    };
+    if let Some(at) = earlier.import {
+        error = context_in(error, index, at, "imported here");
+    }
+    error = context_in(error, earlier_decl.file, earlier_decl.span, "declared here");
+    if later.above || earlier.above {
+        error = error.with_note("one is in a directory above");
+    }
+    Some(error)
+}
+
+/// Defines the scan's types and expands every file's (see [Types](#types)):
+/// copies each declaration's definition into the store, each name in it of
+/// another type, or qualified, as its file's view resolves it
+/// ([`Scan::type_links`]); reports each cycle of types, "type `A` refers to
+/// itself" ([`type_cycle`]); settles every declaration, those it refers to
+/// first, those on a cycle erroneous ([`TypeStore::settle`]); and, if
+/// nothing is wrong, expands each file's tree with them
+/// ([`Ast::expand_types`]). A scan with no type to define and nothing that
+/// reads one costs one look at each file's type expressions.
+fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
+    let links: Vec<Vec<(TypeExprId, TypeLink)>> = (0..count(scan.files.len()))
+        .map(|index| scan.type_links(index))
+        .collect();
+    let base = scan.type_base;
+    for (at, decl) in (0u32..).zip(&scan.types) {
+        let (Some(file), Some(links)) = (
+            scan.files.get(decl.file as usize),
+            links.get(decl.file as usize),
+        ) else {
+            continue;
+        };
+        scan.type_store
+            .declare(base.saturating_add(at), (&file.ast, decl.ty), links);
+    }
+    // What each declaration refers to of the scan's own: the store's
+    // earlier declarations, a session's earlier inputs', are settled.
+    let edges: Vec<Vec<u32>> = (0..count(scan.types.len()))
+        .map(|at| {
+            scan.type_store
+                .refs(base.saturating_add(at))
+                .into_iter()
+                .filter_map(|(to, _)| to.checked_sub(base))
+                .filter(|&to| (to as usize) < scan.types.len())
+                .collect()
+        })
+        .collect();
+    let slices: Vec<&[u32]> = edges.iter().map(Vec::as_slice).collect();
+    let (components, _) = mentions::components(&slices);
+    for component in &components {
+        let cyclic = component.len() > 1
+            || component
+                .first()
+                .is_some_and(|&only| edges.get(only as usize).is_some_and(|e| e.contains(&only)));
+        if cyclic && let Some(error) = type_cycle(scan, component, &edges) {
+            errors.push(error);
+        }
+        for &member in component {
+            scan.type_store.settle(base.saturating_add(member), cyclic);
+        }
+    }
+    if !errors.is_empty() {
+        return;
+    }
+    for (file, links) in scan.files.iter_mut().zip(&links) {
+        file.ast.expand_types(&scan.type_store, links);
+    }
+}
+
+/// The error that the types of `component`, indices in [`Scan::types`]
+/// that refer to each other, `edges` being what each refers to, refer to
+/// themselves: "type `A` refers to itself", at the first of them in path
+/// then source order, labelled at each step of a shortest cycle through it
+/// ("`B` uses `A` here", at the name of `A` in `B`'s definition).
+fn type_cycle(scan: &Scan, component: &[u32], edges: &[Vec<u32>]) -> Option<Diagnostic> {
+    let first = component.iter().copied().min()?;
+    // A shortest cycle through `first`, breadth first within the component.
+    let mut previous: HashMap<u32, u32> = HashMap::new();
+    let mut queue = std::collections::VecDeque::from([first]);
+    let mut closing = None;
+    while let Some(at) = queue.pop_front() {
+        for &to in edges.get(at as usize).into_iter().flatten() {
+            if to == first {
+                closing = Some(at);
+                break;
+            }
+            if component.contains(&to) && !previous.contains_key(&to) {
+                previous.insert(to, at);
+                queue.push_back(to);
+            }
+        }
+        if closing.is_some() {
+            break;
+        }
+    }
+    let mut at = closing?;
+    let mut steps = vec![(at, first)];
+    while at != first {
+        let from = *previous.get(&at)?;
+        steps.push((from, at));
+        at = from;
+    }
+    steps.reverse();
+    let decl = scan.types.get(first as usize)?;
+    let mut error = Diagnostic::error(
+        format!("type `{}` refers to itself", scan.show_type(first)),
+        decl.span,
+    )
+    .in_input(decl.file);
+    for (from, to) in steps {
+        let from_decl = scan.types.get(from as usize)?;
+        let target = scan.type_base.saturating_add(to);
+        let at = scan
+            .type_store
+            .refs(scan.type_base.saturating_add(from))
+            .into_iter()
+            .find(|&(refers, _)| refers == target)
+            .map(|(_, at)| at)?;
+        let (from_name, to_name) = (scan.show_type(from), scan.show_type(to));
+        let label = format!("`{from_name}` uses `{to_name}` here");
+        error = context_in(error, from_decl.file, at, &label);
+    }
+    Some(error)
 }
 
 /// Reports each name of `aliases`, the imports of file `index`, that
@@ -4502,7 +5129,7 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     let mut tails: Vec<(usize, Vec<Name>)> = vec![(0, Vec::new()); scan.files.len()];
     let mut checked: Vec<Option<Types>> = (0..scan.files.len()).map(|_| None).collect();
     let mut warnings = vec![Vec::new(); scan.files.len()];
-    let mut errors = Vec::new();
+    let mut errors = check_type_items(&mut scan, &mut names, &mut types);
     // The files whose check failed, or that need one that did: those are
     // not checked, since their errors would follow from the first.
     let mut failed = vec![false; scan.files.len()];
@@ -4577,11 +5204,9 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
             }
         }
     }
-    if !errors.is_empty() {
-        return Err(merge_files(
-            errors,
-            warnings.into_iter().flatten().collect(),
-        ));
+    if !errors.is_empty() || failed.contains(&true) {
+        let warnings = warnings.into_iter().flatten().collect();
+        return Err(merge_files(reported(errors), warnings));
     }
     scan.names = names;
     Ok(Workspace {
@@ -4605,6 +5230,43 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
         #[cfg(test)]
         view_records,
     })
+}
+
+/// Checks the `type` items of every file of `scan` that has any, before any
+/// file is checked, since a file may use a type of a file checked after it
+/// (see [Types](#types)): what is wrong in each declaration is reported
+/// here, once, and every file that uses it fails quietly. Lends each file
+/// `names`, and interns into `types`. Returns the errors, each naming its
+/// file.
+fn check_type_items(scan: &mut Scan, names: &mut Names, types: &mut TypeTable) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for (index, file) in (0u32..).zip(&mut scan.files) {
+        if file.mentions.types.is_empty() {
+            continue;
+        }
+        file.ast.replace_names(mem::take(names));
+        let found = check_types(&file.ast, types);
+        *names = file.ast.replace_names(Names::new());
+        errors.extend(in_file(found, index));
+    }
+    errors
+}
+
+/// `errors`, the errors of a workspace some file of which failed its check,
+/// or, if there are none, the internal error that one failed with nothing
+/// reported: a check fails so quietly only for an erroneous type, which
+/// [`check_type_items`] reports where it is declared.
+fn reported(errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    if !errors.is_empty() {
+        return errors;
+    }
+    vec![
+        InternalError {
+            message: "a file's check failed with nothing reported",
+            span: Span::new(0, 0),
+        }
+        .into(),
+    ]
 }
 
 /// Whether file `index` commits its declaration `name` for the files
@@ -4974,27 +5636,31 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
 /// view; its cells, after the standard library's, take the slots after the
 /// scope's ([`Scan::slot`]), and its check is a session input's, which
 /// reads the scope's variables as a session's input does (see
-/// [`crate::session`]). It inherits `imports`, those of the session's
-/// earlier inputs, as the imports of its own that follow its `import`s
-/// ([`inherit_imports`]). Its diagnostics name it as the input being run,
+/// [`crate::session`]). It inherits what `earlier` holds of the session's
+/// earlier inputs: their imports, as the imports of its own that follow its
+/// `import`s ([`inherit_imports`]), and their types, as the last source of
+/// its view of types, its own types defined in their store after theirs
+/// (see [Types](#types)). Its diagnostics name it as the input being run,
 /// with no input number; a label in a standard file names that file's.
-/// Returns, with its IR and its check's output, the imports it has, its own
-/// and those it inherited and did not shadow, each with no item or span of
-/// this input's: what a later input inherits, once it has run.
+/// Returns, with its IR and its check's output, what a later input
+/// inherits, once it has run: the imports it has, its own and those it
+/// inherited and did not shadow, each with no item or span of this
+/// input's, and its view of types, each type with its declaration's number
+/// in the store.
 ///
 /// # Errors
 ///
 /// The diagnostics of the scan, the check or the lowering.
 pub(crate) fn check_input(
     standard: &Standard,
-    (source, imports): (&SourceFile, &[Alias]),
+    (source, earlier): (&SourceFile, Earlier),
     (names, types): (&mut Names, &mut TypeTable),
     scope: Scope,
     input: u32,
-) -> Result<(Ir, CheckOutput, Vec<Alias>), Vec<Diagnostic>> {
-    let (lowered, imports) = check_input_then(
+) -> Result<(Ir, CheckOutput, Inherited), Vec<Diagnostic>> {
+    let (lowered, inherited) = check_input_then(
         standard,
-        (source, imports),
+        (source, earlier),
         (names, types),
         scope,
         |ast, checked, types| {
@@ -5002,30 +5668,58 @@ pub(crate) fn check_input(
         },
     )?;
     let (ir, output) = lowered?;
-    Ok((ir, output, imports))
+    Ok((ir, output, inherited))
 }
+
+/// What a session's input inherits from the session's earlier inputs (see
+/// [`check_input`]).
+#[derive(Debug)]
+pub(crate) struct Earlier<'a> {
+    /// Their imports that no later input shadowed.
+    pub(crate) imports: &'a [Alias],
+    /// Their types that no later input shadowed, each with its
+    /// declaration's number in `store`.
+    pub(crate) types: &'a [(Name, u32)],
+    /// The definitions of their types, which the input's are added to.
+    pub(crate) store: &'a mut TypeStore,
+}
+
+/// What a later input inherits of a session's input once it has run: its
+/// imports and its view of types (see [`check_input`]).
+pub(crate) type Inherited = (Vec<Alias>, Vec<(Name, u32)>);
 
 /// [`check_input`] up to its check, whose outcome `then` is given with the
 /// input's tree, its names in it, and the types: what lowering is done by,
-/// or a test looks at. Returns what `then` does, with the input's imports
-/// as [`check_input`] does.
+/// or a test looks at. Returns what `then` does, with what a later input
+/// inherits as [`check_input`] does. The input's `type` items are checked
+/// before it, as a workspace's are ([`check_types`]), what is wrong in
+/// them among the check's errors.
 ///
 /// # Errors
 ///
 /// The diagnostics of the scan.
 fn check_input_then<R>(
     standard: &Standard,
-    (source, imports): (&SourceFile, &[Alias]),
+    (source, earlier): (&SourceFile, Earlier),
     (names, types): (&mut Names, &mut TypeTable),
     scope: Scope,
     then: impl FnOnce(&Ast, Result<CheckOutput, Vec<Diagnostic>>, &mut TypeTable) -> R,
-) -> Result<(R, Vec<Alias>), Vec<Diagnostic>> {
+) -> Result<(R, Inherited), Vec<Diagnostic>> {
     // Every standard file, as the session's start loaded them, so that its
     // cells are numbered as they were there.
     let mut loaded = Vec::new();
-    let placed = (std::slice::from_ref(source), Placing::Lone(imports, true));
-    let mut scan = scan_into(placed, Library::EVERY, names, &mut loaded)
-        .map_err(|errors| being_run(errors, count(loaded.len())))?;
+    let placed = (
+        std::slice::from_ref(source),
+        Placing::Lone(earlier.imports, true),
+    );
+    let store = earlier.store;
+    let mut scan = scan_into_with(
+        placed,
+        Library::EVERY,
+        (names, &mut loaded),
+        (store, earlier.types),
+    )
+    .map_err(|errors| being_run(errors, count(loaded.len())))?;
     // In the session's root, as its start located the standard files.
     scan.locate(standard.dirs.first().map_or("/", |root| root));
     let index = scan.standard;
@@ -5058,6 +5752,7 @@ fn check_input_then<R>(
     let file_names = mem::take(&mut scan.names);
     let Some(file) = scan.files.get_mut(index as usize) else {
         *names = file_names;
+        *store = mem::take(&mut scan.type_store);
         return Err(Vec::new());
     };
     file.ast.replace_names(file_names);
@@ -5068,10 +5763,21 @@ fn check_input_then<R>(
             session: true,
             ..context
         };
+        let declared = if file.mentions.types.is_empty() {
+            Vec::new()
+        } else {
+            check_types(&file.ast, types)
+        };
         let checked = Checker::in_workspace(&file.ast, scope, types, &context).check();
+        let checked = match (declared.is_empty(), checked) {
+            (true, checked) => checked,
+            (false, Ok(output)) => Err(diagnostic::merge(declared, output.warnings)),
+            (false, Err(found)) => Err(diagnostic::merge(declared, found)),
+        };
         Some(then(&file.ast, checked, types))
     });
     let mut imports = Vec::new();
+    let mut view = Vec::new();
     if let Some(file) = scan.files.get_mut(index as usize) {
         *names = file.ast.replace_names(Names::new());
         imports.extend(file.aliases.iter().filter(|a| !a.implicit).map(|a| Alias {
@@ -5080,8 +5786,11 @@ fn check_input_then<R>(
             inherited: true,
             ..*a
         }));
+        view.extend(file.type_view.iter().map(|(&name, &decl)| (name, decl)));
+        view.sort_unstable();
     }
-    finished.map(|r| (r, imports)).ok_or_else(Vec::new)
+    *store = mem::take(&mut scan.type_store);
+    finished.map(|r| (r, (imports, view))).ok_or_else(Vec::new)
 }
 
 /// For the tests of the other modules, which check a text alone: `text`
@@ -5097,9 +5806,14 @@ pub(crate) fn check_beside_prelude(
     let (mut names, mut types) = (started.names, started.types);
     let source = SourceFile::new("test.gcsl", text).unwrap();
     let scope = Scope::of_slots(started.slot_names);
+    let earlier = Earlier {
+        imports: &[],
+        types: &[],
+        store: &mut TypeStore::new(),
+    };
     let checked = check_input_then(
         &started.standard,
-        (&source, &[]),
+        (&source, earlier),
         (&mut names, &mut types),
         scope,
         |ast, checked, _| (ast.clone(), checked),
@@ -8842,9 +9556,14 @@ p26 = com.x"#;
         let started = start("/").unwrap();
         let (mut names, mut types) = (started.names, started.types);
         let source = SourceFile::new("input", "#![no_prelude]\nx = 1").unwrap();
+        let earlier = Earlier {
+            imports: &[],
+            types: &[],
+            store: &mut TypeStore::new(),
+        };
         let errors = check_input(
             &started.standard,
-            (&source, &[]),
+            (&source, earlier),
             (&mut names, &mut types),
             Scope::of_slots(started.slot_names),
             2,
@@ -9422,6 +10141,697 @@ p26 = com.x"#;
         assert_eq!(
             rooted_text(&files, "p/a.gcsl"),
             "{r = \"<root>/lib <root>/p\"}"
+        );
+    }
+
+    /// Every diagnostic of checking the workspace of `files`, in order,
+    /// each shown as `MESSAGE at FILE (LABEL); FILE: LABEL; note: NOTE`,
+    /// its file and each label's by path.
+    fn check_errors(files: &[(&str, &str)]) -> Vec<String> {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let (standard, checked) = check_with_standard(&sources, &[], "/");
+        let Err(errors) = checked else {
+            panic!("{files:?}: checked without an error");
+        };
+        let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
+        paths.sort_unstable();
+        let mut all: Vec<&str> = standard.iter().map(SourceFile::name).collect();
+        all.extend(paths);
+        let path = |input: Option<u32>| {
+            input
+                .and_then(|i| all.get(i as usize))
+                .copied()
+                .unwrap_or("?")
+        };
+        errors
+            .iter()
+            .map(|error| {
+                let mut parts = vec![format!("{} at {}", error.message, path(error.input))];
+                if let Some(label) = &error.label {
+                    parts[0] = format!("{} ({label})", parts[0]);
+                }
+                for label in &error.labels {
+                    let file = path(label.input.or(error.input));
+                    parts.push(format!("{file}: {}", label.text));
+                }
+                for note in &error.notes {
+                    parts.push(format!("note: {note}"));
+                }
+                parts.join("; ")
+            })
+            .collect()
+    }
+
+    /// The files of the slice 33 summary: named record types, one built
+    /// from another by spread, an annotated field, a qualified name and a
+    /// file below reading a type it imports.
+    const TYPES: [(&str, &str); 3] = [
+        (
+            "_lib/types.gcsl",
+            "type PackageDef = {\n\
+             \x20   version: String,\n\
+             \x20   arch: String,\n\
+             \x20   content: String,\n\
+             }\n\
+             type Package = { ...PackageDef, name: String }",
+        ),
+        (
+            "workspace.gcsl",
+            "import _lib.types as t\n\
+             type Steps = List<fn() -> String>\n\
+             def make(name: String, f: fn(): t.PackageDef): { pkg: t.Package } {\n\
+             \x20   pkg: t.Package = { ...f(); name = name }\n\
+             }\n\
+             built = make(\"hello\", fn(): t.PackageDef { version = \"1\"; arch = \"x\"; content = \"usr\" })",
+        ),
+        (
+            "pkg/app.gcsl",
+            "import Package from _lib.types\n\
+             p: Package = { version = \"1\"; arch = \"x\"; content = \"usr\"; name = \"n\" }\n\
+             steps: Steps = []\n\
+             n = built.pkg.name",
+        ),
+    ];
+
+    #[test]
+    fn the_types_summary_runs() {
+        assert_eq!(
+            value(&TYPES, "pkg/app.gcsl"),
+            "{p = {version = \"1\"; arch = \"x\"; content = \"usr\"; name = \"n\"}; \
+             steps = []; n = \"hello\"}"
+        );
+        // A type is shown as what it stands for, never by its name.
+        assert_eq!(
+            value(&TYPES, "workspace.gcsl"),
+            "{make = fn(name: String, f: fn(): {arch: String, content: String, version: \
+             String}): {pkg: {arch: String, content: String, name: String, version: String}}; \
+             built = {pkg = {arch = \"x\"; content = \"usr\"; version = \"1\"; name = \"hello\"}}}"
+        );
+    }
+
+    #[test]
+    fn jacks_workspace_checks_with_spread_for_intersection() {
+        // `/home/jack/projects/peios/newpkgs/workspace.gcsl`, with `&`
+        // written as a spread and `#[def_type]` removed, and `ppk.commit`
+        // stubbed by a module of the test's own.
+        let files = [
+            (
+                "workspace.gcsl",
+                "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
+                 import _lib.ppk\n\
+                 import fileroot\n\
+                 \n\
+                 type PackageDef = {\n\
+                 \x20 version: String,\n\
+                 \x20 arch: String,\n\
+                 \x20 content: String,\n\
+                 }\n\
+                 \n\
+                 type Package = { ...PackageDef, name: String }\n\
+                 \n\
+                 \n\
+                 def package(name: String, func: fn(): PackageDef) -> { pkg: Package, manifest: String } {\n\
+                 \x20   fileroot.helper()\n\
+                 \x20   pkg: Package = { ...func(); name = name }\n\
+                 \n\
+                 \x20   manifest = ppk.commit(\n\
+                 \x20       name = pkg.name,\n\
+                 \x20       version = pkg.version,\n\
+                 \x20       arch = pkg.arch,\n\
+                 \x20       content = pkg.content,\n\
+                 \x20   )\n\
+                 }\n",
+            ),
+            (
+                "_lib/ppk.gcsl",
+                "def commit(name: String, version: String, arch: String, content: String) -> String {\n\
+                 \x20   \"{name} {version} {arch} {content}\"\n\
+                 }",
+            ),
+            (
+                "dev.peios.testpkg/test.gcsl",
+                "built = package(\"dev.peios.testpkg\", fn(): PackageDef {\n\
+                 \x20   version = \"0.1.0\"\n\
+                 \x20   arch = \"x86_64\"\n\
+                 \x20   content = \"usr\"\n\
+                 })",
+            ),
+        ];
+        checked(&files);
+        assert_eq!(
+            value(&files, "dev.peios.testpkg/test.gcsl"),
+            "{built = {pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
+             name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 usr\"}}"
+        );
+    }
+
+    #[test]
+    fn a_type_is_used_above_its_declaration_and_across_files() {
+        // In its own file above its line, from another file of its
+        // directory, and from a directory below, through the chain.
+        let root = "a: Point = { x = 1; y = 2 }\ntype Point = {x: Int, y: Int}";
+        let files = [
+            ("workspace.gcsl", root),
+            ("other.gcsl", "b: Point = { x = 3; y = 4 }"),
+            ("sub/deep.gcsl", "c: Point = { x = 5; y = 6 }"),
+        ];
+        assert_eq!(value(&files, "workspace.gcsl"), "{a = {x = 1; y = 2}}");
+        assert_eq!(value(&files, "other.gcsl"), "{b = {x = 3; y = 4}}");
+        assert_eq!(value(&files, "sub/deep.gcsl"), "{c = {x = 5; y = 6}}");
+        // A sibling directory does not see them.
+        let hidden = [
+            ("workspace.gcsl", ""),
+            ("a/types.gcsl", "type Point = {x: Int}"),
+            ("b/use.gcsl", "p: Point = { x = 1 }"),
+        ];
+        assert_eq!(messages(&hidden, "b/use.gcsl"), ["unknown type `Point`"]);
+    }
+
+    /// A library of types for the import tests: `lib/types.gcsl` with a
+    /// record type and a type also a value's name, and `lib/more.gcsl`.
+    const TYPE_LIB: [(&str, &str); 3] = [
+        ("workspace.gcsl", ""),
+        (
+            "lib/types.gcsl",
+            "type P = {x: Int}\ntype Both = Int\nBoth = 7",
+        ),
+        ("lib/more.gcsl", "type Q = {...P, y: String}"),
+    ];
+
+    #[test]
+    fn types_are_reached_through_every_import_form() {
+        let with = |main: &str| {
+            let mut files = TYPE_LIB.to_vec();
+            files.push(("app/main.gcsl", main));
+            value(&files, "app/main.gcsl")
+        };
+        // Whole, by its path's last segment and `as`.
+        assert_eq!(
+            with("import lib.types\nv: types.P = { x = 1 }"),
+            "{v = {x = 1}}"
+        );
+        assert_eq!(
+            with("import lib.types as t\nv: t.P = { x = 1 }"),
+            "{v = {x = 1}}"
+        );
+        // A directory's merged tree has its files' types.
+        assert_eq!(
+            with("import lib\nv: lib.Q = { x = 1; y = \"a\" }"),
+            "{v = {x = 1; y = \"a\"}}"
+        );
+        // A member, bare or renamed.
+        assert_eq!(
+            with("import P from lib.types\nv: P = { x = 2 }"),
+            "{v = {x = 2}}"
+        );
+        assert_eq!(
+            with("import P as R from lib.types\nv: R = { x = 2 }"),
+            "{v = {x = 2}}"
+        );
+        // `*`, with the fields.
+        assert_eq!(
+            with("import * from lib.types\nv: P = { x = Both }"),
+            "{v = {x = 7}}"
+        );
+        // A member that is both a type and a value binds both.
+        assert_eq!(
+            with("import Both from lib.types\nv: Both = Both + 1"),
+            "{v = 8}"
+        );
+    }
+
+    #[test]
+    fn qualified_names_go_two_deep() {
+        // A deep module path, and a type whose definition names another
+        // module's type qualified, used qualified from a third.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a/b/inner.gcsl", "type Leaf = {v: Int}"),
+            (
+                "a/b/types.gcsl",
+                "import a.b.inner as i\ntype Node = {leaf: i.Leaf, name: String}",
+            ),
+            (
+                "app/main.gcsl",
+                "import a.b.types as t\nn: t.Node = { leaf = { v = 1 }; name = \"n\" }\nw = n.leaf.v",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app/main.gcsl"),
+            "{n = {leaf = {v = 1}; name = \"n\"}; w = 1}"
+        );
+    }
+
+    #[test]
+    fn a_type_and_a_value_of_one_name_coexist() {
+        let files = [(
+            "workspace.gcsl",
+            "type Foo = {a: Int}\nFoo = 3\nlet x: Foo = { a = Foo }\nfn bar(Foo: Foo): Int { Foo.a }\ny = bar(x)",
+        )];
+        assert_eq!(value(&files, "workspace.gcsl"), "{Foo = 3; y = 3}");
+        // `type` is still a name, as it was, for a variable and a field.
+        let files = [(
+            "workspace.gcsl",
+            "type = 1\nlet t = type\nx = { type = t }.type\ny: Int = type",
+        )];
+        assert_eq!(value(&files, "workspace.gcsl"), "{type = 1; x = 1; y = 1}");
+    }
+
+    #[test]
+    fn spread_in_a_record_type_overrides_as_value_spread_does() {
+        let run = |types: &str, value_text: &str| {
+            let prefix = "type A = {a: Int, b: Int}\ntype B = {b: String}";
+            let text = format!("{prefix}\n{types}\n{value_text}");
+            value(&[("workspace.gcsl", &text)], "workspace.gcsl")
+        };
+        // A later field overrides a spread's, its type differing.
+        assert_eq!(
+            run("type T = {...A, b: String}", "v: T = { a = 1; b = \"x\" }"),
+            "{v = {a = 1; b = \"x\"}}"
+        );
+        // A later spread overrides an earlier one's.
+        assert_eq!(
+            run("type T = {...A, ...B}", "v: T = { a = 1; b = \"y\" }"),
+            "{v = {a = 1; b = \"y\"}}"
+        );
+        assert_eq!(
+            run("type T = {...B, ...A}", "v: T = { a = 1; b = 2 }"),
+            "{v = {a = 1; b = 2}}"
+        );
+        // The same spread twice is idempotent.
+        assert_eq!(
+            run("type T = {...A, ...A}", "v: T = { a = 1; b = 2 }"),
+            "{v = {a = 1; b = 2}}"
+        );
+        // A spread of a type built by a spread.
+        assert_eq!(
+            run(
+                "type T = {...A, c: Bool}\ntype U = {...T, d: Int}",
+                "v: U = { a = 1; b = 2; c = true; d = 4 }"
+            ),
+            "{v = {a = 1; b = 2; c = true; d = 4}}"
+        );
+        // A record type written in place spread.
+        assert_eq!(
+            run(
+                "type T = {...{z: Int}, ...A}",
+                "v: T = { z = 0; a = 1; b = 2 }"
+            ),
+            "{v = {z = 0; a = 1; b = 2}}"
+        );
+    }
+
+    #[test]
+    fn spread_problems_in_record_types() {
+        let one = |text: &str| check_errors(&[("workspace.gcsl", text)]);
+        let twice = "field `b` is defined twice at workspace.gcsl (`b` is a field of this, of \
+                     type Int); workspace.gcsl: first defined here; note: a spread cannot \
+                     replace a field defined before it; put the spread first";
+        let text = "type A = {b: Int}\ntype T = {b: String, ...A}";
+        assert_eq!(one(text), [twice]);
+        let text = "type A = {b: Int, c: Int}\nx: {b: String, c: Bool, ...A} = { b = \"x\" }";
+        let others = format!("{twice} (it also has 1 other field defined before it)");
+        assert_eq!(one(text), [others]);
+        assert_eq!(
+            one("type T = {...Int, a: Int}"),
+            ["cannot spread type Int: it is not a record type at workspace.gcsl"]
+        );
+        assert_eq!(
+            one("type N = List<Int>\ntype T = {...N}"),
+            ["cannot spread type `List<Int>`: it is not a record type at workspace.gcsl"]
+        );
+        // Only a record type, written so or named, is spread: the type is
+        // shown as what it stands for.
+        assert_eq!(
+            one("x: {...Future<{a: Int}>} = { a = 1 }"),
+            ["cannot spread type `Future<{a: Int}>`: it is not a record type at workspace.gcsl"]
+        );
+        let union = "cannot spread type `{a: Int} | {b: Int}`: it is not a record type at \
+                     workspace.gcsl";
+        assert_eq!(
+            one("type A = {a: Int}\ntype B = {b: Int}\nx: {...A | B} = { a = 1 }"),
+            [union]
+        );
+        // A record type written in place with a name twice, spread, is the
+        // repeated-name error it is anywhere else, at the same place, in a
+        // `type` and in a field's annotation alike.
+        let repeated = |text: &str| {
+            let source = SourceFile::new("workspace.gcsl", text).unwrap();
+            let errors = check(std::slice::from_ref(&source)).unwrap_err();
+            assert_eq!(errors.len(), 1, "{text}: {errors:?}");
+            let at = u32::try_from(text.rfind("a: String").unwrap()).unwrap();
+            assert_eq!(errors[0].span, Span::new(at, at + 1), "{text}");
+            errors[0].message.clone()
+        };
+        let twice = "field `a` appears twice in this type";
+        for text in [
+            "type R = { a: Int, a: String }",
+            "type R = { ...{ a: Int, a: String } }",
+            "x: { a: Int, a: String } = { a = 1 }",
+            "x: { ...{ a: Int, a: String } } = { a = 1 }",
+            "type B = {b: Int}\nx: { ...B, ...{ a: Int, a: String } } = { a = 1; b = 2 }",
+        ] {
+            assert_eq!(repeated(text), twice, "{text}");
+        }
+        // And a type so defined is erroneous wherever it is used, reported
+        // once, where it is written.
+        assert_eq!(
+            check_errors(&[
+                ("workspace.gcsl", "type R = { ...{ a: Int, a: String } }"),
+                ("use.gcsl", "x: R = { a = 1 }"),
+            ]),
+            [format!("{twice} at workspace.gcsl")]
+        );
+        // An erroneous type spread is reported where it is written, once.
+        assert_eq!(
+            one("type A = {a: Strng}\ntype T = {...A}\nx: T = { a = 1 }"),
+            ["unknown type `Strng` at workspace.gcsl"]
+        );
+    }
+
+    #[test]
+    fn type_declaration_errors() {
+        let one = |text: &str| check_errors(&[("workspace.gcsl", text)]);
+        assert_eq!(
+            one("type Int = String"),
+            ["`Int` is a built-in type at workspace.gcsl"]
+        );
+        assert_eq!(
+            one("type List = {a: Int}\ntype Future = Int"),
+            [
+                "`List` is a built-in type at workspace.gcsl",
+                "`Future` is a built-in type at workspace.gcsl"
+            ]
+        );
+        assert_eq!(
+            one("type A = Int\nx = 1\ntype A = String"),
+            ["type `A` is declared twice at workspace.gcsl; workspace.gcsl: first declared here"]
+        );
+        assert_eq!(
+            one("type A = {a: Nope}\nx: A = { a = 1 }\ny: A = { a = 2 }"),
+            ["unknown type `Nope` at workspace.gcsl"]
+        );
+        assert_eq!(
+            one("type A = Int\nx: A<Int> = 1"),
+            ["type `A` takes no type argument at workspace.gcsl"]
+        );
+        let mismatch = "mismatched types at workspace.gcsl (expected Int, found String); \
+                        workspace.gcsl: expected because of this annotation";
+        assert_eq!(one("type A = Int\nx: A = \"s\""), [mismatch]);
+    }
+
+    #[test]
+    fn an_erroneous_type_is_reported_once_whichever_file_is_checked_first() {
+        // `a.gcsl` is checked before `z.gcsl`, whose type it uses; and
+        // `n.gcsl`, which needs `z.gcsl`, after it.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x: Bad = { b = 1 }"),
+            ("n.gcsl", "y = zed + 1"),
+            ("z.gcsl", "type Bad = {b: Strng}\nzed = 1"),
+        ];
+        assert_eq!(check_errors(&files), ["unknown type `Strng` at z.gcsl"]);
+    }
+
+    #[test]
+    fn type_conflicts_are_the_conflicts_of_fields() {
+        let errors = |files: &[(&str, &str)]| check_errors(files);
+        // Two files of one directory.
+        let two = "type `Foo` is declared in two files at b.gcsl (declared here); \
+                   a.gcsl: declared here";
+        assert_eq!(
+            errors(&[
+                ("workspace.gcsl", ""),
+                ("a.gcsl", "type Foo = Int"),
+                ("b.gcsl", "type Foo = String"),
+            ]),
+            [two]
+        );
+        // An inner directory's and an outer one's.
+        let above = "type `Foo` is declared in two files at workspace.gcsl (declared here); \
+                     sub/a.gcsl: declared here; note: one is in a directory above";
+        assert_eq!(
+            errors(&[
+                ("workspace.gcsl", "type Foo = Int"),
+                ("sub/a.gcsl", "type Foo = String"),
+            ]),
+            [above]
+        );
+        // An imported one and an own one.
+        let imported = "type `Foo` is declared in two files at app/m.gcsl (imported here); \
+                        lib/t.gcsl: declared here; app/m.gcsl: declared here";
+        assert_eq!(
+            errors(&[
+                ("workspace.gcsl", ""),
+                ("lib/t.gcsl", "type Foo = Int"),
+                ("app/m.gcsl", "import Foo from lib.t\ntype Foo = String"),
+            ]),
+            [imported]
+        );
+        // A `#[shadowable]` import brings types as plain ones, which an own
+        // type of their name conflicts with.
+        let star = "type `Foo` is declared in two files at app/m.gcsl (imported here); \
+                    lib/t.gcsl: declared here; app/m.gcsl: declared here";
+        assert_eq!(
+            errors(&[
+                ("workspace.gcsl", ""),
+                ("lib/t.gcsl", "type Foo = Int"),
+                (
+                    "app/m.gcsl",
+                    "#[shadowable] import * from lib.t\ntype Foo = String"
+                ),
+            ]),
+            [star]
+        );
+        // One type reached twice is one type.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/t.gcsl", "type Foo = Int"),
+            (
+                "lib/m.gcsl",
+                "import * from lib\nimport Foo from lib.t\nx: Foo = 1",
+            ),
+        ];
+        assert_eq!(value(&files, "lib/m.gcsl"), "{x = 1}");
+    }
+
+    #[test]
+    fn qualified_names_that_name_no_type() {
+        let with = |main: &str| {
+            let mut files = TYPE_LIB.to_vec();
+            files.push(("app/main.gcsl", main));
+            check_errors(&files)
+        };
+        assert_eq!(
+            with("import lib.types as t\nx: t.Nope = 1"),
+            ["`t` has no type `Nope` at app/main.gcsl; note: `t` has the types `P`, `Both`"]
+        );
+        assert_eq!(
+            with("import lib.more as m\nimport builtins\nx: builtins.Int = 1"),
+            ["`builtins` has no type `Int` at app/main.gcsl; note: `builtins` has no types"]
+        );
+        assert_eq!(
+            with("import lib.types as t\nx: t = 1"),
+            ["`t` is a module, not a type at app/main.gcsl"]
+        );
+        assert_eq!(
+            with("import lib.types as t\nx: t.P.x = 1"),
+            ["`t.P` is a type, not a module at app/main.gcsl"]
+        );
+        assert_eq!(
+            with("x: nothing.P = 1"),
+            ["unknown type `nothing.P` at app/main.gcsl"]
+        );
+    }
+
+    #[test]
+    fn cycles_of_types() {
+        let one = |text: &str| check_errors(&[("workspace.gcsl", text)]);
+        assert_eq!(
+            one("type A = {a: A}"),
+            ["type `A` refers to itself at workspace.gcsl; workspace.gcsl: `A` uses `A` here"]
+        );
+        assert_eq!(
+            one("type A = B\ntype B = {a: A}"),
+            ["type `A` refers to itself at workspace.gcsl; \
+              workspace.gcsl: `A` uses `B` here; workspace.gcsl: `B` uses `A` here"]
+        );
+        // Across files, at the first in path then source order.
+        let three = "type `A` refers to itself at a.gcsl; a.gcsl: `A` uses `B` here; \
+                     b.gcsl: `B` uses `C` here; x.gcsl: `C` uses `A` here";
+        assert_eq!(
+            check_errors(&[
+                ("workspace.gcsl", ""),
+                ("x.gcsl", "type C = {c: A}"),
+                ("a.gcsl", "type A = List<B>"),
+                ("b.gcsl", "type B = {...C}"),
+            ]),
+            [three]
+        );
+    }
+
+    #[test]
+    fn annotated_fields_have_their_annotations_types() {
+        // Top-level, in an inner block, dotted and quoted, read from another
+        // file, whose readers see the annotation's type, not the value's.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "x: Int | String = 1\n\
+                 conf.port: Int | String = 80\n\
+                 \"a b\": Float = 2\n\
+                 inner = { y: Int | String = \"s\"; z = y }",
+            ),
+            (
+                "b.gcsl",
+                "import a as m\n\
+                 kind = if x is Int { \"int\" } else { \"string\" }\n\
+                 port = conf.port\n\
+                 f = m.\"a b\" + 0.5",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "a.gcsl"),
+            "{x = 1; conf = {port = 80}; \"a b\" = 2.0; inner = {y = \"s\"; z = \"s\"}}"
+        );
+        assert_eq!(
+            value(&files, "b.gcsl"),
+            "{kind = \"int\"; port = 80; f = 2.5}"
+        );
+        let wide = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x: Int | String = 1"),
+            ("b.gcsl", "y = x + 1"),
+        ];
+        let add = "cannot add `Int | String` and Int at b.gcsl; b.gcsl: Int | String; \
+                   b.gcsl: Int; note: tell them apart first, as in `if x is Int { ... }`";
+        assert_eq!(check_errors(&wide), [add]);
+    }
+
+    #[test]
+    fn annotated_fields_check_as_annotated_lets_do() {
+        let one = |text: &str| value(&[("workspace.gcsl", text)], "workspace.gcsl");
+        let errors = |text: &str| check_errors(&[("workspace.gcsl", text)]);
+        // A value that fits once awaited is awaited, a literal adapts, and a
+        // pure function's parameter the annotation needs present is
+        // measured, present.
+        assert_eq!(
+            one("x: Int = lazy 1\ny: Float = 2\nf = fn(n: Int): {v: Int} { v: Int = n }"),
+            "{x = 1; y = 2.0; f = fn(n: Int): {v: Int}}"
+        );
+        // In a record block checked against an expected record type.
+        assert_eq!(
+            one("let r: {a: Int | String} = { a: Int = 1 }\nv = r.a"),
+            "{v = 1}"
+        );
+        let mismatch = "mismatched types at workspace.gcsl (expected Int, found Int | String); \
+                        workspace.gcsl: expected because of this annotation";
+        assert_eq!(
+            errors("let r: {a: Int} = { a: Int | String = 1 }"),
+            [mismatch]
+        );
+        // TEMPORARY (alias rule): an annotated field is no alias of a
+        // built-in function, as an annotated `let` is none.
+        let value_yet = "`len` is a built-in function and cannot be used as a value yet at \
+                         workspace.gcsl; note: a built-in function with a type for any list \
+                         cannot be written as a type yet; call it, or bind it to a name";
+        assert_eq!(errors("l: fn(xs: List<Int>): Int = len"), [value_yet]);
+    }
+
+    #[test]
+    fn an_alias_is_bare_where_it_is_used() {
+        // As if `Int` were written at each use: the either shape in an
+        // impure function's bare parameter, inferred in a pure one's.
+        let files = [(
+            "workspace.gcsl",
+            "type N = Int\n\
+             type F = Future<Int>\n\
+             def impure(x: N) -> N { x }\n\
+             def pure(x: N): Int { x }\n\
+             def either(x: Int | F): Int { 1 }",
+        )];
+        assert_eq!(
+            value(&files, "workspace.gcsl"),
+            "{impure = fn(x: Int | Future<Int>) -> Int | Future<Int>; \
+              pure = fn(x: Int): Int; either = fn(x: Int | Future<Int>): Int}"
+        );
+        assert_eq!(
+            check_errors(&[(
+                "workspace.gcsl",
+                "type F = Future<Int>\nx: Int | F | String = 1"
+            )]),
+            ["a union with a `Future` member must be `T | Future<T>` at workspace.gcsl"]
+        );
+    }
+
+    #[test]
+    fn a_type_expanded_too_deep_is_an_error_where_it_is_written() {
+        // Each type nests the one before it a level deeper, so the chain
+        // passes `MAX_DEPTH` though no type is written deeply: `T10000` is
+        // one level too deep where it is written, and `T10001`, which uses
+        // it, is erroneous wherever it is used.
+        let chain: Vec<String> = (1..=10_001)
+            .map(|at| format!("type T{at} = {{a: T{}}}", at - 1))
+            .collect();
+        let text = format!("type T0 = Int\n{}\nx: T10001 = 1", chain.join("\n"));
+        let errors = std::thread::Builder::new()
+            .stack_size(crate::STACK_SIZE)
+            .spawn(move || check_errors(&[("workspace.gcsl", &text)]))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(errors, ["expression nested too deeply at workspace.gcsl"]);
+    }
+
+    #[test]
+    fn a_value_file_declares_types() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/v.gcsl", "type T = {a: Int}\n= 5"),
+            (
+                "app.gcsl",
+                "import lib.v\nimport T from lib.v\nx: v.T = { a = v }\ny: T = x",
+            ),
+        ];
+        assert_eq!(value(&files, "app.gcsl"), "{x = {a = 5}; y = {a = 5}}");
+    }
+
+    #[test]
+    fn dump_types_shows_each_type_with_its_expansion() {
+        let mut workspace = checked(&TYPES);
+        let index = workspace.file("_lib/types.gcsl").unwrap();
+        assert_eq!(
+            workspace.dump_types(index).unwrap(),
+            "(file\n\
+             \x20 (type PackageDef {version: String, arch: String, content: String} = \
+             {arch: String, content: String, version: String} @0..81)\n\
+             \x20 (type Package {...PackageDef, name: String} = {arch: String, content: String, \
+             name: String, version: String} @82..128))"
+        );
+        // A use prints as written.
+        let index = workspace.file("pkg/app.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(dump.contains("(field p : Package @"), "{dump}");
+        let index = workspace.file("workspace.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(dump.contains("(f fn(): t.PackageDef)"), "{dump}");
+        assert!(
+            dump.contains(
+                "(type Steps List<fn() -> String> = List<fn() -> String | Future<String>> @"
+            ),
+            "{dump}"
+        );
+        // A type defined as another prints as written, and dumps as what
+        // both stand for.
+        let mut workspace = checked(&[("workspace.gcsl", "type A = Int\ntype B = A")]);
+        let index = workspace.file("workspace.gcsl").unwrap();
+        assert_eq!(
+            workspace.dump_types(index).unwrap(),
+            "(file\n  (type A Int = Int @0..12)\n  (type B A = Int @13..23))"
         );
     }
 }

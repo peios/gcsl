@@ -30,6 +30,8 @@
 //!   [`crate::Diagnostic::input`]), whose source [`Session::source`]
 //!   returns for rendering it. A future that
 //!   fails is left unrun, so a later input that awaits it runs it again;
+//! - the definitions of the types its inputs have declared, and which of
+//!   them, by name, the next input inherits (see [Types](#types));
 //! - the [`MemoTables`] of every memoised (`->>`) closure any input has
 //!   called, from lists of arguments to what the closure returned, so that
 //!   a later input calling the closure with equal arguments gets the
@@ -148,6 +150,23 @@
 //! later change of the working directory changes nothing; nor does an
 //! input, so the table is never extended.
 //!
+//! # Types
+//!
+//! An input may declare types, `type Foo = ...` (see the checker's "Type
+//! declarations"), which later inputs see, as they see its `fn`s: the
+//! session keeps their definitions in a [`TypeStore`], each input's after
+//! the earlier inputs', and, once an input has run, its view of types, its
+//! own and those it imported or inherited and did not shadow, each with its
+//! definition's number there, which the next input inherits as the last
+//! source of its own view (`crate::workspace::check_input`). So a later
+//! input's `type Foo` shadows an earlier one's, as a later `fn` does, for
+//! itself and every input after it, and a type of a later input may be
+//! built from an earlier one's. A failed input's types are forgotten with
+//! its names: the store is put back where it was. An input that only
+//! declares a type has the value `{}`, and shows nothing, as one that only
+//! declares a `fn`. Types have no runtime existence: nothing of the frame
+//! is theirs.
+//!
 //! # Workspaces
 //!
 //! A [`crate::workspace::Workspace`] is driven like a session: its files
@@ -167,7 +186,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::Outcome;
-use crate::ast::Ast;
+use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
 use crate::eval::{self, MemoTables};
@@ -177,7 +196,7 @@ use crate::names::{Name, Names};
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, Value};
-use crate::workspace::{self, Alias, Standard};
+use crate::workspace::{self, Alias, Earlier, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
 /// documentation.
@@ -206,6 +225,13 @@ pub struct Session {
     /// which the next input inherits (see [The standard
     /// library](#the-standard-library)).
     imports: Vec<Alias>,
+    /// The definitions of the types the inputs have declared (see
+    /// [Types](#types)).
+    type_store: TypeStore,
+    /// The types of the committed inputs that no later one has shadowed,
+    /// each with its declaration's number in `type_store`, which the next
+    /// input inherits.
+    declared_types: Vec<(Name, u32)>,
 }
 
 impl Default for Session {
@@ -235,6 +261,8 @@ impl Session {
                 exec_result: Some(started.exec_result),
                 standard: Ok(Rc::new(started.standard)),
                 imports: Vec::new(),
+                type_store: TypeStore::new(),
+                declared_types: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -247,6 +275,8 @@ impl Session {
                 exec_result: None,
                 standard: Err(diagnostics),
                 imports: Vec::new(),
+                type_store: TypeStore::new(),
+                declared_types: Vec::new(),
             },
         }
     }
@@ -271,12 +301,15 @@ impl Session {
     pub fn eval(&mut self, source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
         let names_before = self.names.len();
         let memo_before = self.memo.checkpoint();
+        let types_before = self.type_store.mark();
         let result = self.eval_uncommitted(source);
         if result.is_err() {
             // What the input memoised may hold its names and closures of
-            // its code, which mean nothing once it is forgotten.
+            // its code, which mean nothing once it is forgotten; and so may
+            // the definitions of the types it declared.
             self.memo.rollback(memo_before);
             self.names.truncate(names_before);
+            self.type_store.truncate(types_before);
         }
         result
     }
@@ -312,9 +345,14 @@ impl Session {
         // The names are lent to the scan and given back whatever happens;
         // the input's tree, and its string table, which lowering copies
         // what the IR needs out of, are dropped once it is lowered.
-        let (ir, output, mut imports) = workspace::check_input(
+        let earlier = Earlier {
+            imports: &self.imports,
+            types: &self.declared_types,
+            store: &mut self.type_store,
+        };
+        let (ir, output, (mut imports, declared_types)) = workspace::check_input(
             &standard,
-            (source, &self.imports),
+            (source, earlier),
             (&mut self.names, &mut self.types),
             self.scope.clone(),
             input,
@@ -332,6 +370,7 @@ impl Session {
                 let declared: HashSet<Name> = output.scope.names().skip(self.scope.len()).collect();
                 imports.retain(|alias| !declared.contains(&alias.name));
                 self.imports = imports;
+                self.declared_types = declared_types;
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());
@@ -455,6 +494,67 @@ mod tests {
             .types()
             .display(session.value_type(), session.names())
             .to_string()
+    }
+
+    #[test]
+    fn types_persist_and_later_inputs_shadow_them() {
+        let mut session = Session::new();
+        // An input of only a type shows nothing, as one of only a `fn`.
+        assert_eq!(value(&mut session, "type Foo = Int"), Value::Empty);
+        assert_eq!(value(&mut session, "fn f(): Int { 1 }"), Value::Empty);
+        assert_eq!(value(&mut session, "let x: Foo = 1\nx"), Value::Int(1));
+        // A later input's `type Foo` shadows the earlier one, as a later
+        // `fn` does, for itself and every input after it.
+        assert_eq!(
+            value(&mut session, "type Foo = String\nlet y: Foo = \"a\"\ny").to_string(),
+            "a"
+        );
+        assert_eq!(
+            value(&mut session, "let z: Foo = \"b\"\nz").to_string(),
+            "b"
+        );
+        assert_eq!(
+            messages(&mut session, "let w: Foo = 1"),
+            ["mismatched types"]
+        );
+        // A type built from an earlier input's, by spread.
+        assert_eq!(value(&mut session, "type R = {a: Foo}"), Value::Empty);
+        assert_eq!(
+            value(
+                &mut session,
+                "type S = {...R, b: Int}\nlet s: S = { a = \"x\"; b = 1 }\ns.b"
+            ),
+            Value::Int(1)
+        );
+        // A failed input's types are forgotten with it.
+        assert_eq!(
+            messages(&mut session, "type Bad = {a: Nope}"),
+            ["unknown type `Nope`"]
+        );
+        assert_eq!(
+            messages(&mut session, "let b: Bad = { a = 1 }"),
+            ["unknown type `Bad`"]
+        );
+        assert_eq!(
+            messages(&mut session, "type Gone = Int\nlet g: Gone = \"no\""),
+            ["mismatched types"]
+        );
+        assert_eq!(
+            messages(&mut session, "let g: Gone = 1"),
+            ["unknown type `Gone`"]
+        );
+        // So are those of one that checks but fails as it runs.
+        assert!(eval(&mut session, "type Late = Int\nlet l: Late = 1 // 0").is_err());
+        assert_eq!(
+            messages(&mut session, "let l: Late = 1"),
+            ["unknown type `Late`"]
+        );
+        // A type and a value of one name are apart, across inputs too.
+        assert_eq!(value(&mut session, "Foo = 3").to_string(), "{Foo = 3}");
+        assert_eq!(
+            value(&mut session, "let v: Foo = \"c\"\nFoo").to_string(),
+            "3"
+        );
     }
 
     #[test]

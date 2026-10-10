@@ -2,7 +2,8 @@
 //!
 //! A program is a block body: a sequence of items (`let` declarations,
 //! `let mut` declarations of mutable variables, named functions, `:=`
-//! rebindings, fields, a `= EXPR` result and expression statements)
+//! rebindings, fields, `type` declarations, a `= EXPR` result and
+//! expression statements)
 //! whose value is its result, or the record of its fields. It passes
 //! through these stages, each exposed as its own module so that tools can
 //! stop after any of them:
@@ -22,6 +23,14 @@
 //!    await wherever a value that may be a future is used as its bits.
 //! 5. [`eval::eval`]: IR, shared by reference count with the closures and
 //!    futures made from it, to a [`Value`].
+//!
+//! A file may also declare types, `type PackageDef = {...}`, structural
+//! aliases in a namespace of their own, used bare, qualified through an
+//! import (`t.PackageDef`) or spread into a record type (`{...PackageDef,
+//! name: String}`); and a field may be annotated, `x: Int = 1`, as a `let`
+//! may. Before a file is checked, its types are *expanded*: each name of a
+//! declared type made what its definition is, as if written there
+//! ([`ast::Ast::expand_types`], [`workspace`], "Types").
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A
@@ -124,7 +133,11 @@ pub use value::{Value, ValueKind};
 /// tallest of its parameter and return types, an applied type such as
 /// `Future<Int>` one more than its argument, `T[]` one more than `T`, and a
 /// union one more than the
-/// taller of its sides. A `let`, field or `:=` with a dotted path is two levels taller than
+/// taller of its sides; a type written as the name of a declared type is,
+/// once the file's types are expanded, as tall as its definition, and a
+/// type expanded taller than this limit is rejected where it is written,
+/// with the same error (see [`ast::Ast::expand_types`]). A `let`, field or
+/// `:=` with a dotted path is two levels taller than
 /// the taller of its value and the positions of its path's index segments
 /// for each segment of the path after the first, since later stages build
 /// a record, or a list, for each segment and read the old one's field or

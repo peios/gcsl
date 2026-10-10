@@ -20,8 +20,11 @@ const PROMPT: &str = "> ";
 /// lines. A line prints `value : Type`, with the value as it would be
 /// written in a program (a string quoted and escaped, see
 /// [`Value::repr`]) and the type the checker gave it, nothing if its value
-/// is `{}` (as for a `let`), or its diagnostics; a line with errors changes
-/// nothing. A line's warnings go to stderr before its value. A runtime error
+/// is `{}` (as for a `let`, or a line that only declares a `fn` or a
+/// `type`), or its diagnostics; a line with errors changes nothing. A line
+/// may declare types, which later lines see, a later line's `type` of a name
+/// shadowing an earlier one's. A line's warnings go to stderr before its
+/// value. A runtime error
 /// inside a function an earlier line defined is shown against that line,
 /// and a part of a diagnostic in the standard library, every file of which
 /// the session runs before the first line, against its file
