@@ -32,6 +32,16 @@
 //! declared type made what its definition is, as if written there
 //! ([`ast::Ast::expand_types`], [`workspace`], "Types").
 //!
+//! A `def` marked `#[def_type]` is a *def-type*, which other `def`s are
+//! made with: `def package dev.peios.testpkg() { ... }` defines, in
+//! `package`'s namespace, a function whose type `package` gives, binding
+//! nothing a variable or a field can name, and `package
+//! dev.peios.testpkg()` calls `package` with the definition's path, the
+//! definition and its own arguments. A namespace is a root of the field
+//! trees under a key no source can write, so definitions merge, conflict
+//! and are shadowed as dotted `def`s are, through directories and `*`
+//! imports (see [`check`], "Def-types", and [`workspace`], "Def-types").
+//!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A
 //! [`workspace::Workspace`] performs them on the files of a directory tree,

@@ -1,0 +1,9 @@
+import path
+import fileroot
+# A stand-in for the `ppk` wrapper: what it would commit, its content
+# relative to its caller's directory and its output to the workspace's.
+def commit(name: String, version: String, arch: String, content: String) -> String {
+    let content = path.join(fileroot.caller, content)
+    let output = path.join(fileroot.workspace, "_dist")
+    "{name} {version} {arch} {content} -> {output}"
+}

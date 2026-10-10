@@ -23,7 +23,14 @@
 //! `type` has no IR. A `def` named by a dotted path dumps by its path where
 //! a `def`'s name is shown: `(def dev.peios.hello @..)` in the syntax tree
 //! and the types, and its code `fn #0 dev.peios.hello (frame ...)` in the
-//! IR.
+//! IR. A def-type's attribute dumps as `#[def_type]` before its `def`
+//! (`Attribute(def_type)` among the tokens), a definition made with one as
+//! `(def-type-def package dev.peios.testpkg @..)`, its parameters by name
+//! alone, and a reference to one as `(def-type-ref package
+//! dev.peios.testpkg @..)`; in the IR the definition's code is `fn #0
+//! package dev.peios.testpkg (frame ...)`, and the reference the
+//! `make-closure` of a function of its own, which calls the def-type. The
+//! command line itself knows nothing of def-types.
 //!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its

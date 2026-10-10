@@ -167,14 +167,38 @@
 //! definition used twice shares its nodes, so a tree's type expressions may
 //! share children; the parser's are still allocated children first.
 //!
+//! # Def-types
+//!
+//! A `def` marked `#[def_type]` is a *def-type*, and other `def`s are made
+//! with it: `def package dev.peios.testpkg() { ... }`, a definition,
+//! [`ItemKind::DefTypeDef`], and `package dev.peios.testpkg`, a reference
+//! to one, [`ExprKind::DefTypeRef`] (see the checker's "Def-types"). What
+//! does not fit in their nodes is in an arena of its own, [`Ast::def_type`],
+//! a [`DefTypeUse`] for each: the def-type, `DT`, written as a name or a
+//! dotted path and kept as the expression that reads it, a name with a
+//! field access for each further segment, outside the item's or the
+//! reference's own subtree but before it in the arena; the definition's
+//! path, `PATH`, in the path pool; and, once the workspace has found what
+//! `DT` names, the key of its namespace (see [`crate::names`], "Namespace
+//! keys"), under which the definitions made with it are leaves of the tree
+//! of top-level fields. A definition's function expression is a
+//! [`FnDecl`] like any other, but that its parameters are written by name
+//! alone, each with a type expression of [`TypeExprKind::Invalid`] that
+//! nothing reads, and it has no return type and a marker that means
+//! nothing: all three are the def-type's. A reference also holds the read
+//! of the definition, a name with a field access for each segment of
+//! `PATH`, whose name stands for nothing until the workspace makes it the
+//! namespace's key ([`Ast::set_def_type_key`]): it is then an ordinary
+//! reference to the definition's cell.
+//!
 //! # Attributes
 //!
-//! An item of a file's outermost block may be marked `#[shadowable]` (see
-//! the parser's [Attributes](crate::parser#attributes)), and the file
-//! itself `#![no_prelude]`. Neither fits in an [`Item`], which stays 36
-//! bytes: the marked items are kept in a side table of the tree
-//! ([`Ast::is_shadowable`]), and the file's attribute as the span it is
-//! written at ([`Ast::no_prelude`]). A workspace gives every file whose
+//! An item of a file's outermost block may be marked `#[shadowable]` or
+//! `#[def_type]` (see the parser's [Attributes](crate::parser#attributes)),
+//! and the file itself `#![no_prelude]`. None fits in an [`Item`], which
+//! stays 36 bytes: the marked items are kept in side tables of the tree
+//! ([`Ast::is_shadowable`], [`Ast::is_def_type`]), and the file's attribute
+//! as the span it is written at ([`Ast::no_prelude`]). A workspace gives every file whose
 //! tree has no `#![no_prelude]` an *implicit* `#[shadowable] import * from
 //! prelude` ([`Ast::add_implicit_import`]): an import item of the tree's
 //! arenas, written nowhere (its spans are `0..0`), which is not among the
@@ -293,6 +317,14 @@ impl FnId {
         Self(number)
     }
 
+    /// The function numbered `number`, at or past [`Ast::fn_count`], that
+    /// lowering makes for code no function expression of the tree is: the
+    /// function a def-type reference evaluates to (see
+    /// [Def-types](#def-types)).
+    pub(crate) const fn lowered(number: u32) -> Self {
+        Self(number)
+    }
+
     /// The id as an index into the arena and into side tables.
     #[must_use]
     pub const fn index(self) -> usize {
@@ -340,6 +372,49 @@ impl ImportId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Index of a def-type definition's or reference's [`DefTypeUse`] in the
+/// def-type arena of the [`Ast`] (or [`AstBuilder`]) that allocated it (see
+/// [Def-types](#def-types)). Like [`ExprId`], only meaningful for that arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DefTypeId(u32);
+
+impl DefTypeId {
+    /// The id as an index into the arena and into side tables.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// A use of a def-type, a definition made with it, `def DT PATH(PARAMS)
+/// BODY` ([`ItemKind::DefTypeDef`]), or a reference to one, `DT PATH`
+/// ([`ExprKind::DefTypeRef`]): what does not fit in their nodes, in the
+/// tree's def-type arena (see [Def-types](#def-types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DefTypeUse {
+    /// The def-type, `DT`, as it is written: a name, or a chain of field
+    /// accesses directly on one, an expression of the tree read as any value
+    /// is, which is not among the expressions of the item or the reference
+    /// it belongs to but before them in the arena.
+    pub dt: ExprId,
+    /// The definition's path, `PATH`, as it is written: identifiers joined
+    /// by `.`.
+    pub path: PathRange,
+    /// For a reference, the read of the definition: a name standing for
+    /// DT's namespace with a field access for each segment of PATH, which
+    /// the workspace, once it finds DT to be a def-type, makes a reference
+    /// to the definition's cell by naming the namespace's key
+    /// ([`Ast::set_def_type_key`]); `None` for a definition.
+    pub read: Option<ExprId>,
+    /// The key of DT's namespace (see [`crate::names`], "Namespace keys"),
+    /// once the workspace has found DT to be a def-type; `None` until then,
+    /// and for good when it is not one.
+    pub key: Option<Name>,
+    /// For a definition, its parameter list, `(` through `)`; for a
+    /// reference, the whole of it, DT through PATH.
+    pub span: Span,
 }
 
 /// A name written in an import item, with where it is written.
@@ -795,8 +870,10 @@ pub fn path_span(segments: &[PathSegment]) -> Span {
 /// then `.` and a name for each name segment, each a plain identifier or a
 /// quoted string literal as [`FieldName`] shows it, and each index segment
 /// in brackets, with the source text of its position, as in `server.port`,
-/// `"log level".format` or `conf.hosts[i + 1].up`. Returned by
-/// [`Ast::show_path`].
+/// `"log level".format` or `conf.hosts[i + 1].up`; a first name that is a
+/// namespace key as its def-type and a space, as a definition is written,
+/// `package dev.peios.testpkg` (see [`crate::names`], "Namespace keys").
+/// Returned by [`Ast::show_path`].
 #[derive(Clone, Copy, Debug)]
 pub struct PathDisplay<'a> {
     names: &'a Names,
@@ -806,13 +883,25 @@ pub struct PathDisplay<'a> {
 
 impl fmt::Display for PathDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // What goes before the next name: nothing before the first, a space
+        // after a namespace key, which is shown as its def-type so that the
+        // path reads as a definition is written (see [`crate::names`],
+        // "Namespace keys"), and `.` otherwise.
+        let mut separator = "";
         for (index, segment) in self.segments.iter().enumerate() {
             match segment.kind {
                 SegmentKind::Name(name) => {
-                    if index > 0 {
-                        f.write_str(".")?;
+                    let text = self.names.get(name);
+                    if index == 0
+                        && let Some(def_type) = crate::names::key_def_type(text)
+                    {
+                        f.write_str(def_type)?;
+                        separator = " ";
+                        continue;
                     }
-                    FieldName(self.names.get(name)).fmt(f)?;
+                    f.write_str(separator)?;
+                    FieldName(text).fmt(f)?;
+                    separator = ".";
                 }
                 SegmentKind::Index { text, .. } => {
                     write!(f, "[{}]", self.strings.get(text))?;
@@ -1162,6 +1251,11 @@ pub enum ExprKind {
     /// the list of what their iterations contribute. Its details are in
     /// the `for` arena (see [`Ast::for_decl`]).
     For(ForId),
+    /// A def-type reference, `DT PATH`, as in `package dev.peios.testpkg`:
+    /// the function that calls the def-type with the definition's path, the
+    /// definition and its own arguments (see [Def-types](#def-types)). Its
+    /// details are in the def-type arena (see [`Ast::def_type`]).
+    DefTypeRef(DefTypeId),
 }
 
 /// One node of the tree.
@@ -1181,7 +1275,9 @@ pub struct Expr {
     /// through its operand. A `List` covers its brackets, an `Index` its
     /// list expression through its `]`, and a `For` its `for` keyword
     /// through its body's `}`, or, for a `do` loop, its `do` keyword
-    /// through its condition.
+    /// through its condition. A def-type definition's `Fn` covers its path
+    /// through its body's `}`, and a `DefTypeRef` its def-type through its
+    /// path.
     pub span: Span,
 }
 
@@ -1210,7 +1306,8 @@ impl Expr {
             | ExprKind::Lazy(_)
             | ExprKind::List(_)
             | ExprKind::Index { .. }
-            | ExprKind::For(_) => None,
+            | ExprKind::For(_)
+            | ExprKind::DefTypeRef(_) => None,
         }
     }
 
@@ -1352,6 +1449,19 @@ pub enum ItemKind {
         /// The type it stands for.
         ty: TypeExprId,
     },
+    /// `def DT PATH(PARAMS) BODY`: a definition made with the def-type `DT`,
+    /// as in `def package dev.peios.testpkg() { ... }` (see
+    /// [Def-types](#def-types)). It binds nothing a variable or a field
+    /// could name: its function is a leaf of `DT`'s namespace. Only ever an
+    /// item of a file's outermost block.
+    DefTypeDef {
+        /// Its def-type and path, in the def-type arena.
+        def: DefTypeId,
+        /// The function expression, whose parameters are written by name
+        /// alone, their types, its return type and its marker being the
+        /// def-type's to say.
+        value: ExprId,
+    },
 }
 
 impl ItemKind {
@@ -1366,7 +1476,8 @@ impl ItemKind {
             | ItemKind::Rebind { value, .. }
             | ItemKind::Spread(value)
             | ItemKind::Result(value)
-            | ItemKind::Expr(value) => Some(value),
+            | ItemKind::Expr(value)
+            | ItemKind::DefTypeDef { value, .. } => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
             ItemKind::Import(_) | ItemKind::Type { .. } => None,
         }
@@ -2041,6 +2152,8 @@ pub struct AstBuilder {
     imports: Vec<ImportDecl>,
     import_members: Vec<ImportMember>,
     shadowable: Vec<ItemId>,
+    def_type_marks: Vec<ItemId>,
+    def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
 }
 
@@ -2215,6 +2328,25 @@ impl AstBuilder {
         }
     }
 
+    /// Marks the item `id` `#[def_type]` (see [Attributes](#attributes)).
+    pub fn mark_def_type(&mut self, id: ItemId) {
+        let at = self
+            .def_type_marks
+            .partition_point(|&marked| marked.0 < id.0);
+        if self.def_type_marks.get(at) != Some(&id) {
+            self.def_type_marks.insert(at, id);
+        }
+    }
+
+    /// Appends `def_type`, a def-type definition's or reference's details,
+    /// to the def-type arena and returns its id (see
+    /// [Def-types](#def-types)).
+    pub fn push_def_type(&mut self, def_type: DefTypeUse) -> DefTypeId {
+        let id = DefTypeId(next_id(self.def_types.len()));
+        self.def_types.push(def_type);
+        id
+    }
+
     /// Records that the file is marked `#![no_prelude]`, written at `span`
     /// (see [Attributes](#attributes)).
     pub fn set_no_prelude(&mut self, span: Span) {
@@ -2290,6 +2422,8 @@ impl AstBuilder {
             imports: self.imports,
             import_members: self.import_members,
             shadowable: self.shadowable,
+            def_type_marks: self.def_type_marks,
+            def_types: self.def_types,
             no_prelude: self.no_prelude,
             implicit_import: None,
             expansion: Expansion::default(),
@@ -2320,6 +2454,11 @@ pub struct Ast {
     import_members: Vec<ImportMember>,
     /// The items marked `#[shadowable]`, in id order.
     shadowable: Vec<ItemId>,
+    /// The items marked `#[def_type]`, in id order.
+    def_type_marks: Vec<ItemId>,
+    /// The def-type definitions and references, in the order they were
+    /// parsed (see [Def-types](#def-types)).
+    def_types: Vec<DefTypeUse>,
     /// Where the file's `#![no_prelude]` is written, if it has one.
     no_prelude: Option<Span>,
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
@@ -2646,6 +2785,96 @@ impl Ast {
             .is_ok()
     }
 
+    /// Whether the item `id` is marked `#[def_type]` (see
+    /// [Attributes](#attributes)).
+    #[must_use]
+    pub fn is_def_type(&self, id: ItemId) -> bool {
+        self.def_type_marks
+            .binary_search_by_key(&id.0, |marked| marked.0)
+            .is_ok()
+    }
+
+    /// The details of the def-type definition or reference `id` (see
+    /// [Def-types](#def-types)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to this tree.
+    #[must_use]
+    pub fn def_type(&self, id: DefTypeId) -> &DefTypeUse {
+        &self.def_types[id.index()]
+    }
+
+    /// Every def-type definition and reference of the tree, with its id, in
+    /// the order they were parsed.
+    pub fn def_types(&self) -> impl Iterator<Item = (DefTypeId, &DefTypeUse)> + '_ {
+        (0..next_id(self.def_types.len()))
+            .map(DefTypeId)
+            .zip(&self.def_types)
+    }
+
+    /// The names of the def-type, `DT`, of the definition or reference
+    /// `id`, as it is written: a name, then the name of each field access
+    /// on it.
+    #[must_use]
+    pub fn def_type_names(&self, id: DefTypeId) -> Vec<Name> {
+        let mut names = Vec::new();
+        let mut at = self.def_type(id).dt;
+        loop {
+            match self.get(at).kind {
+                ExprKind::Field { expr, name } => {
+                    names.push(name);
+                    at = expr;
+                }
+                ExprKind::Name(name) => {
+                    names.push(name);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        names.reverse();
+        names
+    }
+
+    /// The def-type, `DT`, of the definition or reference `id`, and its
+    /// path, `PATH`, each as it is written, as in `t.package` and
+    /// `dev.peios.testpkg`.
+    #[must_use]
+    pub fn show_def_type(&self, id: DefTypeId) -> (String, String) {
+        let names: Vec<&str> = self
+            .def_type_names(id)
+            .into_iter()
+            .map(|name| self.names.get(name))
+            .collect();
+        let path = self
+            .show_path(self.path(self.def_type(id).path))
+            .to_string();
+        (names.join("."), path)
+    }
+
+    /// Gives the def-type definition or reference `id` `key`, the key of
+    /// its def-type's namespace, which the workspace found its `DT` names
+    /// (see [Def-types](#def-types)): a reference's read of the definition
+    /// is then of the namespace, its name made the key.
+    pub fn set_def_type_key(&mut self, id: DefTypeId, key: Name) {
+        let Some(entry) = self.def_types.get_mut(id.index()) else {
+            return;
+        };
+        entry.key = Some(key);
+        let mut at = entry.read;
+        while let Some(node) = at.and_then(|node| self.exprs.get_mut(node.index())) {
+            match node.kind {
+                ExprKind::Field { expr, .. } => at = Some(expr),
+                ExprKind::Name(_) => {
+                    node.kind = ExprKind::Name(key);
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
+
     /// Whether an item of the file's own is marked `#[shadowable]`, the
     /// implicit import aside: without one, nothing of the file is shadowed.
     #[must_use]
@@ -2875,10 +3104,11 @@ impl Ast {
     /// a function's or `lazy`'s body, an interpolated string's first
     /// expression, a list literal's first element's, an index's list, an
     /// iteration's iterable, a condition loop's first header item's, its
-    /// condition or its body, whichever comes first, and a `do` loop's
-    /// body. (A block's first item may hold no expression, a `break`
-    /// without a value: the first item that holds one is followed.)
-    /// Debug builds check that every node of the range lies
+    /// condition or its body, whichever comes first, a `do` loop's body,
+    /// and a def-type reference's `DT`, its read of the definition coming
+    /// between that and itself. (A block's first item may hold no
+    /// expression, a `break` without a value: the first item that holds one
+    /// is followed.) Debug builds check that every node of the range lies
     /// within `id`'s span and the node before it starts before `id`.
     pub(crate) fn subtree(&self, id: ExprId) -> impl Iterator<Item = ExprId> + use<> {
         let first = self.first_node(id);
@@ -2932,6 +3162,7 @@ impl Ast {
                 | ExprKind::Is { expr: inner, .. }
                 | ExprKind::As { expr: inner, .. } => inner,
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
+                ExprKind::DefTypeRef(def) => self.def_type(def).dt,
                 ExprKind::Call { callee, .. } => callee,
                 ExprKind::For(id) => {
                     let decl = self.for_decl(id);
@@ -3104,9 +3335,15 @@ impl Annotate for NoAnnotation {
 /// span) and expressions as their nodes. `(if ...)` is followed by its
 /// condition, its block and its else branch, which for an `if` without
 /// `else` is the parser's empty block. Operators print as their symbol,
-/// except negation, `(neg ...)`. The file has no span. An item marked
-/// `#[shadowable]` is preceded by the attribute, as in `#[shadowable] (field
-/// arch ...)`, and a file marked `#![no_prelude]` has it after `file`, as in
+/// except negation, `(neg ...)`. A def-type definition prints as
+/// `(def-type-def package dev.peios.testpkg ...)`, its def-type and its path
+/// as written, followed by its function, whose parameters are their names
+/// alone, as in `(params a b)`, with no `(ret ...)`; a reference to one as
+/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it.
+/// The file has no span. An item marked `#[shadowable]` or `#[def_type]` is
+/// preceded by the attribute, as in `#[shadowable] (field arch ...)` or
+/// `#[def_type] (def package ...)`, both `#[shadowable] #[def_type]` in that
+/// order, and a file marked `#![no_prelude]` has it after `file`, as in
 /// `(file #![no_prelude] ...)`; the implicit import a workspace gives a
 /// file is not printed (see [Attributes](crate::ast#attributes)). There is
 /// no trailing newline.
@@ -3169,7 +3406,12 @@ impl<A: Annotate> Pretty<'_, A> {
         } else {
             ""
         };
-        write!(f, "{:indent$}{marked}(", "", indent = depth * 2)?;
+        let def_type = if ast.is_def_type(id) {
+            "#[def_type] "
+        } else {
+            ""
+        };
+        write!(f, "{:indent$}{marked}{def_type}(", "", indent = depth * 2)?;
         let value = match item.kind {
             ItemKind::Let {
                 path,
@@ -3237,6 +3479,11 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.type_expr(f, ty)?;
                 self.annotation.annotate_type(id, f)?;
                 return write!(f, " @{})", item.span);
+            }
+            ItemKind::DefTypeDef { def, value } => {
+                let (def_type, path) = ast.show_def_type(def);
+                write!(f, "def-type-def {def_type} {path}")?;
+                value
             }
         };
         writeln!(f, " @{}", item.span)?;
@@ -3372,15 +3619,24 @@ impl<A: Annotate> Pretty<'_, A> {
         let decl = self.ast.fn_decl(id);
         write!(f, "\n{:indent$}(params", "", indent = depth * 2)?;
         for param in self.ast.params(decl.params) {
-            write!(f, " ({} ", FieldName(self.ast.names().get(param.name)))?;
+            let name = FieldName(self.ast.names().get(param.name));
+            // A def-type definition's parameter is written by name alone,
+            // its type the def-type's, and so is its result.
+            if self.ast.written_type(param.ty) == TypeExprKind::Invalid {
+                write!(f, " {name}")?;
+                continue;
+            }
+            write!(f, " ({name} ")?;
             self.type_expr(f, param.ty)?;
             f.write_str(")")?;
         }
         f.write_str(")")?;
+        if decl.ret.is_none() {
+            return Ok(());
+        }
         let effect = decl.effect.name();
         write!(f, "\n{:indent$}(ret {effect}", "", indent = depth * 2)?;
-        // A function expression always has a return type; only a `lazy`,
-        // which is not printed through here, has none.
+        // Written: a definition, which writes none, has returned above.
         if let Some(ret) = decl.ret {
             f.write_str(" ")?;
             self.type_expr(f, ret)?;
@@ -3554,6 +3810,10 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::List(_) => f.write_str("list"),
             ExprKind::Index { .. } => f.write_str("index"),
             ExprKind::For(id) => self.for_head(f, id),
+            ExprKind::DefTypeRef(def) => {
+                let (def_type, path) = self.ast.show_def_type(def);
+                write!(f, "def-type-ref {def_type} {path}")
+            }
         }
     }
 
@@ -3582,7 +3842,8 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Float(_)
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
-            | ExprKind::Name(_) => {}
+            | ExprKind::Name(_)
+            | ExprKind::DefTypeRef(_) => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::Field { expr: operand, .. }

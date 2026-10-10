@@ -1,0 +1,4 @@
+#[def_type]
+def build(name: String, f: fn(): String): String { "{name}: {f()}" }
+def build lib.core() { "core" }
+x = build lib.cor()

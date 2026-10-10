@@ -9,7 +9,8 @@
 //! EXPR`, a field `PATH (: TYPE)? = EXPR`, `= EXPR`, a spread `...EXPR`, a
 //! named function `fn NAME(...) ...`, a `break`, a `continue` or a `return`
 //! (see [Loops](#loops)), an expression, or, in a file's body only, an
-//! `import` (see [Imports](#imports)) or a `type` (see [Types](#types)).
+//! `import` (see [Imports](#imports)), a `type` (see [Types](#types)) or a
+//! definition made with a def-type (see [Def-types](#def-types)).
 //! After an item the next
 //! token must be a separator or the end of the body; anything else is
 //! "expected end of item".
@@ -58,14 +59,23 @@
 //! An *attribute* is a token of its own (see the lexer's
 //! [Attributes](crate::lexer#attributes)): `#[NAME]` an outer one, which
 //! applies to the item after it, and `#![NAME]` an inner one, which applies
-//! to the whole file. There are two names, and no arguments:
+//! to the whole file. There are three names, and no arguments:
 //!
 //! - `#[shadowable]` marks a top-level field (a dotted one included), a
-//!   `def` or an `import` of any form, as one a later declaration of its
-//!   name may shadow (see [`crate::workspace`], "Shadowable declarations"),
-//!   recorded in the tree's side table ([`Ast::is_shadowable`]). It applies
-//!   to the next item, on its line or a later one, comments and blank lines
-//!   between being skipped as any separators are.
+//!   `def`, a definition made with a def-type or an `import` of any form, as
+//!   one a later declaration of its name may shadow (see
+//!   [`crate::workspace`], "Shadowable declarations"), recorded in the
+//!   tree's side table ([`Ast::is_shadowable`]). It applies to the next
+//!   item, on its line or a later one, comments and blank lines between
+//!   being skipped as any separators are.
+//! - `#[def_type]` marks a top-level `def`, of one name or a path, as a
+//!   def-type (see [Def-types](#def-types)), recorded in a side table of its
+//!   own ([`Ast::is_def_type`]). It applies to the next item as
+//!   `#[shadowable]` does, and both may mark one item, in either order;
+//!   before anything but a top-level `def` (a definition made with a
+//!   def-type, a field, a `fn`, an item of an inner block) it is
+//!   "`#[def_type]` applies only to a file's top-level `def`s", at the
+//!   attribute, and its other errors are `#[shadowable]`'s, with its name.
 //! - `#![no_prelude]` marks the file as one without the implicit `import *
 //!   from prelude` ([`Ast::no_prelude`]). It must come before the file's
 //!   first item, comments and blank lines alone before it.
@@ -90,6 +100,48 @@
 //! starts, or after an item on its line, is reported as any token is there.
 //! Whether a session's input may be marked `#![no_prelude]` is the
 //! workspace's to say: the parser does not know what it parses.
+//!
+//! # Def-types
+//!
+//! A def-type, a `def` marked `#[def_type]`, makes definitions, and a
+//! reference calls one (see the checker's "Def-types"):
+//!
+//! ```text
+//! DEFINITION = "def" DT PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
+//! REFERENCE  = DT PATH
+//! DT, PATH   = IDENT ("." IDENT)*
+//! ```
+//!
+//! A definition, [`ItemKind::DefTypeDef`], is recognised after `def` and a
+//! name or a path (`Parser::parse_def`): an identifier that follows them on
+//! their line starts its path. Its parameters are written by name alone,
+//! each given a type expression nothing reads ([`TypeExprKind::Invalid`]);
+//! a type written is "the parameter types of a `package` definition come
+//! from `package`", at its `:`, and a return marker after them "the result
+//! type of a `package` definition comes from `package`", at the marker,
+//! `package` being its DT as written. Its path is a `def`'s, identifiers
+//! joined by `.` ("a `def`'s path is made of identifiers" otherwise, at the
+//! segment), then `(`, the parameters and the body, each "expected ..."
+//! otherwise. It is an item of a file's outermost body only: anywhere else,
+//! "a def-type definition is declared only at the top level of a file", at
+//! its `def`. Its function expression spans its path through its body, the
+//! expression that reads its DT coming before its body's in the arena.
+//!
+//! A reference, [`ExprKind::DefTypeRef`], is recognised where a postfix
+//! operator may follow an expression (`Parser::parse_expr_inner`): after a
+//! name, or a chain of field accesses directly on one, an identifier that
+//! starts on the same line starts its path, so `package dev.peios.testpkg()`
+//! is the call of the reference, and `-p x` the negation of one; it binds as
+//! a field access does. "The same line" is the source's: the lexer emits no
+//! newline inside parentheses, so `f(a\nb)` is the error it was, and two
+//! names on two lines of a body are two items. Two names in a row never
+//! parsed before, so every program that parsed parses as it did; one that
+//! did not may now fail later, at the checker, which notes that two names
+//! in a row are read as a reference. Its path is a definition's. A quoted
+//! field name of the form of a namespace's key (see [`crate::names`],
+//! "Namespace keys") is "a field cannot be named `\"<p#1.2>\"`: names of
+//! that form are def-types' namespaces", at the name, so no source can
+//! write a key.
 //!
 //! # Imports
 //!
@@ -592,10 +644,10 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, Effect, Element, Expr, ExprId, ExprKind, FieldTy,
-    FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId,
-    ItemKind, ItemRange, Jump, Label, Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart,
-    TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, DefTypeUse, Effect, Element, Expr, ExprId, ExprKind,
+    FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item,
+    ItemId, ItemKind, ItemRange, Jump, Label, Param, ParamTy, PathRange, PathSegment, SegmentKind,
+    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -667,6 +719,22 @@ const SHADOWABLE: &str = "shadowable";
 
 /// The name of the inner attribute that turns the implicit prelude off.
 const NO_PRELUDE: &str = "no_prelude";
+
+/// The name of the outer attribute that makes a `def` a def-type.
+const DEF_TYPE: &str = "def_type";
+
+/// The error for `#[def_type]` before anything but a top-level `def`.
+const MISPLACED_DEF_TYPE: &str = "`#[def_type]` applies only to a file's top-level `def`s";
+
+/// The error for a definition made with a def-type anywhere but in a file's
+/// outermost body.
+const MISPLACED_DEF_TYPE_DEF: &str =
+    "a def-type definition is declared only at the top level of a file";
+
+/// The text of the name a def-type reference's read of its definition
+/// starts with until the workspace names the def-type's namespace: no
+/// program can write it, `<` being in no identifier.
+const UNRESOLVED_NAMESPACE: &str = "<def-type>";
 
 /// The error for `#[shadowable]` before anything but a top-level field,
 /// `def` or `import`.
@@ -827,6 +895,32 @@ impl PathShape {
     };
 }
 
+/// The outer attributes read before an item of a body, waiting for it (see
+/// [Attributes](#attributes)): where each is written, if it is.
+#[derive(Clone, Copy, Debug, Default)]
+struct Pending {
+    /// `#[shadowable]`.
+    shadowable: Option<Span>,
+    /// `#[def_type]`.
+    def_type: Option<Span>,
+}
+
+impl Pending {
+    /// Whether no attribute is waiting.
+    const fn is_empty(&self) -> bool {
+        self.shadowable.is_none() && self.def_type.is_none()
+    }
+
+    /// The first attribute written of those waiting, by its name and where
+    /// it is written.
+    fn first(&self) -> Option<(&'static str, Span)> {
+        [(SHADOWABLE, self.shadowable), (DEF_TYPE, self.def_type)]
+            .into_iter()
+            .filter_map(|(name, span)| Some((name, span?)))
+            .min_by_key(|&(_, span)| span.start)
+    }
+}
+
 /// What a `{` means where the parser is (see [Trailing
 /// blocks](#trailing-blocks)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,8 +1014,8 @@ impl Parser<'_> {
     fn parse_body(&mut self, open: Option<Span>) -> ParseResult<(ItemRange, u32)> {
         let base = self.item_stack.len();
         let mut height = 0;
-        // The outer attribute waiting for the item it applies to.
-        let mut pending: Option<Span> = None;
+        // The outer attributes waiting for the item they apply to.
+        let mut pending = Pending::default();
         loop {
             self.skip_separators();
             let token = self.peek();
@@ -932,7 +1026,7 @@ impl Parser<'_> {
                 }
                 TokenKind::InnerAttribute(name) => {
                     let first =
-                        open.is_none() && self.item_stack.len() == base && pending.is_none();
+                        open.is_none() && self.item_stack.len() == base && pending.is_empty();
                     self.inner_attribute(token, name, first)?;
                     continue;
                 }
@@ -940,10 +1034,11 @@ impl Parser<'_> {
             }
             match (token.kind, open) {
                 (TokenKind::Eof, None) | (TokenKind::RBrace, Some(_)) => {
-                    if let Some(attribute) = pending {
-                        return Err(
-                            self.error("`#[shadowable]` is not followed by anything", attribute)
-                        );
+                    if let Some((written, attribute)) = pending.first() {
+                        return Err(self.error(
+                            format!("`#[{written}]` is not followed by anything"),
+                            attribute,
+                        ));
                     }
                     break;
                 }
@@ -972,8 +1067,20 @@ impl Parser<'_> {
                 }
                 _ => self.parse_item()?,
             };
-            if let Some(attribute) = pending.take() {
+            if open.is_some()
+                && let item = *self.builder.item(item)
+                && matches!(item.kind, ItemKind::DefTypeDef { .. })
+            {
+                // At its `def`.
+                let start = item.span.start;
+                let keyword = Span::new(start, start.saturating_add(3));
+                return Err(self.error(MISPLACED_DEF_TYPE_DEF, keyword));
+            }
+            if let Some(attribute) = pending.shadowable.take() {
                 self.attach_shadowable(attribute, item, open.is_none())?;
+            }
+            if let Some(attribute) = pending.def_type.take() {
+                self.attach_def_type(attribute, item, open.is_none())?;
             }
             self.item_stack.push(item);
             height = height.max(item_height);
@@ -985,26 +1092,27 @@ impl Parser<'_> {
     }
 
     /// Takes the outer attribute `token`, named `name`, at the start of an
-    /// item of a body, as the attribute of the item after it, `pending` (see
-    /// [Attributes](#attributes)): only `#[shadowable]` is one, once.
+    /// item of a body, as an attribute of the item after it, `pending` (see
+    /// [Attributes](#attributes)): `#[shadowable]` and `#[def_type]` are, each
+    /// once.
     fn outer_attribute(
         &mut self,
         token: Token,
         name: Name,
-        pending: &mut Option<Span>,
+        pending: &mut Pending,
     ) -> ParseResult<()> {
         let text = self.names.get(name).to_owned();
-        match text.as_str() {
-            SHADOWABLE if pending.is_some() => {
-                Err(self.error("`#[shadowable]` is written twice", token.span))
-            }
-            SHADOWABLE => {
-                *pending = Some(token.span);
-                self.advance();
-                Ok(())
-            }
-            _ => Err(self.misplaced_attribute(token)),
+        let slot = match text.as_str() {
+            SHADOWABLE => &mut pending.shadowable,
+            DEF_TYPE => &mut pending.def_type,
+            _ => return Err(self.misplaced_attribute(token)),
+        };
+        if slot.is_some() {
+            return Err(self.error(format!("`#[{text}]` is written twice"), token.span));
         }
+        *slot = Some(token.span);
+        self.advance();
+        Ok(())
     }
 
     /// Takes the inner attribute `token`, named `name`, at the start of an
@@ -1033,17 +1141,31 @@ impl Parser<'_> {
         };
         let text = self.names.get(name).to_owned();
         let message = match (text.as_str(), inner) {
-            (SHADOWABLE, true) => {
-                "`shadowable` applies to a declaration: write `#[shadowable]`".to_owned()
+            (SHADOWABLE | DEF_TYPE, true) => {
+                format!("`{text}` applies to a declaration: write `#[{text}]`")
             }
             (NO_PRELUDE, false) => {
                 "`no_prelude` applies to the whole file: write `#![no_prelude]`".to_owned()
             }
             (SHADOWABLE, false) => MISPLACED_SHADOWABLE.to_owned(),
+            (DEF_TYPE, false) => MISPLACED_DEF_TYPE.to_owned(),
             (NO_PRELUDE, true) => MISPLACED_NO_PRELUDE.to_owned(),
             _ => format!("unknown attribute `{text}`"),
         };
         self.error(message, token.span)
+    }
+
+    /// Marks `item`, an item of a body that is the file's if `top`, with the
+    /// `#[def_type]` written at `attribute` before it, if it is a top-level
+    /// `def` (not a definition made with a def-type); else the error that it
+    /// is not one (see [Attributes](#attributes)).
+    fn attach_def_type(&mut self, attribute: Span, item: ItemId, top: bool) -> ParseResult<()> {
+        let kind = self.builder.item(item).kind;
+        if top && matches!(kind, ItemKind::Field { function: true, .. }) {
+            self.builder.mark_def_type(item);
+            return Ok(());
+        }
+        Err(self.error(MISPLACED_DEF_TYPE, attribute))
     }
 
     /// Marks `item`, an item of a body that is the file's if `top`, with the
@@ -1052,7 +1174,12 @@ impl Parser<'_> {
     /// (see [Attributes](#attributes)).
     fn attach_shadowable(&mut self, attribute: Span, item: ItemId, top: bool) -> ParseResult<()> {
         let kind = self.builder.item(item).kind;
-        if top && matches!(kind, ItemKind::Field { .. } | ItemKind::Import(_)) {
+        if top
+            && matches!(
+                kind,
+                ItemKind::Field { .. } | ItemKind::Import(_) | ItemKind::DefTypeDef { .. }
+            )
+        {
             self.builder.mark_shadowable(item);
             return Ok(());
         }
@@ -1385,6 +1512,17 @@ impl Parser<'_> {
                 )));
             }
         };
+        let first = PathSegment {
+            kind: SegmentKind::Name(name),
+            span: name_token.span,
+        };
+        // A name on its line after a name, `def package x`: the definition
+        // of `x` made with the def-type `package`.
+        if self.is_name_after(name_token.span, self.peek_at(2)) {
+            self.advance();
+            self.advance();
+            return self.parse_def_type_def(keyword, &[first]);
+        }
         if !matches!(self.peek_at(2).kind, TokenKind::Dot | TokenKind::LBracket) {
             return self.parse_named_fn(keyword, (name, name_token.span));
         }
@@ -1392,10 +1530,7 @@ impl Parser<'_> {
         self.advance();
         // Kept apart until the function is parsed: the items of its body
         // read paths of their own.
-        let mut segments = vec![PathSegment {
-            kind: SegmentKind::Name(name),
-            span: name_token.span,
-        }];
+        let mut segments = vec![first];
         loop {
             match self.peek().kind {
                 TokenKind::Dot => {
@@ -1431,6 +1566,11 @@ impl Parser<'_> {
                 _ => break,
             }
         }
+        if let Some(last) = segments.last()
+            && self.is_name_after(last.span, self.peek())
+        {
+            return self.parse_def_type_def(keyword, &segments);
+        }
         let value = self.parse_fn(keyword)?;
         let base = self.path.len();
         self.path.extend(segments);
@@ -1442,6 +1582,283 @@ impl Parser<'_> {
             function: true,
         };
         self.finish_item(keyword, (kind, value), 0, shape)
+    }
+
+    /// Whether `token` is an identifier on the line of `before`, the span of
+    /// the name or path before it: what makes the two a def-type and a path
+    /// (see [Def-types](#def-types)). The lexer emits no newline inside
+    /// parentheses, so the source between them says.
+    fn is_name_after(&self, before: Span, token: Token) -> bool {
+        matches!(token.kind, TokenKind::Ident(_))
+            && before.end <= token.span.start
+            && !self
+                .source
+                .slice(Span::new(before.end, token.span.start))
+                .contains('\n')
+    }
+
+    /// Allocates the expression that reads the path `segments`, a name and
+    /// a field access for each segment after it, each spanning the path up
+    /// to its segment, and returns the last: a def-type, `DT`, as it is
+    /// written, or the read of a definition (see [Def-types](#def-types)).
+    fn path_expr(&mut self, segments: &[PathSegment]) -> ParseResult<ExprId> {
+        let mut read: Option<ExprId> = None;
+        for (index, segment) in segments.iter().enumerate() {
+            let Some(name) = segment.name() else {
+                continue;
+            };
+            let span = path_span(&segments[..=index]);
+            read = Some(match read {
+                None => self.alloc(ExprKind::Name(name), span, LEAF_HEIGHT)?,
+                Some(expr) => {
+                    let height = self.height_of(expr) + 1;
+                    self.alloc(ExprKind::Field { expr, name }, span, height)?
+                }
+            });
+        }
+        read.ok_or_else(|| self.error("expected a name", Span::new(0, 0)))
+    }
+
+    /// Reads the path of a definition or a reference made with a def-type,
+    /// `PATH`, starting at its first identifier, the current token:
+    /// identifiers joined by `.`, as a `def`'s path is. A quoted segment, or
+    /// an index, is "a `def`'s path is made of identifiers". Returns its
+    /// segments.
+    fn parse_def_type_path(&mut self) -> ParseResult<Vec<PathSegment>> {
+        let mut segments = Vec::new();
+        loop {
+            let token = self.peek();
+            let TokenKind::Ident(name) = token.kind else {
+                let found = self.describe(token);
+                return Err(self.error(
+                    format!("expected the definition's name after `.`, found {found}"),
+                    error_span(token),
+                ));
+            };
+            self.advance();
+            segments.push(PathSegment {
+                kind: SegmentKind::Name(name),
+                span: token.span,
+            });
+            match (self.peek().kind, self.peek_at(1).kind) {
+                (TokenKind::Dot, TokenKind::Ident(_)) => self.advance(),
+                (TokenKind::Dot, TokenKind::Str(_) | TokenKind::StrStart(_)) => {
+                    self.advance();
+                    let token = self.peek();
+                    let span = match token.kind {
+                        TokenKind::StrStart(first) => {
+                            let literal = self.parse_interpolation(first)?;
+                            self.span_of(literal)
+                        }
+                        _ => token.span,
+                    };
+                    return Err(self.error(DEF_PATH, span));
+                }
+                (TokenKind::LBracket, _) => {
+                    let (_, span) = self.parse_position()?;
+                    return Err(self.error(DEF_PATH, span));
+                }
+                _ => return Ok(segments),
+            }
+        }
+    }
+
+    /// Parses a definition made with a def-type, `def DT PATH(PARAMS)
+    /// BODY`, starting at its path, its `def`, `keyword`, and its def-type,
+    /// `dt`, read (see [Def-types](#def-types)): the parameters by name
+    /// alone, each a type the def-type gives it, no return type, and the
+    /// body. A parameter's type written is "the parameter types of a
+    /// `package` definition come from `package`", at its `:`, and a return
+    /// marker "the result type of a `package` definition comes from
+    /// `package`", at the marker.
+    fn parse_def_type_def(
+        &mut self,
+        keyword: Token,
+        dt: &[PathSegment],
+    ) -> ParseResult<(ItemId, u32)> {
+        let shown = self.show_segments(dt);
+        let dt_expr = self.path_expr(dt)?;
+        let segments = self.parse_def_type_path()?;
+        let open = self.peek();
+        if open.kind != TokenKind::LParen {
+            let found = self.describe(open);
+            return Err(self.error(
+                format!("expected `(` after the definition's path, found {found}"),
+                error_span(open),
+            ));
+        }
+        self.advance();
+        let (params, close) = self.parse_definition_params(open, &shown)?;
+        let marker = self.peek();
+        if matches!(
+            marker.kind,
+            TokenKind::Colon | TokenKind::Arrow | TokenKind::MemoArrow
+        ) {
+            return Err(self.error(
+                format!("the result type of a `{shown}` definition comes from `{shown}`"),
+                marker.span,
+            ));
+        }
+        let brace = self.peek();
+        if brace.kind != TokenKind::LBrace {
+            let found = self.describe(brace);
+            return Err(self.error(
+                format!("expected `{{` to start the definition's body, found {found}"),
+                error_span(brace),
+            ));
+        }
+        let body = self.parse_block()?;
+        let height = self.height_of(body).max(LEAF_HEIGHT) + 1;
+        // From its path, after its `DT`, whose expression comes before its
+        // body's in the arena ([`Ast::subtree`]).
+        let span = Span::join(path_span(&segments), self.span_of(body));
+        let function = self.builder.push_fn(FnDecl {
+            params,
+            ret: None,
+            // The def-type's to say: what is written here means nothing.
+            effect: Effect::Pure,
+            marker: self.span_of(dt_expr),
+            body,
+        });
+        let value = self.alloc(ExprKind::Fn(function), span, height)?;
+        let base = self.path.len();
+        self.path.extend(segments);
+        let (path, mut shape) = self.finish_path(base);
+        // Its leaf is under its namespace's root, one segment more.
+        shape.segments = shape.segments.saturating_add(1);
+        let def = self.builder.push_def_type(DefTypeUse {
+            dt: dt_expr,
+            path,
+            read: None,
+            key: None,
+            span: Span::join(open.span, close.span),
+        });
+        self.finish_item(
+            keyword,
+            (ItemKind::DefTypeDef { def, value }, value),
+            0,
+            shape,
+        )
+    }
+
+    /// Parses the parameters of a definition made with the def-type
+    /// `shown`, as it is written, after their `(`, `open`, through their
+    /// `)`: names alone, separated by `,`, each with a type expression of
+    /// [`TypeExprKind::Invalid`] that nothing reads, the def-type's to give
+    /// (see [Def-types](#def-types)). Returns them, with the `)`.
+    fn parse_definition_params(
+        &mut self,
+        open: Token,
+        shown: &str,
+    ) -> ParseResult<(crate::ast::ParamRange, Token)> {
+        let base = self.param_stack.len();
+        let close = loop {
+            let token = self.peek();
+            let name = match token.kind {
+                TokenKind::RParen => {
+                    self.advance();
+                    break token;
+                }
+                TokenKind::Ident(name) => name,
+                TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
+                TokenKind::StrStart(first) => {
+                    let literal = self.parse_interpolation(first)?;
+                    let span = self.span_of(literal);
+                    return Err(self.error(PLAIN_VARIABLE_NAME, span));
+                }
+                TokenKind::Mut => {
+                    return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
+                }
+                _ => {
+                    let found = self.describe(token);
+                    return Err(self.error(
+                        format!("expected a parameter name, found {found}"),
+                        error_span(token),
+                    ));
+                }
+            };
+            self.advance();
+            let colon = self.peek();
+            if colon.kind == TokenKind::Colon {
+                return Err(self.error(
+                    format!("the parameter types of a `{shown}` definition come from `{shown}`"),
+                    colon.span,
+                ));
+            }
+            let ty = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::Invalid,
+                span: token.span,
+            });
+            self.param_stack.push(Param {
+                name,
+                span: token.span,
+                ty,
+            });
+            let separator = self.peek();
+            if self.list_separator(open)? {
+                break separator;
+            }
+        };
+        let params = self.builder.push_params(&self.param_stack[base..]);
+        self.param_stack.truncate(base);
+        Ok((params, close))
+    }
+
+    /// Parses a def-type reference, `DT PATH`, whose def-type, `dt`, has
+    /// been parsed and whose path starts at the current token, an identifier
+    /// on its line (see [Def-types](#def-types)): the path, and the read of
+    /// the definition, a name standing for the def-type's namespace until
+    /// the workspace names it, with a field access for each segment.
+    fn parse_def_type_ref(&mut self, dt: ExprId) -> ParseResult<ExprId> {
+        let segments = self.parse_def_type_path()?;
+        let base = self.path.len();
+        self.path.extend(segments.iter().copied());
+        let (path, _) = self.finish_path(base);
+        // The namespace's name, which no program can write; the workspace
+        // replaces it with the namespace's key.
+        let namespace = self.names.intern(UNRESOLVED_NAMESPACE);
+        let mut read_path = Vec::with_capacity(segments.len() + 1);
+        if let Some(first) = segments.first() {
+            read_path.push(PathSegment {
+                kind: SegmentKind::Name(namespace),
+                span: Span::new(first.span.start, first.span.start),
+            });
+        }
+        read_path.extend(segments.iter().copied());
+        let read = self.path_expr(&read_path)?;
+        let span = Span::join(self.span_of(dt), path_span(&segments));
+        let height = self.height_of(dt).max(self.height_of(read)) + 1;
+        let def = self.builder.push_def_type(DefTypeUse {
+            dt,
+            path,
+            read: Some(read),
+            key: None,
+            span,
+        });
+        self.alloc(ExprKind::DefTypeRef(def), span, height)
+    }
+
+    /// Whether `expr` is a def-type as a reference writes it, a name or a
+    /// chain of field accesses directly on one (see [Def-types](#def-types)).
+    fn is_path_expr(&self, expr: ExprId) -> bool {
+        let mut at = expr;
+        loop {
+            match self.builder.get(at).kind {
+                ExprKind::Name(_) => return true,
+                ExprKind::Field { expr, .. } => at = expr,
+                _ => return false,
+            }
+        }
+    }
+
+    /// The path `segments`, of names, as it is written.
+    fn show_segments(&self, segments: &[PathSegment]) -> String {
+        segments
+            .iter()
+            .filter_map(PathSegment::name)
+            .map(|name| self.names.get(name))
+            .collect::<Vec<_>>()
+            .join(".")
     }
 
     /// Parses a named function item, `fn NAME(...) ...` or `def NAME(...)
@@ -2004,7 +2421,17 @@ impl Parser<'_> {
         if self.source.slice(token.span).starts_with('r') {
             return Err(self.error(PLAIN_FIELD_NAME, token.span));
         }
-        Ok(self.names.intern(self.strings.get(text)))
+        // A name of the form of a def-type's namespace key could reach its
+        // definitions: no source may write one (see [Def-types](#def-types)).
+        let text = self.strings.get(text);
+        if crate::names::key_def_type(text).is_some() {
+            let message = format!(
+                "a field cannot be named `{}`: names of that form are def-types' namespaces",
+                crate::strings::FieldName(text)
+            );
+            return Err(self.error(message, token.span));
+        }
+        Ok(self.names.intern(text))
     }
 
     /// Parses the name of a field after `.` or in a record type, the
@@ -2506,6 +2933,15 @@ impl Parser<'_> {
                     break;
                 }
                 lhs = self.parse_type_operator(lhs, is)?;
+                continue;
+            }
+            // A name or a dotted path, then on its line another: a def-type
+            // reference, which binds as a field access does.
+            if self.is_name_after(self.span_of(lhs), token) && self.is_path_expr(lhs) {
+                if FIELD_BP < min_bp {
+                    break;
+                }
+                lhs = self.parse_def_type_ref(lhs)?;
                 continue;
             }
             let Some(op) = binary_op(token.kind) else {
@@ -3800,6 +4236,23 @@ mod tests {
                 out.push_str(" = ");
                 type_name(ast, ty, out);
             }
+            ItemKind::DefTypeDef { def, value } => {
+                use std::fmt::Write as _;
+                // As written: `def`, the def-type, the path, the parameters'
+                // names and the body.
+                let (def_type, path) = ast.show_def_type(def);
+                let ExprKind::Fn(function) = ast.get(value).kind else {
+                    panic!("a definition's value is not a function");
+                };
+                let decl = ast.fn_decl(function);
+                let params: Vec<&str> = ast
+                    .params(decl.params)
+                    .iter()
+                    .map(|param| ast.names().get(param.name))
+                    .collect();
+                write!(out, "def {def_type} {path}({}) ", params.join(", ")).unwrap();
+                expr(ast, decl.body, out);
+            }
         }
     }
 
@@ -4022,6 +4475,10 @@ mod tests {
             ExprKind::List(elements) => list_shape(ast, elements, out),
             ExprKind::Index { expr: inner, index } => index_shape(ast, (inner, index), out),
             ExprKind::For(id) => for_shape(ast, id, out),
+            ExprKind::DefTypeRef(def) => {
+                let (def_type, path) = ast.show_def_type(def);
+                write!(out, "({def_type} {path})").unwrap();
+            }
         }
     }
 
@@ -4720,9 +5177,9 @@ mod tests {
             )
         );
         assert_eq!(
-            error("{ x y }"),
+            error("{ x 1 }"),
             (
-                "expected end of item, found `y`".to_owned(),
+                "expected end of item, found `1`".to_owned(),
                 Span::new(4, 5)
             )
         );
@@ -5175,7 +5632,7 @@ mod tests {
         assert_eq!(diagnostic.labels[0].span, Span::new(1, 2));
         assert_eq!(diagnostic.labels[0].text, "unclosed `{`");
         // In a later interpolation, the label is on that one's `{`.
-        let diagnostic = parse_text("\"{a}{b c}\"").unwrap_err();
+        let diagnostic = parse_text("\"{a}{b 1}\"").unwrap_err();
         assert_eq!(diagnostic.labels[0].span, Span::new(4, 5));
         // An empty interpolation, and one missing its closing parenthesis,
         // are reported at the `}`.
@@ -7464,7 +7921,7 @@ mod tests {
             error("for x in xs x"),
             (
                 "expected `{` or `if` after `for` iterable".to_owned(),
-                Span::new(12, 13)
+                Span::new(13, 13)
             )
         );
         assert_eq!(
@@ -7491,10 +7948,10 @@ mod tests {
             )
         );
         assert_eq!(
-            error("for x xs {}"),
+            error("for x 1 {}"),
             (
-                "expected `in` after the `for` variable, found `xs`".to_owned(),
-                Span::new(6, 8)
+                "expected `in` after the `for` variable, found `1`".to_owned(),
+                Span::new(6, 7)
             )
         );
         assert_eq!(
@@ -8195,9 +8652,9 @@ mod tests {
             )
         );
         assert_eq!(
-            error("for a < b c {}"),
+            error("for a < b 1 {}"),
             (
-                "expected `;` or `{` in a `for` header, found `c`".to_owned(),
+                "expected `;` or `{` in a `for` header, found `1`".to_owned(),
                 Span::new(10, 11)
             )
         );
@@ -9011,6 +9468,159 @@ mod tests {
         assert_eq!(
             ast.pretty().to_string(),
             "(file\n  (field a.b : Int @0..12\n    (int 1 @11..12)))"
+        );
+    }
+
+    #[test]
+    fn def_types_are_marked_defined_and_referred_to() {
+        // `#[def_type]` on a `def` of one name or a path, with or without
+        // `#[shadowable]`, in either order.
+        let ast = parse_text(
+            "#[def_type] def p(n: String, f: fn(): Int): Int { 1 }\n\
+             #[shadowable]\n#[def_type]\ndef t.q(n: String, f: fn(): Int): Int { 1 }\n\
+             #[def_type] #[shadowable] def r(n: String, f: fn(): Int): Int { 1 }",
+        )
+        .unwrap();
+        let items = ast.items(ast.root());
+        let marks: Vec<(bool, bool)> = items
+            .iter()
+            .map(|&item| (ast.is_def_type(item), ast.is_shadowable(item)))
+            .collect();
+        assert_eq!(marks, [(true, false), (true, true), (true, true)]);
+        // A definition: its def-type a name or a path, its path a path, its
+        // parameters by name alone; a reference, a def-type and a path on
+        // one line, called or not, binding as a field access does.
+        assert_eq!(
+            shape("def package dev.peios.testpkg() { version = \"1\" }"),
+            "def package dev.peios.testpkg() {version = \"1\"}"
+        );
+        assert_eq!(
+            shape("def t.build x(a, b) { a }"),
+            "def t.build x(a, b) {a}"
+        );
+        assert_eq!(
+            shape("result = package dev.peios.testpkg()"),
+            "result = (package dev.peios.testpkg)()"
+        );
+        assert_eq!(shape("let f = t.p a.b"), "let f = (t.p a.b)");
+        assert_eq!(shape("x = -p a"), "x = (-(p a))");
+        assert_eq!(shape("x = p a(1).y"), "x = ((p a)(1) . y)");
+        // Two names on two lines are two items, or, inside parentheses, the
+        // error they were.
+        assert_eq!(shape("x = p\na"), "x = p; a");
+        assert_eq!(
+            error("f(p\na)"),
+            ("expected `,` or `)`, found `a`".to_owned(), Span::new(4, 5))
+        );
+        // The dump shows them.
+        assert_eq!(
+            parse_text(
+                "#[def_type] def p(n: String, f: fn(a: Int): Int): Int { 1 }\n\
+                        def p x(a) { a }\ny = p x"
+            )
+            .unwrap()
+            .pretty()
+            .to_string(),
+            "(file\n  #[def_type] (def p @12..59\n    (fn @12..59\n      \
+             (params (n String) (f fn(a: Int): Int))\n      (ret pure Int)\n      \
+             (block @54..59\n        (expr @56..57\n          (int 1 @56..57)))))\n  \
+             (def-type-def p x @60..76\n    (fn @66..76\n      (params a)\n      \
+             (block @71..76\n        (expr @73..74\n          (name a @73..74)))))\n  \
+             (field y @77..84\n    (def-type-ref p x @81..84)))"
+        );
+    }
+
+    #[test]
+    fn def_type_errors() {
+        let misplaced = MISPLACED_DEF_TYPE.to_owned();
+        assert_eq!(
+            error("#[def_type] a = 1"),
+            (misplaced.clone(), Span::new(0, 11))
+        );
+        assert_eq!(
+            error("#[def_type] def p x() { 1 }"),
+            (misplaced.clone(), Span::new(0, 11))
+        );
+        assert_eq!(
+            error("#[def_type] fn f(): Int { 1 }"),
+            (misplaced.clone(), Span::new(0, 11))
+        );
+        assert_eq!(
+            error("x = { #[def_type] def f(): Int { 1 } }"),
+            (misplaced, Span::new(6, 17))
+        );
+        assert_eq!(
+            error("#[def_type]\n#[def_type] def f(): Int { 1 }"),
+            (
+                "`#[def_type]` is written twice".to_owned(),
+                Span::new(12, 23)
+            )
+        );
+        assert_eq!(
+            error("#![def_type]\na = 1"),
+            (
+                "`def_type` applies to a declaration: write `#[def_type]`".to_owned(),
+                Span::new(0, 12)
+            )
+        );
+        assert_eq!(
+            error("a = 1\n#[def_type]"),
+            (
+                "`#[def_type]` is not followed by anything".to_owned(),
+                Span::new(6, 17)
+            )
+        );
+        // A definition's own errors.
+        assert_eq!(
+            error("def p x(a: Int) { a }"),
+            (
+                "the parameter types of a `p` definition come from `p`".to_owned(),
+                Span::new(9, 10)
+            )
+        );
+        assert_eq!(
+            error("def t.p x(): Int { 1 }"),
+            (
+                "the result type of a `t.p` definition comes from `t.p`".to_owned(),
+                Span::new(11, 12)
+            )
+        );
+        assert_eq!(
+            error("def p x.\"y\"() { 1 }"),
+            (DEF_PATH.to_owned(), Span::new(8, 11))
+        );
+        assert_eq!(
+            error("def p x { 1 }"),
+            (
+                "expected `(` after the definition's path, found `{`".to_owned(),
+                Span::new(8, 9)
+            )
+        );
+        assert_eq!(
+            error("def p x() 1"),
+            (
+                "expected `{` to start the definition's body, found `1`".to_owned(),
+                Span::new(10, 11)
+            )
+        );
+        assert_eq!(
+            error("x = { def p x() { 1 } }"),
+            (MISPLACED_DEF_TYPE_DEF.to_owned(), Span::new(6, 9))
+        );
+        // A reference's path is made of identifiers too.
+        assert_eq!(
+            error("x = p a.\"b\""),
+            (DEF_PATH.to_owned(), Span::new(8, 11))
+        );
+        // No source writes a namespace's key.
+        assert_eq!(
+            error("\"<p#1.2>\" = 1"),
+            (
+                "a field cannot be named `\"<p#1.2>\"`: names of that form are def-types' \
+                 namespaces"
+                    .to_owned(),
+                Span::new(0, 9)
+            )
         );
     }
 }

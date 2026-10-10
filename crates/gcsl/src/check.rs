@@ -965,6 +965,81 @@
 //! input's record and, in a workspace, of its directory, which commits
 //! only fields ([`Scope`]'s `commit`): a `let` or `fn` is the file's own.
 //!
+//! # Def-types
+//!
+//! A `def` marked `#[def_type]` (see the parser's
+//! [Attributes](crate::parser#attributes)) is a *def-type*, as in
+//! `#[def_type] def package(name: String, func: fn(): PackageDef) -> R`. Its
+//! first parameter must be a `String` and its second a function, its type
+//! F, present or the either shape of one: the function type of the
+//! *definitions* made with it; its further parameters, if any, are its
+//! *invocation parameters*, and its effect and result are free. Otherwise it
+//! is "a def-type takes the name as a `String` and then the definition as a
+//! function, as in `def package(name: String, func: fn(): T)`", the
+//! def-type's own name in place of `package`, at its parameters
+//! (`Checker::check_def_type_signature`). It is still an ordinary `def`,
+//! called as any is.
+//!
+//! **Definitions.** `def DT PATH(PARAMS) BODY` ([`ItemKind::DefTypeDef`])
+//! binds nothing a variable or a field names. Its function is a leaf of
+//! DT's *namespace*, a root of the tree of top-level fields that no source
+//! can write, the namespace's key (see [`crate::names`], "Namespace keys"),
+//! which the workspace finds once it knows what DT names (see
+//! [`crate::workspace`], "Def-types"). So it is a top-level function in
+//! every sense a `def` named by a dotted path is (see [Top-level
+//! functions](#top-level-functions)): usable above it and from every file
+//! that sees it, in its group, its closure made where the rules say, its
+//! leaf's cell holding it. Its type is F: as the input starts, its `DT` is
+//! read quietly and its leaf's cell given F (`Checker::definition_type`),
+//! after the other dotted `def`s', so that a def-type may be one. Its body
+//! is checked (`Checker::check_definition`), its `DT` read again and what
+//! is wrong with it reported, as a function of F's parameters, which
+//! PARAMS name in order, against F's result, with F's effect: so with
+//! `fn(): PackageDef` it is pure and makes a `PackageDef`. Nothing is
+//! inferred of it, no parameter, no result, no callback narrowed: its type
+//! is F exactly. Parameters not as many as F's are "`package` defines
+//! functions of no parameters" ("of 1 parameter, `x`", "of 2 parameters,
+//! `a` and `b`", naming them if F names them all), at its parameter list.
+//!
+//! When the walk reaches a definition (`Checker::place_definition`), it is
+//! placed in its namespace as the dotted field of its path under the key is
+//! placed in a record, but among the namespaces' own fields, apart from the
+//! input's record: so a file of definitions alone has no fields, and two of
+//! one path, one under another and the like are what the rules of dotted
+//! fields say they are, the path shown as the definition writes it ("field
+//! `package x` is defined twice"). One whose DT is no def-type is "`DT` is
+//! not a def-type", noted "a def-type is a `def` marked `#[def_type]`", and
+//! its body is not checked, having no type to be checked as. A shadowed
+//! definition is checked as written (see [Shadowed
+//! declarations](#shadowed-declarations)), but one whose def-type it cannot
+//! read, its file not otherwise needing the def-type's, is not: its types
+//! are the def-type's to give.
+//!
+//! **References.** `DT PATH` ([`ExprKind::DefTypeRef`]) is a function: of
+//! the def-type's invocation parameters, with its effect and its result
+//! (`Checker::check_def_type_ref`). Its DT is read as any value is, and must
+//! name a def-type: "`DT` is not a def-type" otherwise, noted as above and
+//! "two names in a row are read as a def-type reference, as in `package
+//! dev.x()`; is an operator or a line break missing?", with which the
+//! "undefined variable" error of an undefined DT is noted too. A DT that
+//! names a parameter or a local nearer than the input's top-level
+//! declarations is no def-type, whatever the workspace found its name to
+//! name at the top
+//! level (`Checker::shadows_def_type`). Its path must name a definition of
+//! the namespace that the file sees (`Checker::definition_at`): a leaf of
+//! the view under the key, or, in a session, of an earlier input's
+//! namespace, a binding of the key, by its record type. A path that names
+//! nothing is "`package` has no definition `dev.peios.nope`", with a note
+//! listing those the file sees ("the only definition of `package` here is
+//! `x`", "the definitions of `package` here are `a` and `b.c`", "`package`
+//! has no definitions here"); one that names a node above definitions,
+//! "`dev.peios` is not a `package` definition", at the path. The
+//! definition is then read as its leaf's cell is, by its path
+//! (`Checker::field_reference`). A call of a reference is a call of a
+//! function value, of no known callee: calling one of an impure def-type
+//! from a pure function is the purity error. A record read whole through
+//! an import holds no namespace (`Checker::imported_record`).
+//!
 //! # Futures
 //!
 //! `lazy e` is checked as the body of an anonymous, parameterless function
@@ -2375,8 +2450,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, Effect, Element, ElementRange, Expr, ExprId,
-    ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, Effect, Element, ElementRange, Expr,
+    ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
     ItemRange, Jump, Label, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
     TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
 };
@@ -3950,6 +4025,19 @@ struct FieldDecl {
     rejected: bool,
 }
 
+/// What the path of a def-type reference names in its def-type's namespace
+/// (see [Def-types](#def-types)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DefinitionAt {
+    /// A definition.
+    Leaf,
+    /// A node above definitions, no definition itself.
+    Interior,
+    /// Nothing: with the paths of the definitions of the namespace the file
+    /// sees, as written after the def-type.
+    Missing(Vec<String>),
+}
+
 /// What the spread items of the innermost block checked so far have done,
 /// in `Checker::spreads`. See the module documentation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4543,6 +4631,17 @@ pub struct Checker<'a> {
     fields: Vec<FieldDecl>,
     /// Index in `fields` of the innermost block's first field.
     fields_start: usize,
+    /// The roots of the namespaces of the def-types the input's
+    /// definitions are made with, declared as the walk reaches them, as
+    /// `fields` holds the outermost block's: apart from them, since a
+    /// namespace is no field of the input's record (see
+    /// [Def-types](#def-types)).
+    def_fields: Vec<FieldDecl>,
+    /// The definition made with a def-type each function expression of the
+    /// input's outermost block is, if it is one.
+    definitions: HashMap<FnId, DefTypeId>,
+    /// The function expressions of the input's `def`s marked `#[def_type]`.
+    def_type_fns: HashSet<FnId>,
     /// What the innermost block's spread items have done so far.
     spreads: BlockSpreads,
     /// The next free slot.
@@ -4734,6 +4833,9 @@ impl<'a> Checker<'a> {
             block_start: 0,
             fields: Vec::new(),
             fields_start: 0,
+            def_fields: Vec::new(),
+            definitions: HashMap::new(),
+            def_type_fns: HashSet::new(),
             spreads: BlockSpreads::None,
             next_slot,
             frame_size: next_slot,
@@ -5017,7 +5119,9 @@ impl<'a> Checker<'a> {
                 }
                 ItemKind::Spread(value) => self.check_spread_item(id, value, root),
                 ItemKind::Import(_) => self.check_import(id, item.span),
-                ItemKind::Type { .. } => {}
+                // A definition is placed as the walk reaches it, whether or
+                // not it is a top-level function (`Checker::reach_top_fn`).
+                ItemKind::Type { .. } | ItemKind::DefTypeDef { .. } => {}
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -5096,16 +5200,21 @@ impl<'a> Checker<'a> {
     fn check_shadowed_items(&mut self) {
         let ast = self.ast;
         for (id, cut) in std::mem::take(&mut self.shadowed_items) {
-            let ItemKind::Field {
-                path, ty, value, ..
-            } = ast.item(id).kind
-            else {
-                continue;
+            let (path, ty, value) = match ast.item(id).kind {
+                ItemKind::Field {
+                    path, ty, value, ..
+                } => (Some(path), ty, value),
+                // A definition made with a def-type has no name to see
+                // itself by.
+                ItemKind::DefTypeDef { value, .. } => (None, None, value),
+                _ => continue,
             };
             let cut = cut.max(self.top_end).min(self.bindings.len());
             let below = self.bindings.split_off(cut);
             let outer = std::mem::replace(&mut self.checking_shadowed, true);
-            self.name_callee(ast.path(path), value);
+            if let Some(path) = path {
+                self.name_callee(ast.path(path), value);
+            }
             self.annotated_value(ty, value);
             self.callee_name = None;
             self.checking_shadowed = outer;
@@ -5124,6 +5233,11 @@ impl<'a> Checker<'a> {
             .filter_map(|(_, &id)| match self.ast.item(id).kind {
                 ItemKind::Field { value, .. } => {
                     let first = self.ast.subtree(value).next()?;
+                    Some((first.index(), value.index()))
+                }
+                // A definition's `DT` comes just before its function.
+                ItemKind::DefTypeDef { def, value } => {
+                    let first = self.ast.subtree(self.ast.def_type(def).dt).next()?;
                     Some((first.index(), value.index()))
                 }
                 _ => None,
@@ -5318,7 +5432,8 @@ impl<'a> Checker<'a> {
             ItemKind::Field { .. }
             | ItemKind::Spread(_)
             | ItemKind::Import(_)
-            | ItemKind::Type { .. } => false,
+            | ItemKind::Type { .. }
+            | ItemKind::DefTypeDef { .. } => false,
         }
     }
 
@@ -7279,6 +7394,7 @@ impl<'a> Checker<'a> {
             Some(workspace) => workspace.file().mentions.clone(),
             None => mentions::find(self.ast),
         };
+        self.find_def_types();
         self.top_start = self.bindings.len();
         for index in 0..self.mentions.functions.len() {
             let Some(&top) = self.mentions.functions.get(index) else {
@@ -7348,18 +7464,80 @@ impl<'a> Checker<'a> {
     /// function's binding has (see [Top-level
     /// functions](#top-level-functions)).
     fn type_dotted_defs(&mut self) {
-        for index in 0..self.top_fns.len() {
-            let Some(top) = self.top_fns.get(index).copied() else {
-                continue;
-            };
-            let Some(leaf) = top.leaf else {
-                continue;
-            };
-            let ty = self.declared_type(top.function);
-            if let Some(cell) = self.field_cells.get_mut(leaf as usize) {
-                cell.ty = Some(ty);
+        // A definition made with a def-type has the type the def-type gives
+        // it, which may be a dotted `def` of the input: those after the
+        // others (see [Def-types](#def-types)).
+        for definitions in [false, true] {
+            for index in 0..self.top_fns.len() {
+                let Some(top) = self.top_fns.get(index).copied() else {
+                    continue;
+                };
+                let Some(leaf) = top.leaf else {
+                    continue;
+                };
+                let ty = match (self.definitions.get(&top.function), definitions) {
+                    (Some(&def), true) => self.definition_type(def),
+                    (None, false) => self.declared_type(top.function),
+                    _ => continue,
+                };
+                if let Some(cell) = self.field_cells.get_mut(leaf as usize) {
+                    cell.ty = Some(ty);
+                }
             }
         }
+    }
+
+    /// As the input starts: finds which function expressions of its
+    /// outermost block are definitions made with a def-type, and which are
+    /// `def`s marked `#[def_type]` (see [Def-types](#def-types)).
+    fn find_def_types(&mut self) {
+        let ast = self.ast;
+        for &id in ast.items(ast.root()) {
+            match ast.item(id).kind {
+                ItemKind::DefTypeDef { def, value } => {
+                    if let ExprKind::Fn(function) = ast.get(value).kind {
+                        self.definitions.insert(function, def);
+                    }
+                }
+                ItemKind::Field {
+                    value,
+                    function: true,
+                    ..
+                } if ast.is_def_type(id) => {
+                    if let ExprKind::Fn(function) = ast.get(value).kind {
+                        self.def_type_fns.insert(function);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The type of the definition `def` made with a def-type, before its
+    /// body is checked: the function type the def-type's second parameter
+    /// has, read quietly, or `Error` if its def-type is not one (which its
+    /// own check reports).
+    fn definition_type(&mut self, def: DefTypeId) -> TyId {
+        let (errors, warnings) = (self.errors.len(), self.warnings.len());
+        let dt = self.ast.def_type(def).dt;
+        let ty = self.check_expr(dt);
+        self.errors.truncate(errors);
+        self.warnings.truncate(warnings);
+        self.def_type_signature(ty)
+            .map_or(TyId::ERROR, |(function, _)| function)
+    }
+
+    /// The function type of the definitions a def-type of type `ty` makes,
+    /// its second parameter's, present, and its own signature, if it is the
+    /// type of a def-type: a function whose first parameter is a `String`
+    /// and whose second is a function, present or not (see
+    /// [Def-types](#def-types)).
+    fn def_type_signature(&self, ty: TyId) -> Option<(TyId, FnTy)> {
+        let sig = self.types.fn_sig(self.types.strip(ty))?.clone();
+        let (&(_, name), &(_, function)) = (sig.params.first()?, sig.params.get(1)?);
+        let function = self.types.strip(function);
+        (self.types.strip(name) == TyId::STRING && self.types.fn_sig(function).is_some())
+            .then_some((function, sig))
     }
 
     /// Whether `name` is the root of a top-level field of the input all of
@@ -7704,6 +7882,11 @@ impl<'a> Checker<'a> {
         let mut fields = Vec::new();
         let mut erroneous = false;
         for (name, child) in workspace.target_fields(target) {
+            // A def-type's namespace binds nothing a record holds (see
+            // [Def-types](#def-types)).
+            if crate::names::key_def_type(self.ast.names().get(name)).is_some() {
+                continue;
+            }
             let (slot, ty) = match child {
                 Target::Node(node) => (workspace.cell_slot(node), workspace.cell_type(node)),
                 part => self
@@ -8541,9 +8724,19 @@ impl<'a> Checker<'a> {
     /// When the walk of the outermost block reaches the item `id`: if it
     /// is a top-level function, which is declared already, records the
     /// bindings above it, which its body sees, gives the item its slot
-    /// and, for a `def`, adds the field, and returns `true`.
+    /// and, for a `def`, adds the field, and returns `true`; and so for a
+    /// definition made with a def-type that is none, which it places in its
+    /// namespace, or reports, as such ([`Checker::place_definition`]).
     fn reach_top_fn(&mut self, id: ItemId) -> bool {
         let Some(index) = self.top_fns.iter().position(|top| top.item == id) else {
+            // A definition made with a def-type that is no top-level
+            // function: one whose `DT` is no def-type, or that the rules of
+            // dotted fields reject in its namespace (see
+            // [Def-types](#def-types)).
+            if let ItemKind::DefTypeDef { def, value } = self.ast.item(id).kind {
+                self.place_definition(id, def, value);
+                return true;
+            }
             return false;
         };
         let Some(top) = self.top_fns.get_mut(index) else {
@@ -8601,15 +8794,21 @@ impl<'a> Checker<'a> {
     /// it has not yet (`Checker::finish_group`), and gives the item its
     /// leaf's cell, which its closure is stored in.
     fn reach_dotted_def(&mut self, index: usize, id: ItemId) {
-        let ItemKind::Field { path, value, .. } = self.ast.item(id).kind else {
-            return;
-        };
-        let segments = self.ast.path(path);
-        if let Some(first) = segments.first().and_then(PathSegment::name) {
-            self.check_name_clash(id, first);
-        }
         let before = self.nodes.len();
-        self.check_dotted_field(id, segments, (None, value), None);
+        match self.ast.item(id).kind {
+            ItemKind::Field { path, value, .. } => {
+                let segments = self.ast.path(path);
+                if let Some(first) = segments.first().and_then(PathSegment::name) {
+                    self.check_name_clash(id, first);
+                }
+                self.check_dotted_field(id, segments, (None, value), None);
+            }
+            // A definition made with a def-type: the dotted field of its
+            // path under its namespace's key, apart from the input's record
+            // (see [Def-types](#def-types)).
+            ItemKind::DefTypeDef { def, value } => self.place_definition(id, def, value),
+            _ => return,
+        }
         let Some(top) = self.top_fns.get_mut(index) else {
             return;
         };
@@ -8622,6 +8821,408 @@ impl<'a> Checker<'a> {
             .and_then(|leaf| self.field_cells.get(leaf as usize))
             .map_or(Slot::NONE, |cell| cell.slot);
         self.item_slots[id.index()] = slot;
+    }
+
+    /// When the walk of the outermost block reaches the definition `id`,
+    /// made with a def-type, `def`, of function `value`: places it in its
+    /// def-type's namespace as the dotted field of its path under the
+    /// namespace's key is placed in a record, among the namespaces' own
+    /// fields ([`Checker::def_fields`]), never the input's record, so that
+    /// what the rules of dotted fields reject is reported as they report it
+    /// ("field `package x` is defined twice"), its value then checked on its
+    /// own; or, if its `DT` is no def-type, says so (see
+    /// [Def-types](#def-types)).
+    fn place_definition(&mut self, id: ItemId, def: DefTypeId, value: ExprId) {
+        let Some(segments) = self.definition_path(def) else {
+            let dt = self.ast.def_type(def).dt;
+            if self.check_expr(dt) != TyId::ERROR {
+                self.not_a_def_type(def);
+            }
+            return;
+        };
+        let fields = std::mem::replace(&mut self.fields, std::mem::take(&mut self.def_fields));
+        let start = std::mem::replace(&mut self.fields_start, 0);
+        let spreads = std::mem::take(&mut self.spreads);
+        self.check_dotted_field(id, &segments, (None, value), None);
+        self.def_fields = std::mem::replace(&mut self.fields, fields);
+        self.fields_start = start;
+        self.spreads = spreads;
+    }
+
+    /// The path of the definition `def` made with a def-type under its
+    /// def-type's namespace: the namespace's key, written where its `DT` is,
+    /// then its path; `None` if its `DT` is no def-type.
+    fn definition_path(&self, def: DefTypeId) -> Option<Vec<PathSegment>> {
+        let use_ = self.ast.def_type(def);
+        let key = PathSegment {
+            kind: SegmentKind::Name(use_.key?),
+            span: self.ast.get(use_.dt).span,
+        };
+        Some(
+            std::iter::once(key)
+                .chain(self.ast.path(use_.path).iter().copied())
+                .collect(),
+        )
+    }
+
+    /// Reports the def-type definition or reference `def`, whose `DT` names
+    /// something that is not a def-type: "`package` is not a def-type", at
+    /// its `DT`.
+    fn not_a_def_type(&mut self, def: DefTypeId) {
+        let (shown, _) = self.ast.show_def_type(def);
+        let use_ = self.ast.def_type(def);
+        let at = self.ast.get(use_.dt).span;
+        let mut error = Diagnostic::error(format!("`{shown}` is not a def-type"), at)
+            .with_note("a def-type is a `def` marked `#[def_type]`");
+        // A reference may be two names that meant something else.
+        if use_.read.is_some() {
+            error = error.with_note(JUXTAPOSED_NOTE);
+        }
+        self.errors.push(error);
+    }
+
+    /// Types the function expression `id`, of function `function`, the
+    /// definition `def` made with a def-type, and checks its body (see
+    /// [Def-types](#def-types)): its type is the function type of its
+    /// def-type's second parameter, present, whose parameters' types its
+    /// parameters, written by name alone, take in order, whose result its
+    /// body is checked against, and whose effect it has; a count of
+    /// parameters other than that type's is "`package` defines functions of
+    /// no parameters" (or "of 2 parameters, `a` and `b`"), at its parameter
+    /// list. `Error` if its def-type is not one, which its own check
+    /// reports, or the count is wrong.
+    fn check_definition(&mut self, id: ExprId, function: FnId, def: DefTypeId) -> TyId {
+        self.callee_name = None;
+        let decl = *self.ast.fn_decl(function);
+        let use_ = *self.ast.def_type(def);
+        let errors = self.errors.len();
+        let dt_ty = self.check_expr(use_.dt);
+        // A shadowed definition needs nothing, so its def-type, read where
+        // its file does not otherwise need the def-type's, may not be had:
+        // then it is not checked, its types being the def-type's to give
+        // (see [Shadowed declarations](#shadowed-declarations)).
+        if self.checking_shadowed && dt_ty == TyId::ERROR {
+            self.errors.truncate(errors);
+            return TyId::ERROR;
+        }
+        let signature = self.def_type_signature(dt_ty).and_then(|(ty, _)| {
+            let sig = self.types.fn_sig(ty)?.clone();
+            Some((ty, sig))
+        });
+        let Some((ty, sig)) = signature else {
+            return TyId::ERROR;
+        };
+        let params = self.ast.params(decl.params);
+        if params.len() != sig.params.len() {
+            self.definition_arity(def, &sig);
+            return TyId::ERROR;
+        }
+        let base = self.fn_params.len();
+        for (param, &(_, param_ty)) in params.iter().zip(sig.params.iter()) {
+            self.fn_params.push((Some(param.name), param_ty));
+        }
+        self.expr_types[id.index()] = ty;
+        let span = self.ast.get(id).span;
+        let dt_span = self.ast.get(use_.dt).span;
+        self.functions.push(Function {
+            fn_id: function,
+            bindings_start: self.bindings.len(),
+            outer_next_slot: self.next_slot,
+            outer_frame_size: self.frame_size,
+            outer_slot_names: std::mem::take(&mut self.slot_names),
+            captures: Vec::new(),
+            effect: sig.effect,
+            marker: dt_span,
+            keyword: dt_span,
+            demanded: vec![None; params.len()],
+            result: Some((sig.ret, dt_span)),
+            returns: Vec::new(),
+        });
+        (self.next_slot, self.frame_size) = (0, 0);
+        self.check_fn_body(&decl, base, (None, ty, span), sig.ret);
+        self.fn_params.truncate(base);
+        self.finish_function(decl.params.len(), None);
+        ty
+    }
+
+    /// Reports the definition `def` made with a def-type, whose parameters
+    /// are not as many as those of `sig`, the function type its def-type
+    /// gives it: "`package` defines functions of no parameters", "of 1
+    /// parameter, `x`" or "of 2 parameters, `a` and `b`", naming them if the
+    /// type names them all, at its parameter list.
+    fn definition_arity(&mut self, def: DefTypeId, sig: &FnTy) {
+        let (shown, _) = self.ast.show_def_type(def);
+        let count = sig.params.len();
+        let param_names: Option<Vec<String>> = sig
+            .params
+            .iter()
+            .map(|&(name, _)| Some(format!("`{}`", self.ast.names().get(name?))))
+            .collect();
+        let counted = match count {
+            0 => "no parameters".to_owned(),
+            1 => "1 parameter".to_owned(),
+            _ => format!("{count} parameters"),
+        };
+        let named = match param_names.as_deref() {
+            Some([only]) => format!(", {only}"),
+            Some([init @ .., last]) => format!(", {} and {last}", init.join(", ")),
+            _ => String::new(),
+        };
+        let at = self.ast.def_type(def).span;
+        self.errors.push(Diagnostic::error(
+            format!("`{shown}` defines functions of {counted}{named}"),
+            at,
+        ));
+    }
+
+    /// Reports the `#[def_type]` `def` of function `function`, of type
+    /// `ty`, if its parameters are not those of a def-type: "a def-type takes
+    /// the name as a `String` and then the definition as a function, as in
+    /// `def package(name: String, func: fn(): T)`", at its parameters (see
+    /// [Def-types](#def-types)).
+    fn check_def_type_signature(&mut self, function: FnId, ty: TyId) {
+        if !self.def_type_fns.contains(&function)
+            || ty == TyId::ERROR
+            || self.def_type_signature(ty).is_some()
+        {
+            return;
+        }
+        let decl = *self.ast.fn_decl(function);
+        let params = self.ast.params(decl.params);
+        let at = match (params.first(), params.last()) {
+            (Some(first), Some(last)) => Span::join(first.span, last.span),
+            _ => self.ast.get(decl.body).span,
+        };
+        let name = self
+            .ast
+            .items(self.ast.root())
+            .iter()
+            .find_map(|&item| match self.ast.item(item).kind {
+                ItemKind::Field { path, value, .. }
+                    if self.ast.get(value).kind == ExprKind::Fn(function) =>
+                {
+                    Some(self.ast.show_path(self.ast.path(path)).to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        self.errors.push(Diagnostic::error(
+            format!(
+                "a def-type takes the name as a `String` and then the definition as a \
+                 function, as in `def {name}(name: String, func: fn(): T)`"
+            ),
+            at,
+        ));
+    }
+
+    /// Types the def-type reference `id`, `DT PATH`, of `def` (see
+    /// [Def-types](#def-types)): the function that calls the def-type with
+    /// the definition's path, the definition and its own arguments, of the
+    /// type of the def-type's parameters after its second, its result and
+    /// its effect. Its `DT` must name a def-type, "`package` is not a
+    /// def-type" otherwise, and its path a definition of the def-type's
+    /// namespace that the file sees, "`package` has no definition
+    /// `dev.peios.nope`", with a note listing those it sees, or, for a path
+    /// above some, "`dev.peios` is not a `package` definition", at the path.
+    fn check_def_type_ref(&mut self, id: ExprId, def: DefTypeId) -> TyId {
+        let use_ = *self.ast.def_type(def);
+        let errors = self.errors.len();
+        let dt_ty = self.check_expr(use_.dt);
+        if dt_ty == TyId::ERROR {
+            // Two names in a row, the first undefined, may have meant
+            // something else.
+            let at = self.ast.get(use_.dt).span;
+            for error in self.errors.get_mut(errors..).unwrap_or_default() {
+                if error.message.starts_with("undefined variable")
+                    && error.span.start >= at.start
+                    && error.span.end <= at.end
+                {
+                    error.notes.push(JUXTAPOSED_NOTE.to_owned());
+                }
+            }
+            return TyId::ERROR;
+        }
+        let (Some(key), Some(read)) = (use_.key, use_.read) else {
+            self.not_a_def_type(def);
+            return TyId::ERROR;
+        };
+        if self.shadows_def_type(use_.dt) {
+            self.not_a_def_type(def);
+            return TyId::ERROR;
+        }
+        // What is wrong with a def-type's own parameters is reported where
+        // it is declared.
+        let Some((_, sig)) = self.def_type_signature(dt_ty) else {
+            return TyId::ERROR;
+        };
+        let (shown, path) = self.ast.show_def_type(def);
+        let at = self.ast.get(read).span;
+        match self.definition_at(key, read) {
+            DefinitionAt::Leaf => {}
+            DefinitionAt::Interior => {
+                self.errors.push(Diagnostic::error(
+                    format!("`{path}` is not a `{shown}` definition"),
+                    at,
+                ));
+                return TyId::ERROR;
+            }
+            DefinitionAt::Missing(seen) => {
+                let note = match seen.as_slice() {
+                    [] => format!("`{shown}` has no definitions here"),
+                    [only] => format!("the only definition of `{shown}` here is `{only}`"),
+                    [init @ .., last] => {
+                        let init: Vec<String> = init.iter().map(|d| format!("`{d}`")).collect();
+                        format!(
+                            "the definitions of `{shown}` here are {} and `{last}`",
+                            init.join(", ")
+                        )
+                    }
+                };
+                self.errors.push(
+                    Diagnostic::error(format!("`{shown}` has no definition `{path}`"), at)
+                        .with_note(note),
+                );
+                return TyId::ERROR;
+            }
+        }
+        // The definition's cell, read as any dotted field's is.
+        let read_ty = match self.field_reference(read) {
+            Some(ty) => ty,
+            None => self.check_expr(read),
+        };
+        self.expr_types[read.index()] = read_ty;
+        if read_ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        let ty = self.types.fn_type(
+            sig.params.get(2..).unwrap_or_default().iter().copied(),
+            sig.ret,
+            sig.effect,
+        );
+        self.expr_types[id.index()] = ty;
+        ty
+    }
+
+    /// Whether the def-type `dt` of a reference names a binding nearer than
+    /// the input's top-level declarations, a parameter or a local, which is
+    /// then what it names, whatever the workspace found its name names at
+    /// the top level (see [Def-types](#def-types)).
+    fn shadows_def_type(&self, dt: ExprId) -> bool {
+        let mut at = dt;
+        while let ExprKind::Field { expr, .. } = self.ast.get(at).kind {
+            at = expr;
+        }
+        let ExprKind::Name(name) = self.ast.get(at).kind else {
+            return false;
+        };
+        self.lookup(name)
+            .is_some_and(|(index, _)| index >= self.top_end)
+    }
+
+    /// What the path `read` of a def-type reference, a namespace's key,
+    /// `key`, and the reference's path, names in the file's view: a
+    /// definition, a node above some, or nothing, with the paths of the
+    /// definitions under the key it sees (see [Def-types](#def-types)). An
+    /// earlier session input's namespace is a binding of the key's, whose
+    /// record type says.
+    fn definition_at(&mut self, key: Name, read: ExprId) -> DefinitionAt {
+        let mut path = Vec::new();
+        let mut at = read;
+        while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
+            path.push(name);
+            at = expr;
+        }
+        path.reverse();
+        if let Some(workspace) = self.workspace
+            && let Some(root) = workspace.scope.root(key)
+        {
+            let scope = &workspace.scope;
+            let mut node = root;
+            for &name in &path {
+                match scope.child(node, name) {
+                    Some(child) => node = child,
+                    None => return DefinitionAt::Missing(self.definitions_under(root)),
+                }
+            }
+            return if scope.is_leaf(node) {
+                DefinitionAt::Leaf
+            } else {
+                DefinitionAt::Interior
+            };
+        }
+        let Some((_, binding)) = self.lookup(key) else {
+            return DefinitionAt::Missing(Vec::new());
+        };
+        let mut ty = binding.ty;
+        for &name in &path {
+            match self.types.field(self.types.strip(ty), name) {
+                Some(field) => ty = field,
+                None => return DefinitionAt::Missing(self.definitions_of(binding.ty)),
+            }
+        }
+        if self.types.fn_sig(self.types.strip(ty)).is_some() {
+            DefinitionAt::Leaf
+        } else {
+            DefinitionAt::Interior
+        }
+    }
+
+    /// The paths of the definitions at or under the scope's number `root`
+    /// of the file's view, a namespace's root, in the view's order, as
+    /// written after the def-type.
+    fn definitions_under(&self, root: u32) -> Vec<String> {
+        let Some(workspace) = self.workspace else {
+            return Vec::new();
+        };
+        let names = self.ast.names();
+        let mut found = Vec::new();
+        let mut stack: Vec<(u32, String)> = vec![(root, String::new())];
+        while let Some((node, path)) = stack.pop() {
+            if workspace.scope.is_leaf(node) {
+                found.push(path);
+                continue;
+            }
+            for (name, child) in workspace.scope.children(node).into_iter().rev() {
+                let text = names.get(name);
+                let child_path = if path.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{path}.{text}")
+                };
+                stack.push((child, child_path));
+            }
+        }
+        found
+    }
+
+    /// The paths of the definitions of a namespace of type `ty`, an earlier
+    /// session input's: the paths of its function-typed leaves, in the
+    /// order of its fields' names.
+    fn definitions_of(&self, ty: TyId) -> Vec<String> {
+        let names = self.ast.names();
+        let mut found = Vec::new();
+        let mut stack: Vec<(TyId, String)> = vec![(ty, String::new())];
+        while let Some((ty, path)) = stack.pop() {
+            let ty = self.types.strip(ty);
+            let Some(fields) = self.types.record_fields(ty) else {
+                found.push(path);
+                continue;
+            };
+            let mut fields: Vec<(&str, TyId)> = fields
+                .iter()
+                .map(|&(name, field)| (names.get(name), field))
+                .collect();
+            fields.sort_unstable_by(|a, b| b.0.cmp(a.0));
+            for (text, field) in fields {
+                let child = if path.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{path}.{text}")
+                };
+                stack.push((field, child));
+            }
+        }
+        found
     }
 
     /// Checks `value`, the value of a field item that the rules of dotted
@@ -11008,6 +11609,7 @@ impl<'a> Checker<'a> {
             ExprKind::List(elements) => self.check_list(id, elements),
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, None),
+            ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
         };
         self.expr_types[id.index()] = ty;
         ty
@@ -11299,6 +11901,9 @@ impl<'a> Checker<'a> {
     /// [`Checker::narrow_callbacks`]), and its type, recorded again, is the
     /// function type of those parameters and that result.
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
+        if let Some(&def) = self.definitions.get(&function) {
+            return self.check_definition(id, function, def);
+        }
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
         let pure = decl.effect == Effect::Pure;
@@ -11329,6 +11934,7 @@ impl<'a> Checker<'a> {
         };
         let mut ty = self.intern_fn_type(base, ret, decl.effect);
         self.expr_types[id.index()] = ty;
+        self.check_def_type_signature(function, ty);
         let ret_span = decl.ret.map_or(self.ast.get(decl.body).span, |ret| {
             self.ast.type_expr(ret).span
         });
@@ -14629,7 +15235,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
             | ItemKind::Import(_)
-            | ItemKind::Type { .. } => {}
+            | ItemKind::Type { .. }
+            | ItemKind::DefTypeDef { .. } => {}
         }
     }
 
@@ -15452,7 +16059,8 @@ impl<'a> Checker<'a> {
             | ExprKind::Lazy(_)
             | ExprKind::List(_)
             | ExprKind::Index { .. }
-            | ExprKind::For(_) => {}
+            | ExprKind::For(_)
+            | ExprKind::DefTypeRef(_) => {}
             // An `await` of an untyped operand is one of a present value,
             // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
@@ -15497,7 +16105,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Continue(_)
             | ItemKind::Return(_)
             | ItemKind::Import(_)
-            | ItemKind::Type { .. } => {}
+            | ItemKind::Type { .. }
+            | ItemKind::DefTypeDef { .. } => {}
         }
     }
 
@@ -15622,6 +16231,12 @@ fn narrowed_rebind_error(text: &str, name_span: Span, binding: Binding) -> Diagn
 
 /// The note on a dotted path under a field, or a segment, defined whole.
 const WHOLE_FIELD_NOTE: &str = "a field defined as a whole cannot be extended with dotted paths";
+
+/// The note on a def-type reference whose def-type is undefined or no
+/// def-type: two names in a row that may have meant something else (see
+/// [Def-types](#def-types)).
+const JUXTAPOSED_NOTE: &str = "two names in a row are read as a def-type reference, as in \
+     `package dev.x()`; is an operator or a line break missing?";
 
 /// The note on a field that the expected record type lacks.
 const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can see it";
@@ -16540,7 +17155,8 @@ mod tests {
                 | ExprKind::Float(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
-                | ExprKind::Name(_) => {}
+                | ExprKind::Name(_)
+                | ExprKind::DefTypeRef(_) => {}
             }
         }
         for &id in ast.items(body) {
@@ -16553,7 +17169,8 @@ mod tests {
                 | ItemKind::Field { value, .. }
                 | ItemKind::Spread(value)
                 | ItemKind::Result(value)
-                | ItemKind::Expr(value) => {
+                | ItemKind::Expr(value)
+                | ItemKind::DefTypeDef { value, .. } => {
                     visit(ast, value, out);
                 }
                 ItemKind::Break(_)

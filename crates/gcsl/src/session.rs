@@ -180,6 +180,23 @@
 //! declares a `fn`. Types have no runtime existence: nothing of the frame
 //! is theirs.
 //!
+//! # Def-types
+//!
+//! An input may declare a def-type, define with one and invoke one (see the
+//! checker's "Def-types"), and later inputs see its definitions as they see
+//! its dotted `def`s: through the binding of the namespace's key, a root
+//! whose record holds their closures. The session keeps, as it keeps the
+//! inputs' imports, the def-types of the committed inputs, each by its path
+//! with its namespace's key, which the next input inherits
+//! (`crate::workspace::check_input`): a `DT` the input's own view does not
+//! have is looked up there. A name an input binds ends an earlier def-type
+//! under it, and a def-type it declares takes the earlier one's place. A
+//! later input's definitions made with a def-type are its own namespace,
+//! the key's binding, which stands for the namespace's whole for itself and
+//! every input after it, as a later input's dotted root stands for its
+//! root's: so an earlier input's definitions of the def-type are no longer
+//! seen. An input of definitions alone has the value `{}`.
+//!
 //! # Workspaces
 //!
 //! A [`crate::workspace::Workspace`] is driven like a session: its files
@@ -245,6 +262,10 @@ pub struct Session {
     /// each with its declaration's number in `type_store`, which the next
     /// input inherits.
     declared_types: Vec<(Name, u32)>,
+    /// The def-types of the committed inputs that no later one has
+    /// shadowed, each by its path, with its namespace's key, which the next
+    /// input inherits (see [Def-types](#def-types)).
+    def_types: Vec<(Vec<Name>, Name)>,
 }
 
 impl Default for Session {
@@ -276,6 +297,7 @@ impl Session {
                 imports: Vec::new(),
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
+                def_types: Vec::new(),
             },
             Err(diagnostics) => Self {
                 names: Names::new(),
@@ -290,6 +312,7 @@ impl Session {
                 imports: Vec::new(),
                 type_store: TypeStore::new(),
                 declared_types: Vec::new(),
+                def_types: Vec::new(),
             },
         }
     }
@@ -362,8 +385,9 @@ impl Session {
             imports: &self.imports,
             types: &self.declared_types,
             store: &mut self.type_store,
+            def_types: &self.def_types,
         };
-        let (ir, output, (mut imports, declared_types)) = workspace::check_input(
+        let (ir, output, (mut imports, declared_types, def_types)) = workspace::check_input(
             &standard,
             (source, earlier),
             (&mut self.names, &mut self.types),
@@ -384,6 +408,11 @@ impl Session {
                 imports.retain(|alias| !declared.contains(&alias.name));
                 self.imports = imports;
                 self.declared_types = declared_types;
+                // A name the input binds shadows an earlier def-type under
+                // it, but a def-type the input declares.
+                self.def_types
+                    .retain(|(path, _)| path.first().is_none_or(|name| !declared.contains(name)));
+                self.def_types.extend(def_types);
                 self.scope = output.scope;
                 self.value_type = output.ty;
                 self.sources.push(source.clone());
@@ -507,6 +536,47 @@ mod tests {
             .types()
             .display(session.value_type(), session.names())
             .to_string()
+    }
+
+    #[test]
+    fn def_types_and_their_definitions_persist() {
+        let mut session = Session::new();
+        // One input declares a def-type, defines with it and invokes it;
+        // its value has no namespace.
+        assert_eq!(
+            value(
+                &mut session,
+                "#[def_type]\n\
+                 def build(name: String, f: fn(t: String): String): String { f(name) }\n\
+                 def build x(t) { \"x of {t}\" }\n\
+                 a = build x()"
+            )
+            .to_string(),
+            "{build = fn(name: String, f: fn(t: String): String): String; a = \"x of x\"}"
+        );
+        // Later inputs see the def-type and its definitions, define more,
+        // and invoke both.
+        assert_eq!(value(&mut session, "build x()").to_string(), "x of x");
+        assert_eq!(
+            value(&mut session, "def build y(t) { \"y of {t}\" }\nbuild y()").to_string(),
+            "y of y"
+        );
+        // A later input's namespace stands for the def-type's whole, as a
+        // later input's dotted root does.
+        assert_eq!(
+            messages(&mut session, "build x()"),
+            ["`build` has no definition `x`"]
+        );
+        assert_eq!(
+            value(&mut session, "let f = build y\nf()").to_string(),
+            "y of y"
+        );
+        // A later input's binding of the def-type's name ends it.
+        assert_eq!(value(&mut session, "build = 1").to_string(), "{build = 1}");
+        assert_eq!(
+            messages(&mut session, "build y()"),
+            ["`build` is not a def-type"]
+        );
     }
 
     #[test]

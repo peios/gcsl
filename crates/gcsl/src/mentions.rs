@@ -2,8 +2,10 @@
 //! the groups of mutually recursive top-level functions.
 //!
 //! A *top-level function* of an input is a named function item (`fn
-//! NAME`) or a `def` (`def NAME`, or `def PATH` named by a dotted path) that
-//! is directly an item of the input's outermost block. Its name, or its
+//! NAME`), a `def` (`def NAME`, or `def PATH` named by a dotted path) or a
+//! definition made with a def-type (`def DT PATH`, see
+//! [Def-types](#def-types)) that is directly an item of the input's
+//! outermost block. Its name, or its
 //! path, is in scope in the whole input, so the checker must know, before
 //! it checks anything, which functions each top-level item and each
 //! function body may use: that is what decides the order the bodies are
@@ -59,6 +61,27 @@
 //! it mentions the other file's node, which makes this file need that one,
 //! as for any field. A `def` of one name is unchanged: its leaf is a root,
 //! never under another node.
+//!
+//! # Def-types
+//!
+//! A definition made with a def-type, `def DT PATH(PARAMS) BODY` (see the
+//! checker's "Def-types"), binds nothing a variable could read, so it
+//! declares no name here. Once the workspace has given it its def-type's
+//! namespace's key (see [`crate::names`], "Namespace keys"), it is exactly a
+//! `def` named by the path of the key and PATH ([`top_level_function`],
+//! [`declarations`]): a leaf of the tree under the key's root, order-free, a
+//! top-level function with no name, in its groups, swept for shadowing as
+//! any declaration is. One whose namespace is not known, its DT no def-type,
+//! is in no tree and no top-level function: the checker reports it. Its item
+//! mentions what its body does and what its DT reads, the def-type, a
+//! function or a field node (another file's, if the def-type is), so that
+//! the def-type is checked, or its file run, before it.
+//!
+//! A reference, `DT PATH`, mentions what its DT reads and, once its
+//! namespace is known, what its read of the definition, the key's root with
+//! a field access for each segment of PATH, means: the definition's leaf and
+//! function, as a reference to a dotted `def` does. No declaration can
+//! shadow the key, which no source can write.
 //!
 //! # Top-level fields
 //!
@@ -180,7 +203,7 @@ use std::collections::HashMap;
 use std::mem;
 
 use crate::ast::{
-    Ast, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
+    Ast, DefTypeId, ExprId, ExprKind, FnId, ForHead, ForId, ItemId, ItemKind, ItemRange, PathRange,
     PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind,
 };
 use crate::names::Name;
@@ -358,13 +381,12 @@ impl FieldTree {
             ..Self::default()
         };
         for (position, &id) in root.iter().enumerate() {
-            let ItemKind::Field { path, value, .. } = ast.item(id).kind else {
+            let Some((names, value)) = leaf_path(ast, id) else {
                 continue;
             };
             if tree.shadowed.get(position) == Some(&true) {
                 continue;
             }
-            let names: Option<Vec<Name>> = ast.path(path).iter().map(PathSegment::name).collect();
             let Some(names) = names else { continue };
             if tree.accepts(&names) {
                 let node = tree.insert(&names, position);
@@ -800,12 +822,32 @@ pub fn declarations(ast: &Ast) -> impl Iterator<Item = (usize, Vec<Name>, bool)>
         .iter()
         .enumerate()
         .filter_map(|(position, &id)| {
-            let ItemKind::Field { path, .. } = ast.item(id).kind else {
-                return None;
-            };
-            let names: Option<Vec<Name>> = ast.path(path).iter().map(PathSegment::name).collect();
+            let (names, _) = leaf_path(ast, id)?;
             Some((position, names?, ast.is_shadowable(id)))
         })
+}
+
+/// The path of the leaf the item `id` of an outermost block is, if it is a
+/// field item or a definition made with a def-type whose namespace is
+/// known, the definition's under its namespace's key (see
+/// [Def-types](#def-types)), with its value: the path's names, or `None`
+/// for a path with a segment that is not one.
+fn leaf_path(ast: &Ast, id: ItemId) -> Option<(Option<Vec<Name>>, ExprId)> {
+    match ast.item(id).kind {
+        ItemKind::Field { path, value, .. } => Some((
+            ast.path(path).iter().map(PathSegment::name).collect(),
+            value,
+        )),
+        ItemKind::DefTypeDef { def, value } => {
+            let def = ast.def_type(def);
+            let names = std::iter::once(def.key)
+                .chain(ast.path(def.path).iter().map(PathSegment::name))
+                .collect::<Option<Vec<Name>>>();
+            // A definition whose def-type is not known is in no tree.
+            Some((Some(names?), value))
+        }
+        _ => None,
+    }
 }
 
 /// Leaf declarations swept in one order, each declared after those before
@@ -1398,6 +1440,15 @@ fn first_of_each(mut found: Vec<(u32, Span)>) -> (Vec<u32>, Vec<Span>) {
 #[must_use]
 pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Option<Name>, ExprId, FnId)> {
     let (path, value, def) = match ast.item(id).kind {
+        // A definition made with a def-type whose namespace is known: a
+        // leaf under the namespace's key (see [Def-types](#def-types)).
+        ItemKind::DefTypeDef { def, value } => {
+            ast.def_type(def).key?;
+            let ExprKind::Fn(function) = ast.get(value).kind else {
+                return None;
+            };
+            return Some((None, value, function));
+        }
         ItemKind::Let {
             path,
             value,
@@ -1562,7 +1613,9 @@ impl Walker<'_> {
     /// declares its root rather than reading it, so its path's first
     /// segment is a mention of a function of that name only.
     fn top_item(&mut self, id: ItemId) {
-        if let ItemKind::Field { path, value, .. } = self.ast.item(id).kind
+        if let ItemKind::DefTypeDef { def, value } = self.ast.item(id).kind {
+            self.def_type_def(def, value);
+        } else if let ItemKind::Field { path, value, .. } = self.ast.item(id).kind
             && let [first, _, ..] = self.ast.path(path)
         {
             if let Some(name) = first.name() {
@@ -1643,7 +1696,17 @@ impl Walker<'_> {
             // is a type's, read only in type positions (see
             // [Types](#types)).
             ItemKind::Import(_) | ItemKind::Type { .. } => {}
+            ItemKind::DefTypeDef { def, value } => self.def_type_def(def, value),
         }
+    }
+
+    /// Walks a definition made with a def-type, `def DT PATH(PARAMS) BODY`,
+    /// of def-type `def` and function `value`, which declares nothing a
+    /// variable can name: its body, and its `DT`, a read of the def-type,
+    /// whose type its function's is made from (see [Def-types](#def-types)).
+    fn def_type_def(&mut self, def: DefTypeId, value: ExprId) {
+        self.expr(self.ast.def_type(def).dt);
+        self.expr(value);
     }
 
     /// Walks a `let` or a field (`field`) of the path `path` initialised
@@ -1742,6 +1805,16 @@ impl Walker<'_> {
                 self.expr(index);
             }
             ExprKind::For(id) => self.for_loop(id),
+            // A read of the def-type, and, once its namespace is known, of
+            // the definition's cell, by a path under the namespace's key,
+            // which nothing can shadow (see [Def-types](#def-types)).
+            ExprKind::DefTypeRef(def) => {
+                let def = *ast.def_type(def);
+                self.expr(def.dt);
+                if let (Some(_), Some(read)) = (def.key, def.read) {
+                    self.expr(read);
+                }
+            }
         }
     }
 

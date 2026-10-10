@@ -1,0 +1,8 @@
+def package dev.peios.testpkg() {
+    version = "0.1.0"
+    arch = "x86_64"
+    content = "usr"
+}
+
+
+result = package dev.peios.testpkg()

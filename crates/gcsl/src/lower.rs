@@ -281,6 +281,24 @@
 //! into the function table, as code of [`FnKind::Future`], and the
 //! expression to a `MakeFuture` that captures as a `MakeClosure` does.
 //!
+//! A definition made with a def-type (see the checker's "Def-types") is a
+//! top-level function named by the path of its namespace's key and its
+//! own, lowered as a dotted `def` is: its closure stored into its leaf's
+//! cell where it is made, its code shown in the dump by its def-type and
+//! path, `fn #0 package dev.peios.testpkg`, and of [`FnKind::Memo`] if the
+//! function type its def-type gives it is memoised, which its function
+//! expression, declaring none, does not say. It is in no record. A
+//! reference to one, `DT PATH`, lowers to a `MakeClosure` of a function
+//! lowering makes for it, past the tree's in the function table
+//! ([`crate::ast::FnId::lowered`]), that captures the def-type and the
+//! definition, each read where the reference is, and whose body, of the
+//! def-type's invocation parameters, is a `Block` of a `Helper`, so that
+//! the def-type runs for the caller the closure is called by, and then the
+//! `Call` of the def-type, captured, with the definition's path as written,
+//! a `StrConst`, the definition, captured, and its own parameters, in order
+//! (`Lowerer::lower_def_type_ref`). So a closure is made each time a
+//! reference is evaluated, and a call of a reference is a call of it.
+//!
 //! An expression the checker marked to be awaited (see
 //! [`crate::check::Resolution::await_of`]) is lowered as it would be
 //! otherwise, of the kind of its type before the await, which is
@@ -338,9 +356,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArgRange, Ast, BinaryOp, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead, ForId, ItemId,
-    ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
-    UnaryOp, path_span, symbol_span,
+    ArgRange, Ast, BinaryOp, DefTypeId, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead,
+    ForId, ItemId, ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment,
+    SegmentKind, StrPart, UnaryOp, path_span, symbol_span,
 };
 use crate::check::{
     AwaitMark, Builtin, Checked, FieldSchedule, Fileroot, JumpTarget, MadeAt, PathResolution,
@@ -470,16 +488,25 @@ fn dotted_paths(ast: &Ast, resolution: &Resolution) -> Vec<(FnId, Box<[Name]>)> 
         .top_functions()
         .iter()
         .filter_map(|&(item, _)| {
-            let ItemKind::Field { path, value, .. } = ast.item(item).kind else {
+            // A definition made with a def-type is named by its path under
+            // its namespace's key.
+            let (key, path, value) = match ast.item(item).kind {
+                ItemKind::Field { path, value, .. } => (None, path, value),
+                ItemKind::DefTypeDef { def, value } => {
+                    let def = ast.def_type(def);
+                    (Some(def.key?), def.path, value)
+                }
+                _ => return None,
+            };
+            let ExprKind::Fn(function) = ast.get(value).kind else {
                 return None;
             };
-            let (ExprKind::Fn(function), [_, _, ..]) = (ast.get(value).kind, ast.path(path)) else {
+            if key.is_none() && ast.path(path).len() < 2 {
                 return None;
-            };
-            let names = ast
-                .path(path)
-                .iter()
-                .filter_map(PathSegment::name)
+            }
+            let names = key
+                .into_iter()
+                .chain(ast.path(path).iter().filter_map(PathSegment::name))
                 .collect();
             Some((function, names))
         })
@@ -614,7 +641,8 @@ impl Lowerer<'_> {
                 | ItemKind::Field { .. }
                 | ItemKind::Spread(_)
                 | ItemKind::Import(_)
-                | ItemKind::Type { .. },
+                | ItemKind::Type { .. }
+                | ItemKind::DefTypeDef { .. },
             )
             | None => Ok(ValueKind::Record),
         }
@@ -681,7 +709,13 @@ impl Lowerer<'_> {
                 continue;
             }
             match item.kind {
-                ItemKind::Let { .. } | ItemKind::Rebind { .. } | ItemKind::Field { .. } => {
+                // A definition made with a def-type is a top-level function,
+                // whose closure is stored into its leaf's cell here if it
+                // is made here.
+                ItemKind::Let { .. }
+                | ItemKind::Rebind { .. }
+                | ItemKind::Field { .. }
+                | ItemKind::DefTypeDef { .. } => {
                     let store = self.lower_store(id)?;
                     self.item_stack.push(store);
                 }
@@ -768,7 +802,9 @@ impl Lowerer<'_> {
         let ast = self.ast;
         let root = ast.items(ast.root());
         for (position, &id) in root.iter().enumerate() {
-            let ItemKind::Field { value, .. } = ast.item(id).kind else {
+            let (ItemKind::Field { value, .. } | ItemKind::DefTypeDef { value, .. }) =
+                ast.item(id).kind
+            else {
                 continue;
             };
             if !self.is_shadowed(position) {
@@ -776,10 +812,7 @@ impl Lowerer<'_> {
             }
             for expr in ast.subtree(value) {
                 let (function, kind) = match ast.get(expr).kind {
-                    ExprKind::Fn(function) => match ast.fn_decl(function).effect {
-                        Effect::Memo => (function, FnKind::Memo),
-                        Effect::Pure | Effect::Impure => (function, FnKind::Function),
-                    },
+                    ExprKind::Fn(function) => (function, self.fn_kind(expr, function)),
                     ExprKind::Lazy(function) => (function, FnKind::Future),
                     _ => continue,
                 };
@@ -1064,14 +1097,19 @@ impl Lowerer<'_> {
     /// slot the checker gave it.
     fn lower_store(&mut self, id: ItemId) -> Result<IrId, InternalError> {
         let item = self.ast.item(id);
-        let (ItemKind::Let { path, value, .. }
-        | ItemKind::Rebind { path, value }
-        | ItemKind::Field { path, value, .. }) = item.kind
-        else {
-            return Err(InternalError {
-                message: "an item that declares nothing lowered as a declaration",
-                span: item.span,
-            });
+        // A definition made with a def-type has no path of its own to
+        // update: its closure is stored in its leaf's cell.
+        let (path, value) = match item.kind {
+            ItemKind::Let { path, value, .. }
+            | ItemKind::Rebind { path, value }
+            | ItemKind::Field { path, value, .. } => (Some(path), value),
+            ItemKind::DefTypeDef { value, .. } => (None, value),
+            _ => {
+                return Err(InternalError {
+                    message: "an item that declares nothing lowered as a declaration",
+                    span: item.span,
+                });
+            }
         };
         let slot = self.resolution.item_slot(id);
         if slot == Slot::NONE {
@@ -1080,7 +1118,10 @@ impl Lowerer<'_> {
                 span: item.span,
             });
         }
-        let value = self.lower_declaration(id, path, value)?;
+        let value = match path {
+            Some(path) => self.lower_declaration(id, path, value)?,
+            None => self.lower_expr(value)?,
+        };
         Ok(self.builder.alloc(IrKind::Store(slot, value), item.span))
     }
 
@@ -1767,6 +1808,7 @@ impl Lowerer<'_> {
             (ExprKind::List(_) | ExprKind::For(_), _) => {
                 self.lower_listing(expr.kind, kind, span)?
             }
+            (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
             (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
                     message: "float literal typed as Int",
@@ -2118,10 +2160,7 @@ impl Lowerer<'_> {
     /// expression to the `MakeClosure` that captures, in the current frame,
     /// what the checker found the function captures.
     fn lower_fn(&mut self, id: ExprId, function: FnId) -> Result<IrKind, InternalError> {
-        let kind = match self.ast.fn_decl(function).effect {
-            Effect::Memo => FnKind::Memo,
-            Effect::Pure | Effect::Impure => FnKind::Function,
-        };
+        let kind = self.fn_kind(id, function);
         // A function's caller is its callers' file, whatever the frame that
         // makes it: what its body reads of the caller is no `lazy`'s.
         self.reads_caller.push(false);
@@ -2131,6 +2170,138 @@ impl Lowerer<'_> {
             function,
             captures: captures?,
         })
+    }
+
+    /// Lowers the def-type reference `id`, `DT PATH`, of `def` (see the
+    /// checker's "Def-types"), to the `MakeClosure` of a function of its
+    /// own, made here, past the tree's ([`FnId::lowered`]), which captures
+    /// the def-type and the definition, read where the reference is, and
+    /// whose body, run with its parameters, those of the def-type after its
+    /// second, sets its helper flag, so that the def-type is called with the
+    /// caller the closure is called with, and calls the def-type with the
+    /// definition's path, as written, the definition and its own
+    /// parameters, in order: so a closure is made each time the reference
+    /// is evaluated. It is of kind `kind`, which can only be a function's.
+    fn lower_def_type_ref(
+        &mut self,
+        id: ExprId,
+        def: DefTypeId,
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let span = self.ast.get(id).span;
+        let def = *self.ast.def_type(def);
+        let mistyped = InternalError {
+            message: "a def-type reference without a definition or a function type",
+            span,
+        };
+        if kind != ValueKind::Fn {
+            return Err(mistyped);
+        }
+        let read = def.read.ok_or(mistyped)?;
+        let sig = self
+            .table
+            .fn_sig(self.expr_types.get(id))
+            .cloned()
+            .ok_or(mistyped)?;
+        let def_type = self.lower_expr(def.dt)?;
+        let definition = self.lower_expr(read)?;
+        let base = self.item_stack.len();
+        self.item_stack.push(def_type);
+        self.item_stack.push(definition);
+        let captures = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        // The body: the helper flag set, then the call of the def-type.
+        let path = self.ast.show_path(self.ast.path(def.path)).to_string();
+        let path = self.builder.push_string(&path);
+        let callee = self
+            .builder
+            .alloc(IrKind::LoadCapture(0, ValueKind::Fn), span);
+        let name = self.builder.alloc(IrKind::StrConst(path), span);
+        let definition = self
+            .builder
+            .alloc(IrKind::LoadCapture(1, ValueKind::Fn), span);
+        let base = self.item_stack.len();
+        for (param, value) in [(0, name), (1, definition)] {
+            let arg = self.builder.alloc(IrKind::Arg { param, value }, span);
+            self.item_stack.push(arg);
+        }
+        for (at, &(_, ty)) in (0u32..).zip(sig.params.iter()) {
+            let kind = self.table.value_kind(ty).ok_or(mistyped)?;
+            let value = self.builder.alloc(IrKind::Load(Slot::at(at), kind), span);
+            let arg = self.builder.alloc(
+                IrKind::Arg {
+                    param: at.saturating_add(2),
+                    value,
+                },
+                span,
+            );
+            self.item_stack.push(arg);
+        }
+        let args = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        let kind = self.table.value_kind(sig.ret).ok_or(mistyped)?;
+        let call = self.builder.alloc(
+            IrKind::Call {
+                callee,
+                args,
+                kind,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
+            },
+            span,
+        );
+        let helper = self.builder.alloc(IrKind::Helper, span);
+        let items = self.builder.push_item_list(&[helper]);
+        let body = self.builder.alloc(
+            IrKind::Block {
+                items,
+                result: call,
+            },
+            span,
+        );
+        let params = u32::try_from(sig.params.len()).unwrap_or(u32::MAX);
+        let function = FnId::lowered(u32::try_from(self.functions.len()).unwrap_or(u32::MAX));
+        self.functions.push(Some(FnCode {
+            body,
+            kind: FnKind::Function,
+            frame_size: params,
+            param_count: params,
+            capture_count: 2,
+            // Set by `IrBuilder::measure` once every node is built.
+            height: 0,
+            name: None,
+            display: self
+                .table
+                .display(self.expr_types.get(id), self.ast.names())
+                .to_string()
+                .into_boxed_str(),
+            slot_names: sig
+                .params
+                .iter()
+                .map(|&(name, _)| name)
+                .collect::<Option<Box<[Name]>>>()
+                .unwrap_or_default(),
+        }));
+        Ok(IrKind::MakeClosure { function, captures })
+    }
+
+    /// The kind of the code of the function expression `id`, of function
+    /// `function`: [`FnKind::Memo`] if it is declared with `->>`, and
+    /// [`FnKind::Function`] otherwise. A definition made with a def-type
+    /// declares nothing: its function type, its def-type's to give, says
+    /// (see the checker's "Def-types").
+    fn fn_kind(&self, id: ExprId, function: FnId) -> FnKind {
+        let effect = match self.ast.get(id).kind {
+            ExprKind::Fn(_) if self.ast.fn_decl(function).ret.is_none() => self
+                .table
+                .fn_sig(self.expr_types.get(id))
+                .map_or(Effect::Impure, |sig| sig.effect),
+            _ => self.ast.fn_decl(function).effect,
+        };
+        match effect {
+            Effect::Memo => FnKind::Memo,
+            Effect::Pure | Effect::Impure => FnKind::Function,
+        }
     }
 
     /// Lowers the `lazy` `id`, whose body is function `function`: the body

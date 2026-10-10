@@ -347,6 +347,43 @@
 //! a definition is reported once, where it is written, and every file using
 //! it fails quietly (see the checker's "Type declarations").
 //!
+//! # Def-types
+//!
+//! A def-type, a `def` marked `#[def_type]`, has a *namespace*: the
+//! definitions made with it, `def package dev.peios.testpkg() { ... }` (see
+//! the checker's "Def-types"). The namespace is keyed by the def-type's
+//! identity, the `def` its `DT` names, whatever import or alias names it: a
+//! name no source can write, its *key*, `<package#F.I>`, of the def-type's
+//! path as it is declared, its file's number (a session's input's number
+//! for one an input declares) and its item's (see [`crate::names`],
+//! "Namespace keys"). A definition is a leaf of the tree of top-level
+//! fields at the path of the key and its own path, so in their namespace
+//! definitions merge, conflict and are shadowable exactly as dotted `def`s
+//! do among fields, in the files of a directory, the directories below and
+//! every view, through every `*` import of a file or a directory, and never
+//! meet a field: the key is a root of its own. Conflicts are reported as
+//! any leaf's, the path shown as the definition writes it ("field `package
+//! x` is defined in two files"). A whole import's record, a directory's or a
+//! file's, holds no namespace (the checker's `imported_record` passes the
+//! keys by), so definitions are reached by their def-type alone.
+//!
+//! What a `DT` names is known only once the views are, which are made of
+//! the trees the definitions are leaves of. So the scan makes the trees,
+//! resolves the imports and makes the views (`scan_trees`), and then finds
+//! the key of each definition and reference whose `DT` is not known yet
+//! (`name_namespaces`): the leaf the file's view has at its path, if it is a
+//! `def` marked `#[def_type]` (`def_type_key`, through [`FileScope`]'s
+//! leaf's owner), and for a session's input whose view has nothing of its
+//! first name, the def-type of that path an earlier input declared
+//! ([`Earlier`]). Each is given its key ([`Ast::set_def_type_key`]), which
+//! its file is then taken to spell. If a definition got one, the trees,
+//! views and types are forgotten (`unscan`) and made again, once, with the
+//! definitions under their keys; a scan with no definition makes them once.
+//! A reference's key changes no tree, and its read of the definition is
+//! resolved with the other references ([`resolve`]): it needs the
+//! definition's file, and its `DT` the def-type's, and a definition's `DT`
+//! makes its file need the def-type's.
+//!
 //! # The standard library
 //!
 //! Two kinds of module are not files of the workspace. `builtins` and
@@ -508,8 +545,8 @@ use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::{
-    Ast, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment, TypeExprId, TypeLink,
-    TypeStore,
+    self, Ast, DefTypeId, ImportDecl, ImportForm, ImportMember, ItemId, ItemKind, PathSegment,
+    TypeExprId, TypeLink, TypeStore, TypeStoreMark,
 };
 #[cfg(test)]
 use crate::check::ViewRecord;
@@ -522,7 +559,7 @@ use crate::eval::MemoTables;
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
 use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule, Sweep, TypeRead};
-use crate::names::{Name, Names};
+use crate::names::{self, Name, Names};
 use crate::parser;
 use crate::session;
 use crate::source::{SourceFile, Span};
@@ -1006,6 +1043,14 @@ pub struct Scan {
     /// with its declaration's number in `type_store`: the last source of its
     /// view, shadowed by anything (see [`crate::session`]).
     inherited_types: Vec<(Name, u32)>,
+    /// The def-types a session's input inherits from the earlier inputs,
+    /// each by its path, with its namespace's key: what a `DT` names that
+    /// nothing of the input does (see [Def-types](#def-types)).
+    inherited_def_types: Vec<(Vec<Name>, Name)>,
+    /// For a session's input, its number among the session's inputs, which
+    /// the keys of the def-types it declares are made with, in place of its
+    /// index among the scan's files, which every input shares.
+    input_number: Option<u32>,
 }
 
 impl Scan {
@@ -1497,44 +1542,56 @@ impl Scan {
         };
         match (top.name, file.ast.item(top.item).kind) {
             (Some(name), _) => self.names.get(name).to_owned(),
-            (None, ItemKind::Field { path, .. }) => file
-                .ast
-                .path(path)
-                .iter()
-                .filter_map(PathSegment::name)
-                .map(|name| self.names.get(name))
-                .collect::<Vec<_>>()
-                .join("."),
+            (None, ItemKind::Field { path, .. }) => {
+                let path: Vec<Name> = file
+                    .ast
+                    .path(path)
+                    .iter()
+                    .filter_map(PathSegment::name)
+                    .collect();
+                names::show_path(&self.names, &path)
+            }
+            // A definition made with a def-type, as it is written.
+            (None, ItemKind::DefTypeDef { def, .. }) => {
+                let def = file.ast.def_type(def);
+                let path: Vec<Name> = def
+                    .key
+                    .into_iter()
+                    .chain(file.ast.path(def.path).iter().filter_map(PathSegment::name))
+                    .collect();
+                names::show_path(&self.names, &path)
+            }
             (None, _) => String::new(),
         }
     }
 
     /// The dotted path in its file's view of the view node `view`.
     fn show_view(&self, view: u32) -> String {
-        let mut names = Vec::new();
+        let mut path = Vec::new();
         let mut at = Some(view);
         while let Some(index) = at
             && let Some(entry) = self.views.get(index as usize)
         {
-            names.push(self.names.get(entry.name));
+            path.push(entry.name);
             at = entry.parent;
         }
-        names.reverse();
-        names.join(".")
+        path.reverse();
+        names::show_path(&self.names, &path)
     }
 
-    /// The dotted path of the merged node `node`.
+    /// The dotted path of the merged node `node`, a definition's as it is
+    /// written (see [`crate::names`], "Namespace keys").
     fn show(&self, node: u32) -> String {
-        let mut names = Vec::new();
+        let mut path = Vec::new();
         let mut at = Some(node);
         while let Some(index) = at
             && let Some(entry) = self.nodes.get(index as usize)
         {
-            names.push(self.names.get(entry.name));
+            path.push(entry.name);
             at = entry.parent;
         }
-        names.reverse();
-        names.join(".")
+        path.reverse();
+        names::show_path(&self.names, &path)
     }
 }
 
@@ -1763,6 +1820,58 @@ impl<'a> FileScope<'a> {
     pub fn foreign_function(&self, function: u32) -> Option<u32> {
         function.checked_sub(count(self.own.len()))
     }
+
+    /// Whether the scope's number `node` is a leaf of the view: the file's
+    /// own leaf, one of a directory of its chain, or one an import reaches.
+    #[must_use]
+    pub fn is_leaf(&self, node: u32) -> bool {
+        if self.own_view(node).is_some() {
+            return false;
+        }
+        let merged = self.merged(node).or(match self.target(node) {
+            Some(Target::Node(merged)) => Some(merged),
+            _ => None,
+        });
+        merged
+            .and_then(|merged| self.scan.nodes.get(merged as usize))
+            .is_some_and(|entry| entry.leaf.is_some())
+    }
+
+    /// The children of the scope's number `node` in the view, each with its
+    /// name and its scope's number, in the view's order: none for a leaf.
+    #[must_use]
+    pub fn children(&self, node: u32) -> Vec<(Name, u32)> {
+        if self.own_view(node).is_some() || matches!(self.target(node), Some(Target::View(_))) {
+            return self.view_children(node);
+        }
+        let names = match (self.merged(node), self.target(node)) {
+            (Some(merged), _) => self.scan.child_names(Target::Node(merged)),
+            (None, Some(target)) => self.scan.child_names(target),
+            (None, None) => Vec::new(),
+        };
+        names
+            .into_iter()
+            .filter_map(|name| Some((name, self.child(node, name)?)))
+            .collect()
+    }
+
+    /// The file whose leaf the scope's number `node` is, with the file's own
+    /// node of it, if it is a leaf of the view.
+    fn leaf_owner(&self, node: u32) -> Option<(u32, u32)> {
+        let merged = self.merged(node).or(match self.target(node) {
+            Some(Target::Node(merged)) => Some(merged),
+            _ => None,
+        })?;
+        let owner = self.scan.nodes.get(merged as usize)?.leaf?;
+        let own = self
+            .scan
+            .files
+            .get(owner as usize)?
+            .global
+            .iter()
+            .position(|&g| g == merged)?;
+        Some((owner, count(own)))
+    }
 }
 
 impl Resolve for FileScope<'_> {
@@ -1908,6 +2017,7 @@ fn scan_into(
         library,
         (names, loaded),
         (&mut TypeStore::new(), &[]),
+        (&[], None),
     )
 }
 
@@ -1915,12 +2025,16 @@ fn scan_into(
 /// the scan holds once it succeeds ([`Scan::type_store`]) and which is given
 /// back to `store` if it fails, and with `inherited`, the types a session's
 /// input inherits from the earlier inputs, each with its declaration's
-/// number in `store` (see [Types](#types)).
+/// number in `store` (see [Types](#types)); and for a session's input, with
+/// `def_types`, the def-types it inherits from the earlier inputs, by path
+/// with their namespaces' keys, and its number among the session's inputs
+/// (see [Def-types](#def-types)).
 fn scan_into_with(
     (sources, placing): (&[SourceFile], Placing),
     library: Library,
     (names, loaded): (&mut Names, &mut Vec<usize>),
     (store, inherited): (&mut TypeStore, &[(Name, u32)]),
+    def_types: (&[(Vec<Name>, Name)], Option<u32>),
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
         files: Vec::with_capacity(sources.len() + library.table.len()),
@@ -1949,6 +2063,8 @@ fn scan_into_with(
         type_store: mem::take(store),
         type_base: 0,
         inherited_types: inherited.to_vec(),
+        inherited_def_types: def_types.0.to_vec(),
+        input_number: def_types.1,
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
@@ -2010,6 +2126,60 @@ fn scan_files(
     if !errors.is_empty() {
         return Err(errors);
     }
+    // A definition made with a def-type is a leaf of its def-type's
+    // namespace, which is known only once the files' views are: the trees
+    // are made again with the definitions under their namespaces' keys, if
+    // any definition has one (see [Def-types](#def-types)).
+    let mark = scan.type_store.mark();
+    for pass in 0..2 {
+        scan_trees(scan, placing, &dirs)?;
+        if !name_namespaces(scan) || pass > 0 {
+            break;
+        }
+        unscan(scan, mark);
+    }
+    type_views(scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    define_types(scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    value_cells(scan);
+    resolve(scan);
+    let mentioned = find_needs(scan, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    report_cycles(scan, &mentioned, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    scan.order = order(&scan.needs);
+    scan.rank = scan.ranks();
+    schedule(scan);
+    Ok(())
+}
+
+/// Merges the trees of `scan`'s files, placed as `placing` says, into their
+/// directories' trees, resolves their imports, the directories being
+/// `dirs`, by path, and makes their views: the part of [`scan_files`] that
+/// a def-type's namespace needs done before it is known, and done again
+/// once the definitions are under their namespaces' keys (see
+/// [Def-types](#def-types)).
+///
+/// # Errors
+///
+/// The conflicts of the directories' trees, the types declared twice, the
+/// imports' errors and the conflicts of the views, each stage's stopping
+/// the scan.
+fn scan_trees(
+    scan: &mut Scan,
+    placing: Placing,
+    dirs: &HashMap<String, u32>,
+) -> Result<(), Vec<Diagnostic>> {
+    let mut errors = Vec::new();
     shadow(scan);
     scan.roots = vec![Vec::new(); scan.dirs.len()];
     builtin_nodes(scan);
@@ -2035,7 +2205,7 @@ fn scan_files(
         Placing::Workspace(nested) => (nested, &[][..]),
         Placing::Lone(inherited, _) => (&[][..], inherited),
     };
-    imports(scan, &dirs, (nested, inherited), &mut errors);
+    imports(scan, dirs, (nested, inherited), &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -2043,28 +2213,118 @@ fn scan_files(
     if !errors.is_empty() {
         return Err(errors);
     }
-    type_views(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    define_types(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    value_cells(scan);
-    resolve(scan);
-    let mentioned = find_needs(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    report_cycles(scan, &mentioned, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    scan.order = order(&scan.needs);
-    scan.rank = scan.ranks();
-    schedule(scan);
     Ok(())
+}
+
+/// Forgets what [`scan_trees`] made of `scan`'s files, and their files'
+/// declarations, so that it can make them again from the files' trees,
+/// which have changed: every file's declarations found again, the merged
+/// nodes, functions, views and types gone, the type store put back at
+/// `mark`, where it was before the types were declared.
+fn unscan(scan: &mut Scan, mark: TypeStoreMark) {
+    let files = mem::take(&mut scan.files);
+    scan.files = files
+        .into_iter()
+        .map(|file| File::new(&file.path, file.dir, file.ast, file.spelled))
+        .collect();
+    scan.nodes.clear();
+    scan.by_name.clear();
+    scan.functions.clear();
+    scan.views.clear();
+    scan.defs.clear();
+    scan.part_base.clear();
+    scan.types.clear();
+    scan.dir_types.clear();
+    scan.type_store.truncate(mark);
+    scan.type_base = 0;
+}
+
+/// Names the namespace of each def-type definition and reference of every
+/// file of `scan` whose namespace is not known yet: what its `DT` names in
+/// the file's view, if that is a `def` marked `#[def_type]`, or, for a
+/// session's input, a def-type of the earlier inputs by its path, gives it
+/// the def-type's key ([`Ast::set_def_type_key`]), which the file is then
+/// taken to spell (see [Def-types](#def-types)). Returns whether a
+/// definition was given one, which changes the trees.
+fn name_namespaces(scan: &mut Scan) -> bool {
+    let mut found: Vec<(u32, DefTypeId, String, bool)> = Vec::new();
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let mut unknown = file
+            .ast
+            .def_types()
+            .filter(|(_, def)| def.key.is_none())
+            .peekable();
+        if unknown.peek().is_none() {
+            continue;
+        }
+        let scope = FileScope::new(scan, file);
+        for (id, def) in unknown {
+            let names = file.ast.def_type_names(id);
+            if let Some(key) = def_type_key(scan, index, &scope, &names) {
+                found.push((index, id, key, def.read.is_none()));
+            }
+        }
+    }
+    let mut definitions = false;
+    for (index, id, text, definition) in found {
+        let key = scan.names.intern(&text);
+        if let Some(file) = scan.files.get_mut(index as usize) {
+            file.ast.set_def_type_key(id, key);
+            if let Err(at) = file.spelled.binary_search(&key) {
+                file.spelled.insert(at, key);
+            }
+        }
+        definitions |= definition;
+    }
+    definitions
+}
+
+/// The text of the key of the namespace of the def-type `names`, a path,
+/// names in file `index`'s view, `scope`: the leaf of its path there, if it
+/// is a `def` marked `#[def_type]`, keyed by its path, its file's number,
+/// or for a session's input the input's, and its item (see
+/// [`crate::names`], "Namespace keys"); or, for a session's input whose
+/// view has nothing of its first name, the def-type of that path of the
+/// earlier inputs.
+fn def_type_key(scan: &Scan, index: u32, scope: &FileScope, names: &[Name]) -> Option<String> {
+    let (&first, rest) = names.split_first()?;
+    let Some(mut node) = scope.root(first) else {
+        return scan
+            .inherited_def_types
+            .iter()
+            .find(|(path, _)| path.as_slice() == names)
+            .map(|&(_, key)| scan.names.get(key).to_owned());
+    };
+    for &name in rest {
+        node = scope.child(node, name)?;
+    }
+    let (owner, own) = scope.leaf_owner(node)?;
+    let file = scan.files.get(owner as usize)?;
+    let leaf = file.mentions.tree.nodes.get(own as usize)?.leaf?;
+    let ItemKind::Field {
+        path,
+        function: true,
+        ..
+    } = file.ast.item(leaf.item).kind
+    else {
+        return None;
+    };
+    if !file.ast.is_def_type(leaf.item) {
+        return None;
+    }
+    let shown: Vec<&str> = file
+        .ast
+        .path(path)
+        .iter()
+        .filter_map(PathSegment::name)
+        .map(|name| scan.names.get(name))
+        .collect();
+    let number = match scan.input_number {
+        Some(input) if owner == index => input,
+        _ => owner,
+    };
+    let item = u32::try_from(leaf.item.index()).unwrap_or(u32::MAX);
+    Some(names::namespace_key(&shown.join("."), number, item))
 }
 
 /// A file parsed: its tree and the names it spells (see [`parse`]).
@@ -2419,6 +2679,12 @@ fn leaf_spans(file: &File, own: u32) -> Option<(Span, Span)> {
             let first = segments.first().map(|s: &PathSegment| s.span)?;
             let last = segments.last().map_or(first, |s| s.span);
             Span::new(first.start, last.end)
+        }
+        // A definition made with a def-type: its def-type and its path.
+        ItemKind::DefTypeDef { def, .. } => {
+            let def = file.ast.def_type(def);
+            let segments = file.ast.path(def.path);
+            Span::join(file.ast.get(def.dt).span, ast::path_span(segments))
         }
         _ => item.span,
     };
@@ -5729,7 +5995,7 @@ pub(crate) fn check_input(
 ) -> Result<(Ir, CheckOutput, Inherited), Vec<Diagnostic>> {
     let (lowered, inherited) = check_input_then(
         standard,
-        (source, earlier),
+        (source, earlier, input),
         (names, types),
         scope,
         |ast, checked, types| {
@@ -5751,11 +6017,15 @@ pub(crate) struct Earlier<'a> {
     pub(crate) types: &'a [(Name, u32)],
     /// The definitions of their types, which the input's are added to.
     pub(crate) store: &'a mut TypeStore,
+    /// Their def-types that no later input shadowed, each by its path, with
+    /// its namespace's key (see [Def-types](#def-types)).
+    pub(crate) def_types: &'a [(Vec<Name>, Name)],
 }
 
 /// What a later input inherits of a session's input once it has run: its
-/// imports and its view of types (see [`check_input`]).
-pub(crate) type Inherited = (Vec<Alias>, Vec<(Name, u32)>);
+/// imports, its view of types and the def-types it declares, each by its
+/// path with its namespace's key (see [`check_input`]).
+pub(crate) type Inherited = (Vec<Alias>, Vec<(Name, u32)>, Vec<(Vec<Name>, Name)>);
 
 /// [`check_input`] up to its check, whose outcome `then` is given with the
 /// input's tree, its names in it, and the types: what lowering is done by,
@@ -5769,7 +6039,7 @@ pub(crate) type Inherited = (Vec<Alias>, Vec<(Name, u32)>);
 /// The diagnostics of the scan.
 fn check_input_then<R>(
     standard: &Standard,
-    (source, earlier): (&SourceFile, Earlier),
+    (source, earlier, input): (&SourceFile, Earlier, u32),
     (names, types): (&mut Names, &mut TypeTable),
     scope: Scope,
     then: impl FnOnce(&Ast, Result<CheckOutput, Vec<Diagnostic>>, &mut TypeTable) -> R,
@@ -5787,6 +6057,7 @@ fn check_input_then<R>(
         Library::EVERY,
         (names, &mut loaded),
         (store, earlier.types),
+        (earlier.def_types, Some(input)),
     )
     .map_err(|errors| being_run(errors, count(loaded.len())))?;
     // In the session's root, as its start located the standard files.
@@ -5847,6 +6118,7 @@ fn check_input_then<R>(
     });
     let mut imports = Vec::new();
     let mut view = Vec::new();
+    let mut def_types = Vec::new();
     if let Some(file) = scan.files.get_mut(index as usize) {
         *names = file.ast.replace_names(Names::new());
         imports.extend(file.aliases.iter().filter(|a| !a.implicit).map(|a| Alias {
@@ -5857,9 +6129,47 @@ fn check_input_then<R>(
         }));
         view.extend(file.type_view.iter().map(|(&name, &decl)| (name, decl)));
         view.sort_unstable();
+        def_types = declared_def_types(file, names, input);
     }
     *store = mem::take(&mut scan.type_store);
-    finished.map(|r| (r, (imports, view))).ok_or_else(Vec::new)
+    finished
+        .map(|r| (r, (imports, view, def_types)))
+        .ok_or_else(Vec::new)
+}
+
+/// The def-types `file`, session input number `input` whose names are
+/// `names`, declares: each `def` marked `#[def_type]` that stands, by its
+/// path, with its namespace's key, as [`name_namespaces`] makes it (see
+/// [Def-types](#def-types)).
+fn declared_def_types(file: &File, names: &mut Names, input: u32) -> Vec<(Vec<Name>, Name)> {
+    let mut found = Vec::new();
+    for node in &file.mentions.tree.nodes {
+        let Some(leaf) = node.leaf else {
+            continue;
+        };
+        let ItemKind::Field {
+            path,
+            function: true,
+            ..
+        } = file.ast.item(leaf.item).kind
+        else {
+            continue;
+        };
+        if !file.ast.is_def_type(leaf.item) {
+            continue;
+        }
+        let path: Vec<Name> = file
+            .ast
+            .path(path)
+            .iter()
+            .filter_map(PathSegment::name)
+            .collect();
+        let shown: Vec<&str> = path.iter().map(|&name| names.get(name)).collect();
+        let item = u32::try_from(leaf.item.index()).unwrap_or(u32::MAX);
+        let text = names::namespace_key(&shown.join("."), input, item);
+        found.push((path, names.intern(&text)));
+    }
+    found
 }
 
 /// For the tests of the other modules, which check a text alone: `text`
@@ -5879,10 +6189,13 @@ pub(crate) fn check_beside_prelude(
         imports: &[],
         types: &[],
         store: &mut TypeStore::new(),
+        def_types: &[],
     };
+    // A session's first input, after the standard files.
+    let input = count(crate::STANDARD.len());
     let checked = check_input_then(
         &started.standard,
-        (&source, earlier),
+        (&source, earlier, input),
         (&mut names, &mut types),
         scope,
         |ast, checked, _| (ast.clone(), checked),
@@ -9629,6 +9942,7 @@ p26 = com.x"#;
             imports: &[],
             types: &[],
             store: &mut TypeStore::new(),
+            def_types: &[],
         };
         let errors = check_input(
             &started.standard,
@@ -11213,6 +11527,474 @@ p26 = com.x"#;
         assert_eq!(
             workspace.dump_types(index).unwrap(),
             "(file\n  (type A Int = Int @0..12)\n  (type B A = Int @13..23))"
+        );
+    }
+
+    /// Jack's `/home/jack/projects/peios/newpkgs` as it is written, with
+    /// `&` written as a spread and the commas of the package's block as
+    /// newlines, the bottom line `result = package dev.peios.testpkg()`,
+    /// and `ppk.commit` stubbed by a module of the test's own, which joins
+    /// the content to its caller's directory as the real one does.
+    const JACKS_PACKAGE: [(&str, &str); 3] = [
+        (
+            "workspace.gcsl",
+            "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
+             import _lib.ppk\n\
+             import fileroot\n\
+             \n\
+             type PackageDef = {\n\
+             \x20 version: String,\n\
+             \x20 arch: String,\n\
+             \x20 content: String,\n\
+             }\n\
+             \n\
+             type Package = { ...PackageDef, name: String }\n\
+             \n\
+             \n\
+             #[def_type]\n\
+             def package(name: String, func: fn(): PackageDef) -> { pkg: Package, manifest: String } {\n\
+             \x20   fileroot.helper()\n\
+             \x20   pkg: Package = { ...func(); name = name }\n\
+             \n\
+             \x20   manifest = ppk.commit(\n\
+             \x20       name = pkg.name,\n\
+             \x20       version = pkg.version,\n\
+             \x20       arch = pkg.arch,\n\
+             \x20       content = pkg.content,\n\
+             \x20   )\n\
+             }\n",
+        ),
+        (
+            "_lib/ppk.gcsl",
+            "import path\n\
+             import fileroot\n\
+             def commit(name: String, version: String, arch: String, content: String) -> String {\n\
+             \x20   let content = path.join(fileroot.caller, content)\n\
+             \x20   \"{name} {version} {arch} {content}\"\n\
+             }",
+        ),
+        (
+            "dev.peios.testpkg/test.gcsl",
+            "def package dev.peios.testpkg() {\n\
+             \x20   version = \"0.1.0\"\n\
+             \x20   arch = \"x86_64\"\n\
+             \x20   content = \"usr\"\n\
+             }\n\
+             \n\
+             \n\
+             result = package dev.peios.testpkg()",
+        ),
+    ];
+
+    #[test]
+    fn jacks_package_is_defined_and_called_with_its_def_type() {
+        // The stub is given the package's directory as the content's base,
+        // through the def-type's `fileroot.helper()`; the definition binds
+        // nothing of the file's record.
+        assert_eq!(
+            rooted_text(&JACKS_PACKAGE, "dev.peios.testpkg/test.gcsl"),
+            "{result = {pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
+             name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 \
+             <root>/dev.peios.testpkg/usr\"}}"
+        );
+    }
+
+    /// A def-type of the root of a workspace, for the def-type tests:
+    /// `build`, whose definitions take a target and give a string, and
+    /// which takes a mode when it is invoked.
+    const BUILD: (&str, &str) = (
+        "workspace.gcsl",
+        "#[def_type]\n\
+         def build(name: String, f: fn(target: String): String, mode: String): String {\n\
+         \x20   \"{name}: {f(mode)}\"\n\
+         }",
+    );
+
+    #[test]
+    fn a_definition_takes_its_types_and_its_invocation_its_arguments() {
+        // A definition with a parameter, used above it; invocation
+        // parameters; a reference stored and called later; `def x()` beside
+        // `def build x()`, a bare `x` seeing only the former.
+        let files = [
+            BUILD,
+            (
+                "app.gcsl",
+                "y = build x(\"release\")\n\
+                 def build x(target) { \"built {target}\" }\n\
+                 def x(): Int { 7 }\n\
+                 let later = build x\n\
+                 z = later(mode = \"debug\")\n\
+                 plain = x()",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app.gcsl"),
+            "{y = \"x: built release\"; x = fn(): Int; z = \"x: built debug\"; plain = 7}"
+        );
+        // From another file of the directory and from a directory below.
+        let files = [
+            BUILD,
+            ("a.gcsl", "def build lib.core(t) { \"core-{t}\" }"),
+            ("b.gcsl", "b = build lib.core(\"b\")"),
+            ("sub/c.gcsl", "c = build lib.core(\"c\")"),
+        ];
+        assert_eq!(value(&files, "b.gcsl"), "{b = \"lib.core: core-b\"}");
+        assert_eq!(value(&files, "sub/c.gcsl"), "{c = \"lib.core: core-c\"}");
+        assert_eq!(value(&files, "a.gcsl"), "{}");
+    }
+
+    #[test]
+    fn a_definition_is_a_leaf_under_its_namespace_s_key() {
+        // The scan names the namespace, makes the definition a top-level
+        // function and a leaf under its key, and a reference above it
+        // mentions it, as a read of its path.
+        let files = [
+            BUILD,
+            ("app.gcsl", "y = build x(\"m\")\ndef build x(t) { t }"),
+        ];
+        let scan = ws(&files).unwrap();
+        let app = scan.files.iter().find(|f| f.path == "app.gcsl").unwrap();
+        let workspace = scan
+            .files
+            .iter()
+            .position(|f| f.path == "workspace.gcsl")
+            .unwrap();
+        let tree = &app.mentions.tree;
+        // The roots: `y`, then the namespace, whose child `x` is the leaf.
+        let root = &tree.nodes[tree.roots[1] as usize];
+        // The `def`'s item, the second the parser made, after its body's.
+        assert_eq!(scan.names.get(root.name), format!("<build#{workspace}.1>"));
+        assert_eq!(root.children, [2]);
+        assert_eq!(tree.path(2).len(), 2);
+        assert_eq!(app.mentions.functions.len(), 1);
+        assert_eq!(app.mentions.functions[0].name, None);
+        assert_eq!(app.mentions.items[0], [0]);
+        assert_eq!(app.mentions.fields[0], [2]);
+        // The definition's item mentions its def-type, another file's `def`:
+        // its node and its function.
+        assert_eq!(app.mentions.foreign[1].len(), 2);
+    }
+
+    #[test]
+    fn each_def_type_has_a_namespace_of_its_own() {
+        // Two def-types, each with a definition of one path, and a field of
+        // that path too: none meets another.
+        let files = [
+            BUILD,
+            (
+                "app.gcsl",
+                "#[def_type]\n\
+                 def test(name: String, f: fn(target: String): String): String { f(name) }\n\
+                 def build lib.core(t) { \"built {t}\" }\n\
+                 def test lib.core(t) { \"tested {t}\" }\n\
+                 lib.core = 1\n\
+                 a = build lib.core(\"r\")\n\
+                 b = test lib.core()",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app.gcsl"),
+            "{test = fn(name: String, f: fn(target: String): String): String; \
+             lib = {core = 1}; a = \"lib.core: built r\"; b = \"tested lib.core\"}"
+        );
+    }
+
+    #[test]
+    fn definitions_conflict_and_shadow_as_dotted_defs_do() {
+        let conflict = [
+            BUILD,
+            ("a.gcsl", "def build x(t) { t }"),
+            ("b.gcsl", "def build x(t) { t }"),
+        ];
+        assert_eq!(
+            error(&conflict).0,
+            "field `build x` is defined in two files"
+        );
+        let under = [
+            BUILD,
+            ("a.gcsl", "def build x(t) { t }"),
+            ("b.gcsl", "def build x.y(t) { t }"),
+        ];
+        assert_eq!(error(&under).0, "field `build x` is already defined");
+        // In one file, as the dotted fields of a block.
+        let files = [
+            BUILD,
+            (
+                "a.gcsl",
+                "def build x(t) { t }\ndef build x(t) { t }\ny = build x(\"m\")",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "a.gcsl"),
+            ["field `build x` is defined twice"]
+        );
+        // Shadowable, across files in path order and within one file.
+        let shadowed = [
+            BUILD,
+            ("a.gcsl", "#[shadowable] def build x(t) { \"a {t}\" }"),
+            (
+                "b.gcsl",
+                "#[shadowable] def build x(t) { \"b {t}\" }\ndef build x(t) { \"c {t}\" }",
+            ),
+            ("d.gcsl", "y = build x(\"m\")"),
+        ];
+        assert_eq!(value(&shadowed, "d.gcsl"), "{y = \"x: c m\"}");
+        let reversed = [
+            BUILD,
+            ("a.gcsl", "def build x(t) { t }"),
+            ("b.gcsl", "#[shadowable] def build x(t) { t }"),
+        ];
+        assert_eq!(
+            error(&reversed).0,
+            "field `build x` is defined in two files"
+        );
+    }
+
+    #[test]
+    fn a_def_type_is_reached_through_its_imports() {
+        let lib = (
+            "lib/types.gcsl",
+            "#[def_type]\n\
+             def build(name: String, f: fn(): String): String { \"{name} {f()}\" }",
+        );
+        // Through a renamed member, defining and invoking; through a whole
+        // import, qualified; and a definition through one alias is in the
+        // def-type's namespace whatever another file calls it.
+        let files = [
+            ("workspace.gcsl", ""),
+            lib,
+            (
+                "app/a.gcsl",
+                "import build as b from lib.types\n\
+                 def b x() { \"via b\" }\n\
+                 one = b x()",
+            ),
+            (
+                "app/c.gcsl",
+                "import lib.types as t\n\
+                 two = t.build x()",
+            ),
+        ];
+        assert_eq!(value(&files, "app/a.gcsl"), "{one = \"x via b\"}");
+        assert_eq!(value(&files, "app/c.gcsl"), "{two = \"x via b\"}");
+        // `*` brings a file's definitions; a whole import of it does not.
+        let defs = (
+            "lib/defs.gcsl",
+            "import * from lib.types\ndef build x() { \"x\" }",
+        );
+        let files = [
+            ("workspace.gcsl", ""),
+            lib,
+            defs,
+            (
+                "app/a.gcsl",
+                "import * from lib.defs\nimport * from lib.types\na = build x()",
+            ),
+            ("app/c.gcsl", "import lib.defs\nc = defs"),
+        ];
+        assert_eq!(value(&files, "app/a.gcsl"), "{a = \"x x\"}");
+        // Read whole, a file holds no namespace.
+        assert_eq!(value(&files, "app/c.gcsl"), "{c = {}}");
+        let files = [
+            ("workspace.gcsl", ""),
+            lib,
+            defs,
+            (
+                "app/b.gcsl",
+                "import lib.defs\nimport * from lib.types\nb = build x()",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "app/b.gcsl"),
+            ["`build` has no definition `x`"]
+        );
+    }
+
+    #[test]
+    fn a_def_type_s_caller_is_where_its_reference_is_called() {
+        // The reference is made in `a/`, called in `b/`: the def-type runs
+        // for `b/`, and the definition for the def-type's file, but through
+        // its helper.
+        let files = [
+            (
+                "workspace.gcsl",
+                "import fileroot\n\
+                 #[def_type]\n\
+                 def where(name: String, f: fn() -> String) -> { called: String, defined: String } {\n\
+                 \x20   called = fileroot.caller\n\
+                 \x20   defined = f()\n\
+                 }\n\
+                 #[def_type]\n\
+                 def helped(name: String, f: fn() -> String) -> String {\n\
+                 \x20   fileroot.helper()\n\
+                 \x20   f()\n\
+                 }",
+            ),
+            (
+                "a/a.gcsl",
+                "import fileroot\n\
+                 def where x() { fileroot.caller }\n\
+                 def helped x() { fileroot.caller }\n\
+                 def made(): fn() -> { called: String, defined: String } { where x }\n\
+                 def made_helped(): fn() -> String { helped x }",
+            ),
+            (
+                "b/b.gcsl",
+                "import a.a\n\
+                 there = a.made()()\n\
+                 through = a.made_helped()()",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "b/b.gcsl"),
+            "{there = {called = \"<root>/b\"; defined = \"<root>\"}; through = \"<root>/b\"}"
+        );
+    }
+
+    #[test]
+    fn a_pure_definition_cannot_call_an_impure_function() {
+        let files = [
+            BUILD,
+            (
+                "app.gcsl",
+                "fn noisy() -> String { \"n\" }\n\
+                 def build x(t) { noisy() }",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "app.gcsl"),
+            ["cannot call an impure function from a pure function"]
+        );
+        // And an impure def-type's reference from a pure function.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef run(name: String, f: fn(): String) -> String { f() }",
+            ),
+            (
+                "app.gcsl",
+                "def run x() { \"x\" }\nfn p(): String { run x() }",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "app.gcsl"),
+            ["cannot call an impure function from a pure function"]
+        );
+    }
+
+    #[test]
+    fn def_type_errors() {
+        // Each error with its labels and notes, joined by `; `, the errors
+        // by newlines.
+        let errors = |text: &str| {
+            let files = [BUILD, ("app.gcsl", text)];
+            check_errors(&files).join("\n")
+        };
+        let signature = "a def-type takes the name as a `String` and then the definition as a \
+                         function, as in `def bad(name: String, func: fn(): T)` at app.gcsl";
+        assert_eq!(
+            errors("#[def_type]\ndef bad(name: Int, f: fn(): Int): Int { 1 }"),
+            signature
+        );
+        assert_eq!(errors("#[def_type]\ndef bad(): Int { 1 }"), signature);
+        let not_one = "note: a def-type is a `def` marked `#[def_type]`";
+        assert_eq!(
+            errors("def plain(): Int { 1 }\ndef plain x() { 1 }"),
+            format!("`plain` is not a def-type at app.gcsl; {not_one}")
+        );
+        assert_eq!(
+            errors("def build x() { \"x\" }"),
+            "`build` defines functions of 1 parameter, `target` at app.gcsl"
+        );
+        assert_eq!(
+            errors(
+                "#[def_type]\ndef two(name: String, f: fn(a: Int, b: Int): Int): Int { 1 }\n\
+                 def two x(a) { a }"
+            ),
+            "`two` defines functions of 2 parameters, `a` and `b` at app.gcsl"
+        );
+        assert_eq!(
+            errors(
+                "#[def_type]\ndef none(name: String, f: fn(): Int): Int { 1 }\n\
+                 def none x(a) { a }"
+            ),
+            "`none` defines functions of no parameters at app.gcsl"
+        );
+        assert_eq!(
+            errors("def build a.b(t) { t }\nx = build a.c\ny = build a\nz = build q"),
+            "`build` has no definition `a.c` at app.gcsl; \
+             note: the only definition of `build` here is `a.b`\n\
+             `a` is not a `build` definition at app.gcsl\n\
+             `build` has no definition `q` at app.gcsl; \
+             note: the only definition of `build` here is `a.b`"
+        );
+        assert_eq!(
+            errors("def build a(t) { t }\ndef build b.c(t) { t }\nx = build d"),
+            "`build` has no definition `d` at app.gcsl; \
+             note: the definitions of `build` here are `a` and `b.c`"
+        );
+        assert_eq!(
+            errors("x = build d"),
+            "`build` has no definition `d` at app.gcsl; note: `build` has no definitions here"
+        );
+        // Two names in a row, the first no def-type, or undefined.
+        let juxtaposed = "note: two names in a row are read as a def-type reference, as in \
+                          `package dev.x()`; is an operator or a line break missing?";
+        assert_eq!(
+            errors("let a = 1\nx = a b"),
+            format!("`a` is not a def-type at app.gcsl; {not_one}; {juxtaposed}")
+        );
+        assert!(
+            errors("x = nope b").starts_with("undefined variable `nope` at app.gcsl")
+                && errors("x = nope b").ends_with(juxtaposed),
+            "{}",
+            errors("x = nope b")
+        );
+        // A parameter of the def-type's name is no def-type.
+        assert_eq!(
+            errors("def build x(t) { t }\nfn f(build: Int): Int { build x() }"),
+            format!("`build` is not a def-type at app.gcsl; {not_one}; {juxtaposed}")
+        );
+    }
+
+    #[test]
+    fn no_source_can_write_a_namespace_s_key() {
+        // A field of the key's form is no field at all, so it cannot reach
+        // a namespace's definitions.
+        let files = [
+            BUILD,
+            ("app.gcsl", "def build x(t) { t }\n\"<build#1.0>\" = 1"),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "a field cannot be named `\"<build#1.0>\"`: names of that form are def-types' \
+                 namespaces at app.gcsl"
+            ]
+        );
+        let files = [BUILD, ("app.gcsl", "x = {}.\"<build#1.0>\"")];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "a field cannot be named `\"<build#1.0>\"`: names of that form are def-types' \
+                 namespaces at app.gcsl"
+            ]
+        );
+    }
+
+    #[test]
+    fn dump_ast_shows_definitions_and_references() {
+        let mut workspace = checked(&[
+            BUILD,
+            ("app.gcsl", "def build x(t) { t }\ny = build x(\"m\")"),
+        ]);
+        let index = workspace.file("app.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(dump.contains("(def-type-def build x @0..20\n"), "{dump}");
+        assert!(dump.contains("(params t)\n"), "{dump}");
+        assert!(
+            dump.contains("(def-type-ref build x : fn(mode: String): String @25..32)"),
+            "{dump}"
         );
     }
 }

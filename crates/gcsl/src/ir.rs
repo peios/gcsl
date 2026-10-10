@@ -126,7 +126,9 @@
 //! # Functions
 //!
 //! Every function expression of the program has an entry in the function
-//! table, [`Ir::function`], indexed by the [`FnId`] the parser gave it: its
+//! table, [`Ir::function`], indexed by the [`FnId`] the parser gave it, and
+//! so has each function lowering makes for a def-type reference, past
+//! those (see [`crate::lower`]): its
 //! body, a [`IrKind::Block`] in the same node arena as the rest of the
 //! program, the sizes of its frame, parameters and captures, and its
 //! [`FnKind`], which says whether calls of its closures are memoised
@@ -2610,9 +2612,19 @@ impl fmt::Display for Pretty<'_> {
             if let Some(name) = code.name {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }
+            // A definition made with a def-type, as it is written, its
+            // namespace's key shown as its def-type.
+            let mut before = " ";
             for (at, &segment) in self.ir.path_of(index).iter().enumerate() {
-                let before = if at == 0 { " " } else { "." };
-                write!(f, "{before}{}", FieldName(self.names.get(segment)))?;
+                let text = self.names.get(segment);
+                if at == 0
+                    && let Some(def_type) = crate::names::key_def_type(text)
+                {
+                    write!(f, " {def_type}")?;
+                    continue;
+                }
+                write!(f, "{before}{}", FieldName(text))?;
+                before = ".";
             }
             writeln!(
                 f,

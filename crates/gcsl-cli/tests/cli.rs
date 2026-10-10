@@ -2884,6 +2884,124 @@ fn repl_keeps_dotted_defs_across_lines() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The def-types summary: Jack's packages, defined with the def-type
+/// `package` and invoked by its path, the stub of `ppk` given the package's
+/// directory, run from another working directory than the workspace's.
+#[test]
+fn run_defines_and_invokes_with_a_def_type() {
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_deftypes/dev.peios.testpkg/test.gcsl",
+    ]);
+    assert_eq!(
+        stdout(&output).replace(&crate_dir(), "<dir>"),
+        "{result = {pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
+         name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 \
+         <dir>/tests/fixtures/ws_deftypes/dev.peios.testpkg/usr -> \
+         <dir>/tests/fixtures/ws_deftypes/_dist\"}}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// A reference to a definition the def-type does not have, rendered with
+/// the definitions it has.
+#[test]
+fn run_renders_a_missing_definition() {
+    let output = gcsl(&["run", "tests/fixtures/def_type_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `build` has no definition `lib.cor`\n\
+         \x20--> tests/fixtures/def_type_error.gcsl:4:11\n\
+         \x20 |\n\
+         4 | x = build lib.cor()\n\
+         \x20 |           ^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: the only definition of `build` here is `lib.core`\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `--dump-ast` shows a definition and a reference as they are written,
+/// and `--dump-ir` the definition's code by its path and the reference as
+/// the closure it makes.
+#[test]
+fn dumps_show_def_types() {
+    let file = "tests/fixtures/ws_deftypes/dev.peios.testpkg/test.gcsl";
+    let output = gcsl(&["run", file, "--dump-ast"]);
+    assert_eq!(
+        stdout(&output),
+        "(file\n\
+         \x20 (def-type-def package dev.peios.testpkg @0..97\n\
+         \x20   (fn @12..97\n\
+         \x20     (params)\n\
+         \x20     (block @32..97\n\
+         \x20       (field version @38..55\n\
+         \x20         (str \"0.1.0\" @48..55))\n\
+         \x20       (field arch @60..75\n\
+         \x20         (str \"x86_64\" @67..75))\n\
+         \x20       (field content @80..95\n\
+         \x20         (str \"usr\" @90..95)))))\n\
+         \x20 (field result @100..136\n\
+         \x20   (call @109..136\n\
+         \x20     (def-type-ref package dev.peios.testpkg @109..134))))\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", file, "--dump-ir"]);
+    let heads: Vec<&str> = stdout(&output)
+        .lines()
+        .filter(|line| line.starts_with("fn #"))
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "fn #0 package dev.peios.testpkg (frame 3, params 0, captures 0, height 3)",
+            "fn #1 (frame 0, params 0, captures 2, height 4)",
+        ]
+    );
+    assert!(
+        stdout(&output).contains("(call @109..136\n      (make-closure #1 @109..134\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The REPL: a line may declare a def-type, define with it and invoke it,
+/// and later lines see its definitions; two names in a row that name no
+/// def-type are reported with a note.
+#[test]
+fn repl_keeps_def_types_across_lines() {
+    let output = repl(
+        "#[def_type] def p(n: String, f: fn(): Int) -> Int { f() }\n\
+         def p y() { 2 }\n\
+         p y()\n\
+         let g = p y\n\
+         g()\n\
+         x = a b\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{p = fn(n: String | Future<String>, f: fn(): Int) -> Int} : \
+         {p: fn(n: String | Future<String>, f: fn(): Int) -> Int}\n\
+         2 : Int\n\
+         2 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: undefined variable `a`\n\
+         \x20--> <repl>:1:5\n\
+         \x20 |\n\
+         1 | x = a b\n\
+         \x20 |     ^\n\
+         \x20 |\n\
+         \x20 = note: two names in a row are read as a def-type reference, as in \
+         `package dev.x()`; is an operator or a line break missing?\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// The canonical path of this crate's directory, which the `fileroot`
 /// tests' paths start with, whatever directory they run from.
 fn crate_dir() -> String {

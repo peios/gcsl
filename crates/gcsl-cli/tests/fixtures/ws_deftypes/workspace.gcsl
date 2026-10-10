@@ -1,0 +1,25 @@
+# A workspace whose packages are defined with a def-type: Jack's newpkgs,
+# with `ppk` stubbed by `_lib/ppk.gcsl`.
+import _lib.ppk
+import fileroot
+
+type PackageDef = {
+  version: String,
+  arch: String,
+  content: String,
+}
+
+type Package = { ...PackageDef, name: String }
+
+#[def_type]
+def package(name: String, func: fn(): PackageDef) -> { pkg: Package, manifest: String } {
+    fileroot.helper()
+    pkg: Package = { ...func(); name = name }
+
+    manifest = ppk.commit(
+        name = pkg.name,
+        version = pkg.version,
+        arch = pkg.arch,
+        content = pkg.content,
+    )
+}
