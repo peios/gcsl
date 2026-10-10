@@ -2,11 +2,12 @@
 //! the groups of mutually recursive top-level functions.
 //!
 //! A *top-level function* of an input is a named function item (`fn
-//! NAME`) or a `def` that is directly an item of the input's outermost
-//! block. Its name is in scope in the whole input, so the checker must
-//! know, before it checks anything, which functions each top-level item
-//! and each function body may use: that is what decides the order the
-//! bodies are checked in (see the checker's module documentation, "Top-level
+//! NAME`) or a `def` (`def NAME`, or `def PATH` named by a dotted path) that
+//! is directly an item of the input's outermost block. Its name, or its
+//! path, is in scope in the whole input, so the checker must know, before
+//! it checks anything, which functions each top-level item and each
+//! function body may use: that is what decides the order the bodies are
+//! checked in (see the checker's module documentation, "Top-level
 //! functions").
 //!
 //! An item or a body *mentions* a top-level function when a name in it,
@@ -15,7 +16,9 @@
 //! inner block, a `for` variable or a header variable, each from where it
 //! is in scope, and a function's name for itself in its own body. The
 //! first segment of a dotted path, and the variable a `:=` rebinds, count
-//! as mentions too.
+//! as mentions too. A function named by a dotted path is mentioned by a
+//! reference to its path, or to a prefix of it (see [Dotted
+//! `def`s](#dotted-defs)), shadowed as the reference's first name is.
 //!
 //! The relation over-approximates, and only ever that way: a name that a
 //! *spread* inside a nested block defines is not known before checking, so
@@ -30,11 +33,39 @@
 //! callee first: every group a group mentions, other than itself, comes
 //! before it. The order is deterministic, a function of the tree alone.
 //!
+//! # Dotted `def`s
+//!
+//! A `def` may be named by a dotted path, `def dev.peios.count(...)`: it is
+//! then exactly a `def` whose name is its path. Its item is a top-level
+//! function ([`TopLevel`], its `name` `None`) and the leaf of its path in
+//! the tree of top-level fields (below), whose cell holds its closure; the
+//! leaf of a `def` the tree leaves out, which today's rules reject (a leaf
+//! twice, a leaf under a leaf or over an interior node), is no top-level
+//! function, but the field it is written as, which the checker reports.
+//! There is no name a variable could read it by, and it does not see
+//! itself by one: inside `def dev.peios.count`, `count` is whatever else
+//! binds it, if anything. A use of it is a read of its path, a reference
+//! (below) whose longest declared prefix is its leaf, so a reference
+//! mentions both the leaf and the function, as a plain `def`'s name
+//! mentions both its root and its function, wherever it is: in an item, an
+//! initialiser, its own body (recursion is by path) or another function's
+//! body (mutual recursion). A reference to a node above such leaves, a
+//! prefix read whole (`dev.peios`, `dev`), mentions each of those
+//! functions too, all at the reference ([`FieldTree::dotted_defs_under`],
+//! [`Resolve::dotted_defs_under`]): its record holds their closures, so an
+//! item reading it whole can only run once they exist, and its type is the
+//! record of their types, which their bodies settle. A function named by a
+//! dotted path of another file is no function of this input: a reference to
+//! it mentions the other file's node, which makes this file need that one,
+//! as for any field. A `def` of one name is unchanged: its leaf is a root,
+//! never under another node.
+//!
 //! # Top-level fields
 //!
 //! The field items directly at the top level of an input, plain (`a = e`),
-//! quoted (`"a b" = e`), dotted (`a.b.c = e`) and `def`, form a tree by
-//! their paths ([`FieldTree`]): each item is a *leaf*, and every proper
+//! quoted (`"a b" = e`), dotted (`a.b.c = e`) and `def` (`def f`, `def
+//! a.b.f`), form a tree by their paths ([`FieldTree`]): each item is a
+//! *leaf*, and every proper
 //! prefix of a leaf's path is an *interior* node, a record assembled from
 //! the nodes below it, whose children are in the order of their first item
 //! in the source. An item that today's rules reject (a second leaf with one
@@ -293,12 +324,16 @@ pub struct FieldNode {
     /// interior node all of whose leaves are (see [Shadowed
     /// declarations](#shadowed-declarations)).
     pub shadowable: bool,
+    /// Whether it is the leaf of a top-level function named by a dotted
+    /// path, or an interior node with one under it (see [Dotted
+    /// `def`s](#dotted-defs)).
+    pub dotted_defs: bool,
 }
 
 /// The item of a leaf of a [`FieldTree`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldLeaf {
-    /// The field item, `PATH = EXPR` or `def NAME ...`.
+    /// The field item, `PATH = EXPR` or `def PATH ...`.
     pub item: ItemId,
     /// The item's position among the outermost block's items.
     pub position: usize,
@@ -306,6 +341,9 @@ pub struct FieldLeaf {
     pub value: ExprId,
     /// Whether the item is marked `#[shadowable]`.
     pub shadowable: bool,
+    /// For a `def`'s leaf, its top-level function, by its index among the
+    /// input's ([`Mentions::functions`]).
+    pub function: Option<u32>,
 }
 
 impl FieldTree {
@@ -336,6 +374,7 @@ impl FieldTree {
                         position,
                         value,
                         shadowable: ast.is_shadowable(id),
+                        function: None,
                     });
                 }
                 if let Some(entry) = tree.item_leaf.get_mut(position) {
@@ -358,6 +397,63 @@ impl FieldTree {
             }
         }
         tree
+    }
+
+    /// Gives each `def`'s leaf its top-level function, of `functions`, and
+    /// marks the leaf of each function named by a dotted path, and every
+    /// node above it, as having one (see [Dotted `def`s](#dotted-defs)).
+    fn link(&mut self, functions: &[TopLevel]) {
+        for (index, function) in (0u32..).zip(functions) {
+            let Some(&Some(node)) = self.item_leaf.get(function.position) else {
+                continue;
+            };
+            if let Some(leaf) = self
+                .nodes
+                .get_mut(node as usize)
+                .and_then(|entry| entry.leaf.as_mut())
+            {
+                leaf.function = Some(index);
+            }
+            if function.name.is_some() {
+                continue;
+            }
+            let mut at = Some(node);
+            while let Some(entry) = at.and_then(|at| self.nodes.get_mut(at as usize)) {
+                if entry.dotted_defs {
+                    break;
+                }
+                entry.dotted_defs = true;
+                at = entry.parent;
+            }
+        }
+    }
+
+    /// Calls `each` with the top-level function of every leaf of a function
+    /// named by a dotted path at or under `node`, in no particular order
+    /// (see [Dotted `def`s](#dotted-defs)). Visits only the nodes that have
+    /// one, so it costs nothing for a node with none.
+    pub fn dotted_defs_under(&self, node: u32, each: &mut dyn FnMut(u32)) {
+        if !self
+            .nodes
+            .get(node as usize)
+            .is_some_and(|entry| entry.dotted_defs)
+        {
+            return;
+        }
+        let mut stack = vec![node];
+        while let Some(at) = stack.pop() {
+            let Some(entry) = self.nodes.get(at as usize).filter(|n| n.dotted_defs) else {
+                continue;
+            };
+            match entry.leaf {
+                Some(leaf) => {
+                    if let Some(function) = leaf.function {
+                        each(function);
+                    }
+                }
+                None => stack.extend(&entry.children),
+            }
+        }
     }
 
     /// Whether a leaf of the path `names` may be added: no node along it is
@@ -397,6 +493,7 @@ impl FieldTree {
                     last: position,
                     leaf: None,
                     shadowable: false,
+                    dotted_defs: false,
                 });
                 self.by_name.insert((parent, name), node);
                 match self.nodes.get_mut(parent as usize) {
@@ -469,8 +566,16 @@ pub trait Resolve {
     /// The child of the field node `node` named `name`, if it has one.
     fn child(&self, node: u32, name: Name) -> Option<u32>;
 
-    /// The top-level function named `name`, if any.
+    /// The top-level function named `name`, if any: one named by a dotted
+    /// path has no name, and is found by its path's references instead
+    /// ([`Resolve::dotted_defs_under`]).
     fn function(&self, name: Name) -> Option<u32>;
+
+    /// Calls `each` with every top-level function of the input's own named
+    /// by a dotted path whose leaf is the field node `node` or under it
+    /// (see [Dotted `def`s](#dotted-defs)); with none for a node that is
+    /// not the input's own.
+    fn dotted_defs_under(&self, node: u32, each: &mut dyn FnMut(u32));
 
     /// The number of the input's own field nodes and of its own top-level
     /// functions: the scope's numbers below them are the input's own.
@@ -523,8 +628,12 @@ impl Resolve for Own<'_> {
     fn function(&self, name: Name) -> Option<u32> {
         self.functions
             .iter()
-            .position(|f| f.name == name)
+            .position(|f| f.name == Some(name))
             .map(index_u32)
+    }
+
+    fn dotted_defs_under(&self, node: u32, each: &mut dyn FnMut(u32)) {
+        self.tree.dotted_defs_under(node, each);
     }
 
     fn own(&self) -> (u32, u32) {
@@ -538,12 +647,13 @@ impl Resolve for Own<'_> {
 /// One top-level function.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TopLevel {
-    /// Its item, `fn NAME ...` or `def NAME ...`.
+    /// Its item, `fn NAME ...`, `def NAME ...` or `def PATH ...`.
     pub item: ItemId,
     /// The item's position among the outermost block's items.
     pub position: usize,
-    /// Its name.
-    pub name: Name,
+    /// Its name; `None` for a `def` named by a dotted path, which has none
+    /// a variable could be read by (see [Dotted `def`s](#dotted-defs)).
+    pub name: Option<Name>,
     /// Its function expression.
     pub expr: ExprId,
     /// Its function.
@@ -555,10 +665,8 @@ pub struct TopLevel {
 #[must_use]
 pub fn find(ast: &Ast) -> Mentions {
     let mut mentions = scan(ast);
-    let (functions, tree) = (
-        mem::take(&mut mentions.functions),
-        mem::take(&mut mentions.tree),
-    );
+    // The functions stay: the groups are found among them.
+    let (functions, tree) = (mentions.functions.clone(), mem::take(&mut mentions.tree));
     mentions.resolve(
         ast,
         &Own {
@@ -566,7 +674,6 @@ pub fn find(ast: &Ast) -> Mentions {
             functions: &functions,
         },
     );
-    mentions.functions = functions;
     mentions.tree = tree;
     mentions
 }
@@ -590,22 +697,29 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
     let shadowed: Vec<bool> = (0..root.len())
         .map(|position| shadowed.get(position).copied().unwrap_or(false))
         .collect();
+    let mut tree = FieldTree::build(ast, root, &shadowed);
     let mut functions = Vec::new();
     for (position, &id) in root.iter().enumerate() {
         if shadowed.get(position) == Some(&true) {
             continue;
         }
-        if let Some((name, expr, function)) = top_level_function(ast, id) {
-            functions.push(TopLevel {
-                item: id,
-                position,
-                name,
-                expr,
-                function,
-            });
+        let Some((name, expr, function)) = top_level_function(ast, id) else {
+            continue;
+        };
+        // A dotted `def` the tree left out, which today's rules reject, is
+        // the field it is written as, which the checker reports.
+        if name.is_none() && tree.item_leaf.get(position).is_none_or(Option::is_none) {
+            continue;
         }
+        functions.push(TopLevel {
+            item: id,
+            position,
+            name,
+            expr,
+            function,
+        });
     }
-    let tree = FieldTree::build(ast, root, &shadowed);
+    tree.link(&functions);
     let types = (0_usize..)
         .zip(root)
         .filter_map(|(position, &item)| match ast.item(item).kind {
@@ -846,7 +960,8 @@ impl Mentions {
     /// number of `scope` below the count of this input's own is its own;
     /// the rest are kept apart, in [`Mentions::foreign`], and nothing else
     /// here (the groups, the schedule, the cycles, [`Mentions::needs`])
-    /// sees them.
+    /// sees them. The groups are found among [`Mentions::functions`], which
+    /// must be [`scan`]'s.
     pub fn resolve(&mut self, ast: &Ast, scope: &dyn Resolve) {
         let root = ast.items(ast.root());
         let (own_nodes, own_functions) = scope.own();
@@ -886,15 +1001,12 @@ impl Mentions {
             others.sort_by_key(|&(_, span)| span.start);
             foreign.push(others);
         }
-        // A shadowed `def` is no top-level function.
-        let edges: Vec<&[u32]> = root
+        // The edges of the top-level functions, as [`scan`] found them: a
+        // shadowed `def`, and a dotted one the tree left out, are none.
+        let edges: Vec<&[u32]> = self
+            .functions
             .iter()
-            .zip(&items)
-            .enumerate()
-            .filter(|&(position, (&id, _))| {
-                top_level_function(ast, id).is_some() && self.shadowed.get(position) != Some(&true)
-            })
-            .map(|(_, (_, found))| found.as_slice())
+            .map(|function| items.get(function.position).map_or(&[][..], Vec::as_slice))
             .collect();
         (self.groups, self.group_of) = components(&edges);
         self.items = items;
@@ -1281,25 +1393,33 @@ fn first_of_each(mut found: Vec<(u32, Span)>) -> (Vec<u32>, Vec<Span>) {
 }
 
 /// The name, function expression and function of the item `id`, if it is
-/// a named function item or a `def`.
+/// a named function item or a `def`: the name `None` for a `def` named by a
+/// dotted path (see [Dotted `def`s](#dotted-defs)).
 #[must_use]
-pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Name, ExprId, FnId)> {
-    match ast.item(id).kind {
+pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Option<Name>, ExprId, FnId)> {
+    let (path, value, def) = match ast.item(id).kind {
         ItemKind::Let {
             path,
             value,
             function: true,
             ..
-        }
-        | ItemKind::Field {
+        } => (path, value, false),
+        ItemKind::Field {
             path,
             value,
             function: true,
             ..
-        } => match (ast.path(path), ast.get(value).kind) {
-            ([single], ExprKind::Fn(function)) => Some((single.name()?, value, function)),
-            _ => None,
-        },
+        } => (path, value, true),
+        _ => return None,
+    };
+    let ExprKind::Fn(function) = ast.get(value).kind else {
+        return None;
+    };
+    match ast.path(path) {
+        [single] => Some((Some(single.name()?), value, function)),
+        segments @ [_, _, ..] if def && segments.iter().all(|s| s.name().is_some()) => {
+            Some((None, value, function))
+        }
         _ => None,
     }
 }
@@ -1403,7 +1523,9 @@ struct Walker<'a> {
 
 impl Walker<'_> {
     /// Records `name`, read as a variable at `span`, if it is a top-level
-    /// function's or a top-level field's root and nothing shadows it.
+    /// function's or a top-level field's root and nothing shadows it: a
+    /// root read whole mentions the functions named by dotted paths under
+    /// it too.
     fn name(&mut self, name: Name, span: Span) {
         if self.shadows.contains(&name) {
             return;
@@ -1411,7 +1533,18 @@ impl Walker<'_> {
         self.function_name(name, span);
         if let Some(root) = self.scope.root(name) {
             self.found_fields.push((root, span));
+            self.dotted_defs(root, span);
         }
+    }
+
+    /// Records, as mentioned at `span`, every top-level function named by a
+    /// dotted path whose leaf is the field node `node` or under it: a
+    /// reference to a node reads the functions at or under it (see [Dotted
+    /// `def`s](#dotted-defs)).
+    fn dotted_defs(&mut self, node: u32, span: Span) {
+        let found = &mut self.found;
+        self.scope
+            .dotted_defs_under(node, &mut |function| found.push((function, span)));
     }
 
     /// Records `name`, read as a variable at `span`, if it is a top-level
@@ -1456,7 +1589,9 @@ impl Walker<'_> {
             ExprKind::Name(name) if !self.shadows.contains(&name) => {
                 self.function_name(name, ast.get(base).span);
                 if let Some((node, at)) = self.scope.reference(ast, id) {
-                    self.found_fields.push((node, ast.get(at).span));
+                    let span = ast.get(at).span;
+                    self.found_fields.push((node, span));
+                    self.dotted_defs(node, span);
                 }
             }
             _ => self.expr(base),
@@ -1687,8 +1822,14 @@ mod tests {
             indices
                 .iter()
                 .map(|&index| {
-                    let name = found.functions[index as usize].name;
-                    ast.names().get(name).to_owned()
+                    let top = found.functions[index as usize];
+                    match (top.name, ast.item(top.item).kind) {
+                        (Some(name), _) => ast.names().get(name).to_owned(),
+                        (None, ItemKind::Field { path, .. }) => {
+                            ast.show_path(ast.path(path)).to_string()
+                        }
+                        (None, _) => String::new(),
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -1908,6 +2049,54 @@ mod tests {
         assert_eq!(order.len(), 2001);
         assert_eq!(order[0], "f1@0");
         assert_eq!(order[2000], "x@0");
+    }
+
+    #[test]
+    fn a_dotted_def_is_a_top_level_function_found_by_its_path() {
+        // Its path mentions it, wherever it is read, so it groups with the
+        // functions it calls and that call it.
+        let (items, groups) = mentions(
+            "x = dev.peios.count(1)\n\
+             def dev.peios.count(n: Int): Int { if n == 0 { 0 } else { dev.peios.count(n - 1) } }\n\
+             def even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }\n\
+             def dev.odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }",
+        );
+        assert_eq!(
+            items,
+            [
+                vec!["dev.peios.count"],
+                vec!["dev.peios.count"],
+                vec!["dev.odd"],
+                vec!["even"]
+            ]
+        );
+        assert_eq!(groups, [vec!["dev.peios.count"], vec!["even", "dev.odd"]]);
+        // It has no name: `count` alone mentions nothing, and a parameter
+        // named like the path's root shadows it.
+        let (items, _) =
+            mentions("x = count\ny = fn(dev: {}): {} { dev }\ndef dev.count(): Int { 1 }");
+        assert!(items[..2].iter().all(Vec::is_empty), "{items:?}");
+        // A prefix read whole mentions every one under it; a sibling
+        // field's path does not.
+        let (items, _) = mentions(
+            "all = a\nmid = a.b\ng = a.g\ndef a.b.f(): Int { 1 }\ndef a.c(): Int { 2 }\n\
+             a.g = 3",
+        );
+        assert_eq!(items[..3], [vec!["a.b.f", "a.c"], vec!["a.b.f"], vec![]]);
+        // One the tree leaves out, as today's rules reject it, is no
+        // top-level function, and the groups of the others are as ever.
+        let (items, groups) =
+            mentions("a.b = 1\ndef a.b(): Int { 1 }\nfn p(): Int { q() }\nfn q(): Int { p() }");
+        assert_eq!(items[2..], [vec!["q"], vec!["p"]]);
+        assert_eq!(groups, [vec!["p", "q"]]);
+        // Its leaf is the tree's, and, as a plain `def`'s, needs nothing:
+        // its function carries its body.
+        let (nodes, _) = field_mentions("def a.b.f(): Int { c }\nc = 1");
+        assert_eq!(nodes, ["a", "a.b", "a.b.f (leaf)", "c (leaf)"]);
+        assert_eq!(
+            schedule("def a.b.f(): Int { c }\nc = 1\nlet x = 2"),
+            ["a.b.f@0", "a.b@1", "a@1", "c@1"]
+        );
     }
 
     #[test]

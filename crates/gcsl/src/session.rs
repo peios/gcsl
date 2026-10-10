@@ -88,6 +88,19 @@
 //! slots. A later input sees an earlier input's field root whole, as a
 //! field of its type, and `a.c = 2` in a later input declares its own `a`.
 //!
+//! A `def` named by a dotted path, `def dev.peios.count(...)`, is a leaf of
+//! its input's tree like any dotted field, and needs nothing new: its leaf's
+//! cell holds its closure, so it takes a slot of its own, committed with
+//! the input's other cells (a `def` of one name has none: its cell is its
+//! function's binding's slot), and its body reads its input's cells, the
+//! cell of its own path among them, through the frame. A later input sees
+//! it as it sees dotted fields: through the root's binding, `dev`, whose
+//! record holds the closure, so `dev.peios.count(3)` calls it; it has no
+//! name of its own (`count` is no variable), and `def dev.other()` in a
+//! later input declares that input's own `dev`. Called from a later input,
+//! it is no known callee, as a function held by a dotted field is not: the
+//! call-site form of the implicit-await error is a `def` of one name's.
+//!
 //! # The standard library
 //!
 //! A session is not a workspace: its inputs share their `let`s, which the
@@ -1102,6 +1115,51 @@ mod tests {
         assert_eq!(session.scope, scope);
         assert_eq!(messages(&mut session, "t"), vec!["undefined variable `t`"]);
         assert_eq!(value(&mut session, "get()"), Value::Str("lib".into()));
+    }
+
+    #[test]
+    fn dotted_defs_across_inputs() {
+        let mut session = Session::new();
+        value(
+            &mut session,
+            "def dev.peios.count(n: Int): Int { if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) } }\n\
+             def dev.peios.hello(): String { \"hello {dev.peios.name}\" }\n\
+             dev.peios.name = \"world\"",
+        );
+        // A slot for the root `dev`, and a cell for each of `dev.peios`, its
+        // two functions, which hold their closures, and `name`.
+        assert_eq!(session.frame.len(), standard_slots() + 5);
+        assert_eq!(
+            value_type(&session),
+            "{dev: {peios: {count: fn(n: Int): Int, hello: fn(): String, name: String}}}"
+        );
+        // A later input sees them, as it sees dotted fields, by path or
+        // through the root's record.
+        assert_eq!(value(&mut session, "dev.peios.count(3)"), Value::Int(3));
+        assert_eq!(
+            value(&mut session, "let r = dev\nr.peios.hello()"),
+            Value::Str("hello world".into())
+        );
+        // A later input's dotted `def` declares that input's own root, and
+        // the earlier functions keep reading their own input's cells.
+        value(&mut session, "def dev.other(): Int { 1 }");
+        assert_eq!(
+            value(&mut session, "dev").to_string(),
+            "{other = fn(): Int}"
+        );
+        // It has no name: `count` is no variable.
+        assert_eq!(
+            messages(&mut session, "count(1)"),
+            vec!["undefined variable `count`"]
+        );
+        // A failed input leaves the session as it was.
+        let scope = session.scope.clone();
+        assert_eq!(
+            messages(&mut session, "def d.f(n: Int): Int { 1 // n }\nx = d.f(0)"),
+            vec!["division by zero"]
+        );
+        assert_eq!(session.scope, scope);
+        assert_eq!(messages(&mut session, "d"), vec!["undefined variable `d`"]);
     }
 
     #[test]

@@ -38,15 +38,20 @@
 //! from its '(' on>`, both spanning `fn` through the body's `}`. `fn`
 //! followed by anything else starts an ordinary expression item.
 //!
-//! A public function, `def NAME PARAMS RETURN BODY`, is recognised by `def`
+//! A public function, `def PATH PARAMS RETURN BODY`, is recognised by `def`
 //! at the start of an item, and has exactly a named function's grammar,
-//! with the same three markers; it is parsed as the field `NAME = <the
-//! function expression from its '(' on>`. Both forms are marked as written
-//! (`function` on [`ItemKind::Let`] and [`ItemKind::Field`]), so the tree
-//! tells them from `let NAME = fn ...` and `NAME = fn ...`. `def` must be
-//! followed by a single identifier: a string or a dotted path is an error
-//! at it, and so is anything else. `def` is a keyword, so anywhere else,
-//! as a name or an expression, it is reported as any keyword is there.
+//! with the same three markers, but that it is named by a path; it is
+//! parsed as the field `PATH = <the function expression from its '(' on>`.
+//! Both forms are marked as written (`function` on [`ItemKind::Let`] and
+//! [`ItemKind::Field`]), so the tree tells them from `let NAME = fn ...`
+//! and `PATH = fn ...`. A `def`'s path is made of identifiers, `def
+//! hello`, `def dev.peios.hello`: one that starts with a string is "a `def`
+//! is named by an identifier, not a string", a quoted or an index segment
+//! after its first, `def a."b"` or `def a[0]`, is "a `def`'s path is made
+//! of identifiers", at the segment, and anything else where a name is
+//! expected, after `def` or after a `.`, is an error at it. `def` is a
+//! keyword, so anywhere else, as a name or an expression, it is reported as
+//! any keyword is there.
 //!
 //! # Attributes
 //!
@@ -628,8 +633,9 @@ const PLAIN_FIELD_NAME: &str = "a field name must be a plain string literal";
 /// The error for a string literal where a variable's name is expected.
 const PLAIN_VARIABLE_NAME: &str = "variables need plain names";
 
-/// The error for a `def` named by a dotted path, at its first `.`.
-const DEF_DOTTED_NAME: &str = "a `def` is named by one identifier, not a dotted path";
+/// The error for a quoted or an index segment of a `def`'s path, at the
+/// segment.
+const DEF_PATH: &str = "a `def`'s path is made of identifiers";
 
 /// The error for a `def` named by a string, at the string.
 const DEF_STRING_NAME: &str = "a `def` is named by an identifier, not a string";
@@ -1355,29 +1361,87 @@ impl Parser<'_> {
         })
     }
 
-    /// Parses a public function item, `def NAME(...) ...`, starting at its
-    /// `def` keyword, `keyword`. The name must be a single identifier
-    /// directly followed by the parameters: a string, a dotted path or
-    /// anything else is an error at it.
+    /// Parses a public function item, `def PATH(...) ...`, starting at its
+    /// `def` keyword, `keyword`. The path is an identifier, then `.` and an
+    /// identifier as many times as they follow, directly followed by the
+    /// parameters: a string where it starts is "a `def` is named by an
+    /// identifier, not a string", a quoted or an index segment after it "a
+    /// `def`'s path is made of identifiers", and anything else where a name
+    /// is expected an error at it. A path of one name is the named function
+    /// item's ([`Parser::parse_named_fn`]); a longer one is the dotted field
+    /// of that path, marked as written as a `def` in the same way.
     fn parse_def(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
         let name_token = self.peek_at(1);
-        let after = self.peek_at(2);
-        match name_token.kind {
-            TokenKind::Ident(_) if after.kind == TokenKind::Dot => {
-                Err(self.error(DEF_DOTTED_NAME, after.span))
-            }
-            TokenKind::Ident(name) => self.parse_named_fn(keyword, (name, name_token.span)),
+        let name = match name_token.kind {
+            TokenKind::Ident(name) => name,
             TokenKind::Str(_) | TokenKind::StrStart(_) => {
-                Err(self.error(DEF_STRING_NAME, name_token.span))
+                return Err(self.error(DEF_STRING_NAME, name_token.span));
             }
             _ => {
                 let found = self.describe(name_token);
-                Err(self.report(Diagnostic::error(
+                return Err(self.report(Diagnostic::error(
                     format!("expected the function's name after `def`, found {found}"),
                     name_token.span,
-                )))
+                )));
+            }
+        };
+        if !matches!(self.peek_at(2).kind, TokenKind::Dot | TokenKind::LBracket) {
+            return self.parse_named_fn(keyword, (name, name_token.span));
+        }
+        self.advance();
+        self.advance();
+        // Kept apart until the function is parsed: the items of its body
+        // read paths of their own.
+        let mut segments = vec![PathSegment {
+            kind: SegmentKind::Name(name),
+            span: name_token.span,
+        }];
+        loop {
+            match self.peek().kind {
+                TokenKind::Dot => {
+                    self.advance();
+                    let token = self.peek();
+                    match token.kind {
+                        TokenKind::Ident(name) => {
+                            self.advance();
+                            segments.push(PathSegment {
+                                kind: SegmentKind::Name(name),
+                                span: token.span,
+                            });
+                        }
+                        TokenKind::Str(_) => return Err(self.error(DEF_PATH, token.span)),
+                        TokenKind::StrStart(first) => {
+                            let literal = self.parse_interpolation(first)?;
+                            let span = self.span_of(literal);
+                            return Err(self.error(DEF_PATH, span));
+                        }
+                        _ => {
+                            let found = self.describe(token);
+                            return Err(self.error(
+                                format!("expected the function's name after `.`, found {found}"),
+                                error_span(token),
+                            ));
+                        }
+                    }
+                }
+                TokenKind::LBracket => {
+                    let (_, span) = self.parse_position()?;
+                    return Err(self.error(DEF_PATH, span));
+                }
+                _ => break,
             }
         }
+        let value = self.parse_fn(keyword)?;
+        let base = self.path.len();
+        self.path.extend(segments);
+        let (path, shape) = self.finish_path(base);
+        let kind = ItemKind::Field {
+            path,
+            ty: None,
+            value,
+            function: true,
+        };
+        self.finish_item(keyword, (kind, value), 0, shape)
     }
 
     /// Parses a named function item, `fn NAME(...) ...` or `def NAME(...)
@@ -5959,10 +6023,10 @@ mod tests {
     #[test]
     fn a_def_needs_one_plain_name_and_the_grammar_of_fn() {
         assert_eq!(
-            error("def a.b(): Int { 1 }"),
+            error("def a.\"b\"(): Int { 1 }"),
             (
-                "a `def` is named by one identifier, not a dotted path".to_owned(),
-                Span::new(5, 6)
+                "a `def`'s path is made of identifiers".to_owned(),
+                Span::new(6, 9)
             )
         );
         assert_eq!(
@@ -6002,6 +6066,95 @@ mod tests {
                 "{with_def}"
             );
         }
+    }
+
+    #[test]
+    fn a_def_may_be_named_by_a_path_of_identifiers() {
+        let text = "def dev.peios.hello(n: Int): Int { n }";
+        let ast = parse_text(text).unwrap();
+        let item = ast.item(ast.items(ast.root())[0]);
+        let ItemKind::Field {
+            path,
+            ty: None,
+            value,
+            function: true,
+        } = item.kind
+        else {
+            panic!("expected a def, got {item:?}");
+        };
+        // The dotted field of the path, its value the function from its
+        // `(` on, spanning the item.
+        let segments = ast.path(path);
+        assert_eq!(ast.show_path(segments).to_string(), "dev.peios.hello");
+        let spans: Vec<Span> = segments.iter().map(|segment| segment.span).collect();
+        assert_eq!(
+            spans,
+            [Span::new(4, 7), Span::new(8, 13), Span::new(14, 19)]
+        );
+        assert_eq!(item.span, Span::new(0, 38));
+        assert_eq!(ast.get(value).span, Span::new(0, 38));
+        // Printed as written, with each marker, and in a record block.
+        assert_eq!(shape(text), "def dev.peios.hello(n: Int): Int {n}");
+        assert_eq!(shape("def a.b() -> Int { 1 }"), "def a.b() -> Int {1}");
+        assert_eq!(
+            shape("{ def a.b(): Int { 1 }; c = 2 }"),
+            "{def a.b(): Int {1}; c = 2}"
+        );
+        assert!(
+            ast.pretty()
+                .to_string()
+                .starts_with("(file\n  (def dev.peios.hello @0..38\n    (fn @0..38\n"),
+            "{}",
+            ast.pretty()
+        );
+        // A quoted or index segment after the first, and anything else
+        // where a name is expected after a `.`, is an error at it.
+        assert_eq!(
+            error("def a.b.\"c d\"(): Int { 1 }"),
+            (
+                "a `def`'s path is made of identifiers".to_owned(),
+                Span::new(8, 13)
+            )
+        );
+        assert_eq!(
+            error("def a[0](): Int { 1 }"),
+            (
+                "a `def`'s path is made of identifiers".to_owned(),
+                Span::new(5, 8)
+            )
+        );
+        assert_eq!(
+            error("def a.b[i + 1](): Int { 1 }"),
+            (
+                "a `def`'s path is made of identifiers".to_owned(),
+                Span::new(7, 14)
+            )
+        );
+        assert_eq!(
+            error("def a.(): Int { 1 }"),
+            (
+                "expected the function's name after `.`, found `(`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        // Without a return type or a body, what `fn` reports.
+        for rest in ["() { 1 }", "(): Int", "()"] {
+            let (message, span) = error(&format!("fn f{rest}"));
+            let shifted = Span::new(span.start + 5, span.end + 5);
+            assert_eq!(
+                error(&format!("def a.b.f{rest}")),
+                (message, shifted),
+                "{rest}"
+            );
+        }
+        // Two levels taller for each segment after the first, as a dotted
+        // field is.
+        let deep = format!("def a{}(): Int {{ 1 }}", ".b".repeat(crate::MAX_DEPTH));
+        assert!(
+            error(&deep).0.contains("nested too deeply"),
+            "{:?}",
+            error(&deep)
+        );
     }
 
     #[test]

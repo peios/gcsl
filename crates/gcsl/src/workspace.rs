@@ -33,6 +33,24 @@
 //! the directory's tree has the winner of each leaf, which every file of
 //! the directory sees.
 //!
+//! A `def` named by a dotted path, `def dev.peios.hello()`, is a leaf like
+//! any dotted field's (see [`crate::mentions`], "Dotted `def`s"): it merges
+//! under its prefixes with every other file's leaves, in its directory, in
+//! every view and through every import, conflicts only as a leaf does, and
+//! is shadowable as any `def`. Its merged node's cell is the one its file
+//! stores its closure into, so it is read as any cell is, by its path,
+//! from another file or through an import, a record of a prefix read whole
+//! holding it among the other leaves. It has no name: it is none of a
+//! directory's `def`s by name ([`FileScope`]'s `function` never finds it),
+//! so another file's reference to it mentions its node, which makes that
+//! file need its own, and never its function; within its own file, a
+//! reference to it, or to a node above it, mentions its function too
+//! (the file's own tree, [`FileScope`]'s `dotted_defs_under`). Once its
+//! file is checked, the workspace carries which of its parameters its body
+//! measures, as for a `def` of one name (from its function's resolution,
+//! since it has no binding: `computed_cells`), so a call of it from another
+//! file is of a known callee.
+//!
 //! # The view of a file
 //!
 //! Dotted paths always merge. Every file has a *view*: one tree, merged
@@ -503,7 +521,7 @@ use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::eval::MemoTables;
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
-use crate::mentions::{self, Mentions, Need, Resolve, Schedule, Sweep, TypeRead};
+use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule, Sweep, TypeRead};
 use crate::names::{Name, Names};
 use crate::parser;
 use crate::session;
@@ -1468,12 +1486,27 @@ impl Scan {
         }
     }
 
-    /// The name of the top-level function `function`.
+    /// The name of the top-level function `function`, or its path if it is
+    /// a `def` named by a dotted path.
     fn show_function(&self, function: Function) -> String {
-        self.files
-            .get(function.file as usize)
-            .and_then(|file| file.mentions.functions.get(function.index as usize))
-            .map_or_else(String::new, |top| self.names.get(top.name).to_owned())
+        let Some(file) = self.files.get(function.file as usize) else {
+            return String::new();
+        };
+        let Some(top) = file.mentions.functions.get(function.index as usize) else {
+            return String::new();
+        };
+        match (top.name, file.ast.item(top.item).kind) {
+            (Some(name), _) => self.names.get(name).to_owned(),
+            (None, ItemKind::Field { path, .. }) => file
+                .ast
+                .path(path)
+                .iter()
+                .filter_map(PathSegment::name)
+                .map(|name| self.names.get(name))
+                .collect::<Vec<_>>()
+                .join("."),
+            (None, _) => String::new(),
+        }
     }
 
     /// The dotted path in its file's view of the view node `view`.
@@ -1523,6 +1556,8 @@ pub struct FileScope<'a> {
     dir: u32,
     /// The file's own functions.
     own: &'a [mentions::TopLevel],
+    /// The file's own tree of top-level fields.
+    tree: &'a FieldTree,
     /// For each of the file's own nodes, the merged node of its path.
     global: &'a [u32],
     /// The file's own node of each merged node it has one of.
@@ -1552,6 +1587,7 @@ impl<'a> FileScope<'a> {
             scan,
             dir: file.dir,
             own: &file.mentions.functions,
+            tree: &file.mentions.tree,
             global: &file.global,
             local,
             aliases: file.aliases.iter().map(|a| (a.name, a.target)).collect(),
@@ -1760,7 +1796,7 @@ impl Resolve for FileScope<'_> {
     }
 
     fn function(&self, name: Name) -> Option<u32> {
-        if let Some(own) = self.own.iter().position(|f| f.name == name) {
+        if let Some(own) = self.own.iter().position(|f| f.name == Some(name)) {
             return Some(count(own));
         }
         let def = self
@@ -1768,6 +1804,18 @@ impl Resolve for FileScope<'_> {
             .chain(self.dir)
             .find_map(|dir| self.scan.defs.get(&(dir, name)))?;
         Some(count(self.own.len()).saturating_add(*def))
+    }
+
+    fn dotted_defs_under(&self, node: u32, each: &mut dyn FnMut(u32)) {
+        // The file's own node, or the file's own node of its view's node:
+        // another file's functions are no mentions of this file's.
+        let own = match self.own_view(node) {
+            Some(view) => self.scan.views.get(view as usize).and_then(|v| v.own),
+            None => (node < count(self.global.len())).then_some(node),
+        };
+        if let Some(own) = own {
+            self.tree.dotted_defs_under(own, each);
+        }
     }
 
     fn own(&self) -> (u32, u32) {
@@ -2303,14 +2351,11 @@ fn resolve(scan: &mut Scan) {
             .map(|file| mem::take(&mut file.mentions))
             .unwrap_or_default();
         if let Some(file) = scan.files.get(index) {
-            let (functions, tree) = (
-                mem::take(&mut mentions.functions),
-                mem::take(&mut mentions.tree),
-            );
+            // The functions stay: the groups are found among them.
+            let (functions, tree) = (mentions.functions.clone(), mem::take(&mut mentions.tree));
             let mut scope = FileScope::new(scan, file);
-            scope.own = &functions;
+            (scope.own, scope.tree) = (&functions, &tree);
             mentions.resolve(&file.ast, &scope);
-            mentions.functions = functions;
             mentions.tree = tree;
         }
         if let Some(file) = scan.files.get_mut(index) {
@@ -2451,8 +2496,10 @@ fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
             .item_leaf
             .get(function.position)
             .is_some_and(Option::is_some);
-        if is_def {
-            scan.defs.entry((dir, function.name)).or_insert(id);
+        // A `def` named by a dotted path is found by its path, through the
+        // merged tree, never by a name.
+        if is_def && let Some(name) = function.name {
+            scan.defs.entry((dir, name)).or_insert(id);
         }
         functions.push(id);
     }
@@ -5271,7 +5318,8 @@ fn reported(errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
 
 /// Whether file `index` commits its declaration `name` for the files
 /// checked after it: a root it computes, being its last contributor, or a
-/// `def`.
+/// `def` of that name. (A `def` named by a dotted path is a leaf under its
+/// root, committed with the root.)
 fn commits(scan: &Scan, index: u32, name: Name) -> bool {
     let Some(file) = scan.files.get(index as usize) else {
         return false;
@@ -5280,7 +5328,7 @@ fn commits(scan: &Scan, index: u32, name: Name) -> bool {
         let global = file.global.get(root as usize).copied();
         global.and_then(|global| scan.computed_by(global)) == Some(index)
     }) || file.mentions.functions.iter().any(|top| {
-        top.name == name && matches!(file.ast.item(top.item).kind, ItemKind::Field { .. })
+        top.name == Some(name) && matches!(file.ast.item(top.item).kind, ItemKind::Field { .. })
     })
 }
 
@@ -5346,16 +5394,37 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
     let global = file.map_or(&[][..], |file| &file.global);
     let slots = output.checked.resolution.field_cells();
     let measured_by_slot = output.scope.measured_by_slot();
+    let nodes = file.map_or(&[][..], |file| &file.mentions.tree.nodes);
     let mut cells = Vec::new();
     for (own, (&global, &ty)) in global.iter().zip(&output.cell_types).enumerate() {
         if scan.computed_by(global) == Some(index) {
             // A `def`'s cell is read from its function's slot.
             let slot = slots.get(own).copied().unwrap_or_else(|| scan.slot(global));
-            let measured = measured_by_slot
+            let mut measured = measured_by_slot
                 .get(&slot)
                 .copied()
                 .flatten()
                 .map(Box::from);
+            // A `def` named by a dotted path has no binding: what its body
+            // measures is its function's, which the cell's type is.
+            if measured.is_none()
+                && ty != TyId::ERROR
+                && let Some(function) = nodes
+                    .get(own)
+                    .and_then(|node| node.leaf)
+                    .and_then(|leaf| leaf.function)
+                    .and_then(|function| file?.mentions.functions.get(function as usize))
+                    .filter(|function| function.name.is_none())
+            {
+                let resolution = output.checked.resolution.function(function.function);
+                measured = Some(
+                    resolution
+                        .param_demands
+                        .iter()
+                        .map(Option::is_some)
+                        .collect(),
+                );
+            }
             cells.push((global, slot, ty, measured));
         }
     }
@@ -10285,6 +10354,318 @@ p26 = com.x"#;
             value(&files, "dev.peios.testpkg/test.gcsl"),
             "{built = {pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
              name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 usr\"}}"
+        );
+    }
+
+    /// The files of the slice 34 summary as it is written: `hello` in
+    /// `a.gcsl` reads `name` of `b.gcsl`, which reads `hello`.
+    const DOTTED_DEFS: [(&str, &str); 3] = [
+        ("workspace.gcsl", ""),
+        (
+            "pkgs/a.gcsl",
+            "def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }\n\
+             def dev.peios.count(n: Int): Int {\n\
+             \x20   if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }\n\
+             }",
+        ),
+        (
+            "pkgs/b.gcsl",
+            "def dev.peios.name(): String { \"world\" }\n\
+             dev.peios.version = \"1\"\n\
+             greeting = dev.peios.hello()     # \"hello world\"\n\
+             all = dev.peios                  # record of hello, count, name, version",
+        ),
+    ];
+
+    #[test]
+    fn the_dotted_defs_summary_is_two_files_that_need_each_other() {
+        // As written, the two files need each other, as they do with every
+        // `def` named by one name: a file runs as a whole before a file
+        // that needs it.
+        let (message, input, labels) = error(&DOTTED_DEFS);
+        assert_eq!(message, "`pkgs/a.gcsl` and `pkgs/b.gcsl` need each other");
+        assert_eq!((input, labels), (Some(1), vec![Some(2)]));
+        let plain = [
+            ("workspace.gcsl", ""),
+            ("pkgs/a.gcsl", "def hello(): String { \"hello {name()}\" }"),
+            (
+                "pkgs/b.gcsl",
+                "def name(): String { \"world\" }\ngreeting = hello()",
+            ),
+        ];
+        assert_eq!(error(&plain).0, message);
+        // With `name` beside `hello`, it runs: each file to its own value,
+        // and `all` the record of the directory's leaves under the prefix,
+        // the functions among them.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "pkgs/a.gcsl",
+                "def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }\n\
+                 def dev.peios.count(n: Int): Int {\n\
+                 \x20   if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }\n\
+                 }\n\
+                 def dev.peios.name(): String { \"world\" }",
+            ),
+            (
+                "pkgs/b.gcsl",
+                "dev.peios.version = \"1\"\n\
+                 greeting = dev.peios.hello()\n\
+                 all = dev.peios\n\
+                 counted = dev.peios.count(3)",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "pkgs/b.gcsl"),
+            "{dev = {peios = {version = \"1\"}}; greeting = \"hello world\"; \
+             all = {hello = fn(): String; count = fn(n: Int): Int; name = fn(): String; \
+             version = \"1\"}; counted = 3}"
+        );
+        assert_eq!(
+            value(&files, "pkgs/a.gcsl"),
+            "{dev = {peios = {hello = fn(): String; count = fn(n: Int): Int; \
+             name = fn(): String}}}"
+        );
+    }
+
+    #[test]
+    fn dotted_defs_across_the_files_of_a_directory() {
+        // Called by path from another file of the directory, and from a
+        // directory below.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "def dev.odd(n: Int): Bool { if n == 0 { false } else { dev.even(n - 1) } }\n\
+                 def dev.even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }",
+            ),
+            ("b.gcsl", "x = dev.even(10)"),
+            ("sub/c.gcsl", "y = dev.odd(3)\nall = dev"),
+        ];
+        assert_eq!(value(&files, "b.gcsl"), "{x = true}");
+        assert_eq!(
+            value(&files, "sub/c.gcsl"),
+            "{y = true; all = {odd = fn(n: Int): Bool; even = fn(n: Int): Bool}}"
+        );
+        // Two in two files that call each other need each other, as two
+        // `def`s of one name do.
+        let mutual = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "def dev.even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }",
+            ),
+            (
+                "b.gcsl",
+                "def dev.odd(n: Int): Bool { if n == 0 { false } else { dev.even(n - 1) } }",
+            ),
+        ];
+        let plain = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "def even(n: Int): Bool { if n == 0 { true } else { odd(n - 1) } }",
+            ),
+            (
+                "b.gcsl",
+                "def odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }",
+            ),
+        ];
+        assert_eq!(error(&mutual), error(&plain));
+        assert_eq!(error(&mutual).0, "`a.gcsl` and `b.gcsl` need each other");
+        // A leaf conflict across files, as any leaf's.
+        let conflict = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "def dev.x(): Int { 1 }"),
+            ("b.gcsl", "dev.x = 2"),
+        ];
+        assert_eq!(error(&conflict).0, "field `dev.x` is defined in two files");
+        // Shadowable across the files of a directory, in path order.
+        let shadowed = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "#[shadowable] def dev.x(): Int { 1 }"),
+            ("b.gcsl", "def dev.x(): Int { 2 }\ny = dev.x()"),
+            ("c.gcsl", "z = dev.x()"),
+        ];
+        assert_eq!(value(&shadowed, "c.gcsl"), "{z = 2}");
+        // A call from another file is of a known callee, as a `def` of one
+        // name is: the call-site form of the implicit-await error.
+        let known = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "def dev.inc(n: Int): Int { n + 1 }\ndef inc(n: Int): Int { n + 1 }",
+            ),
+            (
+                "b.gcsl",
+                "fn p(f: Future<Int>): Int { dev.inc(f) }\n\
+                 fn q(f: Future<Int>): Int { inc(f) }",
+            ),
+        ];
+        assert_eq!(
+            messages(&known, "b.gcsl"),
+            [
+                "argument `f` would be awaited inside `dev.inc`, which is pure",
+                "argument `f` would be awaited inside `inc`, which is pure",
+            ]
+        );
+    }
+
+    #[test]
+    fn dotted_defs_through_each_form_of_import() {
+        let lib = (
+            "pkgs/a.gcsl",
+            "def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }\n\
+             def dev.peios.name(): String { \"world\" }",
+        );
+        for (text, expected) in [
+            (
+                "import dev from pkgs.a\nh = dev.peios.hello()",
+                "{h = \"hello world\"}",
+            ),
+            (
+                "import dev as d from pkgs.a\nh = d.peios.name()",
+                "{h = \"world\"}",
+            ),
+            (
+                "import * from pkgs.a\ndef dev.own(): String { dev.peios.name() }\n\
+                 h = dev.peios.hello()\no = dev.own()\nall = dev",
+                "{dev = {own = fn(): String}; h = \"hello world\"; o = \"world\"; \
+                 all = {own = fn(): String; peios = {hello = fn(): String; \
+                 name = fn(): String}}}",
+            ),
+            (
+                "import pkgs.a\nh = a.dev.peios.hello()\nw = a",
+                "{h = \"hello world\"; w = {dev = {peios = {hello = fn(): String; \
+                 name = fn(): String}}}}",
+            ),
+            ("import pkgs\nh = pkgs.dev.peios.name()", "{h = \"world\"}"),
+        ] {
+            let files = [("workspace.gcsl", ""), lib, ("app/main.gcsl", text)];
+            assert_eq!(value(&files, "app/main.gcsl"), expected, "{text}");
+        }
+        // Through an import, a call is of a known callee.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/x.gcsl", "def dev.inc(n: Int): Int { n + 1 }"),
+            (
+                "app/main.gcsl",
+                "import dev from lib.x\nimport lib\n\
+                 fn p(f: Future<Int>): Int { dev.inc(f) }\n\
+                 fn q(f: Future<Int>): Int { lib.dev.inc(f) }",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "app/main.gcsl"),
+            [
+                "argument `f` would be awaited inside `dev.inc`, which is pure",
+                "argument `f` would be awaited inside `lib.dev.inc`, which is pure",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_view_read_whole_has_its_dotted_defs_resolved() {
+        // `dev` merges the root's, the import's and the file's own leaves:
+        // read whole above the `def`, it holds the type its body gives it,
+        // in either order of the file's items.
+        let resolved = "{base: Int, lib: Int, own: {get: fn(n: Int | Future<Int>) -> Int}}";
+        for text in [
+            "import * from lib\nwhole = dev\ndef dev.own.get(n: Int) -> Int { n + 1 }\n\
+             got = whole.own.get(1)",
+            "import * from lib\ndef dev.own.get(n: Int) -> Int { n + 1 }\nwhole = dev\n\
+             got = whole.own.get(1)",
+        ] {
+            let files = [
+                ("workspace.gcsl", "dev.base = 1"),
+                ("lib/l.gcsl", "dev.lib = 2"),
+                ("app/main.gcsl", text),
+            ];
+            let mut workspace = checked(&files);
+            let index = workspace.file("app/main.gcsl").unwrap();
+            let dump = workspace.dump_types(index).unwrap();
+            assert!(
+                dump.contains(&format!("(name dev : {resolved}")),
+                "{text}\n{dump}"
+            );
+            assert!(
+                value(&files, "app/main.gcsl").ends_with("got = 2}"),
+                "{text}"
+            );
+        }
+        // And one that cannot be had there yet is the error at the read.
+        let files = [
+            ("workspace.gcsl", "dev.base = 1"),
+            ("lib/l.gcsl", "dev.lib = 2"),
+            (
+                "app/main.gcsl",
+                "import * from lib\nwhole = dev\nlet k = 1\ndef dev.own(): Int { k }",
+            ),
+        ];
+        assert_eq!(
+            messages(&files, "app/main.gcsl"),
+            ["`dev.own` cannot be used here yet"]
+        );
+    }
+
+    #[test]
+    fn jacks_package_is_a_dotted_def_given_to_package() {
+        // `/home/jack/projects/peios/newpkgs`, with `&` written as a spread,
+        // `#[def_type]` removed and `ppk.commit` stubbed as in the slice 33
+        // test, and the package written as a `def` named by its dotted path
+        // passed to `package`.
+        let files = [
+            (
+                "workspace.gcsl",
+                "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
+                 import _lib.ppk\n\
+                 import fileroot\n\
+                 \n\
+                 type PackageDef = {\n\
+                 \x20 version: String,\n\
+                 \x20 arch: String,\n\
+                 \x20 content: String,\n\
+                 }\n\
+                 \n\
+                 type Package = { ...PackageDef, name: String }\n\
+                 \n\
+                 \n\
+                 def package(name: String, func: fn(): PackageDef) -> { pkg: Package, manifest: String } {\n\
+                 \x20   fileroot.helper()\n\
+                 \x20   pkg: Package = { ...func(); name = name }\n\
+                 \n\
+                 \x20   manifest = ppk.commit(\n\
+                 \x20       name = pkg.name,\n\
+                 \x20       version = pkg.version,\n\
+                 \x20       arch = pkg.arch,\n\
+                 \x20       content = pkg.content,\n\
+                 \x20   )\n\
+                 }\n",
+            ),
+            (
+                "_lib/ppk.gcsl",
+                "def commit(name: String, version: String, arch: String, content: String) -> String {\n\
+                 \x20   \"{name} {version} {arch} {content}\"\n\
+                 }",
+            ),
+            (
+                "dev.peios.testpkg/test.gcsl",
+                "def dev.peios.testpkg(): PackageDef {\n\
+                 \x20   version = \"0.1.0\"\n\
+                 \x20   arch = \"x86_64\"\n\
+                 \x20   content = \"usr\"\n\
+                 }\n\
+                 \n\
+                 result = package(\"dev.peios.testpkg\", dev.peios.testpkg)",
+            ),
+        ];
+        checked(&files);
+        assert_eq!(
+            value(&files, "dev.peios.testpkg/test.gcsl"),
+            "{dev = {peios = {testpkg = fn(): {arch: String, content: String, \
+             version: String}}}; result = {pkg = {arch = \"x86_64\"; content = \"usr\"; \
+             version = \"0.1.0\"; name = \"dev.peios.testpkg\"}; \
+             manifest = \"dev.peios.testpkg 0.1.0 x86_64 usr\"}}"
         );
     }
 

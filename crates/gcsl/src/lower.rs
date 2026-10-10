@@ -47,7 +47,13 @@
 //! record's fields. A function's or `lazy`'s use of a top-level function of
 //! its input is an [`IrKind::Top`] of the function's slot, of kind `Fn`,
 //! read from the top level's frame, not a capture; top-level code's is the
-//! `Load` any read is.
+//! `Load` any read is. A `def` named by a dotted path is a top-level
+//! function whose slot is its leaf's cell (below): its closure, the
+//! `MakeClosure` of its value as any function's (never an `UpdateField`
+//! chain, as its path would otherwise make it), is stored into the cell,
+//! its item is the dotted field it is in the record of the input (a leaf
+//! under its root, whose cell the record loads), and its code is shown in
+//! the dump by its path ([`Ir::set_paths`]).
 //!
 //! A record block's fields become `Store`s to their slots, as `let`s do, so
 //! that later items can read them, and its result is a `MakeRecord` whose
@@ -131,7 +137,11 @@
 //! (`Lowerer::store_cells`): a leaf's cell gets its initialiser's value, an
 //! interior node's the `MakeRecord` of `Load`s of its children's cells in
 //! the order of their first items (`Lowerer::assemble`), and a `def`'s
-//! cell is its function's slot, stored as a top-level function's is. A
+//! cell is its function's slot (a dotted `def`'s, its leaf's own, which is
+//! that function's), stored as a top-level function's is, where its closure
+//! is made, at its own item or before it: an interior node above it is
+//! assembled after its last child's item, or, if a mention pulls it
+//! earlier, only once the closure exists, which the checker makes sure of. A
 //! field item lowers to nothing at its own line; no `UpdateField` builds a
 //! top-level root item by item, so a root of N dotted items costs N stores.
 //! A reference to a field, the longest declared prefix of a `NAME.f.g`
@@ -442,12 +452,38 @@ pub fn lower(
             span: root_span,
         })?;
     lowerer.builder.measure(root, &mut functions);
-    Ok(lowerer.builder.finish_program(
+    let mut ir = lowerer.builder.finish_program(
         root,
         (resolution.frame_size(), resolution.slot_names().to_vec()),
         functions,
         (input, resolution.place().dir),
-    ))
+    );
+    ir.set_paths(dotted_paths(ast, resolution));
+    Ok(ir)
+}
+
+/// Each top-level function of `ast` named by a dotted path, as `resolution`
+/// lists them, with its path: what the dump shows its code by (see
+/// [`Ir::set_paths`]).
+fn dotted_paths(ast: &Ast, resolution: &Resolution) -> Vec<(FnId, Box<[Name]>)> {
+    resolution
+        .top_functions()
+        .iter()
+        .filter_map(|&(item, _)| {
+            let ItemKind::Field { path, value, .. } = ast.item(item).kind else {
+                return None;
+            };
+            let (ExprKind::Fn(function), [_, _, ..]) = (ast.get(value).kind, ast.path(path)) else {
+                return None;
+            };
+            let names = ast
+                .path(path)
+                .iter()
+                .filter_map(PathSegment::name)
+                .collect();
+            Some((function, names))
+        })
+        .collect()
 }
 
 struct Lowerer<'a> {
@@ -1143,9 +1179,22 @@ impl Lowerer<'_> {
     ) -> Result<IrId, InternalError> {
         match (self.ast.item(id).kind, self.ast.path(path)) {
             (_, [_]) => self.lower_expr(value),
+            // A top-level function named by a dotted path: its closure,
+            // stored in its leaf's cell.
+            (ItemKind::Field { function: true, .. }, _) if self.is_top_function(id) => {
+                self.lower_expr(value)
+            }
             (ItemKind::Field { .. }, segments) => self.lower_field_update(id, segments, value),
             (_, segments) => self.lower_update(id, segments, value),
         }
+    }
+
+    /// Whether the item `id` is one of the input's top-level functions.
+    fn is_top_function(&self, id: ItemId) -> bool {
+        self.resolution
+            .top_functions()
+            .iter()
+            .any(|&(item, _)| item == id)
     }
 
     /// Lowers the dotted field `id`, whose path is `segments`, to the chain
@@ -1474,7 +1523,13 @@ impl Lowerer<'_> {
                 }
                 _ => continue,
             };
-            if is_root && mentions::top_level_function(self.ast, id).is_none() {
+            // A `def` of one name is its own root, whose slot is its
+            // function's; one named by a dotted path is a leaf under its
+            // root, as any dotted field is.
+            if is_root
+                && mentions::top_level_function(self.ast, id)
+                    .is_none_or(|(name, _, _)| name.is_none())
+            {
                 match self.root_field(id)? {
                     RootField::Other => {}
                     RootField::Extends => continue,
@@ -5682,5 +5737,103 @@ mod tests {
             order_free(&["let r = {f = 2}\nx = { ...r; y = f }", "fn f(): Int { 1 }"]);
         assert!(messages.is_empty(), "{messages:?}");
         assert_eq!(shown, "{x: {f: Int, y: Int}}");
+    }
+
+    #[test]
+    fn dotted_defs_do_not_depend_on_order() {
+        // The summary in one file, and mutual recursion by path.
+        let (shown, messages, _) = order_free(&[
+            "def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }",
+            "def dev.peios.count(n: Int): Int { if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) } }",
+            "def dev.peios.name(): String { \"world\" }",
+            "dev.peios.version = \"1\"",
+            "greeting = dev.peios.hello()",
+            "all = dev.peios",
+            "def even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }",
+            "def dev.odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(shown.contains("greeting: String"), "{shown}");
+        // Inferred parameters, inferred results and narrowed callbacks, a
+        // prefix read whole among the readers.
+        let (shown, messages, _) = order_free(&[
+            "def p.show(n: Int): Int { n }",
+            "def p.add(n: Int): Int { n + 1 }",
+            "def p.run(n: Int): Int { p.add(p.show(n)) }",
+            "x = p.run(lazy 1)",
+            "def q.get(n: Int) -> Int { if n == 0 { lazy 0 } else { n } }",
+            "def q.twice(n: Int) -> Int { q.get(n) + q.get(n) }",
+            "y = q.twice(1)",
+            "whole = q",
+            "def r.apply(f: fn(Int) -> Int) -> Int { f(1) }",
+            "def r.run() -> Int { r.apply(r.double) }",
+            "def r.double(x: Int): Int { x * 2 }",
+            "z = r.run()",
+        ]);
+        assert!(messages.is_empty(), "{messages:?}");
+        assert!(shown.contains("x: Int"), "{shown}");
+        // A group by path: the conservative view, from either member.
+        let (shown, _, _) = order_free(&[
+            "def g.a(n: Int) -> Int { if n == 0 { lazy 5 } else { g.b(n - 1) } }",
+            "def g.b(n: Int) -> Int { g.a(n) }",
+        ]);
+        let either = "fn(n: Int | Future<Int>) -> Int | Future<Int>";
+        assert_eq!(shown, format!("{{g: {{a: {either}, b: {either}}}}}"));
+    }
+
+    #[test]
+    fn a_dotted_def_s_closure_is_stored_in_its_leaf_s_cell() {
+        // Made at the start, stored in its leaf's cell, which the prefix's
+        // record loads; shown by its path in the dump.
+        let text = "def dev.peios.count(n: Int): Int {\n\
+                    \x20   if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }\n\
+                    }\nall = dev.peios";
+        assert_eq!(
+            dump(text),
+            "(block @0..108\n\
+             \x20 (store count#3 @0..92\n\
+             \x20   (make-closure #0 @0..92))\n\
+             \x20 (store peios#2 @0..92\n\
+             \x20   (make-record [count] @0..92\n\
+             \x20     (load count#3 @0..92)))\n\
+             \x20 (store dev#0 @0..92\n\
+             \x20   (make-record [peios] @0..92\n\
+             \x20     (load peios#2 @0..92)))\n\
+             \x20 (store all#1 @93..108\n\
+             \x20   (load peios#2 @99..108))\n\
+             \x20 (make-record [dev all] @0..108\n\
+             \x20   (load dev#0 @4..7)\n\
+             \x20   (load all#1 @93..96)))\n\
+             fn #0 dev.peios.count (frame 1, params 1, captures 0, height 8)\n\
+             \x20 (block @33..92\n\
+             \x20   (if @39..90\n\
+             \x20     (int-cmp == @42..48\n\
+             \x20       (load n#0 @42..43)\n\
+             \x20       (int 0 @47..48))\n\
+             \x20     (block @49..54\n\
+             \x20       (int 0 @51..52))\n\
+             \x20     (block @60..90\n\
+             \x20       (int-add @62..88\n\
+             \x20         (int 1 @62..63)\n\
+             \x20         (call @66..88\n\
+             \x20           (fn top count#3 @66..81)\n\
+             \x20           (arg 0 @82..87\n\
+             \x20             (int-sub @82..87\n\
+             \x20               (load n#0 @82..83)\n\
+             \x20               (int 1 @86..87))))))))"
+        );
+        // Copying a variable, it is made after it is bound.
+        let made = dump("let k = 1\ndef a.f(): Int { k }\nx = a.f()");
+        assert!(
+            made.starts_with(
+                "(block @0..40\n\
+                 \x20 (store k#3 @0..9\n\
+                 \x20   (int 1 @8..9))\n\
+                 \x20 (store f#2 @10..30\n\
+                 \x20   (make-closure #0 @10..30\n\
+                 \x20     (load k#3 @10..30)))\n"
+            ),
+            "{made}"
+        );
     }
 }

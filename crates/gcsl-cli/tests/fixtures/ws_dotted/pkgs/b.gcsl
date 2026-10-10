@@ -1,0 +1,4 @@
+dev.peios.version = "1"
+greeting = dev.peios.hello()     # "hello world"
+all = dev.peios                  # record of hello, count, name, version
+counted = dev.peios.count(3)

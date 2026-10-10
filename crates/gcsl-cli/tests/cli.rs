@@ -2749,6 +2749,89 @@ fn dumps_show_types() {
     );
 }
 
+/// The dotted `def`s summary: packages named by dotted paths, recursion by
+/// path, a prefix read whole, a directory's files and imports.
+#[test]
+fn run_uses_dotted_defs() {
+    let output = gcsl(&["run", "tests/fixtures/ws_dotted/pkgs/b.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{dev = {peios = {version = \"1\"}}; greeting = \"hello world\"; \
+         all = {hello = fn(): String; count = fn(n: Int): Int; name = fn(): String; \
+         version = \"1\"}; counted = 3}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/ws_dotted/pkgs/a.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{dev = {peios = {hello = fn(): String; count = fn(n: Int): Int; \
+         name = fn(): String}}}\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", "tests/fixtures/ws_dotted/app/main.gcsl"]);
+    assert_eq!(stdout(&output), "{hello = \"hello world\"; count = 4}\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// `--dump-ast` shows a dotted `def` by its path, and `--dump-ir` its code.
+#[test]
+fn dumps_show_dotted_defs() {
+    let file = "tests/fixtures/ws_dotted/pkgs/a.gcsl";
+    let output = gcsl(&["run", file, "--dump-ast"]);
+    assert!(
+        stdout(&output).starts_with(
+            "(file\n\
+             \x20 (def dev.peios.hello @0..60\n\
+             \x20   (fn @0..60\n\
+             \x20     (params)\n\
+             \x20     (ret pure String)\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("\n  (def dev.peios.count @61..153\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", file, "--dump-ir"]);
+    let heads: Vec<&str> = stdout(&output)
+        .lines()
+        .filter(|line| line.starts_with("fn #"))
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "fn #0 dev.peios.hello (frame 0, params 0, captures 0, height 4)",
+            "fn #1 dev.peios.count (frame 1, params 1, captures 0, height 8)",
+            "fn #2 dev.peios.name (frame 0, params 0, captures 0, height 2)",
+        ]
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// A dotted `def` that cannot be used yet, rendered with its path.
+#[test]
+fn run_renders_a_dotted_def_not_ready() {
+    let output = gcsl(&["run", "tests/fixtures/dotted_def_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `dev.peios.get` cannot be used here yet\n\
+         \x20--> tests/fixtures/dotted_def_error.gcsl:1:5\n\
+         \x20 |\n\
+         1 | x = dev.peios.get()\n\
+         \x20 |     ^^^^^^^^^^^^^\n\
+         2 | let k = 1\n\
+         \x20 | --------- `dev.peios.get` reads `k`, which is bound here\n\
+         \x20 |\n\
+         \x20 = note: a function can be used once every variable it reads is bound\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
 /// The REPL: a line may declare a type, which later lines see, and a later
 /// line's declaration of its name shadows it.
 #[test]
@@ -2772,6 +2855,31 @@ fn repl_keeps_types_across_lines() {
          \x20 |\n\
          1 | type Box<T> = {v: T}\n\
          \x20 |         ^\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// The REPL: a line may declare a dotted `def`, which later lines call by
+/// its path; a quoted segment of its path is an error.
+#[test]
+fn repl_keeps_dotted_defs_across_lines() {
+    let output = repl(
+        "def dev.peios.count(n: Int): Int { if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) } }\n\
+         dev.peios.count(3)\n\
+         def dev.\"x y\"(): Int { 1 }\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{dev = {peios = {count = fn(n: Int): Int}}} : {dev: {peios: {count: fn(n: Int): Int}}}\n\
+         3 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: a `def`'s path is made of identifiers\n\
+         \x20--> <repl>:1:9\n\
+         \x20 |\n\
+         1 | def dev.\"x y\"(): Int { 1 }\n\
+         \x20 |         ^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

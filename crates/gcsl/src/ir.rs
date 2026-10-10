@@ -1487,6 +1487,11 @@ pub struct Ir {
     /// The directory of the file the program was lowered from, by its index
     /// in its run's table of directories (see [`Ir::dir`]).
     dir: u32,
+    /// Each top-level function named by a dotted path, `def
+    /// dev.peios.hello`, which refers to itself by no name, with its path,
+    /// which [`Ir::pretty`] shows where it shows another's name. For
+    /// [`Ir::pretty`] only; usually empty.
+    paths: Vec<(FnId, Box<[Name]>)>,
 }
 
 impl Ir {
@@ -1693,6 +1698,23 @@ impl Ir {
     /// copy of the whole frame's in each (see [`crate::workspace`]).
     pub(crate) fn replace_slot_names(&mut self, slot_names: Vec<Name>) -> Vec<Name> {
         mem::replace(&mut self.slot_names, slot_names)
+    }
+
+    /// Sets the paths of the program's top-level functions named by dotted
+    /// paths, `paths`, each with its function, which only [`Ir::pretty`]
+    /// reads.
+    pub(crate) fn set_paths(&mut self, paths: Vec<(FnId, Box<[Name]>)>) {
+        self.paths = paths;
+    }
+
+    /// The path of the function whose index is `index`, if it is a
+    /// top-level function named by a dotted path (see [`Ir::set_paths`]);
+    /// empty otherwise.
+    fn path_of(&self, index: usize) -> &[Name] {
+        self.paths
+            .iter()
+            .find(|(function, _)| function.index() == index)
+            .map_or(&[][..], |(_, path)| path)
     }
 
     /// Returns function `id`.
@@ -1906,8 +1928,10 @@ impl Ir {
     /// written); a total comparison of two values of a union of kinds shows
     /// as `(value-same === @0..9 ...)`. After the root, each
     /// function is shown on a line of its own as
-    /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, or
-    /// `fn #1 (frame ...)` if it has no name, a memoised function as
+    /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, a top-level
+    /// function named by a dotted path by its path, `fn #0 dev.peios.count
+    /// (frame ...)`, or `fn #1 (frame ...)` if it has no name, a memoised
+    /// function as
     /// `memo fn #2 name (frame ...)`, and each `lazy`'s body as
     /// `future #3 (frame ...)`, followed by its body, whose slots are named
     /// by its own frame's variables. There is no trailing newline.
@@ -2239,6 +2263,7 @@ impl IrBuilder {
             slot_names,
             input,
             dir,
+            paths: Vec::new(),
         }
     }
 }
@@ -2584,6 +2609,10 @@ impl fmt::Display for Pretty<'_> {
             write!(f, "\n{head} #{index}")?;
             if let Some(name) = code.name {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
+            }
+            for (at, &segment) in self.ir.path_of(index).iter().enumerate() {
+                let before = if at == 0 { " " } else { "." };
+                write!(f, "{before}{}", FieldName(self.names.get(segment)))?;
             }
             writeln!(
                 f,

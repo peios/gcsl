@@ -608,7 +608,9 @@
 //! resolves to [`VarRef::Callee`], which the evaluator serves from the
 //! closure being run, so a recursive closure never holds a reference to
 //! itself and reference counts stay free of cycles. It cannot be rebound
-//! with `:=`, and never reaches a session's [`Scope`]. A function is
+//! with `:=`, and never reaches a session's [`Scope`]. A `def` named by a
+//! dotted path has no such name: it calls itself by its path, as any other
+//! top-level function (see [Top-level functions](#top-level-functions)). A function is
 //! visible from the item after its own, as any binding is, except a
 //! top-level function, whose name is in scope in its whole input, so that
 //! top-level functions may be used above their declarations and call each
@@ -648,7 +650,8 @@
 //! # Top-level functions
 //!
 //! A *top-level function* of an input is a named function item (`fn f`)
-//! or a `def` that is directly an item of the input's outermost block;
+//! or a `def` (`def f`, or `def dev.peios.f`, named by a dotted path: see
+//! below) that is directly an item of the input's outermost block;
 //! nothing inside a nested block, a loop body, a labelled block, a function
 //! or a `lazy` is one. The input's top-level fields are order-free too (see
 //! [Top-level fields](#top-level-fields)); together with its top-level
@@ -738,6 +741,46 @@
 //! yet. That spread rule is conservative: it holds whether or not the
 //! spread defines the name.
 //!
+//! **Dotted names.** A `def` named by a dotted path, `def
+//! dev.peios.count(n: Int): Int { ... }`, is exactly a `def` whose name is
+//! its path, in every rule above and below: what differs is only where its
+//! function is kept and how it is read. It is the leaf of its path in the
+//! tree of top-level fields (see [Top-level fields](#top-level-fields)), and
+//! has no binding, since no variable could name it: the leaf's cell, a slot
+//! of the top level's frame after the roots', holds its closure, stored
+//! where the closure is made, and holds its type
+//! (`Checker::type_dotted_defs`): the type its signature declares, and,
+//! once its group is checked (`Checker::finish_group`), the type its body
+//! gives it, as a plain function's binding has. A use of it is a read of
+//! its path, a reference whose longest declared prefix is its leaf, which
+//! reads the cell (`Checker::field_reference`): from top-level code a slot
+//! of the frame, from inside any function or `lazy` [`VarRef::Fn`] of it,
+//! the node a plain function's mention is, so mutual recursion with any
+//! top-level function works as between plain ones, and a call from inside
+//! its group is treated as a recursive call (`Checker::is_recursive`, by the
+//! cell's slot). Once its group is checked, a call by its path is of a
+//! known callee, as a call by a plain name is (`Checker::known_callee`).
+//! There is no short self-name: inside `def dev.peios.count`, `count` is
+//! whatever else binds it, if anything. Its diagnostics name it by its
+//! path ("`dev.peios.count` cannot be used here yet"). When the walk
+//! reaches it, its path joins the record of the input as any dotted field's
+//! does, its leaf typed as the function is by then and retyped when its
+//! group is checked, and its root's name clashes as a dotted field's
+//! (`Checker::reach_dotted_def`); one whose leaf today's rules reject (a
+//! leaf twice, a leaf under a leaf or over another) is no top-level
+//! function but the field it is written as, reported as such. A read of a
+//! prefix of its path whole (`dev.peios`, `dev`) is a record of the leaves
+//! under it, its closure among them: it mentions the function (see
+//! [`crate::mentions`], "Dotted `def`s"), so the read waits for the
+//! function as a use of it does, and the function's group is checked before
+//! the reader. The prefix's type is the record of its children's when it is
+//! computed, which may be before that group is checked, so when the check
+//! changes the function's type, every node computed above its leaf is
+//! retyped (`Checker::retype_above`), before anything reads it; a node of a
+//! workspace file's view above it too. A function that reads a prefix of
+//! its own path whole is no cycle: the record holds its closure, which
+//! reads the record when it runs.
+//!
 //! # When a function may be used
 //!
 //! Top-level code (the initialiser of a `let` or a field, a spread, a `:=`,
@@ -781,8 +824,9 @@
 //! # Top-level fields
 //!
 //! A field declared directly at the top level of an input, plain (`a = e`),
-//! quoted (`"a b" = e`), dotted (`a.b.c = e`) or a `def`, is a *top-level
-//! field*, and, like a top-level function, it is visible in the whole input.
+//! quoted (`"a b" = e`), dotted (`a.b.c = e`) or a `def` (`def f`, `def
+//! a.b.f`), is a *top-level field*, and, like a top-level function, it is
+//! visible in the whole input.
 //!
 //! **The tree.** The top-level field items form a tree by their paths
 //! ([`crate::mentions::FieldTree`], built before the walk): each item is a
@@ -790,8 +834,9 @@
 //! record of its children in the order of their first items. Every node has
 //! a *cell*, a slot of the top level's frame written once: a root's is its
 //! binding's slot, declared as the input starts, after the top-level
-//! functions (`Checker::declare_field_cells`; a `def`'s is its function's),
-//! and every other node's is a slot after those that no name finds. The
+//! functions (`Checker::declare_field_cells`; a `def`'s of one name is its
+//! function's), and every other node's is a slot after those that no name
+//! finds, a dotted `def`'s holding its closure. The
 //! rules of [Dotted fields](#dotted-fields) that keep a leaf from also
 //! being interior hold in either order of the two items.
 //!
@@ -903,7 +948,8 @@
 //! (`Checker::set_aside_shadowed`) and, once the walk is done, checks its
 //! value as it is written (`Checker::check_shadowed_items`), declaring
 //! nothing, in the view of the top level above its own item, as a body
-//! checked late is, a `def`'s function seeing itself by its name. So its
+//! checked late is, a `def`'s function seeing itself by its name (one named
+//! by a dotted path has none: its path reads the declaration that stands). So its
 //! own errors are reported. It needs nothing, so what it alone would read
 //! may not be computed, or checked, before it: a cell of a file this one
 //! does not otherwise need has no type yet, and a record of an import only
@@ -2288,7 +2334,13 @@
 //! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
 //! whose measured parameters the workspace carries, so its call-site
 //! diagnostics are those of a `def` of the directory; the prelude's `half`
-//! is such a `def`.
+//! is such a `def`. So is a call of a `def` named by a dotted path, through
+//! an import or by its path from another file of the directory chain
+//! (`dev.peios.f(x)`), which reads the root the chain committed, a record
+//! that knows no function: the reference is resolved in the file's view to
+//! the merged node (`Checker::committed_callee`), whose measured parameters
+//! the workspace carries as a `def`'s of one name (a dotted one has no
+//! binding: they are its function's).
 //!
 //! The `fileroot` module (see [`crate::workspace`], "The standard library")
 //! is no record: a reference through its whole import resolves, as any
@@ -2329,7 +2381,7 @@ use crate::ast::{
     TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
-use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule};
+use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
@@ -3656,16 +3708,30 @@ enum BodyState {
 /// One top-level function of the input being checked.
 #[derive(Clone, Copy, Debug)]
 struct TopFn {
-    /// Its item, `fn NAME ...` or `def NAME ...`.
+    /// Its item, `fn NAME ...`, `def NAME ...` or `def PATH ...`.
     item: ItemId,
     /// Its function expression.
     expr: ExprId,
     /// Its function.
     function: FnId,
-    /// Its name.
-    name: Name,
-    /// Its binding's index in `bindings`, declared as the input starts.
+    /// Its name; `None` for a `def` named by a dotted path, which has no
+    /// binding (see [Top-level functions](#top-level-functions)).
+    name: Option<Name>,
+    /// Its binding's index in `bindings`, declared as the input starts;
+    /// `usize::MAX` for a `def` named by a dotted path, and, until
+    /// `Checker::declare_shadowing_fns` declares it, for a `fn` that
+    /// shadows a field root.
     binding: usize,
+    /// For a `def` named by a dotted path, its leaf of the tree of
+    /// top-level fields, whose cell holds its closure and its type: the
+    /// type its signature declares, then, once its group is checked, the
+    /// type its body gives it, as a plain function's binding has.
+    leaf: Option<u32>,
+    /// For a `def` named by a dotted path, once the walk has reached it,
+    /// the walk's node of its leaf in the record of the input, which takes
+    /// its type once its group is checked (see `Checker::nodes`); `NO_NODE`
+    /// until then.
+    node: u32,
     /// The number of bindings declared when the walk reached its
     /// declaration, once it has: the bindings its body sees.
     cut: Option<usize>,
@@ -5854,12 +5920,12 @@ impl<'a> Checker<'a> {
                         .with_note(WHOLE_FIELD_NOTE),
                     );
                     self.fields[index].rejected = true;
-                    self.check_alone(value);
+                    self.check_rejected(value);
                     return;
                 };
                 let Some((node, existing)) = self.attach_point(open.node, segments) else {
                     self.fields[index].rejected = true;
-                    self.check_alone(value);
+                    self.check_rejected(value);
                     return;
                 };
                 Some((index, open, node, existing))
@@ -7223,19 +7289,37 @@ impl<'a> Checker<'a> {
                 _ => BindingKind::Variable,
             };
             let span = self.ast.item(top.item).span;
-            if kind == BindingKind::Variable {
-                self.check_directory_clash(top.item, top.name);
-            }
-            // A `fn` named like a shadowable field root of the input
-            // shadows it in the whole input: its binding is declared after
-            // the roots' (`Checker::declare_shadowing_fns`).
-            let binding = if kind == BindingKind::Variable && self.shadowable_root(top.name) {
-                usize::MAX
-            } else {
-                let ty = self.declared_type(top.function);
-                let binding = self.bindings.len();
-                self.declare_binding(top.name, ty, Some(span), kind);
-                binding
+            // A `def` named by a dotted path has no binding: its leaf's
+            // cell, a slot after the roots', holds it, and is typed by it
+            // (`Checker::declare_field_cells`).
+            let binding = match top.name {
+                None => usize::MAX,
+                Some(name) => {
+                    if kind == BindingKind::Variable {
+                        self.check_directory_clash(top.item, name);
+                    }
+                    // A `fn` named like a shadowable field root of the input
+                    // shadows it in the whole input: its binding is declared
+                    // after the roots' (`Checker::declare_shadowing_fns`).
+                    if kind == BindingKind::Variable && self.shadowable_root(name) {
+                        usize::MAX
+                    } else {
+                        let ty = self.declared_type(top.function);
+                        let binding = self.bindings.len();
+                        self.declare_binding(name, ty, Some(span), kind);
+                        binding
+                    }
+                }
+            };
+            let leaf = match top.name {
+                None => self
+                    .mentions
+                    .tree
+                    .item_leaf
+                    .get(top.position)
+                    .copied()
+                    .flatten(),
+                Some(_) => None,
             };
             self.top_fns.push(TopFn {
                 item: top.item,
@@ -7243,6 +7327,8 @@ impl<'a> Checker<'a> {
                 function: top.function,
                 name: top.name,
                 binding,
+                leaf,
+                node: NO_NODE,
                 cut: None,
                 state: BodyState::Unchecked,
                 ready: 0,
@@ -7252,7 +7338,28 @@ impl<'a> Checker<'a> {
         }
         self.top_copies = vec![Vec::new(); self.top_fns.len()];
         self.declare_field_cells();
+        self.type_dotted_defs();
         self.closure_ready = vec![None; self.mentions.node_count() + self.top_fns.len()];
+    }
+
+    /// As the input starts, once the cells are declared: gives the cell of
+    /// each `def` named by a dotted path the type its signature declares,
+    /// which a use of it sees until its group is checked, as a plain
+    /// function's binding has (see [Top-level
+    /// functions](#top-level-functions)).
+    fn type_dotted_defs(&mut self) {
+        for index in 0..self.top_fns.len() {
+            let Some(top) = self.top_fns.get(index).copied() else {
+                continue;
+            };
+            let Some(leaf) = top.leaf else {
+                continue;
+            };
+            let ty = self.declared_type(top.function);
+            if let Some(cell) = self.field_cells.get_mut(leaf as usize) {
+                cell.ty = Some(ty);
+            }
+        }
     }
 
     /// Whether `name` is the root of a top-level field of the input all of
@@ -7266,6 +7373,17 @@ impl<'a> Checker<'a> {
             .is_some_and(|root| root.shadowable)
     }
 
+    /// The binding of the `def` of one name whose item is `leaf`'s, if it
+    /// is one: its cell is its function's binding. A `def` named by a
+    /// dotted path has none, and its cell is a slot of its own.
+    fn plain_def_binding(&self, leaf: Option<FieldLeaf>) -> Option<usize> {
+        let leaf = leaf?;
+        self.top_fns
+            .iter()
+            .find(|top| top.item == leaf.item && top.name.is_some())
+            .map(|top| top.binding)
+    }
+
     /// As the input starts, once its field roots are declared: declares each
     /// top-level `fn` named like a shadowable field root of the input
     /// ([`Checker::shadowable_root`]), so that its binding, later than the
@@ -7275,13 +7393,13 @@ impl<'a> Checker<'a> {
             let Some(top) = self.top_fns.get(index).copied() else {
                 continue;
             };
-            if top.binding != usize::MAX {
+            let (usize::MAX, Some(name)) = (top.binding, top.name) else {
                 continue;
-            }
+            };
             let ty = self.declared_type(top.function);
             let binding = self.bindings.len();
             let span = self.ast.item(top.item).span;
-            self.declare_binding(top.name, ty, Some(span), BindingKind::Variable);
+            self.declare_binding(name, ty, Some(span), BindingKind::Variable);
             if let Some(entry) = self.top_fns.get_mut(index) {
                 entry.binding = binding;
             }
@@ -7312,10 +7430,7 @@ impl<'a> Checker<'a> {
                 break;
             };
             let (name, parent, first) = (node.name, node.parent, node.first);
-            let def = node
-                .leaf
-                .and_then(|leaf| self.top_fns.iter().find(|top| top.item == leaf.item))
-                .map(|top| top.binding);
+            let def = self.plain_def_binding(node.leaf);
             let cell = match (parent, def) {
                 (_, Some(binding)) => FieldCell {
                     slot: self.bindings.get(binding).map_or(Slot::NONE, |b| b.slot),
@@ -7443,10 +7558,7 @@ impl<'a> Checker<'a> {
             let (name, parent, first) = (node.name, node.parent, node.first);
             let global = file.global.get(index).copied().unwrap_or(u32::MAX);
             let slot = workspace.slot(global);
-            let def = node
-                .leaf
-                .and_then(|leaf| self.top_fns.iter().find(|top| top.item == leaf.item))
-                .map(|top| top.binding);
+            let def = self.plain_def_binding(node.leaf);
             let cell = match (parent, def) {
                 (_, Some(binding)) => FieldCell {
                     slot: self.bindings.get(binding).map_or(Slot::NONE, |b| b.slot),
@@ -7704,6 +7816,9 @@ impl<'a> Checker<'a> {
                 // A `def`'s cell is its function's slot, and now typed as
                 // its function, so never its merged node's unwritten one.
                 let global = workspace.scope.merged(node)?;
+                // Called, a `def` named by a dotted path of another file of
+                // the chain is a known callee, as one imported is.
+                self.imported_callees.insert(id, global);
                 (workspace.cell_slot(global), workspace.cell_type(global))
             }
         };
@@ -7972,9 +8087,13 @@ impl<'a> Checker<'a> {
             // the last item, as for any top-level function. Its body is
             // not checked here: it may read fields computed after this
             // point, since a closure reads them when it runs, not when
-            // it is made.
+            // it is made. A `def` named by a dotted path has no binding:
+            // its cell has its type (`Checker::type_dotted_defs`), which
+            // its group's check settles likewise.
             Some(leaf) if self.top_fns.iter().any(|top| top.item == leaf.item) => {
-                if let Some(cell) = self.field_cells.get_mut(node as usize) {
+                if self.plain_def_binding(Some(leaf)).is_some()
+                    && let Some(cell) = self.field_cells.get_mut(node as usize)
+                {
                     cell.ty = Some(TyId::ERROR);
                 }
                 return;
@@ -8024,40 +8143,104 @@ impl<'a> Checker<'a> {
                 }
                 if cell.cyclic { TyId::ERROR } else { ty }
             }
-            None => {
-                let mut erroneous = false;
-                let mut fields = Vec::with_capacity(children.len());
-                for child in children {
-                    let ty = self
-                        .field_cells
-                        .get(child as usize)
-                        .and_then(|cell| cell.ty)
-                        .unwrap_or(TyId::ERROR);
-                    erroneous |= ty == TyId::ERROR;
-                    if let Some(name) = self.mentions.tree.nodes.get(child as usize) {
-                        fields.push((name.name, ty));
-                    }
-                }
-                // A shared node's children of other files, computed before
-                // this file is checked (see [Directory scope](#directory-scope)).
-                if let Some(workspace) = self.workspace {
-                    for (name, _, ty) in workspace.foreign_children(node) {
-                        erroneous |= ty == TyId::ERROR;
-                        fields.push((name, ty));
-                    }
-                }
-                if erroneous || cell.cyclic {
-                    TyId::ERROR
-                } else {
-                    self.types.record(fields)
-                }
-            }
+            None => self.interior_type(node, &children, cell.cyclic),
         };
         if let Some(cell) = self.field_cells.get_mut(node as usize) {
             cell.ty = Some(ty);
         }
         if let Some(binding) = cell.binding.and_then(|b| self.bindings.get_mut(b)) {
             binding.ty = ty;
+        }
+    }
+
+    /// The type of the interior node `node` of the tree of top-level
+    /// fields, whose children are `children`, `cyclic` if it is on a
+    /// cycle: the record of its children's types, with, in a workspace, its
+    /// children of other files; `Error` if one of them is erroneous, or it
+    /// is on a cycle.
+    fn interior_type(&mut self, node: u32, children: &[u32], cyclic: bool) -> TyId {
+        let mut erroneous = false;
+        let mut fields = Vec::with_capacity(children.len());
+        for &child in children {
+            let ty = self
+                .field_cells
+                .get(child as usize)
+                .and_then(|cell| cell.ty)
+                .unwrap_or(TyId::ERROR);
+            erroneous |= ty == TyId::ERROR;
+            if let Some(name) = self.mentions.tree.nodes.get(child as usize) {
+                fields.push((name.name, ty));
+            }
+        }
+        // A shared node's children of other files, computed before this
+        // file is checked (see [Directory scope](#directory-scope)).
+        if let Some(workspace) = self.workspace {
+            for (name, _, ty) in workspace.foreign_children(node) {
+                erroneous |= ty == TyId::ERROR;
+                fields.push((name, ty));
+            }
+        }
+        if erroneous || cyclic {
+            TyId::ERROR
+        } else {
+            self.types.record(fields)
+        }
+    }
+
+    /// Once the group of the `def` named by a dotted path whose leaf is
+    /// `leaf` is checked and has changed its leaf's type: gives each node
+    /// above it already computed the type its children now have, and the
+    /// roots' bindings theirs, as if its group had been checked before
+    /// them, and so each node of the file's view with a leaf of the file
+    /// under it (see [Top-level functions](#top-level-functions)). A node
+    /// computed later reads the leaf's type as it is then.
+    fn retype_above(&mut self, leaf: u32) {
+        let mut changed = vec![leaf];
+        let mut at = self
+            .mentions
+            .tree
+            .nodes
+            .get(leaf as usize)
+            .and_then(|entry| entry.parent);
+        while let Some(node) = at {
+            let Some(entry) = self.mentions.tree.nodes.get(node as usize) else {
+                break;
+            };
+            let (children, parent) = (entry.children.clone(), entry.parent);
+            let Some(cell) = self.field_cells.get(node as usize).copied() else {
+                break;
+            };
+            if cell.ty.is_none() {
+                break;
+            }
+            let ty = self.interior_type(node, &children, cell.cyclic);
+            if let Some(cell) = self.field_cells.get_mut(node as usize) {
+                cell.ty = Some(ty);
+            }
+            if let Some(binding) = cell.binding.and_then(|b| self.bindings.get_mut(b)) {
+                binding.ty = ty;
+            }
+            changed.push(node);
+            at = parent;
+        }
+        // The view's nodes come parents first, so children are retyped
+        // before their parents here.
+        let tree = self.mentions.tree.nodes.len();
+        for at in (0..self.mentions.views.len()).rev() {
+            let number = u32::try_from(tree + at).unwrap_or(u32::MAX);
+            let reads_changed = self
+                .mentions
+                .views
+                .get(at)
+                .is_some_and(|view| view.children.iter().any(|child| changed.contains(child)));
+            let computed = self
+                .field_cells
+                .get(number as usize)
+                .is_some_and(|cell| cell.ty.is_some());
+            if reads_changed && computed {
+                self.compute_view(number);
+                changed.push(number);
+            }
         }
     }
 
@@ -8360,11 +8543,18 @@ impl<'a> Checker<'a> {
     /// bindings above it, which its body sees, gives the item its slot
     /// and, for a `def`, adds the field, and returns `true`.
     fn reach_top_fn(&mut self, id: ItemId) -> bool {
-        let Some(top) = self.top_fns.iter_mut().find(|top| top.item == id) else {
+        let Some(index) = self.top_fns.iter().position(|top| top.item == id) else {
+            return false;
+        };
+        let Some(top) = self.top_fns.get_mut(index) else {
             return false;
         };
         top.cut = Some(self.bindings.len());
         let (name, binding) = (top.name, top.binding);
+        let Some(name) = name else {
+            self.reach_dotted_def(index, id);
+            return true;
+        };
         self.check_declared_twice(id, name);
         let Some(&Binding { slot, ty, .. }) = self.bindings.get(binding) else {
             return true;
@@ -8404,6 +8594,45 @@ impl<'a> Checker<'a> {
         true
     }
 
+    /// When the walk of the outermost block reaches the item `id`, the
+    /// top-level function `index`, a `def` named by a dotted path: adds its
+    /// path to the record of the input as the dotted field it is, its leaf
+    /// typed as its function is by now, which its group's check settles if
+    /// it has not yet (`Checker::finish_group`), and gives the item its
+    /// leaf's cell, which its closure is stored in.
+    fn reach_dotted_def(&mut self, index: usize, id: ItemId) {
+        let ItemKind::Field { path, value, .. } = self.ast.item(id).kind else {
+            return;
+        };
+        let segments = self.ast.path(path);
+        if let Some(first) = segments.first().and_then(PathSegment::name) {
+            self.check_name_clash(id, first);
+        }
+        let before = self.nodes.len();
+        self.check_dotted_field(id, segments, (None, value), None);
+        let Some(top) = self.top_fns.get_mut(index) else {
+            return;
+        };
+        // The leaf is the last node the path added.
+        if self.nodes.len() > before {
+            top.node = u32::try_from(self.nodes.len() - 1).unwrap_or(NO_NODE);
+        }
+        let slot = top
+            .leaf
+            .and_then(|leaf| self.field_cells.get(leaf as usize))
+            .map_or(Slot::NONE, |cell| cell.slot);
+        self.item_slots[id.index()] = slot;
+    }
+
+    /// Checks `value`, the value of a field item that the rules of dotted
+    /// fields reject, on its own, unless it is a top-level function's,
+    /// whose body its group checks, exactly once.
+    fn check_rejected(&mut self, value: ExprId) {
+        if !self.top_fns.iter().any(|top| top.expr == value) {
+            self.check_alone(value);
+        }
+    }
+
     /// Where the item `id`'s name is written: the first segment of its
     /// path, or the item, if it has none.
     fn name_span(&self, id: ItemId) -> Span {
@@ -8431,7 +8660,7 @@ impl<'a> Checker<'a> {
             .top_fns
             .iter()
             .take_while(|top| top.item != id)
-            .find(|top| top.name == name)
+            .find(|top| top.name == Some(name))
             .map(|top| top.item)
         else {
             return;
@@ -8458,10 +8687,18 @@ impl<'a> Checker<'a> {
         let Some(name) = root_declares(self.ast, id) else {
             return;
         };
+        self.check_name_clash(id, name);
+    }
+
+    /// [`Checker::check_clash`] for the item `id`, declaring `name`: a
+    /// top-level item that is no top-level function, or a `def` named by a
+    /// dotted path, whose path's first segment `name` is, as a dotted
+    /// field's is (a function named by a dotted path has no name to clash).
+    fn check_name_clash(&mut self, id: ItemId, name: Name) {
         let Some(function) = self
             .top_fns
             .iter()
-            .find(|top| top.name == name)
+            .find(|top| top.name == Some(name))
             .map(|top| top.item)
         else {
             self.check_field_clash(id, name);
@@ -8678,15 +8915,23 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The name of `need` in a diagnostic: a function's name, or a field
-    /// node's full path.
+    /// The name of `need` in a diagnostic: a function's name, or its path
+    /// if it is a `def` named by a dotted path, or a field node's full path.
     fn need_text(&self, need: Need) -> String {
         let names = self.ast.names();
         match need {
-            Need::Function(function) => self
-                .top_fns
-                .get(function as usize)
-                .map_or_else(String::new, |top| names.get(top.name).to_string()),
+            Need::Function(function) => {
+                let Some(top) = self.top_fns.get(function as usize) else {
+                    return String::new();
+                };
+                match (top.name, self.ast.item(top.item).kind) {
+                    (Some(name), _) => names.get(name).to_string(),
+                    (None, ItemKind::Field { path, .. }) => {
+                        self.ast.show_path(self.ast.path(path)).to_string()
+                    }
+                    (None, _) => String::new(),
+                }
+            }
             Need::Field(node) => {
                 let path: Vec<&str> = self
                     .mentions
@@ -8960,9 +9205,22 @@ impl<'a> Checker<'a> {
                 usize::MAX => (TyId::ERROR, None),
                 _ => (self.expr_types[top.expr.index()], Some(top.function)),
             };
+            let (leaf, node) = (top.leaf, top.node);
             if let Some(binding) = self.bindings.get_mut(top.binding) {
                 binding.ty = ty;
                 binding.function = function;
+            }
+            // A `def` named by a dotted path: its cell, the nodes computed
+            // above it and its node of the input's record take the type.
+            if let Some(leaf) = leaf
+                && let Some(cell) = self.field_cells.get_mut(leaf as usize)
+                && cell.ty != Some(ty)
+            {
+                cell.ty = Some(ty);
+                self.retype_above(leaf);
+            }
+            if let Some(entry) = self.nodes.get_mut(node as usize) {
+                entry.ty = ty;
             }
         }
     }
@@ -8989,7 +9247,8 @@ impl<'a> Checker<'a> {
         self.early = top.cut.is_none().then_some((self.root_position, own));
         self.checking_top = Some(index);
         let below = self.bindings.split_off(cut);
-        self.callee_name = Some(top.name);
+        // A `def` named by a dotted path sees itself by its path only.
+        self.callee_name = top.name;
         let found = self.check_expr(top.expr);
         self.settle(top.expr, found);
         self.callee_name = None;
@@ -9067,13 +9326,17 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The top-level function whose binding is in `slot`, if one of this
-    /// input's is.
+    /// The top-level function whose binding, or for a `def` named by a
+    /// dotted path whose leaf's cell, is in `slot`, if one of this input's
+    /// is.
     fn top_fn_in(&self, slot: Slot) -> Option<&TopFn> {
         self.top_fns.iter().find(|top| {
-            self.bindings
-                .get(top.binding)
-                .is_some_and(|binding| binding.slot == slot)
+            let cell = top
+                .leaf
+                .and_then(|leaf| self.field_cells.get(leaf as usize))
+                .map(|cell| cell.slot);
+            cell.or_else(|| self.bindings.get(top.binding).map(|binding| binding.slot))
+                == Some(slot)
         })
     }
 
@@ -12191,13 +12454,31 @@ impl<'a> Checker<'a> {
     /// The function that `callee` calls, if it is known: `callee` is a
     /// plain name whose binding was initialised directly with a function
     /// expression of this input, or declared by an earlier session input
-    /// (whose measured parameters the scope carries).
+    /// (whose measured parameters the scope carries), or the path of a
+    /// top-level function of this input named by a dotted path once its
+    /// group is checked, as a plain function's binding is then.
     fn known_callee(&self, callee: ExprId) -> Option<KnownCallee> {
         if let Some(&node) = self.imported_callees.get(&callee) {
             let measured = self
                 .workspace
                 .and_then(|workspace| workspace.measured(node));
             return measured.map(|_| KnownCallee::Imported(node));
+        }
+        if let ExprKind::Field { .. } = self.ast.get(callee).kind {
+            if let Some(node) = self.committed_callee(callee) {
+                return Some(KnownCallee::Imported(node));
+            }
+            // A reference reads its node's cell: a slot of the top level's
+            // frame, from top-level code or from inside a function.
+            let slot = match self.expr_vars.get(callee.index()) {
+                Some(&VarRef::Fn(slot)) => slot,
+                Some(&VarRef::Local(slot)) if self.functions.is_empty() => slot,
+                _ => return None,
+            };
+            let top = self.top_fn_in(slot)?;
+            let known =
+                top.leaf.is_some() && top.state == BodyState::Done && top.ready != usize::MAX;
+            return known.then_some(KnownCallee::Current(top.function));
         }
         let ExprKind::Name(name) = self.ast.get(callee).kind else {
             return None;
@@ -12208,6 +12489,33 @@ impl<'a> Checker<'a> {
             None if index < self.scope_measured.len() => Some(KnownCallee::Earlier(index)),
             None => None,
         }
+    }
+
+    /// The merged node of `callee`, if it is the path of a `def` named by a
+    /// dotted path that another file of the directory chain declares, read
+    /// through the root the chain committed (an access of the root's
+    /// record, which knows no function), whose file is checked: a call of
+    /// it is of a known callee, as a call of an imported `def` is, or of a
+    /// `def` of one name of the chain, through its committed binding.
+    fn committed_callee(&self, callee: ExprId) -> Option<u32> {
+        let workspace = self.workspace?;
+        let (node, at) = workspace.scope.reference(self.ast, callee)?;
+        if at != callee {
+            return None;
+        }
+        let mut base = callee;
+        while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
+            base = expr;
+        }
+        let ExprKind::Name(name) = self.ast.get(base).kind else {
+            return None;
+        };
+        let (index, _) = self.lookup(name)?;
+        if index >= self.top_start {
+            return None;
+        }
+        let global = workspace.scope.merged(node)?;
+        workspace.measured(global).map(|_| global)
     }
 
     /// How an argument of the call `call` of `callee`, whose function is
@@ -23050,6 +23358,293 @@ mod tests {
         );
         assert_eq!(first, file_type(&format!("{b}\n{a}\nx = a\ny = b")));
         assert_eq!(first, file_type(&format!("x = a\ny = b\n{a}\n{b}")));
+    }
+
+    #[test]
+    fn a_def_named_by_a_dotted_path_is_a_top_level_function() {
+        // The leaf of its path, used above its declaration, recursive by
+        // path, and in its prefix's record with the fields beside it.
+        let summary = "total = dev.peios.count(4)\n\
+             def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }\n\
+             def dev.peios.count(n: Int): Int {\n\
+             \x20   if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }\n\
+             }\n\
+             def dev.peios.name(): String { \"world\" }\n\
+             dev.peios.version = \"1\"\n\
+             greeting = dev.peios.hello()\n\
+             all = dev.peios";
+        let record = "{count: fn(n: Int): Int, hello: fn(): String, name: fn(): String, \
+                      version: String}";
+        assert_eq!(
+            file_type(summary),
+            format!("{{all: {record}, dev: {{peios: {record}}}, greeting: String, total: Int}}")
+        );
+        // With no lone file's prelude too.
+        let (ast, types, output) = check_text(summary);
+        let output = output.unwrap();
+        assert_eq!(
+            types.display(output.ty, ast.names()).to_string(),
+            file_type(summary)
+        );
+        // Mutual recursion with a plain `def`, and between two dotted ones,
+        // in any order.
+        let even = "def even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }";
+        let odd = "def dev.odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
+        for text in [
+            format!("x = dev.odd(4)\n{even}\n{odd}"),
+            format!("{odd}\nx = even(4)\n{even}"),
+        ] {
+            assert_eq!(
+                file_type(&text),
+                "{dev: {odd: fn(n: Int): Bool}, even: fn(n: Int): Bool, x: Bool}",
+                "{text}"
+            );
+        }
+        let f = "def a.x.f(n: Int): Int { if n == 0 { 0 } else { a.y.g(n - 1) } }";
+        let g = "def a.y.g(n: Int): Int { a.x.f(n) }";
+        for text in [
+            format!("{f}\n{g}\nr = a.x.f(2)"),
+            format!("r = a.x.f(2)\n{g}\n{f}"),
+        ] {
+            assert!(file_type(&text).ends_with("r: Int}"), "{text}");
+        }
+        // There is no short name: inside `def dev.count`, `count` is not
+        // in scope unless something else binds it.
+        assert_eq!(
+            errors("def dev.count(n: Int): Int { if n == 0 { 0 } else { count(n - 1) } }"),
+            [("undefined variable `count`".to_owned(), Span::new(52, 57))]
+        );
+        assert_eq!(
+            file_type(
+                "fn count(n: Int): Int { n * 10 }\n\
+                 def dev.count(n: Int): Int { count(n) }\nx = dev.count(2)"
+            ),
+            "{dev: {count: fn(n: Int): Int}, x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_is_typed_as_a_plain_def_is_by_its_group() {
+        // Outside its group, seen resolved; inside, its declared type, from
+        // either member and in either order, as a plain name is.
+        let a = "def p.a(b: Int) -> Int { lazy b }";
+        let b = "def p.b() -> Int { p.a(1) }";
+        for text in [format!("{a}\n{b}\nx = p.b"), format!("x = p.b\n{b}\n{a}")] {
+            assert!(
+                file_type(&text).contains("x: fn() -> Future<Int>"),
+                "{text}: {}",
+                file_type(&text)
+            );
+        }
+        let a = "def p.a(n: Int) -> Int { if n == 0 { lazy 5 } else { p.b(n - 1) } }";
+        let b = "def p.b(n: Int) -> Int { p.a(n) }";
+        let either = "fn(n: Int | Future<Int>) -> Int | Future<Int>";
+        for text in [
+            format!("{a}\n{b}\nx = p.a\ny = p.b"),
+            format!("x = p.a\ny = p.b\n{b}\n{a}"),
+        ] {
+            assert!(
+                file_type(&text).contains(&format!("x: {either}, y: {either}")),
+                "{text}: {}",
+                file_type(&text)
+            );
+        }
+        // A prefix read whole above the declaration has the type the body
+        // gives the function, not the one its signature declares.
+        let resolved = "def dev.get(n: Int) -> Int { n + 1 }";
+        for text in [
+            format!("r = dev\n{resolved}"),
+            format!("{resolved}\nr = dev"),
+        ] {
+            assert_eq!(
+                file_type(&text),
+                "{dev: {get: fn(n: Int | Future<Int>) -> Int}, \
+                 r: {get: fn(n: Int | Future<Int>) -> Int}}",
+                "{text}"
+            );
+        }
+        // A call by path is of a known callee once its group is checked: the
+        // call-site form of the implicit-await error names the path.
+        assert_eq!(
+            messages(
+                "def dev.inc(n: Int): Int { n + 1 }\nfn p(f: Future<Int>): Int { dev.inc(f) }"
+            ),
+            ["argument `f` would be awaited inside `dev.inc`, which is pure"]
+        );
+        // A pure dotted `def` calling an impure one is the existing error.
+        let text = "def dev.p(): Int { dev.q() }\ndef dev.q() -> Int { 1 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot call an impure function from a pure function"
+        );
+        assert_eq!(found[0].span, Span::new(19, 26));
+        assert_eq!(
+            labels(&found[0]),
+            [
+                (Span::new(19, 24), "this is fn() -> Int"),
+                (
+                    Span::new(11, 12),
+                    "this function is pure, declared with `:`"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_cannot_be_used_before_what_it_reads_is_bound() {
+        // By its path, and by a prefix read whole, which holds its closure.
+        let text = "x = dev.f()\nall = dev\nlet k = 1\ndef dev.f(): Int { k }";
+        let found = diagnostics(text);
+        let label = [(Span::new(22, 31), "`dev.f` reads `k`, which is bound here")];
+        assert_eq!(found.len(), 2, "{found:?}");
+        for (diagnostic, span) in found.iter().zip([Span::new(4, 9), Span::new(18, 21)]) {
+            assert_eq!(diagnostic.message, "`dev.f` cannot be used here yet");
+            assert_eq!(diagnostic.span, span);
+            assert_eq!(labels(diagnostic), label);
+        }
+        // Through another function, the chain names each by its path.
+        assert_eq!(
+            messages("x = a.b()\nlet k = 1\ndef a.b(): Int { c.d() }\ndef c.d(): Int { k }"),
+            ["`a.b` cannot be used here yet"]
+        );
+        let found =
+            diagnostics("x = a.b()\nlet k = 1\ndef a.b(): Int { c.d() }\ndef c.d(): Int { k }");
+        assert_eq!(
+            labels(&found[0]),
+            [(
+                Span::new(10, 19),
+                "`a.b` uses `c.d`, and `c.d` reads `k`, which is bound here"
+            )]
+        );
+        // Below what it reads, it is fine.
+        assert_eq!(
+            file_type("let k = 1\ndef dev.f(): Int { k }\nx = dev.f()\nall = dev"),
+            "{all: {f: fn(): Int}, dev: {f: fn(): Int}, x: Int}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_conflicts_as_a_leaf_does() {
+        // With a field leaf, and with a field or a `def` at a prefix, in
+        // either order: the existing texts at the later item.
+        for (text, expected) in [
+            (
+                "def a.b(): Int { 1 }\na.b = 2",
+                "field `a.b` is defined twice",
+            ),
+            (
+                "a.b = 2\ndef a.b(): Int { 1 }",
+                "field `a.b` is defined twice",
+            ),
+            (
+                "def a.b(): Int { 1 }\ndef a.b(): Int { 2 }",
+                "field `a.b` is defined twice",
+            ),
+            (
+                "a = 1\ndef a.b(): Int { 1 }",
+                "field `a` is already defined",
+            ),
+            ("def a.b(): Int { 1 }\na = 1", "field `a` is defined twice"),
+            (
+                "def a(): Int { 1 }\ndef a.b(): Int { 1 }",
+                "field `a` is already defined",
+            ),
+            (
+                "def a.b(): Int { 1 }\ndef a(): Int { 1 }",
+                "field `a` is defined twice",
+            ),
+        ] {
+            assert_eq!(messages(text), [expected], "{text}");
+        }
+        // As a dotted field does, with the same labels and notes.
+        let shown = |text: &str| -> Vec<(String, Vec<String>, Vec<String>)> {
+            diagnostics(text)
+                .into_iter()
+                .map(|d| {
+                    let labels = d.labels.iter().map(|l| l.text.clone()).collect();
+                    (d.message, labels, d.notes)
+                })
+                .collect()
+        };
+        for (dotted, field) in [
+            (
+                "def a.b(): Int { 1 }\na = 1",
+                "a.b = fn(): Int { 1 }\na = 1",
+            ),
+            (
+                "a = 1\ndef a.b(): Int { 1 }",
+                "a = 1\na.b = fn(): Int { 1 }",
+            ),
+            (
+                "def a.b(): Int { 1 }\na.b = 1",
+                "a.b = fn(): Int { 1 }\na.b = 1",
+            ),
+        ] {
+            assert_eq!(shown(dotted), shown(field), "{dotted}");
+        }
+        // A rejected one is no top-level function: the groups of the others
+        // are found as ever, and nothing else is reported.
+        assert_eq!(
+            messages(
+                "a.b = 1\ndef a.b(): Int { 1 }\nfn p(): Int { q() }\nfn q(): Int { p() }\n\
+                 x = p"
+            ),
+            ["field `a.b` is defined twice"]
+        );
+        // Its root clashes as a dotted field's does.
+        assert_eq!(
+            messages("fn e(): Int { 1 }\ndef e.f(): Int { 1 }"),
+            ["`e` is a function of this file"]
+        );
+        assert_eq!(
+            messages("let g = 1\ndef g.h(): Int { 1 }"),
+            ["`g` is a field of this file"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_is_shadowable_as_any_def_is() {
+        // Shadowed by a later plain one and by a field, for the whole input.
+        assert_eq!(
+            file_type(
+                "before = dev.x()\n#[shadowable] def dev.x(): String { \"a\" }\n\
+                 def dev.x(): Int { 2 }"
+            ),
+            "{before: Int, dev: {x: fn(): Int}}"
+        );
+        assert_eq!(
+            file_type("#[shadowable] def dev.y(): Int { 3 }\ndev.y = \"s\"\nz = dev.y"),
+            "{dev: {y: String}, z: String}"
+        );
+        // A shadowed one is still checked as it is written, by itself.
+        assert_eq!(
+            messages("#[shadowable] def dev.x(): Int { \"no\" }\ndef dev.x(): Int { 2 }"),
+            ["mismatched types"]
+        );
+        // A later declaration overlapping a plain one conflicts.
+        assert_eq!(
+            messages("def dev.x(): Int { 1 }\n#[shadowable] dev.x = 2"),
+            ["field `dev.x` is defined twice"]
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_in_an_inner_block_is_its_dotted_field() {
+        assert_eq!(
+            file_type("r = { def b.c(n: Int): Int { n + 1 }\nd = b.c(1) }"),
+            "{r: {b: {c: fn(n: Int): Int}, d: Int}}"
+        );
+        // Ordered: not visible above its item, and it sees no short name.
+        assert_eq!(
+            messages("r = { d = b.c(1)\ndef b.c(n: Int): Int { n + 1 } }"),
+            ["undefined variable `b`"]
+        );
+        assert_eq!(
+            messages("r = { def b.c(n: Int): Int { c(n) } }"),
+            ["undefined variable `c`"]
+        );
     }
 
     #[test]

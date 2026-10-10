@@ -1,0 +1,5 @@
+def dev.peios.hello(): String { "hello {dev.peios.name()}" }
+def dev.peios.count(n: Int): Int {
+    if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }
+}
+def dev.peios.name(): String { "world" }

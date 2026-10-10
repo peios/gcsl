@@ -80,10 +80,12 @@
 //! an id, from 0 to [`Ast::fn_count`], which later stages use to index
 //! their own per-function tables. A named function item, `fn f(...) ...`,
 //! is a `let` whose value is a function expression, and a public function
-//! item, `def f(...) ...`, is a field whose value is one; each is marked as
+//! item, `def f(...) ...`, is a field whose value is one, its path that of
+//! the field, of one name or of several (`def dev.peios.hello(...) ...`, a
+//! dotted field, every segment an identifier); each is marked as
 //! written (`function` on [`ItemKind::Let`] and [`ItemKind::Field`]), so the
 //! tree tells `fn f`, `def f`, `let f = fn` and `f = fn` apart, and the
-//! printer prints each as it was written. A call, [`ExprKind::Call`], lists its arguments in
+//! printer prints each as it was written, a `def` by its path. A call, [`ExprKind::Call`], lists its arguments in
 //! source order, each positional, named or the trailing block, which is
 //! always last.
 //!
@@ -1300,8 +1302,8 @@ pub enum ItemKind {
         ty: Option<TypeExprId>,
         /// The field's value, or the value at the end of the path.
         value: ExprId,
-        /// Whether it was written as a public function item, `def NAME(...)
-        /// ...`, rather than as `NAME = fn(...) ...`.
+        /// Whether it was written as a public function item, `def PATH(...)
+        /// ...`, rather than as `PATH = fn(...) ...`.
         function: bool,
     },
     /// `...EXPR`, a spread: defines each field of the record `EXPR` is, by

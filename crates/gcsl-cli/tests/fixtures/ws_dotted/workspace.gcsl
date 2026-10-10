@@ -1,0 +1,2 @@
+# Packages are named by dotted paths: `def dev.peios.hello()` is a `def`
+# whose name is its path.

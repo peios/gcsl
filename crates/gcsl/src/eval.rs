@@ -5617,6 +5617,104 @@ mod tests {
     }
 
     #[test]
+    fn a_def_named_by_a_dotted_path_runs_as_a_def() {
+        // The summary in one file: recursion by path, a use above the
+        // declaration, a sibling field, the prefix read whole.
+        let summary = "total = dev.peios.count(4)\n\
+             def dev.peios.hello(): String { \"hello {dev.peios.name()}\" }\n\
+             def dev.peios.count(n: Int): Int {\n\
+             \x20   if n == 0 { 0 } else { 1 + dev.peios.count(n - 1) }\n\
+             }\n\
+             def dev.peios.name(): String { \"world\" }\n\
+             dev.peios.version = \"1\"\n\
+             greeting = dev.peios.hello()\n\
+             all = dev.peios";
+        assert_eq!(
+            run(summary).unwrap().to_string(),
+            "{total = 4; dev = {peios = {hello = fn(): String; count = fn(n: Int): Int; \
+             name = fn(): String; version = \"1\"}}; greeting = \"hello world\"; \
+             all = {hello = fn(): String; count = fn(n: Int): Int; name = fn(): String; \
+             version = \"1\"}}"
+        );
+        // Mutual recursion with a plain `def`, and between two dotted ones,
+        // each written before the other.
+        let even = "def even(n: Int): Bool { if n == 0 { true } else { dev.odd(n - 1) } }";
+        let odd = "def dev.odd(n: Int): Bool { if n == 0 { false } else { even(n - 1) } }";
+        for text in [
+            format!("{even}\n{odd}\nr = [even(10), dev.odd(7)]"),
+            format!("r = [even(10), dev.odd(7)]\n{odd}\n{even}"),
+        ] {
+            let shown = run(&text).unwrap().to_string();
+            assert!(shown.contains("r = [true, true]"), "{text}: {shown}");
+        }
+        let f = "def a.x.f(n: Int): Int { if n == 0 { 0 } else { a.y.g(n - 1) + 1 } }";
+        let g = "def a.y.g(n: Int): Int { if n == 0 { 0 } else { a.x.f(n - 1) + 1 } }";
+        let last = |text: &str| format!("{:?}", fields(text).last().cloned());
+        let int = |value: i64| format!("{:?}", Some(Value::Int(value)));
+        assert_eq!(last(&format!("{f}\n{g}\nr = a.x.f(9)")), int(9));
+        assert_eq!(last(&format!("{g}\n{f}\nr = a.x.f(9)")), int(9));
+        // Through the record of a prefix, and from a function reading its
+        // own prefix whole, which is no cycle: the record holds closures.
+        assert_eq!(
+            last("r = dev\ndef dev.peios.twice(n: Int): Int { n * 2 }\nx = r.peios.twice(4)"),
+            int(8)
+        );
+        // (Run without `assert_cells_scheduled`, which takes the `Load` of
+        // `a.h`'s closure into the record `a` for a call of it, which reads
+        // `a`: the record only holds the closure.)
+        let text = "def a.f(): Int { a.g + 1 }\na.g = 1\n\
+                    def a.h(): Int { let r = a; r.g + r.f() }\nx = a.h()";
+        let outcome = crate::run(&SourceFile::new("t.gcsl", text).unwrap()).unwrap();
+        assert_eq!(
+            outcome.value.to_string(),
+            "{a = {f = fn(): Int; g = 1; h = fn(): Int}; x = 3}"
+        );
+        // A closure that copies a variable is made after it is bound, and
+        // the prefix read below is assembled from it.
+        assert_eq!(
+            run("let k = 5\ndef dev.get(): Int { k }\nall = dev\nx = all.get()")
+                .unwrap()
+                .to_string(),
+            "{dev = {get = fn(): Int}; all = {get = fn(): Int}; x = 5}"
+        );
+        // Memoised mutual recursion, each body run once per argument.
+        assert_eq!(
+            last(
+                "def m.a(n: Int) ->> Int { if n < 2 { n } else { m.b(n - 1) + m.a(n - 2) } }\n\
+                 def m.b(n: Int) ->> Int { if n < 2 { n } else { m.a(n - 1) + m.b(n - 2) } }\n\
+                 x = m.a(80)"
+            ),
+            int(23_416_728_348_467_685)
+        );
+        // In an inner block, the block's dotted field, from its item on.
+        assert_eq!(
+            run("r = { def b.c(n: Int): Int { n + 1 }; d = b.c(1) }")
+                .unwrap()
+                .to_string(),
+            "{r = {b = {c = fn(n: Int): Int}; d = 2}}"
+        );
+    }
+
+    #[test]
+    fn a_dotted_def_recurses_by_path_to_depth() {
+        let (message, _) = on_big_stack(|| {
+            error(
+                "def a.b(n: Int): Int { if n == 0 { 0 } else { a.c(n - 1) + 1 } }\n\
+                 def a.c(n: Int): Int { a.b(n) }\nx = a.b(100000)",
+            )
+        });
+        assert!(message.starts_with("call nested too deeply"), "{message}");
+        let depth = on_big_stack(|| {
+            let found = fields(
+                "def a.b(n: Int): Int { if n == 0 { 0 } else { a.c(n - 1) + 1 } }\n\
+                 def a.c(n: Int): Int { a.b(n) }\nx = a.b(700)",
+            );
+            format!("{:?}", found.last())
+        });
+        assert_eq!(depth, format!("{:?}", Some(Value::Int(700))));
+    }
+
+    #[test]
     fn records_display_as_gcsl_syntax() {
         let value = run("{ x = 1; y = \"a\\n\"; inner = { n = 2.0 }; \"a b\" = true }").unwrap();
         let shown = "{x = 1; y = \"a\\n\"; inner = {n = 2.0}; \"a b\" = true}";
