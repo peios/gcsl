@@ -338,7 +338,7 @@
 //! the new evaluator across the body's evaluation.
 //!
 //! The callee of a `Call` may instead be a built-in function, a
-//! [`Value::Builtin`]: an ordinary one (`int`, `float`, `exec`, `panic`) is
+//! [`Value::Builtin`]: an ordinary one (every one but `len`) is
 //! a value of a function type that a variable, a parameter or a field may
 //! hold, so the `function` walker yields a closure or a built-in, and a
 //! call of a built-in applies it, its arguments evaluated in order as a
@@ -487,6 +487,22 @@
 //!   walker reaches for a value of its kind. A panic inside a function is
 //!   reported where it happens, as any runtime error is: one in the
 //!   prelude's `sh` is located in `<stdlib>/prelude.gcsl`.
+//! - `split(s, sep)` gives the pieces of `s` between occurrences of `sep`,
+//!   in order, as Rust's `str::split` does: `split("/a/b", "/")` is `["",
+//!   "a", "b"]`, `split("", "/")` is `[""]`, and `split("a//b", "/")` is
+//!   `["a", "", "b"]`. `sep` may be of any length; an empty one, which
+//!   would match between every two characters, fails with "`split` needs a
+//!   separator that is not empty", at the call.
+//! - `join(parts, sep)` gives the strings of `parts` with `sep` between
+//!   each pair, `""` for no parts.
+//! - `starts_with(s, prefix)` and `ends_with(s, suffix)` compare bytes, as
+//!   Rust's do: whether `s` begins, or ends, with the bytes of the other.
+//! - `trim(s)` gives `s` without its leading and trailing whitespace, as
+//!   Rust's `str::trim` finds it (Unicode's `White_Space`, so a no-break
+//!   space too): `""` for a string of whitespace alone.
+//!
+//! These five are pure and fail only as said; none has a limit of its own
+//! on the length of a string.
 //!
 //! # Memoised functions
 //!
@@ -1563,8 +1579,10 @@ impl Evaluator<'_> {
     /// toward zero, failing with "integer overflow" when that is not an
     /// `Int` (an infinity, or beyond `i64`) and "cannot truncate NaN to an
     /// Int" for NaN; `float` gives the `Float` nearest its `Int`; `exec`
-    /// runs its program ([`exec`]); and `panic` fails with its message, at
-    /// the call. A built-in whose typing is special is never called through
+    /// runs its program ([`exec`]); `panic` fails with its message, at
+    /// the call; `split` ([`split`]), `join` ([`join`]), `starts_with`,
+    /// `ends_with` and `trim` ([`trim`]) work on their strings as Rust's
+    /// `str` does. A built-in whose typing is special is never called through
     /// a value (the checker lowers each call of one to its own node, `len`'s
     /// to a `ListLen`), so reaching one here is an internal error.
     #[inline(never)]
@@ -1583,9 +1601,10 @@ impl Evaluator<'_> {
             };
             *entry = Some((value, span));
         }
-        let [first] = arguments;
-        match (builtin, first) {
-            (Builtin::Int, Some((Value::Float(x), span))) => match float_to_int(x) {
+        let [first, second] = arguments;
+        let second = second.map(|(value, _)| value);
+        match (builtin, first, second) {
+            (Builtin::Int, Some((Value::Float(x), span)), None) => match float_to_int(x) {
                 Some(truncated) => Ok(Value::Int(truncated)),
                 None if x.is_nan() => {
                     Err(Diagnostic::error("cannot truncate NaN to an Int", node.span).into())
@@ -1594,11 +1613,26 @@ impl Evaluator<'_> {
                     .with_context(span, Value::Float(x).to_string())
                     .into()),
             },
-            (Builtin::Float, Some((Value::Int(x), _))) => Ok(Value::Float(int_to_float(x))),
-            (Builtin::Exec, Some((Value::List(words), _))) => exec(&words, self.exec_result, node),
-            (Builtin::Panic, Some((Value::Str(message), _))) => {
+            (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
+            (Builtin::Exec, Some((Value::List(words), _)), None) => {
+                exec(&words, self.exec_result, node)
+            }
+            (Builtin::Panic, Some((Value::Str(message), _)), None) => {
                 Err(Diagnostic::error(&*message, node.span).into())
             }
+            (Builtin::Split, Some((Value::Str(s), _)), Some(Value::Str(sep))) => {
+                split(&s, &sep, node)
+            }
+            (Builtin::Join, Some((Value::List(parts), _)), Some(Value::Str(sep))) => {
+                join(&parts, &sep, node)
+            }
+            (Builtin::StartsWith, Some((Value::Str(s), _)), Some(Value::Str(prefix))) => {
+                Ok(Value::Bool(s.starts_with(&*prefix)))
+            }
+            (Builtin::EndsWith, Some((Value::Str(s), _)), Some(Value::Str(suffix))) => {
+                Ok(Value::Bool(s.ends_with(&*suffix)))
+            }
+            (Builtin::Trim, Some((Value::Str(s), _)), None) => Ok(Value::Str(trim(s))),
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -4304,6 +4338,51 @@ fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Va
             text(&output.stderr),
         ]),
     })))
+}
+
+/// The pieces of `s` between occurrences of `sep`, in order, as
+/// [`str::split`] gives them, for the call `node` of `split` (see [The
+/// built-in functions](#the-built-in-functions)): an empty `s` is one empty
+/// piece, and a `sep` at either end or twice in a row an empty piece there.
+/// Fails with "`split` needs a separator that is not empty" for an empty
+/// `sep`, which `str::split` would match between every two characters.
+fn split(s: &str, sep: &str, node: &IrNode) -> Flow<Value> {
+    if sep.is_empty() {
+        return Err(
+            Diagnostic::error("`split` needs a separator that is not empty", node.span).into(),
+        );
+    }
+    let pieces = s.split(sep).map(|piece| Value::Str(Rc::from(piece)));
+    Ok(Value::List(List::from_vec(pieces.collect())))
+}
+
+/// The strings `parts` with `sep` between each pair, for the call `node` of
+/// `join` (see [The built-in functions](#the-built-in-functions)): `""` for
+/// no parts. An element that is not a string, which the checker rules out,
+/// is an internal error.
+fn join(parts: &List, sep: &str, node: &IrNode) -> Flow<Value> {
+    let mut joined = String::new();
+    for (at, part) in parts.values().iter().enumerate() {
+        let Value::Str(part) = part else {
+            return mistyped(node, "a part of `join` that is not a string");
+        };
+        if at > 0 {
+            joined.push_str(sep);
+        }
+        joined.push_str(part);
+    }
+    Ok(Value::Str(Rc::from(joined)))
+}
+
+/// `s` without its leading and trailing whitespace, as [`str::trim`] finds
+/// it (Unicode's `White_Space`): `s` itself, shared, when it has none.
+fn trim(s: Rc<str>) -> Rc<str> {
+    let trimmed = s.trim();
+    if trimmed.len() == s.len() {
+        s
+    } else {
+        Rc::from(trimmed)
+    }
 }
 
 /// Fails with the internal error `message` at `node`: a node of a type its

@@ -1,0 +1,12 @@
+parts = split("a/b/c", "/")
+s = join(parts, "-")
+yes = starts_with("/usr", "/")
+gz = ends_with("x.tar.gz", ".gz")
+hash = trim("  abc\n")
+import path
+p = path.join("/src/pkg", "../lib")
+q = path.join("/src/pkg", "/etc")
+d = path.dirname("/src/pkg/a.c")
+b = path.basename("/src/pkg/a.c")
+n = path.normalize("a/./b/../c/")
+abs = path.is_absolute("a")

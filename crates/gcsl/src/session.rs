@@ -94,21 +94,28 @@
 //! workspace that has no file of its own ([`crate::workspace`], "The
 //! standard library"), into its own names, types, frame and memo tables,
 //! keeping the layout of the records `exec` returns that the run built, for
-//! every input (see [`crate::eval`], "The built-in functions"):
-//! the built-in functions' cells are the first slots of its frame and the
-//! standard files' cells and slots the next, its scope's first free slot
-//! past them all; the standard files are its first inputs, so its own
-//! first input is number 1, and [`Session::source`] of a standard file is
-//! its source, named `<stdlib>/prelude.gcsl`, which a diagnostic of one, or
-//! a label in one, is rendered against. Should that fail, which is a bug,
-//! every input fails with its diagnostics.
+//! every input (see [`crate::eval`], "The built-in functions"). Unlike a
+//! workspace, which loads only the standard files its files import, a
+//! session loads, checks and runs EVERY standard file then, each a scope of
+//! its own as in a workspace, so that an input's `import path` finds it
+//! run already; nothing is loaded mid-session. The built-in functions'
+//! cells are the first slots of its frame and the standard files' cells
+//! and slots the next, its scope's first free slot past them all; the
+//! standard files are its first inputs, in path order (`<stdlib>/path.gcsl`
+//! is input 0 and `<stdlib>/prelude.gcsl` input 1), so its own first input
+//! is number 2, and [`Session::source`] of a standard file is its source,
+//! which a diagnostic of one, or a label in one, is rendered against.
+//! Should that fail, which is a bug, every input fails with its
+//! diagnostics.
 //!
 //! Every input is then checked and run as before, from the session's
 //! scope, with two additions to its context: the prelude's declarations as
 //! the yielding last source of its view, and `builtins` and the standard
-//! modules importable by name. To have them, an input is scanned beside the
-//! standard library as a lone file is, its own cells taking the slots after
-//! the scope's (`crate::workspace::check_input`), and checked as a
+//! modules importable by name. To have them, an input is scanned beside
+//! every standard file as a lone file is beside those it needs, so that
+//! the standard files' cells are numbered as they were when the session
+//! started, its own cells taking the slots after the scope's
+//! (`crate::workspace::check_input`), and checked as a
 //! session's input, which reads the scope's variables as before. An
 //! `import` of an input persists for later inputs, as its `let`s, `fn`s and
 //! `def`s do: what the input imports, whole, as a member or by `*`, is kept
@@ -191,8 +198,8 @@ impl Default for Session {
 
 impl Session {
     /// A session with no variables of its own, which has run the standard
-    /// library: the standard files are its first inputs, its first slots
-    /// their cells (see the module documentation).
+    /// library, every standard file of it: the standard files are its first
+    /// inputs, its first slots their cells (see the module documentation).
     #[must_use]
     pub fn new() -> Self {
         let sources = workspace::standard_sources();
@@ -444,9 +451,9 @@ mod tests {
         // The standard files are its first inputs, and the built-in
         // functions' cells its first slots, written as the frame was laid
         // out.
-        assert_eq!(first(), 1);
+        assert_eq!(first(), 2);
         assert_eq!(
-            session.source(0).map(SourceFile::name),
+            session.source(1).map(SourceFile::name),
             Some("<stdlib>/prelude.gcsl")
         );
         assert!(session.source(first()).is_none());
@@ -510,8 +517,8 @@ mod tests {
         assert_eq!(error.message, "field `len` is defined in two files");
         assert_eq!(error.input, None);
         let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
-        assert_eq!(inputs, [Some(0), None]);
-        let prelude = session.source(0).unwrap();
+        assert_eq!(inputs, [Some(1), None]);
+        let prelude = session.source(1).unwrap();
         assert_eq!(prelude.slice(error.labels[0].span), "len");
     }
 
@@ -1574,9 +1581,9 @@ mod tests {
     #[test]
     fn a_session_runs_exec_panic_and_sh() {
         let mut session = Session::new();
-        // The five built-in functions' cells are its first slots.
+        // The ten built-in functions' cells are its first slots.
         assert_eq!(
-            &session.frame[..5],
+            &session.frame[..10],
             Builtin::ALL.map(Value::Builtin).as_slice()
         );
         // On the first input, and on later ones, through a variable.
@@ -1612,12 +1619,12 @@ mod tests {
         };
         assert!(Rc::ptr_eq(&earlier.layout, &layout));
         // A panic fails its input, which the session forgets; a failing `sh`
-        // is the prelude's panic, input 0.
+        // is the prelude's panic, input 1.
         assert_eq!(messages(&mut session, "let x = panic(\"stop\")"), ["stop"]);
         assert_eq!(messages(&mut session, "x"), ["undefined variable `x`"]);
         let failed = eval(&mut session, "sh(\"exit 3\")").unwrap_err();
         assert_eq!(failed[0].message, "`exit 3` exited with status 3: ");
-        assert_eq!(failed[0].input, Some(0));
+        assert_eq!(failed[0].input, Some(1));
         assert_eq!(
             value(&mut session, "exec([\"true\"]).status"),
             Value::Int(0)
@@ -1627,6 +1634,53 @@ mod tests {
         assert_eq!(
             value(&mut session, "exec + e([\"true\"]).status"),
             Value::Int(2)
+        );
+    }
+
+    #[test]
+    fn a_session_has_the_string_built_ins_and_path() {
+        let mut session = Session::new();
+        // Every standard module was loaded as it started, each a scope of
+        // its own, in path order.
+        assert_eq!(
+            session.source(0).map(SourceFile::name),
+            Some("<stdlib>/path.gcsl")
+        );
+        // `split` on the first input.
+        assert_eq!(
+            value(&mut session, "split(\"a/b\", \"/\")").to_string(),
+            "[\"a\", \"b\"]"
+        );
+        assert_eq!(value_type(&session), "List<String>");
+        // `import path`, then `path.join` in that input and a later one,
+        // beside the prelude's `join`.
+        assert_eq!(
+            value(&mut session, "import path\npath.join(\"a\", \"b\")"),
+            Value::Str("a/b".into())
+        );
+        assert_eq!(
+            value(&mut session, "path.join(\"/x\", \"../y\")"),
+            Value::Str("/y".into())
+        );
+        assert_eq!(
+            value(&mut session, "join([\"a\", \"b\"], \", \")"),
+            Value::Str("a, b".into())
+        );
+        assert_eq!(
+            value(&mut session, "trim(\"  t \")"),
+            Value::Str("t".into())
+        );
+        let failed = eval(&mut session, "split(\"a\", \"\")").unwrap_err();
+        assert_eq!(
+            failed[0].message,
+            "`split` needs a separator that is not empty"
+        );
+        // A later input's `join` shadows the prelude's, not `path`'s.
+        value(&mut session, "let join = 5");
+        assert_eq!(value(&mut session, "join + 1"), Value::Int(6));
+        assert_eq!(
+            value(&mut session, "path.join(\"a\", \".\")"),
+            Value::Str("a".into())
         );
     }
 }

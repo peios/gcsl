@@ -34,13 +34,18 @@
 //!
 //! Every one of them has the standard library: the `builtins` module, the
 //! built-in functions implemented in Rust (`len`, `int`, `float`, `exec`,
-//! `panic`), and the standard files, the `.gcsl` files of the repository's
+//! `panic`, and on strings `split`, `join`, `starts_with`, `ends_with` and
+//! `trim`), and the standard files, the `.gcsl` files of the repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
-//! by its bare name from any file; and every file and input begins as if
-//! with `import * from prelude`, whose names its own declarations shadow
-//! silently (see [`workspace`], "The standard library"). The prelude binds
-//! the built-in functions, and `sh`, written in GCSL on `exec` and `panic`,
-//! which runs a shell command and panics unless it succeeds. A file run
+//! by its bare name from any file and each a scope of its own; and every
+//! file and input begins as if with `import * from prelude`, whose names
+//! its own declarations shadow silently (see [`workspace`], "The standard
+//! library"). The prelude binds the built-in functions, and `sh`, written
+//! in GCSL on `exec` and `panic`, which runs a shell command and panics
+//! unless it succeeds; `path` (`import path`) joins, normalises and takes
+//! apart paths, lexically, in GCSL on the string built-ins. A workspace or
+//! a lone file loads only the standard files it needs, the prelude and
+//! those its files import; a [`Session`] loads them all. A file run
 //! alone ([`run`]) is a workspace of one directory beside it, and an
 //! `import` of anything else there, or in a [`Session`], is an error. Every
 //! failure is a [`Diagnostic`] that can be rendered against the
@@ -175,11 +180,17 @@ pub struct Outcome {
 
 /// The standard library: the `.gcsl` files of the repository's `stdlib/`
 /// directory, compiled in, each with its stem, by which it is imported
-/// (`import prelude`), in path order. Written by hand, one entry per file;
-/// a test checks that it and the directory agree. Every scan begins with
-/// them (see [`workspace`], "The standard library"), named
-/// `<stdlib>/STEM.gcsl` ([`workspace::standard_sources`]).
-pub const STANDARD: [(&str, &str); 1] = [("prelude", include_str!("../../../stdlib/prelude.gcsl"))];
+/// (`import prelude`, `import path`), in path order. Written by hand, one
+/// entry per file; a test checks that it and the directory agree. Each is a
+/// scope of its own. A scan begins with those it loads, the prelude always
+/// and each another file imports, in this order (see [`workspace`], "The
+/// standard library"), named `<stdlib>/STEM.gcsl`
+/// ([`workspace::check_with_standard`]); a session loads them all
+/// ([`workspace::standard_sources`]).
+pub const STANDARD: [(&str, &str); 2] = [
+    ("path", include_str!("../../../stdlib/path.gcsl")),
+    ("prelude", include_str!("../../../stdlib/prelude.gcsl")),
+];
 
 /// Runs every stage on `source` as a file outside any workspace, beside the
 /// standard library ([`workspace::check_lone`]), and returns the value of
@@ -191,11 +202,13 @@ pub const STANDARD: [(&str, &str); 1] = [("prelude", include_str!("../../../stdl
 /// syntax or runtime error, and every type error found by the checker. Any
 /// warnings found before the failure are among them, all in source order.
 /// The file's diagnostics name no input; one of a standard file, which is a
-/// bug, names its input number, its index in [`STANDARD`].
+/// bug, names its input number, its index among the standard files the run
+/// loaded ([`workspace::check_lone_with_standard`]).
 pub fn run(source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
-    let index = u32::try_from(STANDARD.len()).unwrap_or(u32::MAX);
+    let (loaded, checked) = workspace::check_lone_loading(source);
+    let index = u32::try_from(loaded.len()).unwrap_or(u32::MAX);
     let being_run = |diagnostics| workspace::being_run(diagnostics, index);
-    let mut workspace = workspace::check_lone(source).map_err(being_run)?;
+    let mut workspace = checked.map_err(being_run)?;
     let outcome = workspace.run(index).map_err(being_run)?;
     Ok(Outcome {
         value: outcome.value,

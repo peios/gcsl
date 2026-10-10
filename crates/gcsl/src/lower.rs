@@ -2035,7 +2035,15 @@ impl Lowerer<'_> {
                 span,
             }),
             // An ordinary built-in is called as any function value is.
-            Builtin::Int | Builtin::Float | Builtin::Exec | Builtin::Panic => Err(InternalError {
+            Builtin::Int
+            | Builtin::Float
+            | Builtin::Exec
+            | Builtin::Panic
+            | Builtin::Split
+            | Builtin::Join
+            | Builtin::StartsWith
+            | Builtin::EndsWith
+            | Builtin::Trim => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

@@ -1,0 +1,90 @@
+# The path module: a module of GCSL's standard library, compiled into every
+# build and loaded by a run that imports it (`import path`). A path is a
+# string of segments separated by `/`, absolute if it starts with `/`, and
+# every function here is pure and LEXICAL: nothing touches the file system,
+# symbolic links are not resolved, and `..` simply removes the segment
+# before it, as Go's `path/filepath.Clean` does. Like every standard file it
+# is a scope of its own: it sees its own declarations, the prelude's names,
+# which its own `join` shadows here, and `builtins`, whose string `join` it
+# calls as `builtins.join`.
+import builtins
+
+# Whether `p` is absolute: whether it starts with `/`.
+def is_absolute(p: String): Bool { starts_with(p, "/") }
+
+# `p` normalised: its kept segments (see `segments`), rendered (see
+# `render`). So `normalize("a/./b/../c/")` is `a/c`, `normalize("")` is
+# `.`, and `normalize("/../a")` is `/a`.
+def normalize(p: String): String { render(segments(p), is_absolute(p)) }
+
+# `rel` resolved against `base`: `rel` normalised if it is absolute or
+# `base` is empty, else the two joined by `/` and normalised. So
+# `join("/src/pkg", "../lib")` is `/src/lib` and `join("/x", "")` is `/x`.
+def join(base: String, rel: String): String {
+    if is_absolute(rel) or base == "" {
+        normalize(rel)
+    } else {
+        normalize("{base}/{rel}")
+    }
+}
+
+# The directory part of `p`: the kept segments of `p` but the last, of
+# which `/` and `.` have none, rendered as `normalize` renders them. So
+# `dirname("/src/pkg/a.c")` is `/src/pkg`, `dirname("a")` is `.`, and
+# `dirname("/")` is `/`.
+def dirname(p: String): String { render(without_last(segments(p)), is_absolute(p)) }
+
+# The last kept segment of `p`, or `normalize(p)` itself, `/` or `.`, if it
+# has none. So `basename("/src/pkg/a.c")` is `a.c`.
+def basename(p: String): String {
+    let kept = segments(p)
+    if len(kept) == 0 { render(kept, is_absolute(p)) } else { kept[len(kept) - 1] }
+}
+
+# The kept segments of `p`: its segments between `/`s, empty and `.` ones
+# dropped, each `..` removing the last kept segment if there is one and it
+# is not `..`, else dropped if `p` is absolute (nothing is above the root),
+# else kept.
+fn segments(p: String): List<String> {
+    let absolute = is_absolute(p)
+    let mut kept: List<String> = []
+    for segment in split(p, "/") {
+        if segment == "" or segment == "." {
+            continue
+        }
+        if segment == ".." {
+            if len(kept) > 0 and kept[len(kept) - 1] != ".." {
+                kept := without_last(kept)
+                continue
+            }
+            if absolute {
+                continue
+            }
+        }
+        kept := [...kept, segment]
+    }
+    kept
+}
+
+# `segments` without its last one, if it has one.
+fn without_last(segments: List<String>): List<String> {
+    let mut kept: List<String> = []
+    for i in 0..len(segments) - 1 {
+        kept := [...kept, segments[i]]
+    }
+    kept
+}
+
+# The path of the kept segments `kept`: for an absolute path, `/` followed
+# by them joined by `/` (so `/` alone if there are none); for a relative
+# one, them joined by `/`, or `.` if there are none.
+fn render(kept: List<String>, absolute: Bool): String {
+    let joined = builtins.join(kept, "/")
+    if absolute {
+        "/{joined}"
+    } else if len(kept) == 0 {
+        "."
+    } else {
+        joined
+    }
+}

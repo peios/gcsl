@@ -7,8 +7,10 @@
 # type a GCSL type can write yet, so a name bound directly to it is that
 # built-in, called by the checker's rule (to be replaced when built-ins get
 # real polymorphic types, R11 and R3 of docs/INFERENCE_REQS.md). `int`,
-# `float`, `exec` and `panic` are ordinary: values of their function types.
-# `sh` runs a shell command with `exec`, and panics unless it succeeds.
+# `float`, `exec`, `panic` and the string built-ins are ordinary: values of
+# their function types. `sh` runs a shell command with `exec`, and panics
+# unless it succeeds. Like every standard file it is a scope of its own: it
+# sees its own declarations and what it imports, nothing else.
 import builtins
 
 len = builtins.len
@@ -22,13 +24,23 @@ def half(n: Int): Float { float(n) / 2.0 }
 exec = builtins.exec
 panic = builtins.panic
 
+# Strings: `split(s, sep)` the pieces of `s` between occurrences of `sep`,
+# `join(parts, sep)` the parts with `sep` between each pair, `starts_with`
+# and `ends_with` byte-wise tests, and `trim(s)` without leading and
+# trailing whitespace. Ordinary built-ins, not the alias rule's.
+split = builtins.split
+join = builtins.join
+starts_with = builtins.starts_with
+ends_with = builtins.ends_with
+trim = builtins.trim
+
 # Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
 # trailing newline included; panics, with the script, its exit status and
-# its standard error, unless it exits with status 0.
+# its standard error, trimmed, unless it exits with status 0.
 def sh(script: String) -> String {
     let result = exec(["/bin/sh", "-c", script])
     if result.status != 0 {
-        panic("`{script}` exited with status {result.status}: {result.stderr}")
+        panic("`{script}` exited with status {result.status}: {trim(result.stderr)}")
     }
     result.stdout
 }

@@ -1863,13 +1863,14 @@
 //!
 //! The built-in functions are the members of the `builtins` module, a
 //! module implemented in Rust (see [`crate::workspace`], "The standard
-//! library"): `len`, `int`, `float`, `exec` and `panic`, each a
-//! [`Builtin`], with its name, its parameters' names, its [`Effect`]
-//! (`exec` is impure, every other one pure) and its [`Typing`]. The checker
-//! knows no name of one: a file has them as it has any other module's
-//! members, by an import, or by the prelude, which binds `len`, `int`,
-//! `float`, `exec` and `panic` to them and which every file and session
-//! input imports implicitly, as the last and yielding source of its view.
+//! library"): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
+//! `starts_with`, `ends_with` and `trim`, each a [`Builtin`], with its
+//! name, its parameters' names (at most [`Builtin::MAX_PARAMS`], two), its
+//! [`Effect`] (`exec` is impure, every other one pure) and its [`Typing`].
+//! The checker knows no name of one: a file has them as it has any other
+//! module's members, by an import, or by the prelude, which binds each of
+//! them to its own name and which every file and session input imports
+//! implicitly, as the last and yielding source of its view.
 //! A file that declares its own `len` (a field, a `def`, a `let`, a `fn`)
 //! shadows the prelude's, and loses the built-in there. The cell of each is
 //! a slot of the frame the driver writes before anything runs, its value a
@@ -1882,10 +1883,19 @@
 //! result's names into the run's names): `int` (`fn(x: Float): Int`,
 //! truncation toward zero), `float` (`fn(x: Int): Float`), `exec`
 //! (`fn(argv: List<String>) -> {status: Int, stderr: String, stdout:
-//! String}`, which runs a program) and `panic` (`fn(message: String):
+//! String}`, which runs a program), `panic` (`fn(message: String):
 //! Never`, which ends the run with a runtime error of the program's own
-//! wording). It is a value of that type like any function: passed, stored,
-//! called through a variable or a parameter, and a call of it is a call
+//! wording), and the five on strings: `split` (`fn(s: String, sep:
+//! String): List<String>`, the pieces between the separators; an empty
+//! separator is a runtime error), `join` (`fn(parts: List<String>, sep:
+//! String): String`), `starts_with` (`fn(s: String, prefix: String):
+//! Bool`), `ends_with` (`fn(s: String, suffix: String): Bool`) and `trim`
+//! (`fn(s: String): String`), each as Rust's `str` does it (see
+//! [`crate::eval`], "The built-in functions"); a file's own `join` shadows
+//! the prelude's as any declaration does, and so does `path`'s, in
+//! `path.gcsl` and in a file importing it by member or `*`. Each is a
+//! value of its type like any function: passed, stored, called through a
+//! variable or a parameter, and a call of it is a call
 //! like any other, typed by its type, binding its arguments by position or
 //! by its parameters' names, awaiting a future argument as any call
 //! does, lowered to a `Call` (see [`crate::eval`], which applies a built-in
@@ -2316,6 +2326,22 @@ pub enum Builtin {
     /// `panic(message: String): Never`: ends the run with the runtime error
     /// `message`, at the call.
     Panic,
+    /// `split(s: String, sep: String): List<String>`: the pieces of `s`
+    /// between occurrences of `sep`, in order, as Rust's `str::split` gives
+    /// them; an empty `sep` is a runtime error.
+    Split,
+    /// `join(parts: List<String>, sep: String): String`: the parts with
+    /// `sep` between each pair.
+    Join,
+    /// `starts_with(s: String, prefix: String): Bool`: whether `s` begins
+    /// with the bytes of `prefix`.
+    StartsWith,
+    /// `ends_with(s: String, suffix: String): Bool`: whether `s` ends with
+    /// the bytes of `suffix`.
+    EndsWith,
+    /// `trim(s: String): String`: `s` without its leading and trailing
+    /// Unicode whitespace.
+    Trim,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -2339,17 +2365,22 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 5] = [
+    pub const ALL: [Builtin; 10] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
         Builtin::Exec,
         Builtin::Panic,
+        Builtin::Split,
+        Builtin::Join,
+        Builtin::StartsWith,
+        Builtin::EndsWith,
+        Builtin::Trim,
     ];
 
     /// The most parameters any built-in function has: what a call of one
     /// collects its arguments into (see [`crate::eval`]).
-    pub const MAX_PARAMS: usize = 1;
+    pub const MAX_PARAMS: usize = 2;
 
     /// The names of the fields of what `exec` returns, in the order of the
     /// record it builds: its exit status, its standard output and its
@@ -2365,6 +2396,11 @@ impl Builtin {
             Builtin::Float => "float",
             Builtin::Exec => "exec",
             Builtin::Panic => "panic",
+            Builtin::Split => "split",
+            Builtin::Join => "join",
+            Builtin::StartsWith => "starts_with",
+            Builtin::EndsWith => "ends_with",
+            Builtin::Trim => "trim",
         }
     }
 
@@ -2377,18 +2413,31 @@ impl Builtin {
             Builtin::Int | Builtin::Float => &["x"],
             Builtin::Exec => &["argv"],
             Builtin::Panic => &["message"],
+            Builtin::Split => &["s", "sep"],
+            Builtin::Join => &["parts", "sep"],
+            Builtin::StartsWith => &["s", "prefix"],
+            Builtin::EndsWith => &["s", "suffix"],
+            Builtin::Trim => &["s"],
         }
     }
 
     /// What it may do: only a pure one may be called from a pure function.
     /// `exec`, which runs a program, is impure; every other built-in
     /// function is pure, `panic` included, which ends the run as a division
-    /// by zero does.
+    /// by zero does, and `split`, whose empty separator does the same.
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
             Builtin::Exec => Effect::Impure,
-            Builtin::Len | Builtin::Int | Builtin::Float | Builtin::Panic => Effect::Pure,
+            Builtin::Len
+            | Builtin::Int
+            | Builtin::Float
+            | Builtin::Panic
+            | Builtin::Split
+            | Builtin::Join
+            | Builtin::StartsWith
+            | Builtin::EndsWith
+            | Builtin::Trim => Effect::Pure,
         }
     }
 
@@ -2397,7 +2446,15 @@ impl Builtin {
     pub const fn typing(self) -> Typing {
         match self {
             Builtin::Len => Typing::Special,
-            Builtin::Int | Builtin::Float | Builtin::Exec | Builtin::Panic => Typing::Ordinary,
+            Builtin::Int
+            | Builtin::Float
+            | Builtin::Exec
+            | Builtin::Panic
+            | Builtin::Split
+            | Builtin::Join
+            | Builtin::StartsWith
+            | Builtin::EndsWith
+            | Builtin::Trim => Typing::Ordinary,
         }
     }
 
@@ -2415,6 +2472,11 @@ impl Builtin {
                 "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
             }
             Builtin::Panic => "fn(message: String): Never",
+            Builtin::Split => "fn(s: String, sep: String): List<String>",
+            Builtin::Join => "fn(parts: List<String>, sep: String): String",
+            Builtin::StartsWith => "fn(s: String, prefix: String): Bool",
+            Builtin::EndsWith => "fn(s: String, suffix: String): Bool",
+            Builtin::Trim => "fn(s: String): String",
         }
     }
 
@@ -2424,10 +2486,13 @@ impl Builtin {
     /// built here, with its [`Builtin::effect`]; the opaque type of a
     /// special one.
     pub(crate) fn ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        // What fills the entries of `param_types` past the built-in's
+        // parameters, which the `zip` with `params` below never reads.
+        const UNUSED: TyId = TyId::ERROR;
         // Each parameter's type, in the order of `params`, and the result's.
         let (param_types, result): ([TyId; Builtin::MAX_PARAMS], TyId) = match self {
-            Builtin::Int => ([TyId::FLOAT], TyId::INT),
-            Builtin::Float => ([TyId::INT], TyId::FLOAT),
+            Builtin::Int => ([TyId::FLOAT, UNUSED], TyId::INT),
+            Builtin::Float => ([TyId::INT, UNUSED], TyId::FLOAT),
             Builtin::Exec => {
                 let argv = types.list(TyId::STRING);
                 let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
@@ -2436,9 +2501,13 @@ impl Builtin {
                     (stdout, TyId::STRING),
                     (stderr, TyId::STRING),
                 ]);
-                ([argv], result)
+                ([argv, UNUSED], result)
             }
-            Builtin::Panic => ([TyId::STRING], types.never()),
+            Builtin::Panic => ([TyId::STRING, UNUSED], types.never()),
+            Builtin::Split => ([TyId::STRING, TyId::STRING], types.list(TyId::STRING)),
+            Builtin::Join => ([types.list(TyId::STRING), TyId::STRING], TyId::STRING),
+            Builtin::StartsWith | Builtin::EndsWith => ([TyId::STRING, TyId::STRING], TyId::BOOL),
+            Builtin::Trim => ([TyId::STRING, UNUSED], TyId::STRING),
             // TEMPORARY (alias rule): the opaque type, until a polymorphic
             // one (R11 of `docs/INFERENCE_REQS.md`).
             Builtin::Len => return types.builtin(self),
@@ -21461,6 +21530,60 @@ mod tests {
         assert_eq!(
             type_of_f("fn f(x: Int): Int { int(float(x) * 1.5) }"),
             "fn(x: Int): Int"
+        );
+    }
+
+    #[test]
+    fn the_string_builtins_have_function_types() {
+        for (text, shown) in [
+            ("split", "fn(s: String, sep: String): List<String>"),
+            ("join", "fn(parts: List<String>, sep: String): String"),
+            ("starts_with", "fn(s: String, prefix: String): Bool"),
+            ("ends_with", "fn(s: String, suffix: String): Bool"),
+            ("trim", "fn(s: String): String"),
+            (
+                "import builtins\nbuiltins.split",
+                "fn(s: String, sep: String): List<String>",
+            ),
+            ("split(\"a/b\", \"/\")", "List<String>"),
+            ("join([\"a\"], sep = \",\")", "String"),
+            ("starts_with(prefix = \"/\", s = \"/usr\")", "Bool"),
+            ("ends_with(\"x.gz\", \".gz\")", "Bool"),
+            ("trim(\" x \")", "String"),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // The summary's string lines.
+        assert_eq!(
+            file_type(
+                "parts = split(\"a/b/c\", \"/\")\n\
+                 s = join(parts, \"-\")\n\
+                 yes = starts_with(\"/usr\", \"/\")\n\
+                 gz = ends_with(\"x.tar.gz\", \".gz\")\n\
+                 hash = trim(sh(\"echo h\"))"
+            ),
+            "{gz: Bool, hash: String, parts: List<String>, s: String, yes: Bool}"
+        );
+        // Their arguments are checked as any call's.
+        assert_eq!(messages("split(1, \"/\")"), ["mismatched types"]);
+        assert_eq!(messages("join([1], \",\")"), ["mismatched types"]);
+        assert_eq!(messages("trim([\"x\"])"), ["mismatched types"]);
+        assert_eq!(messages("split(\"a\")"), ["expected 2 arguments, found 1"]);
+        assert_eq!(
+            messages("ends_with(s = \"a\", prefix = \"b\")"),
+            ["unknown argument `prefix`", "missing argument `suffix`"]
+        );
+        // Pure: a pure function may call them.
+        assert_eq!(
+            type_of_f(
+                "fn f(p: String): Bool { starts_with(trim(join(split(p, \"/\"), \"-\")), \"-\") }"
+            ),
+            "fn(p: String): Bool"
+        );
+        // A file's own `join` shadows the prelude's silently.
+        assert_eq!(
+            file_type("join = \"mine\"\nv = join"),
+            "{join: String, v: String}"
         );
     }
 

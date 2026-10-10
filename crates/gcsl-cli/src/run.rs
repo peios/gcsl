@@ -15,24 +15,29 @@
 //! lowered in the workspace.
 //!
 //! A file run alone is checked and run as the workspace of one directory
-//! holding just it ([`gcsl::workspace::check_lone`]), and its dumps are
-//! its own as a workspace file's are. Either way the standard library is
-//! there, its files the first inputs ([`gcsl::workspace::standard_sources`]):
-//! a diagnostic of a standard file, or a part of one in it, is rendered
-//! against its source, named `<stdlib>/prelude.gcsl`. So is the panic of a
-//! failing `sh`, which is the prelude's. A program a file runs with `exec`
-//! or `sh` has `gcsl`'s working directory and environment and the null
-//! device as its standard input, and its output is captured into the
+//! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its
+//! dumps are its own as a workspace file's are. Either way the standard
+//! library is there: the prelude, and each standard module a file imports
+//! (`import path`), its files the first inputs, which the check says only
+//! once it has scanned the files
+//! ([`gcsl::workspace::check_with_standard`]), so the sources diagnostics
+//! are rendered against, by input number, are known only then. A
+//! diagnostic of a standard file, or a part of one in it, is rendered
+//! against its source, named `<stdlib>/prelude.gcsl` say. So is the panic
+//! of a failing `sh`, which is the prelude's, its message ending in the
+//! command's standard error, trimmed. A program a file runs with
+//! `exec` or `sh` has `gcsl`'s working directory and environment and the
+//! null device as its standard input, and its output is captured into the
 //! value, never shown; a `panic`, like any runtime error, is rendered to
 //! stderr with exit code 1.
 //!
 //! The directories left out as nested workspaces are passed to the
 //! library too, by their paths relative to the root
-//! ([`gcsl::workspace::check_with`]): an `import` of a path into one is "no
-//! module", and only this module knows why, so that the error's note can
-//! say "`vendor/` is a workspace of its own". An `import` of anything but
-//! the standard library in a file that is not in a workspace is an error of
-//! that file, reported by the checker with its other errors.
+//! ([`gcsl::workspace::check_with_standard`]): an `import` of a path into
+//! one is "no module", and only this module knows why, so that the error's
+//! note can say "`vendor/` is a workspace of its own". An `import` of
+//! anything but the standard library in a file that is not in a workspace
+//! is an error of that file, reported by the checker with its other errors.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -141,21 +146,12 @@ pub fn main(args: &RunArgs) -> ExitCode {
 
 /// Runs `source` alone, as a file outside any workspace: the workspace of
 /// one directory holding just it, beside the standard library
-/// ([`gcsl::workspace::check_lone`]). Its diagnostics are shown against it,
-/// and a standard file's against that file, named `<stdlib>/prelude.gcsl`.
+/// ([`gcsl::workspace::check_lone_with_standard`]). Its diagnostics are
+/// shown against it, and a standard file's against that file, named
+/// `<stdlib>/prelude.gcsl` say.
 fn run_alone(args: &RunArgs, source: &SourceFile) -> ExitCode {
-    let mut shown = workspace::standard_sources();
-    let index = u32::try_from(shown.len()).unwrap_or(u32::MAX);
-    shown.push(source.clone());
-    let check = || workspace::check_lone(source);
-    match execute_workspace(args, source, check, &shown, index) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(Failure::Program(diagnostics)) => {
-            output::diagnostics_in(&shown, source, &diagnostics);
-            ExitCode::from(EXIT_PROGRAM_ERROR)
-        }
-        Err(failure) => exit_for(failure),
-    }
+    let check = || workspace::check_lone_with_standard(source);
+    execute_workspace(args, source, check, (vec![source.clone()], 0))
 }
 
 /// The exit code of a failure to write the output, after reporting it, or
@@ -343,9 +339,9 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
         }
     };
     let mut sources = Vec::new();
-    // Indexed by input number: the standard files take the first.
-    let mut shown_sources = workspace::standard_sources();
-    let standard = shown_sources.len();
+    // In path order, as the workspace numbers its files after the standard
+    // files it loads.
+    let mut shown_sources = Vec::new();
     for (name, path) in &paths {
         let (shown_name, text) = if name == relative {
             (file.name().to_owned(), file.text().to_owned())
@@ -373,16 +369,35 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
             }
         }
     }
-    let index = paths.iter().position(|(name, _)| name == relative);
-    let Some(index) = index.and_then(|index| u32::try_from(standard + index).ok()) else {
+    let Some(position) = paths.iter().position(|(name, _)| name == relative) else {
         // Not found among the files listed (a link, say): it runs alone.
         return run_alone(args, file);
     };
-    let check = || workspace::check_with(&sources, &nested);
-    match execute_workspace(args, file, check, &shown_sources, index) {
+    let check = || workspace::check_with_standard(&sources, &nested);
+    execute_workspace(args, file, check, (shown_sources, position))
+}
+
+/// What checking a workspace gives: the standard files it loaded, its
+/// first files by input number, and the workspace, or the diagnostics.
+type Checked = (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>);
+
+/// Runs the pipeline on the workspace `check` checks ([`pipeline`]), whose
+/// files are `files`, as they are shown, in path order, `file` being the
+/// one at `position` among them, and returns the exit code, after
+/// rendering any diagnostics: each against the source of the input it
+/// names, the standard files the check loaded coming before `files`, or
+/// against `file` when it names none.
+fn execute_workspace(
+    args: &RunArgs,
+    file: &SourceFile,
+    check: impl FnOnce() -> Checked,
+    (files, position): (Vec<SourceFile>, usize),
+) -> ExitCode {
+    let mut shown = files;
+    match pipeline(args, file, check, position, &mut shown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Program(diagnostics)) => {
-            output::diagnostics_in(&shown_sources, file, &diagnostics);
+            output::diagnostics_in(&shown, file, &diagnostics);
             ExitCode::from(EXIT_PROGRAM_ERROR)
         }
         Err(failure) => exit_for(failure),
@@ -392,26 +407,32 @@ fn run_workspace(args: &RunArgs, file: &SourceFile, root: &Path, relative: &str)
 /// Runs the pipeline on the workspace `check` checks, printing each
 /// requested dump and stopping after the last one; with no dumps, prints
 /// `file`'s value, as text, unless it is `{}`. The tokens and the syntax
-/// tree are `file`'s alone; the types and the IR are `file`'s, file
-/// `index`, as checked in the workspace, its own block only; the value is
-/// `file`'s own, after the files it needs, and the standard files, have
-/// run. Warnings are the whole workspace's, shown against `shown`, indexed
-/// by input number, once the run has succeeded (after the dumps, or before
-/// the value); if a later stage fails, they are returned with its error
-/// instead, to be printed together.
-fn execute_workspace(
+/// tree are `file`'s alone; the types and the IR are `file`'s, the file at
+/// `position` among the workspace's files, `shown`, as checked in the
+/// workspace, its own block only; the value is `file`'s own, after the
+/// files it needs, and the standard files the check loaded, have run. Once
+/// the check has returned, the standard files it loaded are put before the
+/// files of `shown`, which then holds every source by input number.
+/// Warnings are the whole workspace's, shown against `shown`, once the run
+/// has succeeded (after the dumps, or before the value); if a later stage
+/// fails, they are returned with its error instead, to be printed together.
+fn pipeline(
     args: &RunArgs,
     file: &SourceFile,
-    check: impl FnOnce() -> Result<Workspace, Vec<Diagnostic>>,
-    shown: &[SourceFile],
-    index: u32,
+    check: impl FnOnce() -> Checked,
+    position: usize,
+    shown: &mut Vec<SourceFile>,
 ) -> Result<(), Failure> {
     let last = args.last_dump();
     let mut out = io::stdout().lock();
     if (args.dump_tokens || args.dump_ast) && syntax(args, file, &mut out)?.is_none() {
         return Ok(out.flush()?);
     }
-    let mut workspace = check().map_err(Failure::Program)?;
+    let (mut standard, checked) = check();
+    let index = u32::try_from(standard.len() + position).unwrap_or(u32::MAX);
+    standard.append(shown);
+    *shown = standard;
+    let mut workspace = checked.map_err(Failure::Program)?;
     if args.dump_types {
         writeln!(out, "{}", workspace.dump_types(index).unwrap_or_default())?;
     }

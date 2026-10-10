@@ -121,11 +121,11 @@
 //! [`check`] scans the workspace and then checks and lowers every file in
 //! the order, as the inputs of a [`crate::Session`]: one table of names, of
 //! types and of slots, each file's diagnostics named by its input number,
-//! its index among the files, the standard files first and the workspace's
-//! after them in path order ([`Diagnostic::input`]). After a file is
-//! checked, its declarations are committed to its directory's scope for
-//! the files after it; its private names (`let`, `let mut`, `fn`) are not,
-//! though their slots stay taken. The scope is committed after the check,
+//! its index among the files, the standard files it loads first and the
+//! workspace's after them in path order ([`Diagnostic::input`]). After a
+//! file is checked, its declarations are committed to its directory's scope
+//! for the files after it; its private names (`let`, `let mut`, `fn`) are
+//! not, though their slots stay taken. The scope is committed after the check,
 //! not after a run, since every file is checked before any runs: any error
 //! anywhere stops everything. A file that needs a file whose check failed
 //! is not checked, since its errors would follow from the first.
@@ -197,31 +197,68 @@
 //!
 //! Two kinds of module are not files of the workspace. `builtins` is a
 //! module implemented in Rust, a record of the built-in functions
-//! ([`Builtin`]): `len`, `int`, `float`, `exec` and `panic`. The *standard
-//! files* are the `.gcsl` files of the repository's `stdlib/` directory,
-//! compiled in ([`crate::STANDARD`], [`standard_sources`]): today only
+//! ([`Builtin`]): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
+//! `starts_with`, `ends_with` and `trim`. The *standard files* are the
+//! `.gcsl` files of the repository's `stdlib/` directory, compiled in
+//! ([`crate::STANDARD`]): `path.gcsl`, lexical operations on paths, and
 //! `prelude.gcsl`, which binds the built-in functions and `sh`. Each is
-//! importable by a bare name, `import builtins`,
-//! `import len from builtins`, `import * from prelude`, from any file; the
+//! importable by a bare name, `import builtins`, `import len from
+//! builtins`, `import * from prelude`, `import path`, from any file; the
 //! names are reserved roots of the path namespace, and a file or directory
 //! at the workspace's root named like one of them is an error of the scan,
 //! "`builtins` is the name of a built-in module", "`prelude` is the name of
-//! a standard module", reported at the start of the file, or of the first
-//! file under the directory. A path of more than one segment never names
-//! one, and a file or directory below the root has a path of its own.
+//! a standard module" (and so for `path`), reported at the start of the
+//! file, or of the first file under the directory, whether or not any file
+//! imports it. A path of more than one segment never names one, and a file
+//! or directory below the root has a path of its own.
 //!
-//! Every scan holds them. The standard files are its first files, so they
-//! take the first input numbers, each named `<stdlib>/STEM.gcsl`
-//! ([`STANDARD_DIR`]), in a directory of their own with no directory
-//! above: one directory scope among themselves, a standard file seeing the
-//! other standard files' declarations and nothing of the workspace, and
-//! nothing of the workspace seeing theirs but by an import. They are
+//! EACH STANDARD FILE IS A DIRECTORY SCOPE OF ITS OWN, a directory with no
+//! directory above, whose path is [`STANDARD_DIR`]: it sees its own
+//! declarations, the prelude's through its implicit `import * from
+//! prelude` (below; yielding, as for any file), and what it imports, by
+//! bare name, `builtins` and the other standard files; nothing else of the
+//! standard library and nothing of the workspace, and nothing of the
+//! workspace sees its declarations but by an import. So two standard files
+//! may declare one top-level name, as the prelude's string `join` and
+//! `path`'s `join` do. One standard file importing another is an import
+//! like any other, and standard files that need each other are the usual
+//! error, which is a bug of the library.
+//!
+//! ONLY THE STANDARD FILES A RUN NEEDS ARE LOADED: checked, lowered and
+//! run, given cells, slots and input numbers. A scan of a workspace or a
+//! lone file loads the prelude, always, and each standard file that any
+//! file it scans imports, whether or not the file run needs that file,
+//! since every file of a workspace is checked: an `import` whose path is
+//! one segment naming a standard file, in whatever form (`import path`,
+//! `import path as p`, `import join from path`, `import * from path`);
+//! and, transitively, each standard file that a standard file it loads
+//! imports so. The scan computes the set as it parses (`parse_files`): it
+//! parses the prelude, and what the prelude imports, then the workspace's
+//! files, then reads the top-level `import` items of each file that parsed
+//! and of each standard file as it is parsed in turn (`standard_imports`),
+//! and parses each standard file they name that it has not, until none is
+//! left; a file that fails to parse imports nothing. A standard file
+//! nobody imports is never parsed. A session loads every standard file
+//! instead (see [`crate::session`]).
+//!
+//! The standard files a scan loads are its first files, so they take the
+//! first input numbers, in the order of [`crate::STANDARD`], which is path
+//! order, each named `<stdlib>/STEM.gcsl`, the workspace's files following
+//! them: so `path`, when it is loaded, is input 0 and the prelude input 1,
+//! and a run that loads the prelude alone numbers its files as if there
+//! were no other standard file. Since the caller cannot know which are
+//! loaded before the scan has parsed the files, [`check_with_standard`] and
+//! [`check_lone_with_standard`] return their sources with the check,
+//! whether it succeeds or fails, for rendering diagnostics by input number;
+//! [`standard_sources`] gives every one, as a session loads them. They are
 //! checked and run with the workspace's files, before them in the order
 //! (they need no file of the workspace), on the same frame and memo
-//! tables; every run runs them first ([`Scan::needed`]). An error in one is
-//! reported like any other, and is a bug. The `builtins` module is a
-//! directory of its own too, with no file: its tree is one root leaf per
-//! built-in function, nodes `0..` of [`Scan::nodes`] in the order of
+//! tables; every run runs those loaded first ([`Scan::needed`]). An error
+//! in one is reported like any other, and is a bug.
+//!
+//! The `builtins` module is a directory of its own too, with no file: its
+//! tree is one root leaf per built-in function, nodes `0..` of
+//! [`Scan::nodes`] in the order of
 //! [`Builtin::ALL`], so their cells are the first slots of the frame, which
 //! the driver writes, each a [`Value::Builtin`], as it lays the frame out,
 //! before any file runs ([`check_with`]). No file computes them, and none
@@ -249,14 +286,17 @@
 //!
 //! A file outside any workspace (`gcsl run` of a lone file, [`check_lone`])
 //! is checked and run as a workspace of one directory holding just it,
-//! beside the standard library: it may import `builtins` and the standard
-//! files, and an import of anything else is the checker's error,
-//! "`lib` is not a built-in or standard module, and there is no
-//! `workspace.gcsl` above this file", with the file's other errors. A
-//! session's input is scanned so too (`check_input`), though a session is
-//! not a workspace (see [`crate::session`]); it inherits the imports of the
-//! session's earlier inputs, after its own and before the implicit prelude,
-//! but for each it imports again or declares at its top level.
+//! beside the standard library, loading what it needs as a workspace does:
+//! it may import `builtins` and the standard files, and an import of
+//! anything else is the checker's error, "`lib` is not a built-in or
+//! standard module, and there is no `workspace.gcsl` above this file", with
+//! the file's other errors. A session's input is scanned so too
+//! (`check_input`), though a session is not a workspace (see
+//! [`crate::session`]), beside every standard file, as the session loaded
+//! them when it started, so that their cells are numbered as they were
+//! there; it inherits the imports of the session's earlier inputs, after
+//! its own and before the implicit prelude, but for each it imports again
+//! or declares at its top level.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -283,25 +323,77 @@ use crate::value::{Layout, Value};
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
 const ROOT: u32 = u32::MAX;
 
-/// The path of the standard library's directory, which no path of a
+/// The path of the standard library's directories, which no path of a
 /// workspace can name, `<` being in no name: each standard file is
-/// `<stdlib>/STEM.gcsl`, which is how a diagnostic of one names it.
+/// `<stdlib>/STEM.gcsl`, which is how a diagnostic of one names it, in a
+/// directory of its own with this path.
 pub const STANDARD_DIR: &str = "<stdlib>";
 
 /// The name of the module of built-in functions.
 const BUILTINS: &str = "builtins";
 
-/// The standard files ([`crate::STANDARD`]) as the sources every scan
-/// begins with, in their order, each named `<stdlib>/STEM.gcsl`: what a
-/// caller renders a diagnostic of a standard file against.
+/// The stem of the prelude, the standard file every scan loads.
+const PRELUDE: &str = "prelude";
+
+/// Every standard file ([`crate::STANDARD`]) as a source, in its order,
+/// each named `<stdlib>/STEM.gcsl`: what a session, which loads them all,
+/// renders a diagnostic of one against. A run of a workspace or a lone file
+/// loads only those it needs: [`check_with_standard`] says which.
 #[must_use]
 pub fn standard_sources() -> Vec<SourceFile> {
     crate::STANDARD
         .iter()
-        .filter_map(|&(stem, text)| {
-            SourceFile::new(format!("{STANDARD_DIR}/{stem}.gcsl"), text).ok()
-        })
+        .filter_map(|&(stem, text)| standard_source(stem, text))
         .collect()
+}
+
+/// The standard file of stem `stem` and text `text` as a source, named
+/// `<stdlib>/STEM.gcsl`.
+fn standard_source(stem: &str, text: &str) -> Option<SourceFile> {
+    SourceFile::new(format!("{STANDARD_DIR}/{stem}.gcsl"), text).ok()
+}
+
+/// The standard library a scan is given (see the module documentation,
+/// "The standard library"): a table of standard files, and which of them
+/// it loads.
+#[derive(Clone, Copy, Debug)]
+struct Library<'a> {
+    /// The standard files, each with its stem, in path order: always
+    /// [`crate::STANDARD`] but in tests.
+    table: &'a [(&'a str, &'a str)],
+    /// Whether the scan loads every standard file, as a session does, or
+    /// only the prelude and those its files need.
+    every: bool,
+}
+
+impl Library<'_> {
+    /// The standard library of a workspace or a lone file: only the
+    /// standard files it needs.
+    const NEEDED: Library<'static> = Library {
+        table: &crate::STANDARD,
+        every: false,
+    };
+
+    /// The standard library of a session: every standard file.
+    const EVERY: Library<'static> = Library {
+        table: &crate::STANDARD,
+        every: true,
+    };
+
+    /// The index in the table of the standard file of stem `stem`.
+    fn find(&self, stem: &str) -> Option<usize> {
+        self.table.iter().position(|&(name, _)| name == stem)
+    }
+
+    /// The standard files of the table at `loaded`, its indices, as
+    /// sources, by input number.
+    fn sources(&self, loaded: &[usize]) -> Vec<SourceFile> {
+        loaded
+            .iter()
+            .filter_map(|&at| self.table.get(at))
+            .filter_map(|&(stem, text)| standard_source(stem, text))
+            .collect()
+    }
 }
 
 /// The values of the cells of the built-in functions, the first slots of a
@@ -587,11 +679,10 @@ pub struct Scan {
     /// cell and its name (the file's stem), in path order. Their slots
     /// follow the merged nodes'.
     values: Vec<(u32, Name)>,
-    /// The number of standard files, which are files `0..standard` (see
-    /// the module documentation, "The standard library").
+    /// The number of standard files the scan loaded, which are files
+    /// `0..standard`, each in a directory of its own (see the module
+    /// documentation, "The standard library").
     standard: u32,
-    /// The standard library's directory.
-    standard_dir: u32,
     /// The directory of the `builtins` module, whose nodes are the first
     /// [`Builtin::ALL`]`.len()` of `nodes`.
     builtins_dir: u32,
@@ -615,8 +706,9 @@ impl Scan {
     }
 
     /// The files `file` needs, transitively, with `file` and the standard
-    /// files, which every run runs, in the order: the files to run to run
-    /// `file`.
+    /// files the scan loaded, which every run runs (the prelude and those
+    /// some scanned file imports, see the module documentation, "The
+    /// standard library"), in the order: the files to run to run `file`.
     #[must_use]
     pub fn needed(&self, file: u32) -> Vec<u32> {
         let mut wanted = vec![false; self.files.len()];
@@ -756,14 +848,15 @@ impl Scan {
         Builtin::ALL.get(node as usize).copied()
     }
 
-    /// The number of standard files: files `0..` this are the standard
-    /// library's (see the module documentation, "The standard library").
+    /// The number of standard files the scan loaded: files `0..` this are
+    /// the standard library's (see the module documentation, "The standard
+    /// library").
     #[must_use]
     pub fn standard(&self) -> u32 {
         self.standard
     }
 
-    /// The standard file whose stem is `stem`, if there is one.
+    /// The standard file whose stem is `stem`, if the scan loaded one.
     fn standard_file(&self, stem: &str) -> Option<u32> {
         (0..self.standard).find(|&file| {
             self.files.get(file as usize).is_some_and(|f| {
@@ -1288,12 +1381,14 @@ fn parent_path(path: &str) -> &str {
 /// relative to the root, beside the standard library: parses every file,
 /// merges each directory's trees and each file's view, resolves every
 /// file's references against its view, and finds the order and each file's
-/// schedule (see the module documentation). The standard files are files
-/// `0..` [`Scan::standard`], and the workspace's follow them in path order.
+/// schedule (see the module documentation). The standard files it loads,
+/// the prelude and each that a file imports, are files `0..`
+/// [`Scan::standard`], and the workspace's follow them in path order.
 ///
 /// # Errors
 ///
-/// Every syntax error of every file; else every file or directory of the
+/// Every syntax error of every file (numbered as if the standard files the
+/// files that parsed need were loaded); else every file or directory of the
 /// root named like a module of the standard library; else every conflict
 /// between files' declarations in a directory; else every conflict of
 /// every file's view; else every cycle of files that need each other. Each
@@ -1313,7 +1408,12 @@ pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
 /// the cycles, every reference through an import that reaches back into
 /// its own file.
 pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<Diagnostic>> {
-    scan_into(sources, Placing::Workspace(nested), &mut Names::new())
+    scan_into(
+        (sources, Placing::Workspace(nested)),
+        Library::NEEDED,
+        &mut Names::new(),
+        &mut Vec::new(),
+    )
 }
 
 /// Where the files a scan is given are placed (see the module
@@ -1330,16 +1430,21 @@ enum Placing<'a> {
     Lone(&'a [Alias]),
 }
 
-/// [`scan_with`] of `sources` placed as `placing` says, interning into
-/// `names`, which the scan holds once it succeeds ([`Scan::names`]) and
-/// which are given back to `names` if it fails.
+/// [`scan_with`] of `sources` placed as `placing` says, beside `library`,
+/// interning into `names`, which the scan holds once it succeeds
+/// ([`Scan::names`]) and which are given back to `names` if it fails. The
+/// indices in the library's table of the standard files it loads, which
+/// are files `0..` [`Scan::standard`], are left in `loaded` whether it
+/// succeeds or fails, so that a caller can render a diagnostic of any file
+/// against its source (see [`check_with_standard`]).
 fn scan_into(
-    sources: &[SourceFile],
-    placing: Placing,
+    (sources, placing): (&[SourceFile], Placing),
+    library: Library,
     names: &mut Names,
+    loaded: &mut Vec<usize>,
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
-        files: Vec::with_capacity(sources.len() + crate::STANDARD.len()),
+        files: Vec::with_capacity(sources.len() + library.table.len()),
         dirs: Vec::new(),
         nodes: Vec::new(),
         functions: Vec::new(),
@@ -1354,12 +1459,11 @@ fn scan_into(
         part_base: Vec::new(),
         values: Vec::new(),
         standard: 0,
-        standard_dir: 0,
         builtins_dir: 0,
         lone: matches!(placing, Placing::Lone(_)),
         relocation: None,
     };
-    match scan_files(&mut scan, sources, placing) {
+    match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
         Err(errors) => {
             *names = mem::take(&mut scan.names);
@@ -1368,40 +1472,49 @@ fn scan_into(
     }
 }
 
-/// Fills `scan`, empty but for its names, with the standard library and
-/// `sources` placed as `placing` says (see [`scan_with`]).
+/// Fills `scan`, empty but for its names, with the standard files of
+/// `library` it loads, each in a directory of its own, and `sources`
+/// placed as `placing` says (see [`scan_with`]), leaving in `loaded` the
+/// indices in the library's table of the standard files it loads.
 fn scan_files(
     scan: &mut Scan,
-    sources: &[SourceFile],
-    placing: Placing,
+    (sources, placing): (&[SourceFile], Placing),
+    library: Library,
+    loaded: &mut Vec<usize>,
 ) -> Result<(), Vec<Diagnostic>> {
     let mut sorted: Vec<&SourceFile> = sources.iter().collect();
     sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
-    let standard = standard_sources();
+    let (standard, parsed) = parse_files(scan, &sorted, library, loaded)?;
     scan.standard = count(standard.len());
     let (dirs, user_dirs) = place_dirs(scan, &sorted, placing);
-    let placed = standard
-        .iter()
-        .map(|source| (source, scan.standard_dir, source.name()))
-        .chain(sorted.iter().zip(&user_dirs).map(|(&source, &dir)| {
-            let path = match placing {
-                Placing::Workspace(_) => source.name(),
-                Placing::Lone(_) => source.name().rsplit('/').next().unwrap_or(""),
-            };
-            (source, dir, path)
-        }));
+    // Each standard file is a directory of its own, with no directory
+    // above: a scope of its own, apart from the workspace's tree and from
+    // every other standard file.
+    for (&at, (ast, spelled)) in loaded.iter().zip(standard) {
+        let stem = library.table.get(at).map_or("", |&(stem, _)| stem);
+        let dir = count(scan.dirs.len());
+        scan.dirs.push(Dir {
+            path: STANDARD_DIR.to_owned(),
+            parent: None,
+        });
+        let path = format!("{STANDARD_DIR}/{stem}.gcsl");
+        scan.files.push(File::new(&path, dir, ast, spelled));
+    }
+    scan.builtins_dir = count(scan.dirs.len());
+    scan.dirs.push(Dir {
+        path: BUILTINS.to_owned(),
+        parent: None,
+    });
+    for ((source, &dir), (ast, spelled)) in sorted.iter().zip(&user_dirs).zip(parsed) {
+        let path = match placing {
+            Placing::Workspace(_) => source.name(),
+            Placing::Lone(_) => source.name().rsplit('/').next().unwrap_or(""),
+        };
+        scan.files.push(File::new(path, dir, ast, spelled));
+    }
     let mut errors = Vec::new();
-    for (index, (source, dir, path)) in (0u32..).zip(placed) {
-        match parse(source, &mut scan.names) {
-            Ok((ast, spelled)) => scan.files.push(File::new(path, dir, ast, spelled)),
-            Err(error) => errors.push(error.in_input(index)),
-        }
-    }
-    if !errors.is_empty() {
-        return Err(errors);
-    }
     if matches!(placing, Placing::Workspace(_)) {
-        reserved(scan, &mut errors);
+        reserved(scan, library, &mut errors);
     }
     if !errors.is_empty() {
         return Err(errors);
@@ -1452,11 +1565,117 @@ fn scan_files(
     Ok(())
 }
 
-/// Adds the directories of `scan`: the workspace's in path order, the root
+/// A file parsed: its tree and the names it spells (see [`parse`]).
+type Parsed = (Ast, Vec<Name>);
+
+/// Parses the files `sorted`, in path order, and the standard files of
+/// `library` that the scan loads, interning into the scan's names, and
+/// leaves in `loaded` the indices in the library's table of those it loads,
+/// in the table's order: every one if the library says so (a session's),
+/// else the prelude and each standard file that a file, or a standard file
+/// loaded, imports by its bare stem, in any form ([`standard_imports`]).
+/// The prelude, and what it imports, is parsed first, as it always was (a
+/// session's every standard file, in the table's order), then the files,
+/// then the standard files they need. Returns the trees of the standard
+/// files loaded, in the table's order, and the files'.
+///
+/// # Errors
+///
+/// Every syntax error, each named by its input number: the standard files
+/// loaded first, then the files. A file that fails to parse imports
+/// nothing, so a standard file only it would need is not loaded and takes
+/// no number.
+fn parse_files(
+    scan: &mut Scan,
+    sorted: &[&SourceFile],
+    library: Library,
+    loaded: &mut Vec<usize>,
+) -> Result<(Vec<Parsed>, Vec<Parsed>), Vec<Diagnostic>> {
+    // Each standard file's parse, by its index in the table, once loaded.
+    let mut standard: Vec<Option<Result<Parsed, Diagnostic>>> =
+        library.table.iter().map(|_| None).collect();
+    let mut queue: Vec<usize> = if library.every {
+        (0..library.table.len()).rev().collect()
+    } else {
+        library.find(PRELUDE).into_iter().collect()
+    };
+    load_standard(scan, library, &mut standard, &mut queue);
+    let files: Vec<Result<Parsed, Diagnostic>> = sorted
+        .iter()
+        .map(|source| parse(source, &mut scan.names))
+        .collect();
+    for (ast, _) in files.iter().flatten() {
+        queue.extend(standard_imports(ast, &scan.names, library));
+    }
+    load_standard(scan, library, &mut standard, &mut queue);
+    loaded.clear();
+    loaded.extend((0..standard.len()).filter(|&at| matches!(standard.get(at), Some(Some(_)))));
+    let mut errors = Vec::new();
+    let mut trees = Vec::with_capacity(loaded.len());
+    let numbered = standard.into_iter().flatten().chain(files);
+    for (index, parsed) in (0u32..).zip(numbered) {
+        match parsed {
+            Ok(parsed) => trees.push(parsed),
+            Err(error) => errors.push(error.in_input(index)),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let files = trees.split_off(loaded.len());
+    Ok((trees, files))
+}
+
+/// Parses each standard file of `library` that `queue` holds, and each it
+/// imports in turn, into `standard`, by its index in the library's table,
+/// unless it is there already, emptying `queue`.
+fn load_standard(
+    scan: &mut Scan,
+    library: Library,
+    standard: &mut [Option<Result<Parsed, Diagnostic>>],
+    queue: &mut Vec<usize>,
+) {
+    while let Some(at) = queue.pop() {
+        let (Some(slot @ None), Some(&(stem, text))) =
+            (standard.get_mut(at), library.table.get(at))
+        else {
+            continue;
+        };
+        let Some(source) = standard_source(stem, text) else {
+            continue;
+        };
+        let parsed = parse(&source, &mut scan.names);
+        if let Ok((ast, _)) = &parsed {
+            queue.extend(standard_imports(ast, &scan.names, library));
+        }
+        *slot = Some(parsed);
+    }
+}
+
+/// The indices in `library`'s table of the standard files the file of tree
+/// `ast` imports, its names being `names`: each `import` whose path is one
+/// segment naming a standard file by its stem, in whatever form (`import
+/// path`, `import path as p`, `import join from path`, `import * from
+/// path`). A path of more than one segment never names one.
+fn standard_imports<'a>(
+    ast: &'a Ast,
+    names: &'a Names,
+    library: Library<'a>,
+) -> impl Iterator<Item = usize> + 'a {
+    ast.items(ast.root()).iter().filter_map(move |&item| {
+        let ItemKind::Import(id) = ast.item(item).kind else {
+            return None;
+        };
+        let [only] = ast.path(ast.import_decl(id).path) else {
+            return None;
+        };
+        library.find(names.get(only.name()?))
+    })
+}
+
+/// Adds the directories of the workspace to `scan`, in path order, the root
 /// first, as its files are, `sorted`, placed as `placing` says (a lone
-/// file's is the root); then the standard library's and the `builtins`
-/// module's, with no directory above, apart from the workspace's tree.
-/// Returns the workspace's directories by path, and each file's.
+/// file's is the root). Returns them by path, and each file's.
 fn place_dirs(
     scan: &mut Scan,
     sorted: &[&SourceFile],
@@ -1473,18 +1692,6 @@ fn place_dirs(
             Placing::Lone(_) => 0,
         })
         .collect();
-    for path in [STANDARD_DIR, BUILTINS] {
-        let dir = count(scan.dirs.len());
-        scan.dirs.push(Dir {
-            path: path.to_owned(),
-            parent: None,
-        });
-        if path == STANDARD_DIR {
-            scan.standard_dir = dir;
-        } else {
-            scan.builtins_dir = dir;
-        }
-    }
     (dirs, user_dirs)
 }
 
@@ -1516,8 +1723,10 @@ fn builtin_nodes(scan: &mut Scan) {
 /// module of the standard library, the names it reserves: "`builtins` is
 /// the name of a built-in module", "`prelude` is the name of a standard
 /// module", once per name, at the start of the first file that has it (the
-/// file, or the first file under the directory), in path order.
-fn reserved(scan: &Scan, errors: &mut Vec<Diagnostic>) {
+/// file, or the first file under the directory), in path order. Every
+/// standard file of `library` reserves its stem, whether the scan loads it
+/// or not.
+fn reserved(scan: &Scan, library: Library, errors: &mut Vec<Diagnostic>) {
     let mut reported: Vec<&str> = Vec::new();
     for (index, file) in (0u32..).zip(&scan.files).skip(scan.standard as usize) {
         let first = file.path.split('/').next().unwrap_or("");
@@ -1528,7 +1737,7 @@ fn reserved(scan: &Scan, errors: &mut Vec<Diagnostic>) {
         };
         let message = if name == BUILTINS {
             format!("`{name}` is the name of a built-in module")
-        } else if scan.standard_file(name).is_some() {
+        } else if library.find(name).is_some() {
             format!("`{name}` is the name of a standard module")
         } else {
             continue;
@@ -3382,14 +3591,27 @@ pub fn check(sources: &[SourceFile]) -> Result<Workspace, Vec<Diagnostic>> {
 ///
 /// As [`check`].
 pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace, Vec<Diagnostic>> {
-    check_scan(scan_with(sources, nested)?)
+    check_with_standard(sources, nested).1
+}
+
+/// [`check_with`], with the standard files it loaded as sources, each named
+/// `<stdlib>/STEM.gcsl`, which are its first files, whether the check
+/// succeeds or fails: the sources the diagnostics of the standard files
+/// name by input number, the workspace's files' numbers coming after them.
+/// Only the prelude and the standard files some file imports are loaded,
+/// so the number of the first file of the workspace is their number.
+pub fn check_with_standard(
+    sources: &[SourceFile],
+    nested: &[String],
+) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
+    check_in((sources, Placing::Workspace(nested)), Library::NEEDED)
 }
 
 /// Scans, checks and lowers `source`, a file outside any workspace (`gcsl
 /// run` of a lone file), as the workspace of one directory holding just
 /// it, beside the standard library (see the module documentation, "The
 /// standard library"): it is file [`Scan::standard`], after the standard
-/// files.
+/// files it loads.
 ///
 /// # Errors
 ///
@@ -3397,11 +3619,49 @@ pub fn check_with(sources: &[SourceFile], nested: &[String]) -> Result<Workspace
 /// files is the checker's error, "`lib` is not a built-in or standard
 /// module, and there is no `workspace.gcsl` above this file".
 pub fn check_lone(source: &SourceFile) -> Result<Workspace, Vec<Diagnostic>> {
-    check_scan(scan_into(
-        std::slice::from_ref(source),
-        Placing::Lone(&[]),
-        &mut Names::new(),
-    )?)
+    check_lone_with_standard(source).1
+}
+
+/// [`check_lone`], with the standard files it loaded as sources, as
+/// [`check_with_standard`] gives them: the file's input number is their
+/// number.
+pub fn check_lone_with_standard(
+    source: &SourceFile,
+) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
+    let (loaded, checked) = check_lone_loading(source);
+    (Library::NEEDED.sources(&loaded), checked)
+}
+
+/// [`check_lone`], with the indices in [`crate::STANDARD`] of the standard
+/// files it loaded, which are its first files: what [`crate::run`] numbers
+/// the file by, with no source made of them.
+pub(crate) fn check_lone_loading(
+    source: &SourceFile,
+) -> (Vec<usize>, Result<Workspace, Vec<Diagnostic>>) {
+    let sources = std::slice::from_ref(source);
+    check_loading((sources, Placing::Lone(&[])), Library::NEEDED)
+}
+
+/// Scans `sources` placed as `placing` says, beside `library`, and checks
+/// and lowers every file, as [`check_with`] does; with the standard files
+/// the scan loaded, as [`check_with_standard`] gives them.
+fn check_in(
+    placed: (&[SourceFile], Placing),
+    library: Library,
+) -> (Vec<SourceFile>, Result<Workspace, Vec<Diagnostic>>) {
+    let (loaded, checked) = check_loading(placed, library);
+    (library.sources(&loaded), checked)
+}
+
+/// [`check_in`], with the indices in the library's table of the standard
+/// files the scan loaded in place of their sources.
+fn check_loading(
+    placed: (&[SourceFile], Placing),
+    library: Library,
+) -> (Vec<usize>, Result<Workspace, Vec<Diagnostic>>) {
+    let mut loaded = Vec::new();
+    let checked = scan_into(placed, library, &mut Names::new(), &mut loaded).and_then(check_scan);
+    (loaded, checked)
 }
 
 /// The tables of the cells of `scan` before any file is checked: each
@@ -3753,11 +4013,12 @@ impl Workspace {
         Some(dump)
     }
 
-    /// Runs file `index` and, before it, the standard files and every file
-    /// it needs that has not run, in the order ([`Scan::needed`]), on the
-    /// frame whose first cells the driver wrote with the built-in
-    /// functions, and returns its own value: its result, or the
-    /// record of its own fields, with the warnings of the whole workspace.
+    /// Runs file `index` and, before it, the standard files the scan loaded
+    /// and every file it needs that has not run, in the order
+    /// ([`Scan::needed`]), on the frame whose first cells the driver wrote
+    /// with the built-in functions, and returns its own value: its result,
+    /// or the record of its own fields, with the warnings of the whole
+    /// workspace.
     ///
     /// # Errors
     ///
@@ -3815,10 +4076,11 @@ pub fn being_run(mut diagnostics: Vec<Diagnostic>, index: u32) -> Vec<Diagnostic
 /// of its inputs is scanned and checked beside ([`check_input`]).
 #[derive(Clone, Debug)]
 pub(crate) struct Standard {
-    /// The number of its cells, the built-in functions' and the standard
-    /// files' nodes, which are the first nodes of every scan, an input's
-    /// after them. (A standard file that is a value file has no cell of its
-    /// value here; none is.)
+    /// The number of its cells, the built-in functions' and every standard
+    /// file's nodes, which are the first nodes of the scan of every input,
+    /// which loads every standard file too, an input's after them. (A
+    /// standard file that is a value file has no cell of its value here;
+    /// none is.)
     cells: u32,
     /// The type of each of its cells.
     cell_types: Vec<TyId>,
@@ -3854,14 +4116,15 @@ pub(crate) struct Started {
 }
 
 /// Checks and runs the standard library as a session starts: through the
-/// driver of a workspace with no file of its own, the built-in functions'
-/// cells written as the frame is laid out and every standard file run.
+/// driver of a workspace with no file of its own that loads every standard
+/// file, each a scope of its own, the built-in functions' cells written as
+/// the frame is laid out and every standard file run.
 ///
 /// # Errors
 ///
 /// The diagnostics of the standard library, which are a bug.
 pub(crate) fn start() -> Result<Started, Vec<Diagnostic>> {
-    let mut workspace = check_with(&[], &[])?;
+    let mut workspace = check_loading((&[], Placing::Workspace(&[])), Library::EVERY).1?;
     for file in 0..workspace.scan.standard {
         workspace.run(file)?;
     }
@@ -3947,8 +4210,12 @@ fn check_input_then<R>(
     scope: Scope,
     then: impl FnOnce(&Ast, Result<CheckOutput, Vec<Diagnostic>>, &mut TypeTable) -> R,
 ) -> Result<(R, Vec<Alias>), Vec<Diagnostic>> {
-    let mut scan = scan_into(std::slice::from_ref(source), Placing::Lone(imports), names)
-        .map_err(|errors| being_run(errors, count(crate::STANDARD.len())))?;
+    // Every standard file, as the session's start loaded them, so that its
+    // cells are numbered as they were there.
+    let mut loaded = Vec::new();
+    let placed = (std::slice::from_ref(source), Placing::Lone(imports));
+    let mut scan = scan_into(placed, Library::EVERY, names, &mut loaded)
+        .map_err(|errors| being_run(errors, count(loaded.len())))?;
     let index = scan.standard;
     // The input's cells, but its `def`s', take the slots past the scope's,
     // in order.
@@ -4736,9 +5003,10 @@ mod tests {
             // Its scan and its check, apart.
             let start = std::time::Instant::now();
             let scanned = scan_into(
-                std::slice::from_ref(&source),
-                Placing::Lone(&[]),
+                (std::slice::from_ref(&source), Placing::Lone(&[])),
+                Library::NEEDED,
                 &mut Names::new(),
+                &mut Vec::new(),
             )
             .unwrap();
             let scanning = start.elapsed();
@@ -5293,12 +5561,19 @@ p24 = w.com"#;
     /// The single error of scanning `files`, shown: its message and file,
     /// its label, each other label's file and text, and its notes.
     fn shown_error(files: &[(&str, &str)]) -> String {
-        let errors = ws(files).unwrap_err();
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let mut loaded = Vec::new();
+        let placed = (&sources[..], Placing::Workspace(&[]));
+        let errors =
+            scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded).unwrap_err();
         assert_eq!(errors.len(), 1, "{errors:?}");
         let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
         paths.sort_unstable();
-        // The standard files take the first input numbers.
-        let standard = standard_sources();
+        // The standard files the scan loaded take the first input numbers.
+        let standard = Library::NEEDED.sources(&loaded);
         let mut all: Vec<&str> = standard.iter().map(SourceFile::name).collect();
         all.extend(paths);
         let path = |input: Option<u32>| {
@@ -6082,7 +6357,7 @@ p26 = com.x"#;
         assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
         assert_eq!(scan.order[0], 0);
         // The built-in functions' cells are the first.
-        let builtins: Vec<Option<Builtin>> = (0..6).map(|node| scan.builtin(node)).collect();
+        let builtins: Vec<Option<Builtin>> = (0..11).map(|node| scan.builtin(node)).collect();
         assert_eq!(
             builtins,
             [
@@ -6091,6 +6366,11 @@ p26 = com.x"#;
                 Some(Builtin::Float),
                 Some(Builtin::Exec),
                 Some(Builtin::Panic),
+                Some(Builtin::Split),
+                Some(Builtin::Join),
+                Some(Builtin::StartsWith),
+                Some(Builtin::EndsWith),
+                Some(Builtin::Trim),
                 None
             ]
         );
@@ -6250,7 +6530,22 @@ p26 = com.x"#;
             .iter()
             .map(|alias| scan.names.get(alias.name))
             .collect();
-        assert_eq!(names, ["int", "float", "half", "exec", "panic", "sh"]);
+        assert_eq!(
+            names,
+            [
+                "int",
+                "float",
+                "half",
+                "exec",
+                "panic",
+                "split",
+                "join",
+                "starts_with",
+                "ends_with",
+                "trim",
+                "sh"
+            ]
+        );
         assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
         assert!(scan.files[0].aliases.iter().all(|alias| !alias.implicit));
     }
@@ -6580,10 +6875,11 @@ p26 = com.x"#;
         let error = lone_error("x = sh(\"echo nope >&2; exit 2\")");
         assert_eq!(
             error.message,
-            "`echo nope >&2; exit 2` exited with status 2: nope\n"
+            "`echo nope >&2; exit 2` exited with status 2: nope"
         );
         assert_eq!(error.input, Some(0));
-        let prelude = crate::STANDARD[0].1;
+        let prelude = Library::NEEDED.find("prelude").unwrap();
+        let prelude = crate::STANDARD[prelude].1;
         let at = u32::try_from(prelude.find("panic(\"`").unwrap()).unwrap();
         assert_eq!(error.span.start, at);
         // With no standard error, the message ends in ": ".
@@ -6656,8 +6952,8 @@ p26 = com.x"#;
             .map(|&(path, text)| SourceFile::new(path, text).unwrap())
             .collect();
         let mut workspace = check(&sources).unwrap();
-        // The driver wrote the five built-in functions' cells.
-        assert_eq!(assert_builtins_written(&workspace).len(), 5);
+        // The driver wrote the ten built-in functions' cells.
+        assert_eq!(assert_builtins_written(&workspace).len(), 10);
         let a = workspace.file("a.gcsl").unwrap();
         let b = workspace.file("b.gcsl").unwrap();
         let first = workspace.run(a).unwrap().value;
@@ -6687,5 +6983,515 @@ p26 = com.x"#;
             &*workspace.exec_result.texts,
             ["status", "stdout", "stderr"].map(Box::from)
         );
+    }
+
+    // ----- Strings, `path`, and standard modules as scopes of their own -----
+
+    /// The summary of slice 30, its `sh` a command every machine has.
+    const STRINGS_SUMMARY: &str = "parts = split(\"a/b/c\", \"/\")\n\
+                                   s = join(parts, \"-\")\n\
+                                   yes = starts_with(\"/usr\", \"/\")\n\
+                                   gz = ends_with(\"x.tar.gz\", \".gz\")\n\
+                                   hash = trim(sh(\"echo ' abc '\"))\n\
+                                   import path\n\
+                                   p = path.join(\"/src/pkg\", \"../lib\")\n\
+                                   q = path.join(\"/src/pkg\", \"/etc\")\n\
+                                   d = path.dirname(\"/src/pkg/a.c\")\n\
+                                   b = path.basename(\"/src/pkg/a.c\")\n\
+                                   n = path.normalize(\"a/./b/../c/\")\n\
+                                   abs = path.is_absolute(\"a\")";
+
+    /// The prelude's entry of the table of standard files, for a test's
+    /// own table.
+    fn prelude_entry() -> (&'static str, &'static str) {
+        crate::STANDARD[Library::NEEDED.find("prelude").unwrap()]
+    }
+
+    /// The workspace of `files` checked beside the standard library of
+    /// `table`, which it loads as a workspace does, with the names of the
+    /// standard files it loaded.
+    fn checked_beside(
+        table: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> (Vec<String>, Result<Workspace, Vec<Diagnostic>>) {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let library = Library {
+            table,
+            every: false,
+        };
+        let (standard, checked) = check_in((&sources, Placing::Workspace(&[])), library);
+        let names = standard.iter().map(|s| s.name().to_owned()).collect();
+        (names, checked)
+    }
+
+    /// The value of the file at `path` of the workspace of `files`, checked
+    /// beside the standard library of `table`, with the names of the
+    /// standard files it loaded.
+    fn value_beside(
+        table: &[(&str, &str)],
+        files: &[(&str, &str)],
+        path: &str,
+    ) -> (Vec<String>, String) {
+        let (standard, checked) = checked_beside(table, files);
+        let mut workspace = checked.unwrap();
+        let index = workspace.file(path).unwrap();
+        (standard, workspace.run(index).unwrap().value.to_string())
+    }
+
+    #[test]
+    fn the_strings_summary_runs_in_a_workspace_and_alone() {
+        let expected = "{parts = [\"a\", \"b\", \"c\"]; s = \"a-b-c\"; yes = true; gz = true; \
+                        hash = \"abc\"; p = \"/src/lib\"; q = \"/etc\"; d = \"/src/pkg\"; \
+                        b = \"a.c\"; n = \"a/c\"; abs = false}";
+        assert_eq!(lone(STRINGS_SUMMARY).unwrap(), expected);
+        let files = [("workspace.gcsl", ""), ("app/main.gcsl", STRINGS_SUMMARY)];
+        assert_eq!(value(&files, "app/main.gcsl"), expected);
+        // `path` is loaded, and takes the first input number, before the
+        // prelude, in path order; each is a directory of its own.
+        let scan = ws(&files).unwrap();
+        assert_eq!(scan.standard(), 2);
+        assert_eq!(scan.files[0].path, "<stdlib>/path.gcsl");
+        assert_eq!(scan.files[1].path, "<stdlib>/prelude.gcsl");
+        assert_ne!(scan.files[0].dir, scan.files[1].dir);
+        for file in &scan.files[..2] {
+            assert_eq!(scan.dirs[file.dir as usize].parent, None);
+        }
+        // It needs the prelude, whose `split` it calls: the prelude runs
+        // first.
+        assert_eq!(scan.needs[0], [1]);
+        assert_eq!(&scan.order[..2], [1, 0]);
+    }
+
+    #[test]
+    fn split_gives_the_pieces_between_its_separator() {
+        for (text, expected) in [
+            ("= split(\"a/b/c\", \"/\")", "[\"a\", \"b\", \"c\"]"),
+            ("= split(\"/a/b\", \"/\")", "[\"\", \"a\", \"b\"]"),
+            ("= split(\"\", \"/\")", "[\"\"]"),
+            ("= split(\"a//b\", \"/\")", "[\"a\", \"\", \"b\"]"),
+            ("= split(\"a/\", \"/\")", "[\"a\", \"\"]"),
+            ("= split(\"/\", \"/\")", "[\"\", \"\"]"),
+            ("= split(\"abc\", \"/\")", "[\"abc\"]"),
+            // A separator longer than one byte, and longer than the text.
+            ("= split(\"a::b::\", \"::\")", "[\"a\", \"b\", \"\"]"),
+            ("= split(\"a:::b\", \"::\")", "[\"a\", \":b\"]"),
+            ("= split(\"ab\", \"abc\")", "[\"ab\"]"),
+            // Text of several bytes a character, either side.
+            (
+                "= split(\"h\u{e9}llo w\u{f6}rld\", \"\u{f6}\")",
+                "[\"h\u{e9}llo w\", \"rld\"]",
+            ),
+            (
+                "= split(\"\u{65e5}\u{672c}\u{8a9e}\", \"\u{672c}\")",
+                "[\"\u{65e5}\", \"\u{8a9e}\"]",
+            ),
+            ("= split(\"a\u{2192}b\", \"\u{2192}\")", "[\"a\", \"b\"]"),
+            // Through a variable, by name.
+            (
+                "let f = split\n= f(sep = \",\", s = \"1,2\")",
+                "[\"1\", \"2\"]",
+            ),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // An empty separator is a runtime error at the call.
+        let text = "x = 1\ny = split(\"abc\", \"\")";
+        let error = lone_error(text);
+        assert_eq!(error.message, "`split` needs a separator that is not empty");
+        assert_eq!(error.span, Span::new(10, 26));
+        assert_eq!(error.input, None);
+        let error = lone_error("let sep = \"\"\nlet f = split\nx = f(\"a\", sep)");
+        assert_eq!(error.message, "`split` needs a separator that is not empty");
+    }
+
+    #[test]
+    fn join_starts_with_ends_with_and_trim_work_on_strings() {
+        for (text, expected) in [
+            ("= join([\"a\", \"b\", \"c\"], \"-\")", "a-b-c"),
+            ("let none: List<String> = []\n= join(none, \",\")", ""),
+            ("= join([], \",\")", ""),
+            ("= join([\"a\"], \",\")", "a"),
+            ("= join([\"\", \"\"], \"/\")", "/"),
+            ("= join([\"a\", \"b\"], \"\")", "ab"),
+            ("= join([\"x\", \"y\"], \" \u{2192} \")", "x \u{2192} y"),
+            ("= join(split(\"/a//b/\", \"/\"), \"/\")", "/a//b/"),
+            ("= starts_with(\"/usr\", \"/\")", "true"),
+            ("= starts_with(\"usr\", \"/\")", "false"),
+            ("= starts_with(\"\", \"\")", "true"),
+            ("= starts_with(\"a\", \"\")", "true"),
+            ("= starts_with(\"\", \"a\")", "false"),
+            ("= starts_with(\"/\", \"/usr\")", "false"),
+            ("= ends_with(\"x.tar.gz\", \".gz\")", "true"),
+            ("= ends_with(\"gz\", \".gz\")", "false"),
+            ("= ends_with(\"a\", \"\")", "true"),
+            // Byte-wise: a precomposed `é` is not an `e` with a combining
+            // accent, though they look alike.
+            ("= starts_with(\"\u{e9}t\u{e9}\", \"\u{e9}\")", "true"),
+            ("= starts_with(\"e\\u{301}t\u{e9}\", \"\u{e9}\")", "false"),
+            ("= ends_with(\"caf\u{e9}\", \"\u{e9}\")", "true"),
+            ("= ends_with(\"cafe\\u{301}\", \"\u{e9}\")", "false"),
+            ("= trim(\"  a b \\n\\t\")", "a b"),
+            ("= trim(\"x\")", "x"),
+            ("= trim(\"\")", ""),
+            // Whitespace alone is nothing; Unicode's whitespace is trimmed
+            // too, a no-break space and an ideographic space among it.
+            ("= trim(\" \\n\\t\\r \")", ""),
+            ("= trim(\"\\u{3000}x\\u{a0}\")", "x"),
+            ("= trim(\"\\u{3000}\")", ""),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+        // Their values show as their types.
+        for (text, expected) in [
+            ("= split", "fn(s: String, sep: String): List<String>"),
+            ("= join", "fn(parts: List<String>, sep: String): String"),
+            ("= starts_with", "fn(s: String, prefix: String): Bool"),
+            ("= ends_with", "fn(s: String, suffix: String): Bool"),
+            ("= trim", "fn(s: String): String"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn path_handles_paths_lexically() {
+        for (call, expected) in [
+            // `normalize`, on the spec's examples and the edges.
+            ("normalize(\"a/./b/../c/\")", "a/c"),
+            ("normalize(\"\")", "."),
+            ("normalize(\".\")", "."),
+            ("normalize(\"./\")", "."),
+            ("normalize(\"/\")", "/"),
+            ("normalize(\"//\")", "/"),
+            ("normalize(\"/../a\")", "/a"),
+            ("normalize(\"../../a/..\")", "../.."),
+            ("normalize(\"a/b/\")", "a/b"),
+            ("normalize(\"a/b//\")", "a/b"),
+            ("normalize(\"/a/b/\")", "/a/b"),
+            ("normalize(\"a/../..\")", ".."),
+            ("normalize(\"/a/../..\")", "/"),
+            ("normalize(\"..\")", ".."),
+            ("normalize(\"a//b\")", "a/b"),
+            // `join`.
+            ("join(\"/src/pkg\", \"../lib\")", "/src/lib"),
+            ("join(\"/src/pkg\", \"/etc\")", "/etc"),
+            ("join(\"/x\", \"\")", "/x"),
+            ("join(\"\", \"a/b/\")", "a/b"),
+            ("join(\"\", \"\")", "."),
+            ("join(\"a\", \"b\")", "a/b"),
+            ("join(\"a/\", \"../..\")", ".."),
+            ("join(\"/\", \"..\")", "/"),
+            ("join(\".\", \".\")", "."),
+            // `dirname`.
+            ("dirname(\"/src/pkg/a.c\")", "/src/pkg"),
+            ("dirname(\"a\")", "."),
+            ("dirname(\"/a\")", "/"),
+            ("dirname(\"/\")", "/"),
+            ("dirname(\"..\")", "."),
+            ("dirname(\".\")", "."),
+            ("dirname(\"\")", "."),
+            ("dirname(\"//\")", "/"),
+            ("dirname(\"a/../..\")", "."),
+            ("dirname(\"/a/../..\")", "/"),
+            ("dirname(\"a/b/\")", "a"),
+            ("dirname(\"../../a\")", "../.."),
+            // `basename`.
+            ("basename(\"/src/pkg/a.c\")", "a.c"),
+            ("basename(\"/\")", "/"),
+            ("basename(\".\")", "."),
+            ("basename(\"\")", "."),
+            ("basename(\"//\")", "/"),
+            ("basename(\"a/b/\")", "b"),
+            ("basename(\"a/../..\")", ".."),
+            ("basename(\"/a/../..\")", "/"),
+            ("basename(\"a\")", "a"),
+            // `is_absolute`.
+            ("is_absolute(\"a\")", "false"),
+            ("is_absolute(\"/\")", "true"),
+            ("is_absolute(\"\")", "false"),
+            ("is_absolute(\"//x\")", "true"),
+        ] {
+            let text = format!("import path\n= path.{call}");
+            assert_eq!(lone(&text).unwrap(), expected, "{call}");
+        }
+        // In a workspace, as a member.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "main.gcsl",
+                "import dirname from path\nd = dirname(\"a/b/c\")",
+            ),
+        ];
+        assert_eq!(value(&files, "main.gcsl"), "{d = \"a/b\"}");
+    }
+
+    #[test]
+    fn path_is_not_loaded_when_nobody_imports_it() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/a.gcsl", "x = [1]\ny = len(x)"),
+            ("main.gcsl", "import lib.a\nz = a.y + 1"),
+        ];
+        let (standard, checked) = checked_beside(&crate::STANDARD, &files);
+        assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
+        let mut workspace = checked.unwrap();
+        assert!(
+            workspace
+                .scan
+                .files
+                .iter()
+                .all(|f| f.path != "<stdlib>/path.gcsl")
+        );
+        // Its input numbers and slots are those of a run with no `path` at
+        // all, beside the prelude alone.
+        let (alone, bare) = checked_beside(&[prelude_entry()], &files);
+        assert_eq!(alone, standard);
+        let mut bare = bare.unwrap();
+        let paths = |w: &Workspace| -> Vec<String> {
+            w.scan.files.iter().map(|f| f.path.clone()).collect()
+        };
+        assert_eq!(paths(&workspace), paths(&bare));
+        assert_eq!(workspace.scan.cells(), bare.scan.cells());
+        assert_eq!(workspace.slot_names, bare.slot_names);
+        let main = workspace.file("main.gcsl").unwrap();
+        assert_eq!(main, 2);
+        assert_eq!(workspace.dump_ir(main), bare.dump_ir(main));
+        assert_eq!(
+            workspace.run(main).unwrap().value,
+            bare.run(main).unwrap().value
+        );
+        assert_eq!(workspace.frame.len(), bare.frame.len());
+        // A lone file too: the prelude is input 0, the file the next.
+        let source = SourceFile::new("lone.gcsl", "n = len([1])").unwrap();
+        let (standard, checked) = check_lone_with_standard(&source);
+        assert_eq!(standard.len(), 1);
+        assert_eq!(checked.unwrap().file("lone.gcsl"), Some(1));
+    }
+
+    #[test]
+    fn path_is_loaded_by_any_form_of_import() {
+        for text in [
+            "import path\nv = path.join(\"a\", \"b\")",
+            "import path as p\nv = p.join(\"a\", \"b\")",
+            "import join from path\nv = join(\"a\", \"b\")",
+            "import join as pj from path\nv = pj(\"a\", \"b\")",
+            "import normalize, join from path\nv = join(\"a\", \"b\")",
+            // `*` binds its `join`, to which the prelude's yields.
+            "import * from path\nv = join(\"a\", \"b\")",
+        ] {
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            let (standard, value) = value_beside(&crate::STANDARD, &files, "main.gcsl");
+            assert_eq!(standard, ["<stdlib>/path.gcsl", "<stdlib>/prelude.gcsl"]);
+            assert_eq!(value, "{v = \"a/b\"}", "{text}");
+            assert_eq!(lone(text).unwrap(), "{v = \"a/b\"}", "{text}");
+        }
+        // By any scanned file, even one the file run does not need: every
+        // file is checked, and the standard files loaded run first.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "v = 1"),
+            ("other.gcsl", "import path\nw = path.normalize(\"a/.\")"),
+        ];
+        let (standard, value) = value_beside(&crate::STANDARD, &files, "main.gcsl");
+        assert_eq!(standard.len(), 2);
+        assert_eq!(value, "{v = 1}");
+        let workspace = checked(&files);
+        assert_eq!(workspace.file("main.gcsl"), Some(2));
+        assert_eq!(workspace.scan.needed(2), [1, 0, 2]);
+        // An explicit `*` from both is the conflict of any two.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "main.gcsl",
+                "import * from path\nimport * from prelude\nv = 1",
+            ),
+        ];
+        assert!(
+            shown_error(&files).starts_with("field `join` is defined in two files at main.gcsl"),
+            "{}",
+            shown_error(&files)
+        );
+    }
+
+    #[test]
+    fn its_input_numbers_follow_the_standard_files_loaded() {
+        // A syntax error is numbered after the standard files the files
+        // that parsed need.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "import path"),
+            ("b.gcsl", "y = ("),
+        ];
+        let (standard, checked) = checked_beside(&crate::STANDARD, &files);
+        assert_eq!(standard.len(), 2);
+        assert_eq!(checked.unwrap_err()[0].input, Some(3));
+        // A file that fails to parse imports nothing.
+        let files = [("workspace.gcsl", ""), ("a.gcsl", "import path\ny = (")];
+        let (standard, checked) = checked_beside(&crate::STANDARD, &files);
+        assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
+        assert_eq!(checked.unwrap_err()[0].input, Some(1));
+        // Run alone with `path`, the prelude is input 1, and the file's
+        // diagnostics name no input.
+        let error = lone_error("import path\nx = sh(\"exit 2\")");
+        assert_eq!(error.input, Some(1));
+        let source = SourceFile::new("lone.gcsl", "import path\nx = 1 + true").unwrap();
+        assert_eq!(crate::run(&source).unwrap_err()[0].input, None);
+    }
+
+    #[test]
+    fn a_standard_module_only_another_imports_is_loaded() {
+        // A table of two modules, `a` importing `b`, beside the prelude.
+        let table = [
+            ("a", "import b\nx = b.y + 1"),
+            ("b", "y = len([1, 2])"),
+            prelude_entry(),
+        ];
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "import a\nv = a.x")];
+        let (standard, value) = value_beside(&table, &files, "main.gcsl");
+        assert_eq!(
+            standard,
+            [
+                "<stdlib>/a.gcsl",
+                "<stdlib>/b.gcsl",
+                "<stdlib>/prelude.gcsl"
+            ]
+        );
+        assert_eq!(value, "{v = 3}");
+        // `b` alone; and neither when nobody imports them.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "import y from b\nv = y"),
+        ];
+        let (standard, value) = value_beside(&table, &files, "main.gcsl");
+        assert_eq!(standard, ["<stdlib>/b.gcsl", "<stdlib>/prelude.gcsl"]);
+        assert_eq!(value, "{v = 2}");
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "v = 1")];
+        let (standard, _) = value_beside(&table, &files, "main.gcsl");
+        assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
+        // Standard modules importing each other are the usual error.
+        let table = [
+            ("a", "import b\nx = b.y"),
+            ("b", "import a\ny = a.x"),
+            prelude_entry(),
+        ];
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "import a\nv = a.x")];
+        let (_, checked) = checked_beside(&table, &files);
+        let messages: Vec<String> = checked
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.message)
+            .collect();
+        assert_eq!(
+            messages,
+            ["`<stdlib>/a.gcsl` and `<stdlib>/b.gcsl` need each other"]
+        );
+    }
+
+    #[test]
+    fn standard_modules_are_scopes_of_their_own() {
+        // Two may declare one top-level name: the prelude's string `join`
+        // and `path`'s, and two of a test's table.
+        let text = "import path\nv = [join([\"a\", \"b\"], \"-\"), path.join(\"a\", \"b\")]";
+        assert_eq!(lone(text).unwrap(), "{v = [\"a-b\", \"a/b\"]}");
+        let table = [("a", "x = 1"), ("b", "x = 2"), prelude_entry()];
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "import a\nimport b\nv = a.x * 10 + b.x"),
+        ];
+        assert_eq!(value_beside(&table, &files, "main.gcsl").1, "{v = 12}");
+        // One sees nothing of another it does not import, though both are
+        // loaded; it sees the prelude's names.
+        let table = [("a", "x = 1"), ("b", "y = x"), prelude_entry()];
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "import a\nimport b\nv = b.y"),
+        ];
+        let (standard, checked) = checked_beside(&table, &files);
+        assert_eq!(standard.len(), 3);
+        let errors = checked.unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "undefined variable `x`");
+        assert_eq!(errors[0].input, Some(1));
+        let table = [("a", "x = 1"), ("b", "y = half(2)"), prelude_entry()];
+        let files = [("workspace.gcsl", ""), ("main.gcsl", "import b\nv = b.y")];
+        assert_eq!(value_beside(&table, &files, "main.gcsl").1, "{v = 1.0}");
+        // Nor anything of the workspace.
+        let table = [("a", "y = shared"), prelude_entry()];
+        let files = [
+            ("workspace.gcsl", "shared = 1"),
+            ("main.gcsl", "import a\nv = a.y"),
+        ];
+        let (_, checked) = checked_beside(&table, &files);
+        assert_eq!(
+            checked.unwrap_err()[0].message,
+            "undefined variable `shared`"
+        );
+    }
+
+    #[test]
+    fn path_is_a_reserved_name() {
+        for files in [
+            &[("workspace.gcsl", ""), ("path.gcsl", "x = 1")][..],
+            &[("path/a.gcsl", "x = 1"), ("workspace.gcsl", "")][..],
+        ] {
+            // Reserved whether or not a file imports it.
+            assert_eq!(
+                error(files),
+                (
+                    "`path` is the name of a standard module".to_owned(),
+                    Some(1),
+                    vec![]
+                ),
+                "{files:?}"
+            );
+        }
+        // Below the root, a name of a path of its own.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/path.gcsl", "x = 1"),
+            ("main.gcsl", "import lib.path\nn = path.x"),
+        ];
+        assert_eq!(value(&files, "main.gcsl"), "{n = 1}");
+    }
+
+    #[test]
+    fn a_file_s_own_join_shadows_the_prelude_s() {
+        for (text, expected) in [
+            (
+                "join = \"mine\"\nv = join",
+                "{join = \"mine\"; v = \"mine\"}",
+            ),
+            (
+                "def join(a: Int, b: Int): Int { a + b }\nv = join(1, 2)",
+                "{join = fn(a: Int, b: Int): Int; v = 3}",
+            ),
+            (
+                "import path\njoin = 1\nv = path.join(\"a\", \"b\")",
+                "{join = 1; v = \"a/b\"}",
+            ),
+            ("let trim = 2\nv = trim", "{v = 2}"),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+            let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+            assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn sh_s_message_has_its_standard_error_trimmed() {
+        let error = lone_error("x = sh(\"printf ' a\\\\n\\\\n  ' >&2; exit 1\")");
+        assert_eq!(
+            error.message,
+            "`printf ' a\\n\\n  ' >&2; exit 1` exited with status 1: a"
+        );
+        // Its result is still the raw standard output.
+        assert_eq!(lone("= sh(\"printf ' a\\\\n'\")").unwrap(), " a\n");
     }
 }

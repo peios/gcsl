@@ -23,12 +23,14 @@ const PROMPT: &str = "> ";
 /// is `{}` (as for a `let`), or its diagnostics; a line with errors changes
 /// nothing. A line's warnings go to stderr before its value. A runtime error
 /// inside a function an earlier line defined is shown against that line,
-/// and a part of a diagnostic in the standard library, which the session
-/// runs before the first line, against its file (`<stdlib>/prelude.gcsl`).
-/// The prelude's names, `len`, `exec` and `sh` among them, are every
-/// line's. A program a line runs with `exec` or `sh` reads the null device,
-/// never the REPL's own standard input, so the next line is still the
-/// REPL's; a `panic` is a runtime error of the line, which changes nothing.
+/// and a part of a diagnostic in the standard library, every file of which
+/// the session runs before the first line, against its file
+/// (`<stdlib>/prelude.gcsl` say). The prelude's names, `len`, `exec`,
+/// `split`, `join` and `sh` among them, are every line's, and a line may
+/// `import path`. A program a line runs with `exec` or `sh` reads the null
+/// device, never the REPL's own standard input, so the next line is still
+/// the REPL's; a `panic` is a runtime error of the line, which changes
+/// nothing.
 /// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {
@@ -89,7 +91,7 @@ fn evaluate(session: &mut Session, line: String) -> io::Result<()> {
         Err(diagnostics) => {
             // A diagnostic from a function of an earlier line refers to
             // that line's source, and a part of one in the standard library
-            // to the standard file's, `<stdlib>/prelude.gcsl`, the
+            // to the standard file's, `<stdlib>/prelude.gcsl` say, the
             // session's first inputs.
             output::diagnostics_from(&diagnostics, |input| {
                 input
