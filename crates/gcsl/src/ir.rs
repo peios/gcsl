@@ -160,7 +160,8 @@
 //! are loads, in the frame creating the closure, of the values it captures,
 //! in capture order. A call is a [`IrKind::Call`] whose items are
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
-//! value is passed as.
+//! value is passed as, followed by one for each parameter the call gives
+//! its default, the default's constant, in parameter order.
 //!
 //! A definition made with a def-type that declares a meta (see the
 //! checker's "Metas") has its meta's closure in a cell of the top level's
@@ -961,12 +962,12 @@ pub enum IrKind {
         captures: IrRange,
     },
     /// Calls the function `callee` evaluates to with the arguments `args`,
-    /// which are [`IrKind::Arg`] nodes in source order, and yields its
-    /// result, of kind `kind`.
+    /// which are [`IrKind::Arg`] nodes in source order, then those of the
+    /// defaults the call gives, and yields its result, of kind `kind`.
     Call {
         /// The function called.
         callee: IrId,
-        /// The arguments, in source order.
+        /// The arguments, in source order, then the defaults given.
         args: IrRange,
         /// The kind of the call's value: its function's return type's.
         kind: ValueKind,

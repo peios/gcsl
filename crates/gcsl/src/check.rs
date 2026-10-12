@@ -634,6 +634,58 @@
 //! call of a built-in function is typed apart (see [Built-in
 //! functions](#built-in-functions)).
 //!
+//! **Defaults.** A parameter of a function expression may have a default,
+//! `greeting: String = "hello"`, in any position, before, between or after
+//! parameters without one. A default is a *constant*: a literal (a string
+//! without interpolation, raw or not, an integer, a float, `true` or
+//! `false`), `-` applied directly to an integer or float literal, or a list
+//! literal without spreads or a record block of fields `NAME = CONSTANT`
+//! (of one name each, not annotated; `{}` included) whose elements or
+//! fields are constants, nested freely (`Checker::is_constant`). Anything
+//! else, in parentheses too, is "a parameter's default must be a constant",
+//! at the default, noted "a literal, or a list or record of literals", and
+//! is not checked further. So a default has no scope, no effect and no
+//! order of evaluation. A constant is checked against its parameter's type,
+//! as resolved for the function before any inference (the either shape of
+//! an impure function's bare parameter, which a constant fits as the
+//! present value it is), as an annotated initialiser is against its
+//! annotation, in the function's own frame before its parameters are
+//! declared (`Checker::check_defaults`): so `[]` is any list, an integer is
+//! a `Float` where one is expected, and a mismatch is the usual error, at
+//! the default, "expected because of this annotation" at the parameter's
+//! type. What it is once checked is kept as a [`Constant`], an owned value
+//! that names no node of any tree, in [`FnResolution::defaults`]. The
+//! function's type says nothing of defaults: `fn(name: String, greeting:
+//! String = "hello")` is `fn(name: String, greeting: String)`, wherever
+//! it is shown.
+//!
+//! Only a call that knows the function gives defaults: one of a *known
+//! callee* (`KnownCallee`, `Checker::known_callee`), whose callee is the
+//! name of a binding initialised directly with the function expression (a
+//! `let`, a named `fn` item, a field or a `def`, but not a mutable
+//! variable), a `def` named by a dotted path called by its path, a function
+//! of an earlier session input called by its name, or a `def` of another
+//! file reached through an import or by its path, or by its name from
+//! another file of its directory chain. Positional arguments, the trailing
+//! block and named arguments fill parameters as above; then each parameter
+//! left unfilled that has a default is given it (`Checker::fill_defaults`),
+//! and only the parameters left unfilled after that are reported, as
+//! before, so `pad(1)`, with `def pad(n: Int = 0, s: String)`, fills `n`
+//! and is "expected 2 arguments, found 1". The parameters a call gives
+//! their defaults, with their constants, are recorded by the call's id for
+//! lowering ([`Resolution::call_defaults`]), which passes each as an
+//! argument, so the callee sees an ordinary full list of arguments. A call
+//! through any other function value (a parameter, `let g = greet`, an
+//! element of a list, a mutable variable, a def-type reference, `DT PATH`,
+//! whose function is not the def-type's) fills every parameter, as ever.
+//! Nor does a recursive call, through the function's own name in its body
+//! or through a member of the group being checked (see [Top-level
+//! functions](#top-level-functions)), which has no known callee. A function
+//! of an earlier input, or a `def` of another file, has its defaults
+//! carried, beside which parameters its body measures, as a
+//! [`KnownParams`], in the session's [`Scope`] or the workspace's cell of
+//! the `def`.
+//!
 //! **Purity.** A function declared with `:` is pure, one declared with `->`
 //! impure, and one declared with `->>` impure and memoised: its [`Effect`]
 //! is one of `Pure < Memo < Impure`, and only `Pure` is pure. A memoised
@@ -1411,7 +1463,8 @@
 //! directly with a function expression, of this input
 //! ([`FnResolution::param_demands`] says which
 //! parameters were measured, and where) or of an earlier session input,
-//! whose [`Scope`] keeps which parameters its functions' bodies measure, but
+//! whose [`Scope`] keeps which parameters its functions' bodies measure
+//! ([`KnownParams`]), but
 //! not where, since that input's source is gone: the error then has no label
 //! on the measuring use. A parameter written present, or of a callee that is
 //! not known, gives the generic implicit-await error.
@@ -2552,15 +2605,17 @@
 //!
 //! A call of a `def` reached through an import (`f(x)` after `import f
 //! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
-//! whose measured parameters the workspace carries, so its call-site
-//! diagnostics are those of a `def` of the directory; the prelude's `half`
+//! whose measured parameters and defaults the workspace carries
+//! ([`KnownParams`]), so its call-site diagnostics are those of a `def` of
+//! the directory, and it is given its defaults (see [Calls](#calls)); the
+//! prelude's `half`
 //! is such a `def`. So is a call of a `def` named by a dotted path, through
 //! an import or by its path from another file of the directory chain
 //! (`dev.peios.f(x)`), which reads the root the chain committed, a record
 //! that knows no function: the reference is resolved in the file's view to
 //! the merged node (`Checker::committed_callee`), whose measured parameters
-//! the workspace carries as a `def`'s of one name (a dotted one has no
-//! binding: they are its function's).
+//! and defaults the workspace carries as a `def`'s of one name (a dotted one
+//! has no binding: they are its function's).
 //!
 //! The `fileroot` module (see [`crate::workspace`], "The standard library")
 //! is no record: a reference through its whole import resolves, as any
@@ -2607,7 +2662,7 @@ use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
-use crate::value::ValueKind;
+use crate::value::{ValueKind, int_to_float};
 use crate::workspace::{Context, Target};
 
 /// The type of every expression in an [`Ast`], indexed by [`ExprId`].
@@ -3320,6 +3375,10 @@ pub struct FnResolution {
     /// no parameter has an entry, as for a `lazy`. See the module
     /// documentation.
     pub unnarrowed: Vec<Option<Unnarrowed>>,
+    /// For each parameter, in order, the constant its default is, if it
+    /// declares one (see [Calls](#calls)); `None` for every other
+    /// parameter. Empty if no parameter declares one, as for a `lazy`.
+    pub defaults: Vec<Option<Constant>>,
 }
 
 /// A callback parameter that was not narrowed at some of its narrowable
@@ -3354,6 +3413,72 @@ impl NarrowingBlock {
         match self {
             NarrowingBlock::Given(span) | NarrowingBlock::Used(span) => span,
         }
+    }
+}
+
+/// A parameter's default, as its `= DEFAULT` is once checked against the
+/// parameter's type (see [Calls](#calls)): a constant, which a call that
+/// leaves the parameter unfilled is given, in [`FnResolution::defaults`] and
+/// [`Resolution::call_defaults`]. It holds no id of a tree, since a call of a
+/// `def` of another file, or of a function of an earlier session input, is
+/// given it where that tree is not.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Constant {
+    /// An `Int`.
+    Int(i64),
+    /// A `Float`, by its bits ([`f64::to_bits`]), so that a constant has
+    /// equality: an integer literal typed `Float` included.
+    Float(u64),
+    /// A `Bool`.
+    Bool(bool),
+    /// A `String`.
+    Str(Box<str>),
+    /// A list, of its elements, in order.
+    List(Box<[Constant]>),
+    /// A record of at least one field, of its fields, in the order they are
+    /// written.
+    Record(Box<[(Name, Constant)]>),
+    /// The empty record, `{}`.
+    Empty,
+}
+
+/// What a call of a function whose tree is gone needs to know of its
+/// parameters: a function declared by an earlier session input, through
+/// the binding its scope carries ([`Scope`]), or a `def` of another file of
+/// a workspace, through its cell (see [Imports](#imports)). For each
+/// parameter, in order, whether its body measures it, which makes it
+/// present, for the call-site form of the implicit-await error, and its
+/// default, if it has one, which a call that leaves it unfilled is given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KnownParams {
+    /// For each parameter, whether the body measures it.
+    measured: Box<[bool]>,
+    /// For each parameter, its default, if it has one; empty if none has.
+    defaults: Box<[Option<Constant>]>,
+}
+
+impl KnownParams {
+    /// What a call of the function `resolution` describes needs to know of
+    /// its parameters.
+    pub(crate) fn of(resolution: &FnResolution) -> Rc<Self> {
+        Rc::new(Self {
+            measured: resolution
+                .param_demands
+                .iter()
+                .map(Option::is_some)
+                .collect(),
+            defaults: resolution.defaults.iter().cloned().collect(),
+        })
+    }
+
+    /// Whether the body measures parameter number `param`.
+    fn measured(&self, param: usize) -> bool {
+        self.measured.get(param).copied().unwrap_or(false)
+    }
+
+    /// The default of parameter number `param`, if it has one.
+    fn default(&self, param: usize) -> Option<&Constant> {
+        self.defaults.get(param).and_then(Option::as_ref)
     }
 }
 
@@ -3556,6 +3681,10 @@ pub struct Resolution {
     /// function, with the cell of the top level's frame that holds its
     /// meta's closure (see [Metas](#metas)).
     metas: Vec<(FnId, Slot)>,
+    /// Each call that gives a parameter its default, by its id, with each
+    /// such parameter and its default, in parameter order (see
+    /// [Calls](#calls)); only a program with one has entries.
+    call_defaults: HashMap<ExprId, Box<[(u32, Constant)]>>,
 }
 
 /// What a `break`, `continue` or `return` item is for (see
@@ -3631,6 +3760,15 @@ impl Resolution {
     #[must_use]
     pub fn arg_params(&self, args: ArgRange) -> &[u32] {
         &self.arg_params[args.start()..args.start() + args.count()]
+    }
+
+    /// The parameters that the call `id` gives their defaults, each with
+    /// its default, in parameter order: those it leaves unfilled that have
+    /// one, if its callee is known (see [Calls](#calls)); none for any
+    /// other call, and for an expression that is no call.
+    #[must_use]
+    pub fn call_defaults(&self, id: ExprId) -> &[(u32, Constant)] {
+        self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
     }
 
     /// The slot written by item `id`, or [`Slot::NONE`] if it is not a
@@ -3906,6 +4044,7 @@ impl Resolution {
             tests: HashMap::new(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
+            call_defaults: HashMap::new(),
         }
     }
 
@@ -4000,15 +4139,30 @@ struct Binding {
     kind: BindingKind,
     /// The function expression a single-name `let`, field or named function
     /// item was initialised with directly, for the call-site form of the
-    /// implicit-await error (see `Checker::argument_await_error`); `None`
-    /// for every other binding, and for one declared by an earlier input of
-    /// a session, whose [`FnId`]s belong to another tree.
+    /// implicit-await error (see `Checker::argument_await_error`) and the
+    /// defaults a call of it gives (see [Calls](#calls)); `None` for every
+    /// other binding, and for one declared by an earlier input of a session,
+    /// whose [`FnId`]s belong to another tree.
     function: Option<FnId>,
     /// For a callback parameter of an impure or memoised function being
     /// checked, its index in `Checker::callbacks`, where its calls and uses
     /// are recorded (see `Checker::narrow_callbacks`); `None` for every
     /// other binding.
     callback: Option<usize>,
+}
+
+impl Binding {
+    /// The binding as a later input's [`Scope`] keeps it: without its span
+    /// and function ids, which are meaningless for a later input, with its
+    /// own source and tree.
+    fn forgotten(self) -> Self {
+        Self {
+            declared: None,
+            function: None,
+            callback: None,
+            ..self
+        }
+    }
 }
 
 /// What a [`Binding`] is.
@@ -4332,7 +4486,8 @@ struct CallSite {
 }
 
 /// A callee whose function is known well enough to tell which of its
-/// parameters are present because its body measures them.
+/// parameters are present because its body measures them, and which have
+/// defaults (see [Calls](#calls)).
 #[derive(Clone, Copy, Debug)]
 enum KnownCallee {
     /// A function expression of the input being checked.
@@ -4712,11 +4867,12 @@ pub struct Scope {
     /// binding owns, what the checker named it.
     slot_names: Vec<Name>,
     /// For each binding, if it was initialised directly with a function
-    /// expression, which of that function's parameters are present because
-    /// its body measures them: what the call-site form of the
-    /// implicit-await error needs of a function declared by an earlier
+    /// expression, what a call of it needs to know of that function's
+    /// parameters (see [`KnownParams`]): which are present because its body
+    /// measures them, which the call-site form of the implicit-await error
+    /// needs, and their defaults, of a function declared by an earlier
     /// input, whose tree and spans are gone.
-    measured: Vec<Option<Box<[bool]>>>,
+    known: Vec<Option<Rc<KnownParams>>>,
 }
 
 impl Scope {
@@ -4766,11 +4922,11 @@ impl Scope {
         };
         for (part, picked) in parts {
             for index in picked {
-                if let (Some(&binding), Some(measured)) =
-                    (part.bindings.get(index), part.measured.get(index))
+                if let (Some(&binding), Some(known)) =
+                    (part.bindings.get(index), part.known.get(index))
                 {
                     scope.bindings.push(binding);
-                    scope.measured.push(measured.clone());
+                    scope.known.push(known.clone());
                 }
             }
         }
@@ -4789,11 +4945,11 @@ impl Scope {
     /// file is the file's alone (see [Shadowed
     /// declarations](#shadowed-declarations)).
     pub(crate) fn commit(&mut self, from: &Scope, start: usize, keep: impl Fn(Name) -> bool) {
-        let bindings = from.bindings.iter().zip(&from.measured).skip(start);
-        for (binding, measured) in bindings {
+        let bindings = from.bindings.iter().zip(&from.known).skip(start);
+        for (binding, known) in bindings {
             if binding.kind == BindingKind::Field && keep(binding.name) {
                 self.bindings.push(*binding);
-                self.measured.push(measured.clone());
+                self.known.push(known.clone());
             }
         }
     }
@@ -4829,14 +4985,16 @@ impl Scope {
 
     /// The scope with `fields` added after its own variables, each a
     /// field of a name, read from a slot the scope's slots already include,
-    /// with a type: cells of a workspace, under names no source can write,
-    /// which the call a workspace makes to invoke a definition by name reads
-    /// (see [`crate::workspace`], "Def-types by name").
+    /// with a type, and, for a `def`'s cell, what a call of it needs to know
+    /// of its parameters: cells of a workspace, under names no source can
+    /// write, which the call a workspace makes to invoke a definition by
+    /// name reads, and so calls the def-type as a known callee (see
+    /// [`crate::workspace`], "Def-types by name").
     pub(crate) fn with_fields(
         mut self,
-        fields: impl IntoIterator<Item = (Name, Slot, TyId)>,
+        fields: impl IntoIterator<Item = (Name, Slot, TyId, Option<Rc<KnownParams>>)>,
     ) -> Self {
-        for (name, slot, ty) in fields {
+        for (name, slot, ty, known) in fields {
             self.bindings.push(Binding {
                 name,
                 slot,
@@ -4846,22 +5004,22 @@ impl Scope {
                 function: None,
                 callback: None,
             });
-            self.measured.push(None);
+            self.known.push(known);
         }
         self
     }
 
-    /// For each slot bound, which parameters of the function its latest
-    /// binding holds are present because its body measures them, if that
-    /// binding was initialised directly with a function expression: what a
-    /// call of an imported `def` needs (see [Imports](#imports)). One map
-    /// for every slot, so that a file's cells are looked up in it in
-    /// constant time each.
-    pub(crate) fn measured_by_slot(&self) -> HashMap<Slot, Option<&[bool]>> {
+    /// For each slot bound, what a call of the function its latest binding
+    /// holds needs to know of its parameters, if that binding was
+    /// initialised directly with a function expression: what a call of an
+    /// imported `def` needs (see [Imports](#imports)). One map for every
+    /// slot, so that a file's cells are looked up in it in constant time
+    /// each.
+    pub(crate) fn known_by_slot(&self) -> HashMap<Slot, Option<&Rc<KnownParams>>> {
         self.bindings
             .iter()
-            .zip(&self.measured)
-            .map(|(binding, measured)| (binding.slot, measured.as_deref()))
+            .zip(&self.known)
+            .map(|(binding, known)| (binding.slot, known.as_ref()))
             .collect()
     }
 }
@@ -4962,8 +5120,11 @@ pub struct Checker<'a> {
     /// Every variable, field and callee in scope, outermost block first.
     bindings: Vec<Binding>,
     /// For each binding of the scope the check started from, its entry of
-    /// [`Scope`]'s `measured`.
-    scope_measured: Vec<Option<Box<[bool]>>>,
+    /// [`Scope`]'s `known`.
+    scope_known: Vec<Option<Rc<KnownParams>>>,
+    /// Each call that gives a parameter its default, by its id: see
+    /// [`Resolution::call_defaults`].
+    call_defaults: HashMap<ExprId, Box<[(u32, Constant)]>>,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -5220,9 +5381,9 @@ impl<'a> Checker<'a> {
         // to no binding.
         let slot_names = scope.slot_names;
         let next_slot = u32::try_from(slot_names.len()).unwrap_or(u32::MAX);
-        let never = types.never();
         Self {
             ast,
+            never: types.never(),
             types,
             // Placeholder only: every node is written by `check_expr` before
             // it is read, and the final invariant check catches any that
@@ -5243,10 +5404,10 @@ impl<'a> Checker<'a> {
             loop_resolutions: vec![LoopResolution::default(); ast.for_count()],
             returned_blocks: HashSet::new(),
             block_returns: HashMap::new(),
-            never,
             unreached_path: false,
             bindings: scope.bindings,
-            scope_measured: scope.measured,
+            scope_known: scope.known,
+            call_defaults: HashMap::new(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -5358,20 +5519,9 @@ impl<'a> Checker<'a> {
         }
         let scope_slot_names = self.scope_slot_names();
         let (cell_types, shared_children) = self.cell_tables();
-        let measured = self.measured();
+        let known = self.known();
         let field_cells = self.tree_cells();
-        // Spans and function ids are meaningless for a later input, which
-        // has its own source and tree.
-        let bindings = self
-            .bindings
-            .into_iter()
-            .map(|binding| Binding {
-                declared: None,
-                function: None,
-                callback: None,
-                ..binding
-            })
-            .collect();
+        let bindings = self.bindings.into_iter().map(Binding::forgotten).collect();
         let top_functions = self
             .top_fns
             .iter()
@@ -5420,6 +5570,7 @@ impl<'a> Checker<'a> {
                 tests: self.tests,
                 meta_reads: self.meta_reads,
                 metas: self.metas,
+                call_defaults: self.call_defaults,
             },
         };
         let mut warnings = self.warnings;
@@ -5429,7 +5580,7 @@ impl<'a> Checker<'a> {
             scope: Scope {
                 bindings,
                 slot_names: scope_slot_names,
-                measured,
+                known,
             },
             ty,
             cell_types,
@@ -8142,23 +8293,20 @@ impl<'a> Checker<'a> {
         self.top_slots_end = self.top_slots_end.max(self.next_slot);
     }
 
-    /// As the check ends: what the call-site form of the implicit-await
-    /// error needs to know of this input's functions in a later input,
-    /// whose tree is gone, for every binding of the outermost scope.
-    fn measured(&mut self) -> Vec<Option<Box<[bool]>>> {
-        let mut measured = std::mem::take(&mut self.scope_measured);
-        for binding in self.bindings.get(measured.len()..).unwrap_or_default() {
-            measured.push(binding.function.and_then(|function| {
-                self.fn_resolutions.get(function.index()).map(|resolution| {
-                    resolution
-                        .param_demands
-                        .iter()
-                        .map(Option::is_some)
-                        .collect()
-                })
+    /// As the check ends: what a call of each of this input's functions in
+    /// a later input, whose tree is gone, needs to know of its parameters
+    /// ([`KnownParams`]: what the call-site form of the implicit-await error
+    /// needs, and the defaults), for every binding of the outermost scope.
+    fn known(&mut self) -> Vec<Option<Rc<KnownParams>>> {
+        let mut known = std::mem::take(&mut self.scope_known);
+        for binding in self.bindings.get(known.len()..).unwrap_or_default() {
+            known.push(binding.function.and_then(|function| {
+                self.fn_resolutions
+                    .get(function.index())
+                    .map(KnownParams::of)
             }));
         }
-        measured
+        known
     }
 
     /// As the check ends: the type of each node's cell (`Error` for a
@@ -12660,6 +12808,7 @@ impl<'a> Checker<'a> {
             param_demands: finished.demanded.clone(),
             // Recorded by `check_fn`, for a function that has any.
             unnarrowed: Vec::new(),
+            defaults: Vec::new(),
         };
         // A top-level function's copies decide where its closure is made.
         if self.functions.is_empty()
@@ -12694,7 +12843,9 @@ impl<'a> Checker<'a> {
     /// the body returns (see [`Checker::inferred`]) and its callback
     /// parameters narrowed by what the body gives them (see
     /// [`Checker::narrow_callbacks`]), and its type, recorded again, is the
-    /// function type of those parameters and that result.
+    /// function type of those parameters and that result. Its parameters'
+    /// defaults are checked before its body, in its frame (see
+    /// [`Checker::check_defaults`]).
     fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
         if let Some(&def) = self.definitions.get(&function) {
             return self.check_definition(id, function, def);
@@ -12709,8 +12860,14 @@ impl<'a> Checker<'a> {
         let params = self.ast.params(decl.params);
         let base = self.fn_params.len();
         let mut provisional = false;
+        // Each default and the type it is checked against: its parameter's,
+        // before any inference.
+        let mut defaults = Vec::new();
         for (index, param) in params.iter().enumerate() {
             let mut ty = self.resolve_type(param.ty, params_mode);
+            if let Some(default) = param.default {
+                defaults.push((index, default, (ty, param.ty)));
+            }
             if pure && ty != TyId::ERROR && self.is_inferred(param.ty) {
                 ty = self.types.provisional(function, position(index), ty);
                 provisional = true;
@@ -12751,6 +12908,7 @@ impl<'a> Checker<'a> {
             returns: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
+        let defaults = self.check_defaults(&defaults, params.len());
         let span = self.ast.get(id).span;
         let errors = self.errors.len();
         let callbacks = (self.callbacks.len(), self.callback_positions.len());
@@ -12781,6 +12939,7 @@ impl<'a> Checker<'a> {
         let demanded = self.finish_function(decl.params.len(), callee);
         if let Some(resolution) = self.fn_resolutions.get_mut(function.index()) {
             resolution.unnarrowed = unnarrowed;
+            resolution.defaults = defaults;
         }
         if !provisional {
             return ty;
@@ -12788,6 +12947,146 @@ impl<'a> Checker<'a> {
         let decisions: Vec<bool> = demanded.iter().map(Option::is_some).collect();
         self.settle_function(id, function, &decisions);
         self.expr_types[id.index()]
+    }
+
+    /// Checks the defaults of a function of `count` parameters, `defaults`,
+    /// each with its parameter's number and the type it is checked against,
+    /// its parameter's as resolved before any inference, and as written
+    /// (see [Calls](#calls)), in the function's own frame before its
+    /// parameters are declared, so that the slots a record default's check
+    /// takes are the function's and are free again after it: each must be a
+    /// constant, "a parameter's default must be a constant", at it, and is
+    /// otherwise checked against the type as an annotated initialiser is
+    /// against its annotation. Returns the constant each parameter's
+    /// default is, for [`FnResolution::defaults`]: empty if none has one,
+    /// and `None` for a parameter without one or whose default is in error.
+    fn check_defaults(
+        &mut self,
+        defaults: &[(usize, ExprId, (TyId, TypeExprId))],
+        count: usize,
+    ) -> Vec<Option<Constant>> {
+        if defaults.is_empty() {
+            return Vec::new();
+        }
+        let mut constants = vec![None; count];
+        for &(param, default, (ty, written)) in defaults {
+            if !self.is_constant(default) {
+                self.errors.push(
+                    Diagnostic::error(NOT_CONSTANT, self.ast.get(default).span)
+                        .with_note(CONSTANT_NOTE),
+                );
+                continue;
+            }
+            if ty == TyId::ERROR {
+                continue;
+            }
+            let errors = self.errors.len();
+            let context = self.ast.type_expr(written).span;
+            let found = self.check_expr_expecting(
+                default,
+                ty,
+                context,
+                "expected because of this annotation",
+            );
+            if found == TyId::ERROR || self.errors.len() != errors {
+                continue;
+            }
+            if let Some(entry) = constants.get_mut(param) {
+                *entry = self.constant(default);
+            }
+        }
+        constants
+    }
+
+    /// Whether the expression `id`, a parameter's default, is a constant
+    /// (see [Calls](#calls)): a literal, a string without interpolation
+    /// (raw or not), an integer, a float, `true` or `false`; `-` applied
+    /// directly to an integer or float literal; a list literal without a
+    /// spread whose elements are constants; or a record block whose items
+    /// are all fields `NAME = CONSTANT`, of one name each and not annotated,
+    /// `{}` among them. Nothing else, not even in parentheses.
+    ///
+    /// Recurses once per level of list and record nesting.
+    fn is_constant(&self, id: ExprId) -> bool {
+        let ast = self.ast;
+        match ast.get(id).kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => matches!(ast.get(operand).kind, ExprKind::Int(_) | ExprKind::Float(_)),
+            ExprKind::List(elements) => ast
+                .elements(elements)
+                .iter()
+                .all(|element| element.spread.is_none() && self.is_constant(element.value)),
+            ExprKind::Block { items, label: None } => {
+                ast.items(items)
+                    .iter()
+                    .all(|&item| match ast.item(item).kind {
+                        ItemKind::Field {
+                            path,
+                            ty: None,
+                            value,
+                            function: false,
+                        } => ast.path(path).len() == 1 && self.is_constant(value),
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    /// The constant that `id`, a parameter's default that
+    /// [`Checker::is_constant`] accepts, is once checked without an error:
+    /// an integer literal that is a `Float` there a `Float`, and an
+    /// integer otherwise (an untyped one settles to `Int`). `None` if it is
+    /// not one after all.
+    ///
+    /// Recurses once per level of list and record nesting.
+    fn constant(&self, id: ExprId) -> Option<Constant> {
+        let ast = self.ast;
+        let float = |id: ExprId| self.expr_types.get(id.index()) == Some(&TyId::FLOAT);
+        Some(match ast.get(id).kind {
+            ExprKind::Int(value) if float(id) => Constant::Float(int_to_float(value).to_bits()),
+            ExprKind::Int(value) => Constant::Int(value),
+            ExprKind::Float(value) => Constant::Float(value.to_bits()),
+            ExprKind::Bool(value) => Constant::Bool(value),
+            ExprKind::Str(text) => Constant::Str(ast.strings().get(text).into()),
+            // Negated as lowering negates it: as the whole is typed.
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match ast.get(operand).kind {
+                ExprKind::Int(value) if float(id) => {
+                    Constant::Float((-int_to_float(value)).to_bits())
+                }
+                ExprKind::Int(value) => Constant::Int(value.checked_neg()?),
+                ExprKind::Float(value) => Constant::Float((-value).to_bits()),
+                _ => return None,
+            },
+            ExprKind::List(elements) => Constant::List(
+                ast.elements(elements)
+                    .iter()
+                    .map(|element| self.constant(element.value))
+                    .collect::<Option<_>>()?,
+            ),
+            ExprKind::Block { items, label: None } if ast.items(items).is_empty() => {
+                Constant::Empty
+            }
+            ExprKind::Block { items, label: None } => Constant::Record(
+                ast.items(items)
+                    .iter()
+                    .map(|&item| match ast.item(item).kind {
+                        ItemKind::Field { path, value, .. } => {
+                            let name = ast.path(path).first()?.name()?;
+                            Some((name, self.constant(value)?))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?,
+            ),
+            _ => return None,
+        })
     }
 
     /// Narrows the callback parameters `callbacks[start..]` of the impure or
@@ -13794,9 +14093,11 @@ impl<'a> Checker<'a> {
     /// positional arguments fill parameters left to right, the trailing
     /// block the last, and named arguments the parameters of their names.
     /// Checks each argument against its parameter's type, or alone if it
-    /// fills none, and records the parameter each fills. Reports every
-    /// argument that cannot be bound and every parameter left unfilled, and
-    /// returns whether there was any.
+    /// fills none, and records the parameter each fills. A known callee
+    /// gives each parameter left unfilled that has a default its default,
+    /// which is recorded for the call (see [Calls](#calls)). Reports every
+    /// argument that cannot be bound and every parameter left unfilled
+    /// after that, and returns whether there was any.
     ///
     /// An argument awaited at the top because the parameter it fills is
     /// present by inference, as far as the callee is known, is reported in
@@ -13895,6 +14196,7 @@ impl<'a> Checker<'a> {
                 self.record_argument(callback, param, arg.value, param_ty);
             }
         }
+        let defaults = known.map(|known| self.fill_defaults(known, base, count));
         erroneous |= self.report_unfilled(
             base,
             (call, callee_span, &function_label),
@@ -13902,34 +14204,78 @@ impl<'a> Checker<'a> {
             (found, named, trailing),
         );
         if !erroneous {
-            for (param, &arg) in self
-                .filled
-                .get(base..)
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-            {
-                if let Some(entry) = self.arg_params.get_mut(args.start() + arg as usize) {
-                    *entry = position(param);
-                }
-            }
+            self.record_bound((id, args), base, defaults);
         }
         self.filled.truncate(base);
         erroneous
     }
 
+    /// Records, for lowering, the parameter each of the arguments `args` of
+    /// the call `id` fills, as `filled[base..]` shows, and the defaults the
+    /// call gives, `defaults`, if it gives any (see [Calls](#calls)).
+    fn record_bound(
+        &mut self,
+        (id, args): (ExprId, ArgRange),
+        base: usize,
+        defaults: Option<Vec<(u32, Constant)>>,
+    ) {
+        for (param, &arg) in self
+            .filled
+            .get(base..)
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            if arg == DEFAULTED {
+                continue;
+            }
+            if let Some(entry) = self.arg_params.get_mut(args.start() + arg as usize) {
+                *entry = position(param);
+            }
+        }
+        if let Some(defaults) = defaults.filter(|defaults| !defaults.is_empty()) {
+            self.call_defaults.insert(id, defaults.into());
+        }
+    }
+
+    /// Gives each of the `count` parameters of `known`, a known callee, that
+    /// `filled[base..]` shows no argument fills and that has a default its
+    /// default (see [Calls](#calls)): marks it [`DEFAULTED`] there, so that
+    /// it is not unfilled, and returns each with its default, in parameter
+    /// order (a default in error, which fails the check with its own error,
+    /// left out).
+    fn fill_defaults(
+        &mut self,
+        known: KnownCallee,
+        base: usize,
+        count: usize,
+    ) -> Vec<(u32, Constant)> {
+        let mut defaults = Vec::new();
+        for param in 0..count {
+            if self.filled.get(base + param) != Some(&u32::MAX) || !self.has_default(known, param) {
+                continue;
+            }
+            if let Some(entry) = self.filled.get_mut(base + param) {
+                *entry = DEFAULTED;
+            }
+            if let Some(constant) = self.default_of(known, param) {
+                defaults.push((position(param), constant));
+            }
+        }
+        defaults
+    }
+
     /// The function that `callee` calls, if it is known: `callee` is a
     /// plain name whose binding was initialised directly with a function
     /// expression of this input, or declared by an earlier session input
-    /// (whose measured parameters the scope carries), or the path of a
+    /// (whose measured parameters and defaults the scope carries), or the
+    /// path of a
     /// top-level function of this input named by a dotted path once its
     /// group is checked, as a plain function's binding is then.
     fn known_callee(&self, callee: ExprId) -> Option<KnownCallee> {
         if let Some(&node) = self.imported_callees.get(&callee) {
-            let measured = self
-                .workspace
-                .and_then(|workspace| workspace.measured(node));
-            return measured.map(|_| KnownCallee::Imported(node));
+            let known = self.workspace.and_then(|workspace| workspace.known(node));
+            return known.map(|_| KnownCallee::Imported(node));
         }
         if let ExprKind::Field { .. } = self.ast.get(callee).kind {
             if let Some(node) = self.committed_callee(callee) {
@@ -13953,7 +14299,7 @@ impl<'a> Checker<'a> {
         let (index, binding) = self.lookup(name)?;
         match binding.function {
             Some(function) => Some(KnownCallee::Current(function)),
-            None if index < self.scope_measured.len() => Some(KnownCallee::Earlier(index)),
+            None if index < self.scope_known.len() => Some(KnownCallee::Earlier(index)),
             None => None,
         }
     }
@@ -13982,7 +14328,7 @@ impl<'a> Checker<'a> {
             return None;
         }
         let global = workspace.scope.merged(node)?;
-        workspace.measured(global).map(|_| global)
+        workspace.known(global).map(|_| global)
     }
 
     /// How an argument of the call `call` of `callee`, whose function is
@@ -14041,28 +14387,64 @@ impl<'a> Checker<'a> {
                     _ => AwaitSite::Implicit,
                 }
             }
-            KnownCallee::Earlier(index) => {
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
                 let measured = self
-                    .scope_measured
-                    .get(index)
-                    .and_then(Option::as_ref)
-                    .and_then(|measured| measured.get(param).copied());
-                if measured == Some(true) {
+                    .known_params(known)
+                    .is_some_and(|known| known.measured(param));
+                if measured {
                     argument(None)
                 } else {
                     AwaitSite::Implicit
                 }
             }
-            KnownCallee::Imported(node) => {
-                let measured = self
-                    .workspace
-                    .and_then(|workspace| workspace.measured(node))
-                    .and_then(|measured| measured.get(param).copied());
-                if measured == Some(true) {
-                    argument(None)
-                } else {
-                    AwaitSite::Implicit
-                }
+        }
+    }
+
+    /// What a call of `known`, a known callee whose tree is gone, needs to
+    /// know of its parameters ([`KnownParams`]): the scope's entry for a
+    /// function of an earlier input, the workspace's for a `def` of another
+    /// file; `None` for a function of this input, and if it is not known.
+    fn known_params(&self, known: KnownCallee) -> Option<&KnownParams> {
+        match known {
+            KnownCallee::Current(_) => None,
+            KnownCallee::Earlier(index) => self.scope_known.get(index)?.as_deref(),
+            KnownCallee::Imported(node) => self.workspace?.known(node),
+        }
+    }
+
+    /// Whether parameter number `param` of `known`, a known callee, has a
+    /// default (see [Calls](#calls)): as its function expression declares,
+    /// for a function of this input, and as its [`KnownParams`] say for one
+    /// whose tree is gone.
+    fn has_default(&self, known: KnownCallee, param: usize) -> bool {
+        match known {
+            KnownCallee::Current(function) => {
+                let decl = self.ast.fn_decl(function);
+                self.ast
+                    .params(decl.params)
+                    .get(param)
+                    .is_some_and(|param| param.default.is_some())
+            }
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
+                self.default_of(known, param).is_some()
+            }
+        }
+    }
+
+    /// The default of parameter number `param` of `known`, a known callee,
+    /// if it has one that is known (see [Calls](#calls)): a function of
+    /// this input whose default is in error has none, and fails the check
+    /// with that default's error.
+    fn default_of(&self, known: KnownCallee, param: usize) -> Option<Constant> {
+        match known {
+            KnownCallee::Current(function) => self
+                .fn_resolutions
+                .get(function.index())?
+                .defaults
+                .get(param)?
+                .clone(),
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
+                self.known_params(known)?.default(param).cloned()
             }
         }
     }
@@ -17174,6 +17556,18 @@ impl<'a> Checker<'a> {
 /// The label on a function's declared result type where a value does not
 /// fit it: the body's result, or a `return`'s value.
 const RESULT_WHY: &str = "the return type is declared here";
+
+/// What `Checker::filled` holds for a parameter a call gives its default
+/// (see [Calls](#calls)): no argument's index, and not `u32::MAX`, which is
+/// a parameter left unfilled.
+const DEFAULTED: u32 = u32::MAX - 1;
+
+/// The error for a parameter's default that is not a constant, at the
+/// default (see [Calls](#calls)).
+const NOT_CONSTANT: &str = "a parameter's default must be a constant";
+
+/// The note on [`NOT_CONSTANT`]: what a constant is.
+const CONSTANT_NOTE: &str = "a literal, or a list or record of literals";
 
 /// The span of the keyword `keyword` of a `break`, `continue` or `return`
 /// item spanning `item`, which it starts, through its label, if it has one.
@@ -29697,6 +30091,373 @@ mod tests {
                 "unused value of type `Int | List<{}>`",
                 "this loop is its list or a value returned to it, of different types"
             ]
+        );
+    }
+
+    // ----- Parameter defaults -----
+
+    /// The defaults of the function expression numbered `n` of `text`, as
+    /// the check found them.
+    fn defaults_of(text: &str, n: u32) -> Vec<Option<Constant>> {
+        let (_, _, output) = check_prelude(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        output
+            .checked
+            .resolution
+            .function(FnId::new(n))
+            .defaults
+            .clone()
+    }
+
+    /// Each call of `text` that gives defaults, as its text, with the
+    /// parameters it gives them and their constants, in source order.
+    fn given_defaults(text: &str) -> Vec<(&str, Vec<(u32, Constant)>)> {
+        let (ast, _, output) = check_prelude(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        let resolution = &output.checked.resolution;
+        let mut calls: Vec<(Span, Vec<(u32, Constant)>)> = ast
+            .expr_ids()
+            .filter(|&id| !resolution.call_defaults(id).is_empty())
+            .map(|id| (ast.get(id).span, resolution.call_defaults(id).to_vec()))
+            .collect();
+        calls.sort_by_key(|(span, _)| span.start);
+        calls
+            .into_iter()
+            .map(|(span, defaults)| (&text[span.start as usize..span.end as usize], defaults))
+            .collect()
+    }
+
+    /// The string constant `text`.
+    fn constant_str(text: &str) -> Constant {
+        Constant::Str(text.into())
+    }
+
+    #[test]
+    fn a_default_is_a_constant() {
+        // Each form, nested freely, as checked against its parameter's
+        // type: an integer where a `Float` is expected is a `Float`.
+        let text = "fn f(\n\
+                    s: String = \"text\",\n\
+                    r: String = r\"raw\\n\",\n\
+                    i: Int = 42,\n\
+                    x: Float = 1.5,\n\
+                    y: Float = 2,\n\
+                    n: Int = -3,\n\
+                    m: Float = -2,\n\
+                    k: Float = -0.5,\n\
+                    b: Bool = true,\n\
+                    l: List<Int> = [1, 2],\n\
+                    e: List<Int> = [],\n\
+                    rec: {a: Int, s: String} = { a = 1; s = \"s\" },\n\
+                    deep: List<{a: List<Float>}> = [{ a = [1, 2.5] }],\n\
+                    unit: {} = {},\n\
+                    none: Int,\n\
+                    ): Int { i }";
+        let found = defaults_of(text, 0);
+        assert_eq!(
+            found,
+            vec![
+                Some(constant_str("text")),
+                Some(constant_str("raw\\n")),
+                Some(Constant::Int(42)),
+                Some(Constant::Float(1.5f64.to_bits())),
+                Some(Constant::Float(2.0f64.to_bits())),
+                Some(Constant::Int(-3)),
+                Some(Constant::Float((-2.0f64).to_bits())),
+                Some(Constant::Float((-0.5f64).to_bits())),
+                Some(Constant::Bool(true)),
+                Some(Constant::List(
+                    vec![Constant::Int(1), Constant::Int(2)].into()
+                )),
+                Some(Constant::List(Box::new([]))),
+                found[11].clone(),
+                found[12].clone(),
+                Some(Constant::Empty),
+                None,
+            ]
+        );
+        // A record's fields in the order they are written.
+        let (ast, _, _) = check_prelude(text);
+        let Some(Constant::Record(fields)) = &found[11] else {
+            panic!("expected a record: {:?}", found[11]);
+        };
+        let names: Vec<&str> = fields
+            .iter()
+            .map(|&(name, _)| ast.names().get(name))
+            .collect();
+        assert_eq!(names, ["a", "s"]);
+        assert_eq!(fields[0].1, Constant::Int(1));
+        assert_eq!(fields[1].1, constant_str("s"));
+        let Some(Constant::List(deep)) = &found[12] else {
+            panic!("expected a list: {:?}", found[12]);
+        };
+        let [Constant::Record(fields)] = &deep[..] else {
+            panic!("expected a record: {deep:?}");
+        };
+        assert_eq!(
+            fields[0].1,
+            Constant::List(
+                vec![
+                    Constant::Float(1.0f64.to_bits()),
+                    Constant::Float(2.5f64.to_bits())
+                ]
+                .into()
+            )
+        );
+        // A function without defaults has none.
+        assert!(defaults_of("fn f(a: Int): Int { a }", 0).is_empty());
+    }
+
+    #[test]
+    fn a_default_that_is_not_a_constant_is_an_error() {
+        // A name, a call, an interpolated string, a spread, and what is
+        // not quite a literal, a list or a record of them.
+        let cases = [
+            ("let x = 1\nfn f(p: Int = x): Int { p }", "x"),
+            ("fn f(p: Int = len([1])): Int { p }", "len([1])"),
+            (
+                "let x = 1\nfn f(p: String = \"{x}\"): String { p }",
+                "\"{x}\"",
+            ),
+            ("fn f(p: List<Int> = [...[1]]): Int { 0 }", "[...[1]]"),
+            (
+                "let x = 1\nfn f(p: List<Int> = [1, x]): Int { 0 }",
+                "[1, x]",
+            ),
+            ("fn f(p: Int = (1)): Int { p }", "(1)"),
+            ("fn f(p: Int = 1 + 1): Int { p }", "1 + 1"),
+            ("fn f(p: Bool = not true): Bool { p }", "not true"),
+            ("fn f(p: Int = -(1)): Int { p }", "-(1)"),
+            (
+                "fn f(p: {a: {b: Int}} = { a.b = 1 }): Int { 0 }",
+                "{ a.b = 1 }",
+            ),
+            (
+                "fn f(p: {a: Int} = { a: Int = 1 }): Int { 0 }",
+                "{ a: Int = 1 }",
+            ),
+            (
+                "fn f(p: {a: Int} = { let b = 1; a = b }): Int { 0 }",
+                "{ let b = 1; a = b }",
+            ),
+            (
+                "fn f(p: {a: Int} = { a = { 1 } }): Int { 0 }",
+                "{ a = { 1 } }",
+            ),
+            ("fn f(p: Int = { 1 }): Int { 0 }", "{ 1 }"),
+            ("fn f(p: Future<Int> = lazy 1) -> Int { 0 }", "lazy 1"),
+            (
+                "fn f(p: fn(): Int = fn(): Int { 1 }): Int { 0 }",
+                "fn(): Int { 1 }",
+            ),
+            ("fn f(p: Int = 1 : Int): Int { p }", "1 : Int"),
+        ];
+        for (text, default) in cases {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            let error = &found[0];
+            assert_eq!(error.message, NOT_CONSTANT, "{text}");
+            assert_eq!(error.notes, vec![CONSTANT_NOTE.to_owned()], "{text}");
+            // At the whole default.
+            assert_eq!(
+                &text[error.span.start as usize..error.span.end as usize],
+                default,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_default_is_checked_against_its_parameters_type() {
+        let text = "fn f(p: Int = \"no\"): Int { p }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "\"no\""));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "Int"), "expected because of this annotation")]
+        );
+        assert_eq!(
+            messages("fn f(p: List<Int> = [\"a\"]): Int { 0 }"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(
+            messages("fn f(p: {a: Int} = { b = 1 }): Int { 0 }"),
+            vec![
+                "field `b` is not in `{a: Int}`",
+                "missing field `a` in record"
+            ]
+        );
+        // A future is no constant's type, a present value being none.
+        assert_eq!(
+            messages("fn f(p: Future<Int> = 1) -> Int { await p }"),
+            vec!["mismatched types"]
+        );
+        // The either shape of an impure function's bare parameter takes a
+        // constant, as its present member, and so does a union.
+        assert!(diagnostics_or_none("fn f(p: {a: Int} = { a = 1 }) -> Int { p.a }").is_empty());
+        assert!(diagnostics_or_none("fn f(p: Int | String = 1): String { \"{p}\" }").is_empty());
+        assert_eq!(
+            defaults_of("fn f(p: Int | String = 1): String { \"{p}\" }", 0),
+            vec![Some(Constant::Int(1))]
+        );
+    }
+
+    #[test]
+    fn a_functions_type_does_not_mention_its_defaults() {
+        assert_eq!(
+            shown_result(
+                "fn greet(name: String, greeting: String = \"hi\"): String { name }\ngreet"
+            ),
+            "fn(name: String, greeting: String | Future<String>): String"
+        );
+        assert_eq!(
+            file_type("def greet(name: String, greeting: String = \"hi\"): String { greeting }"),
+            "{greet: fn(name: String | Future<String>, greeting: String): String}"
+        );
+        assert_eq!(
+            shown_result("let f = fn(a: Int = 1) ->> Int { a }\nf"),
+            "fn(a: Int) ->> Int"
+        );
+    }
+
+    #[test]
+    fn a_call_that_knows_the_function_gives_the_defaults() {
+        let hello = || constant_str("hello");
+        // Through a `def`, a named `fn`, a `let` and a field, and with
+        // positional, named and trailing arguments around defaults in
+        // front of, between and after the parameters without one.
+        let text = "def greet(name: String, greeting: String = \"hello\"): String { greeting }\n\
+                    fn pad(n: Int = 0, s: String): String { s }\n\
+                    let mid = fn(a: Int, b: Int = 2, c: Int): Int { a }\n\
+                    run = fn(n: Int = 1, body: {z: Int}, m: Int = 3): Int { n }\n\
+                    a = greet(\"jack\")\n\
+                    b = greet(\"jack\", \"hi\")\n\
+                    c = greet(\"jack\", greeting = \"yo\")\n\
+                    d = pad(s = \"x\")\n\
+                    e = mid(1, c = 3)\n\
+                    g = mid(c = 3, a = 1)\n\
+                    h = run(body = { z = 1 })\n\
+                    i = run(2, { z = 1 })\n\
+                    j = run(m = 4, body = { z = 1 }, n = 5)";
+        assert_eq!(
+            given_defaults(text),
+            vec![
+                ("greet(\"jack\")", vec![(1, hello())]),
+                ("pad(s = \"x\")", vec![(0, Constant::Int(0))]),
+                ("mid(1, c = 3)", vec![(1, Constant::Int(2))]),
+                ("mid(c = 3, a = 1)", vec![(1, Constant::Int(2))]),
+                (
+                    "run(body = { z = 1 })",
+                    vec![(0, Constant::Int(1)), (2, Constant::Int(3))]
+                ),
+                ("run(2, { z = 1 })", vec![(2, Constant::Int(3))]),
+            ]
+        );
+        // The trailing block fills the last parameter, which here has a
+        // default: what comes before it is filled as ever.
+        let text = "def run(n: Int = 1, body: {z: Int} = { z = 0 }): Int { n }\n\
+                    a = run { z = 1 }\n\
+                    b = run()\n\
+                    c = run(2) { z = 1 }";
+        let given = given_defaults(text);
+        assert_eq!(given.len(), 2, "{given:?}");
+        assert_eq!(given[0], ("run { z = 1 }", vec![(0, Constant::Int(1))]));
+        let ("run()", [first, (1, Constant::Record(fields))]) = (given[1].0, &given[1].1[..])
+        else {
+            panic!("{given:?}");
+        };
+        assert_eq!(first, &(0, Constant::Int(1)));
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].1, Constant::Int(0));
+        // A field of a record read through its record is no binding
+        // initialised with the function: its calls fill every parameter.
+        assert_eq!(
+            messages("r = { f = fn(x: Int = 1): Int { x } }\na = r.f()"),
+            vec!["expected 1 argument, found 0"]
+        );
+    }
+
+    #[test]
+    fn a_parameter_left_unfilled_without_a_default_is_reported() {
+        // Defaults in front of, between and after it.
+        let text = "fn pad(n: Int = 0, s: String): String { s }\npad(1)";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "expected 2 arguments, found 1");
+        assert_eq!(found[0].span, at(text, "pad(1)"));
+        assert_eq!(
+            messages("fn f(a: Int = 1, b: Int, c: Int = 3): Int { b }\nf(c = 1)"),
+            vec!["missing argument `b`"]
+        );
+        assert_eq!(
+            messages("fn f(a: Int = 1, b: Int, c: Int = 3): Int { b }\nf(1, 2, 3, 4)"),
+            vec!["expected 3 arguments, found 4"]
+        );
+        assert_eq!(
+            messages("fn f(a: Int, b: Int = 2): Int { a }\nf(b = 1)"),
+            vec!["missing argument `a`"]
+        );
+        // A default and an argument for one parameter are no clash.
+        assert!(
+            diagnostics_or_none("fn f(a: Int = 1, b: Int = 2): Int { a }\nf(b = 1)").is_empty()
+        );
+    }
+
+    #[test]
+    fn a_call_through_another_function_value_gives_no_defaults() {
+        let greet = "def greet(name: String, greeting: String = \"hello\"): String { greeting }\n";
+        let cases = [
+            // A copy, a parameter, a list's element, a mutable variable.
+            "let g = greet\ng(\"jack\")",
+            "fn call(f: fn(name: String, greeting: String): String): String { f(\"jack\") }",
+            "let fs = [greet]\nfs[0](\"jack\")",
+            "let mut g = greet\ng(\"jack\")",
+            "(greet)(\"jack\")",
+        ];
+        for case in cases {
+            let text = format!("{greet}{case}");
+            assert_eq!(
+                messages(&text),
+                vec!["expected 2 arguments, found 1"],
+                "{case}"
+            );
+        }
+        // Nor a recursive call, through the function's own name or a
+        // member of its group.
+        assert_eq!(
+            messages(
+                "fn count(n: Int, acc: Int = 0): Int { if n == 0 { acc } else { count(n - 1) } }"
+            ),
+            vec!["expected 2 arguments, found 1"]
+        );
+        assert_eq!(
+            messages(
+                "def ping(n: Int, d: Int = 0): Int { if n == 0 { d } else { pong(n - 1) } }\n\
+                 def pong(n: Int, d: Int = 0): Int { ping(n) }"
+            ),
+            vec![
+                "expected 2 arguments, found 1",
+                "expected 2 arguments, found 1"
+            ]
+        );
+        // Nor a def-type reference, whose function is not the def-type.
+        let text = "#[def_type]\n\
+                    def lock(name: String, func: fn(): String, version: String = \"\") -> String {\n\
+                    \x20   version\n\
+                    }\n\
+                    def lock x() { \"x\" }\n\
+                    a = lock x()";
+        assert_eq!(messages(text), vec!["expected 1 argument, found 0"]);
+        // Called by its name, the def-type gives its default.
+        let text = text.replace("a = lock x()", "a = lock(\"x\", fn(): String { \"x\" })");
+        assert_eq!(
+            given_defaults(&text),
+            vec![(
+                "lock(\"x\", fn(): String { \"x\" })",
+                vec![(2, constant_str(""))]
+            )]
         );
     }
 }

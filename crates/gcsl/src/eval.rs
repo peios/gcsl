@@ -8208,6 +8208,28 @@ mod tests {
     }
 
     #[test]
+    fn a_default_given_is_the_memo_key_an_argument_would_be() {
+        // The key is the full list of arguments, a default given at the call
+        // as if written: an omitted default and the same value written
+        // share an entry, and another value does not.
+        let text = "fn f(x: Int, y: String = \"d\", z: List<{a: Int}> = [{ a = 1 }]) ->> {v: Int} {\n\
+                    \x20   v = x\n\
+                    }\n\
+                    a = f(1)\n\
+                    b = f(1, \"d\")\n\
+                    c = f(1, \"d\", [{ a = 1 }])\n\
+                    d = f(1, z = [{ a = 1 }])\n\
+                    e = f(1, \"e\")\n\
+                    g = f(1, z = [])";
+        let values = fields(text);
+        assert!(same(&values[0], &values[1]));
+        assert!(same(&values[0], &values[2]));
+        assert!(same(&values[0], &values[3]));
+        assert!(!same(&values[0], &values[4]));
+        assert!(!same(&values[0], &values[5]));
+    }
+
+    #[test]
     fn memo_keys_compare_by_key_equality() {
         let deep = |leaf: i64| format!("{}{leaf}{}", "{ a = ".repeat(6), " }".repeat(6));
         let deep_type = format!("{}Int{}", "{a: ".repeat(6), "}".repeat(6));

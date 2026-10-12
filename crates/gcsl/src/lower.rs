@@ -31,7 +31,15 @@
 //! closure, of each value the function captures. Function bodies nest, and
 //! so does their lowering. A call lowers to a `Call` whose `Arg` nodes are
 //! its arguments in source order, each with the parameter the checker bound
-//! it to.
+//! it to, and then one for each parameter the call gives its default (see
+//! the checker's "Calls", [`crate::check::Resolution::call_defaults`]), in
+//! parameter order, at the call's closing parenthesis, whose value is the
+//! default's [`Constant`] built where the call is: an `IntConst`,
+//! `FloatConst`, `BoolConst` or `StrConst`, a `MakeList` of its elements, a
+//! `MakeRecord` of its fields in the order they are written, its layout
+//! shared as a record block's is, or `Empty` (`Lowerer::lower_constant`).
+//! So the callee is given a full list of arguments, as if every one had
+//! been written, and a memoised function's key is the same either way.
 //!
 //! A declaration a later one shadows (see [`crate::mentions`], "Shadowed
 //! declarations") lowers to nothing and is in no record: it is never run.
@@ -389,8 +397,8 @@ use crate::ast::{
     SegmentKind, StrPart, UnaryOp, path_span, symbol_span,
 };
 use crate::check::{
-    AwaitMark, Builtin, Checked, FieldSchedule, Fileroot, JumpTarget, MadeAt, PathResolution,
-    Resolution, Slot, Types, VarRef,
+    AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot, JumpTarget, MadeAt,
+    PathResolution, Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
 
@@ -1734,10 +1742,19 @@ impl Lowerer<'_> {
     /// The layout for the names in `layout_names`, made if this is the
     /// first record block with those names in that order.
     fn layout(&mut self) -> LayoutId {
-        if let Some(&id) = self.layouts.get(self.layout_names.as_slice()) {
+        let names = std::mem::take(&mut self.layout_names);
+        let id = self.layout_of(&names);
+        self.layout_names = names;
+        id
+    }
+
+    /// The layout for `names`, made if this is the first record with those
+    /// names in that order.
+    fn layout_of(&mut self, names: &[Name]) -> LayoutId {
+        if let Some(&id) = self.layouts.get(names) {
             return id;
         }
-        let names: Box<[Name]> = self.layout_names.as_slice().into();
+        let names: Box<[Name]> = names.into();
         let texts = names
             .iter()
             .map(|&name| Box::from(self.ast.names().get(name)))
@@ -2256,7 +2273,7 @@ impl Lowerer<'_> {
                 }),
                 _ => Ok(IrKind::Call {
                     callee: self.lower_operand(callee, ValueKind::Fn)?,
-                    args: self.lower_args(args, expr.span)?,
+                    args: self.lower_args(id, args, expr.span)?,
                     kind,
                     // Set by `IrBuilder::measure` once every node is built.
                     depth: 0,
@@ -2812,10 +2829,18 @@ impl Lowerer<'_> {
         }
     }
 
-    /// Lowers the arguments `args` of the call spanning `span` to `Arg`
+    /// Lowers the arguments `args` of the call `id` spanning `span` to `Arg`
     /// nodes in source order, each with the parameter the checker bound it
-    /// to, and returns their list.
-    fn lower_args(&mut self, args: ArgRange, span: Span) -> Result<IrRange, InternalError> {
+    /// to, followed by one for each parameter the call gives its default
+    /// ([`crate::check::Resolution::call_defaults`]), in parameter order,
+    /// each the constant's nodes, at the call's closing parenthesis, and
+    /// returns their list.
+    fn lower_args(
+        &mut self,
+        id: ExprId,
+        args: ArgRange,
+        span: Span,
+    ) -> Result<IrRange, InternalError> {
         let (ast, resolution) = (self.ast, self.resolution);
         let params = resolution.arg_params(args);
         let base = self.item_stack.len();
@@ -2832,9 +2857,60 @@ impl Lowerer<'_> {
                 .alloc(IrKind::Arg { param, value }, arg.span(ast));
             self.item_stack.push(node);
         }
+        let close = ast.get(id).close_span().unwrap_or(span);
+        for (param, constant) in resolution.call_defaults(id) {
+            let value = self.lower_constant(constant, close);
+            let node = self.builder.alloc(
+                IrKind::Arg {
+                    param: *param,
+                    value,
+                },
+                close,
+            );
+            self.item_stack.push(node);
+        }
         let list = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         Ok(list)
+    }
+
+    /// Lowers `constant`, a parameter's default, to nodes spanning `span`
+    /// that build it: an `IntConst`, `FloatConst`, `BoolConst` or
+    /// `StrConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
+    /// fields', in the order they are written, with the layout of their
+    /// names, shared as a record block's is, or `Empty` for `{}`.
+    ///
+    /// Recurses once per level of list and record nesting.
+    fn lower_constant(&mut self, constant: &Constant, span: Span) -> IrId {
+        let kind = match constant {
+            Constant::Int(value) => IrKind::IntConst(*value),
+            Constant::Float(bits) => IrKind::FloatConst(f64::from_bits(*bits)),
+            Constant::Bool(value) => IrKind::BoolConst(*value),
+            Constant::Str(text) => IrKind::StrConst(self.builder.push_string(text)),
+            Constant::Empty => IrKind::Empty,
+            Constant::List(elements) => {
+                let items: Vec<IrId> = elements
+                    .iter()
+                    .map(|element| self.lower_constant(element, span))
+                    .collect();
+                IrKind::MakeList {
+                    items: self.builder.push_item_list(&items),
+                    spreads: false,
+                }
+            }
+            Constant::Record(fields) => {
+                let values: Vec<IrId> = fields
+                    .iter()
+                    .map(|(_, value)| self.lower_constant(value, span))
+                    .collect();
+                let names: Vec<Name> = fields.iter().map(|&(name, _)| name).collect();
+                IrKind::MakeRecord {
+                    layout: self.layout_of(&names),
+                    values: self.builder.push_item_list(&values),
+                }
+            }
+        };
+        self.builder.alloc(kind, span)
     }
 
     /// Lowers the prefix operator `op`, of kind `kind` and spanning `span`,

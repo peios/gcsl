@@ -1620,6 +1620,37 @@ fn repl_prints_warnings_before_the_value() {
 }
 
 #[test]
+fn repl_gives_defaults_across_lines() {
+    // A function of an earlier line gives its defaults; its type does not
+    // show them, and a copy of it gives none.
+    let output = repl(
+        "def greet(name: String, greeting: String = \"hello\"): String { \"{greeting}, {name}\" }\n\
+         greet(\"jack\")\n\
+         greet(\"jack\", \"hi\")\n\
+         let g = greet\n\
+         g(\"jack\")\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{greet = fn(name: String, greeting: String): String} : \
+         {greet: fn(name: String, greeting: String): String}\n\
+         \"hello, jack\" : String\n\
+         \"hi, jack\" : String\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: expected 2 arguments, found 1\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | g(\"jack\")\n\
+         \x20 | -^^^^^^^^\n\
+         \x20 | |\n\
+         \x20 | the function is fn(name: String, greeting: String): String\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
 fn repl_shows_functions_and_their_errors_against_their_own_line() {
     let output = repl(
         "fn div(a: Int, b: Int): Int { a // b }\n\

@@ -89,6 +89,14 @@
 //! source order, each positional, named or the trailing block, which is
 //! always last.
 //!
+//! A parameter of a function expression may have a default, `greeting:
+//! String = "hello"`: an expression of the function's tree
+//! ([`Param::default`]), parsed after the parameter's type and so before
+//! the function's body, which a call that knows the function gives the
+//! parameter when it leaves it unfilled (see [`crate::check`], "Calls").
+//! The tree accepts any expression there; the checker accepts only a
+//! constant.
+//!
 //! A `lazy EXPR`, [`ExprKind::Lazy`], is a deferred expression: its operand
 //! is the body of an anonymous, parameterless function, run when the
 //! future it builds is first awaited. It is a function of the same arena,
@@ -733,7 +741,8 @@ impl Element {
     }
 }
 
-/// One parameter of a function expression, `NAME: TYPE`.
+/// One parameter of a function expression, `NAME: TYPE`, or `NAME: TYPE =
+/// DEFAULT` (see [Functions](#functions)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Param {
     /// The parameter's name, always an identifier.
@@ -742,6 +751,8 @@ pub struct Param {
     pub span: Span,
     /// Its type.
     pub ty: TypeExprId,
+    /// Its default, the expression after its `=`, if it has one.
+    pub default: Option<ExprId>,
 }
 
 /// What a function may do, as the marker before its return type declares
@@ -3260,8 +3271,10 @@ impl Ast {
     /// parses first down to a leaf: a block's first item's value, or the
     /// position of the first index segment of its path if it has one, an
     /// `if`'s condition, a call's callee, a binary operator's left operand,
-    /// a function's or `lazy`'s body, an interpolated string's first
-    /// expression, a list literal's first element's, an index's list, an
+    /// a function's first parameter default if it has one (a default is
+    /// parsed before the body) and its body otherwise, a `lazy`'s body, an
+    /// interpolated string's first expression, a list literal's first
+    /// element's, an index's list, an
     /// iteration's iterable, a condition loop's first header item's, its
     /// condition or its body, whichever comes first, a `do` loop's body,
     /// and a def-type reference's `DT`, its read of the definition coming
@@ -3320,7 +3333,15 @@ impl Ast {
                 | ExprKind::Ascribe { expr: inner, .. }
                 | ExprKind::Is { expr: inner, .. }
                 | ExprKind::As { expr: inner, .. } => inner,
-                ExprKind::Fn(function) | ExprKind::Lazy(function) => self.fn_decl(function).body,
+                // A parameter's default is parsed before the body.
+                ExprKind::Fn(function) => {
+                    let decl = self.fn_decl(function);
+                    self.params(decl.params)
+                        .iter()
+                        .find_map(|param| param.default)
+                        .unwrap_or(decl.body)
+                }
+                ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::DefTypeRef(def) => self.def_type(def).dt,
                 ExprKind::Call { callee, .. } => callee,
                 ExprKind::For(id) => {
@@ -3862,7 +3883,9 @@ impl WrittenType<'_> {
 
 impl<A: Annotate> Pretty<'_, A> {
     /// Writes the parameters and return type of the function expression
-    /// `id`, each on a line of its own at `depth`, with a leading newline.
+    /// `id`, each on a line of its own at `depth`, with a leading newline: a
+    /// parameter's default, if it has one, is its node, one level deeper,
+    /// after its type, `(greeting String` then the node and `)`.
     fn fn_head(&self, f: &mut fmt::Formatter<'_>, id: FnId, depth: usize) -> fmt::Result {
         let decl = self.ast.fn_decl(id);
         write!(f, "\n{:indent$}(params", "", indent = depth * 2)?;
@@ -3876,6 +3899,11 @@ impl<A: Annotate> Pretty<'_, A> {
             }
             write!(f, " ({name} ")?;
             self.type_expr(f, param.ty)?;
+            // A default, on lines of its own after its type.
+            if let Some(default) = param.default {
+                f.write_str("\n")?;
+                self.node(f, default, depth + 1)?;
+            }
             f.write_str(")")?;
         }
         f.write_str(")")?;
@@ -4257,6 +4285,12 @@ mod tests {
         // What tells a named function item and a `def` from a `let` or a
         // field whose value is a function expression fits in the padding.
         assert_eq!(size_of::<Item>(), 36);
+    }
+
+    #[test]
+    fn a_parameter_is_small() {
+        // Its name, span and type, 16 bytes, and its optional default, 8.
+        assert_eq!(size_of::<Param>(), 24);
     }
 
     #[test]

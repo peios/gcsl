@@ -317,7 +317,10 @@
 //! separated by `,` with an optional trailing `,`, `)`, the marker `:`,
 //! `->>` or `->`, and the return type; a parameter type is `NAME: TYPE`,
 //! recognised
-//! by an identifier followed by `:`, or just `TYPE`.
+//! by an identifier followed by `:`, or just `TYPE`. A parameter type has no
+//! default: an `=` after one is "a default is written only in a function
+//! expression's parameters", at the `=` (see [Functions and
+//! calls](#functions-and-calls)).
 //!
 //! A function type may have a *meta* (see the checker's "Metas"): after its
 //! whole return type, a union included, the identifier `META` directly
@@ -381,7 +384,14 @@
 //! `,` with an optional trailing `,`, `)`, the return marker, the return
 //! type, and the body, a block whose `{` must follow the return type
 //! directly, as an `if`'s block follows its condition. Every parameter is
-//! annotated. The marker is one of three, each an [`Effect`] of the
+//! annotated. A parameter may have a default, `NAME: TYPE = EXPR`, any
+//! expression after the `=` as an argument is (`Parser::parse_default`),
+//! in any position, in a `fn` expression, a named `fn` item, a `def` and a
+//! def-type's `def` alike, since each is parsed as one ([`Param::default`]);
+//! what a default may be is the checker's business. Not in a function type,
+//! nor in the parameters of a definition made with a def-type, which are
+//! names alone ("expected `,` or `)`" at an `=` there, as before). The
+//! marker is one of three, each an [`Effect`] of the
 //! [`FnDecl`] and of a function type alike: `:` for a pure function, `->>`
 //! for an impure one that is memoised, run at most once per distinct
 //! arguments, and `->` for an impure one run on every call.
@@ -802,6 +812,10 @@ const META: &str = "META";
 /// The error for a meta's marker anywhere but after a function type's
 /// return type.
 const MISPLACED_META: &str = "a meta is written only in a function type";
+
+/// The error for a parameter's default, `= EXPR`, in a function type, at
+/// its `=`: only a function expression's parameter has one.
+const MISPLACED_DEFAULT: &str = "a default is written only in a function expression's parameters";
 
 /// The error for `#[shadowable]` before anything but a top-level field,
 /// `def` or `import`.
@@ -1885,6 +1899,7 @@ impl Parser<'_> {
                 name,
                 span: token.span,
                 ty,
+                default: None,
             });
             let separator = self.peek();
             if self.list_separator(open)? {
@@ -2940,6 +2955,11 @@ impl Parser<'_> {
             };
             let (ty, height) = self.parse_type()?;
             tallest = tallest.max(height);
+            // Only a function expression's parameter has a default.
+            let eq = self.peek();
+            if eq.kind == TokenKind::Eq {
+                return Err(self.error(MISPLACED_DEFAULT, eq.span));
+            }
             self.param_ty_stack.push(ParamTy { name, ty });
             if self.list_separator(open)? {
                 break;
@@ -3454,10 +3474,15 @@ impl Parser<'_> {
             self.advance();
             let (ty, height) = self.parse_type()?;
             tallest = tallest.max(height);
+            let default = self.parse_default()?;
+            if let Some(default) = default {
+                tallest = tallest.max(self.height_of(default));
+            }
             self.param_stack.push(Param {
                 name,
                 span: Span::join(token.span, self.type_span(ty)),
                 ty,
+                default,
             });
             if self.list_separator(open)? {
                 break;
@@ -3487,6 +3512,22 @@ impl Parser<'_> {
             body,
         });
         self.alloc(ExprKind::Fn(id), span, height)
+    }
+
+    /// Parses a parameter's default, `= EXPR`, if the current token, after
+    /// the parameter's type, is its `=`: the expression, any expression,
+    /// parsed at minimum binding power 0 as an argument is, inside the
+    /// parameters' parentheses; `None` if no `=` follows.
+    fn parse_default(&mut self) -> ParseResult<Option<ExprId>> {
+        if self.peek().kind != TokenKind::Eq {
+            return Ok(None);
+        }
+        self.advance();
+        // A default is inside the parameters' parentheses.
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
+        let default = self.parse_expr(0);
+        self.braces = outer;
+        default.map(Some)
     }
 
     /// Parses `lazy EXPR`, starting at its `lazy` keyword: the operand,
@@ -4880,7 +4921,8 @@ mod tests {
     }
 
     /// A function expression as `fn(x: Int): Int {..}`, `->> Int` if
-    /// memoised and `-> Int` if impure.
+    /// memoised and `-> Int` if impure, a parameter with a default as `x:
+    /// Int = 1`.
     fn fn_shape(ast: &Ast, function: crate::ast::FnId, out: &mut String) {
         let decl = ast.fn_decl(function);
         out.push_str("fn(");
@@ -4891,6 +4933,10 @@ mod tests {
             out.push_str(ast.names().get(param.name));
             out.push_str(": ");
             type_name(ast, param.ty, out);
+            if let Some(default) = param.default {
+                out.push_str(" = ");
+                expr(ast, default, out);
+            }
         }
         out.push_str(decl.effect.params_end());
         type_name(ast, decl.ret.unwrap(), out);
@@ -6541,6 +6587,105 @@ mod tests {
         };
         assert_eq!(ast.fn_decl(function).effect, Effect::Pure);
         assert!(ast.fn_decl(function).params.is_empty());
+    }
+
+    #[test]
+    fn parameters_may_have_defaults() {
+        // In any position, any expression, in a `fn` expression, a named
+        // `fn`, a `def` and a def-type's `def`; what a default may be is the
+        // checker's business.
+        assert_eq!(
+            shape("fn(a: Int = 1, b: String, c: List<Int> = []): Int { a }"),
+            "fn(a: Int = 1, b: String, c: List<Int> = list()): Int {a}"
+        );
+        assert_eq!(
+            shape("fn f(x: Int = -1) -> Int { x }"),
+            "fn f(x: Int = (-1)) -> Int {x}"
+        );
+        assert_eq!(
+            shape("def greet(name: String, greeting: String = \"hello\"): String { greeting }"),
+            "def greet(name: String, greeting: String = \"hello\"): String {greeting}"
+        );
+        assert_eq!(
+            shape("#[def_type]\ndef p(n: String, f: fn(): Int, v: String = r\"x\") -> Int { 1 }"),
+            "def p(n: String, f: fn(): Int, v: String = \"x\") -> Int {1}"
+        );
+        assert_eq!(
+            shape("fn(r: {a: Int} = { a = 1 }, s: Int = g(x) + 1): Int { 1 }"),
+            "fn(r: {a: Int} = {a = 1}, s: Int = (g(x) + 1)): Int {1}"
+        );
+        // Newlines inside the parentheses, around the `=` too.
+        assert_eq!(
+            shape("fn(\n  a: Int\n  = 1,\n  b: Int =\n  2,\n): Int { a }"),
+            "fn(a: Int = 1, b: Int = 2): Int {a}"
+        );
+        // The parameter's span is its name through its type; the default is
+        // parsed before the body, and so is the first node of the
+        // function's subtree.
+        let text = "fn(x: Int, y: {a: Int} = { a = 1 }, z: Bool = true): Int { x }";
+        let ast = parse_text(text).unwrap();
+        let value = only_value(&ast);
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            panic!("expected a function");
+        };
+        let params = ast.params(ast.fn_decl(function).params);
+        let spans: Vec<Span> = params.iter().map(|p| p.span).collect();
+        assert_eq!(
+            spans,
+            vec![Span::new(3, 9), Span::new(11, 22), Span::new(36, 43)]
+        );
+        let defaults: Vec<Option<Span>> = params
+            .iter()
+            .map(|p| p.default.map(|default| ast.get(default).span))
+            .collect();
+        assert_eq!(
+            defaults,
+            vec![None, Some(Span::new(25, 34)), Some(Span::new(46, 50))]
+        );
+        let first = ast.subtree(value).next().unwrap();
+        assert_eq!(ast.get(first).span, Span::new(31, 32));
+        assert_eq!(ast.subtree(value).count(), ast.len());
+        // The tree dump shows a default after its parameter's type.
+        assert_eq!(
+            parse_text("fn(a: Int, b: Int = 2): Int { a }")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n  (expr @0..33\n    (fn @0..33\n      (params (a Int) (b Int\n        \
+             (int 2 @20..21)))\n      (ret pure Int)\n      (block @28..33\n        \
+             (expr @30..31\n          (name a @30..31))))))"
+        );
+    }
+
+    #[test]
+    fn a_default_is_written_only_in_a_function_expression() {
+        // Not in a function type, named or not, nested or not, at its `=`.
+        assert_eq!(
+            error("let f: fn(a: Int = 1): Int = g"),
+            (MISPLACED_DEFAULT.to_owned(), Span::new(17, 18))
+        );
+        assert_eq!(
+            error("let f: fn(Int = 1): Int = g"),
+            (MISPLACED_DEFAULT.to_owned(), Span::new(14, 15))
+        );
+        assert_eq!(
+            error("fn(f: fn(x: Int = 1): Int): Int { 1 }"),
+            (MISPLACED_DEFAULT.to_owned(), Span::new(16, 17))
+        );
+        // A function type as a parameter's type, followed by that
+        // parameter's default.
+        assert_eq!(
+            shape("fn(f: fn(Int): Int = g): Int { 1 }"),
+            "fn(f: fn(Int): Int = g): Int {1}"
+        );
+        // A definition's parameters are names alone, as before.
+        assert_eq!(
+            error("def p x(v = \"x\") { 1 }"),
+            (
+                "expected `,` or `)`, found `=`".to_owned(),
+                Span::new(10, 11)
+            )
+        );
     }
 
     #[test]

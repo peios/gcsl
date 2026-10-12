@@ -420,7 +420,8 @@
 //! dump does. [`Workspace::def_types`] lists every `def` marked
 //! `#[def_type]` of the workspace's own files (not the standard files'),
 //! each by its path as declared ([`DefType`]), with the names of its
-//! invocation parameters, as it declares them, and every definition made
+//! invocation parameters, as it declares them, and which of them are
+//! optional, having a default (`version: String = ""`), and every definition made
 //! with it ([`Definition`]): found by a search of every file, whichever
 //! views see it, so a definition in a directory the root does not see is
 //! found, and one a later one shadows too; grouped by the def-type its `DT`
@@ -448,8 +449,16 @@
 //! [`Workspace::invoke`] calls the definition as `DT PATH("ARG", ...)`
 //! would be called from a file of the definition's directory, with its
 //! arguments, given as text, each a string: one for each of the def-type's
-//! invocation parameters, in the order it declares them, as many as there
-//! are. Only a parameter that a present `String` fits can be given so, a
+//! invocation parameters, in the order it declares them, filling them left
+//! to right, as many as there are, or fewer, each left out optional: an
+//! invocation parameter with a default (see the checker's "Calls") may be
+//! left out, with every one after it, and takes its default. So `def
+//! lock(name: String, func: fn(version: String) -> List<Version>, version:
+//! String = "")` takes 0 or 1 arguments, and invoked with none, gives
+//! `version` `""`. Every parameter left out must be optional: since the
+//! arguments fill parameters left to right, a required one after an optional
+//! one is never left out while the optional one is given. Only a parameter
+//! that a present `String` fits can be given so, optional or not, a
 //! `String` or a union or an alias with it, and so a bare `version: String`
 //! of an impure def-type, which is `String | Future<String>` (of a memoised
 //! one, `String`); a `Future` cannot. What it asks for may name nothing: no
@@ -460,7 +469,9 @@
 //! type as it is written, whatever arguments are given, or takes another
 //! number of arguments, "`package` takes 1 argument (`version`), but 0 were
 //! given" ("takes 2 arguments (`target`, `mode`)", "takes no arguments",
-//! "but 1 was given"); each is a [`RequestError`], an error of no source, in
+//! "but 1 was given"; with optional ones, the range, "`lock` takes 0 or 1
+//! arguments (`version`), but 2 were given", "takes 1 to 3 arguments (`a`,
+//! `b`, `c`)"); each is a [`RequestError`], an error of no source, in
 //! that order. Then the
 //! definition's file and the def-type's run as a reference to the
 //! definition needs them to, each as a whole, with the files they need (its
@@ -471,7 +482,10 @@
 //! nothing else (no `{` in it interpolates), whose two names no source can
 //! write are bound, in a scope of the workspace's slots, as fields of the
 //! def-type's cell and the definition's (the slots of their closures), with
-//! their types. It is checked as an input of no workspace, so that it looks
+//! their types, and the def-type's with what a call of it needs to know of
+//! its parameters, as a session's input knows a function of an earlier one,
+//! so that the call is of a known callee and gives each optional parameter
+//! left out its default. It is checked as an input of no workspace, so that it looks
 //! nothing up in any file's view and needs no alias, placed in the
 //! definition's directory, so that the def-type's caller (`fileroot.caller`)
 //! is that directory, as for a call written there, and the definition's is
@@ -676,8 +690,8 @@ use crate::ast::{
 #[cfg(test)]
 use crate::check::ViewRecord;
 use crate::check::{
-    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, Place, Scope, Slot, Types,
-    check_types,
+    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams, Place, Scope, Slot,
+    Types, check_types,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::eval::{MemoTables, TempDirs};
@@ -5299,11 +5313,13 @@ pub(crate) struct Context<'a> {
     /// The slot each cell of the workspace is read from, by its number: its
     /// own, but a `def`'s function's slot, known once its file is checked.
     cell_slots: &'a [Slot],
-    /// For each cell that is a `def`'s, by its number, which parameters of
-    /// its function are present because its body measures them, known once
-    /// its file is checked: what a call of it through an import needs for
-    /// the call-site form of the implicit-await error.
-    cell_measured: &'a [Option<Box<[bool]>>],
+    /// For each cell that is a `def`'s, by its number, what a call of its
+    /// function needs to know of its parameters, known once its file is
+    /// checked ([`KnownParams`]): which are present because its body
+    /// measures them, for the call-site form of the implicit-await error,
+    /// and their defaults, which a call of it through an import or by its
+    /// path gives the parameters it leaves unfilled.
+    cell_known: &'a [Option<Rc<KnownParams>>],
     /// Whether the file is a session's input, whose scope is the session's:
     /// its variables are read as a session's input reads them, captured
     /// by a function, not read through the top level's frame as a
@@ -5316,8 +5332,8 @@ pub(crate) struct Context<'a> {
 }
 
 /// What a [`Context`] reads cells by: the slot each cell is read from, and
-/// for each `def`'s cell which parameters its body measures.
-type CellReads<'a> = (&'a [Slot], &'a [Option<Box<[bool]>>]);
+/// for each `def`'s cell what a call of it needs to know of its parameters.
+type CellReads<'a> = (&'a [Slot], &'a [Option<Rc<KnownParams>>]);
 
 impl<'a> Context<'a> {
     /// The context of file `index` of `scan`, where the scan located it
@@ -5326,7 +5342,7 @@ impl<'a> Context<'a> {
         scan: &'a Scan,
         index: u32,
         cell_types: &'a [TyId],
-        (cell_slots, cell_measured): CellReads<'a>,
+        (cell_slots, cell_known): CellReads<'a>,
     ) -> Option<Self> {
         let file = scan.files.get(index as usize)?;
         Some(Self {
@@ -5336,7 +5352,7 @@ impl<'a> Context<'a> {
             index,
             cell_types,
             cell_slots,
-            cell_measured,
+            cell_known,
             session: false,
             place: scan.place(index),
         })
@@ -5366,10 +5382,10 @@ impl<'a> Context<'a> {
         self.scan.slot(cell)
     }
 
-    /// Which parameters of the `def` whose merged node is `node` its body
-    /// measures, if `node` is a `def`'s cell of a file already checked.
-    pub(crate) fn measured(&self, node: u32) -> Option<&[bool]> {
-        self.cell_measured.get(node as usize)?.as_deref()
+    /// What a call of the `def` whose merged node is `node` needs to know of
+    /// its parameters, if `node` is a `def`'s cell of a file already checked.
+    pub(crate) fn known(&self, node: u32) -> Option<&KnownParams> {
+        self.cell_known.get(node as usize)?.as_deref()
     }
 
     /// The slot the cell of the merged node `node` is read from: its own,
@@ -5606,9 +5622,10 @@ pub struct Workspace {
     /// session's inputs, and for the tests' check that every cell an import
     /// reaches is stored by its owner.
     cell_slots: Vec<Slot>,
-    /// For each cell that is a `def`'s, which parameters its body measures
-    /// (see [`Context::measured`]), kept for a session's inputs.
-    cell_measured: Vec<Option<Box<[bool]>>>,
+    /// For each cell that is a `def`'s, what a call of it needs to know of
+    /// its parameters (see [`Context::known`]), kept for a session's inputs
+    /// and for the call that invokes a definition by name.
+    cell_known: Vec<Option<Rc<KnownParams>>>,
     /// Each file's records of the nodes of its view with a leaf of it under
     /// them, by input number: kept for the tests' check that each reads
     /// only cells stored before it.
@@ -5745,8 +5762,8 @@ fn check_loading(
 /// The tables of the cells of `scan` before any file is checked: each
 /// one's type, `Error` but for the built-in functions', the first
 /// ([`builtin_nodes`]), each built-in's (see [`Builtin::ty`]), interned
-/// into `types` with `names`; each one's slot; and no `def`'s measured
-/// parameters.
+/// into `types` with `names`; each one's slot; and nothing known of any
+/// `def`'s parameters.
 fn cell_tables(scan: &Scan, types: &mut TypeTable, names: &mut Names) -> CellTables {
     let mut cell_types = vec![TyId::ERROR; scan.cells()];
     for (cell, builtin) in cell_types.iter_mut().zip(Builtin::ALL) {
@@ -5768,15 +5785,16 @@ fn own_slot_names(ir: &mut Ir, committed: usize) -> (usize, Vec<Name>) {
 }
 
 /// The tables of a workspace's cells, by number: each one's type, the slot
-/// it is read from, and for a `def`'s which parameters its body measures.
-type CellTables = (Vec<TyId>, Vec<Slot>, Vec<Option<Box<[bool]>>>);
+/// it is read from, and for a `def`'s what a call of it needs to know of its
+/// parameters.
+type CellTables = (Vec<TyId>, Vec<Slot>, Vec<Option<Rc<KnownParams>>>);
 
 /// Checks and lowers every file of `scan` in the order (see [`check`]), each
 /// where the scan located it ([`Scan::locate`]).
 fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     let mut names = mem::take(&mut scan.names);
     let mut types = TypeTable::new();
-    let (mut cell_types, mut cell_slots, mut cell_measured) =
+    let (mut cell_types, mut cell_slots, mut cell_known) =
         cell_tables(&scan, &mut types, &mut names);
     let mut slot_names: Vec<Name> = scan.cell_names();
     let mut scopes = vec![Committed::default(); scan.dirs.len()];
@@ -5805,7 +5823,7 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
         // with the file's own slots added.
         let scope = Committed::scope(&scan, &scopes, file, mem::take(&mut slot_names));
         let start = scope.len();
-        let reads = (&cell_slots[..], &cell_measured[..]);
+        let reads = (&cell_slots[..], &cell_known[..]);
         let compiled = Context::new(&scan, index, &cell_types, reads).map(|context| {
             let output = Checker::in_workspace(&file.ast, scope, &mut types, &context).check();
             output.and_then(|output| session::lower_checked(&file.ast, output, &types, index))
@@ -5841,10 +5859,10 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
         if let Some(file) = scan.files.get_mut(index as usize) {
             names = file.ast.replace_names(Names::new());
         }
-        for (global, slot, ty, measured) in committed {
+        for (global, slot, ty, known) in committed {
             set(&mut cell_types, global, ty);
             set(&mut cell_slots, global, slot);
-            set(&mut cell_measured, global, measured);
+            set(&mut cell_known, global, known);
         }
         match result {
             Ok((mut ir, file_types, found)) => {
@@ -5882,7 +5900,7 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
         types,
         cell_types,
         cell_slots,
-        cell_measured,
+        cell_known,
         #[cfg(test)]
         view_records,
     })
@@ -6002,21 +6020,17 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
     let file = scan.files.get(index as usize);
     let global = file.map_or(&[][..], |file| &file.global);
     let slots = output.checked.resolution.field_cells();
-    let measured_by_slot = output.scope.measured_by_slot();
+    let known_by_slot = output.scope.known_by_slot();
     let nodes = file.map_or(&[][..], |file| &file.mentions.tree.nodes);
     let mut cells = Vec::new();
     for (own, (&global, &ty)) in global.iter().zip(&output.cell_types).enumerate() {
         if scan.computed_by(global) == Some(index) {
             // A `def`'s cell is read from its function's slot.
             let slot = slots.get(own).copied().unwrap_or_else(|| scan.slot(global));
-            let mut measured = measured_by_slot
-                .get(&slot)
-                .copied()
-                .flatten()
-                .map(Box::from);
-            // A `def` named by a dotted path has no binding: what its body
-            // measures is its function's, which the cell's type is.
-            if measured.is_none()
+            let mut known = known_by_slot.get(&slot).copied().flatten().cloned();
+            // A `def` named by a dotted path has no binding: what a call of
+            // it needs to know is its function's, which the cell's type is.
+            if known.is_none()
                 && ty != TyId::ERROR
                 && let Some(function) = nodes
                     .get(own)
@@ -6026,15 +6040,9 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
                     .filter(|function| function.name.is_none())
             {
                 let resolution = output.checked.resolution.function(function.function);
-                measured = Some(
-                    resolution
-                        .param_demands
-                        .iter()
-                        .map(Option::is_some)
-                        .collect(),
-                );
+                known = Some(KnownParams::of(resolution));
             }
-            cells.push((global, slot, ty, measured));
+            cells.push((global, slot, ty, known));
         }
     }
     // An imported value file's value is a cell of the workspace.
@@ -6045,9 +6053,9 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
 }
 
 /// A cell a file computes, as [`computed_cells`] gives it: its number, the
-/// slot it is read from, its type, and for a `def` which parameters its body
-/// measures.
-type ComputedCell = (u32, Slot, TyId, Option<Box<[bool]>>);
+/// slot it is read from, its type, and for a `def` what a call of it needs to
+/// know of its parameters.
+type ComputedCell = (u32, Slot, TyId, Option<Rc<KnownParams>>);
 
 /// Sets the entry `index` of `entries` to `value`, if it has one.
 fn set<T>(entries: &mut [T], index: u32, value: T) {
@@ -6223,6 +6231,11 @@ pub struct DefType {
     /// definition's path and the definition, as it declares them, in order:
     /// what invoking one of its definitions takes an argument for each of.
     pub parameters: Vec<String>,
+    /// For each of its invocation parameters, in the order of `parameters`,
+    /// whether it is optional: whether it has a default, `version: String =
+    /// ""`, which invoking one of its definitions without an argument for
+    /// it gives it (see the module documentation, "Def-types by name").
+    pub optional: Vec<bool>,
     /// Every definition made with it, in path order of their files, then in
     /// source order: none if it has none.
     pub definitions: Vec<Definition>,
@@ -6306,15 +6319,22 @@ pub enum RequestError {
         /// The parameter's type, as it is written.
         ty: String,
     },
-    /// The number of arguments given is not the number of the def-type's
-    /// invocation parameters: "`package` takes 1 argument (`version`), but
-    /// 0 were given".
+    /// The number of arguments given is not a number the def-type's
+    /// invocation parameters take: "`package` takes 1 argument (`version`),
+    /// but 0 were given", or, when some are optional, "`lock` takes 0 or 1
+    /// arguments (`version`), but 2 were given" and "takes 1 to 3 arguments
+    /// (...)". They take as many as there are, and as few as fill every one
+    /// that is not optional, left to right ([`RequestError::required`]).
     ArgumentCount {
         /// The def-type's path.
         def_type: String,
         /// The names of its invocation parameters, as it declares them, in
         /// order.
         parameters: Vec<String>,
+        /// For each of its invocation parameters, in the order of
+        /// `parameters`, whether it is optional, having a default (see
+        /// [`DefType::optional`]).
+        optional: Vec<bool>,
         /// The number of arguments given.
         given: usize,
     },
@@ -6343,14 +6363,26 @@ impl RequestError {
             RequestError::ArgumentCount {
                 def_type,
                 parameters,
+                optional,
                 given,
             } => {
+                let all = parameters.len();
+                let required = RequestError::required(all, optional);
                 let takes = match &parameters[..] {
                     [] => "no arguments".to_owned(),
-                    [_] => format!("1 argument ({})", quoted_list(parameters)),
+                    // Nothing can be left out: as many as there are.
+                    [_] if required == all => format!("1 argument ({})", quoted_list(parameters)),
+                    _ if required == all => {
+                        format!("{all} arguments ({})", quoted_list(parameters))
+                    }
+                    _ if all == required + 1 => {
+                        format!(
+                            "{required} or {all} arguments ({})",
+                            quoted_list(parameters)
+                        )
+                    }
                     _ => format!(
-                        "{} arguments ({})",
-                        parameters.len(),
+                        "{required} to {all} arguments ({})",
                         quoted_list(parameters)
                     ),
                 };
@@ -6358,6 +6390,19 @@ impl RequestError {
                 format!("`{def_type}` takes {takes}, but {given} {was} given")
             }
         }
+    }
+
+    /// The fewest arguments `count` invocation parameters take, of which
+    /// `optional` says which are optional (one it says nothing of is not):
+    /// one for each up to the last that is not, so that every one that is
+    /// not is filled, arguments filling them left to right; the optional
+    /// ones after it may be left out, and take their defaults.
+    #[must_use]
+    pub fn required(count: usize, optional: &[bool]) -> usize {
+        (0..count)
+            .rev()
+            .find(|&at| optional.get(at) != Some(&true))
+            .map_or(0, |last| last + 1)
     }
 
     /// The notes that follow the message: what there is to ask for instead,
@@ -6474,8 +6519,9 @@ impl Workspace {
     /// name"): the definition's file and the def-type's run first, each as a
     /// whole, with the files they need, unless they have run, and then the
     /// def-type is called with the definition's path, the definition and
-    /// the arguments, one for each of its invocation parameters, in order,
-    /// its caller the directory of the definition's file. Returns the value
+    /// the arguments, filling its invocation parameters in order, each
+    /// optional one left out given its default, its caller the directory of
+    /// the definition's file. Returns the value
     /// the def-type returns, with the warnings of the whole workspace.
     /// Invoked again, the call runs again.
     ///
@@ -6485,8 +6531,9 @@ impl Workspace {
     /// definitions under others among them, with the warnings; no def-type
     /// of path `def_type`, no definition of it of path `path`, or `path`
     /// above some, an invocation parameter of the def-type that a present
-    /// `String` does not fit, or another number of `args` than of its
-    /// invocation parameters, each a [`RequestError`]; and the runtime
+    /// `String` does not fit, or more `args` than its invocation parameters,
+    /// or fewer than fill every one that is not optional, each a
+    /// [`RequestError`]; and the runtime
     /// error of a file that runs or of the call, as
     /// [`Workspace::run`] returns it, a part of it in the call itself,
     /// which has no source, located at the definition's path, labelled
@@ -6512,9 +6559,11 @@ impl Workspace {
             .map_err(InvokeError::Diagnostics)?;
         self.run_needed(found.listed.file)
             .map_err(InvokeError::Diagnostics)?;
+        let known = self.def_type_known(&found);
         self.call_definition(
             (definition, Invocation::Call(args)),
             (def_type_cell, definition_cell),
+            known,
         )
     }
 
@@ -6568,6 +6617,7 @@ impl Workspace {
         self.call_definition(
             (definition, Invocation::MetaField(field)),
             (def_type_cell, (definition_cell.0, func)),
+            None,
         )
         .map(Some)
     }
@@ -6673,6 +6723,10 @@ impl Workspace {
                                     .iter()
                                     .map(|param| names.get(param.name).to_owned())
                                     .collect(),
+                                optional: params
+                                    .iter()
+                                    .map(|param| param.default.is_some())
+                                    .collect(),
                                 definitions: Vec::new(),
                             },
                             item,
@@ -6715,8 +6769,10 @@ impl Workspace {
     /// Why `args` cannot be given to the def-type `found`, whose type is
     /// `ty`, if they cannot (see [Def-types by name](#def-types-by-name)):
     /// the first of its invocation parameters, as it declares them, that a
-    /// present `String` does not fit, its type as it is written; else
-    /// `args`' number, if it is not its invocation parameters'.
+    /// present `String` does not fit, its type as it is written, optional
+    /// or not; else `args`' number, if it is more than its invocation
+    /// parameters' or fewer than fill every one that is not optional, left
+    /// to right ([`RequestError::required`]).
     fn cannot_give(&self, found: &FoundDefType, ty: TyId, args: &[String]) -> Option<RequestError> {
         let listed = &found.listed;
         let params = self
@@ -6734,9 +6790,12 @@ impl Workspace {
                 });
             }
         }
-        (args.len() != listed.parameters.len()).then(|| RequestError::ArgumentCount {
+        let all = listed.parameters.len();
+        let required = RequestError::required(all, &listed.optional);
+        (args.len() < required || args.len() > all).then(|| RequestError::ArgumentCount {
             def_type: listed.path.clone(),
             parameters: listed.parameters.clone(),
+            optional: listed.optional.clone(),
             given: args.len(),
         })
     }
@@ -6746,6 +6805,16 @@ impl Workspace {
     /// its type, once its file is checked; `None` if the item is a leaf of
     /// no tree, a later declaration shadowing it in its own directory.
     fn leaf_cell(&self, index: u32, item: ItemId) -> Option<(Slot, TyId)> {
+        let node = self.leaf_node(index, item)?;
+        Some((
+            *self.cell_slots.get(node as usize)?,
+            *self.cell_types.get(node as usize)?,
+        ))
+    }
+
+    /// The merged node of the leaf the item `item` of file `index`
+    /// declares, as [`Workspace::leaf_cell`] finds it.
+    fn leaf_node(&self, index: u32, item: ItemId) -> Option<u32> {
         let file = self.scan.files.get(index as usize)?;
         let position = file
             .ast
@@ -6753,25 +6822,33 @@ impl Workspace {
             .iter()
             .position(|&at| at == item)?;
         let own = (*file.mentions.tree.item_leaf.get(position)?)?;
-        let node = *file.global.get(own as usize)?;
-        Some((
-            *self.cell_slots.get(node as usize)?,
-            *self.cell_types.get(node as usize)?,
-        ))
+        file.global.get(own as usize).copied()
+    }
+
+    /// What a call of the def-type `found` needs to know of its parameters
+    /// (see [`Context::known`]), its defaults among them, once its file is
+    /// checked: so the call that invokes one of its definitions by name
+    /// gives an invocation parameter it leaves out its default.
+    fn def_type_known(&self, found: &FoundDefType) -> Option<Rc<KnownParams>> {
+        let node = self.leaf_node(found.listed.file, found.item)?;
+        self.cell_known.get(node as usize)?.clone()
     }
 
     /// Calls the def-type whose cell is `def_type` with the path of
     /// `definition`, the definition, whose cell is `definition_cell`, and
     /// `args`, their files run: the input `<def-type>("PATH", <definition>,
     /// "ARG", ...)`, its names no source can write bound to the two cells,
-    /// checked from the workspace's slots, as an input of no workspace, and
-    /// lowered as one placed in the definition's directory, its caller,
-    /// numbered after every file (see [Def-types by
-    /// name](#def-types-by-name)).
+    /// the def-type's with what a call of it needs to know of its
+    /// parameters, `known`, so that the call is of a known callee and gives
+    /// an invocation parameter it leaves out its default, checked from the
+    /// workspace's slots, as an input of no workspace, and lowered as one
+    /// placed in the definition's directory, its caller, numbered after
+    /// every file (see [Def-types by name](#def-types-by-name)).
     fn call_definition(
         &mut self,
         (definition, invoked): (&Definition, Invocation),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
+        known: Option<Rc<KnownParams>>,
     ) -> Result<Outcome, InvokeError> {
         let call = count(self.scan.files.len());
         let at = (definition.file, definition.span);
@@ -6782,8 +6859,8 @@ impl Workspace {
         );
         let ast = invocation(names, (&definition.path, invoked), bound, at.1);
         let scope = Scope::of_slots(self.slot_names.clone()).with_fields([
-            (bound.0, def_type.0, def_type.1),
-            (bound.1, definition_cell.0, definition_cell.1),
+            (bound.0, def_type.0, def_type.1, known),
+            (bound.1, definition_cell.0, definition_cell.1, None),
         ]);
         let place = self.scan.place(definition.file);
         let lowered = Checker::with_scope(&ast, scope, &mut self.types)
@@ -7149,9 +7226,9 @@ pub(crate) struct Standard {
     /// The slot each of its cells is read from: its own, or for a `def` its
     /// function's.
     cell_slots: Vec<Slot>,
-    /// For each of its cells that is a `def`'s, which parameters its body
-    /// measures.
-    cell_measured: Vec<Option<Box<[bool]>>>,
+    /// For each of its cells that is a `def`'s, what a call of it needs to
+    /// know of its parameters.
+    cell_known: Vec<Option<Rc<KnownParams>>>,
     /// The table of the directories of the run ([`Scan::locate`]): the
     /// session's root, the working directory it started in, first, at index
     /// 0, where every input is, both its `fileroot.this` and its
@@ -7211,7 +7288,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
         slot_names,
         cell_types,
         cell_slots,
-        cell_measured,
+        cell_known,
         ..
     } = workspace;
     Ok(Started {
@@ -7219,7 +7296,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
             cells: count(scan.cells()),
             cell_types,
             cell_slots,
-            cell_measured,
+            cell_known,
             dirs: scan.dir_texts,
         },
         names: scan.names,
@@ -7355,8 +7432,8 @@ fn check_input_then<R>(
     cell_types.resize(cells, TyId::ERROR);
     let mut cell_slots = standard.cell_slots.clone();
     cell_slots.extend((count(cell_slots.len())..count(cells)).map(|cell| scan.slot(cell)));
-    let mut cell_measured = standard.cell_measured.clone();
-    cell_measured.resize(cells, None);
+    let mut cell_known = standard.cell_known.clone();
+    cell_known.resize(cells, None);
     let scope = scope.with_slots(taken);
     let file_names = mem::take(&mut scan.names);
     let Some(file) = scan.files.get_mut(index as usize) else {
@@ -7366,7 +7443,7 @@ fn check_input_then<R>(
     };
     file.ast.replace_names(file_names);
     let finished = scan.files.get(index as usize).and_then(|file| {
-        let reads = (&cell_slots[..], &cell_measured[..]);
+        let reads = (&cell_slots[..], &cell_known[..]);
         let context = Context::new(&scan, index, &cell_types, reads)?;
         let context = Context {
             session: true,
@@ -14990,6 +15067,7 @@ p26 = com.x"#;
                 file: root,
                 span: Span::new(name, name + 7),
                 parameters: Vec::new(),
+                optional: Vec::new(),
                 definitions: vec![Definition {
                     path: "dev.peios.testpkg".to_owned(),
                     file: package,
@@ -15711,6 +15789,194 @@ p26 = com.x"#;
             })
             .collect();
         assert_eq!(shown, ["run: String | Future<String>", "once: String"]);
+    }
+
+    /// A workspace whose def-types have optional invocation parameters (see
+    /// the checker's "Calls"): Jack's `lock` from his newpkgs, in the shape
+    /// its TODO asks for, and others with optional parameters after, around
+    /// and before required ones.
+    const OPTIONAL: [(&str, &str); 2] = [
+        (
+            "workspace.gcsl",
+            "type Version = { version: String }\n\
+             #[def_type]\n\
+             def lock(name: String, func: fn(version: String) -> List<Version>, version: String = \"\") -> String {\n\
+             \x20   let found = func(version)\n\
+             \x20   \"{name} [{version}] {len(found)}\"\n\
+             }\n\
+             #[def_type]\n\
+             def three(name: String, f: fn(): String, a: String, b: String = \"B\", c: String = \"C\") -> String {\n\
+             \x20   \"{name} {a} {b} {c}\"\n\
+             }\n\
+             #[def_type]\n\
+             def two(name: String, f: fn(): String, a: String = \"A\", b: String = \"B\") -> String {\n\
+             \x20   \"{name} {a} {b}\"\n\
+             }\n\
+             #[def_type]\n\
+             def first(name: String, f: fn(): String, a: String = \"A\", b: String) -> String {\n\
+             \x20   \"{name} {a} {b}\"\n\
+             }",
+        ),
+        (
+            "org.figlet.figlet/lock.gcsl",
+            "def lock org.figlet.figlet(version) { [{ version = version }] }\n\
+             def three x() { \"x\" }\n\
+             def two x() { \"x\" }\n\
+             def first x() { \"x\" }",
+        ),
+    ];
+
+    #[test]
+    fn an_optional_invocation_parameter_may_be_left_out() {
+        let files = OPTIONAL;
+        // Jack's `pekit lock org.figlet.figlet`, and with the version.
+        assert_eq!(
+            invoked_text_with(&files, ("lock", "org.figlet.figlet"), &[]),
+            "org.figlet.figlet [] 1"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("lock", "org.figlet.figlet"), &["2.2.6"]),
+            "org.figlet.figlet [2.2.6] 1"
+        );
+        // Left to right, each left out given its default.
+        assert_eq!(invoked_text_with(&files, ("three", "x"), &["a"]), "x a B C");
+        assert_eq!(
+            invoked_text_with(&files, ("three", "x"), &["a", "b"]),
+            "x a b C"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("three", "x"), &["a", "b", "c"]),
+            "x a b c"
+        );
+        assert_eq!(invoked_text_with(&files, ("two", "x"), &[]), "x A B");
+        assert_eq!(invoked_text_with(&files, ("two", "x"), &["a"]), "x a B");
+        // A required one after an optional one: both must be given.
+        assert_eq!(
+            invoked_text_with(&files, ("first", "x"), &["a", "b"]),
+            "x a b"
+        );
+        // Listed: which are optional, in the order of the parameters.
+        let workspace = rooted(&files).unwrap();
+        let optional: Vec<(String, Vec<String>, Vec<bool>)> = workspace
+            .def_types()
+            .unwrap()
+            .into_iter()
+            .map(|def_type| (def_type.path, def_type.parameters, def_type.optional))
+            .collect();
+        let owned = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+        assert_eq!(
+            optional,
+            [
+                ("lock".to_owned(), owned(&["version"]), vec![true]),
+                (
+                    "three".to_owned(),
+                    owned(&["a", "b", "c"]),
+                    vec![false, true, true]
+                ),
+                ("two".to_owned(), owned(&["a", "b"]), vec![true, true]),
+                ("first".to_owned(), owned(&["a", "b"]), vec![true, false]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_arguments_must_fill_every_required_parameter() {
+        let files = OPTIONAL;
+        let error = |def_type: &str, path: &str, args: &[&str]| {
+            request_error_with(&files, (def_type, path), args)
+        };
+        assert_eq!(
+            error("lock", "org.figlet.figlet", &["a", "b"]),
+            "`lock` takes 0 or 1 arguments (`version`), but 2 were given"
+        );
+        assert_eq!(
+            error("three", "x", &[]),
+            "`three` takes 1 to 3 arguments (`a`, `b`, `c`), but 0 were given"
+        );
+        assert_eq!(
+            error("three", "x", &["a", "b", "c", "d"]),
+            "`three` takes 1 to 3 arguments (`a`, `b`, `c`), but 4 were given"
+        );
+        assert_eq!(
+            error("two", "x", &["a", "b", "c"]),
+            "`two` takes 0 to 2 arguments (`a`, `b`), but 3 were given"
+        );
+        // A required parameter after an optional one: the optional one
+        // cannot be left out, so as many as there are.
+        assert_eq!(
+            error("first", "x", &["b"]),
+            "`first` takes 2 arguments (`a`, `b`), but 1 was given"
+        );
+        assert_eq!(
+            error("first", "x", &[]),
+            "`first` takes 2 arguments (`a`, `b`), but 0 were given"
+        );
+        // The fewest, from which are optional.
+        assert_eq!(RequestError::required(0, &[]), 0);
+        assert_eq!(RequestError::required(3, &[false, true, true]), 1);
+        assert_eq!(RequestError::required(2, &[true, false]), 2);
+        assert_eq!(RequestError::required(2, &[true, true]), 0);
+        assert_eq!(RequestError::required(2, &[true]), 2);
+        // A parameter a string cannot fit is an error, optional or not.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def count(name: String, f: fn(): String, n: Int = 1): String { f() }",
+            ),
+            ("defs.gcsl", "def count x() { \"x\" }"),
+        ];
+        assert_eq!(
+            request_error_with(&files, ("count", "x"), &[]),
+            "`count`'s parameter `n` is `Int`, but only `String` parameters can be given here yet"
+        );
+    }
+
+    #[test]
+    fn a_def_with_defaults_gives_them_from_another_file() {
+        // Called by its name from a directory below, by its path from
+        // another file, through a member import and through its module.
+        let files = [
+            (
+                "workspace.gcsl",
+                "def greet(name: String, greeting: String = \"hello\"): String {\n\
+                 \x20   \"{greeting}, {name}\"\n\
+                 }\n\
+                 def dev.peios.pad(s: String, n: Int = 2, tail: List<String> = [\"!\"]): String {\n\
+                 \x20   \"{s}{n}{tail[0]}\"\n\
+                 }",
+            ),
+            (
+                "lib/strings.gcsl",
+                "def shout(s: String, mark: {m: String} = { m = \"!\" }): String { \"{s}{mark.m}\" }",
+            ),
+            (
+                "app/main.gcsl",
+                "import lib.strings\n\
+                 import shout from lib.strings\n\
+                 a = greet(\"jack\")\n\
+                 b = dev.peios.pad(\"x\")\n\
+                 c = dev.peios.pad(\"x\", tail = [\"?\"])\n\
+                 d = strings.shout(\"hey\")\n\
+                 e = shout(\"ho\")\n\
+                 f = shout(\"ho\", { m = \"?\" })",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "app/main.gcsl"),
+            "{a = \"hello, jack\"; b = \"x2!\"; c = \"x2?\"; d = \"hey!\"; e = \"ho!\"; \
+             f = \"ho?\"}"
+        );
+        // Through a copy, from another file too, every parameter is filled.
+        let files = [
+            files[0],
+            files[1],
+            (
+                "app/main.gcsl",
+                "import shout from lib.strings\nlet s = shout\na = s(\"ho\")",
+            ),
+        ];
+        assert_eq!(rooted_messages(&files), ["expected 2 arguments, found 1"]);
     }
 
     #[test]

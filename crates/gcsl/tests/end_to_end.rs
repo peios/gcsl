@@ -1158,6 +1158,135 @@ fn programs_with_functions() {
 }
 
 #[test]
+fn parameters_with_defaults() {
+    // The summary of slice 44.
+    let summary = "def greet(name: String, greeting: String = \"hello\"): String {\n\
+                   \x20   \"{greeting}, {name}\"\n\
+                   }\n\
+                   a = greet(\"jack\")\n\
+                   b = greet(\"jack\", \"hi\")\n\
+                   c = greet(\"jack\", greeting = \"yo\")\n\
+                   def pad(n: Int = 0, s: String): String { \"{n}{s}\" }\n\
+                   d = pad(s = \"x\")";
+    assert_eq!(
+        run(summary).unwrap().to_string(),
+        "{greet = fn(name: String, greeting: String): String; a = \"hello, jack\"; \
+         b = \"hi, jack\"; c = \"yo, jack\"; pad = fn(n: Int, s: String): String; d = \"0x\"}"
+    );
+    // Each constant, as the callee receives it.
+    let constants = "fn f(\n\
+                     \x20   s: String = \"text\",\n\
+                     \x20   r: String = r\"raw\\n\",\n\
+                     \x20   i: Int = 42,\n\
+                     \x20   x: Float = 1.5,\n\
+                     \x20   y: Float = 2,\n\
+                     \x20   n: Int = -3,\n\
+                     \x20   m: Float = -2,\n\
+                     \x20   b: Bool = true,\n\
+                     \x20   l: List<Int> = [1, 2],\n\
+                     \x20   e: List<Int> = [],\n\
+                     \x20   rec: {a: Int, s: String} = { a = 1; s = \"s\" },\n\
+                     \x20   deep: List<{a: List<Float>}> = [{ a = [1, 2.5] }],\n\
+                     \x20   unit: {} = {},\n\
+                     ): {s: String, r: String, i: Int, x: Float, y: Float, n: Int, m: Float, \
+                     b: Bool, l: List<Int>, e: List<Int>, rec: {a: Int, s: String}, \
+                     deep: List<{a: List<Float>}>, unit: {}} {\n\
+                     \x20   s = s; r = r; i = i; x = x; y = y; n = n; m = m; b = b; l = l; e = e\n\
+                     \x20   rec = rec; deep = deep; unit = unit\n\
+                     }\n\
+                     = f()";
+    assert_eq!(
+        run(constants).unwrap().to_string(),
+        "{s = \"text\"; r = \"raw\\\\n\"; i = 42; x = 1.5; y = 2.0; n = -3; m = -2.0; \
+         b = true; l = [1, 2]; e = []; rec = {a = 1; s = \"s\"}; deep = [{a = [1.0, 2.5]}]; \
+         unit = {}}"
+    );
+    // Positional, named and trailing arguments with defaults in front of,
+    // between and after the parameters without one.
+    let mixed = "fn f(a: Int = 1, b: Int, c: Int = 3, e: Int = 5, d: {v: Int}): String {\n\
+                 \x20   \"{a} {b} {c} {d.v} {e}\"\n\
+                 }\n\
+                 = [\n\
+                 \x20   f(b = 2) { v = 4 },\n\
+                 \x20   f(10, 20) { v = 40 },\n\
+                 \x20   f(10, 20, 30, d = { v = 40 }),\n\
+                 \x20   f(e = 50, b = 20, d = { v = 40 }),\n\
+                 \x20   f(10, 20, 30, 50, { v = 40 }),\n\
+                 \x20   f(10, 20, e = 50) { v = 40 },\n\
+                 ]";
+    assert_eq!(
+        run(mixed).unwrap().to_string(),
+        "[\"1 2 3 4 5\", \"10 20 3 40 5\", \"10 20 30 40 5\", \"1 20 3 40 50\", \
+         \"10 20 30 40 50\", \"10 20 3 40 50\"]"
+    );
+    // In a function's body, a `lazy`, a loop; a `let` and a named `fn` in an
+    // inner block.
+    let nested = "fn outer(): Int {\n\
+                  \x20   fn inner(k: Int = 10): Int { k }\n\
+                  \x20   let lam = fn(j: Int = 20): Int { j }\n\
+                  \x20   inner() + lam()\n\
+                  }\n\
+                  fn twice(n: Int = 2) -> Int { n * 2 }\n\
+                  = [outer(), await lazy twice(), for i in 0..2 { twice() + i }[1]]";
+    assert_eq!(run(nested).unwrap().to_string(), "[30, 4, 5]");
+}
+
+#[test]
+fn defaults_are_kept_across_repl_inputs() {
+    // A function of an earlier input gives its defaults, as one of the same
+    // input does; a copy of it gives none.
+    let mut session = Session::new();
+    let inputs = [
+        "def greet(name: String, greeting: String = \"hello\"): String { \"{greeting}, {name}\" }",
+        "let f = fn(a: Int = 1, b: Int): Int { a + b }",
+        "greet(\"jack\")",
+        "f(b = 10)",
+        "greet(\"jack\", greeting = \"hey\")",
+    ];
+    let mut shown = Vec::new();
+    for input in inputs {
+        let outcome = session.eval(&source(input)).unwrap();
+        shown.push(outcome.value.repr().to_string());
+    }
+    assert_eq!(&shown[2..], ["\"hello, jack\"", "11", "\"hey, jack\""]);
+    session.eval(&source("let g = greet")).unwrap();
+    let errors = session.eval(&source("g(\"jack\")")).unwrap_err();
+    assert_eq!(errors[0].message, "expected 2 arguments, found 1");
+}
+
+#[test]
+fn a_default_error_renders_exactly() {
+    assert_eq!(
+        rendered("let x = 1\nfn f(p: Int = x + 1): Int { p }\n"),
+        "error: a parameter's default must be a constant\n\
+         \x20--> calc.gcsl:2:15\n\
+         \x20 |\n\
+         2 | fn f(p: Int = x + 1): Int { p }\n\
+         \x20 |               ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a literal, or a list or record of literals\n"
+    );
+    assert_eq!(
+        rendered("fn f(p: Int = \"one\"): Int { p }\n"),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:1:15\n\
+         \x20 |\n\
+         1 | fn f(p: Int = \"one\"): Int { p }\n\
+         \x20 |         ---   ^^^^^ expected Int, found String\n\
+         \x20 |         |\n\
+         \x20 |         expected because of this annotation\n"
+    );
+    assert_eq!(
+        rendered("let f: fn(a: Int = 1): Int = g\n"),
+        "error: a default is written only in a function expression's parameters\n\
+         \x20--> calc.gcsl:1:18\n\
+         \x20 |\n\
+         1 | let f: fn(a: Int = 1): Int = g\n\
+         \x20 |                  ^\n"
+    );
+}
+
+#[test]
 fn an_impure_call_error_renders_exactly() {
     assert_eq!(
         rendered("fn f() -> Present<Int> { 1 }\nfn g(): Int { f() }\n"),
