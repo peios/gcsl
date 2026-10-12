@@ -1040,6 +1040,79 @@
 //! from a pure function is the purity error. A record read whole through
 //! an import holds no namespace (`Checker::imported_record`).
 //!
+//! # Metas
+//!
+//! A function type may have a *meta*, written after its return type with a
+//! marker of its own (see the parser's "Types"), as in `fn(v: Version):
+//! PackageDef META-> PackageMeta`: a record attached to the function value,
+//! whose fields are read as the function's. Its type is resolved as a
+//! return type of its marker's effect is (`Checker::resolve_meta`): written
+//! bare, it is the either shape under `META->` and `META->>`, at its
+//! position and every bare position inside it, and present under `META:`,
+//! so a `META: Future<X>` meta is a future. It must be a record type once
+//! every `Future` is taken off it: "a meta must be a record type: its
+//! fields are read from the function" otherwise, at the type. A function
+//! type with a meta is a subtype of the same without one, and metas compare
+//! as results do (see [`crate::types`], "Metas"); a function expression, a
+//! `def` and a built-in function have no meta, so none fits a type with one.
+//!
+//! **Reading.** A field access on a value of a function type with a meta,
+//! once a value that may be a future is awaited as any record a field access
+//! reads is, reads the meta's field (`Checker::meta_read`): `func.versions`
+//! is the meta's field `versions`, of the field's type, and `func.a.b` goes
+//! on from it. A field the meta lacks is "the meta of `func` has no field
+//! `x`", at the `.NAME`, noted with the meta's fields ("the only field is
+//! `versions`"); a field access on a function with no meta is the error it
+//! always was, "cannot access field `x` of `fn(): Int`". A read is a call of
+//! the meta's closure, of the meta's effect: from a pure function, reading a
+//! `META->` or `META->>` meta is "cannot read an impure meta from a pure
+//! function", labelled "reading the meta of `func` is impure (`META->`)" at
+//! the function and at the pure function's marker, noted as the call error
+//! is; a memoised function may read one wherever it may call an impure
+//! function. A meta that may be a future, the either shape of an impure
+//! meta's or a `Future`, is then awaited at the top, as a record a field
+//! access reads is, subject to the purity rule, unless the read is already
+//! that error. What a read reads, and how its meta is awaited, is recorded
+//! for lowering ([`Resolution::meta_read`]).
+//!
+//! **Declaring.** A def-type declares the meta of its definitions by the
+//! meta of its definition parameter's function type, F. `defmeta DT PATH {
+//! ... }` or `defmeta DT PATH = EXPR` ([`ItemKind::DefMeta`]) declares the
+//! meta of the definition `def DT PATH(...)` of its directory: a function of
+//! no parameters, its type the function of F's meta's effect returning F's
+//! meta's type, its body checked as such a function's
+//! (`Checker::check_defmeta`), so under `META->` it may `exec` and under
+//! `META:` it is pure. Its `DT` is read as a definition's is ("`DT` is not
+//! a def-type" otherwise); a def-type that declares no meta is "`package`
+//! declares no meta for its definitions", noted "a def-type declares one by
+//! its definition parameter's type, as in `func: fn(): PackageDef META:
+//! PackageMeta`", at the meta's `defmeta` through its path. A meta binds
+//! nothing a source can read: it is a top-level function, as a definition
+//! is, and the leaf of its path, as one name, under the meta key of its
+//! def-type and its file's directory (see [`crate::names`], "Namespace
+//! keys"), placed among the namespaces' fields as a definition is
+//! (`Checker::place_definition`) and typed as the input starts
+//! (`Checker::defmeta_type`).
+//!
+//! **Pairing.** A definition whose def-type declares a meta reads the cell
+//! of its meta, the leaf of its path among its directory's metas, as a
+//! reference to it would, from inside its own function, as its body reads a
+//! top-level function (`Checker::definition_meta`), and the slot that read
+//! reads is what its code names ([`Resolution::metas`]), which a read of its
+//! closure's meta calls; so the definition needs its meta, as mentions say
+//! ([`crate::mentions`], "Def-types"). One whose directory declares no meta
+//! of its path, which the workspace finds ([`crate::workspace`],
+//! "Def-types"), is "`package dev.peios.x` has no `defmeta` in its
+//! directory", at its def-type and path, noted "`package` declares a meta,
+//! `META-> PackageMeta`, for each of its definitions": the meta as the
+//! def-type's parameter writes it if the workspace has the def-type's tree,
+//! and otherwise as its type shows, present under `META->` and `META->>`,
+//! as a bare type would be written there. A meta declared twice in a
+//! directory, or with no definition of its path there, is the workspace's
+//! error. A definition reads nothing, its read typed `{}`, when its def-type
+//! declares no meta, when its directory declares none, and when it is
+//! shadowed, since it is never made.
+//!
 //! # Futures
 //!
 //! `lazy e` is checked as the body of an anonymous, parameterless function
@@ -2450,17 +2523,18 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, Effect, Element, ElementRange, Expr,
-    ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind,
-    ItemRange, Jump, Label, LabelId, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
-    TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
+    Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, DefTypeRole, Effect, Element,
+    ElementRange, Expr, ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId,
+    Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, PartRange, PathRange,
+    PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span,
+    symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
-use crate::types::{AwaitKind, FnTy, Laziness, TyId, TyKind, TypeTable, ValueTest};
+use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::ValueKind;
 use crate::workspace::{Context, Target};
 
@@ -3196,6 +3270,15 @@ pub struct Resolution {
     /// What was decided for each `is` and `as` expression, by its id; only
     /// a program that has one has entries.
     tests: HashMap<ExprId, TestResolution>,
+    /// Each field access that reads a function's meta, `func.versions`, by
+    /// its id, with the meta's type and how the meta is awaited before its
+    /// field is read (see [Metas](#metas)); only a program that reads one
+    /// has entries.
+    meta_reads: HashMap<ExprId, (TyId, AwaitMark)>,
+    /// Each definition made with a def-type that declares a meta, by its
+    /// function, with the cell of the top level's frame that holds its
+    /// meta's closure (see [Metas](#metas)).
+    metas: Vec<(FnId, Slot)>,
 }
 
 /// What a `break`, `continue` or `return` item is for (see
@@ -3454,6 +3537,23 @@ impl Resolution {
         self.tests.get(&id)
     }
 
+    /// If the field access `id` reads a function's meta (see
+    /// [Metas](#metas)): the meta's type, before any await, and how the
+    /// meta is awaited before its field is read. `None` for any other
+    /// expression.
+    #[must_use]
+    pub fn meta_read(&self, id: ExprId) -> Option<(TyId, AwaitMark)> {
+        self.meta_reads.get(&id).copied()
+    }
+
+    /// Each definition made with a def-type that declares a meta, by its
+    /// function, with the cell of the top level's frame that holds its
+    /// meta's closure, which lowering gives its code (see [Metas](#metas)).
+    #[must_use]
+    pub fn metas(&self) -> &[(FnId, Slot)] {
+        &self.metas
+    }
+
     /// How the path of item `id` resolves: [`PathResolution::NONE`] if it
     /// is not a dotted declaration or builds its record from nothing.
     ///
@@ -3527,6 +3627,8 @@ impl Resolution {
             loops: Vec::new(),
             returned_blocks: HashSet::new(),
             tests: HashMap::new(),
+            meta_reads: HashMap::new(),
+            metas: Vec::new(),
         }
     }
 
@@ -4674,6 +4776,13 @@ pub struct Checker<'a> {
     definitions: HashMap<FnId, DefTypeId>,
     /// The function expressions of the input's `def`s marked `#[def_type]`.
     def_type_fns: HashSet<FnId>,
+    /// The definition's meta each function expression of the input's
+    /// outermost block is, if it is one (see [Metas](#metas)).
+    defmetas: HashMap<FnId, DefTypeId>,
+    /// See [`Resolution::meta_read`].
+    meta_reads: HashMap<ExprId, (TyId, AwaitMark)>,
+    /// See [`Resolution::metas`].
+    metas: Vec<(FnId, Slot)>,
     /// What the innermost block's spread items have done so far.
     spreads: BlockSpreads,
     /// The next free slot.
@@ -4868,6 +4977,9 @@ impl<'a> Checker<'a> {
             def_fields: Vec::new(),
             definitions: HashMap::new(),
             def_type_fns: HashSet::new(),
+            defmetas: HashMap::new(),
+            meta_reads: HashMap::new(),
+            metas: Vec::new(),
             spreads: BlockSpreads::None,
             next_slot,
             frame_size: next_slot,
@@ -4942,6 +5054,7 @@ impl<'a> Checker<'a> {
         let scope_slot_names = self.scope_slot_names();
         let (cell_types, shared_children) = self.cell_tables();
         let measured = self.measured();
+        let field_cells = self.tree_cells();
         // Spans and function ids are meaningless for a later input, which
         // has its own source and tree.
         let bindings = self
@@ -4958,13 +5071,6 @@ impl<'a> Checker<'a> {
             .top_fns
             .iter()
             .map(|top| (top.item, top.made))
-            .collect();
-        // The tree's cells: the view's are in `view_records`.
-        let field_cells = self
-            .field_cells
-            .iter()
-            .take(self.mentions.tree.nodes.len())
-            .map(|cell| cell.slot)
             .collect();
         let field_schedule = FieldSchedule {
             tree: std::mem::take(&mut self.mentions.tree),
@@ -5004,6 +5110,8 @@ impl<'a> Checker<'a> {
                 loops: self.loop_resolutions,
                 returned_blocks: self.returned_blocks,
                 tests: self.tests,
+                meta_reads: self.meta_reads,
+                metas: self.metas,
             },
         };
         let mut warnings = self.warnings;
@@ -5019,6 +5127,16 @@ impl<'a> Checker<'a> {
             cell_types,
             warnings,
         })
+    }
+
+    /// The cells of the nodes of the input's tree of top-level fields, by
+    /// their indices there: the view's are in `view_records`.
+    fn tree_cells(&self) -> Vec<Slot> {
+        self.field_cells
+            .iter()
+            .take(self.mentions.tree.nodes.len())
+            .map(|cell| cell.slot)
+            .collect()
     }
 
     /// Whether, after a check that found no error, every expression has a
@@ -5151,9 +5269,10 @@ impl<'a> Checker<'a> {
                 }
                 ItemKind::Spread(value) => self.check_spread_item(id, value, root),
                 ItemKind::Import(_) => self.check_import(id, item.span),
-                // A definition is placed as the walk reaches it, whether or
-                // not it is a top-level function (`Checker::reach_top_fn`).
-                ItemKind::Type { .. } | ItemKind::DefTypeDef { .. } => {}
+                // A definition, and a meta, is placed as the walk reaches it,
+                // whether or not it is a top-level function
+                // (`Checker::reach_top_fn`).
+                ItemKind::Type { .. } | ItemKind::DefTypeDef { .. } | ItemKind::DefMeta { .. } => {}
                 ItemKind::Result(value) => {
                     let ty = match result_expected {
                         Some(expected) => {
@@ -5465,7 +5584,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Spread(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
-            | ItemKind::DefTypeDef { .. } => false,
+            | ItemKind::DefTypeDef { .. }
+            | ItemKind::DefMeta { .. } => false,
         }
     }
 
@@ -7507,9 +7627,12 @@ impl<'a> Checker<'a> {
                 let Some(leaf) = top.leaf else {
                     continue;
                 };
-                let ty = match (self.definitions.get(&top.function), definitions) {
-                    (Some(&def), true) => self.definition_type(def),
-                    (None, false) => self.declared_type(top.function),
+                let defmeta = self.defmetas.get(&top.function).copied();
+                let ty = match (self.definitions.get(&top.function), defmeta, definitions) {
+                    (Some(&def), _, true) => self.definition_type(def),
+                    // A meta is the function its def-type's meta makes.
+                    (None, Some(def), true) => self.defmeta_type(def),
+                    (None, None, false) => self.declared_type(top.function),
                     _ => continue,
                 };
                 if let Some(cell) = self.field_cells.get_mut(leaf as usize) {
@@ -7520,8 +7643,9 @@ impl<'a> Checker<'a> {
     }
 
     /// As the input starts: finds which function expressions of its
-    /// outermost block are definitions made with a def-type, and which are
-    /// `def`s marked `#[def_type]` (see [Def-types](#def-types)).
+    /// outermost block are definitions made with a def-type, which are
+    /// definitions' metas, and which are `def`s marked `#[def_type]` (see
+    /// [Def-types](#def-types)).
     fn find_def_types(&mut self) {
         let ast = self.ast;
         for &id in ast.items(ast.root()) {
@@ -7529,6 +7653,11 @@ impl<'a> Checker<'a> {
                 ItemKind::DefTypeDef { def, value } => {
                     if let ExprKind::Fn(function) = ast.get(value).kind {
                         self.definitions.insert(function, def);
+                    }
+                }
+                ItemKind::DefMeta { def, value } => {
+                    if let ExprKind::Fn(function) = ast.get(value).kind {
+                        self.defmetas.insert(function, def);
                     }
                 }
                 ItemKind::Field {
@@ -7557,6 +7686,22 @@ impl<'a> Checker<'a> {
         self.warnings.truncate(warnings);
         self.def_type_signature(ty)
             .map_or(TyId::ERROR, |(function, _)| function)
+    }
+
+    /// The type of the definition's meta `def`, before its body is checked:
+    /// the function of no parameters, of the effect of its marker, returning
+    /// its type, that the meta of the function type its def-type gives its
+    /// definitions makes, read quietly; `Error` if its def-type is not one or
+    /// declares no meta, which its own check reports (see [Metas](#metas)).
+    fn defmeta_type(&mut self, def: DefTypeId) -> TyId {
+        let function = self.definition_type(def);
+        match self.types.fn_sig(function).and_then(|sig| sig.meta) {
+            Some(meta) => {
+                let none: [(Option<Name>, TyId); 0] = [];
+                self.types.fn_type(none, meta.ty, meta.effect)
+            }
+            None => TyId::ERROR,
+        }
     }
 
     /// The function type of the definitions a def-type of type `ty` makes,
@@ -7914,9 +8059,9 @@ impl<'a> Checker<'a> {
         let mut fields = Vec::new();
         let mut erroneous = false;
         for (name, child) in workspace.target_fields(target) {
-            // A def-type's namespace binds nothing a record holds (see
-            // [Def-types](#def-types)).
-            if crate::names::key_def_type(self.ast.names().get(name)).is_some() {
+            // A def-type's namespace, or its metas', binds nothing a record
+            // holds (see [Def-types](#def-types)).
+            if crate::names::is_namespace_key(self.ast.names().get(name)) {
                 continue;
             }
             let (slot, ty) = match child {
@@ -8761,11 +8906,13 @@ impl<'a> Checker<'a> {
     /// namespace, or reports, as such ([`Checker::place_definition`]).
     fn reach_top_fn(&mut self, id: ItemId) -> bool {
         let Some(index) = self.top_fns.iter().position(|top| top.item == id) else {
-            // A definition made with a def-type that is no top-level
-            // function: one whose `DT` is no def-type, or that the rules of
-            // dotted fields reject in its namespace (see
+            // A definition made with a def-type, or a definition's meta, that
+            // is no top-level function: one whose `DT` is no def-type, or
+            // that the rules of dotted fields reject in its namespace (see
             // [Def-types](#def-types)).
-            if let ItemKind::DefTypeDef { def, value } = self.ast.item(id).kind {
+            if let ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } =
+                self.ast.item(id).kind
+            {
                 self.place_definition(id, def, value);
                 return true;
             }
@@ -8836,9 +8983,12 @@ impl<'a> Checker<'a> {
                 self.check_dotted_field(id, segments, (None, value), None);
             }
             // A definition made with a def-type: the dotted field of its
-            // path under its namespace's key, apart from the input's record
-            // (see [Def-types](#def-types)).
-            ItemKind::DefTypeDef { def, value } => self.place_definition(id, def, value),
+            // path under its namespace's key, apart from the input's record;
+            // a definition's meta likewise, under its meta key (see
+            // [Def-types](#def-types)).
+            ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
+                self.place_definition(id, def, value);
+            }
             _ => return,
         }
         let Some(top) = self.top_fns.get_mut(index) else {
@@ -8883,9 +9033,25 @@ impl<'a> Checker<'a> {
 
     /// The path of the definition `def` made with a def-type under its
     /// def-type's namespace: the namespace's key, written where its `DT` is,
-    /// then its path; `None` if its `DT` is no def-type.
+    /// then its path; for a definition's meta, its leaf, the meta key,
+    /// written where its `DT` is, then its path as one name, written where
+    /// its path is; `None` if its `DT` is no def-type.
     fn definition_path(&self, def: DefTypeId) -> Option<Vec<PathSegment>> {
         let use_ = self.ast.def_type(def);
+        if use_.role == DefTypeRole::Meta {
+            let (key, leaf) = use_.meta?;
+            let path = path_span(self.ast.path(use_.path));
+            return Some(vec![
+                PathSegment {
+                    kind: SegmentKind::Name(key),
+                    span: self.ast.get(use_.dt).span,
+                },
+                PathSegment {
+                    kind: SegmentKind::Name(leaf),
+                    span: path,
+                },
+            ]);
+        }
         let key = PathSegment {
             kind: SegmentKind::Name(use_.key?),
             span: self.ast.get(use_.dt).span,
@@ -8973,7 +9139,162 @@ impl<'a> Checker<'a> {
         (self.next_slot, self.frame_size) = (0, 0);
         self.check_fn_body(&decl, base, (None, ty, span), sig.ret);
         self.fn_params.truncate(base);
+        // Its meta's cell, read as its body reads a top-level function.
+        self.definition_meta(function, def, sig.meta);
         self.finish_function(decl.params.len(), None);
+        ty
+    }
+
+    /// Resolves the read of its meta of the definition `def` made with a
+    /// def-type, of function `function`, whose def-type declares `meta` for
+    /// its definitions, if it does (see [Metas](#metas)): the cell of the
+    /// meta of its path that its directory declares, read as a reference to
+    /// it is, whose slot the definition's code names, so that reading the
+    /// meta of a closure of it calls the closure in it. A definition whose
+    /// directory declares none is "`package dev.peios.x` has no `defmeta` in
+    /// its directory", at its def-type and path, noted "`package` declares a
+    /// meta, `META-> PackageMeta`, for each of its definitions". The read is
+    /// typed `{}`, and nothing else is done, when the def-type declares no
+    /// meta, when the directory declares none, and for a shadowed
+    /// definition, which is never made.
+    fn definition_meta(&mut self, function: FnId, def: DefTypeId, meta: Option<Meta>) {
+        let use_ = *self.ast.def_type(def);
+        let Some(read) = use_.meta_read else {
+            return;
+        };
+        let unread = |checker: &mut Self| {
+            let mut at = read;
+            loop {
+                checker.expr_types[at.index()] = TyId::EMPTY;
+                match checker.ast.get(at).kind {
+                    ExprKind::Field { expr, .. } => at = expr,
+                    _ => break,
+                }
+            }
+        };
+        let Some(meta) = meta else {
+            unread(self);
+            return;
+        };
+        let unpaired = use_.meta.is_none()
+            || self
+                .workspace
+                .is_some_and(|workspace| workspace.unpaired(def));
+        if !unpaired && self.checking_shadowed {
+            unread(self);
+            return;
+        }
+        let read_ty = if unpaired {
+            None
+        } else {
+            self.field_reference(read)
+        };
+        let slot = match self.expr_vars[read.index()] {
+            VarRef::Local(slot) | VarRef::Fn(slot) => Some(slot),
+            _ => None,
+        };
+        if let (Some(ty), Some(slot)) = (read_ty, slot) {
+            self.expr_types[read.index()] = ty;
+            self.metas.push((function, slot));
+        } else {
+            unread(self);
+            self.no_defmeta(def, meta);
+        }
+    }
+
+    /// Reports the definition `def` made with a def-type whose def-type
+    /// declares `meta` for its definitions and whose directory declares none
+    /// for it: "`package dev.peios.x` has no `defmeta` in its directory", at
+    /// its def-type and path, noted "`package` declares a meta, `META->
+    /// PackageMeta`, for each of its definitions", the meta as the def-type's
+    /// declaration writes it if the workspace has it, else as its type shows
+    /// (see [Metas](#metas)).
+    fn no_defmeta(&mut self, def: DefTypeId, meta: Meta) {
+        let use_ = *self.ast.def_type(def);
+        let (shown, path) = self.ast.show_def_type(def);
+        let at = Span::join(
+            self.ast.get(use_.dt).span,
+            path_span(self.ast.path(use_.path)),
+        );
+        let written = use_.key.and_then(|key| {
+            self.workspace
+                .and_then(|workspace| workspace.meta_written(key, self.ast.names()))
+        });
+        let written = written.unwrap_or_else(|| {
+            // Bare as written, its either shapes those the marker makes.
+            let ty = if meta.effect == Effect::Pure {
+                meta.ty
+            } else {
+                self.types.present(meta.ty)
+            };
+            let ty = self.types.display(ty, self.ast.names()).to_string();
+            format!("{} {ty}", meta.effect.meta_marker())
+        });
+        self.errors.push(
+            Diagnostic::error(
+                format!("`{shown} {path}` has no `defmeta` in its directory"),
+                at,
+            )
+            .with_note(format!(
+                "`{shown}` declares a meta, `{written}`, for each of its definitions"
+            )),
+        );
+    }
+
+    /// Types the function expression `id`, of function `function`, the
+    /// definition's meta `def`, and checks its body (see [Metas](#metas)):
+    /// its type is the function of no parameters, of the effect of its
+    /// marker, returning its type, that the meta its def-type declares for
+    /// its definitions makes, which its body is checked against, as the
+    /// body of such a function. A def-type that declares none is
+    /// "`package` declares no meta for its definitions", at the meta's
+    /// `defmeta` through its path. `Error` if its def-type is not one, which
+    /// its own check reports, or declares no meta.
+    fn check_defmeta(&mut self, id: ExprId, function: FnId, def: DefTypeId) -> TyId {
+        self.callee_name = None;
+        let decl = *self.ast.fn_decl(function);
+        let use_ = *self.ast.def_type(def);
+        let dt_ty = self.check_expr(use_.dt);
+        let Some((definition, _)) = self.def_type_signature(dt_ty) else {
+            return TyId::ERROR;
+        };
+        let Some(meta) = self.types.fn_sig(definition).and_then(|sig| sig.meta) else {
+            let (shown, _) = self.ast.show_def_type(def);
+            self.errors.push(
+                Diagnostic::error(
+                    format!("`{shown}` declares no meta for its definitions"),
+                    use_.span,
+                )
+                .with_note(
+                    "a def-type declares one by its definition parameter's type, as in `func: \
+                     fn(): PackageDef META: PackageMeta`",
+                ),
+            );
+            return TyId::ERROR;
+        };
+        let none: [(Option<Name>, TyId); 0] = [];
+        let ty = self.types.fn_type(none, meta.ty, meta.effect);
+        self.expr_types[id.index()] = ty;
+        let span = self.ast.get(id).span;
+        let dt_span = self.ast.get(use_.dt).span;
+        self.functions.push(Function {
+            fn_id: function,
+            bindings_start: self.bindings.len(),
+            outer_next_slot: self.next_slot,
+            outer_frame_size: self.frame_size,
+            outer_slot_names: std::mem::take(&mut self.slot_names),
+            captures: Vec::new(),
+            effect: meta.effect,
+            marker: dt_span,
+            keyword: dt_span,
+            demanded: Vec::new(),
+            result: Some((meta.ty, dt_span)),
+            returns: Vec::new(),
+        });
+        (self.next_slot, self.frame_size) = (0, 0);
+        let base = self.fn_params.len();
+        self.check_fn_body(&decl, base, (None, ty, span), meta.ty);
+        self.finish_function(0, None);
         ty
     }
 
@@ -9562,6 +9883,14 @@ impl<'a> Checker<'a> {
                     (None, ItemKind::Field { path, .. }) => {
                         self.ast.show_path(self.ast.path(path)).to_string()
                     }
+                    // A definition's meta, as `defmeta`, its def-type and its
+                    // path.
+                    (None, ItemKind::DefMeta { def, .. }) => self
+                        .ast
+                        .def_type(def)
+                        .meta
+                        .map(|(key, leaf)| crate::names::show_path(names, &[key, leaf]))
+                        .unwrap_or_default(),
                     (None, _) => String::new(),
                 }
             }
@@ -10306,6 +10635,7 @@ impl<'a> Checker<'a> {
                 params,
                 ret,
                 effect,
+                meta,
             } => {
                 // A function type has its own rule, whatever surrounds it.
                 let (params_mode, ret_mode) = bareness_of(effect);
@@ -10317,7 +10647,14 @@ impl<'a> Checker<'a> {
                     self.fn_params.push((param.name, param_ty));
                 }
                 let ret = self.resolve_type(ret, ret_mode);
-                let resolved = self.intern_fn_type(base, ret, effect);
+                let meta = meta.map(|meta| self.resolve_meta(meta));
+                // An erroneous meta makes the type erroneous.
+                let ret = if matches!(meta, Some(None)) {
+                    TyId::ERROR
+                } else {
+                    ret
+                };
+                let resolved = self.intern_fn_type_with_meta(base, ret, effect, meta.flatten());
                 self.fn_params.truncate(base);
                 resolved
             }
@@ -10590,11 +10927,50 @@ impl<'a> Checker<'a> {
     /// and whose return type is `ret`, of effect `effect`, or returns
     /// `Error` if any of them is erroneous, having been reported.
     fn intern_fn_type(&mut self, base: usize, ret: TyId, effect: Effect) -> TyId {
+        self.intern_fn_type_with_meta(base, ret, effect, None)
+    }
+
+    /// [`Checker::intern_fn_type`], the function type having the meta
+    /// `meta`, if it has one (see [Metas](#metas)).
+    fn intern_fn_type_with_meta(
+        &mut self,
+        base: usize,
+        ret: TyId,
+        effect: Effect,
+        meta: Option<Meta>,
+    ) -> TyId {
         let params = self.fn_params.get(base..).unwrap_or_default();
         if ret == TyId::ERROR || params.iter().any(|&(_, ty)| ty == TyId::ERROR) {
             return TyId::ERROR;
         }
-        self.types.fn_type(params.iter().copied(), ret, effect)
+        self.types
+            .fn_type_with_meta(params.iter().copied(), ret, effect, meta)
+    }
+
+    /// The meta the function type's meta written as `meta` denotes (see
+    /// [Metas](#metas)): its type resolved as a return type of its marker's
+    /// effect is, either-shaped under `META->` and `META->>` and present under
+    /// `META:` where it is bare, which must be a record type once every
+    /// `Future` is taken off it, "a meta must be a record type: its fields
+    /// are read from the function" otherwise, at the type. `None` if it is
+    /// erroneous, reported.
+    fn resolve_meta(&mut self, meta: MetaTy) -> Option<Meta> {
+        let (_, mode) = bareness_of(meta.effect);
+        let ty = self.resolve_type(meta.ty, mode);
+        if ty == TyId::ERROR {
+            return None;
+        }
+        if !self.types.is_record(self.types.strip(ty)) {
+            self.errors.push(Diagnostic::error(
+                "a meta must be a record type: its fields are read from the function",
+                self.ast.type_expr(meta.ty).span,
+            ));
+            return None;
+        }
+        Some(Meta {
+            effect: meta.effect,
+            ty,
+        })
     }
 
     /// Checks that `expr`, of type `found`, can have type `expected`: an
@@ -11936,6 +12312,9 @@ impl<'a> Checker<'a> {
         if let Some(&def) = self.definitions.get(&function) {
             return self.check_definition(id, function, def);
         }
+        if let Some(&def) = self.defmetas.get(&function) {
+            return self.check_defmeta(id, function, def);
+        }
         let callee = self.callee_name.take();
         let decl = *self.ast.fn_decl(function);
         let pure = decl.effect == Effect::Pure;
@@ -12084,7 +12463,10 @@ impl<'a> Checker<'a> {
                 every.push((name, present));
                 blocks.push(block);
             }
-            let ty = self.types.fn_type(params, sig.ret, sig.effect);
+            // A meta is kept as declared: only parameters are narrowed.
+            let ty = self
+                .types
+                .fn_type_with_meta(params, sig.ret, sig.effect, sig.meta);
             if ty != declared {
                 if let Some(entry) = self.fn_params.get_mut(base + callback.param) {
                     entry.1 = ty;
@@ -12092,7 +12474,9 @@ impl<'a> Checker<'a> {
                 narrowed = true;
             }
             if blocks.iter().any(Option::is_some) {
-                let every = self.types.fn_type(every, sig.ret, sig.effect);
+                let every = self
+                    .types
+                    .fn_type_with_meta(every, sig.ret, sig.effect, sig.meta);
                 if unnarrowed.is_empty() {
                     unnarrowed.resize(count, None);
                 }
@@ -13560,6 +13944,10 @@ impl<'a> Checker<'a> {
         if record_ty == TyId::ERROR || record_ty == self.never {
             return record_ty;
         }
+        // A field of a function with a meta is the meta's.
+        if let Some(meta) = self.types.fn_sig(record_ty).and_then(|sig| sig.meta) {
+            return self.meta_read(id, record, meta, name);
+        }
         if let Some(ty) = self.field_of(record_ty, name) {
             return ty;
         }
@@ -13585,6 +13973,74 @@ impl<'a> Checker<'a> {
             error = error.with_note(note);
         }
         self.errors.push(error);
+        TyId::ERROR
+    }
+
+    /// Types the field access `id`, `func.name`, which reads the meta `meta`
+    /// of `func`, the function `record` evaluates to (see [Metas](#metas)):
+    /// the type of the meta's field `name`. Reading it is calling the meta's
+    /// closure, of the meta's effect: from a pure function, a `META->` or
+    /// `META->>` meta is "cannot read an impure meta from a pure function",
+    /// labelled "reading the meta of `func` is impure (`META->`)" at `func`
+    /// and at the function's marker, as calling an impure function is. A
+    /// meta that may be a future is awaited at the top, subject to the
+    /// purity rule, as a record a field access reads is, unless the read is
+    /// already that error. A field the meta lacks is "the meta of `func` has
+    /// no field `x`", at the `.NAME`, noted with the meta's fields. Recorded
+    /// for lowering ([`Resolution::meta_read`]).
+    fn meta_read(&mut self, id: ExprId, record: ExprId, meta: Meta, name: Name) -> TyId {
+        let subject = match self.ast.get(record).kind {
+            ExprKind::Name(func) => format!("the meta of `{}`", self.ast.names().get(func)),
+            _ => "the meta of this function".to_owned(),
+        };
+        let mut impure = false;
+        if meta.effect != Effect::Pure
+            && let Some(function) = self.functions.last()
+            && function.effect == Effect::Pure
+        {
+            impure = true;
+            let marker = function.marker;
+            let label = format!(
+                "reading {subject} is impure (`{}`)",
+                meta.effect.meta_marker()
+            );
+            self.errors.push(
+                Diagnostic::error(
+                    "cannot read an impure meta from a pure function",
+                    self.ast.get(id).span,
+                )
+                .with_context(self.ast.get(record).span, label)
+                .with_context(marker, PURE_CONTEXT)
+                .with_note(
+                    "a pure function, declared with `:`, may read only pure metas, `META:`; \
+                     declare it with `->` to make it impure",
+                ),
+            );
+        }
+        let mut mark = AwaitMark::None;
+        let mut ty = meta.ty;
+        if self.types.laziness(ty) != Laziness::Present {
+            mark = AwaitMark::Top;
+            if !impure && let Some(marker) = self.pure_marker() {
+                let error = self.implicit_await_error(self.ast.get(id).span, ty, marker, None);
+                self.errors.push(error);
+            }
+            ty = self.types.strip(ty);
+        }
+        self.meta_reads.insert(id, (meta.ty, mark));
+        if let Some(field) = self.types.field(ty, name) {
+            return field;
+        }
+        let expr = self.ast.get(id);
+        let member = expr.member_span(self.ast).unwrap_or(expr.span);
+        let text = FieldName(self.ast.names().get(name));
+        let note = self
+            .types
+            .record_fields(ty)
+            .map_or_else(String::new, |fields| self.field_list(fields));
+        self.errors.push(
+            Diagnostic::error(format!("{subject} has no field `{text}`"), member).with_note(note),
+        );
         TyId::ERROR
     }
 
@@ -15268,7 +15724,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Return(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
-            | ItemKind::DefTypeDef { .. } => {}
+            | ItemKind::DefTypeDef { .. }
+            | ItemKind::DefMeta { .. } => {}
         }
     }
 
@@ -16138,7 +16595,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Return(_)
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
-            | ItemKind::DefTypeDef { .. } => {}
+            | ItemKind::DefTypeDef { .. }
+            | ItemKind::DefMeta { .. } => {}
         }
     }
 
@@ -17202,7 +17660,8 @@ mod tests {
                 | ItemKind::Spread(value)
                 | ItemKind::Result(value)
                 | ItemKind::Expr(value)
-                | ItemKind::DefTypeDef { value, .. } => {
+                | ItemKind::DefTypeDef { value, .. }
+                | ItemKind::DefMeta { value, .. } => {
                     visit(ast, value, out);
                 }
                 ItemKind::Break(_)

@@ -191,6 +191,23 @@
 //! namespace's key ([`Ast::set_def_type_key`]): it is then an ordinary
 //! reference to the definition's cell.
 //!
+//! A function type may have a *meta*, written after its return type with
+//! a marker of its own, `fn(v: Version): PackageDef META-> PackageMeta`: a
+//! [`MetaTy`] in its [`TypeExprKind::Fn`]. A definition's meta is declared
+//! by `defmeta DT PATH { ... }` or `defmeta DT PATH = EXPR`,
+//! [`ItemKind::DefMeta`], whose [`DefTypeUse`] has its def-type and path as
+//! a definition's does, and whose value is a function expression of no
+//! parameters, written nowhere, whose body is the block, or a block whose
+//! result is the expression; like a definition's, it has no return type
+//! and a marker that means nothing, both being the meta's its def-type
+//! declares. A definition and a meta are each, once the workspace has found
+//! their def-type, also given the leaf of the meta in the namespace of the
+//! metas of the def-type's definitions in their file's directory (see
+//! [`crate::names`], "Namespace keys"), and a definition holds the read of
+//! that leaf, a name with a field access, which its workspace makes a
+//! reference to the meta's cell as it makes a reference's read one to the
+//! definition's.
+//!
 //! # Attributes
 //!
 //! An item of a file's outermost block may be marked `#[shadowable]` or
@@ -388,12 +405,26 @@ impl DefTypeId {
     }
 }
 
+/// Which use of a def-type a [`DefTypeUse`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DefTypeRole {
+    /// A definition, `def DT PATH(PARAMS) BODY`.
+    Definition,
+    /// A reference, `DT PATH`.
+    Reference,
+    /// The meta of a definition, `defmeta DT PATH { ... }`.
+    Meta,
+}
+
 /// A use of a def-type, a definition made with it, `def DT PATH(PARAMS)
-/// BODY` ([`ItemKind::DefTypeDef`]), or a reference to one, `DT PATH`
-/// ([`ExprKind::DefTypeRef`]): what does not fit in their nodes, in the
+/// BODY` ([`ItemKind::DefTypeDef`]), a reference to one, `DT PATH`
+/// ([`ExprKind::DefTypeRef`]), or a definition's meta, `defmeta DT PATH {
+/// ... }` ([`ItemKind::DefMeta`]): what does not fit in their nodes, in the
 /// tree's def-type arena (see [Def-types](#def-types)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DefTypeUse {
+    /// Which use it is.
+    pub role: DefTypeRole,
     /// The def-type, `DT`, as it is written: a name, or a chain of field
     /// accesses directly on one, an expression of the tree read as any value
     /// is, which is not among the expressions of the item or the reference
@@ -412,8 +443,22 @@ pub struct DefTypeUse {
     /// once the workspace has found DT to be a def-type; `None` until then,
     /// and for good when it is not one.
     pub key: Option<Name>,
+    /// For a definition and a meta, the leaf of PATH in the namespace of
+    /// the metas of DT's definitions in the directory of the tree's file,
+    /// once the workspace has found DT to be a def-type: that namespace's
+    /// key and PATH as one name (see [`crate::names`], "Namespace keys");
+    /// `None` until then, and for a reference.
+    pub meta: Option<(Name, Name)>,
+    /// For a definition, the read of its meta: a name standing for the
+    /// namespace of the metas with a field access for PATH, as a reference's
+    /// read of its definition, which the workspace makes the read of the
+    /// meta's cell as it gives the definition its key
+    /// ([`Ast::set_def_type_key`]), outside the item's subtree but before it
+    /// in the arena; `None` for a reference and a meta.
+    pub meta_read: Option<ExprId>,
     /// For a definition, its parameter list, `(` through `)`; for a
-    /// reference, the whole of it, DT through PATH.
+    /// reference, the whole of it, DT through PATH; for a meta, its
+    /// `defmeta` through its PATH.
     pub span: Span,
 }
 
@@ -724,6 +769,18 @@ impl Effect {
         }
     }
 
+    /// The marker of a function type's meta of this effect, as it is
+    /// written and shown: `META:`, `META->>` or `META->` (see
+    /// [Types](#types)).
+    #[must_use]
+    pub const fn meta_marker(self) -> &'static str {
+        match self {
+            Effect::Pure => "META:",
+            Effect::Memo => "META->>",
+            Effect::Impure => "META->",
+        }
+    }
+
     /// The effect's name, as the tree's and the IR's debug forms show it:
     /// `pure`, `memo` or `impure`.
     #[must_use]
@@ -872,7 +929,9 @@ pub fn path_span(segments: &[PathSegment]) -> Span {
 /// in brackets, with the source text of its position, as in `server.port`,
 /// `"log level".format` or `conf.hosts[i + 1].up`; a first name that is a
 /// namespace key as its def-type and a space, as a definition is written,
-/// `package dev.peios.testpkg` (see [`crate::names`], "Namespace keys").
+/// `package dev.peios.testpkg`, and one that is a meta key as `defmeta`, its
+/// def-type and a space, the meta's path after it as written, `defmeta
+/// package dev.peios.testpkg` (see [`crate::names`], "Namespace keys").
 /// Returned by [`Ast::show_path`].
 #[derive(Clone, Copy, Debug)]
 pub struct PathDisplay<'a> {
@@ -888,6 +947,8 @@ impl fmt::Display for PathDisplay<'_> {
         // path reads as a definition is written (see [`crate::names`],
         // "Namespace keys"), and `.` otherwise.
         let mut separator = "";
+        // Whether the name is a meta's path as one name, shown as written.
+        let mut meta = false;
         for (index, segment) in self.segments.iter().enumerate() {
             match segment.kind {
                 SegmentKind::Name(name) => {
@@ -899,8 +960,19 @@ impl fmt::Display for PathDisplay<'_> {
                         separator = " ";
                         continue;
                     }
+                    if index == 0
+                        && let Some(def_type) = crate::names::key_meta(text)
+                    {
+                        write!(f, "defmeta {def_type}")?;
+                        (separator, meta) = (" ", true);
+                        continue;
+                    }
                     f.write_str(separator)?;
-                    FieldName(text).fmt(f)?;
+                    if std::mem::take(&mut meta) {
+                        f.write_str(text)?;
+                    } else {
+                        FieldName(text).fmt(f)?;
+                    }
                     separator = ".";
                 }
                 SegmentKind::Index { text, .. } => {
@@ -1462,6 +1534,20 @@ pub enum ItemKind {
         /// def-type's to say.
         value: ExprId,
     },
+    /// `defmeta DT PATH { ... }` or `defmeta DT PATH = EXPR`: the meta of
+    /// the definition `def DT PATH(...)` of the same directory (see
+    /// [Def-types](#def-types)). It binds nothing a source can read: it is
+    /// reached only through its definition. Only ever an item of a file's
+    /// outermost block.
+    DefMeta {
+        /// Its def-type and path, in the def-type arena.
+        def: DefTypeId,
+        /// A function expression of no parameters whose body is the block,
+        /// or a block whose result is the expression; its return type and
+        /// its marker, which it does not write, are the meta's its def-type
+        /// declares.
+        value: ExprId,
+    },
 }
 
 impl ItemKind {
@@ -1477,7 +1563,8 @@ impl ItemKind {
             | ItemKind::Spread(value)
             | ItemKind::Result(value)
             | ItemKind::Expr(value)
-            | ItemKind::DefTypeDef { value, .. } => Some(value),
+            | ItemKind::DefTypeDef { value, .. }
+            | ItemKind::DefMeta { value, .. } => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
             ItemKind::Import(_) | ItemKind::Type { .. } => None,
         }
@@ -1510,7 +1597,8 @@ pub enum TypeExprKind {
     /// and reported by the checker.
     Record(FieldTyRange),
     /// A function type, `fn(Int, name: String): Bool`, `fn(Int) ->> Int` or
-    /// `fn() -> Int`.
+    /// `fn() -> Int`, with a meta or not, as in `fn(v: Version): PackageDef
+    /// META-> PackageMeta` (see [Types](#types)).
     Fn {
         /// The parameters, each with its name if it has one.
         params: ParamTyRange,
@@ -1518,6 +1606,8 @@ pub enum TypeExprKind {
         ret: TypeExprId,
         /// What it may do, as its marker says: `:`, `->>` or `->`.
         effect: Effect,
+        /// Its meta, if it has one.
+        meta: Option<MetaTy>,
     },
     /// A name applied to a type argument, `NAME<TYPE>`, as in
     /// `Future<Int>`. The parser accepts any name; the checker knows which
@@ -1551,6 +1641,17 @@ pub enum TypeExprKind {
     /// if it is this one's to report, is among the tree's problems
     /// ([`Ast::type_problems`]). Never written.
     Invalid,
+}
+
+/// The meta of a function type expression, `META-> PackageMeta`: what its
+/// marker says reading it does, and its type (see [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MetaTy {
+    /// What reading it does, as its marker says: `META:` pure, `META->>`
+    /// memoised, `META->` impure.
+    pub effect: Effect,
+    /// Its type.
+    pub ty: TypeExprId,
 }
 
 /// A type as written in source, in an annotation or an ascription.
@@ -1696,6 +1797,7 @@ impl TypeArena {
                     params,
                     ret,
                     effect,
+                    meta,
                 } => {
                     let params: Vec<ParamTy> = from
                         .params(params)
@@ -1706,10 +1808,15 @@ impl TypeArena {
                         })
                         .collect();
                     let ret = self.copy(from, ret, memo, replace);
+                    let meta = meta.map(|meta| MetaTy {
+                        ty: self.copy(from, meta.ty, memo, replace),
+                        ..meta
+                    });
                     TypeExprKind::Fn {
                         params: self.push_params(&params),
                         ret,
                         effect,
+                        meta,
                     }
                 }
                 TypeExprKind::Applied { name, span, arg } => TypeExprKind::Applied {
@@ -1748,16 +1855,19 @@ impl TypeArena {
     }
 
     /// The children of the node `id`, as they are now: a record type's
-    /// fields' types, a function type's parameters' and return type, an
-    /// applied or list type's argument, a union's sides.
+    /// fields' types, a function type's parameters', return type and meta's,
+    /// an applied or list type's argument, a union's sides.
     fn children(&self, id: TypeExprId) -> Vec<TypeExprId> {
         match self.kind(id) {
             TypeExprKind::Record(range) => self.fields(range).iter().map(|f| f.ty).collect(),
-            TypeExprKind::Fn { params, ret, .. } => self
+            TypeExprKind::Fn {
+                params, ret, meta, ..
+            } => self
                 .params(params)
                 .iter()
                 .map(|p| p.ty)
                 .chain([ret])
+                .chain(meta.map(|meta| meta.ty))
                 .collect(),
             TypeExprKind::Applied { arg, .. } | TypeExprKind::List(arg) => vec![arg],
             TypeExprKind::Union { lhs, rhs, .. } => vec![lhs, rhs],
@@ -2606,6 +2716,27 @@ impl Ast {
         (0..parsed).map(TypeExprId)
     }
 
+    /// The type expression `id` as it is written in source, as the printer
+    /// shows it ([`Ast::pretty`]), its names shown with `names`: the tree's
+    /// own table, or, when the tree's is lent out, the table it is lent to.
+    #[must_use]
+    pub fn show_type_with(&self, id: TypeExprId, names: &Names) -> String {
+        /// The type, displayed.
+        struct Shown<'a>(WrittenType<'a>, TypeExprId);
+        impl fmt::Display for Shown<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.type_expr(f, self.1)
+            }
+        }
+        Shown(WrittenType { ast: self, names }, id).to_string()
+    }
+
+    /// The item numbered `number` of the tree, if it has one.
+    #[must_use]
+    pub fn item_at(&self, number: u32) -> Option<ItemId> {
+        (number < next_id(self.item_count())).then_some(ItemId(number))
+    }
+
     /// Returns the fields of the record type expression `range`, in source
     /// order.
     ///
@@ -2853,16 +2984,25 @@ impl Ast {
         (names.join("."), path)
     }
 
-    /// Gives the def-type definition or reference `id` `key`, the key of
-    /// its def-type's namespace, which the workspace found its `DT` names
-    /// (see [Def-types](#def-types)): a reference's read of the definition
-    /// is then of the namespace, its name made the key.
-    pub fn set_def_type_key(&mut self, id: DefTypeId, key: Name) {
+    /// Gives the def-type definition, reference or meta `id` `key`, the key
+    /// of its def-type's namespace, which the workspace found its `DT` names
+    /// (see [Def-types](#def-types)), and, for a definition or a meta,
+    /// `meta`, the key of the namespace of the metas of the def-type's
+    /// definitions in the directory of the tree's file and PATH as one name:
+    /// a reference's read of the definition is then of the namespace, its
+    /// name made the key, and a definition's read of its meta of the
+    /// namespace of the metas, its name made that key and its field access
+    /// PATH's one name.
+    pub fn set_def_type_key(&mut self, id: DefTypeId, key: Name, meta: Option<(Name, Name)>) {
         let Some(entry) = self.def_types.get_mut(id.index()) else {
             return;
         };
         entry.key = Some(key);
-        let mut at = entry.read;
+        if entry.role != DefTypeRole::Reference {
+            entry.meta = meta;
+        }
+        let (read, meta_read) = (entry.read, entry.meta_read);
+        let mut at = read;
         while let Some(node) = at.and_then(|node| self.exprs.get_mut(node.index())) {
             match node.kind {
                 ExprKind::Field { expr, .. } => at = Some(expr),
@@ -2871,6 +3011,16 @@ impl Ast {
                     break;
                 }
                 _ => break,
+            }
+        }
+        // A definition's read of its meta: the leaf's name, then the key's.
+        if let (Some(read), Some((meta_key, leaf))) = (meta_read, meta)
+            && let Some(node) = self.exprs.get_mut(read.index())
+            && let ExprKind::Field { expr, .. } = node.kind
+        {
+            node.kind = ExprKind::Field { expr, name: leaf };
+            if let Some(base) = self.exprs.get_mut(expr.index()) {
+                base.kind = ExprKind::Name(meta_key);
             }
         }
     }
@@ -3327,7 +3477,9 @@ impl Annotate for NoAnnotation {
 /// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
 /// would otherwise take the rest of the union; a list type written `T[]`
 /// prints so, its element type in parentheses if it is a function type or
-/// a union, `(fn(): Int)[]`; other parentheses in a type
+/// a union, `(fn(): Int)[]`; a function type's meta prints after its return
+/// type as written, `fn(): Int META-> {a: Int}`, the return type in
+/// parentheses if it is a function type; other parentheses in a type
 /// leave no trace in the tree and are not printed.
 /// Booleans print as `(bool true)`, string literals as `(str "text")` with
 /// the text quoted and escaped, and interpolated strings as `(interp ...)`
@@ -3339,7 +3491,11 @@ impl Annotate for NoAnnotation {
 /// `(def-type-def package dev.peios.testpkg ...)`, its def-type and its path
 /// as written, followed by its function, whose parameters are their names
 /// alone, as in `(params a b)`, with no `(ret ...)`; a reference to one as
-/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it.
+/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it;
+/// a definition's meta as `(defmeta package dev.peios.testpkg ...)`,
+/// followed by its function, of no parameters, with no `(ret ...)`, whose
+/// body is the block written, or for `defmeta DT PATH = EXPR` a block whose
+/// result is the expression.
 /// The file has no span. An item marked `#[shadowable]` or `#[def_type]` is
 /// preceded by the attribute, as in `#[shadowable] (field arch ...)` or
 /// `#[def_type] (def package ...)`, both `#[shadowable] #[def_type]` in that
@@ -3480,9 +3636,8 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.annotation.annotate_type(id, f)?;
                 return write!(f, " @{})", item.span);
             }
-            ItemKind::DefTypeDef { def, value } => {
-                let (def_type, path) = ast.show_def_type(def);
-                write!(f, "def-type-def {def_type} {path}")?;
+            ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
+                self.def_type_head(f, item.kind, def)?;
                 value
             }
         };
@@ -3498,6 +3653,24 @@ impl<A: Annotate> Pretty<'_, A> {
         }
         self.node(f, value, depth + 1)?;
         f.write_str(")")
+    }
+
+    /// Writes what an item of `kind`, a definition made with a def-type or a
+    /// definition's meta, whose use of its def-type is `def`, shows before
+    /// its span: `def-type-def` or `defmeta`, then its def-type and its path,
+    /// each as written.
+    fn def_type_head(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        kind: ItemKind,
+        def: DefTypeId,
+    ) -> fmt::Result {
+        let (def_type, path) = self.ast.show_def_type(def);
+        let keyword = match kind {
+            ItemKind::DefMeta { .. } => "defmeta",
+            _ => "def-type-def",
+        };
+        write!(f, "{keyword} {def_type} {path}")
     }
 
     /// Writes the rest of a `break` or `continue` item, `keyword`, whose
@@ -3533,10 +3706,38 @@ impl<A: Annotate> Pretty<'_, A> {
     /// made it, whatever the expansion of the tree's types made of it
     /// ([`Ast::written_type`]).
     fn type_expr(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
-        let names = self.ast.names();
+        WrittenType {
+            ast: self.ast,
+            names: self.ast.names(),
+        }
+        .type_expr(f, id)
+    }
+}
+
+/// The type expressions of a tree as they are written in source, their
+/// names shown with a table that need not be the tree's own: the printer's
+/// ([`Pretty`]), and [`Ast::show_type_with`]'s.
+struct WrittenType<'a> {
+    ast: &'a Ast,
+    names: &'a Names,
+}
+
+impl WrittenType<'_> {
+    /// Writes a type expression as it is written in source: as the parser
+    /// made it, whatever the expansion of the tree's types made of it
+    /// ([`Ast::written_type`]).
+    fn type_expr(&self, f: &mut fmt::Formatter<'_>, id: TypeExprId) -> fmt::Result {
+        let names = self.names;
         match self.ast.written_type(id) {
             TypeExprKind::Named(name) => f.write_str(names.get(name)),
-            TypeExprKind::Path(path) => write!(f, "{}", self.ast.show_path(self.ast.path(path))),
+            TypeExprKind::Path(path) => {
+                let shown = PathDisplay {
+                    names,
+                    strings: &self.ast.strings,
+                    segments: self.ast.path(path),
+                };
+                write!(f, "{shown}")
+            }
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;
                 for (index, field) in self.ast.field_tys(fields).iter().enumerate() {
@@ -3555,6 +3756,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 params,
                 ret,
                 effect,
+                meta,
             } => {
                 f.write_str("fn(")?;
                 for (index, param) in self.ast.param_tys(params).iter().enumerate() {
@@ -3567,7 +3769,13 @@ impl<A: Annotate> Pretty<'_, A> {
                     self.type_expr(f, param.ty)?;
                 }
                 f.write_str(effect.params_end())?;
-                self.type_expr(f, ret)
+                let Some(meta) = meta else {
+                    return self.type_expr(f, ret);
+                };
+                // A return type that is a function type would take the meta.
+                self.union_member(f, ret)?;
+                write!(f, " {} ", meta.effect.meta_marker())?;
+                self.type_expr(f, meta.ty)
             }
             TypeExprKind::Applied { name, arg, .. } => {
                 write!(f, "{}<", names.get(name))?;
@@ -3612,7 +3820,9 @@ impl<A: Annotate> Pretty<'_, A> {
             self.type_expr(f, id)
         }
     }
+}
 
+impl<A: Annotate> Pretty<'_, A> {
     /// Writes the parameters and return type of the function expression
     /// `id`, each on a line of its own at `depth`, with a leading newline.
     fn fn_head(&self, f: &mut fmt::Formatter<'_>, id: FnId, depth: usize) -> fmt::Result {

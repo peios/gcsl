@@ -1,0 +1,22 @@
+# A wrapper around the `ppk` package tool.
+#
+# Paths do not depend on gcsl's working directory: `content` is resolved
+# against the caller's directory, and output goes to the workspace's `_dist/`.
+import path
+import fileroot
+
+# Commits the directory `content`, relative to the calling file's directory,
+# as package `name` at `version` for `arch`, writing its blobs and manifest
+# under `_dist/` at the workspace root, and returns the manifest hash `ppk`
+# prints, trimmed. Panics unless `ppk` succeeds.
+def commit(name: String, version: String, arch: String, content: String) -> String {
+    let content = path.join(fileroot.caller, content)
+    let output = path.join(fileroot.workspace, "_dist")
+
+    let result = exec(["ppk", "commit", "--content", content, "--output", output, name, version, arch])
+    if result.status != 0 {
+        panic("`ppk commit` of {name} {version} {arch} exited with status {result.status}: {trim(result.stderr)}")
+    }
+    trim(result.stdout)
+}
+

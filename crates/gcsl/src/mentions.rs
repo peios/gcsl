@@ -83,6 +83,18 @@
 //! function, as a reference to a dotted `def` does. No declaration can
 //! shadow the key, which no source can write.
 //!
+//! A definition's meta, `defmeta DT PATH { ... }`, is a top-level function
+//! as a definition is, once the workspace has given it its leaf: the meta
+//! key of its def-type and directory, then its path as one name
+//! ([`top_level_function`], [`declarations`]; see [`crate::names`],
+//! "Namespace keys"). Its item mentions what its body does and what its DT
+//! reads. A definition's item also mentions, once its metas' namespace is
+//! known, what its read of its meta, that meta key with a field access for
+//! its path as one name, means: its meta's leaf and function, if its
+//! directory declares one, of its own file or another (whose file it then
+//! needs), so that the meta's closure exists before anything that uses the
+//! definition, and nothing if not.
+//!
 //! # Top-level fields
 //!
 //! The field items directly at the top level of an input, plain (`a = e`),
@@ -829,9 +841,10 @@ pub fn declarations(ast: &Ast) -> impl Iterator<Item = (usize, Vec<Name>, bool)>
 
 /// The path of the leaf the item `id` of an outermost block is, if it is a
 /// field item or a definition made with a def-type whose namespace is
-/// known, the definition's under its namespace's key (see
-/// [Def-types](#def-types)), with its value: the path's names, or `None`
-/// for a path with a segment that is not one.
+/// known, the definition's under its namespace's key, or a definition's
+/// meta whose namespace is known, the meta key and the meta's path as one
+/// name (see [Def-types](#def-types)), with its value: the path's names, or
+/// `None` for a path with a segment that is not one.
 fn leaf_path(ast: &Ast, id: ItemId) -> Option<(Option<Vec<Name>>, ExprId)> {
     match ast.item(id).kind {
         ItemKind::Field { path, value, .. } => Some((
@@ -845,6 +858,10 @@ fn leaf_path(ast: &Ast, id: ItemId) -> Option<(Option<Vec<Name>>, ExprId)> {
                 .collect::<Option<Vec<Name>>>();
             // A definition whose def-type is not known is in no tree.
             Some((Some(names?), value))
+        }
+        ItemKind::DefMeta { def, value } => {
+            let (key, leaf) = ast.def_type(def).meta?;
+            Some((Some(vec![key, leaf]), value))
         }
         _ => None,
     }
@@ -1449,6 +1466,15 @@ pub fn top_level_function(ast: &Ast, id: ItemId) -> Option<(Option<Name>, ExprId
             };
             return Some((None, value, function));
         }
+        // A definition's meta whose namespace is known: a leaf under the
+        // meta key.
+        ItemKind::DefMeta { def, value } => {
+            ast.def_type(def).meta?;
+            let ExprKind::Fn(function) = ast.get(value).kind else {
+                return None;
+            };
+            return Some((None, value, function));
+        }
         ItemKind::Let {
             path,
             value,
@@ -1613,7 +1639,9 @@ impl Walker<'_> {
     /// declares its root rather than reading it, so its path's first
     /// segment is a mention of a function of that name only.
     fn top_item(&mut self, id: ItemId) {
-        if let ItemKind::DefTypeDef { def, value } = self.ast.item(id).kind {
+        if let ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } =
+            self.ast.item(id).kind
+        {
             self.def_type_def(def, value);
         } else if let ItemKind::Field { path, value, .. } = self.ast.item(id).kind
             && let [first, _, ..] = self.ast.path(path)
@@ -1696,16 +1724,27 @@ impl Walker<'_> {
             // is a type's, read only in type positions (see
             // [Types](#types)).
             ItemKind::Import(_) | ItemKind::Type { .. } => {}
-            ItemKind::DefTypeDef { def, value } => self.def_type_def(def, value),
+            ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
+                self.def_type_def(def, value);
+            }
         }
     }
 
     /// Walks a definition made with a def-type, `def DT PATH(PARAMS) BODY`,
-    /// of def-type `def` and function `value`, which declares nothing a
-    /// variable can name: its body, and its `DT`, a read of the def-type,
-    /// whose type its function's is made from (see [Def-types](#def-types)).
+    /// or a definition's meta, `defmeta DT PATH { ... }`, of def-type `def`
+    /// and function `value`, which declares nothing a variable can name: its
+    /// body, its `DT`, a read of the def-type, whose type its function's is
+    /// made from, and, for a definition whose metas' namespace is known, its
+    /// read of its meta, the meta key with a field access for its path as
+    /// one name, which nothing can shadow: so a definition needs its meta, a
+    /// function of its own file or of another of its directory, which its
+    /// closure reads when the meta is read (see [Def-types](#def-types)).
     fn def_type_def(&mut self, def: DefTypeId, value: ExprId) {
-        self.expr(self.ast.def_type(def).dt);
+        let def = *self.ast.def_type(def);
+        self.expr(def.dt);
+        if let (Some(_), Some(read)) = (def.meta, def.meta_read) {
+            self.expr(read);
+        }
         self.expr(value);
     }
 

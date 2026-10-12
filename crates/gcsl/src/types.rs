@@ -77,6 +77,29 @@
 //! `fn(Int) -> Int`, whose bare parameter is the either shape, but is one of
 //! `fn(Present<Int>) -> Int`. That is the contravariance above, nothing new.
 //!
+//! # Metas
+//!
+//! A function type may have a *meta*, [`Meta`]: a record attached to its
+//! values, whose fields are read as the function's own, written after the
+//! return type with a marker of its own, `fn(v: Version): PackageDef META->
+//! PackageMeta`. The marker is an [`Effect`], as a function's is: `META:`
+//! (pure), `META->>` (memoised) or `META->` (impure); the meta's type is a
+//! record type, or a future or the either shape of one (see the checker's
+//! "Metas"). A meta is part of the type as interned and displayed: `fn():
+//! Int META: {a: Int}` and `fn(): Int` are different ids.
+//!
+//! A meta is purely additive. A function type with a meta is a subtype of
+//! the same type without one, the meta forgotten, never the other way round;
+//! with a meta on both sides, the meta types are compared as return types
+//! are, covariantly, and the markers as effects are, `Pure < Memo <
+//! Impure`. Two function types that join to a function type (see
+//! [Functions](#functions)) join their metas as their results: a meta on
+//! both sides joins to the meta of the join of the two types and the greater
+//! of the two markers, widened if that join is; a meta on one side only is
+//! forgotten, so the join has none. A function type's meta is looked into
+//! wherever its return type is, by [`TypeTable::settle`], the helpers for
+//! provisional types and [`TypeTable::special_builtin`].
+//!
 //! # Futures
 //!
 //! A future is a deferred computation: `lazy e` has type `Future<T>`,
@@ -353,6 +376,20 @@ pub struct FnTy {
     /// What the function may do: pure, declared with `:`, memoised,
     /// declared with `->>`, or impure, declared with `->`.
     pub effect: Effect,
+    /// The function's meta, if the type has one (see [Metas](#metas)).
+    pub meta: Option<Meta>,
+}
+
+/// The meta of a function type, `META-> PackageMeta` in `fn(v: Version):
+/// PackageDef META-> PackageMeta`: a record attached to the function value,
+/// whose fields are read as the function's (see [Metas](#metas)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Meta {
+    /// What reading it does, as its marker says: pure (`META:`), memoised
+    /// (`META->>`) or impure (`META->`).
+    pub effect: Effect,
+    /// Its type: a record type, or a future or the either shape of one.
+    pub ty: TyId,
 }
 
 /// What the top of a type says about whether its values are futures. See
@@ -509,6 +546,7 @@ impl TypeTable {
                 .any(|&(_, field)| self.has_provisional(field)),
             TyKind::Fn(sig) => {
                 self.has_provisional(sig.ret)
+                    || sig.meta.is_some_and(|meta| self.has_provisional(meta.ty))
                     || sig.params.iter().any(|&(_, ty)| self.has_provisional(ty))
             }
             TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner) => {
@@ -585,7 +623,8 @@ impl TypeTable {
                 .params
                 .iter()
                 .find_map(|&(_, param)| self.special_builtin(param))
-                .or_else(|| self.special_builtin(sig.ret)),
+                .or_else(|| self.special_builtin(sig.ret))
+                .or_else(|| sig.meta.and_then(|meta| self.special_builtin(meta.ty))),
             TyKind::Future(inner)
             | TyKind::Either(inner)
             | TyKind::List(inner)
@@ -620,10 +659,24 @@ impl TypeTable {
         ret: TyId,
         effect: Effect,
     ) -> TyId {
+        self.fn_type_with_meta(params, ret, effect, None)
+    }
+
+    /// Returns the id of the function type [`TypeTable::fn_type`] makes of
+    /// `params`, `ret` and `effect`, with the meta `meta`, if it has one (see
+    /// [Metas](#metas)), adding it to the table if it is new.
+    pub fn fn_type_with_meta(
+        &mut self,
+        params: impl IntoIterator<Item = (Option<Name>, TyId)>,
+        ret: TyId,
+        effect: Effect,
+        meta: Option<Meta>,
+    ) -> TyId {
         self.intern(TyKind::Fn(FnTy {
             params: params.into_iter().collect(),
             ret,
             effect,
+            meta,
         }))
     }
 
@@ -866,7 +919,11 @@ impl TypeTable {
                     .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
                     .collect();
                 let ret = self.settle(sig.ret, function, decisions);
-                self.fn_type(params, ret, sig.effect)
+                let meta = sig.meta.map(|meta| Meta {
+                    ty: self.settle(meta.ty, function, decisions),
+                    ..meta
+                });
+                self.fn_type_with_meta(params, ret, sig.effect, meta)
             }
             TyKind::Future(inner) => {
                 let inner = self.settle(inner, function, decisions);
@@ -926,6 +983,9 @@ impl TypeTable {
             Some(TyKind::Fn(sig)) => {
                 self.contains_provisional(sig.ret, Some(function))
                     || sig
+                        .meta
+                        .is_some_and(|meta| self.contains_provisional(meta.ty, Some(function)))
+                    || sig
                         .params
                         .iter()
                         .any(|&(_, ty)| self.contains_provisional(ty, Some(function)))
@@ -966,6 +1026,9 @@ impl TypeTable {
                     self.provisional_params(ty, function, out);
                 }
                 self.provisional_params(sig.ret, function, out);
+                if let Some(meta) = sig.meta {
+                    self.provisional_params(meta.ty, function, out);
+                }
             }
             Some(TyKind::Future(inner) | TyKind::Either(inner) | TyKind::List(inner)) => {
                 self.provisional_params(*inner, function, out);
@@ -1066,6 +1129,10 @@ impl TypeTable {
             Some(TyKind::Fn(sig)) => {
                 if let Some(required) = self.fn_sig(self.strip(expected)) {
                     self.provisionals_at_present(sig.ret, required.ret, function, out);
+                    // A meta is compared as a return type is.
+                    if let (Some(meta), Some(required)) = (sig.meta, required.meta) {
+                        self.provisionals_at_present(meta.ty, required.ty, function, out);
+                    }
                 }
             }
             _ => {}
@@ -1286,7 +1353,8 @@ impl TypeTable {
     /// `sub` is `sup`; or both are record types and `sub` has every field
     /// of `sup`, each of a subtype of that field's type in `sup`; or both
     /// are list types and `sub`'s element type is a subtype of `sup`'s; or
-    /// both are function types and `sub`'s signature fits `sup`'s; or `sup` is
+    /// both are function types and `sub`'s signature fits `sup`'s, a meta
+    /// `sup` has included (see [Metas](#metas)); or `sup` is
     /// `Future<T>` and `sub` is `Future<S>` with `S <: T`; or `sup` is `T |
     /// Future<T>` and `sub` stripped is a subtype of `T` (see the module
     /// documentation); or `sub` is a union each of whose members is a
@@ -1332,8 +1400,18 @@ impl TypeTable {
             return self.is_subtype(offered, required);
         }
         if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
+            // A meta is purely additive: one required must be offered, as a
+            // result is, and one offered may be forgotten.
+            let meta = match (offered.meta, required.meta) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some(offered), Some(required)) => {
+                    offered.effect <= required.effect && self.is_subtype(offered.ty, required.ty)
+                }
+            };
             return offered.params.len() == required.params.len()
                 && offered.effect <= required.effect
+                && meta
                 && self.is_subtype(offered.ret, required.ret)
                 && offered
                     .params
@@ -1476,8 +1554,22 @@ impl TypeTable {
             return (self.union([a, b]), true);
         };
         let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
-        let (ret, widened) = self.join(a_ret, b_ret);
-        (self.fn_type(params, ret, effect), widened)
+        let metas = (a_sig.meta, b_sig.meta);
+        let (ret, mut widened) = self.join(a_ret, b_ret);
+        // Metas join as results do; one side's alone is forgotten (see
+        // [Metas](#metas)).
+        let meta = match metas {
+            (Some(a_meta), Some(b_meta)) => {
+                let (ty, meta_widened) = self.join(a_meta.ty, b_meta.ty);
+                widened |= meta_widened;
+                Some(Meta {
+                    effect: a_meta.effect.max(b_meta.effect),
+                    ty,
+                })
+            }
+            _ => None,
+        };
+        (self.fn_type_with_meta(params, ret, effect, meta), widened)
     }
 
     /// The join of the record types `a` and `b`, and whether it is widened,
@@ -1692,7 +1784,10 @@ impl TypeTable {
     /// `List<Int>`, however the source wrote it. A function shows its
     /// parameters in order, each with its name if it has one, then `: ` and
     /// its return type if it is pure, ` ->> ` and its return type if it is
-    /// memoised, or ` -> ` and its return type if it is impure.
+    /// memoised, or ` -> ` and its return type if it is impure, and then its
+    /// meta, if it has one, as ` META-> ` and its type (or `META:`,
+    /// `META->>`), the return type in parentheses if it is a function type,
+    /// which would take the meta, `fn(): (fn(): Int) META: {a: Int}`.
     /// A future shows as `Future<Int>`, and the either shape as `Int |
     /// Future<Int>`, present member first, in parentheses if it is a
     /// function type, `(fn(): Int) | Future<fn(): Int>`, since a function
@@ -1862,7 +1957,17 @@ impl fmt::Display for Display<'_> {
                     self.nested(ty).fmt(f)?;
                 }
                 f.write_str(sig.effect.params_end())?;
-                self.nested(sig.ret).fmt(f)
+                let Some(meta) = sig.meta else {
+                    return self.nested(sig.ret).fmt(f);
+                };
+                // A return type that is a function type would take the
+                // meta.
+                if self.table.fn_sig(sig.ret).is_some() {
+                    write!(f, "({})", self.nested(sig.ret))?;
+                } else {
+                    self.nested(sig.ret).fmt(f)?;
+                }
+                write!(f, " {} {}", meta.effect.meta_marker(), self.nested(meta.ty))
             }
         }
     }
@@ -3589,6 +3694,157 @@ mod tests {
         assert_eq!(
             table.test_plan(None, TyId::EMPTY),
             ValueTest::Kind(ValueKind::Record)
+        );
+    }
+
+    /// The function type of no parameters returning `Int`, of effect
+    /// `effect`, with the meta `meta`, if any.
+    fn with_meta(table: &mut TypeTable, effect: Effect, meta: Option<(Effect, TyId)>) -> TyId {
+        let meta = meta.map(|(effect, ty)| Meta { effect, ty });
+        let none: [(Option<Name>, TyId); 0] = [];
+        table.fn_type_with_meta(none, TyId::INT, effect, meta)
+    }
+
+    #[test]
+    fn a_meta_is_part_of_its_function_type() {
+        let (mut table, _, [a, _, _]) = setup();
+        let rec = table.record([(a, TyId::INT)]);
+        let plain = with_meta(&mut table, Effect::Pure, None);
+        let pure = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, rec)));
+        assert_ne!(plain, pure);
+        assert_eq!(
+            with_meta(&mut table, Effect::Pure, Some((Effect::Pure, rec))),
+            pure
+        );
+        // The marker and the type distinguish.
+        assert_ne!(
+            with_meta(&mut table, Effect::Pure, Some((Effect::Impure, rec))),
+            pure
+        );
+        assert_ne!(
+            with_meta(&mut table, Effect::Pure, Some((Effect::Pure, TyId::EMPTY))),
+            pure
+        );
+        assert_eq!(
+            table.fn_sig(pure).and_then(|sig| sig.meta),
+            Some(Meta {
+                effect: Effect::Pure,
+                ty: rec
+            })
+        );
+        assert_eq!(table.fn_sig(plain).and_then(|sig| sig.meta), None);
+    }
+
+    #[test]
+    fn a_meta_is_purely_additive() {
+        let (mut table, _, [a, b, _]) = setup();
+        let a_only = table.record([(a, TyId::INT)]);
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let plain = with_meta(&mut table, Effect::Pure, None);
+        let with_a = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, a_only)));
+        let with_ab = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, ab)));
+        // A function with a meta stands in for one without, never the reverse.
+        assert!(table.is_subtype(with_a, plain));
+        assert!(!table.is_subtype(plain, with_a));
+        // The meta's type is covariant, as a result is.
+        assert!(table.is_subtype(with_ab, with_a));
+        assert!(!table.is_subtype(with_a, with_ab));
+        // The markers are ordered as effects are: all nine pairs.
+        let effects = [Effect::Pure, Effect::Memo, Effect::Impure];
+        for offered in effects {
+            for required in effects {
+                let sub = with_meta(&mut table, Effect::Pure, Some((offered, a_only)));
+                let sup = with_meta(&mut table, Effect::Pure, Some((required, a_only)));
+                assert_eq!(
+                    table.is_subtype(sub, sup),
+                    offered <= required,
+                    "{offered:?} against {required:?}"
+                );
+            }
+        }
+        // The function's own effect is still compared on its own.
+        let impure = with_meta(&mut table, Effect::Impure, Some((Effect::Pure, a_only)));
+        assert!(table.is_subtype(with_a, impure));
+        assert!(!table.is_subtype(impure, with_a));
+    }
+
+    #[test]
+    fn metas_join_as_results_do() {
+        let (mut table, _, [a, b, _]) = setup();
+        let a_only = table.record([(a, TyId::INT)]);
+        let ab = table.record([(a, TyId::INT), (b, TyId::INT)]);
+        let a_float = table.record([(a, TyId::FLOAT)]);
+        let plain = with_meta(&mut table, Effect::Pure, None);
+        let pure_ab = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, ab)));
+        let impure_a = with_meta(&mut table, Effect::Pure, Some((Effect::Impure, a_only)));
+        // Both sides: the join of the types and the greater marker.
+        assert_eq!(table.join(pure_ab, impure_a), (impure_a, false));
+        assert_eq!(table.join(impure_a, pure_ab), (impure_a, false));
+        // One side only: forgotten.
+        assert_eq!(table.join(pure_ab, plain), (plain, false));
+        assert_eq!(table.join(plain, impure_a), (plain, false));
+        // A widened meta widens the join.
+        let float_a = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, a_float)));
+        let pure_a = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, a_only)));
+        let int_float = table.union([TyId::INT, TyId::FLOAT]);
+        let a_number = table.record([(a, int_float)]);
+        let joined = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, a_number)));
+        assert_eq!(table.join(pure_a, float_a), (joined, true));
+    }
+
+    #[test]
+    fn display_metas_as_written() {
+        let mut names = Names::new();
+        let tag = names.intern("tag");
+        let mut table = TypeTable::new();
+        let rec = table.record([(tag, TyId::STRING)]);
+        let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+        for (effect, shown) in [
+            (Effect::Pure, "fn(): Int META: {tag: String}"),
+            (Effect::Memo, "fn(): Int META->> {tag: String}"),
+            (Effect::Impure, "fn(): Int META-> {tag: String}"),
+        ] {
+            let ty = with_meta(&mut table, Effect::Pure, Some((effect, rec)));
+            assert_eq!(show(&table, ty), shown);
+        }
+        // A function type returned by one with a meta is in parentheses,
+        // which would take the meta otherwise; one with a meta returned by
+        // one without is not.
+        let inner = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, rec)));
+        let meta = Some(Meta {
+            effect: Effect::Impure,
+            ty: rec,
+        });
+        let none: [(Option<Name>, TyId); 0] = [];
+        let plain_inner = table.fn_type(none, TyId::INT, Effect::Pure);
+        let outer = table.fn_type_with_meta(none, plain_inner, Effect::Pure, meta);
+        assert_eq!(
+            show(&table, outer),
+            "fn(): (fn(): Int) META-> {tag: String}"
+        );
+        let outer = table.fn_type(none, inner, Effect::Impure);
+        assert_eq!(show(&table, outer), "fn() -> fn(): Int META: {tag: String}");
+        // In a union, in parentheses as any function type is.
+        let union = table.union([inner, TyId::INT]);
+        assert_eq!(show(&table, union), "Int | (fn(): Int META: {tag: String})");
+    }
+
+    #[test]
+    fn a_meta_s_provisional_types_are_settled() {
+        let (mut table, _, [a, _, _]) = setup();
+        let function = FnId::new(3);
+        let provisional = table.provisional(function, 0, TyId::INT);
+        let held = table.record([(a, provisional)]);
+        let ty = with_meta(&mut table, Effect::Pure, Some((Effect::Pure, held)));
+        assert!(table.contains_provisional(ty, Some(function)));
+        let mut params = Vec::new();
+        table.provisional_params(ty, function, &mut params);
+        assert_eq!(params, [0]);
+        let settled = table.settle(ty, function, &[true]);
+        let present = table.record([(a, TyId::INT)]);
+        assert_eq!(
+            settled,
+            with_meta(&mut table, Effect::Pure, Some((Effect::Pure, present)))
         );
     }
 }

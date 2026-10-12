@@ -384,6 +384,33 @@
 //! definition's file, and its `DT` the def-type's, and a definition's `DT`
 //! makes its file need the def-type's.
 //!
+//! A definition's meta, `defmeta package dev.peios.testpkg { ... }` (see the
+//! checker's "Metas"), belongs to the definition of its path made with its
+//! def-type in its own directory, in any file of it. So its namespace is the
+//! def-type's and the directory's: the meta key of the def-type's key and
+//! the directory's number (see [`crate::names`], "Namespace keys"), under
+//! which the meta is one leaf, its path one name, so that no two metas of a
+//! directory lie one under another and no directory's metas meet another's,
+//! in a view or through an import. `name_namespaces` gives each definition
+//! and each meta, with its key, its leaf there, and a definition its read of
+//! that leaf, which is resolved as a reference's read is: so a definition
+//! needs its meta, and a definition's file the file of its meta, which runs
+//! before it; two files of a directory each holding a definition whose meta
+//! the other holds are files that need each other, the usual error. Before
+//! the trees are made again with the metas in them, a directory's metas are
+//! paired with its definitions (`unpaired_metas`): a meta whose directory
+//! declares another of its def-type and path is "`defmeta package x` is
+//! declared twice in this directory", at the later, labelled "first declared
+//! here" at the first; one whose directory declares no definition of its
+//! def-type and path (one, or several of a `#[shadowable]` chain), "`defmeta
+//! package x` has no definition `x` in its directory"; each from its
+//! `defmeta` through its path, errors of the scan, which stop it. Then each
+//! file records its definitions whose directory declares no meta of their
+//! def-type and path ([`File::unpaired`]), which the checker reports if
+//! their def-type declares a meta, since only it knows the def-type's type.
+//! A definition shadowed in a directory below, which brings its own meta
+//! there, is no concern of its own directory's metas.
+//!
 //! # Def-types by name
 //!
 //! A program that turns def-types into commands (`pekit package
@@ -423,7 +450,8 @@
 //! above definitions, or a def-type with invocation parameters, which
 //! cannot be given yet; each is a [`RequestError`], an error of no source.
 //! Then the definition's file and the def-type's run as a reference to the
-//! definition needs them to, each as a whole, with the files they need,
+//! definition needs them to, each as a whole, with the files they need (its
+//! meta's among them, if it has one),
 //! unless they have run, as for [`Workspace::run`], and the call is made:
 //! an input of its own, built rather than parsed, `<def-type>("PATH",
 //! <definition>)` as its result, whose two names no source can write are
@@ -604,9 +632,9 @@ use std::rc::Rc;
 
 use crate::Outcome;
 use crate::ast::{
-    self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, Expr, ExprKind, ImportDecl, ImportForm,
-    ImportMember, Item, ItemId, ItemKind, PathSegment, TypeExprId, TypeLink, TypeStore,
-    TypeStoreMark,
+    self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, DefTypeRole, Expr, ExprKind, ImportDecl,
+    ImportForm, ImportMember, Item, ItemId, ItemKind, PathSegment, TypeExprId, TypeExprKind,
+    TypeLink, TypeStore, TypeStoreMark,
 };
 #[cfg(test)]
 use crate::check::ViewRecord;
@@ -772,6 +800,11 @@ pub struct File {
     /// Its view of types: the declaration each name of a type names in it,
     /// by its number in [`Scan::type_store`].
     pub type_view: HashMap<Name, u32>,
+    /// Its definitions made with a def-type whose directory declares no
+    /// meta of their path and def-type, by their uses of their def-types,
+    /// in source order: an error of each whose def-type declares a meta (see
+    /// [Def-types](#def-types)).
+    pub unpaired: Vec<DefTypeId>,
 }
 
 impl File {
@@ -804,6 +837,7 @@ impl File {
             types: Vec::new(),
             type_imports: Vec::new(),
             type_view: HashMap::new(),
+            unpaired: Vec::new(),
         }
     }
 }
@@ -1622,6 +1656,16 @@ impl Scan {
                     .collect();
                 names::show_path(&self.names, &path)
             }
+            // A definition's meta, as `defmeta` and its def-type and path.
+            (None, ItemKind::DefMeta { def, .. }) => {
+                let path: Vec<Name> = file
+                    .ast
+                    .def_type(def)
+                    .meta
+                    .map(|(key, leaf)| vec![key, leaf])
+                    .unwrap_or_default();
+                names::show_path(&self.names, &path)
+            }
             (None, _) => String::new(),
         }
     }
@@ -2197,8 +2241,16 @@ fn scan_files(
         if !name_namespaces(scan) || pass > 0 {
             break;
         }
+        // A meta declared twice in a directory, or with no definition there,
+        // is its own error, before the trees with the metas in them would
+        // report it as a conflict (see [Def-types](#def-types)).
+        let errors = unpaired_metas(scan);
+        if !errors.is_empty() {
+            return Err(errors);
+        }
         unscan(scan, mark);
     }
+    mark_unpaired(scan);
     type_views(scan, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
@@ -2300,15 +2352,25 @@ fn unscan(scan: &mut Scan, mark: TypeStoreMark) {
     scan.type_base = 0;
 }
 
+/// A def-type definition, reference or meta whose def-type
+/// [`name_namespaces`] has found: its file, its use, the text of its
+/// def-type's key, and for a definition or a meta, the text of its meta key
+/// and its path as one name.
+type NamedUse = (u32, DefTypeId, String, Option<(String, String)>);
+
 /// Names the namespace of each def-type definition and reference of every
 /// file of `scan` whose namespace is not known yet: what its `DT` names in
 /// the file's view, if that is a `def` marked `#[def_type]`, or, for a
 /// session's input, a def-type of the earlier inputs by its path, gives it
 /// the def-type's key ([`Ast::set_def_type_key`]), which the file is then
-/// taken to spell (see [Def-types](#def-types)). Returns whether a
-/// definition was given one, which changes the trees.
+/// taken to spell (see [Def-types](#def-types)); and a definition or a meta
+/// its leaf in the namespace of the metas of the def-type's definitions in
+/// its file's directory, the meta key and its path as one name (see
+/// [`crate::names`], "Namespace keys"), which the file is taken to spell
+/// too. Returns whether a definition or a meta was given one, which changes
+/// the trees.
 fn name_namespaces(scan: &mut Scan) -> bool {
-    let mut found: Vec<(u32, DefTypeId, String, bool)> = Vec::new();
+    let mut found: Vec<NamedUse> = Vec::new();
     for (index, file) in (0u32..).zip(&scan.files) {
         let mut unknown = file
             .ast
@@ -2321,23 +2383,151 @@ fn name_namespaces(scan: &mut Scan) -> bool {
         let scope = FileScope::new(scan, file);
         for (id, def) in unknown {
             let names = file.ast.def_type_names(id);
-            if let Some(key) = def_type_key(scan, index, &scope, &names) {
-                found.push((index, id, key, def.read.is_none()));
-            }
+            let Some(key) = def_type_key(scan, index, &scope, &names) else {
+                continue;
+            };
+            // A definition's and a meta's leaf in the namespace of the metas
+            // of the def-type's definitions in its directory.
+            let meta = match def.role {
+                DefTypeRole::Reference => None,
+                DefTypeRole::Definition | DefTypeRole::Meta => {
+                    let path: Vec<&str> = file
+                        .ast
+                        .path(def.path)
+                        .iter()
+                        .filter_map(PathSegment::name)
+                        .map(|name| scan.names.get(name))
+                        .collect();
+                    names::meta_key(&key, file.dir).map(|meta_key| (meta_key, path.join(".")))
+                }
+            };
+            found.push((index, id, key, meta));
         }
     }
-    let mut definitions = false;
-    for (index, id, text, definition) in found {
+    let mut leaves = false;
+    for (index, id, text, meta) in found {
         let key = scan.names.intern(&text);
+        let meta =
+            meta.map(|(meta_key, leaf)| (scan.names.intern(&meta_key), scan.names.intern(&leaf)));
         if let Some(file) = scan.files.get_mut(index as usize) {
-            file.ast.set_def_type_key(id, key);
-            if let Err(at) = file.spelled.binary_search(&key) {
-                file.spelled.insert(at, key);
+            file.ast.set_def_type_key(id, key, meta);
+            for name in std::iter::once(key).chain(meta.into_iter().flat_map(|(a, b)| [a, b])) {
+                if let Err(at) = file.spelled.binary_search(&name) {
+                    file.spelled.insert(at, name);
+                }
             }
         }
-        definitions |= definition;
+        leaves |= meta.is_some();
     }
-    definitions
+    leaves
+}
+
+/// A definition or a meta of a file of a scan by its leaf in the namespace
+/// of the metas of its def-type's definitions in its directory (see
+/// [Def-types](#def-types)): that leaf, its file and its use of its
+/// def-type.
+type MetaLeaf = ((Name, Name), u32, DefTypeId);
+
+/// The definitions and the metas of `scan`'s files whose def-types are
+/// known, each by its leaf in the namespace of the metas of its def-type's
+/// definitions in its directory, in path order of their files and then in
+/// source order: so a definition and a meta of one path, def-type and
+/// directory have one leaf.
+fn meta_leaves(scan: &Scan) -> (Vec<MetaLeaf>, Vec<MetaLeaf>) {
+    let (mut definitions, mut metas) = (Vec::new(), Vec::new());
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let ast = &file.ast;
+        for &item in ast.items(ast.root()) {
+            let (ItemKind::DefTypeDef { def, .. } | ItemKind::DefMeta { def, .. }) =
+                ast.item(item).kind
+            else {
+                continue;
+            };
+            let Some(leaf) = ast.def_type(def).meta else {
+                continue;
+            };
+            match ast.item(item).kind {
+                ItemKind::DefMeta { .. } => metas.push((leaf, index, def)),
+                _ => definitions.push((leaf, index, def)),
+            }
+        }
+    }
+    (definitions, metas)
+}
+
+/// The errors of the metas of `scan`'s files that are not each their
+/// directory's one meta of a definition of it (see [Def-types](#def-types)):
+/// a meta whose directory declares another of its path and def-type before
+/// it, "`defmeta package x` is declared twice in this directory", at it,
+/// labelled "first declared here" at the first; and one whose directory
+/// declares no definition of its path and def-type, "`defmeta package x`
+/// has no definition `x` in its directory", at it. Each at the meta's
+/// `defmeta`, def-type and path, in path order of their files, then in
+/// source order.
+fn unpaired_metas(scan: &Scan) -> Vec<Diagnostic> {
+    let (definitions, metas) = meta_leaves(scan);
+    let defined: HashSet<(Name, Name)> = definitions.iter().map(|&(leaf, ..)| leaf).collect();
+    let mut first: HashMap<(Name, Name), (u32, Span)> = HashMap::new();
+    let mut errors = Vec::new();
+    for &(leaf, index, def) in &metas {
+        let Some(file) = scan.files.get(index as usize) else {
+            continue;
+        };
+        let ast = &file.ast;
+        let (def_type, path) = {
+            let shown = ast.def_type_names(def);
+            let shown: Vec<&str> = shown.iter().map(|&name| scan.names.get(name)).collect();
+            let path: Vec<&str> = ast
+                .path(ast.def_type(def).path)
+                .iter()
+                .filter_map(PathSegment::name)
+                .map(|name| scan.names.get(name))
+                .collect();
+            (shown.join("."), path.join("."))
+        };
+        // From its `defmeta` through its path.
+        let at = ast.def_type(def).span;
+        if let Some(&(first_file, first_at)) = first.get(&leaf) {
+            errors.push(
+                Diagnostic::error(
+                    format!("`defmeta {def_type} {path}` is declared twice in this directory"),
+                    at,
+                )
+                .in_input(index)
+                .with_context_in(first_file, first_at, "first declared here"),
+            );
+            continue;
+        }
+        first.insert(leaf, (index, at));
+        if !defined.contains(&leaf) {
+            errors.push(
+                Diagnostic::error(
+                    format!(
+                        "`defmeta {def_type} {path}` has no definition `{path}` in its directory"
+                    ),
+                    at,
+                )
+                .in_input(index),
+            );
+        }
+    }
+    errors
+}
+
+/// Records in each file of `scan` its definitions whose directory declares
+/// no meta of their path and def-type ([`File::unpaired`]), which the
+/// checker reports if their def-type declares a meta (see the checker's
+/// "Metas").
+fn mark_unpaired(scan: &mut Scan) {
+    let (definitions, metas) = meta_leaves(scan);
+    let declared: HashSet<(Name, Name)> = metas.iter().map(|&(leaf, ..)| leaf).collect();
+    for (leaf, index, def) in definitions {
+        if !declared.contains(&leaf)
+            && let Some(file) = scan.files.get_mut(index as usize)
+        {
+            file.unpaired.push(def);
+        }
+    }
 }
 
 /// The text of the key of the namespace of the def-type `names`, a path,
@@ -2741,8 +2931,9 @@ fn leaf_spans(file: &File, own: u32) -> Option<(Span, Span)> {
             let last = segments.last().map_or(first, |s| s.span);
             Span::new(first.start, last.end)
         }
-        // A definition made with a def-type: its def-type and its path.
-        ItemKind::DefTypeDef { def, .. } => {
+        // A definition made with a def-type, or a definition's meta: its
+        // def-type and its path.
+        ItemKind::DefTypeDef { def, .. } | ItemKind::DefMeta { def, .. } => {
             let def = file.ast.def_type(def);
             let segments = file.ast.path(def.path);
             Span::join(file.ast.get(def.dt).span, ast::path_span(segments))
@@ -5182,6 +5373,54 @@ impl<'a> Context<'a> {
             .into_iter()
             .filter_map(|name| Some((name, self.scan.target_child(target, name)?)))
             .collect()
+    }
+
+    /// Whether the file's definition whose use of its def-type is `def` is
+    /// one whose directory declares no meta of its path and def-type
+    /// ([`File::unpaired`]).
+    pub(crate) fn unpaired(&self, def: DefTypeId) -> bool {
+        self.file.unpaired.contains(&def)
+    }
+
+    /// The meta that the def-type whose namespace's key is `key` declares
+    /// for its definitions, as its declaration writes it, `META->
+    /// PackageMeta`, shown with `names`, the table the file being checked
+    /// has: if the def-type is a `def` of a file of the scan whose definition
+    /// parameter is written as a function type with a meta (see
+    /// [Def-types](#def-types)). `None` otherwise, as for one a session's
+    /// earlier input declares, which the scan has no tree of.
+    pub(crate) fn meta_written(&self, key: Name, names: &Names) -> Option<String> {
+        let (number, item) = names::key_numbers(names.get(key))?;
+        // In a session's input, only the input's own def-types are its
+        // file's; any other number is an earlier input's.
+        let index = match self.scan.input_number {
+            Some(input) if input == number => self.scan.standard,
+            Some(_) => return None,
+            None => number,
+        };
+        let ast = &self.scan.files.get(index as usize)?.ast;
+        let item = ast.item_at(item)?;
+        if !ast.is_def_type(item) {
+            return None;
+        }
+        let ItemKind::Field { value, .. } = ast.item(item).kind else {
+            return None;
+        };
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            return None;
+        };
+        let param = ast.params(ast.fn_decl(function).params).get(1)?;
+        let TypeExprKind::Fn {
+            meta: Some(meta), ..
+        } = ast.written_type(param.ty)
+        else {
+            return None;
+        };
+        Some(format!(
+            "{} {}",
+            meta.effect.meta_marker(),
+            ast.show_type_with(meta.ty, names)
+        ))
     }
 
     /// A name for the slot of the record of `target`: the name the file
@@ -13537,5 +13776,390 @@ p26 = com.x"#;
         // At the definition's path, `p`, with nothing elsewhere.
         assert_eq!(errors[0].span, Span::new(9, 10));
         assert!(errors[0].labels.is_empty());
+    }
+
+    /// A def-type of the root of a workspace, for the metas' tests:
+    /// `tagged`, whose definitions give a string and carry a pure meta of a
+    /// tag and a number, read through functions that take less of it: one
+    /// whose meta has the tag alone, and one with no meta.
+    const TAGGED: (&str, &str) = (
+        "workspace.gcsl",
+        "#[def_type]\n\
+         def tagged(name: String, f: fn(): String META: {tag: String, n: Int}): String {\n\
+         \x20   \"{name}: {plain(f)} {tag(f)} {f.n}\"\n\
+         }\n\
+         fn tag(g: fn(): String META: {tag: String}): String { g.tag }\n\
+         fn plain(g: fn(): String): String { g() }",
+    );
+
+    #[test]
+    fn a_meta_is_a_leaf_of_its_directory_s_metas() {
+        // The meta's leaf is its path as one name, under the meta key of its
+        // def-type and directory; the definition and the meta are top-level
+        // functions, and the definition's item mentions the meta's leaf and
+        // function, by its read of its meta.
+        let files = [
+            TAGGED,
+            (
+                "app/a.gcsl",
+                "def tagged dev.x() { \"x\" }\ndefmeta tagged dev.x { tag = \"t\"; n = 1 }",
+            ),
+        ];
+        let scan = ws(&files).unwrap();
+        let app = scan.files.iter().find(|f| f.path == "app/a.gcsl").unwrap();
+        let tree = &app.mentions.tree;
+        let meta_root = &tree.nodes[tree.roots[1] as usize];
+        let key = scan.names.get(tree.nodes[tree.roots[0] as usize].name);
+        assert_eq!(
+            Some(scan.names.get(meta_root.name)),
+            names::meta_key(key, app.dir).as_deref()
+        );
+        let leaf = &tree.nodes[meta_root.children[0] as usize];
+        assert_eq!(scan.names.get(leaf.name), "dev.x");
+        assert!(leaf.children.is_empty());
+        assert_eq!(app.mentions.functions.len(), 2);
+        assert_eq!(app.mentions.items[0], [1]);
+        assert!(app.mentions.fields[0].contains(&meta_root.children[0]));
+        assert!(app.unpaired.is_empty());
+    }
+
+    #[test]
+    fn a_meta_is_read_as_fields_of_its_definition() {
+        // The meta above or below its definition, in its file or in another
+        // of its directory, a block or an expression; read in pure functions,
+        // one whose meta's type is less than the definition's and one that
+        // forgets the meta.
+        let files = [
+            TAGGED,
+            (
+                "app/a.gcsl",
+                "defmeta tagged x { tag = \"t-x\"; n = 1 }\n\
+                 def tagged x() { \"x\" }\n\
+                 def tagged y() { \"y\" }\n\
+                 defmeta tagged y = { tag = \"t-y\"; n = 2 }",
+            ),
+            (
+                "app/b.gcsl",
+                "defmeta tagged dev.z { tag = \"t-z\"; n = 3 }",
+            ),
+            (
+                "app/c.gcsl",
+                "def tagged dev.z() { \"z\" }\n\
+                 r = [tagged x(), tagged y(), tagged dev.z()]",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app/c.gcsl"),
+            "{r = [\"x: x t-x 1\", \"y: y t-y 2\", \"dev.z: z t-z 3\"]}"
+        );
+        // A def-type with no meta works as it always did.
+        let files = [
+            BUILD,
+            ("app.gcsl", "def build x(t) { t }\nr = build x(\"m\")"),
+        ];
+        assert_eq!(value(&files, "app.gcsl"), "{r = \"x: m\"}");
+    }
+
+    #[test]
+    fn each_marker_reads_its_meta_as_its_effect() {
+        let path = std::env::temp_dir().join(format!("gcsl-slice-38-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let count = || std::fs::read_to_string(path).map_or(0, |text| text.lines().count());
+        let _ = std::fs::remove_file(path);
+        // `META->` runs its body at each read, `META->>` once for the run.
+        let impure = "#[def_type]\n\
+             def twice(name: String, f: fn(): Int META-> {n: Int}) -> List<Int> { [f.n, f.n] }";
+        let app = format!(
+            "defmeta twice x {{ n = exec([\"sh\", \"-c\", \"echo x >> {path}\"]).status }}\n\
+             def twice x() {{ 1 }}\n\
+             r = twice x()"
+        );
+        let files = [("workspace.gcsl", impure), ("app.gcsl", app.as_str())];
+        assert_eq!(value(&files, "app.gcsl"), "{r = [0, 0]}");
+        assert_eq!(count(), 2);
+        let memo = impure.replace("META->", "META->>");
+        let files = [
+            ("workspace.gcsl", memo.as_str()),
+            ("app.gcsl", app.as_str()),
+        ];
+        assert_eq!(value(&files, "app.gcsl"), "{r = [0, 0]}");
+        assert_eq!(count(), 3);
+        std::fs::remove_file(path).unwrap();
+        // A `META: Future<...>` meta is read purely, giving a future, which
+        // `defmeta ... = lazy` makes: its field is awaited, which only
+        // impure code may.
+        let future = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def later(name: String, f: fn(): Int META: Future<{v: Int}>) -> Int {\n\
+                 \x20   f.v + f()\n\
+                 }",
+            ),
+            (
+                "app.gcsl",
+                "defmeta later x = lazy { v = 41 }\ndef later x() { 1 }\nr = later x()",
+            ),
+        ];
+        assert_eq!(value(&future, "app.gcsl"), "{r = 42}");
+        let pure = future[0].1.replace(") -> Int", "): Int");
+        let files = [("workspace.gcsl", pure.as_str()), future[1]];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "cannot use a value that may be a future in a pure function at workspace.gcsl \
+                 (this is Future<{v: Int}>); workspace.gcsl: this function is pure, declared \
+                 with `:`; note: using the value here would await it, which may run effects; a \
+                 pure function may hold and pass on a future but not await it. Declare the \
+                 function with `->` to make it impure"
+            ]
+        );
+        // Under `META->`, a field that may be a future is awaited where it is
+        // used.
+        let lazy = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def sum(name: String, f: fn(): Int META-> {ns: List<Int>}) -> Int {\n\
+                 \x20   let mut total = f()\n\
+                 \x20   for n in f.ns { total := total + n }\n\
+                 \x20   total\n\
+                 }",
+            ),
+            (
+                "app.gcsl",
+                "defmeta sum x { ns = lazy [1, 2, lazy 3] }\ndef sum x() { 4 }\nr = sum x()",
+            ),
+        ];
+        assert_eq!(value(&lazy, "app.gcsl"), "{r = 10}");
+    }
+
+    #[test]
+    fn a_meta_s_caller_is_its_reader_s() {
+        // The meta's `fileroot.this` is its own file's directory, and its
+        // caller the directory of the code that reads it: the def-type's, or
+        // through its `fileroot.helper()`, the def-type's own caller's.
+        let files = [
+            (
+                "workspace.gcsl",
+                "import fileroot\n\
+                 #[def_type]\n\
+                 def where(name: String, f: fn(): String META-> {this: String, caller: String}) \
+                 -> String {\n\
+                 \x20   \"{f.this} {f.caller}\"\n\
+                 }\n\
+                 #[def_type]\n\
+                 def helped(name: String, f: fn(): String META-> {this: String, caller: String}) \
+                 -> String {\n\
+                 \x20   fileroot.helper()\n\
+                 \x20   \"{f.this} {f.caller}\"\n\
+                 }",
+            ),
+            (
+                "a/a.gcsl",
+                "import fileroot\n\
+                 defmeta where x { this = fileroot.this; caller = fileroot.caller }\n\
+                 def where x() { \"\" }\n\
+                 defmeta helped x { this = fileroot.this; caller = fileroot.caller }\n\
+                 def helped x() { \"\" }",
+            ),
+            ("a/sub/c.gcsl", "r = [where x(), helped x()]"),
+        ];
+        assert_eq!(
+            rooted_text(&files, "a/sub/c.gcsl"),
+            "{r = [\"<root>/a <root>\", \"<root>/a <root>/a/sub\"]}"
+        );
+    }
+
+    #[test]
+    fn a_meta_pairs_with_its_definition_in_its_directory() {
+        // A `#[shadowable]` definition shadowed in a subdirectory, which
+        // brings its own meta: each view has its own pair.
+        let files = [
+            (
+                "workspace.gcsl",
+                format!(
+                    "{}\n#[shadowable]\ndef tagged s() {{ \"top\" }}\n\
+                     defmeta tagged s {{ tag = \"top-meta\"; n = 0 }}",
+                    TAGGED.1
+                ),
+            ),
+            ("root.gcsl", "r = tagged s()".to_owned()),
+            (
+                "sub/a.gcsl",
+                "def tagged s() { \"sub\" }\n\
+                 defmeta tagged s { tag = \"sub-meta\"; n = 1 }\n\
+                 below = tagged s()"
+                    .to_owned(),
+            ),
+        ];
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        assert_eq!(value(&files, "root.gcsl"), "{r = \"s: top top-meta 0\"}");
+        assert_eq!(
+            value(&files, "sub/a.gcsl"),
+            "{below = \"s: sub sub-meta 1\"}"
+        );
+        // A chain of `#[shadowable]` definitions in one directory has one
+        // meta.
+        let files = [
+            TAGGED,
+            ("app/a.gcsl", "#[shadowable]\ndef tagged c() { \"first\" }"),
+            (
+                "app/b.gcsl",
+                "def tagged c() { \"second\" }\n\
+                 defmeta tagged c { tag = \"one\"; n = 1 }\n\
+                 r = tagged c()",
+            ),
+        ];
+        assert_eq!(value(&files, "app/b.gcsl"), "{r = \"c: second one 1\"}");
+        // A meta in a subdirectory of its definition is no meta of it.
+        let files = [
+            TAGGED,
+            ("app/a.gcsl", "def tagged x() { \"x\" }"),
+            ("app/sub/b.gcsl", "defmeta tagged x { tag = \"t\"; n = 1 }"),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            ["`defmeta tagged x` has no definition `x` in its directory at app/sub/b.gcsl"]
+        );
+        let files = [TAGGED, ("app/a.gcsl", "def tagged x() { \"x\" }")];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "`tagged x` has no `defmeta` in its directory at app/a.gcsl; note: `tagged` \
+                 declares a meta, `META: {tag: String, n: Int}`, for each of its definitions"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_meta_is_invoked_with_its_definition() {
+        // The meta in another file of the definition's directory: invoking
+        // the definition by name runs that file too.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def tag(name: String, f: fn(): String META->> {t: String}) -> String {\n\
+                 \x20   \"{f()} {f.t}\"\n\
+                 }",
+            ),
+            ("pkg/a.gcsl", "defmeta tag p { t = \"meta\" }"),
+            ("pkg/p.gcsl", "def tag p() { \"p\" }"),
+        ];
+        assert_eq!(invoked_text(&files, "tag", "p"), "p meta");
+    }
+
+    #[test]
+    fn meta_errors() {
+        // Each error with its labels and notes, joined by `; `, the errors
+        // by newlines.
+        let errors = |text: &str| {
+            let files = [TAGGED, ("app.gcsl", text)];
+            check_errors(&files).join("\n")
+        };
+        assert_eq!(
+            errors("x: fn(): Int META: Int = 1"),
+            "a meta must be a record type: its fields are read from the function at app.gcsl"
+        );
+        assert_eq!(
+            errors("x: fn(): Int META-> Future<List<Int>> = 1"),
+            "a meta must be a record type: its fields are read from the function at app.gcsl"
+        );
+        assert_eq!(
+            errors("fn f(g: fn(): Int META: {a: Int, b: Int}): Int { g.c }"),
+            "the meta of `g` has no field `c` at app.gcsl; note: the fields are `a` and `b`"
+        );
+        assert_eq!(
+            errors("fn f(g: fn(): Int META-> {a: Int}): Int {\nlet held = g.a\n1\n}"),
+            "cannot read an impure meta from a pure function at app.gcsl; app.gcsl: reading the \
+             meta of `g` is impure (`META->`); app.gcsl: this function is pure, declared with \
+             `:`; note: a pure function, declared with `:`, may read only pure metas, `META:`; \
+             declare it with `->` to make it impure"
+        );
+        // In a memoised function, as calling an impure function is.
+        let memo = [
+            TAGGED,
+            (
+                "app.gcsl",
+                "fn f(g: fn(): Int META-> {a: Int}) ->> Int { g.a }\n\
+                 fn h(g: fn(): Int META->> {a: Int}) -> Int { g.a }",
+            ),
+        ];
+        assert_eq!(value(&memo, "app.gcsl"), "{}");
+        // A function with no meta has no fields, as before.
+        assert_eq!(
+            errors("fn f(g: fn(): Int): Int { g.a }"),
+            "cannot access field `a` of `fn(): Int` at app.gcsl; app.gcsl: this is fn(): Int"
+        );
+        // A function with no meta, or with a meta of a greater marker, does
+        // not fit a type with one.
+        assert_eq!(
+            errors("fn f(g: fn(): Int META: {a: Int}): Int { g.a }\nx = f(fn(): Int { 1 })"),
+            "mismatched types at app.gcsl (expected fn(): Int META: {a: Int}, found fn(): Int); \
+             app.gcsl: the function is fn(g: fn(): Int META: {a: Int}): Int"
+        );
+        assert_eq!(
+            errors(
+                "fn f(g: fn(): Int META: {a: Int}): Int { g.a }\n\
+                 fn h(g: fn(): Int META-> {a: Int}): Int { f(g) }"
+            ),
+            "mismatched types at app.gcsl (expected fn(): Int META: {a: Int}, found fn(): Int \
+             META-> {a: Int | Future<Int>} | Future<{a: Int | Future<Int>}>); app.gcsl: the \
+             function is fn(g: fn(): Int META: {a: Int}): Int"
+        );
+        // The pairing.
+        assert_eq!(
+            errors(
+                "def tagged x() { \"x\" }\n\
+                 defmeta tagged x { tag = \"a\"; n = 1 }\n\
+                 defmeta tagged x { tag = \"b\"; n = 2 }\n\
+                 defmeta tagged y { tag = \"c\"; n = 3 }"
+            ),
+            "`defmeta tagged x` is declared twice in this directory at app.gcsl; app.gcsl: \
+             first declared here\n\
+             `defmeta tagged y` has no definition `y` in its directory at app.gcsl"
+        );
+        assert_eq!(
+            errors(
+                "#[def_type]\ndef plain(name: String, f: fn(): Int): Int { f() }\n\
+                 def plain p() { 1 }\n\
+                 defmeta plain p { tag = \"x\" }"
+            ),
+            "`plain` declares no meta for its definitions at app.gcsl; note: a def-type \
+             declares one by its definition parameter's type, as in `func: fn(): PackageDef \
+             META: PackageMeta`"
+        );
+        assert_eq!(
+            errors("defmeta nope x { a = 1 }"),
+            "undefined variable `nope` at app.gcsl"
+        );
+        // The meta's body is checked against the meta's type, with its marker.
+        assert_eq!(
+            errors("def tagged x() { \"x\" }\ndefmeta tagged x { tag = 1; n = 1 }"),
+            "mismatched types at app.gcsl (expected String, found Int); app.gcsl: the return \
+             type is declared here"
+        );
+        assert_eq!(
+            errors(
+                "def tagged x() { \"x\" }\n\
+                 defmeta tagged x { tag = exec([\"true\"]).stdout; n = 1 }"
+            ),
+            "cannot call an impure function from a pure function at app.gcsl; app.gcsl: this \
+             is fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}; \
+             app.gcsl: this function is pure, declared with `:`; note: a pure function, \
+             declared with `:`, may call only pure functions; declare it with `->` to make it \
+             impure"
+        );
+        // A definition needs its meta: one that reads a variable bound later
+        // is shown as written in the chain.
+        let found = errors(
+            "r = tagged x()\nlet k = 1\ndefmeta tagged x { tag = \"t\"; n = k }\n\
+             def tagged x() { \"x\" }",
+        );
+        assert!(
+            found.contains("uses `defmeta tagged x`, and `defmeta tagged x` reads `k`"),
+            "{found}"
+        );
     }
 }

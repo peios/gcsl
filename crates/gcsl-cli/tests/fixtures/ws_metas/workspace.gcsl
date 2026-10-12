@@ -1,0 +1,98 @@
+# The root of the newpkgs GCSL workspace: imports are absolute from here,
+# and every directory below sees what is declared here, the `package`
+# def-type and its types.
+import _lib.ppk
+import fileroot
+
+# One version a package can be built at: an entry of its meta's `versions`.
+type Version = {
+  version: String,
+}
+
+# What `defmeta package NAME { ... }` declares for each package.
+type PackageMeta = {
+  versions: List<Version>,
+}
+
+# What a package's definition produces for one version.
+type PackageDef = {
+  version: String,
+  arch: String,
+  content: String,
+}
+
+type Package = { ...PackageDef, name: String}
+
+
+# A def-type whose definitions carry a META. Its parameters are, as for any
+# def-type, the definition's path as written (`"dev.peios.testpkg"`), then the
+# definition, then the invocation parameters (here `version`). So
+# `package dev.peios.testpkg("0.1.0")` calls this with the name, the
+# definition and "0.1.0", and `pekit package dev.peios.testpkg 0.1.0` does the
+# same from the command line (invocation arguments as strings).
+#
+# THE META. `defmeta package NAME { ... }` attaches a record to the definition
+# at the same path: its meta. A meta is part of a FUNCTION TYPE, written after
+# the result with a marker of its own:
+#
+#     fn(v: Version): PackageDef META-> PackageMeta
+#
+# `: PackageDef` is what calling it gives; `META-> PackageMeta` is what
+# reading it gives, as fields of the function value: `func.versions` below.
+# It is not an intersection: the meta has an effect of its own, with the full
+# expressiveness of a function's:
+#
+# - `META: X`: the `defmeta` body is pure, and reading the meta is pure;
+# - `META-> X`: the body is impure (it may `exec`, e.g. to ask upstream for
+#   its versions), so reading the meta runs it, and is impure: allowed in
+#   impure code, an error in a pure function, as calling an impure function
+#   is;
+# - `META->> X`: impure and memoised: the body runs once per run, however
+#   often the meta is read.
+#
+# The bareness rules for an impure function's result apply to an impure
+# meta's type. Laziness is written with types, not markers: `META: Future<X>`
+# is a pure read that gives a future, which `defmeta package NAME = lazy
+# { ... }` produces exactly; in practice a meta would more often hold lazy
+# FIELDS, `{ versions: Future<List<Version>> }` from `defmeta package NAME
+# { versions = lazy { ... } }`. A `defmeta` is written as a block, `defmeta DT
+# PATH { ... }`, or with any expression, `defmeta DT PATH = EXPR`.
+#
+# A meta is purely additive: a function with a meta is a subtype of the same
+# function type without one (the meta forgotten), never the other way round,
+# and meta types and markers are compared as results and effects are.
+#
+# The def-type declares its definitions' meta by the meta of its definition
+# parameter's type (`func` here): every `defmeta package` body is checked
+# against `PackageMeta` with that marker. Every definition of a def-type that
+# declares a meta needs exactly one `defmeta` at the same path; a `defmeta`
+# needs such a definition. `defmeta`s live in the def-type's namespace beside
+# its definitions and follow their rules: public, order-free, shared by a
+# directory and seen below.
+#
+# A REFERENCE to a definition, `package dev.peios.testpkg`, is the function of
+# the invocation parameters it always was, and carries the definition's meta
+# too, read as `(package dev.peios.testpkg).versions` or, without the
+# parentheses, `package dev.peios.testpkg.versions`, since a reference means
+# its longest declared prefix and no definition lies under another. Its type:
+#
+#     fn(version: String) -> { pkg: Package, manifest: String } META-> PackageMeta
+#[def_type]
+def package(name: String, func: fn(v: Version): PackageDef META-> PackageMeta, version: String) -> { pkg: Package, manifest: String } {
+    fileroot.helper()
+
+    let found = for v in func.versions if v.version == version { break v }
+    if len(found) == 0 {
+        panic("{name} has no version {version}")
+    }
+    let v = found[0]
+
+    pkg: Package = { ...func(v); name = name}
+
+    manifest = ppk.commit(
+        name = pkg.name,
+        version = pkg.version,
+        arch = pkg.arch,
+        content = pkg.content,
+    )
+}

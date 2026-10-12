@@ -1,0 +1,30 @@
+defmeta package dev.peios.testpkg {
+    versions = [
+        { version = "0.1.0" },
+        { version = "0.2.0" },
+    ]
+}
+
+def package dev.peios.testpkg(v) {
+    arch = "x86_64"
+    content = "usr"
+    version = v.version
+}
+
+
+# This is purely for the GCSL agent to demo the defmeta behaviour. `defmeta`
+# attaches a record to the definition's reference, the meta, and calling the
+# reference gives the definition's result as before:
+#
+#     (package dev.peios.testpkg).versions     # the meta's versions list
+#     package dev.peios.testpkg.versions       # the same
+#     (package dev.peios.testpkg("0.1.0")).pkg.version
+#                                              # "0.1.0": a field of the
+#                                              # call's result, not of the meta
+#     (package dev.peios.testpkg("0.1.0")).versions
+#                                              # an error: the result has no
+#                                              # field `versions`
+#
+# `package` declares its definitions' meta as `META-> PackageMeta`, so the
+# `defmeta` above is an impure body: each read of the meta runs it, and
+# reading it in a pure function is an error.

@@ -161,6 +161,14 @@
 //! [`IrKind::Arg`] nodes in source order, each naming the parameter its
 //! value is passed as.
 //!
+//! A definition made with a def-type that declares a meta (see the
+//! checker's "Metas") has its meta's closure in a cell of the top level's
+//! frame, which the program records for the definition's function, apart
+//! from its [`FnCode`] ([`Ir::meta_of`]), so that every closure of it names
+//! its meta. A read of a meta is the call, of no arguments, of an
+//! [`IrKind::Meta`] of the function, which yields the closure in the cell
+//! the function's code names; a field access reads the call's value.
+//!
 //! A program carries the directory of the file it was lowered from, by its
 //! index in its run's table of directories ([`Ir::dir`]), which every call
 //! its code makes, a closure's or a future's of it included, passes on as
@@ -1026,6 +1034,14 @@ pub enum IrKind {
     /// cell, shown as `top`. Last, so that adding it numbered no other kind
     /// anew.
     Top(Slot, ValueKind),
+    /// Yields the closure of the meta of the function its child, a function
+    /// node, evaluates to: a closure of a definition made with a def-type
+    /// that declares a meta, whose meta's closure is in the cell of the top
+    /// level's frame its code names ([`Ir::meta_of`]). Only ever the callee
+    /// of a [`IrKind::Call`] of no arguments, which a read of the meta,
+    /// `func.versions`, lowers to, a `Field` of it (see [`crate::lower`]). Of
+    /// kind [`ValueKind::Fn`]. Last, as `Top` was.
+    Meta(IrId),
 }
 
 // A call's depth is a `u16` (see `IrKind::Call`), which keeps `IrNode` at
@@ -1091,7 +1107,8 @@ impl IrKind {
             | IrKind::Is { value: operand, .. }
             | IrKind::As { value: operand, .. }
             | IrKind::Await { value: operand, .. }
-            | IrKind::Catch { body: operand, .. } => (None, &[], [Some(operand), None, None]),
+            | IrKind::Catch { body: operand, .. }
+            | IrKind::Meta(operand) => (None, &[], [Some(operand), None, None]),
             IrKind::Break { value, .. }
             | IrKind::Continue { value, .. }
             | IrKind::Return { value, .. } => (None, &[], [value, None, None]),
@@ -1218,7 +1235,8 @@ impl IrKind {
             | IrKind::Return { .. }
             | IrKind::Catch { .. }
             | IrKind::Is { .. }
-            | IrKind::As { .. } => None,
+            | IrKind::As { .. }
+            | IrKind::Meta(_) => None,
         }
     }
 
@@ -1309,6 +1327,7 @@ impl IrKind {
             IrKind::Helper => "helper",
             IrKind::MakeFuture { .. } => "make-future",
             IrKind::Await { .. } => "await",
+            IrKind::Meta(_) => "meta",
         }
     }
 }
@@ -1400,7 +1419,8 @@ impl IrNode {
             | IrKind::MakeFuture { .. }
             | IrKind::Await { .. }
             | IrKind::Is { .. }
-            | IrKind::As { .. } => return None,
+            | IrKind::As { .. }
+            | IrKind::Meta(_) => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))
     }
@@ -1494,6 +1514,10 @@ pub struct Ir {
     /// which [`Ir::pretty`] shows where it shows another's name. For
     /// [`Ir::pretty`] only; usually empty.
     paths: Vec<(FnId, Box<[Name]>)>,
+    /// Each definition made with a def-type that has a meta, with the slot
+    /// of the top level's frame holding the meta's closure (see
+    /// [`Ir::meta_of`]); usually empty.
+    metas: Vec<(FnId, Slot)>,
 }
 
 impl Ir {
@@ -1709,6 +1733,33 @@ impl Ir {
         self.paths = paths;
     }
 
+    /// Sets the metas of the program's definitions made with a def-type
+    /// that declares one, `metas`, each with its function and the slot of
+    /// the top level's frame holding its meta's closure (see
+    /// [`Ir::meta_of`]).
+    pub(crate) fn set_metas(&mut self, metas: Vec<(FnId, Slot)>) {
+        self.metas = metas;
+    }
+
+    /// The slot of the top level's frame, at the bottom of the value stack,
+    /// that holds the closure of the meta of `function`, if it is a
+    /// definition made with a def-type that declares one: what reading the
+    /// meta of a closure of it calls (see [`IrKind::Meta`]). `None` for every
+    /// other function. Linear in the number of the program's definitions with
+    /// a meta, which only a meta's read pays.
+    #[must_use]
+    pub fn meta_of(&self, function: FnId) -> Option<Slot> {
+        self.meta_at(function.index())
+    }
+
+    /// [`Ir::meta_of`] the function whose index is `index`.
+    fn meta_at(&self, index: usize) -> Option<Slot> {
+        self.metas
+            .iter()
+            .find(|(function, _)| function.index() == index)
+            .map(|&(_, slot)| slot)
+    }
+
     /// The path of the function whose index is `index`, if it is a
     /// top-level function named by a dotted path (see [`Ir::set_paths`]);
     /// empty otherwise.
@@ -1861,7 +1912,7 @@ impl Ir {
                 | IrKind::As { kind, .. }
                 | IrKind::Catch { kind, .. }
                 | IrKind::Top(_, kind) => kind,
-                IrKind::MakeClosure { .. } | IrKind::LoadCallee => ValueKind::Fn,
+                IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Meta(_) => ValueKind::Fn,
                 IrKind::MakeFuture { .. } => ValueKind::Deferred,
             };
         }
@@ -1928,11 +1979,16 @@ impl Ir {
     /// slot, as in `(is [int] x#2 @0..9 ...)`, and an `as` its plan, as in
     /// `(as {a: int} @0..9 ...)` (see `Pretty::test` for how a plan is
     /// written); a total comparison of two values of a union of kinds shows
-    /// as `(value-same === @0..9 ...)`. After the root, each
+    /// as `(value-same === @0..9 ...)`. The closure of a function's meta
+    /// shows as `(meta @0..12 ...)` and the function. After the root, each
     /// function is shown on a line of its own as
     /// `fn #0 name (frame 3, params 2, captures 1, height 5)`, a top-level
     /// function named by a dotted path by its path, `fn #0 dev.peios.count
-    /// (frame ...)`, or `fn #1 (frame ...)` if it has no name, a memoised
+    /// (frame ...)`, a definition made with a def-type as it is written,
+    /// `fn #0 package dev.peios.x (frame ...)`, followed by `meta #12`, the
+    /// cell of its meta, if it has one, and the meta's own function as
+    /// `fn #1 defmeta package dev.peios.x (frame ...)`, or `fn #1 (frame
+    /// ...)` if it has no name, a memoised
     /// function as
     /// `memo fn #2 name (frame ...)`, and each `lazy`'s body as
     /// `future #3 (frame ...)`, followed by its body, whose slots are named
@@ -2266,6 +2322,7 @@ impl IrBuilder {
             input,
             dir,
             paths: Vec::new(),
+            metas: Vec::new(),
         }
     }
 }
@@ -2613,8 +2670,10 @@ impl fmt::Display for Pretty<'_> {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }
             // A definition made with a def-type, as it is written, its
-            // namespace's key shown as its def-type.
+            // namespace's key shown as its def-type; a meta as `defmeta`, its
+            // def-type and its path, one name, as written.
             let mut before = " ";
+            let mut meta = false;
             for (at, &segment) in self.ir.path_of(index).iter().enumerate() {
                 let text = self.names.get(segment);
                 if at == 0
@@ -2623,8 +2682,23 @@ impl fmt::Display for Pretty<'_> {
                     write!(f, " {def_type}")?;
                     continue;
                 }
-                write!(f, "{before}{}", FieldName(text))?;
+                if at == 0
+                    && let Some(def_type) = crate::names::key_meta(text)
+                {
+                    write!(f, " defmeta {def_type}")?;
+                    meta = true;
+                    continue;
+                }
+                if mem::take(&mut meta) {
+                    write!(f, "{before}{text}")?;
+                } else {
+                    write!(f, "{before}{}", FieldName(text))?;
+                }
                 before = ".";
+            }
+            // The cell of a definition's meta.
+            if let Some(slot) = self.ir.meta_at(index) {
+                write!(f, " meta {slot}")?;
             }
             writeln!(
                 f,

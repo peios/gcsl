@@ -23,6 +23,19 @@
 //! no variable or field written as one can be a key. A path of names whose
 //! first is a key is shown as its def-type and the rest of the path, as the
 //! definition is written, `package dev.peios.testpkg` ([`show_path`]).
+//!
+//! The metas of a def-type's definitions (`defmeta package x { ... }`) are
+//! kept apart, one namespace per def-type and DIRECTORY, since a meta
+//! belongs to the definition of its path in its own directory: a *meta key*,
+//! `<defmeta `, the def-type's key between its `<` and `>`, `@`, the number
+//! of the directory, and `>`, as in `<defmeta package#3.17@2>`
+//! ([`meta_key`]), under which each meta is one leaf, named by its path as
+//! one name, `dev.peios.testpkg`, so that no two metas of a directory lie
+//! one under another. A path whose first name is a meta key is shown as
+//! `defmeta`, its def-type and the rest, `defmeta package dev.peios.testpkg`.
+//! A name that is either kind of key is a *namespace key*
+//! ([`is_namespace_key`]), which no record read whole holds and no source
+//! can write.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -135,26 +148,79 @@ pub fn key_def_type(text: &str) -> Option<&str> {
     (digits(number) && digits(item)).then_some(path)
 }
 
+/// The number of the file or session input that declares the def-type
+/// whose namespace key is `text`, and the number of its declaring item, if
+/// `text` is a namespace key: 3 and 17 for `<package#3.17>` (see [Namespace
+/// keys](#namespace-keys)).
+#[must_use]
+pub fn key_numbers(text: &str) -> Option<(u32, u32)> {
+    key_def_type(text)?;
+    let inner = text.strip_prefix('<')?.strip_suffix('>')?;
+    let (_, numbers) = inner.rsplit_once('#')?;
+    let (number, item) = numbers.split_once('.')?;
+    Some((number.parse().ok()?, item.parse().ok()?))
+}
+
+/// The text of the meta key of the metas of the definitions made with the
+/// def-type whose namespace key is `key` in the directory numbered `dir`
+/// (see [Namespace keys](#namespace-keys)): `<defmeta package#3.17@2>` for
+/// `<package#3.17>` and 2. `None` if `key` is no namespace key.
+#[must_use]
+pub fn meta_key(key: &str, dir: u32) -> Option<String> {
+    key_def_type(key)?;
+    let inner = key.strip_prefix('<')?.strip_suffix('>')?;
+    Some(format!("<defmeta {inner}@{dir}>"))
+}
+
+/// The path of the def-type whose metas' namespace in a directory `text`
+/// is the meta key of, as its declaration writes it, if `text` is a meta
+/// key: `package` for `<defmeta package#3.17@2>` (see [Namespace
+/// keys](#namespace-keys)).
+#[must_use]
+pub fn key_meta(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("<defmeta ")?.strip_suffix('>')?;
+    let (key, dir) = inner.rsplit_once('@')?;
+    if dir.is_empty() || !dir.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (path, numbers) = key.rsplit_once('#')?;
+    let (number, item) = numbers.split_once('.')?;
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    (digits(number) && digits(item)).then_some(path)
+}
+
+/// Whether `text` is a namespace key, a def-type's or the meta key of a
+/// def-type's metas in a directory (see [Namespace keys](#namespace-keys)):
+/// a name no source can write, and no record read whole holds.
+#[must_use]
+pub fn is_namespace_key(text: &str) -> bool {
+    key_def_type(text).is_some() || key_meta(text).is_some()
+}
+
 /// The path of names `path`, as a diagnostic shows it: joined by `.`, but a
 /// first name that is a namespace key shown as its def-type, then a space and
-/// the rest, `package dev.peios.testpkg` (see [Namespace
-/// keys](#namespace-keys)).
+/// the rest, `package dev.peios.testpkg`, and one that is a meta key as
+/// `defmeta`, its def-type, a space and the rest, `defmeta package
+/// dev.peios.testpkg` (see [Namespace keys](#namespace-keys)).
 #[must_use]
 pub fn show_path(names: &Names, path: &[Name]) -> String {
     let mut shown = String::new();
     let mut separator = "";
     for (index, &name) in path.iter().enumerate() {
         let text = names.get(name);
-        match key_def_type(text).filter(|_| index == 0) {
-            Some(def_type) => {
+        if index == 0 {
+            if let Some(def_type) = key_def_type(text) {
                 shown.push_str(def_type);
                 separator = " ";
                 continue;
             }
-            None => {
-                let _ = write!(shown, "{separator}{text}");
+            if let Some(def_type) = key_meta(text) {
+                let _ = write!(shown, "defmeta {def_type}");
+                separator = " ";
+                continue;
             }
         }
+        let _ = write!(shown, "{separator}{text}");
         separator = ".";
     }
     shown
@@ -177,6 +243,36 @@ mod tests {
         assert_eq!(show_path(&names, &path), "t.package dev.x");
         assert_eq!(show_path(&names, &path[..1]), "t.package");
         assert_eq!(show_path(&names, &path[1..]), "dev.x");
+    }
+
+    #[test]
+    fn a_meta_key_shows_as_defmeta_and_its_def_type() {
+        let key = namespace_key("t.package", 3, 17);
+        assert_eq!(key_numbers(&key), Some((3, 17)));
+        assert_eq!(key_numbers("package"), None);
+        let text = meta_key(&key, 2).unwrap();
+        assert_eq!(text, "<defmeta t.package#3.17@2>");
+        assert_eq!(key_meta(&text), Some("t.package"));
+        // A meta key is no def-type's key, and a def-type's no meta key; both
+        // are namespace keys.
+        assert_eq!(key_def_type(&text), None);
+        assert_eq!(key_meta(&key), None);
+        assert!(is_namespace_key(&text) && is_namespace_key(&key));
+        assert_eq!(meta_key("package", 2), None);
+        for plain in [
+            "<defmeta package#3.17>",
+            "<defmeta package#3.17@>",
+            "<defmeta package#3@2>",
+            "<defmeta package#3.17@x>",
+            "defmeta",
+        ] {
+            assert_eq!(key_meta(plain), None, "{plain}");
+        }
+        assert!(!is_namespace_key("defmeta"));
+        // Its leaf is the definition's path as one name.
+        let mut names = Names::new();
+        let path = [names.intern(&text), names.intern("dev.peios.x")];
+        assert_eq!(show_path(&names, &path), "defmeta t.package dev.peios.x");
     }
 
     #[test]

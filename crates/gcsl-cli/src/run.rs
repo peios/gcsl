@@ -31,8 +31,16 @@
 //! alone, and a reference to one as `(def-type-ref package
 //! dev.peios.testpkg @..)`; in the IR the definition's code is `fn #0
 //! package dev.peios.testpkg (frame ...)`, and the reference the
-//! `make-closure` of a function of its own, which calls the def-type. The
-//! command line itself knows nothing of def-types.
+//! `make-closure` of a function of its own, which calls the def-type. A
+//! definition's meta dumps as `(defmeta package dev.peios.testpkg @..)`,
+//! followed by its function of no parameters, whose body is its block, or a
+//! block whose result is its expression; a function type's meta as written,
+//! `fn(v: Version): PackageDef META-> PackageMeta`, in the tree and in the
+//! types; in the IR the meta's code is `fn #0 defmeta package
+//! dev.peios.testpkg (frame ...)`, the definition's names its meta's cell,
+//! `fn #1 package dev.peios.testpkg meta #12 (frame ...)`, and a read of a
+//! meta, `func.versions`, is the `field` of the `call` of a `meta` of the
+//! function. The command line itself knows nothing of def-types.
 //!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its

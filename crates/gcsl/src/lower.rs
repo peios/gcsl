@@ -299,6 +299,21 @@
 //! (`Lowerer::lower_def_type_ref`). So a closure is made each time a
 //! reference is evaluated, and a call of a reference is a call of it.
 //!
+//! A definition's meta, `defmeta DT PATH { ... }` (see the checker's
+//! "Metas"), is a top-level function too, lowered as a definition is: its
+//! closure stored into its leaf's cell where it is made, its code shown by
+//! `defmeta`, its def-type and its path, `fn #0 defmeta package
+//! dev.peios.testpkg`, and of [`FnKind::Memo`] if its marker is `META->>`,
+//! which its function type, of no parameters, says. The program records,
+//! for each definition whose def-type declares a meta, the cell holding its
+//! meta's closure (`Ir::set_metas`, from [`Resolution::metas`]), so that a
+//! closure of it names its meta. A read of a meta, `func.versions`, lowers
+//! to the `Field` of a `Call` of no arguments of a `Meta` of the function,
+//! which yields its meta's closure, the call of the meta's type's kind,
+//! awaited, as the checker marked it, before its field is read
+//! (`Lowerer::lower_meta_read`): so a read is a call, its caller, its
+//! memoisation and the nesting budget those of any call.
+//!
 //! An expression the checker marked to be awaited (see
 //! [`crate::check::Resolution::await_of`]) is lowered as it would be
 //! otherwise, of the kind of its type before the await, which is
@@ -477,6 +492,7 @@ pub fn lower(
         (input, resolution.place().dir),
     );
     ir.set_paths(dotted_paths(ast, resolution));
+    ir.set_metas(resolution.metas().to_vec());
     Ok(ir)
 }
 
@@ -489,12 +505,20 @@ fn dotted_paths(ast: &Ast, resolution: &Resolution) -> Vec<(FnId, Box<[Name]>)> 
         .iter()
         .filter_map(|&(item, _)| {
             // A definition made with a def-type is named by its path under
-            // its namespace's key.
+            // its namespace's key, and a definition's meta by its leaf, the
+            // meta key and its path as one name.
             let (key, path, value) = match ast.item(item).kind {
                 ItemKind::Field { path, value, .. } => (None, path, value),
                 ItemKind::DefTypeDef { def, value } => {
                     let def = ast.def_type(def);
                     (Some(def.key?), def.path, value)
+                }
+                ItemKind::DefMeta { def, value } => {
+                    let (key, leaf) = ast.def_type(def).meta?;
+                    let ExprKind::Fn(function) = ast.get(value).kind else {
+                        return None;
+                    };
+                    return Some((function, Box::from([key, leaf])));
                 }
                 _ => return None,
             };
@@ -642,7 +666,8 @@ impl Lowerer<'_> {
                 | ItemKind::Spread(_)
                 | ItemKind::Import(_)
                 | ItemKind::Type { .. }
-                | ItemKind::DefTypeDef { .. },
+                | ItemKind::DefTypeDef { .. }
+                | ItemKind::DefMeta { .. },
             )
             | None => Ok(ValueKind::Record),
         }
@@ -709,13 +734,14 @@ impl Lowerer<'_> {
                 continue;
             }
             match item.kind {
-                // A definition made with a def-type is a top-level function,
-                // whose closure is stored into its leaf's cell here if it
-                // is made here.
+                // A definition made with a def-type, and a definition's
+                // meta, is a top-level function, whose closure is stored
+                // into its leaf's cell here if it is made here.
                 ItemKind::Let { .. }
                 | ItemKind::Rebind { .. }
                 | ItemKind::Field { .. }
-                | ItemKind::DefTypeDef { .. } => {
+                | ItemKind::DefTypeDef { .. }
+                | ItemKind::DefMeta { .. } => {
                     let store = self.lower_store(id)?;
                     self.item_stack.push(store);
                 }
@@ -1097,13 +1123,14 @@ impl Lowerer<'_> {
     /// slot the checker gave it.
     fn lower_store(&mut self, id: ItemId) -> Result<IrId, InternalError> {
         let item = self.ast.item(id);
-        // A definition made with a def-type has no path of its own to
-        // update: its closure is stored in its leaf's cell.
+        // A definition made with a def-type, or a definition's meta, has no
+        // path of its own to update: its closure is stored in its leaf's
+        // cell.
         let (path, value) = match item.kind {
             ItemKind::Let { path, value, .. }
             | ItemKind::Rebind { path, value }
             | ItemKind::Field { path, value, .. } => (Some(path), value),
-            ItemKind::DefTypeDef { value, .. } => (None, value),
+            ItemKind::DefTypeDef { value, .. } | ItemKind::DefMeta { value, .. } => (None, value),
             _ => {
                 return Err(InternalError {
                     message: "an item that declares nothing lowered as a declaration",
@@ -1854,6 +1881,9 @@ impl Lowerer<'_> {
         if let VarRef::Fileroot(member) = self.resolution.expr_var(id) {
             return self.lower_fileroot(member, kind, self.ast.get(id).span);
         }
+        if let Some(meta) = self.resolution.meta_read(id) {
+            return self.lower_meta_read(id, (record, name), meta, kind);
+        }
         Ok(match read(self.resolution.expr_var(id), kind) {
             Some(cell) => cell,
             None => IrKind::Field {
@@ -1862,6 +1892,58 @@ impl Lowerer<'_> {
                 kind,
             },
         })
+    }
+
+    /// Lowers the field access `id`, `func.name`, of kind `kind`, which the
+    /// checker found reads the meta of `func`, of type `meta_ty`, awaited as
+    /// `mark` says (see the checker's "Metas"): to a `Field` of the call of
+    /// no arguments of the `Meta` of `func`, which yields its meta's closure,
+    /// awaited as marked, so that reading a meta is calling its closure, the
+    /// caller, the memoisation of a `META->>` meta and the nesting budget
+    /// all as for any call. Apart from `lower_plain`, which is on the
+    /// recursion path of every expression.
+    fn lower_meta_read(
+        &mut self,
+        id: ExprId,
+        (func, name): (ExprId, Name),
+        (meta_ty, mark): (TyId, AwaitMark),
+        kind: ValueKind,
+    ) -> Result<IrKind, InternalError> {
+        let span = self.ast.get(id).span;
+        let mistyped = InternalError {
+            message: "a meta typed as something no value has",
+            span,
+        };
+        let function = self.lower_operand(func, ValueKind::Fn)?;
+        let meta = self.builder.alloc(IrKind::Meta(function), span);
+        let args = self.builder.push_item_list(&[]);
+        let call = self.builder.alloc(
+            IrKind::Call {
+                callee: meta,
+                args,
+                kind: self.table.value_kind(meta_ty).ok_or(mistyped)?,
+                // Set by `IrBuilder::measure` once every node is built.
+                depth: 0,
+            },
+            span,
+        );
+        let record = match mark {
+            AwaitMark::None => call,
+            AwaitMark::Top | AwaitMark::Deep => {
+                let present = self.table.strip(meta_ty);
+                self.builder.alloc(
+                    IrKind::Await {
+                        value: call,
+                        kind: self.table.value_kind(present).ok_or(mistyped)?,
+                        shape: LazyShapeId::NONE,
+                        // Set by `IrBuilder::measure` once every node is built.
+                        depth: 0,
+                    },
+                    span,
+                )
+            }
+        };
+        Ok(IrKind::Field { record, name, kind })
     }
 
     /// Lowers the read of `member` of the `fileroot` module spanning `span`,

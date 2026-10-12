@@ -3093,6 +3093,202 @@ fn fileroot_errors_are_rendered() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// Jack's newpkgs workspace, every file as he wrote it, its `ppk` wrapper
+/// the real one: each file checks, nothing running (the dumps stop before
+/// the run), the definition's type carrying its def-type's meta, which
+/// prints as written in the def-type's parameters.
+#[test]
+fn jacks_newpkgs_check_as_written() {
+    for file in [
+        "workspace.gcsl",
+        "_lib/ppk.gcsl",
+        "dev.peios.testpkg/dev.peios.testpkg.gcsl",
+        "dev.peios.testpkg/build.gcsl",
+    ] {
+        let output = gcsl(&[
+            "run",
+            &format!("tests/fixtures/ws_newpkgs/{file}"),
+            "--dump-types",
+        ]);
+        assert_eq!(stderr(&output), "", "{file}");
+        assert_eq!(output.status.code(), Some(0), "{file}");
+    }
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_newpkgs/workspace.gcsl",
+        "--dump-types",
+    ]);
+    assert!(
+        stdout(&output).contains(
+            "(params (name String) (func fn(v: Version): PackageDef META-> PackageMeta) \
+             (version String))"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_newpkgs/dev.peios.testpkg/dev.peios.testpkg.gcsl",
+        "--dump-types",
+    ]);
+    // The meta's function returns the meta's type, either-shaped under
+    // `META->`; the definition's type is the def-type's parameter's.
+    let either = "{versions: List<{version: String | Future<String>} | Future<{version: String \
+                  | Future<String>}>> | Future<List<{version: String | Future<String>} | \
+                  Future<{version: String | Future<String>}>>>}";
+    let meta = format!("{either} | Future<{either}>");
+    assert!(
+        stdout(&output).contains(&format!(
+            "(defmeta package dev.peios.testpkg @0..122\n    (fn : fn() -> {meta} @16..122\n"
+        )),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "(def-type-def package dev.peios.testpkg @124..224\n    (fn : fn(v: {{version: \
+             String}}): {{arch: String, content: String, version: String}} META-> {meta} \
+             @136..224\n"
+        )),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// Jack's newpkgs with `ppk.commit` stubbed, invoked from source: the
+/// def-type reads its definition's meta for the version asked for, and
+/// panics, as Jack's code says, for one the meta does not list.
+#[test]
+fn run_reads_a_definition_s_meta() {
+    let output = gcsl(&["run", "tests/fixtures/ws_metas/dev.peios.testpkg/run.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{result = {pkg = {arch = \"x86_64\"; content = \"usr\"; version = \"0.1.0\"; \
+         name = \"dev.peios.testpkg\"}; manifest = \"dev.peios.testpkg 0.1.0 x86_64 usr\"}}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_metas/dev.peios.testpkg/missing.gcsl",
+    ]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: dev.peios.testpkg has no version 0.3.0\n\
+         \x20 --> tests/fixtures/ws_metas/workspace.gcsl:86:9\n\
+         \x20  |\n\
+         86 |         panic(\"{name} has no version {version}\")\n\
+         \x20  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `--dump-ast` shows a definition's meta as written, its body the
+/// function's; `--dump-ir` the meta's code by its def-type and path, the
+/// definition's naming the cell of its meta, and a read of the meta as the
+/// call of the `meta` of the function.
+#[test]
+fn dumps_show_metas() {
+    let file = "tests/fixtures/ws_metas/dev.peios.testpkg/dev.peios.testpkg.gcsl";
+    let output = gcsl(&["run", file, "--dump-ast"]);
+    assert!(
+        stdout(&output).starts_with(
+            "(file\n\
+             \x20 (defmeta package dev.peios.testpkg @0..122\n\
+             \x20   (fn @16..122\n\
+             \x20     (params)\n\
+             \x20     (block @34..122\n\
+             \x20       (field versions @40..120\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&["run", file, "--dump-ir"]);
+    let heads: Vec<&str> = stdout(&output)
+        .lines()
+        .filter(|line| line.starts_with("fn #"))
+        .collect();
+    assert_eq!(heads.len(), 2, "{}", stdout(&output));
+    assert_eq!(
+        heads[0],
+        "fn #0 defmeta package dev.peios.testpkg (frame 1, params 0, captures 0, height 6)"
+    );
+    assert!(
+        heads[1].starts_with("fn #1 package dev.peios.testpkg meta #")
+            && heads[1].ends_with(" (frame 4, params 1, captures 0, height 4)"),
+        "{}",
+        heads[1]
+    );
+    let output = gcsl(&["run", "tests/fixtures/ws_metas/workspace.gcsl", "--dump-ir"]);
+    assert!(
+        stdout(&output).contains(
+            "(field versions @3871..3884\n            (await @3871..3884\n              \
+             (call @3871..3884\n                (meta @3871..3884\n                  \
+             (load func#1 @3871..3875))))))"
+        ),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A definition of a def-type that declares a meta, with none in its
+/// directory, rendered with the meta as the def-type writes it.
+#[test]
+fn run_renders_a_missing_defmeta() {
+    let output = gcsl(&["run", "tests/fixtures/meta_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `build x` has no `defmeta` in its directory\n\
+         \x20--> tests/fixtures/meta_error.gcsl:4:5\n\
+         \x20 |\n\
+         4 | def build x() { 1 }\n\
+         \x20 |     ^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: `build` declares a meta, `META: {tag: String}`, for each of its \
+         definitions\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// The REPL: a definition and its meta, declared in one line, are read by
+/// later lines; a definition or a meta alone in a line is the error, since
+/// each line is checked on its own.
+#[test]
+fn repl_keeps_metas_with_their_definitions() {
+    let output = repl(
+        "#[def_type] def p(n: String, f: fn(): Int META: {v: Int}): Int { f() + f.v }\n\
+         defmeta p y { v = 40 }; def p y() { 2 }\n\
+         p y()\n\
+         def p z() { 3 }\n\
+         defmeta p w { v = 0 }\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{p = fn(n: String | Future<String>, f: fn(): Int META: {v: Int}): Int} : \
+         {p: fn(n: String | Future<String>, f: fn(): Int META: {v: Int}): Int}\n\
+         42 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: `p z` has no `defmeta` in its directory\n\
+         \x20--> <repl>:1:5\n\
+         \x20 |\n\
+         1 | def p z() { 3 }\n\
+         \x20 |     ^^^\n\
+         \x20 |\n\
+         \x20 = note: `p` declares a meta, `META: {v: Int}`, for each of its definitions\n\
+         error: `defmeta p w` has no definition `w` in its directory\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | defmeta p w { v = 0 }\n\
+         \x20 | ^^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn repl_evaluates_each_line() {
     let output = repl("1 + 2\n\n   \n7 / 2\n1 +\n-0.0\n");

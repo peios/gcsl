@@ -551,6 +551,26 @@
 //!   awaited by a build driver elsewhere calls `commit` with `test.gcsl`'s
 //!   directory.
 //!
+//! # Metas
+//!
+//! A read of a function's meta, `func.versions` (see the checker's "Metas"),
+//! is a `Field` of a `Call` of no arguments whose callee is a `Meta` of the
+//! function: the function walker evaluates the `Meta` (`Evaluator::meta`)
+//! by evaluating the function to its closure and taking the closure that
+//! the cell of the top level's frame its code names holds
+//! ([`Ir::meta_of`]), the closure of the definition's meta, which the
+//! meta's file stored there as any top-level function's, before anything
+//! that uses the definition ran. Then the call is a call like any other: a
+//! `META->` meta's body runs at each read, a `META->>` meta's closure is
+//! memoised as any closure of a memoised function is, by the closure, so
+//! its body runs once per run however often it is read, and a `META:`
+//! meta's runs at each read too, which is invisible; the body runs for the
+//! caller the reading frame gives a callee, `fileroot.helper()` applying, and
+//! its own code's directory is its `fileroot.this`. A closure whose code
+//! names no meta, or a built-in function, is an internal error, which the
+//! checker rules out. A function with a meta is a closure like any other:
+//! equality, `is` and the keys of memoised calls see nothing of its meta.
+//!
 //! # Memoised functions
 //!
 //! A function declared with `->>` is lowered to code of [`FnKind::Memo`],
@@ -1017,16 +1037,13 @@ impl Evaluator<'_> {
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
             IrKind::Field { record, name, .. } => self.field(record, name, node),
-            IrKind::UpdateField {
-                record,
-                name,
-                value,
-            } => self.update_field((record, name, value), node),
+            IrKind::UpdateField { .. } => self.update_field(node),
             IrKind::Update { .. } => self.update(node),
             IrKind::LoadCapture(index, _) => self.capture_value(index, node),
             IrKind::Top(slot, ValueKind::Fn) => self.top_function_value(slot, node),
             IrKind::Top(slot, kind) => self.top_value(slot, kind, node),
             IrKind::LoadCallee | IrKind::MakeClosure { .. } => self.closure_value(node),
+            IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
                 callee,
                 args,
@@ -1231,6 +1248,32 @@ impl Evaluator<'_> {
             // prelude's `int`, say, read from inside a function.
             Some(&Value::Builtin(builtin)) => Ok(Callee::Builtin(builtin)),
             _ => Err(not_made(node).into()),
+        }
+    }
+
+    /// The closure of the meta of the function that `function` evaluates to,
+    /// for the `Meta` `node` (see [Metas](#metas)): the closure of a
+    /// definition's meta, which the cell of the top level's frame that the
+    /// definition's code names holds ([`Ir::meta_of`]). A built-in function,
+    /// or a closure whose code names no cell, which the checker rules out, is
+    /// an internal error. Out of line: only a meta's read pays for it.
+    #[inline(never)]
+    fn meta(&mut self, function: IrId, node: &IrNode) -> Flow<Callee> {
+        let Callee::Closure(closure) = self.function(function)? else {
+            return Err(internal("the meta of a built-in function read", node.span).into());
+        };
+        let Some(slot) = closure.code.meta_of(closure.function) else {
+            return Err(internal("the meta of a function that has none read", node.span).into());
+        };
+        self.top_function(slot, node)
+    }
+
+    /// [`Evaluator::meta`] as a value. Out of line, as `meta` is.
+    #[inline(never)]
+    fn meta_value(&mut self, function: IrId, node: &IrNode) -> Flow<Value> {
+        match self.meta(function, node)? {
+            Callee::Closure(closure) => Ok(Value::Fn(closure)),
+            Callee::Builtin(builtin) => Ok(Value::Builtin(builtin)),
         }
     }
 
@@ -2114,6 +2157,7 @@ impl Evaluator<'_> {
             IrKind::MakeClosure { function, captures } => {
                 self.make_closure(function, captures).map(Callee::Closure)
             }
+            IrKind::Meta(function) => self.meta(function, node),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.function(result)
@@ -2585,11 +2629,9 @@ impl Evaluator<'_> {
                 ..
             }
             | IrKind::MakeFuture { .. } => mistyped(node, DEFERRED_INT),
-            IrKind::Await { .. } => self.await_as(node, Value::into_int),
-            IrKind::As { .. } => self.narrow_as(node, Value::into_int),
-            IrKind::Index { list, index, .. } => {
-                self.index_as((list, index), node, Value::into_int)
-            }
+            IrKind::Await { .. } => self.await_as(node, into_int),
+            IrKind::As { .. } => self.narrow_as(node, into_int),
+            IrKind::Index { list, index, .. } => self.index_as((list, index), node, into_int),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Load(slot, _) => self.slot_as(slot, node, as_int),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, as_int),
@@ -2599,7 +2641,7 @@ impl Evaluator<'_> {
                 args,
                 depth,
                 ..
-            } => self.call_as((callee, args, depth), node, Value::into_int),
+            } => self.call_as((callee, args, depth), node, into_int),
             IrKind::Block { items, result } => {
                 self.items(items)?;
                 self.int(result)
@@ -2616,9 +2658,7 @@ impl Evaluator<'_> {
             IrKind::IntRem(operands) => {
                 self.int_division(node, operands, |lhs, rhs| Some(floor_mod(lhs, rhs)))
             }
-            IrKind::Field { record, name, .. } => {
-                self.field_as((record, name), node, Value::into_int)
-            }
+            IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_int),
             IrKind::FloatConst(_)
             | IrKind::FloatNeg(_)
             | IrKind::FloatAdd(_)
@@ -2661,13 +2701,14 @@ impl Evaluator<'_> {
             | IrKind::Return { .. }
             | IrKind::Catch { .. }
             | IrKind::For { .. }
-            | IrKind::Loop { .. } => self.stopping(node, Value::into_int),
+            | IrKind::Loop { .. } => self.stopping(node, into_int),
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where an Int was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where an Int was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where an Int was expected"),
         }
     }
 
@@ -2817,9 +2858,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Float was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a Float was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a Float was expected"),
         }
     }
 
@@ -2932,9 +2974,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a Bool was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a Bool was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a Bool was expected"),
         }
     }
 
@@ -3100,9 +3143,10 @@ impl Evaluator<'_> {
             IrKind::MakeList { .. } | IrKind::Spread(_) | IrKind::Range(..) => {
                 mistyped(node, "list node where a String was expected")
             }
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a String was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a String was expected"),
         }
     }
 
@@ -3149,11 +3193,7 @@ impl Evaluator<'_> {
             }
             IrKind::MakeRecord { layout, values } => self.make_record(layout, values),
             IrKind::Field { record, name, .. } => self.field_as((record, name), node, into_record),
-            IrKind::UpdateField {
-                record,
-                name,
-                value,
-            } => self.update_field((record, name, value), node),
+            IrKind::UpdateField { .. } => self.update_field(node),
             IrKind::Update {
                 kind: ValueKind::Record,
                 ..
@@ -3204,20 +3244,25 @@ impl Evaluator<'_> {
             | IrKind::Spread(_)
             | IrKind::Range(..)
             | IrKind::Update { .. } => mistyped(node, "list node where a record was expected"),
-            IrKind::MakeClosure { .. } | IrKind::LoadCallee | IrKind::Arg { .. } => {
-                mistyped(node, "function node where a record was expected")
-            }
+            IrKind::MakeClosure { .. }
+            | IrKind::LoadCallee
+            | IrKind::Meta(_)
+            | IrKind::Arg { .. } => mistyped(node, "function node where a record was expected"),
         }
     }
 
-    /// Evaluates the `UpdateField` `node`, setting field `name` of `record`
-    /// to `value`: a new record, the old one unchanged. See the module
+    /// Evaluates the `UpdateField` `node`, setting its field of its record
+    /// to its value: a new record, the old one unchanged. See the module
     /// documentation.
-    fn update_field(
-        &mut self,
-        (record, name, value): (IrId, Name, IrId),
-        node: &IrNode,
-    ) -> Flow<Value> {
+    fn update_field(&mut self, node: &IrNode) -> Flow<Value> {
+        let IrKind::UpdateField {
+            record,
+            name,
+            value,
+        } = node.kind
+        else {
+            return mistyped(node, "a node that is not a field's update updated");
+        };
         let old = self.record(record)?;
         let value = self.value(value)?;
         self.with_field(old, name, value, node)
@@ -4599,6 +4644,13 @@ fn as_record(value: &Value, node: &IrNode) -> Flow<Value> {
         Value::Empty | Value::Record(_) => Ok(value.clone()),
         _ => mistyped(node, "record load from a slot holding another type"),
     }
+}
+
+/// `value`'s `Int` if it is one: what the Int walker extracts from an
+/// element read by an index, an awaited value or a field, as
+/// [`into_record`] is the record walker's.
+fn into_int(value: Value) -> Option<i64> {
+    value.into_int()
 }
 
 /// `value` if it is a record: what the record walker extracts from an

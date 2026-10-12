@@ -109,6 +109,7 @@
 //! ```text
 //! DEFINITION = "def" DT PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
 //! REFERENCE  = DT PATH
+//! META       = "defmeta" DT PATH (BLOCK | "=" EXPR)
 //! DT, PATH   = IDENT ("." IDENT)*
 //! ```
 //!
@@ -141,7 +142,33 @@
 //! field name of the form of a namespace's key (see [`crate::names`],
 //! "Namespace keys") is "a field cannot be named `\"<p#1.2>\"`: names of
 //! that form are def-types' namespaces", at the name, so no source can
-//! write a key.
+//! write a key, nor a meta key, `\"<defmeta p#1.2@3>\"`. A definition also
+//! holds the read of its meta, a name and a field access both standing for
+//! nothing until the workspace names them, allocated with its path, before
+//! its function in the arena and starting at its `DT`
+//! (`Parser::unresolved_meta_read`).
+//!
+//! A definition's meta, [`ItemKind::DefMeta`] (see the checker's "Metas"),
+//! is recognised where an item starts (`Parser::starts_defmeta`): the name
+//! `defmeta`, then on its line a name or a dotted path, its DT, then on the
+//! line of that an identifier, which starts its PATH, a definition's path.
+//! `defmeta` is contextual, as `type` is: anywhere else it is a name, a
+//! variable, a field or a def-type (`defmeta = 1`, `x = defmeta p`, `defmeta
+//! p { ... }` the call of a reference with a trailing block), and two paths in
+//! a row after it never parsed before, so every program that parsed parses
+//! as it did. After PATH comes its body, a block, or `=` and any
+//! expression, which is the result of a block of that one item, written
+//! nowhere: the body of a function expression of no parameters, no return
+//! type, and a marker that means nothing, spanning its path through its
+//! body, as a definition's does (`Parser::parse_defmeta`). Anything else
+//! after PATH is "expected `{` or `=` after the meta's path", and `META` and
+//! a marker there "a meta is written only in a function type". It is an
+//! item of a file's outermost body only: anywhere else, "a `defmeta` is
+//! declared only at the top level of a file", at its `defmeta`.
+//! `#[shadowable]` before one is "`#[shadowable]` does not apply to a
+//! `defmeta`", at the attribute, since a definition that shadows another
+//! brings its own meta; `#[def_type]` is the error it is before anything but
+//! a `def`.
 //!
 //! # Imports
 //!
@@ -286,6 +313,23 @@
 //! `->>` or `->`, and the return type; a parameter type is `NAME: TYPE`,
 //! recognised
 //! by an identifier followed by `:`, or just `TYPE`.
+//!
+//! A function type may have a *meta* (see the checker's "Metas"): after its
+//! whole return type, a union included, the identifier `META` directly
+//! followed by `:`, `->>` or `->`, its marker, then the meta's type, newlines
+//! skipped after the marker, as in `fn(v: Version): PackageDef META->
+//! PackageMeta` ([`MetaTy`], `Parser::meta_marker`). `META` is no keyword:
+//! anywhere else it is a name, and followed by anything else after a return
+//! type, it is what it always was; a newline outside parentheses ends the
+//! type first, as it always did, so a meta begins on the line its return type
+//! ends on. Since the innermost return type takes it, the meta of a function
+//! type that returns a function type is written with that return type in
+//! parentheses, `fn(): (fn(): Int) META: {a: Int}`. Only a function type has
+//! a meta: `META` and a marker after the return type of a function
+//! expression (a `fn` or a `def` included), or after the parameters of a
+//! definition made with a def-type, are "a meta is written only in a
+//! function type", at `META` and its marker. No program that parsed had
+//! `META` and a marker there, so every one parses as it did.
 //!
 //! An applied type is any identifier directly followed by `<`, a type, and
 //! `>`, which must follow the type directly; there is no `>>` token, so
@@ -644,10 +688,10 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, DefTypeUse, Effect, Element, Expr, ExprId, ExprKind,
-    FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item,
-    ItemId, ItemKind, ItemRange, Jump, Label, Param, ParamTy, PathRange, PathSegment, SegmentKind,
-    StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, DefTypeRole, DefTypeUse, Effect, Element, Expr,
+    ExprId, ExprKind, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember,
+    ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange,
+    PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -733,8 +777,26 @@ const MISPLACED_DEF_TYPE_DEF: &str =
 
 /// The text of the name a def-type reference's read of its definition
 /// starts with until the workspace names the def-type's namespace: no
-/// program can write it, `<` being in no identifier.
+/// program can write it, `<` being in no identifier. A definition's read of
+/// its meta starts with it, and its field access names it, until the
+/// workspace names the namespace of the metas and the meta's leaf.
 const UNRESOLVED_NAMESPACE: &str = "<def-type>";
+
+/// The contextual keyword that begins a definition's meta (see
+/// [Def-types](#def-types)).
+const DEFMETA: &str = "defmeta";
+
+/// The error for a definition's meta anywhere but in a file's outermost
+/// body.
+const MISPLACED_DEFMETA: &str = "a `defmeta` is declared only at the top level of a file";
+
+/// The name that, after a function type's return type and followed by `:`,
+/// `->` or `->>`, begins its meta (see [Types](#types)).
+const META: &str = "META";
+
+/// The error for a meta's marker anywhere but after a function type's
+/// return type.
+const MISPLACED_META: &str = "a meta is written only in a function type";
 
 /// The error for `#[shadowable]` before anything but a top-level field,
 /// `def` or `import`.
@@ -1065,6 +1127,12 @@ impl Parser<'_> {
                     }
                     self.parse_type_item(token)?
                 }
+                _ if self.starts_defmeta() => {
+                    if open.is_some() {
+                        return Err(self.error(MISPLACED_DEFMETA, token.span));
+                    }
+                    self.parse_defmeta(token)?
+                }
                 _ => self.parse_item()?,
             };
             if open.is_some()
@@ -1182,6 +1250,11 @@ impl Parser<'_> {
         {
             self.builder.mark_shadowable(item);
             return Ok(());
+        }
+        // A meta is its definition's: a definition that shadows another
+        // brings its own.
+        if matches!(kind, ItemKind::DefMeta { .. }) {
+            return Err(self.error("`#[shadowable]` does not apply to a `defmeta`", attribute));
         }
         let mut error = Diagnostic::error(MISPLACED_SHADOWABLE, attribute);
         if matches!(kind, ItemKind::Let { .. }) {
@@ -1679,6 +1752,9 @@ impl Parser<'_> {
         let shown = self.show_segments(dt);
         let dt_expr = self.path_expr(dt)?;
         let segments = self.parse_def_type_path()?;
+        // The read of its meta, outside its function's subtree as its `DT`'s
+        // is, which the workspace names once it knows its def-type.
+        let meta_read = self.unresolved_meta_read(self.span_of(dt_expr), &segments)?;
         let open = self.peek();
         if open.kind != TokenKind::LParen {
             let found = self.describe(open);
@@ -1689,6 +1765,10 @@ impl Parser<'_> {
         }
         self.advance();
         let (params, close) = self.parse_definition_params(open, &shown)?;
+        if self.meta_marker().is_some() {
+            let span = Span::join(self.peek().span, self.peek_at(1).span);
+            return Err(self.error(MISPLACED_META, span));
+        }
         let marker = self.peek();
         if matches!(
             marker.kind,
@@ -1727,10 +1807,13 @@ impl Parser<'_> {
         // Its leaf is under its namespace's root, one segment more.
         shape.segments = shape.segments.saturating_add(1);
         let def = self.builder.push_def_type(DefTypeUse {
+            role: DefTypeRole::Definition,
             dt: dt_expr,
             path,
             read: None,
             key: None,
+            meta: None,
+            meta_read: Some(meta_read),
             span: Span::join(open.span, close.span),
         });
         self.finish_item(
@@ -1829,13 +1912,154 @@ impl Parser<'_> {
         let span = Span::join(self.span_of(dt), path_span(&segments));
         let height = self.height_of(dt).max(self.height_of(read)) + 1;
         let def = self.builder.push_def_type(DefTypeUse {
+            role: DefTypeRole::Reference,
             dt,
             path,
             read: Some(read),
             key: None,
+            meta: None,
+            meta_read: None,
             span,
         });
         self.alloc(ExprKind::DefTypeRef(def), span, height)
+    }
+
+    /// Allocates the read of the meta of the definition whose def-type is
+    /// written at `dt` and whose path is `segments`, before the workspace
+    /// names what it reads (see [Def-types](#def-types)): a name standing
+    /// for the namespace of the metas, written nowhere, at the start of
+    /// `DT`, with one field access, spanning `DT` through the path, for the
+    /// meta's leaf, which is the path as one name; both stand for nothing
+    /// until the workspace names them ([`Ast::set_def_type_key`]). Before the
+    /// definition's function in the arena, and starting before it, as its
+    /// `DT` does ([`Ast::subtree`]).
+    fn unresolved_meta_read(&mut self, dt: Span, segments: &[PathSegment]) -> ParseResult<ExprId> {
+        let unresolved = self.names.intern(UNRESOLVED_NAMESPACE);
+        self.path_expr(&[
+            PathSegment {
+                kind: SegmentKind::Name(unresolved),
+                span: Span::new(dt.start, dt.start),
+            },
+            PathSegment {
+                kind: SegmentKind::Name(unresolved),
+                span: path_span(segments),
+            },
+        ])
+    }
+
+    /// Whether the current token begins a definition's meta, `defmeta DT
+    /// PATH { ... }` or `defmeta DT PATH = EXPR` (see
+    /// [Def-types](#def-types)): the name `defmeta`, then on its line a name
+    /// or a dotted path, then on its line an identifier. `defmeta` is a name
+    /// everywhere else: two names in a row after it never parsed before.
+    fn starts_defmeta(&self) -> bool {
+        let keyword = self.peek();
+        if !matches!(keyword.kind, TokenKind::Ident(name) if self.names.get(name) == DEFMETA) {
+            return false;
+        }
+        if !self.is_name_after(keyword.span, self.peek_at(1)) {
+            return false;
+        }
+        // The def-type's path: identifiers joined by `.`.
+        let mut last = 1;
+        while self.peek_at(last + 1).kind == TokenKind::Dot
+            && matches!(self.peek_at(last + 2).kind, TokenKind::Ident(_))
+        {
+            last += 2;
+        }
+        self.is_name_after(self.peek_at(last).span, self.peek_at(last + 1))
+    }
+
+    /// Parses a definition's meta, `defmeta DT PATH { ... }` or `defmeta DT
+    /// PATH = EXPR`, starting at its `defmeta`, `keyword`, which
+    /// [`Parser::starts_defmeta`] has found (see [Def-types](#def-types)):
+    /// its def-type, its path, as a definition's is, and its body, the block
+    /// or the expression, which makes a function of no parameters whose
+    /// result type and marker are the meta's its def-type declares. Anything
+    /// but `{` or `=` after the path is "expected `{` or `=` after the meta's
+    /// path".
+    fn parse_defmeta(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        let mut dt = Vec::new();
+        while let token = self.peek()
+            && let TokenKind::Ident(name) = token.kind
+        {
+            dt.push(PathSegment {
+                kind: SegmentKind::Name(name),
+                span: token.span,
+            });
+            self.advance();
+            if self.peek().kind != TokenKind::Dot
+                || !matches!(self.peek_at(1).kind, TokenKind::Ident(_))
+            {
+                break;
+            }
+            self.advance();
+        }
+        let dt_expr = self.path_expr(&dt)?;
+        let segments = self.parse_def_type_path()?;
+        let token = self.peek();
+        let body = match token.kind {
+            TokenKind::LBrace => self.parse_block()?,
+            // The expression, as the result of a block written nowhere.
+            TokenKind::Eq => {
+                self.advance();
+                self.skip_newlines();
+                let value = self.parse_expr(0)?;
+                let span = self.span_of(value);
+                let height = self.height_of(value);
+                let result = self.builder.alloc_item(Item {
+                    kind: ItemKind::Result(value),
+                    span: Span::join(token.span, span),
+                });
+                let items = self.builder.push_item_list(&[result]);
+                self.alloc(
+                    ExprKind::Block { items, label: None },
+                    span,
+                    height.saturating_add(1),
+                )?
+            }
+            _ => {
+                if self.meta_marker().is_some() {
+                    let span = Span::join(token.span, self.peek_at(1).span);
+                    return Err(self.error(MISPLACED_META, span));
+                }
+                let found = self.describe(token);
+                return Err(self.error(
+                    format!("expected `{{` or `=` after the meta's path, found {found}"),
+                    error_span(token),
+                ));
+            }
+        };
+        let height = self.height_of(body).max(LEAF_HEIGHT) + 1;
+        let span = Span::join(path_span(&segments), self.span_of(body));
+        let params = self.builder.push_params(&[]);
+        let function = self.builder.push_fn(FnDecl {
+            params,
+            ret: None,
+            // The meta's to say, as its def-type declares it.
+            effect: Effect::Pure,
+            marker: self.span_of(dt_expr),
+            body,
+        });
+        let value = self.alloc(ExprKind::Fn(function), span, height)?;
+        let path_at = Span::new(keyword.span.start, path_span(&segments).end);
+        let base = self.path.len();
+        self.path.extend(segments);
+        let (path, mut shape) = self.finish_path(base);
+        // Its leaf is the path, as one name, under its namespace's root.
+        shape.segments = 2;
+        let def = self.builder.push_def_type(DefTypeUse {
+            role: DefTypeRole::Meta,
+            dt: dt_expr,
+            path,
+            read: None,
+            key: None,
+            meta: None,
+            meta_read: None,
+            span: path_at,
+        });
+        self.finish_item(keyword, (ItemKind::DefMeta { def, value }, value), 0, shape)
     }
 
     /// Whether `expr` is a def-type as a reference writes it, a name or a
@@ -2421,10 +2645,11 @@ impl Parser<'_> {
         if self.source.slice(token.span).starts_with('r') {
             return Err(self.error(PLAIN_FIELD_NAME, token.span));
         }
-        // A name of the form of a def-type's namespace key could reach its
-        // definitions: no source may write one (see [Def-types](#def-types)).
+        // A name of the form of a def-type's namespace key, or of a meta key,
+        // could reach its definitions or their metas: no source may write
+        // one (see [Def-types](#def-types)).
         let text = self.strings.get(text);
-        if crate::names::key_def_type(text).is_some() {
+        if crate::names::is_namespace_key(text) {
             let message = format!(
                 "a field cannot be named `{}`: names of that form are def-types' namespaces",
                 crate::strings::FieldName(text)
@@ -2715,15 +2940,50 @@ impl Parser<'_> {
         self.param_ty_stack.truncate(base);
         let (effect, _) = self.return_marker()?;
         let (ret, ret_height) = self.parse_type()?;
+        // The return type, a union included, and then its meta, if `META`
+        // and a marker follow it.
+        let (meta, end, meta_height) = match self.meta_marker() {
+            Some(meta_effect) => {
+                self.advance();
+                self.advance();
+                self.skip_newlines();
+                let (ty, height) = self.parse_type()?;
+                let meta = MetaTy {
+                    effect: meta_effect,
+                    ty,
+                };
+                (Some(meta), ty, height)
+            }
+            None => (None, ret, 0),
+        };
         let id = self.builder.alloc_type(TypeExpr {
             kind: TypeExprKind::Fn {
                 params,
                 ret,
                 effect,
+                meta,
             },
-            span: Span::join(keyword.span, self.type_span(ret)),
+            span: Span::join(keyword.span, self.type_span(end)),
         });
-        Ok((id, tallest.max(ret_height) + 1))
+        Ok((id, tallest.max(ret_height).max(meta_height) + 1))
+    }
+
+    /// The effect of the meta whose marker the current token begins, if it
+    /// does: `META` followed by `:`, `->>` or `->` (see [Types](#types)).
+    /// `META` followed by anything else is a name.
+    fn meta_marker(&self) -> Option<Effect> {
+        let TokenKind::Ident(name) = self.peek().kind else {
+            return None;
+        };
+        if self.names.get(name) != META {
+            return None;
+        }
+        match self.peek_at(1).kind {
+            TokenKind::Colon => Some(Effect::Pure),
+            TokenKind::MemoArrow => Some(Effect::Memo),
+            TokenKind::Arrow => Some(Effect::Impure),
+            _ => None,
+        }
     }
 
     /// Consumes the `(` after `fn`, returning it, or reports what is there
@@ -3198,6 +3458,11 @@ impl Parser<'_> {
         self.param_stack.truncate(base);
         let (effect, marker) = self.return_marker()?;
         let (ret, ret_height) = self.parse_type()?;
+        // Only a function type has a meta.
+        if self.meta_marker().is_some() {
+            let span = Span::join(self.peek().span, self.peek_at(1).span);
+            return Err(self.error(MISPLACED_META, span));
+        }
         let brace = self.peek();
         if brace.kind != TokenKind::LBrace {
             return Err(self.error("expected `{` to start the function body", error_span(brace)));
@@ -4253,7 +4518,20 @@ mod tests {
                 write!(out, "def {def_type} {path}({}) ", params.join(", ")).unwrap();
                 expr(ast, decl.body, out);
             }
+            ItemKind::DefMeta { def, value } => defmeta_shape(ast, (def, value), out),
         }
+    }
+
+    /// A definition's meta, of the use of its def-type `def` and the function
+    /// `value`, as written: `defmeta`, the def-type, the path and the body.
+    fn defmeta_shape(ast: &Ast, (def, value): (crate::ast::DefTypeId, ExprId), out: &mut String) {
+        use std::fmt::Write as _;
+        let (def_type, path) = ast.show_def_type(def);
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            panic!("a meta's value is not a function");
+        };
+        write!(out, "defmeta {def_type} {path} ").unwrap();
+        expr(ast, ast.fn_decl(function).body, out);
     }
 
     /// An import item as it is written.
@@ -4332,6 +4610,7 @@ mod tests {
                 params,
                 ret,
                 effect,
+                meta,
             } => {
                 out.push_str("fn(");
                 for (index, param) in ast.param_tys(params).iter().enumerate() {
@@ -4346,6 +4625,12 @@ mod tests {
                 }
                 out.push_str(effect.params_end());
                 type_name(ast, ret, out);
+                if let Some(meta) = meta {
+                    out.push(' ');
+                    out.push_str(meta.effect.meta_marker());
+                    out.push(' ');
+                    type_name(ast, meta.ty, out);
+                }
             }
             TypeExprKind::Applied { name, arg, .. } => {
                 out.push_str(ast.names().get(name));
@@ -6875,6 +7160,7 @@ mod tests {
             params,
             ret,
             effect,
+            ..
         } = ty.kind
         else {
             panic!("expected a function type, got {ty:?}");
@@ -9621,6 +9907,142 @@ mod tests {
                     .to_owned(),
                 Span::new(0, 9)
             )
+        );
+    }
+
+    /// The meta of the outermost function type of the annotation of the
+    /// only item of `text`, a `let`: its marker's effect and its type's
+    /// span.
+    fn annotation_meta(text: &str) -> Option<(Effect, Span)> {
+        let ast = parse_text(text).unwrap();
+        let ItemKind::Let { ty: Some(ty), .. } = ast.item(ast.items(ast.root())[0]).kind else {
+            panic!("expected an annotated `let`");
+        };
+        let TypeExprKind::Fn { meta, .. } = ast.type_expr(ty).kind else {
+            panic!("expected a function type");
+        };
+        meta.map(|meta| (meta.effect, ast.type_expr(meta.ty).span))
+    }
+
+    #[test]
+    fn a_function_type_may_have_a_meta() {
+        // After the return type, a union included, `META` and a marker.
+        assert_eq!(
+            shape("let f: fn(v: Int): Int META: {a: Int} = g"),
+            "let f: fn(v: Int): Int META: {a: Int} = g"
+        );
+        assert_eq!(
+            shape("let f: fn() -> Int | String META-> {a: Int} = g"),
+            "let f: fn() -> (Int | String) META-> {a: Int} = g"
+        );
+        assert_eq!(
+            annotation_meta("let f: fn() ->> Int META->> Future<{a: Int}> = g"),
+            Some((Effect::Memo, Span::new(28, 44)))
+        );
+        assert_eq!(
+            annotation_meta("let f: fn(): Int META-> {a: Int} = g"),
+            Some((Effect::Impure, Span::new(24, 32)))
+        );
+        // A meta after the return type of a function type returned belongs
+        // to the inner one, unless it is in parentheses.
+        assert_eq!(
+            annotation_meta("let f: fn(): fn(): Int META: {a: Int} = g"),
+            None
+        );
+        assert_eq!(
+            annotation_meta("let f: fn(): (fn(): Int) META: {a: Int} = g"),
+            Some((Effect::Pure, Span::new(31, 39)))
+        );
+        // Newlines inside parentheses are skipped, after the marker too.
+        assert_eq!(
+            annotation_meta("let f: (fn(): Int\nMETA:\n{a: Int}) = g"),
+            Some((Effect::Pure, Span::new(24, 32)))
+        );
+        // The dump prints it as written.
+        assert_eq!(
+            parse_text("x : fn(): (fn(): Int) META-> A")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n  (expr @0..30\n    (: fn(): (fn(): Int) META-> A @0..30\n      \
+             (name x @0..1))))"
+        );
+        // `META` is a name everywhere else.
+        assert_eq!(shape("META = 1\nlet y = META"), "META = 1; let y = META");
+        assert_eq!(shape("let f: fn(): META = g"), "let f: fn(): META = g");
+        // A meta's marker anywhere but after a function type's return type.
+        assert_eq!(
+            error("x = fn(): Int META: {a: Int} { 1 }"),
+            (MISPLACED_META.to_owned(), Span::new(14, 19))
+        );
+        assert_eq!(
+            error("def f() -> Int META-> {a: Int} { 1 }"),
+            (MISPLACED_META.to_owned(), Span::new(15, 21))
+        );
+        assert_eq!(
+            error("def p x() META->> {a: Int} { 1 }"),
+            (MISPLACED_META.to_owned(), Span::new(10, 17))
+        );
+    }
+
+    #[test]
+    fn a_defmeta_is_a_function_of_its_body() {
+        assert_eq!(
+            shape("defmeta p dev.x { a = 1 }"),
+            "defmeta p dev.x {a = 1}"
+        );
+        assert_eq!(
+            shape("defmeta t.p x = lazy { a = 1 }"),
+            "defmeta t.p x {= (lazy {a = 1})}"
+        );
+        // The dump: its function, of no parameters, its body the block, or
+        // a block whose result is the expression.
+        assert_eq!(
+            parse_text("defmeta p x = 1\ndefmeta p y { a = 2 }")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n  (defmeta p x @0..15\n    (fn @10..15\n      (params)\n      \
+             (block @14..15\n        (result @12..15\n          (int 1 @14..15)))))\n  \
+             (defmeta p y @16..37\n    (fn @26..37\n      (params)\n      \
+             (block @28..37\n        (field a @30..35\n          (int 2 @34..35))))))"
+        );
+        // `defmeta` is a name everywhere else: a field, a variable, and the
+        // def-type of a reference.
+        assert_eq!(
+            shape("defmeta = 1\nlet y = defmeta\nz = defmeta p\nw = defmeta p { 1 }"),
+            "defmeta = 1; let y = defmeta; z = (defmeta p); w = (defmeta p)(){1}"
+        );
+        // Its errors.
+        assert_eq!(
+            error("x = { defmeta p a { b = 1 } }"),
+            (MISPLACED_DEFMETA.to_owned(), Span::new(6, 13))
+        );
+        assert_eq!(
+            error("#[shadowable] defmeta p a { b = 1 }"),
+            (
+                "`#[shadowable]` does not apply to a `defmeta`".to_owned(),
+                Span::new(0, 13)
+            )
+        );
+        assert_eq!(
+            error("#[def_type] defmeta p a { b = 1 }"),
+            (MISPLACED_DEF_TYPE.to_owned(), Span::new(0, 11))
+        );
+        assert_eq!(
+            error("defmeta p a b"),
+            (
+                "expected `{` or `=` after the meta's path, found `b`".to_owned(),
+                Span::new(12, 13)
+            )
+        );
+        assert_eq!(
+            error("defmeta p a.\"b\" { }"),
+            (DEF_PATH.to_owned(), Span::new(12, 15))
+        );
+        assert_eq!(
+            error("defmeta p a META: {b: Int} { }"),
+            (MISPLACED_META.to_owned(), Span::new(12, 17))
         );
     }
 }

@@ -197,6 +197,17 @@
 //! root's: so an earlier input's definitions of the def-type are no longer
 //! seen. An input of definitions alone has the value `{}`.
 //!
+//! A definition's meta (see the checker's "Metas") belongs to the
+//! definition of its path in its directory, and the inputs of a session
+//! share one directory scope, but each input is checked on its own, as the
+//! one file of its scan: so a definition whose def-type declares a meta and
+//! its `defmeta` must be in the SAME input. An input with the definition
+//! alone is "`package x` has no `defmeta` in its directory", the meta noted
+//! as its type shows when the def-type is an earlier input's, and one with
+//! the `defmeta` alone "`defmeta package x` has no definition `x` in its
+//! directory". A definition of an earlier input keeps its meta: its code
+//! names its meta's cell, which keeps its slot.
+//!
 //! # Workspaces
 //!
 //! A [`crate::workspace::Workspace`] is driven like a session: its files
@@ -577,6 +588,50 @@ mod tests {
             messages(&mut session, "build y()"),
             ["`build` is not a def-type"]
         );
+    }
+
+    #[test]
+    fn a_definition_and_its_meta_are_of_one_input() {
+        let mut session = Session::new();
+        // One input declares a def-type whose definitions carry a meta, and a
+        // definition with its meta; a later input invokes it.
+        let first = "#[def_type]\n\
+                     def build(name: String, f: fn(): String META->> {tag: String}) -> String {\n\
+                     \x20   \"{f()} {f.tag}\"\n\
+                     }\n\
+                     defmeta build x { tag = \"tx\" }\n\
+                     def build x() { \"x\" }";
+        assert!(matches!(value(&mut session, first), Value::Record(_)));
+        assert_eq!(value(&mut session, "build x()").to_string(), "x tx");
+        // A later input defines another, with its meta, and keeps a function
+        // of it, which an input after it calls.
+        assert_eq!(
+            value(
+                &mut session,
+                "defmeta build y = { tag = \"ty\" }\ndef build y() { \"y\" }\nlet g = build y\ng()"
+            )
+            .to_string(),
+            "y ty"
+        );
+        assert_eq!(value(&mut session, "g()").to_string(), "y ty");
+        // A definition alone in an input, or a meta alone, is an error: each
+        // input is checked on its own. The meta is shown by its type, the
+        // def-type's declaration being an earlier input's.
+        let errors = eval(&mut session, "def build z() { \"z\" }").unwrap_err();
+        assert_eq!(
+            errors[0].message,
+            "`build z` has no `defmeta` in its directory"
+        );
+        assert_eq!(
+            errors[0].notes,
+            ["`build` declares a meta, `META->> {tag: String}`, for each of its definitions"]
+        );
+        assert_eq!(
+            messages(&mut session, "defmeta build w { tag = \"w\" }"),
+            ["`defmeta build w` has no definition `w` in its directory"]
+        );
+        // The failed inputs changed nothing.
+        assert_eq!(value(&mut session, "g()").to_string(), "y ty");
     }
 
     #[test]

@@ -48,6 +48,16 @@
 //! [`workspace`], "Def-types by name"); finding and reading a workspace's
 //! files for it is the `gcsl-disk` crate's.
 //!
+//! A function type may have a *meta*, a record attached to the function
+//! value, written after its result with a marker of its own, `fn(v:
+//! Version): PackageDef META-> PackageMeta`, whose fields are read as the
+//! function's, `func.versions`, purely (`META:`), running its body at each
+//! read (`META->`), or once per run (`META->>`). A def-type declares the
+//! meta of its definitions by its definition parameter's type, and `defmeta
+//! package dev.peios.testpkg { ... }` declares the meta of the definition of
+//! its path in its directory, which a closure of the definition then
+//! carries (see [`check`], "Metas", and [`workspace`], "Def-types").
+//!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A
 //! [`workspace::Workspace`] performs them on the files of a directory tree,

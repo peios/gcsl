@@ -1,0 +1,4 @@
+#[def_type]
+def build(name: String, f: fn(): Int META: {tag: String}): String { f.tag }
+
+def build x() { 1 }
