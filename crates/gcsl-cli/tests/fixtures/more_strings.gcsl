@@ -1,0 +1,6 @@
+a = strip_prefix("refs/tags/debian/6.6", "refs/tags/debian/")  # "6.6"
+b = strip_prefix("x", "y")                                     # "x"
+c = strip_suffix("a.tar.gz", ".gz")                            # "a.tar"
+d = lines("a\nb\n")                                            # ["a", "b"]
+e = fields("  tcp\t6  TCP ")                                   # ["tcp", "6", "TCP"]
+f = compare_versions("6.10", "6.6")                            # 1

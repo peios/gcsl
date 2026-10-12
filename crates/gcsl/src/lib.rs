@@ -74,8 +74,10 @@
 //!
 //! Every one of them has the standard library: the `builtins` module, the
 //! built-in functions implemented in Rust (`len`, `int`, `float`, `exec`,
-//! `panic`, and on strings `split`, `join`, `starts_with`, `ends_with` and
-//! `trim`), and the standard files, the `.gcsl` files of the repository's
+//! `panic`, on strings `split`, `join`, `starts_with`, `ends_with`, `trim`,
+//! `strip_prefix`, `strip_suffix`, `lines` and `fields`, and
+//! `compare_versions`, which orders two strings in version order), and the
+//! standard files, the `.gcsl` files of the repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
 //! by its bare name from any file and each a scope of its own; and every
 //! file and input begins as if with `#[shadowable] import * from prelude`,

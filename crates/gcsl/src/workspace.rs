@@ -490,7 +490,9 @@
 //! Two kinds of module are not files of the workspace. `builtins` and
 //! `fileroot` are modules implemented in Rust: `builtins` a record of the
 //! built-in functions ([`Builtin`]): `len`, `int`, `float`, `exec`,
-//! `panic`, `split`, `join`, `starts_with`, `ends_with` and `trim`;
+//! `panic`, `split`, `join`, `starts_with`, `ends_with`, `trim`,
+//! `strip_prefix`, `strip_suffix`, `lines`, `fields` and
+//! `compare_versions`;
 //! `fileroot` where files are (below). The *standard files* are the
 //! `.gcsl` files of the repository's `stdlib/` directory, compiled in
 //! ([`crate::STANDARD`]): `path.gcsl`, lexical operations on paths, and
@@ -9498,7 +9500,7 @@ p26 = com.x"#;
         assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
         assert_eq!(scan.order[0], 0);
         // The built-in functions' cells are the first.
-        let builtins: Vec<Option<Builtin>> = (0..11).map(|node| scan.builtin(node)).collect();
+        let builtins: Vec<Option<Builtin>> = (0..16).map(|node| scan.builtin(node)).collect();
         assert_eq!(
             builtins,
             [
@@ -9512,6 +9514,11 @@ p26 = com.x"#;
                 Some(Builtin::StartsWith),
                 Some(Builtin::EndsWith),
                 Some(Builtin::Trim),
+                Some(Builtin::StripPrefix),
+                Some(Builtin::StripSuffix),
+                Some(Builtin::Lines),
+                Some(Builtin::Fields),
+                Some(Builtin::CompareVersions),
                 None
             ]
         );
@@ -9684,6 +9691,11 @@ p26 = com.x"#;
                 "starts_with",
                 "ends_with",
                 "trim",
+                "strip_prefix",
+                "strip_suffix",
+                "lines",
+                "fields",
+                "compare_versions",
                 "sh"
             ]
         );
@@ -10093,8 +10105,8 @@ p26 = com.x"#;
             .map(|&(path, text)| SourceFile::new(path, text).unwrap())
             .collect();
         let mut workspace = check(&sources).unwrap();
-        // The driver wrote the ten built-in functions' cells.
-        assert_eq!(assert_builtins_written(&workspace).len(), 10);
+        // The driver wrote the fifteen built-in functions' cells.
+        assert_eq!(assert_builtins_written(&workspace).len(), 15);
         let a = workspace.file("a.gcsl").unwrap();
         let b = workspace.file("b.gcsl").unwrap();
         let first = workspace.run(a).unwrap().value;
@@ -10634,6 +10646,239 @@ p26 = com.x"#;
         );
         // Its result is still the raw standard output.
         assert_eq!(lone("= sh(\"printf ' a\\\\n'\")").unwrap(), " a\n");
+    }
+
+    // ----- More string built-ins, and `compare_versions` -----
+
+    /// The summary of slice 41.
+    const MORE_STRINGS_SUMMARY: &str = "a = strip_prefix(\"refs/tags/debian/6.6\", \"refs/tags/debian/\")  # \"6.6\"\n\
+         b = strip_prefix(\"x\", \"y\")                                     # \"x\"\n\
+         c = strip_suffix(\"a.tar.gz\", \".gz\")                            # \"a.tar\"\n\
+         d = lines(\"a\\nb\\n\")                                            # [\"a\", \"b\"]\n\
+         e = fields(\"  tcp\\t6  TCP \")                                   # [\"tcp\", \"6\", \"TCP\"]\n\
+         f = compare_versions(\"6.10\", \"6.6\")                            # 1";
+
+    /// `text` run as a lone file and as a file of a workspace, each giving
+    /// `expected`.
+    fn runs_to(text: &str, expected: &str) {
+        assert_eq!(lone(text).unwrap(), expected, "{text}");
+        let files = [("workspace.gcsl", ""), ("main.gcsl", text)];
+        assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+    }
+
+    #[test]
+    fn the_more_strings_summary_runs_in_a_workspace_and_alone() {
+        let expected = "{a = \"6.6\"; b = \"x\"; c = \"a.tar\"; d = [\"a\", \"b\"]; \
+                        e = [\"tcp\", \"6\", \"TCP\"]; f = 1}";
+        runs_to(MORE_STRINGS_SUMMARY, expected);
+        // Nothing but the prelude is loaded for them.
+        let files = [("workspace.gcsl", ""), ("main.gcsl", MORE_STRINGS_SUMMARY)];
+        let scan = ws(&files).unwrap();
+        assert_eq!(scan.standard(), 1);
+        assert_eq!(scan.files[0].path, "<stdlib>/prelude.gcsl");
+    }
+
+    #[test]
+    fn strip_prefix_and_strip_suffix_remove_what_is_there_once() {
+        for (text, expected) in [
+            (
+                "= strip_prefix(\"refs/tags/debian/6.6\", \"refs/tags/debian/\")",
+                "6.6",
+            ),
+            ("= strip_prefix(\"x\", \"y\")", "x"),
+            ("= strip_prefix(\"aab\", \"a\")", "ab"),
+            ("= strip_prefix(\"abc\", \"abc\")", ""),
+            ("= strip_prefix(\"ab\", \"abc\")", "ab"),
+            ("= strip_prefix(\"abc\", \"\")", "abc"),
+            ("= strip_prefix(\"\", \"\")", ""),
+            ("= strip_prefix(\"\", \"a\")", ""),
+            ("= strip_prefix(\"ba\", \"a\")", "ba"),
+            ("= strip_suffix(\"a.tar.gz\", \".gz\")", "a.tar"),
+            ("= strip_suffix(\"a.gz.gz\", \".gz\")", "a.gz"),
+            ("= strip_suffix(\"a.tar\", \".gz\")", "a.tar"),
+            ("= strip_suffix(\"abc\", \"\")", "abc"),
+            ("= strip_suffix(\"\", \"\")", ""),
+            ("= strip_suffix(\"gz\", \".gz\")", "gz"),
+            ("= strip_suffix(\".gz\", \".gz\")", ""),
+            // Byte-wise: a precomposed `é` is not an `e` with a combining
+            // accent, and a prefix of `e` leaves the accent, a character of
+            // its own, while it is not the start of a precomposed `é`.
+            ("= strip_prefix(\"\u{e9}t\u{e9}\", \"\u{e9}\")", "t\u{e9}"),
+            (
+                "= strip_prefix(\"e\\u{301}t\u{e9}\", \"\u{e9}\")",
+                "e\u{301}t\u{e9}",
+            ),
+            ("= strip_prefix(\"e\\u{301}x\", \"e\")", "\u{301}x"),
+            ("= strip_prefix(\"\u{e9}t\u{e9}\", \"e\")", "\u{e9}t\u{e9}"),
+            ("= strip_suffix(\"caf\u{e9}\", \"\u{e9}\")", "caf"),
+            (
+                "= strip_suffix(\"cafe\\u{301}\", \"\u{e9}\")",
+                "cafe\u{301}",
+            ),
+            (
+                "= strip_prefix(\"\u{65e5}\u{672c}\", \"\u{65e5}\")",
+                "\u{672c}",
+            ),
+            // By name, and through a variable.
+            ("= strip_prefix(prefix = \"v\", s = \"v1.2\")", "1.2"),
+            ("let f = strip_suffix\n= f(\"x.c\", \".c\")", "x"),
+        ] {
+            runs_to(text, expected);
+        }
+    }
+
+    #[test]
+    fn lines_and_fields_split_strings() {
+        for (text, expected) in [
+            ("= lines(\"a\\nb\\n\")", "[\"a\", \"b\"]"),
+            ("= lines(\"\")", "[]"),
+            ("= lines(\"\\n\")", "[\"\"]"),
+            ("= lines(\"\\n\\n\")", "[\"\", \"\"]"),
+            ("= lines(\"a\")", "[\"a\"]"),
+            ("= lines(\"a\\n\\nb\")", "[\"a\", \"\", \"b\"]"),
+            ("= lines(\"a\\r\\nb\\r\\n\")", "[\"a\", \"b\"]"),
+            ("= lines(\"a\\r\\n\\r\\nb\")", "[\"a\", \"\", \"b\"]"),
+            // A `\r` alone ends no line, and stays, as Rust's `lines` has
+            // it.
+            ("= lines(\"a\\rb\")", "[\"a\\rb\"]"),
+            ("= lines(\"a\\r\")", "[\"a\\r\"]"),
+            ("= lines(\" a \\n\\tb\")", "[\" a \", \"\\tb\"]"),
+            (
+                "= lines(\"h\u{e9}\\n\u{65e5}\")",
+                "[\"h\u{e9}\", \"\u{65e5}\"]",
+            ),
+            ("= fields(\"  tcp\\t6  TCP \")", "[\"tcp\", \"6\", \"TCP\"]"),
+            ("= fields(\"\")", "[]"),
+            ("= fields(\"  \")", "[]"),
+            ("= fields(\" \\n\\t\\r \")", "[]"),
+            ("= fields(\"a\")", "[\"a\"]"),
+            (
+                "= fields(\"a b\\nc\\r\\nd\")",
+                "[\"a\", \"b\", \"c\", \"d\"]",
+            ),
+            // Unicode's whitespace, as `trim`'s: a no-break space and an
+            // ideographic space separate fields too.
+            ("= fields(\"a\\u{a0}b\")", "[\"a\", \"b\"]"),
+            (
+                "= fields(\"\\u{3000}x\\u{3000}\\u{3000}y\")",
+                "[\"x\", \"y\"]",
+            ),
+            (
+                "= fields(\"h\u{e9} \u{65e5}\")",
+                "[\"h\u{e9}\", \"\u{65e5}\"]",
+            ),
+            // Together, as a table is read.
+            (
+                "= for line in lines(\"tcp 6 TCP\\nudp\\t17 UDP\\n\") { fields(line)[1] }",
+                "[\"6\", \"17\"]",
+            ),
+            ("let f = fields\n= f(s = \"x y\")", "[\"x\", \"y\"]"),
+        ] {
+            runs_to(text, expected);
+        }
+    }
+
+    #[test]
+    fn compare_versions_orders_versions() {
+        // Each pair in order, `a` before `b`: the other way round is `1`.
+        let long = "1234567890123456789012345678901234567890";
+        let longer = "12345678901234567890123456789012345678901";
+        for (a, b) in [
+            ("6.6", "6.10"),
+            ("6.6", "6.6.1"),
+            ("6.3", "6.3+nmu1"),
+            ("6.3+nmu1", "6.4"),
+            ("1.0~rc1", "1.0"),
+            ("1.0~rc1", "1.0~rc2"),
+            ("1.0~~", "1.0~"),
+            ("1.0", "1.0a"),
+            ("1.0", "1.0.0"),
+            ("2", "10"),
+            ("", "0"),
+            ("", "a"),
+            ("~", ""),
+            ("1.01", "1.1"),
+            ("01", "1"),
+            ("a", "b"),
+            ("Z", "a"),
+            ("a", "."),
+            ("a", "+"),
+            ("1a", "1."),
+            ("1.2.3", "1.2.10"),
+            ("1:1.0", "1:1.1"),
+            ("2.30-1", "2.30-2"),
+            (long, longer),
+            (
+                "1.1234567890123456789012345678901234567890",
+                "1.1234567890123456789012345678901234567891",
+            ),
+            // Bytes, not characters: a letter before any other byte, a
+            // multi-byte character's bytes among them.
+            ("1.a", "1.\u{e9}"),
+            ("\u{e9}", "\u{f6}"),
+        ] {
+            let before = format!("= compare_versions(\"{a}\", \"{b}\")");
+            runs_to(&before, "-1");
+            let after = format!("= compare_versions(\"{b}\", \"{a}\")");
+            runs_to(&after, "1");
+        }
+        // Equal strings, and only those, are `0`.
+        for a in ["", "0", "6.6", "1.0~rc1", long, "\u{e9}"] {
+            runs_to(&format!("= compare_versions(\"{a}\", \"{a}\")"), "0");
+        }
+        // By name, through `builtins`, and in a pure function.
+        runs_to("= compare_versions(b = \"6.6\", a = \"6.10\")", "1");
+        runs_to(
+            "import builtins\n= builtins.compare_versions(\"1\", \"2\")",
+            "-1",
+        );
+        runs_to(
+            "fn newer(a: String, b: String): Bool { compare_versions(a, b) > 0 }\n\
+             = [newer(\"6.10\", \"6.6\"), newer(\"1.0~rc1\", \"1.0\")]",
+            "[true, false]",
+        );
+    }
+
+    #[test]
+    fn the_more_string_builtins_are_values_of_their_types() {
+        for (text, expected) in [
+            ("= strip_prefix", "fn(s: String, prefix: String): String"),
+            ("= strip_suffix", "fn(s: String, suffix: String): String"),
+            ("= lines", "fn(s: String): List<String>"),
+            ("= fields", "fn(s: String): List<String>"),
+            ("= compare_versions", "fn(a: String, b: String): Int"),
+            // Through `builtins`.
+            (
+                "import builtins\n= builtins.fields(\" a  b \")",
+                "[\"a\", \"b\"]",
+            ),
+            (
+                "import builtins\n= builtins.lines",
+                "fn(s: String): List<String>",
+            ),
+            ("import lines from builtins\n= lines(\"x\\n\")", "[\"x\"]"),
+        ] {
+            runs_to(text, expected);
+        }
+        // A file's own declaration of one of their names shadows the
+        // prelude's silently, and loses the built-in there.
+        for (text, expected) in [
+            (
+                "fields = \"mine\"\nv = fields",
+                "{fields = \"mine\"; v = \"mine\"}",
+            ),
+            ("let lines = 2\nv = lines", "{v = 2}"),
+            (
+                "def compare_versions(a: Int): Int { a }\nv = compare_versions(3)",
+                "{compare_versions = fn(a: Int): Int; v = 3}",
+            ),
+            (
+                "fields.x = 1\nv = trim(\" a \")",
+                "{fields = {x = 1}; v = \"a\"}",
+            ),
+        ] {
+            runs_to(text, expected);
+        }
     }
 
     /// The files of the summary of slice 31, in path order.

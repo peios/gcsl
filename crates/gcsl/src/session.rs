@@ -1923,9 +1923,9 @@ mod tests {
     #[test]
     fn a_session_runs_exec_panic_and_sh() {
         let mut session = Session::new();
-        // The ten built-in functions' cells are its first slots.
+        // The fifteen built-in functions' cells are its first slots.
         assert_eq!(
-            &session.frame[..10],
+            &session.frame[..15],
             Builtin::ALL.map(Value::Builtin).as_slice()
         );
         // On the first input, and on later ones, through a variable.
@@ -2011,6 +2011,26 @@ mod tests {
         assert_eq!(
             value(&mut session, "trim(\"  t \")"),
             Value::Str("t".into())
+        );
+        // The more string built-ins and `compare_versions`, on an input and
+        // through a later one's variable.
+        value(
+            &mut session,
+            "let tags = lines(\"refs/tags/v6.6\\nrefs/tags/v6.10\\n\")",
+        );
+        assert_eq!(value_type(&session), "{}");
+        assert_eq!(
+            value(
+                &mut session,
+                "let vs = for t in tags { strip_prefix(t, \"refs/tags/v\") }\n\
+                 compare_versions(vs[1], vs[0])"
+            ),
+            Value::Int(1)
+        );
+        assert_eq!(value_type(&session), "Int");
+        assert_eq!(
+            value(&mut session, "fields(strip_suffix(\" a b.gz\", \".gz\"))").to_string(),
+            "[\"a\", \"b\"]"
         );
         let failed = eval(&mut session, "split(\"a\", \"\")").unwrap_err();
         assert_eq!(

@@ -500,8 +500,39 @@
 //! - `trim(s)` gives `s` without its leading and trailing whitespace, as
 //!   Rust's `str::trim` finds it (Unicode's `White_Space`, so a no-break
 //!   space too): `""` for a string of whitespace alone.
+//! - `strip_prefix(s, prefix)` gives `s` without `prefix` if `s` begins
+//!   with its bytes, as `starts_with` finds them, else `s` unchanged, as
+//!   Rust's `str::strip_prefix(..).unwrap_or(s)`: once, so
+//!   `strip_prefix("aab", "a")` is `"ab"`; an empty `prefix` gives `s`,
+//!   and so does one that ends inside a character of `s`, which `s` cannot
+//!   begin with. `strip_suffix(s, suffix)` does the same at the end, as
+//!   `ends_with` finds it.
+//! - `lines(s)` gives the lines of `s`, as Rust's `str::lines` does: split
+//!   at each `\n`, a `\r` just before it removed too, with no empty last
+//!   line after a final line ending. So `lines("")` is `[]`, `lines("\n")`
+//!   is `[""]` and `lines("a\r\nb\r\n")` is `["a", "b"]`.
+//! - `fields(s)` gives the pieces of `s` between runs of whitespace, none
+//!   of them empty, as Rust's `str::split_whitespace` does (Unicode's
+//!   `White_Space`, as `trim`'s): `[]` for `""` or whitespace alone.
+//! - `compare_versions(a, b)` gives `-1`, `0` or `1` as `a` sorts before,
+//!   equal to or after `b` in VERSION ORDER, the order of GNU `sort -V`'s
+//!   core, which is dpkg's `verrevcmp` applied to the whole strings (no
+//!   epoch or revision split off, and none of `sort -V`'s handling of file
+//!   suffixes). Each string is taken, by its bytes, as runs alternately of
+//!   non-digits and of ASCII digits, starting with non-digits, either run
+//!   perhaps empty, and the runs compared pairwise in turn. Two non-digit
+//!   runs compare byte by byte by a weight: `~` lightest, before even the
+//!   end of the run, then the end of the run, then the ASCII letters by
+//!   their byte, then every other byte by its byte plus 256 (dpkg's
+//!   `order`), so `1.0~rc1` is before `1.0`, `1.0` before `1.0a` and
+//!   `1.0.0`, and `a` before `.`. Two digit runs compare as numbers: their
+//!   leading zeros skipped, the longer the greater, else by the first digit
+//!   that differs, never parsed, so a run of any length is fine: `6.10` is
+//!   after `6.6`. If every run is equal but the strings differ, as `1.01`
+//!   and `1.1` do, or `""` and `"0"`, they compare by their bytes, so `0`
+//!   means equal strings, as `sort -V` breaks such a tie.
 //!
-//! These five are pure and fail only as said; none has a limit of its own
+//! These ten are pure and fail only as said; none has a limit of its own
 //! on the length of a string.
 //!
 //! # Callers and helpers
@@ -722,6 +753,7 @@
 //! at the operator and labels each operand with the value it had, so the
 //! user sees what actually overflowed or divided by zero.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
@@ -1860,10 +1892,14 @@ impl Evaluator<'_> {
     /// Int" for NaN; `float` gives the `Float` nearest its `Int`; `exec`
     /// runs its program ([`exec`]); `panic` fails with its message, at
     /// the call; `split` ([`split`]), `join` ([`join`]), `starts_with`,
-    /// `ends_with` and `trim` ([`trim`]) work on their strings as Rust's
-    /// `str` does. A built-in whose typing is special is never called through
-    /// a value (the checker lowers each call of one to its own node, `len`'s
-    /// to a `ListLen`), so reaching one here is an internal error.
+    /// `ends_with`, `trim` ([`trim`]), `strip_prefix` ([`strip_prefix`]),
+    /// `strip_suffix` ([`strip_suffix`]), `lines` and `fields`
+    /// ([`string_list`]) work on their strings as Rust's `str` does, and
+    /// `compare_versions` ([`compare_versions`]) gives `-1`, `0` or `1` by
+    /// version order. A built-in whose typing is special is never called
+    /// through a value (the checker lowers each call of one to its own
+    /// node, `len`'s to a `ListLen`), so reaching one here is an internal
+    /// error.
     #[inline(never)]
     fn call_builtin(&mut self, builtin: Builtin, args: IrRange, node: &IrNode) -> Flow<Value> {
         // Each parameter's argument, with its span, by the parameter's index.
@@ -1912,6 +1948,23 @@ impl Evaluator<'_> {
                 Ok(Value::Bool(s.ends_with(&*suffix)))
             }
             (Builtin::Trim, Some((Value::Str(s), _)), None) => Ok(Value::Str(trim(s))),
+            (Builtin::StripPrefix, Some((Value::Str(s), _)), Some(Value::Str(prefix))) => {
+                Ok(Value::Str(strip_prefix(s, &prefix)))
+            }
+            (Builtin::StripSuffix, Some((Value::Str(s), _)), Some(Value::Str(suffix))) => {
+                Ok(Value::Str(strip_suffix(s, &suffix)))
+            }
+            (Builtin::Lines, Some((Value::Str(s), _)), None) => Ok(string_list(s.lines())),
+            (Builtin::Fields, Some((Value::Str(s), _)), None) => {
+                Ok(string_list(s.split_whitespace()))
+            }
+            (Builtin::CompareVersions, Some((Value::Str(a), _)), Some(Value::Str(b))) => {
+                Ok(Value::Int(match compare_versions(&a, &b) {
+                    Ordering::Less => -1,
+                    Ordering::Equal => 0,
+                    Ordering::Greater => 1,
+                }))
+            }
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -4822,6 +4875,106 @@ fn trim(s: Rc<str>) -> Rc<str> {
         s
     } else {
         Rc::from(trimmed)
+    }
+}
+
+/// `s` without the bytes of `prefix` if it begins with them, as
+/// [`str::strip_prefix`] finds them, else `s` itself, shared: so an empty
+/// `prefix`, or one that ends inside a character of `s`, gives `s`.
+fn strip_prefix(s: Rc<str>, prefix: &str) -> Rc<str> {
+    match s.strip_prefix(prefix) {
+        Some(stripped) if stripped.len() < s.len() => Rc::from(stripped),
+        _ => s,
+    }
+}
+
+/// `s` without the bytes of `suffix` if it ends with them, as
+/// [`str::strip_suffix`] finds them, else `s` itself, shared: so an empty
+/// `suffix`, or one that begins inside a character of `s`, gives `s`.
+fn strip_suffix(s: Rc<str>, suffix: &str) -> Rc<str> {
+    match s.strip_suffix(suffix) {
+        Some(stripped) if stripped.len() < s.len() => Rc::from(stripped),
+        _ => s,
+    }
+}
+
+/// The list of the strings `pieces`, in order: what `lines` and `fields`
+/// give (see [The built-in functions](#the-built-in-functions)).
+fn string_list<'a>(pieces: impl Iterator<Item = &'a str>) -> Value {
+    let pieces = pieces.map(|piece| Value::Str(Rc::from(piece)));
+    Value::List(List::from_vec(pieces.collect()))
+}
+
+/// How `a` sorts against `b` in version order, the order of GNU `sort -V`'s
+/// core, dpkg's `verrevcmp` applied to the whole strings (see [The built-in
+/// functions](#the-built-in-functions)): alternately a run of non-digits and
+/// a run of ASCII digits of each, starting with non-digits, either run
+/// perhaps empty; non-digit runs byte by byte by [`version_weight`], the end
+/// of a run weighing as `0`; digit runs as numbers, without their leading
+/// zeros, the longer one the greater, else the first digit that differs,
+/// never parsed, so of any length. Strings whose runs are all equal but
+/// which differ (`1.01` and `1.1`) are ordered by their bytes, so only equal
+/// strings are `Equal`.
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    let (mut a_rest, mut b_rest) = (a.as_bytes(), b.as_bytes());
+    while !a_rest.is_empty() || !b_rest.is_empty() {
+        let (a_run, a_after) = version_run(a_rest, false);
+        let (b_run, b_after) = version_run(b_rest, false);
+        for at in 0..a_run.len().max(b_run.len()) {
+            let order =
+                version_weight(a_run.get(at).copied()).cmp(&version_weight(b_run.get(at).copied()));
+            if order.is_ne() {
+                return order;
+            }
+        }
+        let (a_digits, a_after) = version_run(a_after, true);
+        let (b_digits, b_after) = version_run(b_after, true);
+        let (a_number, b_number) = (
+            without_leading_zeros(a_digits),
+            without_leading_zeros(b_digits),
+        );
+        let order = a_number
+            .len()
+            .cmp(&b_number.len())
+            .then_with(|| a_number.cmp(b_number));
+        if order.is_ne() {
+            return order;
+        }
+        (a_rest, b_rest) = (a_after, b_after);
+    }
+    a.as_bytes().cmp(b.as_bytes())
+}
+
+/// The longest run at the start of `bytes` of ASCII digits if `digits`,
+/// else of other bytes, and what follows it: a run of [`compare_versions`].
+fn version_run(bytes: &[u8], digits: bool) -> (&[u8], &[u8]) {
+    let end = bytes
+        .iter()
+        .position(|byte| byte.is_ascii_digit() != digits)
+        .unwrap_or(bytes.len());
+    bytes.split_at(end)
+}
+
+/// The digits `digits` without their leading zeros: the number they write,
+/// for [`compare_versions`], which compares two such by their length first.
+fn without_leading_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits
+        .iter()
+        .position(|&digit| digit != b'0')
+        .unwrap_or(digits.len());
+    digits.split_at(start).1
+}
+
+/// The weight of a byte of a non-digit run in [`compare_versions`], dpkg's
+/// `order`: `~` lightest, before even the end of the run (`None`, `0`), then
+/// the ASCII letters by their byte, then every other byte by its byte plus
+/// 256.
+fn version_weight(byte: Option<u8>) -> i32 {
+    match byte {
+        None => 0,
+        Some(b'~') => -1,
+        Some(letter) if letter.is_ascii_alphabetic() => i32::from(letter),
+        Some(other) => i32::from(other) + 256,
     }
 }
 
@@ -9803,6 +9956,109 @@ mod tests {
         assert_eq!(
             shown("for'o x in [1, 2] { let y: Int = 1 + for { break'o x * 10 }; y }"),
             "[10]"
+        );
+    }
+
+    /// dpkg's `verrevcmp`, transcribed from its C as it is, a byte past the
+    /// end read as C's terminating zero, then the byte-wise tie-break of
+    /// `sort -V`: what [`compare_versions`] must agree with.
+    fn dpkg_verrevcmp(a: &[u8], b: &[u8]) -> Ordering {
+        let at = |s: &[u8], i: usize| s.get(i).copied().unwrap_or(0);
+        let order = |c: u8| -> i32 {
+            if c.is_ascii_digit() {
+                0
+            } else if c.is_ascii_alphabetic() {
+                i32::from(c)
+            } else if c == b'~' {
+                -1
+            } else if c != 0 {
+                i32::from(c) + 256
+            } else {
+                0
+            }
+        };
+        let (mut i, mut j) = (0, 0);
+        while at(a, i) != 0 || at(b, j) != 0 {
+            let mut first_diff = 0;
+            while (at(a, i) != 0 && !at(a, i).is_ascii_digit())
+                || (at(b, j) != 0 && !at(b, j).is_ascii_digit())
+            {
+                let (ac, bc) = (order(at(a, i)), order(at(b, j)));
+                if ac != bc {
+                    return ac.cmp(&bc);
+                }
+                i += 1;
+                j += 1;
+            }
+            while at(a, i) == b'0' {
+                i += 1;
+            }
+            while at(b, j) == b'0' {
+                j += 1;
+            }
+            while at(a, i).is_ascii_digit() && at(b, j).is_ascii_digit() {
+                if first_diff == 0 {
+                    first_diff = i32::from(at(a, i)) - i32::from(at(b, j));
+                }
+                i += 1;
+                j += 1;
+            }
+            if at(a, i).is_ascii_digit() {
+                return Ordering::Greater;
+            }
+            if at(b, j).is_ascii_digit() {
+                return Ordering::Less;
+            }
+            if first_diff != 0 {
+                return first_diff.cmp(&0);
+            }
+        }
+        a.cmp(b)
+    }
+
+    #[test]
+    fn compare_versions_is_dpkg_s_order_and_total() {
+        // Every string of up to three pieces of a small alphabet that has
+        // each kind of byte: digits, a zero, letters, `~`, others, and a
+        // character of two bytes.
+        let alphabet = ["0", "1", "9", "a", "Z", "~", ".", "+", "\u{e9}"];
+        let mut all = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..3 {
+            last = last
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |piece| format!("{s}{piece}")))
+                .collect();
+            all.extend(last.iter().cloned());
+        }
+        for a in &all {
+            for b in &all {
+                let order = compare_versions(a, b);
+                assert_eq!(
+                    order,
+                    dpkg_verrevcmp(a.as_bytes(), b.as_bytes()),
+                    "{a:?} {b:?}"
+                );
+                assert_eq!(order, compare_versions(b, a).reverse(), "{a:?} {b:?}");
+                assert_eq!(order.is_eq(), a == b, "{a:?} {b:?}");
+            }
+        }
+        // A total order: sorted by it, no string is after a later one.
+        all.sort_by(|a, b| compare_versions(a, b));
+        for (at, a) in all.iter().enumerate() {
+            for b in &all[at..] {
+                assert!(compare_versions(a, b).is_le(), "{a:?} {b:?}");
+            }
+        }
+        // Digit runs far longer than any integer.
+        let nines = "9".repeat(100);
+        assert_eq!(
+            compare_versions(&format!("1.{nines}"), &format!("1.1{nines}")),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions(&format!("000{nines}"), &nines),
+            Ordering::Less
         );
     }
 }

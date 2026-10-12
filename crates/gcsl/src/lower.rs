@@ -2582,7 +2582,12 @@ impl Lowerer<'_> {
             | Builtin::Join
             | Builtin::StartsWith
             | Builtin::EndsWith
-            | Builtin::Trim => Err(InternalError {
+            | Builtin::Trim
+            | Builtin::StripPrefix
+            | Builtin::StripSuffix
+            | Builtin::Lines
+            | Builtin::Fields
+            | Builtin::CompareVersions => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

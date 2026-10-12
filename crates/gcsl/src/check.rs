@@ -2226,7 +2226,8 @@
 //! The built-in functions are the members of the `builtins` module, a
 //! module implemented in Rust (see [`crate::workspace`], "The standard
 //! library"): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
-//! `starts_with`, `ends_with` and `trim`, each a [`Builtin`], with its
+//! `starts_with`, `ends_with`, `trim`, `strip_prefix`, `strip_suffix`,
+//! `lines`, `fields` and `compare_versions`, each a [`Builtin`], with its
 //! name, its parameters' names (at most [`Builtin::MAX_PARAMS`], two), its
 //! [`Effect`] (`exec` is impure, every other one pure) and its [`Typing`].
 //! The checker knows no name of one: a file has them as it has any other
@@ -2249,13 +2250,18 @@
 //! (`fn(argv: List<String>) -> {status: Int, stderr: String, stdout:
 //! String}`, which runs a program), `panic` (`fn(message: String):
 //! Never`, which ends the run with a runtime error of the program's own
-//! wording), and the five on strings: `split` (`fn(s: String, sep:
+//! wording), the nine on strings: `split` (`fn(s: String, sep:
 //! String): List<String>`, the pieces between the separators; an empty
 //! separator is a runtime error), `join` (`fn(parts: List<String>, sep:
 //! String): String`), `starts_with` (`fn(s: String, prefix: String):
-//! Bool`), `ends_with` (`fn(s: String, suffix: String): Bool`) and `trim`
-//! (`fn(s: String): String`), each as Rust's `str` does it (see
-//! [`crate::eval`], "The built-in functions"); a file's own `join` shadows
+//! Bool`), `ends_with` (`fn(s: String, suffix: String): Bool`), `trim`
+//! (`fn(s: String): String`), `strip_prefix` (`fn(s: String, prefix:
+//! String): String`), `strip_suffix` (`fn(s: String, suffix: String):
+//! String`), `lines` and `fields` (each `fn(s: String): List<String>`),
+//! each as Rust's `str` does it, and `compare_versions` (`fn(a: String, b:
+//! String): Int`, `-1`, `0` or `1` as `a` sorts before, equal to or after
+//! `b` in version order; see [`crate::eval`], "The built-in functions"
+//! for all of them); a file's own `join` shadows
 //! the prelude's as any declaration does, and so does `path`'s, in
 //! `path.gcsl` and in a file importing it by member or `*`. Each is a
 //! value of its type like any function: passed, stored, called through a
@@ -2897,6 +2903,21 @@ pub enum Builtin {
     /// `trim(s: String): String`: `s` without its leading and trailing
     /// Unicode whitespace.
     Trim,
+    /// `strip_prefix(s: String, prefix: String): String`: `s` without the
+    /// bytes of `prefix` if it begins with them, else `s` unchanged.
+    StripPrefix,
+    /// `strip_suffix(s: String, suffix: String): String`: `s` without the
+    /// bytes of `suffix` if it ends with them, else `s` unchanged.
+    StripSuffix,
+    /// `lines(s: String): List<String>`: the lines of `s`, as Rust's
+    /// `str::lines` gives them.
+    Lines,
+    /// `fields(s: String): List<String>`: the pieces of `s` between runs of
+    /// Unicode whitespace, as Rust's `str::split_whitespace` gives them.
+    Fields,
+    /// `compare_versions(a: String, b: String): Int`: `-1`, `0` or `1` as
+    /// `a` sorts before, equal to or after `b` in version order.
+    CompareVersions,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -2920,7 +2941,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 10] = [
+    pub const ALL: [Builtin; 15] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -2931,6 +2952,11 @@ impl Builtin {
         Builtin::StartsWith,
         Builtin::EndsWith,
         Builtin::Trim,
+        Builtin::StripPrefix,
+        Builtin::StripSuffix,
+        Builtin::Lines,
+        Builtin::Fields,
+        Builtin::CompareVersions,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -2956,6 +2982,11 @@ impl Builtin {
             Builtin::StartsWith => "starts_with",
             Builtin::EndsWith => "ends_with",
             Builtin::Trim => "trim",
+            Builtin::StripPrefix => "strip_prefix",
+            Builtin::StripSuffix => "strip_suffix",
+            Builtin::Lines => "lines",
+            Builtin::Fields => "fields",
+            Builtin::CompareVersions => "compare_versions",
         }
     }
 
@@ -2970,9 +3001,10 @@ impl Builtin {
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
-            Builtin::StartsWith => &["s", "prefix"],
-            Builtin::EndsWith => &["s", "suffix"],
-            Builtin::Trim => &["s"],
+            Builtin::StartsWith | Builtin::StripPrefix => &["s", "prefix"],
+            Builtin::EndsWith | Builtin::StripSuffix => &["s", "suffix"],
+            Builtin::Trim | Builtin::Lines | Builtin::Fields => &["s"],
+            Builtin::CompareVersions => &["a", "b"],
         }
     }
 
@@ -2992,7 +3024,12 @@ impl Builtin {
             | Builtin::Join
             | Builtin::StartsWith
             | Builtin::EndsWith
-            | Builtin::Trim => Effect::Pure,
+            | Builtin::Trim
+            | Builtin::StripPrefix
+            | Builtin::StripSuffix
+            | Builtin::Lines
+            | Builtin::Fields
+            | Builtin::CompareVersions => Effect::Pure,
         }
     }
 
@@ -3009,7 +3046,12 @@ impl Builtin {
             | Builtin::Join
             | Builtin::StartsWith
             | Builtin::EndsWith
-            | Builtin::Trim => Typing::Ordinary,
+            | Builtin::Trim
+            | Builtin::StripPrefix
+            | Builtin::StripSuffix
+            | Builtin::Lines
+            | Builtin::Fields
+            | Builtin::CompareVersions => Typing::Ordinary,
         }
     }
 
@@ -3032,6 +3074,10 @@ impl Builtin {
             Builtin::StartsWith => "fn(s: String, prefix: String): Bool",
             Builtin::EndsWith => "fn(s: String, suffix: String): Bool",
             Builtin::Trim => "fn(s: String): String",
+            Builtin::StripPrefix => "fn(s: String, prefix: String): String",
+            Builtin::StripSuffix => "fn(s: String, suffix: String): String",
+            Builtin::Lines | Builtin::Fields => "fn(s: String): List<String>",
+            Builtin::CompareVersions => "fn(a: String, b: String): Int",
         }
     }
 
@@ -3063,6 +3109,11 @@ impl Builtin {
             Builtin::Join => ([types.list(TyId::STRING), TyId::STRING], TyId::STRING),
             Builtin::StartsWith | Builtin::EndsWith => ([TyId::STRING, TyId::STRING], TyId::BOOL),
             Builtin::Trim => ([TyId::STRING, UNUSED], TyId::STRING),
+            Builtin::StripPrefix | Builtin::StripSuffix => {
+                ([TyId::STRING, TyId::STRING], TyId::STRING)
+            }
+            Builtin::Lines | Builtin::Fields => ([TyId::STRING, UNUSED], types.list(TyId::STRING)),
+            Builtin::CompareVersions => ([TyId::STRING, TyId::STRING], TyId::INT),
             // TEMPORARY (alias rule): the opaque type, until a polymorphic
             // one (R11 of `docs/INFERENCE_REQS.md`).
             Builtin::Len => return types.builtin(self),
@@ -24274,6 +24325,65 @@ mod tests {
             file_type("join = \"mine\"\nv = join"),
             "{join: String, v: String}"
         );
+    }
+
+    #[test]
+    fn the_more_string_builtins_and_compare_versions_have_function_types() {
+        for (text, shown) in [
+            ("strip_prefix", "fn(s: String, prefix: String): String"),
+            ("strip_suffix", "fn(s: String, suffix: String): String"),
+            ("lines", "fn(s: String): List<String>"),
+            ("fields", "fn(s: String): List<String>"),
+            ("compare_versions", "fn(a: String, b: String): Int"),
+            (
+                "import builtins\nbuiltins.fields",
+                "fn(s: String): List<String>",
+            ),
+            ("strip_prefix(\"ab\", \"a\")", "String"),
+            ("strip_suffix(suffix = \".gz\", s = \"a.gz\")", "String"),
+            ("lines(\"a\\nb\")", "List<String>"),
+            ("fields(\" a b \")", "List<String>"),
+            ("compare_versions(b = \"6.6\", a = \"6.10\")", "Int"),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // The summary of slice 41.
+        assert_eq!(
+            file_type(
+                "a = strip_prefix(\"refs/tags/debian/6.6\", \"refs/tags/debian/\")\n\
+                 b = strip_prefix(\"x\", \"y\")\n\
+                 c = strip_suffix(\"a.tar.gz\", \".gz\")\n\
+                 d = lines(\"a\\nb\\n\")\n\
+                 e = fields(\"  tcp\\t6  TCP \")\n\
+                 f = compare_versions(\"6.10\", \"6.6\")"
+            ),
+            "{a: String, b: String, c: String, d: List<String>, e: List<String>, f: Int}"
+        );
+        // Their arguments are checked as any call's.
+        assert_eq!(messages("lines([\"x\"])"), ["mismatched types"]);
+        assert_eq!(messages("compare_versions(1, \"2\")"), ["mismatched types"]);
+        assert_eq!(
+            messages("fields(\"a\", \"b\")"),
+            ["expected 1 argument, found 2"]
+        );
+        assert_eq!(
+            messages("strip_suffix(s = \"a\", prefix = \"b\")"),
+            ["unknown argument `prefix`", "missing argument `suffix`"]
+        );
+        // Pure: a pure function may call them.
+        assert_eq!(
+            type_of_f(
+                "fn f(v: String, w: String): Bool { \
+                 compare_versions(strip_prefix(v, \"v\"), strip_suffix(w, \"\\n\")) > 0 }"
+            ),
+            "fn(v: String, w: String): Bool"
+        );
+        assert_eq!(
+            type_of_f("fn f(s: String): Int { len(fields(lines(s)[0])) }"),
+            "fn(s: String): Int"
+        );
+        // A file's own `fields` shadows the prelude's silently.
+        assert_eq!(file_type("fields = 1\nv = fields"), "{fields: Int, v: Int}");
     }
 
     /// The type `exec` returns, as the type table shows it.

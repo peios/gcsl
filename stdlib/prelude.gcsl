@@ -8,8 +8,8 @@
 # type a GCSL type can write yet, so a name bound directly to it is that
 # built-in, called by the checker's rule (to be replaced when built-ins get
 # real polymorphic types, R11 and R3 of docs/INFERENCE_REQS.md). `int`,
-# `float`, `exec`, `panic` and the string built-ins are ordinary: values of
-# their function types. `sh` runs a shell command with `exec`, and panics
+# `float`, `exec`, `panic`, the string built-ins and `compare_versions` are
+# ordinary: values of their function types. `sh` runs a shell command with `exec`, and panics
 # unless it succeeds. Like every standard file it is a scope of its own: it
 # sees its own declarations and what it imports, nothing else.
 import builtins
@@ -27,13 +27,26 @@ panic = builtins.panic
 
 # Strings: `split(s, sep)` the pieces of `s` between occurrences of `sep`,
 # `join(parts, sep)` the parts with `sep` between each pair, `starts_with`
-# and `ends_with` byte-wise tests, and `trim(s)` without leading and
-# trailing whitespace. Ordinary built-ins, not the alias rule's.
+# and `ends_with` byte-wise tests, `trim(s)` without leading and trailing
+# whitespace, `strip_prefix(s, prefix)` and `strip_suffix(s, suffix)` `s`
+# without the other at its start, or end, if it is there, `lines(s)` the
+# lines of `s`, and `fields(s)` the pieces of `s` between runs of
+# whitespace. Ordinary built-ins, not the alias rule's.
 split = builtins.split
 join = builtins.join
 starts_with = builtins.starts_with
 ends_with = builtins.ends_with
 trim = builtins.trim
+strip_prefix = builtins.strip_prefix
+strip_suffix = builtins.strip_suffix
+lines = builtins.lines
+fields = builtins.fields
+
+# Versions: `compare_versions(a, b)` is -1, 0 or 1 as `a` sorts before,
+# equal to or after `b` in version order, dpkg's, the core of `sort -V`'s:
+# "6.10" after "6.6", "1.0~rc1" before "1.0". An ordinary built-in, not the
+# alias rule's.
+compare_versions = builtins.compare_versions
 
 # Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
 # trailing newline included; panics, with the script, its exit status and
