@@ -6467,6 +6467,95 @@ impl Workspace {
         path: &str,
         args: &[String],
     ) -> Result<Outcome, InvokeError> {
+        let (found, at, (def_type_cell, definition_cell)) = self.invoked(def_type, path)?;
+        if let Some(error) = self.cannot_give(&found, def_type_cell.1, args) {
+            return Err(InvokeError::Request(error));
+        }
+        let Some(definition) = found.listed.definitions.get(at) else {
+            return Err(InvokeError::Request(missing_definition(
+                &found.listed,
+                path,
+            )));
+        };
+        // The files a reference to the definition needs, each run whole.
+        self.run_needed(definition.file)
+            .map_err(InvokeError::Diagnostics)?;
+        self.run_needed(found.listed.file)
+            .map_err(InvokeError::Diagnostics)?;
+        self.call_definition(
+            (definition, Invocation::Call(args)),
+            (def_type_cell, definition_cell),
+        )
+    }
+
+    /// Reads the field `field` of the meta of the definition of path `path`
+    /// made with the def-type of path `def_type` (see [Metas](#metas)), as
+    /// `(DT PATH).FIELD` would be read from a file of the definition's
+    /// directory: the definition's file runs first, with the files it
+    /// needs, unless they have run, and then the meta is read, running its
+    /// `defmeta` as its marker says. Returns `None` if the def-type declares
+    /// no meta or its meta has no field `field`. What `pekit` reads a
+    /// package's versions with, to list them when none is given.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::invoke`], but for its arguments' errors: the
+    /// duplicates, no such def-type or definition, and the runtime error of
+    /// a file that runs or of the read.
+    pub fn meta_field(
+        &mut self,
+        def_type: &str,
+        path: &str,
+        field: &str,
+    ) -> Result<Option<Outcome>, InvokeError> {
+        let (found, at, (def_type_cell, definition_cell)) = self.invoked(def_type, path)?;
+        let Some(definition) = found.listed.definitions.get(at) else {
+            return Err(InvokeError::Request(missing_definition(
+                &found.listed,
+                path,
+            )));
+        };
+        // The definition's parameter's type, its meta's.
+        let func = self
+            .types
+            .fn_sig(self.types.strip(def_type_cell.1))
+            .and_then(|sig| sig.params.get(1))
+            .map(|&(_, ty)| self.types.strip(ty));
+        let Some(func) = func else {
+            return Ok(None);
+        };
+        let meta = self.types.fn_sig(func).and_then(|sig| sig.meta);
+        let has_field = meta.is_some_and(|meta| {
+            let record = self.types.strip(meta.ty);
+            let name = self.scan.names.lookup(field);
+            name.is_some_and(|name| self.types.field(record, name).is_some())
+        });
+        if !has_field {
+            return Ok(None);
+        }
+        self.run_needed(definition.file)
+            .map_err(InvokeError::Diagnostics)?;
+        self.call_definition(
+            (definition, Invocation::MetaField(field)),
+            (def_type_cell, (definition_cell.0, func)),
+        )
+        .map(Some)
+    }
+
+    /// The def-type of path `def_type` and its definition of path `path`,
+    /// as [`Workspace::invoke`] and [`Workspace::meta_field`] find them: the
+    /// def-type, the definition's place among its definitions, and the two
+    /// cells.
+    ///
+    /// # Errors
+    ///
+    /// The duplicates, with the warnings; no such def-type, or definition.
+    #[allow(clippy::type_complexity)]
+    fn invoked(
+        &self,
+        def_type: &str,
+        path: &str,
+    ) -> Result<(FoundDefType, usize, ((Slot, TyId), (Slot, TyId))), InvokeError> {
         let mut found = self.found_def_types();
         let duplicates = duplicates(&found);
         if !duplicates.is_empty() {
@@ -6485,7 +6574,8 @@ impl Workspace {
         let missing = || InvokeError::Request(missing_definition(&found.listed, path));
         let definitions = &found.listed.definitions;
         let at = definitions.iter().position(|d| d.path == path);
-        let (Some(definition), Some(&item)) = (
+        let (Some(at), Some(definition), Some(&item)) = (
+            at,
             at.and_then(|at| definitions.get(at)),
             at.and_then(|at| found.items.get(at)),
         ) else {
@@ -6502,15 +6592,7 @@ impl Workspace {
             // failed already; kept for safety.
             return Err(missing());
         };
-        if let Some(error) = self.cannot_give(&found, def_type_cell.1, args) {
-            return Err(InvokeError::Request(error));
-        }
-        // The files a reference to the definition needs, each run whole.
-        self.run_needed(definition.file)
-            .map_err(InvokeError::Diagnostics)?;
-        self.run_needed(found.listed.file)
-            .map_err(InvokeError::Diagnostics)?;
-        self.call_definition((definition, args), (def_type_cell, definition_cell))
+        Ok((found, at, (def_type_cell, definition_cell)))
     }
 
     /// Every def-type of the workspace's own files, with its definitions,
@@ -6658,7 +6740,7 @@ impl Workspace {
     /// name](#def-types-by-name)).
     fn call_definition(
         &mut self,
-        (definition, args): (&Definition, &[String]),
+        (definition, invoked): (&Definition, Invocation),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
     ) -> Result<Outcome, InvokeError> {
         let call = count(self.scan.files.len());
@@ -6668,7 +6750,7 @@ impl Workspace {
             names.intern(INVOKED_DEF_TYPE),
             names.intern(INVOKED_DEFINITION),
         );
-        let ast = invocation(names, (&definition.path, args), bound, at.1);
+        let ast = invocation(names, (&definition.path, invoked), bound, at.1);
         let scope = Scope::of_slots(self.slot_names.clone()).with_fields([
             (bound.0, def_type.0, def_type.1),
             (bound.1, definition_cell.0, definition_cell.1),
@@ -6879,11 +6961,17 @@ fn invocation_params(ast: &Ast, item: ItemId) -> &[Param] {
 /// each ARG one of `args`, in order, a string literal, the two names those
 /// of `bound`, each node at `span`.
 fn invocation(
-    names: Names,
-    (path, args): (&str, &[String]),
+    mut names: Names,
+    (path, invoked): (&str, Invocation),
     bound: (Name, Name),
     span: Span,
 ) -> Ast {
+    let args = match invoked {
+        Invocation::Call(args) => args,
+        Invocation::MetaField(field) => {
+            return meta_read(names.intern(field), names, bound.1, span);
+        }
+    };
     let mut builder = AstBuilder::with_capacity(4 + args.len());
     let mut strings = Strings::new();
     let callee = builder.alloc(Expr {
@@ -6929,6 +7017,42 @@ fn invocation(
     });
     let root = builder.push_item_list(&[item]);
     builder.finish(root, names, strings)
+}
+
+/// What the input [`Workspace::call_definition`] runs does with the
+/// definition: call its def-type with it and these arguments, or read this
+/// field of its meta.
+#[derive(Clone, Copy)]
+enum Invocation<'a> {
+    /// `<def-type>("PATH", <definition>, "ARG", ...)`.
+    Call(&'a [String]),
+    /// `<definition>.FIELD`.
+    MetaField(&'a str),
+}
+
+/// The tree of the input that reads the field `field` of a definition's
+/// meta (see [`Workspace::meta_field`]), its names `names`:
+/// `<definition>.FIELD`, its result, the name that of `definition`, each
+/// node at `span`.
+fn meta_read(field: Name, names: Names, definition: Name, span: Span) -> Ast {
+    let mut builder = AstBuilder::with_capacity(2);
+    let read = builder.alloc(Expr {
+        kind: ExprKind::Name(definition),
+        span,
+    });
+    let field = builder.alloc(Expr {
+        kind: ExprKind::Field {
+            expr: read,
+            name: field,
+        },
+        span,
+    });
+    let item = builder.alloc_item(Item {
+        kind: ItemKind::Result(field),
+        span,
+    });
+    let root = builder.push_item_list(&[item]);
+    builder.finish(root, names, Strings::new())
 }
 
 /// `diagnostics` of the call that invokes a definition by name, input
@@ -14130,6 +14254,60 @@ p26 = com.x"#;
     /// `tagged`, whose definitions give a string and carry a pure meta of a
     /// tag and a number, read through functions that take less of it: one
     /// whose meta has the tag alone, and one with no meta.
+    #[test]
+    fn a_field_of_a_definition_s_meta_is_read_by_name() {
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def package(name: String, f: fn(v: String): String META-> {versions: List<String>}, \
+                 version: String) -> String { f(version) }\n\
+                 #[def_type]\n\
+                 def plain(name: String, f: fn(): String): String { f() }",
+            ),
+            (
+                "app/a.gcsl",
+                "defmeta package dev.x { versions = [\"0.1.0\", \"0.2.0\"] }\n\
+                 def package dev.x(v) { v }\n\
+                 def plain y() { \"y\" }",
+            ),
+        ];
+        let mut workspace = rooted(&files).unwrap();
+        // Read from the definition's directory, its `defmeta` run.
+        let versions = workspace.meta_field("package", "dev.x", "versions");
+        assert_eq!(
+            versions.unwrap().unwrap().value.to_string(),
+            "[\"0.1.0\", \"0.2.0\"]"
+        );
+        // No such field, and no meta: nothing to read.
+        assert!(
+            workspace
+                .meta_field("package", "dev.x", "nope")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            workspace
+                .meta_field("plain", "y", "versions")
+                .unwrap()
+                .is_none()
+        );
+        // What cannot be invoked cannot be read either.
+        assert_eq!(
+            workspace
+                .meta_field("package", "dev.nope", "versions")
+                .unwrap_err(),
+            InvokeError::Request(RequestError::NoDefinition {
+                def_type: "package".to_owned(),
+                path: "dev.nope".to_owned(),
+                definitions: vec!["dev.x".to_owned()],
+            })
+        );
+        // Invoking is unchanged.
+        let value = workspace.invoke("package", "dev.x", &["0.1.0".to_owned()]);
+        assert_eq!(value.unwrap().value.to_string(), "0.1.0");
+    }
+
     const TAGGED: (&str, &str) = (
         "workspace.gcsl",
         "#[def_type]\n\
