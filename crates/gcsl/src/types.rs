@@ -202,9 +202,9 @@
 //! # Built-in functions
 //!
 //! TEMPORARY (alias rule): a built-in function whose typing is special
-//! (see [`crate::check::Builtin`]), `len`, has no type a function type can
-//! hold until built-in functions get real polymorphic types (R11 of
-//! `docs/INFERENCE_REQS.md`). Its value has an opaque type of its own,
+//! (see [`crate::check::Builtin`]), `len` or `show`, has no type a function
+//! type can hold until built-in functions get real polymorphic types (R11
+//! of `docs/INFERENCE_REQS.md`). Its value has an opaque type of its own,
 //! [`TyKind::Builtin`], shown `builtin len`, which cannot be written in
 //! source: a subtype of itself only, holding no future, a function as far
 //! as equality goes ([`TypeTable::contains_fn`]), and of kind
@@ -352,9 +352,9 @@ pub enum TyKind {
     /// [Never](#never).
     Never,
     /// TEMPORARY (alias rule): the opaque type of a built-in function whose
-    /// typing is special, `builtin len`, which no type expression can
-    /// write, until built-in functions get real polymorphic types (R11 of
-    /// `docs/INFERENCE_REQS.md`). See [Built-in
+    /// typing is special, `builtin len` or `builtin show`, which no type
+    /// expression can write, until built-in functions get real polymorphic
+    /// types (R11 of `docs/INFERENCE_REQS.md`). See [Built-in
     /// functions](#built-in-functions).
     Builtin(Builtin),
 }

@@ -2227,16 +2227,17 @@
 //! module implemented in Rust (see [`crate::workspace`], "The standard
 //! library"): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
 //! `starts_with`, `ends_with`, `trim`, `strip_prefix`, `strip_suffix`,
-//! `lines`, `fields`, `compare_versions`, and the file system's `fs_exists`,
-//! `fs_read`, `fs_mkdir`, `fs_copy` and `fs_temp_dir`, each a [`Builtin`],
+//! `lines`, `fields`, `compare_versions`, the file system's `fs_exists`,
+//! `fs_read`, `fs_mkdir`, `fs_copy`, `fs_temp_dir` and `fs_write`, and
+//! `sort_versions` and `show`, each a [`Builtin`],
 //! with its name, its parameters' names (at most [`Builtin::MAX_PARAMS`],
 //! two), its [`Effect`] (`exec` and the file system's are impure, every
 //! other one pure) and its [`Typing`]. The checker knows no name of one: a
 //! file has them as it has any other module's members, by an import, or by
 //! the prelude, which binds each of them but the file system's to its own
 //! name, or by the standard `fs` module, whose members `exists`, `read`,
-//! `mkdir`, `copy` and `temp_dir` are the file system's, bound so too; the
-//! prelude is what every file and session input imports
+//! `mkdir`, `copy`, `temp_dir` and `write` are the file system's, bound so
+//! too; the prelude is what every file and session input imports
 //! implicitly, `#[shadowable]` and first of all in its view's order, but a
 //! file marked `#![no_prelude]` (see [`crate::workspace`], "Shadowable
 //! declarations"). A file that declares its own `len` (a field, a `def`, a
@@ -2264,13 +2265,15 @@
 //! String`), `lines` and `fields` (each `fn(s: String): List<String>`),
 //! each as Rust's `str` does it, and `compare_versions` (`fn(a: String, b:
 //! String): Int`, `-1`, `0` or `1` as `a` sorts before, equal to or after
-//! `b` in version order), and the five of the file system, each impure and
-//! each taking only absolute paths: `fs_exists` (`fn(p: String) -> Bool`),
-//! `fs_read` (`fn(p: String) -> String`), `fs_mkdir` (`fn(p: String) ->
-//! {}`), `fs_copy` (`fn(from: String, to: String) -> {}`) and `fs_temp_dir`
-//! (`fn() -> String`), which a file reaches as `fs.exists` and so on after
-//! `import fs` (see [`crate::eval`], "The built-in functions" for all of
-//! them); a file's own `join` shadows
+//! `b` in version order) and `sort_versions` (`fn(vs: List<String>):
+//! List<String>`, the list sorted in that order), and the six of the file
+//! system, each impure and each taking only absolute paths: `fs_exists`
+//! (`fn(p: String) -> Bool`), `fs_read` (`fn(p: String) -> String`),
+//! `fs_mkdir` (`fn(p: String) -> {}`), `fs_copy` (`fn(from: String, to:
+//! String) -> {}`), `fs_temp_dir` (`fn() -> String`) and `fs_write` (`fn(p:
+//! String, contents: String) -> {}`), which a file reaches as `fs.exists`
+//! and so on after `import fs` (see [`crate::eval`], "The built-in
+//! functions" for all of them); a file's own `join` shadows
 //! the prelude's as any declaration does, and so does `path`'s, in
 //! `path.gcsl` and in a file importing it by member or `*`. Each is a
 //! value of its type like any function: passed, stored, called through a
@@ -2292,24 +2295,34 @@
 //! Int`, since `Never` is a subtype of every result. `Never` is shown in its
 //! type although no annotation can write it.
 //!
-//! A SPECIAL built-in ([`Typing::Special`]), `len`, is typed call by call
-//! by the checker, since it is generic: `len(list)`'s argument is measured
-//! at the top, its elements not at all, and must be a list ("`len` takes a
-//! list, found T"), and the call is an `Int`. A call of one binds its
+//! A SPECIAL built-in ([`Typing::Special`]), `len` or `show`, is typed call
+//! by call by the checker, since it is generic. `len(list)`'s argument is
+//! measured at the top, its elements not at all, and must be a list ("`len`
+//! takes a list, found T"), and the call is an `Int`. `show(value)`'s
+//! argument may be of any type with no function in it anywhere, a field,
+//! an element, a member of a union, an alias's expansion, at any depth, a
+//! built-in function's value being one too: else "cannot show a function:
+//! `show` renders data as source", at the argument, noting "the argument is
+//! of type `{run: fn(): Int}`" (`Checker::check_show`); it is used as its
+//! bits all the way down, as an interpolated expression is, so awaited
+//! deeply if it may be a future or hold one, which a pure function cannot
+//! do; and the call is a `String`, the value's GCSL source (see
+//! [`crate::eval`], "The built-in functions"). A call of one binds its
 //! arguments by position or by the table's names, with the errors of any
 //! call's arguments (`Checker::bind_builtin_arguments`); its callee then
 //! resolves to [`VarRef::Builtin`] and has the function type of this call,
-//! and lowering makes the call the built-in's own node, `ListLen`, never
-//! reading the callee. Calling a built-in that is not pure from a pure
-//! function is an error, as for any function.
+//! and lowering makes the call the built-in's own node, `ListLen` or
+//! `Show`, never reading the callee. Calling a built-in that is not pure
+//! from a pure function is an error, as for any function.
 //!
 //! ## The alias rule, temporary
 //!
 //! TEMPORARY (alias rule): a special built-in has no type the table can
 //! hold, so until the inference engine gives built-in functions real
 //! polymorphic types (R11 and R3 of `docs/INFERENCE_REQS.md`), its value
-//! has an opaque type of its own, [`TyKind::Builtin`], shown `builtin len`,
-//! which no type expression can write, so that no annotation, parameter
+//! has an opaque type of its own, [`TyKind::Builtin`], shown `builtin len`
+//! or `builtin show`, which no type expression can write, so that no
+//! annotation, parameter
 //! type, field type or result type accepts it. A reference whose type is
 //! it may stand in two places only (`Checker::alias_site`): the callee of
 //! a call, which is then typed by the built-in's rule as above, and the
@@ -2326,14 +2339,16 @@
 //! to a record holding one (`builtins` or the prelude read whole), is "`len`
 //! is a built-in function and cannot be used as a value yet", with the note
 //! "a built-in function with a type for any list cannot be written as a
-//! type yet; call it, or bind it to a name" (`Checker::builtin_use`, the
-//! one place that says so): an argument, a list element, a field of an
+//! type yet; call it, or bind it to a name" (for `show`, "for any value";
+//! `Checker::builtin_use`, the one place that says so): an argument, a list
+//! element, a field of an
 //! inner record, a function's result, an operand of `==` or `===`, an `is`,
 //! an `as`, an ascription, a `let` in a block, a `let mut`, a rebind, a
 //! branch, a dotted field, a callee in parentheses. What replaces it: a
-//! polymorphic type for `len` (`fn<T>(list: List<T>): Int`), with which
-//! `len` is a value like `int`, its calls ordinary calls, and the opaque
-//! type, `alias_site`, `builtin_use` and the special path of
+//! polymorphic type for `len` (`fn<T>(list: List<T>): Int`) and for `show`
+//! (`fn<T>(value: T): String`, `T` bounded to types without functions),
+//! with which each is a value like `int`, its calls ordinary calls, and the
+//! opaque type, `alias_site`, `builtin_use` and the special path of
 //! `Checker::check_call` go.
 //!
 //! # Scopes
@@ -2944,6 +2959,16 @@ pub enum Builtin {
     /// directory, removed with everything in it when the run that made it
     /// is dropped, and gives its absolute path. Impure.
     FsTempDir,
+    /// `fs_write(p: String, contents: String) -> {}`, `fs.write`: writes
+    /// `contents` to the file at the absolute path `p`, made or replaced
+    /// whole, atomically, in a directory that must exist. Impure.
+    FsWrite,
+    /// `sort_versions(vs: List<String>): List<String>`: `vs` sorted in
+    /// version order, as `compare_versions` orders two, a stable sort.
+    SortVersions,
+    /// `show(value)`: the GCSL source of a value, as text, which reads back
+    /// as an equal value. Its typing is special.
+    Show,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -2957,9 +2982,10 @@ pub enum Typing {
     Ordinary,
     /// TEMPORARY (alias rule): call by call, by the checker's rule for it,
     /// since no function type the table can hold is its type (`len`: a
-    /// `List<T>` for any `T` to `Int`); its value has an opaque type of its
-    /// own, [`TyKind::Builtin`]. To be replaced by a real polymorphic type
-    /// (R11 of `docs/INFERENCE_REQS.md`).
+    /// `List<T>` for any `T` to `Int`; `show`: any `T` without a function
+    /// in it to `String`); its value has an opaque type of its own,
+    /// [`TyKind::Builtin`]. To be replaced by a real polymorphic type (R11
+    /// of `docs/INFERENCE_REQS.md`).
     Special,
 }
 
@@ -2967,7 +2993,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 20] = [
+    pub const ALL: [Builtin; 23] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -2988,6 +3014,9 @@ impl Builtin {
         Builtin::FsMkdir,
         Builtin::FsCopy,
         Builtin::FsTempDir,
+        Builtin::FsWrite,
+        Builtin::SortVersions,
+        Builtin::Show,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -3023,6 +3052,9 @@ impl Builtin {
             Builtin::FsMkdir => "fs_mkdir",
             Builtin::FsCopy => "fs_copy",
             Builtin::FsTempDir => "fs_temp_dir",
+            Builtin::FsWrite => "fs_write",
+            Builtin::SortVersions => "sort_versions",
+            Builtin::Show => "show",
         }
     }
 
@@ -3038,6 +3070,7 @@ impl Builtin {
             Builtin::FsMkdir => Some("fs.mkdir"),
             Builtin::FsCopy => Some("fs.copy"),
             Builtin::FsTempDir => Some("fs.temp_dir"),
+            Builtin::FsWrite => Some("fs.write"),
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -3052,7 +3085,9 @@ impl Builtin {
             | Builtin::StripSuffix
             | Builtin::Lines
             | Builtin::Fields
-            | Builtin::CompareVersions => None,
+            | Builtin::CompareVersions
+            | Builtin::SortVersions
+            | Builtin::Show => None,
         }
     }
 
@@ -3074,15 +3109,19 @@ impl Builtin {
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
             Builtin::FsTempDir => &[],
+            Builtin::FsWrite => &["p", "contents"],
+            Builtin::SortVersions => &["vs"],
+            Builtin::Show => &["value"],
         }
     }
 
     /// What it may do: only a pure one may be called from a pure function.
     /// `exec`, which runs a program, is impure, and so is each of the file
-    /// system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy` and
-    /// `fs_temp_dir`, which touch the world; every other built-in function
-    /// is pure, `panic` included, which ends the run as a division by zero
-    /// does, and `split`, whose empty separator does the same.
+    /// system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`,
+    /// `fs_temp_dir` and `fs_write`, which touch the world; every other
+    /// built-in function is pure, `panic` included, which ends the run as a
+    /// division by zero does, `split`, whose empty separator does the same,
+    /// and `show`, which fails so on a `Float` with no literal.
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
@@ -3091,7 +3130,8 @@ impl Builtin {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
-            | Builtin::FsTempDir => Effect::Impure,
+            | Builtin::FsTempDir
+            | Builtin::FsWrite => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -3105,7 +3145,9 @@ impl Builtin {
             | Builtin::StripSuffix
             | Builtin::Lines
             | Builtin::Fields
-            | Builtin::CompareVersions => Effect::Pure,
+            | Builtin::CompareVersions
+            | Builtin::SortVersions
+            | Builtin::Show => Effect::Pure,
         }
     }
 
@@ -3113,7 +3155,7 @@ impl Builtin {
     #[must_use]
     pub const fn typing(self) -> Typing {
         match self {
-            Builtin::Len => Typing::Special,
+            Builtin::Len | Builtin::Show => Typing::Special,
             Builtin::Int
             | Builtin::Float
             | Builtin::Exec
@@ -3132,18 +3174,22 @@ impl Builtin {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
-            | Builtin::FsTempDir => Typing::Ordinary,
+            | Builtin::FsTempDir
+            | Builtin::FsWrite
+            | Builtin::SortVersions => Typing::Ordinary,
         }
     }
 
     /// How its value is shown: as its type, `fn(x: Float): Int`, for an
     /// ordinary one, as any function is, and as the type table shows that
     /// type (a record's fields by name, `panic`'s result `Never`, which no
-    /// annotation can write); as `builtin len` for a special one.
+    /// annotation can write); as `builtin len`, `builtin show`, for a
+    /// special one.
     #[must_use]
     pub const fn display(self) -> &'static str {
         match self {
             Builtin::Len => "builtin len",
+            Builtin::Show => "builtin show",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec => {
@@ -3164,6 +3210,8 @@ impl Builtin {
             Builtin::FsMkdir => "fn(p: String) -> {}",
             Builtin::FsCopy => "fn(from: String, to: String) -> {}",
             Builtin::FsTempDir => "fn() -> String",
+            Builtin::FsWrite => "fn(p: String, contents: String) -> {}",
+            Builtin::SortVersions => "fn(vs: List<String>): List<String>",
         }
     }
 
@@ -3202,11 +3250,15 @@ impl Builtin {
             Builtin::CompareVersions => ([TyId::STRING, TyId::STRING], TyId::INT),
             Builtin::FsExists => ([TyId::STRING, UNUSED], TyId::BOOL),
             Builtin::FsMkdir => ([TyId::STRING, UNUSED], TyId::EMPTY),
-            Builtin::FsCopy => ([TyId::STRING, TyId::STRING], TyId::EMPTY),
+            Builtin::FsCopy | Builtin::FsWrite => ([TyId::STRING, TyId::STRING], TyId::EMPTY),
             Builtin::FsTempDir => ([UNUSED, UNUSED], TyId::STRING),
+            Builtin::SortVersions => {
+                let list = types.list(TyId::STRING);
+                ([list, UNUSED], list)
+            }
             // TEMPORARY (alias rule): the opaque type, until a polymorphic
             // one (R11 of `docs/INFERENCE_REQS.md`).
-            Builtin::Len => return types.builtin(self),
+            Builtin::Len | Builtin::Show => return types.builtin(self),
         };
         let params = self
             .params()
@@ -13461,6 +13513,9 @@ impl<'a> Checker<'a> {
             (Typing::Special, &[list]) if builtin == Builtin::Len && !erroneous => {
                 self.check_len(callee, list)
             }
+            (Typing::Special, &[value]) if builtin == Builtin::Show && !erroneous => {
+                self.check_show(callee, value)
+            }
             _ => {
                 // Every argument is checked, whatever goes wrong.
                 for &arg in &bound {
@@ -13529,6 +13584,55 @@ impl<'a> Checker<'a> {
             self.types
                 .fn_type([(None, ty)], TyId::INT, Builtin::Len.effect());
         TyId::INT
+    }
+
+    /// TEMPORARY (alias rule): `show`'s rule, until its polymorphic type (R11
+    /// of `docs/INFERENCE_REQS.md`). Types the call of `show`, the callee
+    /// `callee`, whose argument is `value`: the argument may be of any type
+    /// without a function in it, anywhere, a field, an element, a member of
+    /// a union, an alias's expansion, at any depth ([`TypeTable::contains_fn`],
+    /// which a built-in function's type is too), else "cannot show a
+    /// function: `show` renders data as source", at the argument, its type
+    /// in a note; and it is used as its bits all the way down, as an
+    /// interpolated expression is ([`Checker::measure_deep`]), so one that may
+    /// be a future, or hold one, is awaited deeply, subject to the purity
+    /// rule. The call is a `String`, and the callee a pure function from the
+    /// argument's type, once awaited, to `String`; `Error` if the argument is
+    /// erroneous or holds a function.
+    fn check_show(&mut self, callee: ExprId, value: ExprId) -> TyId {
+        let found = self.check_expr(value);
+        let found = self.settle(value, found);
+        if found == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        // Before measuring, so that an argument with a function in it that
+        // may also be a future in a pure function is one error, not two.
+        if self.types.contains_fn(found) {
+            let shown = self.in_message(found);
+            self.errors.push(
+                Diagnostic::error(
+                    format!(
+                        "cannot show a function: `{}` renders data as source",
+                        Builtin::Show.name()
+                    ),
+                    self.ast.get(value).span,
+                )
+                .with_note(format!("the argument is of type {shown}")),
+            );
+            return TyId::ERROR;
+        }
+        let ty = self.measure_deep(value, found);
+        if ty == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        self.expr_types[callee.index()] =
+            self.types
+                .fn_type([(None, ty)], TyId::STRING, Builtin::Show.effect());
+        // A value of type `Never` is never there to show.
+        if ty == self.never {
+            return self.never;
+        }
+        TyId::STRING
     }
 
     /// Binds the arguments `args` of the call `id` of the built-in function
@@ -13666,15 +13770,21 @@ impl<'a> Checker<'a> {
             return ty;
         }
         let name = builtin.name();
+        // What the built-in's type is for, which no type can write yet.
+        let any = if builtin == Builtin::Show {
+            "value"
+        } else {
+            "list"
+        };
         self.errors.push(
             Diagnostic::error(
                 format!("`{name}` is a built-in function and cannot be used as a value yet"),
                 span,
             )
-            .with_note(
-                "a built-in function with a type for any list cannot be written as a type yet; \
-                 call it, or bind it to a name",
-            ),
+            .with_note(format!(
+                "a built-in function with a type for any {any} cannot be written as a type \
+                 yet; call it, or bind it to a name"
+            )),
         );
         TyId::ERROR
     }
@@ -24544,6 +24654,230 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fs_write_and_sort_versions_have_function_types() {
+        for (text, shown) in [
+            (
+                "import fs\nfs.write",
+                "fn(p: String, contents: String) -> {}",
+            ),
+            (
+                "import write from fs\nwrite",
+                "fn(p: String, contents: String) -> {}",
+            ),
+            (
+                "import builtins\nbuiltins.fs_write",
+                "fn(p: String, contents: String) -> {}",
+            ),
+            ("import fs\nfs.write(\"/a\", \"x\")", "{}"),
+            ("import fs\nfs.write(contents = \"x\", p = \"/a\")", "{}"),
+            ("sort_versions", "fn(vs: List<String>): List<String>"),
+            ("sort_versions([\"1\", \"0\"])", "List<String>"),
+            ("sort_versions([])", "List<String>"),
+            ("sort_versions(vs = [\"1\"])", "List<String>"),
+            (
+                "import builtins\nbuiltins.sort_versions",
+                "fn(vs: List<String>): List<String>",
+            ),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // Not the prelude's: without `import fs`, no `write`.
+        assert_eq!(
+            messages("write(\"/a\", \"x\")"),
+            ["undefined variable `write`"]
+        );
+        // Their arguments are checked as any call's.
+        assert_eq!(
+            messages("import fs\nfs.write(\"/a\", 1)"),
+            ["mismatched types"]
+        );
+        assert_eq!(
+            messages("import fs\nfs.write(\"/a\")"),
+            ["expected 2 arguments, found 1"]
+        );
+        assert_eq!(messages("sort_versions([1])"), ["mismatched types"]);
+        assert_eq!(messages("sort_versions(\"1\")"), ["mismatched types"]);
+        // `fs.write` is impure: from a pure function, the existing error, by
+        // any road; `sort_versions` is pure.
+        for text in [
+            "import fs\nfn f(p: String): {} { fs.write(p, \"x\") }",
+            "import write from fs\nfn f(p: String): {} { write(p, \"x\") }",
+            "import builtins\nfn f(p: String): {} { builtins.fs_write(p, \"x\") }",
+        ] {
+            assert_eq!(
+                messages(text),
+                ["cannot call an impure function from a pure function"],
+                "{text}"
+            );
+        }
+        assert_eq!(
+            type_of_f("import fs\nfn f(p: String) -> {} { fs.write(p, \"x\") }"),
+            "fn(p: String | Future<String>) -> {}"
+        );
+        assert_eq!(
+            type_of_f("fn f(vs: List<String>): List<String> { sort_versions(vs) }"),
+            "fn(vs: List<String>): List<String>"
+        );
+    }
+
+    #[test]
+    fn show_is_typed_by_its_rule() {
+        // Any type without a function in it, to `String`.
+        for text in [
+            "show(1)",
+            "show(1.5)",
+            "show(true)",
+            "show(\"a\")",
+            "show({})",
+            "show({a = 1; b = [\"x\"]})",
+            "show([[1], [2]])",
+            "let u: Int | String = 1\nshow(u)",
+            "type Pin = {version: String, commit: String}\nlet p: Pin = {version = \"1\"; commit = \"c\"}\nshow(p)",
+            "show(value = 1)",
+            "import builtins\nbuiltins.show(1)",
+            "let s = show\ns(1)",
+            "import show as render from prelude\nrender(1)",
+            "show(lazy 1)",
+        ] {
+            assert_eq!(shown_result(text), "String", "{text}");
+        }
+        // A special built-in: shown as itself, and no value.
+        assert_eq!(file_type("s = show"), "{s: builtin show}");
+        let found = diagnostics("v = [show]");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "`show` is a built-in function and cannot be used as a value yet"
+        );
+        assert_eq!(
+            found[0].notes,
+            [
+                "a built-in function with a type for any value cannot be written as a type yet; \
+              call it, or bind it to a name"
+            ]
+        );
+        // `len`'s note is as it was.
+        assert_eq!(
+            diagnostics("v = [len]")[0].notes,
+            [
+                "a built-in function with a type for any list cannot be written as a type yet; \
+              call it, or bind it to a name"
+            ]
+        );
+        // Its arguments bind as any call's.
+        assert_eq!(messages("show()"), ["expected 1 argument, found 0"]);
+        assert_eq!(messages("show(1, 2)"), ["expected 1 argument, found 2"]);
+        assert_eq!(
+            messages("show(v = 1)"),
+            ["unknown argument `v`", "missing argument `value`"]
+        );
+        // `[]` alone has no element type to infer, as anywhere.
+        assert_eq!(
+            messages("show([])"),
+            ["cannot infer the element type of `[]`"]
+        );
+        // Pure, and awaiting deeply as an interpolation does: in a pure
+        // function a present argument is fine, its bare parameter made
+        // present, and one that may be a future is the implicit-await error.
+        assert_eq!(
+            type_of_f("fn f(r: {a: Int}): String { show(r) }"),
+            "fn(r: {a: Int}): String"
+        );
+        assert_eq!(
+            type_of_f("fn f(xs: List<Int>): String { show(xs) }"),
+            "fn(xs: List<Int>): String"
+        );
+        assert_eq!(
+            messages("fn f(r: {a: Future<Int>}): String { show(r) }"),
+            ["cannot use a value that may be a future in a pure function"]
+        );
+        assert_eq!(
+            type_of_f("fn f(r: {a: Future<Int>}) -> String { show(r) }"),
+            "fn(r: {a: Future<Int>} | Future<{a: Future<Int>}>) -> String"
+        );
+        // A value of type `Never` is never there to show.
+        assert_eq!(shown_result("show(panic(\"p\"))"), "Never");
+    }
+
+    #[test]
+    fn show_rejects_a_function_anywhere_in_its_argument() {
+        // A function anywhere in the argument's type is an error at the
+        // argument, its type in a note: the function itself, a field, an
+        // element, a member of a union, an alias's expansion, a built-in.
+        for (text, argument, shown) in [
+            (
+                "show(fn(x: Int): Int { x })",
+                "fn(x: Int): Int { x }",
+                "`fn(x: Int): Int`",
+            ),
+            (
+                "show({f = fn(): Int { 1 }})",
+                "{f = fn(): Int { 1 }}",
+                "`{f: fn(): Int}`",
+            ),
+            (
+                "show([fn(): Int { 1 }])",
+                "[fn(): Int { 1 }]",
+                "`List<fn(): Int>`",
+            ),
+            (
+                "let u: Int | fn(): Int = 1\nshow(u)",
+                "u)",
+                "`Int | (fn(): Int)`",
+            ),
+            (
+                "type Handler = {run: fn(): Int}\nlet h: Handler = {run = fn(): Int { 1 }}\nshow(h)",
+                "h)",
+                "`{run: fn(): Int}`",
+            ),
+            ("show(int)", "int)", "`fn(x: Float): Int`"),
+            (
+                "show({e = exec})",
+                "{e = exec}",
+                "`{e: fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}}`",
+            ),
+            (
+                "show(lazy fn(): Int { 1 })",
+                "lazy fn(): Int { 1 }",
+                "`Future<fn(): Int>`",
+            ),
+        ] {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            assert_eq!(
+                found[0].message, "cannot show a function: `show` renders data as source",
+                "{text}"
+            );
+            // The argument of the last `show(` of the text.
+            let argument = argument.trim_end_matches(')');
+            let start = text.rfind("show(").unwrap() + "show(".len();
+            let span = Span::new(
+                u32::try_from(start).unwrap(),
+                u32::try_from(start + argument.len()).unwrap(),
+            );
+            assert_eq!(&text[start..start + argument.len()], argument, "{text}");
+            assert_eq!(found[0].span, span, "{text}");
+            assert_eq!(
+                found[0].notes,
+                [format!("the argument is of type {shown}")],
+                "{text}"
+            );
+            assert!(found[0].labels.is_empty(), "{text}");
+        }
+        // `len` as the argument is the alias rule's error, not this one.
+        assert_eq!(
+            messages("show(len)"),
+            ["`len` is a built-in function and cannot be used as a value yet"]
+        );
+        // One error, not two, for a function that may be a future in a pure
+        // function.
+        assert_eq!(
+            messages("fn f(g: Future<fn(): Int>): String { show(g) }"),
+            ["cannot show a function: `show` renders data as source"]
+        );
+    }
+
     /// The type `exec` returns, as the type table shows it.
     const EXEC_RESULT: &str = "{status: Int, stderr: String, stdout: String}";
 
@@ -24598,7 +24932,9 @@ mod tests {
             let shown = types.display(ty, &names).to_string();
             match builtin.typing() {
                 Typing::Ordinary => assert_eq!(builtin.display(), shown),
-                Typing::Special => assert_eq!(builtin.display(), "builtin len"),
+                Typing::Special => {
+                    assert_eq!(builtin.display(), format!("builtin {}", builtin.name()));
+                }
             }
             assert!(builtin.params().len() <= Builtin::MAX_PARAMS);
         }

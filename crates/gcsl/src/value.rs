@@ -693,7 +693,8 @@ impl Value {
         }
     }
 
-    /// The value as it would be written in a program, for the REPL: a
+    /// The value as it would be written in a program, for the REPL and the
+    /// built-in `show` (see [`crate::eval`], "The built-in functions"): a
     /// string double-quoted with its special characters escaped (see
     /// [`Quoted`]), and every other value as its `Display` form.
     #[must_use]

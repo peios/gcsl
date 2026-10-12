@@ -338,7 +338,7 @@
 //! the new evaluator across the body's evaluation.
 //!
 //! The callee of a `Call` may instead be a built-in function, a
-//! [`Value::Builtin`]: an ordinary one (every one but `len`) is
+//! [`Value::Builtin`]: an ordinary one (every one but `len` and `show`) is
 //! a value of a function type that a variable, a parameter or a field may
 //! hold, so the `function` walker yields a closure or a built-in, and a
 //! call of a built-in applies it, its arguments evaluated in order as a
@@ -347,7 +347,7 @@
 //! This is the one place a node does not say what it does, since no node
 //! could know which function a value is. A built-in whose typing is special
 //! is never called through a value: the checker makes every call of one its
-//! own node (`ListLen`). A built-in's cell holds it from before the first
+//! own node (`ListLen`, `Show`). A built-in's cell holds it from before the first
 //! input runs (see [`crate::workspace`]); `Top` reads it as it reads a
 //! function's slot.
 //!
@@ -532,11 +532,32 @@
 //!   after `6.6`. If every run is equal but the strings differ, as `1.01`
 //!   and `1.1` do, or `""` and `"0"`, they compare by their bytes, so `0`
 //!   means equal strings, as `sort -V` breaks such a tie.
+//! - `sort_versions(vs)` gives the strings of `vs` ascending in that order,
+//!   `compare_versions`' own comparison, by a stable sort: since only equal
+//!   strings compare equal, a string there twice is there twice, side by
+//!   side, and `[]` gives `[]` (`sort_versions`).
 //!
-//! These ten are pure and fail only as said; none has a limit of its own
+//! These eleven are pure and fail only as said; none has a limit of its own
 //! on the length of a string.
 //!
-//! The five of the file system, which a program reaches as the members of
+//! `show(value)`, a built-in whose typing is special, is no call of a value
+//! but a `Show` node of its argument, which the checker has awaited deeply
+//! (`source_of`). It gives the value's GCSL SOURCE, which read back as an
+//! expression, where its type is expected, is an equal value: exactly what
+//! [`Value::repr`] shows, the one printer of values, so what `gcsl run`
+//! shows of a value but for a string at the top, which is quoted as it is
+//! inside a record or a list (`show("a")` is `"\"a\""`, `show(1)` is `"1"`,
+//! `show({})` is `"{}"`, a record's fields in their order, its field names
+//! quoted unless identifiers). A `Float` with no literal, NaN or an
+//! infinity, is "`show` cannot render `nan` as source" (`inf`, `-inf`), at
+//! the call, the first of the value in the order it is shown; and a future
+//! still to run, of which the deep await leaves none, "cannot show a value
+//! that is not ready yet". It is pure. Two values' sources do not read back
+//! everywhere: `Int`'s least value, `-9223372036854775808`, whose digits
+//! are no `Int` literal, and an empty list where no type is expected, which
+//! has no element type to infer.
+//!
+//! The six of the file system, which a program reaches as the members of
 //! the standard module `fs` (`fs.exists` is `fs_exists`, and so on), are
 //! impure, and EVERY PATH THEY TAKE MUST BE ABSOLUTE: a relative one, `""`
 //! included, is "`fs.read` needs an absolute path, found `x.txt`", before
@@ -582,6 +603,16 @@
 //!   "`fs.temp_dir` could not create a temporary directory: REASON"; and
 //!   a call in a run without an owner, which only a test can make, is an
 //!   internal error.
+//! - `fs_write(p, contents)` (`fs.write`) writes `contents` to the file `p`,
+//!   making it or replacing it whole, and is `{}`, ATOMICALLY: to a new
+//!   temporary file beside it, `.NAME.gcsl-tmp-PID-N`, made exclusively,
+//!   flushed to the disk and renamed over `p`, so a reader sees the old
+//!   contents or the new, never a part ([`replace_file`]). The directory of
+//!   `p` must exist. A file it replaces keeps nothing, its permissions
+//!   neither: the new file has the mode any new file gets, `0666` less the
+//!   umask; and a symbolic link at `p` is replaced, not followed. Any
+//!   failure, a missing directory, `p` a directory, is "`fs.write` could not
+//!   write `/a/b`: REASON", and leaves no temporary file behind.
 //!
 //! # Callers and helpers
 //!
@@ -805,10 +836,11 @@ use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
+use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
-use std::io;
+use std::io::{self, Write as _};
 use std::num::NonZeroI64;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
@@ -879,8 +911,10 @@ const FOR_RESERVE: usize = 16_777_216;
 /// is its message; a call of the file system's built-ins with a relative
 /// path is "`fs.read` needs an absolute path, found `x.txt`", and one whose
 /// operation fails names it, its paths and the OS's reason, "`fs.read`
-/// could not read `/a`: REASON" (see [The built-in
-/// functions](#the-built-in-functions)). `Float` arithmetic never fails. A
+/// could not read `/a`: REASON"; and a call of `show` of a value holding
+/// NaN or an infinity is "`show` cannot render `nan` as source" (see [The
+/// built-in functions](#the-built-in-functions)). `Float` arithmetic never
+/// fails. A
 /// run through this function has no standard library, and so no `exec` to
 /// call, nor any owner of temporary directories.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
@@ -1208,7 +1242,7 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Caller => {
+            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Show(_) | IrKind::Caller => {
                 self.string(id).map(Value::Str)
             }
             IrKind::Helper => self.record(id),
@@ -1966,14 +2000,15 @@ impl Evaluator<'_> {
     /// `strip_suffix` ([`strip_suffix`]), `lines` and `fields`
     /// ([`string_list`]) work on their strings as Rust's `str` does,
     /// `compare_versions` ([`compare_versions`]) gives `-1`, `0` or `1` by
-    /// version order, and the file system's, `fs_exists`, `fs_read`,
-    /// `fs_mkdir`, `fs_copy` ([`file_system`]) and `fs_temp_dir`
-    /// ([`TempDirs::make`]), touch the file system at absolute paths, each
+    /// version order, `sort_versions` ([`sort_versions`]) sorts by it, and
+    /// the file system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`
+    /// ([`file_system`]), `fs_temp_dir` ([`TempDirs::make`]) and `fs_write`
+    /// ([`write_file`]), touch the file system at absolute paths, each
     /// failure a runtime error at the call naming the built-in as a member
     /// of `fs`. A built-in whose typing is special is never called
     /// through a value (the checker lowers each call of one to its own
-    /// node, `len`'s to a `ListLen`), so reaching one here is an internal
-    /// error.
+    /// node, `len`'s to a `ListLen`, `show`'s to a `Show`), so reaching one
+    /// here is an internal error.
     #[inline(never)]
     fn call_builtin(&mut self, builtin: Builtin, args: IrRange, node: &IrNode) -> Flow<Value> {
         // Each parameter's argument, with its span, by the parameter's index.
@@ -2038,6 +2073,12 @@ impl Evaluator<'_> {
                     Ordering::Equal => 0,
                     Ordering::Greater => 1,
                 }))
+            }
+            (Builtin::SortVersions, Some((Value::List(versions), _)), None) => {
+                sort_versions(&versions, node)
+            }
+            (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
+                write_file(&p, &contents, node)
             }
             (Builtin::FsTempDir, None, None) => {
                 let Some(temp_dirs) = self.shared.temp_dirs else {
@@ -2856,6 +2897,7 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where an Int was expected")
             }
+            IrKind::Show(_) => mistyped(node, "`show` node where an Int was expected"),
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
@@ -3011,6 +3053,7 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a Float was expected")
             }
+            IrKind::Show(_) => mistyped(node, "`show` node where a Float was expected"),
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
@@ -3127,6 +3170,7 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a Bool was expected")
             }
+            IrKind::Show(_) => mistyped(node, "`show` node where a Bool was expected"),
             IrKind::Empty
             | IrKind::Store(..)
             | IrKind::MakeRecord { .. }
@@ -3258,7 +3302,7 @@ impl Evaluator<'_> {
             }
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
-            IrKind::Caller => self.caller_text(node),
+            IrKind::Show(_) | IrKind::Caller => self.computed_string(node),
             IrKind::Field { record, name, .. } => {
                 self.field_as((record, name), node, Value::into_string)
             }
@@ -3403,6 +3447,7 @@ impl Evaluator<'_> {
             IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
                 mistyped(node, "String node where a record was expected")
             }
+            IrKind::Show(_) => mistyped(node, "`show` node where a record was expected"),
             IrKind::For { .. } | IrKind::Loop { .. } => self.record_loop(node),
             IrKind::Break { .. }
             | IrKind::Continue { .. }
@@ -3651,6 +3696,25 @@ impl Evaluator<'_> {
             }
         }
         Ok(Rc::from(text))
+    }
+
+    /// Evaluates `node`, a `Show` or a `Caller`, the `String` nodes whose
+    /// text is made of what the run holds: a value's source, or the running
+    /// frame's caller. Apart from [`Evaluator::string`], whose match it keeps
+    /// short; any other node is an internal error.
+    fn computed_string(&mut self, node: &IrNode) -> Flow<Rc<str>> {
+        match node.kind {
+            IrKind::Show(operand) => self.show(operand, node),
+            IrKind::Caller => self.caller_text(node),
+            _ => mistyped(node, "a node whose text is not computed"),
+        }
+    }
+
+    /// Evaluates a `Show`, the call `node` of `show`, of `operand`: its
+    /// value's GCSL source (see [`source_of`]).
+    fn show(&mut self, operand: IrId, node: &IrNode) -> Flow<Rc<str>> {
+        let value = self.value(operand)?;
+        source_of(&value, node)
     }
 
     /// A runtime error in a binary operator: the message points at the
@@ -4985,6 +5049,95 @@ fn file_system(builtin: Builtin, p: &str, to: Option<&Value>, node: &IrNode) -> 
     }
 }
 
+/// Applies `fs_write`, `fs.write`, for the call `node`: writes `contents` to
+/// the file at `p`, made or replaced whole, and is `{}` (see [The built-in
+/// functions](#the-built-in-functions)). `p` must be absolute, as every
+/// path of the file system's is, and is used as given: a relative one is
+/// "`fs.write` needs an absolute path, found `x`", before anything is
+/// touched. The write is ATOMIC ([`replace_file`]): a program reading `p`
+/// sees the old contents or the new, whole, never a part. Any failure, the
+/// directory of `p` missing or `p` a directory say, is "`fs.write` could
+/// not write `/a/b`: REASON", the OS's own text, at the call, leaving no
+/// temporary file behind.
+fn write_file(p: &str, contents: &str, node: &IrNode) -> Flow<Value> {
+    let name = Builtin::FsWrite.fs_name().unwrap_or_default();
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let path = Path::new(p);
+    if !path.is_absolute() {
+        return fail(format!("`{name}` needs an absolute path, found `{p}`"));
+    }
+    match replace_file(path, contents.as_bytes()) {
+        Ok(()) => Ok(Value::Empty),
+        Err(reason) => fail(format!("`{name}` could not write `{p}`: {reason}")),
+    }
+}
+
+/// The number of the next temporary file this process makes to write a
+/// file through ([`replace_file`]).
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// How many names a temporary file of [`replace_file`] is tried under
+/// before the write fails: each that is taken, by a file some other process
+/// left behind, is passed over.
+const TEMP_FILE_ATTEMPTS: u32 = 16;
+
+/// Writes `contents` to the file at `path`, an absolute path, atomically:
+/// to a NEW temporary file in the same directory, `.NAME.gcsl-tmp-PID-N`
+/// beside `NAME`, made exclusively, so that it can be no file already there
+/// (a name taken is passed over for the next number, a few times), which is
+/// then flushed to the disk ([`fs::File::sync_all`]) and renamed over
+/// `path` ([`fs::rename`]), which replaces what is there in one step. The
+/// file has the mode a new file gets, `0666` less what the process's umask
+/// takes away, whatever mode a file it replaces had; a symbolic link at
+/// `path` is replaced by the file, not followed. On any failure after it
+/// was made, the temporary file is removed, its removal's own errors
+/// ignored.
+///
+/// # Errors
+///
+/// The reason the file could not be written, as text: the OS's, as "No
+/// such file or directory (os error 2)" for a directory that does not exist
+/// and "Is a directory (os error 21)" for a `path` that is a directory, or
+/// `path` naming no file at all, as `/` does.
+fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err("the path names no file".to_owned());
+    };
+    let mut taken = None;
+    for _ in 0..TEMP_FILE_ATTEMPTS {
+        let number = NEXT_TEMP_FILE.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut temp_name = OsString::from(".");
+        temp_name.push(name);
+        temp_name.push(format!(".gcsl-tmp-{}-{number}", std::process::id()));
+        let temp = dir.join(temp_name);
+        let file = match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                taken = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let written = fill(file, contents).and_then(|()| fs::rename(&temp, path));
+        return written.map_err(|error| {
+            let _ = fs::remove_file(&temp);
+            error.to_string()
+        });
+    }
+    Err(taken.map_or_else(String::new, |error| error.to_string()))
+}
+
+/// Writes `contents` to `file`, a new file, and flushes it to the disk, for
+/// [`replace_file`]; the file is closed as it is dropped.
+///
+/// # Errors
+///
+/// The OS's error, if writing or flushing failed.
+fn fill(mut file: fs::File, contents: &[u8]) -> io::Result<()> {
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
 /// The temporary directories `fs.temp_dir` makes for a run, held by the
 /// run's owner, a [`crate::workspace::Workspace`], which a lone file's run is
 /// too, or a [`crate::Session`], and removed, with everything in them, as it
@@ -5241,6 +5394,73 @@ fn version_weight(byte: Option<u8>) -> i32 {
         Some(letter) if letter.is_ascii_alphabetic() => i32::from(letter),
         Some(other) => i32::from(other) + 256,
     }
+}
+
+/// The strings of `versions`, for the call `node` of `sort_versions`,
+/// ascending in version order, as [`compare_versions`] orders two, by a
+/// stable sort: since only equal strings compare equal, a string that is
+/// there twice is there twice, side by side (see [The built-in
+/// functions](#the-built-in-functions)). An element that is not a string
+/// is an internal error, which the checker rules out.
+fn sort_versions(versions: &List, node: &IrNode) -> Flow<Value> {
+    if versions
+        .values()
+        .iter()
+        .any(|version| !matches!(version, Value::Str(_)))
+    {
+        return mistyped(node, "a version to sort that is not a string");
+    }
+    let mut sorted = versions.values().to_vec();
+    sorted.sort_by(|a, b| match (a, b) {
+        (Value::Str(a), Value::Str(b)) => compare_versions(a, b),
+        _ => Ordering::Equal,
+    });
+    Ok(Value::List(List::from_vec(sorted)))
+}
+
+/// The GCSL source of `value`, for the call `node` of `show` (see [The
+/// built-in functions](#the-built-in-functions)): what [`Value::repr`]
+/// shows, the one printer of values, which is what `gcsl run` shows of a
+/// value, but for a string at the top, quoted as it is inside a record or a
+/// list, and which reads back, as an expression, as an equal value. First
+/// the value is walked, through a work list rather than recursion, in the
+/// order it is shown, for what has no source: a `Float` that is NaN or an
+/// infinity, which no literal writes, is "`show` cannot render `nan` as
+/// source" (`inf`, `-inf`), and a future still to run, which the checker's
+/// deep await of the argument leaves none of, is "cannot show a value that
+/// is not ready yet", each at the call. A function is an internal error,
+/// which the checker rules out.
+fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
+    let mut pending = vec![value];
+    while let Some(next) = pending.pop() {
+        match next {
+            Value::Float(x) if !x.is_finite() => {
+                return Err(Diagnostic::error(
+                    format!(
+                        "`{}` cannot render `{next}` as source",
+                        Builtin::Show.name()
+                    ),
+                    node.span,
+                )
+                .into());
+            }
+            // Reversed, so that what is shown first is met first.
+            Value::Record(record) => pending.extend(record.values.iter().rev()),
+            Value::List(list) => pending.extend(list.values().iter().rev()),
+            Value::Future(_) => {
+                return Err(Diagnostic::error(
+                    "cannot show a value that is not ready yet",
+                    node.span,
+                )
+                .into());
+            }
+            Value::Fn(_) | Value::Builtin(_) => {
+                return mistyped(node, "a function given to `show`");
+            }
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Empty => {}
+        }
+    }
+    Ok(Rc::from(value.repr().to_string()))
 }
 
 /// Fails with the internal error `message` at `node`: a node of a type its

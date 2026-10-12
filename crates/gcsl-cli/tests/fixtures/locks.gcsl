@@ -1,0 +1,9 @@
+import fs
+import path
+a = sort_versions(["6.10", "6.6", "6.6.1", "1.0~rc1", "1.0"])
+b = show({version = "6.6"; commit = "3a8f"})
+c = show("say \"hi\" {{x}}\n")
+d = show([1, 2])
+let lock = path.join(fs.temp_dir(), "lock.gcsl")
+fs.write(lock, "locked = [{b}]\n")
+written = fs.read(lock)

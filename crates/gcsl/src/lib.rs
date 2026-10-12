@@ -76,10 +76,12 @@
 //! built-in functions implemented in Rust (`len`, `int`, `float`, `exec`,
 //! `panic`, on strings `split`, `join`, `starts_with`, `ends_with`, `trim`,
 //! `strip_prefix`, `strip_suffix`, `lines` and `fields`,
-//! `compare_versions`, which orders two strings in version order, and the
-//! file system's `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy` and
-//! `fs_temp_dir`), and the standard files, the `.gcsl` files of the
-//! repository's
+//! `compare_versions`, which orders two strings in version order, and
+//! `sort_versions`, which sorts a list of them so, `show`, which gives the
+//! GCSL source of a value, as text that reads back as an equal value, and
+//! the file system's `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`,
+//! `fs_temp_dir` and `fs_write`), and the standard files, the `.gcsl` files
+//! of the repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
 //! by its bare name from any file and each a scope of its own; and every
 //! file and input begins as if with `#[shadowable] import * from prelude`,
@@ -94,9 +96,11 @@
 //! apart paths, lexically, in GCSL on the string built-ins; and `fs`
 //! (`import fs`) is the file system's built-ins as its members, impure and
 //! taking only absolute paths: `fs.exists`, `fs.read`, `fs.mkdir`,
-//! `fs.copy`, and `fs.temp_dir`, which makes a new directory that is
-//! removed, with everything in it, as the workspace or [`Session`] whose
-//! run made it is dropped (see [`eval`], "The built-in functions"). The
+//! `fs.copy`, `fs.temp_dir`, which makes a new directory that is removed,
+//! with everything in it, as the workspace or [`Session`] whose run made it
+//! is dropped, and `fs.write`, which writes a file whole, atomically,
+//! through a temporary file beside it (see [`eval`], "The built-in
+//! functions"). The
 //! `fileroot` module (`import fileroot`), implemented in Rust, tells code
 //! where files
 //! are, as absolute paths: `fileroot.this`, the directory of the file the
@@ -119,7 +123,7 @@
 //! never prints and reads no source file; the things it does outside itself
 //! are what a program asks of `exec`, which runs a program, its output
 //! captured, its standard input the null device, and of the file system's
-//! built-ins, which read, make and copy files and directories at the
+//! built-ins, which read, make, copy and write files and directories at the
 //! absolute paths the program gives (see [`eval`], "The built-in
 //! functions"), and removing the temporary directories `fs.temp_dir` made,
 //! besides asking the process for its working directory, canonical, where

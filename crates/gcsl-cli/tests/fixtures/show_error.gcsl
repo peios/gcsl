@@ -1,0 +1,2 @@
+handlers = {run = fn(): Int { 1 }}
+text = show(handlers)

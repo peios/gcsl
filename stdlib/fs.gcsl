@@ -19,7 +19,15 @@
 # - `temp_dir()`: makes a new empty directory, mode 0700, and returns its
 #   absolute path. Every directory it makes is removed, with everything in
 #   it, when the run is done, whether it succeeded or failed (but not if
-#   the process is killed).
+#   the process is killed);
+# - `write(p, contents)`: writes `contents` to the file `p`, whose directory
+#   must exist, making it or replacing it whole, ATOMICALLY: to a new
+#   temporary file beside it, `.NAME.gcsl-tmp-PID-N`, renamed over `p`, so a
+#   reader sees the old contents or the new, never a part, and a failure
+#   leaves no temporary file behind. A file it replaces does not keep its
+#   permissions: the new file has the mode any new file gets (0666 less the
+#   umask), and a symbolic link at `p` is replaced, not followed. `p` a
+#   directory is an error.
 #
 # Like every standard file it is a scope of its own: it sees its own
 # declarations, the prelude's names, and `builtins`.
@@ -30,3 +38,4 @@ read = builtins.fs_read
 mkdir = builtins.fs_mkdir
 copy = builtins.fs_copy
 temp_dir = builtins.fs_temp_dir
+write = builtins.fs_write

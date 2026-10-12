@@ -1950,9 +1950,9 @@ mod tests {
     #[test]
     fn a_session_runs_exec_panic_and_sh() {
         let mut session = Session::new();
-        // The twenty built-in functions' cells are its first slots.
+        // The twenty-three built-in functions' cells are its first slots.
         assert_eq!(
-            &session.frame[..20],
+            &session.frame[..23],
             Builtin::ALL.map(Value::Builtin).as_slice()
         );
         // On the first input, and on later ones, through a variable.
@@ -2058,6 +2058,21 @@ mod tests {
         assert_eq!(
             value(&mut session, "fields(strip_suffix(\" a b.gz\", \".gz\"))").to_string(),
             "[\"a\", \"b\"]"
+        );
+        // `sort_versions` and `show` on an input, and `show` through an alias
+        // a later input calls, by the alias rule.
+        assert_eq!(
+            value(
+                &mut session,
+                "show({v = sort_versions([\"1.10\", \"1.9\"])})"
+            ),
+            Value::Str("{v = [\"1.9\", \"1.10\"]}".into())
+        );
+        assert_eq!(value_type(&session), "String");
+        value(&mut session, "let render = show");
+        assert_eq!(
+            value(&mut session, "render(\"a\")"),
+            Value::Str("\"a\"".into())
         );
         let failed = eval(&mut session, "split(\"a\", \"\")").unwrap_err();
         assert_eq!(

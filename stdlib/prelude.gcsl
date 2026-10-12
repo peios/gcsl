@@ -4,17 +4,22 @@
 # to import itself) begins as if with `#[shadowable] import * from prelude`, so
 # any declaration or import of one of its names, or a path below one, shadows
 # it silently. It binds `builtins`' functions, but `fs`'s, for every file.
-# The binding of `len` is the ALIAS RULE's, which is TEMPORARY: `len` has no
-# type a GCSL type can write yet, so a name bound directly to it is that
-# built-in, called by the checker's rule (to be replaced when built-ins get
-# real polymorphic types, R11 and R3 of docs/INFERENCE_REQS.md). `int`,
-# `float`, `exec`, `panic`, the string built-ins and `compare_versions` are
-# ordinary: values of their function types. `sh` runs a shell command with `exec`, and panics
+# The bindings of `len` and `show` are the ALIAS RULE's, which is TEMPORARY:
+# neither has a type a GCSL type can write yet, so a name bound directly to
+# one is that built-in, called by the checker's rule (to be replaced when
+# built-ins get real polymorphic types, R11 and R3 of
+# docs/INFERENCE_REQS.md). `int`, `float`, `exec`, `panic`, the string
+# built-ins, `compare_versions` and `sort_versions` are ordinary: values of
+# their function types. `sh` runs a shell command with `exec`, and panics
 # unless it succeeds. Like every standard file it is a scope of its own: it
 # sees its own declarations and what it imports, nothing else.
 import builtins
 
+# `len(list)` is the number of elements of a list; `show(value)` the GCSL
+# source of a value of any type without a function in it, as text that reads
+# back as an equal value: `show("a")` is "\"a\"", `show({n = 1})` "{n = 1}".
 len = builtins.len
+show = builtins.show
 int = builtins.int
 float = builtins.float
 def half(n: Int): Float { float(n) / 2.0 }
@@ -44,9 +49,11 @@ fields = builtins.fields
 
 # Versions: `compare_versions(a, b)` is -1, 0 or 1 as `a` sorts before,
 # equal to or after `b` in version order, dpkg's, the core of `sort -V`'s:
-# "6.10" after "6.6", "1.0~rc1" before "1.0". An ordinary built-in, not the
-# alias rule's.
+# "6.10" after "6.6", "1.0~rc1" before "1.0"; `sort_versions(vs)` is the list
+# `vs` sorted ascending in that order, a stable sort, a string there twice
+# kept twice, side by side. Ordinary built-ins, not the alias rule's.
 compare_versions = builtins.compare_versions
+sort_versions = builtins.sort_versions
 
 # Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
 # trailing newline included; panics, with the script, its exit status and

@@ -187,10 +187,12 @@
 //! source order, a spread's operand wrapped in a `Spread`, and an index to
 //! an `Index` of the element's kind. A call of a built-in function whose
 //! typing is special, whose callee the checker resolved to
-//! [`VarRef::Builtin`] (the name of `len`, or an alias of it: see the
-//! checker's "The alias rule, temporary"), lowers to the built-in's own
-//! node, of its arguments as the checker bound them, the callee never read:
-//! `len` to a `ListLen` of its list. A call of an ordinary built-in
+//! [`VarRef::Builtin`] (the name of `len` or `show`, or an alias of one:
+//! see the checker's "The alias rule, temporary"), lowers to the built-in's
+//! own node, of its arguments as the checker bound them, the callee never
+//! read: `len` to a `ListLen` of its list, and `show` to a `Show` of its
+//! value, of any kind, in the `Await` the checker marked it for, as an
+//! interpolated expression is. A call of an ordinary built-in
 //! function (`int`, `float`) is a `Call` of its callee, a read of its cell,
 //! as a call of any function value is. A member of the `fileroot` module,
 //! which the checker resolved to [`VarRef::Fileroot`], lowers to a node of
@@ -2554,9 +2556,10 @@ impl Lowerer<'_> {
     /// TEMPORARY (alias rule): lowers the call spanning `span` of the
     /// built-in function `builtin`, whose typing is special, with the
     /// arguments `args`, of kind `kind`, to the built-in's own node: `len` to
-    /// a `ListLen` of its list. (With a polymorphic type for `len`, R11 of
-    /// `docs/INFERENCE_REQS.md`, a call of it is an ordinary call, or this
-    /// stays as a specialisation of a known callee.)
+    /// a `ListLen` of its list, and `show` to a `Show` of its value, of any
+    /// kind, awaited as the checker marked it. (With polymorphic types for
+    /// them, R11 of `docs/INFERENCE_REQS.md`, a call of one is an ordinary
+    /// call, or this stays as a specialisation of a known callee.)
     fn lower_builtin(
         &mut self,
         builtin: Builtin,
@@ -2571,6 +2574,14 @@ impl Lowerer<'_> {
             }
             Builtin::Len => Err(InternalError {
                 message: "a call of `len` typed as something other than an Int",
+                span,
+            }),
+            Builtin::Show if kind == ValueKind::String => {
+                let value = self.builtin_argument(args, 0, span)?;
+                Ok(IrKind::Show(self.lower_expr(value)?))
+            }
+            Builtin::Show => Err(InternalError {
+                message: "a call of `show` typed as something other than a String",
                 span,
             }),
             // An ordinary built-in is called as any function value is.
@@ -2592,7 +2603,9 @@ impl Lowerer<'_> {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
-            | Builtin::FsTempDir => Err(InternalError {
+            | Builtin::FsTempDir
+            | Builtin::FsWrite
+            | Builtin::SortVersions => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

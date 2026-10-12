@@ -65,7 +65,8 @@
 //! [`IrKind::Index`], of the kind of the element read, like a field access.
 //! A call of a built-in function whose typing is special lowers to a node
 //! of its own, specialised as any operator is: `len`'s to
-//! [`IrKind::ListLen`]. An ordinary built-in function (`int`, `float`) is a
+//! [`IrKind::ListLen`], `show`'s to [`IrKind::Show`], of a node of any
+//! kind. An ordinary built-in function (`int`, `float`) is a
 //! value of a function type, which a name or a parameter may hold as well
 //! as any closure, so a call of it is an [`IrKind::Call`] like any other:
 //! no node of its own could be chosen without knowing which function a
@@ -860,6 +861,11 @@ pub enum IrKind {
     /// The number of elements of the list its operand evaluates to, an
     /// `Int`: a call of the built-in function `len`.
     ListLen(IrId),
+    /// The GCSL source of the value its operand evaluates to, a node of any
+    /// kind whose value is present all the way down, as a `String`: a call
+    /// of the built-in function `show` (see [`crate::eval`], "The built-in
+    /// functions").
+    Show(IrId),
     /// A range: the list of the `Int`s from the left operand, an `Int`, up
     /// to the right one, an `Int`, in order, the right one included if the
     /// flag is `true` (`a..=b`) and not if it is `false` (`a..b`); empty if
@@ -1110,6 +1116,7 @@ impl IrKind {
             | IrKind::Arg { value: operand, .. }
             | IrKind::Spread(operand)
             | IrKind::ListLen(operand)
+            | IrKind::Show(operand)
             | IrKind::Is { value: operand, .. }
             | IrKind::As { value: operand, .. }
             | IrKind::Await { value: operand, .. }
@@ -1234,6 +1241,7 @@ impl IrKind {
             | IrKind::Spread(_)
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
+            | IrKind::Show(_)
             | IrKind::For { .. }
             | IrKind::Loop { .. }
             | IrKind::Break { .. }
@@ -1269,6 +1277,7 @@ impl IrKind {
             IrKind::Spread(_) => "spread",
             IrKind::Index { .. } => "index",
             IrKind::ListLen(_) => "list-len",
+            IrKind::Show(_) => "show",
             IrKind::Range(false, _) => "range",
             IrKind::Range(true, _) => "range-inclusive",
             IrKind::For { collect: true, .. } => "for",
@@ -1393,6 +1402,7 @@ impl IrNode {
             | IrKind::Spread(_)
             | IrKind::Index { .. }
             | IrKind::ListLen(_)
+            | IrKind::Show(_)
             | IrKind::For { .. }
             | IrKind::Loop { .. }
             | IrKind::Break { .. }
@@ -1904,9 +1914,11 @@ impl Ir {
                 | IrKind::And(_)
                 | IrKind::Or(_)
                 | IrKind::Not(_) => ValueKind::Bool,
-                IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
-                    ValueKind::String
-                }
+                IrKind::StrConst(_)
+                | IrKind::StrConcat(_)
+                | IrKind::Interp(_)
+                | IrKind::Show(_)
+                | IrKind::Caller => ValueKind::String,
                 IrKind::IntConst(_)
                 | IrKind::IntNeg(_)
                 | IrKind::IntAdd(_)
