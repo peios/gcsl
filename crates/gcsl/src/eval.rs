@@ -592,11 +592,14 @@
 //!   impure, so never shared with another, and in a memoised function it
 //!   runs once for each list of arguments, as its body does. The
 //!   directories are the numbered children, `1`, `2` and so on, of one
-//!   parent directory, `gcsl-PID-N` in the system's temporary directory,
-//!   that the run's owner holds, a [`crate::workspace::Workspace`] (a lone
-//!   file's run is one) or a [`crate::Session`], made by its first call
-//!   and never before, and removed, with everything in it, as the owner is
-//!   dropped, whether its runs succeeded or failed ([`TempDirs`]); it
+//!   parent directory, `gcsl-PID-N` in the system's temporary directory, or
+//!   in the temp root a workspace's host chose
+//!   ([`crate::workspace::Workspace::set_temp_root`]), that the run's owner
+//!   holds, a [`crate::workspace::Workspace`] (a lone file's run is one) or
+//!   a [`crate::Session`], made by its first call and never before, and
+//!   removed, with everything in it, as the owner is dropped, whether its
+//!   runs succeeded or failed ([`TempDirs`]); a temp root is never removed,
+//!   and one that is not absolute is a REASON below. It
 //!   reaches every frame beside the memo tables, as the layout of `exec`'s
 //!   records does (see [`eval_with`]). A process killed before it drops
 //!   the owner leaves the directory behind. One that cannot be made is
@@ -5145,17 +5148,23 @@ fn fill(mut file: fs::File, contents: &[u8]) -> io::Result<()> {
 ///
 /// They are the numbered children, `1`, `2` and so on, of one *parent*
 /// directory per owner, made in the system's temporary directory
-/// ([`std::env::temp_dir`]) by the first call of `fs.temp_dir` that the
-/// owner's runs make, never before: `gcsl-PID-N`, the process's id and a
-/// number counted up for every parent the process makes, so that no two
-/// owners of a process share one; a name some other process left behind is
-/// passed over for the next number, a few times. Each directory is made
-/// with mode `0700`, less what the process's umask takes away. Dropping
-/// the owner removes the parent ([`fs::remove_dir_all`]), errors ignored:
-/// so a process that ends without dropping it, killed say, leaves it
-/// behind.
+/// ([`std::env::temp_dir`]), or in the *temp root* a workspace's host chose
+/// ([`crate::workspace::Workspace::set_temp_root`]), by the first call of
+/// `fs.temp_dir` that the owner's runs make, never before: `gcsl-PID-N`, the
+/// process's id and a number counted up for every parent the process makes,
+/// so that no two owners of a process share one; a name some other process
+/// left behind is passed over for the next number, a few times. Each
+/// directory is made with mode `0700`, less what the process's umask takes
+/// away. A temp root is made then too if it is missing, with its missing
+/// parents ([`fs::create_dir_all`], the mode any new directory gets), and
+/// is never removed. Dropping the owner removes the parent
+/// ([`fs::remove_dir_all`]), errors ignored: so a process that ends without
+/// dropping it, killed say, leaves it behind.
 #[derive(Debug, Default)]
 pub struct TempDirs {
+    /// The directory the parent is made in, if the owner's host chose one:
+    /// else the system's temporary directory.
+    root: Option<PathBuf>,
     /// The parent directory, once it is made.
     parent: OnceCell<PathBuf>,
     /// The number of the last child made, 0 before the first.
@@ -5179,27 +5188,51 @@ impl TempDirs {
         Self::default()
     }
 
-    /// The parent directory, made now if it has not been.
+    /// Makes `root` the directory the parent is made in, the temp root,
+    /// instead of the system's temporary directory. It is read only as the
+    /// parent is made, by the first directory asked for: so once one has
+    /// been, this changes nothing, the parent made staying in use. Nothing
+    /// is checked or made now; a `root` that is not absolute is the error of
+    /// every directory asked for.
+    pub(crate) fn set_root(&mut self, root: PathBuf) {
+        self.root = Some(root);
+    }
+
+    /// The parent directory, made now if it has not been, in the temp root,
+    /// made first if it is missing, or the system's temporary directory.
     ///
     /// # Errors
     ///
-    /// The reason it could not be made, as text: the OS's, or the system's
-    /// temporary directory not being an absolute path.
+    /// The reason it could not be made, as text: the OS's, or the temp root
+    /// or the system's temporary directory not being an absolute path.
     fn parent(&self) -> Result<&Path, String> {
         if let Some(parent) = self.parent.get() {
             return Ok(parent);
         }
-        let system = std::env::temp_dir();
-        if !system.is_absolute() {
-            return Err(format!(
-                "the system's temporary directory `{}` is not an absolute path",
-                system.display()
-            ));
-        }
+        let system;
+        let base = if let Some(root) = &self.root {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "the temporary directory root `{}` is not an absolute path",
+                    root.display()
+                ));
+            }
+            fs::create_dir_all(root).map_err(|error| error.to_string())?;
+            root.as_path()
+        } else {
+            system = std::env::temp_dir();
+            if !system.is_absolute() {
+                return Err(format!(
+                    "the system's temporary directory `{}` is not an absolute path",
+                    system.display()
+                ));
+            }
+            system.as_path()
+        };
         let mut taken = None;
         for _ in 0..Self::ATTEMPTS {
             let number = NEXT_PARENT.fetch_add(1, AtomicOrdering::Relaxed);
-            let candidate = system.join(format!("gcsl-{}-{number}", std::process::id()));
+            let candidate = base.join(format!("gcsl-{}-{number}", std::process::id()));
             match DirBuilder::new().mode(0o700).create(&candidate) {
                 Ok(()) => return Ok(self.parent.get_or_init(|| candidate)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -5219,8 +5252,8 @@ impl TempDirs {
     /// # Errors
     ///
     /// The reason the directory could not be made, as text: the OS's, or
-    /// the system's temporary directory not being an absolute path, or its
-    /// path not being UTF-8.
+    /// the temp root or the system's temporary directory not being an
+    /// absolute path, or its path not being UTF-8.
     fn make(&self) -> Result<String, String> {
         let parent = self.parent()?;
         loop {
@@ -10599,5 +10632,53 @@ mod tests {
         assert!(Path::new(&elsewhere).is_dir());
         drop(other);
         assert!(!Path::new(&elsewhere).exists());
+    }
+
+    #[test]
+    fn temporary_directories_are_made_in_the_temp_root() {
+        let scratch =
+            std::env::temp_dir().join(format!("gcsl-slice-45-{}-unit", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        // A missing root is made, with its parents, as the first is asked
+        // for, never before; the parent is in it, and goes, the root stays.
+        let root = scratch.join("a/b/root");
+        let mut temp_dirs = TempDirs::new();
+        temp_dirs.set_root(root.clone());
+        assert!(!scratch.exists());
+        let first = temp_dirs.make().unwrap();
+        let parent = temp_dirs.parent.get().unwrap().clone();
+        assert_eq!(parent.parent(), Some(root.as_path()));
+        assert_eq!(Path::new(&first), parent.join("1"));
+        let name = parent.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!("gcsl-{}-", std::process::id())),
+            "{name}"
+        );
+        drop(temp_dirs);
+        assert!(!parent.exists());
+        assert!(root.is_dir());
+        // Set after one was made: the parent made stays in use.
+        let mut temp_dirs = TempDirs::new();
+        let first = temp_dirs.make().unwrap();
+        let parent = temp_dirs.parent.get().unwrap().clone();
+        temp_dirs.set_root(root.clone());
+        let second = temp_dirs.make().unwrap();
+        assert_eq!(Path::new(&first).parent(), Some(parent.as_path()));
+        assert_eq!(Path::new(&second), parent.join("2"));
+        assert_eq!(parent.parent(), Some(std::env::temp_dir().as_path()));
+        drop(temp_dirs);
+        assert!(!parent.exists());
+        // A root that is not absolute is every call's error.
+        let mut temp_dirs = TempDirs::new();
+        temp_dirs.set_root(PathBuf::from("rel/tmp"));
+        for _ in 0..2 {
+            assert_eq!(
+                temp_dirs.make(),
+                Err("the temporary directory root `rel/tmp` is not an absolute path".to_owned())
+            );
+        }
+        assert!(temp_dirs.parent.get().is_none());
+        assert!(!Path::new("rel").exists());
+        fs::remove_dir_all(&scratch).unwrap();
     }
 }

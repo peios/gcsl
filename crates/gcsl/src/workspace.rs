@@ -599,9 +599,13 @@
 //! the workspace is dropped, the parent is removed, with everything in it,
 //! whether its runs succeeded or failed: so when `gcsl run`, of a workspace
 //! or of a lone file, whose run is a workspace's too, or `pekit` is done
-//! with it. A process killed before then leaves the directory behind. A
-//! session owns those of its inputs, and of the standard library's run as
-//! it starts, as a workspace does (see [`crate::session`]).
+//! with it. A process killed before then leaves the directory behind. Its
+//! host may choose another directory than the system's temporary directory
+//! for the parent, its TEMP ROOT ([`Workspace::set_temp_root`]), before it
+//! runs anything: the root is made by the first call if it is missing, and
+//! is never removed. A session owns those of its inputs, and of the
+//! standard library's run as it starts, as a workspace does (see
+//! [`crate::session`]), always in the system's temporary directory.
 //!
 //! The `fileroot` module has no file, no cell and no value: it is a target
 //! of its own ([`Target::Fileroot`]), which only a whole import names,
@@ -679,6 +683,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::mem;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::Outcome;
@@ -5599,8 +5604,9 @@ pub struct Workspace {
     exec_result: Rc<Layout>,
     /// The temporary directories `fs.temp_dir` makes for its runs, none
     /// until the first is asked for, removed with everything in them as the
-    /// workspace is dropped (see the module documentation, "The standard
-    /// library").
+    /// workspace is dropped, in the temp root if one was set
+    /// ([`Workspace::set_temp_root`]; see the module documentation, "The
+    /// standard library").
     temp_dirs: TempDirs,
     /// The table the files' types are interned into.
     types: TypeTable,
@@ -6124,6 +6130,24 @@ impl Workspace {
     #[must_use]
     pub fn warnings(&self) -> &[Diagnostic] {
         &self.warnings
+    }
+
+    /// Makes `root` the workspace's temp root: the directory in which the
+    /// parent of the temporary directories `fs.temp_dir` makes in its runs
+    /// is made, instead of the system's temporary directory (see the module
+    /// documentation, "The standard library"). Everything else is as
+    /// without it: the parent, `gcsl-PID-N`, is made by the first call and
+    /// never before, and removed with everything in it as the workspace is
+    /// dropped. `root` is made then, with its missing parents, if it is
+    /// missing, and is never removed. A `root` that is not absolute fails
+    /// every call: "`fs.temp_dir` could not create a temporary directory:
+    /// the temporary directory root `ROOT` is not an absolute path".
+    ///
+    /// The root is read only as the parent is made, so a host calls this
+    /// before running anything: once a temporary directory has been made,
+    /// it changes nothing, and the parent made stays in use.
+    pub fn set_temp_root(&mut self, root: PathBuf) {
+        self.temp_dirs.set_root(root);
     }
 
     /// The syntax tree of file `index` annotated with the types it was
@@ -11486,6 +11510,105 @@ p26 = com.x"#;
             "{}",
             error.message
         );
+    }
+
+    /// The workspace of a `workspace.gcsl` and two files, `one.gcsl` and
+    /// `two.gcsl`, each of whose value is a list of two new temporary
+    /// directories, checked.
+    fn temp_dir_workspace() -> Workspace {
+        let text = "import fs\n= [fs.temp_dir(), fs.temp_dir()]";
+        let files = [
+            ("workspace.gcsl", ""),
+            ("one.gcsl", text),
+            ("two.gcsl", text),
+        ];
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        check(&sources).unwrap()
+    }
+
+    /// The paths of the temporary directories a run of `file` of
+    /// `workspace` gave, each checked to be a directory.
+    fn temp_dirs_of(workspace: &mut Workspace, file: &str) -> Vec<std::path::PathBuf> {
+        let file = workspace.file(file).unwrap();
+        let Value::List(list) = workspace.run(file).unwrap().value else {
+            panic!("not a list");
+        };
+        list.values()
+            .iter()
+            .map(|dir| {
+                let dir = std::path::PathBuf::from(dir.to_string());
+                assert!(dir.is_dir(), "{}", dir.display());
+                dir
+            })
+            .collect()
+    }
+
+    #[test]
+    fn temporary_directories_are_made_in_the_temp_root_set() {
+        let scratch = fs_scratch("temp-root");
+        // A missing root, nested, is made as the first is asked for; the
+        // parent is in it, removed as the workspace is dropped; the root
+        // stays.
+        let root = std::path::Path::new(&scratch).join("a/b/root");
+        let mut workspace = temp_dir_workspace();
+        workspace.set_temp_root(root.clone());
+        assert!(!std::path::Path::new(&scratch).join("a").exists());
+        let dirs = temp_dirs_of(&mut workspace, "one.gcsl");
+        let parent = dirs[0].parent().unwrap().to_owned();
+        assert_eq!(parent.parent(), Some(root.as_path()));
+        assert_eq!(dirs, [parent.join("1"), parent.join("2")]);
+        let name = parent.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!("gcsl-{}-", std::process::id())),
+            "{name}"
+        );
+        std::fs::write(dirs[1].join("kept"), "x").unwrap();
+        drop(workspace);
+        assert!(!parent.exists(), "{}", parent.display());
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        // An existing root is used as it is.
+        let mut workspace = temp_dir_workspace();
+        workspace.set_temp_root(root.clone());
+        let dirs = temp_dirs_of(&mut workspace, "two.gcsl");
+        let parent = dirs[0].parent().unwrap().to_owned();
+        assert_eq!(parent.parent(), Some(root.as_path()));
+        drop(workspace);
+        assert!(!parent.exists(), "{}", parent.display());
+        assert!(root.is_dir());
+        // Set after a run made one: the parent made stays in use, in the
+        // system's temporary directory.
+        let mut workspace = temp_dir_workspace();
+        let first = temp_dirs_of(&mut workspace, "one.gcsl");
+        let parent = first[0].parent().unwrap().to_owned();
+        assert_eq!(parent.parent(), Some(std::env::temp_dir().as_path()));
+        workspace.set_temp_root(root.clone());
+        let second = temp_dirs_of(&mut workspace, "two.gcsl");
+        assert_eq!(second, [parent.join("3"), parent.join("4")]);
+        drop(workspace);
+        assert!(!parent.exists(), "{}", parent.display());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_temp_root_that_is_not_absolute_is_an_error() {
+        let mut workspace = temp_dir_workspace();
+        workspace.set_temp_root(std::path::PathBuf::from("rel/tmp"));
+        let file = workspace.file("one.gcsl").unwrap();
+        let mut errors = workspace.run(file).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let error = errors.remove(0);
+        assert_eq!(
+            error.message,
+            "`fs.temp_dir` could not create a temporary directory: the temporary directory \
+             root `rel/tmp` is not an absolute path"
+        );
+        assert_eq!(error.input, Some(file));
+        assert!(!std::path::Path::new("rel").exists());
     }
 
     #[test]
