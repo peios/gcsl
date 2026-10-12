@@ -109,16 +109,24 @@
 //! workspace that has no file of its own ([`crate::workspace`], "The
 //! standard library"), into its own names, types, frame and memo tables,
 //! keeping the layout of the records `exec` returns that the run built, for
-//! every input (see [`crate::eval`], "The built-in functions"). Unlike a
+//! every input (see [`crate::eval`], "The built-in functions"), and the
+//! run's temporary directories, which `fs.temp_dir` makes in every input
+//! from then on, owned as a workspace owns its own (see
+//! [`crate::workspace`], "The standard library"): none is made until an
+//! input asks for one, and every one is removed, with everything in it, as
+//! the session is dropped, so when the REPL ends, whatever its inputs did.
+//! A clone of the session shares them, and they are removed as the last
+//! clone is dropped. Unlike a
 //! workspace, which loads only the standard files its files import, a
 //! session loads, checks and runs EVERY standard file then, each a scope of
 //! its own as in a workspace, so that an input's `import path` finds it
 //! run already; nothing is loaded mid-session. The built-in functions'
 //! cells are the first slots of its frame and the standard files' cells
 //! and slots the next, its scope's first free slot past them all; the
-//! standard files are its first inputs, in path order (`<stdlib>/path.gcsl`
-//! is input 0 and `<stdlib>/prelude.gcsl` input 1), so its own first input
-//! is number 2, and [`Session::source`] of a standard file is its source,
+//! standard files are its first inputs, in path order (`<stdlib>/fs.gcsl`
+//! is input 0, `<stdlib>/path.gcsl` input 1 and `<stdlib>/prelude.gcsl`
+//! input 2), so its own first input is number 3, and [`Session::source`] of
+//! a standard file is its source,
 //! which a diagnostic of one, or a label in one, is rendered against.
 //! Should that fail, which is a bug, every input fails with its
 //! diagnostics.
@@ -230,7 +238,7 @@ use crate::Outcome;
 use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
-use crate::eval::{self, MemoTables};
+use crate::eval::{self, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lower;
 use crate::names::{Name, Names};
@@ -258,6 +266,11 @@ pub struct Session {
     /// started, for every input; `None` only if the standard library
     /// failed, when no input runs.
     exec_result: Option<Rc<Layout>>,
+    /// The temporary directories `fs.temp_dir` makes for every input, the
+    /// standard library's run's, removed as the session is dropped: shared
+    /// by its clones, so removed as the last of them is (see [The standard
+    /// library](#the-standard-library)).
+    temp_dirs: Rc<TempDirs>,
     /// The standard library as it ran when the session started, beside
     /// which every input is checked; or, should it have failed, which is a
     /// bug, its diagnostics, which every input then fails with.
@@ -304,6 +317,7 @@ impl Session {
                 sources,
                 memo: started.memo,
                 exec_result: Some(started.exec_result),
+                temp_dirs: Rc::new(started.temp_dirs),
                 standard: Ok(Rc::new(started.standard)),
                 imports: Vec::new(),
                 type_store: TypeStore::new(),
@@ -319,6 +333,7 @@ impl Session {
                 sources,
                 memo: MemoTables::new(),
                 exec_result: None,
+                temp_dirs: Rc::new(TempDirs::new()),
                 standard: Err(diagnostics),
                 imports: Vec::new(),
                 type_store: TypeStore::new(),
@@ -410,6 +425,7 @@ impl Session {
             &mut self.memo,
             self.exec_result.as_ref(),
             &standard.dirs[..],
+            &*self.temp_dirs,
         );
         match run_input(ir, &mut self.frame, context) {
             Ok(value) => {
@@ -488,21 +504,32 @@ pub(crate) fn lower_checked(
 /// Runs `ir`, an input of a session or a workspace, on `frame`, the top
 /// level's frame of every input so far, grown to the input's size, with
 /// `memo`, the memo tables of every input, `exec_result`, the layout of
-/// what `exec` returns, built once for every input, and `dirs`, the table
-/// of the run's directories that its code names its own by (see
-/// [`eval::eval_with`]).
+/// what `exec` returns, built once for every input, `dirs`, the table of
+/// the run's directories that its code names its own by, and `temp_dirs`,
+/// the temporary directories of the session or workspace, which
+/// `fs.temp_dir` makes (see [`eval::eval_with`]).
 pub(crate) fn run_input(
     ir: Ir,
     frame: &mut Vec<Value>,
-    (memo, exec_result, dirs): (&mut MemoTables, Option<&Rc<Layout>>, &[Rc<str>]),
+    (memo, exec_result, dirs, temp_dirs): RunContext,
 ) -> Result<Value, Diagnostic> {
     let ir = Rc::new(ir);
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    eval::eval_with(&ir, frame, memo, (exec_result, dirs))
+    eval::eval_with(&ir, frame, memo, (exec_result, dirs, Some(temp_dirs)))
 }
+
+/// What [`run_input`] runs an input with besides its frame: the memo tables
+/// of every input, the layout of what `exec` returns, the table of the
+/// run's directories, and the temporary directories of the run's owner.
+pub(crate) type RunContext<'a> = (
+    &'a mut MemoTables,
+    Option<&'a Rc<Layout>>,
+    &'a [Rc<str>],
+    &'a TempDirs,
+);
 
 #[cfg(test)]
 mod tests {
@@ -748,9 +775,9 @@ mod tests {
         // The standard files are its first inputs, and the built-in
         // functions' cells its first slots, written as the frame was laid
         // out.
-        assert_eq!(first(), 2);
+        assert_eq!(first(), 3);
         assert_eq!(
-            session.source(1).map(SourceFile::name),
+            session.source(2).map(SourceFile::name),
             Some("<stdlib>/prelude.gcsl")
         );
         assert!(session.source(first()).is_none());
@@ -814,8 +841,8 @@ mod tests {
         assert_eq!(error.message, "field `len` is defined in two files");
         assert_eq!(error.input, None);
         let inputs: Vec<Option<u32>> = error.labels.iter().map(|label| label.input).collect();
-        assert_eq!(inputs, [Some(1), None]);
-        let prelude = session.source(1).unwrap();
+        assert_eq!(inputs, [Some(2), None]);
+        let prelude = session.source(2).unwrap();
         assert_eq!(prelude.slice(error.labels[0].span), "len");
     }
 
@@ -1923,9 +1950,9 @@ mod tests {
     #[test]
     fn a_session_runs_exec_panic_and_sh() {
         let mut session = Session::new();
-        // The fifteen built-in functions' cells are its first slots.
+        // The twenty built-in functions' cells are its first slots.
         assert_eq!(
-            &session.frame[..15],
+            &session.frame[..20],
             Builtin::ALL.map(Value::Builtin).as_slice()
         );
         // On the first input, and on later ones, through a variable.
@@ -1961,12 +1988,12 @@ mod tests {
         };
         assert!(Rc::ptr_eq(&earlier.layout, &layout));
         // A panic fails its input, which the session forgets; a failing `sh`
-        // is the prelude's panic, input 1.
+        // is the prelude's panic, input 2.
         assert_eq!(messages(&mut session, "let x = panic(\"stop\")"), ["stop"]);
         assert_eq!(messages(&mut session, "x"), ["undefined variable `x`"]);
         let failed = eval(&mut session, "sh(\"exit 3\")").unwrap_err();
         assert_eq!(failed[0].message, "`exit 3` exited with status 3: ");
-        assert_eq!(failed[0].input, Some(1));
+        assert_eq!(failed[0].input, Some(2));
         assert_eq!(
             value(&mut session, "exec([\"true\"]).status"),
             Value::Int(0)
@@ -1985,7 +2012,7 @@ mod tests {
         // Every standard module was loaded as it started, each a scope of
         // its own, in path order.
         assert_eq!(
-            session.source(0).map(SourceFile::name),
+            session.source(1).map(SourceFile::name),
             Some("<stdlib>/path.gcsl")
         );
         // `split` on the first input.
@@ -2121,5 +2148,63 @@ mod tests {
             messages(&mut session, "x = fileroot"),
             ["`fileroot`'s members are read as `fileroot.caller`"]
         );
+    }
+
+    #[test]
+    fn a_session_has_fs_and_owns_its_temporary_directories() {
+        let mut session = Session::new();
+        // Loaded as the session started, its first input.
+        assert_eq!(
+            session.source(0).map(SourceFile::name),
+            Some("<stdlib>/fs.gcsl")
+        );
+        // `import fs` then a read, in that input and a later one.
+        let dir =
+            std::env::temp_dir().join(format!("gcsl-slice-42-{}-session", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_str().unwrap().to_owned();
+        std::fs::write(format!("{dir}/x.txt"), "from a file\n").unwrap();
+        assert_eq!(
+            value(
+                &mut session,
+                &format!("import fs\nfs.read(\"{dir}/x.txt\")")
+            ),
+            Value::Str("from a file\n".into())
+        );
+        assert_eq!(value_type(&session), "String");
+        assert_eq!(
+            value(&mut session, &format!("fs.exists(\"{dir}/x.txt\")")),
+            Value::Bool(true)
+        );
+        // Its errors are the input's, at the call.
+        let failed = eval(&mut session, "fs.read(\"x.txt\")").unwrap_err();
+        assert_eq!(
+            failed[0].message,
+            "`fs.read` needs an absolute path, found `x.txt`"
+        );
+        assert_eq!(failed[0].input, None);
+        assert_eq!(failed[0].span, crate::Span::new(0, 16));
+        // A temporary directory lasts as long as the session, an input that
+        // failed after making one included, and a clone shares them.
+        let Value::Str(first) = value(&mut session, "let t = fs.temp_dir()\nt") else {
+            panic!("expected a string");
+        };
+        let failed = eval(&mut session, "let u = fs.temp_dir()\npanic(u)").unwrap_err();
+        let second = failed[0].message.clone();
+        assert_ne!(&*first, second);
+        value(&mut session, "fs.mkdir(\"{t}/inner\")");
+        for made in [&*first, &second] {
+            assert!(std::path::Path::new(made).is_dir(), "{made}");
+        }
+        let clone = session.clone();
+        drop(session);
+        assert!(std::path::Path::new(&format!("{first}/inner")).is_dir());
+        drop(clone);
+        for made in [&*first, &second] {
+            assert!(!std::path::Path::new(made).exists(), "{made}");
+        }
+        assert!(!std::path::Path::new(&*first).parent().unwrap().exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

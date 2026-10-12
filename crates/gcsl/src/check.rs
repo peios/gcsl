@@ -2227,12 +2227,16 @@
 //! module implemented in Rust (see [`crate::workspace`], "The standard
 //! library"): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
 //! `starts_with`, `ends_with`, `trim`, `strip_prefix`, `strip_suffix`,
-//! `lines`, `fields` and `compare_versions`, each a [`Builtin`], with its
-//! name, its parameters' names (at most [`Builtin::MAX_PARAMS`], two), its
-//! [`Effect`] (`exec` is impure, every other one pure) and its [`Typing`].
-//! The checker knows no name of one: a file has them as it has any other
-//! module's members, by an import, or by the prelude, which binds each of
-//! them to its own name and which every file and session input imports
+//! `lines`, `fields`, `compare_versions`, and the file system's `fs_exists`,
+//! `fs_read`, `fs_mkdir`, `fs_copy` and `fs_temp_dir`, each a [`Builtin`],
+//! with its name, its parameters' names (at most [`Builtin::MAX_PARAMS`],
+//! two), its [`Effect`] (`exec` and the file system's are impure, every
+//! other one pure) and its [`Typing`]. The checker knows no name of one: a
+//! file has them as it has any other module's members, by an import, or by
+//! the prelude, which binds each of them but the file system's to its own
+//! name, or by the standard `fs` module, whose members `exists`, `read`,
+//! `mkdir`, `copy` and `temp_dir` are the file system's, bound so too; the
+//! prelude is what every file and session input imports
 //! implicitly, `#[shadowable]` and first of all in its view's order, but a
 //! file marked `#![no_prelude]` (see [`crate::workspace`], "Shadowable
 //! declarations"). A file that declares its own `len` (a field, a `def`, a
@@ -2260,8 +2264,13 @@
 //! String`), `lines` and `fields` (each `fn(s: String): List<String>`),
 //! each as Rust's `str` does it, and `compare_versions` (`fn(a: String, b:
 //! String): Int`, `-1`, `0` or `1` as `a` sorts before, equal to or after
-//! `b` in version order; see [`crate::eval`], "The built-in functions"
-//! for all of them); a file's own `join` shadows
+//! `b` in version order), and the five of the file system, each impure and
+//! each taking only absolute paths: `fs_exists` (`fn(p: String) -> Bool`),
+//! `fs_read` (`fn(p: String) -> String`), `fs_mkdir` (`fn(p: String) ->
+//! {}`), `fs_copy` (`fn(from: String, to: String) -> {}`) and `fs_temp_dir`
+//! (`fn() -> String`), which a file reaches as `fs.exists` and so on after
+//! `import fs` (see [`crate::eval`], "The built-in functions" for all of
+//! them); a file's own `join` shadows
 //! the prelude's as any declaration does, and so does `path`'s, in
 //! `path.gcsl` and in a file importing it by member or `*`. Each is a
 //! value of its type like any function: passed, stored, called through a
@@ -2269,8 +2278,9 @@
 //! like any other, typed by its type, binding its arguments by position or
 //! by its parameters' names, awaiting a future argument as any call
 //! does, lowered to a `Call` (see [`crate::eval`], which applies a built-in
-//! it finds called). So a call of `exec` from a pure function is "cannot
-//! call an impure function from a pure function", as for any impure
+//! it finds called). So a call of `exec`, or of `fs.read`, from a pure
+//! function is "cannot call an impure function from a pure function", as
+//! for any impure
 //! function, and from a `lazy`, an impure or memoised function or the top
 //! level it is fine. Like any function it has no equality: `int === int` is
 //! "cannot compare functions".
@@ -2918,6 +2928,22 @@ pub enum Builtin {
     /// `compare_versions(a: String, b: String): Int`: `-1`, `0` or `1` as
     /// `a` sorts before, equal to or after `b` in version order.
     CompareVersions,
+    /// `fs_exists(p: String) -> Bool`, `fs.exists`: whether something is at
+    /// the absolute path `p`, symbolic links followed. Impure.
+    FsExists,
+    /// `fs_read(p: String) -> String`, `fs.read`: the contents of the file
+    /// at the absolute path `p`, which must be UTF-8 text. Impure.
+    FsRead,
+    /// `fs_mkdir(p: String) -> {}`, `fs.mkdir`: makes the directory at the
+    /// absolute path `p` and any missing parents, as `mkdir -p`. Impure.
+    FsMkdir,
+    /// `fs_copy(from: String, to: String) -> {}`, `fs.copy`: copies the
+    /// file at the absolute path `from` to the absolute path `to`. Impure.
+    FsCopy,
+    /// `fs_temp_dir() -> String`, `fs.temp_dir`: makes a new empty
+    /// directory, removed with everything in it when the run that made it
+    /// is dropped, and gives its absolute path. Impure.
+    FsTempDir,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -2941,7 +2967,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 15] = [
+    pub const ALL: [Builtin; 20] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -2957,6 +2983,11 @@ impl Builtin {
         Builtin::Lines,
         Builtin::Fields,
         Builtin::CompareVersions,
+        Builtin::FsExists,
+        Builtin::FsRead,
+        Builtin::FsMkdir,
+        Builtin::FsCopy,
+        Builtin::FsTempDir,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -2987,6 +3018,41 @@ impl Builtin {
             Builtin::Lines => "lines",
             Builtin::Fields => "fields",
             Builtin::CompareVersions => "compare_versions",
+            Builtin::FsExists => "fs_exists",
+            Builtin::FsRead => "fs_read",
+            Builtin::FsMkdir => "fs_mkdir",
+            Builtin::FsCopy => "fs_copy",
+            Builtin::FsTempDir => "fs_temp_dir",
+        }
+    }
+
+    /// The name of the member of the standard `fs` module that is it,
+    /// `fs.read`, for one of the file system's, by which its runtime errors
+    /// name it whatever name it is called by; `None` for every other
+    /// built-in function.
+    #[must_use]
+    pub const fn fs_name(self) -> Option<&'static str> {
+        match self {
+            Builtin::FsExists => Some("fs.exists"),
+            Builtin::FsRead => Some("fs.read"),
+            Builtin::FsMkdir => Some("fs.mkdir"),
+            Builtin::FsCopy => Some("fs.copy"),
+            Builtin::FsTempDir => Some("fs.temp_dir"),
+            Builtin::Len
+            | Builtin::Int
+            | Builtin::Float
+            | Builtin::Exec
+            | Builtin::Panic
+            | Builtin::Split
+            | Builtin::Join
+            | Builtin::StartsWith
+            | Builtin::EndsWith
+            | Builtin::Trim
+            | Builtin::StripPrefix
+            | Builtin::StripSuffix
+            | Builtin::Lines
+            | Builtin::Fields
+            | Builtin::CompareVersions => None,
         }
     }
 
@@ -3005,17 +3071,27 @@ impl Builtin {
             Builtin::EndsWith | Builtin::StripSuffix => &["s", "suffix"],
             Builtin::Trim | Builtin::Lines | Builtin::Fields => &["s"],
             Builtin::CompareVersions => &["a", "b"],
+            Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
+            Builtin::FsCopy => &["from", "to"],
+            Builtin::FsTempDir => &[],
         }
     }
 
     /// What it may do: only a pure one may be called from a pure function.
-    /// `exec`, which runs a program, is impure; every other built-in
-    /// function is pure, `panic` included, which ends the run as a division
-    /// by zero does, and `split`, whose empty separator does the same.
+    /// `exec`, which runs a program, is impure, and so is each of the file
+    /// system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy` and
+    /// `fs_temp_dir`, which touch the world; every other built-in function
+    /// is pure, `panic` included, which ends the run as a division by zero
+    /// does, and `split`, whose empty separator does the same.
     #[must_use]
     pub const fn effect(self) -> Effect {
         match self {
-            Builtin::Exec => Effect::Impure,
+            Builtin::Exec
+            | Builtin::FsExists
+            | Builtin::FsRead
+            | Builtin::FsMkdir
+            | Builtin::FsCopy
+            | Builtin::FsTempDir => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -3051,7 +3127,12 @@ impl Builtin {
             | Builtin::StripSuffix
             | Builtin::Lines
             | Builtin::Fields
-            | Builtin::CompareVersions => Typing::Ordinary,
+            | Builtin::CompareVersions
+            | Builtin::FsExists
+            | Builtin::FsRead
+            | Builtin::FsMkdir
+            | Builtin::FsCopy
+            | Builtin::FsTempDir => Typing::Ordinary,
         }
     }
 
@@ -3078,6 +3159,11 @@ impl Builtin {
             Builtin::StripSuffix => "fn(s: String, suffix: String): String",
             Builtin::Lines | Builtin::Fields => "fn(s: String): List<String>",
             Builtin::CompareVersions => "fn(a: String, b: String): Int",
+            Builtin::FsExists => "fn(p: String) -> Bool",
+            Builtin::FsRead => "fn(p: String) -> String",
+            Builtin::FsMkdir => "fn(p: String) -> {}",
+            Builtin::FsCopy => "fn(from: String, to: String) -> {}",
+            Builtin::FsTempDir => "fn() -> String",
         }
     }
 
@@ -3108,12 +3194,16 @@ impl Builtin {
             Builtin::Split => ([TyId::STRING, TyId::STRING], types.list(TyId::STRING)),
             Builtin::Join => ([types.list(TyId::STRING), TyId::STRING], TyId::STRING),
             Builtin::StartsWith | Builtin::EndsWith => ([TyId::STRING, TyId::STRING], TyId::BOOL),
-            Builtin::Trim => ([TyId::STRING, UNUSED], TyId::STRING),
+            Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
             Builtin::StripPrefix | Builtin::StripSuffix => {
                 ([TyId::STRING, TyId::STRING], TyId::STRING)
             }
             Builtin::Lines | Builtin::Fields => ([TyId::STRING, UNUSED], types.list(TyId::STRING)),
             Builtin::CompareVersions => ([TyId::STRING, TyId::STRING], TyId::INT),
+            Builtin::FsExists => ([TyId::STRING, UNUSED], TyId::BOOL),
+            Builtin::FsMkdir => ([TyId::STRING, UNUSED], TyId::EMPTY),
+            Builtin::FsCopy => ([TyId::STRING, TyId::STRING], TyId::EMPTY),
+            Builtin::FsTempDir => ([UNUSED, UNUSED], TyId::STRING),
             // TEMPORARY (alias rule): the opaque type, until a polymorphic
             // one (R11 of `docs/INFERENCE_REQS.md`).
             Builtin::Len => return types.builtin(self),
@@ -24384,6 +24474,74 @@ mod tests {
         );
         // A file's own `fields` shadows the prelude's silently.
         assert_eq!(file_type("fields = 1\nv = fields"), "{fields: Int, v: Int}");
+    }
+
+    #[test]
+    fn the_file_system_builtins_have_impure_function_types() {
+        for (text, shown) in [
+            ("import fs\nfs.exists", "fn(p: String) -> Bool"),
+            ("import fs\nfs.read", "fn(p: String) -> String"),
+            ("import fs\nfs.mkdir", "fn(p: String) -> {}"),
+            ("import fs\nfs.copy", "fn(from: String, to: String) -> {}"),
+            ("import fs\nfs.temp_dir", "fn() -> String"),
+            (
+                "import builtins\nbuiltins.fs_read",
+                "fn(p: String) -> String",
+            ),
+            ("import read from fs\nread", "fn(p: String) -> String"),
+            ("import fs\nfs.exists(\"/\")", "Bool"),
+            ("import fs\nfs.read(p = \"/x\")", "String"),
+            ("import fs\nfs.mkdir(\"/x\")", "{}"),
+            ("import fs\nfs.copy(to = \"/b\", from = \"/a\")", "{}"),
+            ("import fs\nfs.temp_dir()", "String"),
+        ] {
+            assert_eq!(shown_result(text), shown, "{text}");
+        }
+        // Not the prelude's: without `import fs`, no such names.
+        assert_eq!(
+            messages("fs_read(\"/x\")"),
+            ["undefined variable `fs_read`"]
+        );
+        assert_eq!(messages("read(\"/x\")"), ["undefined variable `read`"]);
+        // Their arguments are checked as any call's.
+        assert_eq!(messages("import fs\nfs.read(1)"), ["mismatched types"]);
+        assert_eq!(
+            messages("import fs\nfs.temp_dir(\"/x\")"),
+            ["expected 0 arguments, found 1"]
+        );
+        assert_eq!(
+            messages("import fs\nfs.copy(\"/a\")"),
+            ["expected 2 arguments, found 1"]
+        );
+        // Impure: from a pure function, the existing error, through the
+        // module, a member import, an alias and `builtins` alike.
+        for text in [
+            "import fs\nfn f(p: String): String { fs.read(p) }",
+            "import read from fs\nfn f(p: String): String { read(p) }",
+            "import fs as files\nfn f(): String { files.temp_dir() }",
+            "import builtins\nfn f(p: String): Bool { builtins.fs_exists(p) }",
+            "import fs\nfn f(p: String): {} { fs.mkdir(p) }",
+        ] {
+            assert_eq!(
+                messages(text),
+                ["cannot call an impure function from a pure function"],
+                "{text}"
+            );
+        }
+        // From a `lazy` in a pure function, an impure or memoised function,
+        // and the top level, it is fine.
+        assert_eq!(
+            type_of_f("import fs\nfn f(p: String): Future<String> { lazy { fs.read(p) } }"),
+            "fn(p: String | Future<String>): Future<String>"
+        );
+        assert_eq!(
+            type_of_f("import fs\nfn f() -> String { fs.read(\"/x\") }"),
+            "fn() -> String"
+        );
+        assert_eq!(
+            type_of_f("import fs\nfn f() ->> String { fs.temp_dir() }"),
+            "fn() ->> String"
+        );
     }
 
     /// The type `exec` returns, as the type table shows it.

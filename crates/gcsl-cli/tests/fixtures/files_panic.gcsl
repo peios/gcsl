@@ -1,0 +1,4 @@
+import fs
+let dir = fs.temp_dir()
+fs.mkdir("{dir}/made")
+panic(dir)

@@ -1,0 +1,9 @@
+import fs
+import fileroot
+import path
+let dir = fs.temp_dir()
+fs.mkdir(path.join(dir, "a/b"))
+fs.copy(path.join(fileroot.this, "fs_input.txt"), path.join(dir, "a/b/x.txt"))
+there = fs.exists(path.join(dir, "a/b/x.txt"))
+text = fs.read(path.join(dir, "a/b/x.txt"))
+temp = dir

@@ -245,11 +245,11 @@ fn dump_ir_shows_strings_and_ifs() {
     assert_eq!(
         stdout(&output),
         "(block @0..36\n\
-         \x20 (store who#34 @0..17\n\
+         \x20 (store who#39 @0..17\n\
          \x20   (str \"world\" @10..17))\n\
          \x20 (interp @18..36\n\
          \x20   (str \"hello,\\t\" @18..36)\n\
-         \x20   (load who#34 @28..31)\n\
+         \x20   (load who#39 @28..31)\n\
          \x20   (str \"!\\n\" @18..36)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
@@ -288,25 +288,25 @@ fn dump_ir_shows_updates() {
     assert_eq!(
         stdout(&output),
         "(block @39..122\n\
-         \x20 (store host#33 @39..64\n\
+         \x20 (store host#38 @39..64\n\
          \x20   (str \"localhost\" @53..64))\n\
-         \x20 (store port#34 @65..83\n\
+         \x20 (store port#39 @65..83\n\
          \x20   (int 8080 @79..83))\n\
-         \x20 (store name#35 @84..96\n\
+         \x20 (store name#40 @84..96\n\
          \x20   (str \"api\" @91..96))\n\
-         \x20 (store enabled#37 @97..122\n\
+         \x20 (store enabled#42 @97..122\n\
          \x20   (bool true @118..122))\n\
-         \x20 (store tls#36 @97..122\n\
+         \x20 (store tls#41 @97..122\n\
          \x20   (make-record [enabled] @97..122\n\
-         \x20     (load enabled#37 @97..122)))\n\
-         \x20 (store server#32 @39..64\n\
+         \x20     (load enabled#42 @97..122)))\n\
+         \x20 (store server#37 @39..64\n\
          \x20   (make-record [host port tls] @39..64\n\
-         \x20     (load host#33 @39..64)\n\
-         \x20     (load port#34 @65..83)\n\
-         \x20     (load tls#36 @97..122)))\n\
+         \x20     (load host#38 @39..64)\n\
+         \x20     (load port#39 @65..83)\n\
+         \x20     (load tls#41 @97..122)))\n\
          \x20 (make-record [server name] @39..122\n\
-         \x20   (load server#32 @39..45)\n\
-         \x20   (load name#35 @84..88)))\n"
+         \x20   (load server#37 @39..45)\n\
+         \x20   (load name#40 @84..88)))\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }
@@ -355,9 +355,9 @@ fn dumps_show_functions_and_calls() {
     let ir = stdout(&output);
     assert!(
         ir.contains(
-            "  (store at#39 @254..301\n\
+            "  (store at#44 @254..301\n\
              \x20   (make-closure #2 @263..301\n\
-             \x20     (load base#38 @263..301)))\n"
+             \x20     (load base#43 @263..301)))\n"
         ),
         "{ir}"
     );
@@ -596,12 +596,12 @@ fn dumps_show_lists() {
          \x20     (int 22 @446..448)\n\
          \x20     (await @450..458\n\
          \x20       (index @450..458\n\
-         \x20         (load found#42 @450..455)\n\
+         \x20         (load found#47 @450..455)\n\
          \x20         (int 0 @456..457)))\n",
         "\n    (list-len @478..487\n\
-         \x20     (load open#43 @482..486)))\n",
+         \x20     (load open#48 @482..486)))\n",
         "\n      (await *! @524..529\n\
-         \x20       (load found#42 @524..529))\n",
+         \x20       (load found#47 @524..529))\n",
         "\n    (list-eq == * @539..563\n",
         "\n    (make-list @575..643\n\
          \x20     (spread @576..611\n",
@@ -683,23 +683,23 @@ fn dumps_show_fors_and_ranges() {
     for node in [
         // A `for` shows its variable's slot, named, as every slot is, by
         // the last variable stored in it.
-        "\n    (for ports#40 @213..248\n\
+        "\n    (for ports#45 @213..248\n\
          \x20     (range @222..235\n\
          \x20       (int 0 @222..223)\n\
          \x20       (list-len @225..235\n",
-        "\n    (for webs#41 if @310..354\n\
-         \x20     (load hosts#39 @322..327)\n\
+        "\n    (for webs#46 if @310..354\n\
+         \x20     (load hosts#44 @322..327)\n\
          \x20     (str-cmp != @331..345\n",
         // The statement of `{}`s discards its body's values; the statement
         // of futures builds its list, and awaits it deeply.
-        "\n  (for-each checks#42 @426..459\n\
-         \x20   (load webs#41 @438..442)\n",
+        "\n  (for-each checks#47 @426..459\n\
+         \x20   (load webs#46 @438..442)\n",
         "\n  (await *! @524..562\n\
-         \x20   (for checks#42 @524..562\n",
-        "\n    (for checks#42 @596..621\n\
-         \x20     (load ports#40 @605..610)\n\
+         \x20   (for checks#47 @524..562\n",
+        "\n    (for checks#47 @596..621\n\
+         \x20     (load ports#45 @605..610)\n\
          \x20     (await @611..621\n",
-        "\n    (for i#43 @678..702\n\
+        "\n    (for i#48 @678..702\n\
          \x20     (range-inclusive @687..692\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
@@ -803,24 +803,24 @@ fn dumps_show_mutable_variables() {
     for node in [
         // A rebind in a `for`'s body, and in an `if` in it, stores into the
         // variable's one slot.
-        "\n  (store total#41 @159..176\n\
+        "\n  (store total#46 @159..176\n\
          \x20   (int 0 @175..176))\n",
         "\n    (block @299..366\n\
-         \x20     (store total#41 @303..324\n\
+         \x20     (store total#46 @303..324\n\
          \x20       (int-add @312..324\n\
-         \x20         (load total#41 @312..317)\n",
+         \x20         (load total#46 @312..317)\n",
         "\n        (block @348..364\n\
-         \x20         (store slowest#42 @350..362\n\
-         \x20           (load conf#43 @361..362))\n",
+         \x20         (store slowest#47 @350..362\n\
+         \x20           (load conf#48 @361..362))\n",
         // The guard reads the slot the body writes.
         "\n      (int-cmp >= @621..635\n\
-         \x20       (load budget#44 @621..627)\n",
-        "\n        (store budget#44 @638..661\n",
+         \x20       (load budget#49 @621..627)\n",
+        "\n        (store budget#49 @638..661\n",
         // The closure copies the variable when it is made.
-        "\n  (store report#46 @721..753\n\
+        "\n  (store report#51 @721..753\n\
          \x20   (make-closure #0 @734..753\n\
-         \x20     (load total#41 @734..753)))\n\
-         \x20 (store total#41 @754..764\n",
+         \x20     (load total#46 @734..753)))\n\
+         \x20 (store total#46 @754..764\n",
         // A function's own variable, in its own frame.
         "\n      (block @823..841\n\
          \x20       (store sum#1 @825..839\n",
@@ -942,7 +942,7 @@ fn dumps_show_loops_and_their_stops() {
         // A header's items before the condition run once, in a block
         // around the loop; those after it are the loop's last parts.
         "\n    (block @306..363\n\
-         \x20     (store costs#36 @310..319\n",
+         \x20     (store costs#41 @310..319\n",
         "\n      (loop @306..363\n",
         // `for { }` tests `true`.
         "\n    (loop @692..753\n\
@@ -1045,10 +1045,10 @@ fn dumps_show_unions_tests_and_narrowing() {
     for node in [
         // The test looks at the kind alone, and writes the slot the
         // branches read, which a later variable takes once it is free.
-        "(is int first#38 @324..332\n\
-         \x20           (load label#37 @324..325))\n\
+        "(is int first#43 @324..332\n\
+         \x20           (load label#42 @324..325))\n\
          \x20         (block @333..338\n\
-         \x20           (load first#38 @335..336))\n",
+         \x20           (load first#43 @335..336))\n",
         "(as int @612..635\n",
         "(value-same === @708..745\n",
     ] {
@@ -1157,17 +1157,17 @@ fn dumps_show_element_updates() {
     for node in [
         // One update for the whole path: its value, its list and its
         // positions, and its steps.
-        "\n  (store hosts#34 @247..266\n\
+        "\n  (store hosts#39 @247..266\n\
          \x20   (update [].up @247..258\n\
          \x20     (bool true @262..266)\n\
-         \x20     (load hosts#34 @247..252)\n\
+         \x20     (load hosts#39 @247..252)\n\
          \x20     (int 0 @253..254)))\n",
-        "\n      (store hosts#34 @364..406\n\
+        "\n      (store hosts#39 @364..406\n\
          \x20       (update [].ports[] @364..381\n\
          \x20         (int-add @385..406\n",
         "\n            (update [][] @497..507\n",
         // The value, which rebinds `r`, comes before the read of `r`.
-        "\n  (store r#38 @735..778\n\
+        "\n  (store r#43 @735..778\n\
          \x20   (update .a @735..738\n\
          \x20     (block @742..778\n",
     ] {
@@ -1271,21 +1271,21 @@ fn dumps_show_spreads() {
     // The operand is stored once, in a slot of its own, and each field is
     // read from it by name into the field's slot; the override stores into
     // the same slot, and the field keeps its place.
-    let node = "\n      (store url#37 @176..187\n\
-                \x20       (load defaults#34 @179..187))\n\
-                \x20     (store conf#35 @176..187\n\
+    let node = "\n      (store url#42 @176..187\n\
+                \x20       (load defaults#39 @179..187))\n\
+                \x20     (store conf#40 @176..187\n\
                 \x20       (field host @179..187\n\
-                \x20         (load url#37 @179..187)))\n\
-                \x20     (store port#36 @176..187\n\
+                \x20         (load url#42 @179..187)))\n\
+                \x20     (store port#41 @176..187\n\
                 \x20       (field port @179..187\n\
-                \x20         (load url#37 @179..187)))\n\
-                \x20     (store port#36 @190..201\n\
+                \x20         (load url#42 @179..187)))\n\
+                \x20     (store port#41 @190..201\n\
                 \x20       (int 8080 @197..201))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     let node = "\n      (make-record [host port url] @172..227\n\
-                \x20       (load conf#35 @179..187)\n\
-                \x20       (load port#36 @190..194)\n\
-                \x20       (load url#37 @204..207))))\n";
+                \x20       (load conf#40 @179..187)\n\
+                \x20       (load port#41 @190..194)\n\
+                \x20       (load url#42 @204..207))))\n";
     assert!(ir.contains(node), "{node}: {ir}");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -1418,13 +1418,13 @@ fn dumps_show_record_types_and_record_ir() {
     assert_eq!(
         stdout(&output),
         "(block @32..45\n\
-         \x20 (store x#32 @32..37\n\
+         \x20 (store x#37 @32..37\n\
          \x20   (int 1 @36..37))\n\
-         \x20 (store y#33 @38..45\n\
+         \x20 (store y#38 @38..45\n\
          \x20   (str \"a\" @42..45))\n\
          \x20 (make-record [x y] @32..45\n\
-         \x20   (load x#32 @32..33)\n\
-         \x20   (load y#33 @38..39)))\n"
+         \x20   (load x#37 @32..33)\n\
+         \x20   (load y#38 @38..39)))\n"
     );
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
@@ -1453,11 +1453,11 @@ fn dumps_show_names_and_slots() {
          Newline @32..33\n\
          Eof @32..32\n\
          (block @0..32\n\
-         \x20 (store count#34 @0..13\n\
+         \x20 (store count#39 @0..13\n\
          \x20   (int 1 @12..13))\n\
-         \x20 (store count#35 @14..32\n\
+         \x20 (store count#40 @14..32\n\
          \x20   (int-add @23..32\n\
-         \x20     (load count#34 @23..28)\n\
+         \x20     (load count#39 @23..28)\n\
          \x20     (int 1 @31..32)))\n\
          \x20 (empty @0..32))\n"
     );
@@ -1708,22 +1708,22 @@ fn dumps_show_top_level_functions_and_where_they_are_made() {
         // Those that copy nothing are made as the input starts, in their
         // own slots, the first of the input's.
         "(block @123..726\n\
-         \x20 (store describe#40 @156..225\n\
+         \x20 (store describe#45 @156..225\n\
          \x20   (make-closure #0 @156..225))\n\
-         \x20 (store even#41 @226..290\n",
+         \x20 (store even#46 @226..290\n",
         // One that copies `rate` just after `rate` is bound.
-        "\n  (store rate#46 @494..506\n\
+        "\n  (store rate#51 @494..506\n\
          \x20   (int 3 @505..506))\n\
-         \x20 (store scale#44 @525..559\n\
+         \x20 (store scale#49 @525..559\n\
          \x20   (make-closure #4 @525..559\n\
-         \x20     (load rate#46 @525..559)))\n\
-         \x20 (store scaled#35 @507..524\n",
+         \x20     (load rate#51 @525..559)))\n\
+         \x20 (store scaled#40 @507..524\n",
         // One that copies a mutable variable where it is written.
-        "\n  (store counted#45 @643..670\n\
+        "\n  (store counted#50 @643..670\n\
          \x20   (make-closure #5 @643..670\n",
         // A function reads another of the top level from the top level's
         // frame, not by a capture.
-        "\n        (fn top even#41 @190..194)\n",
+        "\n        (fn top even#46 @190..194)\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -1781,32 +1781,32 @@ fn dumps_show_the_cells_of_top_level_fields_and_their_points() {
     for node in [
         // `com.x.lib.name` and the interior node `com.x.lib` are computed
         // before `com.x.app.deps`, the first item that needs them.
-        "\n  (store name#38 @273..295\n",
-        "\n  (store lib#37 @273..295\n\
+        "\n  (store name#43 @273..295\n",
+        "\n  (store lib#42 @273..295\n\
          \x20   (make-record [name] @273..295\n\
-         \x20     (load name#38 @273..295)))\n\
-         \x20 (store deps#35 @211..239\n\
+         \x20     (load name#43 @273..295)))\n\
+         \x20 (store deps#40 @211..239\n\
          \x20   (make-list @228..239\n\
-         \x20     (load lib#37 @229..238)))\n\
-         \x20 (store version#39 @296..321\n",
+         \x20     (load lib#42 @229..238)))\n\
+         \x20 (store version#44 @296..321\n",
         // An interior node is assembled from its children's cells once all
         // of them are computed.
-        "\n  (store app#34 @211..239\n\
+        "\n  (store app#39 @211..239\n\
          \x20   (make-record [deps name] @211..239\n\
-         \x20     (load deps#35 @211..239)\n\
-         \x20     (load name#36 @240..272)))\n",
+         \x20     (load deps#40 @211..239)\n\
+         \x20     (load name#41 @240..272)))\n",
         // A root read between its items is computed whole, before the read.
-        "\n  (store part#40 @526..536\n\
+        "\n  (store part#45 @526..536\n\
          \x20   (make-record [a b] @526..536\n\
-         \x20     (load a#41 @526..536)\n\
-         \x20     (load b#43 @550..560)))\n\
-         \x20 (store whole#42 @537..549\n",
+         \x20     (load a#46 @526..536)\n\
+         \x20     (load b#48 @550..560)))\n\
+         \x20 (store whole#47 @537..549\n",
         // The record of the input is made from the roots' cells.
         "\n  (make-record [com version part whole label] @59..574\n\
-         \x20   (load com#32 @211..214)\n",
+         \x20   (load com#37 @211..214)\n",
         // A function reads a cell from the top level's frame, not by a
         // capture.
-        "\n    (top top name#38 @451..465))",
+        "\n    (top top name#43 @451..465))",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -1889,7 +1889,7 @@ fn dumps_show_returns_and_their_catches() {
         "(catch 0 @384..436\n",
         "(return 0 @403..423\n",
         "\n    (catch 1 @532..582\n\
-         \x20     (for hit#40 @532..582\n",
+         \x20     (for hit#45 @532..582\n",
         // A loop that cannot end collects nothing.
         "\n    (catch 2 @692..759\n\
          \x20     (loop-each @692..759\n",
@@ -2066,7 +2066,7 @@ fn dumps_in_a_workspace_are_the_files_alone() {
     assert!(!stdout(&output).contains("version"));
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load lib#39 @49..58)"), "{ir}");
+    assert!(ir.contains("(load lib#44 @49..58)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -2158,7 +2158,7 @@ fn dumps_of_an_importing_file() {
     );
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load build#46 @144..151)"), "{ir}");
+    assert!(ir.contains("(load build#51 @144..151)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert!(!ir.contains("store name"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -2274,10 +2274,10 @@ fn run_has_the_standard_library_alone_and_in_a_workspace() {
     let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-ir"]);
     let ir = stdout(&output);
     assert!(
-        ir.contains("  (store n#33 @87..98\n    (list-len @91..98\n      (load xs#32 @95..97)))\n"),
+        ir.contains("  (store n#38 @87..98\n    (list-len @91..98\n      (load xs#37 @95..97)))\n"),
         "{ir}"
     );
-    assert!(ir.contains("(load half#37 @103..107)"), "{ir}");
+    assert!(ir.contains("(load half#42 @103..107)"), "{ir}");
     assert!(!ir.contains("store len"), "{ir}");
     let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-types"]);
     let types = stdout(&output);
@@ -2465,11 +2465,11 @@ fn run_has_the_string_built_ins_and_path() {
     let output = gcsl(&["run", "tests/fixtures/string_builtins.gcsl", "--dump-ir"]);
     let ir = stdout(&output);
     assert!(
-        ir.contains("  (store parts#37 @0..27\n    (call @8..27\n      (load split#26 @8..13)\n"),
+        ir.contains("  (store parts#42 @0..27\n    (call @8..27\n      (load split#31 @8..13)\n"),
         "{ir}"
     );
-    assert!(ir.contains("(load join#27 @32..36)"), "{ir}");
-    assert!(ir.contains("(load join#52 @153..162)"), "{ir}");
+    assert!(ir.contains("(load join#32 @32..36)"), "{ir}");
+    assert!(ir.contains("(load join#57 @153..162)"), "{ir}");
     // Nothing of `path`'s own code.
     assert!(!ir.contains("segments"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -3427,5 +3427,130 @@ fn repl_evaluates_each_line() {
          1 | 1 +\n\
          \x20 |    ^\n"
     );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// Asserts that `dir`, a temporary directory `fs.temp_dir` made in a run of
+/// `gcsl` that has exited, was absolute, the first of its parent, in the
+/// system's temporary directory, and is gone with its parent.
+fn assert_temp_dir_gone(dir: &str) {
+    let path = std::path::Path::new(dir);
+    assert!(path.is_absolute(), "{dir}");
+    assert_eq!(path.file_name().unwrap(), "1", "{dir}");
+    let parent = path.parent().unwrap();
+    assert!(
+        parent
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("gcsl-"),
+        "{dir}"
+    );
+    assert_eq!(parent.parent().unwrap(), std::env::temp_dir());
+    assert!(!path.exists(), "{dir}");
+    assert!(!parent.exists(), "{dir}");
+}
+
+/// The summary of slice 42, run from other working directories than the
+/// file's: its file is found from its own directory, and the temporary
+/// directory it made, which it prints, is gone once `gcsl` has exited.
+#[test]
+fn fs_works_from_any_directory_and_its_temporary_directory_goes_with_gcsl() {
+    let file = format!("{}/tests/fixtures/files.gcsl", env!("CARGO_MANIFEST_DIR"));
+    for (cwd, file) in [
+        (
+            format!("{}/tests", env!("CARGO_MANIFEST_DIR")),
+            "fixtures/files.gcsl",
+        ),
+        (
+            format!("{}/tests/fixtures/ws", env!("CARGO_MANIFEST_DIR")),
+            "../files.gcsl",
+        ),
+        ("/".to_owned(), file.as_str()),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+            .args(["run", file])
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert_eq!(stderr(&output), "", "{cwd}");
+        let shown = stdout(&output);
+        let Some((_, rest)) = shown.split_once("temp = \"") else {
+            panic!("{cwd}: {shown}");
+        };
+        let (temp, _) = rest.split_once('"').unwrap();
+        assert_eq!(
+            shown,
+            format!("{{there = true; text = \"copied by fs\\n\"; temp = \"{temp}\"}}\n"),
+            "{cwd}"
+        );
+        assert_temp_dir_gone(temp);
+        assert_eq!(output.status.code(), Some(0));
+    }
+}
+
+/// A run that fails after making a temporary directory, and putting a
+/// directory in it, removes it as well.
+#[test]
+fn a_temporary_directory_goes_with_a_run_that_failed() {
+    let output = gcsl(&["run", "tests/fixtures/files_panic.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    let shown = stderr(&output);
+    let Some((temp, _)) = shown
+        .strip_prefix("error: ")
+        .and_then(|rest| rest.split_once('\n'))
+    else {
+        panic!("{shown}");
+    };
+    assert_eq!(
+        shown,
+        format!(
+            "error: {temp}\n\
+             \x20--> tests/fixtures/files_panic.gcsl:4:1\n\
+             \x20 |\n\
+             4 | panic(dir)\n\
+             \x20 | ^^^^^^^^^^\n"
+        )
+    );
+    assert_temp_dir_gone(temp);
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// A relative path given to `fs` is an error at the call, naming the member
+/// as `fs.read` whatever it was imported as.
+#[test]
+fn a_relative_path_given_to_fs_is_rendered() {
+    let output = gcsl(&["run", "tests/fixtures/files_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: `fs.read` needs an absolute path, found `fs_input.txt`\n\
+         \x20--> tests/fixtures/files_error.gcsl:2:8\n\
+         \x20 |\n\
+         2 | text = slurp(\"fs_input.txt\")\n\
+         \x20 |        ^^^^^^^^^^^^^^^^^^^^^\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// The REPL: `import fs`, then a read on a later line; and a temporary
+/// directory made on a line, gone once the REPL has ended.
+#[test]
+fn repl_imports_fs_and_reads_a_file() {
+    let input = format!(
+        "import fs\nfs.read(\"{}/tests/fixtures/fs_input.txt\")\nfs.temp_dir()\n",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = repl(&input);
+    assert_eq!(stderr(&output), "");
+    let shown = stdout(&output);
+    let (read, temp) = shown.split_once('\n').unwrap();
+    assert_eq!(read, "\"copied by fs\\n\" : String");
+    let temp = temp
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix("\" : String\n"))
+        .unwrap_or_else(|| panic!("{shown}"));
+    assert_temp_dir_gone(temp);
     assert_eq!(output.status.code(), Some(0));
 }

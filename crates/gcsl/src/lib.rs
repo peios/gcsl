@@ -75,9 +75,11 @@
 //! Every one of them has the standard library: the `builtins` module, the
 //! built-in functions implemented in Rust (`len`, `int`, `float`, `exec`,
 //! `panic`, on strings `split`, `join`, `starts_with`, `ends_with`, `trim`,
-//! `strip_prefix`, `strip_suffix`, `lines` and `fields`, and
-//! `compare_versions`, which orders two strings in version order), and the
-//! standard files, the `.gcsl` files of the repository's
+//! `strip_prefix`, `strip_suffix`, `lines` and `fields`,
+//! `compare_versions`, which orders two strings in version order, and the
+//! file system's `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy` and
+//! `fs_temp_dir`), and the standard files, the `.gcsl` files of the
+//! repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
 //! by its bare name from any file and each a scope of its own; and every
 //! file and input begins as if with `#[shadowable] import * from prelude`,
@@ -86,11 +88,17 @@
 //! "Shadowable declarations"). A declaration or an import marked
 //! `#[shadowable]` may be shadowed so by a later one of its name, in one
 //! static order of the workspace. The prelude binds the built-in
-//! functions, and `sh`, written
+//! functions but the file system's, and `sh`, written
 //! in GCSL on `exec` and `panic`, which runs a shell command and panics
 //! unless it succeeds; `path` (`import path`) joins, normalises and takes
-//! apart paths, lexically, in GCSL on the string built-ins. The `fileroot`
-//! module (`import fileroot`), implemented in Rust, tells code where files
+//! apart paths, lexically, in GCSL on the string built-ins; and `fs`
+//! (`import fs`) is the file system's built-ins as its members, impure and
+//! taking only absolute paths: `fs.exists`, `fs.read`, `fs.mkdir`,
+//! `fs.copy`, and `fs.temp_dir`, which makes a new directory that is
+//! removed, with everything in it, as the workspace or [`Session`] whose
+//! run made it is dropped (see [`eval`], "The built-in functions"). The
+//! `fileroot` module (`import fileroot`), implemented in Rust, tells code
+//! where files
 //! are, as absolute paths: `fileroot.this`, the directory of the file the
 //! code is written in, `fileroot.workspace`, the workspace's root, and
 //! `fileroot.caller`, the directory of the file whose code called the
@@ -108,11 +116,14 @@
 //! [`SourceFile`], and so is every warning, which does not stop a program
 //! from running and is returned with its value in an [`Outcome`]; a call of
 //! `panic` is a runtime error of the program's own wording. The library
-//! never prints and reads no file; the one thing it does outside itself is
-//! what a program asks of `exec`, which runs a program, its output
-//! captured, its standard input the null device (see [`eval`], "The
-//! built-in functions"), besides asking the process for its working
-//! directory, canonical, where it is given no root.
+//! never prints and reads no source file; the things it does outside itself
+//! are what a program asks of `exec`, which runs a program, its output
+//! captured, its standard input the null device, and of the file system's
+//! built-ins, which read, make and copy files and directories at the
+//! absolute paths the program gives (see [`eval`], "The built-in
+//! functions"), and removing the temporary directories `fs.temp_dir` made,
+//! besides asking the process for its working directory, canonical, where
+//! it is given no root.
 
 #![warn(
     clippy::unwrap_used,
@@ -241,14 +252,16 @@ pub struct Outcome {
 
 /// The standard library: the `.gcsl` files of the repository's `stdlib/`
 /// directory, compiled in, each with its stem, by which it is imported
-/// (`import prelude`, `import path`), in path order. Written by hand, one
-/// entry per file; a test checks that it and the directory agree. Each is a
+/// (`import prelude`, `import path`, `import fs`), in path order. Written
+/// by hand, one entry per file; a test checks that it and the directory
+/// agree. Each is a
 /// scope of its own. A scan begins with those it loads, the prelude always
 /// and each another file imports, in this order (see [`workspace`], "The
 /// standard library"), named `<stdlib>/STEM.gcsl`
 /// ([`workspace::check_with_standard`]); a session loads them all
 /// ([`workspace::standard_sources`]).
-pub const STANDARD: [(&str, &str); 2] = [
+pub const STANDARD: [(&str, &str); 3] = [
+    ("fs", include_str!("../../../stdlib/fs.gcsl")),
     ("path", include_str!("../../../stdlib/path.gcsl")),
     ("prelude", include_str!("../../../stdlib/prelude.gcsl")),
 ];
@@ -266,7 +279,9 @@ pub const STANDARD: [(&str, &str); 2] = [
 /// bug, names its input number, its index among the standard files the run
 /// loaded ([`workspace::check_lone_with_standard`]). The file is taken to
 /// be in the process's working directory, its `fileroot.this` and
-/// `fileroot.workspace` ([`workspace::working_directory`]).
+/// `fileroot.workspace` ([`workspace::working_directory`]). The temporary
+/// directories its run made with `fs.temp_dir` are removed before it
+/// returns, whether the run succeeded or failed.
 pub fn run(source: &SourceFile) -> Result<Outcome, Vec<Diagnostic>> {
     let dir = workspace::working_directory();
     let (loaded, checked) = workspace::check_lone_loading(source, &dir);

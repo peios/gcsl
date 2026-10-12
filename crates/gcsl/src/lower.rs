@@ -2587,7 +2587,12 @@ impl Lowerer<'_> {
             | Builtin::StripSuffix
             | Builtin::Lines
             | Builtin::Fields
-            | Builtin::CompareVersions => Err(InternalError {
+            | Builtin::CompareVersions
+            | Builtin::FsExists
+            | Builtin::FsRead
+            | Builtin::FsMkdir
+            | Builtin::FsCopy
+            | Builtin::FsTempDir => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

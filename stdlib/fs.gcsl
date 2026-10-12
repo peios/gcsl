@@ -1,0 +1,32 @@
+# The fs module: a module of GCSL's standard library, compiled into every
+# build and loaded by a run that imports it (`import fs`). It touches the
+# file system, so every member is IMPURE, called from a `->` or `->>`
+# function, a `lazy` or a top level, never from a pure function; and every
+# path it takes must be ABSOLUTE, used as given, never normalised and never
+# against the working directory (a relative one is a runtime error, as
+# `fs.read("x.txt")` is): join one with `path.join(fileroot.this, "x.txt")`.
+# Its members are the built-in functions of the file system themselves,
+# bound here as the prelude binds the others, so a failure is reported at
+# the call that made it, naming the member, `fs.read`, by whatever name it
+# was imported as:
+#
+# - `exists(p)`: whether something is at `p`, symbolic links followed;
+# - `read(p)`: the contents of the file at `p`, which must be UTF-8 text;
+# - `mkdir(p)`: makes the directory `p` and any missing parents, as
+#   `mkdir -p`; one already there is fine;
+# - `copy(from, to)`: copies the file `from`, its contents and permissions,
+#   to `to`, whose directory must exist, replacing a file there;
+# - `temp_dir()`: makes a new empty directory, mode 0700, and returns its
+#   absolute path. Every directory it makes is removed, with everything in
+#   it, when the run is done, whether it succeeded or failed (but not if
+#   the process is killed).
+#
+# Like every standard file it is a scope of its own: it sees its own
+# declarations, the prelude's names, and `builtins`.
+import builtins
+
+exists = builtins.fs_exists
+read = builtins.fs_read
+mkdir = builtins.fs_mkdir
+copy = builtins.fs_copy
+temp_dir = builtins.fs_temp_dir

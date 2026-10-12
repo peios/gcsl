@@ -3,7 +3,7 @@
 # input and other standard file without `#![no_prelude]` (as this one is, not
 # to import itself) begins as if with `#[shadowable] import * from prelude`, so
 # any declaration or import of one of its names, or a path below one, shadows
-# it silently. It binds the built-in functions of `builtins` for every file.
+# it silently. It binds `builtins`' functions, but `fs`'s, for every file.
 # The binding of `len` is the ALIAS RULE's, which is TEMPORARY: `len` has no
 # type a GCSL type can write yet, so a name bound directly to it is that
 # built-in, called by the checker's rule (to be replaced when built-ins get

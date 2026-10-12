@@ -452,8 +452,9 @@
 //!   overflow" when that is no `Int` (an infinity, or beyond `i64`), the
 //!   operand labelled with its value, or "cannot truncate NaN to an Int";
 //! - `float(x)` gives the `Float` nearest its `Int`;
-//! - `exec(argv)` runs a program, the one thing GCSL does outside itself,
-//!   and reports what it did. It runs `argv[0]`, found through `PATH` as
+//! - `exec(argv)` runs a program, one of the two things GCSL does outside
+//!   itself, beside the file system's built-ins (below), and reports what it
+//!   did. It runs `argv[0]`, found through `PATH` as
 //!   the OS finds it (a name with a `/` is a path), with the arguments
 //!   `argv[1..]`, each passed as it is, with no shell involved
 //!   ([`std::process::Command`]). The program's standard input is the null
@@ -534,6 +535,53 @@
 //!
 //! These ten are pure and fail only as said; none has a limit of its own
 //! on the length of a string.
+//!
+//! The five of the file system, which a program reaches as the members of
+//! the standard module `fs` (`fs.exists` is `fs_exists`, and so on), are
+//! impure, and EVERY PATH THEY TAKE MUST BE ABSOLUTE: a relative one, `""`
+//! included, is "`fs.read` needs an absolute path, found `x.txt`", before
+//! anything is touched. A path is used as it is given, never normalised,
+//! and nothing of them depends on the process's working directory. Each
+//! failure is a runtime error at the call, naming the built-in as the
+//! member of `fs` it is, whatever name the program called it by, the
+//! path or paths, and the OS's own reason, in the message itself (where
+//! `exec` notes it, its message naming only the program), ending the run
+//! as every runtime error does (`file_system`):
+//!
+//! - `fs_exists(p)` (`fs.exists`) gives whether something is at `p`,
+//!   symbolic links followed, so a link to nothing is `false`
+//!   ([`Path::try_exists`]); what cannot be checked, through a directory
+//!   that cannot be searched say, is "`fs.exists` could not check `/a`:
+//!   REASON".
+//! - `fs_read(p)` (`fs.read`) gives the contents of the file at `p`; one
+//!   that cannot be read, missing or a directory, is "`fs.read` could not
+//!   read `/a`: No such file or directory (os error 2)", and one that is
+//!   not UTF-8 "`fs.read`: `/a` is not UTF-8 text".
+//! - `fs_mkdir(p)` (`fs.mkdir`) makes the directory `p` and every missing
+//!   directory above it, as `mkdir -p` ([`fs::create_dir_all`]), a
+//!   directory already there being fine, and is `{}`; a failure, a file in
+//!   the way say, is "`fs.mkdir` could not create `/a`: REASON".
+//! - `fs_copy(from, to)` (`fs.copy`) copies the FILE `from` to `to`, its
+//!   contents and permissions, a file at `to` replaced ([`fs::copy`]), and
+//!   is `{}`; `from` is checked to be absolute before `to`. A directory
+//!   `from`, a missing one, or a directory of `to` that does not exist, is
+//!   "`fs.copy` could not copy `/a` to `/b`: REASON".
+//! - `fs_temp_dir()` (`fs.temp_dir`) makes a NEW empty directory, mode
+//!   `0700`, and gives its absolute path, another each call: a call is
+//!   impure, so never shared with another, and in a memoised function it
+//!   runs once for each list of arguments, as its body does. The
+//!   directories are the numbered children, `1`, `2` and so on, of one
+//!   parent directory, `gcsl-PID-N` in the system's temporary directory,
+//!   that the run's owner holds, a [`crate::workspace::Workspace`] (a lone
+//!   file's run is one) or a [`crate::Session`], made by its first call
+//!   and never before, and removed, with everything in it, as the owner is
+//!   dropped, whether its runs succeeded or failed ([`TempDirs`]); it
+//!   reaches every frame beside the memo tables, as the layout of `exec`'s
+//!   records does (see [`eval_with`]). A process killed before it drops
+//!   the owner leaves the directory behind. One that cannot be made is
+//!   "`fs.temp_dir` could not create a temporary directory: REASON"; and
+//!   a call in a run without an owner, which only a test can make, is an
+//!   internal error.
 //!
 //! # Callers and helpers
 //!
@@ -753,15 +801,21 @@
 //! at the operator and labels each operand with the value it had, so the
 //! user sees what actually overflowed or divided by zero.
 
+use std::cell::{Cell, OnceCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
 use std::fmt::Write as _;
+use std::fs::{self, DirBuilder};
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
+use std::io;
 use std::num::NonZeroI64;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::ast::FnId;
 use crate::check::{Builtin, Slot};
@@ -822,9 +876,13 @@ const FOR_RESERVE: usize = 16_777_216;
 /// at the call. At a call's span: a call of `exec` with an empty list is
 /// "`exec` needs a program to run", and one whose program cannot be started
 /// "cannot run `name`", with the OS's reason as a note; a call of `panic`
-/// is its message (see [The built-in functions](#the-built-in-functions)).
-/// `Float` arithmetic never fails. A run through this function has no
-/// standard library, and so no `exec` to call.
+/// is its message; a call of the file system's built-ins with a relative
+/// path is "`fs.read` needs an absolute path, found `x.txt`", and one whose
+/// operation fails names it, its paths and the OS's reason, "`fs.read`
+/// could not read `/a`: REASON" (see [The built-in
+/// functions](#the-built-in-functions)). `Float` arithmetic never fails. A
+/// run through this function has no standard library, and so no `exec` to
+/// call, nor any owner of temporary directories.
 pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
     // The top level's frame; calls grow the stack beyond it.
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
@@ -838,7 +896,7 @@ pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
 ///
 /// As [`eval_with`].
 pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
-    eval_with(ir, stack, &mut MemoTables::new(), (None, &[]))
+    eval_with(ir, stack, &mut MemoTables::new(), (None, &[], None))
 }
 
 /// Evaluates `ir` to a value with an existing `stack`, which must hold at
@@ -861,7 +919,12 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
 /// `dirs` is the run's table of directories, which the driver built, by
 /// which the code of each file names its directory ([`Ir::dir`]): what
 /// `fileroot.caller` reads (see [Callers and helpers](#callers-and-helpers)).
-/// The top level's caller is its own file's directory.
+/// The top level's caller is its own file's directory. `temp_dirs` holds
+/// the temporary directories `fs.temp_dir` makes, which the owner of the
+/// run, a workspace or a session, holds for as long as it lives and removes
+/// as it is dropped (see [The built-in functions](#the-built-in-functions)):
+/// `None` for a run without one, in which a call of `fs.temp_dir` is an
+/// internal error.
 ///
 /// # Errors
 ///
@@ -870,7 +933,7 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
-    (exec_result, dirs): (Option<&Rc<Layout>>, &[Rc<str>]),
+    (exec_result, dirs, temp_dirs): (Option<&Rc<Layout>>, &[Rc<str>], Option<&TempDirs>),
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
@@ -885,7 +948,11 @@ pub fn eval_with(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let shared = Shared { exec_result, dirs };
+    let shared = Shared {
+        exec_result,
+        dirs,
+        temp_dirs,
+    };
     let result = Evaluator {
         ir,
         stack,
@@ -1016,6 +1083,9 @@ struct Shared<'a> {
     /// a run with no workspace's context, whose code cannot read
     /// `fileroot.caller`.
     dirs: &'a [Rc<str>],
+    /// The temporary directories of the run's owner, which `fs.temp_dir`
+    /// makes; `None` in a run without one.
+    temp_dirs: Option<&'a TempDirs>,
 }
 
 /// The state of one frame's evaluation: the top level's, or a call's.
@@ -1894,9 +1964,13 @@ impl Evaluator<'_> {
     /// the call; `split` ([`split`]), `join` ([`join`]), `starts_with`,
     /// `ends_with`, `trim` ([`trim`]), `strip_prefix` ([`strip_prefix`]),
     /// `strip_suffix` ([`strip_suffix`]), `lines` and `fields`
-    /// ([`string_list`]) work on their strings as Rust's `str` does, and
+    /// ([`string_list`]) work on their strings as Rust's `str` does,
     /// `compare_versions` ([`compare_versions`]) gives `-1`, `0` or `1` by
-    /// version order. A built-in whose typing is special is never called
+    /// version order, and the file system's, `fs_exists`, `fs_read`,
+    /// `fs_mkdir`, `fs_copy` ([`file_system`]) and `fs_temp_dir`
+    /// ([`TempDirs::make`]), touch the file system at absolute paths, each
+    /// failure a runtime error at the call naming the built-in as a member
+    /// of `fs`. A built-in whose typing is special is never called
     /// through a value (the checker lowers each call of one to its own
     /// node, `len`'s to a `ListLen`), so reaching one here is an internal
     /// error.
@@ -1965,6 +2039,24 @@ impl Evaluator<'_> {
                     Ordering::Greater => 1,
                 }))
             }
+            (Builtin::FsTempDir, None, None) => {
+                let Some(temp_dirs) = self.shared.temp_dirs else {
+                    return mistyped(node, "`fs.temp_dir` called in a run without an owner");
+                };
+                match temp_dirs.make() {
+                    Ok(dir) => Ok(Value::Str(Rc::from(dir))),
+                    Err(reason) => Err(Diagnostic::error(
+                        format!("`fs.temp_dir` could not create a temporary directory: {reason}"),
+                        node.span,
+                    )
+                    .into()),
+                }
+            }
+            (
+                Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
+                Some((Value::Str(p), _)),
+                to,
+            ) => file_system(builtin, &p, to.as_ref(), node),
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -4833,6 +4925,179 @@ fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Va
     })))
 }
 
+/// Applies `builtin`, one of the file system's built-in functions but
+/// `fs_temp_dir`, for the call `node`, to the path `p` and, for `fs_copy`,
+/// the path `to` it copies to (see [The built-in functions](#the-built-in-functions)):
+/// `fs_exists` whether something is at `p`, symbolic links followed
+/// ([`Path::try_exists`]); `fs_read` the contents of the file at `p`, which
+/// must be UTF-8; `fs_mkdir` makes the directory `p` and any missing parent
+/// ([`fs::create_dir_all`]), `{}`; `fs_copy` copies the file `p` to `to`
+/// ([`fs::copy`]), `{}`. Every path must be absolute, `p` first, and each is
+/// used as it is given, never normalised and never against the working
+/// directory: a relative one is "`fs.read` needs an absolute path, found
+/// `x.txt`", before anything is touched. A failure of the operation is
+/// "`fs.read` could not read `/a`: REASON", the OS's own text, as "No such
+/// file or directory (os error 2)", "could not check", "could not create"
+/// or "could not copy `/a` to `/b`" for the others, and a file that is not
+/// UTF-8 "`fs.read`: `/a` is not UTF-8 text". Every error is at the call,
+/// and names the built-in as the member of `fs` it is, whatever name it was
+/// called by. A `to` that is not a string, or any other built-in, is an
+/// internal error, which the checker rules out.
+fn file_system(builtin: Builtin, p: &str, to: Option<&Value>, node: &IrNode) -> Flow<Value> {
+    let Some(name) = builtin.fs_name() else {
+        return mistyped(node, "a built-in function that is not the file system's");
+    };
+    let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let to = match (builtin, to) {
+        (Builtin::FsCopy, Some(Value::Str(to))) => Some(&**to),
+        (Builtin::FsCopy, _) => {
+            return mistyped(node, "a call of `fs.copy` with no path to copy to");
+        }
+        _ => None,
+    };
+    for path in std::iter::once(p).chain(to) {
+        if !Path::new(path).is_absolute() {
+            return fail(format!("`{name}` needs an absolute path, found `{path}`"));
+        }
+    }
+    match (builtin, to) {
+        (Builtin::FsExists, None) => match Path::new(p).try_exists() {
+            Ok(exists) => Ok(Value::Bool(exists)),
+            Err(error) => fail(format!("`{name}` could not check `{p}`: {error}")),
+        },
+        (Builtin::FsRead, None) => match fs::read(p).map(String::from_utf8) {
+            Ok(Ok(text)) => Ok(Value::Str(Rc::from(text))),
+            Ok(Err(_)) => fail(format!("`{name}`: `{p}` is not UTF-8 text")),
+            Err(error) => fail(format!("`{name}` could not read `{p}`: {error}")),
+        },
+        (Builtin::FsMkdir, None) => match fs::create_dir_all(p) {
+            Ok(()) => Ok(Value::Empty),
+            Err(error) => fail(format!("`{name}` could not create `{p}`: {error}")),
+        },
+        (Builtin::FsCopy, Some(to)) => match fs::copy(p, to) {
+            Ok(_) => Ok(Value::Empty),
+            Err(error) => fail(format!("`{name}` could not copy `{p}` to `{to}`: {error}")),
+        },
+        _ => mistyped(
+            node,
+            "a built-in function of the file system with other arguments",
+        ),
+    }
+}
+
+/// The temporary directories `fs.temp_dir` makes for a run, held by the
+/// run's owner, a [`crate::workspace::Workspace`], which a lone file's run is
+/// too, or a [`crate::Session`], and removed, with everything in them, as it
+/// is dropped (see [The built-in functions](#the-built-in-functions)).
+///
+/// They are the numbered children, `1`, `2` and so on, of one *parent*
+/// directory per owner, made in the system's temporary directory
+/// ([`std::env::temp_dir`]) by the first call of `fs.temp_dir` that the
+/// owner's runs make, never before: `gcsl-PID-N`, the process's id and a
+/// number counted up for every parent the process makes, so that no two
+/// owners of a process share one; a name some other process left behind is
+/// passed over for the next number, a few times. Each directory is made
+/// with mode `0700`, less what the process's umask takes away. Dropping
+/// the owner removes the parent ([`fs::remove_dir_all`]), errors ignored:
+/// so a process that ends without dropping it, killed say, leaves it
+/// behind.
+#[derive(Debug, Default)]
+pub struct TempDirs {
+    /// The parent directory, once it is made.
+    parent: OnceCell<PathBuf>,
+    /// The number of the last child made, 0 before the first.
+    made: Cell<u64>,
+}
+
+/// The number of the next parent directory of temporary directories this
+/// process makes ([`TempDirs`]).
+static NEXT_PARENT: AtomicU64 = AtomicU64::new(0);
+
+impl TempDirs {
+    /// How many names a parent directory is tried under before making it
+    /// fails: each that is taken, by a directory some other process left
+    /// behind, is passed over.
+    const ATTEMPTS: u32 = 16;
+
+    /// Temporary directories of a new owner, none made: nothing is made on
+    /// disk until the first is asked for.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The parent directory, made now if it has not been.
+    ///
+    /// # Errors
+    ///
+    /// The reason it could not be made, as text: the OS's, or the system's
+    /// temporary directory not being an absolute path.
+    fn parent(&self) -> Result<&Path, String> {
+        if let Some(parent) = self.parent.get() {
+            return Ok(parent);
+        }
+        let system = std::env::temp_dir();
+        if !system.is_absolute() {
+            return Err(format!(
+                "the system's temporary directory `{}` is not an absolute path",
+                system.display()
+            ));
+        }
+        let mut taken = None;
+        for _ in 0..Self::ATTEMPTS {
+            let number = NEXT_PARENT.fetch_add(1, AtomicOrdering::Relaxed);
+            let candidate = system.join(format!("gcsl-{}-{number}", std::process::id()));
+            match DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => return Ok(self.parent.get_or_init(|| candidate)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    taken = Some(error);
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Err(taken.map_or_else(String::new, |error| error.to_string()))
+    }
+
+    /// Makes a new empty temporary directory, mode `0700`, the next numbered
+    /// child of the parent, which is made first if it has not been, and
+    /// returns its absolute path. A number something else has taken in the
+    /// parent, a directory the program made there, is passed over.
+    ///
+    /// # Errors
+    ///
+    /// The reason the directory could not be made, as text: the OS's, or
+    /// the system's temporary directory not being an absolute path, or its
+    /// path not being UTF-8.
+    fn make(&self) -> Result<String, String> {
+        let parent = self.parent()?;
+        loop {
+            let number = self.made.get() + 1;
+            self.made.set(number);
+            let dir = parent.join(number.to_string());
+            match DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => {
+                    return dir
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|dir| format!("`{}` is not UTF-8", Path::new(&dir).display()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+}
+
+impl Drop for TempDirs {
+    /// Removes the parent directory, with every temporary directory and
+    /// everything in them, if it was made; errors are ignored.
+    fn drop(&mut self) {
+        if let Some(parent) = self.parent.get() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+}
+
 /// The pieces of `s` between occurrences of `sep`, in order, as
 /// [`str::split`] gives them, for the call `node` of `split` (see [The
 /// built-in functions](#the-built-in-functions)): an empty `s` is one empty
@@ -6752,6 +7017,7 @@ mod tests {
             shared: &Shared {
                 exec_result: None,
                 dirs: &[],
+                temp_dirs: None,
             },
             caller: Caller::default(),
             levels: 0,
@@ -7664,7 +7930,7 @@ mod tests {
     fn run_with(text: &str, memo: &mut MemoTables) -> Result<Value, Diagnostic> {
         let ir = compile(text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        eval_with(&ir, &mut stack, memo, (None, &[]))
+        eval_with(&ir, &mut stack, memo, (None, &[], None))
     }
 
     /// The values of the fields of the record that `text` evaluates to, in
@@ -8087,7 +8353,7 @@ mod tests {
         let ir = compile(text);
         let mut frame = vec![Value::Empty; ir.frame_size() as usize];
         let mut memo = MemoTables::new();
-        eval_with(&ir, &mut frame, &mut memo, (None, &[])).unwrap();
+        eval_with(&ir, &mut frame, &mut memo, (None, &[], None)).unwrap();
         // `make`, a top-level function, has slot 0, and `r` slot 1.
         let Value::Record(record) = frame[1].clone() else {
             panic!("expected a record");
@@ -8111,7 +8377,8 @@ mod tests {
         );
         let ir = compile(&text);
         let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-        let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo, (None, &[])).unwrap()
+        let Value::Record(record) =
+            eval_with(&ir, &mut stack, &mut memo, (None, &[], None)).unwrap()
         else {
             panic!("expected a record");
         };
@@ -10060,5 +10327,35 @@ mod tests {
             compare_versions(&format!("000{nines}"), &nines),
             Ordering::Less
         );
+    }
+
+    #[test]
+    fn temporary_directories_are_made_when_asked_and_removed_when_dropped() {
+        // Nothing is made until the first is asked for.
+        let temp_dirs = TempDirs::new();
+        assert!(temp_dirs.parent.get().is_none());
+        drop(temp_dirs);
+        let temp_dirs = TempDirs::new();
+        let first = temp_dirs.make().unwrap();
+        let parent = temp_dirs.parent.get().unwrap().clone();
+        assert_eq!(Path::new(&first), parent.join("1"));
+        let name = parent.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(&format!("gcsl-{}-", std::process::id())),
+            "{name}"
+        );
+        // A number something else took is passed over.
+        fs::create_dir(parent.join("2")).unwrap();
+        assert_eq!(Path::new(&temp_dirs.make().unwrap()), parent.join("3"));
+        // Two owners have two parents.
+        let other = TempDirs::new();
+        let elsewhere = other.make().unwrap();
+        assert_ne!(Path::new(&elsewhere).parent(), Some(parent.as_path()));
+        fs::write(parent.join("1/file"), "x").unwrap();
+        drop(temp_dirs);
+        assert!(!parent.exists());
+        assert!(Path::new(&elsewhere).is_dir());
+        drop(other);
+        assert!(!Path::new(&elsewhere).exists());
     }
 }

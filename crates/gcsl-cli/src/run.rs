@@ -69,6 +69,17 @@
 //! value, never shown; a `panic`, like any runtime error, is rendered to
 //! stderr with exit code 1.
 //!
+//! A file that imports `fs` reads, makes and copies files and directories
+//! with it, at absolute paths only (`path.join(fileroot.this, "x.txt")`,
+//! say), so it does the same whatever directory `gcsl` runs in; a relative
+//! path, or a failure, is a runtime error at the call, exit code 1. The
+//! directories `fs.temp_dir` makes are removed, with everything in them,
+//! once the run is done, whether it succeeded or failed: the workspace that
+//! owns them, a lone file's too, is dropped as the run returns, on the
+//! thread the work runs on, which `gcsl` waits for before it exits. A
+//! `gcsl` that is killed leaves them behind, in a `gcsl-PID-N` directory of
+//! the system's temporary directory.
+//!
 //! The library is also given where the files are, for the `fileroot`
 //! module (`import fileroot`): a workspace's root, which
 //! [`gcsl_disk::find_workspace`] found above the file's canonical path

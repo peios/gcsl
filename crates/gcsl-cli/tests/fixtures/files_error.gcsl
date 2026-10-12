@@ -1,0 +1,2 @@
+import read as slurp from fs
+text = slurp("fs_input.txt")
