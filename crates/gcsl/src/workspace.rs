@@ -419,7 +419,8 @@
 //! written in any source, and nothing of it changes what a file, a run or a
 //! dump does. [`Workspace::def_types`] lists every `def` marked
 //! `#[def_type]` of the workspace's own files (not the standard files'),
-//! each by its path as declared ([`DefType`]), with every definition made
+//! each by its path as declared ([`DefType`]), with the names of its
+//! invocation parameters, as it declares them, and every definition made
 //! with it ([`Definition`]): found by a search of every file, whichever
 //! views see it, so a definition in a directory the root does not see is
 //! found, and one a later one shadows too; grouped by the def-type its `DT`
@@ -444,20 +445,33 @@
 //! the workspace checks and runs regardless. A path above definitions that
 //! is none itself is no duplicate, but names no definition to invoke.
 //!
-//! [`Workspace::invoke`] calls the definition as `DT PATH()` would be
-//! called from a file of the definition's directory. What it asks for may
-//! name nothing: no def-type of the name, no definition of the path, a path
-//! above definitions, or a def-type with invocation parameters, which
-//! cannot be given yet; each is a [`RequestError`], an error of no source.
-//! Then the definition's file and the def-type's run as a reference to the
+//! [`Workspace::invoke`] calls the definition as `DT PATH("ARG", ...)`
+//! would be called from a file of the definition's directory, with its
+//! arguments, given as text, each a string: one for each of the def-type's
+//! invocation parameters, in the order it declares them, as many as there
+//! are. Only a parameter that a present `String` fits can be given so, a
+//! `String` or a union or an alias with it, and so a bare `version: String`
+//! of an impure def-type, which is `String | Future<String>` (of a memoised
+//! one, `String`); a `Future` cannot. What it asks for may name nothing: no
+//! def-type of the name, no definition of the path, or a path above
+//! definitions; or it may not fit the def-type, which has an invocation
+//! parameter a string does not fit, "`build`'s parameter `n` is `Int`, but
+//! only `String` parameters can be given here yet", the first such, its
+//! type as it is written, whatever arguments are given, or takes another
+//! number of arguments, "`package` takes 1 argument (`version`), but 0 were
+//! given" ("takes 2 arguments (`target`, `mode`)", "takes no arguments",
+//! "but 1 was given"); each is a [`RequestError`], an error of no source, in
+//! that order. Then the
+//! definition's file and the def-type's run as a reference to the
 //! definition needs them to, each as a whole, with the files they need (its
-//! meta's among them, if it has one),
-//! unless they have run, as for [`Workspace::run`], and the call is made:
-//! an input of its own, built rather than parsed, `<def-type>("PATH",
-//! <definition>)` as its result, whose two names no source can write are
-//! bound, in a scope of the workspace's slots, as fields of the def-type's
-//! cell and the definition's (the slots of their closures), with their
-//! types. It is checked as an input of no workspace, so that it looks
+//! meta's among them, if it has one), unless they have run, as for
+//! [`Workspace::run`], and the call is made: an input of its own, built
+//! rather than parsed, `<def-type>("PATH", <definition>, "ARG", ...)` as its
+//! result, each argument a string literal of the text given, read as
+//! nothing else (no `{` in it interpolates), whose two names no source can
+//! write are bound, in a scope of the workspace's slots, as fields of the
+//! def-type's cell and the definition's (the slots of their closures), with
+//! their types. It is checked as an input of no workspace, so that it looks
 //! nothing up in any file's view and needs no alias, placed in the
 //! definition's directory, so that the def-type's caller (`fileroot.caller`)
 //! is that directory, as for a call written there, and the definition's is
@@ -633,7 +647,7 @@ use std::rc::Rc;
 use crate::Outcome;
 use crate::ast::{
     self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, DefTypeRole, Expr, ExprKind, ImportDecl,
-    ImportForm, ImportMember, Item, ItemId, ItemKind, PathSegment, TypeExprId, TypeExprKind,
+    ImportForm, ImportMember, Item, ItemId, ItemKind, Param, PathSegment, TypeExprId, TypeExprKind,
     TypeLink, TypeStore, TypeStoreMark,
 };
 #[cfg(test)]
@@ -6175,6 +6189,10 @@ pub struct DefType {
     pub file: u32,
     /// Where its name, its whole path, is written in its file.
     pub span: Span,
+    /// The names of its invocation parameters, its parameters after the
+    /// definition's path and the definition, as it declares them, in order:
+    /// what invoking one of its definitions takes an argument for each of.
+    pub parameters: Vec<String>,
     /// Every definition made with it, in path order of their files, then in
     /// source order: none if it has none.
     pub definitions: Vec<Definition>,
@@ -6203,13 +6221,15 @@ pub enum InvokeError {
     /// [`Workspace::run`] returns them. Each names its file, a standard
     /// file or one of the workspace's.
     Diagnostics(Vec<Diagnostic>),
-    /// What was asked for names nothing that can be invoked: an error of no
-    /// source, which is shown as a line and its notes.
+    /// What was asked for names nothing that can be invoked, or its
+    /// arguments do not fit the def-type's invocation parameters: an error
+    /// of no source, which is shown as a line and its notes.
     Request(RequestError),
 }
 
-/// A def-type and a definition asked for by name that cannot be invoked
-/// (see the module documentation, "Def-types by name"): an error of no
+/// A def-type and a definition asked for by name that cannot be invoked,
+/// or not with the arguments given (see the module documentation,
+/// "Def-types by name"): an error of no
 /// source, so no [`Diagnostic`], which needs a span. Shown, it is its message,
 /// [`RequestError::message`], which its notes follow,
 /// [`RequestError::notes`].
@@ -6244,15 +6264,29 @@ pub enum RequestError {
         /// The paths of the def-type's definitions, sorted.
         definitions: Vec<String>,
     },
-    /// The def-type takes invocation parameters, which cannot be given by
-    /// name yet: "`build` takes parameters of its own (`target`), which
-    /// cannot be given here yet".
-    TakesParameters {
+    /// An invocation parameter of the def-type is of a type that a string
+    /// does not fit, and only strings can be given by name yet: "`build`'s
+    /// parameter `n` is `Int`, but only `String` parameters can be given
+    /// here yet". The first such parameter, as it declares them.
+    CannotBeGiven {
+        /// The def-type's path.
+        def_type: String,
+        /// The parameter's name.
+        parameter: String,
+        /// The parameter's type, as it is written.
+        ty: String,
+    },
+    /// The number of arguments given is not the number of the def-type's
+    /// invocation parameters: "`package` takes 1 argument (`version`), but
+    /// 0 were given".
+    ArgumentCount {
         /// The def-type's path.
         def_type: String,
         /// The names of its invocation parameters, as it declares them, in
         /// order.
         parameters: Vec<String>,
+        /// The number of arguments given.
+        given: usize,
     },
 }
 
@@ -6268,13 +6302,31 @@ impl RequestError {
             RequestError::NotADefinition { def_type, path, .. } => {
                 format!("`{path}` is not a `{def_type}` definition")
             }
-            RequestError::TakesParameters {
+            RequestError::CannotBeGiven {
+                def_type,
+                parameter,
+                ty,
+            } => format!(
+                "`{def_type}`'s parameter `{parameter}` is `{ty}`, but only `String` parameters \
+                 can be given here yet"
+            ),
+            RequestError::ArgumentCount {
                 def_type,
                 parameters,
-            } => format!(
-                "`{def_type}` takes parameters of its own ({}), which cannot be given here yet",
-                quoted_list(parameters)
-            ),
+                given,
+            } => {
+                let takes = match &parameters[..] {
+                    [] => "no arguments".to_owned(),
+                    [_] => format!("1 argument ({})", quoted_list(parameters)),
+                    _ => format!(
+                        "{} arguments ({})",
+                        parameters.len(),
+                        quoted_list(parameters)
+                    ),
+                };
+                let was = if *given == 1 { "was" } else { "were" };
+                format!("`{def_type}` takes {takes}, but {given} {was} given")
+            }
         }
     }
 
@@ -6303,7 +6355,7 @@ impl RequestError {
                 [only] => vec![format!("its only definition is `{only}`")],
                 _ => vec![format!("its definitions are {}", quoted_list(definitions))],
             },
-            RequestError::TakesParameters { .. } => Vec::new(),
+            RequestError::CannotBeGiven { .. } | RequestError::ArgumentCount { .. } => Vec::new(),
         }
     }
 }
@@ -6326,7 +6378,8 @@ fn quoted_list(items: &[String]) -> String {
 }
 
 /// A def-type as [`Workspace::def_types`] finds it, with what invoking one
-/// of its definitions needs besides: its item, and the item of each of its
+/// of its definitions needs besides: its item, the type of each of its
+/// invocation parameters as it is written, and the item of each of its
 /// definitions, in the order of `listed`'s.
 #[derive(Debug)]
 struct FoundDefType {
@@ -6334,6 +6387,9 @@ struct FoundDefType {
     listed: DefType,
     /// Its `def`'s item.
     item: ItemId,
+    /// The type of each of its invocation parameters, as it is written, in
+    /// the order of `listed`'s parameters.
+    written: Vec<String>,
     /// The item of each of its definitions.
     items: Vec<ItemId>,
 }
@@ -6381,27 +6437,36 @@ impl Workspace {
     }
 
     /// Invokes the definition of path `path` made with the def-type of path
-    /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`), as
-    /// if `DT PATH()` were called from a file of the definition's directory
-    /// (see the module documentation, "Def-types by name"): the
-    /// definition's file and the def-type's run first, each as a whole, with
-    /// the files they need, unless they have run, and then the def-type is
-    /// called with the definition's path and the definition, its caller the
-    /// directory of the definition's file. Returns the value the def-type
-    /// returns, with the warnings of the whole workspace. Invoked again, the
-    /// call runs again.
+    /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`),
+    /// with the arguments `args`, as if `DT PATH("ARG", ...)` were called
+    /// from a file of the definition's directory, each argument a string
+    /// literal of its text (see the module documentation, "Def-types by
+    /// name"): the definition's file and the def-type's run first, each as a
+    /// whole, with the files they need, unless they have run, and then the
+    /// def-type is called with the definition's path, the definition and
+    /// the arguments, one for each of its invocation parameters, in order,
+    /// its caller the directory of the definition's file. Returns the value
+    /// the def-type returns, with the warnings of the whole workspace.
+    /// Invoked again, the call runs again.
     ///
     /// # Errors
     ///
     /// In this order: the duplicates [`Workspace::def_types`] fails with,
-    /// definitions under others among them, with the warnings; no def-type of path
-    /// `def_type`, no definition of it of path `path`, or `path` above some,
-    /// or a def-type with invocation parameters, each a [`RequestError`];
-    /// and the runtime error of a file that runs or of the call, as
+    /// definitions under others among them, with the warnings; no def-type
+    /// of path `def_type`, no definition of it of path `path`, or `path`
+    /// above some, an invocation parameter of the def-type that a present
+    /// `String` does not fit, or another number of `args` than of its
+    /// invocation parameters, each a [`RequestError`]; and the runtime
+    /// error of a file that runs or of the call, as
     /// [`Workspace::run`] returns it, a part of it in the call itself,
     /// which has no source, located at the definition's path, labelled
     /// "invoked here".
-    pub fn invoke(&mut self, def_type: &str, path: &str) -> Result<Outcome, InvokeError> {
+    pub fn invoke(
+        &mut self,
+        def_type: &str,
+        path: &str,
+        args: &[String],
+    ) -> Result<Outcome, InvokeError> {
         let mut found = self.found_def_types();
         let duplicates = duplicates(&found);
         if !duplicates.is_empty() {
@@ -6426,13 +6491,6 @@ impl Workspace {
         ) else {
             return Err(missing());
         };
-        let parameters = self.invocation_parameters(&found);
-        if !parameters.is_empty() {
-            return Err(InvokeError::Request(RequestError::TakesParameters {
-                def_type: found.listed.path.clone(),
-                parameters,
-            }));
-        }
         let cells = (
             self.leaf_cell(found.listed.file, found.item),
             self.leaf_cell(definition.file, item),
@@ -6444,12 +6502,15 @@ impl Workspace {
             // failed already; kept for safety.
             return Err(missing());
         };
+        if let Some(error) = self.cannot_give(&found, def_type_cell.1, args) {
+            return Err(InvokeError::Request(error));
+        }
         // The files a reference to the definition needs, each run whole.
         self.run_needed(definition.file)
             .map_err(InvokeError::Diagnostics)?;
         self.run_needed(found.listed.file)
             .map_err(InvokeError::Diagnostics)?;
-        self.call_definition(definition, (def_type_cell, definition_cell))
+        self.call_definition((definition, args), (def_type_cell, definition_cell))
     }
 
     /// Every def-type of the workspace's own files, with its definitions,
@@ -6490,14 +6551,23 @@ impl Workspace {
                         // [Def-types](#def-types)).
                         let key = names::namespace_key(&path, index, number);
                         by_key.insert(key, found.len());
+                        let params = invocation_params(ast, item);
                         found.push(FoundDefType {
                             listed: DefType {
                                 path,
                                 file: index,
                                 span: span(segments),
+                                parameters: params
+                                    .iter()
+                                    .map(|param| names.get(param.name).to_owned())
+                                    .collect(),
                                 definitions: Vec::new(),
                             },
                             item,
+                            written: params
+                                .iter()
+                                .map(|param| ast.show_type_with(param.ty, names))
+                                .collect(),
                             items: Vec::new(),
                         });
                     }
@@ -6530,26 +6600,33 @@ impl Workspace {
         found
     }
 
-    /// The names of the invocation parameters of the def-type `found`, its
-    /// parameters after its second, as it declares them.
-    fn invocation_parameters(&self, found: &FoundDefType) -> Vec<String> {
-        let Some(file) = self.scan.files.get(found.listed.file as usize) else {
-            return Vec::new();
-        };
-        let ast = &file.ast;
-        let ItemKind::Field { value, .. } = ast.item(found.item).kind else {
-            return Vec::new();
-        };
-        let ExprKind::Fn(function) = ast.get(value).kind else {
-            return Vec::new();
-        };
-        let params = ast.params(ast.fn_decl(function).params);
-        params
-            .get(2..)
-            .unwrap_or_default()
-            .iter()
-            .map(|param| self.scan.names.get(param.name).to_owned())
-            .collect()
+    /// Why `args` cannot be given to the def-type `found`, whose type is
+    /// `ty`, if they cannot (see [Def-types by name](#def-types-by-name)):
+    /// the first of its invocation parameters, as it declares them, that a
+    /// present `String` does not fit, its type as it is written; else
+    /// `args`' number, if it is not its invocation parameters'.
+    fn cannot_give(&self, found: &FoundDefType, ty: TyId, args: &[String]) -> Option<RequestError> {
+        let listed = &found.listed;
+        let params = self
+            .types
+            .fn_sig(ty)
+            .and_then(|sig| sig.params.get(2..))
+            .unwrap_or_default();
+        let parameters = listed.parameters.iter().zip(&found.written);
+        for (&(_, param), (parameter, written)) in params.iter().zip(parameters) {
+            if !self.types.is_subtype(TyId::STRING, param) {
+                return Some(RequestError::CannotBeGiven {
+                    def_type: listed.path.clone(),
+                    parameter: parameter.clone(),
+                    ty: written.clone(),
+                });
+            }
+        }
+        (args.len() != listed.parameters.len()).then(|| RequestError::ArgumentCount {
+            def_type: listed.path.clone(),
+            parameters: listed.parameters.clone(),
+            given: args.len(),
+        })
     }
 
     /// The cell of the leaf the item `item` of file `index` declares, a
@@ -6572,15 +6649,16 @@ impl Workspace {
     }
 
     /// Calls the def-type whose cell is `def_type` with the path of
-    /// `definition` and the definition, whose cell is `definition_cell`,
-    /// their files run: the input `<def-type>("PATH", <definition>)`, its
-    /// names no source can write bound to the two cells, checked from the
-    /// workspace's slots, as an input of no workspace, and lowered as one
-    /// placed in the definition's directory, its caller, numbered after
-    /// every file (see [Def-types by name](#def-types-by-name)).
+    /// `definition`, the definition, whose cell is `definition_cell`, and
+    /// `args`, their files run: the input `<def-type>("PATH", <definition>,
+    /// "ARG", ...)`, its names no source can write bound to the two cells,
+    /// checked from the workspace's slots, as an input of no workspace, and
+    /// lowered as one placed in the definition's directory, its caller,
+    /// numbered after every file (see [Def-types by
+    /// name](#def-types-by-name)).
     fn call_definition(
         &mut self,
-        definition: &Definition,
+        (definition, args): (&Definition, &[String]),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
     ) -> Result<Outcome, InvokeError> {
         let call = count(self.scan.files.len());
@@ -6590,7 +6668,7 @@ impl Workspace {
             names.intern(INVOKED_DEF_TYPE),
             names.intern(INVOKED_DEFINITION),
         );
-        let ast = invocation(names, &definition.path, bound, at.1);
+        let ast = invocation(names, (&definition.path, args), bound, at.1);
         let scope = Scope::of_slots(self.slot_names.clone()).with_fields([
             (bound.0, def_type.0, def_type.1),
             (bound.1, definition_cell.0, definition_cell.1),
@@ -6779,12 +6857,34 @@ fn duplicate(
     Some(error)
 }
 
+/// The invocation parameters of the def-type whose `def` is the item `item`
+/// of `ast`: its parameters after its second, the definition's path's and
+/// the definition's, as it declares them; none if it declares none, or if
+/// the item is no `def` of a function.
+fn invocation_params(ast: &Ast, item: ItemId) -> &[Param] {
+    let ItemKind::Field { value, .. } = ast.item(item).kind else {
+        return &[];
+    };
+    let ExprKind::Fn(function) = ast.get(value).kind else {
+        return &[];
+    };
+    ast.params(ast.fn_decl(function).params)
+        .get(2..)
+        .unwrap_or_default()
+}
+
 /// The tree of the input of the call that invokes a definition by name
 /// (see [Def-types by name](#def-types-by-name)), its names `names`:
-/// `<def-type>("PATH", <definition>)`, its result, the two names those of
-/// `bound`, each node at `span`.
-fn invocation(names: Names, path: &str, bound: (Name, Name), span: Span) -> Ast {
-    let mut builder = AstBuilder::with_capacity(4);
+/// `<def-type>("PATH", <definition>, "ARG", ...)`, its result, PATH `path`,
+/// each ARG one of `args`, in order, a string literal, the two names those
+/// of `bound`, each node at `span`.
+fn invocation(
+    names: Names,
+    (path, args): (&str, &[String]),
+    bound: (Name, Name),
+    span: Span,
+) -> Ast {
+    let mut builder = AstBuilder::with_capacity(4 + args.len());
     let mut strings = Strings::new();
     let callee = builder.alloc(Expr {
         kind: ExprKind::Name(bound.0),
@@ -6798,7 +6898,7 @@ fn invocation(names: Names, path: &str, bound: (Name, Name), span: Span) -> Ast 
         kind: ExprKind::Name(bound.1),
         span,
     });
-    let args = builder.push_args(&[
+    let mut positional = vec![
         Arg {
             kind: ArgKind::Positional,
             value: name,
@@ -6807,7 +6907,18 @@ fn invocation(names: Names, path: &str, bound: (Name, Name), span: Span) -> Ast 
             kind: ArgKind::Positional,
             value: definition,
         },
-    ]);
+    ];
+    for arg in args {
+        let value = builder.alloc(Expr {
+            kind: ExprKind::Str(strings.push(arg)),
+            span,
+        });
+        positional.push(Arg {
+            kind: ArgKind::Positional,
+            value,
+        });
+    }
+    let args = builder.push_args(&positional);
     let call = builder.alloc(Expr {
         kind: ExprKind::Call { callee, args },
         span,
@@ -13024,26 +13135,52 @@ p26 = com.x"#;
     ];
 
     /// Checks the workspace of `files`, located at [`SCRATCH`], and invokes
-    /// the definition `path` of the def-type `def_type` in it.
-    fn invoke(files: &[(&str, &str)], def_type: &str, path: &str) -> Result<Value, InvokeError> {
+    /// the definition `path` of the def-type `def_type` in it, with the
+    /// arguments `args`.
+    fn invoke_with(
+        files: &[(&str, &str)],
+        (def_type, path): (&str, &str),
+        args: &[&str],
+    ) -> Result<Value, InvokeError> {
         let mut workspace = rooted(files).unwrap_or_else(|errors| panic!("{errors:?}"));
+        let args: Vec<String> = args.iter().map(|&arg| arg.to_owned()).collect();
         workspace
-            .invoke(def_type, path)
+            .invoke(def_type, path, &args)
             .map(|outcome| outcome.value)
     }
 
-    /// [`invoke`]'s value shown, [`SCRATCH`] shown as `<root>`.
+    /// [`invoke_with`]'s value with no arguments shown, [`SCRATCH`] shown as
+    /// `<root>`.
     fn invoked_text(files: &[(&str, &str)], def_type: &str, path: &str) -> String {
-        match invoke(files, def_type, path) {
+        invoked_text_with(files, (def_type, path), &[])
+    }
+
+    /// [`invoke_with`]'s value shown, [`SCRATCH`] shown as `<root>`.
+    fn invoked_text_with(
+        files: &[(&str, &str)],
+        (def_type, path): (&str, &str),
+        args: &[&str],
+    ) -> String {
+        match invoke_with(files, (def_type, path), args) {
             Ok(value) => value.to_string().replace(SCRATCH, "<root>"),
-            Err(error) => panic!("{def_type} {path}: {error:?}"),
+            Err(error) => panic!("{def_type} {path} {args:?}: {error:?}"),
         }
     }
 
     /// The request error of invoking `path` of `def_type` in the workspace
-    /// of `files`: its message and its notes, joined by `; `.
+    /// of `files`, with no arguments: its message and its notes, joined by
+    /// `; `.
     fn request_error(files: &[(&str, &str)], def_type: &str, path: &str) -> String {
-        match invoke(files, def_type, path) {
+        request_error_with(files, (def_type, path), &[])
+    }
+
+    /// [`request_error`] with the arguments `args`.
+    fn request_error_with(
+        files: &[(&str, &str)],
+        (def_type, path): (&str, &str),
+        args: &[&str],
+    ) -> String {
+        match invoke_with(files, (def_type, path), args) {
             Err(InvokeError::Request(error)) => {
                 let mut parts = vec![error.message()];
                 parts.extend(
@@ -13067,7 +13204,7 @@ p26 = com.x"#;
             .map(|&(path, text)| SourceFile::new(path, text).unwrap())
             .collect();
         let (standard, checked) = check_with_standard(&sources, &[], SCRATCH);
-        let errors = match checked.unwrap().invoke(def_type, path) {
+        let errors = match checked.unwrap().invoke(def_type, path, &[]) {
             Err(InvokeError::Diagnostics(errors)) => errors,
             other => panic!("{def_type} {path}: {other:?}"),
         };
@@ -13127,6 +13264,7 @@ p26 = com.x"#;
                 path: "package".to_owned(),
                 file: root,
                 span: Span::new(name, name + 7),
+                parameters: Vec::new(),
                 definitions: vec![Definition {
                     path: "dev.peios.testpkg".to_owned(),
                     file: package,
@@ -13559,12 +13697,11 @@ p26 = com.x"#;
         );
         assert_eq!(
             request_error(&files, "build", "x"),
-            "`build` takes parameters of its own (`mode`), which cannot be given here yet"
+            "`build` takes 1 argument (`mode`), but 0 were given"
         );
         assert_eq!(
             request_error(&files, "deploy", "site"),
-            "`deploy` takes parameters of its own (`target`, `mode`), which cannot be given \
-             here yet"
+            "`deploy` takes 2 arguments (`target`, `mode`), but 0 were given"
         );
         // Before parameters, the path.
         assert_eq!(
@@ -13646,6 +13783,211 @@ p26 = com.x"#;
         );
     }
 
+    /// A def-type of one invocation parameter, [`BUILD`]'s `build`, one of
+    /// two, `deploy`, and one of none, `package`, with a definition of
+    /// each.
+    const ARGUMENTS: [(&str, &str); 3] = [
+        BUILD,
+        ("app.gcsl", "def build x(t) { t }"),
+        (
+            "lib/defs.gcsl",
+            "#[def_type]\n\
+             def deploy(name: String, f: fn(): String, target: String, mode: String): String {\n\
+             \x20   \"{name} {f()} {target} {mode}\"\n\
+             }\n\
+             #[def_type]\n\
+             def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+             def deploy site() { \"s\" }\n\
+             def package p() { \"p\" }",
+        ),
+    ];
+
+    #[test]
+    fn invoking_gives_its_arguments_as_strings() {
+        // One argument, two, and none, in the order of the parameters.
+        let files = ARGUMENTS;
+        assert_eq!(
+            invoked_text_with(&files, ("build", "x"), &["debug"]),
+            "x: debug"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("deploy", "site"), &["prod", "fast"]),
+            "site s prod fast"
+        );
+        assert_eq!(invoked_text_with(&files, ("package", "p"), &[]), "p p");
+        // Each a string literal as it is, nothing in it read as GCSL.
+        assert_eq!(
+            invoked_text_with(&files, ("build", "x"), &["{mode} \\ \" -1"]),
+            "x: {mode} \\ \" -1"
+        );
+        assert_eq!(invoked_text_with(&files, ("build", "x"), &[""]), "x: ");
+        // Listed, the def-types' invocation parameters, as declared.
+        let mut workspace = rooted(&files).unwrap();
+        let parameters: Vec<(String, Vec<String>)> = workspace
+            .def_types()
+            .unwrap()
+            .into_iter()
+            .map(|def_type| (def_type.path, def_type.parameters))
+            .collect();
+        let owned = |names: &[&str]| names.iter().map(|&name| name.to_owned()).collect();
+        assert_eq!(
+            parameters,
+            [
+                ("deploy".to_owned(), owned(&["target", "mode"])),
+                ("package".to_owned(), owned(&[])),
+                ("build".to_owned(), owned(&["mode"])),
+            ]
+        );
+        // Invoked again on one workspace, with other arguments.
+        for mode in ["a", "b"] {
+            let value = workspace.invoke("build", "x", &[mode.to_owned()]);
+            assert_eq!(value.unwrap().value.to_string(), format!("x: {mode}"));
+        }
+    }
+
+    #[test]
+    fn the_arguments_must_be_as_many_as_the_parameters() {
+        let files = ARGUMENTS;
+        let error = |def_type: &str, path: &str, args: &[&str]| {
+            request_error_with(&files, (def_type, path), args)
+        };
+        assert_eq!(
+            error("build", "x", &[]),
+            "`build` takes 1 argument (`mode`), but 0 were given"
+        );
+        assert_eq!(
+            error("build", "x", &["a", "b"]),
+            "`build` takes 1 argument (`mode`), but 2 were given"
+        );
+        assert_eq!(
+            error("deploy", "site", &["a"]),
+            "`deploy` takes 2 arguments (`target`, `mode`), but 1 was given"
+        );
+        assert_eq!(
+            error("deploy", "site", &["a", "b", "c"]),
+            "`deploy` takes 2 arguments (`target`, `mode`), but 3 were given"
+        );
+        assert_eq!(
+            error("package", "p", &["a"]),
+            "`package` takes no arguments, but 1 was given"
+        );
+        assert_eq!(
+            error("package", "p", &["a", "b"]),
+            "`package` takes no arguments, but 2 were given"
+        );
+        // Before the arguments, the path.
+        assert_eq!(
+            error("build", "y", &["a", "b"]),
+            "`build` has no definition `y`; note: its only definition is `x`"
+        );
+    }
+
+    #[test]
+    fn only_string_parameters_can_be_given() {
+        let files = [
+            (
+                "workspace.gcsl",
+                "type Version = { version: String }\n\
+                 type Name = String\n\
+                 #[def_type]\n\
+                 def count(name: String, f: fn(): String, n: Int): String { f() }\n\
+                 #[def_type]\n\
+                 def mixed(name: String, f: fn(): String, a: String, b: List<String>, c: Int): String { f() }\n\
+                 #[def_type]\n\
+                 def versioned(name: String, f: fn(): String, v: Version): String { f() }\n\
+                 #[def_type]\n\
+                 def later(name: String, f: fn(): String, s: Future<String>) -> String { f() }\n\
+                 #[def_type]\n\
+                 def fits(name: String, f: fn(): String, n: Name, s: String | Int): String {\n\
+                 \x20   \"{f()} {n} {s}\"\n\
+                 }",
+            ),
+            (
+                "defs.gcsl",
+                "def count x() { \"x\" }\n\
+                 def mixed x() { \"x\" }\n\
+                 def versioned x() { \"x\" }\n\
+                 def later x() { \"x\" }\n\
+                 def fits x() { \"x\" }",
+            ),
+        ];
+        let error =
+            |def_type: &str, args: &[&str]| request_error_with(&files, (def_type, "x"), args);
+        // Before the number of the arguments, whatever it is.
+        let count = "`count`'s parameter `n` is `Int`, but only `String` parameters can be \
+                     given here yet";
+        assert_eq!(error("count", &[]), count);
+        assert_eq!(error("count", &["1"]), count);
+        assert_eq!(error("count", &["1", "2"]), count);
+        // The first that cannot be, its type as it is written.
+        assert_eq!(
+            error("mixed", &["a", "b", "c"]),
+            "`mixed`'s parameter `b` is `List<String>`, but only `String` parameters can be \
+             given here yet"
+        );
+        assert_eq!(
+            error("versioned", &["1"]),
+            "`versioned`'s parameter `v` is `Version`, but only `String` parameters can be \
+             given here yet"
+        );
+        // A present string fits no future.
+        assert_eq!(
+            error("later", &["1"]),
+            "`later`'s parameter `s` is `Future<String>`, but only `String` parameters can be \
+             given here yet"
+        );
+        // An alias of `String`, and a union with it, a string fits.
+        assert_eq!(
+            invoked_text_with(&files, ("fits", "x"), &["n", "s"]),
+            "x n s"
+        );
+    }
+
+    #[test]
+    fn a_bare_string_parameter_of_an_impure_def_type_is_given() {
+        // `version: String` of an impure def-type is `String |
+        // Future<String>`, which a string fits; of a memoised one, `String`.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def run(name: String, f: fn(v: String) -> String, version: String) -> String {\n\
+                 \x20   f(version)\n\
+                 }\n\
+                 #[def_type]\n\
+                 def once(name: String, f: fn(v: String) -> String, version: String) ->> String {\n\
+                 \x20   f(version)\n\
+                 }",
+            ),
+            (
+                "pkg/p.gcsl",
+                "def run p(v) { \"run p at {v}\" }\ndef once p(v) { \"once p at {v}\" }",
+            ),
+        ];
+        assert_eq!(
+            invoked_text_with(&files, ("run", "p"), &["0.1.0"]),
+            "run p at 0.1.0"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("once", "p"), &["0.2.0"]),
+            "once p at 0.2.0"
+        );
+        let workspace = rooted(&files).unwrap();
+        let shown: Vec<String> = workspace
+            .found_def_types()
+            .iter()
+            .map(|found| {
+                let (_, ty) = workspace.leaf_cell(found.listed.file, found.item).unwrap();
+                let sig = workspace.types.fn_sig(ty).unwrap();
+                let version = workspace
+                    .types
+                    .display(sig.params[2].1, &workspace.scan.names);
+                format!("{}: {version}", found.listed.path)
+            })
+            .collect();
+        assert_eq!(shown, ["run: String | Future<String>", "once: String"]);
+    }
+
     #[test]
     fn an_invoked_definition_is_called_as_from_its_directory() {
         // The def-type's caller is the definition's directory; without
@@ -13705,8 +14047,13 @@ p26 = com.x"#;
             ("pkg/p.gcsl", package.as_str()),
         ];
         let mut workspace = rooted(&files).unwrap();
-        let mut invoke =
-            |def_type: &str| workspace.invoke(def_type, "p").unwrap().value.to_string();
+        let mut invoke = |def_type: &str| {
+            workspace
+                .invoke(def_type, "p", &[])
+                .unwrap()
+                .value
+                .to_string()
+        };
         for _ in 0..2 {
             assert_eq!(invoke("logged"), "l");
             assert_eq!(invoke("cached"), "c");
@@ -13756,7 +14103,8 @@ p26 = com.x"#;
                 ];
                 let shown = invoke_errors(&files, "deep", "p");
                 let mut workspace = rooted(&files).unwrap();
-                let Err(InvokeError::Diagnostics(errors)) = workspace.invoke("deep", "p") else {
+                let Err(InvokeError::Diagnostics(errors)) = workspace.invoke("deep", "p", &[])
+                else {
                     panic!("no error");
                 };
                 (shown, errors)
