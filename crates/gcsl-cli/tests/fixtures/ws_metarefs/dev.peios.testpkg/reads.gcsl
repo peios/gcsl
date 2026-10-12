@@ -1,0 +1,4 @@
+# The examples of the comment of dev.peios.testpkg.gcsl that read.
+parenthesised = (package dev.peios.testpkg).versions
+dotted = package dev.peios.testpkg.versions
+version = (package dev.peios.testpkg("0.1.0")).pkg.version

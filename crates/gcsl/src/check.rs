@@ -1013,10 +1013,15 @@
 //! definition is checked as written (see [Shadowed
 //! declarations](#shadowed-declarations)), but one whose def-type it cannot
 //! read, its file not otherwise needing the def-type's, is not: its types
-//! are the def-type's to give.
+//! are the def-type's to give. Where an error names a definition as what
+//! cannot be used yet, or along the chain of uses that says why, it is shown
+//! by its def-type and its path, as written, "`package dev.peios.x` cannot be
+//! used here yet" (`Checker::need_text`).
 //!
 //! **References.** `DT PATH` ([`ExprKind::DefTypeRef`]) is a function: of
-//! the def-type's invocation parameters, with its effect and its result
+//! the def-type's invocation parameters, with its effect and its result,
+//! and the meta of F, if F has one, so that it carries its definition's
+//! (see [Metas](#metas), "Through a reference")
 //! (`Checker::check_def_type_ref`). Its DT is read as any value is, and must
 //! name a def-type: "`DT` is not a def-type" otherwise, noted as above and
 //! "two names in a row are read as a def-type reference, as in `package
@@ -1033,7 +1038,10 @@
 //! listing those the file sees ("the only definition of `package` here is
 //! `x`", "the definitions of `package` here are `a` and `b.c`", "`package`
 //! has no definitions here"); one that names a node above definitions,
-//! "`dev.peios` is not a `package` definition", at the path. The
+//! "`dev.peios` is not a `package` definition", at the path. For a def-type
+//! whose F has a meta, a path that goes on past a definition names it, the
+//! rest of the path read from its meta (see [Metas](#metas)); for any other
+//! the whole path must name one, as here. The
 //! definition is then read as its leaf's cell is, by its path
 //! (`Checker::field_reference`). A call of a reference is a call of a
 //! function value, of no known callee: calling one of an impure def-type
@@ -1112,6 +1120,39 @@
 //! error. A definition reads nothing, its read typed `{}`, when its def-type
 //! declares no meta, when its directory declares none, and when it is
 //! shadowed, since it is never made.
+//!
+//! **Through a reference.** A reference to a definition, `package
+//! dev.peios.testpkg`, carries the definition's meta: its type is the
+//! function of the def-type's invocation parameters with F's meta, its marker
+//! and type, `fn(version: String) -> R META-> PackageMeta` (see
+//! [Def-types](#def-types)), so `(package dev.peios.testpkg).versions`, or a
+//! reference stored, `let r = package x` then `r.versions`, reads it as any
+//! function's meta is read, the errors naming the reference as written ("the
+//! meta of `package dev.peios.testpkg` has no field `x`"). Without the
+//! parentheses, a reference means the longest prefix of its path that names
+//! a definition, since no definition lies under another
+//! (`Checker::definition_at`): the rest of the path is read from that
+//! definition's meta, `package dev.peios.testpkg.versions` its field
+//! `versions`, each further segment a field of the one before. Only a
+//! def-type whose F has a meta reads a path so: for any other, `package x.y`
+//! names the definition `x.y`, as it always did, and a path no prefix of
+//! which is a definition is the error it was. The parser reads the whole
+//! path, and the reference's read is a field access for each of its
+//! segments, so the accesses past the definition are typed as the field
+//! accesses they are, the first reading the meta of the definition's cell
+//! (`Checker::read_past`), with the meta read's errors, effect and awaiting,
+//! a field the meta lacks noted "`package dev.peios.testpkg.x` is read as
+//! the field `x` of the meta of `package dev.peios.testpkg`, its longest
+//! prefix that is a definition". The reference has the type of the last of
+//! them, and what it reads past, with the type of the reference to the
+//! definition, is recorded for lowering and the dump
+//! ([`Types::reference_past`]). A read through a reference and a read
+//! through the definition, as the def-type's `func.versions`, read the one
+//! meta, one closure in one cell: so a `META->>` meta's body runs once for
+//! both, and a `META->` meta's at each. A read has the meta's effect wherever
+//! it is, allowed at the top level of a file, an error in a pure function.
+//! It needs what reading the reference needs, the definition, and so, as the
+//! definition reads its meta, the meta.
 //!
 //! # Futures
 //!
@@ -2547,9 +2588,20 @@ use crate::workspace::{Context, Target};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Types {
     types: Vec<TyId>,
+    /// The types of what is not an expression's, usually empty.
+    others: OtherTypes,
+}
+
+/// The types a [`Types`] holds that are not an expression's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OtherTypes {
     /// The type each `type` item of the tree stands for, by item, in
     /// source order (see [Type declarations](#type-declarations)).
     declared: Vec<(ItemId, TyId)>,
+    /// Each def-type reference whose path goes on past the definition it
+    /// names, by its id, with the read of the definition and the type of
+    /// the reference to it (see [Metas](#metas)); usually empty.
+    references_past: Vec<(ExprId, ExprId, TyId)>,
 }
 
 impl Types {
@@ -2557,15 +2609,32 @@ impl Types {
     pub(crate) fn new(types: Vec<TyId>) -> Self {
         Self {
             types,
-            declared: Vec::new(),
+            others: OtherTypes::default(),
         }
+    }
+
+    /// If the def-type reference `id` has a path that goes on past the
+    /// definition it names, `package dev.peios.testpkg.versions`: the read
+    /// of that definition, the prefix of the reference's hidden read that
+    /// names it, and the type of the reference to it, the function with the
+    /// definition's meta, whose meta the rest of the path reads, the
+    /// reference itself having the type of the last field read (see
+    /// [Metas](#metas)). `None` for any other expression.
+    #[must_use]
+    pub fn reference_past(&self, id: ExprId) -> Option<(ExprId, TyId)> {
+        self.others
+            .references_past
+            .iter()
+            .find(|&&(at, ..)| at == id)
+            .map(|&(_, read, ty)| (read, ty))
     }
 
     /// The type the `type` item `item` stands for, its expansion, if it is
     /// one the check resolved.
     #[must_use]
     pub fn declared(&self, item: ItemId) -> Option<TyId> {
-        self.declared
+        self.others
+            .declared
             .iter()
             .find(|&&(at, _)| at == item)
             .map(|&(_, ty)| ty)
@@ -2622,6 +2691,21 @@ impl Annotate for TypeAnnotation<'_> {
     fn annotate_type(&self, item: ItemId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.types.declared(item) {
             Some(ty) => write!(f, " = {}", self.table.display(ty, self.names)),
+            None => Ok(()),
+        }
+    }
+
+    /// The read of the definition a def-type reference's path goes on past,
+    /// as the check found it ([`Types::reference_past`]).
+    fn reference_past(&self, id: ExprId) -> Option<ExprId> {
+        self.types.reference_past(id).map(|(read, _)| read)
+    }
+
+    /// Writes ` : Type` after the reference to the definition a def-type
+    /// reference's path goes on past: its type, with the definition's meta.
+    fn annotate_reference(&self, id: ExprId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.types.reference_past(id) {
+            Some((_, ty)) => write!(f, " : {}", self.table.display(ty, self.names)),
             None => Ok(()),
         }
     }
@@ -4141,11 +4225,30 @@ struct FieldDecl {
 enum DefinitionAt {
     /// A definition.
     Leaf,
+    /// A definition at a prefix of the path, whose read is this prefix of
+    /// the reference's read, the rest of the path being read from its meta
+    /// (see [Metas](#metas)): only for a def-type that declares one.
+    Past(ExprId),
     /// A node above definitions, no definition itself.
     Interior,
     /// Nothing: with the paths of the definitions of the namespace the file
     /// sees, as written after the def-type.
     Missing(Vec<String>),
+}
+
+/// What a read of a meta reads it of, as its errors show it (see
+/// [Metas](#metas)); `Checker::meta_of` says what each is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MetaOf {
+    /// "the meta of `func`".
+    subject: String,
+    /// Where the function is written.
+    func: Span,
+    /// Where the read is written.
+    read: Span,
+    /// For a def-type reference's path past its definition, the reference
+    /// to the definition, `package dev.peios.testpkg`.
+    past: Option<String>,
 }
 
 /// What the spread items of the innermost block checked so far have done,
@@ -4783,6 +4886,13 @@ pub struct Checker<'a> {
     meta_reads: HashMap<ExprId, (TyId, AwaitMark)>,
     /// See [`Resolution::metas`].
     metas: Vec<(FnId, Slot)>,
+    /// See [`Types::reference_past`].
+    references_past: Vec<(ExprId, ExprId, TyId)>,
+    /// While the path of a def-type reference past its definition is read
+    /// from the definition's meta: the read of the definition, a prefix of
+    /// the reference's read, and the reference, so that the meta's errors
+    /// name the reference (see [Metas](#metas)).
+    reading_past: Option<(ExprId, DefTypeId)>,
     /// What the innermost block's spread items have done so far.
     spreads: BlockSpreads,
     /// The next free slot.
@@ -4980,6 +5090,8 @@ impl<'a> Checker<'a> {
             defmetas: HashMap::new(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
+            references_past: Vec::new(),
+            reading_past: None,
             spreads: BlockSpreads::None,
             next_slot,
             frame_size: next_slot,
@@ -5078,7 +5190,10 @@ impl<'a> Checker<'a> {
         };
         let checked = Checked {
             types: Types {
-                declared: self.declared_types,
+                others: OtherTypes {
+                    declared: self.declared_types,
+                    references_past: self.references_past,
+                },
                 ..Types::new(self.expr_types)
             },
             resolution: Resolution {
@@ -9405,13 +9520,18 @@ impl<'a> Checker<'a> {
         }
         // What is wrong with a def-type's own parameters is reported where
         // it is declared.
-        let Some((_, sig)) = self.def_type_signature(dt_ty) else {
+        let Some((definition, sig)) = self.def_type_signature(dt_ty) else {
             return TyId::ERROR;
         };
+        // The meta the def-type declares for its definitions, which a
+        // reference carries, and which a path past its definition reads.
+        let meta = self.types.fn_sig(definition).and_then(|f| f.meta);
         let (shown, path) = self.ast.show_def_type(def);
         let at = self.ast.get(read).span;
-        match self.definition_at(key, read) {
+        let mut defined = read;
+        match self.definition_at(key, read, meta.is_some()) {
             DefinitionAt::Leaf => {}
+            DefinitionAt::Past(prefix) => defined = prefix,
             DefinitionAt::Interior => {
                 self.errors.push(Diagnostic::error(
                     format!("`{path}` is not a `{shown}` definition"),
@@ -9439,21 +9559,78 @@ impl<'a> Checker<'a> {
             }
         }
         // The definition's cell, read as any dotted field's is.
-        let read_ty = match self.field_reference(read) {
+        let read_ty = match self.field_reference(defined) {
             Some(ty) => ty,
-            None => self.check_expr(read),
+            None => self.check_expr(defined),
         };
-        self.expr_types[read.index()] = read_ty;
+        self.expr_types[defined.index()] = read_ty;
         if read_ty == TyId::ERROR {
+            self.unread_past(read, defined);
             return TyId::ERROR;
         }
-        let ty = self.types.fn_type(
+        let ty = self.types.fn_type_with_meta(
             sig.params.get(2..).unwrap_or_default().iter().copied(),
             sig.ret,
             sig.effect,
+            meta,
         );
-        self.expr_types[id.index()] = ty;
+        if defined == read {
+            self.expr_types[id.index()] = ty;
+            return ty;
+        }
+        self.references_past.push((id, defined, ty));
+        let found = self.read_past(def, read, (defined, read_ty));
+        self.expr_types[id.index()] = found;
+        found
+    }
+
+    /// Types the field accesses of the read `read` of the def-type reference
+    /// `def` past `defined`, its prefix that reads the definition, of type
+    /// `defined_ty`, as the field accesses they are: the first reads the
+    /// definition's meta, `package dev.peios.testpkg.versions` the meta's
+    /// field `versions`, each further one a field of the one before (see
+    /// [Metas](#metas)). The meta's errors name the reference, `package
+    /// dev.peios.testpkg`, as reading its meta would (`Checker::meta_read`).
+    /// Returns the type of the last.
+    fn read_past(&mut self, def: DefTypeId, read: ExprId, defined: (ExprId, TyId)) -> TyId {
+        // The accesses past the definition, innermost first.
+        let mut accesses = Vec::new();
+        let mut at = read;
+        while at != defined.0 {
+            let ExprKind::Field { expr, name } = self.ast.get(at).kind else {
+                break;
+            };
+            accesses.push((at, name));
+            at = expr;
+        }
+        accesses.reverse();
+        let outer = self.reading_past.replace((defined.0, def));
+        let (mut record, mut ty) = defined;
+        for &(access, name) in &accesses {
+            ty = if ty == TyId::ERROR {
+                TyId::ERROR
+            } else {
+                self.field_access(access, (record, ty), name)
+            };
+            self.expr_types[access.index()] = ty;
+            record = access;
+        }
+        self.reading_past = outer;
         ty
+    }
+
+    /// Types the field accesses of the read `read` of a def-type reference
+    /// past `defined`, its prefix that reads the definition, as erroneous,
+    /// when the definition cannot be read, so that none is left untyped.
+    fn unread_past(&mut self, read: ExprId, defined: ExprId) {
+        let mut at = read;
+        while at != defined {
+            self.expr_types[at.index()] = TyId::ERROR;
+            let ExprKind::Field { expr, .. } = self.ast.get(at).kind else {
+                break;
+            };
+            at = expr;
+        }
     }
 
     /// Whether the def-type `dt` of a reference names a binding nearer than
@@ -9477,24 +9654,32 @@ impl<'a> Checker<'a> {
     /// definition, a node above some, or nothing, with the paths of the
     /// definitions under the key it sees (see [Def-types](#def-types)). An
     /// earlier session input's namespace is a binding of the key's, whose
-    /// record type says.
-    fn definition_at(&mut self, key: Name, read: ExprId) -> DefinitionAt {
+    /// record type says. With `past`, for a def-type that declares a meta,
+    /// a definition at a proper prefix of the path is what it names, the
+    /// rest of the path read from its meta, since no definition lies under
+    /// another (see [Metas](#metas)).
+    fn definition_at(&mut self, key: Name, read: ExprId, past: bool) -> DefinitionAt {
+        // The path's names, each with the prefix of the read through it.
         let mut path = Vec::new();
         let mut at = read;
         while let ExprKind::Field { expr, name } = self.ast.get(at).kind {
-            path.push(name);
+            path.push((name, at));
             at = expr;
         }
         path.reverse();
+        let last = path.len().saturating_sub(1);
         if let Some(workspace) = self.workspace
             && let Some(root) = workspace.scope.root(key)
         {
             let scope = &workspace.scope;
             let mut node = root;
-            for &name in &path {
+            for (index, &(name, prefix)) in path.iter().enumerate() {
                 match scope.child(node, name) {
                     Some(child) => node = child,
                     None => return DefinitionAt::Missing(self.definitions_under(root)),
+                }
+                if past && index < last && scope.is_leaf(node) {
+                    return DefinitionAt::Past(prefix);
                 }
             }
             return if scope.is_leaf(node) {
@@ -9507,10 +9692,13 @@ impl<'a> Checker<'a> {
             return DefinitionAt::Missing(Vec::new());
         };
         let mut ty = binding.ty;
-        for &name in &path {
+        for (index, &(name, prefix)) in path.iter().enumerate() {
             match self.types.field(self.types.strip(ty), name) {
                 Some(field) => ty = field,
                 None => return DefinitionAt::Missing(self.definitions_of(binding.ty)),
+            }
+            if past && index < last && self.types.fn_sig(self.types.strip(ty)).is_some() {
+                return DefinitionAt::Past(prefix);
             }
         }
         if self.types.fn_sig(self.types.strip(ty)).is_some() {
@@ -9891,6 +10079,12 @@ impl<'a> Checker<'a> {
                         .meta
                         .map(|(key, leaf)| crate::names::show_path(names, &[key, leaf]))
                         .unwrap_or_default(),
+                    // A definition made with a def-type, as its def-type and
+                    // its path are written.
+                    (None, ItemKind::DefTypeDef { def, .. }) => {
+                        let (shown, path) = self.ast.show_def_type(def);
+                        format!("{shown} {path}")
+                    }
                     (None, _) => String::new(),
                 }
             }
@@ -13987,12 +14181,18 @@ impl<'a> Checker<'a> {
     /// purity rule, as a record a field access reads is, unless the read is
     /// already that error. A field the meta lacks is "the meta of `func` has
     /// no field `x`", at the `.NAME`, noted with the meta's fields. Recorded
-    /// for lowering ([`Resolution::meta_read`]).
+    /// for lowering ([`Resolution::meta_read`]). A def-type reference, read
+    /// in parentheses or by a path past its definition, is named as it is
+    /// written, "the meta of `package dev.peios.testpkg`", and a field
+    /// missing past a definition is noted as read from its meta
+    /// (`Checker::meta_of`).
     fn meta_read(&mut self, id: ExprId, record: ExprId, meta: Meta, name: Name) -> TyId {
-        let subject = match self.ast.get(record).kind {
-            ExprKind::Name(func) => format!("the meta of `{}`", self.ast.names().get(func)),
-            _ => "the meta of this function".to_owned(),
-        };
+        let MetaOf {
+            subject,
+            func: func_span,
+            read: read_span,
+            past,
+        } = self.meta_of(id, record);
         let mut impure = false;
         if meta.effect != Effect::Pure
             && let Some(function) = self.functions.last()
@@ -14005,16 +14205,13 @@ impl<'a> Checker<'a> {
                 meta.effect.meta_marker()
             );
             self.errors.push(
-                Diagnostic::error(
-                    "cannot read an impure meta from a pure function",
-                    self.ast.get(id).span,
-                )
-                .with_context(self.ast.get(record).span, label)
-                .with_context(marker, PURE_CONTEXT)
-                .with_note(
-                    "a pure function, declared with `:`, may read only pure metas, `META:`; \
-                     declare it with `->` to make it impure",
-                ),
+                Diagnostic::error("cannot read an impure meta from a pure function", read_span)
+                    .with_context(func_span, label)
+                    .with_context(marker, PURE_CONTEXT)
+                    .with_note(
+                        "a pure function, declared with `:`, may read only pure metas, `META:`; \
+                         declare it with `->` to make it impure",
+                    ),
             );
         }
         let mut mark = AwaitMark::None;
@@ -14022,7 +14219,7 @@ impl<'a> Checker<'a> {
         if self.types.laziness(ty) != Laziness::Present {
             mark = AwaitMark::Top;
             if !impure && let Some(marker) = self.pure_marker() {
-                let error = self.implicit_await_error(self.ast.get(id).span, ty, marker, None);
+                let error = self.implicit_await_error(read_span, ty, marker, None);
                 self.errors.push(error);
             }
             ty = self.types.strip(ty);
@@ -14038,10 +14235,69 @@ impl<'a> Checker<'a> {
             .types
             .record_fields(ty)
             .map_or_else(String::new, |fields| self.field_list(fields));
-        self.errors.push(
-            Diagnostic::error(format!("{subject} has no field `{text}`"), member).with_note(note),
-        );
+        let mut error =
+            Diagnostic::error(format!("{subject} has no field `{text}`"), member).with_note(note);
+        // A path past a definition that may have been meant as a longer
+        // definition's.
+        if let Some(reference) = past {
+            error = error.with_note(format!(
+                "`{reference}.{text}` is read as the field `{text}` of the meta of \
+                 `{reference}`, its longest prefix that is a definition"
+            ));
+        }
+        self.errors.push(error);
         TyId::ERROR
+    }
+
+    /// What the field access `id` reads the meta of, the function `record`
+    /// evaluates to, as a meta read's errors show it (see [Metas](#metas)):
+    /// "the meta of `func`" for a variable, "the meta of `package
+    /// dev.peios.testpkg`" for a def-type reference, in parentheses or read
+    /// by a path past its definition ([`Checker::reading_past`]), and "the
+    /// meta of this function" for anything else; the span of the function
+    /// and of the read, which for a path past a definition start at the
+    /// reference's def-type; and for such a path, the reference to the
+    /// definition, as written, for the error of a missing field's note.
+    fn meta_of(&self, id: ExprId, record: ExprId) -> MetaOf {
+        let ast = self.ast;
+        if let Some((defined, def)) = self.reading_past
+            && defined == record
+        {
+            let start = ast.get(ast.def_type(def).dt).span;
+            let (shown, _) = ast.show_def_type(def);
+            let mut path = Vec::new();
+            let mut at = defined;
+            while let ExprKind::Field { expr, name } = ast.get(at).kind {
+                path.push(ast.names().get(name));
+                at = expr;
+            }
+            path.reverse();
+            let reference = format!("{shown} {}", path.join("."));
+            return MetaOf {
+                subject: format!("the meta of `{reference}`"),
+                func: Span::join(start, ast.get(defined).span),
+                read: Span::join(start, ast.get(id).span),
+                past: Some(reference),
+            };
+        }
+        let mut inner = record;
+        while let ExprKind::Paren(expr) = ast.get(inner).kind {
+            inner = expr;
+        }
+        let subject = match (ast.get(record).kind, ast.get(inner).kind) {
+            (ExprKind::Name(func), _) => format!("the meta of `{}`", ast.names().get(func)),
+            (_, ExprKind::DefTypeRef(def)) => {
+                let (shown, path) = ast.show_def_type(def);
+                format!("the meta of `{shown} {path}`")
+            }
+            _ => "the meta of this function".to_owned(),
+        };
+        MetaOf {
+            subject,
+            func: ast.get(record).span,
+            read: ast.get(id).span,
+            past: None,
+        }
     }
 
     /// The note listing a record type's `fields`, in alphabetical order:

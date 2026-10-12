@@ -1,0 +1,4 @@
+# A stand-in for the `ppk` wrapper, which runs nothing: its arguments.
+def commit(name: String, version: String, arch: String, content: String) -> String {
+    "{name} {version} {arch} {content}"
+}

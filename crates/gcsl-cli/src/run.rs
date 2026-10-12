@@ -40,7 +40,16 @@
 //! dev.peios.testpkg (frame ...)`, the definition's names its meta's cell,
 //! `fn #1 package dev.peios.testpkg meta #12 (frame ...)`, and a read of a
 //! meta, `func.versions`, is the `field` of the `call` of a `meta` of the
-//! function. The command line itself knows nothing of def-types.
+//! function. A reference whose def-type declares a meta has a type with it,
+//! and its code in the IR is followed by `meta capture 1`, the capture of
+//! the definition whose meta it carries. A reference by a path past its
+//! definition, `package dev.peios.testpkg.versions`, dumps in the syntax
+//! tree as written, `(def-type-ref package dev.peios.testpkg.versions
+//! @..)`, since only the check finds where its definition's path ends, and
+//! in the types as the field accesses past it around the reference to the
+//! definition, `(. versions : ... (def-type-ref package dev.peios.testpkg :
+//! fn(...) META-> ... @..))`; in the IR it is the read of the meta of the
+//! definition's cell. The command line itself knows nothing of def-types.
 //!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its

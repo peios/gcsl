@@ -138,7 +138,12 @@
 //! names on two lines of a body are two items. Two names in a row never
 //! parsed before, so every program that parsed parses as it did; one that
 //! did not may now fail later, at the checker, which notes that two names
-//! in a row are read as a reference. Its path is a definition's. A quoted
+//! in a row are read as a reference. Its path is a definition's, read
+//! whole, however long, since what part of it names a definition the
+//! checker finds (`package dev.peios.testpkg.versions` reads the meta of
+//! `package dev.peios.testpkg`, see the checker's "Metas"); but that an
+//! index ends it, as in `package x.versions[0]`, where a definition's path
+//! is the error below. A quoted
 //! field name of the form of a namespace's key (see [`crate::names`],
 //! "Namespace keys") is "a field cannot be named `\"<p#1.2>\"`: names of
 //! that form are def-types' namespaces", at the name, so no source can
@@ -1695,9 +1700,10 @@ impl Parser<'_> {
     /// Reads the path of a definition or a reference made with a def-type,
     /// `PATH`, starting at its first identifier, the current token:
     /// identifiers joined by `.`, as a `def`'s path is. A quoted segment, or
-    /// an index, is "a `def`'s path is made of identifiers". Returns its
-    /// segments.
-    fn parse_def_type_path(&mut self) -> ParseResult<Vec<PathSegment>> {
+    /// an index, is "a `def`'s path is made of identifiers", but that an
+    /// index ends the path of a `reference`, to index what it reads. Returns
+    /// its segments.
+    fn parse_def_type_path(&mut self, reference: bool) -> ParseResult<Vec<PathSegment>> {
         let mut segments = Vec::new();
         loop {
             let token = self.peek();
@@ -1727,7 +1733,10 @@ impl Parser<'_> {
                     };
                     return Err(self.error(DEF_PATH, span));
                 }
-                (TokenKind::LBracket, _) => {
+                // A reference's path ends before an index, which indexes
+                // what the reference reads: a list of its definition's
+                // meta, `package x.versions[0]` (see the checker's "Metas").
+                (TokenKind::LBracket, _) if !reference => {
                     let (_, span) = self.parse_position()?;
                     return Err(self.error(DEF_PATH, span));
                 }
@@ -1751,7 +1760,7 @@ impl Parser<'_> {
     ) -> ParseResult<(ItemId, u32)> {
         let shown = self.show_segments(dt);
         let dt_expr = self.path_expr(dt)?;
-        let segments = self.parse_def_type_path()?;
+        let segments = self.parse_def_type_path(false)?;
         // The read of its meta, outside its function's subtree as its `DT`'s
         // is, which the workspace names once it knows its def-type.
         let meta_read = self.unresolved_meta_read(self.span_of(dt_expr), &segments)?;
@@ -1893,7 +1902,7 @@ impl Parser<'_> {
     /// the definition, a name standing for the def-type's namespace until
     /// the workspace names it, with a field access for each segment.
     fn parse_def_type_ref(&mut self, dt: ExprId) -> ParseResult<ExprId> {
-        let segments = self.parse_def_type_path()?;
+        let segments = self.parse_def_type_path(true)?;
         let base = self.path.len();
         self.path.extend(segments.iter().copied());
         let (path, _) = self.finish_path(base);
@@ -1997,7 +2006,7 @@ impl Parser<'_> {
             self.advance();
         }
         let dt_expr = self.path_expr(&dt)?;
-        let segments = self.parse_def_type_path()?;
+        let segments = self.parse_def_type_path(false)?;
         let token = self.peek();
         let body = match token.kind {
             TokenKind::LBrace => self.parse_block()?,
@@ -9897,6 +9906,17 @@ mod tests {
         assert_eq!(
             error("x = p a.\"b\""),
             (DEF_PATH.to_owned(), Span::new(8, 11))
+        );
+        // But an index ends it, indexing what it reads; a definition's path
+        // and a meta's have none.
+        assert_eq!(shape("x = p a.b[0].c"), "x = (((p a.b) at 0) . c)");
+        assert_eq!(
+            error("def p a[0]() { 1 }"),
+            (DEF_PATH.to_owned(), Span::new(7, 10))
+        );
+        assert_eq!(
+            error("defmeta p a[0] { b = 1 }"),
+            (DEF_PATH.to_owned(), Span::new(11, 14))
         );
         // No source writes a namespace's key.
         assert_eq!(

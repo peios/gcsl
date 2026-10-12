@@ -560,7 +560,12 @@
 //! the cell of the top level's frame its code names holds
 //! ([`Ir::meta_of`]), the closure of the definition's meta, which the
 //! meta's file stored there as any top-level function's, before anything
-//! that uses the definition ran. Then the call is a call like any other: a
+//! that uses the definition ran. The closure of a def-type reference
+//! carries its definition's meta: its code names, for its function, the
+//! capture that holds the definition ([`MetaAt::Capture`]), whose closure's
+//! meta is then taken as above; so a read through a reference and one
+//! through the definition, as the def-type reads it, take the one closure of
+//! the one meta. Then the call is a call like any other: a
 //! `META->` meta's body runs at each read, a `META->>` meta's closure is
 //! memoised as any closure of a memoised function is, by the closure, so
 //! its body runs once per run however often it is read, and a `META:`
@@ -731,8 +736,8 @@ use crate::check::{Builtin, Slot};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
-    LazyShapeId, ListShape, Operands, ShapeId, ShapedOperands, StepAt, StepMode, UpdatePathId,
-    UpdateStep,
+    LazyShapeId, ListShape, MetaAt, Operands, ShapeId, ShapedOperands, StepAt, StepMode,
+    UpdatePathId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -1254,18 +1259,36 @@ impl Evaluator<'_> {
     /// The closure of the meta of the function that `function` evaluates to,
     /// for the `Meta` `node` (see [Metas](#metas)): the closure of a
     /// definition's meta, which the cell of the top level's frame that the
-    /// definition's code names holds ([`Ir::meta_of`]). A built-in function,
-    /// or a closure whose code names no cell, which the checker rules out, is
+    /// definition's code names holds ([`Ir::meta_of`]); for a def-type
+    /// reference's closure, which carries its definition's meta, that of the
+    /// definition it captures ([`MetaAt::Capture`]). A built-in function, or
+    /// a closure whose code names no meta, which the checker rules out, is
     /// an internal error. Out of line: only a meta's read pays for it.
     #[inline(never)]
     fn meta(&mut self, function: IrId, node: &IrNode) -> Flow<Callee> {
-        let Callee::Closure(closure) = self.function(function)? else {
+        let Callee::Closure(mut closure) = self.function(function)? else {
             return Err(internal("the meta of a built-in function read", node.span).into());
         };
-        let Some(slot) = closure.code.meta_of(closure.function) else {
-            return Err(internal("the meta of a function that has none read", node.span).into());
-        };
-        self.top_function(slot, node)
+        loop {
+            match closure.code.meta_of(closure.function) {
+                Some(MetaAt::Cell(slot)) => return self.top_function(slot, node),
+                Some(MetaAt::Capture(index)) => {
+                    let Some(Value::Fn(captured)) = closure.captures.get(index as usize) else {
+                        return Err(internal(
+                            "the meta of a reference that captures no definition read",
+                            node.span,
+                        )
+                        .into());
+                    };
+                    closure = Rc::clone(captured);
+                }
+                None => {
+                    return Err(
+                        internal("the meta of a function that has none read", node.span).into(),
+                    );
+                }
+            }
+        }
     }
 
     /// [`Evaluator::meta`] as a value. Out of line, as `meta` is.

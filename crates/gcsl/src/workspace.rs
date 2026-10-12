@@ -14162,4 +14162,346 @@ p26 = com.x"#;
             "{found}"
         );
     }
+
+    /// A def-type of the root of a workspace, for the tests of reading a
+    /// meta through a reference: `info`, whose definitions give a number and
+    /// carry a pure meta of a record, a list and a string.
+    const INFO: (&str, &str) = (
+        "workspace.gcsl",
+        "#[def_type]\n\
+         def info(name: String, f: fn(): Int META: {about: {owner: String}, ns: List<Int>, \
+         peios: String}): Int {\n\
+         \x20   f() + len(f.ns)\n\
+         }",
+    );
+
+    #[test]
+    fn a_reference_reads_its_definition_s_meta() {
+        // In parentheses and by a path past the definition, deeper reads, a
+        // reference stored and passed as a function with less of the meta,
+        // in a pure function: the meta is pure.
+        let def_types = format!("{}\n{}", INFO.1, TAGGED.1);
+        let files = [
+            ("workspace.gcsl", def_types.as_str()),
+            (
+                "app/a.gcsl",
+                "defmeta info dev.x { about = { owner = \"jack\" }; ns = [4, 5]; peios = \"p\" }\n\
+                 def info dev.x() { 1 }\n\
+                 defmeta tagged dev.x { tag = \"t\"; n = 7 }\n\
+                 def tagged dev.x() { \"x\" }\n\
+                 fn owner(): String { info dev.x.about.owner }\n\
+                 fn tag(g: fn(): String META: {tag: String}): String { g.tag }\n\
+                 r = [\n\
+                 \x20   info dev.x.peios,\n\
+                 \x20   (info dev.x).peios,\n\
+                 \x20   owner(),\n\
+                 \x20   \"{info dev.x.ns[1]}\",\n\
+                 \x20   \"{(info dev.x).ns[0]}\",\n\
+                 ]\n\
+                 let stored = tagged dev.x\n\
+                 s = [stored.tag, tag(stored), tag(tagged dev.x), \"{stored.n}\"]\n\
+                 called = info dev.x()",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app/a.gcsl"),
+            "{r = [\"p\", \"p\", \"jack\", \"5\", \"4\"]; s = [\"t\", \"t\", \"t\", \"7\"]; \
+             called = 3}"
+        );
+        // Under `META->`, each field past the definition that may be a future
+        // is awaited where the next reads it, a lazy one included.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def t(name: String, f: fn(): Int META-> {about: {owner: String}}) -> Int { f() }",
+            ),
+            (
+                "app.gcsl",
+                "defmeta t x { about = { owner = \"o\" } }\n\
+                 def t x() { 1 }\n\
+                 defmeta t y { about = lazy { owner = lazy \"lazy\" } }\n\
+                 def t y() { 2 }\n\
+                 r = \"{t x.about.owner} {t y.about.owner} {(t y).about.owner}\"",
+            ),
+        ];
+        assert_eq!(value(&files, "app.gcsl"), "{r = \"o lazy lazy\"}");
+    }
+
+    #[test]
+    fn a_reference_means_its_longest_definition() {
+        // `info dev` is a definition, and so is `tagged dev.peios.x`: each
+        // path means the definition of its own def-type, `info
+        // dev.peios` the field `peios` of `info dev`'s meta.
+        let def_types = format!("{}\n{}", INFO.1, TAGGED.1);
+        let files = [
+            ("workspace.gcsl", def_types.as_str()),
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"meta of dev\" }\n\
+                 def info dev() { 1 }\n\
+                 defmeta tagged dev.peios.x { tag = \"t\"; n = 1 }\n\
+                 def tagged dev.peios.x() { \"x\" }\n\
+                 r = [info dev.peios, tagged dev.peios.x.tag]",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "app/a.gcsl"),
+            "{r = [\"meta of dev\", \"t\"]}"
+        );
+        // A name past the definition that is no field of its meta: the
+        // meta's error, noted with how the path was read.
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev() { 1 }\n\
+                 r = info dev.peios.x",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            ["cannot access field `x` of String at app/a.gcsl; app/a.gcsl: this is String"]
+        );
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev() { 1 }\n\
+                 r = info dev.pieos.x",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "the meta of `info dev` has no field `pieos` at app/a.gcsl; note: the fields \
+                 are `about`, `ns` and `peios`; note: `info dev.pieos` is read as the field \
+                 `pieos` of the meta of `info dev`, its longest prefix that is a definition"
+            ]
+        );
+        // In parentheses the reference is all there is: no second note.
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev() { 1 }\n\
+                 r = (info dev).pieos",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "the meta of `info dev` has no field `pieos` at app/a.gcsl; note: the fields \
+                 are `about`, `ns` and `peios`"
+            ]
+        );
+        // A path no prefix of which is a definition: as before.
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev.x { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev.x() { 1 }\n\
+                 r = info dev.y.peios\n\
+                 s = info dev",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "`info` has no definition `dev.y.peios` at app/a.gcsl; note: the only \
+                 definition of `info` here is `dev.x`",
+                "`dev` is not a `info` definition at app/a.gcsl"
+            ]
+        );
+        // The result of a call has the fields of the result, not of the meta.
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev() { 1 }\n\
+                 r = (info dev()).peios",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            ["cannot access field `peios` of Int at app/a.gcsl; app/a.gcsl: this is Int"]
+        );
+    }
+
+    #[test]
+    fn a_def_type_without_a_meta_reads_no_path_past_a_definition() {
+        // `build x.y` names the definition `x.y`, as it always did.
+        let files = [BUILD, ("app.gcsl", "def build x(t) { t }\nr = build x.y")];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "`build` has no definition `x.y` at app.gcsl; note: the only definition of \
+                 `build` here is `x`"
+            ]
+        );
+        // Nor does its reference have a meta, nor any field.
+        let files = [BUILD, ("app.gcsl", "def build x(t) { t }\nr = (build x).y")];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "cannot access field `y` of `fn(mode: String): String` at app.gcsl; app.gcsl: \
+                 this is fn(mode: String): String"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_meta_read_through_a_reference_needs_the_meta() {
+        // The meta in one file, the definition in another, the read in a
+        // directory below: each runs before what reads it.
+        let files = [
+            INFO,
+            (
+                "pkg/m.gcsl",
+                "defmeta info x { about = { owner = \"o\" }; ns = [1]; peios = \"m\" }",
+            ),
+            ("pkg/d.gcsl", "def info x() { 1 }"),
+            ("pkg/sub/app.gcsl", "r = info x.peios"),
+        ];
+        assert_eq!(value(&files, "pkg/sub/app.gcsl"), "{r = \"m\"}");
+        // Read in the definition's file, above its meta, which reads a field
+        // of the file.
+        let files = [
+            INFO,
+            (
+                "pkg/d.gcsl",
+                "r = info x.peios\n\
+                 def info x() { 1 }\n\
+                 defmeta info x { about = { owner = \"o\" }; ns = [1]; peios = owner }\n\
+                 owner = \"later\"",
+            ),
+        ];
+        assert_eq!(
+            value(&files, "pkg/d.gcsl"),
+            "{r = \"later\"; owner = \"later\"}"
+        );
+        // A meta that reads a variable bound below the read cannot be read
+        // there: the chain names the definition and its meta.
+        let files = [
+            INFO,
+            (
+                "app.gcsl",
+                "r = info x.peios\n\
+                 let k = \"k\"\n\
+                 def info x() { 1 }\n\
+                 defmeta info x { about = { owner = \"o\" }; ns = [1]; peios = k }",
+            ),
+        ];
+        let found = check_errors(&files).join("\n");
+        assert!(
+            found.starts_with("`info x` cannot be used here yet at app.gcsl")
+                && found.contains("`info x` uses `defmeta info x`, and `defmeta info x` reads `k`"),
+            "{found}"
+        );
+    }
+
+    #[test]
+    fn a_meta_read_through_a_reference_is_the_definition_s_meta() {
+        let path = std::env::temp_dir().join(format!("gcsl-slice-39-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        let count = || std::fs::read_to_string(path).map_or(0, |text| text.lines().count());
+        let _ = std::fs::remove_file(path);
+        // `META->>`: one run for the def-type's two reads and the
+        // references' three, in parentheses, past the definition and
+        // stored; at the top level of a file, which is impure.
+        let memo = "#[def_type]\n\
+             def twice(name: String, f: fn(): Int META->> {n: Int}) -> List<Int> { [f.n, f.n] }";
+        let app = format!(
+            "defmeta twice x {{ n = exec([\"sh\", \"-c\", \"echo x >> {path}\"]).status }}\n\
+             def twice x() {{ 1 }}\n\
+             r = twice x()\n\
+             let stored = twice x\n\
+             s = [(twice x).n, twice x.n, stored.n]"
+        );
+        let files = [("workspace.gcsl", memo), ("app.gcsl", app.as_str())];
+        assert_eq!(value(&files, "app.gcsl"), "{r = [0, 0]; s = [0, 0, 0]}");
+        assert_eq!(count(), 1);
+        // `META->`: one run for each read.
+        let impure = memo.replace("META->>", "META->");
+        let files = [
+            ("workspace.gcsl", impure.as_str()),
+            ("app.gcsl", app.as_str()),
+        ];
+        assert_eq!(value(&files, "app.gcsl"), "{r = [0, 0]; s = [0, 0, 0]}");
+        assert_eq!(count(), 6);
+        std::fs::remove_file(path).unwrap();
+        // In a pure function, the read is the error, however the reference
+        // is written; in an impure one, it is allowed.
+        let files = [
+            ("workspace.gcsl", impure.as_str()),
+            (
+                "app.gcsl",
+                "defmeta twice x { n = 1 }\n\
+                 def twice x() { 1 }\n\
+                 fn a(): Int {\nlet held = twice x.n\n1\n}\n\
+                 fn b(): Int {\nlet held = (twice x).n\n1\n}\n\
+                 fn c() -> Int { twice x.n }",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&files),
+            [
+                "cannot read an impure meta from a pure function at app.gcsl; app.gcsl: \
+                 reading the meta of `twice x` is impure (`META->`); app.gcsl: this function is \
+                 pure, declared with `:`; note: a pure function, declared with `:`, may read \
+                 only pure metas, `META:`; declare it with `->` to make it impure",
+                "cannot read an impure meta from a pure function at app.gcsl; app.gcsl: \
+                 reading the meta of `twice x` is impure (`META->`); app.gcsl: this function is \
+                 pure, declared with `:`; note: a pure function, declared with `:`, may read \
+                 only pure metas, `META:`; declare it with `->` to make it impure"
+            ]
+        );
+    }
+
+    #[test]
+    fn dumps_show_a_reference_past_its_definition() {
+        let mut workspace = checked(&[
+            INFO,
+            (
+                "app.gcsl",
+                "defmeta info x { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info x() { 1 }\n\
+                 r = info x.about.owner",
+            ),
+        ]);
+        let index = workspace.file("app.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        let meta = "META: {about: {owner: String}, ns: List<Int>, peios: String}";
+        assert!(
+            dump.contains(&format!(
+                "(field r @84..106\n    (. owner : String @88..106\n      (. about : {{owner: \
+                 String}} @88..100\n        (def-type-ref info x : fn(): Int {meta} @88..94))))"
+            )),
+            "{dump}"
+        );
+        // The syntax tree alone has the reference as it is written.
+        let source = SourceFile::new("app.gcsl", "r = info x.about.owner").unwrap();
+        let (tokens, names, strings) = crate::lexer::tokenize(&source).unwrap();
+        let ast = crate::parser::parse(&tokens, names, strings, &source).unwrap();
+        assert!(
+            ast.pretty()
+                .to_string()
+                .contains("(def-type-ref info x.about.owner @4..22)"),
+            "{}",
+            ast.pretty()
+        );
+        // The reads of the meta read it through the definition's cell.
+        let ir = workspace.dump_ir(index).unwrap();
+        assert!(
+            ir.contains(
+                "(field owner @93..106\n      (field about @93..100\n        (call @93..100\n"
+            ),
+            "{ir}"
+        );
+    }
 }

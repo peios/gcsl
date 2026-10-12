@@ -208,6 +208,15 @@
 //! reference to the meta's cell as it makes a reference's read one to the
 //! definition's.
 //!
+//! A reference's `PATH` is read whole, however long: what part of it names
+//! the definition is known only once the file's view is, so `package
+//! dev.peios.testpkg.versions` is one reference, its read one field access
+//! longer than the definition's path, whose last access the checker finds
+//! reads the definition's meta (see the checker's "Metas"). The tree keeps
+//! it as parsed; only a printer told so ([`Annotate::reference_past`]), as
+//! `--dump-types` is, shows it as the reference to the definition with a
+//! field access around it for each segment past it.
+//!
 //! # Attributes
 //!
 //! An item of a file's outermost block may be marked `#[shadowable]` or
@@ -3406,6 +3415,31 @@ pub trait Annotate {
         let _ = (item, f);
         Ok(())
     }
+
+    /// If the def-type reference `id`, `DT PATH`, was found to have a path
+    /// that goes on past the definition it names, as `package
+    /// dev.peios.testpkg.versions` reads the field `versions` of the meta of
+    /// `package dev.peios.testpkg` (see the checker's "Metas"): the prefix
+    /// of its read ([`DefTypeUse::read`]) that reads the definition. The
+    /// reference is then printed as the reference to the definition with a
+    /// field access around it for each segment past it. By default, `None`:
+    /// every reference as it is parsed.
+    fn reference_past(&self, id: ExprId) -> Option<ExprId> {
+        let _ = id;
+        None
+    }
+
+    /// Writes the annotation, including any leading space, of the reference
+    /// to the definition that the path of the def-type reference `id` goes
+    /// on past ([`Annotate::reference_past`]): by default, nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the formatter.
+    fn annotate_reference(&self, id: ExprId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = (id, f);
+        Ok(())
+    }
 }
 
 /// The empty annotation used by [`Ast::pretty`].
@@ -3491,7 +3525,11 @@ impl Annotate for NoAnnotation {
 /// `(def-type-def package dev.peios.testpkg ...)`, its def-type and its path
 /// as written, followed by its function, whose parameters are their names
 /// alone, as in `(params a b)`, with no `(ret ...)`; a reference to one as
-/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it;
+/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it,
+/// its whole path as written, unless the annotation says the path goes on
+/// past the definition ([`Annotate::reference_past`]): then as a field access
+/// for each segment past it, `(. versions ...)`, around the reference to the
+/// definition, `(def-type-ref package dev.peios.testpkg ...)`;
 /// a definition's meta as `(defmeta package dev.peios.testpkg ...)`,
 /// followed by its function, of no parameters, with no `(ret ...)`, whose
 /// body is the block written, or for `defmeta DT PATH = EXPR` a block whose
@@ -4027,8 +4065,74 @@ impl<A: Annotate> Pretty<'_, A> {
         }
     }
 
+    /// Writes the def-type reference `id`, of `def`, whose path goes on past
+    /// the definition its read's prefix `read` names, at `depth`: as a field
+    /// access for each segment past the definition, the outermost spanning
+    /// the reference and annotated as it is, around the reference to the
+    /// definition, its def-type and the path's prefix, annotated with
+    /// [`Annotate::annotate_reference`]; each spanning from the reference's
+    /// def-type through its last segment.
+    fn reference_past(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+        (id, def, read): (ExprId, DefTypeId, ExprId),
+        depth: usize,
+    ) -> fmt::Result {
+        let ast = self.ast;
+        let use_ = ast.def_type(def);
+        let start = ast.get(use_.dt).span;
+        // The accesses past the definition, outermost first.
+        let mut accesses = Vec::new();
+        let mut at = use_.read.unwrap_or(read);
+        while at != read {
+            let ExprKind::Field { expr, name } = ast.get(at).kind else {
+                break;
+            };
+            accesses.push((at, name));
+            at = expr;
+        }
+        for (index, &(access, name)) in accesses.iter().enumerate() {
+            if index > 0 {
+                f.write_str("\n")?;
+            }
+            let indent = (depth + index) * 2;
+            write!(f, "{:indent$}(. {}", "", FieldName(ast.names().get(name)))?;
+            if index == 0 {
+                self.annotation.annotate(id, f)?;
+                write!(f, " @{}", ast.get(id).span)?;
+            } else {
+                self.annotation.annotate(access, f)?;
+                write!(f, " @{}", Span::join(start, ast.get(access).span))?;
+            }
+        }
+        let (def_type, _) = ast.show_def_type(def);
+        let segments = ast.path(use_.path);
+        let defined = segments.len().saturating_sub(accesses.len());
+        let path = ast.show_path(segments.get(..defined).unwrap_or_default());
+        if !accesses.is_empty() {
+            f.write_str("\n")?;
+        }
+        write!(
+            f,
+            "{:indent$}(def-type-ref {def_type} {path}",
+            "",
+            indent = (depth + accesses.len()) * 2
+        )?;
+        self.annotation.annotate_reference(id, f)?;
+        write!(f, " @{})", Span::join(start, ast.get(read).span))?;
+        for _ in &accesses {
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+
     fn node(&self, f: &mut fmt::Formatter<'_>, id: ExprId, depth: usize) -> fmt::Result {
         let expr = self.ast.get(id);
+        if let ExprKind::DefTypeRef(def) = expr.kind
+            && let Some(read) = self.annotation.reference_past(id)
+        {
+            return self.reference_past(f, (id, def, read), depth);
+        }
         write!(f, "{:indent$}(", "", indent = depth * 2)?;
         self.head(f, expr)?;
         self.annotation.annotate(id, f)?;

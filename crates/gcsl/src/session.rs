@@ -635,6 +635,40 @@ mod tests {
     }
 
     #[test]
+    fn a_reference_reads_its_meta_in_later_inputs() {
+        let mut session = Session::new();
+        let first = "#[def_type]\n\
+                     def build(name: String, f: fn(): String META: {tag: String}): String {\n\
+                     \x20   \"{f()} {f.tag}\"\n\
+                     }\n\
+                     defmeta build dev.x { tag = \"tx\" }\n\
+                     def build dev.x() { \"x\" }\n\
+                     own = build dev.x.tag";
+        assert_eq!(
+            value(&mut session, first).to_string(),
+            "{build = fn(name: String | Future<String>, f: fn(): String META: {tag: String}): \
+             String; own = \"tx\"}"
+        );
+        // An earlier input's definition, by a path past it, in parentheses
+        // and stored, its type carrying the meta.
+        assert_eq!(value(&mut session, "build dev.x.tag").to_string(), "tx");
+        assert_eq!(value(&mut session, "(build dev.x).tag").to_string(), "tx");
+        assert_eq!(
+            value(&mut session, "let r = build dev.x\nr").to_string(),
+            "fn(): String META: {tag: String}"
+        );
+        assert_eq!(value(&mut session, "r.tag").to_string(), "tx");
+        assert_eq!(
+            messages(&mut session, "build dev.x.nope"),
+            ["the meta of `build dev.x` has no field `nope`"]
+        );
+        assert_eq!(
+            messages(&mut session, "build dev.y.tag"),
+            ["`build` has no definition `dev.y.tag`"]
+        );
+    }
+
+    #[test]
     fn types_persist_and_later_inputs_shadow_them() {
         let mut session = Session::new();
         // An input of only a type shows nothing, as one of only a `fn`.

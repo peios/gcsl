@@ -3253,6 +3253,118 @@ fn run_renders_a_missing_defmeta() {
     assert_eq!(output.status.code(), Some(1));
 }
 
+/// Jack's newpkgs with `ppk.commit` stubbed, and the examples of the comment
+/// of his package's file: the meta read through a reference, in parentheses
+/// and without, and a field of the call's result; and the error of reading
+/// the meta's field from the call's result (a workspace of its own, since a
+/// workspace is checked whole).
+#[test]
+fn run_reads_metas_through_references() {
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_metarefs/dev.peios.testpkg/reads.gcsl",
+    ]);
+    assert_eq!(
+        stdout(&output),
+        "{parenthesised = [{version = \"0.1.0\"}, {version = \"0.2.0\"}]; dotted = [{version = \
+         \"0.1.0\"}, {version = \"0.2.0\"}]; version = \"0.1.0\"}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl(&[
+        "run",
+        "tests/fixtures/ws_metarefs_error/dev.peios.testpkg/error.gcsl",
+    ]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: no field `versions` in `{manifest: String, pkg: {arch: String, content: String, \
+         name: String, version: String}}`\n\
+         \x20--> tests/fixtures/ws_metarefs_error/dev.peios.testpkg/error.gcsl:2:48\n\
+         \x20 |\n\
+         2 | versions = (package dev.peios.testpkg(\"0.1.0\")).versions\n\
+         \x20 |                                                ^^^^^^^^^\n\
+         \x20 |\n\
+         \x20 = note: the fields are `manifest` and `pkg`\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+/// `--dump-ast` shows a reference by a path past its definition as written,
+/// `--dump-types` as the reference to the definition, of a type with its
+/// meta, in a field access, and `--dump-ir` a reference's function by the
+/// capture whose meta it carries.
+#[test]
+fn dumps_show_references_past_definitions() {
+    let file = "tests/fixtures/ws_metarefs/dev.peios.testpkg/reads.gcsl";
+    let output = gcsl(&["run", file, "--dump-ast"]);
+    assert!(
+        stdout(&output).contains(
+            "(field dotted @120..163\n    (def-type-ref package dev.peios.testpkg.versions \
+             @129..163))\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    let output = gcsl(&["run", file, "--dump-types"]);
+    let either = "{version: String | Future<String>}";
+    let versions =
+        format!("List<{either} | Future<{either}>> | Future<List<{either} | Future<{either}>>>");
+    let reference = format!(
+        "fn(version: String | Future<String>) -> {{manifest: String, pkg: {{arch: String, \
+         content: String, name: String, version: String}}}} META-> {{versions: {versions}}} | \
+         Future<{{versions: {versions}}}>"
+    );
+    assert!(
+        stdout(&output).contains(&format!(
+            "(field dotted @120..163\n    (. versions : {versions} @129..163\n      \
+             (def-type-ref package dev.peios.testpkg : {reference} @129..154)))\n"
+        )),
+        "{}",
+        stdout(&output)
+    );
+    let output = gcsl(&["run", file, "--dump-ir"]);
+    assert!(
+        stdout(&output)
+            .contains("fn #0 meta capture 1 (frame 1, params 1, captures 2, height 4)\n"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// The REPL: a meta read through a reference to an earlier line's
+/// definition.
+#[test]
+fn repl_reads_metas_through_references() {
+    let output = repl(
+        "#[def_type] def p(n: String, f: fn(): Int META: {v: Int}): Int { f() + f.v }\n\
+         defmeta p y { v = 40 }; def p y() { 2 }\n\
+         p y.v\n\
+         (p y).v + 1\n\
+         p y.w\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{p = fn(n: String | Future<String>, f: fn(): Int META: {v: Int}): Int} : \
+         {p: fn(n: String | Future<String>, f: fn(): Int META: {v: Int}): Int}\n\
+         40 : Int\n\
+         41 : Int\n"
+    );
+    assert_eq!(
+        stderr(&output),
+        "error: the meta of `p y` has no field `w`\n\
+         \x20--> <repl>:1:4\n\
+         \x20 |\n\
+         1 | p y.w\n\
+         \x20 |    ^^\n\
+         \x20 |\n\
+         \x20 = note: the only field is `v`\n\
+         \x20 = note: `p y.w` is read as the field `w` of the meta of `p y`, its longest prefix \
+         that is a definition\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// The REPL: a definition and its meta, declared in one line, are read by
 /// later lines; a definition or a meta alone in a line is the error, since
 /// each line is checked on its own.

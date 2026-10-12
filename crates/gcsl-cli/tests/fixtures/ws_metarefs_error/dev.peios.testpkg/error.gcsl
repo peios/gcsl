@@ -1,0 +1,2 @@
+# The example of the comment of dev.peios.testpkg.gcsl that is an error.
+versions = (package dev.peios.testpkg("0.1.0")).versions

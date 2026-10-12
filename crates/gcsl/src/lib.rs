@@ -56,7 +56,11 @@
 //! meta of its definitions by its definition parameter's type, and `defmeta
 //! package dev.peios.testpkg { ... }` declares the meta of the definition of
 //! its path in its directory, which a closure of the definition then
-//! carries (see [`check`], "Metas", and [`workspace`], "Def-types").
+//! carries (see [`check`], "Metas", and [`workspace`], "Def-types"). So does
+//! a reference to the definition: `(package dev.peios.testpkg).versions`
+//! reads it, and so does `package dev.peios.testpkg.versions`, a reference
+//! meaning the longest prefix of its path that names a definition, the rest
+//! read from its meta.
 //!
 //! [`run`] performs all of them on one file. A [`Session`] performs them on
 //! a sequence of inputs that share their variables, as the REPL needs. A

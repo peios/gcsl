@@ -165,9 +165,13 @@
 //! checker's "Metas") has its meta's closure in a cell of the top level's
 //! frame, which the program records for the definition's function, apart
 //! from its [`FnCode`] ([`Ir::meta_of`]), so that every closure of it names
-//! its meta. A read of a meta is the call, of no arguments, of an
-//! [`IrKind::Meta`] of the function, which yields the closure in the cell
-//! the function's code names; a field access reads the call's value.
+//! its meta. A def-type reference whose def-type declares a meta carries
+//! its definition's: the function made for it is recorded likewise, its
+//! meta that of the closure it captures, the definition ([`MetaAt`]). A
+//! read of a meta is the call, of no arguments, of an [`IrKind::Meta`] of
+//! the function, which yields the closure in the cell the function's code
+//! names, through a reference's capture of its definition if it is one; a
+//! field access reads the call's value.
 //!
 //! A program carries the directory of the file it was lowered from, by its
 //! index in its run's table of directories ([`Ir::dir`]), which every call
@@ -1037,7 +1041,9 @@ pub enum IrKind {
     /// Yields the closure of the meta of the function its child, a function
     /// node, evaluates to: a closure of a definition made with a def-type
     /// that declares a meta, whose meta's closure is in the cell of the top
-    /// level's frame its code names ([`Ir::meta_of`]). Only ever the callee
+    /// level's frame its code names ([`Ir::meta_of`]), or of a def-type
+    /// reference that carries its definition's meta, whose meta is that of
+    /// the definition it captures ([`MetaAt::Capture`]). Only ever the callee
     /// of a [`IrKind::Call`] of no arguments, which a read of the meta,
     /// `func.versions`, lowers to, a `Field` of it (see [`crate::lower`]). Of
     /// kind [`ValueKind::Fn`]. Last, as `Top` was.
@@ -1514,10 +1520,34 @@ pub struct Ir {
     /// which [`Ir::pretty`] shows where it shows another's name. For
     /// [`Ir::pretty`] only; usually empty.
     paths: Vec<(FnId, Box<[Name]>)>,
-    /// Each definition made with a def-type that has a meta, with the slot
-    /// of the top level's frame holding the meta's closure (see
-    /// [`Ir::meta_of`]); usually empty.
-    metas: Vec<(FnId, Slot)>,
+    /// Each function whose closures have a meta, a definition made with a
+    /// def-type that has one or a def-type reference that carries it, with
+    /// where the meta is (see [`Ir::meta_of`]); usually empty.
+    metas: Vec<(FnId, MetaAt)>,
+}
+
+/// Where the meta of a function's closures is, for a function that has one
+/// (see [`Ir::meta_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MetaAt {
+    /// The meta's closure is in this cell of the top level's frame: a
+    /// definition made with a def-type that declares a meta, whose cell
+    /// holds its `defmeta`'s closure.
+    Cell(Slot),
+    /// The meta is that of the closure the closure captures at this index:
+    /// a def-type reference, whose closure captures the definition it
+    /// calls the def-type with, whose meta it carries.
+    Capture(u32),
+}
+
+impl fmt::Display for MetaAt {
+    /// `#12` for a cell, as a slot shows, and `capture 1` for a capture.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cell(slot) => write!(f, "{slot}"),
+            Self::Capture(index) => write!(f, "capture {index}"),
+        }
+    }
 }
 
 impl Ir {
@@ -1733,31 +1763,36 @@ impl Ir {
         self.paths = paths;
     }
 
-    /// Sets the metas of the program's definitions made with a def-type
-    /// that declares one, `metas`, each with its function and the slot of
-    /// the top level's frame holding its meta's closure (see
+    /// Sets the metas of the program's functions whose closures have one,
+    /// `metas`, each with its function and where its meta is: the
+    /// definitions made with a def-type that declares one, each with the
+    /// slot of the top level's frame holding its meta's closure, and the
+    /// def-type references that carry their definitions' (see
     /// [`Ir::meta_of`]).
-    pub(crate) fn set_metas(&mut self, metas: Vec<(FnId, Slot)>) {
+    pub(crate) fn set_metas(&mut self, metas: Vec<(FnId, MetaAt)>) {
         self.metas = metas;
     }
 
-    /// The slot of the top level's frame, at the bottom of the value stack,
-    /// that holds the closure of the meta of `function`, if it is a
-    /// definition made with a def-type that declares one: what reading the
-    /// meta of a closure of it calls (see [`IrKind::Meta`]). `None` for every
-    /// other function. Linear in the number of the program's definitions with
-    /// a meta, which only a meta's read pays.
+    /// Where the meta of the closures of `function` is, if they have one:
+    /// for a definition made with a def-type that declares one, the slot of
+    /// the top level's frame, at the bottom of the value stack, that holds
+    /// its meta's closure, and for a def-type reference that carries its
+    /// definition's meta, the capture that holds the definition, whose meta
+    /// it is; what reading the meta of a closure of it calls (see
+    /// [`IrKind::Meta`]). `None` for every other function. Linear in the
+    /// number of the program's functions with a meta, which only a meta's
+    /// read pays.
     #[must_use]
-    pub fn meta_of(&self, function: FnId) -> Option<Slot> {
+    pub fn meta_of(&self, function: FnId) -> Option<MetaAt> {
         self.meta_at(function.index())
     }
 
     /// [`Ir::meta_of`] the function whose index is `index`.
-    fn meta_at(&self, index: usize) -> Option<Slot> {
+    fn meta_at(&self, index: usize) -> Option<MetaAt> {
         self.metas
             .iter()
             .find(|(function, _)| function.index() == index)
-            .map(|&(_, slot)| slot)
+            .map(|&(_, at)| at)
     }
 
     /// The path of the function whose index is `index`, if it is a
@@ -1986,7 +2021,9 @@ impl Ir {
     /// function named by a dotted path by its path, `fn #0 dev.peios.count
     /// (frame ...)`, a definition made with a def-type as it is written,
     /// `fn #0 package dev.peios.x (frame ...)`, followed by `meta #12`, the
-    /// cell of its meta, if it has one, and the meta's own function as
+    /// cell of its meta, if it has one, the function of a def-type reference
+    /// that carries its definition's meta by `meta capture 1`, the capture
+    /// holding the definition, and the meta's own function as
     /// `fn #1 defmeta package dev.peios.x (frame ...)`, or `fn #1 (frame
     /// ...)` if it has no name, a memoised
     /// function as
@@ -2696,9 +2733,10 @@ impl fmt::Display for Pretty<'_> {
                 }
                 before = ".";
             }
-            // The cell of a definition's meta.
-            if let Some(slot) = self.ir.meta_at(index) {
-                write!(f, " meta {slot}")?;
+            // The cell of a definition's meta, or a reference's capture of
+            // the definition whose meta it carries.
+            if let Some(at) = self.ir.meta_at(index) {
+                write!(f, " meta {at}")?;
             }
             writeln!(
                 f,

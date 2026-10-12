@@ -314,6 +314,17 @@
 //! (`Lowerer::lower_meta_read`): so a read is a call, its caller, its
 //! memoisation and the nesting budget those of any call.
 //!
+//! A reference whose def-type declares a meta carries its definition's: the
+//! program records its function too, its meta that of the closure's capture
+//! of the definition (`Ir::set_metas`, [`MetaAt::Capture`]), so that
+//! `(package dev.peios.testpkg).versions`, or a read of a reference stored,
+//! is a read of the definition's meta. A reference whose path goes on past
+//! its definition, `package dev.peios.testpkg.versions` (see the checker's
+//! [`crate::check::Types::reference_past`]), makes no closure: it lowers to
+//! its read, whose accesses past the definition the checker typed as the
+//! reads of the meta of the definition's cell they are, so it is the read of
+//! the meta of the definition itself, which is the same meta.
+//!
 //! An expression the checker marked to be awaited (see
 //! [`crate::check::Resolution::await_of`]) is lowered as it would be
 //! otherwise, of the kind of its type before the await, which is
@@ -400,11 +411,15 @@ enum RootField {
 use crate::diagnostic::InternalError;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField,
-    LazyShape, LazyShapeId, ListShape, Operands, Shape, ShapeId, ShapedOperands, StepAt, StepMode,
-    TestCode, TestId, UpdateStep,
+    LazyShape, LazyShapeId, ListShape, MetaAt, Operands, Shape, ShapeId, ShapedOperands, StepAt,
+    StepMode, TestCode, TestId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
+
+/// The capture of the closure of a def-type reference that holds the
+/// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
+const REFERENCE_DEFINITION: u32 = 1;
 use crate::types::{Laziness, TyId, TypeTable, ValueTest};
 use crate::value::{Layout, ValueKind, int_to_float};
 
@@ -468,12 +483,25 @@ pub fn lower(
         catches: Vec::new(),
         next_catch: 0,
         reads_caller: Vec::new(),
+        meta_captures: Vec::new(),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
     let kind = lowerer.lower_body(root, root_span, kind)?;
     let root = lowerer.builder.alloc(kind, root_span);
     lowerer.stub_shadowed_functions(root_span);
+    // A definition's meta is in its cell; a reference's, its definition's.
+    let metas: Vec<(FnId, MetaAt)> = resolution
+        .metas()
+        .iter()
+        .map(|&(function, slot)| (function, MetaAt::Cell(slot)))
+        .chain(
+            lowerer
+                .meta_captures
+                .iter()
+                .map(|&function| (function, MetaAt::Capture(REFERENCE_DEFINITION))),
+        )
+        .collect();
     // Every function expression is reachable from the root, so each has
     // been lowered, but those of a shadowed declaration, stubbed.
     let mut functions = lowerer
@@ -492,7 +520,7 @@ pub fn lower(
         (input, resolution.place().dir),
     );
     ir.set_paths(dotted_paths(ast, resolution));
-    ir.set_metas(resolution.metas().to_vec());
+    ir.set_metas(metas);
     Ok(ir)
 }
 
@@ -597,6 +625,10 @@ struct Lowerer<'a> {
     /// as its `MakeFuture`'s mark (see [`IrKind::MakeFuture`]); empty at the
     /// top level, where nothing is kept.
     reads_caller: Vec<bool>,
+    /// The functions made for def-type references that carry their
+    /// definitions' metas, whose closures' metas are those of the
+    /// definitions they capture (see [`MetaAt::Capture`]).
+    meta_captures: Vec<FnId>,
 }
 
 impl Lowerer<'_> {
@@ -1835,6 +1867,9 @@ impl Lowerer<'_> {
             (ExprKind::List(_) | ExprKind::For(_), _) => {
                 self.lower_listing(expr.kind, kind, span)?
             }
+            (ExprKind::DefTypeRef(def), _) if self.expr_types.reference_past(id).is_some() => {
+                return self.lower_reference_past(def, kind, span);
+            }
             (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
             (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
@@ -2254,6 +2289,24 @@ impl Lowerer<'_> {
         })
     }
 
+    /// Lowers a def-type reference of `def`, spanning `span`, whose path goes
+    /// on past its definition, `package dev.peios.testpkg.versions` (see the
+    /// checker's "Metas"), of kind `kind`: to its read, whose accesses past
+    /// the definition the checker typed as reads of the meta of the
+    /// definition's cell and fields of them, so that it makes no closure.
+    fn lower_reference_past(
+        &mut self,
+        def: DefTypeId,
+        kind: ValueKind,
+        span: Span,
+    ) -> Result<IrId, InternalError> {
+        let read = self.ast.def_type(def).read.ok_or(InternalError {
+            message: "a def-type reference without a definition",
+            span,
+        })?;
+        self.lower_operand(read, kind)
+    }
+
     /// Lowers the def-type reference `id`, `DT PATH`, of `def` (see the
     /// checker's "Def-types"), to the `MakeClosure` of a function of its
     /// own, made here, past the tree's ([`FnId::lowered`]), which captures
@@ -2263,7 +2316,10 @@ impl Lowerer<'_> {
     /// caller the closure is called with, and calls the def-type with the
     /// definition's path, as written, the definition and its own
     /// parameters, in order: so a closure is made each time the reference
-    /// is evaluated. It is of kind `kind`, which can only be a function's.
+    /// is evaluated. If the reference carries its definition's meta, the
+    /// function's meta is recorded as its capture of the definition's
+    /// ([`MetaAt::Capture`]). It is of kind `kind`, which can only be a
+    /// function's.
     fn lower_def_type_ref(
         &mut self,
         id: ExprId,
@@ -2299,9 +2355,10 @@ impl Lowerer<'_> {
             .builder
             .alloc(IrKind::LoadCapture(0, ValueKind::Fn), span);
         let name = self.builder.alloc(IrKind::StrConst(path), span);
-        let definition = self
-            .builder
-            .alloc(IrKind::LoadCapture(1, ValueKind::Fn), span);
+        let definition = self.builder.alloc(
+            IrKind::LoadCapture(REFERENCE_DEFINITION, ValueKind::Fn),
+            span,
+        );
         let base = self.item_stack.len();
         for (param, value) in [(0, name), (1, definition)] {
             let arg = self.builder.alloc(IrKind::Arg { param, value }, span);
@@ -2343,6 +2400,11 @@ impl Lowerer<'_> {
         );
         let params = u32::try_from(sig.params.len()).unwrap_or(u32::MAX);
         let function = FnId::lowered(u32::try_from(self.functions.len()).unwrap_or(u32::MAX));
+        // A reference carries its definition's meta: its closure's is the
+        // definition's, its second capture.
+        if sig.meta.is_some() {
+            self.meta_captures.push(function);
+        }
         self.functions.push(Some(FnCode {
             body,
             kind: FnKind::Function,
