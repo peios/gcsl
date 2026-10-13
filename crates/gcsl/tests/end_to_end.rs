@@ -1286,6 +1286,139 @@ fn a_default_error_renders_exactly() {
     );
 }
 
+/// The summary of slice 49, without its error: a type with a defaulted
+/// field, and record literals written where it is expected.
+const RECORD_DEFAULTS: &str = "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+                               entries: List<Install> = [\n\
+                               \x20   { from = \"a\"; to = \"b\" },\n\
+                               \x20   { from = \"c\"; to = \"d\"; exclude = [\"x\"] },\n\
+                               ]\n\
+                               def f(e: Install): Int { len(e.exclude) }\n\
+                               n = f({ from = \"a\"; to = \"b\" })\n";
+
+#[test]
+fn record_fields_with_defaults() {
+    assert_eq!(
+        run(RECORD_DEFAULTS).unwrap().to_string(),
+        "{entries = [{from = \"a\"; to = \"b\"; exclude = []}, \
+         {from = \"c\"; to = \"d\"; exclude = [\"x\"]}]; \
+         f = fn(e: {exclude: List<String> = [], from: String, to: String}): Int; n = 0}"
+    );
+    // A filled value is an ordinary record: shown, tested with `is` and
+    // compared as one, and its field read without a test.
+    let text = "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+                let entries: List<Install> = [{ from = \"a\"; to = \"b\" }]\n\
+                let first: {from: String} = entries[0]\n\
+                let given: Install = { from = \"a\"; to = \"b\"; exclude = [] }\n\
+                = [\n\
+                \x20   show(entries[0]),\n\
+                \x20   \"{first is {from: String, exclude: List<String>}}\",\n\
+                \x20   \"{entries[0] == given}\",\n\
+                \x20   \"{len(entries[0].exclude)}\",\n\
+                ]";
+    assert_eq!(
+        run(text).unwrap().to_string(),
+        "[\"{{from = \\\"a\\\"; to = \\\"b\\\"; exclude = []}}\", \"true\", \"true\", \"0\"]"
+    );
+    // `{}` is given every default, nested defaults too.
+    assert_eq!(
+        run(
+            "fn f(e: {a: Int = 2, o: {b: String = \"b\"} = {}}): String { \"{e.a}{e.o.b}\" }\n\
+             = [f({}), show(({} : {x: List<Int> = [1]}))]"
+        )
+        .unwrap()
+        .to_string(),
+        "[\"2b\", \"{{x = [1]}}\"]"
+    );
+    // The REPL shows a type's defaults.
+    assert_eq!(
+        show("let e: {a: Int = 1, b: Int} = { b = 2 }\n= e"),
+        "{b = 2; a = 1} : {a: Int = 1, b: Int}"
+    );
+    // A definition's meta is a literal checked against the meta's type.
+    let text = "type Meta = { versions: List<String>, note: String = \"none\" }\n\
+                #[def_type]\n\
+                def package(name: String, func: fn(): {v: Int} META: Meta) -> String {\n\
+                \x20   \"{name} {func.note}\"\n\
+                }\n\
+                defmeta package dev.x { versions = [\"1\"] }\n\
+                def package dev.x() { v = 1 }\n\
+                r = package dev.x.note";
+    assert_eq!(
+        run(text).unwrap().to_string(),
+        "{package = fn(name: String | Future<String>, func: fn(): {v: Int} META: \
+         {note: String = \"none\", versions: List<String>}) -> String; r = \"none\"}"
+    );
+}
+
+#[test]
+fn record_defaults_are_kept_across_repl_inputs() {
+    // A type of an earlier input, and a function of one, give their
+    // defaults to a later input's literals.
+    let mut session = Session::new();
+    let inputs = [
+        "type Opt = { name: String, level: Float = 1, tags: List<String> = [\"t\"] }",
+        "def level(o: Opt): Float { o.level }",
+        "let o: Opt = { name = \"o\" }",
+        "o",
+        "level({ name = \"p\"; level = 2 })",
+        "level({ name = \"q\" })",
+    ];
+    let mut shown = Vec::new();
+    for input in inputs {
+        let outcome = session.eval(&source(input)).unwrap();
+        shown.push(outcome.value.repr().to_string());
+    }
+    assert_eq!(
+        &shown[3..],
+        ["{name = \"o\"; level = 1.0; tags = [\"t\"]}", "2.0", "1.0"]
+    );
+    let errors = session
+        .eval(&source("let plain = { name = \"r\" }\nlevel(plain)"))
+        .unwrap_err();
+    assert_eq!(errors[0].message, "mismatched types");
+}
+
+#[test]
+fn a_record_default_error_renders_exactly() {
+    assert_eq!(
+        rendered(&format!(
+            "{RECORD_DEFAULTS}let plain = {{ from = \"a\"; to = \"b\" }}\nm = f(plain)\n"
+        )),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:9:7\n\
+         \x20 |\n\
+         9 | m = f(plain)\n\
+         \x20 |     - ^^^^^ expected {exclude: List<String> = [], from: String, to: String}, \
+         found {from: String, to: String}\n\
+         \x20 |     |\n\
+         \x20 |     the function is fn(e: {exclude: List<String> = [], from: String, to: String}): Int\n\
+         \x20 |\n\
+         \x20 = note: a default fills only a record literal written where \
+         `{exclude: List<String> = [], from: String, to: String}` is expected\n"
+    );
+    assert_eq!(
+        rendered("let x = 1\nlet p: {a: Int = x + 1} = { a = 1 }\n"),
+        "error: a field's default must be a constant\n\
+         \x20--> calc.gcsl:2:18\n\
+         \x20 |\n\
+         2 | let p: {a: Int = x + 1} = { a = 1 }\n\
+         \x20 |                  ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: a literal, or a list or record of literals\n"
+    );
+    assert_eq!(
+        rendered("let p: {a: Int = \"one\"} = { a = 1 }\n"),
+        "error: mismatched types\n\
+         \x20--> calc.gcsl:1:18\n\
+         \x20 |\n\
+         1 | let p: {a: Int = \"one\"} = { a = 1 }\n\
+         \x20 |            ---   ^^^^^ expected Int, found String\n\
+         \x20 |            |\n\
+         \x20 |            expected because of this annotation\n"
+    );
+}
+
 #[test]
 fn an_impure_call_error_renders_exactly() {
     assert_eq!(

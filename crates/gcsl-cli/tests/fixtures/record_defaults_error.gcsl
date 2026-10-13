@@ -1,0 +1,4 @@
+type Install = { from: String, to: String, exclude: List<String> = [] }
+def f(e: Install): Int { len(e.exclude) }
+let plain = { from = "a"; to = "b" }
+m = f(plain)

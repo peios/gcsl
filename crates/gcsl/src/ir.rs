@@ -782,7 +782,9 @@ pub enum IrKind {
         result: IrId,
     },
     /// Builds a record with at least one field from `values`, which are in
-    /// the order of `layout`'s names: the value of a record block.
+    /// the order of `layout`'s names: the value of a record block, the
+    /// constants of the fields the checker gave it their defaults after its
+    /// own fields' (see the checker's "Field defaults").
     MakeRecord {
         /// The record's field names.
         layout: LayoutId,

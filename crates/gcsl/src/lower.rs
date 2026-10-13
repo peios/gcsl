@@ -69,7 +69,16 @@
 //! statement in it, the last included, is a statement. Each record block's
 //! field names become a [`Layout`], built here once and shared by every
 //! record the block builds; blocks with the same names in the same order
-//! share one layout, found through a map from the names to the layout.
+//! share one layout, found through a map from the names to the layout. A
+//! record block written where a record type with defaults is expected, and
+//! lacking a defaulted field, is given the field by the checker (see its
+//! "Field defaults", [`crate::check::Resolution::record_fills`]): its
+//! `MakeRecord`'s values after those `Load`s are each such field's default,
+//! in the order of the fields' names' text, built where the block closes as
+//! a parameter's default is built where a call closes
+//! (`Lowerer::lower_constant`), and its layout has their names after the
+//! block's own. A `{}` given fields so is the `MakeRecord` of them alone,
+//! not `Empty`. So at run time the value simply has the field.
 //!
 //! A spread item is what its soft assignments say: a `Store` of its
 //! operand, awaited first if the checker marked it to be, into the item's
@@ -497,7 +506,7 @@ pub fn lower(
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
-    let kind = lowerer.lower_body(root, root_span, kind)?;
+    let kind = lowerer.lower_body((None, root), root_span, kind)?;
     let root = lowerer.builder.alloc(kind, root_span);
     lowerer.stub_shadowed_functions(root_span);
     // A definition's meta is in its cell; a reference's, its definition's.
@@ -738,15 +747,19 @@ impl Lowerer<'_> {
     }
 
     /// Lowers a body whose value is of kind `kind` to a `Block`, which the
-    /// caller allocates.
+    /// caller allocates: the body of the block `block`, or the root's for
+    /// `None`. A `{}` the checker gave fields their defaults (see the
+    /// checker's "Field defaults") is a record of them, as a record block
+    /// given them is.
     fn lower_body(
         &mut self,
-        body: ItemRange,
+        (block, body): (Option<ExprId>, ItemRange),
         span: Span,
         kind: ValueKind,
     ) -> Result<IrKind, InternalError> {
         let items = self.ast.items(body);
-        let is_record = self.is_record_body(body);
+        let is_record = self.is_record_body(body)
+            || block.is_some_and(|block| !self.resolution.record_fills(block).is_empty());
         let base = self.item_stack.len();
         let mut result = None;
         let is_root = body == self.ast.root();
@@ -846,7 +859,7 @@ impl Lowerer<'_> {
                     span,
                 });
             }
-            None if is_record => self.make_record(items, is_root, span)?,
+            None if is_record => self.make_record((block, items), is_root, span)?,
             None => self.builder.alloc(IrKind::Empty, span),
         };
         // An imported value file's value is a cell: stored as the block
@@ -1584,9 +1597,16 @@ impl Lowerer<'_> {
     /// under that root, and a spread's field that a top-level declaration
     /// of its name overrides, below it or above, takes the declaration's
     /// load.
+    ///
+    /// The fields the checker gave the block, `block` (`None` for the root,
+    /// which is given none), their defaults (see the checker's "Field
+    /// defaults", [`crate::check::Resolution::record_fills`]) follow those
+    /// it defines, in the order of their names' text, each its constant's
+    /// nodes (`Lowerer::lower_constant`) at the block's closing brace; a
+    /// `{}` given fields has only those.
     fn make_record(
         &mut self,
-        items: &[ItemId],
+        (block, items): (Option<ExprId>, &[ItemId]),
         is_root: bool,
         span: Span,
     ) -> Result<IrId, InternalError> {
@@ -1668,6 +1688,13 @@ impl Lowerer<'_> {
         for &(slot, kind, field_span) in &self.record_loads {
             let load = self.builder.alloc(IrKind::Load(slot, kind), field_span);
             self.item_stack.push(load);
+        }
+        let close = Span::new(span.end.saturating_sub(1), span.end);
+        let fills = block.map_or(&[][..], |block| resolution.record_fills(block));
+        for (name, constant) in fills {
+            let value = self.lower_constant(constant, close);
+            self.item_stack.push(value);
+            self.layout_names.push(*name);
         }
         let layout = self.layout();
         let values = self.builder.push_item_list(&self.item_stack[base..]);
@@ -2050,11 +2077,11 @@ impl Lowerer<'_> {
     ) -> Result<IrKind, InternalError> {
         let span = self.ast.get(id).span;
         if label.is_none() || !self.resolution.is_returned_block(id) {
-            return self.lower_body(items, span, kind);
+            return self.lower_body((Some(id), items), span, kind);
         }
         let catch = self.start_catch(JumpTarget::Block(id));
         let own = self.body_kind(items)?;
-        let block = self.lower_body(items, span, own)?;
+        let block = self.lower_body((Some(id), items), span, own)?;
         Ok(self.end_catch(catch, (block, span), kind))
     }
 
@@ -2878,7 +2905,8 @@ impl Lowerer<'_> {
         Ok(list)
     }
 
-    /// Lowers `constant`, a parameter's default, to nodes spanning `span`
+    /// Lowers `constant`, a parameter's default or a field's (see the
+    /// checker's "Field defaults"), to nodes spanning `span`
     /// that build it: an `IntConst`, `FloatConst`, `BoolConst` or
     /// `StrConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
     /// fields', in the order they are written, with the layout of their

@@ -1650,6 +1650,57 @@ fn repl_gives_defaults_across_lines() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The summary of slice 49: a record literal written where a type with a
+/// defaulted field is expected is given the field.
+#[test]
+fn run_gives_record_literals_their_fields_defaults() {
+    let output = gcsl(&["run", "tests/fixtures/record_defaults.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{entries = [{from = \"a\"; to = \"b\"; exclude = []}, \
+         {from = \"c\"; to = \"d\"; exclude = [\"x\"]}]; \
+         f = fn(e: {exclude: List<String> = [], from: String, to: String}): Int; n = 0}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    // A value that is no such literal is not given it.
+    let output = gcsl(&["run", "tests/fixtures/record_defaults_error.gcsl"]);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: mismatched types\n\
+         \x20--> tests/fixtures/record_defaults_error.gcsl:4:7\n\
+         \x20 |\n\
+         4 | m = f(plain)\n\
+         \x20 |     - ^^^^^ expected {exclude: List<String> = [], from: String, to: String}, \
+         found {from: String, to: String}\n\
+         \x20 |     |\n\
+         \x20 |     the function is fn(e: {exclude: List<String> = [], from: String, to: String}): Int\n\
+         \x20 |\n\
+         \x20 = note: a default fills only a record literal written where \
+         `{exclude: List<String> = [], from: String, to: String}` is expected\n"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn repl_gives_record_literals_defaults_across_lines() {
+    // A type of an earlier line gives its defaults; a type shows them.
+    let output = repl(
+        "type Install = { from: String, exclude: List<String> = [] }\n\
+         let e: Install = { from = \"a\" }\n\
+         e\n\
+         [{ from = \"b\" }] : List<Install>\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{from = \"a\"; exclude = []} : {exclude: List<String> = [], from: String}\n\
+         [{from = \"b\"; exclude = []}] : List<{exclude: List<String> = [], from: String}>\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn repl_shows_functions_and_their_errors_against_their_own_line() {
     let output = repl(

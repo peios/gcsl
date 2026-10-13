@@ -93,7 +93,11 @@
 //! directly by `Checker::check_expr_expecting`: each field's initialiser
 //! is checked against the expected field's type, so literals adapt and
 //! nested record blocks are checked the same way; a missing field is an
-//! error, and a field item the type lacks is a *warning*, since nothing with
+//! error, unless the record type is expected itself (not as a union's
+//! member) and has a default for it, which the block is then given (see
+//! "Field defaults" under [Functions](#functions); `{}` is checked so too
+//! where such a type is expected), and a field item the
+//! type lacks is a *warning*, since nothing with
 //! the expected type can see it. Warnings are collected apart from errors
 //! and returned with a successful check.
 //!
@@ -685,6 +689,73 @@
 //! carried, beside which parameters its body measures, as a
 //! [`KnownParams`], in the session's [`Scope`] or the workspace's cell of
 //! the `def`.
+//!
+//! **Field defaults.** A field of a record type may have a default too,
+//! `type Install = {from: String, exclude: List<String> = []}`, wherever a
+//! record type is written: a `type`, an annotation, a parameter's or a
+//! return type, a list, function or union type, another record type. It
+//! is a constant by the rule above (`Checker::is_constant`); anything else
+//! is "a field's default must be a constant", at it, with the same note.
+//! It is checked against its field's type as a parameter's default is
+//! against its parameter's, in the mode the type is resolved in (the
+//! either shape of an impure function's bare parameter taking it as the
+//! present value it is), the usual mismatch at it if it does not fit
+//! (`Checker::field_default`), each time the type it is written in is
+//! resolved, as the rest of the type is (a top-level function's signature,
+//! resolved first in silence, reports it once). What it
+//! is once checked, a [`Constant`], is part of the record type
+//! ([`crate::types::RecordTy::defaults`]); a record type with an erroneous
+//! default is erroneous. A declared type's definition is copied into each
+//! tree using it apart from its own (see [Type
+//! declarations](#type-declarations)), its defaults as the constants they
+//! are written as, with no type known (`written_constant`): there each is
+//! fitted to its field's type as `check_expr_expecting` would check it
+//! (`Checker::fit_constant`: an integer a `Float` where one is expected, a
+//! record given the defaults of its own type), with nothing reported, the
+//! declaration's own file reporting what is wrong; one that is no
+//! constant or does not fit fails the check quietly.
+//!
+//! A record literal (a record block, or `{}`, the empty record's, through
+//! any parentheses) checked
+//! against an expected type that is, once stripped of the either shape of
+//! an impure function's bare parameter or result, a record type with
+//! defaults, which it lacks fields of, by a field item or a spread whose
+//! type has the field, is *given* each such field: the field is not
+//! missing, the literal's type has it, of the expected type's type of it,
+//! so it is read with no `is`, and the field with its default is recorded
+//! for lowering by the literal's id ([`Resolution::record_fills`]), which
+//! builds the record with it, so at run time the value simply has the
+//! field (`Checker::report_missing_fields`). So `{}` where such a type is
+//! expected is the record of its defaults if every field of it has one,
+//! and otherwise each other field is missing, as for any record literal
+//! (`Checker::empty_record`); where no record type with defaults is
+//! expected itself, `{}` is checked as ever. That is wherever a literal is
+//! checked against an expected type: an annotated `let` or field, an
+//! ascription, an argument, a list's element, a field of an enclosing
+//! literal, `:=`, a function's body and a `return`'s value against its
+//! return type, a meta's body, and a parameter's or a field's default that
+//! is a record literal, whose constant then has the fields given it. A
+//! union of record types expected gives nothing, its one record member's
+//! missing fields being missing as ever, nor does a dotted field's segment
+//! (an open field); and a literal that
+//! is a block's result or an `if`'s branch, as `defmeta DT PATH = { ... }`'s
+//! is, is checked with no record type expected, as ever. Nothing else is
+//! given anything: a value that is not such a literal, a variable, a
+//! call's result, a field read, a literal checked with no expected type,
+//! that lacks a defaulted field is the usual mismatch where it meets the
+//! type, noted "a default fills only a record literal written where `T` is
+//! expected", `T` the record type, shown as types are
+//! (`Checker::default_note`); nothing is converted at run time.
+//!
+//! Defaults do not change which values a type admits: subtyping and the
+//! join ignore them (see [`crate::types`], "Defaults"), and where two
+//! types must be one, as the operands of `==` must, a record type with
+//! defaults is one with the record type without them
+//! ([`TypeTable::same`]). Every type is shown with its defaults, after
+//! their fields' types, `{exclude: List<String> = [], from: String}`, in
+//! errors, hovers and the dumps; a function's type shows those of its
+//! parameters' record types, which are part of them, unlike its own
+//! parameters' defaults.
 //!
 //! **Purity.** A function declared with `:` is pure, one declared with `->`
 //! impure, and one declared with `->>` impure and memoised: its [`Effect`]
@@ -2654,10 +2725,10 @@ use std::rc::Rc;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, DefTypeRole, Effect, Element,
-    ElementRange, Expr, ExprId, ExprKind, FieldTy, FieldTyRange, FnDecl, FnId, ForHead, ForId,
-    Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, PartRange, PathRange,
-    PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span,
-    symbol_span,
+    ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyRange, FnDecl, FnId,
+    ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, PartRange,
+    PathRange, PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, TypeProblem, UnaryOp,
+    path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -3435,7 +3506,10 @@ impl NarrowingBlock {
 /// leaves the parameter unfilled is given, in [`FnResolution::defaults`] and
 /// [`Resolution::call_defaults`]. It holds no id of a tree, since a call of a
 /// `def` of another file, or of a function of an earlier session input, is
-/// given it where that tree is not.
+/// given it where that tree is not. A field's default of a record type is
+/// one too, held in the type ([`crate::types::RecordTy::defaults`]), which
+/// a record literal that lacks the field is given, in
+/// [`Resolution::record_fills`] (see [Field defaults](#field-defaults)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Constant {
     /// An `Int`.
@@ -3455,6 +3529,10 @@ pub enum Constant {
     /// The empty record, `{}`.
     Empty,
 }
+
+/// Each record literal given fields' defaults, by its id, with each such
+/// field and its default: see [`Resolution::record_fills`].
+type RecordFills = HashMap<ExprId, Box<[(Name, Constant)]>>;
 
 /// What a call of a function whose tree is gone needs to know of its
 /// parameters: a function declared by an earlier session input, through
@@ -3699,6 +3777,12 @@ pub struct Resolution {
     /// such parameter and its default, in parameter order (see
     /// [Calls](#calls)); only a program with one has entries.
     call_defaults: HashMap<ExprId, Box<[(u32, Constant)]>>,
+    /// Each record literal, a record block or `{}`, that the checker gave
+    /// fields their defaults, by its id, with each such field and its
+    /// default, in the order of
+    /// their names' text (see [Field defaults](#field-defaults)); only a
+    /// program with one has entries.
+    record_fills: RecordFills,
 }
 
 /// What a `break`, `continue` or `return` item is for (see
@@ -3783,6 +3867,16 @@ impl Resolution {
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, Constant)] {
         self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
+    }
+
+    /// The fields that the record literal `block`, a record block or `{}`,
+    /// lacks and is given, each with its default, in the order of their
+    /// names' text: the defaulted fields of the record type it is written
+    /// where it is expected (see [Field defaults](#field-defaults)); none
+    /// for any other block, and for an expression that is no block.
+    #[must_use]
+    pub fn record_fills(&self, block: ExprId) -> &[(Name, Constant)] {
+        self.record_fills.get(&block).map_or(&[], |fills| fills)
     }
 
     /// The slot written by item `id`, or [`Slot::NONE`] if it is not a
@@ -4059,6 +4153,7 @@ impl Resolution {
             meta_reads: HashMap::new(),
             metas: Vec::new(),
             call_defaults: HashMap::new(),
+            record_fills: HashMap::new(),
         }
     }
 
@@ -4686,17 +4781,24 @@ struct Expecting<'w> {
     why: &'w str,
     /// The block's closing brace, where a missing field is reported.
     close: Span,
+    /// For a record literal, a record block or `{}`, whose expected record
+    /// type is what is expected itself, once stripped, and not the one
+    /// record member of a union: its id, by which the defaulted fields it
+    /// lacks are recorded as given their defaults (see [Field
+    /// defaults](#field-defaults)).
+    fill: Option<ExprId>,
 }
 
 impl<'w> Expecting<'w> {
     /// The expectation of a value of type `ty`, stated at `context`,
-    /// labelled `why`, of the block spanning `block`.
+    /// labelled `why`, of the block spanning `block`, which fills nothing.
     const fn new(ty: TyId, (context, why): (Span, &'w str), block: Span) -> Self {
         Self {
             ty,
             context,
             why,
             close: Span::new(block.end.saturating_sub(1), block.end),
+            fill: None,
         }
     }
 }
@@ -5139,6 +5241,9 @@ pub struct Checker<'a> {
     /// Each call that gives a parameter its default, by its id: see
     /// [`Resolution::call_defaults`].
     call_defaults: HashMap<ExprId, Box<[(u32, Constant)]>>,
+    /// Each record literal given fields' defaults, by its id: see
+    /// [`Resolution::record_fills`].
+    record_fills: RecordFills,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -5393,8 +5498,7 @@ impl<'a> Checker<'a> {
         // The scope's slots are exactly `0..n`, each named as it was when
         // the scope was made; some, such as a dotted field's cells, belong
         // to no binding.
-        let slot_names = scope.slot_names;
-        let next_slot = u32::try_from(slot_names.len()).unwrap_or(u32::MAX);
+        let next_slot = u32::try_from(scope.slot_names.len()).unwrap_or(u32::MAX);
         Self {
             ast,
             never: types.never(),
@@ -5422,6 +5526,7 @@ impl<'a> Checker<'a> {
             bindings: scope.bindings,
             scope_known: scope.known,
             call_defaults: HashMap::new(),
+            record_fills: HashMap::new(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -5463,7 +5568,7 @@ impl<'a> Checker<'a> {
             spreads: BlockSpreads::None,
             next_slot,
             frame_size: next_slot,
-            slot_names,
+            slot_names: scope.slot_names,
             top_slots_end: next_slot,
             field_clash: None,
             shadowed_items: Vec::new(),
@@ -5585,6 +5690,7 @@ impl<'a> Checker<'a> {
                 meta_reads: self.meta_reads,
                 metas: self.metas,
                 call_defaults: self.call_defaults,
+                record_fills: self.record_fills,
             },
         };
         let mut warnings = self.warnings;
@@ -7034,7 +7140,8 @@ impl<'a> Checker<'a> {
     /// expected type is present is measured, at the spread's operand, and a
     /// field that still does not fit is "mismatched types" at the operand,
     /// "expected E, found F for field `a`", with a note if awaiting it would
-    /// have made it fit. A field that fits takes the expected type, as a
+    /// have made it fit, and one if it lacks a defaulted field
+    /// ([`Checker::default_note`]). A field that fits takes the expected type, as a
     /// field item's does. A soft field the type lacks is not warned about:
     /// spreading a wider record is normal. Returns whether anything was
     /// reported.
@@ -7084,6 +7191,9 @@ impl<'a> Checker<'a> {
                     "a spread's field cannot be awaited; define the field with its value{example}"
                 ));
             }
+            if let Some(note) = self.default_note(found, expected) {
+                error = error.with_note(note);
+            }
             self.errors.push(error);
             reported = true;
         }
@@ -7091,23 +7201,45 @@ impl<'a> Checker<'a> {
     }
 
     /// Reports each field of `expecting`'s record type that is not among the
-    /// block's fields, `sorted_fields[base..]`, in alphabetical order.
-    /// Returns whether any was missing.
+    /// block's fields, `sorted_fields[base..]`, in alphabetical order,
+    /// unless the block fills it (see [`Expecting::fill`]) and the type has
+    /// a default for it: such a field is added to the block's fields, at the
+    /// end of `sorted_fields`, with the type's type of it, and recorded,
+    /// with its default, as given it ([`Resolution::record_fills`]; see
+    /// [Field defaults](#field-defaults)). Returns whether any was missing.
     fn report_missing_fields(&mut self, base: usize, expecting: Expecting<'_>) -> bool {
         let names = self.ast.names();
         let present = self.sorted_fields.get(base..).unwrap_or_default();
-        let mut missing: Vec<&str> = self
-            .types
-            .record_fields(expecting.ty)
-            .unwrap_or_default()
-            .iter()
-            .filter(|&&(name, _)| {
-                present
-                    .binary_search_by_key(&name, |&(present, _, _)| present)
-                    .is_err()
-            })
-            .map(|&(name, _)| names.get(name))
-            .collect();
+        let mut missing: Vec<&str> = Vec::new();
+        let mut filled: Vec<(Name, TyId, Constant)> = Vec::new();
+        for &(name, ty) in self.types.record_fields(expecting.ty).unwrap_or_default() {
+            if present
+                .binary_search_by_key(&name, |&(present, _, _)| present)
+                .is_ok()
+            {
+                continue;
+            }
+            let default = self
+                .types
+                .field_default(expecting.ty, name)
+                .filter(|_| expecting.fill.is_some());
+            match default {
+                Some(default) => filled.push((name, ty, default.clone())),
+                None => missing.push(names.get(name)),
+            }
+        }
+        if let Some(block) = expecting.fill
+            && !filled.is_empty()
+        {
+            filled.sort_unstable_by(|(a, _, _), (b, _, _)| names.get(*a).cmp(names.get(*b)));
+            self.sorted_fields
+                .extend(filled.iter().map(|&(name, ty, _)| (name, u32::MAX, ty)));
+            let fills = filled
+                .into_iter()
+                .map(|(name, _, default)| (name, default))
+                .collect();
+            self.record_fills.insert(block, fills);
+        }
         if missing.is_empty() {
             return false;
         }
@@ -11242,6 +11374,7 @@ impl<'a> Checker<'a> {
         let fields = self.ast.field_tys(range);
         let base = self.sorted_fields.len();
         let mut erroneous = false;
+        let mut defaults: Vec<(Name, Constant)> = Vec::new();
         for (index, field) in fields.iter().enumerate() {
             // A spread is merged into the fields by the expansion of the
             // file's types, which a workspace does before checking a file.
@@ -11260,6 +11393,12 @@ impl<'a> Checker<'a> {
             // one's entries and truncates back.
             let field_ty = self.resolve_type(field.ty, mode);
             erroneous |= field_ty == TyId::ERROR;
+            if let Some(default) = field.default {
+                match self.field_default(default, (field_ty, field.ty)) {
+                    Some(constant) => defaults.push((name, constant)),
+                    None => erroneous = true,
+                }
+            }
             self.sorted_fields.push((name, position(index), field_ty));
         }
         erroneous |= self.spread_problems(id);
@@ -11287,11 +11426,74 @@ impl<'a> Checker<'a> {
             let sorted = self.sorted_fields.get(base..).unwrap_or_default();
             let record = self
                 .types
-                .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
+                .record_with_defaults(sorted.iter().map(|&(name, _, ty)| (name, ty)), defaults);
             self.bare(record, mode)
         };
         self.sorted_fields.truncate(base);
         resolved
+    }
+
+    /// The constant that `default`, the default of a field of a record type
+    /// whose type is `ty`, written as `written`, is (see [Field
+    /// defaults](#field-defaults)), or `None` if it is in error, which makes
+    /// the record type erroneous. One the parser made is checked where its
+    /// type is resolved, as a parameter's default is (see
+    /// [`Checker::check_defaults`]), and as the rest of the type is, so
+    /// that a type resolved in silence first, as a top-level function's
+    /// signature is ([`Checker::declared_type`]), reports it once, where it
+    /// is resolved again: it must be a constant, "a field's
+    /// default must be a constant" at it, noted "a literal, or a list or
+    /// record of literals", and is otherwise checked against `ty` as an
+    /// annotated initialiser is against its annotation, the usual mismatch
+    /// at it if it does not fit. One a copy of a declared type's definition
+    /// holds, its own file's check having reported what is wrong in it, is
+    /// fitted to `ty` ([`Checker::fit_constant`]), with nothing reported:
+    /// one that is no constant, or does not fit, fails the check quietly.
+    fn field_default(
+        &mut self,
+        default: FieldDefault,
+        (ty, written): (TyId, TypeExprId),
+    ) -> Option<Constant> {
+        match default {
+            FieldDefault::Copied(at) => {
+                let fitted = self
+                    .ast
+                    .copied_default(at)
+                    .and_then(|constant| self.fit_constant(constant, ty));
+                self.quiet.failed |= fitted.is_none();
+                fitted
+            }
+            FieldDefault::Expr(expr) => self.check_field_default(expr, (ty, written)),
+        }
+    }
+
+    /// Checks the expression `default`, a field's default that the parser
+    /// made, against `ty`, the field's type, written as `written`, as
+    /// [`Checker::field_default`] says, and returns the constant it is, or
+    /// `None` if it is in error.
+    fn check_field_default(
+        &mut self,
+        default: ExprId,
+        (ty, written): (TyId, TypeExprId),
+    ) -> Option<Constant> {
+        if !self.is_constant(default) {
+            self.errors.push(
+                Diagnostic::error(FIELD_NOT_CONSTANT, self.ast.get(default).span)
+                    .with_note(CONSTANT_NOTE),
+            );
+            return None;
+        }
+        if ty == TyId::ERROR {
+            return None;
+        }
+        let errors = self.errors.len();
+        let context = self.ast.type_expr(written).span;
+        let found =
+            self.check_expr_expecting(default, ty, context, "expected because of this annotation");
+        if found == TyId::ERROR || self.errors.len() != errors {
+            return None;
+        }
+        self.constant(default)
     }
 
     /// The type the union written as `id`, whose last `|` is at `bar`,
@@ -11720,9 +11922,11 @@ impl<'a> Checker<'a> {
     /// and the parameter the argument fills, with a label at what kept the
     /// parameter from being narrowed, if that is the cause (see
     /// [`Checker::narrowing_label`]); with a note when a future is expected
-    /// and what is found is not one; and with the note saying to tell a
+    /// and what is found is not one; with the note saying to tell a
     /// union's members apart when what is found is one (see
-    /// [`Checker::union_note`]).
+    /// [`Checker::union_note`]); and with the note saying that a default
+    /// fills only a record literal when what is found lacks a defaulted
+    /// field (see [`Checker::default_note`]).
     fn mismatch(
         &mut self,
         expr: ExprId,
@@ -11746,6 +11950,9 @@ impl<'a> Checker<'a> {
         if let Some(note) = self.union_note(expr, found) {
             error = error.with_note(note);
         }
+        if let Some(note) = self.default_note(found, expected) {
+            error = error.with_note(note);
+        }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);
             let found = self.shown(found);
@@ -11767,6 +11974,60 @@ impl<'a> Checker<'a> {
             }
         }
         self.errors.push(error);
+    }
+
+    /// The note on a mismatch of a value of type `found` with `expected`
+    /// when `found` lacks a defaulted field of a record type of `expected`
+    /// (see [Field defaults](#field-defaults)), which no default fills, the
+    /// value being no record literal written where the record type is
+    /// expected: "a default fills only a record literal written where `T`
+    /// is expected", `T` that record type ([`Checker::lacked_default`]).
+    /// `None` otherwise.
+    fn default_note(&mut self, found: TyId, expected: TyId) -> Option<String> {
+        let record = self.lacked_default(found, expected)?;
+        let shown = self.in_message(record);
+        Some(format!(
+            "a default fills only a record literal written where {shown} is expected"
+        ))
+    }
+
+    /// The record type, of `expected` or of a type in it, that has a
+    /// defaulted field that `found` lacks where the two types meet: each
+    /// stripped of its future layers, at the top, and then through the
+    /// element types of two list types and through the fields that two
+    /// record types share, outermost first. `None` if there is none, and
+    /// where `expected` is a `Future`.
+    ///
+    /// Recurses once per level of list and record nesting shared by the two
+    /// types.
+    fn lacked_default(&self, found: TyId, expected: TyId) -> Option<TyId> {
+        if self.types.laziness(expected) == Laziness::Future {
+            return None;
+        }
+        let (found, expected) = (self.types.strip(found), self.types.strip(expected));
+        if let (Some(found), Some(expected)) = (
+            self.types.list_element(found),
+            self.types.list_element(expected),
+        ) {
+            return self.lacked_default(found, expected);
+        }
+        let (Some(_), Some(fields)) = (
+            self.types.record_fields(found),
+            self.types.record_fields(expected),
+        ) else {
+            return None;
+        };
+        let lacked = self
+            .types
+            .defaults(expected)
+            .iter()
+            .any(|&(name, _)| self.types.field(found, name).is_none());
+        if lacked {
+            return Some(expected);
+        }
+        fields
+            .iter()
+            .find_map(|&(name, ty)| self.lacked_default(self.types.field(found, name)?, ty))
     }
 
     /// The context label on the mismatch of an argument of type `found`
@@ -12163,11 +12424,14 @@ impl<'a> Checker<'a> {
             && let Some((block, body)) = self.record_block_within(id)
         {
             let span = self.ast.get(block).span;
+            // A union of record types fills nothing.
+            let itself = record == self.types.strip(expected);
             let expecting = Expecting {
                 ty: record,
                 context,
                 why,
                 close: Span::new(span.end.saturating_sub(1), span.end),
+                fill: itself.then_some(block),
             };
             let ty = self.check_block(body, Some(expecting));
             let mut node = id;
@@ -12178,6 +12442,23 @@ impl<'a> Checker<'a> {
                     _ => break,
                 }
             }
+            return ty;
+        }
+        // `{}`, the empty record's literal, is given the defaults of a
+        // record type with defaults expected itself.
+        if let Some(block) = self.empty_block_within(id)
+            && let Some(record) = self.defaulted_record(expected)
+        {
+            let span = self.ast.get(block).span;
+            let expecting = Expecting {
+                ty: record,
+                context,
+                why,
+                close: Span::new(span.end.saturating_sub(1), span.end),
+                fill: Some(block),
+            };
+            let ty = self.empty_record(expecting);
+            self.set_through_parens(id, ty);
             return ty;
         }
         if self.expects_list(expected)
@@ -12415,7 +12696,9 @@ impl<'a> Checker<'a> {
     /// `found`, holds once the awaits marked on its fields' values have run:
     /// the record of what each field's value is, found as
     /// [`Checker::value_of`] finds it, a record block in turn as this finds
-    /// it, and a field that `record` lacks as its type says. A block with a
+    /// it, a field that `record` lacks as its type says, and a defaulted
+    /// field of `record` that the block lacks, which it was given (see
+    /// [Field defaults](#field-defaults)), as `record` has it. A block with a
     /// dotted field or a spread keeps `found`, the record of the expected
     /// fields' types, and of what the soft fields the expected type lacks
     /// hold, a supertype of what it holds.
@@ -12454,12 +12737,99 @@ impl<'a> Checker<'a> {
             };
             self.sorted_fields.push((name, 0, ty));
         }
+        // The defaulted fields the block lacks, which it was given (see
+        // [Field defaults](#field-defaults)), as the type has them.
+        for &(name, _) in self.types.defaults(record) {
+            let written = self
+                .sorted_fields
+                .get(base..)
+                .unwrap_or_default()
+                .iter()
+                .any(|&(field, _, _)| field == name);
+            if !written && let Some(ty) = self.types.field(record, name) {
+                self.sorted_fields.push((name, 0, ty));
+            }
+        }
         let fields = self.sorted_fields.get(base..).unwrap_or_default();
         let held = self
             .types
             .record(fields.iter().map(|&(name, _, ty)| (name, ty)));
         self.sorted_fields.truncate(base);
         held
+    }
+
+    /// The empty block `{}`, unlabelled, that `id` is, through any
+    /// parentheses: the empty record's literal; `None` if it is not one.
+    fn empty_block_within(&self, id: ExprId) -> Option<ExprId> {
+        let mut node = id;
+        loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::Block { items, label: None } if self.ast.items(items).is_empty() => {
+                    return Some(node);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The record type that `expected` is once stripped, if it is not a
+    /// future and the record type has defaults: what `{}` is given the
+    /// defaults of where `expected` is expected (see [Field
+    /// defaults](#field-defaults)). `None` otherwise, a union of record
+    /// types included, where `{}` is checked as ever.
+    fn defaulted_record(&self, expected: TyId) -> Option<TyId> {
+        if self.types.laziness(expected) == Laziness::Future {
+            return None;
+        }
+        let record = self.types.strip(expected);
+        (self.types.is_record(record) && !self.types.defaults(record).is_empty()).then_some(record)
+    }
+
+    /// The type of `{}`, the empty record's literal, checked against
+    /// `expecting`'s record type, which has defaults, as a record block is
+    /// ([`Checker::report_missing_fields`]): each defaulted field is given
+    /// it, and the record of those fields is its type; each other field is
+    /// missing, reported, and its type `Error`.
+    fn empty_record(&mut self, expecting: Expecting<'_>) -> TyId {
+        let base = self.sorted_fields.len();
+        let missing = self.report_missing_fields(base, expecting);
+        let fields: Vec<(Name, TyId)> = self
+            .sorted_fields
+            .get(base..)
+            .unwrap_or_default()
+            .iter()
+            .map(|&(name, _, ty)| (name, ty))
+            .collect();
+        self.sorted_fields.truncate(base);
+        if missing {
+            TyId::ERROR
+        } else {
+            self.types.record(fields)
+        }
+    }
+
+    /// The type of the function body `body`, if it is `{}` and the return
+    /// type `ret`, stated at `context`, labelled `why`, is a record type
+    /// with defaults: `{}` given them, as any `{}` is where such a type is
+    /// expected ([`Checker::empty_record`]). `None` otherwise, the body
+    /// being checked as ever.
+    fn empty_body(
+        &mut self,
+        body: ExprId,
+        ret: TyId,
+        (context, why): (Span, &str),
+    ) -> Option<TyId> {
+        let block = self.empty_block_within(body)?;
+        let record = self.defaulted_record(ret)?;
+        let span = self.ast.get(block).span;
+        Some(self.empty_record(Expecting {
+            ty: record,
+            context,
+            why,
+            close: Span::new(span.end.saturating_sub(1), span.end),
+            fill: Some(block),
+        }))
     }
 
     /// The record block that `id` is, through any parentheses, with its
@@ -13012,95 +13382,130 @@ impl<'a> Checker<'a> {
         constants
     }
 
-    /// Whether the expression `id`, a parameter's default, is a constant
-    /// (see [Calls](#calls)): a literal, a string without interpolation
-    /// (raw or not), an integer, a float, `true` or `false`; `-` applied
-    /// directly to an integer or float literal; a list literal without a
-    /// spread whose elements are constants; or a record block whose items
-    /// are all fields `NAME = CONSTANT`, of one name each and not annotated,
-    /// `{}` among them. Nothing else, not even in parentheses.
+    /// Whether the expression `id`, a parameter's or a field's default, is
+    /// a constant (see [Calls](#calls)): [`is_constant`].
+    fn is_constant(&self, id: ExprId) -> bool {
+        is_constant(self.ast, id)
+    }
+
+    /// The constant that `id`, a parameter's or a field's default that
+    /// [`Checker::is_constant`] accepts, is once checked without an error
+    /// ([`constant_of`]): an integer literal that is a `Float` there a
+    /// `Float`, and a record block given fields' defaults with those fields
+    /// (see [Field defaults](#field-defaults)). `None` if it is not one
+    /// after all.
+    fn constant(&self, id: ExprId) -> Option<Constant> {
+        constant_of(self.ast, id, (&self.expr_types, &self.record_fills))
+    }
+
+    /// The constant that `constant`, a field's default of a declared type as
+    /// a copy of its definition holds it, written with no type known (see
+    /// [`written_constant`]), is where the field is of type
+    /// `expected`, as [`Checker::check_expr_expecting`] would check the
+    /// default it is written as (see [Field defaults](#field-defaults)):
+    /// `None` if it does not fit. An `Int` is the `Int` or `Float` that an
+    /// integer literal adapts to; a `Float`, `Bool` or `String` must be a
+    /// subtype; a list is fitted against the list type expected, or the one
+    /// list member of the union expected, or, for one with several, the
+    /// first of them it fits, as a list literal checked bottom up would
+    /// be; a record likewise against a record type, a field the type lacks
+    /// kept as it is, and, where the record type is expected itself and
+    /// not a union of it, each defaulted field it lacks given its default,
+    /// as a record block is; and `{}` is given every default of a record
+    /// type with defaults expected itself, as a record block is, and must
+    /// be a subtype otherwise. Nothing fits a `Future`.
     ///
     /// Recurses once per level of list and record nesting.
-    fn is_constant(&self, id: ExprId) -> bool {
-        let ast = self.ast;
-        match ast.get(id).kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => matches!(ast.get(operand).kind, ExprKind::Int(_) | ExprKind::Float(_)),
-            ExprKind::List(elements) => ast
-                .elements(elements)
-                .iter()
-                .all(|element| element.spread.is_none() && self.is_constant(element.value)),
-            ExprKind::Block { items, label: None } => {
-                ast.items(items)
+    fn fit_constant(&self, constant: &Constant, expected: TyId) -> Option<Constant> {
+        if expected == TyId::ERROR || self.types.laziness(expected) == Laziness::Future {
+            return None;
+        }
+        let stripped = self.types.strip(expected);
+        // The members a list or record is tried against, in turn.
+        let members: &[TyId] = match self.types.union_members(stripped) {
+            Some(members) => members,
+            None => std::slice::from_ref(&stripped),
+        };
+        match constant {
+            Constant::Int(value) => match self.numeric_member(stripped)? {
+                TyId::FLOAT => Some(Constant::Float(int_to_float(*value).to_bits())),
+                _ => Some(Constant::Int(*value)),
+            },
+            Constant::Float(_) => self
+                .types
+                .is_subtype(TyId::FLOAT, expected)
+                .then(|| constant.clone()),
+            Constant::Bool(_) => self
+                .types
+                .is_subtype(TyId::BOOL, expected)
+                .then(|| constant.clone()),
+            Constant::Str(_) => self
+                .types
+                .is_subtype(TyId::STRING, expected)
+                .then(|| constant.clone()),
+            // `{}` is given the defaults of a record type with defaults
+            // expected itself, as a record block is, and is checked as ever
+            // otherwise.
+            Constant::Empty => match self.defaulted_record(expected) {
+                Some(record) => self.fit_record(&[], record, true),
+                None => self
+                    .types
+                    .is_subtype(TyId::EMPTY, expected)
+                    .then_some(Constant::Empty),
+            },
+            Constant::List(elements) => members.iter().find_map(|&member| {
+                let element = self.types.list_element(member)?;
+                elements
                     .iter()
-                    .all(|&item| match ast.item(item).kind {
-                        ItemKind::Field {
-                            path,
-                            ty: None,
-                            value,
-                            function: false,
-                        } => ast.path(path).len() == 1 && self.is_constant(value),
-                        _ => false,
-                    })
+                    .map(|value| self.fit_constant(value, element))
+                    .collect::<Option<_>>()
+                    .map(Constant::List)
+            }),
+            Constant::Record(fields) => {
+                // Only a record type expected itself fills.
+                let fills = members.len() == 1;
+                members
+                    .iter()
+                    .find_map(|&member| self.fit_record(fields, member, fills))
             }
-            _ => false,
         }
     }
 
-    /// The constant that `id`, a parameter's default that
-    /// [`Checker::is_constant`] accepts, is once checked without an error:
-    /// an integer literal that is a `Float` there a `Float`, and an
-    /// integer otherwise (an untyped one settles to `Int`). `None` if it is
-    /// not one after all.
+    /// The record constant of `fields` fitted to the record type `record`,
+    /// as [`Checker::fit_constant`] says, each defaulted field it lacks
+    /// given its default if `fills`, after the fields written, in the order
+    /// of their names; `None` if `record` is no record type, a field does
+    /// not fit, or one it lacks has no default.
     ///
     /// Recurses once per level of list and record nesting.
-    fn constant(&self, id: ExprId) -> Option<Constant> {
-        let ast = self.ast;
-        let float = |id: ExprId| self.expr_types.get(id.index()) == Some(&TyId::FLOAT);
-        Some(match ast.get(id).kind {
-            ExprKind::Int(value) if float(id) => Constant::Float(int_to_float(value).to_bits()),
-            ExprKind::Int(value) => Constant::Int(value),
-            ExprKind::Float(value) => Constant::Float(value.to_bits()),
-            ExprKind::Bool(value) => Constant::Bool(value),
-            ExprKind::Str(text) => Constant::Str(ast.strings().get(text).into()),
-            // Negated as lowering negates it: as the whole is typed.
-            ExprKind::Unary {
-                op: UnaryOp::Neg,
-                operand,
-            } => match ast.get(operand).kind {
-                ExprKind::Int(value) if float(id) => {
-                    Constant::Float((-int_to_float(value)).to_bits())
-                }
-                ExprKind::Int(value) => Constant::Int(value.checked_neg()?),
-                ExprKind::Float(value) => Constant::Float((-value).to_bits()),
-                _ => return None,
-            },
-            ExprKind::List(elements) => Constant::List(
-                ast.elements(elements)
-                    .iter()
-                    .map(|element| self.constant(element.value))
-                    .collect::<Option<_>>()?,
-            ),
-            ExprKind::Block { items, label: None } if ast.items(items).is_empty() => {
-                Constant::Empty
+    fn fit_record(
+        &self,
+        fields: &[(Name, Constant)],
+        record: TyId,
+        fills: bool,
+    ) -> Option<Constant> {
+        let expected = self.types.record_fields(record)?;
+        let mut fitted = Vec::with_capacity(expected.len().max(fields.len()));
+        for (name, value) in fields {
+            let value = match self.types.field(record, *name) {
+                Some(ty) => self.fit_constant(value, ty)?,
+                // Checked on its own, an integer settling to `Int`.
+                None => value.clone(),
+            };
+            fitted.push((*name, value));
+        }
+        let mut filled: Vec<(Name, Constant)> = Vec::new();
+        for &(name, _) in expected {
+            if fields.iter().any(|&(written, _)| written == name) {
+                continue;
             }
-            ExprKind::Block { items, label: None } => Constant::Record(
-                ast.items(items)
-                    .iter()
-                    .map(|&item| match ast.item(item).kind {
-                        ItemKind::Field { path, value, .. } => {
-                            let name = ast.path(path).first()?.name()?;
-                            Some((name, self.constant(value)?))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Option<_>>()?,
-            ),
-            _ => return None,
-        })
+            let default = self.types.field_default(record, name).filter(|_| fills)?;
+            filled.push((name, default.clone()));
+        }
+        let names = self.ast.names();
+        filled.sort_unstable_by(|(a, _), (b, _)| names.get(*a).cmp(names.get(*b)));
+        fitted.extend(filled);
+        Some(Constant::Record(fitted.into_boxed_slice()))
     }
 
     /// Narrows the callback parameters `callbacks[start..]` of the impure or
@@ -13448,11 +13853,16 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        let sorted = self.sorted_fields.get(base..end).unwrap_or_default();
-        // Sorted by name, so interning does not sort it again.
-        let record = self
-            .types
-            .record(sorted.iter().map(|&(name, _, ty)| (name, ty)));
+        let sorted: Vec<(Name, TyId)> = self
+            .sorted_fields
+            .get(base..end)
+            .unwrap_or_default()
+            .iter()
+            .map(|&(name, _, ty)| (name, ty))
+            .collect();
+        // Sorted by name, so interning does not sort it again; the declared
+        // fields keep their defaults (see [Field defaults](#field-defaults)).
+        let record = self.types.record_like(present, sorted);
         self.sorted_fields.truncate(base);
         Some(record)
     }
@@ -14738,8 +15148,11 @@ impl<'a> Checker<'a> {
                 context,
                 why,
                 close: Span::new(block.span.end.saturating_sub(1), block.span.end),
+                fill: Some(body),
             };
             let found = self.check_body(items, Some(expecting));
+            self.expr_types[body.index()] = found;
+        } else if let Some(found) = self.empty_body(body, ret, (context, why)) {
             self.expr_types[body.index()] = found;
         } else {
             // A list literal the body results in is checked against a list
@@ -15775,7 +16188,9 @@ impl<'a> Checker<'a> {
         (lhs, lhs_ty): (ExprId, TyId),
         (rhs, rhs_ty): (ExprId, TyId),
     ) -> Option<TyId> {
-        if lhs_ty == rhs_ty
+        // Two types that differ only in their fields' defaults are one (see
+        // [Field defaults](#field-defaults)).
+        if self.types.same(lhs_ty, rhs_ty)
             && (lhs_ty == TyId::BOOL
                 || lhs_ty == TyId::STRING
                 || self.types.is_record(lhs_ty)
@@ -17580,8 +17995,128 @@ const DEFAULTED: u32 = u32::MAX - 1;
 /// default (see [Calls](#calls)).
 const NOT_CONSTANT: &str = "a parameter's default must be a constant";
 
-/// The note on [`NOT_CONSTANT`]: what a constant is.
+/// The note on [`NOT_CONSTANT`] and [`FIELD_NOT_CONSTANT`]: what a
+/// constant is.
 const CONSTANT_NOTE: &str = "a literal, or a list or record of literals";
+
+/// The error for a field's default of a record type that is not a constant,
+/// at the default (see [Field defaults](#field-defaults)).
+const FIELD_NOT_CONSTANT: &str = "a field's default must be a constant";
+
+/// Whether the expression `id` of `ast`, a parameter's or a field's
+/// default, is a constant (see [Calls](#calls)): a literal, a string
+/// without interpolation (raw or not), an integer, a float, `true` or
+/// `false`; `-` applied directly to an integer or float literal; a list
+/// literal without a spread whose elements are constants; or a record
+/// block whose items are all fields `NAME = CONSTANT`, of one name each
+/// and not annotated, `{}` among them. Nothing else, not even in
+/// parentheses.
+///
+/// Recurses once per level of list and record nesting.
+fn is_constant(ast: &Ast, id: ExprId) -> bool {
+    match ast.get(id).kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => matches!(ast.get(operand).kind, ExprKind::Int(_) | ExprKind::Float(_)),
+        ExprKind::List(elements) => ast
+            .elements(elements)
+            .iter()
+            .all(|element| element.spread.is_none() && is_constant(ast, element.value)),
+        ExprKind::Block { items, label: None } => {
+            ast.items(items)
+                .iter()
+                .all(|&item| match ast.item(item).kind {
+                    ItemKind::Field {
+                        path,
+                        ty: None,
+                        value,
+                        function: false,
+                    } => ast.path(path).len() == 1 && is_constant(ast, value),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The constant that `id` of `ast`, a parameter's or a field's default that
+/// [`is_constant`] accepts, is, `types` being the type of each expression,
+/// as the check found it, and `fills` the fields each record literal was
+/// given ([`Resolution::record_fills`]): an integer literal that is a
+/// `Float` there a `Float`, and an integer otherwise (an untyped one
+/// settles to `Int`, and one of no type known is an `Int`); a record block
+/// the record of its fields in the order they are written and then of
+/// those it was given; and `{}` the record of the fields it was given, if
+/// any, and the empty record otherwise. `None` if it is not one after all.
+///
+/// Recurses once per level of list and record nesting.
+fn constant_of(ast: &Ast, id: ExprId, (types, fills): (&[TyId], &RecordFills)) -> Option<Constant> {
+    let float = |id: ExprId| types.get(id.index()) == Some(&TyId::FLOAT);
+    Some(match ast.get(id).kind {
+        ExprKind::Int(value) if float(id) => Constant::Float(int_to_float(value).to_bits()),
+        ExprKind::Int(value) => Constant::Int(value),
+        ExprKind::Float(value) => Constant::Float(value.to_bits()),
+        ExprKind::Bool(value) => Constant::Bool(value),
+        ExprKind::Str(text) => Constant::Str(ast.strings().get(text).into()),
+        // Negated as lowering negates it: as the whole is typed.
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => match ast.get(operand).kind {
+            ExprKind::Int(value) if float(id) => Constant::Float((-int_to_float(value)).to_bits()),
+            ExprKind::Int(value) => Constant::Int(value.checked_neg()?),
+            ExprKind::Float(value) => Constant::Float((-value).to_bits()),
+            _ => return None,
+        },
+        ExprKind::List(elements) => Constant::List(
+            ast.elements(elements)
+                .iter()
+                .map(|element| constant_of(ast, element.value, (types, fills)))
+                .collect::<Option<_>>()?,
+        ),
+        // `{}` given fields is the record of them.
+        ExprKind::Block { items, label: None } if ast.items(items).is_empty() => {
+            match fills.get(&id) {
+                Some(filled) => Constant::Record(filled.clone()),
+                None => Constant::Empty,
+            }
+        }
+        ExprKind::Block { items, label: None } => {
+            let mut fields = ast
+                .items(items)
+                .iter()
+                .map(|&item| match ast.item(item).kind {
+                    ItemKind::Field { path, value, .. } => {
+                        let name = ast.path(path).first()?.name()?;
+                        Some((name, constant_of(ast, value, (types, fills))?))
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if let Some(filled) = fills.get(&id) {
+                fields.extend(filled.iter().cloned());
+            }
+            Constant::Record(fields.into_boxed_slice())
+        }
+        _ => return None,
+    })
+}
+
+/// The constant that `id` of `ast`, a field's default of a record type
+/// copied out of its tree into a [`crate::ast::TypeStore`], is written as,
+/// with no type known and nothing filled ([`constant_of`]), if
+/// [`is_constant`] accepts it; `None` if it is not a constant, which the
+/// check of its own tree reports (see [Field defaults](#field-defaults)).
+/// The checker of each tree using the type fits it to its field's type
+/// (`Checker::fit_constant`).
+pub(crate) fn written_constant(ast: &Ast, id: ExprId) -> Option<Constant> {
+    if !is_constant(ast, id) {
+        return None;
+    }
+    constant_of(ast, id, (&[], &HashMap::new()))
+}
 
 /// The span of the keyword `keyword` of a `break`, `continue` or `return`
 /// item spanning `item`, which it starts, through its label, if it has one.
@@ -30511,6 +31046,377 @@ mod tests {
                 "lock(\"x\", fn(): String { \"x\" })",
                 vec![(2, constant_str(""))]
             )]
+        );
+    }
+
+    // ----- Field defaults -----
+
+    /// Each record block of `text` that the check gave fields their
+    /// defaults, as its text, with each such field's name and default, in
+    /// source order.
+    fn filled(text: &str) -> Vec<(&str, Vec<(String, Constant)>)> {
+        let (ast, _, output) = check_prelude(text);
+        let output = output.unwrap_or_else(|errors| panic!("{text}: {errors:?}"));
+        let resolution = &output.checked.resolution;
+        let mut blocks: Vec<(Span, Vec<(String, Constant)>)> = ast
+            .expr_ids()
+            .filter_map(|id| {
+                let fills = resolution.record_fills(id);
+                (!fills.is_empty()).then(|| {
+                    let fills = fills
+                        .iter()
+                        .map(|(name, default)| (ast.names().get(*name).to_owned(), default.clone()))
+                        .collect();
+                    (ast.get(id).span, fills)
+                })
+            })
+            .collect();
+        blocks.sort_by_key(|(span, _)| span.start);
+        blocks
+            .into_iter()
+            .map(|(span, fills)| (&text[span.start as usize..span.end as usize], fills))
+            .collect()
+    }
+
+    /// The name `name` as the check of `text` interns it, for constants
+    /// [`filled`] finds there.
+    fn name_of(text: &str, name: &str) -> Name {
+        let (ast, _, _) = check_prelude(text);
+        ast.names()
+            .lookup(name)
+            .unwrap_or_else(|| panic!("{text}: no name `{name}`"))
+    }
+
+    #[test]
+    fn a_record_literal_is_given_the_defaults_it_lacks() {
+        // Wherever a literal is checked against an expected record type:
+        // an annotation, an argument, a list's element, an enclosing
+        // literal's field, `:=`, a body's result and a `return`, a
+        // parameter's default, a spread that lacks the field, an
+        // ascription. A field given, by an item or a spread, is not.
+        let text = "def f(e: {a: Int, b: Int = 2}): Int { e.b }\n\
+                    let ann: {x: Int = 1, y: Int} = { y = 2 }\n\
+                    arg = f({ a = 1 })\n\
+                    list: List<{n: String = \"n\", m: Int}> = [{ m = 1 }, { m = 2; n = \"o\" }]\n\
+                    outer: {inner: {p: Bool = true, q: Int}} = { inner = { q = 1 } }\n\
+                    let mut v: {s: Float = 1, t: Int} = { t = 1; s = 2 }\n\
+                    v := { t = 3 }\n\
+                    def r(): {u: List<Int> = [1], w: Int} { w = 1 }\n\
+                    def r2(k: Bool): {u: Int = 5, w: Int} {\n\
+                    \x20   if k { return { w = 1 } }\n\
+                    \x20   w = 2\n\
+                    }\n\
+                    def d(o: {z: Int = 9, y: Int} = { y = 1 }): Int { o.z }\n\
+                    spread: {a: Int, b: Int = 2} = { ...{ a = 1 } }\n\
+                    given: {a: Int, b: Int = 2} = { ...{ a = 1; b = 3 } }\n\
+                    asc = ({ c = 1 } : {c: Int, d: {} = {}})";
+        let found = filled(text);
+        let one = |name: &str, default: Constant| vec![(name.to_owned(), default)];
+        assert_eq!(
+            found,
+            vec![
+                ("{ y = 2 }", one("x", Constant::Int(1))),
+                ("{ a = 1 }", one("b", Constant::Int(2))),
+                ("{ m = 1 }", one("n", constant_str("n"))),
+                ("{ q = 1 }", one("p", Constant::Bool(true))),
+                ("{ t = 3 }", one("s", Constant::Float(1.0f64.to_bits()))),
+                (
+                    "{ w = 1 }",
+                    one("u", Constant::List(Box::new([Constant::Int(1)])))
+                ),
+                (
+                    "{\n    if k { return { w = 1 } }\n    w = 2\n}",
+                    one("u", Constant::Int(5))
+                ),
+                ("{ w = 1 }", one("u", Constant::Int(5))),
+                ("{ y = 1 }", one("z", Constant::Int(9))),
+                ("{ ...{ a = 1 } }", one("b", Constant::Int(2))),
+                ("{ c = 1 }", one("d", Constant::Empty)),
+            ]
+        );
+        // Several, in the order of their names' text; and the literal's
+        // type has each, as the expected type has it, so it reads.
+        let text = "let e: {z: Int = 1, a: String = \"a\", m: Int} = { m = 0 }\n\
+                    = \"{e.a}{e.z}\"";
+        assert_eq!(
+            filled(text),
+            vec![(
+                "{ m = 0 }",
+                vec![
+                    ("a".to_owned(), constant_str("a")),
+                    ("z".to_owned(), Constant::Int(1))
+                ]
+            )]
+        );
+        assert_eq!(
+            shown_result("= ({ m = 0 } : {z: Int = 1, a: String = \"a\", m: Int}).z"),
+            "Int"
+        );
+        // A parameter's default given a field's is the constant with it.
+        assert_eq!(
+            defaults_of("fn d(o: {z: Int = 9, y: Int} = { y = 1 }): Int { o.z }", 0)[0]
+                .as_ref()
+                .map(|constant| match constant {
+                    Constant::Record(fields) => fields.len(),
+                    _ => 0,
+                }),
+            Some(2)
+        );
+        // An inline record type with defaults in a parameter's type, an
+        // impure function's bare parameter being its either shape.
+        let text = "def g(e: {a: Int = 1, b: Int}) -> Int { e.a }\nx = g({ b = 2 })";
+        assert_eq!(
+            filled(text),
+            vec![("{ b = 2 }", one("a", Constant::Int(1)))]
+        );
+    }
+
+    #[test]
+    fn a_field_default_must_be_a_constant() {
+        // As a parameter's: a name, a call, an interpolation, a spread, an
+        // expression of literals, wherever the type is written.
+        let cases = [
+            ("let x = 1\nlet p: {a: Int = x} = { a = 1 }", "x"),
+            ("let p: {a: Int = len([1])} = { a = 1 }", "len([1])"),
+            (
+                "let x = 1\nlet p: {a: String = \"{x}\"} = { a = \"\" }",
+                "\"{x}\"",
+            ),
+            ("let p: {a: List<Int> = [...[1]]} = { a = [1] }", "[...[1]]"),
+            ("let p: {a: Int = 1 + 1} = { a = 1 }", "1 + 1"),
+            ("let p: {a: Int = (1)} = { a = 1 }", "(1)"),
+            (
+                "let p: {a: {b: Int} = { b: Int = 1 }} = { a = { b = 1 } }",
+                "{ b: Int = 1 }",
+            ),
+            ("def f(e: {a: Int = -(1)}): Int { e.a }", "-(1)"),
+            (
+                "let f: fn({a: Int = not true}): Int = fn(e: {a: Int}): Int { 1 }",
+                "not true",
+            ),
+        ];
+        for (text, default) in cases {
+            let found = diagnostics(text);
+            assert_eq!(found.len(), 1, "{text}: {found:?}");
+            let error = &found[0];
+            assert_eq!(error.message, FIELD_NOT_CONSTANT, "{text}");
+            assert_eq!(error.notes, vec![CONSTANT_NOTE.to_owned()], "{text}");
+            assert_eq!(
+                &text[error.span.start as usize..error.span.end as usize],
+                default,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_default_is_checked_against_its_fields_type() {
+        let text = "let p: {a: Int = \"no\"} = { a = 1 }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(text, "\"no\""));
+        assert_eq!(
+            labels(&found[0]),
+            vec![(at(text, "Int"), "expected because of this annotation")]
+        );
+        assert_eq!(
+            messages("let p: {a: List<Int> = [\"a\"]} = { a = [1] }"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(
+            messages("let p: {a: {b: Int} = { c = 1 }} = { a = { b = 1 } }"),
+            vec![
+                "field `c` is not in `{b: Int}`",
+                "missing field `b` in record"
+            ]
+        );
+        // An integer where a `Float` is expected is a `Float`, nested too; a
+        // record default lacking a defaulted field of its own type is given
+        // it, as any record literal is; and `{}`, the empty record's
+        // literal, is given every default.
+        let text = "let p: {x: Float = 1, l: List<Float> = [2, 2.5], r: {b: Int, c: Int = 3} = { b = 2 }} = {}\n\
+                    = p";
+        assert_eq!(
+            shown_result(text),
+            "{l: List<Float> = [2.0, 2.5], r: {b: Int, c: Int = 3} = {b = 2; c = 3}, \
+             x: Float = 1.0}"
+        );
+        let r = Constant::Record(Box::new([
+            (name_of(text, "b"), Constant::Int(2)),
+            (name_of(text, "c"), Constant::Int(3)),
+        ]));
+        let floats = [2.0f64, 2.5].map(|value| Constant::Float(value.to_bits()));
+        assert_eq!(
+            filled(text),
+            vec![
+                ("{ b = 2 }", vec![("c".to_owned(), Constant::Int(3))]),
+                (
+                    "{}",
+                    vec![
+                        ("l".to_owned(), Constant::List(Box::new(floats))),
+                        ("r".to_owned(), r),
+                        ("x".to_owned(), Constant::Float(1.0f64.to_bits())),
+                    ]
+                ),
+            ]
+        );
+        // So is `{}` as the default of a field of a type with defaults.
+        let text = "let p: {a: {b: Int = 1} = {}} = {}";
+        let b = Constant::Record(Box::new([(name_of(text, "b"), Constant::Int(1))]));
+        assert_eq!(
+            filled(text),
+            vec![
+                ("{}", vec![("b".to_owned(), Constant::Int(1))]),
+                ("{}", vec![("a".to_owned(), b)]),
+            ]
+        );
+        // Checked once, however often its type is resolved.
+        assert_eq!(
+            messages("def f(e: {a: Int = \"x\"}): {a: Int = true} { a = 1 }\nb = f({ a = 2 })"),
+            vec!["mismatched types", "mismatched types"]
+        );
+    }
+
+    #[test]
+    fn the_empty_record_literal_is_given_defaults() {
+        // `{}` where a record type with defaults is expected itself: an
+        // annotation, an argument, a list's element, through parentheses,
+        // a function's body and a parameter's default.
+        let text = "def f(e: {a: Int = 2}): Int { e.a }\n\
+                    let v: {a: Int = 1, s: String = \"s\"} = {}\n\
+                    x = f(({}))\n\
+                    l: List<{k: Int = 4}> = [{}, { k = 5 }]\n\
+                    def r(): {q: Bool = true} {}\n\
+                    def d(o: {z: Int = 9} = {}): Int { o.z }";
+        let one = |name: &str, default: Constant| vec![(name.to_owned(), default)];
+        assert_eq!(
+            filled(text),
+            vec![
+                (
+                    "{}",
+                    vec![
+                        ("a".to_owned(), Constant::Int(1)),
+                        ("s".to_owned(), constant_str("s"))
+                    ]
+                ),
+                ("{}", one("a", Constant::Int(2))),
+                ("{}", one("k", Constant::Int(4))),
+                ("{}", one("q", Constant::Bool(true))),
+                ("{}", one("z", Constant::Int(9))),
+            ]
+        );
+        assert_eq!(
+            shown_result("let v: {a: Int = 1, s: String = \"s\"} = {}\n= v.s"),
+            "String"
+        );
+        // A parameter's default that is `{}` is the record of what it is
+        // given.
+        assert_eq!(
+            defaults_of("fn d(o: {z: Int = 9} = {}): Int { o.z }", 0),
+            vec![Some(Constant::Record(Box::new([(
+                name_of("fn d(o: {z: Int = 9} = {}): Int { o.z }", "z"),
+                Constant::Int(9)
+            )])))]
+        );
+        // A field without a default is missing, as for any record literal.
+        let text = "let w: {a: Int, b: Int = 1} = {}";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "missing field `a` in record");
+        assert_eq!(found[0].span, last(text, "}"));
+        // A union expected, or a record type without defaults, or none
+        // expected: `{}` is checked as ever.
+        assert_eq!(
+            messages("let u: {a: Int = 1} | String = {}"),
+            vec!["mismatched types"]
+        );
+        assert_eq!(messages("let p: {a: Int} = {}"), vec!["mismatched types"]);
+        assert!(filled("let e: {} = {}\nlet f = {}").is_empty());
+        assert_eq!(shown_result("let e = {}\n= e"), "{}");
+    }
+
+    #[test]
+    fn only_a_record_literal_is_given_defaults() {
+        let note = "a default fills only a record literal written where \
+                    `{b: Int = 2, c: Int}` is expected";
+        let def = "def f(e: {b: Int = 2, c: Int}): Int { e.b }\n";
+        // A variable, a call's result, a field read, a literal checked with
+        // no expected type and used later: the usual mismatch, noted.
+        let cases = [
+            ("let plain = { c = 1 }\nm = f(plain)", "plain"),
+            ("fn mk(): {c: Int} { c = 1 }\nm = f(mk())", "mk()"),
+            ("let o = { i = { c = 1 } }\nm = f(o.i)", "o.i"),
+        ];
+        for (case, at_text) in cases {
+            let text = format!("{def}{case}");
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{case}: {found:?}");
+            assert_eq!(found[0].message, "mismatched types", "{case}");
+            assert_eq!(found[0].span, last(&text, at_text), "{case}");
+            assert_eq!(
+                found[0].label.as_deref(),
+                Some("expected {b: Int = 2, c: Int}, found {c: Int}"),
+                "{case}"
+            );
+            assert_eq!(found[0].notes, vec![note.to_owned()], "{case}");
+        }
+        // Where the record meets the type inside a list or a field too.
+        let found = diagnostics(
+            "let xs = [{ c = 1 }]\nlet ys: List<{b: Int = 2, c: Int}> = xs\n\
+             let o = { r = { c = 1 } }\nlet p: {r: {b: Int = 2, c: Int}} = o",
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].notes, vec![note.to_owned()]);
+        assert_eq!(found[1].notes, vec![note.to_owned()]);
+        // A spread's field, met where its record's field is expected.
+        let found =
+            diagnostics("let i = { c = 1 }\nlet p: {r: {b: Int = 2, c: Int}} = { ...{ r = i } }");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].notes, vec![note.to_owned()]);
+        // No note where nothing defaulted is lacking.
+        let found = diagnostics(&format!("{def}m = f(1)"));
+        assert!(found[0].notes.is_empty(), "{found:?}");
+        // A union of record types expected fills nothing.
+        let text = "let p: {a: Int = 1, b: Int} | String = { b = 2 }";
+        assert_eq!(messages(text), vec!["missing field `a` in record"]);
+        // A field given is checked as ever.
+        assert_eq!(
+            messages(&format!("{def}m = f({{ c = 1; b = \"x\" }})")),
+            vec!["mismatched types"]
+        );
+    }
+
+    #[test]
+    fn defaults_change_no_types_identity() {
+        // Assignable and equal both ways; joined and listed without a
+        // union.
+        let text = "let p: {a: Int = 1} = { a = 2 }\n\
+                    let q: {a: Int} = p\n\
+                    let r: {a: Int = 5} = q\n\
+                    e = p == q\n\
+                    t = q === r\n\
+                    u = r != p\n\
+                    j = if e { p } else { q }\n\
+                    l = [p, q, r]";
+        assert!(
+            diagnostics_or_none(text).is_empty(),
+            "{:?}",
+            diagnostics_or_none(text)
+        );
+        assert!(warnings(text).is_empty(), "{:?}", warnings(text));
+        // Shown with their defaults in an error.
+        let found = diagnostics("let s: {a: Int = 1, b: List<String> = []} = 5");
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected {a: Int = 1, b: List<String> = []}, found Int")
+        );
+        // A function's type shows the defaults of its parameters' record
+        // types, which are part of them.
+        assert_eq!(
+            file_type("def f(e: {a: Int = 1}): Int { e.a }"),
+            "{f: fn(e: {a: Int = 1}): Int}"
         );
     }
 }

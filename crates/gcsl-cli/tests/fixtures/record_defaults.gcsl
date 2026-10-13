@@ -1,0 +1,9 @@
+# The summary of slice 49: a field of a record type with a default, which a
+# record literal written where the type is expected is given if it lacks it.
+type Install = { from: String, to: String, exclude: List<String> = [] }
+entries: List<Install> = [
+    { from = "a"; to = "b" },
+    { from = "c"; to = "d"; exclude = ["x"] },
+]
+def f(e: Install): Int { len(e.exclude) }
+n = f({ from = "a"; to = "b" })

@@ -175,6 +175,20 @@
 //! definition used twice shares its nodes, so a tree's type expressions may
 //! share children; the parser's are still allocated children first.
 //!
+//! A field of a record type may have a default, `{exclude: List<String> =
+//! [], from: String}` (see the checker's "Field defaults"): its
+//! [`FieldTy::default`], a [`FieldDefault`]. As the parser writes it, it is
+//! an expression of the tree, any expression, parsed after the field's type
+//! and so before whatever follows the type (a `let`'s value, a function's
+//! body), and its nodes are part of the subtree of the expression or item
+//! the type is written in (`Ast::subtree`). A copy of a definition cannot
+//! hold an expression of another tree, so a default copied out of a tree
+//! into a [`TypeStore`] is made the [`Constant`] it is written as, if it is
+//! one, its integers left as integers and nothing filled
+//! (`check::written_constant`), held in the arena's pool of constants,
+//! and copied on, pool and all, into each tree using its declaration; the
+//! checker fits it to its field's type there.
+//!
 //! # Def-types
 //!
 //! A `def` marked `#[def_type]` is a *def-type*, and other `def`s are made
@@ -252,10 +266,12 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::MAX_DEPTH;
+use crate::check::{Constant, written_constant};
 use crate::diagnostic::Diagnostic;
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted, StrId, Strings};
+use crate::types::write_constant;
 
 /// Index of an [`Expr`] in the arena of the [`Ast`] (or [`AstBuilder`]) that
 /// allocated it.
@@ -1017,9 +1033,9 @@ impl fmt::Display for PathDisplay<'_> {
     }
 }
 
-/// One entry of a record type expression: a field, `NAME: TYPE`, or a
-/// spread, `...TYPE`, whose fields join the record type (see
-/// [Types](#types)).
+/// One entry of a record type expression: a field, `NAME: TYPE` or `NAME:
+/// TYPE = DEFAULT`, or a spread, `...TYPE`, whose fields join the record
+/// type (see [Types](#types)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FieldTy {
     /// The field's name, plain or quoted in source; `None` for a spread.
@@ -1028,6 +1044,30 @@ pub struct FieldTy {
     pub span: Span,
     /// The field's type, or the type a spread spreads.
     pub ty: TypeExprId,
+    /// The field's default, if it has one; a spread never has one.
+    pub default: Option<FieldDefault>,
+}
+
+/// What [`TypeArena::copy`] makes a node of a kind of, if anything: the
+/// kind the node is given in place of its own, with nothing under it.
+type Replace<'r> = &'r dyn Fn(TypeExprId) -> Option<TypeExprKind>;
+
+/// What [`TypeArena::copy`] makes the constant of a field's default that is
+/// an expression of the tree copied from: the constant it is written as,
+/// if it is one.
+type ToConstant<'c> = &'c dyn Fn(ExprId) -> Option<Constant>;
+
+/// The default of a field of a record type expression (see
+/// [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldDefault {
+    /// As the parser made it: the expression after the field's `=`, of the
+    /// tree whose arena holds the field.
+    Expr(ExprId),
+    /// As a copy of a declaration's definition holds it: an index into the
+    /// pool of constants of the arena that holds the field
+    /// ([`Ast::copied_default`]).
+    Copied(u32),
 }
 
 /// One part of an interpolated string.
@@ -1698,12 +1738,16 @@ pub struct TypeExpr {
 
 /// The type expressions of a tree, or of a [`TypeStore`]: the nodes, in an
 /// arena indexed by [`TypeExprId`], with the fields of record types and the
-/// parameters of function types each in a pool of their own.
+/// parameters of function types each in a pool of their own, and the
+/// defaults of fields that copies hold ([`FieldDefault::Copied`]) in a
+/// third, each the constant it is, or `None` for one that is not a
+/// constant.
 #[derive(Clone, Debug, Default)]
 pub struct TypeArena {
     exprs: Vec<TypeExpr>,
     fields: Vec<FieldTy>,
     params: Vec<ParamTy>,
+    constants: Vec<Option<Constant>>,
 }
 
 impl TypeArena {
@@ -1797,13 +1841,16 @@ impl TypeArena {
     /// its span, with nothing under it; every other node is a node of its
     /// kind and span, its children copied. A qualified name `replace` gives
     /// no kind is [`TypeExprKind::Invalid`], its path being of `from`'s tree.
+    /// A field's default is copied into this arena's pool of constants: one
+    /// `from` holds as an expression, of `from`'s tree, as what `constant`
+    /// makes of it, and one `from` holds in its pool as it is there.
     /// Recurses once per level of nesting under `root`.
     fn copy(
         &mut self,
         from: &TypeArena,
         root: TypeExprId,
         memo: &mut HashMap<TypeExprId, TypeExprId>,
-        replace: &dyn Fn(TypeExprId) -> Option<TypeExprKind>,
+        (replace, constant): (Replace<'_>, ToConstant<'_>),
     ) -> TypeExprId {
         if let Some(&copied) = memo.get(&root) {
             return copied;
@@ -1819,9 +1866,23 @@ impl TypeArena {
                     let fields: Vec<FieldTy> = from
                         .fields(range)
                         .iter()
-                        .map(|field| FieldTy {
-                            ty: self.copy(from, field.ty, memo, replace),
-                            ..*field
+                        .map(|field| {
+                            let default = field.default.map(|default| {
+                                let copied = match default {
+                                    FieldDefault::Expr(expr) => constant(expr),
+                                    FieldDefault::Copied(at) => {
+                                        from.constants.get(at as usize).cloned().flatten()
+                                    }
+                                };
+                                let at = next_id(self.constants.len());
+                                self.constants.push(copied);
+                                FieldDefault::Copied(at)
+                            });
+                            FieldTy {
+                                ty: self.copy(from, field.ty, memo, (replace, constant)),
+                                default,
+                                ..*field
+                            }
                         })
                         .collect();
                     TypeExprKind::Record(self.push_fields(&fields))
@@ -1836,13 +1897,13 @@ impl TypeArena {
                         .params(params)
                         .iter()
                         .map(|param| ParamTy {
-                            ty: self.copy(from, param.ty, memo, replace),
+                            ty: self.copy(from, param.ty, memo, (replace, constant)),
                             ..*param
                         })
                         .collect();
-                    let ret = self.copy(from, ret, memo, replace);
+                    let ret = self.copy(from, ret, memo, (replace, constant));
                     let meta = meta.map(|meta| MetaTy {
-                        ty: self.copy(from, meta.ty, memo, replace),
+                        ty: self.copy(from, meta.ty, memo, (replace, constant)),
                         ..meta
                     });
                     TypeExprKind::Fn {
@@ -1855,14 +1916,14 @@ impl TypeArena {
                 TypeExprKind::Applied { name, span, arg } => TypeExprKind::Applied {
                     name,
                     span,
-                    arg: self.copy(from, arg, memo, replace),
+                    arg: self.copy(from, arg, memo, (replace, constant)),
                 },
                 TypeExprKind::List(element) => {
-                    TypeExprKind::List(self.copy(from, element, memo, replace))
+                    TypeExprKind::List(self.copy(from, element, memo, (replace, constant)))
                 }
                 TypeExprKind::Union { lhs, rhs, bar } => {
-                    let lhs = self.copy(from, lhs, memo, replace);
-                    let rhs = self.copy(from, rhs, memo, replace);
+                    let lhs = self.copy(from, lhs, memo, (replace, constant));
+                    let rhs = self.copy(from, rhs, memo, (replace, constant));
                     TypeExprKind::Union { lhs, rhs, bar }
                 }
                 TypeExprKind::Path(_) => TypeExprKind::Invalid,
@@ -2085,6 +2146,7 @@ pub struct TypeStoreMark {
     exprs: usize,
     fields: usize,
     params: usize,
+    constants: usize,
     decls: usize,
 }
 
@@ -2133,6 +2195,7 @@ impl TypeStore {
             exprs: self.arena.exprs.len(),
             fields: self.arena.fields.len(),
             params: self.arena.params.len(),
+            constants: self.arena.constants.len(),
             decls: self.decls.len(),
         }
     }
@@ -2142,6 +2205,7 @@ impl TypeStore {
         self.arena.exprs.truncate(mark.exprs);
         self.arena.fields.truncate(mark.fields);
         self.arena.params.truncate(mark.params);
+        self.arena.constants.truncate(mark.constants);
         self.heights.truncate(mark.exprs);
         self.decls.truncate(mark.decls);
     }
@@ -2161,7 +2225,11 @@ impl TypeStore {
     /// `ast`, copied out of it, with each node `links` has an entry for (by
     /// id, in order) a [`TypeExprKind::Ref`] to the declaration it names, or
     /// [`TypeExprKind::Invalid`] if it names none it can. Spreads are
-    /// copied as they are written, until it is settled.
+    /// copied as they are written, until it is settled. A field's default
+    /// is copied as the constant it is written as, if it is one
+    /// (`check::written_constant`), which the checker of each tree using
+    /// the declaration fits to the field's type; what is wrong in it, its
+    /// own file's check reports.
     pub fn declare(
         &mut self,
         decl: u32,
@@ -2176,9 +2244,10 @@ impl TypeStore {
                 _ => TypeExprKind::Invalid,
             })
         };
+        let constant = |expr: ExprId| written_constant(ast, expr);
         let copied = self
             .arena
-            .copy(&ast.types, root, &mut HashMap::new(), &replace);
+            .copy(&ast.types, root, &mut HashMap::new(), (&replace, &constant));
         self.heights.resize(self.arena.len(), 1);
         if let Some(entry) = self.decls.get_mut(decl as usize) {
             *entry = (first, copied);
@@ -2781,6 +2850,64 @@ impl Ast {
         self.types.fields(range)
     }
 
+    /// The constant that the default [`FieldDefault::Copied`] `at` of a
+    /// copy of a declaration's definition is (see [Types](#types)): `None`
+    /// if it is written as something that is not a constant, which its own
+    /// file's check reports.
+    #[must_use]
+    pub fn copied_default(&self, at: u32) -> Option<&Constant> {
+        self.types.constants.get(at as usize)?.as_ref()
+    }
+
+    /// The first of the defaults written in the type expression `id` that
+    /// the parser made, at any depth, in the order it parsed them: the one
+    /// of the least id, since each is a subtree of its own, allocated where
+    /// it is written. `None` if it has none. Recurses once per level of
+    /// nesting in the type.
+    fn first_default(&self, id: TypeExprId) -> Option<ExprId> {
+        let mut first: Option<ExprId> = None;
+        let mut take = |found: Option<ExprId>| {
+            if let Some(found) = found
+                && first.is_none_or(|first| found.0 < first.0)
+            {
+                first = Some(found);
+            }
+        };
+        match self.types.kind(id) {
+            TypeExprKind::Record(range) => {
+                for field in self.types.fields(range) {
+                    take(self.first_default(field.ty));
+                    if let Some(FieldDefault::Expr(default)) = field.default {
+                        take(Some(default));
+                    }
+                }
+            }
+            TypeExprKind::Fn {
+                params, ret, meta, ..
+            } => {
+                for param in self.types.params(params) {
+                    take(self.first_default(param.ty));
+                }
+                take(self.first_default(ret));
+                if let Some(meta) = meta {
+                    take(self.first_default(meta.ty));
+                }
+            }
+            TypeExprKind::Applied { arg, .. } | TypeExprKind::List(arg) => {
+                take(self.first_default(arg));
+            }
+            TypeExprKind::Union { lhs, rhs, .. } => {
+                take(self.first_default(lhs));
+                take(self.first_default(rhs));
+            }
+            TypeExprKind::Named(_)
+            | TypeExprKind::Path(_)
+            | TypeExprKind::Ref(_)
+            | TypeExprKind::Invalid => {}
+        }
+        first
+    }
+
     /// Returns the segments of the path `range`, in source order. A path
     /// always has at least one.
     ///
@@ -3183,7 +3310,13 @@ impl Ast {
                     let expanded = match definition {
                         Some(root) => {
                             let start = self.types.len();
-                            let copy = self.types.copy(&store.arena, root, &mut memo, &|_| None);
+                            // A store holds no expression of a tree.
+                            let copy = self.types.copy(
+                                &store.arena,
+                                root,
+                                &mut memo,
+                                (&|_| None, &|_| None),
+                            );
                             // The copies are children first, so each one's
                             // height follows from its children's.
                             for new in self.types.ids_from(start) {
@@ -3296,9 +3429,11 @@ impl Ast {
     /// segments, which belong to its item).
     /// The first is found by following, from `id`, the child the parser
     /// parses first down to a leaf: a block's first item's value, or the
-    /// position of the first index segment of its path if it has one, an
+    /// position of the first index segment of its path if it has one, or
+    /// the first field default in its annotation if it has one, an
     /// `if`'s condition, a call's callee, a binary operator's left operand,
-    /// a function's first parameter default if it has one (a default is
+    /// a function's first parameter default, or field default in a
+    /// parameter's or its return type, if it has one (a default is
     /// parsed before the body) and its body otherwise, a `lazy`'s body, an
     /// interpolated string's first expression, a list literal's first
     /// element's, an index's list, an
@@ -3360,12 +3495,16 @@ impl Ast {
                 | ExprKind::Ascribe { expr: inner, .. }
                 | ExprKind::Is { expr: inner, .. }
                 | ExprKind::As { expr: inner, .. } => inner,
-                // A parameter's default is parsed before the body.
+                // A parameter's default, and a field's default in a
+                // parameter's or the return type, is parsed before the body.
                 ExprKind::Fn(function) => {
                     let decl = self.fn_decl(function);
                     self.params(decl.params)
                         .iter()
-                        .find_map(|param| param.default)
+                        .flat_map(|param| [self.first_default(param.ty), param.default])
+                        .chain([decl.ret.and_then(|ret| self.first_default(ret))])
+                        .flatten()
+                        .min_by_key(|default| default.0)
                         .unwrap_or(decl.body)
                 }
                 ExprKind::Lazy(function) => self.fn_decl(function).body,
@@ -3407,6 +3546,18 @@ impl Ast {
                         .find_map(PathSegment::position)
                         .unwrap_or(value),
                 ),
+                // A field's default in the annotation is parsed before the
+                // value.
+                ItemKind::Let {
+                    ty: Some(ty),
+                    value,
+                    ..
+                }
+                | ItemKind::Field {
+                    ty: Some(ty),
+                    value,
+                    ..
+                } => Some(self.first_default(ty).unwrap_or(value)),
                 kind => kind.value(),
             })
     }
@@ -3836,6 +3987,20 @@ impl WrittenType<'_> {
                         None => f.write_str("...")?,
                     }
                     self.type_expr(f, field.ty)?;
+                    match field.default {
+                        Some(FieldDefault::Expr(default)) => {
+                            f.write_str(" = ")?;
+                            self.default_expr(f, default)?;
+                        }
+                        Some(FieldDefault::Copied(at)) => {
+                            f.write_str(" = ")?;
+                            match self.ast.copied_default(at) {
+                                Some(constant) => write_constant(f, constant, names)?,
+                                None => f.write_str("...")?,
+                            }
+                        }
+                        None => {}
+                    }
                 }
                 f.write_str("}")
             }
@@ -3905,6 +4070,70 @@ impl WrittenType<'_> {
             f.write_str(")")
         } else {
             self.type_expr(f, id)
+        }
+    }
+
+    /// Writes the expression `id`, a field's default as the parser made it,
+    /// on one line, as a type is written: a literal as a value's `repr`
+    /// shows it (an integer or a float as written, `true`, `false`, a
+    /// string quoted), `-` before a number, a list literal of such in
+    /// brackets, `[1, 2]`, and a record block of fields of one name each,
+    /// `{a = 1; b = 2}`, `{}` included; and anything else, which is no
+    /// constant (see the checker's "Field defaults"), as `...`.
+    ///
+    /// Recurses once per level of list and record nesting.
+    fn default_expr(&self, f: &mut fmt::Formatter<'_>, id: ExprId) -> fmt::Result {
+        let ast = self.ast;
+        match ast.get(id).kind {
+            ExprKind::Int(value) => write!(f, "{value}"),
+            ExprKind::Float(value) => write!(f, "{value:?}"),
+            ExprKind::Bool(value) => write!(f, "{value}"),
+            ExprKind::Str(text) => write!(f, "{}", Quoted(ast.strings.get(text))),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => {
+                f.write_str("-")?;
+                self.default_expr(f, operand)
+            }
+            ExprKind::List(elements) => {
+                f.write_str("[")?;
+                for (index, element) in ast.elements(elements).iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    if element.spread.is_some() {
+                        f.write_str("...")?;
+                    }
+                    self.default_expr(f, element.value)?;
+                }
+                f.write_str("]")
+            }
+            ExprKind::Block { items, label: None } => {
+                f.write_str("{")?;
+                for (index, &item) in ast.items(items).iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    let ItemKind::Field { path, value, .. } = ast.item(item).kind else {
+                        f.write_str("...")?;
+                        continue;
+                    };
+                    let name = match ast.path(path) {
+                        [field] => field.name(),
+                        _ => None,
+                    };
+                    match name {
+                        Some(name) => {
+                            write!(f, "{} = ", FieldName(self.names.get(name)))?;
+                            self.default_expr(f, value)?;
+                        }
+                        None => f.write_str("...")?,
+                    }
+                }
+                f.write_str("}")
+            }
+            _ => f.write_str("..."),
         }
     }
 }
@@ -4319,6 +4548,13 @@ mod tests {
     fn a_parameter_is_small() {
         // Its name, span and type, 16 bytes, and its optional default, 8.
         assert_eq!(size_of::<Param>(), 24);
+    }
+
+    #[test]
+    fn a_field_type_is_small() {
+        // Its optional name, span and type, 20 bytes, and its optional
+        // default, 8: a tag and an expression or a constant's index.
+        assert_eq!(size_of::<FieldTy>(), 28);
     }
 
     #[test]

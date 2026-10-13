@@ -372,10 +372,18 @@
 //! the field access `(x : Int).y` and could only be an error, is now the
 //! ascription of a qualified name. A
 //! record type is `{` then `}`, or entries separated by `,`, each `NAME:
-//! TYPE` or a spread, `...TYPE`, whose fields join the record type,
-//! with an optional trailing `,`, then `}`. The lexer does not know it is
+//! TYPE`, `NAME: TYPE = DEFAULT` or a spread, `...TYPE`, whose fields join
+//! the record type, with an optional trailing `,`, then `}`. A field's
+//! default, [`FieldDefault::Expr`], is any expression, after the `=`, as a
+//! parameter's default is (`Parser::parse_field_default`), wherever the
+//! record type is written: in an annotation, a `type`, a parameter's or a
+//! return type, a list or function type, nested in another record type or
+//! in a union; what a default may be is the checker's business (see its
+//! "Field defaults"). A spread has none: an `=` after one is "expected
+//! `,` or `}`", as before. The lexer does not know it is
 //! in a type, so it emits the newlines inside the braces, and the parser
-//! skips them all: a record type may span lines freely. Repeated field names
+//! skips them all, around a default's `=` too: a record type may span lines
+//! freely. Repeated field names
 //! are left to the checker, and the merging of spreads to the expansion of
 //! the file's types (see [`crate::ast`], "Types"). A function type is
 //! `fn`, `(`, parameter types
@@ -749,7 +757,7 @@
 //! field access one above its record, an ascription, an `is` or an `as`
 //! one above the taller of its expression and its type (a record type
 //! being one above its tallest
-//! field type, a function type one above the tallest of its parameter and
+//! field type or field default, a function type one above the tallest of its parameter and
 //! return types, an applied type one above its argument, a `T[]` one above
 //! `T`, a parenthesised
 //! type one above the type inside, though it leaves no node of its own, and
@@ -769,9 +777,10 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, DefTypeRole, DefTypeUse, Effect, Element, Expr,
-    ExprId, ExprKind, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember,
-    ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange,
-    PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    ExprId, ExprKind, FieldDefault, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm,
+    ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param,
+    ParamTy, PathRange, PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind,
+    UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -3288,10 +3297,20 @@ impl Parser<'_> {
             };
             let (ty, height) = self.parse_type()?;
             tallest = tallest.max(height);
+            self.skip_newlines();
+            // A field's default; a spread has none.
+            let default = match name {
+                Some(_) => self.parse_field_default()?,
+                None => None,
+            };
+            if let Some(default) = default {
+                tallest = tallest.max(self.height_of(default));
+            }
             self.field_ty_stack.push(FieldTy {
                 name,
                 span: token.span,
                 ty,
+                default: default.map(FieldDefault::Expr),
             });
             self.skip_newlines();
             let separator = self.peek();
@@ -3312,6 +3331,24 @@ impl Parser<'_> {
             span: Span::join(open.span, close.span),
         });
         Ok((id, tallest + 1))
+    }
+
+    /// Parses a field's default in a record type, `= EXPR`, if the current
+    /// token, after the field's type and any newlines, is its `=`: the
+    /// newlines after the `=`, and the expression, any expression, parsed
+    /// at minimum binding power 0 as a parameter's default is, inside the
+    /// type's braces, where a `{` after an expression on its line starts a
+    /// trailing block; `None` if no `=` follows.
+    fn parse_field_default(&mut self) -> ParseResult<Option<ExprId>> {
+        if self.peek().kind != TokenKind::Eq {
+            return Ok(None);
+        }
+        self.advance();
+        self.skip_newlines();
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
+        let default = self.parse_expr(0);
+        self.braces = outer;
+        default.map(Some)
     }
 
     /// Parses an expression whose binary operators all have a left binding
@@ -4822,6 +4859,10 @@ mod tests {
                         None => out.push_str("..."),
                     }
                     type_name(ast, field.ty, out);
+                    if let Some(FieldDefault::Expr(default)) = field.default {
+                        out.push_str(" = ");
+                        expr(ast, default, out);
+                    }
                 }
                 out.push('}');
             }
@@ -6571,6 +6612,76 @@ mod tests {
         assert_eq!(fields[1].span, Span::new(13, 16));
         assert_eq!(fields[1].name.map(|name| ast.names().get(name)), Some("b"));
         assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(18, 20));
+    }
+
+    #[test]
+    fn record_type_fields_may_have_defaults() {
+        // Any expression, after any field, wherever a record type is
+        // written: an annotation, a parameter's type, a return type, a
+        // function type, nested, in a list or a union. What a default may
+        // be is the checker's business.
+        assert_eq!(
+            shape("let p: {a: Int = 1, b: String, c: List<String> = []} = q"),
+            "let p: {a: Int = 1, b: String, c: List<String> = list()} = q"
+        );
+        assert_eq!(
+            shape("fn(e: {a: Int = -1}): {r: Bool = true} { e }"),
+            "fn(e: {a: Int = (-1)}): {r: Bool = true} {e}"
+        );
+        assert_eq!(
+            shape("let f: fn({a: Int = 1}): Int = g"),
+            "let f: fn({a: Int = 1}): Int = g"
+        );
+        assert_eq!(
+            shape("1 : {a: {b: Int = 1} = { b = 2 }, c: List<{d: String = \"x\"}>} | Int"),
+            "(1 : ({a: {b: Int = 1} = {b = 2}, c: List<{d: String = \"x\"}>} | Int))"
+        );
+        assert_eq!(shape("x is {a: Int = k + 1}"), "(x is {a: Int = (k + 1)})");
+        // Newlines around the `=`, and a trailing block in a default, the
+        // braces being the type's.
+        assert_eq!(
+            shape("let p: {\n  a: Int\n  =\n  1,\n  b: Int = g { x = 1 }\n} = q"),
+            "let p: {a: Int = 1, b: Int = g(){x = 1}} = q"
+        );
+        // A spread has none.
+        assert_eq!(
+            error("1 : {...T = 1}"),
+            ("expected `,` or `}`".to_owned(), Span::new(10, 11))
+        );
+        assert_eq!(
+            error("1 : {a: Int = }"),
+            (
+                "expected expression, found `}`".to_owned(),
+                Span::new(14, 15)
+            )
+        );
+        // A default is parsed after its field's type, before what follows
+        // the type: the first node of a `let`'s block and of a function, as
+        // a parameter's default is.
+        let text = "fn(x: {a: Int = 1}, y: Int = 2): {r: Int = 3} { x }";
+        let ast = parse_text(text).unwrap();
+        let value = only_value(&ast);
+        let first = ast.subtree(value).next().unwrap();
+        assert_eq!(ast.get(first).span, Span::new(16, 17));
+        assert_eq!(ast.subtree(value).count(), ast.len());
+        let text = "{\n  let p: List<{a: Int = 7}> = q\n  = p\n}";
+        let ast = parse_text(text).unwrap();
+        let value = only_value(&ast);
+        let first = ast.subtree(value).next().unwrap();
+        assert_eq!(
+            &text[ast.get(first).span.start as usize..],
+            "7}> = q\n  = p\n}"
+        );
+        assert_eq!(ast.subtree(value).count(), ast.len());
+        // The tree dump shows a default after its field's type.
+        assert_eq!(
+            parse_text("1 : {a: Int = -1, b: List<{c: String}> = [{ c = \"x\" }], d: Int = k}")
+                .unwrap()
+                .pretty()
+                .to_string(),
+            "(file\n  (expr @0..67\n    (: {a: Int = -1, b: List<{c: String}> = \
+             [{c = \"x\"}], d: Int = ...} @0..67\n      (int 1 @0..1))))"
+        );
     }
 
     #[test]

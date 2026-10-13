@@ -31,6 +31,33 @@
 //! fields they share, each with the join of its two types; see
 //! [`TypeTable::join`].
 //!
+//! # Defaults
+//!
+//! A field of a record type as written may have a default, `{exclude:
+//! List<String> = [], from: String}`: a [`Constant`], which the checker
+//! gives a record literal written where the type is expected and that
+//! lacks the field (see [`crate::check`], "Field defaults"). A
+//! [`RecordTy`] keeps its defaults beside its fields, sorted by name too,
+//! so a record type with defaults is interned as a type of its own, and
+//! [`TypeTable::display`] shows them where they are written. A record
+//! literal's own type has none, though a field of it may have the type the
+//! expected type gave it, defaults and all.
+//!
+//! Defaults do not change which values a type admits, so nothing that
+//! compares types looks at them: subtyping, the test of `is` and `as`,
+//! [`TypeTable::overlaps`] and the join compare fields alone, so `{a: Int =
+//! 1}` and `{a: Int}` are each a subtype of the other, and where the
+//! checker needs two types to be one it asks [`TypeTable::same`], which
+//! forgets them. Where one of two such types must be kept, the type made
+//! is as follows: the join of two record types has no default (it is built
+//! from their shared fields, as a value's type is); a union keeps, of two
+//! members that are each a subtype of the other, the one interned first,
+//! with its defaults, as it does any two such members; and a record type
+//! rebuilt from another's fields ([`TypeTable::settle`],
+//! [`TypeTable::present`], [`TypeTable::with_field`]) keeps the defaults of
+//! the fields it keeps, a field whose type a functional update sets losing
+//! its own.
+//!
 //! # Lists
 //!
 //! `List<T>`, [`TyKind::List`], is the type of every list whose elements
@@ -256,9 +283,9 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::ast::{Effect, FnId};
-use crate::check::Builtin;
+use crate::check::{Builtin, Constant};
 use crate::names::{Name, Names};
-use crate::strings::FieldName;
+use crate::strings::{FieldName, Quoted};
 use crate::value::ValueKind;
 
 /// An interned type: an index into the [`TypeTable`] that produced it.
@@ -359,12 +386,22 @@ pub enum TyKind {
     Builtin(Builtin),
 }
 
-/// The fields of a record type.
+/// The fields of a record type, and the defaults of those that have one
+/// (see [Defaults](#defaults)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RecordTy {
     /// Each field's name and type, sorted by name, with no name twice.
     pub fields: Box<[(Name, TyId)]>,
+    /// Each defaulted field's name and default, sorted by name, each a name
+    /// of `fields`; `None` for a record type without defaults, never an
+    /// empty list. Boxed once more, behind a thin pointer, so that a record
+    /// type, nearly every one of which has none, makes a [`TyKind`] no
+    /// larger than a function type's signature does.
+    pub defaults: Option<Box<Defaults>>,
 }
+
+/// The defaults of a record type's fields: see [`RecordTy::defaults`].
+pub type Defaults = Box<[(Name, Constant)]>;
 
 /// The signature of a function type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -498,6 +535,7 @@ impl TypeTable {
             TyKind::String,
             TyKind::Record(RecordTy {
                 fields: Box::default(),
+                defaults: None,
             }),
             TyKind::UntypedInt,
             TyKind::Error,
@@ -509,9 +547,10 @@ impl TypeTable {
 
     /// Returns the id of `kind`, adding it to the table if it is new.
     ///
-    /// A record's fields are sorted by name here, so they may be given in
-    /// any order; they must not repeat a name (the checker reports repeated
-    /// names before it builds a type). A future, an either shape, a union
+    /// A record's fields, and its defaults, are sorted by name here, so they
+    /// may be given in any order; they must not repeat a name (the checker
+    /// reports repeated names before it builds a type), and each default
+    /// must be of one of the fields. A future, an either shape, a union
     /// and a provisional type must already satisfy the invariants
     /// documented on [`TyKind::Future`], [`TyKind::Either`],
     /// [`TyKind::Union`] and [`TyKind::Provisional`].
@@ -526,11 +565,21 @@ impl TypeTable {
     /// table; past it, ids would saturate.
     pub fn intern(&mut self, kind: TyKind) -> TyId {
         let kind = match kind {
-            TyKind::Record(RecordTy { mut fields }) => {
+            TyKind::Record(RecordTy {
+                mut fields,
+                mut defaults,
+            }) => {
                 if !fields.is_sorted_by_key(|&(name, _)| name) {
                     fields.sort_unstable_by_key(|&(name, _)| name);
                 }
-                TyKind::Record(RecordTy { fields })
+                if let Some(defaults) = &mut defaults
+                    && !defaults.is_sorted_by_key(|&(name, _)| name)
+                {
+                    defaults.sort_unstable_by_key(|&(name, _)| name);
+                }
+                // No default is none.
+                let defaults = defaults.filter(|defaults| !defaults.is_empty());
+                TyKind::Record(RecordTy { fields, defaults })
             }
             other => other,
         };
@@ -645,9 +694,66 @@ impl TypeTable {
     /// Returns the id of the record type with `fields`, in any order, adding
     /// it to the table if it is new. The fields must not repeat a name.
     pub fn record(&mut self, fields: impl IntoIterator<Item = (Name, TyId)>) -> TyId {
+        self.record_with_defaults(fields, Vec::new())
+    }
+
+    /// Returns the id of the record type with `fields`, in any order, the
+    /// fields named in `defaults` having those defaults (see
+    /// [Defaults](#defaults)), adding it to the table if it is new. The
+    /// fields must not repeat a name, and each default must be of one of
+    /// them.
+    pub fn record_with_defaults(
+        &mut self,
+        fields: impl IntoIterator<Item = (Name, TyId)>,
+        defaults: Vec<(Name, Constant)>,
+    ) -> TyId {
         self.intern(TyKind::Record(RecordTy {
             fields: fields.into_iter().collect(),
+            defaults: (!defaults.is_empty()).then(|| Box::new(defaults.into_boxed_slice())),
         }))
+    }
+
+    /// The record type with `fields`, sorted by name, keeping the default
+    /// that the record type `template` has of each of them that it has one
+    /// for, adding it to the table if it is new: a record type rebuilt from
+    /// another's fields, settled or made present, which is still what was
+    /// written (see [Defaults](#defaults)).
+    pub fn record_like(&mut self, template: TyId, fields: Vec<(Name, TyId)>) -> TyId {
+        let defaults: Vec<(Name, Constant)> = self
+            .defaults(template)
+            .iter()
+            .filter(|(name, _)| {
+                fields
+                    .binary_search_by_key(name, |&(field, _)| field)
+                    .is_ok()
+            })
+            .cloned()
+            .collect();
+        self.record_with_defaults(fields, defaults)
+    }
+
+    /// The defaults of the fields of record type `id` that have one, sorted
+    /// by name; empty for a record type without defaults and for any other
+    /// type.
+    #[must_use]
+    pub fn defaults(&self, id: TyId) -> &[(Name, Constant)] {
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Record(RecordTy {
+                defaults: Some(defaults),
+                ..
+            })) => defaults,
+            _ => &[],
+        }
+    }
+
+    /// The default of field `name` of record type `record`, if it has one.
+    #[must_use]
+    pub fn field_default(&self, record: TyId, name: Name) -> Option<&Constant> {
+        let defaults = self.defaults(record);
+        let index = defaults
+            .binary_search_by_key(&name, |&(field, _)| field)
+            .ok()?;
+        defaults.get(index).map(|(_, constant)| constant)
     }
 
     /// Returns the id of the function type with `params`, each a parameter's
@@ -910,7 +1016,7 @@ impl TypeTable {
                     .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
                     .collect();
                 // Still sorted, so interning does not sort it again.
-                self.record(fields)
+                self.record_like(id, fields)
             }
             TyKind::Fn(sig) => {
                 let params: Vec<(Option<Name>, TyId)> = sig
@@ -1219,7 +1325,7 @@ impl TypeTable {
         }
         if changed {
             // Still sorted, so interning does not sort it again.
-            self.record(presented)
+            self.record_like(top, presented)
         } else {
             top
         }
@@ -1277,7 +1383,9 @@ impl TypeTable {
     /// The record type `record` with field `name` set to type `ty`: the
     /// field's type replaced if `record` has it, and the field added
     /// otherwise. `None` if `record` is not a record type. The type of a
-    /// functional update that sets one field.
+    /// functional update that sets one field. The other fields keep their
+    /// defaults, if they have any; the field set has none, its type being
+    /// another.
     pub fn with_field(&mut self, record: TyId, name: Name, ty: TyId) -> Option<TyId> {
         let fields = self.record_fields(record)?;
         let at = fields.partition_point(|&(field, _)| field < name);
@@ -1287,10 +1395,88 @@ impl TypeTable {
         updated.push((name, ty));
         let rest = at + usize::from(replaces);
         updated.extend_from_slice(fields.get(rest..).unwrap_or_default());
+        let defaults: Vec<(Name, Constant)> = self
+            .defaults(record)
+            .iter()
+            .filter(|&&(field, _)| field != name)
+            .cloned()
+            .collect();
         // Still sorted, so interning does not sort it again.
-        Some(self.intern(TyKind::Record(RecordTy {
-            fields: updated.into_boxed_slice(),
-        })))
+        Some(self.record_with_defaults(updated, defaults))
+    }
+
+    /// Whether `a` and `b` are one type once their defaults are forgotten
+    /// (see [Defaults](#defaults)): the same type, or two record types of
+    /// the same fields whose types are so in turn, two list types whose
+    /// element types are, two function types of the same parameter names,
+    /// marker and meta marker whose parameter, return and meta types are,
+    /// two futures, either shapes or provisional types of the same
+    /// parameter whose inner types are, or two unions each of whose members
+    /// is so with one of the other's. What the checker asks where it needs
+    /// two types to be one, which defaults do not change.
+    ///
+    /// Recurses once per level of nesting shared by the two types.
+    #[must_use]
+    pub fn same(&self, a: TyId, b: TyId) -> bool {
+        if a == b {
+            return true;
+        }
+        let (Some(a_kind), Some(b_kind)) = (self.kinds.get(a.index()), self.kinds.get(b.index()))
+        else {
+            return false;
+        };
+        match (a_kind, b_kind) {
+            (TyKind::Record(a_record), TyKind::Record(b_record)) => {
+                a_record.fields.len() == b_record.fields.len()
+                    && a_record.fields.iter().zip(&b_record.fields).all(
+                        |(&(a_name, a_ty), &(b_name, b_ty))| {
+                            a_name == b_name && self.same(a_ty, b_ty)
+                        },
+                    )
+            }
+            (TyKind::List(a_inner), TyKind::List(b_inner))
+            | (TyKind::Future(a_inner), TyKind::Future(b_inner))
+            | (TyKind::Either(a_inner), TyKind::Either(b_inner)) => self.same(*a_inner, *b_inner),
+            (
+                TyKind::Provisional {
+                    function: a_function,
+                    param: a_param,
+                    inner: a_inner,
+                },
+                TyKind::Provisional {
+                    function: b_function,
+                    param: b_param,
+                    inner: b_inner,
+                },
+            ) => a_function == b_function && a_param == b_param && self.same(*a_inner, *b_inner),
+            (TyKind::Fn(a_sig), TyKind::Fn(b_sig)) => {
+                let metas = match (a_sig.meta, b_sig.meta) {
+                    (None, None) => true,
+                    (Some(a_meta), Some(b_meta)) => {
+                        a_meta.effect == b_meta.effect && self.same(a_meta.ty, b_meta.ty)
+                    }
+                    _ => false,
+                };
+                a_sig.effect == b_sig.effect
+                    && metas
+                    && self.same(a_sig.ret, b_sig.ret)
+                    && a_sig.params.len() == b_sig.params.len()
+                    && a_sig.params.iter().zip(&b_sig.params).all(
+                        |(&(a_name, a_ty), &(b_name, b_ty))| {
+                            a_name == b_name && self.same(a_ty, b_ty)
+                        },
+                    )
+            }
+            (TyKind::Union(a_members), TyKind::Union(b_members)) => {
+                a_members.len() == b_members.len()
+                    && a_members.iter().all(|&a_member| {
+                        b_members
+                            .iter()
+                            .any(|&b_member| self.same(a_member, b_member))
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// The kind of type `id`.
@@ -1779,7 +1965,9 @@ impl TypeTable {
     /// names of record fields and parameters: `Int`, `{x: Int, y: String}`,
     /// `fn(Int, name: String): Bool`, `fn() -> Int`. A record shows its
     /// fields in alphabetical order of their text, a field whose name is not
-    /// a plain identifier quoted as a string literal (`{"a b": Int}`), and a
+    /// a plain identifier quoted as a string literal (`{"a b": Int}`), a
+    /// field with a default followed by ` = ` and the default as a value's
+    /// `repr` shows it (`{exclude: List<String> = [], from: String}`), and a
     /// nested record nested. The empty record is `{}`. A list type shows as
     /// `List<Int>`, however the source wrote it. A function shows its
     /// parameters in order, each with its name if it has one, then `: ` and
@@ -1930,18 +2118,23 @@ impl fmt::Display for Display<'_> {
             TyKind::Union(members) => self.union(members, f),
             TyKind::Record(record) => {
                 // Stored by `Name`, shown by text.
-                let mut fields: Vec<(&str, TyId)> = record
+                let mut fields: Vec<(&str, Name, TyId)> = record
                     .fields
                     .iter()
-                    .map(|&(name, ty)| (self.names.get(name), ty))
+                    .map(|&(name, ty)| (self.names.get(name), name, ty))
                     .collect();
-                fields.sort_unstable_by_key(|&(text, _)| text);
+                fields.sort_unstable_by_key(|&(text, _, _)| text);
                 f.write_str("{")?;
-                for (index, &(text, ty)) in fields.iter().enumerate() {
+                for (index, &(text, name, ty)) in fields.iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
                     write!(f, "{}: {}", FieldName(text), self.nested(ty))?;
+                    // A default after its field's type, as it is written.
+                    if let Some(constant) = self.table.field_default(self.id, name) {
+                        f.write_str(" = ")?;
+                        write_constant(f, constant, self.names)?;
+                    }
                 }
                 f.write_str("}")
             }
@@ -1969,6 +2162,59 @@ impl fmt::Display for Display<'_> {
                 }
                 write!(f, " {} {}", meta.effect.meta_marker(), self.nested(meta.ty))
             }
+        }
+    }
+}
+
+/// Writes `constant`, a field's default, as it would be written in source,
+/// as a value's `repr` shows it (see [`crate::Value`]), its record fields'
+/// names shown with `names`: an `Int` in decimal, a `Float` with a decimal
+/// point or an exponent, by the shortest text that reads back as it, `nan`
+/// and `inf` as a value shows them, a `Bool` as `true` or `false`, a
+/// `String` quoted ([`Quoted`]), a list as `[1, 2]`, a record as `{a = 1;
+/// b = "x"}`, its fields in the order they are written, and the empty
+/// record as `{}`.
+///
+/// Recurses once per level of list and record nesting.
+pub(crate) fn write_constant(
+    f: &mut fmt::Formatter<'_>,
+    constant: &Constant,
+    names: &Names,
+) -> fmt::Result {
+    match constant {
+        Constant::Int(value) => write!(f, "{value}"),
+        Constant::Float(bits) => {
+            let value = f64::from_bits(*bits);
+            // `{:?}` would show NaN as `NaN`.
+            if value.is_nan() {
+                f.write_str("nan")
+            } else {
+                write!(f, "{value:?}")
+            }
+        }
+        Constant::Bool(value) => write!(f, "{value}"),
+        Constant::Str(text) => write!(f, "{}", Quoted(text)),
+        Constant::Empty => f.write_str("{}"),
+        Constant::List(elements) => {
+            f.write_str("[")?;
+            for (index, element) in elements.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+                write_constant(f, element, names)?;
+            }
+            f.write_str("]")
+        }
+        Constant::Record(fields) => {
+            f.write_str("{")?;
+            for (index, (name, value)) in fields.iter().enumerate() {
+                if index > 0 {
+                    f.write_str("; ")?;
+                }
+                write!(f, "{} = ", FieldName(names.get(*name)))?;
+                write_constant(f, value, names)?;
+            }
+            f.write_str("}")
         }
     }
 }
@@ -2001,6 +2247,154 @@ mod tests {
     }
 
     #[test]
+    fn a_kind_is_small() {
+        // A record type's defaults are behind a thin pointer, which a
+        // record type without any, nearly every one, leaves null: so a
+        // record type is 24 bytes, and a kind no larger than before, a
+        // function type's signature being the largest.
+        assert_eq!(size_of::<RecordTy>(), 24);
+        assert_eq!(size_of::<TyKind>(), 32);
+    }
+
+    #[test]
+    fn a_record_types_defaults_change_nothing_it_admits() {
+        let (mut table, _, [a, b, c]) = setup();
+        let one = || Constant::Int(1);
+        let plain = table.record([(a, TyId::INT), (b, TyId::STRING)]);
+        let defaulted =
+            table.record_with_defaults([(a, TyId::INT), (b, TyId::STRING)], vec![(a, one())]);
+        // A type of its own, interned by its defaults too, in any order.
+        assert_ne!(defaulted, plain);
+        assert_eq!(
+            table.record_with_defaults([(b, TyId::STRING), (a, TyId::INT)], vec![(a, one())]),
+            defaulted
+        );
+        let other = table.record_with_defaults(
+            [(a, TyId::INT), (b, TyId::STRING)],
+            vec![(a, Constant::Int(2))],
+        );
+        assert_ne!(other, defaulted);
+        // No default is none.
+        assert_eq!(
+            table.record_with_defaults([(a, TyId::INT), (b, TyId::STRING)], Vec::new()),
+            plain
+        );
+        assert_eq!(table.defaults(defaulted), &[(a, one())][..]);
+        assert_eq!(table.field_default(defaulted, a), Some(&one()));
+        assert_eq!(table.field_default(defaulted, b), None);
+        assert!(table.defaults(plain).is_empty());
+        assert!(table.defaults(TyId::INT).is_empty());
+        // Each a subtype of the other, and one type once they are
+        // forgotten, at any depth.
+        assert!(table.is_subtype(plain, defaulted));
+        assert!(table.is_subtype(defaulted, plain));
+        assert!(table.same(plain, defaulted));
+        assert!(table.same(defaulted, other));
+        let (plain_list, defaulted_list) = (table.list(plain), table.list(defaulted));
+        assert!(table.same(plain_list, defaulted_list));
+        let plain_fn = table.fn_type([(Some(c), plain)], plain_list, Effect::Pure);
+        let defaulted_fn = table.fn_type([(Some(c), defaulted)], defaulted_list, Effect::Pure);
+        assert!(table.same(plain_fn, defaulted_fn));
+        let (plain_either, defaulted_either) =
+            (table.deferrable(plain), table.deferrable(defaulted));
+        assert!(table.same(plain_either, defaulted_either));
+        let plain_union = table.union([plain_list, TyId::INT]);
+        let defaulted_union = table.union([defaulted_list, TyId::INT]);
+        assert!(table.same(plain_union, defaulted_union));
+        // But not where anything else differs.
+        let wider = table.record([(a, TyId::INT), (b, TyId::STRING), (c, TyId::BOOL)]);
+        assert!(!table.same(plain, wider));
+        let unnamed = table.fn_type([(None, plain)], plain_list, Effect::Pure);
+        assert!(!table.same(plain_fn, unnamed));
+        let impure = table.fn_type([(Some(c), defaulted)], defaulted_list, Effect::Impure);
+        assert!(!table.same(plain_fn, impure));
+        assert!(!table.same(plain_list, plain));
+        // The join has none, and is not widened; a union keeps, of the two,
+        // the one interned first.
+        assert_eq!(table.join(defaulted, plain), (plain, false));
+        assert_eq!(table.join(defaulted, defaulted), (defaulted, false));
+        assert_eq!(table.union([defaulted, plain]), plain);
+        let union = table.union([defaulted, TyId::BOOL]);
+        assert_eq!(
+            table.union_members(union),
+            Some(&[TyId::BOOL, defaulted][..])
+        );
+        let kept = table.union([TyId::BOOL, plain]);
+        assert_eq!(table.union([union, plain]), kept);
+    }
+
+    #[test]
+    fn a_record_types_defaults_are_kept_and_shown() {
+        let (mut table, names, [a, b, c]) = setup();
+        let one = || Constant::Int(1);
+        let defaulted =
+            table.record_with_defaults([(a, TyId::INT), (b, TyId::STRING)], vec![(a, one())]);
+        let plain = table.record([(a, TyId::INT), (b, TyId::STRING)]);
+        let plain_list = table.list(plain);
+        // A record type rebuilt from its fields keeps theirs; a field a
+        // functional update sets loses its own.
+        let lazy_int = table.deferrable(TyId::INT);
+        let lazy = table.record_with_defaults([(a, lazy_int), (b, TyId::STRING)], vec![(a, one())]);
+        assert_eq!(table.present(lazy), defaulted);
+        assert_eq!(
+            table
+                .with_field(defaulted, c, TyId::BOOL)
+                .map(|set| table.defaults(set).len()),
+            Some(1)
+        );
+        let set = table.with_field(defaulted, a, TyId::FLOAT);
+        assert_eq!(set.map(|set| table.defaults(set).is_empty()), Some(true));
+        // Shown after their fields' types, each as a value's `repr` shows
+        // it, a record's fields in the order they are written.
+        let every = table.record_with_defaults(
+            [(a, defaulted), (b, TyId::FLOAT), (c, TyId::STRING)],
+            vec![
+                (
+                    a,
+                    Constant::Record(Box::new([(b, Constant::Str("x\"y".into())), (a, one())])),
+                ),
+                (b, Constant::Float(2.0f64.to_bits())),
+                (c, Constant::Str("{z}".into())),
+            ],
+        );
+        assert_eq!(
+            table.display(every, &names).to_string(),
+            "{a: {a: Int = 1, b: String} = {b = \"x\\\"y\"; a = 1}, b: Float = 2.0, \
+             c: String = \"{{z}}\"}"
+        );
+        let lists = table.list(TyId::FLOAT);
+        let more = table.record_with_defaults(
+            [(a, lists), (b, TyId::FLOAT), (c, TyId::EMPTY)],
+            vec![
+                (
+                    a,
+                    Constant::List(Box::new([
+                        Constant::Float(f64::NAN.to_bits()),
+                        Constant::Float(f64::NEG_INFINITY.to_bits()),
+                    ])),
+                ),
+                (b, Constant::Float((-0.5f64).to_bits())),
+                (c, Constant::Empty),
+            ],
+        );
+        assert_eq!(
+            table.display(more, &names).to_string(),
+            "{a: List<Float> = [nan, -inf], b: Float = -0.5, c: {} = {}}"
+        );
+        let bools = table.record_with_defaults(
+            [(a, TyId::BOOL), (b, plain_list)],
+            vec![
+                (a, Constant::Bool(false)),
+                (b, Constant::List(Box::new([]))),
+            ],
+        );
+        assert_eq!(
+            table.display(bools, &names).to_string(),
+            "{a: Bool = false, b: List<{a: Int, b: String}> = []}"
+        );
+    }
+
+    #[test]
     fn interning_is_by_structure() {
         let (mut table, _, [a, b, _]) = setup();
         let ab = table.record([(a, TyId::INT), (b, TyId::STRING)]);
@@ -2009,6 +2403,7 @@ mod tests {
         assert_eq!(
             table.intern(TyKind::Record(RecordTy {
                 fields: Box::new([(b, TyId::STRING), (a, TyId::INT)]),
+                defaults: None,
             })),
             ab
         );

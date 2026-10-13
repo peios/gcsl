@@ -16282,6 +16282,65 @@ p26 = com.x"#;
     }
 
     #[test]
+    fn a_declared_types_field_defaults_reach_every_file() {
+        // A type's defaults are copied out of the file declaring it into
+        // each file using it, by its name from a directory below and
+        // through an import: an integer default of a `Float` field is a
+        // `Float` there, and a record default is given the defaults of its
+        // own type, as if written there. A record literal written where the
+        // type is expected is given them.
+        let files = [
+            (
+                "workspace.gcsl",
+                "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+                 def count(e: Install): Int { len(e.exclude) }",
+            ),
+            (
+                "lib/types.gcsl",
+                "type Opt = { level: Float = 1, inner: {b: Int, c: Int = 3} = { b = 2 }, name: String,\n\
+                 \x20   flags: {debug: Bool = false} = {} }\n\
+                 type Flags = { debug: Bool = false, level: Int = 1 }",
+            ),
+            (
+                "app/main.gcsl",
+                "import lib.types\n\
+                 entries: List<Install> = [\n\
+                 \x20   { from = \"a\"; to = \"b\" },\n\
+                 \x20   { from = \"c\"; to = \"d\"; exclude = [\"x\"] },\n\
+                 ]\n\
+                 n = count({ from = \"a\"; to = \"b\" })\n\
+                 o: types.Opt = { name = \"o\" }\n\
+                 type Both = { ...types.Opt, extra: Bool = true }\n\
+                 b: Both = { name = \"b\" }\n\
+                 f: types.Flags = {}",
+            ),
+        ];
+        assert_eq!(
+            rooted_text(&files, "app/main.gcsl"),
+            "{entries = [{from = \"a\"; to = \"b\"; exclude = []}, \
+             {from = \"c\"; to = \"d\"; exclude = [\"x\"]}]; n = 0; \
+             o = {name = \"o\"; flags = {debug = false}; inner = {b = 2; c = 3}; level = 1.0}; \
+             b = {name = \"b\"; extra = true; flags = {debug = false}; inner = {b = 2; c = 3}; \
+             level = 1.0}; f = {debug = false; level = 1}}"
+        );
+        // What is wrong in a default is reported once, where it is written;
+        // a file using the type fails quietly.
+        let files = [
+            ("workspace.gcsl", "type T = { a: Int = \"x\" }"),
+            ("app/main.gcsl", "t: T = { a = 1 }"),
+        ];
+        assert_eq!(rooted_messages(&files), ["mismatched types"]);
+        let files = [
+            ("workspace.gcsl", "let k = 1\ntype T = { a: Int = k }"),
+            ("app/main.gcsl", "t: T = { a = 1 }"),
+        ];
+        assert_eq!(
+            rooted_messages(&files),
+            ["a field's default must be a constant"]
+        );
+    }
+
+    #[test]
     fn an_invoked_definition_is_called_as_from_its_directory() {
         // The def-type's caller is the definition's directory; without
         // `fileroot.helper()` in the def-type, the definition's is the
