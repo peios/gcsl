@@ -5833,12 +5833,20 @@ fn cell_tables(scan: &Scan, types: &mut TypeTable, names: &mut Names) -> CellTab
 }
 
 /// Takes the names of the slots of `ir`, a file's: its slots' names are the
-/// workspace's (see [`Workspace::dump_ir`]), but for those of its
-/// temporaries past the `committed` slots it committed, which a later file
-/// may take and name otherwise, which are kept, with `committed`.
-fn own_slot_names(ir: &mut Ir, committed: usize) -> (usize, Vec<Name>) {
+/// workspace's, `slot_names` (see [`Workspace::dump_ir`]), but for those of
+/// its temporaries past the slots it committed, which are kept, with how
+/// many it committed, and added to `slot_names`, so that the files checked
+/// after it take slots past them. Files do not run in the order they are
+/// checked in (a second invocation runs the files it needs after files
+/// checked later have run), so a later file's slots, which hold its cells
+/// for as long as the workspace lives, must not be a temporary of one that
+/// may run after it.
+fn own_slot_names(ir: &mut Ir, slot_names: &mut Vec<Name>) -> (usize, Vec<Name>) {
+    let committed = slot_names.len();
     let own = ir.replace_slot_names(Vec::new());
-    (committed, own.get(committed..).unwrap_or_default().to_vec())
+    let tail = own.get(committed..).unwrap_or_default().to_vec();
+    slot_names.extend_from_slice(&tail);
+    (committed, tail)
 }
 
 /// The tables of a workspace's cells, by number: each one's type, the slot
@@ -5923,7 +5931,7 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
         }
         match result {
             Ok((mut ir, file_types, found)) => {
-                set(&mut tails, index, own_slot_names(&mut ir, slot_names.len()));
+                set(&mut tails, index, own_slot_names(&mut ir, &mut slot_names));
                 set(&mut irs, index, Some(ir));
                 set(&mut checked, index, Some(file_types));
                 set(&mut warnings, index, in_file(found, index));
@@ -17324,9 +17332,10 @@ p26 = com.x"#;
     #[test]
     fn definitions_of_two_directories_invoked_on_one_workspace() {
         // Each directory shadows a `#[shadowable]` field with a file of its
-        // own, whose frame is smaller than the workspace file's: run after
-        // it, `b/lock.gcsl` must keep the def-type's slot, not cut the
-        // frame back to its own.
+        // own, checked before the workspace file but run, for the second
+        // invocation, after it: `b/lock.gcsl` must neither cut the frame
+        // back to its own, nor write its temporaries (its list's record's
+        // fields) over the def-type's slot.
         let files = [
             (
                 "workspace.gcsl",
@@ -17335,12 +17344,18 @@ p26 = com.x"#;
                  \x20   \"{name} {f()}\"\n\
                  }\n\
                  #[shadowable]\n\
-                 x: String = \"ws\"",
+                 x: List<{ v: String, d: String }> = []",
             ),
-            ("a/a.gcsl", "def run a() { \"A {x}\" }"),
-            ("a/lock.gcsl", "x: String = \"xa\""),
-            ("b/b.gcsl", "def run b() { \"B {x}\" }"),
-            ("b/lock.gcsl", "x: String = \"xb\""),
+            ("a/a.gcsl", "def run a() { \"A {x[0].v}\" }"),
+            (
+                "a/lock.gcsl",
+                "x: List<{ v: String, d: String }> = [{ v = \"xa\"; d = \"1\" }]",
+            ),
+            ("b/b.gcsl", "def run b() { \"B {x[0].v}\" }"),
+            (
+                "b/lock.gcsl",
+                "x: List<{ v: String, d: String }> = [{ v = \"xb\"; d = \"2\" }]",
+            ),
         ];
         for order in [["a", "b"], ["b", "a"]] {
             let mut workspace = rooted(&files).unwrap();
