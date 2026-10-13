@@ -4112,6 +4112,33 @@ impl MemoTables {
         self.tables.len()
     }
 
+    /// Whether `closure` has returned for the arguments `key`, as a call of
+    /// it made from code of the directory `dir`, by its index in the run's
+    /// table of directories, with no helper passing a caller on, would find:
+    /// an entry of its table whose key is equal by key equality and each of
+    /// whose dependencies that caller has (see [Memoised
+    /// functions](#memoised-functions)), holding a value. A call that
+    /// failed has left no entry, and one that is running holds no value.
+    /// Looks the table up as such a call would, but records nothing, passes
+    /// nothing on and marks nothing re-entered.
+    #[must_use]
+    pub(crate) fn completed(&self, closure: &Rc<Closure>, key: &[Value], dir: u32) -> bool {
+        let caller = Caller {
+            dir,
+            ..Caller::default()
+        };
+        let entry = self
+            .tables
+            .get(&Rc::as_ptr(closure))
+            .and_then(|table| table.buckets.get(&key_hash(key)))
+            .and_then(|bucket| {
+                bucket.entries().iter().find(|entry| {
+                    key_eq(&entry.key, key) && entry.deps.iter().all(|dep| dep.holds(caller))
+                })
+            });
+        entry.is_some_and(|entry| matches!(entry.state, EntryState::Done(_)))
+    }
+
     /// The number of entries recorded as running, for tests: none once an
     /// evaluation has returned.
     #[cfg(test)]

@@ -522,6 +522,33 @@
 //! def-type's body nested within a few levels of the limit) is located at
 //! the definition's path in its file instead, labelled "invoked here".
 //!
+//! # Top-level functions by name
+//!
+//! A host may give a file of the workspace a meaning of its own (`pekit`
+//! its root's `pekit.gcsl`, whose `environment` it tears down with its
+//! `teardown`), which nothing here knows of: it asks for the file's
+//! top-level fields and `def`s by name, the fields of the file's own record
+//! that another file reads as members of its module. A private name (`let`,
+//! `fn`) is none, and nor is a dotted path under the name, or a declaration
+//! a later one shadows in its own file. [`Workspace::top_level`] tells one's
+//! type, as it is written (a `def`'s as `fn(env: Vm) -> {}`), and, for a
+//! function, what it may do and how many parameters it takes;
+//! [`Workspace::memoised`] whether a memoised (`->>`) function has returned
+//! for no arguments in the workspace's memo tables, which every run,
+//! invocation and call shares for the workspace's life, as a call of it
+//! written in the file's directory would find; [`Workspace::call_composed`]
+//! calls a composition of them, `teardown(environment())` for `["teardown",
+//! "environment"]`, as if written in a file of the file's directory, after
+//! the file and those it needs have run, as the call that invokes a
+//! definition is made, built rather than parsed, the functions bound by names
+//! no source can write, checked, lowered and run on the workspace's frame
+//! and memo tables, so a memoised function called before is not run again;
+//! and [`Workspace::check_composed`] checks that call without running
+//! anything, which says whether each function takes what the next returns,
+//! as the checker says it of a call. Every diagnostic of the call located in
+//! it is located at the first function's name instead, labelled "invoked
+//! here".
+//!
 //! # The standard library
 //!
 //! Two kinds of module are not files of the workspace. `builtins` and
@@ -6304,7 +6331,8 @@ pub struct Definition {
     pub span: Span,
 }
 
-/// Why [`Workspace::invoke`] could not invoke a definition.
+/// Why [`Workspace::invoke`] could not invoke a definition, or another
+/// call by name could not be made ([`Workspace::call_composed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvokeError {
     /// What the workspace's files say: the duplicates that
@@ -6417,6 +6445,15 @@ pub enum RequestError {
         /// order.
         parameters: Vec<String>,
     },
+    /// A function asked for by name to call is no top-level function of its
+    /// file ([`Workspace::call_composed`]): "`pekit.gcsl` has no top-level
+    /// function `teardown`".
+    NoFunction {
+        /// The file's path, relative to the root.
+        file: String,
+        /// The name asked for.
+        name: String,
+    },
 }
 
 impl RequestError {
@@ -6470,6 +6507,9 @@ impl RequestError {
                     "`{def_type}` needs {}, which {was} not given",
                     and_list(parameters)
                 )
+            }
+            RequestError::NoFunction { file, name } => {
+                format!("`{file}` has no top-level function `{name}`")
             }
         }
     }
@@ -6526,7 +6566,8 @@ impl RequestError {
             },
             RequestError::CannotBeGiven { .. }
             | RequestError::DuplicateArgument { .. }
-            | RequestError::MissingArguments { .. } => Vec::new(),
+            | RequestError::MissingArguments { .. }
+            | RequestError::NoFunction { .. } => Vec::new(),
         }
     }
 }
@@ -6908,6 +6949,244 @@ impl Workspace {
         .map(Some)
     }
 
+    /// The top-level field or `def` of file `file` named `name`, a field of
+    /// the file's own record, which another file reads as a member of its
+    /// module (`pekit.environment` of `pekit.gcsl` at the root): its type
+    /// and, if it is a function, what it may do and how many parameters it
+    /// takes (see the module documentation, "Top-level functions by name").
+    /// `None` if the file declares none such: no item of the name, or only
+    /// a private one (`let`, `fn`), a dotted path under the name, or one
+    /// shadowed in its own file.
+    #[must_use]
+    pub fn top_level(&self, file: u32, name: &str) -> Option<TopLevel> {
+        let (item, ((_, ty), _)) = self.top_level_cell(file, name)?;
+        let function = self.types.fn_sig(self.types.strip(ty));
+        Some(TopLevel {
+            ty: self.shown_top_level(file, item, ty),
+            function: function.map(|sig| (sig.effect, sig.params.len())),
+        })
+    }
+
+    /// Whether the top-level function of file `file` named `name`, as
+    /// [`Workspace::top_level`] finds it, has returned for no arguments: as
+    /// a call of it with none written in a file of `file`'s directory would
+    /// find, its closure, which the file stored as it ran, holding a value
+    /// for them in the workspace's memo tables (see the evaluator's
+    /// "Memoised functions"). So only a memoised (`->>`) function's call
+    /// that completed counts: one that failed has left nothing, and one
+    /// still running nothing yet. The tables are the workspace's, which
+    /// every run of a file, every invocation and every call it makes share,
+    /// so a call made in any of them counts, once, for the workspace's life.
+    /// False if the file has not run, or has no such function. Looks the
+    /// tables up as such a call would, its caller the file's directory: a
+    /// function whose call read `fileroot.caller` (see the evaluator's
+    /// "Ambient inputs") counts only if it was called from that directory.
+    /// Runs nothing and changes nothing.
+    #[must_use]
+    pub fn memoised(&self, file: u32, name: &str) -> bool {
+        let Some((_, ((slot, _), _))) = self.top_level_cell(file, name) else {
+            return false;
+        };
+        let Some(Value::Fn(closure)) = self.frame.get(slot.index()) else {
+            return false;
+        };
+        let dir = self.scan.place(file).dir;
+        self.memo.completed(closure, &[], dir)
+    }
+
+    /// Checks the call [`Workspace::call_composed`] makes of `functions`,
+    /// top-level functions of file `file`, running nothing: whether each
+    /// takes what the next returns, as the checker checks a call written in
+    /// a file of `file`'s directory, `f(g())` for `["f", "g"]`. An empty
+    /// `functions` calls nothing, which is well.
+    ///
+    /// # Errors
+    ///
+    /// As [`Workspace::call_composed`], but for the runtime errors: a name
+    /// that is no top-level function of the file, or the diagnostics of the
+    /// call's check.
+    pub fn check_composed(&mut self, file: u32, functions: &[&str]) -> Result<(), InvokeError> {
+        let Some((cells, at)) = self.composed(file, functions)? else {
+            return Ok(());
+        };
+        self.lower_composed(&cells, at).map(|_| ())
+    }
+
+    /// Calls the composition of `functions`, top-level functions of file
+    /// `file` as [`Workspace::top_level`] finds them, each given what the
+    /// next returns and the last none, `f(g(h()))` for `["f", "g", "h"]`, as
+    /// if written in a file of `file`'s directory, its caller: the file runs
+    /// first, with the files it needs, unless they have run, as for
+    /// [`Workspace::run`], and then the call, a call built rather than parsed
+    /// that reads the functions' cells by names no source can write, as the
+    /// call [`Workspace::invoke`] makes does (see the module documentation,
+    /// "Top-level functions by name"), on the workspace's frame and memo
+    /// tables, so a memoised function called before returns what it
+    /// returned. Returns the value the first returns, with the warnings of
+    /// the whole workspace; for an empty `functions`, `{}`, running nothing.
+    /// Called again, the call runs again.
+    ///
+    /// # Errors
+    ///
+    /// A name that is no top-level function of the file,
+    /// [`RequestError::NoFunction`], the first such, before anything runs;
+    /// the runtime error of a file that runs, as [`Workspace::run`] returns
+    /// it; and the diagnostics of the call's check, a function that does
+    /// not take what the next returns, or its runtime error, each part of
+    /// them in the call itself, which has no source, located at the first
+    /// function's name, labelled "invoked here".
+    pub fn call_composed(&mut self, file: u32, functions: &[&str]) -> Result<Outcome, InvokeError> {
+        let Some((cells, at)) = self.composed(file, functions)? else {
+            return Ok(Outcome {
+                value: Value::Empty,
+                warnings: self.warnings.clone(),
+            });
+        };
+        self.run_needed(file).map_err(InvokeError::Diagnostics)?;
+        let lowered = self.lower_composed(&cells, at)?;
+        self.run_built(lowered, at)
+    }
+
+    /// The cells of `functions`, top-level functions of file `file`, as
+    /// [`Workspace::top_level`] finds them, each with what a call of it
+    /// needs to know of its parameters, and where the first's name is
+    /// written; `None` for an empty `functions`.
+    ///
+    /// # Errors
+    ///
+    /// The first name that is no top-level function of the file.
+    fn composed(&self, file: u32, functions: &[&str]) -> Result<Option<Composed>, InvokeError> {
+        let mut cells = Vec::new();
+        let mut at = None;
+        for &name in functions {
+            let found = self
+                .top_level_cell(file, name)
+                .filter(|&(_, ((_, ty), _))| self.types.fn_sig(self.types.strip(ty)).is_some());
+            let Some((item, (cell, known))) = found else {
+                let path = self.scan.files.get(file as usize);
+                return Err(InvokeError::Request(RequestError::NoFunction {
+                    file: path.map(|path| path.path.clone()).unwrap_or_default(),
+                    name: name.to_owned(),
+                }));
+            };
+            at = at.or_else(|| Some((file, self.top_level_span(file, item))));
+            cells.push((cell, known));
+        }
+        Ok(at.map(|at| (cells, at)))
+    }
+
+    /// Checks and lowers the call of `cells`, each given what the next
+    /// returns, the first's name written at `at` ([`Workspace::lower_built`]).
+    ///
+    /// # Errors
+    ///
+    /// The diagnostics of its check or lowering.
+    fn lower_composed(
+        &mut self,
+        cells: &[CellOf],
+        at: (u32, Span),
+    ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
+        let bound: Vec<BoundCell> = (0..cells.len())
+            .zip(cells)
+            .map(|(number, (cell, known))| {
+                let name = self.scan.names.intern(&format!("<function{number}>"));
+                (name, *cell, known.clone())
+            })
+            .collect();
+        let names: Vec<Name> = bound.iter().map(|&(name, _, _)| name).collect();
+        self.lower_built(&bound, |all| composition(all, &names, at.1), at)
+    }
+
+    /// The top-level field or `def` of file `file` named `name`, as
+    /// [`Workspace::top_level`] finds it: its item, its cell and what a call
+    /// of it needs to know of its parameters, if it is a `def`'s.
+    fn top_level_cell(&self, file: u32, name: &str) -> Option<(ItemId, CellOf)> {
+        let ast = &self.scan.files.get(file as usize)?.ast;
+        ast.items(ast.root()).iter().find_map(|&item| {
+            let ItemKind::Field { path, .. } = ast.item(item).kind else {
+                return None;
+            };
+            let [segment] = ast.path(path) else {
+                return None;
+            };
+            let named = segment.name()?;
+            if self.scan.names.get(named) != name {
+                return None;
+            }
+            // A declaration a later one shadows in its own file is a leaf of
+            // no tree.
+            let cell = self.leaf_cell(file, item)?;
+            let known = self
+                .leaf_node(file, item)
+                .and_then(|node| self.cell_known.get(node as usize).cloned().flatten());
+            Some((item, (cell, known)))
+        })
+    }
+
+    /// Where the name of the top-level item `item` of file `file` is
+    /// written.
+    fn top_level_span(&self, file: u32, item: ItemId) -> Span {
+        let Some(source) = self.scan.files.get(file as usize) else {
+            return Span::new(0, 0);
+        };
+        let ast = &source.ast;
+        match ast.item(item).kind {
+            ItemKind::Field { path, .. } => match ast.path(path) {
+                [first, .., last] => first.span.join(last.span),
+                [only] => only.span,
+                [] => ast.item(item).span,
+            },
+            _ => ast.item(item).span,
+        }
+    }
+
+    /// The type of the top-level item `item` of file `file`, whose type is
+    /// `ty`, as [`TopLevel::ty`] shows it: its annotation as it is written,
+    /// if it has one; else, for a function expression (a `def`'s), `fn(`,
+    /// its parameters, each `NAME: TYPE`, and its marker and return type as
+    /// they are written, `fn(env: Vm) -> {}`; else its type as a diagnostic
+    /// shows it.
+    fn shown_top_level(&self, file: u32, item: ItemId, ty: TyId) -> String {
+        let names = &self.scan.names;
+        let shown = || self.types.display(ty, names).to_string();
+        let Some(source) = self.scan.files.get(file as usize) else {
+            return shown();
+        };
+        let ast = &source.ast;
+        let ItemKind::Field {
+            ty: annotation,
+            value,
+            ..
+        } = ast.item(item).kind
+        else {
+            return shown();
+        };
+        if let Some(annotation) = annotation {
+            return ast.show_type_with(annotation, names);
+        }
+        let ExprKind::Fn(function) = ast.get(value).kind else {
+            return shown();
+        };
+        let decl = ast.fn_decl(function);
+        let Some(ret) = decl.ret else {
+            return shown();
+        };
+        let params: Vec<String> = ast
+            .params(decl.params)
+            .iter()
+            .map(|param| {
+                let ty = ast.show_type_with(param.ty, names);
+                format!("{}: {ty}", names.get(param.name))
+            })
+            .collect();
+        format!(
+            "fn({}{}{}",
+            params.join(", "),
+            decl.effect.params_end(),
+            ast.show_type_with(ret, names)
+        )
+    }
+
     /// The def-type of path `def_type` and its definition of path `path`,
     /// as [`Workspace::invoke`] and [`Workspace::meta_field`] find them: the
     /// def-type, the definition's place among its definitions, and the two
@@ -7228,19 +7507,57 @@ impl Workspace {
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
         known: Option<Rc<KnownParams>>,
     ) -> Result<Outcome, InvokeError> {
-        let call = count(self.scan.files.len());
         let at = (definition.file, definition.span);
-        let mut names = mem::take(&mut self.scan.names);
         let bound = (
-            names.intern(INVOKED_DEF_TYPE),
-            names.intern(INVOKED_DEFINITION),
+            self.scan.names.intern(INVOKED_DEF_TYPE),
+            self.scan.names.intern(INVOKED_DEFINITION),
         );
-        let ast = invocation(names, (&definition.path, invoked), bound, at.1);
-        let scope = Scope::of_slots(self.slot_names.clone()).with_fields([
-            (bound.0, def_type.0, def_type.1, known),
-            (bound.1, definition_cell.0, definition_cell.1, None),
-        ]);
-        let place = self.scan.place(definition.file);
+        let cells = [(bound.0, def_type, known), (bound.1, definition_cell, None)];
+        let path = &definition.path;
+        let lowered = self.lower_built(
+            &cells,
+            |names| invocation(names, (path, invoked), bound, at.1),
+            at,
+        )?;
+        self.run_built(lowered, at)
+    }
+
+    /// Checks and lowers a call built rather than parsed, the input `build`
+    /// makes, given the workspace's names, which it reads the cells of
+    /// `bound` by, each by its name, one no source can write, bound in a
+    /// scope of the workspace's slots as a field of the cell's slot, with its
+    /// type and what a call of it needs to know of its parameters, so that a
+    /// call of it is of a known callee and gives each optional parameter
+    /// given none its default: checked as an input of no workspace, so that
+    /// it looks nothing up in any file's view and needs no alias, and
+    /// lowered as one placed in the directory of file `at.0`, its caller,
+    /// numbered after every file (see [Def-types by
+    /// name](#def-types-by-name)). Returns its IR, with its own warnings,
+    /// located as [`invoked_here`] locates them. It takes no cell and
+    /// commits nothing, so it changes nothing any file sees. What
+    /// [`Workspace::invoke`], [`Workspace::meta_field`] and
+    /// [`Workspace::call_composed`] run, and [`Workspace::check_composed`]
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// The diagnostics of its check or lowering, each part of them in the
+    /// call itself, which has no source, located at `at.1` of file `at.0`,
+    /// labelled "invoked here" ([`invoked_here`]), with the workspace's
+    /// warnings.
+    fn lower_built(
+        &mut self,
+        bound: &[BoundCell],
+        build: impl FnOnce(Names) -> Ast,
+        at: (u32, Span),
+    ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
+        let call = count(self.scan.files.len());
+        let ast = build(mem::take(&mut self.scan.names));
+        let fields = bound
+            .iter()
+            .map(|(name, (slot, ty), known)| (*name, *slot, *ty, known.clone()));
+        let scope = Scope::of_slots(self.slot_names.clone()).with_fields(fields);
+        let place = self.scan.place(at.0);
         let lowered = Checker::with_scope(&ast, scope, &mut self.types)
             .check()
             .and_then(|mut output| {
@@ -7253,6 +7570,26 @@ impl Workspace {
             let errors = invoked_here(errors, call, at);
             InvokeError::Diagnostics(merge_files(errors, self.warnings.clone()))
         })?;
+        Ok((ir, invoked_here(output.warnings, call, at)))
+    }
+
+    /// Runs `ir`, a call [`Workspace::lower_built`] lowered, whose own
+    /// warnings are `own`, on the workspace's frame and memo tables, as
+    /// [`Workspace::run`] runs a file, and returns its value, with the
+    /// warnings of the whole workspace and its own. Run again, it runs
+    /// again, a call like any other.
+    ///
+    /// # Errors
+    ///
+    /// Its runtime error, a part of it in the call itself, which has no
+    /// source, located at `at.1` of file `at.0`, labelled "invoked here"
+    /// ([`invoked_here`]), with the warnings.
+    fn run_built(
+        &mut self,
+        (ir, own): (Ir, Vec<Diagnostic>),
+        at: (u32, Span),
+    ) -> Result<Outcome, InvokeError> {
+        let call = count(self.scan.files.len());
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
@@ -7260,7 +7597,7 @@ impl Workspace {
             &self.temp_dirs,
         );
         let mut warnings = self.warnings.clone();
-        warnings.extend(invoked_here(output.warnings, call, at));
+        warnings.extend(own);
         match session::run_input(ir, &mut self.frame, context) {
             Ok(value) => Ok(Outcome { value, warnings }),
             Err(error) => {
@@ -7269,6 +7606,75 @@ impl Workspace {
             }
         }
     }
+}
+
+/// A cell a call built rather than parsed reads (see
+/// [`Workspace::lower_built`]): the name, no source can write it, it is read
+/// by, its slot and type, and what a call of it needs to know of its
+/// parameters, if it is a `def`'s.
+type BoundCell = (Name, (Slot, TyId), Option<Rc<KnownParams>>);
+
+/// A top-level function's cell, its slot and type, with what a call of it
+/// needs to know of its parameters, if it is a `def`'s (see
+/// [`Workspace::top_level`]).
+type CellOf = ((Slot, TyId), Option<Rc<KnownParams>>);
+
+/// The functions of a composed call (see [`Workspace::call_composed`]): the
+/// cell of each, in order, and where the first's name is written, its file
+/// and span.
+type Composed = (Vec<CellOf>, (u32, Span));
+
+/// A top-level field or `def` of a file of a workspace, as
+/// [`Workspace::top_level`] finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopLevel {
+    /// Its type as it is written: its annotation, or for a `def`, `fn(`,
+    /// its parameters, each `NAME: TYPE`, and its marker and return type,
+    /// `fn() ->> Vm`; or, for a field with neither, as a diagnostic shows
+    /// it.
+    pub ty: String,
+    /// If its type is a function type, what the function may do, as it is
+    /// declared, pure (`:`), memoised (`->>`) or impure (`->`), and how many
+    /// parameters it takes.
+    pub function: Option<(ast::Effect, usize)>,
+}
+
+/// The tree of the input of a composed call (see
+/// [`Workspace::call_composed`]), its names `names`: `<function0>(
+/// <function1>( ... ))`, its result, each name one of `functions`, in
+/// order, the last called with no argument and each other with what the
+/// next returns, each node at `span`. An empty `functions` is the empty
+/// block.
+fn composition(names: Names, functions: &[Name], span: Span) -> Ast {
+    let mut builder = AstBuilder::with_capacity(2 * functions.len() + 2);
+    let mut inner = None;
+    for &function in functions.iter().rev() {
+        let callee = builder.alloc(Expr {
+            kind: ExprKind::Name(function),
+            span,
+        });
+        let arguments: Vec<Arg> = inner
+            .into_iter()
+            .map(|value| Arg {
+                kind: ArgKind::Positional,
+                value,
+            })
+            .collect();
+        let args = builder.push_args(&arguments);
+        inner = Some(builder.alloc(Expr {
+            kind: ExprKind::Call { callee, args },
+            span,
+        }));
+    }
+    let items = match inner {
+        Some(call) => vec![builder.alloc_item(Item {
+            kind: ItemKind::Result(call),
+            span,
+        })],
+        None => Vec::new(),
+    };
+    let root = builder.push_item_list(&items);
+    builder.finish(root, names, Strings::new())
 }
 
 /// The error of `path`, which no definition made with the def-type `listed`
@@ -18324,5 +18730,293 @@ p26 = com.x"#;
         ];
         assert_eq!(invoked_text(&apart, "package", "x.1"), "x.1 a");
         assert_eq!(invoked_text(&apart, "package", "x.10"), "x.10 b");
+    }
+
+    /// A scratch directory of the test `name`'s own, empty, and the path of
+    /// the log file in it, which the [`environment`] workspaces append to.
+    fn log_in(name: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("gcsl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("log").display().to_string();
+        (dir, log)
+    }
+
+    /// What the log `log` holds, empty if it is missing.
+    fn logged(log: &str) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// A workspace with a root `pekit.gcsl` whose memoised `environment`
+    /// logs `boot` to `log` and returns a handle, and whose `teardown` logs
+    /// `down` and the handle's `pid`; a def-type `run`, whose definition
+    /// `uses` calls `environment` through an import of `pekit`, and `plain`
+    /// does not.
+    fn environment(log: &str) -> [(&'static str, String); 3] {
+        [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef run(name: String, f: fn() -> String) -> String { f() }"
+                    .to_owned(),
+            ),
+            (
+                "pekit.gcsl",
+                format!(
+                    "def environment() ->> {{pid: Int, port: Int}} {{\n\
+                     \x20   let out = sh(\"echo boot >> {log}\")\n\
+                     \x20   {{ pid = 7; port = if out == \"\" {{ 22 }} else {{ 0 }} }}\n\
+                     }}\n\
+                     def teardown(env: {{pid: Int, port: Int}}) -> String {{\n\
+                     \x20   sh(\"echo down {{env.pid}} >> {log}\")\n\
+                     }}\n\
+                     x = 1\n\
+                     fn private() ->> Int {{ 1 }}"
+                ),
+            ),
+            (
+                "pkg/p.gcsl",
+                "import pekit\n\
+                 def run uses() { \"uses {pekit.environment().pid}\" }\n\
+                 def run plain() { \"plain\" }"
+                    .to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_top_level_function_is_found_by_name() {
+        let (dir, log) = log_in("top-level");
+        let files = environment(&log);
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let mut workspace = rooted(&files).unwrap();
+        let pekit = workspace.file("pekit.gcsl").unwrap();
+        assert_eq!(
+            workspace.top_level(pekit, "environment"),
+            Some(TopLevel {
+                ty: "fn() ->> {pid: Int, port: Int}".to_owned(),
+                function: Some((ast::Effect::Memo, 0)),
+            })
+        );
+        assert_eq!(
+            workspace.top_level(pekit, "teardown"),
+            Some(TopLevel {
+                ty: "fn(env: {pid: Int, port: Int}) -> String".to_owned(),
+                function: Some((ast::Effect::Impure, 1)),
+            })
+        );
+        // A field that is no function; a private function, a name that is
+        // none and a file that is none, nothing.
+        assert_eq!(
+            workspace.top_level(pekit, "x"),
+            Some(TopLevel {
+                ty: "Int".to_owned(),
+                function: None,
+            })
+        );
+        assert_eq!(workspace.top_level(pekit, "private"), None);
+        assert_eq!(workspace.top_level(pekit, "nope"), None);
+        assert_eq!(workspace.top_level(u32::MAX, "environment"), None);
+        // An annotated field as its annotation is written, a function
+        // field's as a diagnostic shows its type.
+        let annotated = rooted(&[
+            ("workspace.gcsl", "x = 1"),
+            (
+                "pekit.gcsl",
+                "type Vm = {pid: Int}\n\
+                 environment: fn() ->> Vm = fn() ->> Vm { { pid = 1 } }\n\
+                 teardown = fn(env: Vm) -> {} { {} }",
+            ),
+        ])
+        .unwrap();
+        let file = annotated.file("pekit.gcsl").unwrap();
+        assert_eq!(
+            annotated.top_level(file, "environment"),
+            Some(TopLevel {
+                ty: "fn() ->> Vm".to_owned(),
+                function: Some((ast::Effect::Memo, 0)),
+            })
+        );
+        assert_eq!(
+            annotated.top_level(file, "teardown"),
+            Some(TopLevel {
+                ty: "fn(env: Vm) -> {}".to_owned(),
+                function: Some((ast::Effect::Impure, 1)),
+            })
+        );
+        // Nothing has run.
+        assert!(!workspace.memoised(pekit, "environment"));
+        assert_eq!(
+            workspace.check_composed(pekit, &["teardown", "environment"]),
+            Ok(())
+        );
+        assert_eq!(logged(&log), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn memoised_says_whether_a_memoised_call_completed() {
+        let (dir, log) = log_in("memoised");
+        let files = environment(&log);
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let mut workspace = rooted(&files).unwrap();
+        let pekit = workspace.file("pekit.gcsl").unwrap();
+        assert!(!workspace.memoised(pekit, "environment"));
+        // `pekit.gcsl` runs, as `p.gcsl` needs it, but nothing calls
+        // `environment`.
+        let plain = workspace.invoke("run", "plain", &[]).unwrap();
+        assert_eq!(plain.value.to_string(), "plain");
+        assert!(!workspace.memoised(pekit, "environment"));
+        // Called: it has returned, once, across invocations of the one
+        // workspace.
+        for _ in 0..2 {
+            let uses = workspace.invoke("run", "uses", &[]).unwrap();
+            assert_eq!(uses.value.to_string(), "uses 7");
+            assert!(workspace.memoised(pekit, "environment"));
+        }
+        assert_eq!(logged(&log), "boot\n");
+        // Not a memoised function, or no function, or none: never.
+        for name in ["teardown", "x", "private", "nope"] {
+            assert!(!workspace.memoised(pekit, name), "{name}");
+        }
+        // Another workspace has tables of its own.
+        let fresh = rooted(&files).unwrap();
+        assert!(!fresh.memoised(pekit, "environment"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_memoised_call_that_failed_or_read_another_caller_is_not_found() {
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef run(name: String, f: fn() -> String) -> String { f() }",
+            ),
+            (
+                "pekit.gcsl",
+                "import fileroot\n\
+                 def environment() ->> String { panic(\"no vm\") }\n\
+                 def called() ->> String { fileroot.caller }",
+            ),
+            (
+                "pkg/p.gcsl",
+                "import pekit\n\
+                 def run boots() { pekit.environment() }\n\
+                 def run reads() { pekit.called() }",
+            ),
+        ];
+        let mut workspace = rooted(&files).unwrap();
+        let pekit = workspace.file("pekit.gcsl").unwrap();
+        assert!(workspace.invoke("run", "boots", &[]).is_err());
+        assert!(!workspace.memoised(pekit, "environment"));
+        // Its value depends on its caller, `pkg`, which a call written at
+        // the root is not: such a call would run it again.
+        let read = workspace.invoke("run", "reads", &[]).unwrap();
+        assert_eq!(read.value.to_string(), format!("{SCRATCH}/pkg"));
+        assert!(!workspace.memoised(pekit, "called"));
+        // Called from the root, it is found.
+        let mut rooted_call = rooted(&files).unwrap();
+        let root = rooted_call.call_composed(pekit, &["called"]).unwrap();
+        assert_eq!(root.value.to_string(), SCRATCH);
+        assert!(rooted_call.memoised(pekit, "called"));
+    }
+
+    #[test]
+    fn a_composition_of_top_level_functions_is_called_by_name() {
+        let (dir, log) = log_in("composed");
+        let files = environment(&log);
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        let mut workspace = rooted(&files).unwrap();
+        let pekit = workspace.file("pekit.gcsl").unwrap();
+        let uses = workspace.invoke("run", "uses", &[]).unwrap();
+        assert_eq!(uses.value.to_string(), "uses 7");
+        // The inner call takes what the first returned: no second boot.
+        let down = workspace
+            .call_composed(pekit, &["teardown", "environment"])
+            .unwrap();
+        assert_eq!(down.value.to_string(), "");
+        assert_eq!(logged(&log), "boot\ndown 7\n");
+        // Called alone, run again, as any call.
+        workspace.call_composed(pekit, &["environment"]).unwrap();
+        assert_eq!(logged(&log), "boot\ndown 7\n");
+        // A composition of none is `{}`, and runs nothing.
+        let none = workspace.call_composed(pekit, &[]).unwrap();
+        assert_eq!(none.value, Value::Empty);
+        // In a workspace where nothing has run, the call runs the file
+        // first, and boots.
+        let mut fresh = rooted(&files).unwrap();
+        fresh
+            .call_composed(pekit, &["teardown", "environment"])
+            .unwrap();
+        assert_eq!(logged(&log), "boot\ndown 7\nboot\ndown 7\n");
+        // A name that is no top-level function of the file, before anything
+        // runs.
+        for name in ["nope", "x", "private"] {
+            assert_eq!(
+                fresh.call_composed(pekit, &["teardown", name]),
+                Err(InvokeError::Request(RequestError::NoFunction {
+                    file: "pekit.gcsl".to_owned(),
+                    name: name.to_owned(),
+                })),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            RequestError::NoFunction {
+                file: "pekit.gcsl".to_owned(),
+                name: "x".to_owned(),
+            }
+            .message(),
+            "`pekit.gcsl` has no top-level function `x`"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_composition_is_checked_as_a_call_is() {
+        // Each `teardown` with the `environment` it takes, or does not.
+        let check = |environment: &str, teardown: &str| {
+            let pekit = format!("type Vm = {{pid: Int}}\n{environment}\n{teardown}");
+            let files = [("workspace.gcsl", "x = 1"), ("pekit.gcsl", pekit.as_str())];
+            let mut workspace = rooted(&files).unwrap();
+            let file = workspace.file("pekit.gcsl").unwrap();
+            workspace
+                .check_composed(file, &["teardown", "environment"])
+                .map_err(|error| match error {
+                    InvokeError::Diagnostics(errors) => {
+                        errors.into_iter().map(|e| e.message).collect::<Vec<_>>()
+                    }
+                    InvokeError::Request(error) => vec![error.message()],
+                })
+        };
+        let memoised = "def environment() ->> Vm { { pid = 1 } }";
+        for teardown in [
+            "def teardown(env: Vm) -> {} { {} }",
+            "def teardown(env: Vm) ->> {} { {} }",
+            "def teardown(env: {pid: Int}) -> Int { env.pid }",
+            "def teardown(env: Vm | String) -> {} { {} }",
+        ] {
+            assert_eq!(check(memoised, teardown), Ok(()), "{teardown}");
+        }
+        for teardown in [
+            "def teardown(env: String) -> {} { {} }",
+            "def teardown(env: {pid: Int, port: Int}) -> {} { {} }",
+        ] {
+            assert_eq!(
+                check(memoised, teardown),
+                Err(vec!["mismatched types".to_owned()]),
+                "{teardown}"
+            );
+        }
+        // An impure `environment`'s value too.
+        assert_eq!(
+            check(
+                "def environment() -> Vm { { pid = 1 } }",
+                "def teardown(env: Vm) ->> {} { {} }"
+            ),
+            Ok(())
+        );
+        // A `teardown` of no parameters takes nothing.
+        let none = check(memoised, "def teardown() -> {} { {} }").unwrap_err();
+        assert_eq!(none.len(), 1, "{none:?}");
     }
 }
