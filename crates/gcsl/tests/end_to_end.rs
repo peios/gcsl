@@ -1419,6 +1419,76 @@ fn a_record_default_error_renders_exactly() {
     );
 }
 
+/// The three forms of slice 52: a record type with defaults reaches the
+/// literal a spread `for`'s body, a `for` that is a function's result, and
+/// a body block result in.
+const RECORD_DEFAULTS_REACH: &str = "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+     content: List<Install> = [ ...for name in [\"zstd\", \"unzstd\"] { { from = \"dest/usr/bin/{name}\"; to = \"usr/bin/{name}\" } } ]\n\
+     fn licenses(name: String): List<Install> { for file in [\"COPYING\", \"LGPL-2.1\"] { { from = \"src/{file}\"; to = \"x\" } } }\n\
+     fn license(name: String): Install { { from = \"src/LICENSE\"; to = \"y\" } }\n";
+
+#[test]
+fn record_defaults_reach_blocks_ifs_and_fors() {
+    let text = format!(
+        "{RECORD_DEFAULTS_REACH}all = licenses(\"zstd\")\n\
+         one = license(\"zstd\")\n\
+         fn pick(n: Int): Install {{ if n == 0 {{ {{ from = \"a\"; to = \"b\" }} }} else {{ {{ from = \"c\"; to = \"d\"; exclude = [\"e\"] }} }} }}\n\
+         picked = [pick(0).exclude, pick(1).exclude]"
+    );
+    assert_eq!(
+        run(&text).unwrap().to_string(),
+        "{content = [{from = \"dest/usr/bin/zstd\"; to = \"usr/bin/zstd\"; exclude = []}, \
+         {from = \"dest/usr/bin/unzstd\"; to = \"usr/bin/unzstd\"; exclude = []}]; \
+         all = [{from = \"src/COPYING\"; to = \"x\"; exclude = []}, \
+         {from = \"src/LGPL-2.1\"; to = \"x\"; exclude = []}]; \
+         one = {from = \"src/LICENSE\"; to = \"y\"; exclude = []}; \
+         picked = [[], [\"e\"]]}"
+    );
+    // A meta written `defmeta DT PATH = { ... }`, the result of its body's
+    // block, is given its type's defaults too.
+    let text = "type Meta = { versions: List<String>, note: String = \"none\" }\n\
+                #[def_type]\n\
+                def package(name: String, func: fn(): {v: Int} META: Meta) -> String {\n\
+                \x20   \"{name} {func.note}\"\n\
+                }\n\
+                defmeta package dev.x = { versions = [\"1\"] }\n\
+                def package dev.x() { v = 1 }\n\
+                r = package dev.x.note";
+    assert_eq!(
+        run(text).unwrap().to_string(),
+        "{package = fn(name: String | Future<String>, func: fn(): {v: Int} META: \
+         {note: String = \"none\", versions: List<String>}) -> String; r = \"none\"}"
+    );
+}
+
+#[test]
+fn record_defaults_reach_blocks_in_the_repl() {
+    // A type and functions of earlier inputs; a later input's block result.
+    let mut session = Session::new();
+    let inputs = [
+        "type Install = { from: String, to: String, exclude: List<String> = [] }",
+        "fn license(name: String): Install { { from = \"src/{name}\"; to = \"y\" } }",
+        "license(\"a\")",
+        "let xs: List<Install> = [...for n in [\"b\"] { { from = n; to = n } }]",
+        "xs",
+        "((if true { { from = \"c\"; to = \"c\" } } else { { from = \"d\"; to = \"d\" } }) : Install)",
+    ];
+    let mut shown = Vec::new();
+    for input in inputs {
+        let outcome = session.eval(&source(input)).unwrap();
+        shown.push(outcome.value.repr().to_string());
+    }
+    assert_eq!(
+        &shown[2..],
+        [
+            "{from = \"src/a\"; to = \"y\"; exclude = []}",
+            "{}",
+            "[{from = \"b\"; to = \"b\"; exclude = []}]",
+            "{from = \"c\"; to = \"c\"; exclude = []}",
+        ]
+    );
+}
+
 #[test]
 fn an_impure_call_error_renders_exactly() {
     assert_eq!(

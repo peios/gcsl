@@ -1701,6 +1701,43 @@ fn repl_gives_record_literals_defaults_across_lines() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The three forms of slice 52: a record literal that a spread `for`'s
+/// body, a `for` that is a function's result, or a body block results in,
+/// where a type with a defaulted field is expected, is given the field.
+#[test]
+fn run_gives_defaults_to_literals_in_blocks_and_fors() {
+    let output = gcsl(&["run", "tests/fixtures/record_defaults_reach.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{content = [{from = \"dest/usr/bin/zstd\"; to = \"usr/bin/zstd\"; exclude = []}, \
+         {from = \"dest/usr/bin/unzstd\"; to = \"usr/bin/unzstd\"; exclude = []}]; \
+         all = [{from = \"src/COPYING\"; to = \"x\"; exclude = []}, \
+         {from = \"src/LGPL-2.1\"; to = \"x\"; exclude = []}]; \
+         one = {from = \"src/LICENSE\"; to = \"y\"; exclude = []}}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn repl_gives_defaults_to_literals_in_blocks_and_ifs() {
+    // A function of an earlier line whose body results in the literal; an
+    // `if` whose branches do.
+    let output = repl(
+        "type Install = { from: String, exclude: List<String> = [] }\n\
+         fn one(): Install { { from = \"a\" } }\n\
+         one()\n\
+         (if true { { from = \"b\" } } else { { from = \"c\" } }) : Install\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "{from = \"a\"; exclude = []} : {exclude: List<String> = [], from: String}\n\
+         {from = \"b\"; exclude = []} : {exclude: List<String> = [], from: String}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn repl_shows_functions_and_their_errors_against_their_own_line() {
     let output = repl(

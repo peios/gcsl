@@ -1,0 +1,9 @@
+type Install = { from: String, to: String, exclude: List<String> = [] }
+# 1. a spread comprehension under an expected List<Install>
+content: List<Install> = [ ...for name in ["zstd", "unzstd"] { { from = "dest/usr/bin/{name}"; to = "usr/bin/{name}" } } ]
+# 2. a comprehension as a function's result
+fn licenses(name: String): List<Install> { for file in ["COPYING", "LGPL-2.1"] { { from = "src/{file}"; to = "x" } } }
+# 3. a body block whose result is the literal
+fn license(name: String): Install { { from = "src/LICENSE"; to = "y" } }
+all = licenses("zstd")
+one = license("zstd")
