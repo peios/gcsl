@@ -448,7 +448,8 @@ pub struct DefTypeUse {
     /// it belongs to but before them in the arena.
     pub dt: ExprId,
     /// The definition's path, `PATH`, as it is written: identifiers, or
-    /// names with `+` in them, `gmp-c++`, each one name (see the parser's
+    /// names with `+` in them, `gmp-c++`, or, after the first, starting with
+    /// a digit, `24` or `24rc1`, each one name (see the parser's
     /// "Def-types"), joined by `.`.
     pub path: PathRange,
     /// For a reference, the read of the definition: a name standing for
@@ -956,8 +957,9 @@ pub fn path_span(segments: &[PathSegment]) -> Span {
 /// names of a definition's path, after a namespace key or in a path shown by
 /// [`Ast::show_definition_path`], are shown as their source spells them,
 /// never quoted as a field's name that is no identifier is: each is an
-/// identifier, or a name with `+` in it, `org.gnu.gmp-c++` (see the parser's
-/// "Def-types"). Returned by [`Ast::show_path`] and
+/// identifier, or a name with `+` in it, `org.gnu.gmp-c++`, or, after the
+/// first, one starting with a digit, `org.golang.go-stage0-1.24` (see the
+/// parser's "Def-types"). Returned by [`Ast::show_path`] and
 /// [`Ast::show_definition_path`].
 #[derive(Clone, Copy, Debug)]
 pub struct PathDisplay<'a> {
@@ -2936,7 +2938,8 @@ impl Ast {
     /// Shows `segments`, the path of a definition or a reference made with a
     /// def-type, `PATH`, or a prefix of one, as it is written: its names
     /// joined by `.`, each as its source spells it, `+` and all, as in
-    /// `org.gnu.gmp-c++` (see [`PathDisplay`]).
+    /// `org.gnu.gmp-c++`, and digits and all, as in
+    /// `org.golang.go-stage0-1.24` (see [`PathDisplay`]).
     #[must_use]
     pub fn show_definition_path<'a>(&'a self, segments: &'a [PathSegment]) -> PathDisplay<'a> {
         PathDisplay {

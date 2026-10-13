@@ -448,12 +448,14 @@
 //!
 //! A path, as listed and as asked for, is the definition's as it writes it,
 //! its names joined by `.`, a name with `+` in it as written
-//! (`org.gnu.gmp-c++`, see the parser's "Def-types"). A path asked for is
+//! (`org.gnu.gmp-c++`), and one starting with a digit too
+//! (`org.golang.go-stage0-1.24`, `x.1.83.0`, the float `1.83` being the
+//! names `1` and `83`; see the parser's "Def-types"). A path asked for is
 //! not parsed or checked against the rule of names: it is compared with the
 //! definitions' as text, so it names the definition whose path it spells,
 //! or none, the error of a path that names none. One path lies under
 //! another only at a `.`, so `x.a+b` is not under `x.a`, and `x.a+b.c` is
-//! under `x.a+b`.
+//! under `x.a+b`; `x.1.83` is under `x.1`, and `x.10` is not.
 //!
 //! [`Workspace::invoke`] calls the definition as `DT PATH("ARG", ...)`
 //! would be called from a file of the definition's directory, with its
@@ -6547,7 +6549,8 @@ impl Workspace {
 
     /// Invokes the definition of path `path` made with the def-type of path
     /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`,
-    /// `"org.gnu.gmp-c++"`), compared with the listed paths as text,
+    /// `"org.gnu.gmp-c++"`, `"org.golang.go-stage0-1.24"`), compared with
+    /// the listed paths as text,
     /// with the arguments `args`, as if `DT PATH("ARG", ...)` were called
     /// from a file of the definition's directory, each argument a string
     /// literal of its text (see the module documentation, "Def-types by
@@ -17385,5 +17388,203 @@ p26 = com.x"#;
             check_errors(&added),
             ["cannot add `fn() -> Int` and Int at a.gcsl; a.gcsl: fn() -> Int; a.gcsl: Int"]
         );
+    }
+
+    /// A workspace whose definitions have names starting with a digit in
+    /// their paths: the names of real toolchain lanes, a float's split at its
+    /// `.`, an integer's glued to a name, written with `_` and with an
+    /// exponent, defined with their metas in two files of one directory,
+    /// `pkgs`, and referred to from a third file of it and from a directory
+    /// below it, called and read past.
+    const DIGITS: [(&str, &str); 5] = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+             def package(name: String, f: fn(v: String): String META: {versions: List<String>}, \
+             version: String) -> String { \"{name} {f(version)}\" }",
+        ),
+        (
+            "pkgs/lanes.gcsl",
+            "defmeta package org.golang.go-stage0-1.24 { versions = [\"1.24.0\"] }\n\
+             def package org.golang.go-stage0-1.24(v) { \"go {v}\" }\n\
+             defmeta package org.rust-lang.rust-1.83 { versions = [\"1.83.0\"] }\n\
+             def package org.rust-lang.rust-1.83(v) { \"rust {v}\" }",
+        ),
+        (
+            "pkgs/more.gcsl",
+            "defmeta package x.1.83.0 { versions = [\"0\"] }\n\
+             def package x.1.83.0(v) { \"x {v}\" }\n\
+             defmeta package x.24rc1 { versions = [] }\n\
+             def package x.24rc1(v) { \"rc {v}\" }\n\
+             defmeta package x.1.83rc1 { versions = [\"rc1\"] }\n\
+             def package x.1.83rc1(v) { \"rc1 {v}\" }\n\
+             defmeta package x.1_0 { versions = [\"10\"] }\n\
+             def package x.1_0(v) { \"ten {v}\" }\n\
+             defmeta package x.1e5 { versions = [\"1e5\"] }\n\
+             def package x.1e5(v) { \"exp {v}\" }",
+        ),
+        (
+            "pkgs/use.gcsl",
+            "a = package org.golang.go-stage0-1.24(\"1.24.0\")\n\
+             b = package org.rust-lang.rust-1.83.versions\n\
+             c = package x.1.83.0(\"9\")\n\
+             d = package x.24rc1.versions\n\
+             e = package x.1.83rc1(\"1\")\n\
+             f = package x.1_0.versions[0]\n\
+             g = package x.1e5(\"2\")",
+        ),
+        (
+            "pkgs/sub/below.gcsl",
+            "let r = package org.rust-lang.rust-1.83\n\
+             below = r(\"1.83.0\")\n\
+             none = package x.24rc1.versions",
+        ),
+    ];
+
+    #[test]
+    fn definitions_with_digits_in_their_paths_are_ordinary_definitions() {
+        // Referred to from another file of their directory and from one
+        // below it: called, their def-type given their paths as written,
+        // and their metas read.
+        assert_eq!(
+            rooted_text(&DIGITS, "pkgs/use.gcsl"),
+            "{a = \"org.golang.go-stage0-1.24 go 1.24.0\"; b = [\"1.83.0\"]; \
+             c = \"x.1.83.0 x 9\"; d = []; e = \"x.1.83rc1 rc1 1\"; f = \"10\"; \
+             g = \"x.1e5 exp 2\"}"
+        );
+        assert_eq!(
+            rooted_text(&DIGITS, "pkgs/sub/below.gcsl"),
+            "{below = \"org.rust-lang.rust-1.83 rust 1.83.0\"; none = []}"
+        );
+        // Listed, invoked and their metas read by name, by their paths as
+        // written.
+        let mut workspace = rooted(&DIGITS).unwrap();
+        assert_eq!(
+            listed(&workspace, &DIGITS),
+            [
+                "package in workspace.gcsl: org.golang.go-stage0-1.24 in pkgs/lanes.gcsl, \
+                 org.rust-lang.rust-1.83 in pkgs/lanes.gcsl, x.1.83.0 in pkgs/more.gcsl, \
+                 x.24rc1 in pkgs/more.gcsl, x.1.83rc1 in pkgs/more.gcsl, \
+                 x.1_0 in pkgs/more.gcsl, x.1e5 in pkgs/more.gcsl"
+            ]
+        );
+        for (path, value) in [
+            ("org.golang.go-stage0-1.24", "go"),
+            ("org.rust-lang.rust-1.83", "rust"),
+            ("x.1.83.0", "x"),
+            ("x.24rc1", "rc"),
+            ("x.1.83rc1", "rc1"),
+            ("x.1_0", "ten"),
+            ("x.1e5", "exp"),
+        ] {
+            let outcome = workspace.invoke("package", path, &["9".to_owned()]);
+            assert_eq!(
+                outcome.unwrap().value.to_string(),
+                format!("{path} {value} 9")
+            );
+        }
+        let versions = workspace.meta_field("package", "org.golang.go-stage0-1.24", "versions");
+        assert_eq!(versions.unwrap().unwrap().value.to_string(), "[\"1.24.0\"]");
+        let versions = workspace.meta_field("package", "org.rust-lang.rust-1.83", "versions");
+        assert_eq!(versions.unwrap().unwrap().value.to_string(), "[\"1.83.0\"]");
+        // A path that names none is the error it is, its definitions listed
+        // as written; a number's value is not its name.
+        assert_eq!(
+            request_error_with(&DIGITS, ("package", "org.golang.go-stage0-1.2"), &["1"]),
+            "`package` has no definition `org.golang.go-stage0-1.2`; note: its definitions are \
+             `org.golang.go-stage0-1.24`, `org.rust-lang.rust-1.83`, `x.1.83.0`, `x.1.83rc1`, \
+             `x.1_0`, `x.1e5`, `x.24rc1`"
+        );
+        assert_eq!(
+            request_error_with(&DIGITS, ("package", "x.10"), &["1"]),
+            "`package` has no definition `x.10`; note: its definitions are \
+             `org.golang.go-stage0-1.24`, `org.rust-lang.rust-1.83`, `x.1.83.0`, `x.1.83rc1`, \
+             `x.1_0`, `x.1e5`, `x.24rc1`"
+        );
+        // The dumps show them as written, of files not yet run.
+        let mut workspace = rooted(&DIGITS).unwrap();
+        let index = workspace.file("pkgs/sub/below.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(
+            dump.contains("(def-type-ref package org.rust-lang.rust-1.83 : fn(version:"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("(def-type-ref package x.24rc1 : fn(version:"),
+            "{dump}"
+        );
+        let index = workspace.file("pkgs/lanes.gcsl").unwrap();
+        let ir = workspace.dump_ir(index).unwrap();
+        assert!(
+            ir.contains("fn #1 package org.golang.go-stage0-1.24 meta #"),
+            "{ir}"
+        );
+    }
+
+    #[test]
+    fn definitions_with_digits_in_their_paths_conflict_as_any_do() {
+        // In one directory, a definition under another, and two of one path:
+        // the language's errors, the paths shown as written.
+        let under = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "def package x.1() { \"1\" }\ndef package x.1.83() { \"2\" }",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&under),
+            [
+                "cannot define `package x.1.83`: `package x.1` is `fn(): String`, not a record \
+                 at a.gcsl; a.gcsl: `package x.1` defined here"
+            ]
+        );
+        let twice = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "def package x.1.83() { \"1\" }\ndef package x.1.83() { \"2\" }",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&twice),
+            ["field `package x.1.83` is defined twice at a.gcsl; a.gcsl: first defined here"]
+        );
+        // In two sibling directories, a duplicate when invoked by name, and
+        // one lying under another.
+        let siblings = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.1.83() { \"a\" }"),
+            ("b/y.gcsl", "def package x.1.83() { \"b\" }"),
+        ];
+        assert_eq!(
+            invoke_errors(&siblings, "package", "x.1.83"),
+            [
+                "`package x.1.83` is defined 2 times in the workspace at a/x.gcsl; \
+                 b/y.gcsl: also defined here; note: a definition invoked by name must be \
+                 the only one of its path in the workspace"
+            ]
+        );
+        let under = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.1() { \"a\" }"),
+            ("b/y.gcsl", "def package x.1.83() { \"b\" }"),
+        ];
+        assert_eq!(
+            listing_errors(&under),
+            [
+                "`package x.1.83` lies under another `package` definition at b/y.gcsl; \
+                 a/x.gcsl: `x.1` is defined here; note: a definition invoked by name must \
+                 not lie under another in the workspace"
+            ]
+        );
+        // `10` is a name of its own, under no `1`.
+        let apart = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.1() { \"a\" }"),
+            ("b/y.gcsl", "def package x.10() { \"b\" }"),
+        ];
+        assert_eq!(invoked_text(&apart, "package", "x.1"), "x.1 a");
+        assert_eq!(invoked_text(&apart, "package", "x.10"), "x.10 b");
     }
 }

@@ -24,10 +24,11 @@
 //! first is a key is shown as its def-type and the rest of the path, as the
 //! definition is written, `package dev.peios.testpkg` ([`show_path`]). The
 //! names of a definition's path are identifiers, or names with `+` in them,
-//! `gmp-c++` (see the parser's "Def-types"), each one name, shown as it is
-//! written, `package org.gnu.gmp-c++`; none holds `<`, `#`, `@` or `>`, and a
-//! key holds only the def-type's path, made of identifiers, so no key reads
-//! differently for them.
+//! `gmp-c++`, or, after the first, names starting with a digit, `24`,
+//! `24rc1` (see the parser's "Def-types"), each one name, shown as it is
+//! written, `package org.gnu.gmp-c++`, `package org.golang.go-stage0-1.24`;
+//! none holds `<`, `#`, `@` or `>`, and a key holds only the def-type's
+//! path, made of identifiers, so no key reads differently for them.
 //!
 //! The metas of a def-type's definitions (`defmeta package x { ... }`) are
 //! kept apart, one namespace per def-type and DIRECTORY, since a meta

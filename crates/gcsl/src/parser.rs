@@ -111,8 +111,9 @@
 //! REFERENCE  = DT PATH
 //! META       = "defmeta" DT PATH (BLOCK | "=" EXPR)
 //! DT         = IDENT ("." IDENT)*
-//! PATH       = SEGMENT ("." SEGMENT)*
+//! PATH       = SEGMENT ("." (SEGMENT | NUMBER))*
 //! SEGMENT    = IDENT | IDENT "+" ...      (the run glued to it, below)
+//! NUMBER     = INT ...  | FLOAT ...       (from a digit, below)
 //! ```
 //!
 //! A segment of PATH, and only of PATH, may have `+` in its name after its
@@ -124,9 +125,10 @@
 //! and `-` is glued to the identifier, a lone `-` only with a token glued
 //! after it, and the segment is named by the source text of the run,
 //! interned as one name. So a segment is a maximal run of ASCII letters,
-//! digits, `_`, `-` and `+`, starting with a letter or `_`, in which every
-//! `-` is directly followed by a letter, digit, `_` or `+`, and which may end
-//! with `+` but not with `-`, whatever its tokens are: `gmp-c++`, `a+b`,
+//! digits, `_`, `-` and `+`, starting with a letter or `_` (or, after the
+//! first segment, a digit, below), in which every `-` is directly followed
+//! by a letter, digit, `_` or `+`, and which may end with `+` but not with
+//! `-`, whatever its tokens are: `gmp-c++`, `a+b`,
 //! `c++11`, and `gcc-libstdc++-devel`, lexed as `gcc-libstdc`, `+`, `+`, a
 //! negation's `-`, and `devel`. What the lexer rejects stays rejected
 //! (`c++11-x` is "`-` here is ambiguous", as `1-x` is, and `c++1_` a number
@@ -141,9 +143,38 @@
 //! addition of the reference and what followed, and is now one reference
 //! (references are new); with a space before the `+`, it is the addition
 //! still. A `+` directly after a `.` is the error it was, since a segment
-//! starts with an identifier. The names are definitions' like any other
-//! from here on, shown as written wherever a definition's path is
+//! starts with an identifier or a digit. The names are definitions' like
+//! any other from here on, shown as written wherever a definition's path is
 //! ([`Ast::show_definition_path`]).
+//!
+//! A segment after the first may start with a digit, as versioned names
+//! do, `org.golang.go-stage0-1.24` and `org.rust-lang.rust-1.83`
+//! (`Parser::number_segments`): after a `.`, an integer literal starts a
+//! segment, and so does a float, split at its `.` as if it were an integer,
+//! `.` and an integer, each part with its own span (the lexer, unchanged,
+//! makes `x.1.83.0` `x`, `.`, the float `1.83`, `.` and `0`: the segments
+//! `x`, `1`, `83` and `0`). The segment the integer starts, or the float's
+//! part after its `.`, is the run of it and every token glued to it as
+//! above, `+` after it or not, named by the run's source text: `24rc1`
+//! (`24` and `rc1`) is one segment, `1.83rc1` the two `1` and `83rc1`, `1_0`
+//! is named `1_0`, a float with an exponent and no `.`, `1e5`, is one
+//! segment, and `1.5e3` is `1` and `5e3`. A segment of digits alone is a
+//! name like any other, `24`, which is not `024`. The first segment still
+//! starts with an identifier, which is what makes a definition, a meta or
+//! a reference (`def package 1.x(v)` is "expected `(` after `fn`, found
+//! `1`", as it was), and nowhere else does a digit start a name: `x.0` in a
+//! field's path, an expression, a `def`'s name or DT is the error it was.
+//! What the lexer rejects stays rejected: an integer out of the range of
+//! `Int`, `x.99999999999999999999` (a float's part after its `.` is no
+//! integer, so `x.1.99999999999999999999` is `1` and
+//! `99999999999999999999`), and a `-` directly after a number, `x.1-rc`,
+//! "`-` here is ambiguous". A float in a run, not directly after a `.`, is
+//! not split: `x.c++1.5` and `x.24+1.5` end the segment before it, where it
+//! is an error, as `c++1.5` was. No program that parsed means anything
+//! else: a number after a `.` that ends a reference was "expected a field
+//! name after `.`", and after a definition's or a meta's path "expected `(`
+//! after the definition's path" or "expected `{` or `=` after the meta's
+//! path".
 //!
 //! A definition, [`ItemKind::DefTypeDef`], is recognised after `def` and a
 //! name or a path (`Parser::parse_def`): an identifier that follows them on
@@ -153,10 +184,10 @@
 //! from `package`", at its `:`, and a return marker after them "the result
 //! type of a `package` definition comes from `package`", at the marker,
 //! `package` being its DT as written. Its path is a `def`'s, identifiers
-//! joined by `.`, but that a segment may have `+` in it, as above ("a
-//! `def`'s path is made of identifiers" otherwise, at the segment), then
-//! `(`, the parameters and the body, each "expected ..."
-//! otherwise. It is an item of a file's outermost body only: anywhere else,
+//! joined by `.`, but that a segment may have `+` in it, and one after the
+//! first start with a digit, as above ("a `def`'s path is made of
+//! identifiers" otherwise, at the segment), then `(`, the parameters and the
+//! body, each "expected ..." otherwise. It is an item of a file's outermost body only: anywhere else,
 //! "a def-type definition is declared only at the top level of a file", at
 //! its `def`. Its function expression spans its path through its body, the
 //! expression that reads its DT coming before its body's in the arena.
@@ -1749,25 +1780,39 @@ impl Parser<'_> {
     /// `PATH`, starting at its first identifier, the current token:
     /// segments joined by `.`, each an identifier, or an identifier with the
     /// tokens glued to it that make a name with `+` in it
-    /// ([`Parser::path_segment`]). A quoted segment, or an index, is "a
+    /// ([`Parser::path_segment`]), or, after the first, one that starts with
+    /// a digit, from an integer or a float, split at its `.`
+    /// ([`Parser::number_segments`]). A quoted segment, or an index, is "a
     /// `def`'s path is made of identifiers", but that an index ends the path
     /// of a `reference`, to index what it reads. Returns its segments.
     fn parse_def_type_path(&mut self, reference: bool) -> ParseResult<Vec<PathSegment>> {
         let mut segments = Vec::new();
         loop {
             let token = self.peek();
-            let TokenKind::Ident(name) = token.kind else {
-                let found = self.describe(token);
-                return Err(self.error(
-                    format!("expected the definition's name after `.`, found {found}"),
-                    error_span(token),
-                ));
-            };
-            self.advance();
-            let segment = self.path_segment(token, name);
-            segments.push(segment);
+            match token.kind {
+                TokenKind::Ident(name) => {
+                    self.advance();
+                    let segment = self.path_segment(token, name);
+                    segments.push(segment);
+                }
+                // A segment after the first may start with a digit: an
+                // integer, or a float split at its `.`.
+                TokenKind::Int(_) | TokenKind::Float(_) if !segments.is_empty() => {
+                    self.advance();
+                    self.number_segments(token, &mut segments);
+                }
+                _ => {
+                    let found = self.describe(token);
+                    return Err(self.error(
+                        format!("expected the definition's name after `.`, found {found}"),
+                        error_span(token),
+                    ));
+                }
+            }
             match (self.peek().kind, self.peek_at(1).kind) {
-                (TokenKind::Dot, TokenKind::Ident(_)) => self.advance(),
+                (TokenKind::Dot, TokenKind::Ident(_) | TokenKind::Int(_) | TokenKind::Float(_)) => {
+                    self.advance();
+                }
                 (TokenKind::Dot, TokenKind::Str(_) | TokenKind::StrStart(_)) => {
                     self.advance();
                     let token = self.peek();
@@ -1795,38 +1840,17 @@ impl Parser<'_> {
     /// The segment of a definition's path that starts at the identifier
     /// `first`, of name `name`, just consumed (see [Def-types](#def-types)):
     /// the identifier alone, unless a `+` directly follows it, when the
-    /// segment is the run of the tokens glued to it, consumed, and its name
-    /// the run's source text, interned, so that `gmp-c++` is one name. A
-    /// token is glued when it directly follows the one before, nothing
-    /// between them, and its text is made only of ASCII letters, digits, `_`,
-    /// `+` and `-`, a `-` that ends one being glued only with a token glued
-    /// after it: so the run is a maximal one of those characters in which
-    /// every `-` is directly followed by a letter, a digit, `_` or `+` (the
-    /// lexer allowing no `--`), and that does not end with `-`. `gmp-c++`, `a+b`, `c++11` and `gcc-libstdc++-devel`
-    /// (lexed as `gcc-libstdc`, `+`, `+`, `-`, `devel`) are each one segment;
-    /// `a + 1`, with spaces, is not.
+    /// segment is the run of the tokens glued to it ([`Parser::glued_run`]),
+    /// consumed, and its name the run's source text, interned, so that
+    /// `gmp-c++` is one name. `gmp-c++`, `a+b`, `c++11` and
+    /// `gcc-libstdc++-devel` (lexed as `gcc-libstdc`, `+`, `+`, `-`,
+    /// `devel`) are each one segment; `a + 1`, with spaces, is not.
     fn path_segment(&mut self, first: Token, name: Name) -> PathSegment {
-        let (mut glued, mut glued_end) = (0, first.span.end);
-        if self.peek().kind == TokenKind::Plus {
-            let (mut ahead, mut end) = (0, first.span.end);
-            loop {
-                let token = self.peek_at(ahead);
-                let text = self.source.slice(token.span);
-                if token.span.start != end
-                    || text.is_empty()
-                    || !text.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b'-')
-                    })
-                {
-                    break;
-                }
-                ahead += 1;
-                end = token.span.end;
-                if !text.ends_with('-') {
-                    (glued, glued_end) = (ahead, end);
-                }
-            }
-        }
+        let (glued, end) = if self.peek().kind == TokenKind::Plus {
+            self.glued_run(first.span.end)
+        } else {
+            (0, first.span.end)
+        };
         if glued == 0 {
             return PathSegment {
                 kind: SegmentKind::Name(name),
@@ -1834,7 +1858,71 @@ impl Parser<'_> {
             };
         }
         self.pos += glued;
-        let span = Span::new(first.span.start, glued_end);
+        self.written_segment(Span::new(first.span.start, end))
+    }
+
+    /// The segments of a definition's path that start at the number literal
+    /// `first`, an integer or a float, just consumed, after the path's first
+    /// segment (see [Def-types](#def-types)), pushed onto `segments`: a
+    /// float with a fraction is split at its `.`, as if it were an integer,
+    /// `.` and an integer, into the digits before it, one segment, and those
+    /// after it, which start the next; anything else starts one whole
+    /// (`24`, `1_0`, `1e5`). The segment it starts is the run of it and the
+    /// tokens glued to it, consumed ([`Parser::glued_run`]), whatever
+    /// follows, named by the run's source text, interned: `1.83` is `1` and
+    /// `83`, `24rc1` (`24` and `rc1`) one segment, and `1.83rc1` `1` and
+    /// `83rc1`.
+    fn number_segments(&mut self, first: Token, segments: &mut Vec<PathSegment>) {
+        let mut start = first.span.start;
+        let dot = self
+            .source
+            .slice(first.span)
+            .find('.')
+            .and_then(|at| u32::try_from(at).ok());
+        if let Some(dot) = dot {
+            segments.push(self.written_segment(Span::new(start, start + dot)));
+            start += dot + 1;
+        }
+        let (glued, end) = self.glued_run(first.span.end);
+        self.pos += glued;
+        segments.push(self.written_segment(Span::new(start, end)));
+    }
+
+    /// How many tokens, from the current one on, are glued to a segment of a
+    /// definition's path whose run so far ends at `end`, and where the run
+    /// then ends (see [Def-types](#def-types)). A token is glued when it
+    /// directly follows the one before, nothing between them, and its text
+    /// is made only of ASCII letters, digits, `_`, `+` and `-`, a `-` that
+    /// ends one being glued only with a token glued after it: so the run is
+    /// a maximal one of those characters in which every `-` is directly
+    /// followed by a letter, a digit, `_` or `+` (the lexer allowing no
+    /// `--`), and that does not end with `-`.
+    fn glued_run(&self, end: u32) -> (usize, u32) {
+        let (mut glued, mut glued_end) = (0, end);
+        let (mut ahead, mut end) = (0, end);
+        loop {
+            let token = self.peek_at(ahead);
+            let text = self.source.slice(token.span);
+            if token.span.start != end
+                || text.is_empty()
+                || !text
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b'-'))
+            {
+                break;
+            }
+            ahead += 1;
+            end = token.span.end;
+            if !text.ends_with('-') {
+                (glued, glued_end) = (ahead, end);
+            }
+        }
+        (glued, glued_end)
+    }
+
+    /// The segment of a definition's path of span `span`, named by its
+    /// source text, interned.
+    fn written_segment(&mut self, span: Span) -> PathSegment {
         PathSegment {
             kind: SegmentKind::Name(self.names.intern(self.source.slice(span))),
             span,
@@ -10435,6 +10523,178 @@ mod tests {
                 "expected end of item, found `=`".to_owned(),
                 Span::new(6, 7)
             )
+        );
+    }
+
+    #[test]
+    fn a_definition_s_path_may_have_names_starting_with_a_digit() {
+        // The names of real toolchain lanes, each a definition, a meta and a
+        // reference, called and read past, the last name a number's.
+        for path in ["org.golang.go-stage0-1.24", "org.rust-lang.rust-1.83"] {
+            let text = format!(
+                "defmeta package {path} {{ versions = [] }}\n\
+                 def package {path}(v) {{ v }}\n\
+                 x = package {path}(\"1\")\n\
+                 y = package {path}.versions"
+            );
+            assert_eq!(
+                shape(&text),
+                format!(
+                    "defmeta package {path} {{versions = list()}}; def package {path}(v) {{v}}; \
+                     x = (package {path})(\"1\"); y = (package {path}.versions)"
+                )
+            );
+            let (_, last) = path.rsplit_once('.').unwrap();
+            let paths = def_type_paths(&text);
+            let lengths: Vec<usize> = paths.iter().map(Vec::len).collect();
+            assert_eq!(lengths, [4, 4, 4, 5]);
+            for names in &paths {
+                let (name, span) = &names[3];
+                assert_eq!(name, last);
+                assert_eq!(&text[span.start as usize..span.end as usize], last);
+            }
+            assert_eq!(paths[3][4].0, "versions");
+        }
+        // A float is split at its `.`, each part a name with its own span;
+        // an integer glues on what touches it; a name is its source text.
+        assert_eq!(
+            def_type_paths(
+                "def p x.1.83.0() { 1 }\nx = p x.24rc1\ny = p x.1.83rc1.versions\nz = p x.1_0"
+            ),
+            [
+                vec![
+                    ("x".to_owned(), Span::new(6, 7)),
+                    ("1".to_owned(), Span::new(8, 9)),
+                    ("83".to_owned(), Span::new(10, 12)),
+                    ("0".to_owned(), Span::new(13, 14)),
+                ],
+                vec![
+                    ("x".to_owned(), Span::new(29, 30)),
+                    ("24rc1".to_owned(), Span::new(31, 36)),
+                ],
+                vec![
+                    ("x".to_owned(), Span::new(43, 44)),
+                    ("1".to_owned(), Span::new(45, 46)),
+                    ("83rc1".to_owned(), Span::new(47, 52)),
+                    ("versions".to_owned(), Span::new(53, 61)),
+                ],
+                vec![
+                    ("x".to_owned(), Span::new(68, 69)),
+                    ("1_0".to_owned(), Span::new(70, 73)),
+                ],
+            ]
+        );
+        // A float with an exponent: whole without a `.`, split with one, the
+        // exponent's sign kept.
+        assert_eq!(
+            def_type_paths("x = p a.1e5.2.5e-3.7.5E+3"),
+            [vec![
+                ("a".to_owned(), Span::new(6, 7)),
+                ("1e5".to_owned(), Span::new(8, 11)),
+                ("2".to_owned(), Span::new(12, 13)),
+                ("5e-3".to_owned(), Span::new(14, 18)),
+                ("7".to_owned(), Span::new(19, 20)),
+                ("5E+3".to_owned(), Span::new(21, 25)),
+            ]]
+        );
+        // A float written with `_` is split the same way.
+        assert_eq!(
+            def_type_paths("x = p a.1_0.2_5"),
+            [vec![
+                ("a".to_owned(), Span::new(6, 7)),
+                ("1_0".to_owned(), Span::new(8, 11)),
+                ("2_5".to_owned(), Span::new(12, 15)),
+            ]]
+        );
+        // `+` glues as it does after an identifier, and `-` before a name.
+        assert_eq!(
+            def_type_paths("x = p a.1+2.c.3a-b.007"),
+            [vec![
+                ("a".to_owned(), Span::new(6, 7)),
+                ("1+2".to_owned(), Span::new(8, 11)),
+                ("c".to_owned(), Span::new(12, 13)),
+                ("3a-b".to_owned(), Span::new(14, 18)),
+                ("007".to_owned(), Span::new(19, 22)),
+            ]]
+        );
+        // A float in a run, not after a `.`, is not split: the segment ends
+        // before it, as it did after `c++`.
+        assert_eq!(
+            error("def p x.24+1.5() { 1 }"),
+            (
+                "expected `(` after the definition's path, found `1.5`".to_owned(),
+                Span::new(11, 14)
+            )
+        );
+        assert_eq!(
+            error("def p x.c++1.5() { 1 }"),
+            (
+                "expected `(` after the definition's path, found `1.5`".to_owned(),
+                Span::new(11, 14)
+            )
+        );
+    }
+
+    #[test]
+    fn a_digit_starts_a_name_nowhere_else() {
+        // The first segment of a definition's path is what makes it one, an
+        // identifier: a digit there is the error it was.
+        assert_eq!(
+            error("def p 1.x() { 1 }"),
+            (
+                "expected `(` after `fn`, found `1`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        assert_eq!(
+            error("x = p 1.x"),
+            (
+                "expected end of item, found `1`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        // `x.0` is the error it was in a field's path, an expression, a
+        // `def`'s name and a def-type.
+        assert_eq!(
+            error("c = a.0"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        assert_eq!(
+            error("let y = x.1.5"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(10, 13)
+            )
+        );
+        assert_eq!(
+            error("def x.0() { 1 }"),
+            (
+                "expected the function's name after `.`, found `0`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        assert_eq!(
+            error("x = p.1 a"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(6, 7)
+            )
+        );
+        // After a reference's path, what follows its last name is read as it
+        // was, so a range of one.
+        assert_eq!(shape("x = p a.1..3"), "x = ((p a.1) .. 3)");
+        // A quoted name or an index after a number is the error it is after
+        // an identifier.
+        assert_eq!(
+            error("def p x.1.\"a\"() { 1 }"),
+            (DEF_PATH.to_owned(), Span::new(10, 13))
+        );
+        assert_eq!(
+            error("def p x.1[0]() { 1 }"),
+            (DEF_PATH.to_owned(), Span::new(9, 12))
         );
     }
 }

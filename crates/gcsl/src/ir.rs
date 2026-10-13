@@ -2721,9 +2721,9 @@ impl fmt::Display for Pretty<'_> {
             }
             // A definition made with a def-type, as it is written, its
             // namespace's key shown as its def-type and its path's names as
-            // their source spells them, `+` and all (see the parser's
-            // "Def-types"); a meta as `defmeta`, its def-type and its path,
-            // one name, as written.
+            // their source spells them, `+` and all, a name of digits too
+            // (see the parser's "Def-types"); a meta as `defmeta`, its
+            // def-type and its path, one name, as written.
             let mut before = " ";
             let mut meta = false;
             let mut definition = false;
