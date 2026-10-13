@@ -5495,8 +5495,10 @@ fn string_list<'a>(pieces: impl Iterator<Item = &'a str>) -> Value {
 /// zeros, the longer one the greater, else the first digit that differs,
 /// never parsed, so of any length. Strings whose runs are all equal but
 /// which differ (`1.01` and `1.1`) are ordered by their bytes, so only equal
-/// strings are `Equal`.
-fn compare_versions(a: &str, b: &str) -> Ordering {
+/// strings are `Equal`. Public, so that a host orders versions as the
+/// built-in does (`pekit` chooses `@latest` by it).
+#[must_use]
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let (mut a_rest, mut b_rest) = (a.as_bytes(), b.as_bytes());
     while !a_rest.is_empty() || !b_rest.is_empty() {
         let (a_run, a_after) = version_run(a_rest, false);

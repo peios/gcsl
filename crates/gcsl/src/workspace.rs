@@ -457,46 +457,58 @@
 //! another only at a `.`, so `x.a+b` is not under `x.a`, and `x.a+b.c` is
 //! under `x.a+b`; `x.1.83` is under `x.1`, and `x.10` is not.
 //!
-//! [`Workspace::invoke`] calls the definition as `DT PATH("ARG", ...)`
+//! [`Workspace::invoke`] calls the definition as `DT PATH(NAME = VALUE, ...)`
 //! would be called from a file of the definition's directory, with its
-//! arguments, given as text, each a string: one for each of the def-type's
-//! invocation parameters, in the order it declares them, filling them left
-//! to right, as many as there are, or fewer, each left out optional: an
-//! invocation parameter with a default (see the checker's "Calls") may be
-//! left out, with every one after it, and takes its default. So `def
-//! lock(name: String, func: fn(version: String) -> List<Version>, version:
-//! String = "")` takes 0 or 1 arguments, and invoked with none, gives
-//! `version` `""`. Every parameter left out must be optional: since the
-//! arguments fill parameters left to right, a required one after an optional
-//! one is never left out while the optional one is given. Only a parameter
-//! that a present `String` fits can be given so, optional or not, a
-//! `String` or a union or an alias with it, and so a bare `version: String`
-//! of an impure def-type, which is `String | Future<String>` (of a memoised
-//! one, `String`); a `Future` cannot. What it asks for may name nothing: no
+//! arguments BY NAME, each the name of one of the def-type's invocation
+//! parameters and a value ([`Given`]), in any order; each invocation
+//! parameter given none takes its default (see the checker's "Calls"), if it
+//! has one, whichever others are given: so `def lock(name: String, func:
+//! fn(version: String) -> List<Version>, version: String = "")` invoked with
+//! none gives `version` `""`, and `def build(name: String, f: fn(): String,
+//! version: String = "", target: String)` may be given `target` alone. A
+//! value is of one of four types, `String`, `Int`, `Float` and `Bool`, and
+//! is given only for a parameter of that type as it is declared, an alias of
+//! it, or the either shape of an impure def-type's bare one (`version:
+//! String` of an impure def-type is `String | Future<String>`, of a memoised
+//! one `String`); a parameter of any other type, a union, a `Future`, a
+//! record or a list, cannot be given one, and so a def-type with such a
+//! parameter that has no default cannot be invoked so, while one with a
+//! default is left out and takes it. [`Workspace::arguments`] reads them from
+//! text, as a command line gives them, each by its parameter's type: a
+//! `String` the text as it is, read as nothing else (no `{` in it
+//! interpolates), an `Int` a decimal integer, with `-` before it if
+//! negative, in range, a `Float` a decimal number Rust's `f64` reads, finite,
+//! a `Bool` `true` or `false`; it runs nothing, so a host can check every
+//! request before it runs any. What is asked for may name nothing: no
 //! def-type of the name, no definition of the path, or a path above
-//! definitions; or it may not fit the def-type, which has an invocation
-//! parameter a string does not fit, "`build`'s parameter `n` is `Int`, but
-//! only `String` parameters can be given here yet", the first such, its
-//! type as it is written, whatever arguments are given, or takes another
-//! number of arguments, "`package` takes 1 argument (`version`), but 0 were
-//! given" ("takes 2 arguments (`target`, `mode`)", "takes no arguments",
-//! "but 1 was given"; with optional ones, the range, "`lock` takes 0 or 1
-//! arguments (`version`), but 2 were given", "takes 1 to 3 arguments (`a`,
-//! `b`, `c`)"); each is a [`RequestError`], an error of no source, in
-//! that order. Then the
+//! definitions; or the arguments may not fit the def-type: an invocation
+//! parameter that has no default and cannot be given a value, "`build`'s
+//! parameter `n` is `List<Int>`, but only `String`, `Int`, `Float` and
+//! `Bool` parameters can be given here yet", the first such, its type as it
+//! is written, whatever is given; then, argument by argument, a name that
+//! is no invocation parameter's, "`package` has no invocation parameter
+//! `jbos`", noting those it has, one named twice, "`package`'s parameter
+//! `version` is given more than once", one given for a parameter that
+//! cannot be given a value (the same error as above), or a text that is not
+//! a value of its parameter's type, "`x` is not an `Int`, the type of `jobs`
+//! of `package org.foo`", noting how one is written; and last the
+//! parameters that have no default and are given none, "`deploy` needs
+//! `target` and `mode`, which were not given". Each is a [`RequestError`],
+//! an error of no source, in that order. Then the
 //! definition's file and the def-type's run as a reference to the
 //! definition needs them to, each as a whole, with the files they need (its
 //! meta's among them, if it has one), unless they have run, as for
 //! [`Workspace::run`], and the call is made: an input of its own, built
-//! rather than parsed, `<def-type>("PATH", <definition>, "ARG", ...)` as its
-//! result, each argument a string literal of the text given, read as
-//! nothing else (no `{` in it interpolates), whose two names no source can
+//! rather than parsed, `<def-type>("PATH", <definition>, NAME = VALUE, ...)`
+//! as its result, each value a literal of its kind (a string literal of the
+//! text given, an integer, a float, or `true` or `false`), named by its
+//! parameter, whose two names no source can
 //! write are bound, in a scope of the workspace's slots, as fields of the
 //! def-type's cell and the definition's (the slots of their closures), with
 //! their types, and the def-type's with what a call of it needs to know of
 //! its parameters, as a session's input knows a function of an earlier one,
 //! so that the call is of a known callee and gives each optional parameter
-//! left out its default. It is checked as an input of no workspace, so that it looks
+//! given none its default. It is checked as an input of no workspace, so that it looks
 //! nothing up in any file's view and needs no alias, placed in the
 //! definition's directory, so that the def-type's caller (`fileroot.caller`)
 //! is that directory, as for a call written there, and the definition's is
@@ -720,7 +732,7 @@ use crate::parser;
 use crate::session;
 use crate::source::{SourceFile, Span};
 use crate::strings::Strings;
-use crate::types::{TyId, TypeTable};
+use crate::types::{Laziness, TyId, TypeTable};
 use crate::value::{Layout, Value};
 
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
@@ -6265,12 +6277,13 @@ pub struct DefType {
     pub span: Span,
     /// The names of its invocation parameters, its parameters after the
     /// definition's path and the definition, as it declares them, in order:
-    /// what invoking one of its definitions takes an argument for each of.
+    /// what invoking one of its definitions takes arguments by the names of.
     pub parameters: Vec<String>,
     /// For each of its invocation parameters, in the order of `parameters`,
     /// whether it is optional: whether it has a default, `version: String =
     /// ""`, which invoking one of its definitions without an argument for
-    /// it gives it (see the module documentation, "Def-types by name").
+    /// it gives it, whichever others are given (see the module
+    /// documentation, "Def-types by name").
     pub optional: Vec<bool>,
     /// Every definition made with it, in path order of their files, then in
     /// source order: none if it has none.
@@ -6343,10 +6356,13 @@ pub enum RequestError {
         /// The paths of the def-type's definitions, sorted.
         definitions: Vec<String>,
     },
-    /// An invocation parameter of the def-type is of a type that a string
-    /// does not fit, and only strings can be given by name yet: "`build`'s
-    /// parameter `n` is `Int`, but only `String` parameters can be given
-    /// here yet". The first such parameter, as it declares them.
+    /// An invocation parameter of the def-type that is given an argument, or
+    /// that must be, having no default, is of a type no argument can be
+    /// given for: only a `String`, `Int`, `Float` or `Bool` one can be (see
+    /// [`Given`]): "`build`'s parameter `n` is `List<Int>`, but only
+    /// `String`, `Int`, `Float` and `Bool` parameters can be given here
+    /// yet". One that must be given is reported whatever is given, the
+    /// first as it declares them, before anything given is looked at.
     CannotBeGiven {
         /// The def-type's path.
         def_type: String,
@@ -6355,24 +6371,51 @@ pub enum RequestError {
         /// The parameter's type, as it is written.
         ty: String,
     },
-    /// The number of arguments given is not a number the def-type's
-    /// invocation parameters take: "`package` takes 1 argument (`version`),
-    /// but 0 were given", or, when some are optional, "`lock` takes 0 or 1
-    /// arguments (`version`), but 2 were given" and "takes 1 to 3 arguments
-    /// (...)". They take as many as there are, and as few as fill every one
-    /// that is not optional, left to right ([`RequestError::required`]).
-    ArgumentCount {
+    /// An argument names no invocation parameter of the def-type:
+    /// "`package` has no invocation parameter `jbos`".
+    UnknownParameter {
         /// The def-type's path.
         def_type: String,
+        /// The name the argument gives.
+        parameter: String,
         /// The names of its invocation parameters, as it declares them, in
         /// order.
         parameters: Vec<String>,
-        /// For each of its invocation parameters, in the order of
-        /// `parameters`, whether it is optional, having a default (see
-        /// [`DefType::optional`]).
-        optional: Vec<bool>,
-        /// The number of arguments given.
-        given: usize,
+    },
+    /// Two arguments or more name one invocation parameter: "`package`'s
+    /// parameter `version` is given more than once".
+    DuplicateArgument {
+        /// The def-type's path.
+        def_type: String,
+        /// The parameter's name.
+        parameter: String,
+    },
+    /// An argument's text is not a value of its parameter's type as the
+    /// parameter's type reads it, or a value of another type is given for
+    /// it: "`x` is not an `Int`, the type of `jobs` of `package org.foo`".
+    CannotParse {
+        /// The def-type's path.
+        def_type: String,
+        /// The definition's path.
+        path: String,
+        /// The parameter's name.
+        parameter: String,
+        /// Which of the four types that can be given the parameter's is,
+        /// named as it is written: `"String"`, `"Int"`, `"Float"` or
+        /// `"Bool"` (an alias's, or an impure def-type's either shape's).
+        expected: &'static str,
+        /// The text given, or the value given, as [`Given`] shows it.
+        text: String,
+    },
+    /// Invocation parameters that have no default are given no argument:
+    /// "`package` needs `version`, which was not given", "`deploy` needs
+    /// `target` and `mode`, which were not given".
+    MissingArguments {
+        /// The def-type's path.
+        def_type: String,
+        /// The names of the parameters given none, as it declares them, in
+        /// order.
+        parameters: Vec<String>,
     },
 }
 
@@ -6393,58 +6436,51 @@ impl RequestError {
                 parameter,
                 ty,
             } => format!(
-                "`{def_type}`'s parameter `{parameter}` is `{ty}`, but only `String` parameters \
-                 can be given here yet"
+                "`{def_type}`'s parameter `{parameter}` is `{ty}`, but only `String`, `Int`, \
+                 `Float` and `Bool` parameters can be given here yet"
             ),
-            RequestError::ArgumentCount {
+            RequestError::UnknownParameter {
+                def_type,
+                parameter,
+                ..
+            } => format!("`{def_type}` has no invocation parameter `{parameter}`"),
+            RequestError::DuplicateArgument {
+                def_type,
+                parameter,
+            } => format!("`{def_type}`'s parameter `{parameter}` is given more than once"),
+            RequestError::CannotParse {
+                def_type,
+                path,
+                parameter,
+                expected,
+                text,
+            } => {
+                let article = if *expected == "Int" { "an" } else { "a" };
+                format!(
+                    "`{text}` is not {article} `{expected}`, the type of `{parameter}` of \
+                     `{def_type} {path}`"
+                )
+            }
+            RequestError::MissingArguments {
                 def_type,
                 parameters,
-                optional,
-                given,
             } => {
-                let all = parameters.len();
-                let required = RequestError::required(all, optional);
-                let takes = match &parameters[..] {
-                    [] => "no arguments".to_owned(),
-                    // Nothing can be left out: as many as there are.
-                    [_] if required == all => format!("1 argument ({})", quoted_list(parameters)),
-                    _ if required == all => {
-                        format!("{all} arguments ({})", quoted_list(parameters))
-                    }
-                    _ if all == required + 1 => {
-                        format!(
-                            "{required} or {all} arguments ({})",
-                            quoted_list(parameters)
-                        )
-                    }
-                    _ => format!(
-                        "{required} to {all} arguments ({})",
-                        quoted_list(parameters)
-                    ),
-                };
-                let was = if *given == 1 { "was" } else { "were" };
-                format!("`{def_type}` takes {takes}, but {given} {was} given")
+                let was = if parameters.len() == 1 { "was" } else { "were" };
+                format!(
+                    "`{def_type}` needs {}, which {was} not given",
+                    and_list(parameters)
+                )
             }
         }
-    }
-
-    /// The fewest arguments `count` invocation parameters take, of which
-    /// `optional` says which are optional (one it says nothing of is not):
-    /// one for each up to the last that is not, so that every one that is
-    /// not is filled, arguments filling them left to right; the optional
-    /// ones after it may be left out, and take their defaults.
-    #[must_use]
-    pub fn required(count: usize, optional: &[bool]) -> usize {
-        (0..count)
-            .rev()
-            .find(|&at| optional.get(at) != Some(&true))
-            .map_or(0, |last| last + 1)
     }
 
     /// The notes that follow the message: what there is to ask for instead,
     /// "the def-types are `build`, `package`", or with one, "the only
     /// def-type is `package`", and so "its definitions are `a`, `b`" and
-    /// "its only definition is `a`".
+    /// "its only definition is `a`", and "its invocation parameters are
+    /// `a`, `b`" and "its only invocation parameter is `a`"; or how a value
+    /// of the type asked for is written, "a `Bool` is written `true` or
+    /// `false`".
     #[must_use]
     pub fn notes(&self) -> Vec<String> {
         match self {
@@ -6466,7 +6502,31 @@ impl RequestError {
                 [only] => vec![format!("its only definition is `{only}`")],
                 _ => vec![format!("its definitions are {}", quoted_list(definitions))],
             },
-            RequestError::CannotBeGiven { .. } | RequestError::ArgumentCount { .. } => Vec::new(),
+            RequestError::UnknownParameter { parameters, .. } => match &parameters[..] {
+                [] => vec!["it has no invocation parameters".to_owned()],
+                [only] => vec![format!("its only invocation parameter is `{only}`")],
+                _ => vec![format!(
+                    "its invocation parameters are {}",
+                    quoted_list(parameters)
+                )],
+            },
+            RequestError::CannotParse { expected, .. } => match *expected {
+                "Int" => vec![format!(
+                    "an `Int` is written as a decimal integer, with `-` before it if it is \
+                     negative, from {} to {}",
+                    i64::MIN,
+                    i64::MAX
+                )],
+                "Float" => vec![
+                    "a `Float` is written as a decimal number, `1.5` or `2`, and must be finite"
+                        .to_owned(),
+                ],
+                "Bool" => vec!["a `Bool` is written `true` or `false`".to_owned()],
+                _ => Vec::new(),
+            },
+            RequestError::CannotBeGiven { .. }
+            | RequestError::DuplicateArgument { .. }
+            | RequestError::MissingArguments { .. } => Vec::new(),
         }
     }
 }
@@ -6486,6 +6546,151 @@ fn quoted_list(items: &[String]) -> String {
         .map(|item| format!("`{item}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// `items`, each in backquotes, the last two joined by ` and `, the others
+/// by `, `: "`a`", "`a` and `b`", "`a`, `b` and `c`".
+fn and_list(items: &[String]) -> String {
+    match items {
+        [rest @ .., last] if !rest.is_empty() => {
+            format!("{} and `{last}`", quoted_list(rest))
+        }
+        _ => quoted_list(items),
+    }
+}
+
+/// A value given for an invocation parameter of a def-type, to invoke one of
+/// its definitions with ([`Workspace::invoke`]): of one of the four types a
+/// parameter given an argument can be, `String`, `Int`, `Float` or `Bool`,
+/// which the call that invokes the definition writes as a literal of its
+/// kind (see the module documentation, "Def-types by name").
+/// [`Workspace::arguments`] reads one from text, by the parameter's type.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Given {
+    /// A `String`.
+    Str(String),
+    /// An `Int`.
+    Int(i64),
+    /// A `Float`, which must be finite.
+    Float(f64),
+    /// A `Bool`.
+    Bool(bool),
+}
+
+impl std::fmt::Display for Given {
+    /// The value as text: a string as it is, unquoted; a number in decimal;
+    /// a `Bool` as `true` or `false`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Given::Str(text) => f.write_str(text),
+            Given::Int(value) => write!(f, "{value}"),
+            Given::Float(value) => write!(f, "{value}"),
+            Given::Bool(value) => write!(f, "{value}"),
+        }
+    }
+}
+
+/// One of the four types an invocation parameter given an argument can be
+/// (see [`Given`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scalar {
+    /// `String`.
+    String,
+    /// `Int`.
+    Int,
+    /// `Float`.
+    Float,
+    /// `Bool`.
+    Bool,
+}
+
+impl Scalar {
+    /// The four.
+    const ALL: [Scalar; 4] = [Scalar::String, Scalar::Int, Scalar::Float, Scalar::Bool];
+
+    /// Its type.
+    fn ty(self) -> TyId {
+        match self {
+            Scalar::String => TyId::STRING,
+            Scalar::Int => TyId::INT,
+            Scalar::Float => TyId::FLOAT,
+            Scalar::Bool => TyId::BOOL,
+        }
+    }
+
+    /// Its name, as a type is written.
+    fn name(self) -> &'static str {
+        match self {
+            Scalar::String => "String",
+            Scalar::Int => "Int",
+            Scalar::Float => "Float",
+            Scalar::Bool => "Bool",
+        }
+    }
+
+    /// The value of this type `text` is, if it is one: for a `String`, the
+    /// text as it is; for an `Int`, a decimal integer, with `-` before it if
+    /// negative (no `+`), in range; for a `Float`, a number Rust's `f64`
+    /// reads (`1.5`, `2`, `1e3`), finite; for a `Bool`, `true` or `false`.
+    fn read(self, text: &str) -> Option<Given> {
+        match self {
+            Scalar::String => Some(Given::Str(text.to_owned())),
+            Scalar::Int => {
+                let digits = text.strip_prefix('-').unwrap_or(text);
+                let decimal = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+                decimal
+                    .then(|| text.parse::<i64>().ok())
+                    .flatten()
+                    .map(Given::Int)
+            }
+            Scalar::Float => text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(Given::Float),
+            Scalar::Bool => match text {
+                "true" => Some(Given::Bool(true)),
+                "false" => Some(Given::Bool(false)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether `given` is a value of this type: of its kind, and, for a
+    /// `Float`, finite.
+    fn fits(self, given: &Given) -> bool {
+        match (self, given) {
+            (Scalar::String, Given::Str(_))
+            | (Scalar::Int, Given::Int(_))
+            | (Scalar::Bool, Given::Bool(_)) => true,
+            (Scalar::Float, Given::Float(value)) => value.is_finite(),
+            _ => false,
+        }
+    }
+}
+
+/// An argument for an invocation parameter, as [`Workspace::given`] reads
+/// it: the text of a value, read by the parameter's type, or none, its value
+/// not known yet; or a value.
+#[derive(Clone, Copy)]
+enum Argument<'a> {
+    /// The text of the value, or none.
+    Text(Option<&'a str>),
+    /// The value.
+    Given(&'a Given),
+}
+
+/// An invocation parameter of a def-type, as [`Workspace::given`] reads
+/// arguments for it.
+struct Invocable<'a> {
+    /// Its name.
+    name: &'a str,
+    /// Its type, as it is written.
+    written: &'a str,
+    /// Whether it has a default.
+    optional: bool,
+    /// Which of the four types an argument can be given for it is, if one.
+    scalar: Option<Scalar>,
 }
 
 /// A def-type as [`Workspace::def_types`] finds it, with what invoking one
@@ -6551,14 +6756,15 @@ impl Workspace {
     /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`,
     /// `"org.gnu.gmp-c++"`, `"org.golang.go-stage0-1.24"`), compared with
     /// the listed paths as text,
-    /// with the arguments `args`, as if `DT PATH("ARG", ...)` were called
-    /// from a file of the definition's directory, each argument a string
-    /// literal of its text (see the module documentation, "Def-types by
-    /// name"): the definition's file and the def-type's run first, each as a
+    /// with the arguments `args`, each the name of one of its invocation
+    /// parameters and the value given for it, as if `DT PATH(NAME = VALUE,
+    /// ...)` were called from a file of the definition's directory, each
+    /// value a literal of its kind (see the module documentation, "Def-types
+    /// by name"): the definition's file and the def-type's run first, each as a
     /// whole, with the files they need, unless they have run, and then the
     /// def-type is called with the definition's path, the definition and
-    /// the arguments, filling its invocation parameters in order, each
-    /// optional one left out given its default, its caller the directory of
+    /// the arguments, each filling the parameter it names, each one given
+    /// none given its default, its caller the directory of
     /// the definition's file. Returns the value
     /// the def-type returns, with the warnings of the whole workspace.
     /// Invoked again, the call runs again.
@@ -6568,10 +6774,9 @@ impl Workspace {
     /// In this order: the duplicates [`Workspace::def_types`] fails with,
     /// definitions under others among them, with the warnings; no def-type
     /// of path `def_type`, no definition of it of path `path`, or `path`
-    /// above some, an invocation parameter of the def-type that a present
-    /// `String` does not fit, or more `args` than its invocation parameters,
-    /// or fewer than fill every one that is not optional, each a
-    /// [`RequestError`]; and the runtime
+    /// above some, and the errors of the arguments that
+    /// [`Workspace::arguments`] finds, a value of another type than its
+    /// parameter's among them, each a [`RequestError`]; and the runtime
     /// error of a file that runs or of the call, as
     /// [`Workspace::run`] returns it, a part of it in the call itself,
     /// which has no source, located at the definition's path, labelled
@@ -6580,12 +6785,15 @@ impl Workspace {
         &mut self,
         def_type: &str,
         path: &str,
-        args: &[String],
+        args: &[(String, Given)],
     ) -> Result<Outcome, InvokeError> {
         let (found, at, (def_type_cell, definition_cell)) = self.invoked(def_type, path)?;
-        if let Some(error) = self.cannot_give(&found, def_type_cell.1, args) {
-            return Err(InvokeError::Request(error));
-        }
+        let given = args
+            .iter()
+            .map(|(name, value)| (name.as_str(), Argument::Given(value)));
+        let args = self
+            .given(&found, (def_type_cell.1, path), given)
+            .map_err(InvokeError::Request)?;
         let Some(definition) = found.listed.definitions.get(at) else {
             return Err(InvokeError::Request(missing_definition(
                 &found.listed,
@@ -6599,10 +6807,50 @@ impl Workspace {
             .map_err(InvokeError::Diagnostics)?;
         let known = self.def_type_known(&found);
         self.call_definition(
-            (definition, Invocation::Call(args)),
+            (definition, Invocation::Call(&args)),
             (def_type_cell, definition_cell),
             known,
         )
+    }
+
+    /// Reads the arguments `args` for the invocation parameters of the
+    /// def-type of path `def_type`, to invoke its definition of path `path`
+    /// with ([`Workspace::invoke`]), both as written: each the name of a
+    /// parameter and the text of its value, read by the parameter's declared
+    /// type (an impure def-type's either shape, `String | Future<String>`
+    /// of a bare `String`, taken off), which must be one of `String`,
+    /// `Int`, `Float` and `Bool` (see [`Given`]): a `String` the text as it
+    /// is, an `Int` a decimal integer, with `-` before it if negative, in
+    /// range, a `Float` a decimal number, finite, a `Bool` `true` or
+    /// `false`. A name with no text is checked as one given, its value not
+    /// known yet, and left out of what is returned: so a host can check a
+    /// request before it knows every value. Runs nothing: what it finds
+    /// wrong, invoking would. Returns each value read, with its parameter's
+    /// name, in the order of `args`.
+    ///
+    /// # Errors
+    ///
+    /// In this order: the duplicates [`Workspace::def_types`] fails with, with
+    /// the warnings; no def-type of path `def_type`, no definition of it of
+    /// path `path`, or `path` above some; an invocation parameter that has
+    /// no default and is not one of the four types, the first; then, for
+    /// each argument in order, a name that is no invocation parameter's, a
+    /// parameter named twice, a parameter given an argument that is not one
+    /// of the four types, or a text that is not a value of its type; and
+    /// every parameter that has no default given none, each a
+    /// [`RequestError`].
+    pub fn arguments(
+        &self,
+        def_type: &str,
+        path: &str,
+        args: &[(&str, Option<&str>)],
+    ) -> Result<Vec<(String, Given)>, InvokeError> {
+        let (found, _, (def_type_cell, _)) = self.invoked(def_type, path)?;
+        let texts = args
+            .iter()
+            .map(|&(name, text)| (name, Argument::Text(text)));
+        self.given(&found, (def_type_cell.1, path), texts)
+            .map_err(InvokeError::Request)
     }
 
     /// Reads the field `field` of the meta of the definition of path `path`
@@ -6804,37 +7052,127 @@ impl Workspace {
         found
     }
 
-    /// Why `args` cannot be given to the def-type `found`, whose type is
-    /// `ty`, if they cannot (see [Def-types by name](#def-types-by-name)):
-    /// the first of its invocation parameters, as it declares them, that a
-    /// present `String` does not fit, its type as it is written, optional
-    /// or not; else `args`' number, if it is more than its invocation
-    /// parameters' or fewer than fill every one that is not optional, left
-    /// to right ([`RequestError::required`]).
-    fn cannot_give(&self, found: &FoundDefType, ty: TyId, args: &[String]) -> Option<RequestError> {
+    /// The values of `args`, each the name of an invocation parameter of the
+    /// def-type `found`, whose type is `ty`, and an argument for it, for its
+    /// definition of path `path`, in the order of `args`, each with its
+    /// parameter's name, an argument with no text left out (see
+    /// [`Workspace::arguments`]).
+    ///
+    /// # Errors
+    ///
+    /// In this order: the first invocation parameter, as it declares them,
+    /// that has no default and is not one of the four types an argument can
+    /// be given for, its type as it is written; for each argument in order,
+    /// a name that is no invocation parameter's, a parameter already named,
+    /// a parameter not of the four types, or a text that is not a value of
+    /// its type, or a value that is not one, as [`Given`] shows it; then the
+    /// invocation parameters that have no default given none.
+    fn given<'a>(
+        &self,
+        found: &FoundDefType,
+        (ty, path): (TyId, &str),
+        args: impl Iterator<Item = (&'a str, Argument<'a>)>,
+    ) -> Result<Vec<(String, Given)>, RequestError> {
         let listed = &found.listed;
-        let params = self
+        let types = self
             .types
             .fn_sig(ty)
             .and_then(|sig| sig.params.get(2..))
             .unwrap_or_default();
-        let parameters = listed.parameters.iter().zip(&found.written);
-        for (&(_, param), (parameter, written)) in params.iter().zip(parameters) {
-            if !self.types.is_subtype(TyId::STRING, param) {
-                return Some(RequestError::CannotBeGiven {
-                    def_type: listed.path.clone(),
-                    parameter: parameter.clone(),
-                    ty: written.clone(),
+        let params: Vec<Invocable> = listed
+            .parameters
+            .iter()
+            .zip(&found.written)
+            .zip(&listed.optional)
+            .zip(types)
+            .map(|(((name, written), &optional), &(_, ty))| Invocable {
+                name,
+                written,
+                optional,
+                scalar: self.scalar(ty),
+            })
+            .collect();
+        let def_type = || listed.path.clone();
+        let cannot_be_given = |param: &Invocable| RequestError::CannotBeGiven {
+            def_type: def_type(),
+            parameter: param.name.to_owned(),
+            ty: param.written.to_owned(),
+        };
+        if let Some(param) = params
+            .iter()
+            .find(|param| !param.optional && param.scalar.is_none())
+        {
+            return Err(cannot_be_given(param));
+        }
+        let mut given = vec![false; params.len()];
+        let mut values = Vec::new();
+        for (name, argument) in args {
+            let at = params.iter().position(|param| param.name == name);
+            let (Some(param), Some(seen)) = (
+                at.and_then(|at| params.get(at)),
+                at.and_then(|at| given.get_mut(at)),
+            ) else {
+                return Err(RequestError::UnknownParameter {
+                    def_type: def_type(),
+                    parameter: name.to_owned(),
+                    parameters: listed.parameters.clone(),
+                });
+            };
+            if mem::replace(seen, true) {
+                return Err(RequestError::DuplicateArgument {
+                    def_type: def_type(),
+                    parameter: name.to_owned(),
                 });
             }
+            let Some(scalar) = param.scalar else {
+                return Err(cannot_be_given(param));
+            };
+            let (value, text) = match argument {
+                Argument::Text(None) => continue,
+                Argument::Text(Some(text)) => (scalar.read(text), text.to_owned()),
+                Argument::Given(value) => {
+                    (scalar.fits(value).then(|| value.clone()), value.to_string())
+                }
+            };
+            let Some(value) = value else {
+                return Err(RequestError::CannotParse {
+                    def_type: def_type(),
+                    path: path.to_owned(),
+                    parameter: name.to_owned(),
+                    expected: scalar.name(),
+                    text,
+                });
+            };
+            values.push((name.to_owned(), value));
         }
-        let all = listed.parameters.len();
-        let required = RequestError::required(all, &listed.optional);
-        (args.len() < required || args.len() > all).then(|| RequestError::ArgumentCount {
-            def_type: listed.path.clone(),
-            parameters: listed.parameters.clone(),
-            optional: listed.optional.clone(),
-            given: args.len(),
+        let missing: Vec<String> = params
+            .iter()
+            .zip(&given)
+            .filter(|&(param, &given)| !given && !param.optional)
+            .map(|(param, _)| param.name.to_owned())
+            .collect();
+        if !missing.is_empty() {
+            return Err(RequestError::MissingArguments {
+                def_type: def_type(),
+                parameters: missing,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Which of the four types an argument can be given for (see [`Given`])
+    /// an invocation parameter of type `ty` is, if one: its declared type,
+    /// an impure def-type's either shape (`String | Future<String>` of a
+    /// bare `String`) taken off, the same type as one of them, each a
+    /// subtype of the other. A union, an explicit `Future`, a record, a
+    /// list or a function is none.
+    fn scalar(&self, ty: TyId) -> Option<Scalar> {
+        let ty = match self.types.laziness(ty) {
+            Laziness::Either => self.types.strip(ty),
+            _ => ty,
+        };
+        Scalar::ALL.into_iter().find(|scalar| {
+            self.types.is_subtype(scalar.ty(), ty) && self.types.is_subtype(ty, scalar.ty())
         })
     }
 
@@ -6874,8 +7212,10 @@ impl Workspace {
 
     /// Calls the def-type whose cell is `def_type` with the path of
     /// `definition`, the definition, whose cell is `definition_cell`, and
-    /// `args`, their files run: the input `<def-type>("PATH", <definition>,
-    /// "ARG", ...)`, its names no source can write bound to the two cells,
+    /// the arguments `invoked` gives, their files run: the input
+    /// `<def-type>("PATH", <definition>, NAME = VALUE, ...)`, or the read of a
+    /// field of the definition's meta, its names no source can write bound
+    /// to the two cells,
     /// the def-type's with what a call of it needs to know of its
     /// parameters, `known`, so that the call is of a known callee and gives
     /// an invocation parameter it leaves out its default, checked from the
@@ -7103,9 +7443,9 @@ fn invocation_params(ast: &Ast, item: ItemId) -> &[Param] {
 
 /// The tree of the input of the call that invokes a definition by name
 /// (see [Def-types by name](#def-types-by-name)), its names `names`:
-/// `<def-type>("PATH", <definition>, "ARG", ...)`, its result, PATH `path`,
-/// each ARG one of `args`, in order, a string literal, the two names those
-/// of `bound`, each node at `span`.
+/// `<def-type>("PATH", <definition>, NAME = VALUE, ...)`, its result, PATH
+/// `path`, each named argument one of `args`, in order, its value a literal
+/// of its kind, the two names those of `bound`, each node at `span`.
 fn invocation(
     mut names: Names,
     (path, invoked): (&str, Invocation),
@@ -7132,7 +7472,8 @@ fn invocation(
         kind: ExprKind::Name(bound.1),
         span,
     });
-    let mut positional = vec![
+    // The path and the definition positionally, then the arguments by name.
+    let mut arguments = vec![
         Arg {
             kind: ArgKind::Positional,
             value: name,
@@ -7142,17 +7483,23 @@ fn invocation(
             value: definition,
         },
     ];
-    for arg in args {
-        let value = builder.alloc(Expr {
-            kind: ExprKind::Str(strings.push(arg)),
-            span,
-        });
-        positional.push(Arg {
-            kind: ArgKind::Positional,
+    for (name, given) in args {
+        let kind = match given {
+            Given::Str(text) => ExprKind::Str(strings.push(text)),
+            Given::Int(value) => ExprKind::Int(*value),
+            Given::Float(value) => ExprKind::Float(*value),
+            Given::Bool(value) => ExprKind::Bool(*value),
+        };
+        let value = builder.alloc(Expr { kind, span });
+        arguments.push(Arg {
+            kind: ArgKind::Named {
+                name: names.intern(name),
+                span,
+            },
             value,
         });
     }
-    let args = builder.push_args(&positional);
+    let args = builder.push_args(&arguments);
     let call = builder.alloc(Expr {
         kind: ExprKind::Call { callee, args },
         span,
@@ -7170,8 +7517,8 @@ fn invocation(
 /// field of its meta.
 #[derive(Clone, Copy)]
 enum Invocation<'a> {
-    /// `<def-type>("PATH", <definition>, "ARG", ...)`.
-    Call(&'a [String]),
+    /// `<def-type>("PATH", <definition>, NAME = VALUE, ...)`.
+    Call(&'a [(String, Given)]),
     /// `<definition>.FIELD`.
     MetaField(&'a str),
 }
@@ -15240,17 +15587,28 @@ p26 = com.x"#;
 
     /// Checks the workspace of `files`, located at [`SCRATCH`], and invokes
     /// the definition `path` of the def-type `def_type` in it, with the
-    /// arguments `args`.
+    /// arguments `args`, each a parameter's name and the text of its value,
+    /// read by [`Workspace::arguments`].
     fn invoke_with(
         files: &[(&str, &str)],
         (def_type, path): (&str, &str),
-        args: &[&str],
+        args: &[(&str, &str)],
     ) -> Result<Value, InvokeError> {
         let mut workspace = rooted(files).unwrap_or_else(|errors| panic!("{errors:?}"));
-        let args: Vec<String> = args.iter().map(|&arg| arg.to_owned()).collect();
+        let texts: Vec<(&str, Option<&str>)> = args
+            .iter()
+            .map(|&(name, text)| (name, Some(text)))
+            .collect();
+        let args = workspace.arguments(def_type, path, &texts)?;
         workspace
             .invoke(def_type, path, &args)
             .map(|outcome| outcome.value)
+    }
+
+    /// The argument named `name` of the string `text`, as
+    /// [`Workspace::invoke`] takes it.
+    fn string(name: &str, text: &str) -> (String, Given) {
+        (name.to_owned(), Given::Str(text.to_owned()))
     }
 
     /// [`invoke_with`]'s value with no arguments shown, [`SCRATCH`] shown as
@@ -15263,7 +15621,7 @@ p26 = com.x"#;
     fn invoked_text_with(
         files: &[(&str, &str)],
         (def_type, path): (&str, &str),
-        args: &[&str],
+        args: &[(&str, &str)],
     ) -> String {
         match invoke_with(files, (def_type, path), args) {
             Ok(value) => value.to_string().replace(SCRATCH, "<root>"),
@@ -15278,11 +15636,12 @@ p26 = com.x"#;
         request_error_with(files, (def_type, path), &[])
     }
 
-    /// [`request_error`] with the arguments `args`.
+    /// [`request_error`] with the arguments `args`, each a parameter's name
+    /// and the text of its value.
     fn request_error_with(
         files: &[(&str, &str)],
         (def_type, path): (&str, &str),
-        args: &[&str],
+        args: &[(&str, &str)],
     ) -> String {
         match invoke_with(files, (def_type, path), args) {
             Err(InvokeError::Request(error)) => {
@@ -15802,11 +16161,11 @@ p26 = com.x"#;
         );
         assert_eq!(
             request_error(&files, "build", "x"),
-            "`build` takes 1 argument (`mode`), but 0 were given"
+            "`build` needs `mode`, which was not given"
         );
         assert_eq!(
             request_error(&files, "deploy", "site"),
-            "`deploy` takes 2 arguments (`target`, `mode`), but 0 were given"
+            "`deploy` needs `target` and `mode`, which were not given"
         );
         // Before parameters, the path.
         assert_eq!(
@@ -15909,23 +16268,39 @@ p26 = com.x"#;
 
     #[test]
     fn invoking_gives_its_arguments_as_strings() {
-        // One argument, two, and none, in the order of the parameters.
+        // One argument, two, and none, each by its parameter's name, in any
+        // order.
         let files = ARGUMENTS;
         assert_eq!(
-            invoked_text_with(&files, ("build", "x"), &["debug"]),
+            invoked_text_with(&files, ("build", "x"), &[("mode", "debug")]),
             "x: debug"
         );
         assert_eq!(
-            invoked_text_with(&files, ("deploy", "site"), &["prod", "fast"]),
+            invoked_text_with(
+                &files,
+                ("deploy", "site"),
+                &[("target", "prod"), ("mode", "fast")]
+            ),
+            "site s prod fast"
+        );
+        assert_eq!(
+            invoked_text_with(
+                &files,
+                ("deploy", "site"),
+                &[("mode", "fast"), ("target", "prod")]
+            ),
             "site s prod fast"
         );
         assert_eq!(invoked_text_with(&files, ("package", "p"), &[]), "p p");
         // Each a string literal as it is, nothing in it read as GCSL.
         assert_eq!(
-            invoked_text_with(&files, ("build", "x"), &["{mode} \\ \" -1"]),
+            invoked_text_with(&files, ("build", "x"), &[("mode", "{mode} \\ \" -1")]),
             "x: {mode} \\ \" -1"
         );
-        assert_eq!(invoked_text_with(&files, ("build", "x"), &[""]), "x: ");
+        assert_eq!(
+            invoked_text_with(&files, ("build", "x"), &[("mode", "")]),
+            "x: "
+        );
         // Listed, the def-types' invocation parameters, as declared.
         let mut workspace = rooted(&files).unwrap();
         let parameters: Vec<(String, Vec<String>)> = workspace
@@ -15945,50 +16320,85 @@ p26 = com.x"#;
         );
         // Invoked again on one workspace, with other arguments.
         for mode in ["a", "b"] {
-            let value = workspace.invoke("build", "x", &[mode.to_owned()]);
+            let value = workspace.invoke("build", "x", &[string("mode", mode)]);
             assert_eq!(value.unwrap().value.to_string(), format!("x: {mode}"));
         }
     }
 
     #[test]
-    fn the_arguments_must_be_as_many_as_the_parameters() {
+    fn the_arguments_must_name_each_required_parameter_once() {
         let files = ARGUMENTS;
-        let error = |def_type: &str, path: &str, args: &[&str]| {
+        let error = |def_type: &str, path: &str, args: &[(&str, &str)]| {
             request_error_with(&files, (def_type, path), args)
         };
+        // Missing, every one, by name.
         assert_eq!(
             error("build", "x", &[]),
-            "`build` takes 1 argument (`mode`), but 0 were given"
+            "`build` needs `mode`, which was not given"
         );
         assert_eq!(
-            error("build", "x", &["a", "b"]),
-            "`build` takes 1 argument (`mode`), but 2 were given"
+            error("deploy", "site", &[("target", "a")]),
+            "`deploy` needs `mode`, which was not given"
         );
         assert_eq!(
-            error("deploy", "site", &["a"]),
-            "`deploy` takes 2 arguments (`target`, `mode`), but 1 was given"
+            error("deploy", "site", &[]),
+            "`deploy` needs `target` and `mode`, which were not given"
+        );
+        // Twice.
+        assert_eq!(
+            error("build", "x", &[("mode", "a"), ("mode", "b")]),
+            "`build`'s parameter `mode` is given more than once"
+        );
+        // No such parameter, those there are noted.
+        assert_eq!(
+            error(
+                "deploy",
+                "site",
+                &[("target", "a"), ("mode", "b"), ("extra", "c")]
+            ),
+            "`deploy` has no invocation parameter `extra`; note: its invocation parameters are \
+             `target`, `mode`"
         );
         assert_eq!(
-            error("deploy", "site", &["a", "b", "c"]),
-            "`deploy` takes 2 arguments (`target`, `mode`), but 3 were given"
+            error("build", "x", &[("mdoe", "a")]),
+            "`build` has no invocation parameter `mdoe`; note: its only invocation parameter is \
+             `mode`"
         );
         assert_eq!(
-            error("package", "p", &["a"]),
-            "`package` takes no arguments, but 1 was given"
+            error("package", "p", &[("a", "a")]),
+            "`package` has no invocation parameter `a`; note: it has no invocation parameters"
         );
         assert_eq!(
-            error("package", "p", &["a", "b"]),
-            "`package` takes no arguments, but 2 were given"
+            error("package", "p", &[("a", "a"), ("b", "b")]),
+            "`package` has no invocation parameter `a`; note: it has no invocation parameters"
+        );
+        // Argument by argument, in order, before what is missing.
+        assert_eq!(
+            error(
+                "deploy",
+                "site",
+                &[("x", "a"), ("target", "a"), ("target", "b")]
+            ),
+            "`deploy` has no invocation parameter `x`; note: its invocation parameters are \
+             `target`, `mode`"
+        );
+        assert_eq!(
+            error(
+                "deploy",
+                "site",
+                &[("target", "a"), ("target", "b"), ("x", "a")]
+            ),
+            "`deploy`'s parameter `target` is given more than once"
         );
         // Before the arguments, the path.
         assert_eq!(
-            error("build", "y", &["a", "b"]),
+            error("build", "y", &[("mode", "a"), ("mode", "b")]),
             "`build` has no definition `y`; note: its only definition is `x`"
         );
     }
 
     #[test]
-    fn only_string_parameters_can_be_given() {
+    fn only_four_types_of_parameter_can_be_given() {
         let files = [
             (
                 "workspace.gcsl",
@@ -16016,35 +16426,41 @@ p26 = com.x"#;
                  def fits x() { \"x\" }",
             ),
         ];
-        let error =
-            |def_type: &str, args: &[&str]| request_error_with(&files, (def_type, "x"), args);
-        // Before the number of the arguments, whatever it is.
-        let count = "`count`'s parameter `n` is `Int`, but only `String` parameters can be \
-                     given here yet";
-        assert_eq!(error("count", &[]), count);
-        assert_eq!(error("count", &["1"]), count);
-        assert_eq!(error("count", &["1", "2"]), count);
-        // The first that cannot be, its type as it is written.
+        let error = |def_type: &str, args: &[(&str, &str)]| {
+            request_error_with(&files, (def_type, "x"), args)
+        };
+        // An `Int` can be given now; not given, it is missing.
         assert_eq!(
-            error("mixed", &["a", "b", "c"]),
-            "`mixed`'s parameter `b` is `List<String>`, but only `String` parameters can be \
-             given here yet"
+            invoked_text_with(&files, ("count", "x"), &[("n", "1")]),
+            "x"
         );
         assert_eq!(
-            error("versioned", &["1"]),
-            "`versioned`'s parameter `v` is `Version`, but only `String` parameters can be \
-             given here yet"
+            error("count", &[]),
+            "`count` needs `n`, which was not given"
         );
-        // A present string fits no future.
+        // One that has no default is reported whatever is given, before
+        // anything given, the first, its type as it is written.
+        let mixed = "`mixed`'s parameter `b` is `List<String>`, but only `String`, `Int`, \
+                     `Float` and `Bool` parameters can be given here yet";
+        assert_eq!(error("mixed", &[("a", "a"), ("b", "b"), ("c", "1")]), mixed);
+        assert_eq!(error("mixed", &[("a", "a"), ("c", "1")]), mixed);
+        assert_eq!(error("mixed", &[("nope", "a")]), mixed);
         assert_eq!(
-            error("later", &["1"]),
-            "`later`'s parameter `s` is `Future<String>`, but only `String` parameters can be \
-             given here yet"
+            error("versioned", &[("v", "1")]),
+            "`versioned`'s parameter `v` is `Version`, but only `String`, `Int`, `Float` and \
+             `Bool` parameters can be given here yet"
         );
-        // An alias of `String`, and a union with it, a string fits.
+        // A present value fits no future.
         assert_eq!(
-            invoked_text_with(&files, ("fits", "x"), &["n", "s"]),
-            "x n s"
+            error("later", &[("s", "1")]),
+            "`later`'s parameter `s` is `Future<String>`, but only `String`, `Int`, `Float` \
+             and `Bool` parameters can be given here yet"
+        );
+        // An alias of `String` can be given; a union with it cannot.
+        assert_eq!(
+            error("fits", &[("n", "n"), ("s", "s")]),
+            "`fits`'s parameter `s` is `String | Int`, but only `String`, `Int`, `Float` and \
+             `Bool` parameters can be given here yet"
         );
     }
 
@@ -16070,11 +16486,11 @@ p26 = com.x"#;
             ),
         ];
         assert_eq!(
-            invoked_text_with(&files, ("run", "p"), &["0.1.0"]),
+            invoked_text_with(&files, ("run", "p"), &[("version", "0.1.0")]),
             "run p at 0.1.0"
         );
         assert_eq!(
-            invoked_text_with(&files, ("once", "p"), &["0.2.0"]),
+            invoked_text_with(&files, ("once", "p"), &[("version", "0.2.0")]),
             "once p at 0.2.0"
         );
         let workspace = rooted(&files).unwrap();
@@ -16137,25 +16553,38 @@ p26 = com.x"#;
             "org.figlet.figlet [] 1"
         );
         assert_eq!(
-            invoked_text_with(&files, ("lock", "org.figlet.figlet"), &["2.2.6"]),
+            invoked_text_with(
+                &files,
+                ("lock", "org.figlet.figlet"),
+                &[("version", "2.2.6")]
+            ),
             "org.figlet.figlet [2.2.6] 1"
         );
-        // Left to right, each left out given its default.
-        assert_eq!(invoked_text_with(&files, ("three", "x"), &["a"]), "x a B C");
-        assert_eq!(
-            invoked_text_with(&files, ("three", "x"), &["a", "b"]),
-            "x a b C"
-        );
-        assert_eq!(
-            invoked_text_with(&files, ("three", "x"), &["a", "b", "c"]),
-            "x a b c"
-        );
+        // By name, each left out given its default, whichever others are
+        // given.
+        let three = |args: &[(&str, &str)]| invoked_text_with(&files, ("three", "x"), args);
+        assert_eq!(three(&[("a", "a")]), "x a B C");
+        assert_eq!(three(&[("a", "a"), ("b", "b")]), "x a b C");
+        assert_eq!(three(&[("a", "a"), ("b", "b"), ("c", "c")]), "x a b c");
+        assert_eq!(three(&[("c", "c"), ("a", "a")]), "x a B c");
         assert_eq!(invoked_text_with(&files, ("two", "x"), &[]), "x A B");
-        assert_eq!(invoked_text_with(&files, ("two", "x"), &["a"]), "x a B");
-        // A required one after an optional one: both must be given.
         assert_eq!(
-            invoked_text_with(&files, ("first", "x"), &["a", "b"]),
+            invoked_text_with(&files, ("two", "x"), &[("a", "a")]),
+            "x a B"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("two", "x"), &[("b", "b")]),
+            "x A b"
+        );
+        // A required one after an optional one: the optional one may be
+        // left out too.
+        assert_eq!(
+            invoked_text_with(&files, ("first", "x"), &[("a", "a"), ("b", "b")]),
             "x a b"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("first", "x"), &[("b", "b")]),
+            "x A b"
         );
         // Listed: which are optional, in the order of the parameters.
         let workspace = rooted(&files).unwrap();
@@ -16184,54 +16613,300 @@ p26 = com.x"#;
     #[test]
     fn the_arguments_must_fill_every_required_parameter() {
         let files = OPTIONAL;
-        let error = |def_type: &str, path: &str, args: &[&str]| {
+        let error = |def_type: &str, path: &str, args: &[(&str, &str)]| {
             request_error_with(&files, (def_type, path), args)
         };
         assert_eq!(
-            error("lock", "org.figlet.figlet", &["a", "b"]),
-            "`lock` takes 0 or 1 arguments (`version`), but 2 were given"
+            error(
+                "lock",
+                "org.figlet.figlet",
+                &[("version", "a"), ("version", "b")]
+            ),
+            "`lock`'s parameter `version` is given more than once"
         );
         assert_eq!(
             error("three", "x", &[]),
-            "`three` takes 1 to 3 arguments (`a`, `b`, `c`), but 0 were given"
+            "`three` needs `a`, which was not given"
         );
         assert_eq!(
-            error("three", "x", &["a", "b", "c", "d"]),
-            "`three` takes 1 to 3 arguments (`a`, `b`, `c`), but 4 were given"
+            error(
+                "three",
+                "x",
+                &[("a", "a"), ("b", "b"), ("c", "c"), ("d", "d")]
+            ),
+            "`three` has no invocation parameter `d`; note: its invocation parameters are `a`, \
+             `b`, `c`"
         );
         assert_eq!(
-            error("two", "x", &["a", "b", "c"]),
-            "`two` takes 0 to 2 arguments (`a`, `b`), but 3 were given"
+            error("two", "x", &[("a", "a"), ("b", "b"), ("c", "c")]),
+            "`two` has no invocation parameter `c`; note: its invocation parameters are `a`, `b`"
         );
-        // A required parameter after an optional one: the optional one
-        // cannot be left out, so as many as there are.
+        // A required parameter after an optional one: it alone must be
+        // given.
         assert_eq!(
-            error("first", "x", &["b"]),
-            "`first` takes 2 arguments (`a`, `b`), but 1 was given"
+            error("first", "x", &[("a", "a")]),
+            "`first` needs `b`, which was not given"
         );
         assert_eq!(
             error("first", "x", &[]),
-            "`first` takes 2 arguments (`a`, `b`), but 0 were given"
+            "`first` needs `b`, which was not given"
         );
-        // The fewest, from which are optional.
-        assert_eq!(RequestError::required(0, &[]), 0);
-        assert_eq!(RequestError::required(3, &[false, true, true]), 1);
-        assert_eq!(RequestError::required(2, &[true, false]), 2);
-        assert_eq!(RequestError::required(2, &[true, true]), 0);
-        assert_eq!(RequestError::required(2, &[true]), 2);
-        // A parameter a string cannot fit is an error, optional or not.
+        // A parameter of one of the four types, with a default, left out.
         let files = [
             (
                 "workspace.gcsl",
                 "#[def_type]\n\
-                 def count(name: String, f: fn(): String, n: Int = 1): String { f() }",
+                 def count(name: String, f: fn(): String, n: Int = 1): String { \"{f()} {n}\" }",
             ),
             ("defs.gcsl", "def count x() { \"x\" }"),
         ];
+        assert_eq!(invoked_text_with(&files, ("count", "x"), &[]), "x 1");
         assert_eq!(
-            request_error_with(&files, ("count", "x"), &[]),
-            "`count`'s parameter `n` is `Int`, but only `String` parameters can be given here yet"
+            invoked_text_with(&files, ("count", "x"), &[("n", "5")]),
+            "x 5"
         );
+    }
+
+    /// A def-type with an invocation parameter of each of the four types
+    /// that can be given, each with a default, and one of another type with
+    /// a default; an impure one whose bare `Int` is either-shaped; and one
+    /// whose parameter is an alias of `Int`.
+    const TYPED: [(&str, &str); 2] = [
+        (
+            "workspace.gcsl",
+            "type Count = Int\n\
+             #[def_type]\n\
+             def typed(name: String, f: fn(): String, s: String = \"-\", i: Int = 0, x: Float = 0.5, \
+             b: Bool = false, tags: List<String> = []) -> String {\n\
+             \x20   \"{f()} {s} {i} {x} {b} {len(tags)}\"\n\
+             }\n\
+             #[def_type]\n\
+             def later(name: String, f: fn(): String, n: Int) -> String { \"{f()} {n + 1}\" }\n\
+             #[def_type]\n\
+             def aliased(name: String, f: fn(): String, n: Count): String { \"{f()} {n}\" }",
+        ),
+        (
+            "defs.gcsl",
+            "def typed x() { \"x\" }\ndef later x() { \"x\" }\ndef aliased x() { \"x\" }",
+        ),
+    ];
+
+    #[test]
+    fn each_of_the_four_types_is_read_from_its_text() {
+        let files = TYPED;
+        let typed = |args: &[(&str, &str)]| invoked_text_with(&files, ("typed", "x"), args);
+        assert_eq!(typed(&[]), "x - 0 0.5 false 0");
+        // A `String` as it is, an empty one too.
+        assert_eq!(typed(&[("s", "a b,c=d")]), "x a b,c=d 0 0.5 false 0");
+        assert_eq!(typed(&[("s", "")]), "x  0 0.5 false 0");
+        // An `Int` in decimal, `-` before it if negative, in range.
+        for (text, shown) in [
+            ("4", "4"),
+            ("-4", "-4"),
+            ("007", "7"),
+            ("9223372036854775807", "9223372036854775807"),
+            ("-9223372036854775808", "-9223372036854775808"),
+        ] {
+            assert_eq!(typed(&[("i", text)]), format!("x - {shown} 0.5 false 0"));
+        }
+        // A `Float` as Rust's `f64` reads it, finite.
+        for (text, shown) in [
+            ("1.5", "1.5"),
+            ("2", "2.0"),
+            ("-0.25", "-0.25"),
+            ("1e3", "1000.0"),
+        ] {
+            assert_eq!(typed(&[("x", text)]), format!("x - 0 {shown} false 0"));
+        }
+        // A `Bool`, `true` or `false`.
+        assert_eq!(typed(&[("b", "true")]), "x - 0 0.5 true 0");
+        assert_eq!(typed(&[("b", "false")]), "x - 0 0.5 false 0");
+        // All at once, in any order.
+        assert_eq!(
+            typed(&[("b", "true"), ("x", "3.25"), ("i", "-1"), ("s", "s")]),
+            "x s -1 3.25 true 0"
+        );
+        // An impure def-type's bare `Int`, and an alias of `Int`.
+        assert_eq!(
+            invoked_text_with(&files, ("later", "x"), &[("n", "41")]),
+            "x 42"
+        );
+        assert_eq!(
+            invoked_text_with(&files, ("aliased", "x"), &[("n", "3")]),
+            "x 3"
+        );
+    }
+
+    #[test]
+    fn a_text_that_is_not_a_value_of_its_type_is_an_error() {
+        let files = TYPED;
+        let error =
+            |name: &str, text: &str| request_error_with(&files, ("typed", "x"), &[(name, text)]);
+        let int = "note: an `Int` is written as a decimal integer, with `-` before it if it is \
+                   negative, from -9223372036854775808 to 9223372036854775807";
+        for text in [
+            "9223372036854775808",
+            "-9223372036854775809",
+            "1.5",
+            "+1",
+            "",
+            "-",
+            " 1",
+            "1_0",
+            "0x10",
+        ] {
+            assert_eq!(
+                error("i", text),
+                format!("`{text}` is not an `Int`, the type of `i` of `typed x`; {int}")
+            );
+        }
+        let float = "note: a `Float` is written as a decimal number, `1.5` or `2`, and must be \
+                     finite";
+        for text in ["nan", "NaN", "inf", "-inf", "infinity", "1e400", "x", ""] {
+            assert_eq!(
+                error("x", text),
+                format!("`{text}` is not a `Float`, the type of `x` of `typed x`; {float}")
+            );
+        }
+        let bool = "note: a `Bool` is written `true` or `false`";
+        for text in ["True", "FALSE", "1", "yes", ""] {
+            assert_eq!(
+                error("b", text),
+                format!("`{text}` is not a `Bool`, the type of `b` of `typed x`; {bool}")
+            );
+        }
+        // A parameter of another type, with a default: left out, fine;
+        // given, it cannot be.
+        assert_eq!(
+            error("tags", "a"),
+            "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float` \
+             and `Bool` parameters can be given here yet"
+        );
+        // An alias, by the type it names.
+        assert_eq!(
+            request_error_with(&files, ("aliased", "x"), &[("n", "three")]),
+            format!("`three` is not an `Int`, the type of `n` of `aliased x`; {int}")
+        );
+    }
+
+    #[test]
+    fn invoke_takes_typed_values_by_name() {
+        let mut workspace = rooted(&TYPED).unwrap();
+        let mut invoke = |args: &[(&str, Given)]| {
+            let args: Vec<(String, Given)> = args
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), value.clone()))
+                .collect();
+            workspace
+                .invoke("typed", "x", &args)
+                .map(|outcome| outcome.value.to_string())
+        };
+        assert_eq!(
+            invoke(&[
+                ("i", Given::Int(i64::MIN)),
+                ("x", Given::Float(-1.5)),
+                ("b", Given::Bool(true)),
+                ("s", Given::Str("{s}".to_owned())),
+            ]),
+            Ok("x {s} -9223372036854775808 -1.5 true 0".to_owned())
+        );
+        // A value of another type than its parameter's, or not finite, as
+        // the text it shows as.
+        let error = |result: Result<String, InvokeError>| match result {
+            Err(InvokeError::Request(error)) => error.message(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            error(invoke(&[("i", Given::Str("4".to_owned()))])),
+            "`4` is not an `Int`, the type of `i` of `typed x`"
+        );
+        assert_eq!(
+            error(invoke(&[("s", Given::Int(4))])),
+            "`4` is not a `String`, the type of `s` of `typed x`"
+        );
+        assert_eq!(
+            error(invoke(&[("x", Given::Float(f64::NAN))])),
+            "`NaN` is not a `Float`, the type of `x` of `typed x`"
+        );
+        assert_eq!(
+            error(invoke(&[("x", Given::Int(1))])),
+            "`1` is not a `Float`, the type of `x` of `typed x`"
+        );
+        assert_eq!(
+            error(invoke(&[("i", Given::Int(1)), ("i", Given::Int(2))])),
+            "`typed`'s parameter `i` is given more than once"
+        );
+        assert_eq!(
+            error(invoke(&[("n", Given::Int(1))])),
+            "`typed` has no invocation parameter `n`"
+        );
+        // Shown as text.
+        assert_eq!(Given::Str("a b".to_owned()).to_string(), "a b");
+        assert_eq!(Given::Int(-3).to_string(), "-3");
+        assert_eq!(Given::Float(2.0).to_string(), "2");
+        assert_eq!(Given::Bool(false).to_string(), "false");
+    }
+
+    #[test]
+    fn arguments_are_checked_without_running_anything() {
+        // The definition's file panics when it runs: reading the
+        // arguments runs nothing; invoking runs it.
+        let files = [
+            TYPED[0],
+            (
+                "defs.gcsl",
+                "def typed x() { \"x\" }\ndef later x() { \"x\" }\n\
+                 def aliased x() { \"x\" }\nboom = panic(\"ran\")",
+            ),
+        ];
+        let mut workspace = rooted(&files).unwrap();
+        let read = workspace.arguments("typed", "x", &[("i", Some("4")), ("b", Some("true"))]);
+        assert_eq!(
+            read.unwrap(),
+            [
+                ("i".to_owned(), Given::Int(4)),
+                ("b".to_owned(), Given::Bool(true))
+            ]
+        );
+        // A name with no text is checked as given, and left out.
+        let read = workspace.arguments("later", "x", &[("n", None)]);
+        assert_eq!(read.unwrap(), []);
+        let request = |result: Result<Vec<(String, Given)>, InvokeError>| match result {
+            Err(InvokeError::Request(error)) => error.message(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            request(workspace.arguments("later", "x", &[])),
+            "`later` needs `n`, which was not given"
+        );
+        assert_eq!(
+            request(workspace.arguments("later", "x", &[("n", None), ("n", Some("1"))])),
+            "`later`'s parameter `n` is given more than once"
+        );
+        assert_eq!(
+            request(workspace.arguments("later", "x", &[("m", None)])),
+            "`later` has no invocation parameter `m`"
+        );
+        assert_eq!(
+            request(workspace.arguments("typed", "x", &[("tags", None)])),
+            "`typed`'s parameter `tags` is `List<String>`, but only `String`, `Int`, `Float` \
+             and `Bool` parameters can be given here yet"
+        );
+        // What is asked for, before its arguments.
+        assert_eq!(
+            request(workspace.arguments("later", "y", &[("m", None)])),
+            "`later` has no definition `y`"
+        );
+        assert_eq!(
+            request(workspace.arguments("nope", "x", &[])),
+            "no def-type `nope`"
+        );
+        // Nothing ran: invoking runs the file, which panics.
+        let invoked = workspace.invoke("later", "x", &[("n".to_owned(), Given::Int(1))]);
+        let Err(InvokeError::Diagnostics(errors)) = invoked else {
+            panic!("{invoked:?}");
+        };
+        assert_eq!(errors[0].message, "ran");
     }
 
     #[test]
@@ -16532,7 +17207,7 @@ p26 = com.x"#;
             })
         );
         // Invoking is unchanged.
-        let value = workspace.invoke("package", "dev.x", &["0.1.0".to_owned()]);
+        let value = workspace.invoke("package", "dev.x", &[string("version", "0.1.0")]);
         assert_eq!(value.unwrap().value.to_string(), "0.1.0");
     }
 
@@ -17351,7 +18026,7 @@ p26 = com.x"#;
             ("org.gnu.a+b", "a+b"),
             ("c++11", "c++11"),
         ] {
-            let outcome = workspace.invoke("package", path, &["9".to_owned()]);
+            let outcome = workspace.invoke("package", path, &[string("version", "9")]);
             assert_eq!(
                 outcome.unwrap().value.to_string(),
                 format!("{path} {value} 9")
@@ -17362,7 +18037,7 @@ p26 = com.x"#;
         // A path that names none is the error it is, its definitions listed
         // as written.
         assert_eq!(
-            request_error_with(&PLUS, ("package", "org.gnu.gmp-c"), &["1"]),
+            request_error_with(&PLUS, ("package", "org.gnu.gmp-c"), &[("version", "1")]),
             "`package` has no definition `org.gnu.gmp-c`; note: its definitions are \
              `c++11`, `dev.peios.build-essentials-c++`, `org.gnu.a+b`, `org.gnu.gcc-c++`, \
              `org.gnu.gcc-libstdc++`, `org.gnu.gcc-libstdc++-devel`, `org.gnu.gmp-c++`"
@@ -17536,7 +18211,7 @@ p26 = com.x"#;
             ("x.1_0", "ten"),
             ("x.1e5", "exp"),
         ] {
-            let outcome = workspace.invoke("package", path, &["9".to_owned()]);
+            let outcome = workspace.invoke("package", path, &[string("version", "9")]);
             assert_eq!(
                 outcome.unwrap().value.to_string(),
                 format!("{path} {value} 9")
@@ -17549,13 +18224,17 @@ p26 = com.x"#;
         // A path that names none is the error it is, its definitions listed
         // as written; a number's value is not its name.
         assert_eq!(
-            request_error_with(&DIGITS, ("package", "org.golang.go-stage0-1.2"), &["1"]),
+            request_error_with(
+                &DIGITS,
+                ("package", "org.golang.go-stage0-1.2"),
+                &[("version", "1")]
+            ),
             "`package` has no definition `org.golang.go-stage0-1.2`; note: its definitions are \
              `org.golang.go-stage0-1.24`, `org.rust-lang.rust-1.83`, `x.1.83.0`, `x.1.83rc1`, \
              `x.1_0`, `x.1e5`, `x.24rc1`"
         );
         assert_eq!(
-            request_error_with(&DIGITS, ("package", "x.10"), &["1"]),
+            request_error_with(&DIGITS, ("package", "x.10"), &[("version", "1")]),
             "`package` has no definition `x.10`; note: its definitions are \
              `org.golang.go-stage0-1.24`, `org.rust-lang.rust-1.83`, `x.1.83.0`, `x.1.83rc1`, \
              `x.1_0`, `x.1e5`, `x.24rc1`"

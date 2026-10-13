@@ -43,9 +43,11 @@
 //! imports (see [`check`], "Def-types", and [`workspace`], "Def-types").
 //! A checked workspace lists its def-types with their definitions, and
 //! invokes a definition by the def-type's name and its path, given as text,
-//! with the def-type's invocation arguments, given as strings, as if `DT
-//! PATH("ARG", ...)` were called from the definition's directory, for a
-//! program that turns def-types into commands, as `pekit` does (see
+//! with the def-type's invocation arguments, given by name, each a string,
+//! an integer, a float or a `Bool`, read from text by the parameter's type,
+//! as if `DT PATH(NAME = VALUE, ...)` were called from the definition's
+//! directory, for a program that turns def-types into commands, as `pekit`
+//! does (see
 //! [`workspace`], "Def-types by name"); finding and reading a workspace's
 //! files for it is the `gcsl-disk` crate's.
 //!
