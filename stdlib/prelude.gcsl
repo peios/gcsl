@@ -8,11 +8,12 @@
 # neither has a type a GCSL type can write yet, so a name bound directly to
 # one is that built-in, called by the checker's rule (to be replaced when
 # built-ins get real polymorphic types, R11 and R3 of
-# docs/INFERENCE_REQS.md). `int`, `float`, `exec`, `panic`, the string
-# built-ins, `compare_versions` and `sort_versions` are ordinary: values of
-# their function types. `sh` runs a shell command with `exec`, and panics
-# unless it succeeds. Like every standard file it is a scope of its own: it
-# sees its own declarations and what it imports, nothing else.
+# docs/INFERENCE_REQS.md). `int`, `float`, `exec`, `exec_live`, `panic`, the
+# string built-ins, `compare_versions` and `sort_versions` are ordinary:
+# values of their function types. `sh` runs a shell command with `exec`, and
+# panics unless it succeeds; `sh_live` does the same with `exec_live`. Like
+# every standard file it is a scope of its own: it sees its own declarations
+# and what it imports, nothing else.
 import builtins
 
 # `len(list)` is the number of elements of a list; `show(value)` the GCSL
@@ -25,9 +26,13 @@ float = builtins.float
 def half(n: Int): Float { float(n) / 2.0 }
 
 # `exec(argv)` runs the program `argv[0]` with the arguments `argv[1..]` and
-# returns `{status, stdout, stderr}`; `panic(message)` ends the run with the
-# runtime error `message`. Both are ordinary built-ins, not the alias rule's.
+# returns `{status, stdout, stderr}`; `exec_live(argv)` does the same, and
+# also copies the program's standard output and standard error, line by line
+# as they arrive, to gcsl's standard error, so that a long build is seen as
+# it runs; `panic(message)` ends the run with the runtime error `message`.
+# All three are ordinary built-ins, not the alias rule's.
 exec = builtins.exec
+exec_live = builtins.exec_live
 panic = builtins.panic
 
 # Strings: `split(s, sep)` the pieces of `s` between occurrences of `sep`,
@@ -62,6 +67,18 @@ def sh(script: String) -> String {
     let result = exec(["/bin/sh", "-c", script])
     if result.status != 0 {
         panic("`{script}` exited with status {result.status}: {trim(result.stderr)}")
+    }
+    result.stdout
+}
+
+# As `sh`, but with `exec_live`: the script's output is shown on gcsl's
+# standard error as it runs, and its standard output still returned. Its
+# panic has the script and its exit status, without its standard error, which
+# has been shown already.
+def sh_live(script: String) -> String {
+    let result = exec_live(["/bin/sh", "-c", script])
+    if result.status != 0 {
+        panic("`{script}` exited with status {result.status}")
     }
     result.stdout
 }

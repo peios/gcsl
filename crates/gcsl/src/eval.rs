@@ -452,9 +452,9 @@
 //!   overflow" when that is no `Int` (an infinity, or beyond `i64`), the
 //!   operand labelled with its value, or "cannot truncate NaN to an Int";
 //! - `float(x)` gives the `Float` nearest its `Int`;
-//! - `exec(argv)` runs a program, one of the two things GCSL does outside
-//!   itself, beside the file system's built-ins (below), and reports what it
-//!   did. It runs `argv[0]`, found through `PATH` as
+//! - `exec(argv)` runs a program, one of the things GCSL does outside
+//!   itself, beside `exec_live` and the file system's built-ins (below), and
+//!   reports what it did. It runs `argv[0]`, found through `PATH` as
 //!   the OS finds it (a name with a `/` is a path), with the arguments
 //!   `argv[1..]`, each passed as it is, with no shell involved
 //!   ([`std::process::Command`]). The program's standard input is the null
@@ -480,6 +480,26 @@
 //!   error 2)". Both are at the call, and end the run as every runtime
 //!   error does. A memoised function around `exec` runs its program once
 //!   for each distinct list of arguments, as its body runs once.
+//! - `exec_live(argv)` is `exec`, the same program run the same way, the
+//!   same record of the same layout, the same errors (but "`exec_live`
+//!   needs a program to run"), but for one thing: while the program runs,
+//!   what it writes to its standard output and to its standard error is
+//!   ALSO copied, as it arrives, to `gcsl`'s own standard error, never to
+//!   its standard output, which is a host's channel for results, and still
+//!   captured whole into the record (`run_live`). Each stream is read on a
+//!   thread of its own, both joined before the call returns, so a program
+//!   that fills both pipes never waits on one while the other is read. The
+//!   copy is line by line: each complete line, its newline included, is
+//!   written as it is complete, in one write under the lock of standard
+//!   error, so the lines of the two streams interleave in the order they
+//!   are complete but never mix within a line, and a last line without a
+//!   newline is written when its stream ends, as it is, with no newline
+//!   added (`copy_lines`). The bytes are copied as they are, not decoded;
+//!   the record's strings are decoded as `exec`'s are. A failure to write
+//!   to `gcsl`'s standard error is ignored, the program running on and its
+//!   output captured whole. It is what a build step whose program is silent
+//!   for minutes until it finishes, a compiler, calls, so that its progress
+//!   is seen; the prelude's `sh_live` is `sh` with it.
 //! - `panic(message)` fails with the runtime error `message`, its own
 //!   wording, at the call, with no label or note, ending the run as every
 //!   runtime error does. A call of it is of kind `Never` (see
@@ -843,14 +863,15 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher};
-use std::io::{self, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read, Write as _};
 use std::num::NonZeroI64;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::thread::{self, ScopedJoinHandle};
 
 use crate::ast::FnId;
 use crate::check::{Builtin, Slot};
@@ -1997,8 +2018,10 @@ impl Evaluator<'_> {
     /// toward zero, failing with "integer overflow" when that is not an
     /// `Int` (an infinity, or beyond `i64`) and "cannot truncate NaN to an
     /// Int" for NaN; `float` gives the `Float` nearest its `Int`; `exec`
-    /// runs its program ([`exec`]); `panic` fails with its message, at
-    /// the call; `split` ([`split`]), `join` ([`join`]), `starts_with`,
+    /// runs its program, and `exec_live` runs it so, copying its output to
+    /// this process's standard error as it runs ([`exec`]); `panic` fails
+    /// with its message, at the call; `split` ([`split`]), `join`
+    /// ([`join`]), `starts_with`,
     /// `ends_with`, `trim` ([`trim`]), `strip_prefix` ([`strip_prefix`]),
     /// `strip_suffix` ([`strip_suffix`]), `lines` and `fields`
     /// ([`string_list`]) work on their strings as Rust's `str` does,
@@ -2041,8 +2064,8 @@ impl Evaluator<'_> {
                     .into()),
             },
             (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
-            (Builtin::Exec, Some((Value::List(words), _)), None) => {
-                exec(&words, self.shared.exec_result, node)
+            (Builtin::Exec | Builtin::ExecLive, Some((Value::List(words), _)), None) => {
+                exec(builtin, &words, self.shared.exec_result, node)
             }
             (Builtin::Panic, Some((Value::Str(message), _)), None) => {
                 Err(Diagnostic::error(&*message, node.span).into())
@@ -4931,27 +4954,41 @@ fn float_to_int(x: f64) -> Option<i64> {
     (LOW..HIGH).contains(&truncated).then_some(truncated as i64)
 }
 
-/// Runs the program `argv` names, for the call `node` of `exec`, and
-/// returns what it did as a record of the layout `exec_result` (see [The
-/// built-in functions](#the-built-in-functions)): `argv[0]` found through
-/// `PATH` as the OS finds it and given the arguments `argv[1..]`, with no
-/// shell, its standard input the null device, its standard output and
-/// standard error captured whole, its working directory and environment
-/// this process's; once it has exited, its exit status, or 128 plus the
-/// number of the signal that killed it, and its output decoded as UTF-8,
-/// each invalid sequence replaced by U+FFFD. Fails with "`exec` needs a
-/// program to run" for an empty `argv`, and with "cannot run `name`",
-/// noting the OS's own reason, for a program that cannot be started. A
-/// run without the standard library has no `exec` layout, nor any `exec`
-/// to call, so `exec_result` being `None` is an internal error, as is an
-/// element of `argv` that is not a string, which the checker rules out.
+/// Runs the program `argv` names, for the call `node` of `builtin`, `exec`
+/// or `exec_live`, and returns what it did as a record of the layout
+/// `exec_result` (see [The built-in functions](#the-built-in-functions)):
+/// `argv[0]` found through `PATH` as the OS finds it and given the
+/// arguments `argv[1..]`, with no shell, its standard input the null
+/// device, its standard output and standard error captured whole, its
+/// working directory and environment this process's; once it has exited,
+/// its exit status, or 128 plus the number of the signal that killed it,
+/// and its output decoded as UTF-8, each invalid sequence replaced by
+/// U+FFFD. For `exec_live` the program's standard output and standard
+/// error are also copied, as they arrive, to this process's standard error
+/// ([`run_live`]); nothing else differs. Fails with "`exec` needs a
+/// program to run" for an empty `argv` (`exec_live` naming itself), and
+/// with "cannot run `name`", noting the OS's own reason, for a program that
+/// cannot be started, or whose output cannot be read or whose end cannot be
+/// waited for, as [`Command::output`] reports each. A run without the
+/// standard library has no `exec` layout, nor any `exec` to call, so
+/// `exec_result` being `None` is an internal error, as is an element of
+/// `argv` that is not a string, which the checker rules out.
 #[inline(never)]
-fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Value> {
+fn exec(
+    builtin: Builtin,
+    argv: &List,
+    exec_result: Option<&Rc<Layout>>,
+    node: &IrNode,
+) -> Flow<Value> {
     let Some(layout) = exec_result else {
         return mistyped(node, "`exec` called in a run without its result's layout");
     };
     let Some((program, arguments)) = argv.values().split_first() else {
-        return Err(Diagnostic::error("`exec` needs a program to run", node.span).into());
+        return Err(Diagnostic::error(
+            format!("`{}` needs a program to run", builtin.name()),
+            node.span,
+        )
+        .into());
     };
     let Value::Str(program) = program else {
         return mistyped(node, "a program of `exec` that is not a string");
@@ -4963,7 +5000,13 @@ fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Va
         };
         command.arg(&**argument);
     }
-    let output = match command.stdin(Stdio::null()).output() {
+    command.stdin(Stdio::null());
+    let output = if builtin == Builtin::ExecLive {
+        run_live(&mut command, node)?
+    } else {
+        command.output()
+    };
+    let output = match output {
         Ok(output) => output,
         Err(error) => {
             return Err(
@@ -4976,7 +5019,7 @@ fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Va
     let status = match (output.status.code(), output.status.signal()) {
         (Some(code), _) => i64::from(code),
         (None, Some(signal)) => 128 + i64::from(signal),
-        // A program `output` waited for has exited or been killed.
+        // A program waited for has exited or been killed.
         (None, None) => {
             return mistyped(node, "a program ended neither by exiting nor by a signal");
         }
@@ -4990,6 +5033,93 @@ fn exec(argv: &List, exec_result: Option<&Rc<Layout>>, node: &IrNode) -> Flow<Va
             text(&output.stderr),
         ]),
     })))
+}
+
+/// Runs `command`, for the call `node` of `exec_live`, as
+/// [`Command::output`] does, its standard output and standard error
+/// captured whole, but copying each, as it arrives, to this process's
+/// standard error, never to its standard output ([`copy_lines`]): each
+/// stream is read on a thread of its own, and both threads are joined
+/// before the program is waited for, so that neither stream can fill its
+/// pipe and stop the program while the other is read. Gives what `output`
+/// would: the output, or the first error of starting the program, of
+/// starting the thread of its standard output or of its standard error, of
+/// reading either, or of waiting for the program, in that order, the
+/// program waited for once it has started, whatever else failed. A stream
+/// whose thread cannot be started is closed unread, so the program is not
+/// left waiting to write to it. A pipe `command` did not make, or a thread
+/// that panicked, which nothing it runs can do, is an internal error.
+#[inline(never)]
+fn run_live(command: &mut Command, node: &IrNode) -> Flow<io::Result<Output>> {
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return mistyped(
+            node,
+            "a program of `exec_live` without the pipes of its output",
+        );
+    };
+    let (stdout, stderr) = thread::scope(|scope| {
+        let stdout = thread::Builder::new().spawn_scoped(scope, move || copy_lines(out));
+        let stderr = thread::Builder::new().spawn_scoped(scope, move || copy_lines(err));
+        (
+            stdout.map(ScopedJoinHandle::join),
+            stderr.map(ScopedJoinHandle::join),
+        )
+    });
+    let status = child.wait();
+    let (Some(stdout), Some(stderr)) = (copied(stdout), copied(stderr)) else {
+        return mistyped(node, "a thread copying a program's output panicked");
+    };
+    Ok(match (stdout, stderr, status) {
+        (Ok(stdout), Ok(stderr), Ok(status)) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    })
+}
+
+/// What a thread of [`run_live`] gave, `copier`: what it read of its
+/// stream, or the error of reading it or of starting the thread; `None` if
+/// it panicked.
+fn copied(copier: io::Result<thread::Result<io::Result<Vec<u8>>>>) -> Option<io::Result<Vec<u8>>> {
+    match copier {
+        Ok(Ok(read)) => Some(read),
+        Ok(Err(_)) => None,
+        Err(error) => Some(Err(error)),
+    }
+}
+
+/// Reads `stream`, a program's standard output or standard error, to its
+/// end, and gives every byte of it, for [`run_live`], copying each line, its
+/// newline included, to this process's standard error once it is complete,
+/// in one write under the lock of standard error, so that the lines of the
+/// two streams interleave but a line is never written inside another; a
+/// last line without a newline is copied as the stream ends, as it is, no
+/// newline added. The bytes are copied as they are, never decoded. A failure
+/// to write to standard error is ignored, the reading going on whole; the
+/// first failure to read, an interruption retried, is returned.
+fn copy_lines(stream: impl Read) -> io::Result<Vec<u8>> {
+    let mut stream = BufReader::new(stream);
+    let mut read = Vec::new();
+    loop {
+        let start = read.len();
+        if stream.read_until(b'\n', &mut read)? == 0 {
+            return Ok(read);
+        }
+        if let Some(line) = read.get(start..) {
+            // A copy that cannot be shown changes nothing else.
+            let _ = io::stderr().lock().write_all(line);
+        }
+    }
 }
 
 /// Applies `builtin`, one of the file system's built-in functions but

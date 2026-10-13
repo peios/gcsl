@@ -583,9 +583,10 @@
 //! needs another for them. Their types are each built-in's: its function
 //! type, or for one whose typing is special the opaque type of the alias
 //! rule (see [`crate::check`], "Built-in functions"). As it lays the frame
-//! out, the driver also builds the one layout of the records `exec`
-//! returns (`exec_layout`), its field names interned in the run's names,
-//! and gives it to every file it runs, beside the memo tables, so that
+//! out, the driver also builds the one layout of the records `exec` and
+//! `exec_live` return (`exec_layout`), its field names interned in the
+//! run's names, and gives it to every file it runs, beside the memo tables,
+//! so that
 //! every such record in the run shares it (see [`crate::eval`], "The
 //! built-in functions"); a session gets it with the rest of the standard
 //! library's run.
@@ -794,12 +795,12 @@ fn builtin_cells() -> Vec<Value> {
     Builtin::ALL.into_iter().map(Value::Builtin).collect()
 }
 
-/// The layout of the record `exec` returns, its fields
+/// The layout of the record `exec` returns, and `exec_live`, its fields
 /// ([`Builtin::EXEC_FIELDS`]) interned into `names`, the run's, as the
 /// checker interns them for `exec`'s type, so that `r.status` reads it:
 /// built once per run as the frame is laid out, and shared by every record
-/// `exec` builds in the run, whatever file, input or function calls it (see
-/// [`crate::eval`]).
+/// `exec` or `exec_live` builds in the run, whatever file, input or function
+/// calls it (see [`crate::eval`]).
 fn exec_layout(names: &mut Names) -> Rc<Layout> {
     Rc::new(Layout {
         names: Builtin::EXEC_FIELDS
@@ -9635,7 +9636,7 @@ p26 = com.x"#;
         assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
         assert_eq!(scan.order[0], 0);
         // The built-in functions' cells are the first.
-        let builtins: Vec<Option<Builtin>> = (0..24).map(|node| scan.builtin(node)).collect();
+        let builtins: Vec<Option<Builtin>> = (0..25).map(|node| scan.builtin(node)).collect();
         assert_eq!(
             builtins,
             [
@@ -9662,6 +9663,7 @@ p26 = com.x"#;
                 Some(Builtin::FsWrite),
                 Some(Builtin::SortVersions),
                 Some(Builtin::Show),
+                Some(Builtin::ExecLive),
                 None
             ]
         );
@@ -9829,6 +9831,7 @@ p26 = com.x"#;
                 "float",
                 "half",
                 "exec",
+                "exec_live",
                 "panic",
                 "split",
                 "join",
@@ -9841,7 +9844,8 @@ p26 = com.x"#;
                 "fields",
                 "compare_versions",
                 "sort_versions",
-                "sh"
+                "sh",
+                "sh_live"
             ]
         );
         assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
@@ -10250,8 +10254,8 @@ p26 = com.x"#;
             .map(|&(path, text)| SourceFile::new(path, text).unwrap())
             .collect();
         let mut workspace = check(&sources).unwrap();
-        // The driver wrote the twenty-three built-in functions' cells.
-        assert_eq!(assert_builtins_written(&workspace).len(), 23);
+        // The driver wrote the twenty-four built-in functions' cells.
+        assert_eq!(assert_builtins_written(&workspace).len(), 24);
         let a = workspace.file("a.gcsl").unwrap();
         let b = workspace.file("b.gcsl").unwrap();
         let first = workspace.run(a).unwrap().value;
@@ -10280,6 +10284,168 @@ p26 = com.x"#;
         assert_eq!(
             &*workspace.exec_result.texts,
             ["status", "stdout", "stderr"].map(Box::from)
+        );
+    }
+
+    // ----- `exec_live` and `sh_live` -----
+    //
+    // What `exec_live` copies goes to this process's standard error, which
+    // the test harness does not capture: these programs say little. The
+    // copy itself, and output larger than a pipe holds, are the CLI's tests.
+
+    #[test]
+    fn exec_live_gives_the_record_exec_gives() {
+        for (argv, expected) in [
+            ("[\"true\"]", "{status = 0; stdout = \"\"; stderr = \"\"}"),
+            ("[\"false\"]", "{status = 1; stdout = \"\"; stderr = \"\"}"),
+            (
+                "[\"sh\", \"-c\", \"echo out; echo err >&2; exit 3\"]",
+                "{status = 3; stdout = \"out\\n\"; stderr = \"err\\n\"}",
+            ),
+            // Killed by a signal: 128 plus its number.
+            (
+                "[\"sh\", \"-c\", \"kill -9 $$\"]",
+                "{status = 137; stdout = \"\"; stderr = \"\"}",
+            ),
+            // Its standard input is the null device: `cat` ends at once.
+            ("[\"cat\"]", "{status = 0; stdout = \"\"; stderr = \"\"}"),
+            // Invalid UTF-8 is replaced in the record, on either stream.
+            (
+                "[\"sh\", \"-c\", \"printf '\\\\377ok'; printf 'e\\\\376' >&2\"]",
+                "{status = 0; stdout = \"\u{FFFD}ok\"; stderr = \"e\u{FFFD}\"}",
+            ),
+            // A last line without a newline is captured as it is.
+            (
+                "[\"sh\", \"-c\", \"printf 'a\\\\nb'\"]",
+                "{status = 0; stdout = \"a\\nb\"; stderr = \"\"}",
+            ),
+            // The arguments are passed as they are, with no shell.
+            (
+                "[\"printf\", \"%s|\", \"a b\", \"$HOME\", \"*\"]",
+                "{status = 0; stdout = \"a b|$HOME|*|\"; stderr = \"\"}",
+            ),
+        ] {
+            for builtin in ["exec", "exec_live"] {
+                let text = format!("= {builtin}({argv})");
+                assert_eq!(lone(&text).unwrap(), expected, "{text}");
+                let files = [("workspace.gcsl", ""), ("main.gcsl", text.as_str())];
+                assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
+            }
+        }
+        // Named, through a variable, a field, an impure function, an import,
+        // and a future argument, as `exec`.
+        for (text, expected) in [
+            ("= exec_live(argv = [\"echo\", \"n\"]).stdout", "n\n"),
+            ("let e = exec_live\n= e([\"echo\", \"v\"]).stdout", "v\n"),
+            (
+                "fn run(a: String) -> String { exec_live([\"echo\", a]).stdout }\n= run(\"i\")",
+                "i\n",
+            ),
+            (
+                "import exec_live as run from builtins\n= run([\"true\"]).status",
+                "0",
+            ),
+            (
+                "let xs = lazy [\"echo\", \"later\"]\n= exec_live(xs).stdout",
+                "later\n",
+            ),
+            // The value shows as its type, `exec`'s.
+            (
+                "= exec_live",
+                "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}",
+            ),
+        ] {
+            assert_eq!(lone(text).unwrap(), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn exec_live_fails_as_exec_does_naming_itself() {
+        let text = "let none: List<String> = []\nr = exec_live(none)";
+        let error = lone_error(text);
+        assert_eq!(error.message, "`exec_live` needs a program to run");
+        assert_eq!(error.span, Span::new(32, 47));
+        assert!(error.notes.is_empty());
+        let text = "r = exec_live([\"gcsl-no-such-program-slice-46\", \"x\"])";
+        let error = lone_error(text);
+        assert_eq!(error.message, "cannot run `gcsl-no-such-program-slice-46`");
+        assert_eq!(error.span, Span::new(4, 53));
+        assert_eq!(error.notes, ["No such file or directory (os error 2)"]);
+        let error = lone_error("r = exec_live([\"/\"])");
+        assert_eq!(error.message, "cannot run `/`");
+        assert_eq!(error.notes, ["Permission denied (os error 13)"]);
+        // `exec`'s own message is unchanged.
+        assert_eq!(
+            lone_error("let none: List<String> = []\nr = exec(none)").message,
+            "`exec` needs a program to run"
+        );
+    }
+
+    #[test]
+    fn every_record_exec_live_builds_shares_the_runs_one_layout() {
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "a.gcsl",
+                "ra = exec_live([\"true\"])\nlet e = exec_live\ns = e([\"false\"])\nt = exec([\"true\"])",
+            ),
+        ];
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let mut workspace = check(&sources).unwrap();
+        let a = workspace.file("a.gcsl").unwrap();
+        let Value::Record(record) = workspace.run(a).unwrap().value else {
+            panic!("not a record");
+        };
+        for field in ["ra", "s", "t"] {
+            let name = workspace.scan.names.lookup(field).unwrap();
+            let Some(Value::Record(result)) = record.get(name) else {
+                panic!("no record {field}");
+            };
+            assert!(
+                Rc::ptr_eq(&result.layout, &workspace.exec_result),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn sh_live_returns_its_output_or_panics_without_its_standard_error() {
+        assert_eq!(lone("= sh_live(\"echo hi\")").unwrap(), "hi\n");
+        assert_eq!(lone("= sh_live(\"printf hi\")").unwrap(), "hi");
+        // The panic is the prelude's, located in it, at `sh_live`'s own
+        // `panic`, and has no standard error in it.
+        let error = lone_error("x = sh_live(\"echo nope >&2; exit 2\")");
+        assert_eq!(
+            error.message,
+            "`echo nope >&2; exit 2` exited with status 2"
+        );
+        assert_eq!(error.input, Some(0));
+        let prelude = Library::NEEDED.find("prelude").unwrap();
+        let prelude = crate::STANDARD[prelude].1;
+        let def = prelude.find("def sh_live(").unwrap();
+        let at = def + prelude[def..].find("panic(\"`").unwrap();
+        assert_eq!(error.span.start, u32::try_from(at).unwrap());
+        let files = [
+            ("workspace.gcsl", ""),
+            ("main.gcsl", "x = sh_live(\"exit 2\")"),
+        ];
+        assert_eq!(
+            run_file(&files, "main.gcsl").unwrap_err(),
+            [("`exit 2` exited with status 2".to_owned(), Some(0))]
+        );
+        // `sh`'s message is unchanged.
+        assert_eq!(
+            lone_error("x = sh(\"echo nope >&2; exit 2\")").message,
+            "`echo nope >&2; exit 2` exited with status 2: nope"
+        );
+        // Impure, as `sh`: from a pure function, the existing error.
+        let found = lone("fn f(): String { sh_live(\"true\") }\n= f()").unwrap_err();
+        assert_eq!(
+            found,
+            ["cannot call an impure function from a pure function"]
         );
     }
 

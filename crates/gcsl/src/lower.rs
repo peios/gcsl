@@ -2622,7 +2622,8 @@ impl Lowerer<'_> {
             | Builtin::FsCopy
             | Builtin::FsTempDir
             | Builtin::FsWrite
-            | Builtin::SortVersions => Err(InternalError {
+            | Builtin::SortVersions
+            | Builtin::ExecLive => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

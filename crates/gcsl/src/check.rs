@@ -2281,11 +2281,11 @@
 //! library"): `len`, `int`, `float`, `exec`, `panic`, `split`, `join`,
 //! `starts_with`, `ends_with`, `trim`, `strip_prefix`, `strip_suffix`,
 //! `lines`, `fields`, `compare_versions`, the file system's `fs_exists`,
-//! `fs_read`, `fs_mkdir`, `fs_copy`, `fs_temp_dir` and `fs_write`, and
-//! `sort_versions` and `show`, each a [`Builtin`],
+//! `fs_read`, `fs_mkdir`, `fs_copy`, `fs_temp_dir` and `fs_write`,
+//! `sort_versions`, `show` and `exec_live`, each a [`Builtin`],
 //! with its name, its parameters' names (at most [`Builtin::MAX_PARAMS`],
-//! two), its [`Effect`] (`exec` and the file system's are impure, every
-//! other one pure) and its [`Typing`]. The checker knows no name of one: a
+//! two), its [`Effect`] (`exec`, `exec_live` and the file system's are
+//! impure, every other one pure) and its [`Typing`]. The checker knows no name of one: a
 //! file has them as it has any other module's members, by an import, or by
 //! the prelude, which binds each of them but the file system's to its own
 //! name, or by the standard `fs` module, whose members `exists`, `read`,
@@ -2306,7 +2306,9 @@
 //! result's names into the run's names): `int` (`fn(x: Float): Int`,
 //! truncation toward zero), `float` (`fn(x: Int): Float`), `exec`
 //! (`fn(argv: List<String>) -> {status: Int, stderr: String, stdout:
-//! String}`, which runs a program), `panic` (`fn(message: String):
+//! String}`, which runs a program), `exec_live` (of `exec`'s type, which
+//! runs a program as `exec` does, copying its output to standard error as
+//! it runs), `panic` (`fn(message: String):
 //! Never`, which ends the run with a runtime error of the program's own
 //! wording), the nine on strings: `split` (`fn(s: String, sep:
 //! String): List<String>`, the pieces between the separators; an empty
@@ -2334,7 +2336,8 @@
 //! like any other, typed by its type, binding its arguments by position or
 //! by its parameters' names, awaiting a future argument as any call
 //! does, lowered to a `Call` (see [`crate::eval`], which applies a built-in
-//! it finds called). So a call of `exec`, or of `fs.read`, from a pure
+//! it finds called). So a call of `exec`, of `exec_live` or of `fs.read`,
+//! from a pure
 //! function is "cannot call an impure function from a pure function", as
 //! for any impure
 //! function, and from a `lazy`, an impure or memoised function or the top
@@ -3024,6 +3027,11 @@ pub enum Builtin {
     /// `show(value)`: the GCSL source of a value, as text, which reads back
     /// as an equal value. Its typing is special.
     Show,
+    /// `exec_live(argv: List<String>) -> {status: Int, stderr: String,
+    /// stdout: String}`: `exec`, but the program's standard output and
+    /// standard error are also copied, line by line as they arrive, to this
+    /// process's standard error (see [`crate::eval`]). Impure.
+    ExecLive,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -3048,7 +3056,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 23] = [
+    pub const ALL: [Builtin; 24] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -3072,15 +3080,16 @@ impl Builtin {
         Builtin::FsWrite,
         Builtin::SortVersions,
         Builtin::Show,
+        Builtin::ExecLive,
     ];
 
     /// The most parameters any built-in function has: what a call of one
     /// collects its arguments into (see [`crate::eval`]).
     pub const MAX_PARAMS: usize = 2;
 
-    /// The names of the fields of what `exec` returns, in the order of the
-    /// record it builds: its exit status, its standard output and its
-    /// standard error.
+    /// The names of the fields of what `exec` and `exec_live` return, in the
+    /// order of the record each builds: its exit status, its standard output
+    /// and its standard error.
     pub const EXEC_FIELDS: [&'static str; 3] = ["status", "stdout", "stderr"];
 
     /// The name of its member of the `builtins` module.
@@ -3110,6 +3119,7 @@ impl Builtin {
             Builtin::FsWrite => "fs_write",
             Builtin::SortVersions => "sort_versions",
             Builtin::Show => "show",
+            Builtin::ExecLive => "exec_live",
         }
     }
 
@@ -3142,7 +3152,8 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::CompareVersions
             | Builtin::SortVersions
-            | Builtin::Show => None,
+            | Builtin::Show
+            | Builtin::ExecLive => None,
         }
     }
 
@@ -3153,7 +3164,7 @@ impl Builtin {
         match self {
             Builtin::Len => &["list"],
             Builtin::Int | Builtin::Float => &["x"],
-            Builtin::Exec => &["argv"],
+            Builtin::Exec | Builtin::ExecLive => &["argv"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -3171,7 +3182,8 @@ impl Builtin {
     }
 
     /// What it may do: only a pure one may be called from a pure function.
-    /// `exec`, which runs a program, is impure, and so is each of the file
+    /// `exec` and `exec_live`, which run a program, are impure, and so is
+    /// each of the file
     /// system's, `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`,
     /// `fs_temp_dir` and `fs_write`, which touch the world; every other
     /// built-in function is pure, `panic` included, which ends the run as a
@@ -3181,6 +3193,7 @@ impl Builtin {
     pub const fn effect(self) -> Effect {
         match self {
             Builtin::Exec
+            | Builtin::ExecLive
             | Builtin::FsExists
             | Builtin::FsRead
             | Builtin::FsMkdir
@@ -3231,7 +3244,8 @@ impl Builtin {
             | Builtin::FsCopy
             | Builtin::FsTempDir
             | Builtin::FsWrite
-            | Builtin::SortVersions => Typing::Ordinary,
+            | Builtin::SortVersions
+            | Builtin::ExecLive => Typing::Ordinary,
         }
     }
 
@@ -3247,7 +3261,7 @@ impl Builtin {
             Builtin::Show => "builtin show",
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
-            Builtin::Exec => {
+            Builtin::Exec | Builtin::ExecLive => {
                 "fn(argv: List<String>) -> {status: Int, stderr: String, stdout: String}"
             }
             Builtin::Panic => "fn(message: String): Never",
@@ -3283,7 +3297,7 @@ impl Builtin {
         let (param_types, result): ([TyId; Builtin::MAX_PARAMS], TyId) = match self {
             Builtin::Int => ([TyId::FLOAT, UNUSED], TyId::INT),
             Builtin::Float => ([TyId::INT, UNUSED], TyId::FLOAT),
-            Builtin::Exec => {
+            Builtin::Exec | Builtin::ExecLive => {
                 let argv = types.list(TyId::STRING);
                 let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
                 let result = types.record([
@@ -25394,6 +25408,45 @@ mod tests {
         );
         assert_eq!(messages("exec === exec"), ["cannot compare functions"]);
         assert_eq!(messages("panic === panic"), ["cannot compare functions"]);
+    }
+
+    #[test]
+    fn exec_live_is_typed_as_exec_and_impure() {
+        assert_eq!(shown_result("exec_live"), shown_result("exec"));
+        assert_eq!(
+            shown_result("import builtins\nbuiltins.exec_live"),
+            shown_result("exec")
+        );
+        assert_eq!(shown_result("exec_live([\"true\"])"), EXEC_RESULT);
+        assert_eq!(shown_result("exec_live(argv = [\"true\"])"), EXEC_RESULT);
+        assert_eq!(messages("exec_live([1])"), ["mismatched types"]);
+        // From a pure function, the existing error, through its name or a
+        // variable; from a `lazy`, an impure function or the top level, fine.
+        let text = "fn f(): Int { exec_live([\"true\"]).status }";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "cannot call an impure function from a pure function"
+        );
+        assert_eq!(found[0].span, at(text, "exec_live([\"true\"])"));
+        assert_eq!(
+            messages("let e = exec_live\nfn f(): Int { e([\"true\"]).status }"),
+            ["cannot call an impure function from a pure function"]
+        );
+        assert_eq!(
+            messages("fn f(): String { sh_live(\"true\") }"),
+            ["cannot call an impure function from a pure function"]
+        );
+        assert_eq!(
+            type_of_f("fn f(): Future<Int> { lazy { exec_live([\"true\"]).status } }"),
+            "fn(): Future<Int>"
+        );
+        assert_eq!(
+            type_of_f("fn f() -> String { sh_live(\"true\") }"),
+            "fn() -> String"
+        );
+        assert_eq!(messages("exec_live === exec"), ["cannot compare functions"]);
     }
 
     #[test]

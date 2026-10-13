@@ -1950,9 +1950,9 @@ mod tests {
     #[test]
     fn a_session_runs_exec_panic_and_sh() {
         let mut session = Session::new();
-        // The twenty-three built-in functions' cells are its first slots.
+        // The twenty-four built-in functions' cells are its first slots.
         assert_eq!(
-            &session.frame[..23],
+            &session.frame[..24],
             Builtin::ALL.map(Value::Builtin).as_slice()
         );
         // On the first input, and on later ones, through a variable.

@@ -38,8 +38,10 @@ const PROMPT: &str = "> ";
 /// removes them, with everything in them, before `gcsl` exits (but not if
 /// it is killed). A program a line runs with `exec` or `sh` reads the
 /// null device, never the REPL's own standard input, so the next line is still
-/// the REPL's; a `panic` is a runtime error of the line, which changes
-/// nothing.
+/// the REPL's; one it runs with `exec_live` or `sh_live` does too, and its
+/// output, captured into the line's value as `exec`'s is, is also copied to
+/// stderr, line by line, as it runs; a `panic` is a runtime error of the
+/// line, which changes nothing.
 /// Ctrl-C discards the current line. History lasts for the session only.
 pub fn main() -> ExitCode {
     let mut editor = match DefaultEditor::new() {

@@ -80,7 +80,9 @@
 //! `sort_versions`, which sorts a list of them so, `show`, which gives the
 //! GCSL source of a value, as text that reads back as an equal value, and
 //! the file system's `fs_exists`, `fs_read`, `fs_mkdir`, `fs_copy`,
-//! `fs_temp_dir` and `fs_write`), and the standard files, the `.gcsl` files
+//! `fs_temp_dir` and `fs_write`, and `exec_live`, which runs a program as
+//! `exec` does, copying its output to standard error as it runs), and the
+//! standard files, the `.gcsl` files
 //! of the repository's
 //! `stdlib/` directory compiled in ([`STANDARD`]), each a module importable
 //! by its bare name from any file and each a scope of its own; and every
@@ -92,7 +94,7 @@
 //! static order of the workspace. The prelude binds the built-in
 //! functions but the file system's, and `sh`, written
 //! in GCSL on `exec` and `panic`, which runs a shell command and panics
-//! unless it succeeds; `path` (`import path`) joins, normalises and takes
+//! unless it succeeds, and `sh_live`, the same on `exec_live`; `path` (`import path`) joins, normalises and takes
 //! apart paths, lexically, in GCSL on the string built-ins; and `fs`
 //! (`import fs`) is the file system's built-ins as its members, impure and
 //! taking only absolute paths: `fs.exists`, `fs.read`, `fs.mkdir`,
@@ -120,9 +122,12 @@
 //! [`SourceFile`], and so is every warning, which does not stop a program
 //! from running and is returned with its value in an [`Outcome`]; a call of
 //! `panic` is a runtime error of the program's own wording. The library
-//! never prints and reads no source file; the things it does outside itself
+//! never prints, but the copy `exec_live` makes to the process's standard
+//! error, and reads no source file; the things it does outside itself
 //! are what a program asks of `exec`, which runs a program, its output
-//! captured, its standard input the null device, and of the file system's
+//! captured, its standard input the null device, of `exec_live`, which does
+//! the same, copying the program's output to standard error, line by line,
+//! as it runs, and of the file system's
 //! built-ins, which read, make, copy and write files and directories at the
 //! absolute paths the program gives (see [`eval`], "The built-in
 //! functions"), and removing the temporary directories `fs.temp_dir` made,

@@ -66,8 +66,12 @@
 //! command's standard error, trimmed. A program a file runs with
 //! `exec` or `sh` has `gcsl`'s working directory and environment and the
 //! null device as its standard input, and its output is captured into the
-//! value, never shown; a `panic`, like any runtime error, is rendered to
-//! stderr with exit code 1.
+//! value, never shown; one it runs with `exec_live` or `sh_live` is run so
+//! too, its output captured as well, but copied, line by line as it
+//! arrives, to `gcsl`'s stderr, never to its stdout, which holds only the
+//! value (a failing `sh_live`'s panic leaves out the standard error it has
+//! shown); a `panic`, like any runtime error, is rendered to stderr with
+//! exit code 1.
 //!
 //! A file that imports `fs` reads, makes and copies files and directories
 //! with it, at absolute paths only (`path.join(fileroot.this, "x.txt")`,

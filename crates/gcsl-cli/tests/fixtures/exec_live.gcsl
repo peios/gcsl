@@ -1,0 +1,2 @@
+# The program's output is copied to stderr as it runs, and captured.
+= exec_live(["/bin/sh", "-c", "echo out; echo err >&2"])

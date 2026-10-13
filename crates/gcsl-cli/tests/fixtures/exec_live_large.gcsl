@@ -1,0 +1,7 @@
+# More than a pipe holds on each stream, the streams written in turn: a
+# reader of one stream at a time would wait forever.
+let script = "yes o | head -n 100000; yes e | head -n 100000 >&2; yes o | head -n 100000"
+let r = exec_live(["/bin/sh", "-c", script])
+status = r.status
+out = len(lines(r.stdout))
+err = len(lines(r.stderr))

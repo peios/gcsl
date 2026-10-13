@@ -1,0 +1,2 @@
+# A last line without a newline is copied as it is, no newline added.
+= exec_live(["/bin/sh", "-c", "printf 'a\\nb'"])
