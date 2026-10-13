@@ -792,8 +792,11 @@
 //! - no entry: the call checks the nesting budget as any call does, copies
 //!   the arguments into a new entry marked running, the one allocation the
 //!   memoisation makes, runs the body as any call does, and then finds the
-//!   entry again, by the address of its key, which it compares equal to or
-//!   not, and records the value. If the body fails, the entry is removed
+//!   entry again, by its *identity*, a number from a counter of
+//!   [`MemoTables`], new for each entry, which tells it from every other
+//!   entry of its bucket, whatever their keys compare equal to and however
+//!   many are empty (every empty key, having no elements, has one address),
+//!   and records the value. If the body fails, the entry is removed
 //!   before the error goes on, so that a later call, in a later input of a
 //!   session, runs the body again.
 //!
@@ -2253,16 +2256,16 @@ impl Evaluator<'_> {
         } else {
             caller
         };
-        let key = self.memo.start(closure, hash, key);
+        let entry = self.memo.start(closure, hash, key);
         self.memo.running.push(Running {
             closure: Rc::as_ptr(closure),
             hash,
-            key,
+            entry,
             origin: caller.origin,
         });
         Ok(MemoBegin::Started(Mark {
             hash,
-            key,
+            entry,
             entering,
             caller,
         }))
@@ -3974,6 +3977,10 @@ pub struct MemoTables {
     /// The last origin given to a caller (see [Callers and
     /// helpers](#callers-and-helpers)): each is new, 0 being no frame's.
     origins: u64,
+    /// The last identity given to an entry: each is new, so that it tells
+    /// the entry apart from every other of its bucket, as the address of
+    /// its key cannot, every empty key having the same one.
+    entries: u64,
     /// The memoised calls running, outermost first, each with the origin of
     /// its caller: those an ambient input read is a dependency of (see
     /// [Memoised functions](#memoised-functions), "Ambient inputs"). Empty
@@ -3989,16 +3996,16 @@ pub struct MemoTables {
 const NO_ORIGIN: u64 = 0;
 
 /// A memoised call that is running, on [`MemoTables`]'s stack of them: its
-/// entry, by its closure, its arguments' hash and the address of its stored
-/// key, as [`Mark`] finds it, and the origin of its caller.
+/// entry, by its closure, its arguments' hash and its identity, as [`Mark`]
+/// finds it, and the origin of its caller.
 #[derive(Clone, Copy, Debug)]
 struct Running {
     /// The address of the closure, which finds its table.
     closure: *const Closure,
     /// The hash of the arguments.
     hash: u64,
-    /// The address of the stored key, which finds the entry.
-    key: *const Value,
+    /// The identity of the entry, which finds it in its bucket.
+    entry: u64,
     /// The origin of the call's caller.
     origin: u64,
 }
@@ -4043,6 +4050,7 @@ impl MemoTables {
             threshold: MIN_SWEEP_THRESHOLD,
             generation: 0,
             origins: 0,
+            entries: 0,
             running: Vec::new(),
         }
     }
@@ -4052,6 +4060,13 @@ impl MemoTables {
     fn new_origin(&mut self) -> u64 {
         self.origins = self.origins.wrapping_add(1);
         self.origins
+    }
+
+    /// A new identity, for an entry [`MemoTables::start`] makes: no entry
+    /// had it before.
+    fn new_entry(&mut self) -> u64 {
+        self.entries = self.entries.wrapping_add(1);
+        self.entries
     }
 
     /// Records `ambient`, an ambient input a frame of origin `origin` read,
@@ -4073,7 +4088,7 @@ impl MemoTables {
                     bucket
                         .entries_mut()
                         .iter_mut()
-                        .find(|entry| entry.key.as_ptr() == running.key)
+                        .find(|entry| entry.id == running.entry)
                 });
             if let Some(entry) = entry
                 && !entry.deps.contains(&ambient)
@@ -4203,25 +4218,26 @@ impl MemoTables {
 
     /// Records `key`, whose hash is `hash`, as running in `closure`'s
     /// table, which is made if the closure has none, after sweeping if the
-    /// number of tables has reached the threshold. Returns the address of
-    /// the stored key, by which [`MemoTables::finish`] finds the entry
-    /// again, whatever its key compares equal to.
-    fn start(&mut self, closure: &Rc<Closure>, hash: u64, key: &[Value]) -> *const Value {
+    /// number of tables has reached the threshold. Returns the entry's
+    /// identity, by which [`MemoTables::finish`] finds it again, whatever
+    /// its key compares equal to, and however many other entries of its
+    /// bucket have empty keys.
+    fn start(&mut self, closure: &Rc<Closure>, hash: u64, key: &[Value]) -> u64 {
         let address = Rc::as_ptr(closure);
         if self.tables.len() >= self.threshold && !self.tables.contains_key(&address) {
             self.sweep();
         }
+        let id = self.new_entry();
         let table = self.tables.entry(address).or_insert_with(|| MemoTable {
             closure: Rc::downgrade(closure),
             buckets: HashMap::default(),
         });
-        let key: Box<[Value]> = Box::from(key);
-        let stored = key.as_ptr();
         let entry = Entry {
-            key,
+            key: Box::from(key),
             state: EntryState::Running { reentered: false },
             deps: Box::default(),
             generation: self.generation,
+            id,
         };
         match table.buckets.entry(hash) {
             MapEntry::Occupied(mut bucket) => bucket.get_mut().push(entry),
@@ -4229,7 +4245,7 @@ impl MemoTables {
                 vacant.insert(Bucket::One(entry));
             }
         }
-        stored
+        id
     }
 
     /// Ends the call of `closure` that [`MemoTables::start`] recorded as
@@ -4256,7 +4272,7 @@ impl MemoTables {
             .get_mut(&mark.hash)?
             .entries_mut()
             .iter_mut()
-            .find(|entry| entry.key.as_ptr() == mark.key)?;
+            .find(|entry| entry.id == mark.entry)?;
         entry.state = EntryState::Done(value.clone());
         Some(false)
     }
@@ -4284,14 +4300,14 @@ struct MemoTable {
 }
 
 impl MemoTable {
-    /// Removes the entry `mark` recorded, found by the address of its key,
-    /// and returns its state; `None` if there is none.
+    /// Removes the entry `mark` recorded, found by its identity, and
+    /// returns its state; `None` if there is none.
     fn remove(&mut self, mark: &Mark) -> Option<EntryState> {
         let bucket = self.buckets.get_mut(&mark.hash)?;
         let index = bucket
             .entries()
             .iter()
-            .position(|entry| entry.key.as_ptr() == mark.key)?;
+            .position(|entry| entry.id == mark.entry)?;
         if let Bucket::Many(entries) = bucket
             && entries.len() > 1
         {
@@ -4374,6 +4390,10 @@ struct Entry {
     /// The checkpoint the entry was made after (see
     /// [`MemoTables::checkpoint`]).
     generation: u64,
+    /// The entry's identity, new for each (see [`MemoTables::start`]): what
+    /// a running call finds its entry by, since keys that compare equal may
+    /// share a bucket, and empty keys share an address.
+    id: u64,
 }
 
 /// Where a memoised call is.
@@ -4415,8 +4435,8 @@ enum MemoBegin {
 struct Mark {
     /// The hash of the arguments.
     hash: u64,
-    /// The address of the stored key, which finds the entry again.
-    key: *const Value,
+    /// The identity of the entry, which finds it again in its bucket.
+    entry: u64,
     /// The nesting at which the body runs (see the module documentation).
     entering: usize,
     /// The caller the body runs with (see [Callers and
@@ -8671,6 +8691,128 @@ mod tests {
             int("fn f(n: Int) ->> Int { if n == 0 { 0 } else { f(n - 1) + 1 } }\nf(3)"),
             3
         );
+    }
+
+    #[test]
+    fn a_memoised_call_of_no_arguments_depending_on_its_own_result_fails() {
+        let text = "fn f() ->> Int { f() + 1 }\nf()";
+        let diagnostic = run(text).unwrap_err();
+        assert_eq!(diagnostic.message, "this call depends on its own result");
+        let inner = text.find("f() + 1").unwrap();
+        let running = text.rfind("f()").unwrap();
+        let span = |start: usize| {
+            Span::new(
+                u32::try_from(start).unwrap(),
+                u32::try_from(start + 3).unwrap(),
+            )
+        };
+        assert_eq!(diagnostic.span, span(inner));
+        assert_eq!(
+            labels(&diagnostic),
+            vec![(span(running), "called here with the same arguments")]
+        );
+        let mut memo = MemoTables::new();
+        run_with(text, &mut memo).unwrap_err();
+        assert_eq!(memo.running_count(), 0);
+    }
+
+    /// The closure of a memoised function of no parameters, for driving
+    /// [`MemoTables`] by hand.
+    fn memoised_closure() -> Rc<Closure> {
+        match run("fn h() ->> Int { 1 }\nh") {
+            Ok(Value::Fn(closure)) => closure,
+            other => panic!("expected a closure, got {other:?}"),
+        }
+    }
+
+    /// Starts a call of `closure` with no arguments in `memo`, as
+    /// [`Evaluator::memo_begin`] does, for a caller of origin `origin`,
+    /// which then reads the directory `dir` as its `fileroot.caller`.
+    fn start_reading(memo: &mut MemoTables, closure: &Rc<Closure>, origin: u64, dir: u32) -> Mark {
+        let hash = key_hash(&[]);
+        let entry = memo.start(closure, hash, &[]);
+        memo.running.push(Running {
+            closure: Rc::as_ptr(closure),
+            hash,
+            entry,
+            origin,
+        });
+        memo.depend(origin, Ambient::Caller(dir));
+        Mark {
+            hash,
+            entry,
+            entering: 0,
+            caller: Caller {
+                dir,
+                helper: false,
+                origin,
+            },
+        }
+    }
+
+    /// What a call of `closure` with no arguments from the directory `dir`
+    /// finds in `memo`: its value, `None` if the entry is running, or the
+    /// text `missing`.
+    fn found(
+        memo: &mut MemoTables,
+        closure: &Rc<Closure>,
+        dir: u32,
+    ) -> Result<Option<Value>, &'static str> {
+        let caller = Caller {
+            dir,
+            helper: false,
+            origin: NO_ORIGIN,
+        };
+        match memo.lookup(closure, &[], (caller, false)) {
+            Lookup::Done(value) => Ok(Some(value)),
+            Lookup::Running => Ok(None),
+            Lookup::Missing(_) => Err("missing"),
+        }
+    }
+
+    #[test]
+    fn entries_with_empty_keys_are_told_apart() {
+        // Two calls of no arguments, from two directories, each reading
+        // its caller: two entries of one bucket, both with empty keys,
+        // whose boxes share an address.
+        let closure = memoised_closure();
+        let mut memo = MemoTables::new();
+        let first = start_reading(&mut memo, &closure, 1, 1);
+        memo.running.pop();
+        assert_eq!(
+            memo.finish(&closure, &first, Some(&Value::Int(10))),
+            Some(false)
+        );
+        let second = start_reading(&mut memo, &closure, 2, 2);
+        assert_ne!(first.entry, second.entry);
+        // The second is running: found so from its directory, and marked
+        // re-entered, the first untouched.
+        assert_eq!(found(&mut memo, &closure, 2), Ok(None));
+        assert_eq!(found(&mut memo, &closure, 1), Ok(Some(Value::Int(10))));
+        memo.running.pop();
+        assert_eq!(
+            memo.finish(&closure, &second, Some(&Value::Int(20))),
+            Some(false)
+        );
+        // Both completed, each with its own dependency, and both reused.
+        assert_eq!(memo.running_count(), 0);
+        for _ in 0..2 {
+            assert_eq!(found(&mut memo, &closure, 1), Ok(Some(Value::Int(10))));
+            assert_eq!(found(&mut memo, &closure, 2), Ok(Some(Value::Int(20))));
+            assert_eq!(found(&mut memo, &closure, 3), Err("missing"));
+        }
+        assert!(memo.completed(&closure, &[], 1));
+        assert!(memo.completed(&closure, &[], 2));
+        assert!(!memo.completed(&closure, &[], 3));
+        // A third that fails, re-entered, removes itself and nothing else.
+        let third = start_reading(&mut memo, &closure, 3, 3);
+        assert_eq!(found(&mut memo, &closure, 3), Ok(None));
+        memo.running.pop();
+        assert_eq!(memo.finish(&closure, &third, None), Some(true));
+        assert_eq!(found(&mut memo, &closure, 3), Err("missing"));
+        assert_eq!(found(&mut memo, &closure, 1), Ok(Some(Value::Int(10))));
+        assert_eq!(found(&mut memo, &closure, 2), Ok(Some(Value::Int(20))));
+        assert_eq!(memo.running_count(), 0);
     }
 
     #[test]

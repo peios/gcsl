@@ -18921,6 +18921,86 @@ p26 = com.x"#;
     }
 
     #[test]
+    fn memoised_calls_of_no_arguments_from_several_directories_are_told_apart() {
+        // A memoised function of no parameters reading its caller, called
+        // from two directories, and again from the first: one entry for
+        // each, both with an empty key, each completing, and each found.
+        let (dir, log) = log_in("empty-keys");
+        let lib = format!(
+            "import fileroot\nimport path\n\
+             def called() ->> String {{\n\
+             \x20   let out = sh(\"echo ran {{fileroot.caller}} >> {log}\")\n\
+             \x20   \"{{fileroot.caller}}{{out}}\"\n\
+             }}\n\
+             def cycle() ->> String {{\n\
+             \x20   let caller = fileroot.caller\n\
+             \x20   let out = sh(\"echo cycle {{caller}} >> {log}\")\n\
+             \x20   fileroot.helper()\n\
+             \x20   if caller == path.join(fileroot.workspace, \"b\") {{ cycle() }} else {{ \"{{caller}}{{out}}\" }}\n\
+             }}"
+        );
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef run(name: String, f: fn() -> String) -> String { f() }",
+            ),
+            ("lib.gcsl", lib.as_str()),
+            (
+                "a/a.gcsl",
+                "import lib\ndef run a() { lib.called() }\ndef run ca() { lib.cycle() }",
+            ),
+            (
+                "b/b.gcsl",
+                "import lib\ndef run b() { lib.called() }\ndef run cb() { lib.cycle() }",
+            ),
+            ("top.gcsl", "import lib\ndef run top() { lib.called() }"),
+        ];
+        let mut workspace = rooted(&files).unwrap();
+        let lib = workspace.file("lib.gcsl").unwrap();
+        let invoked = |workspace: &mut Workspace, name: &str| {
+            let outcome = workspace.invoke("run", name, &[]).unwrap();
+            outcome.value.to_string().replace(SCRATCH, "<root>")
+        };
+        for _ in 0..2 {
+            assert_eq!(invoked(&mut workspace, "a"), "<root>/a");
+            assert_eq!(invoked(&mut workspace, "b"), "<root>/b");
+        }
+        assert_eq!(
+            logged(&log).replace(SCRATCH, "<root>"),
+            "ran <root>/a\nran <root>/b\n"
+        );
+        // Neither entry is a call from the root's.
+        assert!(!workspace.memoised(lib, "called"));
+        assert_eq!(invoked(&mut workspace, "top"), "<root>");
+        assert!(workspace.memoised(lib, "called"));
+        for name in ["a", "b", "top", "a"] {
+            invoked(&mut workspace, name);
+        }
+        assert_eq!(
+            logged(&log).replace(SCRATCH, "<root>"),
+            "ran <root>/a\nran <root>/b\nran <root>\n"
+        );
+        // A call of no arguments depending on its own result is still one,
+        // beside an entry of the same key that completed, which it leaves.
+        assert_eq!(invoked(&mut workspace, "ca"), "<root>/a");
+        let Err(InvokeError::Diagnostics(errors)) = workspace.invoke("run", "cb", &[]) else {
+            panic!("expected `cb` to fail");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "this call depends on its own result"),
+            "{errors:?}"
+        );
+        assert_eq!(invoked(&mut workspace, "ca"), "<root>/a");
+        assert_eq!(
+            logged(&log).replace(SCRATCH, "<root>"),
+            "ran <root>/a\nran <root>/b\nran <root>\ncycle <root>/a\ncycle <root>/b\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_composition_of_top_level_functions_is_called_by_name() {
         let (dir, log) = log_in("composed");
         let files = environment(&log);
