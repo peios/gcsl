@@ -1719,6 +1719,21 @@ fn run_gives_defaults_to_literals_in_blocks_and_fors() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// The form of slice 54: a record literal in the list literal that a
+/// spread `if`'s `else` branch results in, where a list of a type with a
+/// defaulted field is expected, is given the field.
+#[test]
+fn run_gives_defaults_to_literals_in_spread_ifs() {
+    let output = gcsl(&["run", "tests/fixtures/record_defaults_spread.gcsl"]);
+    assert_eq!(
+        stdout(&output),
+        "{none_installed = []; content = [{from = \"a\"; to = \"b\"; exclude = []}, \
+         {from = \"src/src/tools/cargo/LICENSE-MIT\"; to = \"c\"; exclude = []}]}\n"
+    );
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 #[test]
 fn repl_gives_defaults_to_literals_in_blocks_and_ifs() {
     // A function of an earlier line whose body results in the literal; an

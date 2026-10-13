@@ -1,0 +1,11 @@
+type Install = { from: String, to: String, exclude: List<String> = [] }
+# a stub of the workspace's lane test
+fn kernel_lane(v: String): Bool { v == "kernel" }
+let v = "6.1"
+none_installed: List<Install> = []
+content: List<Install> = [
+    { from = "a"; to = "b" },
+    ...if kernel_lane(v) { none_installed } else {
+        [ { from = "src/src/tools/cargo/LICENSE-MIT"; to = "c" } ]
+    },
+]

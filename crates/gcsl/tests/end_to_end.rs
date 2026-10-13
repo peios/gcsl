@@ -1489,6 +1489,78 @@ fn record_defaults_reach_blocks_in_the_repl() {
     );
 }
 
+/// The form of slice 54: a spread `if` whose `else` branch results in a
+/// list literal of a record lacking a defaulted field, where a list of the
+/// type is expected, with a stub of `kernel_lane`; `v` is bound before it.
+const RECORD_DEFAULTS_SPREAD: &str = "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+     fn kernel_lane(v: String): Bool { v == \"kernel\" }\n\
+     none_installed: List<Install> = []\n\
+     content: List<Install> = [\n\
+     \x20   { from = \"a\"; to = \"b\" },\n\
+     \x20   ...if kernel_lane(v) { none_installed } else {\n\
+     \x20       [ { from = \"src/src/tools/cargo/LICENSE-MIT\"; to = \"c\" } ]\n\
+     \x20   },\n\
+     ]\n";
+
+#[test]
+fn record_defaults_reach_spread_ifs_and_blocks() {
+    // Either branch taken.
+    let lanes = [
+        (
+            "6.1",
+            "[{from = \"a\"; to = \"b\"; exclude = []}, \
+             {from = \"src/src/tools/cargo/LICENSE-MIT\"; to = \"c\"; exclude = []}]",
+        ),
+        ("kernel", "[{from = \"a\"; to = \"b\"; exclude = []}]"),
+    ];
+    for (lane, content) in lanes {
+        let text = format!("let v = \"{lane}\"\n{RECORD_DEFAULTS_SPREAD}");
+        assert_eq!(
+            run(&text).unwrap().to_string(),
+            format!("{{none_installed = []; content = {content}}}"),
+            "{lane}"
+        );
+    }
+    // A spread block, an `else if`, a `for` that is a branch, and nesting.
+    let text = "type Install = { from: String, exclude: List<String> = [] }\n\
+                fn pick(n: Int): List<Install> {\n\
+                \x20   [...if n == 0 { [{ from = \"a\" }] } else if n == 1 { for f in [\"b\", \"c\"] { { from = f } } } else { [{ from = \"d\"; exclude = [\"e\"] }] }]\n\
+                }\n\
+                block: List<Install> = [...{ let f = \"g\"; [{ from = f }, ...if true { [{ from = \"h\" }] } else { ([] : List<Install>) }] }]\n\
+                picked = [pick(0), pick(1), pick(2)]";
+    assert_eq!(
+        run(text).unwrap().to_string(),
+        "{block = [{from = \"g\"; exclude = []}, {from = \"h\"; exclude = []}]; \
+         picked = [[{from = \"a\"; exclude = []}], \
+         [{from = \"b\"; exclude = []}, {from = \"c\"; exclude = []}], \
+         [{from = \"d\"; exclude = [\"e\"]}]]}"
+    );
+}
+
+#[test]
+fn record_defaults_reach_spread_ifs_in_the_repl() {
+    // A type of an earlier input; a later input's spreads.
+    let mut session = Session::new();
+    let inputs = [
+        "type Install = { from: String, to: String, exclude: List<String> = [] }",
+        "let xs: List<Install> = [...{ [{ from = \"a\"; to = \"a\" }] }]",
+        "xs",
+        "([...if false { xs } else { [{ from = \"b\"; to = \"b\" }] }] : List<Install>)",
+    ];
+    let mut shown = Vec::new();
+    for input in inputs {
+        let outcome = session.eval(&source(input)).unwrap();
+        shown.push(outcome.value.repr().to_string());
+    }
+    assert_eq!(
+        &shown[2..],
+        [
+            "[{from = \"a\"; to = \"a\"; exclude = []}]",
+            "[{from = \"b\"; to = \"b\"; exclude = []}]",
+        ]
+    );
+}
+
 #[test]
 fn an_impure_call_error_renders_exactly() {
     assert_eq!(

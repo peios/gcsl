@@ -748,19 +748,29 @@
 //! expected, a `for`'s body where a list of the type is expected of the
 //! loop (see [For](#for)), a `break`'s value for such a loop, and the body
 //! of a `for` spread in a list literal whose elements are expected to be of
-//! the type, `[...for x in xs { { ... } }]` (see [Lists](#lists)). A
+//! the type, `[...for x in xs { { ... } }]` (see [Lists](#lists)). Where the
+//! elements of such a list literal are expected to be of the type, a spread
+//! of a block with a result or of an `if` with `else` reaches, through the
+//! same blocks and branches (`Checker::fill_elements`), a list literal they
+//! result in, whose elements are then reached as the enclosing literal's
+//! are, each an element that is no spread, as above, and each spread of a
+//! `for`, a block or an `if` in turn, and a `for` they result in, whose
+//! body is reached as a spread `for`'s is: `[...if c { xs } else { [{ ...
+//! }] }]`, `[...{ let y = 1; [{ ... }] }]`. A
 //! literal reached so that lacks a defaulted field, by its field items, and
 //! has no spread is checked against the type as any literal is where it is
 //! expected, field by field, and given the defaults it lacks; one that
 //! gives every defaulted field, or has a spread, is checked as it is with
-//! nothing expected, as ever. Nothing else of the block, the `if` or the
-//! loop changes: a result or a branch that is no literal is checked as
-//! with nothing expected, the branches are joined, a labelled block's
-//! `return`s are checked and joined with its result, and the whole must
-//! then fit the type where it stands, as ever, a mismatch being reported
-//! there. A record type without defaults reaches none of these, nor does
-//! one that is a union's member; nor is the result of an `if` without
-//! `else`, or a spread other than a `for`, reached. Nothing else is
+//! nothing expected, as ever. Nothing else of the block, the `if`, the
+//! loop or the list literal changes: a result or a branch that is no
+//! literal, a name or a call, is checked as with nothing expected, `[]`
+//! included, the branches are joined, a list literal's elements are
+//! joined, a labelled block's `return`s are checked and joined with its
+//! result, and the whole must then fit the type where it stands, as ever, a
+//! mismatch being reported there. A record type without defaults reaches
+//! none of these, nor does one that is a union's member; nor is the result
+//! of an `if` without `else`, or a spread of anything else, a list literal
+//! itself included, reached. Nothing else is
 //! given anything: a value that is not such a literal, a variable, a
 //! call's result, a field read, a literal checked with no expected type,
 //! that lacks a defaulted field is the usual mismatch where it meets the
@@ -1814,7 +1824,11 @@
 //! are expected to be of a record type with defaults, whose body has a
 //! record literal it results in given them, as a `for`'s body has where a
 //! list of the type is expected of it (`Checker::check_spread`; see "Field
-//! defaults"), the rest of the loop checked as ever.
+//! defaults"), the rest of the loop checked as ever; and there for a block
+//! with a result or an `if` with `else`, whose list literal results, and
+//! `for`s, have the record literals among their elements, and their
+//! spreads, given them in the same way, the rest of the block, the `if` and
+//! the list checked as ever (`Checker::fill_elements`).
 //! Its elements are not measured: where an element type is expected, they
 //! must fit it as they are, since there is no expression to await for each;
 //! a list whose elements would fit only once awaited is a mismatch, with a
@@ -1949,7 +1963,8 @@
 //! value that is a block results in, or an `if`'s branches do, is given
 //! them (see "Field defaults" under [Functions](#functions)), as is one a
 //! spread `for`'s body results in where the list's elements are expected
-//! to be of such a type (see [Lists](#lists)). `E` is
+//! to be of such a type, or the body of a `for` that a spread block or `if`
+//! results in there (see [Lists](#lists)). `E` is
 //! then the join of what they are once those awaits have run, the type of
 //! every value the evaluator collects, or `X` if that is not a subtype of
 //! `X`, as for a literal, and is no warning. A bare `break` or `continue`
@@ -4810,8 +4825,9 @@ struct Node {
 /// The record type a record block is checked against, or the list type the
 /// result of a block that is not one is checked against, or the record type
 /// with defaults a record literal it results in is (see
-/// [`Expecting::literal_only`]), and where the expectation comes from, for
-/// [`Checker::check_expr_expecting`].
+/// [`Expecting::literal_only`]), or that the elements of a list literal it
+/// results in are (see [`Expecting::elements_only`]), and where the
+/// expectation comes from, for [`Checker::check_expr_expecting`].
 #[derive(Clone, Copy, Debug)]
 struct Expecting<'w> {
     /// The expected record type, present; or the expected list type or
@@ -4829,13 +4845,31 @@ struct Expecting<'w> {
     /// lacks are recorded as given their defaults (see [Field
     /// defaults](#field-defaults)).
     fill: Option<ExprId>,
-    /// For the result of a block that is not a record block: whether `ty`
-    /// is a record type with defaults that reaches only a record literal
-    /// the result is, through blocks and the branches of an `if` with
-    /// `else`, to give it the defaults it lacks, the result being checked
+    /// For the result of a block that is not a record block: what of it
+    /// `ty` reaches (see [`Reach`]).
+    reach: Reach,
+}
+
+/// What the type an [`Expecting`] carries reaches of the result of a block
+/// that is not a record block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// The whole result, which is checked against the type
+    /// ([`Checker::fit`]).
+    Whole,
+    /// Only a record literal the result is, through blocks and the
+    /// branches of an `if` with `else`, the type being a record type with
+    /// defaults, to give it the defaults it lacks, the result being checked
     /// otherwise as it is with nothing expected (see
     /// [`Checker::fill_result`]).
-    literal_only: bool,
+    Literal,
+    /// Only the elements of a list literal the result is, or the body of a
+    /// `for` it is, through blocks and the branches of an `if` with `else`,
+    /// the type being a record type with defaults that the elements are
+    /// expected to be of, to give a record literal among them the defaults
+    /// it lacks, the result being checked otherwise as it is with nothing
+    /// expected (see [`Checker::fill_elements`]).
+    Elements,
 }
 
 impl<'w> Expecting<'w> {
@@ -4848,17 +4882,29 @@ impl<'w> Expecting<'w> {
             why,
             close: Span::new(block.end.saturating_sub(1), block.end),
             fill: None,
-            literal_only: false,
+            reach: Reach::Whole,
         }
     }
 
     /// The expectation of the record type with defaults `record`, stated at
     /// `context`, labelled `why`, of the result of the block spanning
     /// `block`, which is not a record block, that reaches only a record
-    /// literal the result is (see [`Expecting::literal_only`]).
+    /// literal the result is (see [`Reach::Literal`]).
     const fn literal_only(record: TyId, (context, why): (Span, &'w str), block: Span) -> Self {
         Self {
-            literal_only: true,
+            reach: Reach::Literal,
+            ..Self::new(record, (context, why), block)
+        }
+    }
+
+    /// The expectation of the record type with defaults `record`, stated at
+    /// `context`, labelled `why`, of the elements of the result of the
+    /// block spanning `block`, which is not a record block, that reaches
+    /// only the elements of a list literal the result is, or the body of a
+    /// `for` it is (see [`Reach::Elements`]).
+    const fn elements_only(record: TyId, (context, why): (Span, &'w str), block: Span) -> Self {
+        Self {
+            reach: Reach::Elements,
             ..Self::new(record, (context, why), block)
         }
     }
@@ -4880,6 +4926,11 @@ enum Branch<'w> {
     /// which reaches only a record literal the branch results in
     /// ([`Checker::fill_result`]).
     Fills(TyId, (Span, &'w str)),
+    /// A record type with defaults that the elements of the branch, a list,
+    /// are expected to be of, with where that is stated and its label,
+    /// which reaches only the elements of a list literal the branch results
+    /// in, or the body of a `for` it does ([`Checker::fill_elements`]).
+    FillsElements(TyId, (Span, &'w str)),
 }
 
 /// What [`Checker::check_test`] found of an `is` or `as` that is not
@@ -5858,7 +5909,9 @@ impl<'a> Checker<'a> {
     /// type its result has once any await marked on it has run (see
     /// [`Checker::fit`]); or, for a record type with defaults that reaches
     /// only a record literal its result is ([`Expecting::literal_only`]),
-    /// has its result checked so ([`Checker::fill_result`]), and the type
+    /// or only the elements of a list literal it is
+    /// ([`Expecting::elements_only`]), has its result checked so
+    /// ([`Checker::fill_result`], [`Checker::fill_elements`]), and the type
     /// its result has. A `break` or `continue` that is its last item
     /// makes it `Never`. The first item after one that never completes is
     /// warned about, "this is never run" (see [Never](#never)).
@@ -6100,10 +6153,14 @@ impl<'a> Checker<'a> {
         expected: Option<Expecting<'_>>,
     ) -> TyId {
         match expected {
-            Some(expected) if expected.literal_only => {
-                self.fill_result(value, expected.ty, (expected.context, expected.why))
+            Some(expected) => {
+                let context = (expected.context, expected.why);
+                match expected.reach {
+                    Reach::Whole => self.fit(value, expected.ty, context),
+                    Reach::Literal => self.fill_result(value, expected.ty, context),
+                    Reach::Elements => self.fill_elements(value, expected.ty, context),
+                }
             }
-            Some(expected) => self.fit(value, expected.ty, (expected.context, expected.why)),
             None if !is_result && self.is_empty_list(value) => {
                 // A statement `[]` holds nothing, and is the unit-like
                 // `List<{}>`.
@@ -12518,7 +12575,7 @@ impl<'a> Checker<'a> {
                 why,
                 close: Span::new(span.end.saturating_sub(1), span.end),
                 fill: itself.then_some(block),
-                literal_only: false,
+                reach: Reach::Whole,
             };
             let ty = self.check_block(body, Some(expecting));
             let mut node = id;
@@ -12543,7 +12600,7 @@ impl<'a> Checker<'a> {
                 why,
                 close: Span::new(span.end.saturating_sub(1), span.end),
                 fill: Some(block),
-                literal_only: false,
+                reach: Reach::Whole,
             };
             let ty = self.empty_record(expecting);
             self.set_through_parens(id, ty);
@@ -12617,16 +12674,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Block { items, label } if self.has_result(items) => {
                 let expecting = Expecting::literal_only(record, (context, why), expr.span);
-                match label {
-                    // Its `return`s are checked as ever, and joined with its
-                    // result.
-                    Some(label) => {
-                        self.enter_block(node, self.ast.label(label), None);
-                        let ty = self.check_block(items, Some(expecting));
-                        self.leave_block(node, ty, None)
-                    }
-                    None => self.check_block(items, Some(expecting)),
-                }
+                self.reach_block(node, (items, label), expecting)
             }
             ExprKind::If {
                 cond,
@@ -12642,6 +12690,78 @@ impl<'a> Checker<'a> {
         };
         self.set_through_parens(id, ty);
         ty
+    }
+
+    /// Checks `id`, a list whose elements the record type with defaults
+    /// `record` is expected to be of, as stated at `context`, labelled
+    /// `why`, for the defaults alone (see [Field defaults](#field-defaults)),
+    /// and returns its type, recorded for `id` and every parenthesis around
+    /// it. A list literal, through any parentheses, is checked as it is
+    /// with nothing expected but for its elements: each that is no spread
+    /// as [`Checker::fill_result`] says, so that a record literal lacking a
+    /// defaulted field is given it, and each spread's operand as
+    /// [`Checker::check_spread`] says with `record` ([`Checker::check_list`]).
+    /// A `for` has the record literal its body results in given the
+    /// defaults it lacks, as a spread `for` has ([`Checker::check_for`]). A
+    /// block with a result has its result checked so in turn
+    /// ([`Expecting::elements_only`]), and a labelled one's `return`s as
+    /// ever; an `if` with `else` has each branch checked so, and is their
+    /// join, as ever ([`Checker::check_if`]). Anything else is checked as it
+    /// is with nothing expected, and nothing else of the list, the loop, the
+    /// block or the `if` changes: what it is must then fit what is expected
+    /// where it stands, as ever.
+    ///
+    /// Recurses once per level of blocks, branches, list literals and
+    /// spreads nested in each other.
+    fn fill_elements(&mut self, id: ExprId, record: TyId, (context, why): (Span, &str)) -> TyId {
+        let mut node = id;
+        while let ExprKind::Paren(inner) = self.ast.get(node).kind {
+            node = inner;
+        }
+        let expr = *self.ast.get(node);
+        let fill = (record, (context, why));
+        let ty = match expr.kind {
+            ExprKind::List(elements) => self.check_list(node, elements, Some(fill)),
+            ExprKind::For(for_id) => self.check_for(node, for_id, (None, Some(fill))),
+            ExprKind::Block { items, label } if self.has_result(items) => {
+                let expecting = Expecting::elements_only(record, (context, why), expr.span);
+                self.reach_block(node, (items, label), expecting)
+            }
+            ExprKind::If {
+                cond,
+                then,
+                else_,
+                has_else: true,
+            } => {
+                let keyword = expr.keyword_span().unwrap_or(expr.span);
+                let fills = Branch::FillsElements(record, (context, why));
+                self.check_if(keyword, cond, (then, else_), (true, fills))
+            }
+            _ => return self.check_expr(id),
+        };
+        self.set_through_parens(id, ty);
+        ty
+    }
+
+    /// Checks the block `node`, with a result, whose items are `items`,
+    /// labelled `label` if it is, with `expecting`, which reaches only part
+    /// of its result ([`Expecting::literal_only`],
+    /// [`Expecting::elements_only`]), and returns its type: a labelled one
+    /// has its `return`s checked as ever, and joined with its result.
+    fn reach_block(
+        &mut self,
+        node: ExprId,
+        (items, label): (ItemRange, Option<LabelId>),
+        expecting: Expecting<'_>,
+    ) -> TyId {
+        match label {
+            Some(label) => {
+                self.enter_block(node, self.ast.label(label), None);
+                let ty = self.check_block(items, Some(expecting));
+                self.leave_block(node, ty, None)
+            }
+            None => self.check_block(items, Some(expecting)),
+        }
     }
 
     /// Whether the record literal whose items are `items`, a record block's
@@ -13028,7 +13148,7 @@ impl<'a> Checker<'a> {
             why,
             close: Span::new(span.end.saturating_sub(1), span.end),
             fill: Some(block),
-            literal_only: false,
+            reach: Reach::Whole,
         }))
     }
 
@@ -13133,7 +13253,7 @@ impl<'a> Checker<'a> {
             ExprKind::Lazy(function) => {
                 self.check_lazy(function, symbol_span("lazy", expr.span.start))
             }
-            ExprKind::List(elements) => self.check_list(id, elements),
+            ExprKind::List(elements) => self.check_list(id, elements, None),
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, (None, None)),
             ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
@@ -15351,7 +15471,7 @@ impl<'a> Checker<'a> {
                 why,
                 close: Span::new(block.span.end.saturating_sub(1), block.span.end),
                 fill: Some(body),
-                literal_only: false,
+                reach: Reach::Whole,
             };
             let found = self.check_body(items, Some(expecting));
             self.expr_types[body.index()] = found;
@@ -15362,7 +15482,7 @@ impl<'a> Checker<'a> {
             // A labelled body is a labelled block like any other, whose
             // `return`s give it its value, checked as ever where only a
             // record literal its result is is reached.
-            let returns = expecting.filter(|expecting| !expecting.literal_only);
+            let returns = expecting.filter(|expecting| expecting.reach == Reach::Whole);
             let label = label.map(|label| self.ast.label(label));
             if let Some(label) = label {
                 self.enter_block(body, label, returns);
@@ -15616,8 +15736,10 @@ impl<'a> Checker<'a> {
     /// each branch its binding (see [`Checker::if_condition`]). Each branch
     /// is checked as `branch` says: bottom-up, or, with `else`, where a
     /// record type with defaults is expected of the `if` itself, for a
-    /// record literal it results in alone ([`Checker::fill_result`]), the
-    /// branches agreeing as ever.
+    /// record literal it results in alone ([`Checker::fill_result`]), or of
+    /// the elements of the list the `if` is, for those of a list literal it
+    /// results in alone ([`Checker::fill_elements`]), the branches agreeing
+    /// as ever.
     fn check_if(
         &mut self,
         keyword: Span,
@@ -15758,7 +15880,10 @@ impl<'a> Checker<'a> {
     /// and has what it is once any await marked on it has run (see
     /// [`Checker::fit`]); with [`Branch::Fills`], a record type with
     /// defaults reaches only a record literal it results in (see
-    /// [`Checker::fill_result`]); otherwise it is checked bottom-up.
+    /// [`Checker::fill_result`]); with [`Branch::FillsElements`], only the
+    /// elements of a list literal it results in, or the body of a `for` it
+    /// does (see [`Checker::fill_elements`]); otherwise it is checked
+    /// bottom-up.
     fn check_branch(
         &mut self,
         branch: ExprId,
@@ -15781,6 +15906,7 @@ impl<'a> Checker<'a> {
         match expected {
             Branch::Fits(expected, context) => self.fit(branch, expected, context),
             Branch::Fills(record, context) => self.fill_result(branch, record, context),
+            Branch::FillsElements(record, context) => self.fill_elements(branch, record, context),
             Branch::Free => self.check_expr(branch),
         }
     }
@@ -16599,8 +16725,13 @@ impl<'a> Checker<'a> {
     /// first element whose type widens the join of those before it (see
     /// [`Checker::elements_widened`]). An empty literal has nothing to join,
     /// "cannot infer the element type of `[]`". `Error` for that, and for a
-    /// literal with an erroneous element.
-    fn check_list(&mut self, id: ExprId, elements: ElementRange) -> TyId {
+    /// literal with an erroneous element. With `fill`, a record type with
+    /// defaults that the elements are expected to be of, with where that is
+    /// stated and its label, each element that is no spread is checked for
+    /// the defaults alone ([`Checker::fill_result`]), and each spread's
+    /// operand as [`Checker::check_spread`] says with `fill`; nothing else
+    /// of the literal changes (see [`Checker::fill_elements`]).
+    fn check_list(&mut self, id: ExprId, elements: ElementRange, fill: Option<Stated<'_>>) -> TyId {
         let ast = self.ast;
         let list = ast.elements(elements);
         if list.is_empty() {
@@ -16613,12 +16744,13 @@ impl<'a> Checker<'a> {
         // Every element is checked, in order, before any is joined.
         let base = self.element_types.len();
         for element in list {
-            let ty = match element.spread {
-                Some(spread) => self
-                    .check_spread(element.value, spread, None)
+            let ty = match (element.spread, fill) {
+                (Some(spread), _) => self
+                    .check_spread(element.value, spread, fill)
                     .and_then(|list| self.types.list_element(list))
                     .unwrap_or(TyId::ERROR),
-                None => self.check_expr(element.value),
+                (None, Some((record, context))) => self.fill_result(element.value, record, context),
+                (None, None) => self.check_expr(element.value),
             };
             self.element_types.push(ty);
         }
@@ -16781,21 +16913,24 @@ impl<'a> Checker<'a> {
     /// defaults that the list's elements are expected to be of, with where
     /// that is stated and its label, an operand that is, through any
     /// parentheses, a `for` has the record literal its body results in
-    /// given the defaults it lacks ([`Checker::check_for`]); the operand is
-    /// otherwise checked as it is with nothing expected.
+    /// given the defaults it lacks ([`Checker::check_for`]), and one that
+    /// is a block with a result or an `if` with `else` has the elements of
+    /// a list literal it results in, or the body of a `for` it does, checked
+    /// so ([`Checker::fill_elements`]); the operand is otherwise checked as
+    /// it is with nothing expected, a list literal included.
     fn check_spread(
         &mut self,
         value: ExprId,
         spread: Span,
         fill: Option<Stated<'_>>,
     ) -> Option<TyId> {
-        let found = match fill.and_then(|fill| Some((self.loop_within(value)?, fill))) {
-            Some(((node, for_id), fill)) => {
-                let ty = self.check_for(node, for_id, (None, Some(fill)));
-                self.set_through_parens(value, ty);
-                ty
+        let found = match fill {
+            Some((record, context))
+                if self.loop_within(value).is_some() || self.reaches_result(value) =>
+            {
+                self.fill_elements(value, record, context)
             }
-            None => self.check_expr(value),
+            _ => self.check_expr(value),
         };
         let found = self.settle(value, found);
         let ty = self.measure(value, found);
@@ -16896,7 +17031,9 @@ impl<'a> Checker<'a> {
     /// to await for each element, so a list whose elements would fit only
     /// once awaited is a mismatch, whose note says so. Where `element` is a
     /// record type with defaults itself, an operand that is a `for` has the
-    /// record literal its body results in given them first (see
+    /// record literal its body results in given them first, and one that is
+    /// a block with a result or an `if` with `else` the record literals
+    /// among the elements of a list literal it results in (see
     /// [`Checker::check_spread`]). Returns the list's element type, or
     /// `Error` if it does not fit.
     fn fit_spread(
@@ -31905,5 +32042,205 @@ mod tests {
         assert_eq!(found[0].message, "missing field `c` in record");
         let brace = last(text, "1 }");
         assert_eq!(found[0].span, Span::new(brace.end - 1, brace.end));
+    }
+
+    /// What the tests of spreads of an `if` or a block bind beside
+    /// [`REACH_T`]: an empty list of `T`, a list of records lacking `b`
+    /// that is no literal, and a list of numbers.
+    const SPREAD_NAMES: &str = "let none: List<T> = []\n\
+                                let plain = [{ a = 1 }]\n\
+                                let ns = [1, 2]\n";
+
+    #[test]
+    fn the_workspace_spread_if_is_given_defaults() {
+        // The form verbatim, with a stub of `kernel_lane`.
+        let text = "type Install = { from: String, to: String, exclude: List<String> = [] }\n\
+                    fn kernel_lane(v: String): Bool { v == \"kernel\" }\n\
+                    let v = \"6.1\"\n\
+                    none_installed: List<Install> = []\n\
+                    content: List<Install> = [\n\
+                    \x20   { from = \"a\"; to = \"b\" },\n\
+                    \x20   ...if kernel_lane(v) { none_installed } else {\n\
+                    \x20       [ { from = \"src/src/tools/cargo/LICENSE-MIT\"; to = \"c\" } ]\n\
+                    \x20   },\n\
+                    ]";
+        let exclude = || vec![("exclude".to_owned(), Constant::List(Box::new([])))];
+        assert_eq!(
+            filled(text),
+            vec![
+                ("{ from = \"a\"; to = \"b\" }", exclude()),
+                (
+                    "{ from = \"src/src/tools/cargo/LICENSE-MIT\"; to = \"c\" }",
+                    exclude()
+                ),
+            ]
+        );
+        assert!(warnings(text).is_empty(), "{:?}", warnings(text));
+    }
+
+    #[test]
+    fn spreads_of_ifs_and_blocks_are_given_defaults() {
+        // Every branch of an `if` with `else`, `else if` included, beside a
+        // literal that gives the field; a block's result, after a `let`,
+        // labelled and nested, and a `= EXPR` result through parentheses.
+        let text = format!(
+            "{REACH_T}{SPREAD_NAMES}\
+             fn pick(n: Int): List<T> {{ [ ...if n == 0 {{ [ {{ a = 1 }} ] }} else if n == 1 {{ [ {{ a = 2 }}, {{ a = 3; b = 4 }} ] }} else {{ [ {{ a = 5 }} ] }} ] }}\n\
+             blocks: List<T> = [ ...{{ let y = 6; [ {{ a = y }} ] }}, ...{{'l {{ [ {{ a = 7 }} ] }} }}, ...({{ = [ {{ a = 8 }} ] }}) ]\n\
+             read: List<Int> = [pick(0)[0].b, blocks[2].b]"
+        );
+        let b = || vec![("b".to_owned(), Constant::Int(2))];
+        assert_eq!(
+            filled(&text),
+            vec![
+                ("{ a = 1 }", b()),
+                ("{ a = 2 }", b()),
+                ("{ a = 5 }", b()),
+                ("{ a = y }", b()),
+                ("{ a = 7 }", b()),
+                ("{ a = 8 }", b()),
+            ]
+        );
+        assert!(warnings(&text).is_empty(), "{:?}", warnings(&text));
+    }
+
+    #[test]
+    fn spreads_of_ifs_and_fors_nest() {
+        // A `...for` in a spread `if`'s list, a `for` that is a branch, an
+        // `if` in a spread `for`'s body, a `...if` in a spread `if`'s list,
+        // and a `...{ }` in a spread block's list.
+        let text = format!(
+            "{REACH_T}{SPREAD_NAMES}\
+             for_in_if: List<T> = [ ...if true {{ [ ...for n in ns {{ {{ a = n }} }} ] }} else {{ none }} ]\n\
+             for_result: List<T> = [ ...if false {{ none }} else {{ for n in ns {{ {{ a = n * 10 }} }} }} ]\n\
+             if_in_for: List<T> = [ ...for n in ns {{ if n == 1 {{ {{ a = n }} }} else {{ {{ a = n + 1 }} }} }} ]\n\
+             if_in_if: List<T> = [ ...if true {{ [ ...if false {{ none }} else {{ [ {{ a = 11 }} ] }}, {{ a = 12 }} ] }} else {{ none }} ]\n\
+             block_in_block: List<T> = [ ...{{ [ ...{{ [ {{ a = 13 }} ] }} ] }} ]"
+        );
+        let b = || vec![("b".to_owned(), Constant::Int(2))];
+        assert_eq!(
+            filled(&text),
+            vec![
+                ("{ a = n }", b()),
+                ("{ a = n * 10 }", b()),
+                ("{ a = n }", b()),
+                ("{ a = n + 1 }", b()),
+                ("{ a = 11 }", b()),
+                ("{ a = 12 }", b()),
+                ("{ a = 13 }", b()),
+            ]
+        );
+        assert!(warnings(&text).is_empty(), "{:?}", warnings(&text));
+    }
+
+    #[test]
+    fn other_spreads_are_checked_as_before() {
+        let found_t = "found List<{a: Int}>";
+        // A branch that is a name or a call, a list literal spread itself,
+        // and an `if` without `else`: the usual mismatch at the operand.
+        let cases = [
+            (
+                "[...if true { plain } else { none }]",
+                "if true { plain } else { none }",
+            ),
+            (
+                "[...if true { id(plain) } else { none }]",
+                "if true { id(plain) } else { none }",
+            ),
+            ("[...[ { a = 1 } ]]", "[ { a = 1 } ]"),
+        ];
+        for (list, operand) in cases {
+            let text = format!(
+                "{REACH_T}{SPREAD_NAMES}fn id(x: List<{{a: Int}}>): List<{{a: Int}}> {{ x }}\n\
+                 xs: List<T> = {list}"
+            );
+            let found = diagnostics(&text);
+            assert_eq!(found.len(), 1, "{list}: {found:?}");
+            assert_eq!(found[0].message, "mismatched types", "{list}");
+            assert_eq!(found[0].span, last(&text, operand), "{list}");
+            assert_eq!(
+                found[0].label.as_deref(),
+                Some(format!("expected List<{{a: Int, b: Int = 2}}>, {found_t}").as_str()),
+                "{list}"
+            );
+        }
+        let text = format!("{REACH_T}xs: List<T> = [...if true {{ [ {{ a = 1 }} ] }}]");
+        assert_eq!(messages(&text), vec!["`if` without `else` must be `{}`"]);
+        // A union expected of the elements gives nothing, the branches
+        // joined as ever.
+        let text = format!(
+            "{REACH_T}us: List<T | Int> = [...if true {{ [ {{ a = 1 }} ] }} else {{ [2] }}]"
+        );
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            found[1].message,
+            "the branches of this `if` have different types"
+        );
+        let operand = at(&text, "if true");
+        assert_eq!(
+            found[0].span,
+            Span::new(operand.start, at(&text, "] }]").end - 1)
+        );
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected List<Int | {a: Int, b: Int = 2}>, found List<Int | {a: Int}>")
+        );
+        // `[]` is a branch's list, not inferred.
+        let text =
+            format!("{REACH_T}xs: List<T> = [...if true {{ [] }} else {{ [ {{ a = 1 }} ] }}]");
+        assert_eq!(
+            messages(&text),
+            vec!["cannot infer the element type of `[]`"]
+        );
+        // A record type without defaults reaches nothing.
+        let text = "type P = { a: Int }\n\
+                    xs: List<P> = [...if true { [ { a = \"x\" } ] } else { [ { a = 1 } ] }]";
+        let found = diagnostics(text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        let operand = at(text, "if true");
+        assert_eq!(
+            found[0].span,
+            Span::new(operand.start, at(text, "] }]").end - 1)
+        );
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected List<{a: Int}>, found List<{a: Int | String}>")
+        );
+        assert_eq!(
+            found[1].message,
+            "the branches of this `if` have different types"
+        );
+    }
+
+    #[test]
+    fn a_mismatch_in_a_spread_literal() {
+        // A literal given the defaults has its fields checked against the
+        // type's: a mismatch at the field, and an extra field a warning.
+        let text = format!(
+            "{REACH_T}{SPREAD_NAMES}xs: List<T> = [...if true {{ [ {{ a = \"x\" }} ] }} else {{ none }}]"
+        );
+        let found = diagnostics(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].message, "mismatched types");
+        assert_eq!(found[0].span, at(&text, "\"x\""));
+        assert_eq!(
+            found[0].label.as_deref(),
+            Some("expected Int, found String")
+        );
+        let text =
+            format!("{REACH_T}{SPREAD_NAMES}xs: List<T> = [...{{ [ {{ a = 1; c = 3 }} ] }}]");
+        let found = warnings(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "field `c` is not in `{a: Int, b: Int = 2}`"
+        );
+        // One reported inside the literal before is reported there still,
+        // and alone.
+        let text = format!(
+            "{REACH_T}{SPREAD_NAMES}xs: List<T> = [...if true {{ [ {{ a = 1 + \"x\" }} ] }} else {{ none }}]"
+        );
+        assert_eq!(messages(&text), vec!["cannot add Int and String"]);
     }
 }
