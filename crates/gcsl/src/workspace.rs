@@ -6264,9 +6264,12 @@ impl Workspace {
     /// As [`Workspace::run`].
     fn run_needed(&mut self, index: u32) -> Result<(), Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
-            let Some(ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
+            let Some(mut ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
                 continue;
             };
+            // The slots of the files run before it, which may end after its
+            // own, are kept (see [`Ir::reserve_frame`]).
+            ir.reserve_frame(count(self.frame.len()));
             let context = (
                 &mut self.memo,
                 Some(&self.exec_result),
@@ -7586,10 +7589,13 @@ impl Workspace {
     /// ([`invoked_here`]), with the warnings.
     fn run_built(
         &mut self,
-        (ir, own): (Ir, Vec<Diagnostic>),
+        (mut ir, own): (Ir, Vec<Diagnostic>),
         at: (u32, Span),
     ) -> Result<Outcome, InvokeError> {
         let call = count(self.scan.files.len());
+        // Numbered after every file, its slots end after theirs; kept
+        // nonetheless, as a file's are (see [`Ir::reserve_frame`]).
+        ir.reserve_frame(count(self.frame.len()));
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
@@ -17313,6 +17319,38 @@ p26 = com.x"#;
             panic!("{invoked:?}");
         };
         assert_eq!(errors[0].message, "ran");
+    }
+
+    #[test]
+    fn definitions_of_two_directories_invoked_on_one_workspace() {
+        // Each directory shadows a `#[shadowable]` field with a file of its
+        // own, whose frame is smaller than the workspace file's: run after
+        // it, `b/lock.gcsl` must keep the def-type's slot, not cut the
+        // frame back to its own.
+        let files = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\n\
+                 def run(name: String, f: fn() -> String) -> String {\n\
+                 \x20   \"{name} {f()}\"\n\
+                 }\n\
+                 #[shadowable]\n\
+                 x: String = \"ws\"",
+            ),
+            ("a/a.gcsl", "def run a() { \"A {x}\" }"),
+            ("a/lock.gcsl", "x: String = \"xa\""),
+            ("b/b.gcsl", "def run b() { \"B {x}\" }"),
+            ("b/lock.gcsl", "x: String = \"xb\""),
+        ];
+        for order in [["a", "b"], ["b", "a"]] {
+            let mut workspace = rooted(&files).unwrap();
+            for path in order {
+                let outcome = workspace.invoke("run", path, &[]);
+                let value = outcome.unwrap_or_else(|error| panic!("{order:?}: {error:?}"));
+                let upper = path.to_uppercase();
+                assert_eq!(value.value.to_string(), format!("{path} {upper} x{path}"));
+            }
+        }
     }
 
     #[test]

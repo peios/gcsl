@@ -1761,6 +1761,18 @@ impl Ir {
         self.frame_size
     }
 
+    /// Raises the number of slots the root's frame needs to at least
+    /// `size`. A workspace runs each file's code, and each call it builds,
+    /// on one frame holding every file's slots, numbered in the order the
+    /// files are checked, which is not the order they run in; and
+    /// evaluation truncates the stack to the frame on return
+    /// ([`crate::eval::eval_with`]). So the workspace raises each to the
+    /// frame's length before running it, and a file whose own slots end
+    /// before another's keeps that other's.
+    pub(crate) fn reserve_frame(&mut self, size: u32) {
+        self.frame_size = self.frame_size.max(size);
+    }
+
     /// Replaces the names of the root frame's slots, which only
     /// [`Ir::pretty`] reads, with `slot_names`, returning the old ones: a
     /// workspace keeps one table for every file's program rather than a
