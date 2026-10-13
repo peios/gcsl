@@ -446,6 +446,15 @@
 //! the workspace checks and runs regardless. A path above definitions that
 //! is none itself is no duplicate, but names no definition to invoke.
 //!
+//! A path, as listed and as asked for, is the definition's as it writes it,
+//! its names joined by `.`, a name with `+` in it as written
+//! (`org.gnu.gmp-c++`, see the parser's "Def-types"). A path asked for is
+//! not parsed or checked against the rule of names: it is compared with the
+//! definitions' as text, so it names the definition whose path it spells,
+//! or none, the error of a path that names none. One path lies under
+//! another only at a `.`, so `x.a+b` is not under `x.a`, and `x.a+b.c` is
+//! under `x.a+b`.
+//!
 //! [`Workspace::invoke`] calls the definition as `DT PATH("ARG", ...)`
 //! would be called from a file of the definition's directory, with its
 //! arguments, given as text, each a string: one for each of the def-type's
@@ -6537,7 +6546,8 @@ impl Workspace {
     }
 
     /// Invokes the definition of path `path` made with the def-type of path
-    /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`),
+    /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`,
+    /// `"org.gnu.gmp-c++"`), compared with the listed paths as text,
     /// with the arguments `args`, as if `DT PATH("ARG", ...)` were called
     /// from a file of the definition's directory, each argument a string
     /// literal of its text (see the module documentation, "Def-types by
@@ -17184,6 +17194,196 @@ p26 = com.x"#;
                 "(field owner @93..106\n      (field about @93..100\n        (call @93..100\n"
             ),
             "{ir}"
+        );
+    }
+
+    /// A workspace whose definitions have `+` in their paths' names: the
+    /// names of real packages, `a+b` and `c++11`, defined with their metas in
+    /// two files of one directory, `pkgs`, and referred to from a third file
+    /// of it and from a directory below it, called and read past.
+    const PLUS: [(&str, &str); 5] = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+             def package(name: String, f: fn(v: String): String META: {versions: List<String>}, \
+             version: String) -> String { \"{name} {f(version)}\" }",
+        ),
+        (
+            "pkgs/gnu.gcsl",
+            "defmeta package org.gnu.gmp-c++ { versions = [\"6.3.0\"] }\n\
+             def package org.gnu.gmp-c++(v) { \"gmp {v}\" }\n\
+             defmeta package org.gnu.gcc-c++ { versions = [\"14\"] }\n\
+             def package org.gnu.gcc-c++(v) { \"g++ {v}\" }\n\
+             defmeta package org.gnu.gcc-libstdc++ { versions = [\"14.1\"] }\n\
+             def package org.gnu.gcc-libstdc++(v) { \"libstdc++ {v}\" }\n\
+             defmeta package org.gnu.gcc-libstdc++-devel { versions = [\"14.2\"] }\n\
+             def package org.gnu.gcc-libstdc++-devel(v) { \"devel {v}\" }",
+        ),
+        (
+            "pkgs/more.gcsl",
+            "defmeta package dev.peios.build-essentials-c++ { versions = [\"1\"] }\n\
+             def package dev.peios.build-essentials-c++(v) { \"essentials {v}\" }\n\
+             defmeta package org.gnu.a+b { versions = [] }\n\
+             def package org.gnu.a+b(v) { \"a+b {v}\" }\n\
+             defmeta package c++11 { versions = [\"11\"] }\n\
+             def package c++11(v) { \"c++11 {v}\" }",
+        ),
+        (
+            "pkgs/use.gcsl",
+            "x = package org.gnu.gmp-c++(\"6.3.0\")\n\
+             y = package org.gnu.gmp-c++.versions\n\
+             gxx = package org.gnu.gcc-c++.versions[0]\n\
+             lib = package org.gnu.gcc-libstdc++(\"1\")\n\
+             devel = (package org.gnu.gcc-libstdc++-devel).versions\n\
+             essentials = package dev.peios.build-essentials-c++(\"2\")\n\
+             ab = package org.gnu.a+b(\"3\")\n\
+             c11 = package c++11.versions\n\
+             z = 1 + 2\n\
+             let a = 4\n\
+             let b = 5\n\
+             c = a+b",
+        ),
+        (
+            "pkgs/sub/below.gcsl",
+            "let f = package org.gnu.gcc-libstdc++-devel\n\
+             below = f(\"4\")\n\
+             none = package org.gnu.a+b.versions",
+        ),
+    ];
+
+    #[test]
+    fn definitions_with_plus_in_their_paths_are_ordinary_definitions() {
+        // Referred to from another file of their directory and from one
+        // below it: called, with their paths as written, and their metas
+        // read; `a+b` anywhere else is the addition it always was.
+        assert_eq!(
+            rooted_text(&PLUS, "pkgs/use.gcsl"),
+            "{x = \"org.gnu.gmp-c++ gmp 6.3.0\"; y = [\"6.3.0\"]; gxx = \"14\"; \
+             lib = \"org.gnu.gcc-libstdc++ libstdc++ 1\"; devel = [\"14.2\"]; \
+             essentials = \"dev.peios.build-essentials-c++ essentials 2\"; \
+             ab = \"org.gnu.a+b a+b 3\"; c11 = [\"11\"]; z = 3; c = 9}"
+        );
+        assert_eq!(
+            rooted_text(&PLUS, "pkgs/sub/below.gcsl"),
+            "{below = \"org.gnu.gcc-libstdc++-devel devel 4\"; none = []}"
+        );
+        // Listed, invoked and their metas read by name, by their paths as
+        // written.
+        let mut workspace = rooted(&PLUS).unwrap();
+        assert_eq!(
+            listed(&workspace, &PLUS),
+            [
+                "package in workspace.gcsl: org.gnu.gmp-c++ in pkgs/gnu.gcsl, \
+                 org.gnu.gcc-c++ in pkgs/gnu.gcsl, org.gnu.gcc-libstdc++ in pkgs/gnu.gcsl, \
+                 org.gnu.gcc-libstdc++-devel in pkgs/gnu.gcsl, \
+                 dev.peios.build-essentials-c++ in pkgs/more.gcsl, \
+                 org.gnu.a+b in pkgs/more.gcsl, c++11 in pkgs/more.gcsl"
+            ]
+        );
+        for (path, value) in [
+            ("org.gnu.gmp-c++", "gmp"),
+            ("org.gnu.gcc-c++", "g++"),
+            ("org.gnu.gcc-libstdc++", "libstdc++"),
+            ("org.gnu.gcc-libstdc++-devel", "devel"),
+            ("dev.peios.build-essentials-c++", "essentials"),
+            ("org.gnu.a+b", "a+b"),
+            ("c++11", "c++11"),
+        ] {
+            let outcome = workspace.invoke("package", path, &["9".to_owned()]);
+            assert_eq!(
+                outcome.unwrap().value.to_string(),
+                format!("{path} {value} 9")
+            );
+        }
+        let versions = workspace.meta_field("package", "org.gnu.gmp-c++", "versions");
+        assert_eq!(versions.unwrap().unwrap().value.to_string(), "[\"6.3.0\"]");
+        // A path that names none is the error it is, its definitions listed
+        // as written.
+        assert_eq!(
+            request_error_with(&PLUS, ("package", "org.gnu.gmp-c"), &["1"]),
+            "`package` has no definition `org.gnu.gmp-c`; note: its definitions are \
+             `c++11`, `dev.peios.build-essentials-c++`, `org.gnu.a+b`, `org.gnu.gcc-c++`, \
+             `org.gnu.gcc-libstdc++`, `org.gnu.gcc-libstdc++-devel`, `org.gnu.gmp-c++`"
+        );
+        // The dumps show them as written, of files not yet run.
+        let mut workspace = rooted(&PLUS).unwrap();
+        let index = workspace.file("pkgs/sub/below.gcsl").unwrap();
+        let dump = workspace.dump_types(index).unwrap();
+        assert!(
+            dump.contains("(def-type-ref package org.gnu.gcc-libstdc++-devel : fn(version:"),
+            "{dump}"
+        );
+        assert!(
+            dump.contains("(def-type-ref package org.gnu.a+b : fn(version:"),
+            "{dump}"
+        );
+        let index = workspace.file("pkgs/gnu.gcsl").unwrap();
+        let ir = workspace.dump_ir(index).unwrap();
+        assert!(ir.contains("fn #1 package org.gnu.gmp-c++ meta #"), "{ir}");
+    }
+
+    #[test]
+    fn definitions_with_plus_in_their_paths_conflict_as_any_do() {
+        // Two of one path in one directory: the language's error, the path
+        // shown as written.
+        let one = [
+            PACKAGE,
+            (
+                "a.gcsl",
+                "def package x.a+b() { \"1\" }\ndef package x.a+b() { \"2\" }",
+            ),
+        ];
+        assert_eq!(
+            check_errors(&one),
+            ["field `package x.a+b` is defined twice at a.gcsl; a.gcsl: first defined here"]
+        );
+        // In two sibling directories, a duplicate when invoked by name, and
+        // one lying under another.
+        let siblings = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.a+b() { \"a\" }"),
+            ("b/y.gcsl", "def package x.a+b() { \"b\" }"),
+        ];
+        assert_eq!(
+            invoke_errors(&siblings, "package", "x.a+b"),
+            [
+                "`package x.a+b` is defined 2 times in the workspace at a/x.gcsl; \
+                 b/y.gcsl: also defined here; note: a definition invoked by name must be \
+                 the only one of its path in the workspace"
+            ]
+        );
+        let under = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.a+b() { \"a\" }"),
+            ("b/y.gcsl", "def package x.a+b.c() { \"b\" }"),
+        ];
+        assert_eq!(
+            listing_errors(&under),
+            [
+                "`package x.a+b.c` lies under another `package` definition at b/y.gcsl; \
+                 a/x.gcsl: `x.a+b` is defined here; note: a definition invoked by name must \
+                 not lie under another in the workspace"
+            ]
+        );
+        // `a+b` is a name of its own, under no `a`.
+        let apart = [
+            PACKAGE,
+            ("a/x.gcsl", "def package x.a() { \"a\" }"),
+            ("b/y.gcsl", "def package x.a+b() { \"b\" }"),
+        ];
+        assert_eq!(invoked_text(&apart, "package", "x.a"), "x.a a");
+        assert_eq!(invoked_text(&apart, "package", "x.a+b"), "x.a+b b");
+        // A reference followed by `+` and a space is added to, as it was.
+        let added = [
+            (
+                "workspace.gcsl",
+                "#[def_type]\ndef package(name: String, func: fn(): Int) -> Int { func() }",
+            ),
+            ("a.gcsl", "def package x.a() { 1 }\nr = package x.a + 1"),
+        ];
+        assert_eq!(
+            check_errors(&added),
+            ["cannot add `fn() -> Int` and Int at a.gcsl; a.gcsl: fn() -> Int; a.gcsl: Int"]
         );
     }
 }

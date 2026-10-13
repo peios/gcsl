@@ -2720,16 +2720,20 @@ impl fmt::Display for Pretty<'_> {
                 write!(f, " {}", FieldName(self.names.get(name)))?;
             }
             // A definition made with a def-type, as it is written, its
-            // namespace's key shown as its def-type; a meta as `defmeta`, its
-            // def-type and its path, one name, as written.
+            // namespace's key shown as its def-type and its path's names as
+            // their source spells them, `+` and all (see the parser's
+            // "Def-types"); a meta as `defmeta`, its def-type and its path,
+            // one name, as written.
             let mut before = " ";
             let mut meta = false;
+            let mut definition = false;
             for (at, &segment) in self.ir.path_of(index).iter().enumerate() {
                 let text = self.names.get(segment);
                 if at == 0
                     && let Some(def_type) = crate::names::key_def_type(text)
                 {
                     write!(f, " {def_type}")?;
+                    definition = true;
                     continue;
                 }
                 if at == 0
@@ -2739,7 +2743,7 @@ impl fmt::Display for Pretty<'_> {
                     meta = true;
                     continue;
                 }
-                if mem::take(&mut meta) {
+                if mem::take(&mut meta) || definition {
                     write!(f, "{before}{text}")?;
                 } else {
                     write!(f, "{before}{}", FieldName(text))?;

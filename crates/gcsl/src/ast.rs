@@ -447,8 +447,9 @@ pub struct DefTypeUse {
     /// is, which is not among the expressions of the item or the reference
     /// it belongs to but before them in the arena.
     pub dt: ExprId,
-    /// The definition's path, `PATH`, as it is written: identifiers joined
-    /// by `.`.
+    /// The definition's path, `PATH`, as it is written: identifiers, or
+    /// names with `+` in them, `gmp-c++`, each one name (see the parser's
+    /// "Def-types"), joined by `.`.
     pub path: PathRange,
     /// For a reference, the read of the definition: a name standing for
     /// DT's namespace with a field access for each segment of PATH, which
@@ -951,13 +952,21 @@ pub fn path_span(segments: &[PathSegment]) -> Span {
 /// namespace key as its def-type and a space, as a definition is written,
 /// `package dev.peios.testpkg`, and one that is a meta key as `defmeta`, its
 /// def-type and a space, the meta's path after it as written, `defmeta
-/// package dev.peios.testpkg` (see [`crate::names`], "Namespace keys").
-/// Returned by [`Ast::show_path`].
+/// package dev.peios.testpkg` (see [`crate::names`], "Namespace keys"). The
+/// names of a definition's path, after a namespace key or in a path shown by
+/// [`Ast::show_definition_path`], are shown as their source spells them,
+/// never quoted as a field's name that is no identifier is: each is an
+/// identifier, or a name with `+` in it, `org.gnu.gmp-c++` (see the parser's
+/// "Def-types"). Returned by [`Ast::show_path`] and
+/// [`Ast::show_definition_path`].
 #[derive(Clone, Copy, Debug)]
 pub struct PathDisplay<'a> {
     names: &'a Names,
     strings: &'a Strings,
     segments: &'a [PathSegment],
+    /// Whether the path is a definition's, made with a def-type, whose
+    /// names are shown as written.
+    definition: bool,
 }
 
 impl fmt::Display for PathDisplay<'_> {
@@ -969,6 +978,8 @@ impl fmt::Display for PathDisplay<'_> {
         let mut separator = "";
         // Whether the name is a meta's path as one name, shown as written.
         let mut meta = false;
+        // Whether the names are a definition's path, each shown as written.
+        let mut definition = self.definition;
         for (index, segment) in self.segments.iter().enumerate() {
             match segment.kind {
                 SegmentKind::Name(name) => {
@@ -977,7 +988,7 @@ impl fmt::Display for PathDisplay<'_> {
                         && let Some(def_type) = crate::names::key_def_type(text)
                     {
                         f.write_str(def_type)?;
-                        separator = " ";
+                        (separator, definition) = (" ", true);
                         continue;
                     }
                     if index == 0
@@ -988,7 +999,7 @@ impl fmt::Display for PathDisplay<'_> {
                         continue;
                     }
                     f.write_str(separator)?;
-                    if std::mem::take(&mut meta) {
+                    if std::mem::take(&mut meta) || definition {
                         f.write_str(text)?;
                     } else {
                         FieldName(text).fmt(f)?;
@@ -2918,6 +2929,19 @@ impl Ast {
             names: &self.names,
             strings: &self.strings,
             segments,
+            definition: false,
+        }
+    }
+
+    /// Shows `segments`, the path of a definition or a reference made with a
+    /// def-type, `PATH`, or a prefix of one, as it is written: its names
+    /// joined by `.`, each as its source spells it, `+` and all, as in
+    /// `org.gnu.gmp-c++` (see [`PathDisplay`]).
+    #[must_use]
+    pub fn show_definition_path<'a>(&'a self, segments: &'a [PathSegment]) -> PathDisplay<'a> {
+        PathDisplay {
+            definition: true,
+            ..self.show_path(segments)
         }
     }
 
@@ -2990,7 +3014,7 @@ impl Ast {
 
     /// The def-type, `DT`, of the definition or reference `id`, and its
     /// path, `PATH`, each as it is written, as in `t.package` and
-    /// `dev.peios.testpkg`.
+    /// `dev.peios.testpkg` ([`Ast::show_definition_path`]).
     #[must_use]
     pub fn show_def_type(&self, id: DefTypeId) -> (String, String) {
         let names: Vec<&str> = self
@@ -2999,7 +3023,7 @@ impl Ast {
             .map(|name| self.names.get(name))
             .collect();
         let path = self
-            .show_path(self.path(self.def_type(id).path))
+            .show_definition_path(self.path(self.def_type(id).path))
             .to_string();
         (names.join("."), path)
     }
@@ -3794,6 +3818,7 @@ impl WrittenType<'_> {
                     names,
                     strings: &self.ast.strings,
                     segments: self.ast.path(path),
+                    definition: false,
                 };
                 write!(f, "{shown}")
             }
@@ -4136,7 +4161,7 @@ impl<A: Annotate> Pretty<'_, A> {
         let (def_type, _) = ast.show_def_type(def);
         let segments = ast.path(use_.path);
         let defined = segments.len().saturating_sub(accesses.len());
-        let path = ast.show_path(segments.get(..defined).unwrap_or_default());
+        let path = ast.show_definition_path(segments.get(..defined).unwrap_or_default());
         if !accesses.is_empty() {
             f.write_str("\n")?;
         }

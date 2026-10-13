@@ -22,7 +22,12 @@
 //! `<package#3.17>` ([`namespace_key`]). An identifier never holds `<`, so
 //! no variable or field written as one can be a key. A path of names whose
 //! first is a key is shown as its def-type and the rest of the path, as the
-//! definition is written, `package dev.peios.testpkg` ([`show_path`]).
+//! definition is written, `package dev.peios.testpkg` ([`show_path`]). The
+//! names of a definition's path are identifiers, or names with `+` in them,
+//! `gmp-c++` (see the parser's "Def-types"), each one name, shown as it is
+//! written, `package org.gnu.gmp-c++`; none holds `<`, `#`, `@` or `>`, and a
+//! key holds only the def-type's path, made of identifiers, so no key reads
+//! differently for them.
 //!
 //! The metas of a def-type's definitions (`defmeta package x { ... }`) are
 //! kept apart, one namespace per def-type and DIRECTORY, since a meta

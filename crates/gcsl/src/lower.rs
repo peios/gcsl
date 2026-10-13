@@ -2368,7 +2368,10 @@ impl Lowerer<'_> {
         let captures = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
         // The body: the helper flag set, then the call of the def-type.
-        let path = self.ast.show_path(self.ast.path(def.path)).to_string();
+        let path = self
+            .ast
+            .show_definition_path(self.ast.path(def.path))
+            .to_string();
         let path = self.builder.push_string(&path);
         let callee = self
             .builder

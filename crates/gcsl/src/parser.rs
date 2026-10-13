@@ -110,8 +110,40 @@
 //! DEFINITION = "def" DT PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
 //! REFERENCE  = DT PATH
 //! META       = "defmeta" DT PATH (BLOCK | "=" EXPR)
-//! DT, PATH   = IDENT ("." IDENT)*
+//! DT         = IDENT ("." IDENT)*
+//! PATH       = SEGMENT ("." SEGMENT)*
+//! SEGMENT    = IDENT | IDENT "+" ...      (the run glued to it, below)
 //! ```
+//!
+//! A segment of PATH, and only of PATH, may have `+` in its name after its
+//! first character, as real packages' names do, `org.gnu.gmp-c++`, whose
+//! `+` the lexer, unchanged, makes tokens of their own
+//! (`Parser::path_segment`): when a `+` directly follows a segment's
+//! identifier, every token directly following the one before it, nothing
+//! between them, whose text is made only of ASCII letters, digits, `_`, `+`
+//! and `-` is glued to the identifier, a lone `-` only with a token glued
+//! after it, and the segment is named by the source text of the run,
+//! interned as one name. So a segment is a maximal run of ASCII letters,
+//! digits, `_`, `-` and `+`, starting with a letter or `_`, in which every
+//! `-` is directly followed by a letter, digit, `_` or `+`, and which may end
+//! with `+` but not with `-`, whatever its tokens are: `gmp-c++`, `a+b`,
+//! `c++11`, and `gcc-libstdc++-devel`, lexed as `gcc-libstdc`, `+`, `+`, a
+//! negation's `-`, and `devel`. What the lexer rejects stays rejected
+//! (`c++11-x` is "`-` here is ambiguous", as `1-x` is, and `c++1_` a number
+//! literal's error), and a token only part of whose text is of those
+//! characters, a float with a fraction (`c++1.5`) or a raw string
+//! (`a+r"x"`), ends the segment before it, where both are an error. `.`,
+//! `(`, `[`, a space or any other token ends a segment. Anywhere else,
+//! `a+b` is the addition it always was: in a field's path, a variable, a
+//! `def`'s name (`def a+b()` is "expected `(` after `fn`, found `+`") and
+//! DT. One program that parsed before means something else: a reference
+//! directly followed by `+`, `package x.a+b` or `package x.a+1`, was the
+//! addition of the reference and what followed, and is now one reference
+//! (references are new); with a space before the `+`, it is the addition
+//! still. A `+` directly after a `.` is the error it was, since a segment
+//! starts with an identifier. The names are definitions' like any other
+//! from here on, shown as written wherever a definition's path is
+//! ([`Ast::show_definition_path`]).
 //!
 //! A definition, [`ItemKind::DefTypeDef`], is recognised after `def` and a
 //! name or a path (`Parser::parse_def`): an identifier that follows them on
@@ -121,8 +153,9 @@
 //! from `package`", at its `:`, and a return marker after them "the result
 //! type of a `package` definition comes from `package`", at the marker,
 //! `package` being its DT as written. Its path is a `def`'s, identifiers
-//! joined by `.` ("a `def`'s path is made of identifiers" otherwise, at the
-//! segment), then `(`, the parameters and the body, each "expected ..."
+//! joined by `.`, but that a segment may have `+` in it, as above ("a
+//! `def`'s path is made of identifiers" otherwise, at the segment), then
+//! `(`, the parameters and the body, each "expected ..."
 //! otherwise. It is an item of a file's outermost body only: anywhere else,
 //! "a def-type definition is declared only at the top level of a file", at
 //! its `def`. Its function expression spans its path through its body, the
@@ -136,7 +169,8 @@
 //! a field access does. "The same line" is the source's: the lexer emits no
 //! newline inside parentheses, so `f(a\nb)` is the error it was, and two
 //! names on two lines of a body are two items. Two names in a row never
-//! parsed before, so every program that parsed parses as it did; one that
+//! parsed before, so every program that parsed parses as it did, but for
+//! a reference directly followed by `+` (above); one that
 //! did not may now fail later, at the checker, which notes that two names
 //! in a row are read as a reference. Its path is a definition's, read
 //! whole, however long, since what part of it names a definition the
@@ -1713,10 +1747,11 @@ impl Parser<'_> {
 
     /// Reads the path of a definition or a reference made with a def-type,
     /// `PATH`, starting at its first identifier, the current token:
-    /// identifiers joined by `.`, as a `def`'s path is. A quoted segment, or
-    /// an index, is "a `def`'s path is made of identifiers", but that an
-    /// index ends the path of a `reference`, to index what it reads. Returns
-    /// its segments.
+    /// segments joined by `.`, each an identifier, or an identifier with the
+    /// tokens glued to it that make a name with `+` in it
+    /// ([`Parser::path_segment`]). A quoted segment, or an index, is "a
+    /// `def`'s path is made of identifiers", but that an index ends the path
+    /// of a `reference`, to index what it reads. Returns its segments.
     fn parse_def_type_path(&mut self, reference: bool) -> ParseResult<Vec<PathSegment>> {
         let mut segments = Vec::new();
         loop {
@@ -1729,10 +1764,8 @@ impl Parser<'_> {
                 ));
             };
             self.advance();
-            segments.push(PathSegment {
-                kind: SegmentKind::Name(name),
-                span: token.span,
-            });
+            let segment = self.path_segment(token, name);
+            segments.push(segment);
             match (self.peek().kind, self.peek_at(1).kind) {
                 (TokenKind::Dot, TokenKind::Ident(_)) => self.advance(),
                 (TokenKind::Dot, TokenKind::Str(_) | TokenKind::StrStart(_)) => {
@@ -1756,6 +1789,55 @@ impl Parser<'_> {
                 }
                 _ => return Ok(segments),
             }
+        }
+    }
+
+    /// The segment of a definition's path that starts at the identifier
+    /// `first`, of name `name`, just consumed (see [Def-types](#def-types)):
+    /// the identifier alone, unless a `+` directly follows it, when the
+    /// segment is the run of the tokens glued to it, consumed, and its name
+    /// the run's source text, interned, so that `gmp-c++` is one name. A
+    /// token is glued when it directly follows the one before, nothing
+    /// between them, and its text is made only of ASCII letters, digits, `_`,
+    /// `+` and `-`, a `-` that ends one being glued only with a token glued
+    /// after it: so the run is a maximal one of those characters in which
+    /// every `-` is directly followed by a letter, a digit, `_` or `+` (the
+    /// lexer allowing no `--`), and that does not end with `-`. `gmp-c++`, `a+b`, `c++11` and `gcc-libstdc++-devel`
+    /// (lexed as `gcc-libstdc`, `+`, `+`, `-`, `devel`) are each one segment;
+    /// `a + 1`, with spaces, is not.
+    fn path_segment(&mut self, first: Token, name: Name) -> PathSegment {
+        let (mut glued, mut glued_end) = (0, first.span.end);
+        if self.peek().kind == TokenKind::Plus {
+            let (mut ahead, mut end) = (0, first.span.end);
+            loop {
+                let token = self.peek_at(ahead);
+                let text = self.source.slice(token.span);
+                if token.span.start != end
+                    || text.is_empty()
+                    || !text.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'+' | b'-')
+                    })
+                {
+                    break;
+                }
+                ahead += 1;
+                end = token.span.end;
+                if !text.ends_with('-') {
+                    (glued, glued_end) = (ahead, end);
+                }
+            }
+        }
+        if glued == 0 {
+            return PathSegment {
+                kind: SegmentKind::Name(name),
+                span: first.span,
+            };
+        }
+        self.pos += glued;
+        let span = Span::new(first.span.start, glued_end);
+        PathSegment {
+            kind: SegmentKind::Name(self.names.intern(self.source.slice(span))),
+            span,
         }
     }
 
@@ -10208,6 +10290,151 @@ mod tests {
         assert_eq!(
             error("defmeta p a META: {b: Int} { }"),
             (MISPLACED_META.to_owned(), Span::new(12, 17))
+        );
+    }
+
+    /// The path of each definition, meta and reference made with a def-type
+    /// in `text`, in the order they are parsed: each name's text, as its
+    /// source spells it, and its span.
+    fn def_type_paths(text: &str) -> Vec<Vec<(String, Span)>> {
+        let ast = parse_text(text).unwrap();
+        ast.def_types()
+            .map(|(_, def)| {
+                ast.path(def.path)
+                    .iter()
+                    .map(|segment| {
+                        let name = segment.name().unwrap();
+                        (ast.names().get(name).to_owned(), segment.span)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_definition_s_path_may_have_plus_in_its_names() {
+        // The names of real packages, each a definition, a meta and a
+        // reference, called and read past, with one name of the source text
+        // of its run of tokens.
+        for path in [
+            "org.gnu.gmp-c++",
+            "org.gnu.gcc-c++",
+            "org.gnu.gcc-libstdc++",
+            "org.gnu.gcc-libstdc++-devel",
+            "dev.peios.build-essentials-c++",
+        ] {
+            let text = format!(
+                "defmeta package {path} {{ versions = [] }}\n\
+                 def package {path}(v) {{ v }}\n\
+                 x = package {path}(\"1\")\n\
+                 y = package {path}.versions"
+            );
+            assert_eq!(
+                shape(&text),
+                format!(
+                    "defmeta package {path} {{versions = list()}}; def package {path}(v) {{v}}; \
+                     x = (package {path})(\"1\"); y = (package {path}.versions)"
+                )
+            );
+            let (_, last) = path.rsplit_once('.').unwrap();
+            let paths = def_type_paths(&text);
+            let lengths: Vec<usize> = paths.iter().map(Vec::len).collect();
+            assert_eq!(lengths, [3, 3, 3, 4]);
+            for names in &paths {
+                let (name, span) = &names[2];
+                assert_eq!(name, last);
+                assert_eq!(&text[span.start as usize..span.end as usize], last);
+            }
+            assert_eq!(paths[3][3].0, "versions");
+        }
+        // Any name with `+` after its first character, `+` ending it or not,
+        // and names after it.
+        assert_eq!(
+            def_type_paths("def p a+b() { 1 }\nx = p c++11\ny = p a+b.c+d.e"),
+            [
+                vec![("a+b".to_owned(), Span::new(6, 9))],
+                vec![("c++11".to_owned(), Span::new(24, 29))],
+                vec![
+                    ("a+b".to_owned(), Span::new(36, 39)),
+                    ("c+d".to_owned(), Span::new(40, 43)),
+                    ("e".to_owned(), Span::new(44, 45)),
+                ],
+            ]
+        );
+        // The rule is of the characters, whatever the tokens are: a keyword,
+        // an integer with `_` and a float with an exponent are glued too.
+        assert_eq!(
+            def_type_paths("x = p a+in.c++1_0.c++1e5"),
+            [vec![
+                ("a+in".to_owned(), Span::new(6, 10)),
+                ("c++1_0".to_owned(), Span::new(11, 17)),
+                ("c++1e5".to_owned(), Span::new(18, 24)),
+            ]]
+        );
+        // A `-` is glued only before what it is directly followed by, as in
+        // an identifier: before `(`, it is the negation it was.
+        assert_eq!(shape("x = p a+-b"), "x = (p a+-b)");
+        assert_eq!(shape("x = p a+-1"), "x = (p a+-1)");
+        assert_eq!(
+            error("x = p a+-(1)"),
+            (
+                "expected end of item, found `-(`".to_owned(),
+                Span::new(8, 10)
+            )
+        );
+    }
+
+    #[test]
+    fn plus_ends_a_definition_s_path_where_it_did_and_is_added_elsewhere() {
+        // Anything not directly after the segment ends it: `+` with a space
+        // before it, or after it, is the addition it was.
+        assert_eq!(shape("x = p a + 1"), "x = ((p a) + 1)");
+        assert_eq!(shape("x = p a +1"), "x = ((p a) + 1)");
+        assert_eq!(shape("x = p a.b + c"), "x = ((p a.b) + c)");
+        // But a reference directly followed by `+` reads it into its path,
+        // where it was the addition of the reference and what followed.
+        assert_eq!(
+            error("x = p a+ 1"),
+            (
+                "expected end of item, found `1`".to_owned(),
+                Span::new(9, 10)
+            )
+        );
+        assert_eq!(shape("x = p a+(1)"), "x = (p a+)(1)");
+        // A path's name starts with an identifier, so a `+` after `.` is the
+        // error it was, and so is one after `def` and a name.
+        assert_eq!(
+            error("x = p a.+b"),
+            (
+                "expected a field name after `.`".to_owned(),
+                Span::new(8, 9)
+            )
+        );
+        assert_eq!(
+            error("def p a.+b() { 1 }"),
+            (
+                "expected `(` after the definition's path, found `.`".to_owned(),
+                Span::new(7, 8)
+            )
+        );
+        assert_eq!(
+            error("def a+b() { 1 }"),
+            (
+                "expected `(` after `fn`, found `+`".to_owned(),
+                Span::new(5, 6)
+            )
+        );
+        // Anywhere else, `a+b` is the addition it was: a field's path, a
+        // variable, a `def`'s name, a def-type's.
+        assert_eq!(shape("c = a+b"), "c = (a + b)");
+        assert_eq!(shape("let y = x.a+b"), "let y = ((x . a) + b)");
+        assert_eq!(shape("x = p+q a"), "x = (p + (q a))");
+        assert_eq!(
+            error("x.a+b = 1"),
+            (
+                "expected end of item, found `=`".to_owned(),
+                Span::new(6, 7)
+            )
         );
     }
 }
