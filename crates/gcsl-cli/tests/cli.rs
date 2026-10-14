@@ -115,6 +115,33 @@ fn every_syntax_error_of_a_repl_input_is_shown() {
     );
 }
 
+/// A name that names nothing is shown with the name it was probably meant
+/// to be, found among the earlier lines' too.
+#[test]
+fn a_misspelled_name_is_shown_with_what_it_was_probably_meant_to_be() {
+    let output = repl("let version = 1\nversoin + 1\nlet r = {port = 80}\nr.prot\n");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(
+        stderr(&output),
+        "error: undefined variable `versoin`\n\
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | versoin + 1\n\
+         \x20 | ^^^^^^^\n\
+         \x20 |\n\
+         \x20 = help: did you mean `version`?\n\
+         error: no field `prot` in `{port: Int}`\n\
+         \x20--> <repl>:1:2\n\
+         \x20 |\n\
+         1 | r.prot\n\
+         \x20 |  ^^^^^\n\
+         \x20 |\n\
+         \x20 = note: the only field is `port`\n\
+         \x20 = help: did you mean `port`?\n"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// Colour is only used on a terminal, and tests run through pipes, so this
 /// is the plain path; `NO_COLOR` set is the other way to get it.
 #[test]
@@ -4077,7 +4104,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"inlayHintProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"codeActionProvider":{{"codeActionKinds":["quickfix","source.fixAll"],"resolveProvider":false}},"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"inlayHintProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

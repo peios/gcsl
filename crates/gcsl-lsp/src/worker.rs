@@ -6,8 +6,8 @@
 //! the snapshot of the open documents of one workspace, or of one lone
 //! file, as they are when it is handed over; a [`Query`], a hover, a
 //! definition, references, highlights, a rename or its preparation, a
-//! document's symbols, a completion, signature help or inlay hints asked of
-//! an open document, with such a snapshot; a
+//! document's symbols, a completion, signature help, inlay hints or code
+//! actions asked of an open document, with such a snapshot; a
 //! [`Job::Symbols`], `workspace/symbol`, with a snapshot of every
 //! workspace and lone file known; or a [`Job::Clear`] of a workspace or
 //! lone file there is no more to say of. It says on its `done` channel when
@@ -35,8 +35,9 @@
 //! directory. Nothing is run, and nothing is written to disk.
 //!
 //! It keeps the latest index of each workspace and lone file, with the
-//! version of each open document it was made from, whether its check
-//! succeeded or failed (see [`gcsl::index`]): a file with errors is
+//! version of each open document it was made from and the diagnostics of
+//! its check that carry a suggestion, which code actions make, whether its
+//! check succeeded or failed (see [`gcsl::index`]): a file with errors is
 //! indexed for everything that resolved, and so is one that needs a file
 //! whose check failed; one whose braces do not match is not checked, and
 //! has nothing indexed, not even what the last good index had. A query is
@@ -77,17 +78,17 @@ use gcsl::index::{
     Completion, CompletionKind, DocumentSymbol, Edit, Index, Indexed, Signature, SymbolKind,
 };
 use gcsl::workspace;
-use gcsl::{Diagnostic, Severity, SourceFile, Span};
+use gcsl::{Diagnostic, Severity, SourceFile, Span, Suggestion};
 use gcsl_disk::{ReadError, Sources};
 use lsp_server::{ErrorCode, Message, Notification, RequestId, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit,
-    DiagnosticRelatedInformation, DiagnosticSeverity, DocumentHighlight, DocumentHighlightKind,
-    Documentation, GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind,
-    InlayHintLabel, InsertReplaceEdit, Location, MarkupContent, MarkupKind, MessageType, OneOf,
-    ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams, ShowMessageParams,
-    SignatureHelp, SignatureInformation, TextEdit, Uri, WorkspaceSymbol,
+    CodeActionContext, CodeActionKind, CompletionItem, CompletionItemKind, CompletionList,
+    CompletionTextEdit, DiagnosticRelatedInformation, DiagnosticSeverity, DocumentHighlight,
+    DocumentHighlightKind, Documentation, GotoDefinitionResponse, Hover, HoverContents, InlayHint,
+    InlayHintKind, InlayHintLabel, InsertReplaceEdit, Location, MarkupContent, MarkupKind,
+    MessageType, OneOf, ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams,
+    ShowMessageParams, SignatureHelp, SignatureInformation, TextEdit, Uri, WorkspaceSymbol,
 };
 use serde_json::{Map, Value, json};
 
@@ -167,6 +168,10 @@ pub enum Asked {
     /// `textDocument/inlayHint`, of the range from the query's position to
     /// this one.
     InlayHints(Position),
+    /// `textDocument/codeAction`, of the range from the query's position to
+    /// this one, with what the client sent of its diagnostics there and
+    /// the kinds it wants.
+    CodeActions(Position, CodeActionContext),
 }
 
 /// The most symbols a `workspace/symbol` answers with.
@@ -338,6 +343,13 @@ struct Kept {
     /// The URI of each input, by input number; `None` for a standard file,
     /// and a file whose path is not UTF-8.
     uris: Vec<Option<Uri>>,
+    /// How many of the inputs are standard files, the first.
+    standard: usize,
+    /// The diagnostics of the check that carry a suggestion, which code
+    /// actions make, as the check found them.
+    suggested: Vec<Diagnostic>,
+    /// The input a diagnostic naming none is of: a lone file's own.
+    own: Option<u32>,
     /// How what it is of is indexed again, as a rename's check does.
     again: Again,
 }
@@ -527,7 +539,7 @@ impl Worker {
             nested: disk.nested.clone(),
             root: root_name.into_owned(),
         };
-        let kept = Kept::of(found, (files, uris), again, check);
+        let kept = Kept::of(found, (files, uris), (again, None), check);
         (Some(report), Some(kept))
     }
 
@@ -607,7 +619,7 @@ impl Worker {
         let own = u32::try_from(found.standard.len()).ok();
         let report = self.report(&found, &files, own, (&uri_at, version_at), check);
         let uris = vec![Some(uri.clone())];
-        let kept = Kept::of(found, (files, uris), Again::Lone(dir), check);
+        let kept = Kept::of(found, (files, uris), (Again::Lone(dir), own), check);
         (Some(report), Some(kept))
     }
 
@@ -765,23 +777,115 @@ impl Worker {
 impl Kept {
     /// What is kept of `found`, a check of `files` (after its standard
     /// files), whose URIs are `uris`, made of `check`'s documents, indexed
-    /// again as `again` says.
+    /// again as `again` says; a diagnostic naming no input is of `own`.
     fn of(
         found: Indexed,
         (files, uris): (Vec<SourceFile>, Vec<Option<Uri>>),
-        again: Again,
+        (again, own): (Again, Option<u32>),
         check: &Check,
     ) -> Self {
+        let standard = found.standard.len();
         let uris = found.standard.iter().map(|_| None).chain(uris).collect();
         let mut sources = found.standard;
         sources.extend(files);
+        let suggested = found
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.suggestion.is_some())
+            .collect();
         Self {
             versions: versions(check),
             index: found.index,
             sources,
             uris,
+            standard,
+            suggested,
+            own,
             again,
         }
+    }
+
+    /// The code actions of the document `uri`, the input `input`, for the
+    /// range of its bytes `asked` (its ends included), positions counted in
+    /// `encoding`, as the client's `context` asks for them (see the crate's
+    /// documentation, "Queries"): a quick fix for each diagnostic with a
+    /// suggestion that touches the range, and, for two suggestions or more
+    /// in the document, one that makes them all.
+    fn code_actions(
+        &self,
+        (uri, input): (&Uri, usize),
+        asked: Span,
+        context: &CodeActionContext,
+        encoding: Encoding,
+    ) -> Vec<Value> {
+        let Some(file) = input.checked_sub(self.standard) else {
+            return Vec::new();
+        };
+        let mut mapper = Mapper {
+            standard: self.sources.get(..self.standard).unwrap_or_default(),
+            files: self.sources.get(self.standard..).unwrap_or_default(),
+            encoding,
+            lines: HashMap::new(),
+            uris: HashMap::new(),
+            uri_at: |at: usize| self.uris.get(self.standard + at).cloned().flatten(),
+        };
+        let own = u32::try_from(input).ok();
+        // Each suggestion of the document, with its edit and its diagnostic
+        // as it is published, in source order.
+        let mut fixes: Vec<(&Diagnostic, &Suggestion, TextEdit, lsp_types::Diagnostic)> = self
+            .suggested
+            .iter()
+            .filter(|diagnostic| diagnostic.input.or(self.own) == own)
+            .filter_map(|diagnostic| {
+                let found = diagnostic.suggestion.as_deref()?;
+                let published = mapper.convert(diagnostic, file)?;
+                let range = mapper.range(file, found.span);
+                let edit = TextEdit::new(range, found.replacement.clone());
+                Some((diagnostic, found, edit, published))
+            })
+            .collect();
+        fixes.sort_by_key(|&(_, found, _, _)| (found.span.start, found.span.end));
+        let mut actions = Vec::new();
+        if wants(context, &CodeActionKind::QUICKFIX) {
+            for (diagnostic, found, edit, published) in &fixes {
+                let span = diagnostic.span;
+                if span.start > asked.end || asked.start > span.end {
+                    continue;
+                }
+                // The client's own diagnostic, if it sent this one.
+                let sent = context.diagnostics.iter().find(|sent| {
+                    sent.range == published.range && sent.message == published.message
+                });
+                let title = format!("Change to `{}`", found.replacement);
+                let attached = [sent.unwrap_or(published)];
+                let mut action = code_action(&title, &CodeActionKind::QUICKFIX, &attached);
+                action["edit"] = workspace_change(uri, &[edit]);
+                action["isPreferred"] = Value::Bool(true);
+                actions.push(action);
+            }
+        }
+        if wants(context, &CodeActionKind::SOURCE_FIX_ALL) {
+            // Every suggestion, but one overlapping one taken before it.
+            let mut edits: Vec<&TextEdit> = Vec::new();
+            let mut resolved: Vec<&lsp_types::Diagnostic> = Vec::new();
+            let mut end = None;
+            for (_, found, edit, published) in &fixes {
+                if end.is_some_and(|end| found.span.start < end) {
+                    continue;
+                }
+                end = Some(found.span.end);
+                edits.push(edit);
+                resolved.push(published);
+            }
+            if edits.len() >= 2 {
+                let title = "Apply all suggestions in this file";
+                let kind = CodeActionKind::SOURCE_FIX_ALL;
+                let mut action = code_action(title, &kind, &resolved);
+                action["edit"] = workspace_change(uri, &edits);
+                actions.push(action);
+            }
+        }
+        actions
     }
 
     /// The answer to `asked` at `position` of the document `uri`, counted
@@ -858,6 +962,12 @@ impl Kept {
             Asked::Highlight | Asked::DocumentSymbols | Asked::InlayHints(_) => {
                 let at = (file, offset);
                 Some(of_document(index, &asked, at, (&lines, encoding)))
+            }
+            Asked::CodeActions(end, context) => {
+                let end = u32::try_from(lines.offset(end, encoding)).unwrap_or(u32::MAX);
+                let asked = Span::new(offset, end.max(offset));
+                let actions = self.code_actions((uri, input), asked, &context, encoding);
+                Some(Ok(Value::Array(actions)))
             }
             Asked::PrepareRename => {
                 let prepared = index.prepare_rename(file, offset)?;
@@ -968,6 +1078,44 @@ fn workspace_edit(edits: Vec<Edit>, places: &mut Places<'_>) -> Result<Value, St
         }
     }
     Ok(json!({ "changes": changes }))
+}
+
+/// Whether the client's `context` wants code actions of `kind`: it names no
+/// kinds, or names `kind` or a kind it is under (`source` for
+/// `source.fixAll`).
+fn wants(context: &CodeActionContext, kind: &CodeActionKind) -> bool {
+    let kind = kind.as_str();
+    context.only.as_ref().is_none_or(|only| {
+        only.iter().any(|asked| {
+            let asked = asked.as_str();
+            asked.is_empty()
+                || kind == asked
+                || kind
+                    .strip_prefix(asked)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    })
+}
+
+/// A code action as LSP's `CodeAction`, its edit to be added: its title,
+/// its kind and the diagnostics it resolves. (Made as JSON, as a rename's
+/// edit is: a map keyed by [`Uri`]s would key by values with a cache
+/// inside them.)
+fn code_action(
+    title: &str,
+    kind: &CodeActionKind,
+    diagnostics: &[&lsp_types::Diagnostic],
+) -> Value {
+    json!({ "title": title, "kind": kind.as_str(), "diagnostics": diagnostics })
+}
+
+/// A `WorkspaceEdit` making `edits` in the document `uri`, as its
+/// `changes`.
+fn workspace_change(uri: &Uri, edits: &[&TextEdit]) -> Value {
+    let mut changes = Map::new();
+    let edits = serde_json::to_value(edits).unwrap_or(Value::Null);
+    changes.insert(uri.as_str().to_owned(), edits);
+    json!({ "changes": changes })
 }
 
 /// `symbol`, of the file whose lines are `lines`, as LSP's
@@ -1390,8 +1538,9 @@ impl<U: Fn(usize) -> Option<Uri>> Mapper<'_, U> {
         lines.range(span, self.encoding)
     }
 
-    /// `diagnostic`, of the file of index `file`, as LSP's: its message and
-    /// a line `note: ...` for each note; its primary span's label, if it
+    /// `diagnostic`, of the file of index `file`, as LSP's: its message, a
+    /// line `note: ...` for each note and a line `help: did you mean `x`?`
+    /// for its suggestion, if it has one; its primary span's label, if it
     /// has text, and each of its labels in a file, as related information.
     /// `None`, logged, if the file has no URI (its path is not UTF-8).
     fn convert(&mut self, diagnostic: &Diagnostic, file: usize) -> Option<lsp_types::Diagnostic> {
@@ -1409,11 +1558,15 @@ impl<U: Fn(usize) -> Option<Uri>> Mapper<'_, U> {
             message.push_str("\nnote: ");
             message.push_str(note);
         }
+        if let Some(found) = &diagnostic.suggestion {
+            message.push_str("\nhelp: ");
+            message.push_str(&found.help());
+        }
         let mut related = Vec::new();
         if let Some(text) = diagnostic.label.as_ref().filter(|text| !text.is_empty()) {
             related.push(DiagnosticRelatedInformation {
                 location: Location::new(uri, range),
-                message: text.clone(),
+                message: text.to_string(),
             });
         }
         let own = u32::try_from(self.standard.len() + file).unwrap_or(u32::MAX);

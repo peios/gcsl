@@ -2,7 +2,10 @@
 //! mode (`cargo test --release -p gcsl-disk --test recovery -- --ignored
 //! --nocapture`): timings of the front end on valid input, and a robustness
 //! run over mutants of every `.gcsl` file of the repository and of Jack's
-//! newpkgs, which is only read; and the same for the index a language
+//! newpkgs, which is only read, counting the diagnostics that carry a
+//! suggestion, with examples, and with newpkgs's files misspelled at an
+//! identifier each, to show what the suggestions are like; and the same for
+//! the index a language
 //! server answers its queries from (`gcsl::index`): timings of a check that
 //! records for it, of a rename's check, of a workspace's symbols and of
 //! doc comments, and a hover, a definition, references and a rename's
@@ -189,6 +192,10 @@ struct Found {
     internal: Vec<String>,
     /// The slowest mutant and its time.
     slowest: (Duration, String),
+    /// The diagnostics of the mutants with errors.
+    diagnostics: usize,
+    /// Each of them with a suggestion, as `WHAT: MESSAGE => REPLACEMENT`.
+    suggested: Vec<String>,
 }
 
 impl Found {
@@ -219,9 +226,64 @@ impl Found {
                 {
                     self.internal.push(what.to_owned());
                 }
+                self.diagnostics += diagnostics.len();
+                for diagnostic in &diagnostics {
+                    if let Some(found) = &diagnostic.suggestion {
+                        let shown =
+                            format!("{what}: {} => {}", diagnostic.message, found.replacement);
+                        self.suggested.push(shown);
+                    }
+                }
             }
         }
     }
+
+    /// Prints how many diagnostics of the run of `set` have a suggestion,
+    /// with `examples` of them, evenly spaced among them.
+    fn report_suggestions(&self, set: &str, examples: usize) {
+        println!(
+            "{set}: {} diagnostics, {} with a suggestion",
+            self.diagnostics,
+            self.suggested.len()
+        );
+        let step = (self.suggested.len() / examples.max(1)).max(1);
+        for shown in self.suggested.iter().step_by(step).take(examples) {
+            println!("  {shown}");
+        }
+    }
+}
+
+/// `text` misspelled at `count` of its identifiers of 3 characters or more,
+/// evenly spaced among them, one at a time: the identifier's second and
+/// third characters swapped, a typo of the commonest kind, where they
+/// differ. Each with the identifier as it was.
+fn typos(text: &str, count: usize) -> Vec<(String, String)> {
+    let source = SourceFile::new("t.gcsl", text).unwrap();
+    let lexed = lexer::lex(&source, &mut Names::new());
+    let words: Vec<(usize, usize)> = lexed
+        .tokens
+        .iter()
+        .filter(|token| matches!(token.kind, lexer::TokenKind::Ident(_)))
+        .map(|token| (token.span.start as usize, token.span.end as usize))
+        .filter(|&(start, end)| {
+            let word = &text[start..end];
+            word.is_ascii() && word.len() >= 3 && word.as_bytes()[1] != word.as_bytes()[2]
+        })
+        .collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    (0..count.min(words.len()))
+        .map(|at| {
+            let (start, end) = words[words.len() * at / count.min(words.len())];
+            let word = &text[start..end];
+            let mut typo = word.as_bytes().to_vec();
+            typo.swap(1, 2);
+            let typo = String::from_utf8(typo).unwrap();
+            let mutant = format!("{}{typo}{}", &text[..start], &text[end..]);
+            (mutant, word.to_owned())
+        })
+        .collect()
 }
 
 #[test]
@@ -272,6 +334,7 @@ fn robustness() {
             found.panics,
             found.internal
         );
+        found.report_suggestions(&format!("{set} mutants alone"), 8);
         assert!(found.panics.is_empty() && found.internal.is_empty());
     }
     // Each of newpkgs's files cut in its middle, and with its middle token
@@ -308,6 +371,43 @@ fn robustness() {
         found.panics,
         found.internal
     );
+    found.report_suggestions("newpkgs workspaces", 8);
+    assert!(found.panics.is_empty() && found.internal.is_empty());
+    newpkgs_typos(&sources);
+}
+
+/// Each of newpkgs's files, `sources`, with a typo in one identifier, at 4
+/// places, in its workspace: what the suggestions are like (see
+/// `gcsl::suggest`).
+fn newpkgs_typos(sources: &gcsl_disk::Sources) {
+    let mut found = Found::default();
+    for at in 0..sources.relative.len() {
+        let original = &sources.relative[at];
+        for (mutant, word) in typos(original.text(), 4) {
+            let mut files = sources.relative.clone();
+            files[at] = SourceFile::new(original.name(), mutant.as_str()).unwrap();
+            let what = format!("{} typo of `{word}`", original.name());
+            found.run(
+                &what,
+                || {
+                    workspace::check_with_standard(&files, &sources.nested, NEWPKGS)
+                        .1
+                        .map(|_| ())
+                },
+                0,
+            );
+        }
+    }
+    println!(
+        "newpkgs typos: {} mutants, {} with errors, slowest {:?} ({}), panics {:?}, internal errors {:?}",
+        found.mutants,
+        found.with_errors,
+        found.slowest.0,
+        found.slowest.1,
+        found.panics,
+        found.internal
+    );
+    found.report_suggestions("newpkgs typos", 30);
     assert!(found.panics.is_empty() && found.internal.is_empty());
 }
 

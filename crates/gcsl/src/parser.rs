@@ -3261,6 +3261,7 @@ impl Parser<'_> {
             );
             return Err(self.error(message, token.span));
         }
+        self.builder.push_quoted(token.span);
         Ok(self.names.intern(text))
     }
 

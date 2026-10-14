@@ -20,8 +20,10 @@
 //! `workspaceSymbolProvider`, `documentFormattingProvider`,
 //! `documentRangeFormattingProvider`, `completionProvider` (triggered by
 //! `.`, with no `completionItem/resolve`), `signatureHelpProvider`
-//! (triggered by `(` and `,`, retriggered by `,`) and `inlayHintProvider`
-//! (with no `inlayHint/resolve`). It answers `shutdown`, and any
+//! (triggered by `(` and `,`, retriggered by `,`), `inlayHintProvider`
+//! (with no `inlayHint/resolve`) and `codeActionProvider` (of the kinds
+//! `quickfix` and `source.fixAll`, with no `codeAction/resolve`). It
+//! answers `shutdown`, and any
 //! request after it with an error; `exit` ends it, cleanly after a
 //! `shutdown`, else not ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
@@ -31,8 +33,8 @@
 //!
 //! QUERIES. `textDocument/hover`, `definition`, `references`,
 //! `documentHighlight`, `prepareRename`, `rename`, `documentSymbol`,
-//! `completion`, `signatureHelp` and `inlayHint`, and `workspace/symbol`,
-//! are answered
+//! `completion`, `signatureHelp`, `inlayHint` and `codeAction`, and
+//! `workspace/symbol`, are answered
 //! from the index the latest check of the document's workspace, or lone
 //! file, made (see [`gcsl::index`]):
 //!
@@ -89,6 +91,20 @@
 //!   result's; see the library's [Inlay hints](gcsl::index#inlay-hints)),
 //!   each of kind `Type`, its label `: Int` (a result's as GCSL writes it
 //!   after a `)`, ` -> Int` for an impure one), with no padding;
+//! - code actions as `CodeAction[]`: for each diagnostic of the document
+//!   with a suggestion (`= help: did you mean `version`?`, see the
+//!   library's [`gcsl::suggest`]) whose range touches the range asked for,
+//!   its ends included, a `quickfix`, "Change to `version`", preferred,
+//!   whose `WorkspaceEdit` replaces the misspelled name, with the
+//!   diagnostic: the one the client sent of the same range and message if
+//!   it sent one, else the diagnostic as it is published; and, when the
+//!   document has two suggestions or more, a `source.fixAll`, "Apply all
+//!   suggestions in this file", which makes every one (one of two that
+//!   overlap left out). A client's `context.only` keeps those of the kinds
+//!   it names. The edits are made against the text the answer is made
+//!   from, which a stale index is checked again for first, as for every
+//!   query, so a fix never edits old text. Formatting is no code action:
+//!   `textDocument/formatting` does it;
 //!
 //! and `null` for nothing there, for a hover of what has no type the check
 //! found, for a definition of what the standard library or a built-in
@@ -227,12 +243,14 @@ use lsp_types::notification::{
     DidOpenTextDocument, DidSaveTextDocument, Notification as _,
 };
 use lsp_types::request::{
-    Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
-    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
-    RegisterCapability, Rename, Request as _, SignatureHelpRequest, WorkspaceSymbolRequest,
+    CodeActionRequest, Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting,
+    GotoDefinition, HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting,
+    References, RegisterCapability, Rename, Request as _, SignatureHelpRequest,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
+    CancelParams, CodeActionKind, CodeActionOptions, CodeActionParams,
+    CodeActionProviderCapability, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, DocumentRangeFormattingParams,
@@ -414,6 +432,14 @@ fn initialize_result(encoding: Encoding) -> Value {
                 work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
             }),
             inlay_hint_provider: Some(OneOf::Left(true)),
+            code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                code_action_kinds: Some(vec![
+                    CodeActionKind::QUICKFIX,
+                    CodeActionKind::SOURCE_FIX_ALL,
+                ]),
+                resolve_provider: Some(false),
+                ..CodeActionOptions::default()
+            })),
             ..ServerCapabilities::default()
         },
         server_info: Some(ServerInfo {
@@ -729,6 +755,7 @@ impl Server<'_> {
             | Completion::METHOD
             | SignatureHelpRequest::METHOD
             | InlayHintRequest::METHOD
+            | CodeActionRequest::METHOD
             | WorkspaceSymbolRequest::METHOD => return self.ask(request),
             Formatting::METHOD | RangeFormatting::METHOD => self.format(request),
             method => Response::new_err(
@@ -1079,6 +1106,12 @@ fn asked(method: &str, params: Value) -> serde_json::Result<(Uri, Position, Aske
             let (start, end) = (params.range.start, params.range.end);
             (params.text_document.uri, start, Asked::InlayHints(end))
         }
+        CodeActionRequest::METHOD => {
+            let params: CodeActionParams = serde_json::from_value(params)?;
+            let (start, end) = (params.range.start, params.range.end);
+            let asked = Asked::CodeActions(end, params.context);
+            (params.text_document.uri, start, asked)
+        }
         _ => at(serde_json::from_value(params)?, Asked::Hover),
     })
 }
@@ -1338,7 +1371,172 @@ mod tests {
         assert_eq!(capabilities["documentFormattingProvider"], true);
         assert_eq!(capabilities["documentRangeFormattingProvider"], true);
         assert_eq!(capabilities["inlayHintProvider"], true);
+        assert_eq!(
+            capabilities["codeActionProvider"],
+            json!({ "codeActionKinds": ["quickfix", "source.fixAll"], "resolveProvider": false })
+        );
         assert_eq!(result["serverInfo"]["name"], "gcsl");
+        client.shut_down().unwrap();
+    }
+
+    /// The code actions the server answers for the range `range` of the
+    /// document `uri`, the client sending `diagnostics` and, if any, the
+    /// kinds `only`.
+    fn code_actions(
+        client: &mut Client,
+        uri: &Uri,
+        range: Range,
+        diagnostics: &Value,
+        only: Option<&[&str]>,
+    ) -> Vec<Value> {
+        let mut context = json!({ "diagnostics": diagnostics });
+        if let Some(only) = only {
+            context["only"] = json!(only);
+        }
+        let params = json!({ "textDocument": { "uri": uri }, "range": range, "context": context });
+        let response = client.request("textDocument/codeAction", params);
+        let Value::Array(actions) = response.response_result.unwrap() else {
+            panic!("not a list of actions");
+        };
+        actions
+    }
+
+    /// The edits of the code action `action` of the document `uri`, each as
+    /// its range and its new text.
+    fn action_edits(action: &Value, uri: &Uri) -> Vec<(Range, String)> {
+        let edits = action["edit"]["changes"][uri.as_str()].as_array().unwrap();
+        edits
+            .iter()
+            .map(|edit| {
+                let text = edit["newText"].as_str().unwrap().to_owned();
+                (as_range(&edit["range"]), text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_quick_fix_changes_a_misspelled_name_and_the_file_checks_clean() {
+        let scratch = Scratch::workspace("quickfix", "");
+        let text = "version = 1\nx = versoin + 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let published = client.published_at(&uri, 1);
+        assert_eq!(published.diagnostics.len(), 1);
+        let diagnostic = &published.diagnostics[0];
+        assert_eq!(
+            diagnostic.message,
+            "undefined variable `versoin`\nhelp: did you mean `version`?"
+        );
+        let sent = json!([diagnostic]);
+        let actions = code_actions(&mut client, &uri, diagnostic.range, &sent, None);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        let action = &actions[0];
+        assert_eq!(action["title"], "Change to `version`");
+        assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["isPreferred"], true);
+        assert_eq!(action["diagnostics"], sent);
+        let edits = action_edits(action, &uri);
+        assert_eq!(edits, [(range((1, 4), (1, 11)), "version".to_owned())]);
+        // A cursor anywhere on the diagnostic has it too.
+        let at = range((1, 6), (1, 6));
+        assert_eq!(code_actions(&mut client, &uri, at, &sent, None).len(), 1);
+        // Applied, the file checks clean.
+        let (edit_range, new_text) = &edits[0];
+        let (start, end) = (edit_range.start, edit_range.end);
+        let span = ((start.line, start.character), (end.line, end.character));
+        client.change(&uri, 2, span, new_text);
+        assert!(client.published_at(&uri, 2).diagnostics.is_empty());
+        let whole = range((0, 0), (2, 0));
+        assert!(code_actions(&mut client, &uri, whole, &json!([]), None).is_empty());
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn nothing_is_offered_for_a_diagnostic_without_a_suggestion() {
+        let scratch = Scratch::workspace("nofix", "");
+        let text = "version = 1\nx = 1 + \"a\"\ny = zzzzz\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let published = client.published_at(&uri, 1);
+        assert_eq!(published.diagnostics.len(), 2);
+        assert!(
+            published
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("help:"))
+        );
+        let sent = serde_json::to_value(&published.diagnostics).unwrap();
+        let whole = range((0, 0), (3, 0));
+        assert!(code_actions(&mut client, &uri, whole, &sent, None).is_empty());
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_stale_code_action_request_is_answered_from_the_text_as_changed() {
+        let scratch = Scratch::workspace("stalefix", "");
+        let text = "version = 1\nx = versoin\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let old = client.published_at(&uri, 1).diagnostics;
+        assert_eq!(old[0].range, range((1, 4), (1, 11)));
+        // A line added above, and the request at once, with the diagnostic
+        // as the client has it, of the old text: the index is checked again
+        // first, and the edit is of the new text, with the diagnostic as it
+        // is now.
+        client.change(&uri, 2, ((0, 0), (0, 0)), "\n");
+        let stale = json!(old);
+        let actions = code_actions(&mut client, &uri, range((2, 4), (2, 11)), &stale, None);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(
+            action_edits(&actions[0], &uri),
+            [(range((2, 4), (2, 11)), "version".to_owned())]
+        );
+        let attached = &actions[0]["diagnostics"][0];
+        assert_eq!(as_range(&attached["range"]), range((2, 4), (2, 11)));
+        // The old place has nothing now.
+        let at = range((1, 4), (1, 4));
+        assert!(code_actions(&mut client, &uri, at, &stale, None).is_empty());
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn every_suggestion_of_a_file_is_applied_at_once_when_there_are_two() {
+        let scratch = Scratch::workspace("fixall", "");
+        let text = "version = 1\nx = versoin\ny = verison\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        assert_eq!(client.published_at(&uri, 1).diagnostics.len(), 2);
+        let at = range((1, 5), (1, 5));
+        let actions = code_actions(&mut client, &uri, at, &json!([]), None);
+        let titles: Vec<&str> = actions
+            .iter()
+            .map(|action| action["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            ["Change to `version`", "Apply all suggestions in this file"]
+        );
+        let all = &actions[1];
+        assert_eq!(all["kind"], "source.fixAll");
+        assert_eq!(all["diagnostics"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            action_edits(all, &uri),
+            [
+                (range((1, 4), (1, 11)), "version".to_owned()),
+                (range((2, 4), (2, 11)), "version".to_owned())
+            ]
+        );
+        // The kinds asked for, alone.
+        let only = code_actions(&mut client, &uri, at, &json!([]), Some(&["quickfix"]));
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0]["kind"], "quickfix");
+        let only = code_actions(&mut client, &uri, at, &json!([]), Some(&["source"]));
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0]["kind"], "source.fixAll");
         client.shut_down().unwrap();
     }
 

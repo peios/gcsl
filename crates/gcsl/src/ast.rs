@@ -2416,6 +2416,7 @@ pub struct AstBuilder {
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
     syntax: Syntax,
+    quoted: Vec<Span>,
 }
 
 /// Where every arena and pool of an [`AstBuilder`] was, to put it back
@@ -2662,6 +2663,12 @@ impl AstBuilder {
         self.no_prelude
     }
 
+    /// Records that a field's name is written quoted, as the string literal
+    /// at `span` (see [`Ast::written_name`]).
+    pub fn push_quoted(&mut self, span: Span) {
+        self.quoted.push(span);
+    }
+
     /// Records that the tree has syntax errors of at least the kind
     /// `syntax` (see [`Ast::syntax`]): a tree is as bad as its worst error.
     pub fn set_syntax(&mut self, syntax: Syntax) {
@@ -2777,7 +2784,11 @@ impl AstBuilder {
     /// holding the text of its string literals.
     #[must_use]
     pub fn finish(self, root: ItemRange, names: Names, strings: Strings) -> Ast {
+        let mut quoted = self.quoted;
+        quoted.sort_unstable_by_key(|span| (span.end, span.start));
+        quoted.dedup();
         Ast {
+            quoted,
             exprs: self.exprs,
             items: self.items,
             item_lists: self.item_lists,
@@ -2835,6 +2846,9 @@ pub struct Ast {
     no_prelude: Option<Span>,
     /// Whether it was parsed from source with syntax errors.
     syntax: Syntax,
+    /// Where each field name written quoted, as a string literal, is, by
+    /// where it ends (see [`Ast::written_name`]).
+    quoted: Vec<Span>,
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
     /// gave the file one.
     implicit_import: Option<ItemId>,
@@ -3395,6 +3409,24 @@ impl Ast {
     #[must_use]
     pub fn syntax(&self) -> Syntax {
         self.syntax
+    }
+
+    /// Where the name whose text is `text`, written last in a span that
+    /// ends at `end`, is written: the string literal of a quoted field name
+    /// that ends there, quotes and all, if there is one, else the `text`'s
+    /// length before `end`, an identifier written as its text. A field
+    /// access spans its record through its name, so this is the name of
+    /// `r.x` and of `r."x"`.
+    #[must_use]
+    pub fn written_name(&self, end: u32, text: &str) -> Span {
+        let at = self.quoted.partition_point(|span| span.end < end);
+        match self.quoted.get(at) {
+            Some(&quoted) if quoted.end == end => quoted,
+            _ => {
+                let length = u32::try_from(text.len()).unwrap_or(u32::MAX);
+                Span::new(end.saturating_sub(length), end)
+            }
+        }
     }
 
     /// The implicit `#[shadowable] import * from prelude` a workspace gave

@@ -171,11 +171,12 @@ pub mod parser;
 pub mod session;
 pub mod source;
 pub mod strings;
+pub mod suggest;
 pub mod types;
 pub mod value;
 pub mod workspace;
 
-pub use diagnostic::{Diagnostic, Severity};
+pub use diagnostic::{Diagnostic, Severity, Suggestion};
 pub use session::Session;
 pub use source::{SourceFile, Span};
 pub use types::{TyId, TypeTable};

@@ -8,6 +8,12 @@
 //! warnings, which are rendered as `warning: ...` and do not stop a program
 //! from running.
 //!
+//! A diagnostic about a name that names nothing may carry a [`Suggestion`]:
+//! what the name was probably meant to be, found among those usable where
+//! it is written (see [`crate::suggest`]), rendered last, as `= help: did
+//! you mean `version`?`, and kept as a structured edit, the exact span of
+//! the name and its replacement, for a language server's quick fix.
+//!
 //! Rendering is done by [`Renderer`], which wraps the `annotate-snippets`
 //! crate (the rendering engine extracted from rustc). Line and column
 //! numbers are computed only at render time.
@@ -78,8 +84,11 @@ pub struct Diagnostic {
     pub message: String,
     /// The source region the message is about.
     pub span: Span,
-    /// Text shown next to the primary span's underline, if any.
-    pub label: Option<String>,
+    /// Text shown next to the primary span's underline, if any. A boxed
+    /// `str`, not a `String`, to keep a diagnostic within the size that
+    /// every `Result<_, Diagnostic>` of the lexer and the evaluator can
+    /// carry (see the test `a_diagnostic_stays_small`).
+    pub label: Option<Box<str>>,
     /// Related spans, each with its own text.
     pub labels: Vec<Label>,
     /// Additional lines rendered as `= note: ...` after the source excerpt.
@@ -90,6 +99,33 @@ pub struct Diagnostic {
     /// `None`, as every builder leaves it, means the input being run (or
     /// the file, outside a session).
     pub input: Option<u32>,
+    /// What the name the message is about was probably meant to be, for a
+    /// name that names nothing: rendered after the notes as `= help: did
+    /// you mean `x`?`, and what a quick fix edits (see
+    /// [`crate::suggest`]). It is of the diagnostic's own input. Boxed, as
+    /// the label is, to keep a diagnostic small: every walker of the
+    /// evaluator returns room for one.
+    pub suggestion: Option<Box<Suggestion>>,
+}
+
+/// A fix a diagnostic suggests: replace the text at `span`, of the
+/// diagnostic's own input, with `replacement`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    /// Exactly the text to replace: the misspelled name, as it is written.
+    pub span: Span,
+    /// The text to put there, as it must be written: a name that is no
+    /// plain identifier is quoted.
+    pub replacement: String,
+}
+
+impl Suggestion {
+    /// The help line the suggestion is rendered as, without its `help: `:
+    /// "did you mean `version`?".
+    #[must_use]
+    pub fn help(&self) -> String {
+        format!("did you mean `{}`?", self.replacement)
+    }
 }
 
 impl Diagnostic {
@@ -104,6 +140,7 @@ impl Diagnostic {
             labels: Vec::new(),
             notes: Vec::new(),
             input: None,
+            suggestion: None,
         }
     }
 
@@ -120,7 +157,7 @@ impl Diagnostic {
     /// diagnostic.
     #[must_use]
     pub fn with_label(mut self, text: impl Into<String>) -> Self {
-        self.label = Some(text.into());
+        self.label = Some(text.into().into_boxed_str());
         self
     }
 
@@ -160,6 +197,16 @@ impl Diagnostic {
     #[must_use]
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
+        self
+    }
+
+    /// Sets the suggestion, if there is one, to replace the text at `span`
+    /// with `replacement`, returning the modified diagnostic.
+    #[must_use]
+    pub fn with_suggestion(mut self, suggestion: Option<(Span, String)>) -> Self {
+        if let Some((span, replacement)) = suggestion {
+            self.suggestion = Some(Box::new(Suggestion { span, replacement }));
+        }
         self
     }
 
@@ -292,6 +339,10 @@ impl Renderer {
         for note in &diagnostic.notes {
             group = group.element(Level::NOTE.message(note.as_str()));
         }
+        let help = diagnostic.suggestion.as_ref().map(|found| found.help());
+        if let Some(help) = &help {
+            group = group.element(Level::HELP.message(help.as_str()));
+        }
         let mut text = self.inner.render(&[group]);
         text.push('\n');
         text
@@ -373,6 +424,45 @@ mod tests {
              \x20 |\n\
              \x20 = note: a note\n"
         );
+    }
+
+    #[test]
+    fn renders_a_suggestion_as_help_after_the_notes() {
+        let source = file("versoin + 1");
+        let diagnostic = Diagnostic::error("undefined variable `versoin`", Span::new(0, 7))
+            .with_note("a note")
+            .with_suggestion(Some((Span::new(0, 7), "version".to_owned())));
+        assert_eq!(
+            diagnostic.suggestion.as_deref(),
+            Some(&Suggestion {
+                span: Span::new(0, 7),
+                replacement: "version".to_owned()
+            })
+        );
+        assert_eq!(
+            diagnostic.render(&source),
+            "error: undefined variable `versoin`\n\
+             \x20--> calc.gcsl:1:1\n\
+             \x20 |\n\
+             1 | versoin + 1\n\
+             \x20 | ^^^^^^^\n\
+             \x20 |\n\
+             \x20 = note: a note\n\
+             \x20 = help: did you mean `version`?\n"
+        );
+        // None leaves the diagnostic as it was.
+        let plain = Diagnostic::error("oops", Span::new(0, 1)).with_suggestion(None);
+        assert_eq!(plain.suggestion, None);
+    }
+
+    #[test]
+    fn a_diagnostic_stays_small() {
+        // Clippy's `result_large_err` flags an error type of 128 bytes or
+        // more, and the lexer and the evaluator return `Result<_,
+        // Diagnostic>` at every level of their recursion: a field added
+        // inline would cross it, which is why the suggestion and the label
+        // are boxed.
+        assert!(size_of::<Diagnostic>() < 128, "{}", size_of::<Diagnostic>());
     }
 
     #[test]

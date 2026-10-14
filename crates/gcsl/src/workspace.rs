@@ -4720,10 +4720,11 @@ pub(crate) fn module(
         (Some(first), Some(last)) => first.span.join(last.span),
         _ => return Err(None),
     };
-    let shown: Vec<&str> = path
+    let named: Vec<(&str, Span)> = path
         .iter()
-        .filter_map(|segment| Some(scan.names.get(segment.name()?)))
+        .filter_map(|segment| Some((scan.names.get(segment.name()?), segment.span)))
         .collect();
+    let shown: Vec<&str> = named.iter().map(|&(text, _)| text).collect();
     if let [only] = shown.as_slice() {
         if *only == BUILTINS {
             return Ok(Target::Dir(scan.builtins_dir));
@@ -4770,7 +4771,8 @@ pub(crate) fn module(
             (Some(dir), None) if last => return Ok(Target::Dir(dir)),
             (Some(_), None) => at = candidate,
             (None, None) => {
-                let note = if modules.nested.contains(&candidate) {
+                let nested = modules.nested.contains(&candidate);
+                let note = if nested {
                     format!("`{candidate}/` is a workspace of its own")
                 } else {
                     let listed = contents(scan, modules.dirs.get(&at).copied());
@@ -4780,15 +4782,76 @@ pub(crate) fn module(
                         format!("`{at}/` has {listed}")
                     }
                 };
+                let suggestion = named
+                    .get(position)
+                    .filter(|_| !nested)
+                    .and_then(|&(_, span)| {
+                        let only = shown.len() == 1;
+                        let best = module_suggestion(modules, &at, (last, only), name)?;
+                        Some((span, best))
+                    });
                 return Err(Some(
                     Diagnostic::error(format!("no module `{}`", shown.join(".")), written)
-                        .with_note(note),
+                        .with_note(note)
+                        .with_suggestion(suggestion),
                 ));
             }
         }
     }
     Err(None)
 }
+
+/// The suggestion for `name`, a segment of a module path that names no
+/// module in the directory at path `at` (`""`, the root), the path's last
+/// segment if `last` and its only one if `only` (see
+/// [Suggestions](crate::check#suggestions)): the nearest of the directories
+/// in `at` (none a workspace of its own), the stems of its files if `last`
+/// (a file has no modules in it), and, for a path of one segment, the
+/// standard modules, `builtins` and `fileroot`.
+fn module_suggestion(
+    modules: &Modules<'_>,
+    at: &str,
+    (last, only): (bool, bool),
+    name: &str,
+) -> Option<String> {
+    let prefix = if at.is_empty() {
+        String::new()
+    } else {
+        format!("{at}/")
+    };
+    let child = |path: &str| -> Option<String> {
+        let rest = path.strip_prefix(prefix.as_str())?;
+        (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_owned())
+    };
+    let mut candidates: Vec<(String, u8)> = Vec::new();
+    for path in modules.dirs.keys() {
+        if !path.starts_with(STANDARD_DIR) && !modules.nested.contains(path) {
+            candidates.extend(child(path).map(|dir| (dir, 0)));
+        }
+    }
+    if last {
+        for &path in modules.files.keys() {
+            if path.starts_with(STANDARD_DIR) || path == WORKSPACE_FILE {
+                continue;
+            }
+            let stem = child(path).and_then(|file| Some(file.strip_suffix(".gcsl")?.to_owned()));
+            candidates.extend(stem.map(|stem| (stem, 0)));
+        }
+    }
+    if only {
+        let standard = crate::STANDARD.iter().map(|&(stem, _)| stem);
+        let modules = standard.chain([BUILTINS, Fileroot::MODULE]);
+        candidates.extend(modules.map(|module| (module.to_owned(), 1)));
+    }
+    let usable = candidates
+        .iter()
+        .filter(|(text, _)| lexer::is_identifier(text))
+        .map(|(text, rank)| (text.as_str(), *rank));
+    crate::suggest::best(name, usable).map(str::to_owned)
+}
+
+/// The name of a workspace's root file, which no path imports.
+const WORKSPACE_FILE: &str = "workspace.gcsl";
 
 /// Gives a cell to the value of each value file (one whose outermost block
 /// ends in a result) that some file imports whole ([`Scan::value_slot`]).
@@ -4912,14 +4975,16 @@ fn members(
                             });
                         }
                         if child.is_none() && ty.is_none() {
-                            errors.push(Diagnostic::error(
-                                format!(
-                                    "`{}` has no `{}`",
-                                    scan.show_target(target),
-                                    scan.names.get(name.name)
-                                ),
-                                name.span,
-                            ));
+                            let text = scan.names.get(name.name);
+                            let suggestion = member_suggestion(scan, target, text)
+                                .map(|best| (name.span, best.to_owned()));
+                            errors.push(
+                                Diagnostic::error(
+                                    format!("`{}` has no `{text}`", scan.show_target(target)),
+                                    name.span,
+                                )
+                                .with_suggestion(suggestion),
+                            );
                         }
                     }
                     ImportMember::All(star) => {
@@ -4961,6 +5026,22 @@ fn members(
     }
 }
 
+/// The suggestion for `name`, imported by member from `target`, which has
+/// no root or type of that name (see
+/// [Suggestions](crate::check#suggestions)): the nearest of its roots and
+/// its types.
+fn member_suggestion<'s>(scan: &'s Scan, target: Target, name: &str) -> Option<&'s str> {
+    let roots = target_roots(scan, target);
+    let types = scan.target_types(target);
+    let candidates = roots
+        .into_iter()
+        .chain(types.into_iter().filter_map(|decl| scan.type_name(decl)))
+        .map(|candidate| scan.names.get(candidate))
+        .filter(|text| lexer::is_identifier(text))
+        .map(|text| (text, 0));
+    crate::suggest::best(name, candidates)
+}
+
 /// The error of `member`, a member or the `*` of an import from the
 /// `fileroot` module, whose members are read as `fileroot.NAME` only, after
 /// a whole import of it (see the module documentation, "The standard
@@ -4971,6 +5052,7 @@ fn fileroot_member_import(scan: &Scan, member: ImportMember) -> Diagnostic {
     let (read_as, at) = match member {
         ImportMember::Named { name, .. } => {
             let text = scan.names.get(name.name);
+            // No suggestion: no member of `fileroot` can be imported.
             let Some(read_as) = Fileroot::named(text) else {
                 return Diagnostic::error(
                     format!("`{}` has no `{text}`", Fileroot::MODULE),
@@ -6098,6 +6180,44 @@ impl<'a> Context<'a> {
     /// (see [Syntax errors](#syntax-errors)).
     pub(crate) fn sees_broken(&self) -> bool {
         self.scan.sees_broken(self.index)
+    }
+
+    /// The roots of the file's view, each with the rank of its scope for a
+    /// suggestion (see [Suggestions](crate::check#suggestions)), the nearer
+    /// the smaller: its own, 4; its directories', one rank each from 5 up,
+    /// its own directory first; what it imports, the rank after the root
+    /// directory's; the implicit prelude's, the one after that; but not the
+    /// name of a whole import of `fileroot`, which is never a value. A name
+    /// may come more than once.
+    pub(crate) fn suggestion_roots(&self) -> Vec<(Name, u8)> {
+        let tree = &self.file.mentions.tree;
+        let mut found: Vec<(Name, u8)> = tree
+            .roots
+            .iter()
+            .filter_map(|&root| tree.nodes.get(root as usize).map(|node| (node.name, 4)))
+            .collect();
+        let mut rank: u8 = 5;
+        for dir in self.scan.chain(self.file.dir) {
+            let roots = target_roots(self.scan, Target::Dir(dir));
+            found.extend(roots.into_iter().map(|name| (name, rank)));
+            rank = rank.saturating_add(1);
+        }
+        // The `fileroot` module is never a value: only its members are read.
+        let values = self
+            .file
+            .aliases
+            .iter()
+            .filter(|alias| !matches!(alias.target, Target::Fileroot(_)));
+        for alias in values {
+            let at = u8::from(alias.implicit);
+            found.push((alias.name, rank.saturating_add(at)));
+        }
+        found
+    }
+
+    /// The names of the types of the file's view ([`File::type_view`]).
+    pub(crate) fn type_names(&self) -> impl Iterator<Item = Name> + '_ {
+        self.file.type_view.keys().copied()
     }
 
     /// Whether the file reads any name as `Error` ([`File::poisoned`]).
@@ -9026,7 +9146,7 @@ fn invoked_here(
         if own {
             diagnostic.input = Some(file);
             diagnostic.span = span;
-            diagnostic.label = Some(INVOKED.to_owned());
+            diagnostic.label = Some(INVOKED.into());
         }
     }
     diagnostics
@@ -20635,6 +20755,136 @@ p26 = com.x"#;
                 "`defmeta tagged x` is declared twice in this directory at app/b.gcsl",
                 "mismatched types at o.gcsl",
             ]
+        );
+    }
+
+    /// Each diagnostic of checking the workspace of `files`, as `MESSAGE at
+    /// FILE`, with its suggestion as `WRITTEN -> REPLACEMENT`, the text it
+    /// replaces read from its file at its span, if it has one.
+    fn suggestions(files: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        let mut sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        sources.sort_by(|a, b| a.name().cmp(b.name()));
+        let (standard, checked) = check_with_standard(&sources, &[], "/");
+        let Err(errors) = checked else {
+            panic!("{files:?}: checked without an error");
+        };
+        let mut all = standard;
+        all.extend(sources);
+        errors
+            .iter()
+            .map(|error| {
+                let file = error.input.and_then(|input| all.get(input as usize));
+                let name = file.map_or("?", SourceFile::name);
+                let shown = error.suggestion.as_ref().map(|found| {
+                    let written = file.map_or("?", |file| file.slice(found.span));
+                    format!("{written} -> {}", found.replacement)
+                });
+                (format!("{} at {name}", error.message), shown)
+            })
+            .collect()
+    }
+
+    /// The suggestion of the one diagnostic of checking `files`, as
+    /// [`suggestions`] shows it, its message starting with `message`.
+    fn suggestion_of(files: &[(&str, &str)], message: &str) -> Option<String> {
+        let found = suggestions(files);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (shown, suggestion) = found.into_iter().next().unwrap();
+        assert!(shown.starts_with(message), "{shown}");
+        suggestion
+    }
+
+    #[test]
+    fn an_import_of_no_module_suggests_one_at_its_level() {
+        let lib = (
+            "lib/util.gcsl",
+            "version = 1\ntype Package = {name: String}",
+        );
+        let with = |text| [("workspace.gcsl", ""), lib, ("app.gcsl", text)];
+        assert_eq!(
+            suggestion_of(
+                &with("import lib.utl\nx = 1"),
+                "no module `lib.utl` at app.gcsl"
+            ),
+            Some("utl -> util".to_owned())
+        );
+        // A segment before the last: a directory.
+        assert_eq!(
+            suggestion_of(&with("import lbi.util\nx = 1"), "no module `lbi.util`"),
+            Some("lbi -> lib".to_owned())
+        );
+        // One segment: a standard module too.
+        assert_eq!(
+            suggestion_of(&with("import pth\nx = 1"), "no module `pth`"),
+            Some("pth -> path".to_owned())
+        );
+        // A member: a root or a type of the module.
+        assert_eq!(
+            suggestion_of(
+                &with("import verison from lib.util\nx = 1"),
+                "`lib.util` has no"
+            ),
+            Some("verison -> version".to_owned())
+        );
+        assert_eq!(
+            suggestion_of(
+                &with("import Pakage from lib.util\nx = 1"),
+                "`lib.util` has no"
+            ),
+            Some("Pakage -> Package".to_owned())
+        );
+        // Too far: none.
+        assert_eq!(
+            suggestion_of(&with("import nothing\nx = 1"), "no module `nothing`"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_name_of_the_view_is_suggested() {
+        // A root of a directory above, a node's child, a type of the
+        // directory.
+        let files = [
+            ("workspace.gcsl", "top = 1\ndev.peios.count = 2"),
+            ("sub/a.gcsl", "x = tpo + 1"),
+        ];
+        assert_eq!(
+            suggestion_of(&files, "undefined variable `tpo` at sub/a.gcsl"),
+            Some("tpo -> top".to_owned())
+        );
+        let files = [
+            ("workspace.gcsl", "top = 1\ndev.peios.count = 2"),
+            ("sub/a.gcsl", "x = dev.peios.cuont + 1"),
+        ];
+        assert_eq!(
+            suggestion_of(&files, "no field `cuont` in"),
+            Some("cuont -> count".to_owned())
+        );
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/types.gcsl", "type Package = {name: String}"),
+            ("lib/a.gcsl", "p: Pakage = {name = \"n\"}"),
+        ];
+        assert_eq!(
+            suggestion_of(&files, "unknown type `Pakage`"),
+            Some("Pakage -> Package".to_owned())
+        );
+        // A meta's field.
+        let files = [
+            INFO,
+            (
+                "app/a.gcsl",
+                "defmeta info dev { about = { owner = \"o\" }; ns = []; peios = \"p\" }\n\
+                 def info dev() { 1 }\n\
+                 r = (info dev).pieos",
+            ),
+        ];
+        assert_eq!(
+            suggestion_of(&files, "the meta of `info dev` has no field `pieos`"),
+            Some("pieos -> peios".to_owned())
         );
     }
 }

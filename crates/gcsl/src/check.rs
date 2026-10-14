@@ -2825,6 +2825,34 @@
 //! for everything that resolved: an expression that failed is `Error`, and
 //! after a failure some may be untyped or provisional. Not recording costs
 //! one test of an `Option` per binding declared and per name read.
+//!
+//! # Suggestions
+//!
+//! An error about a name that names nothing carries a suggestion of what
+//! it was probably meant to be, if a name usable where it is written is
+//! close enough by [`crate::suggest`]'s rule, as the exact span of the name
+//! and its replacement ([`crate::diagnostic::Suggestion`]):
+//!
+//! - an undefined variable: the bindings in scope, the nearest first (the
+//!   innermost block's, then the enclosing ones', then the top level's,
+//!   then those the input was checked from: committed by its directory
+//!   chain or an earlier session input), then the roots of the file's view
+//!   (its own, its directories', what it imports, the implicit prelude's),
+//!   leaving out the top-level field whose initialiser is being checked,
+//!   a name the file reads as `Error`, one that a top-level function
+//!   checked early could not read yet, and a name that is no identifier;
+//! - a missing field, "no field `x` in ..." and "the meta of `f` has no
+//!   field `x`": the record type's fields, a view node's children among
+//!   them, quoted as a field's name is if need be;
+//! - an unknown type: the types of the file's view, then `Int`, `Float`,
+//!   `Bool` and `String`; written with a type argument, `List`, `Future`
+//!   and `Present` instead, which alone take one;
+//! - a named argument no parameter has: the callee's named parameters that
+//!   no other argument fills.
+//!
+//! The ranks are coarse, as the checker keeps no stack of blocks: names of
+//! one rank tie and are taken in alphabetical order. The search runs only
+//! as such an error is reported, never on valid input.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -2842,6 +2870,7 @@ use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Sched
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
+use crate::suggest;
 use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::{ValueKind, int_to_float};
 use crate::workspace::{Context, Target};
@@ -5731,6 +5760,10 @@ pub struct Checker<'a> {
     /// costing one test per binding and per name read, on every other path
     /// (see [Recording](#recording)).
     record: Option<Box<Record>>,
+    /// The roots of the file's view with their ranks, for suggestions (see
+    /// [Suggestions](#suggestions)): gathered at the first undefined
+    /// variable, never on valid input.
+    view_roots: Option<Vec<(Name, u8)>>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -5866,6 +5899,7 @@ impl<'a> Checker<'a> {
             declared_types: Vec::new(),
             copies: HashMap::new(),
             record: None,
+            view_roots: None,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -6412,20 +6446,34 @@ impl<'a> Checker<'a> {
             return;
         };
         let names = self.ast.names();
-        let path: Vec<&str> = self
-            .ast
-            .path(self.ast.import_decl(decl).path)
+        let segments = self.ast.path(self.ast.import_decl(decl).path);
+        let path: Vec<&str> = segments
             .iter()
             .filter_map(|segment| Some(names.get(segment.name()?)))
             .collect();
-        self.errors.push(Diagnostic::error(
-            format!(
-                "`{}` is not a built-in or standard module, and there is no `workspace.gcsl` \
-                 above this file",
-                path.join(".")
-            ),
-            span,
-        ));
+        // A module of one name may be a standard one misspelled.
+        let suggestion = match (segments, path.as_slice()) {
+            ([segment], [text]) => {
+                let modules = crate::STANDARD
+                    .iter()
+                    .map(|&(stem, _)| stem)
+                    .chain([crate::workspace::BUILTINS, Fileroot::MODULE])
+                    .map(|module| (module, 0));
+                suggest::best(text, modules).map(|best| (segment.span, best.to_owned()))
+            }
+            _ => None,
+        };
+        self.errors.push(
+            Diagnostic::error(
+                format!(
+                    "`{}` is not a built-in or standard module, and there is no \
+                     `workspace.gcsl` above this file",
+                    path.join(".")
+                ),
+                span,
+            )
+            .with_suggestion(suggestion),
+        );
     }
 
     /// Resolves the file's `type` items, each's type with every bare type
@@ -9220,12 +9268,19 @@ impl<'a> Checker<'a> {
             return None;
         }
         let names = self.ast.names();
+        let text = names.get(name);
+        let members = Fileroot::ALL.map(|member| (member.name(), 0));
+        let suggestion = suggest::best(text, members).map(|best| {
+            let span = self.ast.written_name(self.ast.get(id).span.end, text);
+            (span, best.to_owned())
+        });
         self.errors.push(
             Diagnostic::error(
-                format!("`{}` has no `{}`", names.get(module), names.get(name)),
+                format!("`{}` has no `{text}`", names.get(module)),
                 self.ast.get(id).span,
             )
-            .with_note(FILEROOT_MEMBERS),
+            .with_note(FILEROOT_MEMBERS)
+            .with_suggestion(suggestion),
         );
         self.expr_types[record.index()] = TyId::EMPTY;
         Some(TyId::ERROR)
@@ -11710,7 +11765,11 @@ impl<'a> Checker<'a> {
                     self.errors.push(Diagnostic::error(message, ty.span));
                 } else {
                     let message = format!("unknown type `{text}`");
-                    self.unresolved_name(name, Diagnostic::error(message, ty.span));
+                    let suggestion = self.type_suggestion(name, ty.span, false);
+                    self.unresolved_name(
+                        name,
+                        Diagnostic::error(message, ty.span).with_suggestion(suggestion),
+                    );
                 }
                 TyId::ERROR
             }
@@ -12079,12 +12138,43 @@ impl<'a> Checker<'a> {
             let message = format!("type `{text}` takes no type argument");
             self.errors.push(Diagnostic::error(message, span));
         } else {
+            let suggestion = self.type_suggestion(name, span, true);
             self.unresolved_name(
                 name,
-                Diagnostic::error(format!("unknown type `{text}`"), span),
+                Diagnostic::error(format!("unknown type `{text}`"), span)
+                    .with_suggestion(suggestion),
             );
         }
         TyId::ERROR
+    }
+
+    /// The suggestion for the unknown type `name`, written at `span`, with a
+    /// type argument if `applied` (see [Suggestions](#suggestions)): the
+    /// nearest of the types of the file's view and the built-in types that
+    /// take no argument, or, applied, of `List`, `Future` and `Present`.
+    /// None where the error is not reported: resolving quietly, or in a
+    /// file whose view sees one with syntax errors.
+    fn type_suggestion(&self, name: Name, span: Span, applied: bool) -> Option<(Span, String)> {
+        if self.quiet.types || self.sees_broken() {
+            return None;
+        }
+        let names = self.ast.names();
+        let mut candidates: Vec<(&str, u8)> = Vec::new();
+        if applied {
+            candidates.extend(["List", "Future", "Present"].map(|text| (text, 1)));
+        } else {
+            candidates.extend(["Int", "Float", "Bool", "String"].map(|text| (text, 1)));
+            if let Some(workspace) = self.workspace {
+                candidates.extend(
+                    workspace
+                        .type_names()
+                        .map(|declared| (names.get(declared), 0))
+                        .filter(|&(text, _)| crate::lexer::is_identifier(text)),
+                );
+            }
+        }
+        let best = suggest::best(names.get(name), candidates)?;
+        Some((span, best.to_owned()))
     }
 
     /// Reports `error`, of a name that names nothing, a variable's or a
@@ -15107,10 +15197,9 @@ impl<'a> Checker<'a> {
                     let text = ast.names().get(name);
                     let param = params.iter().position(|&param| param == text);
                     if param.is_none() {
-                        self.errors.push(
-                            Diagnostic::error(format!("unknown argument `{text}`"), span)
-                                .with_context(callee_span, label.as_str()),
-                        );
+                        let at = ((text, span), (callee_span, label.as_str()));
+                        self.errors
+                            .push(unknown_builtin_argument(ast, arg_list, params, at));
                         erroneous = true;
                     }
                     param
@@ -15281,7 +15370,17 @@ impl<'a> Checker<'a> {
                         .iter()
                         .position(|&(param, _)| param == Some(name));
                     if param.is_none() {
-                        self.report_unknown_argument((name, span), (callee, callee_ty), sig);
+                        let filled = filled_by(arg_list, count, |name| {
+                            sig.params
+                                .iter()
+                                .position(|&(param, _)| param == Some(name))
+                        });
+                        self.report_unknown_argument(
+                            (name, span),
+                            (callee, callee_ty),
+                            sig,
+                            &filled,
+                        );
                         erroneous = true;
                     }
                     param
@@ -15638,13 +15737,15 @@ impl<'a> Checker<'a> {
 
     /// Reports the named argument `name`, written at `span`, that no
     /// parameter of the callee, of type `callee_ty` with signature `sig`,
-    /// is named: an unknown argument, or, if none of its parameters has a
-    /// name, a function that takes none.
+    /// is named: an unknown argument, suggesting the nearest of the named
+    /// parameters that `filled` (by position) shows no argument fills, or,
+    /// if none of its parameters has a name, a function that takes none.
     fn report_unknown_argument(
         &mut self,
         (name, span): (Name, Span),
         (callee, callee_ty): (ExprId, TyId),
         sig: &FnTy,
+        filled: &[bool],
     ) {
         let callee_span = self.ast.get(callee).span;
         let shown = self.in_label(callee_ty);
@@ -15653,9 +15754,18 @@ impl<'a> Checker<'a> {
                 .with_context(callee_span, format!("this is {shown}"))
                 .with_note("call it with positional arguments")
         } else {
-            let text = self.ast.names().get(name);
+            let names = self.ast.names();
+            let text = names.get(name);
+            let free = sig
+                .params
+                .iter()
+                .zip(filled)
+                .filter(|&(_, &filled)| !filled)
+                .filter_map(|(&(param, _), _)| Some((names.get(param?), 0)));
+            let suggestion = suggest::best(text, free).map(|best| (span, best.to_owned()));
             Diagnostic::error(format!("unknown argument `{text}`"), span)
                 .with_context(callee_span, format!("the function is {shown}"))
+                .with_suggestion(suggestion)
         };
         self.errors.push(error);
     }
@@ -15938,10 +16048,15 @@ impl<'a> Checker<'a> {
         let text = FieldName(self.ast.names().get(name));
         if let Some(fields) = self.types.record_fields(record_ty) {
             let note = self.field_list(fields);
+            let suggestion = self.field_suggestion(id, name, fields);
             let message = format!("no field `{text}` in {}", self.in_message(record_ty));
             // A path of the view's names nothing then: its field may be
             // declared in source that could not be parsed.
-            self.unresolved(Diagnostic::error(message, member).with_note(note));
+            self.unresolved(
+                Diagnostic::error(message, member)
+                    .with_note(note)
+                    .with_suggestion(suggestion),
+            );
             return TyId::ERROR;
         }
         let record_ty = self.settle(record, record_ty);
@@ -16020,12 +16135,12 @@ impl<'a> Checker<'a> {
         let expr = self.ast.get(id);
         let member = expr.member_span(self.ast).unwrap_or(expr.span);
         let text = FieldName(self.ast.names().get(name));
-        let note = self
-            .types
-            .record_fields(ty)
-            .map_or_else(String::new, |fields| self.field_list(fields));
-        let mut error =
-            Diagnostic::error(format!("{subject} has no field `{text}`"), member).with_note(note);
+        let fields = self.types.record_fields(ty);
+        let note = fields.map_or_else(String::new, |fields| self.field_list(fields));
+        let suggestion = fields.and_then(|fields| self.field_suggestion(id, name, fields));
+        let mut error = Diagnostic::error(format!("{subject} has no field `{text}`"), member)
+            .with_note(note)
+            .with_suggestion(suggestion);
         // A path past a definition that may have been meant as a longer
         // definition's.
         if let Some(reference) = past {
@@ -16087,6 +16202,33 @@ impl<'a> Checker<'a> {
             read: ast.get(id).span,
             past: None,
         }
+    }
+
+    /// The suggestion for the field `name` that the field access `id` reads
+    /// and that its record, of the record type with `fields`, lacks (see
+    /// [Suggestions](#suggestions)): the field nearest it, written as a
+    /// field's name is, in place of the name as it is written, plain or
+    /// quoted.
+    fn field_suggestion(
+        &self,
+        id: ExprId,
+        name: Name,
+        fields: &[(Name, TyId)],
+    ) -> Option<(Span, String)> {
+        let expr = self.ast.get(id);
+        if !matches!(expr.kind, ExprKind::Field { .. }) {
+            return None;
+        }
+        let names = self.ast.names();
+        let text = names.get(name);
+        let candidates = fields
+            .iter()
+            .map(|&(field, _)| names.get(field))
+            .filter(|field| !crate::names::is_namespace_key(field))
+            .map(|field| (field, 0));
+        let best = suggest::best(text, candidates)?;
+        let span = self.ast.written_name(expr.span.end, text);
+        Some((span, FieldName(best).to_string()))
     }
 
     /// The note listing a record type's `fields`, in alphabetical order:
@@ -16638,8 +16780,10 @@ impl<'a> Checker<'a> {
             self.expr_vars[id.index()] = self.resolve(index, binding);
             return (self.builtin_use(id, binding.ty, span), binding.callback);
         }
+        let suggestion = self.variable_suggestion(name, span);
         let text = self.ast.names().get(name);
-        let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span);
+        let mut error = Diagnostic::error(format!("undefined variable `{text}`"), span)
+            .with_suggestion(suggestion);
         if text.contains('-') {
             error = error.with_note(
                 "names may contain `-`, so `x-1` is one name; write `x - 1` for subtraction",
@@ -16684,34 +16828,7 @@ impl<'a> Checker<'a> {
     /// earlier input. If so, it records the first such read as why the
     /// function cannot be used yet, and the read is not resolved.
     fn reads_between(&mut self, name: Name, found: Option<(usize, Binding)>) -> bool {
-        let Some((from, to)) = self.early else {
-            return false;
-        };
-        if self.checking_top.is_none() && self.checking_leaf.is_none() {
-            return false;
-        }
-        let inner = self
-            .functions
-            .first()
-            .map_or(usize::MAX, |function| function.bindings_start);
-        let top_range = self.top_start..self.top_end;
-        match found {
-            Some((index, _)) if index >= inner || top_range.contains(&index) => return false,
-            _ => {}
-        }
-        let mutable = found.is_some_and(|(_, binding)| binding.kind == BindingKind::Mutable);
-        let root = self.ast.items(self.ast.root());
-        let between = root.get(from..to).unwrap_or_default();
-        let Some((span, kind)) = between.iter().find_map(|&item| {
-            let declared = self.ast.item(item);
-            match declared.kind {
-                ItemKind::Spread(_) => Some((declared.span, BlockerKind::Spread)),
-                // A `:=` of a mutable variable declares nothing.
-                ItemKind::Rebind { .. } if mutable => None,
-                _ => (root_declares(self.ast, item) == Some(name))
-                    .then_some((declared.span, BlockerKind::Bound)),
-            }
-        }) else {
+        let Some((span, kind)) = self.early_blocker(name, found) else {
             return false;
         };
         let blocker = Some(Blocker { name, span, kind });
@@ -16724,6 +16841,110 @@ impl<'a> Checker<'a> {
             cell.blocker = cell.blocker.or(blocker);
         }
         true
+    }
+
+    /// What keeps a read of `name`, found as `found`, from being resolved
+    /// while a top-level function's body is checked early, as
+    /// [`Checker::reads_between`] says: the item between that declares it,
+    /// or a spread there, with where it is; `None` if nothing does.
+    fn early_blocker(
+        &self,
+        name: Name,
+        found: Option<(usize, Binding)>,
+    ) -> Option<(Span, BlockerKind)> {
+        let (from, to) = self.early?;
+        if self.checking_top.is_none() && self.checking_leaf.is_none() {
+            return None;
+        }
+        let inner = self
+            .functions
+            .first()
+            .map_or(usize::MAX, |function| function.bindings_start);
+        let top_range = self.top_start..self.top_end;
+        match found {
+            Some((index, _)) if index >= inner || top_range.contains(&index) => return None,
+            _ => {}
+        }
+        let mutable = found.is_some_and(|(_, binding)| binding.kind == BindingKind::Mutable);
+        let root = self.ast.items(self.ast.root());
+        let between = root.get(from..to).unwrap_or_default();
+        between.iter().find_map(|&item| {
+            let declared = self.ast.item(item);
+            match declared.kind {
+                ItemKind::Spread(_) => Some((declared.span, BlockerKind::Spread)),
+                // A `:=` of a mutable variable declares nothing.
+                ItemKind::Rebind { .. } if mutable => None,
+                _ => (root_declares(self.ast, item) == Some(name))
+                    .then_some((declared.span, BlockerKind::Bound)),
+            }
+        })
+    }
+
+    /// The suggestion for the undefined variable `name`, read at `span`
+    /// (see [Suggestions](#suggestions)): the name nearest it among the
+    /// bindings in scope and the roots of the file's view that a read here
+    /// would resolve. None in a file whose view sees one with syntax
+    /// errors, where the error is not reported.
+    fn variable_suggestion(&mut self, name: Name, span: Span) -> Option<(Span, String)> {
+        if self.sees_broken() {
+            return None;
+        }
+        // The top-level field whose initialiser is being checked: a read of
+        // it there would be of itself.
+        let declaring = self
+            .checking_leaf
+            .and_then(|node| self.field_cells.get(node as usize))
+            .and_then(|cell| cell.binding);
+        let innermost = self.block_start;
+        let function = self
+            .functions
+            .last()
+            .map_or(usize::MAX, |function| function.bindings_start);
+        let mut candidates: Vec<(Name, u8)> = Vec::new();
+        for (index, binding) in self.bindings.iter().enumerate() {
+            if Some(index) == declaring {
+                continue;
+            }
+            let rank = if index >= innermost {
+                0
+            } else if index >= function || index >= self.top_end {
+                1
+            } else if index >= self.top_start {
+                2
+            } else {
+                3
+            };
+            candidates.push((binding.name, rank));
+        }
+        if let Some(workspace) = self.workspace {
+            let roots = self
+                .view_roots
+                .get_or_insert_with(|| workspace.suggestion_roots());
+            candidates.extend(roots.iter().copied());
+        }
+        let names = self.ast.names();
+        let ranked = suggest::ranked(
+            names.get(name),
+            candidates
+                .into_iter()
+                .map(|(candidate, rank)| (names.get(candidate), rank, candidate)),
+        );
+        // The closest that a read here would resolve: looked for among those
+        // close enough alone, which are few.
+        let best = ranked.into_iter().find(|&candidate| {
+            if !crate::lexer::is_identifier(names.get(candidate)) {
+                return false;
+            }
+            let found = self.lookup(candidate);
+            if declaring.is_some() && found.map(|(index, _)| index) == declaring {
+                return false;
+            }
+            !self
+                .workspace
+                .is_some_and(|workspace| workspace.poisoned(candidate))
+                && self.early_blocker(candidate, found).is_none()
+        })?;
+        Some((span, names.get(best).to_owned()))
     }
 
     /// While a top-level leaf's initialiser is checked (see
@@ -18955,6 +19176,66 @@ fn leaf_label(segments: &[PathSegment]) -> &'static str {
 /// test. Rebinding the copy would not change the variable it was copied
 /// from, a mutable one included, so the note says how to keep the variable
 /// free to rebind.
+/// Which of the `count` parameters of a callee the arguments `args` fill,
+/// by position: the positional arguments the first, a trailing block the
+/// last, and each named argument the parameter `param_named` finds by its
+/// name. What a suggestion for an unknown argument leaves out, a parameter
+/// it would give twice.
+fn filled_by(
+    args: &[crate::ast::Arg],
+    count: usize,
+    param_named: impl Fn(Name) -> Option<usize>,
+) -> Vec<bool> {
+    let mut filled = vec![false; count];
+    let positional = args
+        .iter()
+        .filter(|arg| arg.kind == ArgKind::Positional)
+        .count();
+    for slot in filled.iter_mut().take(positional) {
+        *slot = true;
+    }
+    if positional < count
+        && args.iter().any(|arg| arg.kind == ArgKind::Trailing)
+        && let Some(last) = filled.last_mut()
+    {
+        *last = true;
+    }
+    for arg in args {
+        if let ArgKind::Named { name, .. } = arg.kind
+            && let Some(slot) = param_named(name).and_then(|at| filled.get_mut(at))
+        {
+            *slot = true;
+        }
+    }
+    filled
+}
+
+/// The error of the named argument `text`, written at `span`, of a call of
+/// `ast` whose arguments are `args`, that no parameter of the built-in
+/// function, named `params`, has: "unknown argument `x`", labelled `label`
+/// at the callee, at `callee`, suggesting the nearest of the parameters that
+/// no other argument fills (see [Suggestions](#suggestions)).
+fn unknown_builtin_argument(
+    ast: &Ast,
+    args: &[crate::ast::Arg],
+    params: &[&str],
+    ((text, span), (callee, label)): ((&str, Span), (Span, &str)),
+) -> Diagnostic {
+    let filled = filled_by(args, params.len(), |name| {
+        let text = ast.names().get(name);
+        params.iter().position(|&param| param == text)
+    });
+    let free = params
+        .iter()
+        .zip(&filled)
+        .filter(|&(_, &filled)| !filled)
+        .map(|(&param, _)| (param, 0));
+    let suggestion = suggest::best(text, free).map(|best| (span, best.to_owned()));
+    Diagnostic::error(format!("unknown argument `{text}`"), span)
+        .with_context(callee, label)
+        .with_suggestion(suggestion)
+}
+
 fn narrowed_rebind_error(text: &str, name_span: Span, binding: Binding) -> Diagnostic {
     let mut error = Diagnostic::error(
         format!("cannot rebind `{text}` here: it is narrowed by `is`"),
@@ -32646,5 +32927,180 @@ mod tests {
             "{REACH_T}{SPREAD_NAMES}xs: List<T> = [...if true {{ [ {{ a = 1 + \"x\" }} ] }} else {{ none }}]"
         );
         assert_eq!(messages(&text), vec!["cannot add Int and String"]);
+    }
+
+    /// Each error of `text` with its suggestion, as the text it replaces,
+    /// read from `text` at its span, and its replacement.
+    fn suggested(text: &str) -> Vec<(String, Option<(String, String)>)> {
+        diagnostics(text)
+            .into_iter()
+            .map(|diagnostic| {
+                let suggestion = diagnostic.suggestion.map(|found| {
+                    let span = found.span.start as usize..found.span.end as usize;
+                    (text[span].to_owned(), found.replacement)
+                });
+                (diagnostic.message, suggestion)
+            })
+            .collect()
+    }
+
+    /// The suggestion of the one error of `text`, as [`suggested`] shows it.
+    fn suggestion(text: &str) -> Option<(String, String)> {
+        let found = suggested(text);
+        assert_eq!(found.len(), 1, "{text}: {found:?}");
+        found
+            .into_iter()
+            .next()
+            .and_then(|(_, suggestion)| suggestion)
+    }
+
+    /// The suggestion to replace `written` with `replacement`, as
+    /// [`suggestion`] gives it: `written -> replacement`.
+    fn fix(fix: &str) -> Option<(String, String)> {
+        let (written, replacement) = fix.split_once(" -> ")?;
+        Some((written.to_owned(), replacement.to_owned()))
+    }
+
+    #[test]
+    fn an_undefined_variable_suggests_the_nearest_name_in_scope() {
+        let found = suggested("let version = 1\nx = versoin + 1");
+        assert_eq!(
+            found,
+            [(
+                "undefined variable `versoin`".to_owned(),
+                fix("versoin -> version")
+            )]
+        );
+        // A parameter, a field of the block being built, a name of the
+        // prelude.
+        assert_eq!(
+            suggestion("fn f(count: Int): Int { cuont }\nr = f(1)"),
+            fix("cuont -> count")
+        );
+        assert_eq!(
+            suggestion("r = { port = 80; next = prot + 1 }"),
+            fix("prot -> port")
+        );
+        assert_eq!(suggestion("n = lne(\"abc\")"), fix("lne -> len"));
+        // Differing in case only, which always qualifies.
+        assert_eq!(
+            suggestion("let Total = 1\nx = total"),
+            fix("total -> Total")
+        );
+        // Too far from every name: none.
+        assert_eq!(suggestion("let version = 1\nx = vrsn"), None);
+        // A short name: never another short one, only a longer one an edit
+        // away.
+        assert_eq!(suggestion("let y = 1\nx = z"), None);
+        assert_eq!(
+            suggestion("let ab = 1\nlet idx = 2\nx = id"),
+            fix("id -> idx")
+        );
+        // `x-1` is one name, as its note says, and not a misspelling of `x`.
+        assert_eq!(suggestion("let count = 1\nx = count-1"), None);
+    }
+
+    #[test]
+    fn a_name_not_usable_yet_is_never_suggested() {
+        // A `let` declared later in the block.
+        assert_eq!(
+            suggestion("fn f(): Int {\n    let a = valeu\n    let value = 1\n    a\n}\nr = f()"),
+            None
+        );
+        // A top-level `let` below the function, which the error labels.
+        let found = suggested("fn f(): Int { totl }\nlet total = 1\nr = f()");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].1, None);
+        // The field being declared, which would read itself.
+        assert_eq!(suggestion("count = coutn + 1"), None);
+        // But another field, wherever it is declared.
+        assert_eq!(
+            suggestion("count = countr + 1\ncounter = 1"),
+            fix("countr -> counter")
+        );
+        // The `fileroot` module, which is no value.
+        assert_eq!(suggestion("import fileroot\nx = filerootthis"), None);
+        // But a module misspelled where it is imported.
+        assert_eq!(
+            suggestion("import fileroo\nx = 1"),
+            fix("fileroo -> fileroot")
+        );
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_nearer_scope_then_the_first_in_alphabetical_order() {
+        assert_eq!(
+            suggestion("let cart = 1\nlet card = 2\nx = car"),
+            fix("car -> card")
+        );
+        assert_eq!(
+            suggestion("let card = 1\nfn f(): Int {\n    let cart = 2\n    car\n}\nr = f()"),
+            fix("car -> cart")
+        );
+    }
+
+    #[test]
+    fn a_missing_field_suggests_the_nearest_field_written_as_it_must_be() {
+        let found = suggested("let r = {port = 80; host = \"h\"}\nx = r.prot");
+        assert_eq!(
+            found,
+            [(
+                "no field `prot` in `{host: String, port: Int}`".to_owned(),
+                fix("prot -> port")
+            )]
+        );
+        // Quoted, the quotes replaced too; after a call, the name alone.
+        assert_eq!(
+            suggestion("let r = {port = 80}\nx = r.\"prot\""),
+            fix("\"prot\" -> port")
+        );
+        assert_eq!(
+            suggestion("fn g(): {port: Int} { {port = 80} }\nx = g().prot"),
+            fix("prot -> port")
+        );
+        // A field whose name must be quoted is suggested quoted.
+        assert_eq!(
+            suggestion("let r = {\"a b\" = 1}\nx = r.\"a c\""),
+            fix("\"a c\" -> \"a b\"")
+        );
+        // Differing in case only; too far.
+        assert_eq!(
+            suggestion("let r = {Port = 80}\nx = r.port"),
+            fix("port -> Port")
+        );
+        assert_eq!(suggestion("let r = {port = 80}\nx = r.host"), None);
+    }
+
+    #[test]
+    fn an_unknown_type_suggests_a_type_that_can_be_written_there() {
+        assert_eq!(suggestion("let x: Strng = \"a\""), fix("Strng -> String"));
+        assert_eq!(suggestion("let x: int = 1"), fix("int -> Int"));
+        // `List` takes a type argument: suggested only where one is given.
+        assert_eq!(suggestion("let x: Lst<Int> = []"), fix("Lst -> List"));
+        assert_eq!(suggestion("let x: Lst = 1"), None);
+        assert_eq!(suggestion("let x: Strig<Int> = 1"), None);
+    }
+
+    #[test]
+    fn an_unknown_argument_suggests_a_parameter_no_other_argument_fills() {
+        let text = "fn f(name: String, count: Int): Int { count }\nr = f(name = \"a\", cuont = 1)";
+        let found = suggested(text);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            found[0],
+            ("unknown argument `cuont`".to_owned(), fix("cuont -> count"))
+        );
+        // `name` is filled by position already: suggesting it would give it
+        // twice.
+        let found =
+            suggested("fn f(name: String, count: Int): Int { count }\nr = f(\"a\", nmae = 1)");
+        assert_eq!(found[0].0, "unknown argument `nmae`");
+        assert_eq!(found[0].1, None);
+        // A built-in function's parameters.
+        let found = suggested("r = exec(args = [\"true\"])");
+        assert_eq!(
+            found[0],
+            ("unknown argument `args`".to_owned(), fix("args -> argv"))
+        );
     }
 }
