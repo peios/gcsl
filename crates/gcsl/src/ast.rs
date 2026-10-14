@@ -1408,6 +1408,37 @@ pub enum ExprKind {
     /// silently. Only ever in a tree with syntax errors ([`Ast::syntax`]),
     /// which is never lowered.
     Error,
+    /// A field access with no name after its `.`, `EXPR.`, as an editor
+    /// leaves one half-typed: what the parser kept of it, its record,
+    /// which is checked as any expression is, the access itself of type
+    /// `Error` (see the parser's [Errors and
+    /// recovery](crate::parser#errors-and-recovery)). Only ever in a tree
+    /// with syntax errors, which is never lowered.
+    NoField(ExprId),
+    /// A call whose `(` is never closed, `callee(ARGS` at the end of the
+    /// input or of the block around it, as an editor leaves one
+    /// half-typed: what the parser kept of it, its callee and the
+    /// arguments it parsed, each checked as any expression is, the call
+    /// itself of type `Error` (see the parser's [Errors and
+    /// recovery](crate::parser#errors-and-recovery)). Only ever in a tree
+    /// with syntax errors, which is never lowered.
+    Unclosed {
+        /// The function called.
+        callee: ExprId,
+        /// The arguments parsed, in source order.
+        args: ArgRange,
+    },
+}
+
+impl ExprKind {
+    /// Whether it stands for source the parser could not parse, or could
+    /// not finish: an error node, a field access with no name, an unclosed
+    /// call. Only a tree with syntax errors has one, which is never
+    /// lowered.
+    #[must_use]
+    pub const fn is_unparsed(&self) -> bool {
+        matches!(self, Self::Error | Self::NoField(_) | Self::Unclosed { .. })
+    }
 }
 
 /// One node of the tree.
@@ -1460,7 +1491,9 @@ impl Expr {
             | ExprKind::Index { .. }
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
-            | ExprKind::Error => None,
+            | ExprKind::Error
+            | ExprKind::NoField(_)
+            | ExprKind::Unclosed { .. } => None,
         }
     }
 
@@ -3651,7 +3684,8 @@ impl Ast {
                 | ExprKind::Index { expr: inner, .. }
                 | ExprKind::Ascribe { expr: inner, .. }
                 | ExprKind::Is { expr: inner, .. }
-                | ExprKind::As { expr: inner, .. } => inner,
+                | ExprKind::As { expr: inner, .. }
+                | ExprKind::NoField(inner) => inner,
                 // A parameter's default, and a field's default in a
                 // parameter's or the return type, is parsed before the body.
                 ExprKind::Fn(function) => {
@@ -3666,7 +3700,7 @@ impl Ast {
                 }
                 ExprKind::Lazy(function) => self.fn_decl(function).body,
                 ExprKind::DefTypeRef(def) => self.def_type(def).dt,
-                ExprKind::Call { callee, .. } => callee,
+                ExprKind::Call { callee, .. } | ExprKind::Unclosed { callee, .. } => callee,
                 ExprKind::For(id) => {
                     let decl = self.for_decl(id);
                     match decl.head {
@@ -4506,6 +4540,8 @@ impl<A: Annotate> Pretty<'_, A> {
                 write!(f, "def-type-ref {def_type} {path}")
             }
             ExprKind::Error => f.write_str("error"),
+            ExprKind::NoField(_) => f.write_str(". <missing>"),
+            ExprKind::Unclosed { .. } => f.write_str("unclosed call"),
         }
     }
 
@@ -4591,7 +4627,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 f.write_str("\n")?;
                 self.node(f, self.ast.fn_decl(function).body, depth + 1)?;
             }
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
                 f.write_str("\n")?;
                 self.node(f, callee, depth + 1)?;
                 self.args(f, args, depth + 1)?;
@@ -4606,6 +4642,7 @@ impl<A: Annotate> Pretty<'_, A> {
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::Field { expr: operand, .. }
+            | ExprKind::NoField(operand)
             | ExprKind::Ascribe { expr: operand, .. }
             | ExprKind::Is { expr: operand, .. }
             | ExprKind::As { expr: operand, .. } => {

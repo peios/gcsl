@@ -816,7 +816,7 @@ const ROOT: u32 = u32::MAX;
 pub const STANDARD_DIR: &str = "<stdlib>";
 
 /// The name of the module of built-in functions.
-const BUILTINS: &str = "builtins";
+pub(crate) const BUILTINS: &str = "builtins";
 
 /// The stem of the prelude, the standard file every scan loads.
 const PRELUDE: &str = "prelude";
@@ -1612,6 +1612,13 @@ impl Scan {
     #[must_use]
     pub fn standard(&self) -> u32 {
         self.standard
+    }
+
+    /// Whether the scan is of one file outside any workspace, a lone file
+    /// or a session's input, which imports nothing but the standard
+    /// library's modules.
+    pub(crate) fn is_lone(&self) -> bool {
+        self.lone
     }
 
     /// The standard file whose stem is `stem`, if the scan loaded one.
@@ -4627,7 +4634,7 @@ impl Scan {
     /// The types of `target`, a directory or a file, as indices in
     /// [`Scan::types`], in order: a directory's, each the first of its name
     /// among its files', and a file's own. Any other target has none.
-    fn target_types(&self, target: Target) -> Vec<u32> {
+    pub(crate) fn target_types(&self, target: Target) -> Vec<u32> {
         match target {
             Target::Dir(dir) => self.dir_types.get(dir as usize).cloned(),
             Target::File(file) => self.files.get(file as usize).map(|f| f.types.clone()),

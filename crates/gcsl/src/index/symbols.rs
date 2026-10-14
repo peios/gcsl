@@ -312,13 +312,13 @@ impl Index {
 
     /// The type of the expression `id` of file `file`, as its check left
     /// it.
-    fn expr_type(&self, file: u32, id: ExprId) -> Option<TyId> {
+    pub(super) fn expr_type(&self, file: u32, id: ExprId) -> Option<TyId> {
         let types = &self.files.get(file as usize)?.types;
         types.get(id.index()).copied().and_then(known)
     }
 
     /// `ty` on one line, cut to [`DETAIL`] characters.
-    fn short(&self, ty: TyId) -> Option<String> {
+    pub(super) fn short(&self, ty: TyId) -> Option<String> {
         let shown = self.one_line(ty);
         let line = shown.lines().next()?.trim();
         if line.chars().count() <= DETAIL {

@@ -53,7 +53,9 @@ enum Command {
     /// each file's errors and warnings as it is edited, answering hover,
     /// go-to-definition, references, highlights, rename (checked before it
     /// is offered; it renames no file or directory), document and workspace
-    /// symbols, and formatting. Checks only: runs nothing.
+    /// symbols, formatting, completion (after `.`, of names in scope, of
+    /// types, of import paths) and signature help. Checks only: runs
+    /// nothing.
     Lsp,
 }
 

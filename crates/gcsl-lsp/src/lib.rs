@@ -1,7 +1,8 @@
 //! `gcsl lsp`: a language server for GCSL, which reports each file's errors
 //! and warnings as it is edited, answers what a name is (hover), where it
 //! is declared (go to definition) and written (references, highlights),
-//! renames it, lists symbols, and formats.
+//! renames it, lists symbols, formats, completes what is being typed, and
+//! shows the signature of the call being written.
 //!
 //! It speaks LSP through `lsp-server`, synchronously, on stdin and stdout
 //! ([`stdio`]), or on any [`Connection`] ([`serve`]); it logs to stderr
@@ -16,8 +17,10 @@
 //! incremental changes, and saves), `hoverProvider`, `definitionProvider`,
 //! `referencesProvider`, `documentHighlightProvider`, `renameProvider`
 //! (with `prepareProvider`), `documentSymbolProvider`,
-//! `workspaceSymbolProvider`, `documentFormattingProvider` and
-//! `documentRangeFormattingProvider`. It answers `shutdown`, and any
+//! `workspaceSymbolProvider`, `documentFormattingProvider`,
+//! `documentRangeFormattingProvider`, `completionProvider` (triggered by
+//! `.`, with no `completionItem/resolve`) and `signatureHelpProvider`
+//! (triggered by `(` and `,`, retriggered by `,`). It answers `shutdown`, and any
 //! request after it with an error; `exit` ends it, cleanly after a
 //! `shutdown`, else not ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
@@ -26,9 +29,10 @@
 //! for watched files dynamically, the server asks it to watch `**/*.gcsl`.
 //!
 //! QUERIES. `textDocument/hover`, `definition`, `references`,
-//! `documentHighlight`, `prepareRename`, `rename` and `documentSymbol`, and
-//! `workspace/symbol`, are answered from the index the latest check of the
-//! document's workspace, or lone file, made (see [`gcsl::index`]):
+//! `documentHighlight`, `prepareRename`, `rename`, `documentSymbol`,
+//! `completion` and `signatureHelp`, and `workspace/symbol`, are answered
+//! from the index the latest check of the document's workspace, or lone
+//! file, made (see [`gcsl::index`]):
 //!
 //! - a hover as Markdown, with the range of the name or segment hovered:
 //!   what it is, its doc comment (the `#` lines directly above its
@@ -52,12 +56,31 @@
 //!   workspace's, matched by a subsequence of the query ignoring case in
 //!   every workspace and lone file the server has indexed, as
 //!   `WorkspaceSymbol`s, 200 at most;
+//! - a completion as a `CompletionList`, never incomplete, the client
+//!   filtering by what is typed: after a `.`, the fields of what is before
+//!   it (a record's, a node's children, a module's members); in a type, the
+//!   types in scope; in an `import`'s path, the directories, files and
+//!   standard modules by segment; after a def-type's name, the definitions
+//!   under the path; elsewhere every name in scope, nearest first by
+//!   `sortText` (locals, the file's, its directories', imported, the
+//!   standard library's, then keywords); each with its kind, its type as
+//!   `detail` and its doc comment, and an `insertText` only for a name
+//!   that must be quoted. Nothing, an empty list, in a string or a comment
+//!   or where a name is declared;
+//! - signature help as one signature, the callee's, each parameter as
+//!   offsets in its label, counted in the negotiated encoding, with the
+//!   active parameter: the one a named argument names, else the next one
+//!   the arguments before the place have not filled; in a trailing block,
+//!   the last;
 //!
 //! and `null` for nothing there, for a hover of what has no type the check
-//! found, and for a definition of what the standard library or a built-in
-//! declares, which has no file on disk. A file with errors is indexed for
-//! everything that resolved, and so is one that needs a file whose check
-//! failed; one whose braces do not match has nothing indexed. A query waits
+//! found, for a definition of what the standard library or a built-in
+//! declares, which has no file on disk, and for signature help outside a
+//! call. A file with errors is indexed for everything that resolved, and so
+//! is one that needs a file whose check failed, and the parser keeps what
+//! an editor leaves half-typed, `a.` and an unclosed `f(`, so that what is
+//! before them is indexed; one whose braces do not match has nothing
+//! indexed. A query waits
 //! for the worker as a check does, and is handed over before any check
 //! due: if a document of the workspace has changed since its index was
 //! made, the worker checks it at once, skipping the quiet period, publishes
@@ -182,18 +205,19 @@ use lsp_types::notification::{
     DidOpenTextDocument, DidSaveTextDocument, Notification as _,
 };
 use lsp_types::request::{
-    DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-    PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename, Request as _,
-    WorkspaceSymbolRequest,
+    Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
+    HoverRequest, PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename,
+    Request as _, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
-    DocumentHighlightParams, DocumentRangeFormattingParams, DocumentSymbolParams,
-    FileSystemWatcher, GlobPattern, HoverProviderCapability, InitializeResult, NumberOrString,
-    OneOf, Position, ReferenceParams, Registration, RegistrationParams, RenameOptions,
-    RenameParams, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    CancelParams, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentFormattingParams, DocumentHighlightParams, DocumentRangeFormattingParams,
+    DocumentSymbolParams, FileSystemWatcher, GlobPattern, HoverProviderCapability,
+    InitializeResult, NumberOrString, OneOf, Position, ReferenceParams, Registration,
+    RegistrationParams, RenameOptions, RenameParams, ServerCapabilities, ServerInfo,
+    SignatureHelpOptions, SignatureHelpParams, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, Uri, WorkspaceSymbolParams,
 };
@@ -353,6 +377,16 @@ fn initialize_result(encoding: Encoding) -> Value {
             workspace_symbol_provider: Some(OneOf::Left(true)),
             document_formatting_provider: Some(OneOf::Left(true)),
             document_range_formatting_provider: Some(OneOf::Left(true)),
+            completion_provider: Some(CompletionOptions {
+                trigger_characters: Some(vec![".".to_owned()]),
+                resolve_provider: Some(false),
+                ..CompletionOptions::default()
+            }),
+            signature_help_provider: Some(SignatureHelpOptions {
+                trigger_characters: Some(vec!["(".to_owned(), ",".to_owned()]),
+                retrigger_characters: Some(vec![",".to_owned()]),
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+            }),
             ..ServerCapabilities::default()
         },
         server_info: Some(ServerInfo {
@@ -665,6 +699,8 @@ impl Server<'_> {
             | PrepareRenameRequest::METHOD
             | Rename::METHOD
             | DocumentSymbolRequest::METHOD
+            | Completion::METHOD
+            | SignatureHelpRequest::METHOD
             | WorkspaceSymbolRequest::METHOD => return self.ask(request),
             Formatting::METHOD | RangeFormatting::METHOD => self.format(request),
             method => Response::new_err(
@@ -997,6 +1033,14 @@ fn asked(method: &str, params: Value) -> serde_json::Result<(Uri, Position, Aske
             let params: DocumentSymbolParams = serde_json::from_value(params)?;
             let start = Position::default();
             (params.text_document.uri, start, Asked::DocumentSymbols)
+        }
+        Completion::METHOD => {
+            let params: CompletionParams = serde_json::from_value(params)?;
+            at(params.text_document_position, Asked::Completion)
+        }
+        SignatureHelpRequest::METHOD => {
+            let params: SignatureHelpParams = serde_json::from_value(params)?;
+            at(params.text_document_position_params, Asked::SignatureHelp)
         }
         _ => at(serde_json::from_value(params)?, Asked::Hover),
     })
@@ -1666,6 +1710,95 @@ mod tests {
     }
 
     #[test]
+    fn completion_and_signature_help_are_offered() {
+        let (client, result) = Client::start(&["utf-8"]);
+        let capabilities = &result["capabilities"];
+        assert_eq!(
+            capabilities["completionProvider"],
+            json!({ "triggerCharacters": ["."], "resolveProvider": false })
+        );
+        assert_eq!(
+            capabilities["signatureHelpProvider"],
+            json!({ "triggerCharacters": ["(", ","], "retriggerCharacters": [","] })
+        );
+        client.shut_down().unwrap();
+    }
+
+    /// The labels of the completion list `list`.
+    fn completion_labels(list: &Value) -> Vec<String> {
+        assert_eq!(list["isIncomplete"], false, "{list}");
+        list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["label"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_completion_just_after_a_dot_is_typed_is_of_the_new_text_in_each_encoding() {
+        // `é` is two bytes and one UTF-16 unit, `😀` four bytes and two: the
+        // end of `c` is at character 24 in utf-8, 21 in utf-16.
+        let text = "c = {port = 80; host = \"h\"}\nt = {s = \"é😀\"; v = c}\n";
+        for (encoding, at) in [("utf-8", 24), ("utf-16", 21)] {
+            let scratch = Scratch::workspace(&format!("complete-{encoding}"), "");
+            let uri = scratch.write("app.gcsl", text);
+            let (mut client, _) = Client::start(&[encoding]);
+            client.open(&uri, text);
+            client.published(&uri);
+            // Typed: `c.`, and completion asked at once, after the `.`.
+            client.change(&uri, 2, ((1, at), (1, at)), ".");
+            let list = client.ask("textDocument/completion", &uri, (1, at + 1));
+            assert_eq!(completion_labels(&list), ["host", "port"], "{encoding}");
+            let port = &list["items"][1];
+            assert_eq!(port["kind"], 5, "{encoding}: a field");
+            assert_eq!(port["detail"], "Int", "{encoding}");
+            // A name: the file's, the standard library's, keywords.
+            let list = client.ask("textDocument/completion", &uri, (2, 0));
+            let labels = completion_labels(&list);
+            for label in ["c", "t", "len", "if"] {
+                assert!(labels.iter().any(|l| l == label), "{encoding}: {labels:?}");
+            }
+            // In a string: an empty list.
+            let list = client.ask("textDocument/completion", &uri, (1, 10));
+            assert_eq!(completion_labels(&list), Vec::<String>::new(), "{encoding}");
+            client.shut_down().unwrap();
+        }
+    }
+
+    #[test]
+    fn signature_help_names_the_active_parameter() {
+        let scratch = Scratch::workspace("signature", "");
+        let text = "# Adds.\ndef f(a: Int, b: String): Int { a }\nr = f(1, \"s\")\n";
+        let uri = scratch.write("app.gcsl", text);
+        for encoding in ["utf-8", "utf-16"] {
+            let (mut client, _) = Client::start(&[encoding]);
+            client.open(&uri, text);
+            let help = client.ask("textDocument/signatureHelp", &uri, (2, 9));
+            let label = "def f(a: Int, b: String): Int";
+            assert_eq!(help["signatures"][0]["label"], label, "{encoding}");
+            assert_eq!(
+                help["signatures"][0]["parameters"],
+                json!([{ "label": [6, 12] }, { "label": [14, 23] }]),
+                "{encoding}"
+            );
+            assert_eq!(help["signatures"][0]["documentation"]["value"], "Adds.");
+            assert_eq!(help["activeSignature"], 0);
+            assert_eq!(help["activeParameter"], 1, "{encoding}");
+            // Typed: `f(` at the end of the file, unclosed.
+            client.change(&uri, 2, ((3, 0), (3, 0)), "q = f(");
+            let help = client.ask("textDocument/signatureHelp", &uri, (3, 6));
+            assert_eq!(help["activeParameter"], 0, "{encoding}");
+            // Outside any call: nothing.
+            assert_eq!(
+                client.ask("textDocument/signatureHelp", &uri, (2, 0)),
+                Value::Null
+            );
+            client.shut_down().unwrap();
+        }
+    }
+
+    #[test]
     fn whitespace_and_keywords_have_nothing() {
         let scratch = Scratch::workspace("nothing-there", "");
         let text = "fn f(a: Int): Int {  a }\nr = f(1)\n";
@@ -2138,6 +2271,78 @@ mod tests {
                 warm[warm.len() - 1],
                 changed[changed.len() / 2],
                 changed[changed.len() - 1],
+            );
+        }
+        client.shut_down().unwrap();
+    }
+
+    /// The time of a completion and of signature help, on a small workspace,
+    /// and on the one at `$GCSL_LSP_BENCH` if it is set, its
+    /// `workspace.gcsl` opened with two lines added, in memory only: warm,
+    /// and just after a keystroke, which the query checks first. Run with
+    /// `--ignored --nocapture` to see it.
+    #[test]
+    #[ignore = "a measurement, not a test"]
+    fn time_of_a_completion_and_signature_help() {
+        let scratch = Scratch::workspace("typing-latency", "");
+        let uri = scratch.write("app.gcsl", "x = 1\n");
+        measure_typing("a small workspace", &uri, "x = 1\n");
+        if let Some(root) = std::env::var_os("GCSL_LSP_BENCH") {
+            let path = fs::canonicalize(root).unwrap().join(WORKSPACE);
+            let text = fs::read_to_string(&path).unwrap();
+            let uri = uri_of(&path).unwrap();
+            measure_typing("$GCSL_LSP_BENCH", &uri, &text);
+        }
+    }
+
+    /// Opens the document `uri` as `text` with a record and a probe line
+    /// after it, then twenty times types a key and asks at once (a `.`
+    /// after the probe's name and a completion; a `(` after `len` and
+    /// signature help), asks again warm, and takes the key away; and
+    /// reports the times.
+    fn measure_typing(name: &str, uri: &Uri, text: &str) {
+        let mut text = text.to_owned();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let first = u32::try_from(text.matches('\n').count()).unwrap() + 1;
+        text.push_str("lsp_base = {a = 1}\nlsp_probe = lsp_base\nlsp_call = len\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(uri, &text);
+        client.ask("textDocument/completion", uri, (first, 0));
+        let mut version = 1;
+        for (method, (line, end), key, wanted) in [
+            ("textDocument/completion", (first, 20), ".", "\"a\""),
+            (
+                "textDocument/signatureHelp",
+                (first + 1, 14),
+                "(",
+                "list: List<T>",
+            ),
+        ] {
+            let (mut warm, mut typed) = (Vec::new(), Vec::new());
+            for _ in 0..20 {
+                version += 1;
+                let start = Instant::now();
+                client.change(uri, version, ((line, end), (line, end)), key);
+                let answer = client.ask(method, uri, (line, end + 1));
+                typed.push(start.elapsed());
+                assert!(answer.to_string().contains(wanted), "{answer}");
+                let start = Instant::now();
+                client.ask(method, uri, (line, end + 1));
+                warm.push(start.elapsed());
+                version += 1;
+                client.change(uri, version, ((line, end), (line, end + 1)), "");
+            }
+            warm.sort();
+            typed.sort();
+            let _ = writeln!(
+                io::stderr(),
+                "{method}, {name}: warm median {:?} (max {:?}), after a keystroke median {:?} (max {:?})",
+                warm[warm.len() / 2],
+                warm[warm.len() - 1],
+                typed[typed.len() / 2],
+                typed[typed.len() - 1],
             );
         }
         client.shut_down().unwrap();

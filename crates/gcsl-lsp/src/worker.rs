@@ -5,8 +5,9 @@
 //! The main thread hands it a [`Job`] at a time ([`spawn`]): a [`Check`],
 //! the snapshot of the open documents of one workspace, or of one lone
 //! file, as they are when it is handed over; a [`Query`], a hover, a
-//! definition, references, highlights, a rename or its preparation, or a
-//! document's symbols asked of an open document, with such a snapshot; a
+//! definition, references, highlights, a rename or its preparation, a
+//! document's symbols, a completion or signature help asked of an open
+//! document, with such a snapshot; a
 //! [`Job::Symbols`], `workspace/symbol`, with a snapshot of every
 //! workspace and lone file known; or a [`Job::Clear`] of a workspace or
 //! lone file there is no more to say of. It says on its `done` channel when
@@ -72,16 +73,20 @@ use std::time::SystemTime;
 
 use crossbeam_channel::{Receiver, Sender};
 use gcsl::diagnostic::Renderer;
-use gcsl::index::{DocumentSymbol, Edit, Index, Indexed, SymbolKind};
+use gcsl::index::{
+    Completion, CompletionKind, DocumentSymbol, Edit, Index, Indexed, Signature, SymbolKind,
+};
 use gcsl::workspace;
 use gcsl::{Diagnostic, Severity, SourceFile, Span};
 use gcsl_disk::{ReadError, Sources};
 use lsp_server::{ErrorCode, Message, Notification, RequestId, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    DiagnosticRelatedInformation, DiagnosticSeverity, DocumentHighlight, DocumentHighlightKind,
+    CompletionItem, CompletionItemKind, CompletionList, DiagnosticRelatedInformation,
+    DiagnosticSeverity, DocumentHighlight, DocumentHighlightKind, Documentation,
     GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent, MarkupKind, MessageType,
-    OneOf, Position, PublishDiagnosticsParams, ShowMessageParams, TextEdit, Uri, WorkspaceSymbol,
+    OneOf, ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams,
+    ShowMessageParams, SignatureHelp, SignatureInformation, TextEdit, Uri, WorkspaceSymbol,
 };
 use serde_json::{Map, Value, json};
 
@@ -154,6 +159,10 @@ pub enum Asked {
     Rename(String),
     /// `textDocument/documentSymbol`, which has no position.
     DocumentSymbols,
+    /// `textDocument/completion`.
+    Completion,
+    /// `textDocument/signatureHelp`.
+    SignatureHelp,
 }
 
 /// The most symbols a `workspace/symbol` answers with.
@@ -870,6 +879,9 @@ impl Kept {
                     .collect();
                 Some(Ok(Value::Array(symbols)))
             }
+            Asked::Completion | Asked::SignatureHelp => {
+                Some(typing(index, &asked, (file, offset), encoding))
+            }
         };
         Ok(answer.and_then(Result::ok).unwrap_or(Value::Null))
     }
@@ -982,6 +994,98 @@ fn symbol_json(symbol: &DocumentSymbol, lines: &LineIndex<'_>, encoding: Encodin
         shown["children"] = Value::Array(children);
     }
     shown
+}
+
+/// The answer of `index` to `asked`, a completion or signature help, at
+/// byte `offset` of the file of input number `file`, positions counted in
+/// `encoding`: a `CompletionList`, empty for nothing to offer, or a
+/// `SignatureHelp`, `null` for no call there.
+fn typing(
+    index: &Index,
+    asked: &Asked,
+    (file, offset): (u32, u32),
+    encoding: Encoding,
+) -> serde_json::Result<Value> {
+    if *asked == Asked::SignatureHelp {
+        return match index.signature(file, offset) {
+            Some(found) => serde_json::to_value(signature_help(&found, encoding)),
+            None => Ok(Value::Null),
+        };
+    }
+    let items = index
+        .completion(file, offset)
+        .into_iter()
+        .map(completion_item)
+        .collect();
+    serde_json::to_value(CompletionList {
+        is_incomplete: false,
+        items,
+    })
+}
+
+/// `found`, a completion, as LSP's `CompletionItem`: its label, kind,
+/// detail, documentation as Markdown, the text it is ordered by, and what
+/// is written, if that is not its label.
+fn completion_item(found: Completion) -> CompletionItem {
+    let kind = match found.kind {
+        CompletionKind::Variable => CompletionItemKind::VARIABLE,
+        CompletionKind::Field => CompletionItemKind::FIELD,
+        CompletionKind::Function => CompletionItemKind::FUNCTION,
+        CompletionKind::Module => CompletionItemKind::MODULE,
+        CompletionKind::Type => CompletionItemKind::STRUCT,
+        CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+    };
+    CompletionItem {
+        label: found.label,
+        kind: Some(kind),
+        detail: found.detail,
+        documentation: found.documentation.map(|value| {
+            Documentation::MarkupContent(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            })
+        }),
+        sort_text: Some(found.sort),
+        insert_text: found.insert,
+        ..CompletionItem::default()
+    }
+}
+
+/// `found`, a call's signature, as LSP's `SignatureHelp`, its one
+/// signature's parameters as offsets in its label counted in `encoding`.
+fn signature_help(found: &Signature, encoding: Encoding) -> SignatureHelp {
+    let count = |at: u32| {
+        let before = found.label.get(..at as usize).unwrap_or_default();
+        let units = match encoding {
+            Encoding::Utf8 => before.len(),
+            Encoding::Utf16 => before.encode_utf16().count(),
+        };
+        u32::try_from(units).unwrap_or(u32::MAX)
+    };
+    let parameters = found
+        .params
+        .iter()
+        .map(|&(start, end)| ParameterInformation {
+            label: ParameterLabel::LabelOffsets([count(start), count(end)]),
+            documentation: None,
+        })
+        .collect();
+    let documentation = found.documentation.clone().map(|value| {
+        Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        })
+    });
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: found.label.clone(),
+            documentation,
+            parameters: Some(parameters),
+            active_parameter: None,
+        }],
+        active_signature: Some(0),
+        active_parameter: found.active,
+    }
 }
 
 /// LSP's kind of a symbol of `kind`.

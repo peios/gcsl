@@ -1828,12 +1828,13 @@ impl Walker<'_> {
             ExprKind::Paren(expr)
             | ExprKind::Ascribe { expr, .. }
             | ExprKind::Is { expr, .. }
-            | ExprKind::As { expr, .. } => self.expr(expr),
+            | ExprKind::As { expr, .. }
+            | ExprKind::NoField(expr) => self.expr(expr),
             ExprKind::Name(name) => self.name(name, ast.get(id).span),
             ExprKind::Block { items, .. } => self.block(items),
             ExprKind::Fn(function) => self.function(function),
             ExprKind::Lazy(function) => self.expr(ast.fn_decl(function).body),
-            ExprKind::Call { callee, args } => {
+            ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
                 self.expr(callee);
                 for arg in ast.args(args) {
                     self.expr(arg.value);

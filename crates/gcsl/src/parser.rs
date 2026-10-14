@@ -756,6 +756,27 @@
 //!   error, which may have meant something else for it, and attributes
 //!   waiting for an item that fails are dropped.
 //!
+//! Two constructs an editor leaves half-typed are kept, for a language
+//! server, which completes what is typed after them, rather than failing
+//! what they are in: their error is reported as it was, and the parse goes
+//! on. A field access with no name after its `.`, `a.`, where what follows
+//! may end an expression in the innermost bracket open
+//! (`Parser::ends_unfinished`: the end of a line or of the input, a `;`, a
+//! `}` of a block, the `)` or `]` of the bracket open, or a `,` in one) is a
+//! [`ExprKind::NoField`] of its record, which is checked as any expression
+//! is; where anything else follows, it fails as before. A call whose
+//! argument list ends where no `)` is, at the end of the input or at the
+//! `}` of the block around it, which closes the `(` too, is an
+//! [`ExprKind::Unclosed`] of its callee and of the arguments it parsed (an
+//! argument that failed leaves nothing of it), from its callee through the
+//! last token it went on to; since the lexer emits no newline inside a
+//! `(`, that is the rest of the file, or of the block, each line of it
+//! parsed as an argument (`q = 2` a named one). A list that ends at its
+//! `)` with an error fails as before. The bracket of a list or of
+//! parentheses whose `,`, `)` or `]` is missing at the token a `.` with no
+//! name was reported at, the end of the input or a `}`, is not reported
+//! again (`Parser::report_close`).
+//!
 //! An item, or a value, that fails having gone on past a newline, as it
 //! does after an operator, `=`, `:` or `let`, to a line that is an item of
 //! its own (`Parser::item_line`: a `let`, `fn NAME`, `def`, `import`,
@@ -1262,11 +1283,22 @@ enum Braces {
 
 /// Proof that an error is on record: pushed to the parser's sink, or, for
 /// one at a [`TokenKind::Error`], the lexer's. Only [`Parser::report`]
-/// creates one.
+/// creates one, and [`Parser::report_close`], for an error on record at its
+/// place already.
 #[derive(Debug)]
 struct Reported;
 
 type ParseResult<T> = Result<T, Reported>;
+
+/// How an argument of a call failed: its value, or the separator after it,
+/// the argument parsed.
+#[derive(Debug)]
+enum Entry {
+    /// The value.
+    Value(Reported),
+    /// The separator after it.
+    Separator(Reported),
+}
 
 struct Parser<'a> {
     tokens: &'a [Token],
@@ -3621,7 +3653,7 @@ impl Parser<'_> {
             }
             _ => {
                 let found = self.describe(separator);
-                Err(self.report(
+                Err(self.report_close(
                     Diagnostic::error(
                         format!("expected `,` or `)`, found {found}"),
                         error_span(separator),
@@ -3630,6 +3662,68 @@ impl Parser<'_> {
                 ))
             }
         }
+    }
+
+    /// The field access of `record` whose `.`, `dot`, is followed by no
+    /// name but by `next`: "expected a field name after `.`", and, as an
+    /// editor leaves one half-typed, if `next` may end it there
+    /// ([`Parser::ends_unfinished`]), a [`ExprKind::NoField`] of the record,
+    /// spanning it through the `.`; else the error.
+    fn no_field(&mut self, record: ExprId, dot: Token, next: Token) -> ParseResult<ExprId> {
+        let reported = self.error("expected a field name after `.`", error_span(next));
+        if !self.ends_unfinished(next.kind) {
+            return Err(reported);
+        }
+        let span = Span::join(self.span_of(record), dot.span);
+        let height = self.height_of(record) + 1;
+        self.alloc(ExprKind::NoField(record), span, height)
+    }
+
+    /// Whether a field access whose `.` is followed by the token of `kind`,
+    /// no name, ends there as an editor leaves one half-typed, `a.` (see
+    /// [Errors and recovery](#errors-and-recovery)): what may end an
+    /// expression where it is, in the innermost bracket open, the lexer's
+    /// way ([`nest`]): the end of a line or of the input, a `;` or the `}`
+    /// of a block (which closes a `(` or `[` open in it too), the `)` or `]`
+    /// of the bracket open, or a `,` in one. Costs a walk of the tokens
+    /// before it, on an error only.
+    fn ends_unfinished(&self, kind: TokenKind) -> bool {
+        let mut nesting = Nesting::default();
+        for index in 0..self.pos {
+            nest(&mut nesting, self.token_at(index).kind);
+        }
+        let open = &nesting.open;
+        let inner = open.last().copied();
+        match kind {
+            TokenKind::Eof => true,
+            TokenKind::Newline | TokenKind::Semi => matches!(inner, None | Some(Open::Brace)),
+            TokenKind::RBrace => {
+                inner != Some(Open::Str)
+                    && open
+                        .get(nesting.strings.last().map_or(0, |&at| at + 1)..)
+                        .is_some_and(|inside| inside.contains(&Open::Brace))
+            }
+            TokenKind::RParen => inner == Some(Open::Paren),
+            TokenKind::RBracket => inner == Some(Open::Square),
+            TokenKind::Comma => matches!(inner, Some(Open::Paren | Open::Square)),
+            _ => false,
+        }
+    }
+
+    /// Reports `diagnostic`, of a list's separator or a closing bracket
+    /// missing at a token, unless an error is reported at that token
+    /// already: a field access's with no name before it, `f(a.` at the end
+    /// of the input or before the `}` around it, whose error is there, and
+    /// the bracket is reported unclosed by it.
+    fn report_close(&mut self, diagnostic: Diagnostic) -> Reported {
+        if self
+            .diagnostics
+            .last()
+            .is_some_and(|last| last.span == diagnostic.span)
+        {
+            return Reported;
+        }
+        self.report(diagnostic)
     }
 
     /// Consumes the return marker of a function or function type, `:` for a
@@ -3821,9 +3915,8 @@ impl Parser<'_> {
                 self.advance();
                 let name_token = self.peek();
                 let Some(name) = self.field_name()? else {
-                    return Err(
-                        self.error("expected a field name after `.`", error_span(name_token))
-                    );
+                    lhs = self.no_field(lhs, token, name_token)?;
+                    continue;
                 };
                 let span = Span::join(self.span_of(lhs), name_token.span);
                 let height = self.height_of(lhs) + 1;
@@ -4218,7 +4311,21 @@ impl Parser<'_> {
             let outer = std::mem::replace(&mut self.braces, Braces::Free);
             let close = self.parse_arguments(open, &mut tallest);
             self.braces = outer;
-            end = close?;
+            let Some(close) = close? else {
+                // Never closed: what was parsed of it is kept, for an
+                // editor, through the last token it went on to.
+                let args = self.builder.push_args(&self.arg_stack[base..]);
+                self.arg_stack.truncate(base);
+                let last = self.token_at(self.pos.saturating_sub(1)).span;
+                let last = if last.end > open.span.end {
+                    last
+                } else {
+                    open.span
+                };
+                let span = Span::join(self.span_of(callee), last);
+                return self.alloc(ExprKind::Unclosed { callee, args }, span, tallest + 1);
+            };
+            end = close;
         }
         if self.peek().kind == TokenKind::LBrace && self.braces == Braces::Free {
             let block = self.parse_block()?;
@@ -4239,34 +4346,56 @@ impl Parser<'_> {
     /// `)`, whose span it returns, pushing each on `arg_stack` and raising
     /// `tallest` to the tallest's height. An identifier directly followed
     /// by `=` names its argument. An argument that fails is skipped to its
-    /// `,`, and the list goes on, to fail at its end (see [Errors and
-    /// recovery](#errors-and-recovery)).
-    fn parse_arguments(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Span> {
+    /// `,`, nothing of it left in the tree, and the list goes on, to fail at
+    /// its end (see [Errors and recovery](#errors-and-recovery)); but a list
+    /// that ends where no `)` is, at the end of the input or at the `}`
+    /// around it, which closes it, is the unclosed call's, `None`, the
+    /// arguments parsed pushed.
+    fn parse_arguments(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Option<Span>> {
         let mut failed = None;
         loop {
             let start = self.pos;
             let token = self.peek();
             if token.kind == TokenKind::RParen {
                 self.advance();
-                return failed.map_or(Ok(token.span), Err);
+                return failed.map_or(Ok(Some(token.span)), Err);
             }
-            match self.parse_argument(open, tallest) {
-                Ok(Some(close)) => return failed.map_or(Ok(close), Err),
-                Ok(None) => {}
-                Err(reported) => {
-                    if self.recover_entry(start, TokenKind::RParen) {
-                        return Err(reported);
-                    }
-                    failed = Some(reported);
+            let marks = self.marks();
+            let (reported, kept) = match self.parse_argument(open, tallest) {
+                Ok(Some(close)) => return failed.map_or(Ok(Some(close)), Err),
+                Ok(None) => continue,
+                Err(Entry::Separator(reported)) => (reported, true),
+                Err(Entry::Value(reported)) => (reported, false),
+            };
+            if !kept {
+                self.restore(marks);
+            }
+            // As `recover_entry`, knowing whether the list ended at its `)`.
+            if self.deep {
+                return Err(reported);
+            }
+            match self.skip(
+                start,
+                Sync::Entry {
+                    close: TokenKind::RParen,
+                },
+            ) {
+                Stop::Separator => self.advance(),
+                Stop::Close => {
+                    self.advance();
+                    return Err(reported);
                 }
+                Stop::Outer => return Ok(None),
             }
+            failed = Some(reported);
         }
     }
 
     /// Parses an argument of a call whose argument list `open` opens, and
     /// the `,` or the `)` after it, raising `tallest` to its height. Returns
-    /// the span of the `)` if it ends the list.
-    fn parse_argument(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Option<Span>> {
+    /// the span of the `)` if it ends the list; if what fails is the
+    /// separator, the argument is pushed.
+    fn parse_argument(&mut self, open: Token, tallest: &mut u32) -> Result<Option<Span>, Entry> {
         let token = self.peek();
         let kind = match (token.kind, self.peek_at(1).kind) {
             (TokenKind::Ident(name), TokenKind::Eq) => {
@@ -4279,11 +4408,12 @@ impl Parser<'_> {
             }
             _ => ArgKind::Positional,
         };
-        let value = self.parse_expr(0)?;
+        let value = self.parse_expr(0).map_err(Entry::Value)?;
         *tallest = (*tallest).max(self.height_of(value));
         self.arg_stack.push(Arg { kind, value });
         let close = self.peek();
-        Ok(self.list_separator(open)?.then_some(close.span))
+        let closed = self.list_separator(open).map_err(Entry::Separator)?;
+        Ok(closed.then_some(close.span))
     }
 
     /// Parses a list literal, starting at its `[`: its elements, each an
@@ -4362,7 +4492,7 @@ impl Parser<'_> {
             }
             _ => {
                 let found = self.describe(separator);
-                Err(self.report(
+                Err(self.report_close(
                     Diagnostic::error(
                         format!("expected `,` or `]`, found {found}"),
                         error_span(separator),
@@ -4396,7 +4526,7 @@ impl Parser<'_> {
         let close = self.peek();
         if close.kind != TokenKind::RBracket {
             let found = self.describe(close);
-            return Err(self.report(
+            return Err(self.report_close(
                 Diagnostic::error(format!("expected `]`, found {found}"), error_span(close))
                     .with_context(open.span, "unclosed `[`"),
             ));
@@ -4416,7 +4546,7 @@ impl Parser<'_> {
         let close = self.peek();
         if close.kind != TokenKind::RParen {
             let found = self.describe(close);
-            return Err(self.report(
+            return Err(self.report_close(
                 Diagnostic::error(format!("expected `)`, found {found}"), error_span(close))
                     .with_context(open.span, "unclosed `(`"),
             ));
@@ -5779,7 +5909,6 @@ mod tests {
     fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         use std::fmt::Write as _;
         match ast.get(id).kind {
-            ExprKind::Error => out.push_str("<error>"),
             ExprKind::Int(value) => write!(out, "{value}").unwrap(),
             ExprKind::Float(value) => write!(out, "{value:?}").unwrap(),
             ExprKind::Bool(value) => write!(out, "{value}").unwrap(),
@@ -5878,6 +6007,25 @@ mod tests {
                 let (def_type, path) = ast.show_def_type(def);
                 write!(out, "({def_type} {path})").unwrap();
             }
+            _ => unparsed_shape(ast, id, out),
+        }
+    }
+
+    /// What the parser could not parse, `<error>`, or kept of a half-typed
+    /// field access, `(a . <missing>)`, or call, `<unclosed f(1)>`.
+    fn unparsed_shape(ast: &Ast, id: ExprId, out: &mut String) {
+        match ast.get(id).kind {
+            ExprKind::NoField(inner) => {
+                out.push('(');
+                expr(ast, inner, out);
+                out.push_str(" . <missing>)");
+            }
+            ExprKind::Unclosed { callee, args } => {
+                out.push_str("<unclosed ");
+                call_shape(ast, callee, args, out);
+                out.push('>');
+            }
+            _ => out.push_str("<error>"),
         }
     }
 
@@ -11899,14 +12047,14 @@ mod tests {
             errors_of(&[("expected `}`, found end of input", "")])
         );
         // A `(` and a `[`, inside which there are no newlines: the rest of
-        // the file is their item's.
+        // the file is their item's. An unclosed call keeps what it parsed.
         assert_eq!(
             all_errors("x = 1\ny = f(1, 2\nz = 3"),
             errors_of(&[("expected `,` or `)`, found `z`", "z")])
         );
         assert_eq!(
             recovered("x = 1\ny = f(1, 2\nz = 3").0,
-            "x = 1; y = <error>"
+            "x = 1; y = <unclosed f(1, 2)>"
         );
         assert_eq!(
             all_errors("x = [1, 2"),
@@ -11922,6 +12070,81 @@ mod tests {
             all_errors("y = \"a{1\nz = 2"),
             errors_of(&[("unterminated interpolation", "{")])
         );
+    }
+
+    #[test]
+    fn a_field_access_with_no_name_keeps_its_record() {
+        // At the end of a line, and of the file: one error, the record kept.
+        for (text, tree) in [
+            ("x = a.\ny = 2", "x = (a . <missing>); y = 2"),
+            ("x = a.b.", "x = ((a . b) . <missing>)"),
+            ("x = f(1).\n", "x = (f(1) . <missing>)"),
+            ("f = {\n    x = a.\n}", "f = {x = (a . <missing>)}"),
+            ("x = g(a.)", "x = g((a . <missing>))"),
+            ("x = g(a., 1)", "x = g((a . <missing>), 1)"),
+            ("x = [a.]", "x = list((a . <missing>))"),
+        ] {
+            let errors = all_errors(text);
+            assert_eq!(errors.len(), 1, "{text:?}: {errors:?}");
+            assert_eq!(errors[0].0, "expected a field name after `.`", "{text:?}");
+            assert_eq!(
+                recovered(text),
+                (tree.to_owned(), Syntax::Recovered),
+                "{text:?}"
+            );
+        }
+        // Where something else follows, as before: the value is an error.
+        for text in ["x = a.)", "x = a. + 1", "x = a.}"] {
+            assert!(recovered(text).0.starts_with("x = <error>"), "{text:?}");
+        }
+        // At the end of the file in a bracket, or before the `}` that
+        // closes the bracket: the bracket's error is not reported again.
+        for text in ["x = g(a.", "x = (a.", "x = [a.", "f = {\n    x = g(a.\n}"] {
+            let errors = all_errors(text);
+            assert_eq!(errors.len(), 1, "{text:?}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn an_unclosed_call_keeps_its_callee_and_arguments() {
+        for (text, tree, error) in [
+            (
+                "x = f(",
+                "x = <unclosed f()>",
+                "expected expression, found end of input",
+            ),
+            (
+                "x = f(1, y = 2",
+                "x = <unclosed f(1, y = 2)>",
+                "expected `,` or `)`, found end of input",
+            ),
+            (
+                "x = f(a.",
+                "x = <unclosed f((a . <missing>))>",
+                "expected a field name after `.`",
+            ),
+            (
+                "x = g(f(1, ",
+                "x = <unclosed g(<unclosed f(1)>)>",
+                "expected expression, found end of input",
+            ),
+            (
+                "fn h(): Int {\n    let y = f(1,\n}",
+                "fn h(): Int {let y = <unclosed f(1)>}",
+                "expected expression, found `}`",
+            ),
+        ] {
+            let errors = all_errors(text);
+            assert_eq!(errors.len(), 1, "{text:?}: {errors:?}");
+            assert_eq!(errors[0].0, error, "{text:?}");
+            assert_eq!(
+                recovered(text),
+                (tree.to_owned(), Syntax::Recovered),
+                "{text:?}"
+            );
+        }
+        // A list that ends at its `)` fails as before.
+        assert_eq!(recovered("x = f(1 2)").0, "x = <error>");
     }
 
     #[test]

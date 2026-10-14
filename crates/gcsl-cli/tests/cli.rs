@@ -3991,8 +3991,8 @@ const LSP_EXIT: &str = r#"{"jsonrpc":"2.0","method":"exit"}"#;
 
 /// `gcsl lsp` speaks LSP on stdin and stdout: it answers `initialize` with
 /// its capabilities (diagnostics, hover, go to definition, references,
-/// highlights, rename, symbols and formatting) and
-/// `shutdown` with null, and exits with code 0 on
+/// highlights, rename, symbols, formatting, completion and signature help)
+/// and `shutdown` with null, and exits with code 0 on
 /// `exit` after `shutdown`, and 1 on `exit` alone.
 #[test]
 fn lsp_initializes_and_shuts_down() {
@@ -4004,7 +4004,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

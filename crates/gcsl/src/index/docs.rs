@@ -147,7 +147,7 @@ impl Index {
     /// of input number `file`: the run of lines directly above it, its
     /// attributes' lines apart, each of which is a comment alone; `None` if
     /// there is none, or the item does not start its line.
-    fn doc_comment(&self, file: u32, start: u32) -> Option<String> {
+    pub(super) fn doc_comment(&self, file: u32, start: u32) -> Option<String> {
         let text = self.text(file);
         let comments = self.comments(file)?;
         let start = start as usize;

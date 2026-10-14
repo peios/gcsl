@@ -1919,35 +1919,17 @@ impl Lowerer<'_> {
                 return self.lower_reference_past(def, kind, span);
             }
             (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
-            (ExprKind::Error, _) => return Err(unparsed(span)),
-            (ExprKind::Float(_), ValueKind::Int) => {
-                return Err(InternalError {
-                    message: "float literal typed as Int",
-                    span,
-                });
+            (ExprKind::Error | ExprKind::NoField(_) | ExprKind::Unclosed { .. }, _) => {
+                return Err(unparsed(span));
             }
             (
-                ExprKind::Int(_) | ExprKind::Float(_),
-                ValueKind::Bool
-                | ValueKind::String
-                | ValueKind::Record
-                | ValueKind::List
-                | ValueKind::Fn
-                | ValueKind::Deferred
-                | ValueKind::Mixed
-                | ValueKind::Never,
-            ) => {
-                return Err(InternalError {
-                    message: "numeric literal typed as a non-numeric type",
-                    span,
-                });
-            }
-            (ExprKind::Bool(_) | ExprKind::Str(_) | ExprKind::Interp(_), _) => {
-                return Err(InternalError {
-                    message: "literal typed as a type it cannot have",
-                    span,
-                });
-            }
+                ExprKind::Int(_)
+                | ExprKind::Float(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Str(_)
+                | ExprKind::Interp(_),
+                _,
+            ) => return Err(mistyped(expr.kind, kind, span)),
         };
         Ok(self.builder.alloc(lowered, span))
     }
@@ -3436,6 +3418,18 @@ const fn comparison(op: BinaryOp) -> Option<Cmp> {
         | BinaryOp::Range
         | BinaryOp::RangeInclusive => None,
     }
+}
+
+/// The internal error of the literal `literal`, at `span`, typed as a value
+/// of `kind`, which it cannot be: a float as an `Int`, a number as no
+/// number, any other literal as anything but its own type.
+const fn mistyped(literal: ExprKind, kind: ValueKind, span: Span) -> InternalError {
+    let message = match (literal, kind) {
+        (ExprKind::Float(_), ValueKind::Int) => "float literal typed as Int",
+        (ExprKind::Int(_) | ExprKind::Float(_), _) => "numeric literal typed as a non-numeric type",
+        _ => "literal typed as a type it cannot have",
+    };
+    InternalError { message, span }
 }
 
 /// The internal error of an error node of the parser's at `span` reaching

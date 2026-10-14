@@ -479,10 +479,18 @@ struct Asked {
     renamable: usize,
     /// Symbols of the files.
     symbols: usize,
+    /// Places a completion offered something at, of the places asked at
+    /// every token's start and end.
+    completions: usize,
+    /// Places signature help answered at, of the same.
+    signatures: usize,
     /// Panics, and answers out of their file, by what was asked.
     failures: Vec<String>,
-    /// The time spent asking, indexing apart.
+    /// The time spent asking, indexing apart, completion and signature help
+    /// apart.
     asking: Duration,
+    /// The time spent on completion and signature help.
+    completing: Duration,
     /// The time spent indexing.
     indexing: Duration,
 }
@@ -491,7 +499,8 @@ impl Asked {
     /// Indexes what `work` checks, `what`, and asks for a hover, a
     /// definition, references and a rename's preparation at every token
     /// start of each file of `files`, its index among the files after the
-    /// standard ones with its text, and for each file's symbols, recording
+    /// standard ones with its text, for a completion and signature help at
+    /// every token's start and end, and for each file's symbols, recording
     /// what it finds.
     fn run(&mut self, what: &str, work: impl FnOnce() -> Option<Index>, files: &[(u32, &str)]) {
         let start = Instant::now();
@@ -507,6 +516,7 @@ impl Asked {
             }
         };
         let start = Instant::now();
+        let mut completing = Duration::ZERO;
         for &(file, text) in files {
             let file = file + index.standard();
             let symbols = panic::catch_unwind(AssertUnwindSafe(|| index.document_symbols(file)));
@@ -560,15 +570,60 @@ impl Asked {
                     }
                 }
             }
+            let started = Instant::now();
+            for token in &lexed.tokens {
+                for at in [token.span.start, token.span.end] {
+                    self.complete(what, &index, (file, at));
+                }
+            }
+            completing += started.elapsed();
         }
-        self.asking += start.elapsed();
+        self.completing += completing;
+        self.asking += start.elapsed().saturating_sub(completing);
+    }
+
+    /// Asks `index` for a completion and signature help at byte `at` of
+    /// file `file`, of `what`, recording what it finds.
+    fn complete(&mut self, what: &str, index: &Index, (file, at): (u32, u32)) {
+        let asked = panic::catch_unwind(AssertUnwindSafe(|| {
+            (index.completion(file, at), index.signature(file, at))
+        }));
+        let Ok((completion, signature)) = asked else {
+            self.failures.push(format!(
+                "{what}: file {file} at {at}: completion or signature help panicked"
+            ));
+            return;
+        };
+        self.completions += usize::from(!completion.is_empty());
+        if completion.iter().any(|found| found.label.is_empty()) {
+            self.failures
+                .push(format!("{what}: file {file} at {at}: an empty label"));
+        }
+        if let Some(signature) = signature {
+            self.signatures += 1;
+            let len = u32::try_from(signature.label.len()).unwrap_or(u32::MAX);
+            let fits = signature
+                .params
+                .iter()
+                .all(|&(start, end)| start <= end && end <= len);
+            let active = signature
+                .active
+                .is_none_or(|active| (active as usize) < signature.params.len());
+            if !fits || !active {
+                self.failures.push(format!(
+                    "{what}: file {file} at {at}: signature {signature:?}"
+                ));
+            }
+        }
     }
 
     /// Prints what was found, for `set`, and fails on any failure.
     fn report(&self, set: &str) {
         let per = self.asking / u32::try_from(self.places.max(1)).unwrap_or(u32::MAX);
+        // Completion and signature help at each token's start and end.
+        let typed = self.completing / u32::try_from(self.places.max(1) * 2).unwrap_or(u32::MAX);
         println!(
-            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, {} with references, {} renamable, {} symbols, failures {:?}",
+            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, {} with references, {} renamable, {} symbols; completion and signature help at {} places in {:?} ({typed:?} each), {} with completions, {} with a signature; failures {:?}",
             self.indexed,
             self.indexing,
             self.places,
@@ -578,6 +633,10 @@ impl Asked {
             self.references,
             self.renamable,
             self.symbols,
+            self.places * 2,
+            self.completing,
+            self.completions,
+            self.signatures,
             self.failures
         );
         assert!(self.failures.is_empty());

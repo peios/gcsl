@@ -171,9 +171,82 @@
 //! on one line, cut to 60 characters. The workspace's
 //! ([`Index::workspace_symbols`]) are every file's but the imports, matched
 //! by a subsequence of a query, ignoring case.
+//!
+//! # Completion
+//!
+//! What may be written at a place ([`Index::completion`]) is found from the
+//! file's text as it is, lexed again, and the index of it: while it is
+//! edited it is mostly broken, and the parser keeps what an editor leaves
+//! half-typed for it, `a.` and `f(` (see the parser's [Errors and
+//! recovery](crate::parser#errors-and-recovery)), so what is before the
+//! place is checked and indexed. The tokens before the place, the word
+//! being typed at it set aside (the client filters by it), say what the
+//! place is, and so what is offered, each a [`Completion`] with its kind, its
+//! type on one line cut to 60 characters, its doc comment (see
+//! "Documentation"), and its name quoted if it is no identifier:
+//!
+//! - In a comment or in a string's text, nothing. Nor where a name is
+//!   declared (after `let`, `mut`, `fn`, `def`, `for`, at a function's or a
+//!   definition's parameter, a `type` item's name), nor after what ends an
+//!   expression (a literal, a closing bracket).
+//! - After a `.`, the fields of what is before it: of a path through the
+//!   file's view, `com.foo.`, the children of its node, of a module an
+//!   import reaches, `lib.`, its members, of `fileroot.`, its four; else of
+//!   the record type the check gave it (a local's, a field's, a call's),
+//!   each documented when the record is written as a record block, the
+//!   value of a local or a node. The access is found in the tree, a
+//!   [`ExprKind::NoField`] or a [`ExprKind::Field`] whose name is being
+//!   typed; where the tree has none, a path of names is followed by its
+//!   names.
+//! - In an `import`'s path, after `import` or `from`, the modules under the
+//!   segments before the place: the directories and files of the directory
+//!   they name, and at the start the standard library's modules, every one
+//!   of them whether the scan loaded it or not, `builtins` and `fileroot`
+//!   (only those in a lone file).
+//! - After a def-type's name, `package dev.`, the children of the node of
+//!   the path in the def-type's namespace: the definitions under it. The
+//!   namespace's key is a reference's or a definition's of the def-type
+//!   already in the tree, of the file or else of any file whose def-type is
+//!   what the name is here.
+//! - In a type, after a `:`, a return marker, `is`, `as`, `|`, `List<` or a
+//!   `type` item's `=`: the types of the file's view, then the built-in
+//!   types; after `lib.` there, the types of the module `lib` imports.
+//! - Anywhere else, a name of an expression: everything in scope, each name
+//!   once, the nearest, ordered by group ([`Completion::sort`]): the locals
+//!   (the `let`s, `fn`s and fields of each block around the place before
+//!   the item it is in, the parameters of each function whose body it is
+//!   in, the variable of each `for` whose body or guard it is in), rebuilt
+//!   from the tree at the place, innermost and latest first, with the types
+//!   the check recorded; then the file's own top-level `let`s before the
+//!   place, `fn`s and fields; its directories' fields; what it imports; the
+//!   standard library's, the prelude's names; and the keywords an
+//!   expression or an item may start with.
+//!
+//! # Signature help
+//!
+//! The signature of the call a place is in the argument list or trailing
+//! block of ([`Index::signature`]) is found from the brackets open before
+//! it, innermost first, in the file's text lexed again: the first `(` that
+//! is a call's, a [`ExprKind::Call`] or an [`ExprKind::Unclosed`] whose
+//! callee ends just before it (one that only groups is passed over), or the
+//! `{` of a call's trailing block; a block's `{` or a string's
+//! interpolation ends the search. The callee's type is its declaration's (a
+//! node's cell's, a `def`'s or a local function's), else what the check
+//! gave the callee; `len` and `show` have their generic signatures. The
+//! [`Signature`] is the callee as written, a `def`'s with `def`, each
+//! parameter named as its source names it and typed as written (a
+//! parameter that accepts a future too shows the type it is declared
+//! with), with its doc comment. Its active parameter is the one a named
+//! argument names, `name = ...`, when the place is in one; else the next one
+//! not yet filled, from the left, by a positional argument before the
+//! place, nor anywhere by a named one, nor, the last, by a trailing block;
+//! in a trailing block, the last. The arguments are counted on the tokens,
+//! so a list half-typed counts as it is written.
 
+mod complete;
 mod docs;
 mod rename;
+mod signature;
 mod symbols;
 
 use std::cell::OnceCell;
@@ -181,7 +254,9 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+pub use complete::{Completion, CompletionKind};
 pub use rename::{Edit, Prepared};
+pub use signature::Signature;
 pub use symbols::{DocumentSymbol, FoundSymbol, SymbolKind};
 
 use crate::ast::{
@@ -2005,13 +2080,7 @@ impl<'s> Builder<'s> {
 
     /// The symbol of the scope's number `number`.
     fn symbol_of(&self, number: u32) -> Option<Symbol> {
-        if let Some(global) = self.scope.merged(number) {
-            return Some(Symbol::Node(global));
-        }
-        if let Some(view) = self.scope.own_view(number) {
-            return Some(Symbol::View(view));
-        }
-        self.scope.target(number).map(target_symbol)
+        scope_symbol(&self.scope, number)
     }
 
     /// The occurrences of the reference whose variable is the name `name`
@@ -2346,6 +2415,17 @@ fn item_value(ast: &Ast, item: ItemId) -> Option<ExprId> {
         ItemKind::Let { value, .. } | ItemKind::Field { value, .. } => Some(value),
         _ => None,
     }
+}
+
+/// The symbol of the number `number` of the file's view `scope`.
+fn scope_symbol(scope: &FileScope<'_>, number: u32) -> Option<Symbol> {
+    if let Some(global) = scope.merged(number) {
+        return Some(Symbol::Node(global));
+    }
+    if let Some(view) = scope.own_view(number) {
+        return Some(Symbol::View(view));
+    }
+    scope.target(number).map(target_symbol)
 }
 
 /// The symbol of what an import or a path through the view reaches.
@@ -3387,6 +3467,27 @@ mod tests {
             "{}",
             hover.text
         );
+    }
+
+    #[test]
+    fn a_half_typed_access_or_call_keeps_what_it_has_checked() {
+        // A field access with no name, at the end of a line and of the
+        // file: its record is checked, and has its hover.
+        for text in [
+            "c = {port = 80}\nx = c.\ny = 1\n",
+            "c = {port = 80}\nx = c.",
+        ] {
+            let (mut index, file) = index_of(&[("app.gcsl", text)], "app.gcsl");
+            let hover = index.hover(file, offset(text, "x = |c")).unwrap();
+            assert!(hover.text.contains("c: {port: Int}"), "{}", hover.text);
+        }
+        // An unclosed call's callee and arguments.
+        let text = "fn f(n: Int): Int { n }\nlet v = 2\nx = f(v, ";
+        let (mut index, file) = index_of(&[("app.gcsl", text)], "app.gcsl");
+        let hover = index.hover(file, offset(text, "x = |f")).unwrap();
+        assert!(hover.text.contains("fn f(n: Int): Int"), "{}", hover.text);
+        let hover = index.hover(file, offset(text, "f(|v")).unwrap();
+        assert!(hover.text.contains("v: Int"), "{}", hover.text);
     }
 
     #[test]

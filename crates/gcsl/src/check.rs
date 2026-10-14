@@ -58,7 +58,13 @@
 //! A tree the parser recovered from syntax errors ([`Ast::syntax`]) is
 //! checked as any is, an error node ([`ExprKind::Error`]) being of type
 //! `Error` and a block with an error item ([`ItemKind::Error`]) erroneous,
-//! its fields' and its result's types unknown; its check always fails. In
+//! its fields' and its result's types unknown; its check always fails. What
+//! the parser kept of a half-typed field access or call
+//! ([`ExprKind::NoField`], [`ExprKind::Unclosed`]) is of type `Error` too,
+//! its parts checked as any expression is, for an index, with no
+//! diagnostic: alone, a part may be what it may not be (a module or a
+//! built-in read whole, a callback whose parameters only its call types),
+//! and the error is the parser's (`Checker::check_unfinished`). In
 //! it, and in a workspace's file whose view sees a file with syntax errors,
 //! a name that names nothing, a variable, a type or a record's field, is no
 //! error, since it may be declared where the source could not be parsed:
@@ -13492,9 +13498,37 @@ impl<'a> Checker<'a> {
             ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
             // What the parser could not parse, reported already.
             ExprKind::Error => TyId::ERROR,
+            // What the parser kept of what it could not finish, reported
+            // already: checked for what it is, silently.
+            ExprKind::NoField(record) => {
+                self.check_unfinished(&[record]);
+                TyId::ERROR
+            }
+            ExprKind::Unclosed { callee, args } => {
+                let mut parts = vec![callee];
+                parts.extend(self.ast.args(args).iter().map(|arg| arg.value));
+                self.check_unfinished(&parts);
+                TyId::ERROR
+            }
         };
         self.expr_types[id.index()] = ty;
         ty
+    }
+
+    /// Checks `parts`, what the parser kept of an expression it could not
+    /// finish (a field access with no name's record, an unclosed call's
+    /// callee and arguments), each as any expression is but with no
+    /// diagnostic: the expression's error is the parser's, and what each is
+    /// alone may be what it may not be alone, a module or a built-in read
+    /// whole, a callback whose parameters only the call types (see
+    /// [Recording](#recording)).
+    fn check_unfinished(&mut self, parts: &[ExprId]) {
+        let (errors, warnings) = (self.errors.len(), self.warnings.len());
+        for &part in parts {
+            self.check_expr(part);
+        }
+        self.errors.truncate(errors);
+        self.warnings.truncate(warnings);
     }
 
     /// Types the binary operator `op` of expression `id` applied to `lhs`
@@ -18512,7 +18546,9 @@ impl<'a> Checker<'a> {
             | ExprKind::Index { .. }
             | ExprKind::For(_)
             | ExprKind::DefTypeRef(_)
-            | ExprKind::Error => {}
+            | ExprKind::Error
+            | ExprKind::NoField(_)
+            | ExprKind::Unclosed { .. } => {}
             // An `await` of an untyped operand is one of a present value,
             // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
@@ -19691,7 +19727,8 @@ mod tests {
                 | ExprKind::Field { expr: inner, .. }
                 | ExprKind::Ascribe { expr: inner, .. }
                 | ExprKind::Is { expr: inner, .. }
-                | ExprKind::As { expr: inner, .. } => visit(ast, inner, out),
+                | ExprKind::As { expr: inner, .. }
+                | ExprKind::NoField(inner) => visit(ast, inner, out),
                 ExprKind::If {
                     cond, then, else_, ..
                 } => {
@@ -19709,7 +19746,7 @@ mod tests {
                 ExprKind::Fn(function) | ExprKind::Lazy(function) => {
                     visit(ast, ast.fn_decl(function).body, out);
                 }
-                ExprKind::Call { callee, args } => {
+                ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
                     visit(ast, callee, out);
                     for arg in ast.args(args) {
                         visit(ast, arg.value, out);
