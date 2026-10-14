@@ -55,6 +55,16 @@
 //! mistakes elsewhere in the tree are still reported, so one run shows every
 //! real error.
 //!
+//! A tree the parser recovered from syntax errors ([`Ast::syntax`]) is
+//! checked as any is, an error node ([`ExprKind::Error`]) being of type
+//! `Error` and a block with an error item ([`ItemKind::Error`]) erroneous,
+//! its fields' and its result's types unknown; its check always fails. In
+//! it, and in a workspace's file whose view sees a file with syntax errors,
+//! a name that names nothing, a variable, a type or a record's field, is no
+//! error, since it may be declared where the source could not be parsed:
+//! the check fails quietly instead (`Checker::unresolved`, and see
+//! [`crate::workspace`], "Syntax errors").
+//!
 //! In a diagnostic's message and notes, a type written as a name, such as
 //! `Int`, is shown plainly, and a structural type (a record, list,
 //! function, future or union type) in backticks, since it contains spaces and
@@ -2782,8 +2792,8 @@ use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, DefTypeRole, Effect, Element,
     ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyRange, FnDecl, FnId,
     ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, PartRange,
-    PathRange, PathSegment, SegmentKind, StrPart, TypeExprId, TypeExprKind, TypeProblem, UnaryOp,
-    path_span, symbol_span,
+    PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExprId, TypeExprKind, TypeProblem,
+    UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -4366,6 +4376,9 @@ struct Quiet {
     /// its error being reported where it is written: the check fails then,
     /// with no error of its own if it has none.
     failed: bool,
+    /// Whether the input's view sees another file with syntax errors (see
+    /// [`Checker::sees_broken`]).
+    sees_broken: bool,
 }
 
 /// What a bare type written in a type expression means: see the module
@@ -5296,9 +5309,12 @@ pub fn check(
 /// wrong in each declaration, reported once, here, before any file is
 /// checked, since a file may use a type of a file checked after it (see
 /// [Type declarations](#type-declarations)). Returns the errors, none for a
-/// file with no `type` item.
-pub(crate) fn check_types(ast: &Ast, types: &mut TypeTable) -> Vec<Diagnostic> {
+/// file with no `type` item. If the file's view `sees_broken`, a file with
+/// syntax errors, an unknown type is none of them (see
+/// [`Checker::unresolved`]).
+pub(crate) fn check_types(ast: &Ast, types: &mut TypeTable, sees_broken: bool) -> Vec<Diagnostic> {
     let mut checker = Checker::new(ast, types);
+    checker.quiet.sees_broken = sees_broken;
     checker.type_items();
     checker.errors
 }
@@ -5612,9 +5628,11 @@ impl<'a> Checker<'a> {
         types: &'a mut TypeTable,
         workspace: &'a Context<'a>,
     ) -> Self {
+        let mut checker = Self::with_scope(ast, scope, types);
+        checker.quiet.sees_broken = workspace.sees_broken();
         Self {
             workspace: Some(workspace),
-            ..Self::with_scope(ast, scope, types)
+            ..checker
         }
     }
 
@@ -5741,6 +5759,9 @@ impl<'a> Checker<'a> {
     /// As [`check`].
     pub fn check(mut self) -> Result<CheckOutput, Vec<Diagnostic>> {
         let root = self.ast.root();
+        // A tree with syntax errors is checked for the errors of what was
+        // parsed, and is never lowered: its check always fails.
+        self.quiet.failed |= self.ast.syntax() != Syntax::Clean;
         // A workspace has checked the file's `type` items already, before
         // any file's check ([`check_types`]): they are resolved quietly.
         let quiet = std::mem::replace(&mut self.quiet.types, self.workspace.is_some());
@@ -5930,6 +5951,8 @@ impl<'a> Checker<'a> {
         // The first item that never completes, and whether the item after
         // it has been warned about.
         let (mut leaves, mut warned) = (None, false);
+        // Whether an item is one the parser could not parse.
+        let mut broken = false;
         for (index, &id) in items.iter().enumerate() {
             let next = items.get(index + 1).copied();
             let item = *self.ast.item(id);
@@ -6017,6 +6040,9 @@ impl<'a> Checker<'a> {
                         result = self.left_type(id);
                     }
                 }
+                // What the parser could not parse: the block's result or
+                // fields are unknown.
+                ItemKind::Error => broken = true,
             }
             if leaves.is_none() && !early && self.never_completes(id, item.kind) {
                 leaves = Some(item.span);
@@ -6025,9 +6051,27 @@ impl<'a> Checker<'a> {
         if root {
             self.finish_top_level(items.len());
         }
-        match first_field {
-            Some(_) => self.record_type(expecting),
-            None => result,
+        self.body_type(first_field.is_some(), (result, broken), expecting)
+    }
+
+    /// The type of a body, a record block if `record`, whose result's type
+    /// is `result`, as [`Checker::check_body`] gives it: `Error` if it has
+    /// an error item (`broken`), whose fields' and result's types are
+    /// unknown, nothing then being expected of its record.
+    fn body_type(
+        &mut self,
+        record: bool,
+        (result, broken): (TyId, bool),
+        expecting: Option<Expecting<'_>>,
+    ) -> TyId {
+        match (record, broken) {
+            (true, true) => {
+                self.record_type(None);
+                TyId::ERROR
+            }
+            (true, false) => self.record_type(expecting),
+            (false, true) => TyId::ERROR,
+            (false, false) => result,
         }
     }
 
@@ -6303,7 +6347,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
             | ItemKind::DefTypeDef { .. }
-            | ItemKind::DefMeta { .. } => false,
+            | ItemKind::DefMeta { .. }
+            | ItemKind::Error => false,
         }
     }
 
@@ -11342,7 +11387,7 @@ impl<'a> Checker<'a> {
     fn invalid_type(&mut self, id: TypeExprId) -> TyId {
         let ast = self.ast;
         let mut reported = false;
-        if !self.quiet.types {
+        if !self.quiet.types && !self.sees_broken() {
             for problem in ast.type_problems(id) {
                 if let TypeProblem::Unresolved(error) = problem {
                     self.errors.push(error.clone());
@@ -11437,12 +11482,14 @@ impl<'a> Checker<'a> {
                     return self.bare(builtin, mode);
                 }
                 let text = self.ast.names().get(name);
-                let message = if self.is_type_constructor(name) {
-                    format!("type `{text}` needs a type argument, as in `{text}<Int>`")
+                if self.is_type_constructor(name) {
+                    let message =
+                        format!("type `{text}` needs a type argument, as in `{text}<Int>`");
+                    self.errors.push(Diagnostic::error(message, ty.span));
                 } else {
-                    format!("unknown type `{text}`")
-                };
-                self.errors.push(Diagnostic::error(message, ty.span));
+                    let message = format!("unknown type `{text}`");
+                    self.unresolved(Diagnostic::error(message, ty.span));
+                }
                 TyId::ERROR
             }
             TypeExprKind::List(element) => self.resolve_list(element, mode),
@@ -11482,7 +11529,7 @@ impl<'a> Checker<'a> {
             // the file's types; checked alone, a file names no module.
             TypeExprKind::Path(path) => {
                 let shown = self.ast.show_path(self.ast.path(path)).to_string();
-                self.errors.push(Diagnostic::error(
+                self.unresolved(Diagnostic::error(
                     format!("unknown type `{shown}`"),
                     ty.span,
                 ));
@@ -11804,13 +11851,34 @@ impl<'a> Checker<'a> {
             .builtin_types
             .iter()
             .any(|(builtin, _)| *builtin == Some(name));
-        let message = if builtin {
-            format!("type `{text}` takes no type argument")
+        if builtin {
+            let message = format!("type `{text}` takes no type argument");
+            self.errors.push(Diagnostic::error(message, span));
         } else {
-            format!("unknown type `{text}`")
-        };
-        self.errors.push(Diagnostic::error(message, span));
+            self.unresolved(Diagnostic::error(format!("unknown type `{text}`"), span));
+        }
         TyId::ERROR
+    }
+
+    /// Reports `error`, of a name that names nothing, a variable's or a
+    /// type's, unless the input's view sees a file with syntax errors, in
+    /// whose source that could not be parsed the name may be declared: the
+    /// check then fails quietly, its error reported where the source is
+    /// (see [Syntax errors](crate::workspace#syntax-errors)).
+    fn unresolved(&mut self, error: Diagnostic) {
+        if self.sees_broken() {
+            self.quiet.failed = true;
+        } else {
+            self.errors.push(error);
+        }
+    }
+
+    /// Whether the input's view sees a file with syntax errors, its own
+    /// tree among them: a name that names nothing may be declared in source
+    /// its parser could not parse, so it is no error, and the check fails
+    /// quietly (see [`Checker::unresolved`]).
+    fn sees_broken(&self) -> bool {
+        self.quiet.sees_broken || self.ast.syntax() != Syntax::Clean
     }
 
     /// Interns the function type whose parameters are `fn_params[base..]`
@@ -13257,6 +13325,8 @@ impl<'a> Checker<'a> {
             ExprKind::Index { expr: list, index } => self.check_index(id, list, index),
             ExprKind::For(for_id) => self.check_for(id, for_id, (None, None)),
             ExprKind::DefTypeRef(def) => self.check_def_type_ref(id, def),
+            // What the parser could not parse, reported already.
+            ExprKind::Error => TyId::ERROR,
         };
         self.expr_types[id.index()] = ty;
         ty
@@ -15558,8 +15628,9 @@ impl<'a> Checker<'a> {
         if let Some(fields) = self.types.record_fields(record_ty) {
             let note = self.field_list(fields);
             let message = format!("no field `{text}` in {}", self.in_message(record_ty));
-            self.errors
-                .push(Diagnostic::error(message, member).with_note(note));
+            // A path of the view's names nothing then: its field may be
+            // declared in source that could not be parsed.
+            self.unresolved(Diagnostic::error(message, member).with_note(note));
             return TyId::ERROR;
         }
         let record_ty = self.settle(record, record_ty);
@@ -16282,7 +16353,7 @@ impl<'a> Checker<'a> {
                 )
                 .with_note(note);
         }
-        self.errors.push(error);
+        self.unresolved(error);
         (TyId::ERROR, None)
     }
 
@@ -17443,7 +17514,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
             | ItemKind::DefTypeDef { .. }
-            | ItemKind::DefMeta { .. } => {}
+            | ItemKind::DefMeta { .. }
+            | ItemKind::Error => {}
         }
     }
 
@@ -18267,7 +18339,8 @@ impl<'a> Checker<'a> {
             | ExprKind::List(_)
             | ExprKind::Index { .. }
             | ExprKind::For(_)
-            | ExprKind::DefTypeRef(_) => {}
+            | ExprKind::DefTypeRef(_)
+            | ExprKind::Error => {}
             // An `await` of an untyped operand is one of a present value,
             // which it passes through.
             ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
@@ -18314,7 +18387,8 @@ impl<'a> Checker<'a> {
             | ItemKind::Import(_)
             | ItemKind::Type { .. }
             | ItemKind::DefTypeDef { .. }
-            | ItemKind::DefMeta { .. } => {}
+            | ItemKind::DefMeta { .. }
+            | ItemKind::Error => {}
         }
     }
 
@@ -19496,7 +19570,8 @@ mod tests {
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
                 | ExprKind::Name(_)
-                | ExprKind::DefTypeRef(_) => {}
+                | ExprKind::DefTypeRef(_)
+                | ExprKind::Error => {}
             }
         }
         for &id in ast.items(body) {
@@ -19518,7 +19593,8 @@ mod tests {
                 | ItemKind::Continue(_)
                 | ItemKind::Return(_)
                 | ItemKind::Import(_)
-                | ItemKind::Type { .. } => {}
+                | ItemKind::Type { .. }
+                | ItemKind::Error => {}
             }
         }
     }

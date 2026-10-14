@@ -577,6 +577,25 @@ mod tests {
     }
 
     #[test]
+    fn an_input_with_syntax_errors_reports_them_all_and_commits_nothing() {
+        let mut session = Session::new();
+        // Every syntax error, and nothing of the input runs or is kept: not
+        // even `y`, which parsed.
+        let marker = std::env::temp_dir().join(format!("gcsl-recovery-{}", std::process::id()));
+        let text = format!(
+            "x = 1 2\ny = 3\nz = sh(\"touch {}\")\nw = (4 4)",
+            marker.display()
+        );
+        assert_eq!(
+            messages(&mut session, &text),
+            ["expected end of item, found `2`", "expected `)`, found `4`"]
+        );
+        assert!(!marker.exists());
+        assert_eq!(messages(&mut session, "y"), ["undefined variable `y`"]);
+        assert_eq!(value(&mut session, "= 1 + 1"), Value::Int(2));
+    }
+
+    #[test]
     fn def_types_and_their_definitions_persist() {
         let mut session = Session::new();
         // One input declares a def-type, defines with it and invokes it;

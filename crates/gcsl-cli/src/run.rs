@@ -51,6 +51,12 @@
 //! fn(...) META-> ... @..))`; in the IR it is the read of the meta of the
 //! definition's cell. The command line itself knows nothing of def-types.
 //!
+//! A lexical or syntax error anywhere in the workspace runs nothing: every
+//! one is shown, each file's, with the type errors of what parsed around
+//! them and of the other files (see [`gcsl::workspace`], "Syntax errors").
+//! `--dump-tokens` with a lexical error, and `--dump-ast` with a syntax
+//! error, print nothing and show every one of the file's.
+//!
 //! A file run alone is checked and run as the workspace of one directory
 //! holding just it ([`gcsl::workspace::check_lone_with_standard`]), and its
 //! dumps are its own as a workspace file's are. Either way the standard
@@ -258,14 +264,26 @@ fn print_value(value: &Value, out: &mut impl Write) -> io::Result<()> {
 }
 
 /// Lexes and parses `source`, printing its tokens and its syntax tree if
-/// they are asked for; `None` when nothing after them is.
+/// they are asked for; `None` when nothing after them is. A lexical error
+/// fails it before the tokens are printed, and a syntax error before the
+/// tree is, with every lexical and syntax error of the file
+/// ([`gcsl::parser::parse_all`]).
 fn syntax(
     args: &RunArgs,
     source: &SourceFile,
     out: &mut impl Write,
 ) -> Result<Option<Ast>, Failure> {
     let last = args.last_dump();
-    let (tokens, names, strings) = lexer::tokenize(source)?;
+    let mut names = gcsl::names::Names::new();
+    let lexer::Lexed {
+        tokens,
+        strings,
+        diagnostics: lexical,
+    } = lexer::lex(source, &mut names);
+    if !lexical.is_empty() {
+        let (_, diagnostics) = parser::parse_all(&tokens, names, strings, source, lexical);
+        return Err(Failure::Program(diagnostics));
+    }
     if args.dump_tokens {
         // Names by their text and string pieces by their quoted text, as in
         // `Ident(x)`, `Label(outer)`, `Attribute(shadowable)` and
@@ -299,7 +317,10 @@ fn syntax(
         return Ok(None);
     }
 
-    let ast = parser::parse(&tokens, names, strings, source)?;
+    let (ast, diagnostics) = parser::parse_all(&tokens, names, strings, source, Vec::new());
+    if !diagnostics.is_empty() {
+        return Err(Failure::Program(diagnostics));
+    }
     if args.dump_ast {
         writeln!(out, "{}", ast.pretty())?;
     }

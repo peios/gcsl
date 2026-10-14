@@ -721,14 +721,84 @@
 //! parsed, as it does for items, so nested interpolations need no
 //! allocation of their own.
 //!
-//! # Errors and depth
+//! # Errors and recovery
 //!
 //! Errors are values. Parsing functions return `Result`, and a failure is
-//! recorded in the parser's diagnostic sink before the `Err` propagates. The
-//! parser stops at the first error for now; recovery can be added later by
-//! catching an `Err` at a synchronisation point (such as the next item
-//! separator) and continuing, with the sink then holding several
-//! diagnostics.
+//! recorded in the parser's diagnostic sink before the `Err` propagates, up
+//! to the nearest *recovery point*, which puts back what the failed parse
+//! made (the parser's stacks and every arena of the tree, so that nothing
+//! of it is left in the tree, `Parser::restore`), skips the source to a
+//! *synchronisation point* and goes on. [`parse_all`] returns the tree so
+//! recovered, with every error; [`parse`] returns the first error, as it
+//! always did, or the tree if there is none.
+//!
+//! The recovery points, innermost first:
+//!
+//! - **An entry of a list**: an argument of a call, a parameter of a
+//!   function expression, of a function type or of a definition made with
+//!   a def-type, an element of a list literal, an entry of a record type.
+//!   The list skips to the `,` after the entry and goes on with the next,
+//!   or to its closing bracket, and ends. Each later entry is parsed as any
+//!   is, its errors reported. A list with an error fails once it has ended,
+//!   so its errors are reported and its construct (the call, the function,
+//!   the list, the type) is no part of the tree.
+//! - **The expression of an interpolation**: the string skips to the piece
+//!   after it and goes on, to fail at its end, as a list does.
+//! - **The value of an item of a body**, after the `=` of a `let`, a field
+//!   or a result, the `:=` of a rebind or the `...` of a spread, the end of
+//!   the item checked with it (`Parser::parse_value`): the value is an
+//!   error node, [`ExprKind::Error`], spanning what is skipped to the end
+//!   of the item, so the item still declares what it declares. Not in a
+//!   `for` header, whose parts' errors are the header's.
+//! - **An item of a body**, the file's or a block's: it is an error item,
+//!   [`ItemKind::Error`], spanning what is skipped to the end of the item
+//!   (`Parser::error_item`). So is the item after an attribute that is an
+//!   error, which may have meant something else for it, and attributes
+//!   waiting for an item that fails are dropped.
+//!
+//! A skip (`Parser::skip`) follows the brackets the lexer follows (`nest`):
+//! it goes over everything between brackets opened since what failed
+//! started, newlines inside braces included, and stops, without consuming
+//! it, at the synchronisation point with nothing opened since then left
+//! open: an item's newline or `;`; a `}` that closes a block's body; an
+//! entry's `,`, or the list's closing bracket; the string's piece after an
+//! interpolation; or the end of the input. A closing bracket of something
+//! opened before what failed that is not the point is something around a
+//! list (a `}`, or a string's piece, which closes the list too), where the
+//! list ends, or one the lexer ignores, as a `)` or `]` of nothing is,
+//! skipped. In the file's body a `}` closes nothing, and is skipped. An
+//! item starts at none of the points, so it, and every loop, always moves
+//! on; a value may be empty, `x = ;`. Nesting too deep is recovered from by the item or its value
+//! alone, not by every list it is in, which would skip what is nested in
+//! each of them again.
+//!
+//! What is reported: each error, once, where it is found. Nothing skipped
+//! is reported: it may be part of the error. A list that has failed reports
+//! what is wrong in its later entries, and the end of the input where its
+//! closing bracket should be. Nothing is reported at a lexical error's
+//! token, [`TokenKind::Error`], which the lexer has reported: what it is in
+//! fails silently, as an expression, a type, a separator; nor after a
+//! lexical error whose token runs to the end of the input (an unterminated
+//! string literal), after which nothing was lexed. A block whose body meets
+//! the end of the input ends there, "expected `}`", reported once, for the
+//! innermost block; a `}` in the file's body that closes nothing is
+//! "unexpected `}`", and skipped. The errors of one file, the lexer's and
+//! the parser's together, are capped at [`MAX_ERRORS`]: after them the
+//! parser skips to the end of the input, and the next is replaced by "too
+//! many errors" ([`capped`]).
+//!
+//! What the tree says: [`Ast::syntax`] is [`Syntax::Clean`] for a tree with
+//! no error, [`Syntax::Recovered`] for one with errors, each in an error
+//! node or left out of the tree (a failed list's construct, a failed
+//! interpolated string), and [`Syntax::Unbalanced`] for one whose braces
+//! did not match, a `}` that closes nothing or a block that the end of the
+//! input closed, where items may be in the wrong block: the workspace does
+//! not check that one. A recovered tree is checked, an error node being of
+//! type `Error`, silently, and a block with an error item erroneous, as is
+//! a name that names nothing in it (see the workspace's [Syntax
+//! errors](crate::workspace#syntax-errors)); it is never lowered.
+//!
+//! # Depth
 //!
 //! The parser enforces [`MAX_DEPTH`] in two places, because nesting arises in
 //! two ways. Parentheses, prefix operators (`await` included), blocks, `if`s,
@@ -776,14 +846,14 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, Ast, AstBuilder, BinaryOp, DefTypeRole, DefTypeUse, Effect, Element, Expr,
-    ExprId, ExprKind, FieldDefault, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl, ImportForm,
-    ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param,
-    ParamTy, PathRange, PathSegment, SegmentKind, StrPart, TypeExpr, TypeExprId, TypeExprKind,
-    UnaryOp, path_span,
+    Arg, ArgKind, Ast, AstBuilder, BinaryOp, BuilderMark, DefTypeRole, DefTypeUse, Effect, Element,
+    Expr, ExprId, ExprKind, FieldDefault, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl,
+    ImportForm, ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy,
+    Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExpr, TypeExprId,
+    TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{MAX_ERRORS, Token, TokenKind, lex};
 use crate::names::{Name, Names};
 use crate::source::{SourceFile, Span};
 use crate::strings::{StrId, Strings};
@@ -968,30 +1038,111 @@ const RETURN_TYPE_NOTE: &str = "a function declares its return type: `: T` for a
 ///
 /// # Errors
 ///
-/// Returns the first syntax error.
+/// Returns the first syntax error, or, for tokens with a
+/// [`TokenKind::Error`] and no syntax error, "invalid token" at the first.
+/// [`parse_all`] gives every error, with the tree recovered from them.
 pub fn parse(
     tokens: &[Token],
     mut names: Names,
     mut strings: Strings,
     source: &SourceFile,
 ) -> Result<Ast, Diagnostic> {
-    let (builder, root) = parse_parts(tokens, source, &mut names, &mut strings)?;
+    let (builder, root, diagnostics) = parse_parts(tokens, source, (&mut names, &mut strings), 0);
+    if let Some(first) = diagnostics.into_iter().next() {
+        return Err(first);
+    }
+    if let Some(token) = tokens.iter().find(|token| token.kind == TokenKind::Error) {
+        return Err(Diagnostic::error("invalid token", token.span));
+    }
     Ok(builder.finish(root, names, strings))
 }
 
-/// Like [`parse`], returning the unfinished arenas and the file's body
+/// Parses `tokens` as [`parse`] does, but going on past every syntax error
+/// (see [Errors and recovery](#errors-and-recovery)): returns the tree,
+/// with an error node in place of each part of the source that could not
+/// be parsed ([`Ast::syntax`] says whether it has any), and every error,
+/// `lexical`, the lexer's ([`crate::lexer::lex`]), among them, in source
+/// order and capped ([`capped`]).
+#[must_use]
+pub fn parse_all(
+    tokens: &[Token],
+    mut names: Names,
+    mut strings: Strings,
+    source: &SourceFile,
+    lexical: Vec<Diagnostic>,
+) -> (Ast, Vec<Diagnostic>) {
+    let (builder, root, syntax) =
+        parse_parts(tokens, source, (&mut names, &mut strings), lexical.len());
+    (
+        builder.finish(root, names, strings),
+        capped(lexical, syntax),
+    )
+}
+
+/// Lexes and parses `source` going on past every error ([`lex`],
+/// [`parse_all`]): its tree, recovered from the errors, and every lexical
+/// and syntax error, in source order and capped.
+#[must_use]
+pub fn parse_source(source: &SourceFile) -> (Ast, Vec<Diagnostic>) {
+    let mut names = Names::new();
+    let lexed = lex(source, &mut names);
+    parse_all(
+        &lexed.tokens,
+        names,
+        lexed.strings,
+        source,
+        lexed.diagnostics,
+    )
+}
+
+/// The errors of one source, its lexer's, `lexical`, and its parser's,
+/// `syntax`, each in the order found, merged in source order (a lexical
+/// error first among those that start at one place) and capped: past
+/// [`MAX_ERRORS`], the first after them is replaced by "too many errors",
+/// at it, and the rest are left out.
+#[must_use]
+pub fn capped(lexical: Vec<Diagnostic>, syntax: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let mut all = lexical;
+    all.extend(syntax);
+    all.sort_by_key(|diagnostic| diagnostic.span.start);
+    if all.len() > MAX_ERRORS {
+        all.truncate(MAX_ERRORS + 1);
+        if let Some(last) = all.last_mut() {
+            *last = Diagnostic::error("too many errors", last.span).with_note(format!(
+                "only the first {MAX_ERRORS} errors of this file are reported"
+            ));
+        }
+    }
+    all
+}
+
+/// Like [`parse_all`], returning the unfinished arenas and the file's body
 /// instead of an [`Ast`], and borrowing the tables rather than taking them,
-/// so that a caller lending its [`Names`] only hands them over once parsing
-/// has succeeded. The text of every quoted field name is interned into
-/// `names`; on error, names met before the error remain interned. The
+/// so that a caller lending its [`Names`] hands them over only once the
+/// tree is finished, with the parser's errors alone, `lexical` being the
+/// number of the lexer's. The text of every quoted field name is interned
+/// into `names`, those of source that could not be parsed among them. The
 /// source text of the position of every index segment of a path is added
 /// to `strings` (see [`crate::ast::SegmentKind::Index`]).
 pub(crate) fn parse_parts(
     tokens: &[Token],
     source: &SourceFile,
-    names: &mut Names,
-    strings: &mut Strings,
-) -> Result<(AstBuilder, ItemRange), Diagnostic> {
+    (names, strings): (&mut Names, &mut Strings),
+    lexical: usize,
+) -> (AstBuilder, ItemRange, Vec<Diagnostic>) {
+    // A lexical error whose token runs to the end of the source, an
+    // unterminated string literal, leaves nothing after it to parse: what
+    // is missing there is no error of its own.
+    let quiet_from = match tokens {
+        [.., last, eof]
+            if last.kind == TokenKind::Error
+                && eof.kind == TokenKind::Eof
+                && last.span.end == source.len() =>
+        {
+            last.span.start
+        }
+        _ => u32::MAX,
+    };
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -1005,7 +1156,9 @@ pub(crate) fn parse_parts(
         // with only a trailing block, whose block likewise consumes two.
         // (A field access consumes two, `.` and the name, a call with an
         // argument list its `(` and `)`, and a function expression at least
-        // `fn`, `(`, `)`, a marker and a type besides its body.)
+        // `fn`, `(`, `)`, a marker and a type besides its body.) An error
+        // node takes the place of the nodes of the source it stands for,
+        // which is at least the token it is at, but at the end of the input.
         builder: AstBuilder::with_capacity(tokens.len()),
         heights: Vec::with_capacity(tokens.len()),
         depth: 0,
@@ -1018,17 +1171,17 @@ pub(crate) fn parse_parts(
         element_stack: Vec::new(),
         path: Vec::new(),
         braces: Braces::Free,
+        recovery: Recovery::Body { top: true },
+        quiet_from,
+        unclosed: false,
+        deep: false,
         diagnostics: Vec::new(),
     };
-    match parser.parse_body(None) {
-        Ok((root, _)) => Ok((parser.builder, root)),
-        Err(Reported) => Err(parser.diagnostics.into_iter().next().unwrap_or_else(|| {
-            Diagnostic::error(
-                "internal error: parser failed without reporting a diagnostic",
-                Span::new(0, 0),
-            )
-        })),
+    if lexical > 0 {
+        parser.builder.set_syntax(Syntax::Recovered);
     }
+    let (root, _) = parser.parse_body(None);
+    (parser.builder, root, parser.diagnostics)
 }
 
 /// What an item's height needs to know of its path: its number of segments,
@@ -1092,8 +1245,9 @@ enum Braces {
     Header,
 }
 
-/// Proof that a diagnostic has been pushed to the parser's sink. Only
-/// [`Parser::report`] creates one.
+/// Proof that an error is on record: pushed to the parser's sink, or, for
+/// one at a [`TokenKind::Error`], the lexer's. Only [`Parser::report`]
+/// creates one.
 #[derive(Debug)]
 struct Reported;
 
@@ -1156,9 +1310,105 @@ struct Parser<'a> {
     /// expression is the body too. Lifted inside parentheses, argument
     /// lists, list literals, indexes, blocks and interpolations.
     braces: Braces,
-    /// Errors reported so far. Only one is ever pushed until error recovery
-    /// exists.
+    /// Whether the value of an item being parsed recovers from an error in
+    /// it, as a body's items' do, and in which body (see [Errors and
+    /// recovery](#errors-and-recovery)).
+    recovery: Recovery,
+    /// Where the lexical error whose token runs to the end of the source
+    /// starts, if one does: no error is reported from there on, since
+    /// nothing after it was lexed. `u32::MAX` if none does.
+    quiet_from: u32,
+    /// Whether the end of the input inside a block has been reported: it is
+    /// reported once, at the innermost block.
+    unclosed: bool,
+    /// Whether the error being recovered from is nesting too deep, which
+    /// no list and no interpolation recovers from: the item, or its value,
+    /// does.
+    deep: bool,
+    /// Errors reported so far, in the order found: at most [`MAX_ERRORS`]
+    /// and one more, after which the parser skips to the end of the input.
     diagnostics: Vec<Diagnostic>,
+}
+
+/// Whether the value of an item recovers from an error in it (see [Errors
+/// and recovery](#errors-and-recovery)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+    /// It does, as an item of a body does: of the file's body if `top`, of
+    /// a block's otherwise.
+    Body {
+        /// Whether the body is the file's.
+        top: bool,
+    },
+    /// It does not, as a part of a `for` header does not: its error is its
+    /// header's.
+    None,
+}
+
+/// Where the parser's stacks and the builder's arenas were, with its depth
+/// and what a `{` meant: what a recovery point puts back when what it
+/// parses fails, so that nothing of the source it skips is left in the tree
+/// (see [Errors and recovery](#errors-and-recovery)).
+#[derive(Clone, Copy, Debug)]
+struct Marks {
+    builder: BuilderMark,
+    heights: usize,
+    items: usize,
+    parts: usize,
+    field_tys: usize,
+    params: usize,
+    param_tys: usize,
+    args: usize,
+    elements: usize,
+    path: usize,
+    depth: usize,
+    braces: Braces,
+}
+
+/// What ends a skip over source that could not be parsed (see [Errors and
+/// recovery](#errors-and-recovery)).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sync {
+    /// An item of a body, or its value: a newline or `;` ends it, and so
+    /// does a `}` that closes the body, which is a block's but if `top`.
+    Item {
+        /// Whether the body is the file's, which no `}` closes.
+        top: bool,
+    },
+    /// An entry of a list that `close` closes: a `,` or `close` ends it.
+    Entry {
+        /// The token that closes the list.
+        close: TokenKind,
+    },
+    /// The expression of an interpolation: the string's piece after it
+    /// ends it.
+    Interpolation,
+}
+
+/// Where a skip stopped, at a token it did not consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stop {
+    /// At the separator after an item or an entry: a newline, a `;` or a
+    /// `,`.
+    Separator,
+    /// At what closes the body, the list or the interpolation.
+    Close,
+    /// At the end of the input, or at what closes something around the list.
+    Outer,
+}
+
+/// A bracket opened in the source a skip goes over: what the lexer keeps
+/// on its stack, which a skip follows (see [`nest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Open {
+    /// `(`
+    Paren,
+    /// `[`
+    Square,
+    /// `{`
+    Brace,
+    /// The start of an interpolated string, which its last piece closes.
+    Str,
 }
 
 impl Parser<'_> {
@@ -1166,90 +1416,154 @@ impl Parser<'_> {
     /// or the end of input for the file's body, when `open` is `None`.
     /// Returns the body and the height of its tallest item expression (0 if
     /// it has no items).
-    fn parse_body(&mut self, open: Option<Span>) -> ParseResult<(ItemRange, u32)> {
+    ///
+    /// An item that fails is an error item, spanning it and what is skipped
+    /// after it to the item's end (see [Errors and
+    /// recovery](#errors-and-recovery)), and so is the item after an
+    /// attribute that is an error. A block's body ends at the end of the
+    /// input too, which is reported once, "expected `}`", for the innermost
+    /// block; and a `}` in the file's body is reported, "unexpected `}`",
+    /// and skipped. Either makes the tree [`Syntax::Unbalanced`].
+    fn parse_body(&mut self, open: Option<Span>) -> (ItemRange, u32) {
         let base = self.item_stack.len();
         let mut height = 0;
-        // The outer attributes waiting for the item they apply to.
+        let top = open.is_none();
+        let recovery = std::mem::replace(&mut self.recovery, Recovery::Body { top });
+        // The outer attributes waiting for the item they apply to, and
+        // whether one was an error, which makes it an error item.
         let mut pending = Pending::default();
+        let mut poisoned = false;
         loop {
             self.skip_separators();
             let token = self.peek();
+            if self.diagnostics.len() > MAX_ERRORS {
+                // Too many errors: the rest is not parsed.
+                self.pos = self.tokens.len().max(self.pos);
+                break;
+            }
             match token.kind {
                 TokenKind::Attribute(name) => {
-                    self.outer_attribute(token, name, &mut pending)?;
+                    if self.outer_attribute(token, name, &mut pending).is_err() {
+                        self.advance();
+                        poisoned = true;
+                    }
                     continue;
                 }
                 TokenKind::InnerAttribute(name) => {
                     let first =
                         open.is_none() && self.item_stack.len() == base && pending.is_empty();
-                    self.inner_attribute(token, name, first)?;
+                    if self.inner_attribute(token, name, first).is_err() {
+                        self.advance();
+                        poisoned = true;
+                    }
                     continue;
                 }
                 _ => {}
             }
             match (token.kind, open) {
                 (TokenKind::Eof, None) | (TokenKind::RBrace, Some(_)) => {
-                    if let Some((written, attribute)) = pending.first() {
-                        return Err(self.error(
+                    if !poisoned && let Some((written, attribute)) = pending.first() {
+                        self.error(
                             format!("`#[{written}]` is not followed by anything"),
                             attribute,
-                        ));
+                        );
                     }
                     break;
                 }
                 (TokenKind::Eof, Some(open)) => {
-                    let found = self.describe(token);
-                    return Err(self.report(
-                        Diagnostic::error(format!("expected `}}`, found {found}"), token.span)
-                            .with_context(open, "unclosed `{`"),
-                    ));
+                    self.builder.set_syntax(Syntax::Unbalanced);
+                    if !self.unclosed {
+                        self.unclosed = true;
+                        let found = self.describe(token);
+                        self.report(
+                            Diagnostic::error(format!("expected `}}`, found {found}"), token.span)
+                                .with_context(open, "unclosed `{`"),
+                        );
+                    }
+                    break;
                 }
                 (TokenKind::RBrace, None) => {
-                    return Err(self.error("unexpected `}`", token.span));
+                    self.builder.set_syntax(Syntax::Unbalanced);
+                    self.error("unexpected `}`", token.span);
+                    self.advance();
+                    continue;
                 }
                 _ => {}
             }
-            let (item, item_height) = match (token.kind, open) {
-                (TokenKind::Import, None) => (self.parse_import(token)?, 0),
-                (TokenKind::Import, Some(_)) => {
-                    return Err(self.error(MISPLACED_IMPORT, token.span));
-                }
-                _ if self.starts_type_item() => {
-                    if open.is_some() {
-                        return Err(self.error(MISPLACED_TYPE, token.span));
+            let start = self.pos;
+            let marks = self.marks();
+            let parsed = self.parse_body_item(token, open.is_some(), &mut pending);
+            let (item, item_height) = match parsed {
+                Ok(parsed) if !poisoned => parsed,
+                Ok(_) | Err(Reported) => {
+                    pending = Pending::default();
+                    let item = self.error_item(start, marks, Sync::Item { top });
+                    // An item starts at no separator, closing brace or end
+                    // of input, where a skip stops, so it consumes a token
+                    // and the loop ends; this keeps it so whatever happens.
+                    let stops = matches!(
+                        self.peek().kind,
+                        TokenKind::Eof | TokenKind::RBrace | TokenKind::Newline | TokenKind::Semi
+                    );
+                    if self.pos == start && !stops {
+                        self.advance();
                     }
-                    self.parse_type_item(token)?
+                    (item, 0)
                 }
-                _ if self.starts_defmeta() => {
-                    if open.is_some() {
-                        return Err(self.error(MISPLACED_DEFMETA, token.span));
-                    }
-                    self.parse_defmeta(token)?
-                }
-                _ => self.parse_item()?,
             };
-            if open.is_some()
-                && let item = *self.builder.item(item)
-                && matches!(item.kind, ItemKind::DefTypeDef { .. })
-            {
-                // At its `def`.
-                let start = item.span.start;
-                let keyword = Span::new(start, start.saturating_add(3));
-                return Err(self.error(MISPLACED_DEF_TYPE_DEF, keyword));
-            }
-            if let Some(attribute) = pending.shadowable.take() {
-                self.attach_shadowable(attribute, item, open.is_none())?;
-            }
-            if let Some(attribute) = pending.def_type.take() {
-                self.attach_def_type(attribute, item, open.is_none())?;
-            }
+            poisoned = false;
             self.item_stack.push(item);
             height = height.max(item_height);
-            self.expect_end_of_item()?;
         }
+        self.recovery = recovery;
         let range = self.builder.push_item_list(&self.item_stack[base..]);
         self.item_stack.truncate(base);
-        Ok((range, height))
+        (range, height)
+    }
+
+    /// Parses the item of a body, a block's if `inner`, starting at
+    /// `token`, which is followed by the end of the item, and applies the
+    /// outer attributes `pending` to it. Returns it and its height.
+    fn parse_body_item(
+        &mut self,
+        token: Token,
+        inner: bool,
+        pending: &mut Pending,
+    ) -> ParseResult<(ItemId, u32)> {
+        let (item, item_height) = match token.kind {
+            TokenKind::Import if inner => return Err(self.error(MISPLACED_IMPORT, token.span)),
+            TokenKind::Import => (self.parse_import(token)?, 0),
+            _ if self.starts_type_item() => {
+                if inner {
+                    return Err(self.error(MISPLACED_TYPE, token.span));
+                }
+                self.parse_type_item(token)?
+            }
+            _ if self.starts_defmeta() => {
+                if inner {
+                    return Err(self.error(MISPLACED_DEFMETA, token.span));
+                }
+                self.parse_defmeta(token)?
+            }
+            _ => self.parse_item()?,
+        };
+        if inner
+            && let item = *self.builder.item(item)
+            && matches!(item.kind, ItemKind::DefTypeDef { .. })
+        {
+            // At its `def`.
+            let start = item.span.start;
+            let keyword = Span::new(start, start.saturating_add(3));
+            return Err(self.error(MISPLACED_DEF_TYPE_DEF, keyword));
+        }
+        if let Some(attribute) = pending.shadowable.take() {
+            self.attach_shadowable(attribute, item, !inner)?;
+        }
+        if let Some(attribute) = pending.def_type.take() {
+            self.attach_def_type(attribute, item, !inner)?;
+        }
+        self.expect_end_of_item()?;
+        Ok((item, item_height))
     }
 
     /// Takes the outer attribute `token`, named `name`, at the start of an
@@ -1387,13 +1701,13 @@ impl Parser<'_> {
             TokenKind::Eq => {
                 self.advance();
                 self.skip_newlines();
-                let value = self.parse_expr(0)?;
+                let value = self.parse_value()?;
                 (ItemKind::Result(value), value)
             }
             TokenKind::DotDotDot => {
                 self.advance();
                 self.skip_newlines();
-                let value = self.parse_expr(0)?;
+                let value = self.parse_value()?;
                 (ItemKind::Spread(value), value)
             }
             _ if self.starts_path_item() => {
@@ -1448,7 +1762,7 @@ impl Parser<'_> {
         }
         self.advance();
         self.skip_newlines();
-        let value = self.parse_expr(0)?;
+        let value = self.parse_value()?;
         let kind = ItemKind::Let {
             path,
             ty,
@@ -2030,64 +2344,86 @@ impl Parser<'_> {
     /// `shown`, as it is written, after their `(`, `open`, through their
     /// `)`: names alone, separated by `,`, each with a type expression of
     /// [`TypeExprKind::Invalid`] that nothing reads, the def-type's to give
-    /// (see [Def-types](#def-types)). Returns them, with the `)`.
+    /// (see [Def-types](#def-types)). Returns them, with the `)`. A
+    /// parameter that fails is skipped to its `,`, and the list goes on, to
+    /// fail at its end (see [Errors and recovery](#errors-and-recovery)).
     fn parse_definition_params(
         &mut self,
         open: Token,
         shown: &str,
     ) -> ParseResult<(crate::ast::ParamRange, Token)> {
         let base = self.param_stack.len();
+        let mut failed = None;
         let close = loop {
+            let start = self.pos;
             let token = self.peek();
-            let name = match token.kind {
-                TokenKind::RParen => {
-                    self.advance();
-                    break token;
-                }
-                TokenKind::Ident(name) => name,
-                TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
-                TokenKind::StrStart(first) => {
-                    let literal = self.parse_interpolation(first)?;
-                    let span = self.span_of(literal);
-                    return Err(self.error(PLAIN_VARIABLE_NAME, span));
-                }
-                TokenKind::Mut => {
-                    return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
-                }
-                _ => {
-                    let found = self.describe(token);
-                    return Err(self.error(
-                        format!("expected a parameter name, found {found}"),
-                        error_span(token),
-                    ));
-                }
-            };
-            self.advance();
-            let colon = self.peek();
-            if colon.kind == TokenKind::Colon {
-                return Err(self.error(
-                    format!("the parameter types of a `{shown}` definition come from `{shown}`"),
-                    colon.span,
-                ));
+            if token.kind == TokenKind::RParen {
+                self.advance();
+                break token;
             }
-            let ty = self.builder.alloc_type(TypeExpr {
-                kind: TypeExprKind::Invalid,
-                span: token.span,
-            });
-            self.param_stack.push(Param {
-                name,
-                span: token.span,
-                ty,
-                default: None,
-            });
-            let separator = self.peek();
-            if self.list_separator(open)? {
-                break separator;
+            match self.parse_definition_param(open, shown) {
+                Ok(Some(close)) => break close,
+                Ok(None) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RParen) {
+                        return Err(reported);
+                    }
+                    failed = Some(reported);
+                }
             }
         };
+        if let Some(reported) = failed {
+            return Err(reported);
+        }
         let params = self.builder.push_params(&self.param_stack[base..]);
         self.param_stack.truncate(base);
         Ok((params, close))
+    }
+
+    /// Parses a parameter of a definition made with the def-type `shown`
+    /// whose parameter list `open` opens, a name alone, and the `,` or the
+    /// `)` after it. Returns the `)` if it ends the list.
+    fn parse_definition_param(&mut self, open: Token, shown: &str) -> ParseResult<Option<Token>> {
+        let token = self.peek();
+        let name = match token.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
+            TokenKind::StrStart(first) => {
+                let literal = self.parse_interpolation(first)?;
+                let span = self.span_of(literal);
+                return Err(self.error(PLAIN_VARIABLE_NAME, span));
+            }
+            TokenKind::Mut => {
+                return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
+            }
+            _ => {
+                let found = self.describe(token);
+                return Err(self.error(
+                    format!("expected a parameter name, found {found}"),
+                    error_span(token),
+                ));
+            }
+        };
+        self.advance();
+        let colon = self.peek();
+        if colon.kind == TokenKind::Colon {
+            return Err(self.error(
+                format!("the parameter types of a `{shown}` definition come from `{shown}`"),
+                colon.span,
+            ));
+        }
+        let ty = self.builder.alloc_type(TypeExpr {
+            kind: TypeExprKind::Invalid,
+            span: token.span,
+        });
+        self.param_stack.push(Param {
+            name,
+            span: token.span,
+            ty,
+            default: None,
+        });
+        let separator = self.peek();
+        Ok(self.list_separator(open)?.then_some(separator))
     }
 
     /// Parses a def-type reference, `DT PATH`, whose def-type, `dt`, has
@@ -2732,7 +3068,7 @@ impl Parser<'_> {
         shape.positions = positions;
         self.advance();
         self.skip_newlines();
-        let value = self.parse_expr(0)?;
+        let value = self.parse_value()?;
         let kind = if rebind {
             ItemKind::Rebind { path, value }
         } else {
@@ -3118,31 +3454,29 @@ impl Parser<'_> {
         let open = self.expect_fn_paren()?;
         let base = self.param_ty_stack.len();
         let mut tallest = 0;
+        // A parameter that fails is skipped to its `,`, and the list goes
+        // on, to fail at its end (see [Errors and
+        // recovery](#errors-and-recovery)).
+        let mut failed = None;
         loop {
-            let token = self.peek();
-            if token.kind == TokenKind::RParen {
+            let start = self.pos;
+            if self.peek().kind == TokenKind::RParen {
                 self.advance();
                 break;
             }
-            let name = match (token.kind, self.peek_at(1).kind) {
-                (TokenKind::Ident(name), TokenKind::Colon) => {
-                    self.advance();
-                    self.advance();
-                    Some(name)
+            match self.parse_param_ty(open, &mut tallest) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RParen) {
+                        return Err(reported);
+                    }
+                    failed = Some(reported);
                 }
-                _ => None,
-            };
-            let (ty, height) = self.parse_type()?;
-            tallest = tallest.max(height);
-            // Only a function expression's parameter has a default.
-            let eq = self.peek();
-            if eq.kind == TokenKind::Eq {
-                return Err(self.error(MISPLACED_DEFAULT, eq.span));
             }
-            self.param_ty_stack.push(ParamTy { name, ty });
-            if self.list_separator(open)? {
-                break;
-            }
+        }
+        if let Some(reported) = failed {
+            return Err(reported);
         }
         let params = self.builder.push_param_tys(&self.param_ty_stack[base..]);
         self.param_ty_stack.truncate(base);
@@ -3174,6 +3508,31 @@ impl Parser<'_> {
             span: Span::join(keyword.span, self.type_span(end)),
         });
         Ok((id, tallest.max(ret_height).max(meta_height) + 1))
+    }
+
+    /// Parses a parameter of a function type whose parameter list `open`
+    /// opens, `NAME: TYPE` or `TYPE`, and the `,` or the `)` after it,
+    /// raising `tallest` to the height of its type. Returns whether the `)`
+    /// ends the list.
+    fn parse_param_ty(&mut self, open: Token, tallest: &mut u32) -> ParseResult<bool> {
+        let token = self.peek();
+        let name = match (token.kind, self.peek_at(1).kind) {
+            (TokenKind::Ident(name), TokenKind::Colon) => {
+                self.advance();
+                self.advance();
+                Some(name)
+            }
+            _ => None,
+        };
+        let (ty, height) = self.parse_type()?;
+        *tallest = (*tallest).max(height);
+        // Only a function expression's parameter has a default.
+        let eq = self.peek();
+        if eq.kind == TokenKind::Eq {
+            return Err(self.error(MISPLACED_DEFAULT, eq.span));
+        }
+        self.param_ty_stack.push(ParamTy { name, ty });
+        self.list_separator(open)
     }
 
     /// The effect of the meta whose marker the current token begins, if it
@@ -3268,62 +3627,31 @@ impl Parser<'_> {
         self.advance();
         let base = self.field_ty_stack.len();
         let mut tallest = 0;
+        // A field that fails is skipped to its `,`, and the type goes on, to
+        // fail at its end (see [Errors and recovery](#errors-and-recovery)).
+        let mut failed = None;
         let close = loop {
             self.skip_newlines();
+            let start = self.pos;
             let token = self.peek();
             if token.kind == TokenKind::RBrace {
                 self.advance();
                 break token;
             }
-            // A spread, `...TYPE`.
-            let name = if token.kind == TokenKind::DotDotDot {
-                self.advance();
-                self.skip_newlines();
-                None
-            } else {
-                let Some(name) = self.field_name()? else {
-                    return Err(
-                        self.error("expected a field name in record type", error_span(token))
-                    );
-                };
-                self.skip_newlines();
-                let colon = self.peek();
-                if colon.kind != TokenKind::Colon {
-                    return Err(self.error("expected `:` after field name", error_span(colon)));
+            match self.parse_field_ty(&mut tallest) {
+                Ok(Some(close)) => break close,
+                Ok(None) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RBrace) {
+                        return Err(reported);
+                    }
+                    failed = Some(reported);
                 }
-                self.advance();
-                self.skip_newlines();
-                Some(name)
-            };
-            let (ty, height) = self.parse_type()?;
-            tallest = tallest.max(height);
-            self.skip_newlines();
-            // A field's default; a spread has none.
-            let default = match name {
-                Some(_) => self.parse_field_default()?,
-                None => None,
-            };
-            if let Some(default) = default {
-                tallest = tallest.max(self.height_of(default));
-            }
-            self.field_ty_stack.push(FieldTy {
-                name,
-                span: token.span,
-                ty,
-                default: default.map(FieldDefault::Expr),
-            });
-            self.skip_newlines();
-            let separator = self.peek();
-            match separator.kind {
-                // A `}` after it ends the type at the top of the loop.
-                TokenKind::Comma => self.advance(),
-                TokenKind::RBrace => {
-                    self.advance();
-                    break separator;
-                }
-                _ => return Err(self.error("expected `,` or `}`", error_span(separator))),
             }
         };
+        if let Some(reported) = failed {
+            return Err(reported);
+        }
         let fields = self.builder.push_field_tys(&self.field_ty_stack[base..]);
         self.field_ty_stack.truncate(base);
         let id = self.builder.alloc_type(TypeExpr {
@@ -3331,6 +3659,63 @@ impl Parser<'_> {
             span: Span::join(open.span, close.span),
         });
         Ok((id, tallest + 1))
+    }
+
+    /// Parses an entry of a record type, a field, `NAME: TYPE` with its
+    /// default if it has one, or a spread, `...TYPE`, and the `,` or the `}`
+    /// after it, newlines skipped, raising `tallest` to the height of its
+    /// type and its default. Returns the `}` if it ends the type.
+    fn parse_field_ty(&mut self, tallest: &mut u32) -> ParseResult<Option<Token>> {
+        let token = self.peek();
+        // A spread, `...TYPE`.
+        let name = if token.kind == TokenKind::DotDotDot {
+            self.advance();
+            self.skip_newlines();
+            None
+        } else {
+            let Some(name) = self.field_name()? else {
+                return Err(self.error("expected a field name in record type", error_span(token)));
+            };
+            self.skip_newlines();
+            let colon = self.peek();
+            if colon.kind != TokenKind::Colon {
+                return Err(self.error("expected `:` after field name", error_span(colon)));
+            }
+            self.advance();
+            self.skip_newlines();
+            Some(name)
+        };
+        let (ty, height) = self.parse_type()?;
+        *tallest = (*tallest).max(height);
+        self.skip_newlines();
+        // A field's default; a spread has none.
+        let default = match name {
+            Some(_) => self.parse_field_default()?,
+            None => None,
+        };
+        if let Some(default) = default {
+            *tallest = (*tallest).max(self.height_of(default));
+        }
+        self.field_ty_stack.push(FieldTy {
+            name,
+            span: token.span,
+            ty,
+            default: default.map(FieldDefault::Expr),
+        });
+        self.skip_newlines();
+        let separator = self.peek();
+        match separator.kind {
+            // A `}` after it ends the type at the top of the loop.
+            TokenKind::Comma => {
+                self.advance();
+                Ok(None)
+            }
+            TokenKind::RBrace => {
+                self.advance();
+                Ok(Some(separator))
+            }
+            _ => Err(self.error("expected `,` or `}`", error_span(separator))),
+        }
     }
 
     /// Parses a field's default in a record type, `= EXPR`, if the current
@@ -3552,6 +3937,9 @@ impl Parser<'_> {
             TokenKind::LBracket => return self.parse_list(),
             TokenKind::DotDotDot => return Err(self.error(MISPLACED_SPREAD, token.span)),
             TokenKind::Mut => return Err(self.misplaced_mut(token, None)),
+            // A lexical error, the lexer's to report: what it is part of
+            // fails silently.
+            TokenKind::Error => return Err(self.error("invalid token", token.span)),
             TokenKind::Minus
             | TokenKind::Plus
             | TokenKind::Star
@@ -3641,59 +4029,29 @@ impl Parser<'_> {
         let open = self.expect_fn_paren()?;
         let base = self.param_stack.len();
         let mut tallest = 0;
+        // A parameter that fails is skipped to its `,`, and the list goes
+        // on, to fail at its end (see [Errors and
+        // recovery](#errors-and-recovery)).
+        let mut failed = None;
         loop {
-            let token = self.peek();
-            let name = match token.kind {
-                TokenKind::RParen => {
-                    self.advance();
-                    break;
-                }
-                TokenKind::Ident(name) => name,
-                TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
-                TokenKind::StrStart(first) => {
-                    let literal = self.parse_interpolation(first)?;
-                    let span = self.span_of(literal);
-                    return Err(self.error(PLAIN_VARIABLE_NAME, span));
-                }
-                TokenKind::Mut => {
-                    return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
-                }
-                _ => {
-                    let found = self.describe(token);
-                    return Err(self.error(
-                        format!("expected a parameter name, found {found}"),
-                        error_span(token),
-                    ));
-                }
-            };
-            self.advance();
-            let colon = self.peek();
-            if colon.kind != TokenKind::Colon {
-                let message = format!(
-                    "expected `:` and a type after parameter `{}`",
-                    self.names.get(name)
-                );
-                return Err(self.report(
-                    Diagnostic::error(message, error_span(colon))
-                        .with_note("parameters must be annotated"),
-                ));
-            }
-            self.advance();
-            let (ty, height) = self.parse_type()?;
-            tallest = tallest.max(height);
-            let default = self.parse_default()?;
-            if let Some(default) = default {
-                tallest = tallest.max(self.height_of(default));
-            }
-            self.param_stack.push(Param {
-                name,
-                span: Span::join(token.span, self.type_span(ty)),
-                ty,
-                default,
-            });
-            if self.list_separator(open)? {
+            let start = self.pos;
+            if self.peek().kind == TokenKind::RParen {
+                self.advance();
                 break;
             }
+            match self.parse_param(open, &mut tallest) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RParen) {
+                        return Err(reported);
+                    }
+                    failed = Some(reported);
+                }
+            }
+        }
+        if let Some(reported) = failed {
+            return Err(reported);
         }
         let params = self.builder.push_params(&self.param_stack[base..]);
         self.param_stack.truncate(base);
@@ -3719,6 +4077,59 @@ impl Parser<'_> {
             body,
         });
         self.alloc(ExprKind::Fn(id), span, height)
+    }
+
+    /// Parses a parameter of a function expression whose parameter list
+    /// `open` opens, `NAME: TYPE` and its default, if it has one, and the
+    /// `,` or the `)` after it, raising `tallest` to the height of its type
+    /// and its default. Returns whether the `)` ends the list.
+    fn parse_param(&mut self, open: Token, tallest: &mut u32) -> ParseResult<bool> {
+        let token = self.peek();
+        let name = match token.kind {
+            TokenKind::Ident(name) => name,
+            TokenKind::Str(_) => return Err(self.error(PLAIN_VARIABLE_NAME, token.span)),
+            TokenKind::StrStart(first) => {
+                let literal = self.parse_interpolation(first)?;
+                let span = self.span_of(literal);
+                return Err(self.error(PLAIN_VARIABLE_NAME, span));
+            }
+            TokenKind::Mut => {
+                return Err(self.misplaced_mut(token, Some(MUT_PARAM_NOTE)));
+            }
+            _ => {
+                let found = self.describe(token);
+                return Err(self.error(
+                    format!("expected a parameter name, found {found}"),
+                    error_span(token),
+                ));
+            }
+        };
+        self.advance();
+        let colon = self.peek();
+        if colon.kind != TokenKind::Colon {
+            let message = format!(
+                "expected `:` and a type after parameter `{}`",
+                self.names.get(name)
+            );
+            return Err(self.report(
+                Diagnostic::error(message, error_span(colon))
+                    .with_note("parameters must be annotated"),
+            ));
+        }
+        self.advance();
+        let (ty, height) = self.parse_type()?;
+        *tallest = (*tallest).max(height);
+        let default = self.parse_default()?;
+        if let Some(default) = default {
+            *tallest = (*tallest).max(self.height_of(default));
+        }
+        self.param_stack.push(Param {
+            name,
+            span: Span::join(token.span, self.type_span(ty)),
+            ty,
+            default,
+        });
+        self.list_separator(open)
     }
 
     /// Parses a parameter's default, `= EXPR`, if the current token, after
@@ -3793,33 +4204,52 @@ impl Parser<'_> {
     /// Parses the arguments of a call after its `(`, `open`, through its
     /// `)`, whose span it returns, pushing each on `arg_stack` and raising
     /// `tallest` to the tallest's height. An identifier directly followed
-    /// by `=` names its argument.
+    /// by `=` names its argument. An argument that fails is skipped to its
+    /// `,`, and the list goes on, to fail at its end (see [Errors and
+    /// recovery](#errors-and-recovery)).
     fn parse_arguments(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Span> {
+        let mut failed = None;
         loop {
+            let start = self.pos;
             let token = self.peek();
             if token.kind == TokenKind::RParen {
                 self.advance();
-                return Ok(token.span);
+                return failed.map_or(Ok(token.span), Err);
             }
-            let kind = match (token.kind, self.peek_at(1).kind) {
-                (TokenKind::Ident(name), TokenKind::Eq) => {
-                    self.advance();
-                    self.advance();
-                    ArgKind::Named {
-                        name,
-                        span: token.span,
+            match self.parse_argument(open, tallest) {
+                Ok(Some(close)) => return failed.map_or(Ok(close), Err),
+                Ok(None) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RParen) {
+                        return Err(reported);
                     }
+                    failed = Some(reported);
                 }
-                _ => ArgKind::Positional,
-            };
-            let value = self.parse_expr(0)?;
-            *tallest = (*tallest).max(self.height_of(value));
-            self.arg_stack.push(Arg { kind, value });
-            let close = self.peek();
-            if self.list_separator(open)? {
-                return Ok(close.span);
             }
         }
+    }
+
+    /// Parses an argument of a call whose argument list `open` opens, and
+    /// the `,` or the `)` after it, raising `tallest` to its height. Returns
+    /// the span of the `)` if it ends the list.
+    fn parse_argument(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Option<Span>> {
+        let token = self.peek();
+        let kind = match (token.kind, self.peek_at(1).kind) {
+            (TokenKind::Ident(name), TokenKind::Eq) => {
+                self.advance();
+                self.advance();
+                ArgKind::Named {
+                    name,
+                    span: token.span,
+                }
+            }
+            _ => ArgKind::Positional,
+        };
+        let value = self.parse_expr(0)?;
+        *tallest = (*tallest).max(self.height_of(value));
+        self.arg_stack.push(Arg { kind, value });
+        let close = self.peek();
+        Ok(self.list_separator(open)?.then_some(close.span))
     }
 
     /// Parses a list literal, starting at its `[`: its elements, each an
@@ -3847,40 +4277,64 @@ impl Parser<'_> {
     /// Parses the elements of a list literal after its `[`, `open`, through
     /// its `]`, whose span it returns, pushing each on `element_stack` and
     /// raising `tallest` to the tallest's height, a spread's being its
-    /// expression's.
+    /// expression's. An element that fails is skipped to its `,`, and the
+    /// list goes on, to fail at its end (see [Errors and
+    /// recovery](#errors-and-recovery)).
     fn parse_elements(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Span> {
+        let mut failed = None;
         loop {
+            let start = self.pos;
             let token = self.peek();
             if token.kind == TokenKind::RBracket {
                 self.advance();
-                return Ok(token.span);
+                return failed.map_or(Ok(token.span), Err);
             }
-            let spread = if token.kind == TokenKind::DotDotDot {
+            match self.parse_element(open, tallest) {
+                Ok(Some(close)) => return failed.map_or(Ok(close), Err),
+                Ok(None) => {}
+                Err(reported) => {
+                    if self.recover_entry(start, TokenKind::RBracket) {
+                        return Err(reported);
+                    }
+                    failed = Some(reported);
+                }
+            }
+        }
+    }
+
+    /// Parses an element of a list literal that `open` opens, and the `,`
+    /// or the `]` after it, raising `tallest` to its height. Returns the
+    /// span of the `]` if it ends the list.
+    fn parse_element(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Option<Span>> {
+        let token = self.peek();
+        let spread = if token.kind == TokenKind::DotDotDot {
+            self.advance();
+            Some(token.span)
+        } else {
+            None
+        };
+        let value = self.parse_expr(0)?;
+        *tallest = (*tallest).max(self.height_of(value));
+        self.element_stack.push(Element { value, spread });
+        let separator = self.peek();
+        match separator.kind {
+            TokenKind::Comma => {
                 self.advance();
-                Some(token.span)
-            } else {
-                None
-            };
-            let value = self.parse_expr(0)?;
-            *tallest = (*tallest).max(self.height_of(value));
-            self.element_stack.push(Element { value, spread });
-            let separator = self.peek();
-            match separator.kind {
-                TokenKind::Comma => self.advance(),
-                TokenKind::RBracket => {
-                    self.advance();
-                    return Ok(separator.span);
-                }
-                _ => {
-                    let found = self.describe(separator);
-                    return Err(self.report(
-                        Diagnostic::error(
-                            format!("expected `,` or `]`, found {found}"),
-                            error_span(separator),
-                        )
-                        .with_context(open.span, "unclosed `[`"),
-                    ));
-                }
+                Ok(None)
+            }
+            TokenKind::RBracket => {
+                self.advance();
+                Ok(Some(separator.span))
+            }
+            _ => {
+                let found = self.describe(separator);
+                Err(self.report(
+                    Diagnostic::error(
+                        format!("expected `,` or `]`, found {found}"),
+                        error_span(separator),
+                    )
+                    .with_context(open.span, "unclosed `[`"),
+                ))
             }
         }
     }
@@ -3963,10 +4417,9 @@ impl Parser<'_> {
         let label = self.parse_label(open)?;
         self.enter()?;
         let outer = std::mem::replace(&mut self.braces, Braces::Free);
-        let body = self.parse_body(Some(open.span));
+        let (items, tallest) = self.parse_body(Some(open.span));
         self.braces = outer;
         self.depth -= 1;
-        let (items, tallest) = body?;
         let label = match label {
             Some(label) if self.is_record_body(items) => {
                 return Err(self.error(LABELLED_RECORD, label.span));
@@ -3974,9 +4427,12 @@ impl Parser<'_> {
             Some(label) => Some(self.builder.push_label(label)),
             None => None,
         };
-        // `parse_body` only returns successfully at the matching `}`.
+        // `parse_body` returns at the matching `}`, or at the end of the
+        // input, which it has reported.
         let close = self.peek();
-        self.advance();
+        if close.kind == TokenKind::RBrace {
+            self.advance();
+        }
         self.alloc(
             ExprKind::Block { items, label },
             Span::join(open.span, close.span),
@@ -4155,7 +4611,11 @@ impl Parser<'_> {
     /// brackets, is the body.
     fn parse_header(&mut self, keyword: Token, label: Option<Label>) -> ParseResult<ExprId> {
         let outer = std::mem::replace(&mut self.braces, Braces::Header);
+        // An error in a part is the header's (see [Errors and
+        // recovery](#errors-and-recovery)).
+        let recovery = std::mem::replace(&mut self.recovery, Recovery::None);
         let header = self.parse_header_parts();
+        self.recovery = recovery;
         self.braces = outer;
         let (head, tallest) = header?;
         // The header ends only at a `{`.
@@ -4374,13 +4834,18 @@ impl Parser<'_> {
         // The `{` the current interpolation opened with: the last byte of
         // the token before it.
         let mut open = start.span;
+        // An expression that fails is skipped to the piece after it, and the
+        // string goes on, to fail at its end (see [Errors and
+        // recovery](#errors-and-recovery)).
+        let mut failed = None;
         let end = loop {
-            let outer = std::mem::replace(&mut self.braces, Braces::Free);
-            let expr = self.parse_expr(0);
-            self.braces = outer;
-            let expr = expr?;
-            tallest = tallest.max(self.height_of(expr));
-            self.part_stack.push(StrPart::Expr(expr));
+            let part = self.pos;
+            if let Err(reported) = self.parse_interpolated(open, &mut tallest) {
+                if self.deep || self.skip(part, Sync::Interpolation) != Stop::Close {
+                    return Err(reported);
+                }
+                failed = Some(reported);
+            }
             let token = self.peek();
             match token.kind {
                 TokenKind::StrMid(text) => {
@@ -4393,16 +4858,13 @@ impl Parser<'_> {
                     self.part_stack.push(StrPart::Lit(text));
                     break token.span;
                 }
-                _ => {
-                    let found = self.describe(token);
-                    let brace = Span::new(open.end.saturating_sub(1), open.end);
-                    return Err(self.report(
-                        Diagnostic::error(format!("expected `}}`, found {found}"), token.span)
-                            .with_context(brace, "unclosed `{`"),
-                    ));
-                }
+                // Neither follows an expression that parsed.
+                _ => return Err(failed.unwrap_or_else(|| self.error("expected `}`", token.span))),
             }
         };
+        if let Some(reported) = failed {
+            return Err(reported);
+        }
         let parts = self.builder.push_parts(&self.part_stack[base..]);
         self.part_stack.truncate(base);
         self.alloc(
@@ -4410,6 +4872,28 @@ impl Parser<'_> {
             Span::join(start.span, end),
             tallest + 1,
         )
+    }
+
+    /// Parses the expression of an interpolation of a string, opened by the
+    /// last byte of `open`, at minimum binding power 0, which the string's
+    /// piece after it must follow, raising `tallest` to its height.
+    fn parse_interpolated(&mut self, open: Span, tallest: &mut u32) -> ParseResult<()> {
+        let outer = std::mem::replace(&mut self.braces, Braces::Free);
+        let expr = self.parse_expr(0);
+        self.braces = outer;
+        let expr = expr?;
+        *tallest = (*tallest).max(self.height_of(expr));
+        self.part_stack.push(StrPart::Expr(expr));
+        let token = self.peek();
+        if matches!(token.kind, TokenKind::StrMid(_) | TokenKind::StrEnd(_)) {
+            return Ok(());
+        }
+        let found = self.describe(token);
+        let brace = Span::new(open.end.saturating_sub(1), open.end);
+        Err(self.report(
+            Diagnostic::error(format!("expected `}}`, found {found}"), token.span)
+                .with_context(brace, "unclosed `{`"),
+        ))
     }
 
     /// Allocates a node of the given `height`, failing if that height
@@ -4429,10 +4913,179 @@ impl Parser<'_> {
     }
 
     fn too_deep(&mut self, span: Span) -> Reported {
+        self.deep = true;
         self.report(
             Diagnostic::error("expression nested too deeply", span)
                 .with_note(format!("the limit is {MAX_DEPTH} levels")),
         )
+    }
+
+    /// Where the parser's stacks and the builder's arenas are, with its
+    /// depth and what a `{` means, for [`Parser::restore`].
+    fn marks(&self) -> Marks {
+        Marks {
+            builder: self.builder.mark(),
+            heights: self.heights.len(),
+            items: self.item_stack.len(),
+            parts: self.part_stack.len(),
+            field_tys: self.field_ty_stack.len(),
+            params: self.param_stack.len(),
+            param_tys: self.param_ty_stack.len(),
+            args: self.arg_stack.len(),
+            elements: self.element_stack.len(),
+            path: self.path.len(),
+            depth: self.depth,
+            braces: self.braces,
+        }
+    }
+
+    /// Puts the parser's stacks and the builder's arenas back where
+    /// `marks` says they were, with its depth and what a `{` means:
+    /// forgets everything parsed since.
+    fn restore(&mut self, marks: Marks) {
+        self.builder.truncate(marks.builder);
+        self.heights.truncate(marks.heights);
+        self.item_stack.truncate(marks.items);
+        self.part_stack.truncate(marks.parts);
+        self.field_ty_stack.truncate(marks.field_tys);
+        self.param_stack.truncate(marks.params);
+        self.param_ty_stack.truncate(marks.param_tys);
+        self.arg_stack.truncate(marks.args);
+        self.element_stack.truncate(marks.elements);
+        self.path.truncate(marks.path);
+        self.depth = marks.depth;
+        self.braces = marks.braces;
+    }
+
+    /// After what started at token number `start` failed, `marks` saying
+    /// where the parser was then: forgets what it parsed, skips to its end
+    /// as `sync` says ([`Parser::skip`]), and returns the span of the
+    /// source skipped, from `start`; an empty span at `start` if nothing
+    /// was.
+    fn recover(&mut self, start: usize, marks: Marks, sync: Sync) -> Span {
+        self.deep = false;
+        self.restore(marks);
+        self.skip(start, sync);
+        let first = self.token_at(start).span;
+        if self.pos > start {
+            Span::join(first, self.token_at(self.pos - 1).span)
+        } else {
+            Span::new(first.start, first.start)
+        }
+    }
+
+    /// The error item standing for the item of a body that started at
+    /// token number `start` and failed, `marks` saying where the parser
+    /// was then: spanning the item and what is skipped after it, as `sync`
+    /// says (see [Errors and recovery](#errors-and-recovery)).
+    fn error_item(&mut self, start: usize, marks: Marks, sync: Sync) -> ItemId {
+        let span = self.recover(start, marks, sync);
+        self.builder.alloc_item(Item {
+            kind: ItemKind::Error,
+            span,
+        })
+    }
+
+    /// Parses the value of an item of a body, after its `=`, `:=` or
+    /// `...`: any expression, at minimum binding power 0, which must be
+    /// followed by the end of the item. If it fails, or something else
+    /// follows it, the value is an error node spanning it and what is
+    /// skipped to the item's end (see [Errors and
+    /// recovery](#errors-and-recovery)), so that the item still declares
+    /// what it declares; in a `for` header, which does not recover, it
+    /// fails, and the end of the item is not looked for.
+    fn parse_value(&mut self) -> ParseResult<ExprId> {
+        let Recovery::Body { top } = self.recovery else {
+            return self.parse_expr(0);
+        };
+        let start = self.pos;
+        let marks = self.marks();
+        let parsed = self.parse_expr(0);
+        if let Ok(value) = parsed
+            && self.expect_end_of_item().is_ok()
+        {
+            return Ok(value);
+        }
+        let span = self.recover(start, marks, Sync::Item { top });
+        let id = self.builder.alloc(Expr {
+            kind: ExprKind::Error,
+            span,
+        });
+        self.heights.push(LEAF_HEIGHT);
+        Ok(id)
+    }
+
+    /// After the entry of a list closed by `close` that started at token
+    /// number `start` failed: skips to its end, and past the `,` after it,
+    /// and returns whether the list has ended there, past `close` or before
+    /// what closes something around it (see [Errors and
+    /// recovery](#errors-and-recovery)).
+    fn recover_entry(&mut self, start: usize, close: TokenKind) -> bool {
+        // Nesting too deep is no entry's error: the item's recovers from it,
+        // once, rather than every list it is in, each skipping what is
+        // nested in it again.
+        if self.deep {
+            return true;
+        }
+        match self.skip(start, Sync::Entry { close }) {
+            Stop::Separator => {
+                self.advance();
+                false
+            }
+            Stop::Close => {
+                self.advance();
+                true
+            }
+            Stop::Outer => true,
+        }
+    }
+
+    /// Skips the source of what started at token number `start` and failed,
+    /// from the current token to where `sync` says it ends, following the
+    /// brackets as the lexer does ([`nest`]) from `start` on: at a
+    /// separator, or a closing token, with no bracket opened since `start`
+    /// still open, or at the end of the input. The token it stops at is not
+    /// consumed. A closing bracket of nothing opened since `start` that
+    /// does not end it is skipped, as the lexer ignores it, but a `}` of
+    /// the file's body, which closes no block, makes the tree
+    /// [`Syntax::Unbalanced`].
+    fn skip(&mut self, start: usize, sync: Sync) -> Stop {
+        let mut open = Nesting::default();
+        for index in start..self.pos {
+            nest(&mut open, self.token_at(index).kind);
+        }
+        loop {
+            let kind = self.peek().kind;
+            if kind == TokenKind::Eof {
+                return Stop::Outer;
+            }
+            if open.open.is_empty() {
+                match (sync, kind) {
+                    (Sync::Item { .. }, TokenKind::Newline | TokenKind::Semi)
+                    | (Sync::Entry { .. }, TokenKind::Comma) => return Stop::Separator,
+                    _ => {}
+                }
+            }
+            if nest(&mut open, kind) {
+                match (sync, kind) {
+                    (Sync::Entry { close }, _) if kind == close => return Stop::Close,
+                    (
+                        Sync::Entry { .. },
+                        TokenKind::RBrace | TokenKind::StrMid(_) | TokenKind::StrEnd(_),
+                    )
+                    | (Sync::Interpolation, TokenKind::RBrace) => return Stop::Outer,
+                    (Sync::Item { top: false }, TokenKind::RBrace)
+                    | (Sync::Interpolation, TokenKind::StrMid(_) | TokenKind::StrEnd(_)) => {
+                        return Stop::Close;
+                    }
+                    (Sync::Item { top: true }, TokenKind::RBrace) => {
+                        self.builder.set_syntax(Syntax::Unbalanced);
+                    }
+                    _ => {}
+                }
+            }
+            self.advance();
+        }
     }
 
     /// Skips item separators: newlines and `;`.
@@ -4505,11 +5158,91 @@ impl Parser<'_> {
     }
 
     /// Records a diagnostic in the sink and returns the proof that it was
-    /// recorded.
+    /// recorded, the tree then being [`Syntax::Recovered`] at least. Not one
+    /// at a [`TokenKind::Error`], which is the lexer's to report, nor one
+    /// after a lexical error that runs to the end of the input, after which
+    /// nothing was lexed; nor past [`MAX_ERRORS`] and one more.
     fn report(&mut self, diagnostic: Diagnostic) -> Reported {
-        self.diagnostics.push(diagnostic);
+        self.builder.set_syntax(Syntax::Recovered);
+        let token = self.peek();
+        let lexical = (token.kind == TokenKind::Error && diagnostic.span.start == token.span.start)
+            || diagnostic.span.start >= self.quiet_from;
+        if !lexical && self.diagnostics.len() <= MAX_ERRORS {
+            self.diagnostics.push(diagnostic);
+        }
         Reported
     }
+}
+
+/// Follows the token of `kind` in the brackets `open`, those opened since a
+/// skip began, innermost last, as the lexer follows its own (see
+/// [`crate::lexer`]): an opening bracket, or the start of an interpolated
+/// string, is pushed; a `)` or `]` closes the bracket of its kind on top of
+/// the innermost interpolation's, or nothing; a `}` closes the nearest `{`
+/// of the innermost interpolation, with everything opened after it; and the
+/// piece of a string after an interpolation closes everything opened in
+/// it, its last piece the string too. Returns whether the token closes
+/// something opened before the skip began: a closing bracket or piece with
+/// nothing of its own open, or a `}` with no `{` open outside an
+/// interpolation.
+fn nest(nesting: &mut Nesting, kind: TokenKind) -> bool {
+    let Nesting { open, strings } = nesting;
+    // Where the innermost interpolation's brackets start.
+    let context = strings.last().map_or(0, |&at| at + 1);
+    match kind {
+        TokenKind::LParen => open.push(Open::Paren),
+        TokenKind::LBracket => open.push(Open::Square),
+        TokenKind::LBrace => open.push(Open::Brace),
+        TokenKind::StrStart(_) => {
+            strings.push(open.len());
+            open.push(Open::Str);
+        }
+        TokenKind::RParen | TokenKind::RBracket => {
+            let bracket = if kind == TokenKind::RParen {
+                Open::Paren
+            } else {
+                Open::Square
+            };
+            if open.len() > context && open.last() == Some(&bracket) {
+                open.pop();
+            } else {
+                return open.is_empty();
+            }
+        }
+        TokenKind::RBrace => {
+            let brace = open
+                .get(context..)
+                .and_then(|inner| inner.iter().rposition(|&bracket| bracket == Open::Brace));
+            match brace {
+                Some(at) => open.truncate(context + at),
+                None => return context == 0,
+            }
+        }
+        TokenKind::StrMid(_) | TokenKind::StrEnd(_) => {
+            let Some(at) = context.checked_sub(1) else {
+                return true;
+            };
+            if matches!(kind, TokenKind::StrMid(_)) {
+                open.truncate(context);
+            } else {
+                open.truncate(at);
+                strings.pop();
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// The brackets opened in the source a skip goes over, innermost last
+/// ([`nest`]), with where each interpolated string among them is, so that
+/// the innermost is found at once.
+#[derive(Debug, Default)]
+struct Nesting {
+    /// The brackets open, innermost last.
+    open: Vec<Open>,
+    /// The index in `open` of each [`Open::Str`], innermost last.
+    strings: Vec<usize>,
 }
 
 /// The binary operator a token denotes, if any. `Neg` is not one: a `-`
@@ -4582,6 +5315,7 @@ fn binary_op(kind: TokenKind) -> Option<BinaryOp> {
         | TokenKind::DotDotDot
         | TokenKind::Comma
         | TokenKind::Newline
+        | TokenKind::Error
         | TokenKind::Eof => None,
     }
 }
@@ -4675,6 +5409,7 @@ mod tests {
     /// value after a space.
     fn body_item(ast: &Ast, id: ItemId, out: &mut String) {
         match ast.item(id).kind {
+            ItemKind::Error => out.push_str("<error>"),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                 out.push_str(match ast.item(id).kind {
                     ItemKind::Break(_) => "break",
@@ -4927,6 +5662,7 @@ mod tests {
     fn expr(ast: &Ast, id: ExprId, out: &mut String) {
         use std::fmt::Write as _;
         match ast.get(id).kind {
+            ExprKind::Error => out.push_str("<error>"),
             ExprKind::Int(value) => write!(out, "{value}").unwrap(),
             ExprKind::Float(value) => write!(out, "{value:?}").unwrap(),
             ExprKind::Bool(value) => write!(out, "{value}").unwrap(),
@@ -10807,5 +11543,301 @@ mod tests {
             error("def p x.1[0]() { 1 }"),
             (DEF_PATH.to_owned(), Span::new(9, 12))
         );
+    }
+
+    // ----- Errors and recovery -----
+
+    /// Every error of `text`, lexical and syntax, as its message and the
+    /// source it is at.
+    fn all_errors(text: &str) -> Vec<(String, String)> {
+        let source = SourceFile::new("test.gcsl", text).unwrap();
+        let (_, diagnostics) = parse_source(&source);
+        diagnostics
+            .iter()
+            .map(|d| (d.message.clone(), source.slice(d.span).to_owned()))
+            .collect()
+    }
+
+    /// The tree recovered from `text`, as [`shape`] writes it, an error
+    /// node as `<error>`, and how far it can be trusted.
+    fn recovered(text: &str) -> (String, Syntax) {
+        let source = SourceFile::new("test.gcsl", text).unwrap();
+        let (ast, _) = parse_source(&source);
+        let mut out = String::new();
+        body(&ast, ast.root(), &mut out);
+        (out, ast.syntax())
+    }
+
+    /// `pairs` as [`all_errors`] gives them.
+    fn errors_of(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|&(message, at)| (message.to_owned(), at.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_valid_file_parses_as_it_did_with_no_error() {
+        let text = "x = f(1, [2, 3])\ny: {a: Int} = {a = 1}\ns = \"a{x}b\"";
+        assert!(all_errors(text).is_empty());
+        let (shape_of, syntax) = recovered(text);
+        assert_eq!(shape_of, shape(text));
+        assert_eq!(syntax, Syntax::Clean);
+    }
+
+    #[test]
+    fn items_recover_at_their_newline_or_semicolon() {
+        // A value may be missing, its separator ending it still.
+        assert_eq!(
+            all_errors("x = ; y = 1"),
+            errors_of(&[("expected expression, found `;`", ";")])
+        );
+        assert_eq!(recovered("x = ; y = 1").0, "x = <error>; y = 1");
+        let expected = errors_of(&[
+            ("expected end of item, found `2`", "2"),
+            ("expected end of item, found `5`", "5"),
+        ]);
+        assert_eq!(all_errors("x = 1 2\ny = 3\nz = 4 5"), expected);
+        assert_eq!(all_errors("x = 1 2; y = 3; z = 4 5"), expected);
+        // The items keep their names, their values are errors.
+        let (tree, syntax) = recovered("x = 1 2\ny = 3\nz = 4 5");
+        assert_eq!(tree, "x = <error>; y = 3; z = <error>");
+        assert_eq!(syntax, Syntax::Recovered);
+        // An item that fails before its value is an error item.
+        assert_eq!(
+            all_errors("x . = 1\ny = 2\n) z"),
+            errors_of(&[
+                ("expected a field name after `.`", "="),
+                ("expected expression, found `)`", ")"),
+            ])
+        );
+        assert_eq!(
+            recovered("x . = 1\ny = 2\n) z").0,
+            "<error>; y = 2; <error>"
+        );
+    }
+
+    #[test]
+    fn a_block_s_items_recover_at_its_closing_brace() {
+        assert_eq!(
+            all_errors("f = { a = 1 2 }\ng = { b = 3 4 }"),
+            errors_of(&[
+                ("expected end of item, found `2`", "2"),
+                ("expected end of item, found `4`", "4"),
+            ])
+        );
+        assert_eq!(
+            recovered("f = { a = 1 2 }\ng = { b = 3 4 }").0,
+            "f = {a = <error>}; g = {b = <error>}"
+        );
+        // An error inside a block is that block's item's alone.
+        assert_eq!(
+            all_errors("f = {\n    a = 1\n    b = = 2\n    c = 3\n}\ng = 4 4"),
+            errors_of(&[
+                ("expected expression, found `=`", "="),
+                ("expected end of item, found `4`", "4"),
+            ])
+        );
+        assert_eq!(
+            recovered("f = {\n    a = 1\n    b = = 2\n    c = 3\n}").0,
+            "f = {a = 1; b = <error>; c = 3}"
+        );
+    }
+
+    #[test]
+    fn lists_of_arguments_parameters_and_elements_recover_at_their_commas() {
+        assert_eq!(
+            all_errors("x = f(1 2, 3, 4 5)"),
+            errors_of(&[
+                ("expected `,` or `)`, found `2`", "2"),
+                ("expected `,` or `)`, found `5`", "5"),
+            ])
+        );
+        assert_eq!(
+            all_errors("x = f(+, 2, *)"),
+            errors_of(&[
+                ("expected expression, found `+`", "+"),
+                ("expected expression, found `*`", "*"),
+            ])
+        );
+        assert_eq!(
+            all_errors("fn f(a: Int b: Int, c: Int, d: ): Int { 1 }"),
+            errors_of(&[
+                ("expected `,` or `)`, found `b`", "b"),
+                ("expected a type", ")"),
+            ])
+        );
+        assert_eq!(
+            all_errors("x = [1 2, 3, 4 5]"),
+            errors_of(&[
+                ("expected `,` or `]`, found `2`", "2"),
+                ("expected `,` or `]`, found `5`", "5"),
+            ])
+        );
+        assert_eq!(
+            all_errors("t: fn(Int Int, String, ): Int = g\nu = fn(+): Int { 1 }"),
+            errors_of(&[
+                ("expected `,` or `)`, found `Int`", "Int"),
+                ("expected a parameter name, found `+`", "+"),
+            ])
+        );
+        // The value of an item whose list has an error is an error.
+        assert_eq!(recovered("x = f(1 2, 3)\ny = 2").0, "x = <error>; y = 2");
+        // A named function whose parameters fail declares nothing.
+        assert_eq!(recovered("fn f(a: ): Int { 1 }\ny = 2").0, "<error>; y = 2");
+    }
+
+    #[test]
+    fn record_types_recover_at_their_commas() {
+        assert_eq!(
+            all_errors("x: {a: Int b: Int, c: Int, d: } = {}"),
+            errors_of(&[("expected `,` or `}`", "b"), ("expected a type", "}"),])
+        );
+        assert_eq!(
+            all_errors("type T = {\n    a: Int\n    b Int\n    c: String,\n    1: Int\n}"),
+            errors_of(&[
+                ("expected `,` or `}`", "b"),
+                ("expected a field name in record type", "1"),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_interpolation_recovers_at_its_closing_brace() {
+        assert_eq!(
+            all_errors("s = \"a{1 +}b{f(}c{2 3}\""),
+            errors_of(&[
+                ("expected expression, found `}`", "}"),
+                ("expected expression, found `}`", "}"),
+                ("expected `}`, found `3`", "3"),
+            ])
+        );
+        assert_eq!(recovered("s = \"a{1 +}b\"\nt = 2").0, "s = <error>; t = 2");
+    }
+
+    #[test]
+    fn unclosed_brackets_and_strings_at_the_end_of_the_file() {
+        // A `{`: the block ends with the file; the tree is unbalanced.
+        assert_eq!(
+            all_errors("x = 1\nf = {\n    a = 2"),
+            errors_of(&[("expected `}`, found end of input", "")])
+        );
+        assert_eq!(recovered("x = 1\nf = {\n    a = 2").1, Syntax::Unbalanced);
+        // Nested ones are reported once, for the innermost.
+        assert_eq!(
+            all_errors("f = {\n    g = {\n        a = 2"),
+            errors_of(&[("expected `}`, found end of input", "")])
+        );
+        // A `(` and a `[`, inside which there are no newlines: the rest of
+        // the file is their item's.
+        assert_eq!(
+            all_errors("x = 1\ny = f(1, 2\nz = 3"),
+            errors_of(&[("expected `,` or `)`, found `z`", "z")])
+        );
+        assert_eq!(
+            recovered("x = 1\ny = f(1, 2\nz = 3").0,
+            "x = 1; y = <error>"
+        );
+        assert_eq!(
+            all_errors("x = [1, 2"),
+            errors_of(&[("expected `,` or `]`, found end of input", "")])
+        );
+        // A string: nothing after its quote was lexed.
+        assert_eq!(
+            all_errors("x = 1\ny = \"abc\nz = (\n"),
+            errors_of(&[("unterminated string literal", "\"")])
+        );
+        assert_eq!(recovered("x = 1\ny = \"abc").0, "x = 1; y = <error>");
+        assert_eq!(
+            all_errors("y = \"a{1\nz = 2"),
+            errors_of(&[("unterminated interpolation", "{")])
+        );
+    }
+
+    #[test]
+    fn a_closing_brace_that_closes_nothing_is_reported_and_unbalances_the_tree() {
+        assert_eq!(
+            all_errors("x = 1\n}\ny = 2 2"),
+            errors_of(&[
+                ("unexpected `}`", "}"),
+                ("expected end of item, found `2`", "2"),
+            ])
+        );
+        let (tree, syntax) = recovered("x = 1\n}\ny = 2");
+        assert_eq!(tree, "x = 1; y = 2");
+        assert_eq!(syntax, Syntax::Unbalanced);
+    }
+
+    #[test]
+    fn lexical_errors_are_reported_once_by_the_lexer() {
+        // Each error token is the lexer's, and what it is part of fails
+        // silently.
+        assert_eq!(
+            all_errors("x = 1 @ 2\ny = $\nz = f(1, ?)"),
+            errors_of(&[
+                ("unexpected character `@`", "@"),
+                ("unexpected character `$`", "$"),
+                ("unexpected character `?`", "?"),
+            ])
+        );
+        assert_eq!(
+            recovered("x = 1 @ 2\ny = $\nz = 3").0,
+            "x = <error>; y = <error>; z = 3"
+        );
+        // A malformed number is one token, however it goes on.
+        assert_eq!(
+            all_errors("x = 1__0.5e+3x + 1\ny = 2"),
+            errors_of(&[("consecutive `_` in number literal", "__")])
+        );
+    }
+
+    #[test]
+    fn errors_are_capped() {
+        let text = "x = 1 1\n".repeat(150);
+        let errors = all_errors(&text);
+        assert_eq!(errors.len(), MAX_ERRORS + 1);
+        assert_eq!(errors[MAX_ERRORS - 1].0, "expected end of item, found `1`");
+        assert_eq!(errors[MAX_ERRORS].0, "too many errors");
+        let text = "@\n".repeat(150);
+        assert_eq!(all_errors(&text).len(), MAX_ERRORS + 1);
+    }
+
+    #[test]
+    fn parse_still_gives_the_first_error() {
+        assert_eq!(
+            message("x = 1 2\ny = 3 4"),
+            "expected end of item, found `2`"
+        );
+    }
+
+    #[test]
+    fn attributes_and_misplaced_items_recover() {
+        // An unknown attribute makes the item after it an error item.
+        assert_eq!(
+            all_errors("#[bogus]\nx = 1\ny = 2 2"),
+            errors_of(&[
+                ("unknown attribute `bogus`", "#[bogus]"),
+                ("expected end of item, found `2`", "2"),
+            ])
+        );
+        assert_eq!(recovered("#[bogus]\nx = 1\ny = 2").0, "<error>; y = 2");
+        // An import in a block, an error item.
+        assert_eq!(
+            recovered("f = {\n    import x\n    a = 1\n}").0,
+            "f = {<error>; a = 1}"
+        );
+    }
+
+    #[test]
+    fn nothing_hangs_on_any_prefix_of_a_program() {
+        let text = "#![no_prelude]\nimport a.b as c\ntype T = {a: Int, b: String[] = []}\n\
+                    #[shadowable] def f(x: Int, y: T = {a = 1}): Int -> Int {\n\
+                    \x20   let mut z = [x, ...[1, 2]]\n    for i in 0..3 if i > 0 { z := z }\n\
+                    \x20   do { break } for false\n    \"s{x}t{y.a}\" \n    = x\n}\n\
+                    defmeta p q.r = 1\nv = p q.r(1)[0].x : Int as Int is Int";
+        for end in (0..=text.len()).filter(|&end| text.is_char_boundary(end)) {
+            let source = SourceFile::new("t.gcsl", &text[..end]).unwrap();
+            let _ = parse_source(&source);
+        }
     }
 }

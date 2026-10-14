@@ -93,6 +93,28 @@ fn an_import_in_the_repl_is_an_error() {
     );
 }
 
+/// An input of the REPL with syntax errors shows every one, and runs and
+/// keeps nothing of it.
+#[test]
+fn every_syntax_error_of_a_repl_input_is_shown() {
+    let output = repl("let x = 1 2; let y = (3 3)\nx\n1 + 1\n");
+    assert_eq!(stdout(&output), "2 : Int\n");
+    let errors: Vec<&str> = stderr(&output)
+        .lines()
+        .filter(|line| line.starts_with("error"))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "error: expected end of item, found `2`",
+            "error: expected `)`, found `3`",
+            "error: undefined variable `x`",
+        ],
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// Colour is only used on a terminal, and tests run through pipes, so this
 /// is the plain path; `NO_COLOR` set is the other way to get it.
 #[test]
@@ -1499,6 +1521,93 @@ fn deepest_accepted_expression_runs() {
     assert_eq!(stderr(&output), "");
     assert_eq!(stdout(&output), format!("{}\n", gcsl::MAX_DEPTH));
     assert_eq!(output.status.code(), Some(0));
+}
+
+/// A syntax error in one file of a workspace, or in the file itself, runs
+/// nothing: neither a file's top-level `sh` nor the file asked for. Every
+/// syntax error of the workspace is rendered, and a type error of a file
+/// that parses with them.
+#[test]
+fn a_syntax_error_anywhere_runs_nothing() {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-syntax-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+    let files = [
+        ("workspace.gcsl", String::new()),
+        (
+            "top.gcsl",
+            format!("z = sh(\"touch {}\")\nw: Int = \"s\"", marker("TOP")),
+        ),
+        (
+            "bad.gcsl",
+            format!("x = sh(\"touch {}\")\ny = (1 2)\nv = [3 3]", marker("BAD")),
+        ),
+    ];
+    for (path, text) in &files {
+        std::fs::write(dir.join(path), text).unwrap();
+    }
+    let outputs: Vec<Output> = ["top.gcsl", "bad.gcsl"]
+        .iter()
+        .map(|file| gcsl(&["run", dir.join(file).to_str().unwrap()]))
+        .collect();
+    let markers = [dir.join("TOP").exists(), dir.join("BAD").exists()];
+    // Without the errors, `top.gcsl` runs.
+    std::fs::write(dir.join("bad.gcsl"), "x = 1").unwrap();
+    std::fs::write(
+        dir.join("top.gcsl"),
+        &files[1].1[..files[1].1.find('\n').unwrap()],
+    )
+    .unwrap();
+    let fixed = gcsl(&["run", dir.join("top.gcsl").to_str().unwrap()]);
+    let ran = dir.join("TOP").exists();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(markers, [false, false]);
+    assert_eq!(stderr(&fixed), "");
+    assert!(ran);
+    for output in &outputs {
+        assert_eq!(stdout(output), "");
+        let errors: Vec<&str> = stderr(output)
+            .lines()
+            .filter(|line| line.starts_with("error"))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "error: expected `)`, found `2`",
+                "error: expected `,` or `]`, found `3`",
+                "error: mismatched types",
+            ],
+            "{}",
+            stderr(output)
+        );
+        assert_eq!(output.status.code(), Some(1));
+    }
+}
+
+/// `--dump-ast` of a file with syntax errors prints nothing and shows them
+/// all.
+#[test]
+fn dump_ast_shows_every_syntax_error() {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-dump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("two.gcsl");
+    std::fs::write(&path, "x = (1 2)\ny = 3\nz = [4 4]").unwrap();
+    let output = gcsl(&["run", path.to_str().unwrap(), "--dump-ast"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(stdout(&output), "");
+    let errors: Vec<&str> = stderr(&output)
+        .lines()
+        .filter(|line| line.starts_with("error"))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            "error: expected `)`, found `2`",
+            "error: expected `,` or `]`, found `4`"
+        ]
+    );
+    assert_eq!(output.status.code(), Some(1));
 }
 
 /// Runs the REPL with `input` on stdin until it ends.

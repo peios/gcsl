@@ -721,6 +721,7 @@ impl Lowerer<'_> {
                 | ItemKind::DefMeta { .. },
             )
             | None => Ok(ValueKind::Record),
+            Some(ItemKind::Error) => Err(unparsed(self.ast.root_span())),
         }
     }
 
@@ -805,6 +806,7 @@ impl Lowerer<'_> {
                 // is read where it is mentioned. Nor does a `type`, which
                 // has no existence at runtime.
                 ItemKind::Import(_) | ItemKind::Type { .. } => {}
+                ItemKind::Error => return Err(unparsed(item.span)),
                 ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => {
                     let node = self.lower_jump(id, jump)?;
                     if is_result {
@@ -1917,6 +1919,7 @@ impl Lowerer<'_> {
                 return self.lower_reference_past(def, kind, span);
             }
             (ExprKind::DefTypeRef(def), _) => self.lower_def_type_ref(id, def, kind)?,
+            (ExprKind::Error, _) => return Err(unparsed(span)),
             (ExprKind::Float(_), ValueKind::Int) => {
                 return Err(InternalError {
                     message: "float literal typed as Int",
@@ -3432,6 +3435,15 @@ const fn comparison(op: BinaryOp) -> Option<Cmp> {
         | BinaryOp::Or
         | BinaryOp::Range
         | BinaryOp::RangeInclusive => None,
+    }
+}
+
+/// The internal error of an error node of the parser's at `span` reaching
+/// lowering: no tree with a syntax error is lowered.
+const fn unparsed(span: Span) -> InternalError {
+    InternalError {
+        message: "a node the parser could not parse reached lowering",
+        span,
     }
 }
 

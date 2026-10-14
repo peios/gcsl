@@ -168,6 +168,34 @@
 //! A line break inside a literal is a `\n` byte, and only spaces and tabs are
 //! indentation: a `\r` before a line break is ordinary content.
 //!
+//! # Errors
+//!
+//! The lexer goes on past every error ([`lex`]), reporting each once, in
+//! source order, and puts a [`TokenKind::Error`] where it is, which the
+//! parser reports nothing at (see the parser's [Errors and
+//! recovery](crate::parser#errors-and-recovery)), so that a mistake is no
+//! other token and nothing is reported of it twice:
+//!
+//! - An unexpected character, a `'` with no name after it, and an
+//!   ambiguous `-` are an error token of their own, one character.
+//! - A malformed number literal (a misplaced `_`, an exponent with no
+//!   digits, a literal too large for its type) is one error token with
+//!   every ASCII letter, digit and `_` glued to it, a `.` followed by a
+//!   digit or `_`, and a sign after an `e` or `E`, so that no part of it is
+//!   lexed again as a number or a name.
+//! - An unknown or invalid escape and an unmatched `}` in a string literal
+//!   are reported and the literal goes on, the escape standing for nothing
+//!   and the `}` for itself: the literal is a string as any is.
+//! - A literal whose end cannot be found, unterminated or with an
+//!   unterminated interpolation, or nested too deep, is reported by the
+//!   scan, and the rest of the source, from it, is one error token: nothing
+//!   after it is lexed, no context left open, and the parser reports nothing
+//!   after it.
+//!
+//! The lexer records at most [`MAX_ERRORS`] errors and one more, which says
+//! there are too many. [`tokenize`] returns the first error, as it always
+//! did, or the tokens if there is none.
+//!
 //! # Allocation
 //!
 //! Besides the output vector and the pieces, the lexer allocates only one
@@ -356,6 +384,11 @@ pub enum TokenKind {
     /// A `\n` outside parentheses, brackets and interpolations. Each newline
     /// is its own token.
     Newline,
+    /// The source of a lexical error, reported already (see
+    /// [Errors](#errors)): a character no token starts with, a malformed
+    /// number literal, or, from a string literal whose end cannot be found,
+    /// the rest of the source.
+    Error,
     /// End of input. Always the last token.
     Eof,
 }
@@ -432,6 +465,7 @@ impl TokenKind {
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_)
             | TokenKind::Newline
+            | TokenKind::Error
             | TokenKind::Eof => None,
         }
     }
@@ -484,12 +518,13 @@ pub fn is_identifier(text: &str) -> bool {
 ///
 /// # Errors
 ///
-/// Returns the first lexical error: an unexpected character, an ambiguous
-/// `-`, a malformed number (misplaced `_`, missing exponent digits), a
-/// literal too large for its type, or a malformed string literal
-/// (unterminated, an unknown or invalid escape, a stray `}`, an
-/// unterminated interpolation, or literals nested more than
-/// [`MAX_DEPTH`] deep in each other's interpolations).
+/// Returns the first lexical error (see [Errors](#errors)): an unexpected
+/// character, an ambiguous `-`, a malformed number (misplaced `_`, missing
+/// exponent digits), a literal too large for its type, or a malformed
+/// string literal (unterminated, an unknown or invalid escape, a stray `}`,
+/// an unterminated interpolation, or literals nested more than
+/// [`MAX_DEPTH`] deep in each other's interpolations). [`lex`] gives every
+/// error, with the tokens.
 pub fn tokenize(source: &SourceFile) -> Result<(Vec<Token>, Names, Strings), Diagnostic> {
     let mut names = Names::new();
     let (tokens, strings) = tokenize_with(source, &mut names)?;
@@ -509,13 +544,48 @@ pub fn tokenize_with(
     source: &SourceFile,
     names: &mut Names,
 ) -> Result<(Vec<Token>, Strings), Diagnostic> {
+    let lexed = lex(source, names);
+    match lexed.diagnostics.into_iter().next() {
+        Some(first) => Err(first),
+        None => Ok((lexed.tokens, lexed.strings)),
+    }
+}
+
+/// What [`lex`] makes of a source: every token, the text of its string
+/// literals, and every lexical error.
+#[derive(Debug)]
+pub struct Lexed {
+    /// The tokens, ending with exactly one [`TokenKind::Eof`]; the source
+    /// of each lexical error a [`TokenKind::Error`].
+    pub tokens: Vec<Token>,
+    /// The text of the string literals.
+    pub strings: Strings,
+    /// The lexical errors, in source order, at most [`MAX_ERRORS`] and one
+    /// more: the lexer stops recording them there.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// The most errors reported of one source, its lexer's and its parser's
+/// together (see [`crate::parser::parse_all`]): past them, one more says
+/// that there are too many.
+pub const MAX_ERRORS: usize = 100;
+
+/// Lexes the whole of `source`, as [`tokenize_with`] does, interning names
+/// into `names`, but going on past every lexical error (see
+/// [Errors](#errors)): the tokens, with a [`TokenKind::Error`] where each
+/// error is, and every error.
+pub fn lex(source: &SourceFile, names: &mut Names) -> Lexed {
     let mut lexer = Lexer::new(source, names);
     let mut tokens = Vec::new();
     loop {
-        let token = lexer.next_token()?;
+        let token = lexer.next_token();
         tokens.push(token);
         if token.kind == TokenKind::Eof {
-            return Ok((tokens, lexer.strings));
+            return Lexed {
+                tokens,
+                strings: lexer.strings,
+                diagnostics: lexer.diagnostics,
+            };
         }
     }
 }
@@ -666,10 +736,10 @@ struct Lexer<'a> {
     bytes: &'a [u8],
     /// Byte offset of the next unread byte. Always on a character boundary:
     /// outside comments and string literals the lexer only consumes ASCII
-    /// bytes and stops with an error at the first byte it does not
-    /// recognise, a comment is skipped up to a `\n` or the end of the text,
-    /// and every piece of a string literal ends at an ASCII `{` or quote.
-    /// Slicing `text` at `pos` is therefore safe.
+    /// bytes, but a character it does not recognise, whole, a comment is
+    /// skipped up to a `\n` or the end of the text, and every piece of a
+    /// string literal ends at an ASCII `{` or quote. Slicing `text` at `pos`
+    /// is therefore safe.
     pos: usize,
     /// End of the most recent token other than a newline, used to place the
     /// `Eof` token.
@@ -687,6 +757,9 @@ struct Lexer<'a> {
     names: &'a mut Names,
     /// Where the pieces of string literals are stored.
     strings: Strings,
+    /// The errors found so far, in source order, at most [`MAX_ERRORS`] and
+    /// one more.
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> Lexer<'a> {
@@ -701,6 +774,61 @@ impl<'a> Lexer<'a> {
             scratch: String::new(),
             names,
             strings: Strings::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Records `error`, unless [`MAX_ERRORS`] and one more are recorded
+    /// already, which says there are too many.
+    fn report(&mut self, error: Diagnostic) {
+        if self.diagnostics.len() <= MAX_ERRORS {
+            self.diagnostics.push(error);
+        }
+    }
+
+    /// The next token: [`Lexer::lex_token`]'s, or where it fails, the
+    /// error recorded and a [`TokenKind::Error`] in place of the source it
+    /// covers (see [Errors](#errors)).
+    fn next_token(&mut self) -> Token {
+        self.skip_trivia();
+        let start = self.pos;
+        match self.lex_token(start) {
+            Ok(token) => token,
+            Err(error) => self.recover(start, error),
+        }
+    }
+
+    /// Records `error`, found lexing the token starting at `start`, and
+    /// returns the [`TokenKind::Error`] that stands for its source, the
+    /// lexer moved past it: a malformed number literal whole, with every
+    /// letter, digit, `_` and `.` glued to it; the rest of the source from
+    /// a string literal, or the `}` that resumes one, since its end cannot
+    /// be found; one character otherwise.
+    fn recover(&mut self, start: usize, error: Diagnostic) -> Token {
+        self.report(error);
+        let len = self.bytes.len();
+        let end = match self.bytes.get(start) {
+            Some(b'0'..=b'9') => malformed_number_end(self.bytes, start),
+            Some(b'"' | b'}') | None => len,
+            Some(b'r') if self.bytes.get(start + 1) == Some(&b'"') => len,
+            Some(_) => {
+                let ch = self.text.get(start..).and_then(|rest| rest.chars().next());
+                start + ch.map_or(1, char::len_utf8)
+            }
+        };
+        // Always past `start`, and on a character boundary: the end of the
+        // text, or past ASCII bytes or a whole character.
+        let end = end.max(start + 1).min(len);
+        if end >= len {
+            // Nothing after it is lexed: no context is left open.
+            self.interpolations.clear();
+            self.brackets.clear();
+        }
+        self.pos = end;
+        self.last_end = end;
+        Token {
+            kind: TokenKind::Error,
+            span: span(start, end),
         }
     }
 
@@ -712,9 +840,9 @@ impl<'a> Lexer<'a> {
         self.bytes.get(self.pos + ahead).copied()
     }
 
-    fn next_token(&mut self) -> Result<Token, Diagnostic> {
-        self.skip_trivia();
-        let start = self.pos;
+    /// Lexes the token starting at `start`, the next unread byte after the
+    /// trivia, which [`Lexer::next_token`] has skipped.
+    fn lex_token(&mut self, start: usize) -> Result<Token, Diagnostic> {
         let Some(byte) = self.peek() else {
             // The scan checks that every interpolation of a literal closes
             // before the literal is lexed, so this only guards against the
@@ -1420,11 +1548,14 @@ impl<'a> Lexer<'a> {
                     self.scratch.push('}');
                     pos += 2;
                 }
+                // Reported, and kept as the `}` it most likely means.
                 Some(b'}') => {
-                    return Err(
+                    self.report(
                         Diagnostic::error("unmatched `}` in string", span(pos, pos + 1))
                             .with_note("write `}}` for a literal `}`"),
                     );
+                    self.scratch.push('}');
+                    pos += 1;
                 }
                 _ => return Err(internal("a string piece stopped at an ordinary byte", pos)),
             }
@@ -1453,7 +1584,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// Replaces the escape whose `\` is at `pos`, returning the offset after
-    /// it.
+    /// it. An unknown or invalid escape is reported and replaced by nothing,
+    /// the literal going on after it (see [Errors](#errors)).
     fn escape(&mut self, layout: &Layout, pos: usize) -> Result<usize, Diagnostic> {
         let next = self
             .bytes
@@ -1468,10 +1600,12 @@ impl<'a> Lexer<'a> {
             Some(b'"') => '"',
             Some(b'u') => {
                 let (end, value) = unicode_escape(self.bytes, pos);
-                let Some(ch) = value else {
-                    return Err(Diagnostic::error("invalid unicode escape", span(pos, end)));
-                };
-                self.scratch.push(ch);
+                match value {
+                    Some(ch) => self.scratch.push(ch),
+                    None => {
+                        self.report(Diagnostic::error("invalid unicode escape", span(pos, end)));
+                    }
+                }
                 return Ok(end);
             }
             // A line continuation: the line break and the next line's
@@ -1479,7 +1613,11 @@ impl<'a> Lexer<'a> {
             // first, so what it removes is whatever indentation the line has
             // beyond the common indentation.
             Some(b'\n') => return Ok(pos + 2 + whitespace_len(self.bytes, pos + 2)),
-            Some(_) => return Err(self.unknown_escape(pos)),
+            Some(_) => {
+                let (error, end) = self.unknown_escape(pos);
+                self.report(error);
+                return Ok(end);
+            }
             // The scan never ends a piece's text just after an unescaped
             // `\`: before a closing quote it is an escaped quote, and before
             // a final line break it stops that line break being removed.
@@ -1489,8 +1627,9 @@ impl<'a> Lexer<'a> {
         Ok(pos + 2)
     }
 
-    /// The error for an unknown escape whose `\` is at `pos`.
-    fn unknown_escape(&self, pos: usize) -> Diagnostic {
+    /// The error for an unknown escape whose `\` is at `pos`, and the offset
+    /// just after the escape: after the character the `\` escapes.
+    fn unknown_escape(&self, pos: usize) -> (Diagnostic, usize) {
         let ch = self
             .text
             .get(pos + 1..)
@@ -1504,9 +1643,10 @@ impl<'a> Lexer<'a> {
         } else {
             ch.to_string()
         };
-        Diagnostic::error(
-            format!("unknown escape `\\{shown}`"),
-            span(pos, pos + 1 + ch.len_utf8()),
+        let end = pos + 1 + ch.len_utf8();
+        (
+            Diagnostic::error(format!("unknown escape `\\{shown}`"), span(pos, end)),
+            end,
         )
     }
 }
@@ -1562,6 +1702,28 @@ fn number_end(bytes: &[u8], start: usize) -> usize {
             pos += 1;
         }
         pos = digits(pos);
+    }
+    pos
+}
+
+/// The offset just after the malformed number literal starting at `start`,
+/// as the lexer skips it once it has reported it (see [Errors](#errors)):
+/// every ASCII letter, digit and `_` glued to it, a `.` followed by a digit
+/// or `_`, and a sign after an `e` or `E`, so that no part of it is lexed
+/// again as a token of its own.
+fn malformed_number_end(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while let Some(&byte) = bytes.get(pos) {
+        let glued = match byte {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'_' => true,
+            b'.' => matches!(bytes.get(pos + 1), Some(b'0'..=b'9' | b'_')),
+            b'+' | b'-' => pos > start && matches!(bytes.get(pos - 1), Some(b'e' | b'E')),
+            _ => false,
+        };
+        if !glued {
+            break;
+        }
+        pos += 1;
     }
     pos
 }
@@ -3578,5 +3740,87 @@ mod tests {
                 "Eof"
             ]
         );
+    }
+
+    /// The tokens of `text` lexed going on past its errors, and the errors'
+    /// messages, each with the source it is at.
+    fn lex_all(text: &str) -> (Vec<TokenKind>, Vec<(String, String)>) {
+        let source = SourceFile::new("test.gcsl", text).unwrap();
+        let lexed = super::lex(&source, &mut Names::new());
+        let errors = lexed
+            .diagnostics
+            .iter()
+            .map(|d| (d.message.clone(), source.slice(d.span).to_owned()))
+            .collect();
+        (
+            lexed.tokens.iter().map(|token| token.kind).collect(),
+            errors,
+        )
+    }
+
+    #[test]
+    fn the_lexer_goes_on_past_each_error() {
+        // Two unexpected characters are two errors, each an error token.
+        let (tokens, errors) = lex_all("a @ b $ c");
+        assert_eq!(
+            errors,
+            [
+                ("unexpected character `@`".to_owned(), "@".to_owned()),
+                ("unexpected character `$`".to_owned(), "$".to_owned()),
+            ]
+        );
+        assert_eq!(tokens.len(), 6);
+        assert_eq!(tokens[1], TokenKind::Error);
+        assert_eq!(tokens[3], TokenKind::Error);
+        // A multi-byte character is one error token.
+        let (tokens, errors) = lex_all("a é b");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(tokens.len(), 4);
+        // A malformed number is one error token, glued letters and all; an
+        // ambiguous `-` one of its own.
+        let (tokens, errors) = lex_all("1__0x 2e f(x)-1");
+        assert_eq!(
+            errors,
+            [
+                (
+                    "consecutive `_` in number literal".to_owned(),
+                    "__".to_owned()
+                ),
+                ("missing digits in exponent".to_owned(), "e".to_owned()),
+                ("`-` here is ambiguous".to_owned(), "-".to_owned()),
+            ]
+        );
+        assert_eq!(tokens[0], TokenKind::Error);
+        assert_eq!(tokens[1], TokenKind::Error);
+        assert_eq!(tokens[6], TokenKind::Error);
+        assert!(matches!(tokens[7], TokenKind::Int(1)));
+        // Errors inside a string literal are reported, and it is a string.
+        let (tokens, errors) = lex_all(r#""a\qb\u{zz}c}d" x"#);
+        assert_eq!(
+            errors,
+            [
+                ("unknown escape `\\q`".to_owned(), "\\q".to_owned()),
+                ("invalid unicode escape".to_owned(), "\\u{zz}".to_owned()),
+                ("unmatched `}` in string".to_owned(), "}".to_owned()),
+            ]
+        );
+        assert!(matches!(tokens[0], TokenKind::Str(_)));
+        assert!(matches!(tokens[1], TokenKind::Ident(_)));
+        // A literal whose end cannot be found is an error token to the end
+        // of the source.
+        let (tokens, errors) = lex_all("x = \"a{ (\n y");
+        assert_eq!(
+            errors,
+            [("unterminated interpolation".to_owned(), "{".to_owned())]
+        );
+        assert!(matches!(
+            tokens.as_slice(),
+            [
+                TokenKind::Ident(_),
+                TokenKind::Eq,
+                TokenKind::Error,
+                TokenKind::Eof
+            ]
+        ));
     }
 }

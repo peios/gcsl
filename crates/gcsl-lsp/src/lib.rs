@@ -57,9 +57,13 @@
 //! version as it was checked, and the change's own check follows its quiet
 //! period.
 //!
-//! KNOWN LIMIT. While the scan of a workspace fails, a file not parsing or
-//! an import not resolved, its check reports only those errors, so the
-//! other files' type errors disappear until it parses again: what the check
+//! KNOWN LIMIT. A file that does not parse no longer hides the rest: its
+//! syntax errors are published with the type errors of every file, its own
+//! where it parses among them (see the library's [Syntax
+//! errors](gcsl::workspace#syntax-errors)). But while the scan of a
+//! workspace fails, an import not resolved or two files declaring one
+//! name, its check reports only those errors, with the syntax errors, so
+//! the other files' type errors disappear until it is fixed: what the check
 //! reports is published, and stale diagnostics are not kept.
 
 #![warn(
@@ -1022,6 +1026,28 @@ mod tests {
             diagnostic.message
         );
         assert!(diagnostic.range.start.line >= 1, "{:?}", diagnostic.range);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_syntax_error_hides_no_other_files_type_error() {
+        let scratch = Scratch::workspace("syntax-and-type", "");
+        let other = scratch.write("other.gcsl", "z: Int = true\n");
+        let text = "x = (1 2)\ny = 3\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let published = client.published(&uri);
+        let [syntax] = published.diagnostics.as_slice() else {
+            panic!("{published:?}");
+        };
+        assert_eq!(syntax.message, "expected `)`, found `2`");
+        let published = client.published(&other);
+        let [mismatched] = published.diagnostics.as_slice() else {
+            panic!("{published:?}");
+        };
+        assert_eq!(mismatched.message, "mismatched types");
+        assert_eq!(mismatched.range, range((0, 9), (0, 13)));
         client.shut_down().unwrap();
     }
 

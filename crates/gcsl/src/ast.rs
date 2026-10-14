@@ -1401,6 +1401,13 @@ pub enum ExprKind {
     /// definition and its own arguments (see [Def-types](#def-types)). Its
     /// details are in the def-type arena (see [`Ast::def_type`]).
     DefTypeRef(DefTypeId),
+    /// What the parser put in place of source it could not parse, or of a
+    /// lexical error's token (see the parser's [Errors and
+    /// recovery](crate::parser#errors-and-recovery)): its error is
+    /// reported already, so it is of type `Error`, which every use accepts
+    /// silently. Only ever in a tree with syntax errors ([`Ast::syntax`]),
+    /// which is never lowered.
+    Error,
 }
 
 /// One node of the tree.
@@ -1452,7 +1459,8 @@ impl Expr {
             | ExprKind::List(_)
             | ExprKind::Index { .. }
             | ExprKind::For(_)
-            | ExprKind::DefTypeRef(_) => None,
+            | ExprKind::DefTypeRef(_)
+            | ExprKind::Error => None,
         }
     }
 
@@ -1621,12 +1629,19 @@ pub enum ItemKind {
         /// declares.
         value: ExprId,
     },
+    /// What the parser put in place of an item it could not parse, its
+    /// span the source it skipped (see the parser's [Errors and
+    /// recovery](crate::parser#errors-and-recovery)): its error is
+    /// reported already. It declares nothing, has no value, and is no
+    /// field, result or statement of its block, whose type is `Error`.
+    /// Only ever in a tree with syntax errors ([`Ast::syntax`]).
+    Error,
 }
 
 impl ItemKind {
     /// The expression the item holds, if it has one: every item's but a
-    /// `break`'s, `continue`'s or `return`'s without a value, an import's
-    /// and a `type`'s.
+    /// `break`'s, `continue`'s or `return`'s without a value, an import's,
+    /// a `type`'s and an error item's.
     #[must_use]
     pub const fn value(self) -> Option<ExprId> {
         match self {
@@ -1639,7 +1654,7 @@ impl ItemKind {
             | ItemKind::DefTypeDef { value, .. }
             | ItemKind::DefMeta { value, .. } => Some(value),
             ItemKind::Break(jump) | ItemKind::Continue(jump) | ItemKind::Return(jump) => jump.value,
-            ItemKind::Import(_) | ItemKind::Type { .. } => None,
+            ItemKind::Import(_) | ItemKind::Type { .. } | ItemKind::Error => None,
         }
     }
 }
@@ -2367,6 +2382,48 @@ pub struct AstBuilder {
     def_type_marks: Vec<ItemId>,
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
+    syntax: Syntax,
+}
+
+/// Where every arena and pool of an [`AstBuilder`] was, to put it back
+/// there ([`AstBuilder::mark`], [`AstBuilder::truncate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuilderMark {
+    exprs: usize,
+    items: usize,
+    item_lists: usize,
+    parts: usize,
+    types: usize,
+    fields: usize,
+    param_tys: usize,
+    paths: usize,
+    fns: usize,
+    params: usize,
+    args: usize,
+    elements: usize,
+    fors: usize,
+    labels: usize,
+    imports: usize,
+    import_members: usize,
+    def_types: usize,
+}
+
+/// Whether a tree was parsed from source with syntax errors, and so how far
+/// its shape can be trusted (see the parser's [Errors and
+/// recovery](crate::parser#errors-and-recovery)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Syntax {
+    /// No error: the tree is the source as written.
+    #[default]
+    Clean,
+    /// Errors, each in an error node ([`ExprKind::Error`],
+    /// [`ItemKind::Error`], [`TypeExprKind::Invalid`]) or left out of the
+    /// tree; everything else as written.
+    Recovered,
+    /// Errors that leave unknown which block some items belong to: a `}`
+    /// that closes no block, or the end of the source inside a block. The
+    /// tree is not checked.
+    Unbalanced,
 }
 
 impl AstBuilder {
@@ -2572,6 +2629,63 @@ impl AstBuilder {
         self.no_prelude
     }
 
+    /// Records that the tree has syntax errors of at least the kind
+    /// `syntax` (see [`Ast::syntax`]): a tree is as bad as its worst error.
+    pub fn set_syntax(&mut self, syntax: Syntax) {
+        self.syntax = self.syntax.max(syntax);
+    }
+
+    /// Where every arena and pool is now, for [`AstBuilder::truncate`].
+    #[must_use]
+    pub fn mark(&self) -> BuilderMark {
+        BuilderMark {
+            exprs: self.exprs.len(),
+            items: self.items.len(),
+            item_lists: self.item_lists.len(),
+            parts: self.parts.len(),
+            types: self.types.exprs.len(),
+            fields: self.types.fields.len(),
+            param_tys: self.types.params.len(),
+            paths: self.paths.len(),
+            fns: self.fns.len(),
+            params: self.params.len(),
+            args: self.args.len(),
+            elements: self.elements.len(),
+            fors: self.fors.len(),
+            labels: self.labels.len(),
+            imports: self.imports.len(),
+            import_members: self.import_members.len(),
+            def_types: self.def_types.len(),
+        }
+    }
+
+    /// Forgets everything allocated since `mark`, and the marks of the
+    /// items forgotten: what a parser does with the nodes of source it
+    /// could not parse, so that no node of the tree is unreachable and a
+    /// subtree's nodes stay contiguous ([`Ast::subtree`]).
+    pub fn truncate(&mut self, mark: BuilderMark) {
+        self.exprs.truncate(mark.exprs);
+        self.items.truncate(mark.items);
+        self.item_lists.truncate(mark.item_lists);
+        self.parts.truncate(mark.parts);
+        self.types.exprs.truncate(mark.types);
+        self.types.fields.truncate(mark.fields);
+        self.types.params.truncate(mark.param_tys);
+        self.paths.truncate(mark.paths);
+        self.fns.truncate(mark.fns);
+        self.params.truncate(mark.params);
+        self.args.truncate(mark.args);
+        self.elements.truncate(mark.elements);
+        self.fors.truncate(mark.fors);
+        self.labels.truncate(mark.labels);
+        self.imports.truncate(mark.imports);
+        self.import_members.truncate(mark.import_members);
+        self.def_types.truncate(mark.def_types);
+        let items = next_id(mark.items);
+        self.shadowable.retain(|item| item.0 < items);
+        self.def_type_marks.retain(|item| item.0 < items);
+    }
+
     /// Returns the node `id`.
     ///
     /// # Panics
@@ -2637,6 +2751,7 @@ impl AstBuilder {
             def_type_marks: self.def_type_marks,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
+            syntax: self.syntax,
             implicit_import: None,
             expansion: Expansion::default(),
             root,
@@ -2673,6 +2788,8 @@ pub struct Ast {
     def_types: Vec<DefTypeUse>,
     /// Where the file's `#![no_prelude]` is written, if it has one.
     no_prelude: Option<Span>,
+    /// Whether it was parsed from source with syntax errors.
+    syntax: Syntax,
     /// The implicit `#[shadowable] import * from prelude`, if a workspace
     /// gave the file one.
     implicit_import: Option<ItemId>,
@@ -3214,6 +3331,14 @@ impl Ast {
         self.no_prelude
     }
 
+    /// Whether the tree was parsed from source with syntax errors, and so
+    /// how far its shape can be trusted: [`Syntax::Clean`] for every tree
+    /// that is run.
+    #[must_use]
+    pub fn syntax(&self) -> Syntax {
+        self.syntax
+    }
+
     /// The implicit `#[shadowable] import * from prelude` a workspace gave
     /// the file, if it has one (see [Attributes](#attributes)).
     #[must_use]
@@ -3467,7 +3592,8 @@ impl Ast {
                 | ExprKind::Float(_)
                 | ExprKind::Bool(_)
                 | ExprKind::Str(_)
-                | ExprKind::Name(_) => return node,
+                | ExprKind::Name(_)
+                | ExprKind::Error => return node,
                 ExprKind::Interp(parts) => {
                     let first = self.parts(parts).iter().find_map(|&part| match part {
                         StrPart::Expr(expr) => Some(expr),
@@ -3877,6 +4003,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 self.def_type_head(f, item.kind, def)?;
                 value
             }
+            ItemKind::Error => return write!(f, "error @{})", item.span),
         };
         writeln!(f, " @{}", item.span)?;
         // The positions of a `:=` path's index segments, in order, before
@@ -4347,6 +4474,7 @@ impl<A: Annotate> Pretty<'_, A> {
                 let (def_type, path) = self.ast.show_def_type(def);
                 write!(f, "def-type-ref {def_type} {path}")
             }
+            ExprKind::Error => f.write_str("error"),
         }
     }
 
@@ -4442,7 +4570,8 @@ impl<A: Annotate> Pretty<'_, A> {
             | ExprKind::Bool(_)
             | ExprKind::Str(_)
             | ExprKind::Name(_)
-            | ExprKind::DefTypeRef(_) => {}
+            | ExprKind::DefTypeRef(_)
+            | ExprKind::Error => {}
             ExprKind::Unary { operand, .. }
             | ExprKind::Paren(operand)
             | ExprKind::Field { expr: operand, .. }

@@ -12,7 +12,10 @@
 //!    a [`names::Names`] table and storing the processed text of every
 //!    string literal in a [`strings::Strings`] table.
 //! 2. [`parser::parse`]: tokens to an arena-based [`ast::Ast`], which owns
-//!    both tables from then on.
+//!    both tables from then on. Both stages go on past their errors
+//!    ([`lexer::lex`], [`parser::parse_all`]), reporting each and leaving
+//!    an error node where it is, so that a tool sees every error and what
+//!    parsed around them; nothing with an error runs.
 //! 3. [`check::check`]: types for every expression, interned into a
 //!    [`TypeTable`] the caller owns, and a storage slot for every variable,
 //!    in the side tables of a [`check::Checked`]; and any warnings. Alone,
@@ -283,9 +286,11 @@ pub const STANDARD: [(&str, &str); 3] = [
 ///
 /// # Errors
 ///
-/// Returns the diagnostics of the first stage that fails: one for a lexical,
-/// syntax or runtime error, and every type error found by the checker. Any
-/// warnings found before the failure are among them, all in source order.
+/// Returns the diagnostics of the first stage that fails: every lexical and
+/// syntax error, with the type errors of what parsed (see
+/// [`workspace`], "Syntax errors"); every type error found by the checker;
+/// or one runtime error. Any warnings found before the failure are among
+/// them, all in source order, but those of a file with a syntax error.
 /// The file's diagnostics name no input; one of a standard file, which is a
 /// bug, names its input number, its index among the standard files the run
 /// loaded ([`workspace::check_lone_with_standard`]). The file is taken to

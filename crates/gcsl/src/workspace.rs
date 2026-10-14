@@ -227,6 +227,43 @@
 //! happen before those of a file that needs it. A runtime error names the
 //! file whose code failed.
 //!
+//! # Syntax errors
+//!
+//! A file with lexical or syntax errors is scanned and checked as its
+//! parser recovered it (see the parser's [Errors and
+//! recovery](crate::parser#errors-and-recovery)), so that one file's typo
+//! hides nothing of the others', but nothing runs: the check fails, with
+//! every file's syntax errors ([`Scan::syntax_errors`]), and with every
+//! other error found that is no cascade of them. Each error is reported
+//! once, where it is; what may follow from source that could not be parsed
+//! is not:
+//!
+//! - The file with the errors is checked, its error nodes of type `Error`
+//!   and a block with an error item erroneous, silently, and reports its
+//!   errors, never its warnings, which may be of what could not be parsed.
+//!   It fails, whatever its check finds, and is never lowered, and every
+//!   file that needs it is not checked, as a file that needs one whose
+//!   check failed is not. A file whose tree is
+//!   [`crate::ast::Syntax::Unbalanced`], its braces not matching, is not
+//!   checked at all: some of its items may be in the wrong block.
+//! - A name that names nothing (an undefined variable, an unknown type, a
+//!   record's field it lacks), in a file whose view sees a file with
+//!   syntax errors ([`Scan::sees_broken`]: it has them, a file of its
+//!   directory or of one above has, or it imports something of one), is no
+//!   error, since it may be declared in source that could not be parsed:
+//!   the file's check fails quietly instead.
+//! - A stage of the scan that finds errors stops it, as it always did, and
+//!   reports them, with the syntax errors, but those of a file that may
+//!   see a file with syntax errors (it has them, a file of its directory or
+//!   of one above has, or it imports anything but `builtins`, `fileroot`
+//!   and the standard files), whose declarations may be missing or
+//!   misplaced.
+//!
+//! Files that parse cleanly and see no file with errors are checked as
+//! ever. A session's input with an error is not checked: nothing of it is
+//! run or kept. [`check_partial`] leaves what a failed check found
+//! ([`Partial`]).
+//!
 //! # Imports
 //!
 //! An `import` gives a file the rest of the workspace, by name. Its path is
@@ -740,8 +777,8 @@ use std::rc::Rc;
 use crate::Outcome;
 use crate::ast::{
     self, Arg, ArgKind, Ast, AstBuilder, DefTypeId, DefTypeRole, Expr, ExprKind, ImportDecl,
-    ImportForm, ImportMember, Item, ItemId, ItemKind, Param, PathSegment, TypeExprId, TypeExprKind,
-    TypeLink, TypeStore, TypeStoreMark,
+    ImportForm, ImportMember, Item, ItemId, ItemKind, Param, PathSegment, Syntax, TypeExprId,
+    TypeExprKind, TypeLink, TypeStore, TypeStoreMark,
 };
 #[cfg(test)]
 use crate::check::ViewRecord;
@@ -749,7 +786,7 @@ use crate::check::{
     BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams, Place, Scope, Slot,
     Types, check_types,
 };
-use crate::diagnostic::{self, Diagnostic, InternalError};
+use crate::diagnostic::{self, Diagnostic, InternalError, Severity};
 use crate::eval::{MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
@@ -1253,9 +1290,143 @@ pub struct Scan {
     /// the keys of the def-types it declares are made with, in place of its
     /// index among the scan's files, which every input shares.
     input_number: Option<u32>,
+    /// The lexical and syntax errors of every file, each naming its file,
+    /// in path then source order (see [Syntax errors](#syntax-errors)): a
+    /// file with some is scanned as its parser recovered it.
+    syntax_errors: Vec<Diagnostic>,
 }
 
 impl Scan {
+    /// The lexical and syntax errors of every file, each naming its file by
+    /// its input number, in path then source order (see [Syntax
+    /// errors](#syntax-errors)).
+    #[must_use]
+    pub fn syntax_errors(&self) -> &[Diagnostic] {
+        &self.syntax_errors
+    }
+
+    /// Whether file `index` has syntax errors, which the scan and the
+    /// checker take the tree its parser recovered for.
+    #[must_use]
+    pub fn is_broken(&self, index: u32) -> bool {
+        self.files
+            .get(index as usize)
+            .is_some_and(|file| file.ast.syntax() != Syntax::Clean)
+    }
+
+    /// Whether each file has syntax errors, by input number.
+    fn broken_files(&self) -> Vec<bool> {
+        (0..count(self.files.len()))
+            .map(|index| self.is_broken(index))
+            .collect()
+    }
+
+    /// The diagnostics `found` of the failed check of file `index`, as they
+    /// are reported, each naming the file: the errors alone of a file with
+    /// syntax errors, a warning of which may be of source that could not be
+    /// parsed.
+    fn failure(&self, index: u32, mut found: Vec<Diagnostic>) -> Vec<Diagnostic> {
+        if self.is_broken(index) {
+            found.retain(|diagnostic| diagnostic.severity == Severity::Error);
+        }
+        in_file(found, index)
+    }
+
+    /// Whether file `index`'s tree is [`Syntax::Unbalanced`], its braces not
+    /// matching, which is not checked.
+    fn is_unbalanced(&self, index: u32) -> bool {
+        self.files
+            .get(index as usize)
+            .is_some_and(|file| file.ast.syntax() == Syntax::Unbalanced)
+    }
+
+    /// Whether the view of file `index` sees a file with syntax errors, in
+    /// which a declaration may be missing or misplaced (see [Syntax
+    /// errors](#syntax-errors)): it has them, a file of its directory or of
+    /// one above it has, or it imports a name, a type, a file or a
+    /// directory of a file that has. A name it reads that names nothing is
+    /// no error then.
+    #[must_use]
+    pub fn sees_broken(&self, index: u32) -> bool {
+        if self.syntax_errors.is_empty() {
+            return false;
+        }
+        let Some(file) = self.files.get(index as usize) else {
+            return false;
+        };
+        let chain: Vec<u32> = self.chain(file.dir).collect();
+        let in_chain = (0u32..)
+            .zip(&self.files)
+            .any(|(at, other)| chain.contains(&other.dir) && self.is_broken(at));
+        // A type by its index in `types`; one of a session's earlier input
+        // is none of them.
+        let broken_type = |at: u32| {
+            self.types
+                .get(at as usize)
+                .is_some_and(|declared| self.is_broken(declared.file))
+        };
+        in_chain
+            || file.aliases.iter().any(|alias| {
+                self.target_files(alias.target)
+                    .into_iter()
+                    .any(|at| self.is_broken(at))
+            })
+            || file
+                .type_imports
+                .iter()
+                .any(|import| broken_type(import.decl))
+            || file
+                .type_view
+                .values()
+                .any(|&decl| decl.checked_sub(self.type_base).is_some_and(broken_type))
+    }
+
+    /// Whether file `index` may see a file with syntax errors, before its
+    /// imports are resolved: it has them, a file of its directory or of one
+    /// above it has, or it imports anything but `builtins`, `fileroot` and
+    /// the standard files.
+    fn may_see_broken(&self, index: u32) -> bool {
+        let Some(file) = self.files.get(index as usize) else {
+            return true;
+        };
+        let chain: Vec<u32> = self.chain(file.dir).collect();
+        let in_chain = (0u32..)
+            .zip(&self.files)
+            .any(|(at, other)| chain.contains(&other.dir) && self.is_broken(at));
+        in_chain
+            || file.ast.items(file.ast.root()).iter().any(|&item| {
+                let ItemKind::Import(id) = file.ast.item(item).kind else {
+                    return false;
+                };
+                let first = file
+                    .ast
+                    .path(file.ast.import_decl(id).path)
+                    .first()
+                    .and_then(PathSegment::name)
+                    .map_or("", |name| self.names.get(name));
+                first != BUILTINS
+                    && first != Fileroot::MODULE
+                    && !crate::STANDARD.iter().any(|&(stem, _)| stem == first)
+            })
+    }
+
+    /// The errors a stage of the scan that found `errors`, which stop it,
+    /// reports: every syntax error of the files, then those of `errors` of
+    /// files that cannot see a file with one, since in any other a
+    /// declaration of it may be missing or misplaced (see [Syntax
+    /// errors](#syntax-errors)).
+    fn stage_errors(&self, errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
+        if self.syntax_errors.is_empty() {
+            return errors;
+        }
+        let mut all = self.syntax_errors.clone();
+        all.extend(
+            errors
+                .into_iter()
+                .filter(|error| error.input.is_some_and(|input| !self.may_see_broken(input))),
+        );
+        all
+    }
     /// The directories from `dir` up to the root, `dir` first.
     pub fn chain(&self, dir: u32) -> impl Iterator<Item = u32> + '_ {
         std::iter::successors(Some(dir), |&at| {
@@ -2166,12 +2337,14 @@ fn parent_path(path: &str) -> &str {
 ///
 /// # Errors
 ///
-/// Every syntax error of every file (numbered as if the standard files the
-/// files that parsed need were loaded); else every file or directory of the
-/// root named like a module of the standard library; else every conflict
-/// between files' declarations in a directory; else every conflict of
-/// every file's view; else every cycle of files that need each other. Each
-/// names its file in [`Diagnostic::input`], its index among the files.
+/// Every lexical and syntax error of every file, the files scanned as their
+/// parser recovered them (see [Syntax errors](#syntax-errors)), with the
+/// errors of a stage below that stops the scan of the files that cannot
+/// see one; else every file or directory of the root named like a module of
+/// the standard library; else every conflict between files' declarations
+/// in a directory; else every conflict of every file's view; else every
+/// cycle of files that need each other. Each names its file in
+/// [`Diagnostic::input`], its index among the files.
 pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
     scan_with(sources, &[])
 }
@@ -2187,12 +2360,17 @@ pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
 /// the cycles, every reference through an import that reaches back into
 /// its own file.
 pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<Diagnostic>> {
-    scan_into(
+    let scan = scan_into(
         (sources, Placing::Workspace(nested)),
         Library::NEEDED,
         &mut Names::new(),
         &mut Vec::new(),
-    )
+    )?;
+    if scan.syntax_errors.is_empty() {
+        Ok(scan)
+    } else {
+        Err(scan.syntax_errors)
+    }
 }
 
 /// Where the files a scan is given are placed (see the module
@@ -2277,6 +2455,7 @@ fn scan_into_with(
         inherited_types: inherited.to_vec(),
         inherited_def_types: def_types.0.to_vec(),
         input_number: def_types.1,
+        syntax_errors: Vec::new(),
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
@@ -2300,7 +2479,13 @@ fn scan_files(
 ) -> Result<(), Vec<Diagnostic>> {
     let mut sorted: Vec<&SourceFile> = sources.iter().collect();
     sorted.sort_by(|a, b| a.name().as_bytes().cmp(b.name().as_bytes()));
-    let (standard, parsed) = parse_files(scan, &sorted, library, loaded)?;
+    let (standard, parsed, syntax_errors) = parse_files(scan, &sorted, library, loaded);
+    // A session's input with an error is not checked: nothing of it is
+    // committed, whatever its parts hold.
+    if !syntax_errors.is_empty() && matches!(placing, Placing::Lone(_, true)) {
+        return Err(syntax_errors);
+    }
+    scan.syntax_errors = syntax_errors;
     scan.standard = count(standard.len());
     scan.fileroot_names = Fileroot::ALL.map(|member| scan.names.lookup(member.name()));
     let (dirs, user_dirs) = place_dirs(scan, &sorted, placing);
@@ -2335,8 +2520,10 @@ fn scan_files(
         Placing::Lone(_, true) => no_prelude_in_input(scan, &mut errors),
         Placing::Lone(_, false) => {}
     }
+    // Each stage that finds errors stops the scan, with the files' syntax
+    // errors (see [Syntax errors](#syntax-errors)).
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(scan.stage_errors(errors));
     }
     // A definition made with a def-type is a leaf of its def-type's
     // namespace, which is known only once the files' views are: the trees
@@ -2344,7 +2531,9 @@ fn scan_files(
     // any definition has one (see [Def-types](#def-types)).
     let mark = scan.type_store.mark();
     for pass in 0..2 {
-        scan_trees(scan, placing, &dirs)?;
+        if let Err(errors) = scan_trees(scan, placing, &dirs) {
+            return Err(scan.stage_errors(errors));
+        }
         if !name_namespaces(scan) || pass > 0 {
             break;
         }
@@ -2353,28 +2542,28 @@ fn scan_files(
         // report it as a conflict (see [Def-types](#def-types)).
         let errors = unpaired_metas(scan);
         if !errors.is_empty() {
-            return Err(errors);
+            return Err(scan.stage_errors(errors));
         }
         unscan(scan, mark);
     }
     mark_unpaired(scan);
     type_views(scan, &mut errors);
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(scan.stage_errors(errors));
     }
     define_types(scan, &mut errors);
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(scan.stage_errors(errors));
     }
     value_cells(scan);
     resolve(scan);
     let mentioned = find_needs(scan, &mut errors);
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(scan.stage_errors(errors));
     }
     report_cycles(scan, &mentioned, &mut errors);
     if !errors.is_empty() {
-        return Err(errors);
+        return Err(scan.stage_errors(errors));
     }
     scan.order = order(&scan.needs);
     scan.rank = scan.ranks();
@@ -2685,8 +2874,12 @@ fn def_type_key(scan: &Scan, index: u32, scope: &FileScope, names: &[Name]) -> O
     Some(names::namespace_key(&shown.join("."), number, item))
 }
 
-/// A file parsed: its tree and the names it spells (see [`parse`]).
-type Parsed = (Ast, Vec<Name>);
+/// A file parsed: its tree and the names it spells, with its lexical and
+/// syntax errors, in source order (see [`parse`]).
+type Parsed = (Ast, Vec<Name>, Vec<Diagnostic>);
+
+/// Files parsed, each its tree and the names it spells.
+type Trees = Vec<(Ast, Vec<Name>)>;
 
 /// Parses the files `sorted`, in path order, and the standard files of
 /// `library` that the scan loads, interning into the scan's names, and
@@ -2697,53 +2890,44 @@ type Parsed = (Ast, Vec<Name>);
 /// The prelude, and what it imports, is parsed first, as it always was (a
 /// session's every standard file, in the table's order), then the files,
 /// then the standard files they need. Returns the trees of the standard
-/// files loaded, in the table's order, and the files'.
-///
-/// # Errors
-///
-/// Every syntax error, each named by its input number: the standard files
-/// loaded first, then the files. A file that fails to parse imports
-/// nothing, so a standard file only it would need is not loaded and takes
-/// no number.
+/// files loaded, in the table's order, and the files', each with the names
+/// it spells, and every lexical and syntax error, each named by its input
+/// number, the standard files loaded first, then the files: a file with
+/// errors is its recovered tree (see [Syntax errors](#syntax-errors)),
+/// whose imports load the standard files they name as any file's do.
 fn parse_files(
     scan: &mut Scan,
     sorted: &[&SourceFile],
     library: Library,
     loaded: &mut Vec<usize>,
-) -> Result<(Vec<Parsed>, Vec<Parsed>), Vec<Diagnostic>> {
+) -> (Trees, Trees, Vec<Diagnostic>) {
     // Each standard file's parse, by its index in the table, once loaded.
-    let mut standard: Vec<Option<Result<Parsed, Diagnostic>>> =
-        library.table.iter().map(|_| None).collect();
+    let mut standard: Vec<Option<Parsed>> = library.table.iter().map(|_| None).collect();
     let mut queue: Vec<usize> = if library.every {
         (0..library.table.len()).rev().collect()
     } else {
         library.find(PRELUDE).into_iter().collect()
     };
     load_standard(scan, library, &mut standard, &mut queue);
-    let files: Vec<Result<Parsed, Diagnostic>> = sorted
+    let files: Vec<Parsed> = sorted
         .iter()
         .map(|source| parse(source, &mut scan.names))
         .collect();
-    for (ast, _) in files.iter().flatten() {
+    for (ast, _, _) in &files {
         queue.extend(standard_imports(ast, &scan.names, library));
     }
     load_standard(scan, library, &mut standard, &mut queue);
     loaded.clear();
     loaded.extend((0..standard.len()).filter(|&at| matches!(standard.get(at), Some(Some(_)))));
     let mut errors = Vec::new();
-    let mut trees = Vec::with_capacity(loaded.len());
+    let mut trees = Vec::with_capacity(loaded.len() + files.len());
     let numbered = standard.into_iter().flatten().chain(files);
-    for (index, parsed) in (0u32..).zip(numbered) {
-        match parsed {
-            Ok(parsed) => trees.push(parsed),
-            Err(error) => errors.push(error.in_input(index)),
-        }
-    }
-    if !errors.is_empty() {
-        return Err(errors);
+    for (index, (ast, spelled, found)) in (0u32..).zip(numbered) {
+        errors.extend(found.into_iter().map(|error| error.in_input(index)));
+        trees.push((ast, spelled));
     }
     let files = trees.split_off(loaded.len());
-    Ok((trees, files))
+    (trees, files, errors)
 }
 
 /// Parses each standard file of `library` that `queue` holds, and each it
@@ -2752,7 +2936,7 @@ fn parse_files(
 fn load_standard(
     scan: &mut Scan,
     library: Library,
-    standard: &mut [Option<Result<Parsed, Diagnostic>>],
+    standard: &mut [Option<Parsed>],
     queue: &mut Vec<usize>,
 ) {
     while let Some(at) = queue.pop() {
@@ -2765,9 +2949,7 @@ fn load_standard(
             continue;
         };
         let parsed = parse(&source, &mut scan.names);
-        if let Ok((ast, _)) = &parsed {
-            queue.extend(standard_imports(ast, &scan.names, library));
-        }
+        queue.extend(standard_imports(&parsed.0, &scan.names, library));
         *slot = Some(parsed);
     }
 }
@@ -2982,12 +3164,20 @@ fn resolve(scan: &mut Scan) {
     }
 }
 
-/// Lexes and parses `source`, interning into `names`; the tree's own table
-/// is left empty. With the tree, the names its checker can look up (see
-/// [`File::spelled`]).
-fn parse(source: &SourceFile, names: &mut Names) -> Result<(Ast, Vec<Name>), Diagnostic> {
-    let (tokens, mut strings) = lexer::tokenize_with(source, names)?;
-    let (builder, root) = parser::parse_parts(&tokens, source, names, &mut strings)?;
+/// Lexes and parses `source`, interning into `names`, going on past every
+/// error ([`lexer::lex`], [`parser::parse_all`]); the tree's own table is
+/// left empty. With the tree, recovered from the errors, the names its
+/// checker can look up (see [`File::spelled`]), and the errors, in source
+/// order and capped ([`parser::capped`]).
+fn parse(source: &SourceFile, names: &mut Names) -> Parsed {
+    let lexer::Lexed {
+        tokens,
+        mut strings,
+        diagnostics: lexical,
+    } = lexer::lex(source, names);
+    let (builder, root, syntax) =
+        parser::parse_parts(&tokens, source, (names, &mut strings), lexical.len());
+    let errors = parser::capped(lexical, syntax);
     let mut spelled: Vec<Name> = tokens
         .iter()
         .filter_map(|token| match token.kind {
@@ -3007,7 +3197,7 @@ fn parse(source: &SourceFile, names: &mut Names) -> Result<(Ast, Vec<Name>), Dia
     if ast.no_prelude().is_none() {
         ast.add_implicit_import(names.intern(PRELUDE));
     }
-    Ok((ast, spelled))
+    (ast, spelled, errors)
 }
 
 /// The directory `path`, added with the directories above it if new.
@@ -5425,6 +5615,13 @@ impl<'a> Context<'a> {
         &self.place
     }
 
+    /// Whether the file's view sees a file with syntax errors
+    /// ([`Scan::sees_broken`]), in which a name it reads may be declared
+    /// (see [Syntax errors](#syntax-errors)).
+    pub(crate) fn sees_broken(&self) -> bool {
+        self.scan.sees_broken(self.index)
+    }
+
     /// Whether the import item `item` of a lone file, or of a session's
     /// input, names nothing it can: a path of anything but `builtins` and
     /// the standard files, which the checker reports as needing a
@@ -5696,9 +5893,11 @@ pub struct Workspace {
 /// # Errors
 ///
 /// The diagnostics of the scan, or those of every file whose check or
-/// lowering fails, with the warnings found, in path then source order;
-/// each names its file in [`Diagnostic::input`]. A file that needs a file
-/// that failed is not checked: its errors would follow from the first.
+/// lowering fails, with every file's syntax errors and the warnings found,
+/// in path then source order; each names its file in [`Diagnostic::input`].
+/// A file that needs a file that failed is not checked: its errors would
+/// follow from the first. A file with syntax errors always fails, after
+/// its check of what was parsed (see [Syntax errors](#syntax-errors)).
 pub fn check(sources: &[SourceFile]) -> Result<Workspace, Vec<Diagnostic>> {
     check_with(sources, &[])
 }
@@ -5856,7 +6055,84 @@ type CellTables = (Vec<TyId>, Vec<Slot>, Vec<Option<Rc<KnownParams>>>);
 
 /// Checks and lowers every file of `scan` in the order (see [`check`]), each
 /// where the scan located it ([`Scan::locate`]).
-fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
+fn check_scan(scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
+    check_scan_partial(scan).map_err(|failed| failed.diagnostics)
+}
+
+/// A check of a workspace that failed ([`check_partial`]): its diagnostics,
+/// as [`check_with_standard`] gives them, and what it found of the
+/// workspace, if its scan succeeded.
+#[derive(Debug)]
+pub struct Failed {
+    /// Every diagnostic, in path then source order.
+    pub diagnostics: Vec<Diagnostic>,
+    /// What the check found, once the scan succeeded; `None` if it failed.
+    pub partial: Option<Box<Partial>>,
+}
+
+impl Failed {
+    /// The check of `scan`, which interned its types into `types` and found
+    /// `checked` of its files, failed with `errors`, and each file's
+    /// `warnings`, by input number.
+    fn of(
+        scan: Scan,
+        (types, checked): (TypeTable, Vec<Option<Types>>),
+        (errors, warnings): (Vec<Diagnostic>, Vec<Vec<Diagnostic>>),
+    ) -> Self {
+        let warnings = warnings.into_iter().flatten().collect();
+        Self {
+            diagnostics: merge_files(reported(errors), warnings),
+            partial: Some(Box::new(Partial {
+                scan,
+                types,
+                checked,
+            })),
+        }
+    }
+}
+
+/// What a check of a workspace that failed leaves of it once its scan
+/// succeeded ([`check_partial`]), for a tool that shows what it can of it,
+/// as a language server would: the scan, every file's tree as its parser
+/// recovered it from its syntax errors ([`crate::ast::Ast::syntax`]), the
+/// table its types are interned into, and the types of each file whose
+/// check succeeded, by input number. A file whose check failed, one with a
+/// syntax error among them, has none, nor does one not checked.
+#[derive(Debug)]
+pub struct Partial {
+    /// The scanned workspace, its names in [`Scan::names`].
+    pub scan: Scan,
+    /// The table the files' types are interned into.
+    pub types: TypeTable,
+    /// The type of every expression of each file whose check succeeded, by
+    /// input number.
+    pub checked: Vec<Option<Types>>,
+}
+
+/// [`check_with_standard`], with what the check found of the workspace if
+/// it failed after its scan, as [`Partial`] gives it.
+pub fn check_partial(
+    sources: &[SourceFile],
+    nested: &[String],
+    root: &str,
+) -> (Vec<SourceFile>, Result<Workspace, Failed>) {
+    let placed = (sources, Placing::Workspace(nested));
+    let mut loaded = Vec::new();
+    let checked = match scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded) {
+        Ok(mut scan) => {
+            scan.locate(root);
+            check_scan_partial(scan)
+        }
+        Err(diagnostics) => Err(Failed {
+            diagnostics,
+            partial: None,
+        }),
+    };
+    (Library::NEEDED.sources(&loaded), checked)
+}
+
+/// [`check_scan`], with what the check found if it fails ([`Partial`]).
+fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
     let mut names = mem::take(&mut scan.names);
     let mut types = TypeTable::new();
     let (mut cell_types, mut cell_slots, mut cell_known) =
@@ -5869,12 +6145,13 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
     let mut warnings = vec![Vec::new(); scan.files.len()];
     let mut errors = check_type_items(&mut scan, &mut names, &mut types);
     // The files whose check failed, or that need one that did: those are
-    // not checked, since their errors would follow from the first.
-    let mut failed = vec![false; scan.files.len()];
+    // not checked, since their errors would follow from the first; and
+    // those with syntax errors (see [Syntax errors](#syntax-errors)).
+    let mut failed = scan.broken_files();
     #[cfg(test)]
     let mut view_records: Vec<Vec<ViewRecord>> = vec![Vec::new(); scan.files.len()];
     for index in scan.order.clone() {
-        if blocked(&scan, &mut failed, index) {
+        if blocked(&scan, &mut failed, index) || scan.is_unbalanced(index) {
             continue;
         }
         if let Some(file) = scan.files.get_mut(index as usize) {
@@ -5937,16 +6214,15 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
                 set(&mut warnings, index, in_file(found, index));
             }
             Err(found) => {
-                errors.extend(in_file(found, index));
+                errors.extend(scan.failure(index, found));
                 set(&mut failed, index, true);
             }
         }
     }
-    if !errors.is_empty() || failed.contains(&true) {
-        let warnings = warnings.into_iter().flatten().collect();
-        return Err(merge_files(reported(errors), warnings));
-    }
     scan.names = names;
+    if !errors.is_empty() || failed.contains(&true) {
+        return Err(Failed::of(scan, (types, checked), (errors, warnings)));
+    }
     Ok(Workspace {
         values: vec![Value::Empty; scan.files.len()],
         // Built before `scan` moves; its names are interned already.
@@ -5976,15 +6252,21 @@ fn check_scan(mut scan: Scan) -> Result<Workspace, Vec<Diagnostic>> {
 /// (see [Types](#types)): what is wrong in each declaration is reported
 /// here, once, and every file that uses it fails quietly. Lends each file
 /// `names`, and interns into `types`. Returns the errors, each naming its
-/// file.
+/// file, after the files' syntax errors: the errors found before any file
+/// is checked. A file whose tree is unbalanced is not checked; in one whose
+/// view sees a file with syntax errors, an unknown type is no error (see
+/// [Syntax errors](#syntax-errors)).
 fn check_type_items(scan: &mut Scan, names: &mut Names, types: &mut TypeTable) -> Vec<Diagnostic> {
-    let mut errors = Vec::new();
-    for (index, file) in (0u32..).zip(&mut scan.files) {
-        if file.mentions.types.is_empty() {
+    let mut errors = scan.syntax_errors.clone();
+    let broken: Vec<bool> = (0..count(scan.files.len()))
+        .map(|index| scan.sees_broken(index))
+        .collect();
+    for ((index, file), sees_broken) in (0u32..).zip(&mut scan.files).zip(broken) {
+        if file.mentions.types.is_empty() || file.ast.syntax() == Syntax::Unbalanced {
             continue;
         }
         file.ast.replace_names(mem::take(names));
-        let found = check_types(&file.ast, types);
+        let found = check_types(&file.ast, types, sees_broken);
         *names = file.ast.replace_names(Names::new());
         errors.extend(in_file(found, index));
     }
@@ -8257,7 +8539,8 @@ fn check_input_then<R>(
         let declared = if file.mentions.types.is_empty() {
             Vec::new()
         } else {
-            check_types(&file.ast, types)
+            // A session's input with a syntax error is not checked.
+            check_types(&file.ast, types, false)
         };
         let checked = Checker::in_workspace(&file.ast, scope, types, &context).check();
         let checked = match (declared.is_empty(), checked) {
@@ -11576,11 +11859,11 @@ p26 = com.x"#;
         let (standard, checked) = checked_beside(&crate::STANDARD, &files);
         assert_eq!(standard.len(), 2);
         assert_eq!(checked.unwrap_err()[0].input, Some(3));
-        // A file that fails to parse imports nothing.
+        // A file with a syntax error imports what its recovered tree does.
         let files = [("workspace.gcsl", ""), ("a.gcsl", "import path\ny = (")];
         let (standard, checked) = checked_beside(&crate::STANDARD, &files);
-        assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
-        assert_eq!(checked.unwrap_err()[0].input, Some(1));
+        assert_eq!(standard, ["<stdlib>/path.gcsl", "<stdlib>/prelude.gcsl"]);
+        assert_eq!(checked.unwrap_err()[0].input, Some(2));
         // Run alone with `path`, the prelude is input 1, and the file's
         // diagnostics name no input.
         let error = lone_error("import path\nx = sh(\"exit 2\")");
@@ -19151,5 +19434,174 @@ p26 = com.x"#;
         // A `teardown` of no parameters takes nothing.
         let none = check(memoised, "def teardown() -> {} { {} }").unwrap_err();
         assert_eq!(none.len(), 1, "{none:?}");
+    }
+
+    // ----- Syntax errors -----
+
+    /// Every diagnostic of checking the workspace of `files`, as its
+    /// message, the path of its file and the source it is at.
+    fn every_error(files: &[(&str, &str)]) -> Vec<(String, String, String)> {
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        let (standard, checked) = check_with_standard(&sources, &[], "/");
+        let mut shown = standard;
+        let mut sorted = sources;
+        sorted.sort_by(|a, b| a.name().cmp(b.name()));
+        shown.extend(sorted);
+        checked
+            .unwrap_err()
+            .into_iter()
+            .map(|error| {
+                let source = error.input.and_then(|input| shown.get(input as usize));
+                (
+                    error.message,
+                    source.map_or_else(String::new, |s| s.name().to_owned()),
+                    source.map_or_else(String::new, |s| s.slice(error.span).to_owned()),
+                )
+            })
+            .collect()
+    }
+
+    /// `triples` as [`every_error`] gives them.
+    fn expected_errors(triples: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        triples
+            .iter()
+            .map(|&(message, path, at)| (message.to_owned(), path.to_owned(), at.to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_syntax_error_hides_no_other_files_errors() {
+        // `a` has a syntax error, and a type error where it parses; `b` an
+        // unrelated type error; `c` reads `q`, which `a` declares where it
+        // could not be parsed, and `d` reads `x`, whose value could not be.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "q . = 1\nx = (1 2)\ny: Int = \"s\""),
+            ("b.gcsl", "z: Int = true"),
+            ("c.gcsl", "w = q + 1"),
+            ("d.gcsl", "v = x + 1\nu: Int = \"t\""),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[
+                ("expected a field name after `.`", "a.gcsl", "="),
+                ("expected `)`, found `2`", "a.gcsl", "2"),
+                ("mismatched types", "a.gcsl", "\"s\""),
+                ("mismatched types", "b.gcsl", "true"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_name_that_names_nothing_is_an_error_where_no_broken_file_is_seen() {
+        // `sub2/d` sees the root's files, not `sub1/a`.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("sub1/a.gcsl", "q . = 1"),
+            ("sub2/d.gcsl", "w = nope + 1\nt: Nope = 1"),
+            ("sub3/e.gcsl", "import sub1.a\nw = a.q + nope"),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[
+                ("expected a field name after `.`", "sub1/a.gcsl", "="),
+                ("undefined variable `nope`", "sub2/d.gcsl", "nope"),
+                ("unknown type `Nope`", "sub2/d.gcsl", "Nope"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_failed_check_leaves_the_recovered_trees_and_the_types_found() {
+        let sources: Vec<SourceFile> = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x = (1 2)\ny = 3"),
+            ("b.gcsl", "z = 4"),
+        ]
+        .iter()
+        .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+        .collect();
+        let (standard, checked) = check_partial(&sources, &[], "/");
+        let Err(Failed {
+            diagnostics,
+            partial: Some(partial),
+        }) = checked
+        else {
+            panic!("{checked:?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let (a, b) = (standard.len(), standard.len() + 1);
+        assert_eq!(partial.scan.files[a].path, "a.gcsl");
+        assert_eq!(partial.scan.files[a].ast.syntax(), Syntax::Recovered);
+        assert_eq!(partial.scan.files[b].ast.syntax(), Syntax::Clean);
+        // `y` is in `a`'s tree; `a` failed, `b` was checked.
+        assert_eq!(
+            partial.scan.files[a]
+                .ast
+                .items(partial.scan.files[a].ast.root())
+                .len(),
+            2
+        );
+        assert!(partial.checked[a].is_none());
+        assert!(partial.checked[b].is_some());
+    }
+
+    #[test]
+    fn an_unbalanced_file_is_not_checked() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x: Int = \"s\"\n}\ny = 1"),
+            ("b.gcsl", "z: Int = true"),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[
+                ("unexpected `}`", "a.gcsl", "}"),
+                ("mismatched types", "b.gcsl", "true"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_syntax_error_has_no_warnings() {
+        // A list of an `Int` and a `String` is warned about, being of a
+        // union; not in a file with a syntax error, whose warnings may be of
+        // source that could not be parsed.
+        let clean = [("workspace.gcsl", ""), ("a.gcsl", "x = 1\ny = [1, \"a\"]")];
+        let sources: Vec<SourceFile> = clean
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        assert_eq!(check(&sources).unwrap().warnings().len(), 1);
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x = 1 1\ny = [1, \"a\"]"),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[("expected end of item, found `1`", "a.gcsl", "1")])
+        );
+    }
+
+    #[test]
+    fn scan_errors_beside_a_syntax_error_are_reported_only_where_no_broken_file_is_seen() {
+        // Two files of `sub2` define `k`; `sub1/a` has a syntax error and
+        // two definitions of `j`, which may be the recovery's.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("sub1/a.gcsl", "j = 1\nj = 2\nx = 1 1"),
+            ("sub2/b.gcsl", "k = 1"),
+            ("sub2/c.gcsl", "k = 2"),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[
+                ("expected end of item, found `1`", "sub1/a.gcsl", "1"),
+                ("field `k` is defined in two files", "sub2/c.gcsl", "k"),
+            ])
+        );
     }
 }

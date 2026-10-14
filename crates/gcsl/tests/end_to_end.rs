@@ -894,8 +894,16 @@ fn nesting_beyond_the_limit_is_a_diagnostic_not_a_crash() {
             ),
             format!("{}0{}", "(0..".repeat(200_000), ")".repeat(200_000)),
         ] {
+            // The tree recovered from it is checked, and may have errors of
+            // its own: nested functions declared `: Int` return functions.
             let diagnostics = run(&text).unwrap_err();
-            assert_eq!(diagnostics[0].message, "expression nested too deeply");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message == "expression nested too deeply"),
+                "{}",
+                text.get(..40).unwrap_or(&text)
+            );
         }
     });
 }

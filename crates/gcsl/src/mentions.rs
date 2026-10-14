@@ -1723,7 +1723,8 @@ impl Walker<'_> {
             // has no expression either, and declares no variable: its name
             // is a type's, read only in type positions (see
             // [Types](#types)).
-            ItemKind::Import(_) | ItemKind::Type { .. } => {}
+            // What the parser could not parse mentions nothing.
+            ItemKind::Import(_) | ItemKind::Type { .. } | ItemKind::Error => {}
             ItemKind::DefTypeDef { def, value } | ItemKind::DefMeta { def, value } => {
                 self.def_type_def(def, value);
             }
@@ -1799,7 +1800,11 @@ impl Walker<'_> {
     fn expr(&mut self, id: ExprId) {
         let ast = self.ast;
         match ast.get(id).kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Str(_) => {}
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Error => {}
             ExprKind::Interp(parts) => {
                 for &part in ast.parts(parts) {
                     if let StrPart::Expr(expr) = part {
