@@ -1,8 +1,9 @@
 //! `gcsl`: the command-line interface to the GCSL language.
 //!
 //! With no arguments it starts a REPL; `gcsl run FILE` runs a file; `gcsl
-//! lsp` is a language server, speaking LSP on stdin and stdout, which is
-//! the `gcsl-lsp` crate's. All language work is done by the `gcsl` library,
+//! fmt` formats files, or checks that they are formatted; `gcsl lsp` is a
+//! language server, speaking LSP on stdin and stdout, which is the
+//! `gcsl-lsp` crate's. All language work is done by the `gcsl` library,
 //! and finding and reading a workspace's files by the `gcsl-disk` crate,
 //! which `pekit` shares; this crate only reads its input, prints output and
 //! chooses exit codes.
@@ -18,6 +19,7 @@
     clippy::dbg_macro
 )]
 
+mod fmt;
 mod output;
 mod repl;
 mod run;
@@ -44,9 +46,12 @@ struct Cli {
 enum Command {
     /// Run a GCSL file and print its value, unless it is `{}`.
     Run(run::RunArgs),
+    /// Format GCSL files in place, or with `--check` list those that are
+    /// not formatted. A file with a syntax error is left alone.
+    Fmt(fmt::FmtArgs),
     /// Serve the Language Server Protocol on stdin and stdout, reporting
-    /// each file's errors and warnings as it is edited, and answering hover
-    /// and go-to-definition. Checks only: runs nothing.
+    /// each file's errors and warnings as it is edited, answering hover and
+    /// go-to-definition, and formatting. Checks only: runs nothing.
     Lsp,
 }
 
@@ -63,6 +68,7 @@ fn main() -> ExitCode {
         .spawn(move || match cli.command {
             None => repl::main(),
             Some(Command::Run(args)) => run::main(&args),
+            Some(Command::Fmt(args)) => fmt::main(&args),
             Some(Command::Lsp) => gcsl_lsp::stdio(),
         });
     match worker.map(std::thread::JoinHandle::join) {

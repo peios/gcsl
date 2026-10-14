@@ -12,8 +12,9 @@
 //! INITIALISATION. The server counts positions in utf-8 if the client
 //! offers it (`general.positionEncodings`), else in utf-16, LSP's default
 //! (see [`position`]). It offers `textDocumentSync` (open and close,
-//! incremental changes, and saves), `hoverProvider` and
-//! `definitionProvider`. It answers `shutdown`, and any request after it
+//! incremental changes, and saves), `hoverProvider`, `definitionProvider`,
+//! `documentFormattingProvider` and `documentRangeFormattingProvider`. It
+//! answers `shutdown`, and any request after it
 //! with an error; `exit` ends it, cleanly after a `shutdown`, else not
 //! ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
@@ -37,6 +38,15 @@
 //! index (see the `worker` module), so an answer never points at old text.
 //! A `$/cancelRequest` of a query not handed over yet answers it with
 //! `RequestCancelled`; one handed over is answered anyway.
+//!
+//! FORMATTING. `textDocument/formatting` is answered with the edits that
+//! lay the document's text out as `gcsl fmt` does ([`gcsl::fmt`]), each a
+//! run of whole lines that change, as a line diff finds them, and
+//! `textDocument/rangeFormatting` with those of them that touch the range's
+//! lines (see [`formatting`]). The formatting options the client sends are
+//! not read: GCSL has one style. A document with a lexical or syntax error
+//! is answered with no edits, and why is logged; one that is not open with
+//! `null`.
 //!
 //! SOURCES. It keeps the text of each open document, applying incremental
 //! changes in the negotiated encoding. A `.gcsl` file is a file of the
@@ -62,7 +72,9 @@
 //! (see the `worker` module).
 //!
 //! THREADS. Not to lag, the main thread only reads messages, keeps the
-//! documents and schedules checks and queries; it never checks. One worker
+//! documents, schedules checks and queries, and formats; it never checks.
+//! Formatting is work on one document's text alone, a lex and a parse or
+//! two, so it is answered at once there, not queued behind a check. One worker
 //! thread (the `worker` module) reads workspaces from disk, checks and
 //! indexes them, publishes, and answers queries, one job at a time: the
 //! main thread hands it the next only once it has answered the last, so
@@ -103,6 +115,7 @@
     clippy::dbg_macro
 )]
 
+pub mod formatting;
 pub mod place;
 pub mod position;
 mod worker;
@@ -125,15 +138,17 @@ use lsp_types::notification::{
     Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
     DidOpenTextDocument, DidSaveTextDocument, Notification as _,
 };
-use lsp_types::request::{GotoDefinition, HoverRequest, RegisterCapability, Request as _};
+use lsp_types::request::{
+    Formatting, GotoDefinition, HoverRequest, RangeFormatting, RegisterCapability, Request as _,
+};
 use lsp_types::{
     CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern,
-    HoverProviderCapability, InitializeResult, NumberOrString, OneOf, Position, Registration,
-    RegistrationParams, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Uri,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
+    DocumentRangeFormattingParams, FileSystemWatcher, GlobPattern, HoverProviderCapability,
+    InitializeResult, NumberOrString, OneOf, Position, Registration, RegistrationParams,
+    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
 };
 use serde_json::Value;
 
@@ -280,6 +295,8 @@ fn initialize_result(encoding: Encoding) -> Value {
             text_document_sync: Some(TextDocumentSyncCapability::Options(sync)),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             definition_provider: Some(OneOf::Left(true)),
+            document_formatting_provider: Some(OneOf::Left(true)),
+            document_range_formatting_provider: Some(OneOf::Left(true)),
             ..ServerCapabilities::default()
         },
         server_info: Some(ServerInfo {
@@ -563,6 +580,7 @@ impl Server<'_> {
             }
             HoverRequest::METHOD => return self.ask(request, Asked::Hover),
             GotoDefinition::METHOD => return self.ask(request, Asked::Definition),
+            Formatting::METHOD | RangeFormatting::METHOD => self.format(request),
             method => Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
@@ -602,6 +620,47 @@ impl Server<'_> {
             key,
         });
         None
+    }
+
+    /// The response to `request`, a `textDocument/formatting` or a
+    /// `textDocument/rangeFormatting`, made here, on the main thread, from
+    /// the document's text as the server has it (see [`formatting`]): the
+    /// edits that format it, those that touch the range's lines for a
+    /// range (its last line left out when the range ends at its start, as a
+    /// selection of whole lines does). A document with an error has none,
+    /// why logged, and a document that is not open has nothing to say:
+    /// `null`. Parameters that cannot be read are `InvalidParams`.
+    fn format(&self, request: Request) -> Response {
+        let Request { id, method, params } = request;
+        let read = if method == RangeFormatting::METHOD {
+            serde_json::from_value::<DocumentRangeFormattingParams>(params).map(|params| {
+                let (start, end) = (params.range.start, params.range.end);
+                let last = if end.character == 0 && end.line > start.line {
+                    end.line - 1
+                } else {
+                    end.line
+                };
+                (
+                    params.text_document.uri,
+                    Some(start.line as usize..=last as usize),
+                )
+            })
+        } else {
+            serde_json::from_value::<DocumentFormattingParams>(params)
+                .map(|params| (params.text_document.uri, None))
+        };
+        let (uri, lines) = match read {
+            Ok(read) => read,
+            Err(error) => {
+                let message = format!("cannot read the parameters of `{method}`: {error}");
+                return Response::new_err(id, ErrorCode::InvalidParams as i32, message);
+            }
+        };
+        let Some(document) = self.documents.get(uri.as_str()) else {
+            return Response::new_ok(id, Value::Null);
+        };
+        let edits = formatting::edits(uri.as_str(), &document.text, self.encoding, lines.as_ref());
+        Response::new_ok(id, edits.unwrap_or_default())
     }
 
     /// A `$/cancelRequest` of the request `id`: answered with
@@ -1047,6 +1106,8 @@ mod tests {
         );
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["definitionProvider"], true);
+        assert_eq!(capabilities["documentFormattingProvider"], true);
+        assert_eq!(capabilities["documentRangeFormattingProvider"], true);
         assert_eq!(result["serverInfo"]["name"], "gcsl");
         client.shut_down().unwrap();
     }
@@ -1510,6 +1571,65 @@ mod tests {
         client.notify("$/cancelRequest", json!({ "id": 1 }));
         client.notify("$/cancelRequest", json!({ "id": "nothing" }));
         assert!(client.hover(&uri, (0, 0)).is_object());
+        client.shut_down().unwrap();
+    }
+
+    /// The edits of a formatting request, each as its range and new text.
+    fn formatting_edits(response: &Response) -> Vec<(Range, String)> {
+        let edits: Vec<lsp_types::TextEdit> =
+            serde_json::from_value(response.response_result.clone().unwrap()).unwrap();
+        edits
+            .into_iter()
+            .map(|edit| (edit.range, edit.new_text))
+            .collect()
+    }
+
+    #[test]
+    fn a_messy_document_is_formatted_by_lines_and_a_broken_one_not() {
+        let scratch = Scratch::workspace("format", "");
+        // On disk, the file is formatted: the document's own text is.
+        let uri = scratch.write("app.gcsl", "x = 1\n");
+        let text = "x = 1\nmeta = {\n  a=1;\n\n\n  b = [\n    1\n  ]\n}\ny = 2\n";
+        let (mut client, _) = Client::start(&["utf-16"]);
+        client.open(&uri, text);
+        let options = json!({ "tabSize": 2, "insertSpaces": true });
+        let whole = json!({ "textDocument": { "uri": uri }, "options": options });
+        let response = client.request("textDocument/formatting", whole.clone());
+        assert_eq!(
+            formatting_edits(&response),
+            [
+                (range((2, 0), (3, 0)), "    a = 1\n".to_owned()),
+                (
+                    range((4, 0), (8, 0)),
+                    "    b = [\n        1,\n    ]\n".to_owned()
+                ),
+            ]
+        );
+        // A range: the edits that touch its lines. A selection of whole
+        // lines ends at the start of the line after them.
+        let ranged = json!({
+            "textDocument": { "uri": uri },
+            "range": range((5, 0), (7, 0)),
+            "options": options,
+        });
+        let response = client.request("textDocument/rangeFormatting", ranged);
+        assert_eq!(formatting_edits(&response).len(), 1);
+        let ranged = json!({
+            "textDocument": { "uri": uri },
+            "range": range((0, 0), (1, 3)),
+            "options": options,
+        });
+        let response = client.request("textDocument/rangeFormatting", ranged);
+        assert_eq!(formatting_edits(&response), []);
+        // With a syntax error: no edits.
+        client.change(&uri, 2, ((9, 4), (9, 5)), "(");
+        let response = client.request("textDocument/formatting", whole);
+        assert_eq!(formatting_edits(&response), []);
+        // A document not open: nothing to say.
+        let other = scratch.write("other.gcsl", "y  =  2\n");
+        let params = json!({ "textDocument": { "uri": other }, "options": options });
+        let response = client.request("textDocument/formatting", params);
+        assert_eq!(response.response_result.unwrap(), Value::Null);
         client.shut_down().unwrap();
     }
 

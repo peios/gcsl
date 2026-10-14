@@ -196,6 +196,20 @@
 //! there are too many. [`tokenize`] returns the first error, as it always
 //! did, or the tokens if there is none.
 //!
+//! # Comments
+//!
+//! A comment is no token, but a tool that rewrites source, the formatter
+//! ([`crate::fmt`]), or shows what is written above a declaration needs to
+//! know where each is. [`lex_with_comments`] lexes as [`lex`] does and also
+//! records every comment's span, `#` through the end of its line, the `\n`
+//! left out (trailing spaces and tabs are in it), in
+//! [`Comments`], in source order: a comment inside an interpolation among
+//! them, where it is. Only the lexing proper records them, where it skips
+//! one (`Lexer::skip_trivia`); the scan of a string literal skips the same
+//! comments without recording them, and the lexer then reaches each once.
+//! [`lex`] and [`tokenize`] record none and pay nothing for them but one
+//! test per comment.
+//!
 //! # Allocation
 //!
 //! Besides the output vector and the pieces, the lexer allocates only one
@@ -575,18 +589,78 @@ pub const MAX_ERRORS: usize = 100;
 /// [Errors](#errors)): the tokens, with a [`TokenKind::Error`] where each
 /// error is, and every error.
 pub fn lex(source: &SourceFile, names: &mut Names) -> Lexed {
-    let mut lexer = Lexer::new(source, names);
+    lex_into(Lexer::new(source, names, None)).0
+}
+
+/// Lexes `source` as [`lex`] does, and also records where every comment is
+/// (see [Comments](#comments)).
+pub fn lex_with_comments(source: &SourceFile, names: &mut Names) -> (Lexed, Comments) {
+    let (lexed, spans) = lex_into(Lexer::new(source, names, Some(Vec::new())));
+    (
+        lexed,
+        Comments {
+            spans: spans.unwrap_or_default(),
+        },
+    )
+}
+
+/// Runs `lexer` to the end of its source: what it made of it, and the
+/// comments it recorded, if it was asked to.
+fn lex_into(mut lexer: Lexer<'_>) -> (Lexed, Option<Vec<Span>>) {
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
         tokens.push(token);
         if token.kind == TokenKind::Eof {
-            return Lexed {
+            let made = Lexed {
                 tokens,
                 strings: lexer.strings,
                 diagnostics: lexer.diagnostics,
             };
+            return (made, lexer.comments);
         }
+    }
+}
+
+/// Where the comments of a source are, as [`lex_with_comments`] finds them:
+/// each one's span, `#` through the end of its line, the `\n` left out, in
+/// source order, so that the comments around a place are found by binary
+/// search, as the run of `#` lines directly above a declaration is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Comments {
+    /// The spans, in source order.
+    spans: Vec<Span>,
+}
+
+impl Comments {
+    /// Every comment's span, in source order.
+    #[must_use]
+    pub fn spans(&self) -> &[Span] {
+        &self.spans
+    }
+
+    /// The comments that end at or before `offset`, in source order: the
+    /// last of them are the nearest above it.
+    #[must_use]
+    pub fn before(&self, offset: u32) -> &[Span] {
+        let end = self.spans.partition_point(|span| span.end <= offset);
+        self.spans.get(..end).unwrap_or_default()
+    }
+
+    /// The comments that start at or after `offset`, in source order.
+    #[must_use]
+    pub fn after(&self, offset: u32) -> &[Span] {
+        let start = self.spans.partition_point(|span| span.start < offset);
+        self.spans.get(start..).unwrap_or_default()
+    }
+
+    /// The comment that `offset` is in, if any: from its `#` up to the end
+    /// of its line.
+    #[must_use]
+    pub fn at(&self, offset: u32) -> Option<Span> {
+        let after = self.spans.partition_point(|span| span.start <= offset);
+        let span = *self.spans.get(after.checked_sub(1)?)?;
+        (offset < span.end).then_some(span)
     }
 }
 
@@ -760,10 +834,13 @@ struct Lexer<'a> {
     /// The errors found so far, in source order, at most [`MAX_ERRORS`] and
     /// one more.
     diagnostics: Vec<Diagnostic>,
+    /// The comments skipped so far, in source order, if they are recorded
+    /// (see [Comments](#comments)).
+    comments: Option<Vec<Span>>,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(source: &'a SourceFile, names: &'a mut Names) -> Self {
+    fn new(source: &'a SourceFile, names: &'a mut Names, comments: Option<Vec<Span>>) -> Self {
         Self {
             text: source.text(),
             bytes: source.text().as_bytes(),
@@ -775,6 +852,7 @@ impl<'a> Lexer<'a> {
             names,
             strings: Strings::new(),
             diagnostics: Vec::new(),
+            comments,
         }
     }
 
@@ -1024,7 +1102,13 @@ impl<'a> Lexer<'a> {
                 b'#' if attribute_at(self.bytes, self.pos).is_some() => break,
                 // Skip to the newline, which is then either skipped or
                 // emitted like any other.
-                b'#' => self.pos = end_of_line(self.bytes, self.pos),
+                b'#' => {
+                    let end = end_of_line(self.bytes, self.pos);
+                    if let Some(comments) = &mut self.comments {
+                        comments.push(span(self.pos, end));
+                    }
+                    self.pos = end;
+                }
                 _ => break,
             }
         }
@@ -3596,7 +3680,7 @@ mod tests {
             .spawn(|| {
                 let source = SourceFile::new("test.gcsl", nested(MAX_DEPTH)).unwrap();
                 let mut names = Names::new();
-                let deepest = Lexer::new(&source, &mut names)
+                let deepest = Lexer::new(&source, &mut names, None)
                     .scan(0, 1)
                     .map(|layout| layout.end);
                 (deepest, lex(&nested(MAX_DEPTH + 1)))
@@ -3822,5 +3906,41 @@ mod tests {
                 TokenKind::Eof
             ]
         ));
+    }
+
+    #[test]
+    fn comments_are_recorded_in_source_order_when_asked_for() {
+        let text =
+            "#!/usr/bin/env gcsl\n# a\n#[shadowable]\nx = (1 # b\n) # c \t\ny = \"{z # d\n}\"\n# e";
+        let source = SourceFile::new("test.gcsl", text).unwrap();
+        let (lexed, comments) = lex_with_comments(&source, &mut Names::new());
+        let shown: Vec<&str> = comments
+            .spans()
+            .iter()
+            .map(|&span| source.slice(span))
+            .collect();
+        // A shebang is a comment, an attribute is not; one inside brackets
+        // and one inside an interpolation are, and the spaces and tabs
+        // before the line's end are in it.
+        assert_eq!(
+            shown,
+            ["#!/usr/bin/env gcsl", "# a", "# b", "# c \t", "# d", "# e"]
+        );
+        // The tokens are `lex`'s.
+        let plain = super::lex(&source, &mut Names::new());
+        assert_eq!(lexed.tokens, plain.tokens);
+        // Found by position: the run above `x`, after it, and at an offset.
+        let x = u32::try_from(text.find("x =").unwrap()).unwrap();
+        let above: Vec<&str> = comments
+            .before(x)
+            .iter()
+            .map(|&span| source.slice(span))
+            .collect();
+        assert_eq!(above, ["#!/usr/bin/env gcsl", "# a"]);
+        assert_eq!(comments.after(x).len(), 4);
+        let b = u32::try_from(text.find("# b").unwrap()).unwrap();
+        assert_eq!(comments.at(b + 2).map(|span| span.start), Some(b));
+        assert_eq!(comments.at(x), None);
+        assert_eq!(comments.at(b - 1), None);
     }
 }

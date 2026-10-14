@@ -29,7 +29,9 @@
 //!
 //! A language server stops after the check, and indexes what it found, in
 //! files with errors too: what each name refers to, where that is
-//! declared, and what it is ([`index`]).
+//! declared, and what it is ([`index`]). A formatter stops after the
+//! parse: [`fmt::format`] lays a file that parses out in the one style,
+//! from its tokens, its comments and its tree.
 //!
 //! A file may also declare types, `type PackageDef = {...}`, structural
 //! aliases in a namespace of their own, used bare, qualified through an
@@ -158,6 +160,7 @@ pub mod ast;
 pub mod check;
 pub mod diagnostic;
 pub mod eval;
+pub mod fmt;
 pub mod index;
 pub mod ir;
 pub mod lexer;

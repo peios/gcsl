@@ -2947,6 +2947,19 @@ impl Ast {
         (0..parsed).map(TypeExprId)
     }
 
+    /// Every expression node of the tree, in the order allocated, for a walk
+    /// that needs each node once and not the tree's shape: the formatter's
+    /// ([`crate::fmt`]).
+    pub(crate) fn expr_arena(&self) -> &[Expr] {
+        &self.exprs
+    }
+
+    /// Every item of the tree, in the order allocated, as
+    /// [`Ast::expr_arena`] gives the expressions.
+    pub(crate) fn item_arena(&self) -> &[Item] {
+        &self.items
+    }
+
     /// The type expression `id` as it is written in source, as the printer
     /// shows it ([`Ast::pretty`]), its names shown with `names`: the tree's
     /// own table, or, when the tree's is lent out, the table it is lent to.

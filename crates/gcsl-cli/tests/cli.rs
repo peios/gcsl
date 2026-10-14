@@ -3990,7 +3990,7 @@ const LSP_SHUTDOWN: &str = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
 const LSP_EXIT: &str = r#"{"jsonrpc":"2.0","method":"exit"}"#;
 
 /// `gcsl lsp` speaks LSP on stdin and stdout: it answers `initialize` with
-/// its capabilities (diagnostics, hover and go to definition) and
+/// its capabilities (diagnostics, hover, go to definition and formatting) and
 /// `shutdown` with null, and exits with code 0 on
 /// `exit` after `shutdown`, and 1 on `exit` alone.
 #[test]
@@ -4003,7 +4003,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"definitionProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","textDocumentSync":{{"change":2,"openClose":true,"save":true}}}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"definitionProvider":true,"documentFormattingProvider":true,"documentRangeFormattingProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","textDocumentSync":{{"change":2,"openClose":true,"save":true}}}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -4014,4 +4014,253 @@ fn lsp_initializes_and_shuts_down() {
     let output = lsp(&[LSP_INITIALIZE, LSP_INITIALIZED, LSP_EXIT]);
     assert_eq!(frames(&output).len(), 1);
     assert_eq!(output.status.code(), Some(1));
+}
+
+/// A scratch directory for a `gcsl fmt` test, `name`'s own, empty and
+/// canonical, under the system's temporary directory, removed when dropped.
+struct FmtScratch(std::path::PathBuf);
+
+impl FmtScratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("gcsl-cli-fmt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(std::fs::canonicalize(dir).unwrap())
+    }
+
+    /// Writes `text` to `path` below the directory, making the directories
+    /// on the way, its modification time set an hour back; returns its
+    /// path.
+    fn write(&self, path: &str, text: &str) -> std::path::PathBuf {
+        let path = self.0.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        let back = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+        file.set_modified(back).unwrap();
+        path
+    }
+
+    /// The text of the file at `path` below the directory.
+    fn read(&self, path: &str) -> String {
+        std::fs::read_to_string(self.0.join(path)).unwrap()
+    }
+
+    /// The modification time of the file at `path` below the directory.
+    fn modified(&self, path: &str) -> std::time::SystemTime {
+        std::fs::metadata(self.0.join(path))
+            .unwrap()
+            .modified()
+            .unwrap()
+    }
+}
+
+impl Drop for FmtScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Runs `gcsl` with `args` in `dir`, with `input` as its standard input.
+fn gcsl_in(dir: &std::path::Path, args: &[&str], input: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// A file that `gcsl fmt` changes, and what it changes it to.
+const MESSY: &str = "x = {\n  a=1;\n\n\n  b = [\n    1\n  ]   # one\n}\n\n";
+const FORMATTED: &str = "x = {\n    a = 1\n\n    b = [\n        1,\n    ] # one\n}\n";
+
+/// `gcsl fmt FILE` formats a file in place, and leaves a formatted one
+/// alone: not written, its modification time kept.
+#[test]
+fn fmt_formats_a_file_in_place_and_writes_nothing_formatted() {
+    let scratch = FmtScratch::new("in-place");
+    scratch.write("messy.gcsl", MESSY);
+    scratch.write("tidy.gcsl", FORMATTED);
+    let before = scratch.modified("tidy.gcsl");
+    let output = gcsl_in(&scratch.0, &["fmt", "messy.gcsl", "tidy.gcsl"], "");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(scratch.read("messy.gcsl"), FORMATTED);
+    assert_eq!(scratch.read("tidy.gcsl"), FORMATTED);
+    assert_eq!(scratch.modified("tidy.gcsl"), before);
+    // Formatting it again writes nothing either.
+    let before = scratch.modified("messy.gcsl");
+    let output = gcsl_in(&scratch.0, &["fmt", "messy.gcsl"], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(scratch.modified("messy.gcsl"), before);
+    // No temporary file is left beside them.
+    let names: Vec<String> = std::fs::read_dir(&scratch.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+/// `gcsl fmt` of a symbolic link formats the file it leads to, and the link
+/// stays a link.
+#[test]
+fn fmt_writes_through_a_symbolic_link() {
+    let scratch = FmtScratch::new("link");
+    scratch.write("target.gcsl", MESSY);
+    std::os::unix::fs::symlink(scratch.0.join("target.gcsl"), scratch.0.join("link.gcsl")).unwrap();
+    let output = gcsl_in(&scratch.0, &["fmt", "link.gcsl"], "");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(scratch.read("target.gcsl"), FORMATTED);
+    let link = std::fs::symlink_metadata(scratch.0.join("link.gcsl")).unwrap();
+    assert!(link.file_type().is_symlink());
+}
+
+/// `gcsl fmt --check` writes nothing, lists the files formatting would
+/// change and exits with code 1 if there are any.
+#[test]
+fn fmt_check_lists_what_would_change_and_writes_nothing() {
+    let scratch = FmtScratch::new("check");
+    scratch.write("messy.gcsl", MESSY);
+    scratch.write("tidy.gcsl", FORMATTED);
+    let before = scratch.modified("messy.gcsl");
+    let output = gcsl_in(
+        &scratch.0,
+        &["fmt", "--check", "tidy.gcsl", "messy.gcsl"],
+        "",
+    );
+    assert_eq!(stdout(&output), "messy.gcsl\n");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(scratch.read("messy.gcsl"), MESSY);
+    assert_eq!(scratch.modified("messy.gcsl"), before);
+    let output = gcsl_in(&scratch.0, &["fmt", "--check", "tidy.gcsl"], "");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// `gcsl fmt -` formats standard input to standard output; with `--check`
+/// it writes `<stdin>` if that would change, and nothing else.
+#[test]
+fn fmt_formats_standard_input_to_standard_output() {
+    let scratch = FmtScratch::new("stdin");
+    let output = gcsl_in(&scratch.0, &["fmt", "-"], MESSY);
+    assert_eq!(stdout(&output), FORMATTED);
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl_in(&scratch.0, &["fmt", "--check", "-"], MESSY);
+    assert_eq!(stdout(&output), "<stdin>\n");
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl_in(&scratch.0, &["fmt", "--check", "-"], FORMATTED);
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    // With a syntax error: nothing on standard output, the error shown.
+    let output = gcsl_in(&scratch.0, &["fmt", "-"], "x = (1 2)\n");
+    assert_eq!(stdout(&output), "");
+    assert!(stderr(&output).contains("error: expected `)`, found `2`"));
+    assert!(
+        stderr(&output).contains("<stdin>:1:8"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // `-` with other paths is a usage error.
+    let output = gcsl_in(&scratch.0, &["fmt", "-", "x.gcsl"], "");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// A file with a syntax error is left alone, its error shown, and the
+/// other files are formatted; the exit code is 1. A path that is not there
+/// exits with code 2.
+#[test]
+fn fmt_leaves_a_file_with_an_error_alone() {
+    let scratch = FmtScratch::new("error");
+    let broken = "x  =  (1 2)\n";
+    scratch.write("broken.gcsl", broken);
+    scratch.write("messy.gcsl", MESSY);
+    let before = scratch.modified("broken.gcsl");
+    let output = gcsl_in(&scratch.0, &["fmt", "broken.gcsl", "messy.gcsl"], "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("error: expected `)`, found `2`"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("broken.gcsl:1:10"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(scratch.read("broken.gcsl"), broken);
+    assert_eq!(scratch.modified("broken.gcsl"), before);
+    assert_eq!(scratch.read("messy.gcsl"), FORMATTED);
+    let output = gcsl_in(&scratch.0, &["fmt", "missing.gcsl"], "");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("error: cannot read missing.gcsl"));
+}
+
+/// With no paths, `gcsl fmt` formats every file of the workspace the
+/// working directory is in, but those of a nested workspace and those under
+/// a name starting with `.`; a directory given has every `.gcsl` file under
+/// it formatted, those of the workspaces nested in it too. Outside any
+/// workspace, no paths is an error.
+#[test]
+fn fmt_formats_a_workspace_or_a_directory() {
+    let scratch = FmtScratch::new("workspace");
+    for path in [
+        "workspace.gcsl",
+        "sub/a.gcsl",
+        ".hidden/b.gcsl",
+        "nested/workspace.gcsl",
+        "nested/c.gcsl",
+    ] {
+        scratch.write(path, MESSY);
+    }
+    scratch.write("sub/notes.txt", MESSY);
+    // Each named relative to the working directory when under it, in the
+    // order of their paths in the workspace.
+    let output = gcsl_in(&scratch.0.join("sub"), &["fmt", "--check"], "");
+    let root = scratch.0.display();
+    assert_eq!(stdout(&output), format!("a.gcsl\n{root}/workspace.gcsl\n"));
+    assert_eq!(output.status.code(), Some(1));
+    let output = gcsl_in(&scratch.0.join("sub"), &["fmt"], "");
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(scratch.read("workspace.gcsl"), FORMATTED);
+    assert_eq!(scratch.read("sub/a.gcsl"), FORMATTED);
+    for path in [
+        ".hidden/b.gcsl",
+        "nested/workspace.gcsl",
+        "nested/c.gcsl",
+        "sub/notes.txt",
+    ] {
+        assert_eq!(scratch.read(path), MESSY, "{path}");
+    }
+    // A directory: every `.gcsl` file under it, nested workspaces' too.
+    let output = gcsl_in(&scratch.0, &["fmt", "."], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(scratch.read("nested/workspace.gcsl"), FORMATTED);
+    assert_eq!(scratch.read("nested/c.gcsl"), FORMATTED);
+    assert_eq!(scratch.read(".hidden/b.gcsl"), MESSY);
+    assert_eq!(scratch.read("sub/notes.txt"), MESSY);
+    // No workspace above.
+    let outside = FmtScratch::new("outside");
+    let output = gcsl_in(&outside.0, &["fmt"], "");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("no `workspace.gcsl`"),
+        "{}",
+        stderr(&output)
+    );
 }
