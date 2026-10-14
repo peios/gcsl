@@ -2,13 +2,17 @@
 //! mode (`cargo test --release -p gcsl-disk --test recovery -- --ignored
 //! --nocapture`): timings of the front end on valid input, and a robustness
 //! run over mutants of every `.gcsl` file of the repository and of Jack's
-//! newpkgs, which is only read.
+//! newpkgs, which is only read; and the same for the index a language
+//! server answers hovers and definitions from (`gcsl::index`): timings of a
+//! check that records for it, and a hover and a definition at every token
+//! of newpkgs and of the mutants.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use gcsl::index::Index;
 use gcsl::names::Names;
 use gcsl::workspace;
 use gcsl::{Diagnostic, SourceFile, lexer, parser};
@@ -298,4 +302,199 @@ fn robustness() {
         found.internal
     );
     assert!(found.panics.is_empty() && found.internal.is_empty());
+}
+
+#[test]
+#[ignore = "a timing, run by hand in release mode"]
+fn index_timings() {
+    let thread = std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(|| {
+            let sources = gcsl_disk::read_workspace(Path::new(NEWPKGS), None).unwrap();
+            let plain = fastest(10, || {
+                let (_, checked) =
+                    workspace::check_with_standard(&sources.relative, &sources.nested, NEWPKGS);
+                checked.unwrap();
+            });
+            let recorded = fastest(10, || {
+                let indexed =
+                    workspace::index_with_standard(&sources.relative, &sources.nested, NEWPKGS);
+                assert!(indexed.succeeded && indexed.index.is_some());
+            });
+            println!(
+                "newpkgs: {} files, check {plain:?}, check recording and indexing {recorded:?}",
+                sources.relative.len()
+            );
+        })
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// What a run of hovers and definitions found.
+#[derive(Debug, Default)]
+struct Asked {
+    /// Workspaces and files indexed.
+    indexed: usize,
+    /// Places asked about.
+    places: usize,
+    /// Hovers answered.
+    hovers: usize,
+    /// Definitions answered with at least one place.
+    definitions: usize,
+    /// Panics, and answers out of their file, by what was asked.
+    failures: Vec<String>,
+    /// The time spent asking, indexing apart.
+    asking: Duration,
+    /// The time spent indexing.
+    indexing: Duration,
+}
+
+impl Asked {
+    /// Indexes what `work` checks, `what`, and asks for a hover and a
+    /// definition at every token start of each file of `files`, its index
+    /// among the files after the standard ones with its text, recording
+    /// what it finds.
+    fn run(&mut self, what: &str, work: impl FnOnce() -> Option<Index>, files: &[(u32, &str)]) {
+        let start = Instant::now();
+        let index = panic::catch_unwind(AssertUnwindSafe(work));
+        self.indexing += start.elapsed();
+        self.indexed += 1;
+        let mut index = match index {
+            Ok(Some(index)) => index,
+            Ok(None) => return,
+            Err(_) => {
+                self.failures.push(format!("{what}: indexing panicked"));
+                return;
+            }
+        };
+        let start = Instant::now();
+        for &(file, text) in files {
+            let file = file + index.standard();
+            let source = SourceFile::new("t.gcsl", text).unwrap();
+            let lexed = lexer::lex(&source, &mut Names::new());
+            for token in &lexed.tokens {
+                let at = token.span.start;
+                self.places += 1;
+                let asked = panic::catch_unwind(AssertUnwindSafe(|| {
+                    (index.hover(file, at), index.definition(file, at))
+                }));
+                let Ok((hover, definition)) = asked else {
+                    self.failures
+                        .push(format!("{what}: file {file} at {at} panicked"));
+                    continue;
+                };
+                if let Some(hover) = hover {
+                    self.hovers += 1;
+                    if !(hover.span.start <= at && at < hover.span.end) || hover.text.is_empty() {
+                        self.failures
+                            .push(format!("{what}: file {file} at {at}: hover {hover:?}"));
+                    }
+                }
+                if !definition.is_empty() {
+                    self.definitions += 1;
+                }
+                for location in definition {
+                    if location.file < index.standard() || location.span.end < location.span.start {
+                        self.failures.push(format!(
+                            "{what}: file {file} at {at}: definition {location:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        self.asking += start.elapsed();
+    }
+
+    /// Prints what was found, for `set`, and fails on any failure.
+    fn report(&self, set: &str) {
+        let per = self.asking / u32::try_from(self.places.max(1)).unwrap_or(u32::MAX);
+        println!(
+            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, failures {:?}",
+            self.indexed,
+            self.indexing,
+            self.places,
+            self.asking,
+            self.hovers,
+            self.definitions,
+            self.failures
+        );
+        assert!(self.failures.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "a robustness run of minutes, run by hand in release mode"]
+fn every_token_of_newpkgs_and_of_the_mutants_has_a_hover_and_a_definition_without_a_panic() {
+    let thread = std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(hovers_everywhere)
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// The robustness run of the index: newpkgs as it is, every mutant of every
+/// file alone, and two of each of newpkgs's files in their workspace.
+fn hovers_everywhere() {
+    let sources = gcsl_disk::read_workspace(Path::new(NEWPKGS), None).unwrap();
+    let files = &sources.relative;
+    // newpkgs as it is: every token of every file.
+    let mut asked = Asked::default();
+    let numbered: Vec<(u32, &str)> = (0u32..).zip(files).map(|(at, f)| (at, f.text())).collect();
+    asked.run(
+        "newpkgs",
+        || workspace::index_with_standard(files, &sources.nested, NEWPKGS).index,
+        &numbered,
+    );
+    asked.report("newpkgs");
+    // Every mutant of every file alone.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut ours = Vec::new();
+    gcsl_files(&repository.join("crates"), &mut ours);
+    gcsl_files(&repository.join("stdlib"), &mut ours);
+    let mut theirs = Vec::new();
+    gcsl_files(Path::new(NEWPKGS), &mut theirs);
+    for (set, paths) in [
+        ("gcsl mutants alone", &ours),
+        ("newpkgs mutants alone", &theirs),
+    ] {
+        let mut asked = Asked::default();
+        for path in paths {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let (cuts, deletions) = mutants(&text);
+            for mutant in cuts.iter().chain(&deletions) {
+                let what = format!("{} mutant of {} bytes", path.display(), mutant.len());
+                let source = SourceFile::new("mutant.gcsl", mutant.as_str()).unwrap();
+                asked.run(
+                    &what,
+                    || workspace::index_lone_with_standard(&source, "/").index,
+                    &[(0, mutant.as_str())],
+                );
+            }
+        }
+        asked.report(set);
+    }
+    // Each of newpkgs's files cut in its middle, and with its middle token
+    // deleted, in its workspace.
+    let mut asked = Asked::default();
+    for at in 0..files.len() {
+        let original = &files[at];
+        let (cuts, deletions) = mutants(original.text());
+        for (kind, mutant) in [("cut", cuts.get(24)), ("deletion", deletions.get(25))] {
+            let Some(mutant) = mutant else {
+                continue;
+            };
+            let mut changed = files.clone();
+            changed[at] = SourceFile::new(original.name(), mutant.as_str()).unwrap();
+            let what = format!("{} {kind} in newpkgs", original.name());
+            let file = u32::try_from(at).unwrap();
+            asked.run(
+                &what,
+                || workspace::index_with_standard(&changed, &sources.nested, NEWPKGS).index,
+                &[(file, mutant.as_str())],
+            );
+        }
+    }
+    asked.report("newpkgs mutants in their workspace");
 }

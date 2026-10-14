@@ -27,6 +27,10 @@
 //! 5. [`eval::eval`]: IR, shared by reference count with the closures and
 //!    futures made from it, to a [`Value`].
 //!
+//! A language server stops after the check, and indexes what it found, in
+//! files with errors too: what each name refers to, where that is
+//! declared, and what it is ([`index`]).
+//!
 //! A file may also declare types, `type PackageDef = {...}`, structural
 //! aliases in a namespace of their own, used bare, qualified through an
 //! import (`t.PackageDef`) or spread into a record type (`{...PackageDef,
@@ -154,6 +158,7 @@ pub mod ast;
 pub mod check;
 pub mod diagnostic;
 pub mod eval;
+pub mod index;
 pub mod ir;
 pub mod lexer;
 pub mod lower;

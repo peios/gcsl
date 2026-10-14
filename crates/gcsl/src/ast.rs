@@ -3551,11 +3551,17 @@ impl Ast {
         self.items.len()
     }
 
-    /// Every expression's id, in allocation order, for tests that look for
-    /// nodes of a kind.
-    #[cfg(test)]
-    pub(crate) fn expr_ids(&self) -> impl Iterator<Item = ExprId> {
+    /// Every expression's id, in allocation order: for tests that look for
+    /// nodes of a kind, and for an index of the tree's names
+    /// ([`crate::index`]).
+    pub(crate) fn expr_ids(&self) -> impl Iterator<Item = ExprId> + use<> {
         (0..next_id(self.exprs.len())).map(ExprId)
+    }
+
+    /// Every item's id, in allocation order, for an index of the tree's
+    /// names ([`crate::index`]).
+    pub(crate) fn item_ids(&self) -> impl Iterator<Item = ItemId> + use<> {
+        (0..next_id(self.items.len())).map(ItemId)
     }
 
     /// The ids of the nodes of expression `id`'s subtree, its descendants

@@ -1,5 +1,6 @@
 //! `gcsl lsp`: a language server for GCSL, which reports each file's errors
-//! and warnings as it is edited. Diagnostics only, for now.
+//! and warnings as it is edited, and answers what a name is (hover) and
+//! where it is declared (go to definition).
 //!
 //! It speaks LSP through `lsp-server`, synchronously, on stdin and stdout
 //! ([`stdio`]), or on any [`Connection`] ([`serve`]); it logs to stderr
@@ -10,14 +11,32 @@
 //!
 //! INITIALISATION. The server counts positions in utf-8 if the client
 //! offers it (`general.positionEncodings`), else in utf-16, LSP's default
-//! (see [`position`]). It offers only `textDocumentSync`: open and close,
-//! incremental changes, and saves. It answers `shutdown`, and any request
-//! after it with an error; `exit` ends it, cleanly after a `shutdown`, else
-//! not ([`Error::ExitWithoutShutdown`], exit code 1). A
+//! (see [`position`]). It offers `textDocumentSync` (open and close,
+//! incremental changes, and saves), `hoverProvider` and
+//! `definitionProvider`. It answers `shutdown`, and any request after it
+//! with an error; `exit` ends it, cleanly after a `shutdown`, else not
+//! ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
-//! item; any other request with `MethodNotFound`; notifications it does not
-//! know are ignored. If the client can register for watched files
-//! dynamically, the server asks it to watch `**/*.gcsl`.
+//! item; any other request it does not know with `MethodNotFound`;
+//! notifications it does not know are ignored. If the client can register
+//! for watched files dynamically, the server asks it to watch `**/*.gcsl`.
+//!
+//! QUERIES. `textDocument/hover` and `textDocument/definition` are answered
+//! from the index the latest check of the document's workspace, or lone
+//! file, made (see [`gcsl::index`]): a hover as Markdown, with the range of
+//! the name or segment hovered, a definition as a `Location`, or a
+//! `Location[]` when what is there is declared by several items, and `null`
+//! for nothing there, for what has no type the check found, and for what
+//! the standard library or a built-in declares, which has no file on disk.
+//! A file with errors is indexed for everything that resolved; one whose
+//! braces do not match, or that needs a file whose check failed, has
+//! nothing indexed. A query waits for the worker as a check does, and is
+//! handed over before any check due: if a document of the workspace has
+//! changed since its index was made, the worker checks it at once, skipping
+//! the quiet period, publishes the diagnostics, and answers from the new
+//! index (see the `worker` module), so an answer never points at old text.
+//! A `$/cancelRequest` of a query not handed over yet answers it with
+//! `RequestCancelled`; one handed over is answered anyway.
 //!
 //! SOURCES. It keeps the text of each open document, applying incremental
 //! changes in the negotiated encoding. A `.gcsl` file is a file of the
@@ -32,8 +51,9 @@
 //! files', and those not on disk yet are added in path order. Nothing is
 //! ever written to disk.
 //!
-//! CHECKING. A workspace is checked as `gcsl run` and `pekit` check one
-//! ([`gcsl::workspace::check_with_standard`], with its canonical root and
+//! CHECKING. A workspace is checked as `gcsl run` and `pekit` check one,
+//! with the same diagnostics, and indexed as it is
+//! ([`gcsl::workspace::index_with_standard`], with its canonical root and
 //! the directories left out as workspaces of their own), and a lone file as
 //! `gcsl run` checks one; nothing is ever run, so opening a file never runs
 //! `sh`, `exec` or any GCSL code. Every file the check reports on, open or
@@ -42,12 +62,13 @@
 //! (see the `worker` module).
 //!
 //! THREADS. Not to lag, the main thread only reads messages, keeps the
-//! documents and schedules checks; it never checks. One worker thread (the
-//! `worker` module) reads workspaces from disk, checks them and publishes,
-//! one check at a time: the main thread hands it the next only once it has
-//! answered the last, so checks never overlap and stale work never queues
-//! up behind new edits, a check taking the documents as they are when it is
-//! handed over.
+//! documents and schedules checks and queries; it never checks. One worker
+//! thread (the `worker` module) reads workspaces from disk, checks and
+//! indexes them, publishes, and answers queries, one job at a time: the
+//! main thread hands it the next only once it has answered the last, so
+//! checks never overlap and stale work never queues up behind new edits, a
+//! check or a query taking the documents as they are when it is handed
+//! over. The indexes live on the worker, and never leave it.
 //!
 //! DEBOUNCING. A change to a workspace asks for a check of it [`QUIET`]
 //! (150 ms) after the change, and a later change moves that on: a burst of
@@ -57,14 +78,19 @@
 //! version as it was checked, and the change's own check follows its quiet
 //! period.
 //!
-//! KNOWN LIMIT. A file that does not parse no longer hides the rest: its
+//! KNOWN LIMITS. A file that does not parse no longer hides the rest: its
 //! syntax errors are published with the type errors of every file, its own
 //! where it parses among them (see the library's [Syntax
 //! errors](gcsl::workspace#syntax-errors)). But while the scan of a
 //! workspace fails, an import not resolved or two files declaring one
 //! name, its check reports only those errors, with the syntax errors, so
 //! the other files' type errors disappear until it is fixed: what the check
-//! reports is published, and stale diagnostics are not kept.
+//! reports is published, and stale diagnostics are not kept. Nor is a stale
+//! index: while the scan fails nothing is answered, and a file whose braces
+//! do not match, or that needs a file whose check failed, has nothing to
+//! answer until it is checked again. What the standard library and the
+//! built-ins declare has no definition to go to: their sources are
+//! compiled in, with no file on disk.
 
 #![warn(
     clippy::unwrap_used,
@@ -81,7 +107,7 @@ pub mod place;
 pub mod position;
 mod worker;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -96,15 +122,16 @@ use lsp_server::{
     Connection, ErrorCode, Message, Notification, ProtocolError, Request, RequestId, Response,
 };
 use lsp_types::notification::{
-    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
-    DidSaveTextDocument, Notification as _,
+    Cancel, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+    DidOpenTextDocument, DidSaveTextDocument, Notification as _,
 };
-use lsp_types::request::{RegisterCapability, Request as _};
+use lsp_types::request::{GotoDefinition, HoverRequest, RegisterCapability, Request as _};
 use lsp_types::{
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, FileSystemWatcher, GlobPattern,
-    InitializeResult, Registration, RegistrationParams, ServerCapabilities, ServerInfo,
+    HoverProviderCapability, InitializeResult, NumberOrString, OneOf, Position, Registration,
+    RegistrationParams, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, Uri,
 };
@@ -112,7 +139,7 @@ use serde_json::Value;
 
 use crate::place::{Place, locate, path_of};
 use crate::position::Encoding;
-use crate::worker::{Check, Job, Key, Snapshot};
+use crate::worker::{Asked, Check, Job, Key, Query, Snapshot};
 
 /// How long a workspace must go unchanged before it is checked.
 pub const QUIET: Duration = Duration::from_millis(150);
@@ -225,6 +252,7 @@ fn serve_counting(connection: &Connection, checks: &Arc<AtomicUsize>) -> Result<
         jobs,
         documents: HashMap::new(),
         due: HashMap::new(),
+        queries: VecDeque::new(),
         busy: None,
         shutdown: false,
     };
@@ -250,6 +278,8 @@ fn initialize_result(encoding: Encoding) -> Value {
         capabilities: ServerCapabilities {
             position_encoding: Some(encoding.kind()),
             text_document_sync: Some(TextDocumentSyncCapability::Options(sync)),
+            hover_provider: Some(HoverProviderCapability::Simple(true)),
+            definition_provider: Some(OneOf::Left(true)),
             ..ServerCapabilities::default()
         },
         server_info: Some(ServerInfo {
@@ -282,6 +312,21 @@ struct Due {
     reread: bool,
 }
 
+/// A query asked and not handed to the worker yet.
+#[derive(Debug)]
+struct Pending {
+    /// The request's id.
+    id: RequestId,
+    /// What it asks.
+    asked: Asked,
+    /// The document's URI, as the client gave it.
+    uri: Uri,
+    /// Where in it.
+    position: Position,
+    /// What the document is checked as part of.
+    key: Key,
+}
+
 /// What the main loop does after a message.
 #[derive(PartialEq, Eq)]
 enum Flow {
@@ -305,7 +350,9 @@ struct Server<'c> {
     /// The checks asked for, of every workspace known and every lone file
     /// open.
     due: HashMap<Key, Due>,
-    /// What the worker is checking, if anything.
+    /// The queries asked and not handed to the worker yet, in order.
+    queries: VecDeque<Pending>,
+    /// What the worker is checking, or answering a query of, if anything.
     busy: Option<Key>,
     /// Whether the client has said `shutdown`.
     shutdown: bool,
@@ -350,10 +397,43 @@ impl Server<'_> {
         self.due.values().filter_map(|due| due.at).min()
     }
 
-    /// Hands the worker the check due first, if one is due and it is idle:
-    /// the documents of what it checks as they are now.
+    /// Hands the worker, if it is idle, the first query asked, or else the
+    /// check due first, if one is due: with the documents of what it is of
+    /// as they are now.
     fn dispatch(&mut self) -> Result<(), Error> {
         if self.busy.is_some() {
+            return Ok(());
+        }
+        if let Some(Pending {
+            id,
+            asked,
+            uri,
+            position,
+            key,
+        }) = self.queries.pop_front()
+        {
+            // The query's check, if its index is stale, is the check due:
+            // it takes what is due of it.
+            let reread = self.due.get_mut(&key).is_some_and(|due| {
+                due.at = None;
+                std::mem::take(&mut due.reread)
+            });
+            let check = Check {
+                key: key.clone(),
+                documents: self.snapshot(&key),
+                reread,
+            };
+            let query = Query {
+                id,
+                asked,
+                uri,
+                position,
+                check,
+            };
+            self.jobs
+                .send(Job::Query(query))
+                .map_err(|_| Error::WorkerStopped)?;
+            self.busy = Some(key);
             return Ok(());
         }
         let now = Instant::now();
@@ -370,20 +450,9 @@ impl Server<'_> {
             due.at = None;
             std::mem::take(&mut due.reread)
         });
-        let documents = self
-            .documents
-            .values()
-            .filter(|document| Key::of(&document.uri, &document.place) == key)
-            .map(|document| Snapshot {
-                uri: document.uri.clone(),
-                version: document.version,
-                text: document.text.clone(),
-                place: document.place.clone(),
-            })
-            .collect();
         let check = Check {
             key: key.clone(),
-            documents,
+            documents: self.snapshot(&key),
             reread,
         };
         self.jobs
@@ -391,6 +460,20 @@ impl Server<'_> {
             .map_err(|_| Error::WorkerStopped)?;
         self.busy = Some(key);
         Ok(())
+    }
+
+    /// The open documents of `key`, as they are now.
+    fn snapshot(&self, key: &Key) -> Vec<Snapshot> {
+        self.documents
+            .values()
+            .filter(|document| Key::of(&document.uri, &document.place) == *key)
+            .map(|document| Snapshot {
+                uri: document.uri.clone(),
+                version: document.version,
+                text: document.text.clone(),
+                place: document.place.clone(),
+            })
+            .collect()
     }
 
     /// Asks for a check of `key` after the quiet period, reading its files
@@ -444,8 +527,9 @@ impl Server<'_> {
     fn handle(&mut self, message: Message) -> Result<Flow, Error> {
         match message {
             Message::Request(request) => {
-                let response = self.answer(request);
-                self.send(Message::Response(response))?;
+                if let Some(response) = self.answer(request) {
+                    self.send(Message::Response(response))?;
+                }
                 Ok(Flow::Continue)
             }
             Message::Notification(notification) => self.notified(notification),
@@ -454,16 +538,17 @@ impl Server<'_> {
         }
     }
 
-    /// The response to `request`.
-    fn answer(&mut self, request: Request) -> Response {
+    /// The response to `request`; `None` for a query, which the worker
+    /// answers.
+    fn answer(&mut self, request: Request) -> Option<Response> {
         if self.shutdown {
-            return Response::new_err(
+            return Some(Response::new_err(
                 request.id,
                 ErrorCode::InvalidRequest as i32,
                 "the server is shutting down".to_owned(),
-            );
+            ));
         }
-        match request.method.as_str() {
+        let response = match request.method.as_str() {
             "shutdown" => {
                 self.shutdown = true;
                 Response::new_ok(request.id, Value::Null)
@@ -476,12 +561,67 @@ impl Server<'_> {
                     .map_or(0, Vec::len);
                 Response::new_ok(request.id, vec![Value::Null; items])
             }
+            HoverRequest::METHOD => return self.ask(request, Asked::Hover),
+            GotoDefinition::METHOD => return self.ask(request, Asked::Definition),
             method => Response::new_err(
                 request.id,
                 ErrorCode::MethodNotFound as i32,
                 format!("unknown method `{method}`"),
             ),
-        }
+        };
+        Some(response)
+    }
+
+    /// Queues `request`, which asks `asked` of a place of a document, for
+    /// the worker to answer; `None` once it is. Parameters that cannot be
+    /// read are `InvalidParams`, and a document that is not open has
+    /// nothing to say: `null`.
+    fn ask(&mut self, request: Request, asked: Asked) -> Option<Response> {
+        let Request { id, method, params } = request;
+        let params = match serde_json::from_value::<TextDocumentPositionParams>(params) {
+            Ok(params) => params,
+            Err(error) => {
+                let message = format!("cannot read the parameters of `{method}`: {error}");
+                return Some(Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    message,
+                ));
+            }
+        };
+        let uri = params.text_document.uri;
+        let Some(document) = self.documents.get(uri.as_str()) else {
+            return Some(Response::new_ok(id, Value::Null));
+        };
+        let key = Key::of(&uri, &document.place);
+        self.queries.push_back(Pending {
+            id,
+            asked,
+            uri,
+            position: params.position,
+            key,
+        });
+        None
+    }
+
+    /// A `$/cancelRequest` of the request `id`: answered with
+    /// `RequestCancelled` if it is a query not handed to the worker yet,
+    /// else let be.
+    fn cancel(&mut self, id: &NumberOrString) -> Result<(), Error> {
+        let id = match id {
+            NumberOrString::Number(number) => RequestId::from(*number),
+            NumberOrString::String(text) => RequestId::from(text.clone()),
+        };
+        let Some(at) = self.queries.iter().position(|pending| pending.id == id) else {
+            return Ok(());
+        };
+        self.queries.remove(at);
+        let response = Response::new_err(
+            id,
+            ErrorCode::RequestCanceled as i32,
+            "the request was cancelled".to_owned(),
+        );
+        self.send(Message::Response(response))
     }
 
     /// Handles `notification`: `exit`, or a change to the documents or the
@@ -491,6 +631,12 @@ impl Server<'_> {
         let Notification { method, params } = notification;
         match method.as_str() {
             "exit" => return Ok(Flow::Exit),
+            Cancel::METHOD => {
+                let read = serde_json::from_value::<CancelParams>(params);
+                if let Some(params) = parsed(&method, read) {
+                    self.cancel(&params.id)?;
+                }
+            }
             DidOpenTextDocument::METHOD => {
                 let read = serde_json::from_value::<DidOpenTextDocumentParams>(params);
                 if let Some(params) = parsed(&method, read) {
@@ -847,6 +993,24 @@ mod tests {
             self.notify("textDocument/didChange", params);
         }
 
+        /// The result of the request `method` (a query) at `(line,
+        /// character)` of the document `uri`.
+        fn ask(&mut self, method: &str, uri: &Uri, (line, character): (u32, u32)) -> Value {
+            let position = json!({ "line": line, "character": character });
+            let params = json!({ "textDocument": { "uri": uri }, "position": position });
+            self.request(method, params).response_result.unwrap()
+        }
+
+        /// The hover at `at` of the document `uri`.
+        fn hover(&mut self, uri: &Uri, at: (u32, u32)) -> Value {
+            self.ask("textDocument/hover", uri, at)
+        }
+
+        /// The definition at `at` of the document `uri`.
+        fn definition(&mut self, uri: &Uri, at: (u32, u32)) -> Value {
+            self.ask("textDocument/definition", uri, at)
+        }
+
         /// Closes the document `uri`.
         fn close(&self, uri: &Uri) {
             let params = json!({ "textDocument": { "uri": uri } });
@@ -881,6 +1045,8 @@ mod tests {
             capabilities["textDocumentSync"],
             json!({ "openClose": true, "change": 2, "save": true })
         );
+        assert_eq!(capabilities["hoverProvider"], true);
+        assert_eq!(capabilities["definitionProvider"], true);
         assert_eq!(result["serverInfo"]["name"], "gcsl");
         client.shut_down().unwrap();
     }
@@ -1161,7 +1327,7 @@ mod tests {
         let (mut client, _) = Client::start(&["utf-8"]);
         // Unknown requests are not found; `workspace/configuration` is
         // answered with nulls; unknown notifications are ignored.
-        let response = client.request("textDocument/hover", json!({}));
+        let response = client.request("textDocument/references", json!({}));
         let error = response.response_result.unwrap_err();
         assert_eq!(error.code, ErrorCode::MethodNotFound as i32);
         let items = json!({ "items": [{ "section": "gcsl" }, {}] });
@@ -1200,6 +1366,228 @@ mod tests {
         assert_eq!(client.published(&bad).diagnostics.len(), 1);
         assert!(client.checks() >= 1);
         assert!(!scratch.0.join("MARKER").exists());
+        client.shut_down().unwrap();
+    }
+
+    /// `value`, a `Range` as JSON.
+    fn as_range(value: &Value) -> Range {
+        serde_json::from_value(value.clone()).unwrap()
+    }
+
+    #[test]
+    fn hover_and_definition_count_positions_in_each_encoding() {
+        // `é` is two bytes and one UTF-16 unit, `😀` four bytes and two:
+        // the `s` after them is at character 15 in utf-8, 12 in utf-16.
+        let text = "s = \"a\"\nt = \"é😀\" + s\n";
+        for (encoding, at) in [("utf-8", 15), ("utf-16", 12)] {
+            let scratch = Scratch::workspace(&format!("hover-{encoding}"), "");
+            let uri = scratch.write("app.gcsl", text);
+            let (mut client, _) = Client::start(&[encoding]);
+            client.open(&uri, text);
+            let hover = client.hover(&uri, (1, at));
+            assert_eq!(hover["contents"]["kind"], "markdown", "{encoding}");
+            let shown = hover["contents"]["value"].as_str().unwrap();
+            assert!(shown.contains("s: String"), "{encoding}: {shown}");
+            assert_eq!(
+                as_range(&hover["range"]),
+                range((1, at), (1, at + 1)),
+                "{encoding}"
+            );
+            // A position inside the emoji's second half is its start, which
+            // is in a string literal: nothing.
+            assert_eq!(client.hover(&uri, (1, 7)), Value::Null, "{encoding}");
+            let definition = client.definition(&uri, (1, at));
+            assert_eq!(definition["uri"], uri.as_str(), "{encoding}");
+            assert_eq!(
+                as_range(&definition["range"]),
+                range((0, 0), (0, 1)),
+                "{encoding}"
+            );
+            client.shut_down().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_definition_in_another_file_is_located_there() {
+        let scratch = Scratch::workspace("cross-file", "");
+        let a = scratch.write("a.gcsl", "z = y + 1\n");
+        let b = scratch.write("b.gcsl", "x = 0\ny = 1\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&a, "z = y + 1\n");
+        let definition = client.definition(&a, (0, 4));
+        assert_eq!(definition["uri"], b.as_str());
+        assert_eq!(as_range(&definition["range"]), range((1, 0), (1, 1)));
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_stale_query_is_answered_from_the_text_as_changed() {
+        let scratch = Scratch::workspace("stale", "");
+        let text = "x = 1\ny = x\nz = x + 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let shown = client.hover(&uri, (1, 4));
+        assert!(
+            shown["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("x: Int"),
+            "{shown}"
+        );
+        // `1` becomes `"s"`, and the hover follows at once, well inside
+        // the quiet period.
+        let before = client.checks();
+        client.change(&uri, 2, ((0, 4), (0, 5)), "\"s\"");
+        let shown = client.hover(&uri, (1, 4));
+        assert!(
+            shown["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("x: String"),
+            "{shown}"
+        );
+        // The check the query made is published as any is: `z` is now an
+        // error. It was the check the change asked for, which is not made
+        // again once its quiet period is over.
+        assert_eq!(client.published_at(&uri, 2).diagnostics.len(), 1);
+        thread::sleep(QUIET * 3);
+        assert_eq!(client.checks() - before, 1);
+        // A line moved: the definition is where the text now has it.
+        client.change(&uri, 3, ((0, 0), (0, 0)), "\n\n");
+        let definition = client.definition(&uri, (3, 4));
+        assert_eq!(as_range(&definition["range"]), range((2, 0), (2, 1)));
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn whitespace_and_keywords_have_nothing() {
+        let scratch = Scratch::workspace("nothing-there", "");
+        let text = "fn f(a: Int): Int {  a }\nr = f(1)\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        // `fn`, the space after `{`, and `:`.
+        for at in [(0, 0), (0, 20), (0, 12)] {
+            assert_eq!(client.hover(&uri, at), Value::Null, "{at:?}");
+            assert_eq!(client.definition(&uri, at), Value::Null, "{at:?}");
+        }
+        // A document that is not open has nothing either.
+        let other = scratch.write("other.gcsl", "q = 1\n");
+        assert_eq!(client.hover(&other, (0, 0)), Value::Null);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_lone_file_is_indexed() {
+        let scratch = Scratch::new("lone-hover");
+        let text = "fn twice(n: Int): Int { n * 2 }\nr = twice(1)\n";
+        let uri = scratch.write("lone.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-16"]);
+        client.open(&uri, text);
+        let hover = client.hover(&uri, (1, 4));
+        let shown = hover["contents"]["value"].as_str().unwrap();
+        assert!(shown.contains("fn twice(n: Int): Int"), "{shown}");
+        let definition = client.definition(&uri, (1, 4));
+        assert_eq!(definition["uri"], uri.as_str());
+        assert_eq!(as_range(&definition["range"]), range((0, 3), (0, 8)));
+        // A definition of the standard library has no file: nothing.
+        client.change(&uri, 2, ((1, 4), (1, 9)), "len([1]) + twice");
+        assert_eq!(client.definition(&uri, (1, 4)), Value::Null);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_request_does_no_harm() {
+        let scratch = Scratch::workspace("cancel", "");
+        let text = "x = 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        // A request already answered, and one that never was.
+        let hover = client.hover(&uri, (0, 0));
+        assert!(hover.is_object(), "{hover}");
+        client.notify("$/cancelRequest", json!({ "id": 1 }));
+        client.notify("$/cancelRequest", json!({ "id": "nothing" }));
+        assert!(client.hover(&uri, (0, 0)).is_object());
+        client.shut_down().unwrap();
+    }
+
+    /// The time of a hover and a definition, on a small workspace, and on
+    /// the one at `$GCSL_LSP_BENCH` if it is set, its `workspace.gcsl`
+    /// opened, in memory only: warm, from the index of the text as it is,
+    /// and with a change just before, which the query checks first. Run
+    /// with `--ignored --nocapture` to see it.
+    #[test]
+    #[ignore = "a measurement, not a test"]
+    fn time_of_a_hover_and_a_definition() {
+        let scratch = Scratch::workspace("query-latency", "");
+        scratch.write("lib.gcsl", "base = 1\n");
+        let text = "x = base + 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        measure_queries("a small workspace", &uri, text, (0, 4));
+        if let Some(root) = std::env::var_os("GCSL_LSP_BENCH") {
+            let path = fs::canonicalize(root).unwrap().join(WORKSPACE);
+            let text = fs::read_to_string(&path).unwrap();
+            let uri = uri_of(&path).unwrap();
+            // The first name read in a type position, or the first line.
+            let at = text
+                .lines()
+                .enumerate()
+                .find_map(|(line, content)| {
+                    let column = content.find("Version")?;
+                    Some((u32::try_from(line).ok()?, u32::try_from(column).ok()?))
+                })
+                .unwrap_or((0, 0));
+            measure_queries("$GCSL_LSP_BENCH", &uri, &text, at);
+        }
+    }
+
+    /// Opens the document `uri` as `text` and asks for a hover and a
+    /// definition at `at` twenty times each, warm, then twenty times each
+    /// just after a change (a line added at the end and taken away again),
+    /// and reports the times.
+    fn measure_queries(name: &str, uri: &Uri, text: &str, at: (u32, u32)) {
+        let mut text = text.to_owned();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let end = u32::try_from(text.matches('\n').count()).unwrap();
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(uri, &text);
+        // The first query waits for the first check.
+        client.ask("textDocument/hover", uri, at);
+        let mut version = 1;
+        for method in ["textDocument/hover", "textDocument/definition"] {
+            let mut warm = Vec::new();
+            let mut changed = Vec::new();
+            for _ in 0..20 {
+                let start = Instant::now();
+                client.ask(method, uri, at);
+                warm.push(start.elapsed());
+                version += 1;
+                let edit = if version % 2 == 0 {
+                    ((end, 0), (end, 0))
+                } else {
+                    ((end, 0), (end + 1, 0))
+                };
+                let added = if version % 2 == 0 { "probe = 1\n" } else { "" };
+                let start = Instant::now();
+                client.change(uri, version, edit, added);
+                client.ask(method, uri, at);
+                changed.push(start.elapsed());
+            }
+            warm.sort();
+            changed.sort();
+            let _ = writeln!(
+                io::stderr(),
+                "{method}, {name}: warm median {:?} (max {:?}), after a change median {:?} (max {:?})",
+                warm[warm.len() / 2],
+                warm[warm.len() - 1],
+                changed[changed.len() / 2],
+                changed[changed.len() - 1],
+            );
+        }
         client.shut_down().unwrap();
     }
 

@@ -3990,7 +3990,8 @@ const LSP_SHUTDOWN: &str = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
 const LSP_EXIT: &str = r#"{"jsonrpc":"2.0","method":"exit"}"#;
 
 /// `gcsl lsp` speaks LSP on stdin and stdout: it answers `initialize` with
-/// its capabilities and `shutdown` with null, and exits with code 0 on
+/// its capabilities (diagnostics, hover and go to definition) and
+/// `shutdown` with null, and exits with code 0 on
 /// `exit` after `shutdown`, and 1 on `exit` alone.
 #[test]
 fn lsp_initializes_and_shuts_down() {
@@ -4002,7 +4003,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"positionEncoding":"utf-8","textDocumentSync":{{"change":2,"openClose":true,"save":true}}}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"definitionProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","textDocumentSync":{{"change":2,"openClose":true,"save":true}}}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

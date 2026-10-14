@@ -262,7 +262,13 @@
 //! Files that parse cleanly and see no file with errors are checked as
 //! ever. A session's input with an error is not checked: nothing of it is
 //! run or kept. [`check_partial`] leaves what a failed check found
-//! ([`Partial`]).
+//! ([`Partial`]), and [`index_with_standard`] (and, for a lone file,
+//! [`index_lone_with_standard`]) checks as [`check_with_standard`] does,
+//! each file's check recording what its names refer to (see
+//! [`crate::check`], "Recording"), and indexes what every checked file's
+//! check found, failed or not, for a language server ([`crate::index`]); a
+//! file that is not checked, unbalanced or needing a file whose check
+//! failed, has nothing indexed.
 //!
 //! # Imports
 //!
@@ -783,11 +789,12 @@ use crate::ast::{
 #[cfg(test)]
 use crate::check::ViewRecord;
 use crate::check::{
-    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams, Place, Scope, Slot,
-    Types, check_types,
+    BUILTIN_TYPE_NAMES, Builtin, CheckOutput, Checker, Fileroot, KnownParams, Place, Record, Scope,
+    Slot, Types, check_types,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError, Severity};
 use crate::eval::{MemoTables, TempDirs};
+use crate::index::{Index, Indexed};
 use crate::ir::Ir;
 use crate::lexer::{self, TokenKind};
 use crate::mentions::{self, FieldTree, Mentions, Need, Resolve, Schedule, Sweep, TypeRead};
@@ -1243,7 +1250,7 @@ pub struct Scan {
     standard: u32,
     /// The directory of the `builtins` module, whose nodes are the first
     /// [`Builtin::ALL`]`.len()` of `nodes`.
-    builtins_dir: u32,
+    pub(crate) builtins_dir: u32,
     /// The name of each member of the `fileroot` module, in the order of
     /// [`Fileroot::ALL`], if some file spells it: looked up, never interned,
     /// once the files are parsed, since the names are lent to each file as
@@ -1277,7 +1284,7 @@ pub struct Scan {
     /// has the session's, its earlier inputs' declarations first.
     pub type_store: TypeStore,
     /// The number in `type_store` of the first of `types`.
-    type_base: u32,
+    pub(crate) type_base: u32,
     /// The types a session's input inherits from the earlier inputs, each
     /// with its declaration's number in `type_store`: the last source of its
     /// view, shadowed by anything (see [`crate::session`]).
@@ -1695,7 +1702,7 @@ impl Scan {
     /// file imports, among the workspace's cells ([`Scan::cells`]): after
     /// the merged nodes. Like a merged node's, its slot is [`Slot::at`] its
     /// number. `None` for any other file.
-    fn value_cell(&self, file: u32) -> Option<u32> {
+    pub(crate) fn value_cell(&self, file: u32) -> Option<u32> {
         let at = self.values.iter().position(|&(f, _)| f == file)?;
         Some(count(self.nodes.len()).saturating_add(count(at)))
     }
@@ -1727,7 +1734,7 @@ impl Scan {
 
     /// The child of the target `target` named `name`, as a reference
     /// through an import means it.
-    fn target_child(&self, target: Target, name: Name) -> Option<Target> {
+    pub(crate) fn target_child(&self, target: Target, name: Name) -> Option<Target> {
         match target {
             Target::Dir(dir) => self
                 .by_name
@@ -1780,7 +1787,7 @@ impl Scan {
     /// The names of the children of the view node `view`, in the view's
     /// order: by first definition, its parts root directory first, each in
     /// its own order.
-    fn view_names(&self, view: u32) -> Vec<Name> {
+    pub(crate) fn view_names(&self, view: u32) -> Vec<Name> {
         let mut names = Vec::new();
         let mut seen = HashSet::new();
         let parts = self.views.get(view as usize).map_or(&[][..], |v| &v.parts);
@@ -1796,7 +1803,7 @@ impl Scan {
 
     /// The names of the children of `target`, a merged node or a file's
     /// part of one, in its order.
-    fn child_names(&self, target: Target) -> Vec<Name> {
+    pub(crate) fn child_names(&self, target: Target) -> Vec<Name> {
         match target {
             Target::Node(node) => self.nodes.get(node as usize).map_or_else(Vec::new, |n| {
                 n.children
@@ -4174,13 +4181,30 @@ fn context_in(error: Diagnostic, input: u32, span: Span, text: &str) -> Diagnost
 }
 
 /// What [`imports`] looks modules up in.
-struct Modules<'a> {
+pub(crate) struct Modules<'a> {
     /// The directories by path.
     dirs: &'a HashMap<String, u32>,
     /// The files by path.
     files: HashMap<&'a str, u32>,
     /// The directories that are workspaces of their own.
     nested: &'a [String],
+}
+
+impl<'a> Modules<'a> {
+    /// The modules of `scan`, whose directories by path are `dirs`, as
+    /// [`imports`] resolves a path among them, but with no directory left
+    /// out as a workspace of its own: for an index of the scan's imports
+    /// ([`crate::index`]), whose paths the scan has resolved already.
+    pub(crate) fn of(scan: &'a Scan, dirs: &'a HashMap<String, u32>) -> Self {
+        Self {
+            dirs,
+            files: (0u32..)
+                .zip(&scan.files)
+                .map(|(index, file)| (file.path.as_str(), index))
+                .collect(),
+            nested: &[],
+        }
+    }
 }
 
 /// Resolves every file's imports into [`File::aliases`], reporting each
@@ -4295,7 +4319,7 @@ fn inherit_imports(file: &File, inherited: &[Alias], aliases: &mut Vec<Alias>) {
 /// any path of a lone file but the standard library's, which the checker
 /// reports). A single segment naming the `builtins` module, the `fileroot`
 /// module or a standard file names it, before anything of the workspace.
-fn module(
+pub(crate) fn module(
     scan: &Scan,
     modules: &Modules,
     path: &[PathSegment],
@@ -4579,7 +4603,7 @@ fn fileroot_member_import(scan: &Scan, member: ImportMember) -> Diagnostic {
 }
 
 /// The names of the roots of `target`, a directory or a file, in order.
-fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
+pub(crate) fn target_roots(scan: &Scan, target: Target) -> Vec<Name> {
     match target {
         Target::Dir(dir) => scan
             .nodes
@@ -4685,7 +4709,7 @@ impl Scan {
     /// first name that is no module the file imports, "`t` has no type
     /// `Foo`" with a note listing the module's types, and "`t.Foo` is a
     /// type, not a module" for a path that goes on after a type.
-    fn qualified_type(&self, file: &File, path: &[PathSegment], span: Span) -> TypeLink {
+    pub(crate) fn qualified_type(&self, file: &File, path: &[PathSegment], span: Span) -> TypeLink {
         let names: Vec<Name> = path.iter().filter_map(PathSegment::name).collect();
         let shown = |count: usize| -> String {
             names
@@ -6132,7 +6156,88 @@ pub fn check_partial(
 }
 
 /// [`check_scan`], with what the check found if it fails ([`Partial`]).
-fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
+fn check_scan_partial(scan: Scan) -> Result<Workspace, Failed> {
+    check_scan_recording(scan, false).0
+}
+
+/// What a check of a workspace that recorded found for its index, besides
+/// the workspace or what it found of it (see [`crate::index`]).
+#[derive(Debug, Default)]
+pub(crate) struct Recorded {
+    /// What each file's check recorded, by input number; `None` for a file
+    /// not checked, whose tree is unbalanced or which needs a file whose
+    /// check failed.
+    pub(crate) files: Vec<Option<Box<Record>>>,
+    /// The type of each cell, by its number, as the check of the file that
+    /// computes it found it, whether that check succeeded or failed: for
+    /// what is shown, never for what is checked.
+    pub(crate) cells: Vec<TyId>,
+}
+
+impl Recorded {
+    /// What a check of a workspace of `files` files records, if it
+    /// `records`, before any file is checked, the cells' types being
+    /// `cells`: nothing of any file yet.
+    fn new(records: bool, files: usize, cells: &[TyId]) -> Self {
+        if !records {
+            return Self::default();
+        }
+        Self {
+            files: (0..files).map(|_| None).collect(),
+            cells: cells.to_vec(),
+        }
+    }
+
+    /// Keeps `found`, what the check of file `index` of `scan` recorded, if
+    /// it recorded, and the types of the cells the file computes, as its
+    /// check found them, failed or not.
+    fn keep(&mut self, scan: &Scan, index: u32, found: Option<Box<Record>>) {
+        let Some(found) = found else {
+            return;
+        };
+        let global = scan
+            .files
+            .get(index as usize)
+            .map_or(&[][..], |f| &f.global);
+        for (&global, &ty) in global.iter().zip(&found.cells) {
+            if ty != TyId::ERROR && scan.computed_by(global) == Some(index) {
+                set(&mut self.cells, global, ty);
+            }
+        }
+        if let (Some(cell), Some(ty)) = (scan.value_cell(index), found.value) {
+            set(&mut self.cells, cell, ty);
+        }
+        set(&mut self.files, index, Some(found));
+    }
+}
+
+/// The check of file `index` of `scan` in `context`, from `scope`,
+/// interning into `types`, and its lowering if it succeeds: what it records
+/// of its names kept in `recorded`, if the check of the workspace records
+/// (see [`crate::check`], "Recording").
+fn check_file<'a>(
+    (scan, index): (&'a Scan, u32),
+    context: &'a Context<'a>,
+    (scope, types): (Scope, &'a mut TypeTable),
+    recorded: &mut Recorded,
+) -> Result<(Ir, CheckOutput), Vec<Diagnostic>> {
+    let ast = &context.file().ast;
+    let checking = Checker::in_workspace(ast, scope, types, context);
+    let records = !recorded.files.is_empty();
+    let checking = if records {
+        checking.recording()
+    } else {
+        checking
+    };
+    let (output, found) = checking.check_recorded();
+    recorded.keep(scan, index, found);
+    output.and_then(|output| session::lower_checked(ast, output, types, index))
+}
+
+/// [`check_scan_partial`], each file's check recording what its names refer
+/// to if `record` (see [`crate::check`], "Recording"), with what it
+/// recorded.
+fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Failed>, Recorded) {
     let mut names = mem::take(&mut scan.names);
     let mut types = TypeTable::new();
     let (mut cell_types, mut cell_slots, mut cell_known) =
@@ -6148,6 +6253,7 @@ fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
     // not checked, since their errors would follow from the first; and
     // those with syntax errors (see [Syntax errors](#syntax-errors)).
     let mut failed = scan.broken_files();
+    let mut recorded = Recorded::new(record, scan.files.len(), &cell_types);
     #[cfg(test)]
     let mut view_records: Vec<Vec<ViewRecord>> = vec![Vec::new(); scan.files.len()];
     for index in scan.order.clone() {
@@ -6167,8 +6273,7 @@ fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
         let start = scope.len();
         let reads = (&cell_slots[..], &cell_known[..]);
         let compiled = Context::new(&scan, index, &cell_types, reads).map(|context| {
-            let output = Checker::in_workspace(&file.ast, scope, &mut types, &context).check();
-            output.and_then(|output| session::lower_checked(&file.ast, output, &types, index))
+            check_file((&scan, index), &context, (scope, &mut types), &mut recorded)
         });
         // What the file declares, committed for the files after it.
         let committed = match &compiled {
@@ -6221,9 +6326,10 @@ fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
     }
     scan.names = names;
     if !errors.is_empty() || failed.contains(&true) {
-        return Err(Failed::of(scan, (types, checked), (errors, warnings)));
+        let failed = Failed::of(scan, (types, checked), (errors, warnings));
+        return (Err(failed), recorded);
     }
-    Ok(Workspace {
+    let workspace = Workspace {
         values: vec![Value::Empty; scan.files.len()],
         // Built before `scan` moves; its names are interned already.
         exec_result: exec_layout(&mut scan.names),
@@ -6244,7 +6350,76 @@ fn check_scan_partial(mut scan: Scan) -> Result<Workspace, Failed> {
         cell_known,
         #[cfg(test)]
         view_records,
-    })
+    };
+    (Ok(workspace), recorded)
+}
+
+/// Scans `sources` placed as `placing` says, beside the standard library,
+/// and checks every file as [`check_with_standard`] does, the root being
+/// `root`, each file's check recording what its names refer to (see
+/// [`crate::check`], "Recording"), and indexes what it found, whether it
+/// succeeded or failed: what [`index_with_standard`] and
+/// [`index_lone_with_standard`] do.
+fn index_in(placed: (&[SourceFile], Placing), root: &str) -> Indexed {
+    let mut loaded = Vec::new();
+    let scanned = scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded);
+    let standard = Library::NEEDED.sources(&loaded);
+    let mut scan = match scanned {
+        Ok(scan) => scan,
+        Err(diagnostics) => {
+            return Indexed {
+                standard,
+                diagnostics,
+                succeeded: false,
+                index: None,
+            };
+        }
+    };
+    scan.locate(root);
+    let (checked, recorded) = check_scan_recording(scan, true);
+    let (diagnostics, succeeded, parts) = match checked {
+        Ok(workspace) => {
+            let Workspace {
+                scan,
+                types,
+                warnings,
+                ..
+            } = workspace;
+            (warnings, true, Some((scan, types)))
+        }
+        Err(Failed {
+            diagnostics,
+            partial,
+        }) => (diagnostics, false, partial.map(|p| (p.scan, p.types))),
+    };
+    Indexed {
+        standard,
+        diagnostics,
+        succeeded,
+        index: parts.map(|(scan, types)| Index::new(scan, types, recorded)),
+    }
+}
+
+/// Scans, checks and indexes the workspace of `sources`, as
+/// [`check_with_standard`] checks it, with the same diagnostics, running
+/// nothing, for a language server (see [`crate::index`]): each file's check
+/// records what its names
+/// refer to (see [`crate::check`], "Recording"), and the index answers what
+/// a name at a place is and where it is declared, whether the check
+/// succeeded or failed, in every file it checked. `root` is as for
+/// [`check_with_standard`].
+#[must_use]
+pub fn index_with_standard(sources: &[SourceFile], nested: &[String], root: &str) -> Indexed {
+    index_in((sources, Placing::Workspace(nested)), root)
+}
+
+/// [`index_with_standard`] of `source`, a file outside any workspace,
+/// checked as [`check_lone_with_standard`] checks it, in the directory
+/// `dir`.
+#[must_use]
+pub fn index_lone_with_standard(source: &SourceFile, dir: &str) -> Indexed {
+    let sources = std::slice::from_ref(source);
+    index_in((sources, Placing::Lone(&[], false)), dir)
 }
 
 /// Checks the `type` items of every file of `scan` that has any, before any

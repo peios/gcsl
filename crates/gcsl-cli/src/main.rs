@@ -45,8 +45,8 @@ enum Command {
     /// Run a GCSL file and print its value, unless it is `{}`.
     Run(run::RunArgs),
     /// Serve the Language Server Protocol on stdin and stdout, reporting
-    /// each file's errors and warnings as it is edited. Checks only: runs
-    /// nothing.
+    /// each file's errors and warnings as it is edited, and answering hover
+    /// and go-to-definition. Checks only: runs nothing.
     Lsp,
 }
 

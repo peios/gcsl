@@ -1,24 +1,40 @@
 //! The worker: the one thread of a server that reads workspaces from disk,
-//! checks them and publishes their diagnostics.
+//! checks and indexes them, publishes their diagnostics and answers hovers
+//! and definitions.
 //!
 //! The main thread hands it a [`Job`] at a time ([`spawn`]): a [`Check`],
 //! the snapshot of the open documents of one workspace, or of one lone
-//! file, as they are when it is handed over, or a [`Job::Clear`] of a
-//! workspace or lone file there is no more to say of. It answers each
-//! check with the check's [`Key`] once the diagnostics are published, and
-//! the main thread hands it the next one only then, so that checks never
-//! overlap and never queue up behind each other.
+//! file, as they are when it is handed over; a [`Query`], a hover or a
+//! definition asked at a place of an open document, with such a snapshot;
+//! or a [`Job::Clear`] of a workspace or lone file there is no more to say
+//! of. It answers each check with the check's [`Key`] once the diagnostics
+//! are published, and each query with its key once its response is sent,
+//! and the main thread hands it the next job only then, so that checks
+//! never overlap and never queue up behind each other.
 //!
 //! It keeps each workspace's files as read from disk
 //! ([`gcsl_disk::read_workspace`]), read once, and again only when a check
 //! asks for it ([`Check::reread`]); a check's sources are those files with
 //! the open documents' texts in place of theirs, and the open documents
 //! that are none of them added in path order. The workspace is checked as
-//! `gcsl run` and `pekit` check one,
-//! [`gcsl::workspace::check_with_standard`] with its canonical root and the
-//! directories left out as workspaces of their own; a lone file as `gcsl
-//! run` checks one, [`gcsl::workspace::check_lone_with_standard`] with its
-//! canonical directory. Nothing is run, and nothing is written to disk.
+//! `gcsl run` and `pekit` check one, with the same diagnostics, but by
+//! [`gcsl::workspace::index_with_standard`], which indexes what it finds,
+//! with its canonical root and the directories left out as workspaces of
+//! their own; a lone file as `gcsl run` checks one, by
+//! [`gcsl::workspace::index_lone_with_standard`] with its canonical
+//! directory. Nothing is run, and nothing is written to disk.
+//!
+//! It keeps the latest index of each workspace and lone file, with the
+//! version of each open document it was made from, whether its check
+//! succeeded or failed (see [`gcsl::index`]): a file with errors is
+//! indexed for everything that resolved; one whose braces do not match, or
+//! that needs a file whose check failed, is not checked, and has nothing
+//! indexed, not even what the last good index had. A query is answered from
+//! it only if every open document of what it is of has the version it was
+//! made from, and the query's check does not read the files from disk
+//! again: otherwise its positions could point at the wrong text, so the
+//! query's check is made first, at once, its diagnostics published as any
+//! check's are, and the query answered from the new index.
 //!
 //! Every file the check reports on, open or not, gets a
 //! `textDocument/publishDiagnostics` with its diagnostics, by its URI (an
@@ -38,15 +54,18 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
 use gcsl::diagnostic::Renderer;
+use gcsl::index::{Index, Indexed};
 use gcsl::workspace;
 use gcsl::{Diagnostic, Severity, SourceFile, Span};
 use gcsl_disk::{ReadError, Sources};
-use lsp_server::{Message, Notification};
+use lsp_server::{Message, Notification, RequestId, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    DiagnosticRelatedInformation, DiagnosticSeverity, Location, MessageType,
-    PublishDiagnosticsParams, ShowMessageParams, Uri,
+    DiagnosticRelatedInformation, DiagnosticSeverity, GotoDefinitionResponse, Hover, HoverContents,
+    Location, MarkupContent, MarkupKind, MessageType, Position, PublishDiagnosticsParams,
+    ShowMessageParams, Uri,
 };
+use serde_json::Value;
 
 use crate::log;
 use crate::place::{Place, uri_of};
@@ -97,11 +116,40 @@ pub struct Check {
     pub reread: bool,
 }
 
+/// What a [`Query`] asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// `textDocument/hover`.
+    Hover,
+    /// `textDocument/definition`.
+    Definition,
+}
+
+/// A request about a place of an open document, answered from the index of
+/// what it is checked as part of.
+#[derive(Debug)]
+pub struct Query {
+    /// The request's id.
+    pub id: RequestId,
+    /// What it asks.
+    pub asked: Asked,
+    /// The document's URI, as the client gave it.
+    pub uri: Uri,
+    /// The place, counted in the negotiated encoding.
+    pub position: Position,
+    /// The check that makes a stale index fresh: of the open documents of
+    /// what the document is checked as part of, as they are when the query
+    /// is handed over.
+    pub check: Check,
+}
+
 /// What the worker is asked to do.
 #[derive(Debug)]
 pub enum Job {
     /// Check, and publish what the check finds.
     Check(Check),
+    /// Answer a query, checking first if the index is stale.
+    Query(Query),
     /// Forget a workspace or lone file, giving every file it has published
     /// diagnostics for an empty list.
     Clear(Key),
@@ -126,17 +174,22 @@ pub fn spawn(
     done: Sender<Key>,
 ) -> io::Result<(Sender<Job>, JoinHandle<()>)> {
     let (jobs, received) = crossbeam_channel::unbounded();
-    let worker = Worker {
-        client,
-        encoding,
-        checks,
-        disk: HashMap::new(),
-        published: HashMap::new(),
+    // Made on its thread: an index is not `Send`, and never leaves it.
+    let run = move || {
+        let worker = Worker {
+            client,
+            encoding,
+            checks,
+            disk: HashMap::new(),
+            published: HashMap::new(),
+            indexes: HashMap::new(),
+        };
+        worker.run(&received, &done);
     };
     let handle = thread::Builder::new()
         .name("gcsl-lsp-worker".to_owned())
         .stack_size(gcsl::STACK_SIZE)
-        .spawn(move || worker.run(&received, &done))?;
+        .spawn(run)?;
     Ok((jobs, handle))
 }
 
@@ -178,6 +231,24 @@ struct Worker {
     /// The files each workspace or lone file last published diagnostics
     /// for, each URI by its text.
     published: HashMap<Key, HashMap<String, Uri>>,
+    /// The latest index of each workspace and lone file.
+    indexes: HashMap<Key, Kept>,
+}
+
+/// The latest index of a workspace or lone file, with what it was made of.
+#[derive(Debug)]
+struct Kept {
+    /// The version of each open document it was made from, by the text of
+    /// its URI.
+    versions: HashMap<String, i32>,
+    /// The index; `None` if the check's scan failed.
+    index: Option<Index>,
+    /// Each input of the check, by input number: the standard files', then
+    /// the files checked.
+    sources: Vec<SourceFile>,
+    /// The URI of each input, by input number; `None` for a standard file,
+    /// and a file whose path is not UTF-8.
+    uris: Vec<Option<Uri>>,
 }
 
 impl Worker {
@@ -185,41 +256,86 @@ impl Worker {
     /// gone.
     fn run(mut self, jobs: &Receiver<Job>, done: &Sender<Key>) {
         for job in jobs {
-            match job {
+            let key = match job {
                 Job::Check(check) => {
                     let key = check.key.clone();
                     self.check(check);
-                    if done.send(key).is_err() {
-                        return;
-                    }
+                    key
                 }
-                Job::Clear(key) => self.clear(&key),
+                Job::Query(query) => {
+                    let key = query.check.key.clone();
+                    self.query(query);
+                    key
+                }
+                Job::Clear(key) => {
+                    self.clear(&key);
+                    continue;
+                }
+            };
+            if done.send(key).is_err() {
+                return;
             }
         }
     }
 
-    /// Makes `check` and publishes what it finds.
+    /// Makes `check`, publishes what it finds, and keeps its index.
     fn check(&mut self, check: Check) {
-        let report = match &check.key {
+        let (report, kept) = match &check.key {
             Key::Root(root) => self.check_workspace(root, &check),
             Key::Lone(uri) => self.check_lone(uri, &check),
+        };
+        match kept {
+            Some(kept) => self.indexes.insert(check.key.clone(), kept),
+            None => self.indexes.remove(&check.key),
         };
         if let Some(report) = report {
             self.publish(check.key, report);
         }
     }
 
+    /// Answers `query`, from the index of what its document is checked as
+    /// part of, made fresh first if it is stale (see the module
+    /// documentation).
+    fn query(&mut self, query: Query) {
+        let Query {
+            id,
+            asked,
+            uri,
+            position,
+            check,
+        } = query;
+        let key = check.key.clone();
+        let fresh = !check.reread
+            && self
+                .indexes
+                .get(&key)
+                .is_some_and(|kept| kept.versions == versions(&check));
+        if !fresh {
+            self.check(check);
+        }
+        let answer = self
+            .indexes
+            .get_mut(&key)
+            .and_then(|kept| kept.answer(asked, &uri, position, self.encoding))
+            .unwrap_or(Value::Null);
+        let _ = self
+            .client
+            .send(Message::Response(Response::new_ok(id, answer)));
+    }
+
     /// Checks the workspace under `root`, its files read from disk if
     /// `check` asks for it or they never were, with the open documents in
-    /// `check`. `None` if the check itself failed, which is logged.
-    fn check_workspace(&mut self, root: &Path, check: &Check) -> Option<Report> {
+    /// `check`; with its index. No report if the check itself failed, which
+    /// is logged, and no index if its files could not be read either.
+    fn check_workspace(&mut self, root: &Path, check: &Check) -> (Option<Report>, Option<Kept>) {
         let fresh = check.reread || !self.disk.contains_key(root);
         if fresh {
             self.disk.insert(root.to_path_buf(), read(root));
         }
-        let disk = match self.disk.get(root)? {
-            Ok(disk) => disk,
-            Err(error) => return Some(read_failure(root, error, check, fresh)),
+        let disk = match self.disk.get(root) {
+            Some(Ok(disk)) => disk,
+            Some(Err(error)) => return (Some(read_failure(root, error, check, fresh)), None),
+            None => return (None, None),
         };
         let (files, open) = merged(disk, &check.documents);
         let uri_at = |index: usize| match open.get(index).copied().flatten() {
@@ -233,17 +349,25 @@ impl Worker {
             check.documents.get(document).map(|doc| doc.version)
         };
         let root_name = root.to_string_lossy();
-        let found = self.checked(&root_name, || {
-            workspace::check_with_standard(&files, &disk.nested, &root_name)
-        })?;
-        Some(self.report(&found, &files, None, (uri_at, version_at), check))
+        let Some(found) = self.checked(&root_name, || {
+            workspace::index_with_standard(&files, &disk.nested, &root_name)
+        }) else {
+            return (None, None);
+        };
+        let report = self.report(&found, &files, None, (&uri_at, version_at), check);
+        let uris = (0..files.len()).map(uri_at).collect();
+        let kept = Kept::of(found, files, uris, check);
+        (Some(report), Some(kept))
     }
 
     /// Checks the lone file of the open document whose URI's text is `uri`,
-    /// as `gcsl run` checks a file outside any workspace. `None` if it is
-    /// not open any more, or the check itself failed, which is logged.
-    fn check_lone(&self, uri: &str, check: &Check) -> Option<Report> {
-        let document = check.documents.iter().find(|doc| doc.uri.as_str() == uri)?;
+    /// as `gcsl run` checks a file outside any workspace; with its index.
+    /// Neither if it is not open any more, or the check itself failed,
+    /// which is logged.
+    fn check_lone(&self, uri: &str, check: &Check) -> (Option<Report>, Option<Kept>) {
+        let Some(document) = check.documents.iter().find(|doc| doc.uri.as_str() == uri) else {
+            return (None, None);
+        };
         let uri = &document.uri;
         let path = match &document.place {
             Place::Lone { path } => path.as_deref(),
@@ -256,46 +380,37 @@ impl Worker {
         let source = match SourceFile::new(name, document.text.clone()) {
             Ok(source) => source,
             Err(error) => {
-                return Some(Report {
+                let report = Report {
                     message: Some(format!("cannot load {}: {error}", uri.as_str())),
                     ..Report::default()
-                });
+                };
+                return (Some(report), None);
             }
         };
         let dir = path.map_or_else(workspace::working_directory, file_dir);
-        let found = self.checked(uri.as_str(), || {
-            workspace::check_lone_with_standard(&source, &dir)
-        })?;
-        let files = [source];
+        let Some(found) = self.checked(uri.as_str(), || {
+            workspace::index_lone_with_standard(&source, &dir)
+        }) else {
+            return (None, None);
+        };
+        let files = vec![source];
         let uri_at = |_: usize| Some(uri.clone());
         let version_at = |_: usize| Some(document.version);
         // A diagnostic naming no input is the file's own, as `gcsl run`
         // renders it.
-        let own = u32::try_from(found.0.len()).ok();
-        Some(self.report(&found, &files, own, (uri_at, version_at), check))
+        let own = u32::try_from(found.standard.len()).ok();
+        let report = self.report(&found, &files, own, (&uri_at, version_at), check);
+        let kept = Kept::of(found, files, vec![Some(uri.clone())], check);
+        (Some(report), Some(kept))
     }
 
     /// Runs `check`, a check of what `name` names, counting it, and returns
-    /// the standard files it loaded and what it found: the warnings if it
-    /// succeeded, else the diagnostics. `None`, logged, if it panicked,
-    /// which a bug in GCSL could make it do; the server goes on.
-    fn checked(
-        &self,
-        name: &str,
-        check: impl FnOnce() -> (
-            Vec<SourceFile>,
-            Result<workspace::Workspace, Vec<Diagnostic>>,
-        ),
-    ) -> Option<(Vec<SourceFile>, Vec<Diagnostic>)> {
+    /// what it found: the standard files it loaded, the warnings if it
+    /// succeeded, else the diagnostics, and its index. `None`, logged, if it
+    /// panicked, which a bug in GCSL could make it do; the server goes on.
+    fn checked(&self, name: &str, check: impl FnOnce() -> Indexed) -> Option<Indexed> {
         self.checks.fetch_add(1, Ordering::SeqCst);
-        let checked = panic::catch_unwind(AssertUnwindSafe(|| {
-            let (standard, checked) = check();
-            let diagnostics = match checked {
-                Ok(workspace) => workspace.warnings().to_vec(),
-                Err(diagnostics) => diagnostics,
-            };
-            (standard, diagnostics)
-        }));
+        let checked = panic::catch_unwind(AssertUnwindSafe(check));
         if checked.is_err() {
             log(format_args!("internal error: the check of {name} panicked"));
         }
@@ -309,7 +424,11 @@ impl Worker {
     /// there is one.
     fn report(
         &self,
-        (standard, diagnostics): &(Vec<SourceFile>, Vec<Diagnostic>),
+        Indexed {
+            standard,
+            diagnostics,
+            ..
+        }: &Indexed,
         files: &[SourceFile],
         own: Option<u32>,
         (uri_at, version_at): (impl Fn(usize) -> Option<Uri>, impl Fn(usize) -> Option<i32>),
@@ -381,6 +500,7 @@ impl Worker {
         if let Key::Root(root) = key {
             self.disk.remove(root);
         }
+        self.indexes.remove(key);
         for uri in self.published.remove(key).unwrap_or_default().into_values() {
             self.send_diagnostics(uri, None, Vec::new());
         }
@@ -409,6 +529,80 @@ impl Worker {
     /// told: the main thread finds it gone too, and stops.
     fn send(&self, notification: Notification) {
         let _ = self.client.send(Message::Notification(notification));
+    }
+}
+
+impl Kept {
+    /// What is kept of `found`, a check of `files` (after its standard
+    /// files), whose URIs are `uris`, made of `check`'s documents.
+    fn of(found: Indexed, files: Vec<SourceFile>, uris: Vec<Option<Uri>>, check: &Check) -> Self {
+        let uris = found.standard.iter().map(|_| None).chain(uris).collect();
+        let mut sources = found.standard;
+        sources.extend(files);
+        Self {
+            versions: versions(check),
+            index: found.index,
+            sources,
+            uris,
+        }
+    }
+
+    /// The answer to `asked` at `position` of the document `uri`, counted
+    /// in `encoding`: a hover, a location or locations, or `None` for
+    /// nothing there (JSON's `null`).
+    fn answer(
+        &mut self,
+        asked: Asked,
+        uri: &Uri,
+        position: Position,
+        encoding: Encoding,
+    ) -> Option<Value> {
+        let input = self
+            .uris
+            .iter()
+            .position(|at| at.as_ref().is_some_and(|at| at.as_str() == uri.as_str()))?;
+        let file = u32::try_from(input).ok()?;
+        let lines = LineIndex::new(self.sources.get(input)?.text());
+        let offset = u32::try_from(lines.offset(position, encoding)).ok()?;
+        let index = self.index.as_mut()?;
+        match asked {
+            Asked::Hover => {
+                let hover = index.hover(file, offset)?;
+                let hover = Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: hover.text,
+                    }),
+                    range: Some(lines.range(hover.span, encoding)),
+                };
+                serde_json::to_value(hover).ok()
+            }
+            Asked::Definition => {
+                let mut indices: HashMap<u32, LineIndex<'_>> = HashMap::new();
+                let mut locations = Vec::new();
+                for found in index.definition(file, offset) {
+                    let Some(Some(uri)) = self.uris.get(found.file as usize) else {
+                        continue;
+                    };
+                    let Some(source) = self.sources.get(found.file as usize) else {
+                        continue;
+                    };
+                    let lines = indices
+                        .entry(found.file)
+                        .or_insert_with(|| LineIndex::new(source.text()));
+                    locations.push(Location::new(
+                        uri.clone(),
+                        lines.range(found.span, encoding),
+                    ));
+                }
+                let response = match locations.len() {
+                    0 => return None,
+                    1 => GotoDefinitionResponse::Scalar(locations.pop()?),
+                    _ => GotoDefinitionResponse::Array(locations),
+                };
+                serde_json::to_value(response).ok()
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "gcsl-lsp"
-description = "A language server for GCSL that reports diagnostics."
+description = "A language server for GCSL that reports diagnostics and answers hovers and definitions."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2783,6 +2783,31 @@
 //! input reads them, captured by a function that reads one, rather than
 //! through the top level's frame as a directory's committed declarations
 //! are.
+//!
+//! # Recording
+//!
+//! A language server answers what a name refers to and what it is from an
+//! index of the workspace ([`crate::index`]), which needs what the check
+//! found of the names it resolved by scope, since scopes are gone once it
+//! ends. A check asked to (`Checker::recording`, which only the index's
+//! entry points do: never `gcsl run`'s, a session's or `pekit`'s) records
+//! (`Record`) each binding as it is declared, where, under its name, of its
+//! type then and of what kind, and each `Name` it reads from a binding
+//! declared in this input, by where that binding was declared. A binding
+//! committed by another file, or by an earlier input of a session, was
+//! declared nowhere here, and a read of it is recorded as none, as is a
+//! name read through the file's view: the index resolves those again in
+//! the view, as the check does (see [Imports](#imports)), and so a read of
+//! the input's own top-level field or `def`, whose declarations are nodes
+//! of the view. A name read from the narrowed copy of a variable is read
+//! from the `is` that narrowed it, and a function's name for itself from
+//! the function expression. `Checker::check_recorded` returns the record
+//! with the type of every expression, of every `type`
+//! item and of every cell of the input's tree as the check left them,
+//! WHETHER IT SUCCEEDED OR FAILED, so that a file with errors is indexed
+//! for everything that resolved: an expression that failed is `Error`, and
+//! after a failure some may be untyped or provisional. Not recording costs
+//! one test of an `Option` per binding declared and per name read.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -4339,9 +4364,50 @@ impl Binding {
     }
 }
 
+/// What a check records of its input's names for an index of it, when it
+/// is asked to ([`Checker::recording`]; see [Recording](#recording)), with
+/// what its tables were as it ended, whether it succeeded or failed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Record {
+    /// Each binding the check declared, in the order it declared them.
+    pub(crate) decls: Vec<RecordedDecl>,
+    /// Each name read from a binding declared in this input: the `Name`
+    /// expression and where its binding was declared
+    /// ([`RecordedDecl::declared`]). A name read through the file's view,
+    /// or from a declaration another input committed, has none.
+    pub(crate) uses: Vec<(ExprId, Span)>,
+    /// The type of every expression as the check left it, indexed by
+    /// [`ExprId`]: `Error` for one that failed, and, after a failed check,
+    /// possibly untyped or provisional.
+    pub(crate) types: Vec<TyId>,
+    /// The type each `type` item of the input stands for, by item.
+    pub(crate) declared_types: Vec<(ItemId, TyId)>,
+    /// The type of the cell of each node of the input's tree of top-level
+    /// fields, by its index there, as [`CheckOutput::cell_types`] has it.
+    pub(crate) cells: Vec<TyId>,
+    /// The type of the input's value, as [`CheckOutput::ty`] has it.
+    pub(crate) value: Option<TyId>,
+}
+
+/// A binding a check declared, as [`Record`] keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedDecl {
+    /// Where it was declared, as [`Binding`] says: a `let`'s, field's or
+    /// `:=`'s item, a spread's item for its soft fields, a parameter, a
+    /// `for`'s name, a function expression for its name for itself, and an
+    /// `is` for the narrowed copy of the variable it tests.
+    pub(crate) declared: Span,
+    /// Its name.
+    pub(crate) name: Name,
+    /// Its type as it was declared.
+    pub(crate) ty: TyId,
+    /// What it is.
+    pub(crate) kind: BindingKind,
+}
+
 /// What a [`Binding`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BindingKind {
+pub(crate) enum BindingKind {
     /// A variable: declared by a `let`, a `:=` or a parameter.
     Variable,
     /// A mutable variable, declared by a `let mut`, which `:=` rebinds in
@@ -5330,6 +5396,16 @@ pub(crate) const BUILTIN_TYPE_NAMES: [&str; 7] = [
 /// the program never mentions has no [`Name`].
 type BuiltinTypes = [(Option<Name>, TyId); 4];
 
+/// The [`BuiltinTypes`] of a program whose names are `names`.
+fn builtin_types(names: &Names) -> BuiltinTypes {
+    [
+        (names.lookup("Int"), TyId::INT),
+        (names.lookup("Float"), TyId::FLOAT),
+        (names.lookup("Bool"), TyId::BOOL),
+        (names.lookup("String"), TyId::STRING),
+    ]
+}
+
 /// A check in progress. See the module documentation.
 pub struct Checker<'a> {
     ast: &'a Ast,
@@ -5606,6 +5682,11 @@ pub struct Checker<'a> {
     /// What each node of a copy of a declared type's definition denotes in
     /// each mode it has been resolved in (see [`Checker::resolve_type`]).
     copies: HashMap<(TypeExprId, Bareness), TyId>,
+    /// What is recorded of the input's names for an index of it, if the
+    /// check was asked to record ([`Checker::recording`]); `None`, and so
+    /// costing one test per binding and per name read, on every other path
+    /// (see [Recording](#recording)).
+    record: Option<Box<Record>>,
     errors: Vec<Diagnostic>,
     warnings: Vec<Diagnostic>,
 }
@@ -5721,12 +5802,7 @@ impl<'a> Checker<'a> {
             field_clash: None,
             shadowed_items: Vec::new(),
             checking_shadowed: false,
-            builtin_types: [
-                (names.lookup("Int"), TyId::INT),
-                (names.lookup("Float"), TyId::FLOAT),
-                (names.lookup("Bool"), TyId::BOOL),
-                (names.lookup("String"), TyId::STRING),
-            ],
+            builtin_types: builtin_types(names),
             future_name: names.lookup("Future"),
             present_name: names.lookup("Present"),
             list_name: names.lookup("List"),
@@ -5745,9 +5821,19 @@ impl<'a> Checker<'a> {
             quiet: Quiet::default(),
             declared_types: Vec::new(),
             copies: HashMap::new(),
+            record: None,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    /// The checker, recording what each name it reads refers to and what
+    /// each binding it declares is, for an index of the input (see
+    /// [Recording](#recording)): [`Checker::check_recorded`] returns it.
+    #[must_use]
+    pub(crate) fn recording(mut self) -> Self {
+        self.record = Some(Box::default());
+        self
     }
 
     /// Checks the file's body. On success, returns the tables, the
@@ -5757,7 +5843,16 @@ impl<'a> Checker<'a> {
     /// # Errors
     ///
     /// As [`check`].
-    pub fn check(mut self) -> Result<CheckOutput, Vec<Diagnostic>> {
+    pub fn check(self) -> Result<CheckOutput, Vec<Diagnostic>> {
+        self.check_recorded().0
+    }
+
+    /// [`Checker::check`], with what it recorded if it was asked to
+    /// ([`Checker::recording`]), whether it succeeded or failed (see
+    /// [Recording](#recording)).
+    pub(crate) fn check_recorded(
+        mut self,
+    ) -> (Result<CheckOutput, Vec<Diagnostic>>, Option<Box<Record>>) {
         let root = self.ast.root();
         // A tree with syntax errors is checked for the errors of what was
         // parsed, and is never lowered: its check always fails.
@@ -5776,8 +5871,9 @@ impl<'a> Checker<'a> {
         } else {
             ty
         };
+        let record = self.finish_record(ty);
         if !self.errors.is_empty() || self.quiet.failed {
-            return Err(diagnostic::merge(self.errors, self.warnings));
+            return (Err(diagnostic::merge(self.errors, self.warnings)), record);
         }
         if !self.settled() {
             let error = InternalError {
@@ -5785,7 +5881,7 @@ impl<'a> Checker<'a> {
                           successful check",
                 span: self.ast.root_span(),
             };
-            return Err(vec![error.into()]);
+            return (Err(vec![error.into()]), record);
         }
         let scope_slot_names = self.scope_slot_names();
         let (cell_types, shared_children) = self.cell_tables();
@@ -5846,7 +5942,7 @@ impl<'a> Checker<'a> {
         };
         let mut warnings = self.warnings;
         warnings.sort_by_key(|warning| warning.span.start);
-        Ok(CheckOutput {
+        let output = CheckOutput {
             checked,
             scope: Scope {
                 bindings,
@@ -5856,7 +5952,8 @@ impl<'a> Checker<'a> {
             ty,
             cell_types,
             warnings,
-        })
+        };
+        (Ok(output), record)
     }
 
     /// The cells of the nodes of the input's tree of top-level fields, by
@@ -8647,16 +8744,7 @@ impl<'a> Checker<'a> {
     /// scope](#directory-scope)).
     fn cell_tables(&self) -> (Vec<TyId>, SharedChildren) {
         let tree = self.mentions.tree.nodes.len();
-        let types = self.field_cells.iter().take(tree);
-        // A `def`'s cell is its function's binding, typed as it is.
-        let types = types
-            .map(|cell| {
-                cell.ty
-                    .filter(|&ty| ty != TyId::ERROR)
-                    .or_else(|| Some(self.bindings.get(cell.binding?)?.ty))
-                    .unwrap_or(TyId::ERROR)
-            })
-            .collect();
+        let types = self.cell_types();
         let Some(workspace) = self.workspace else {
             return (types, Vec::new());
         };
@@ -8678,6 +8766,23 @@ impl<'a> Checker<'a> {
             })
             .collect();
         (types, shared)
+    }
+
+    /// The type of each node's cell of the input's tree of top-level fields,
+    /// by its index there, as the check has found it so far: a `def`'s is
+    /// its function's binding's.
+    fn cell_types(&self) -> Vec<TyId> {
+        let tree = self.mentions.tree.nodes.len();
+        self.field_cells
+            .iter()
+            .take(tree)
+            .map(|cell| {
+                cell.ty
+                    .filter(|&ty| ty != TyId::ERROR)
+                    .or_else(|| Some(self.bindings.get(cell.binding?)?.ty))
+                    .unwrap_or(TyId::ERROR)
+            })
+            .collect()
     }
 
     /// [`Checker::declare_field_cells`] for a file of a workspace: each
@@ -11227,7 +11332,35 @@ impl<'a> Checker<'a> {
             // next one.
             None => self.slot_names.push(binding.name),
         }
+        self.record_decl(binding);
         self.bindings.push(binding);
+    }
+
+    /// As the check ends, the input's value being of type `ty`: what it
+    /// recorded, if it records (see [Recording](#recording)), with the
+    /// tables as they are.
+    fn finish_record(&mut self, ty: TyId) -> Option<Box<Record>> {
+        let mut record = self.record.take()?;
+        record.types.clone_from(&self.expr_types);
+        record.declared_types.clone_from(&self.declared_types);
+        record.cells = self.cell_types();
+        record.value = Some(ty);
+        Some(record)
+    }
+
+    /// Records `binding` as declared, if the check records (see
+    /// [Recording](#recording)) and it was declared in this input.
+    fn record_decl(&mut self, binding: Binding) {
+        if let Some(record) = &mut self.record
+            && let Some(declared) = binding.declared
+        {
+            record.decls.push(RecordedDecl {
+                declared,
+                name: binding.name,
+                ty: binding.ty,
+                kind: binding.kind,
+            });
+        }
     }
 
     /// The innermost, latest binding of `name`, with its index in
@@ -15474,7 +15607,7 @@ impl<'a> Checker<'a> {
         self.block_start = self.bindings.len();
         self.fields_start = self.fields.len();
         if let Some(name) = callee {
-            self.bindings.push(Binding {
+            let binding = Binding {
                 name,
                 slot: Slot::NONE,
                 ty: fn_ty,
@@ -15482,7 +15615,9 @@ impl<'a> Checker<'a> {
                 kind: BindingKind::Callee,
                 function: None,
                 callback: None,
-            });
+            };
+            self.record_decl(binding);
+            self.bindings.push(binding);
         }
         let params = self.ast.params(decl.params);
         for (index, param) in params.iter().enumerate() {
@@ -16315,6 +16450,11 @@ impl<'a> Checker<'a> {
         if let Some((index, binding)) = found {
             if binding.kind == BindingKind::Mutable {
                 self.leaf_reads_mutable(index, binding.name);
+            }
+            if let Some(record) = &mut self.record
+                && let Some(declared) = binding.declared
+            {
+                record.uses.push((id, declared));
             }
             self.expr_vars[id.index()] = self.resolve(index, binding);
             return (self.builtin_use(id, binding.ty, span), binding.callback);
