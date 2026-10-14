@@ -2635,6 +2635,18 @@ impl AstBuilder {
         self.syntax = self.syntax.max(syntax);
     }
 
+    /// The syntax errors recorded so far ([`AstBuilder::set_syntax`]).
+    #[must_use]
+    pub fn syntax(&self) -> Syntax {
+        self.syntax
+    }
+
+    /// Puts back what [`AstBuilder::syntax`] was, as a parser does that
+    /// parses again what it found errors in, forgetting them.
+    pub fn reset_syntax(&mut self, syntax: Syntax) {
+        self.syntax = syntax;
+    }
+
     /// Where every arena and pool is now, for [`AstBuilder::truncate`].
     #[must_use]
     pub fn mark(&self) -> BuilderMark {

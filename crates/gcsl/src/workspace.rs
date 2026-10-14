@@ -19496,6 +19496,27 @@ p26 = com.x"#;
     }
 
     #[test]
+    fn a_half_typed_item_leaves_the_next_line_to_be_checked() {
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "u.gcsl",
+                "let a = 1 +\nlet b: Int = \"x\"\nlet c = f(1,, 2)\nlet e = 3\nx = \ny: Int = true",
+            ),
+        ];
+        assert_eq!(
+            every_error(&files),
+            expected_errors(&[
+                ("expected expression, found newline", "u.gcsl", "\n"),
+                ("mismatched types", "u.gcsl", "\"x\""),
+                ("expected expression, found `,`", "u.gcsl", ","),
+                ("expected expression, found newline", "u.gcsl", "\n"),
+                ("mismatched types", "u.gcsl", "true"),
+            ])
+        );
+    }
+
+    #[test]
     fn a_name_that_names_nothing_is_an_error_where_no_broken_file_is_seen() {
         // `sub2/d` sees the root's files, not `sub1/a`.
         let files = [

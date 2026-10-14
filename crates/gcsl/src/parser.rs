@@ -756,6 +756,20 @@
 //!   error, which may have meant something else for it, and attributes
 //!   waiting for an item that fails are dropped.
 //!
+//! An item, or a value, that fails having gone on past a newline, as it
+//! does after an operator, `=`, `:` or `let`, to a line that is an item of
+//! its own (`Parser::item_line`: a `let`, `fn NAME`, `def`, `import`,
+//! `type`, `defmeta`, `return`, `break`, `continue`, an attribute, or a
+//! path followed by `=`, `:=` or an annotation and `=`), with no bracket
+//! opened in it left open, is forgotten, its errors with it, and parsed
+//! again with that newline its end (`Parser::rewind`), so that the next
+//! line is the next item, as an editor's half-typed `x = ` above it leaves
+//! it: its error is then the one at that newline, "expected expression,
+//! found newline". A line that may go on the line before, an operand, is
+//! not one, and stays the item's. Nor is a line inside a bracket left
+//! open, a `(` or `[`: the lexer emits no newline there, and the rest of
+//! the source is in the bracket.
+//!
 //! A skip (`Parser::skip`) follows the brackets the lexer follows (`nest`):
 //! it goes over everything between brackets opened since what failed
 //! started, newlines inside braces included, and stops, without consuming
@@ -1175,6 +1189,7 @@ pub(crate) fn parse_parts(
         quiet_from,
         unclosed: false,
         deep: false,
+        line_end: None,
         diagnostics: Vec::new(),
     };
     if lexical > 0 {
@@ -1325,6 +1340,10 @@ struct Parser<'a> {
     /// no list and no interpolation recovers from: the item, or its value,
     /// does.
     deep: bool,
+    /// The newline token, by its index, past which no newline is skipped:
+    /// set while an item that failed is parsed again up to the end of its
+    /// line ([`Parser::item_line`]).
+    line_end: Option<usize>,
     /// Errors reported so far, in the order found: at most [`MAX_ERRORS`]
     /// and one more, after which the parser skips to the end of the input.
     diagnostics: Vec<Diagnostic>,
@@ -1363,6 +1382,12 @@ struct Marks {
     path: usize,
     depth: usize,
     braces: Braces,
+    /// The number of errors reported, the tree's syntax and whether the end
+    /// of the input in a block was reported: what [`Parser::rewind`], but
+    /// not [`Parser::restore`], puts back.
+    diagnostics: usize,
+    syntax: Syntax,
+    unclosed: bool,
 }
 
 /// What ends a skip over source that could not be parsed (see [Errors and
@@ -1492,7 +1517,20 @@ impl Parser<'_> {
             }
             let start = self.pos;
             let marks = self.marks();
-            let parsed = self.parse_body_item(token, open.is_some(), &mut pending);
+            let waiting = pending;
+            let mut parsed = self.parse_body_item(token, open.is_some(), &mut pending);
+            // Gone on to a line that is an item of its own: parsed again to
+            // the end of its own line, and the next line left for the next
+            // item.
+            if parsed.is_err()
+                && let Some(line) = self.item_line(start)
+            {
+                self.rewind(start, marks);
+                pending = waiting;
+                let outer = self.line_end.replace(line);
+                parsed = self.parse_body_item(token, open.is_some(), &mut pending);
+                self.line_end = outer;
+            }
             let (item, item_height) = match parsed {
                 Ok(parsed) if !poisoned => parsed,
                 Ok(_) | Err(Reported) => {
@@ -1700,13 +1738,11 @@ impl Parser<'_> {
             TokenKind::Label(_) => return Err(self.misplaced_label(token)),
             TokenKind::Eq => {
                 self.advance();
-                self.skip_newlines();
                 let value = self.parse_value()?;
                 (ItemKind::Result(value), value)
             }
             TokenKind::DotDotDot => {
                 self.advance();
-                self.skip_newlines();
                 let value = self.parse_value()?;
                 (ItemKind::Spread(value), value)
             }
@@ -1761,7 +1797,6 @@ impl Parser<'_> {
             return Err(self.error("expected `=` after variable name", eq.span));
         }
         self.advance();
-        self.skip_newlines();
         let value = self.parse_value()?;
         let kind = ItemKind::Let {
             path,
@@ -3067,7 +3102,6 @@ impl Parser<'_> {
         let (path, mut shape) = self.finish_path(base);
         shape.positions = positions;
         self.advance();
-        self.skip_newlines();
         let value = self.parse_value()?;
         let kind = if rebind {
             ItemKind::Rebind { path, value }
@@ -4936,6 +4970,9 @@ impl Parser<'_> {
             path: self.path.len(),
             depth: self.depth,
             braces: self.braces,
+            diagnostics: self.diagnostics.len(),
+            syntax: self.builder.syntax(),
+            unclosed: self.unclosed,
         }
     }
 
@@ -4987,8 +5024,10 @@ impl Parser<'_> {
     }
 
     /// Parses the value of an item of a body, after its `=`, `:=` or
-    /// `...`: any expression, at minimum binding power 0, which must be
-    /// followed by the end of the item. If it fails, or something else
+    /// `...`: newlines, then any expression, at minimum binding power 0,
+    /// which must be followed by the end of the item. Having gone on to a
+    /// line that is an item of its own ([`Parser::item_line`]), it is
+    /// parsed again up to that line. If it fails, or something else
     /// follows it, the value is an error node spanning it and what is
     /// skipped to the item's end (see [Errors and
     /// recovery](#errors-and-recovery)), so that the item still declares
@@ -4996,15 +5035,24 @@ impl Parser<'_> {
     /// fails, and the end of the item is not looked for.
     fn parse_value(&mut self) -> ParseResult<ExprId> {
         let Recovery::Body { top } = self.recovery else {
+            self.skip_newlines();
             return self.parse_expr(0);
         };
         let start = self.pos;
         let marks = self.marks();
-        let parsed = self.parse_expr(0);
-        if let Ok(value) = parsed
-            && self.expect_end_of_item().is_ok()
-        {
+        if let Some(value) = self.attempt_value() {
             return Ok(value);
+        }
+        // Gone on to a line that is an item of its own: parsed again to the
+        // end of its own line, and the next line left for the next item.
+        if let Some(line) = self.item_line(start) {
+            self.rewind(start, marks);
+            let outer = self.line_end.replace(line);
+            let value = self.attempt_value();
+            self.line_end = outer;
+            if let Some(value) = value {
+                return Ok(value);
+            }
         }
         let span = self.recover(start, marks, Sync::Item { top });
         let id = self.builder.alloc(Expr {
@@ -5013,6 +5061,15 @@ impl Parser<'_> {
         });
         self.heights.push(LEAF_HEIGHT);
         Ok(id)
+    }
+
+    /// Parses a value, as [`Parser::parse_value`] does, and the end of its
+    /// item; `None` if either fails.
+    fn attempt_value(&mut self) -> Option<ExprId> {
+        self.skip_newlines();
+        let value = self.parse_expr(0).ok()?;
+        self.expect_end_of_item().ok()?;
+        Some(value)
     }
 
     /// After the entry of a list closed by `close` that started at token
@@ -5088,6 +5145,66 @@ impl Parser<'_> {
         }
     }
 
+    /// After the item, or the value of an item, that started at token number
+    /// `start` failed, the parser being where it failed: the first newline
+    /// token it went on past, as it does after an operator, `=` or `:`, with
+    /// no bracket opened since `start` left open, after which an item
+    /// starts ([`Parser::starts_item`]): the end of the item, if it does not
+    /// go on to the next line, so that the next line, which an editor's
+    /// half-typed `x = ` above it leaves alone, is the next item. `None` if
+    /// there is none. Costs nothing but on an error.
+    fn item_line(&mut self, start: usize) -> Option<usize> {
+        let mut open = Nesting::default();
+        for index in start..self.pos {
+            let kind = self.token_at(index).kind;
+            if kind == TokenKind::Newline && open.open.is_empty() && self.starts_item(index + 1) {
+                return Some(index);
+            }
+            nest(&mut open, kind);
+        }
+        None
+    }
+
+    /// Whether the token number `index` starts what is surely an item, not
+    /// the rest of an expression: a `let`, a `fn` and its name, a `def`, an
+    /// `import`, a `type`, a `defmeta`, a `return`, `break` or `continue`,
+    /// an attribute, or a field or a rebind, a path followed by `=`, `:=`
+    /// or an annotation and `=`.
+    fn starts_item(&mut self, index: usize) -> bool {
+        let token = self.token_at(index);
+        match token.kind {
+            TokenKind::Let
+            | TokenKind::Def
+            | TokenKind::Import
+            | TokenKind::Return
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::Attribute(_)
+            | TokenKind::InnerAttribute(_) => true,
+            TokenKind::Fn => matches!(self.token_at(index + 1).kind, TokenKind::Ident(_)),
+            _ => {
+                let at = std::mem::replace(&mut self.pos, index);
+                let item =
+                    self.starts_type_item() || self.starts_defmeta() || self.starts_path_item();
+                self.pos = at;
+                item
+            }
+        }
+    }
+
+    /// Puts the parser back where `marks` says it was, at token number
+    /// `start`, as if what it parsed since had never been: its errors
+    /// forgotten too, and what they made of the tree. For parsing it again,
+    /// once more than the first time is known of where it ends.
+    fn rewind(&mut self, start: usize, marks: Marks) {
+        self.restore(marks);
+        self.diagnostics.truncate(marks.diagnostics);
+        self.builder.reset_syntax(marks.syntax);
+        self.unclosed = marks.unclosed;
+        self.deep = false;
+        self.pos = start;
+    }
+
     /// Skips item separators: newlines and `;`.
     fn skip_separators(&mut self) {
         while matches!(self.peek().kind, TokenKind::Newline | TokenKind::Semi) {
@@ -5097,7 +5214,7 @@ impl Parser<'_> {
 
     /// Skips newlines where an item continues on the next line.
     fn skip_newlines(&mut self) {
-        while self.peek().kind == TokenKind::Newline {
+        while self.peek().kind == TokenKind::Newline && self.line_end != Some(self.pos) {
             self.advance();
         }
     }
@@ -11587,6 +11704,59 @@ mod tests {
 
     #[test]
     fn items_recover_at_their_newline_or_semicolon() {
+        // An item that fails having gone on past a newline, after an
+        // operator or `=`, to a line that is an item of its own, ends at
+        // that newline: the line is the next item.
+        assert_eq!(
+            all_errors("let a = 1 +\nlet b: Int = \"x\"\nlet c = f(1,, 2)\nlet e = 3"),
+            errors_of(&[
+                ("expected expression, found newline", "\n"),
+                ("expected expression, found `,`", ","),
+            ])
+        );
+        assert_eq!(
+            recovered("let a = 1 +\nlet b: Int = \"x\"\nlet c = f(1,, 2)\nlet e = 3").0,
+            "let a = <error>; let b: Int = \"x\"; let c = <error>; let e = 3"
+        );
+        assert_eq!(
+            all_errors(
+                "x = \ny = 2\nz: Int =\n#[shadowable] w = 1\nfn f(): Int { 1 }\nv =\nfn g(): Int { 2 }"
+            ),
+            errors_of(&[
+                ("expected expression, found newline", "\n"),
+                ("expected expression, found newline", "\n"),
+                ("expected expression, found newline", "\n"),
+            ])
+        );
+        assert_eq!(
+            recovered("x = \ny = 2\nz: Int =\n#[shadowable] w = 1\nv =\nfn g(): Int { 2 }").0,
+            "x = <error>; y = 2; z: Int = <error>; w = 1; v = <error>; fn g(): Int {2}"
+        );
+        // In a block, and for an item that fails before its value.
+        assert_eq!(
+            recovered("f = {\n    a = 1 +\n    b = 2\n}\ntype T =\nc = 3").0,
+            "f = {a = <error>; b = 2}; <error>; c = 3"
+        );
+        assert_eq!(
+            all_errors("type T =\nc = 3"),
+            errors_of(&[("expected a type", "\n")])
+        );
+        // A line that may go on the line before is not an item of its own:
+        // it is the operand the line before was missing, and the error
+        // after it the item's one error.
+        assert_eq!(
+            all_errors("x = 1 +\n2 3\ny = 4"),
+            errors_of(&[("expected end of item, found `3`", "3")])
+        );
+        assert_eq!(recovered("x = 1 +\n2 3\ny = 4").0, "x = <error>; y = 4");
+        // A line inside brackets left open is no item of the body: the
+        // lexer emits no newline there, so the rest of the file is the
+        // list's.
+        assert_eq!(
+            all_errors("d = [1, 2\ne = 3\nf = 4"),
+            errors_of(&[("expected `,` or `]`, found `e`", "e")])
+        );
+        assert_eq!(recovered("d = [1, 2\ne = 3").0, "d = <error>");
         // A value may be missing, its separator ending it still.
         assert_eq!(
             all_errors("x = ; y = 1"),
