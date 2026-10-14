@@ -1,9 +1,11 @@
 //! `gcsl`: the command-line interface to the GCSL language.
 //!
-//! With no arguments it starts a REPL; `gcsl run FILE` runs a file. All
-//! language work is done by the `gcsl` library, and finding and reading a
-//! workspace's files by the `gcsl-disk` crate, which `pekit` shares; this
-//! crate only reads its input, prints output and chooses exit codes.
+//! With no arguments it starts a REPL; `gcsl run FILE` runs a file; `gcsl
+//! lsp` is a language server, speaking LSP on stdin and stdout, which is
+//! the `gcsl-lsp` crate's. All language work is done by the `gcsl` library,
+//! and finding and reading a workspace's files by the `gcsl-disk` crate,
+//! which `pekit` shares; this crate only reads its input, prints output and
+//! chooses exit codes.
 
 #![warn(
     clippy::unwrap_used,
@@ -42,6 +44,10 @@ struct Cli {
 enum Command {
     /// Run a GCSL file and print its value, unless it is `{}`.
     Run(run::RunArgs),
+    /// Serve the Language Server Protocol on stdin and stdout, reporting
+    /// each file's errors and warnings as it is edited. Checks only: runs
+    /// nothing.
+    Lsp,
 }
 
 fn main() -> ExitCode {
@@ -57,6 +63,7 @@ fn main() -> ExitCode {
         .spawn(move || match cli.command {
             None => repl::main(),
             Some(Command::Run(args)) => run::main(&args),
+            Some(Command::Lsp) => gcsl_lsp::stdio(),
         });
     match worker.map(std::thread::JoinHandle::join) {
         Ok(Ok(code)) => code,

@@ -3837,3 +3837,71 @@ fn repl_shows_values_and_sorts_versions() {
     );
     assert_eq!(output.status.code(), Some(0));
 }
+
+/// Runs `gcsl lsp` with `messages`, each framed as LSP frames a message,
+/// on its stdin until it ends.
+fn lsp(messages: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for message in messages {
+        write!(stdin, "Content-Length: {}\r\n\r\n{message}", message.len()).unwrap();
+    }
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// The messages of `output`, LSP frames on stdout, unframed: nothing else
+/// may be there.
+fn frames(output: &Output) -> Vec<&str> {
+    let mut rest = stdout(output);
+    let mut messages = Vec::new();
+    while !rest.is_empty() {
+        let header = rest.strip_prefix("Content-Length: ").unwrap();
+        let (length, body) = header.split_once("\r\n\r\n").unwrap();
+        let (message, after) = body.split_at(length.parse().unwrap());
+        messages.push(message);
+        rest = after;
+    }
+    messages
+}
+
+/// LSP's `initialize`, from a client offering utf-8 and utf-16.
+const LSP_INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]}}}}"#;
+/// LSP's `initialized`.
+const LSP_INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+/// LSP's `shutdown`.
+const LSP_SHUTDOWN: &str = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
+/// LSP's `exit`.
+const LSP_EXIT: &str = r#"{"jsonrpc":"2.0","method":"exit"}"#;
+
+/// `gcsl lsp` speaks LSP on stdin and stdout: it answers `initialize` with
+/// its capabilities and `shutdown` with null, and exits with code 0 on
+/// `exit` after `shutdown`, and 1 on `exit` alone.
+#[test]
+fn lsp_initializes_and_shuts_down() {
+    let output = lsp(&[LSP_INITIALIZE, LSP_INITIALIZED, LSP_SHUTDOWN, LSP_EXIT]);
+    let messages = frames(&output);
+    let [initialized, shut_down] = messages.as_slice() else {
+        panic!("{messages:?}");
+    };
+    assert_eq!(
+        *initialized,
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"positionEncoding":"utf-8","textDocumentSync":{{"change":2,"openClose":true,"save":true}}}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert_eq!(*shut_down, r#"{"jsonrpc":"2.0","id":2,"result":null}"#);
+    assert_eq!(stderr(&output), "");
+    assert_eq!(output.status.code(), Some(0));
+    // `exit` without `shutdown`.
+    let output = lsp(&[LSP_INITIALIZE, LSP_INITIALIZED, LSP_EXIT]);
+    assert_eq!(frames(&output).len(), 1);
+    assert_eq!(output.status.code(), Some(1));
+}
