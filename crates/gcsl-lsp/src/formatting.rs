@@ -3,10 +3,13 @@
 //!
 //! A document is formatted whole, from the text the server keeps of it, and
 //! answered with the edits that make its text the formatted one: the lines
-//! that differ, as a line diff finds them ([`hunks`]), each run of them one
+//! that differ, as a line diff finds them ([`hunks`]), each one a
 //! [`TextEdit`] replacing whole lines, so that an editor keeps its marks
-//! and its cursor on the lines formatting leaves alone. A range is
-//! answered with those of the edits that touch its lines alone: each edit
+//! and its cursor on the lines formatting leaves alone: a line of its own
+//! where formatting replaces a run of lines by as many, else the run, which
+//! adds or removes lines. A range is answered with those of the edits that
+//! touch its lines alone, so lines either side of it are left as they are
+//! unless a run that adds or removes lines spans them: each edit
 //! leaves a document that parses, so any of them may be made without the
 //! others. A document with a lexical or syntax error is not formatted:
 //! the request fails, saying so and where its first error is, and why is
@@ -81,6 +84,7 @@ pub fn edits(
     let index = LineIndex::new(text);
     let edits = hunks(&old, &new)
         .into_iter()
+        .flat_map(|hunk| per_line(hunk, &old, &new))
         .filter(|(from, _)| {
             // An edit touches the lines if it replaces one of them, or,
             // replacing none, inserts before one or just after the last.
@@ -103,6 +107,24 @@ pub fn edits(
         })
         .collect();
     Ok(edits)
+}
+
+/// `hunk`, a run of lines of `old` replaced by a run of lines of `new`, as
+/// edits a range can be answered with: one a line if it replaces each line
+/// by one (formatting changed their indents or spacing), leaving out the
+/// lines it leaves as they are, else whole (it adds or removes lines).
+fn per_line(
+    (from, to): (Range<usize>, Range<usize>),
+    old: &[&str],
+    new: &[&str],
+) -> Vec<(Range<usize>, Range<usize>)> {
+    if from.len() != to.len() {
+        return vec![(from, to)];
+    }
+    from.zip(to)
+        .filter(|&(before, after)| old.get(before) != new.get(after))
+        .map(|(before, after)| (before..before + 1, after..after + 1))
+        .collect()
 }
 
 /// The span from byte `start` to byte `end`, which a document's text, its
@@ -301,5 +323,20 @@ mod tests {
         let crlf = "x = 1\r\ny = 2\r\n";
         let made = edits("t.gcsl", crlf, Encoding::Utf16, None).unwrap();
         assert_eq!(apply(crlf, &made), "x = 1\ny = 2\n");
+    }
+
+    #[test]
+    fn a_range_leaves_the_lines_either_side_of_it_alone() {
+        // Four lines formatting respaces, one run of the diff: a range of
+        // the middle two has those two edited, and the others kept.
+        let text = "b   =   1\nc   =   2\nd   =   3\ne   =   4\n";
+        let ranged = edits("t.gcsl", text, Encoding::Utf16, Some(&(1..=2))).unwrap();
+        assert_eq!(apply(text, &ranged), "b   =   1\nc = 2\nd = 3\ne   =   4\n");
+        // A run that removes a line is one edit, made whole: the line
+        // respaced with the blank one removed after it.
+        let text = "x = {\n    a=1\n\n\n    b = 2\n}\n";
+        let ranged = edits("t.gcsl", text, Encoding::Utf16, Some(&(2..=2))).unwrap();
+        assert_eq!(ranged.len(), 1, "{ranged:?}");
+        assert_eq!(apply(text, &ranged), "x = {\n    a = 1\n\n    b = 2\n}\n");
     }
 }
