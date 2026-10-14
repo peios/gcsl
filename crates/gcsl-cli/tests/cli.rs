@@ -4063,7 +4063,8 @@ const LSP_EXIT: &str = r#"{"jsonrpc":"2.0","method":"exit"}"#;
 
 /// `gcsl lsp` speaks LSP on stdin and stdout: it answers `initialize` with
 /// its capabilities (diagnostics, hover, go to definition, references,
-/// highlights, rename, symbols, formatting, completion and signature help)
+/// highlights, rename, symbols, formatting, completion, signature help and
+/// inlay hints)
 /// and `shutdown` with null, and exits with code 0 on
 /// `exit` after `shutdown`, and 1 on `exit` alone.
 #[test]
@@ -4076,7 +4077,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"inlayHintProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -4336,4 +4337,165 @@ fn fmt_formats_a_workspace_or_a_directory() {
         "{}",
         stderr(&output)
     );
+}
+
+/// A file with a warning and nothing wrong, whose top-level field runs `sh`
+/// when the file is run.
+const CHECKED: &str = "z = sh(\"touch MARKER\")\np: {x: Int} = {x = 1; y = 2}\n";
+
+/// `gcsl check FILE` checks the file's workspace and runs nothing: no `sh`
+/// of a file that would run, so no marker is made. What it shows is what
+/// `gcsl run` shows of the workspace's diagnostics, then a summary; the
+/// exit code is 0 with warnings alone.
+#[test]
+fn check_runs_nothing_and_shows_what_run_shows() {
+    let scratch = FmtScratch::new("check-runs-nothing");
+    scratch.write("workspace.gcsl", "");
+    scratch.write("app.gcsl", CHECKED);
+    let output = gcsl_in(&scratch.0, &["check", "app.gcsl"], "");
+    let made = scratch.0.join("MARKER").exists();
+    assert!(!made, "`gcsl check` ran `sh`");
+    assert_eq!(stdout(&output), "");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    // `gcsl run` runs it, and shows the same warning.
+    let run = gcsl_in(&scratch.0, &["run", "app.gcsl"], "");
+    assert!(scratch.0.join("MARKER").exists());
+    assert!(stderr(&run).starts_with("warning: field `y` is not in"));
+    assert_eq!(
+        stderr(&output),
+        format!("{}0 errors, 1 warning in 2 files checked\n", stderr(&run))
+    );
+}
+
+/// Each form of path `gcsl check` takes: none (the working directory's
+/// workspace), a directory (every workspace at or under it, nested ones
+/// included, and the one it is in), a file (its workspace, or itself
+/// alone); each workspace once. An error exits with code 1; a path not
+/// there, or no workspace for no paths, with code 2.
+#[test]
+fn check_takes_files_directories_and_nothing() {
+    let scratch = FmtScratch::new("check-paths");
+    scratch.write("workspace.gcsl", "");
+    scratch.write("sub/a.gcsl", "a = 1 + \"s\"\n");
+    scratch.write("nested/workspace.gcsl", "");
+    scratch.write("nested/deeper/workspace.gcsl", "");
+    scratch.write("nested/b.gcsl", CHECKED);
+    scratch.write(".hidden/workspace.gcsl", "");
+    scratch.write(".hidden/h.gcsl", "h = 1 + \"s\"\n");
+    let check = |dir: &str, args: &[&str]| {
+        let mut all = vec!["check"];
+        all.extend_from_slice(args);
+        let output = gcsl_in(&scratch.0.join(dir), &all, "");
+        let summary = stderr(&output).lines().last().unwrap_or("").to_owned();
+        (summary, output)
+    };
+    // No paths: the workspace of the working directory, alone.
+    let (summary, output) = check("sub", &[]);
+    assert_eq!(summary, "1 error, 0 warnings in 2 files checked");
+    assert!(
+        stderr(&output).contains("--> a.gcsl:1:7"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // A directory: the workspace there and those nested in it, but those
+    // under a name starting with `.`.
+    let (summary, output) = check("", &["."]);
+    assert_eq!(summary, "1 error, 1 warning in 5 files checked");
+    assert!(
+        stderr(&output).contains("--> sub/a.gcsl:1:7"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("--> nested/b.gcsl:2:"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // A nested workspace, alone: warnings only, code 0. Given twice, as a
+    // directory and by a file of it, it is checked once.
+    let (summary, output) = check("", &["nested", "nested/b.gcsl"]);
+    assert_eq!(summary, "0 errors, 1 warning in 3 files checked");
+    assert_eq!(output.status.code(), Some(0));
+    // A directory inside a workspace: that workspace.
+    let (summary, _) = check("", &["sub"]);
+    assert_eq!(summary, "1 error, 0 warnings in 2 files checked");
+    // A file of the hidden directory, which is a workspace of its own.
+    let (summary, _) = check("", &[".hidden/h.gcsl"]);
+    assert_eq!(summary, "1 error, 0 warnings in 2 files checked");
+    // A file in no workspace, alone; a path that is not there.
+    let outside = FmtScratch::new("check-outside");
+    outside.write("lone.gcsl", "x = 1\n");
+    let output = gcsl_in(&outside.0, &["check", "lone.gcsl"], "");
+    assert_eq!(stderr(&output), "no problems in 1 file checked\n");
+    assert_eq!(output.status.code(), Some(0));
+    let output = gcsl_in(&outside.0, &["check", "lone.gcsl", "missing.gcsl"], "");
+    assert_eq!(
+        stderr(&output),
+        "error: cannot read missing.gcsl: no such file or directory\n"
+    );
+    assert_eq!(output.status.code(), Some(2));
+    // No paths, and no workspace above.
+    let output = gcsl_in(&outside.0, &["check"], "");
+    assert!(
+        stderr(&output).contains("no `workspace.gcsl`"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(output.status.code(), Some(2));
+}
+
+/// `gcsl check --message-format json` prints each diagnostic as a JSON
+/// object on a line of standard output, columns counted in characters, and
+/// the summary to standard error, rendering nothing.
+#[test]
+fn check_prints_json_lines() {
+    let scratch = FmtScratch::new("check-json");
+    scratch.write("workspace.gcsl", "");
+    scratch.write("app.gcsl", "y = \"é\" + 1\n");
+    scratch.write("b.gcsl", CHECKED);
+    let output = gcsl_in(&scratch.0, &["check", "--message-format", "json"], "");
+    assert_eq!(stderr(&output), "1 error, 1 warning in 3 files checked\n");
+    assert_eq!(output.status.code(), Some(1));
+    let lines: Vec<serde_json::Value> = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let [error, warning] = lines.as_slice() else {
+        panic!("{}", stdout(&output));
+    };
+    assert_eq!(
+        *error,
+        serde_json::json!({
+            "path": "app.gcsl",
+            "severity": "error",
+            "message": "cannot add String and Int",
+            "line": 1,
+            "column": 9,
+            "end_line": 1,
+            "end_column": 10,
+            "labels": [
+                {"path": "app.gcsl", "line": 1, "column": 5, "end_line": 1, "end_column": 8, "text": "String"},
+                {"path": "app.gcsl", "line": 1, "column": 11, "end_line": 1, "end_column": 12, "text": "Int"},
+            ],
+            "notes": [],
+        })
+    );
+    assert_eq!(warning["path"], "b.gcsl");
+    assert_eq!(warning["severity"], "warning");
+    assert_eq!(warning["line"], 2);
+    assert!(
+        !warning["notes"].as_array().unwrap().is_empty(),
+        "{warning}"
+    );
+    // Nothing on standard output for a clean workspace.
+    scratch.write("app.gcsl", "y = 1\n");
+    let output = gcsl_in(
+        &scratch.0,
+        &["check", "--message-format", "json", "app.gcsl"],
+        "",
+    );
+    assert_eq!(stdout(&output).lines().count(), 1);
+    assert_eq!(output.status.code(), Some(0));
 }

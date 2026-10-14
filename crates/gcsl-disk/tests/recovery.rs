@@ -7,7 +7,9 @@
 //! records for it, of a rename's check, of a workspace's symbols and of
 //! doc comments, and a hover, a definition, references and a rename's
 //! preparation at every token of newpkgs and of the mutants, with each
-//! file's symbols (the run is still named for its first two); and the
+//! file's symbols and its inlay hints, asked for whole (the run is still
+//! named for its first two), and the inlay hints of newpkgs, counted, with
+//! examples; and the
 //! scan's recovery from its own errors, over mutants of newpkgs in its
 //! workspace that each make one: a field defined in two files, an import of
 //! no module, files that need each other.
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use gcsl::index::{Index, Indexed};
 use gcsl::names::Names;
 use gcsl::workspace;
-use gcsl::{Diagnostic, SourceFile, lexer, parser};
+use gcsl::{Diagnostic, SourceFile, Span, lexer, parser};
 
 /// Jack's workspace of packages, read and never written.
 const NEWPKGS: &str = "/home/jack/projects/peios/newpkgs";
@@ -482,6 +484,8 @@ struct Asked {
     renamable: usize,
     /// Symbols of the files.
     symbols: usize,
+    /// Inlay hints of the files, each asked for whole.
+    hints: usize,
     /// Places a completion offered something at, of the places asked at
     /// every token's start and end.
     completions: usize,
@@ -503,8 +507,9 @@ impl Asked {
     /// definition, references and a rename's preparation at every token
     /// start of each file of `files`, its index among the files after the
     /// standard ones with its text, for a completion and signature help at
-    /// every token's start and end, and for each file's symbols, recording
-    /// what it finds.
+    /// every token's start and end, and for each file's symbols and its
+    /// inlay hints (each of which must be at a character of its file, with
+    /// a label), recording what it finds.
     fn run(&mut self, what: &str, work: impl FnOnce() -> Option<Index>, files: &[(u32, &str)]) {
         let start = Instant::now();
         let index = panic::catch_unwind(AssertUnwindSafe(work));
@@ -528,6 +533,23 @@ impl Asked {
                 Err(_) => self
                     .failures
                     .push(format!("{what}: file {file}'s symbols panicked")),
+            }
+            let whole = Span::new(0, u32::try_from(text.len()).unwrap());
+            let hints = panic::catch_unwind(AssertUnwindSafe(|| index.inlay_hints(file, whole)));
+            match hints {
+                Ok(hints) => {
+                    self.hints += hints.len();
+                    for hint in hints {
+                        let at = hint.offset as usize;
+                        if at > text.len() || !text.is_char_boundary(at) || hint.label.len() < 3 {
+                            self.failures
+                                .push(format!("{what}: file {file}: inlay hint {hint:?}"));
+                        }
+                    }
+                }
+                Err(_) => self
+                    .failures
+                    .push(format!("{what}: file {file}'s inlay hints panicked")),
             }
             let source = SourceFile::new("t.gcsl", text).unwrap();
             let lexed = lexer::lex(&source, &mut Names::new());
@@ -626,7 +648,7 @@ impl Asked {
         // Completion and signature help at each token's start and end.
         let typed = self.completing / u32::try_from(self.places.max(1) * 2).unwrap_or(u32::MAX);
         println!(
-            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, {} with references, {} renamable, {} symbols; completion and signature help at {} places in {:?} ({typed:?} each), {} with completions, {} with a signature; failures {:?}",
+            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, {} with references, {} renamable, {} symbols, {} inlay hints; completion and signature help at {} places in {:?} ({typed:?} each), {} with completions, {} with a signature; failures {:?}",
             self.indexed,
             self.indexing,
             self.places,
@@ -636,6 +658,7 @@ impl Asked {
             self.references,
             self.renamable,
             self.symbols,
+            self.hints,
             self.places * 2,
             self.completing,
             self.completions,
@@ -739,6 +762,48 @@ fn hovers_everywhere() {
         }
     }
     asked.report("newpkgs mutants in their workspace");
+}
+
+#[test]
+#[ignore = "reads newpkgs; run by hand with --nocapture"]
+fn the_inlay_hints_of_newpkgs() {
+    let thread = std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(|| {
+            let sources = gcsl_disk::read_workspace(Path::new(NEWPKGS), None).unwrap();
+            let files = &sources.relative;
+            let mut index = workspace::index_with_standard(files, &sources.nested, NEWPKGS)
+                .index
+                .unwrap();
+            let mut shown = Vec::new();
+            for (file, source) in (index.standard()..).zip(files) {
+                let whole = Span::new(0, source.len());
+                for hint in index.inlay_hints(file, whole) {
+                    let (line, column) = source.line_col(hint.offset);
+                    let text = source.line_text(line);
+                    let at = text
+                        .char_indices()
+                        .nth(column as usize - 1)
+                        .map_or(text.len(), |(at, _)| at);
+                    shown.push(format!(
+                        "{}:{line}: {}⟨{}⟩{}",
+                        source.name(),
+                        &text[..at],
+                        hint.label,
+                        &text[at..]
+                    ));
+                }
+            }
+            println!("{} inlay hints in {} files", shown.len(), files.len());
+            // Five, spread through them.
+            for at in 0..5 {
+                if let Some(example) = shown.get(shown.len() * at / 5) {
+                    println!("  {}", example.trim_end());
+                }
+            }
+        })
+        .unwrap();
+    thread.join().unwrap();
 }
 
 #[test]

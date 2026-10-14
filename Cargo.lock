@@ -188,6 +188,7 @@ dependencies = [
  "gcsl-disk",
  "gcsl-lsp",
  "rustyline",
+ "serde_json",
 ]
 
 [[package]]

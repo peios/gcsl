@@ -1,6 +1,7 @@
 //! `gcsl`: the command-line interface to the GCSL language.
 //!
 //! With no arguments it starts a REPL; `gcsl run FILE` runs a file; `gcsl
+//! check` checks workspaces and files and runs nothing; `gcsl
 //! fmt` formats files, or checks that they are formatted; `gcsl lsp` is a
 //! language server, speaking LSP on stdin and stdout, which is the
 //! `gcsl-lsp` crate's. All language work is done by the `gcsl` library,
@@ -19,6 +20,7 @@
     clippy::dbg_macro
 )]
 
+mod check;
 mod fmt;
 mod output;
 mod repl;
@@ -46,6 +48,10 @@ struct Cli {
 enum Command {
     /// Run a GCSL file and print its value, unless it is `{}`.
     Run(run::RunArgs),
+    /// Check workspaces and files, as `gcsl run` checks them, and run
+    /// nothing: every error and warning is shown, then a summary line. Exits
+    /// with code 1 if there is any error.
+    Check(check::CheckArgs),
     /// Format GCSL files in place, or with `--check` list those that are
     /// not formatted. A file with a syntax error is left alone.
     Fmt(fmt::FmtArgs),
@@ -54,8 +60,8 @@ enum Command {
     /// go-to-definition, references, highlights, rename (checked before it
     /// is offered; it renames no file or directory), document and workspace
     /// symbols, formatting, completion (after `.`, of names in scope, of
-    /// types, of import paths) and signature help. Checks only: runs
-    /// nothing.
+    /// types, of import paths, of named arguments), signature help and
+    /// inlay hints of the types not written. Checks only: runs nothing.
     Lsp,
 }
 
@@ -72,6 +78,7 @@ fn main() -> ExitCode {
         .spawn(move || match cli.command {
             None => repl::main(),
             Some(Command::Run(args)) => run::main(&args),
+            Some(Command::Check(args)) => check::main(&args),
             Some(Command::Fmt(args)) => fmt::main(&args),
             Some(Command::Lsp) => gcsl_lsp::stdio(),
         });

@@ -19,8 +19,9 @@
 //! (with `prepareProvider`), `documentSymbolProvider`,
 //! `workspaceSymbolProvider`, `documentFormattingProvider`,
 //! `documentRangeFormattingProvider`, `completionProvider` (triggered by
-//! `.`, with no `completionItem/resolve`) and `signatureHelpProvider`
-//! (triggered by `(` and `,`, retriggered by `,`). It answers `shutdown`, and any
+//! `.`, with no `completionItem/resolve`), `signatureHelpProvider`
+//! (triggered by `(` and `,`, retriggered by `,`) and `inlayHintProvider`
+//! (with no `inlayHint/resolve`). It answers `shutdown`, and any
 //! request after it with an error; `exit` ends it, cleanly after a
 //! `shutdown`, else not ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
@@ -30,7 +31,8 @@
 //!
 //! QUERIES. `textDocument/hover`, `definition`, `references`,
 //! `documentHighlight`, `prepareRename`, `rename`, `documentSymbol`,
-//! `completion` and `signatureHelp`, and `workspace/symbol`, are answered
+//! `completion`, `signatureHelp` and `inlayHint`, and `workspace/symbol`,
+//! are answered
 //! from the index the latest check of the document's workspace, or lone
 //! file, made (see [`gcsl::index`]):
 //!
@@ -64,14 +66,29 @@
 //!   under the path; elsewhere every name in scope, nearest first by
 //!   `sortText` (locals, the file's, its directories', imported, the
 //!   standard library's, then keywords); each with its kind, its type as
-//!   `detail` and its doc comment, and an `insertText` only for a name
-//!   that must be quoted. Nothing, an empty list, in a string or a comment
-//!   or where a name is declared;
-//! - signature help as one signature, the callee's, each parameter as
+//!   `detail` and its doc comment, an `insertText` only for a name
+//!   that must be quoted, and a `textEdit` over the name the place is in,
+//!   by GCSL's rules for names (`-` is part of one, so `odd.libcap-t`
+//!   completes to `odd.libcap-tools`): an `InsertReplaceEdit` if the client
+//!   supports them (`completionItem.insertReplaceSupport`), inserting over
+//!   what is typed of the name and replacing all of it, else a `TextEdit`
+//!   over what is typed. Where an argument of a call starts, the named
+//!   arguments not filled come first, `name = `, of kind `Property`.
+//!   Nothing, an empty list, in a string or a comment or where a name is
+//!   declared;
+//! - signature help as one signature, the callee's, its parameters'
+//!   defaults as written, each parameter as
 //!   offsets in its label, counted in the negotiated encoding, with the
 //!   active parameter: the one a named argument names, else the next one
 //!   the arguments before the place have not filled; in a trailing block,
-//!   the last;
+//!   the last, one left open while it is typed included (the workspace is
+//!   indexed again for it with the block closed);
+//! - inlay hints as `InlayHint[]`, those whose positions are in the range
+//!   asked for, its ends included: the types the document does not write
+//!   (a `let`'s, a `for` variable's, a definition's parameters' and
+//!   result's; see the library's [Inlay hints](gcsl::index#inlay-hints)),
+//!   each of kind `Type`, its label `: Int` (a result's as GCSL writes it
+//!   after a `)`, ` -> Int` for an impure one), with no padding;
 //!
 //! and `null` for nothing there, for a hover of what has no type the check
 //! found, for a definition of what the standard library or a built-in
@@ -96,8 +113,11 @@
 //! `textDocument/rangeFormatting` with those of them that touch the range's
 //! lines (see [`formatting`]). The formatting options the client sends are
 //! not read: GCSL has one style. A document with a lexical or syntax error
-//! is answered with no edits, and why is logged; one that is not open with
-//! `null`.
+//! is answered with an error, `RequestFailed`, whose message says why and
+//! where its first error is, `not formatted: it has a syntax error
+//! (LINE:COL)`, the line and the column in characters counted from 1, so
+//! that an editor can tell the user (why is logged too); one that is not
+//! open with `null`.
 //!
 //! SOURCES. It keeps the text of each open document, applying incremental
 //! changes in the negotiated encoding. A `.gcsl` file is a file of the
@@ -208,8 +228,8 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition,
-    HoverRequest, PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename,
-    Request as _, SignatureHelpRequest, WorkspaceSymbolRequest,
+    HoverRequest, InlayHintRequest, PrepareRenameRequest, RangeFormatting, References,
+    RegisterCapability, Rename, Request as _, SignatureHelpRequest, WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CancelParams, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
@@ -217,8 +237,8 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentFormattingParams, DocumentHighlightParams, DocumentRangeFormattingParams,
     DocumentSymbolParams, FileSystemWatcher, GlobPattern, HoverProviderCapability,
-    InitializeResult, NumberOrString, OneOf, Position, ReferenceParams, Registration,
-    RegistrationParams, RenameOptions, RenameParams, ServerCapabilities, ServerInfo,
+    InitializeResult, InlayHintParams, NumberOrString, OneOf, Position, ReferenceParams,
+    Registration, RegistrationParams, RenameOptions, RenameParams, ServerCapabilities, ServerInfo,
     SignatureHelpOptions, SignatureHelpParams, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
     TextDocumentSyncSaveOptions, Uri, WorkspaceSymbolParams,
@@ -325,12 +345,16 @@ fn serve_counting(connection: &Connection, checks: &Arc<AtomicUsize>) -> Result<
         .pointer("/capabilities/workspace/didChangeWatchedFiles/dynamicRegistration")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let insert_replace = params
+        .pointer("/capabilities/textDocument/completion/completionItem/insertReplaceSupport")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     connection.initialize_finish(id, initialize_result(encoding))?;
     let (done, finished) = crossbeam_channel::unbounded();
     // Without the client watching files, the worker looks at them itself.
     let (jobs, worker) = worker::spawn(
         connection.sender.clone(),
-        (encoding, !watch),
+        (encoding, !watch, insert_replace),
         Arc::clone(checks),
         done,
     )
@@ -389,6 +413,7 @@ fn initialize_result(encoding: Encoding) -> Value {
                 retrigger_characters: Some(vec![",".to_owned()]),
                 work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
             }),
+            inlay_hint_provider: Some(OneOf::Left(true)),
             ..ServerCapabilities::default()
         },
         server_info: Some(ServerInfo {
@@ -703,6 +728,7 @@ impl Server<'_> {
             | DocumentSymbolRequest::METHOD
             | Completion::METHOD
             | SignatureHelpRequest::METHOD
+            | InlayHintRequest::METHOD
             | WorkspaceSymbolRequest::METHOD => return self.ask(request),
             Formatting::METHOD | RangeFormatting::METHOD => self.format(request),
             method => Response::new_err(
@@ -763,9 +789,11 @@ impl Server<'_> {
     /// the document's text as the server has it (see [`formatting`]): the
     /// edits that format it, those that touch the range's lines for a
     /// range (its last line left out when the range ends at its start, as a
-    /// selection of whole lines does). A document with an error has none,
-    /// why logged, and a document that is not open has nothing to say:
-    /// `null`. Parameters that cannot be read are `InvalidParams`.
+    /// selection of whole lines does). A document with a lexical or syntax
+    /// error is refused with `RequestFailed`, `not formatted: it has a syntax
+    /// error (LINE:COL)`, at its first error, why logged too; a document that
+    /// is not open has nothing to say: `null`. Parameters that cannot be read
+    /// are `InvalidParams`.
     fn format(&self, request: Request) -> Response {
         let Request { id, method, params } = request;
         let read = if method == RangeFormatting::METHOD {
@@ -795,8 +823,10 @@ impl Server<'_> {
         let Some(document) = self.documents.get(uri.as_str()) else {
             return Response::new_ok(id, Value::Null);
         };
-        let edits = formatting::edits(uri.as_str(), &document.text, self.encoding, lines.as_ref());
-        Response::new_ok(id, edits.unwrap_or_default())
+        match formatting::edits(uri.as_str(), &document.text, self.encoding, lines.as_ref()) {
+            Ok(edits) => Response::new_ok(id, edits),
+            Err(why) => Response::new_err(id, ErrorCode::RequestFailed as i32, why),
+        }
     }
 
     /// A `$/cancelRequest` of the request `id`: answered with
@@ -1043,6 +1073,11 @@ fn asked(method: &str, params: Value) -> serde_json::Result<(Uri, Position, Aske
         SignatureHelpRequest::METHOD => {
             let params: SignatureHelpParams = serde_json::from_value(params)?;
             at(params.text_document_position_params, Asked::SignatureHelp)
+        }
+        InlayHintRequest::METHOD => {
+            let params: InlayHintParams = serde_json::from_value(params)?;
+            let (start, end) = (params.range.start, params.range.end);
+            (params.text_document.uri, start, Asked::InlayHints(end))
         }
         _ => at(serde_json::from_value(params)?, Asked::Hover),
     })
@@ -1302,6 +1337,7 @@ mod tests {
         assert_eq!(capabilities["workspaceSymbolProvider"], true);
         assert_eq!(capabilities["documentFormattingProvider"], true);
         assert_eq!(capabilities["documentRangeFormattingProvider"], true);
+        assert_eq!(capabilities["inlayHintProvider"], true);
         assert_eq!(result["serverInfo"]["name"], "gcsl");
         client.shut_down().unwrap();
     }
@@ -1835,6 +1871,125 @@ mod tests {
     }
 
     #[test]
+    fn completions_edit_the_whole_name_and_offer_named_arguments() {
+        let scratch = Scratch::workspace("completion-edits", "");
+        let text = "odd.libcap-tools = 1\nodd.other = 2\nr = odd.libcap-t\n\
+                    s = {\"a b\" = 1}\nq = s.\ndef f(a: Int, b: Int = 2): Int { a }\n\
+                    n = f(1, )\ndef pair(a: String, body: {x: Int}): String { a }\n";
+        let uri = scratch.write("app.gcsl", text);
+        let item = |list: &Value, label: &str| {
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["label"] == label)
+                .unwrap_or_else(|| panic!("no {label} in {list}"))
+                .clone()
+        };
+        let as_edit =
+            |edit: &Value| -> lsp_types::TextEdit { serde_json::from_value(edit.clone()).unwrap() };
+        // A client without `insertReplaceSupport`: a `TextEdit` over what is
+        // typed of the name, `-` and all.
+        let (mut client, _) = Client::start(&["utf-16"]);
+        client.open(&uri, text);
+        let list = client.ask("textDocument/completion", &uri, (2, 16));
+        let edit = as_edit(&item(&list, "libcap-tools")["textEdit"]);
+        assert_eq!(edit.range, range((2, 8), (2, 16)));
+        assert_eq!(edit.new_text, "libcap-tools");
+        // A quoted name is written quoted.
+        let list = client.ask("textDocument/completion", &uri, (4, 6));
+        let edit = as_edit(&item(&list, "a b")["textEdit"]);
+        assert_eq!(edit.range, range((4, 6), (4, 6)));
+        assert_eq!(edit.new_text, "\"a b\"");
+        // A named argument, first, with its type.
+        let list = client.ask("textDocument/completion", &uri, (6, 9));
+        let named = &list["items"][0];
+        assert_eq!(named["label"], "b =");
+        assert_eq!(
+            named["kind"],
+            json!(lsp_types::CompletionItemKind::PROPERTY)
+        );
+        assert_eq!(named["detail"], "Int");
+        assert_eq!(as_edit(&named["textEdit"]).new_text, "b = ");
+        // Signature help in a trailing block left open at the end.
+        client.change(&uri, 2, ((8, 0), (8, 0)), "p = pair(\"a\") {");
+        let help = client.ask("textDocument/signatureHelp", &uri, (8, 15));
+        assert_eq!(
+            help["signatures"][0]["label"],
+            "def pair(a: String, body: {x: Int}): String"
+        );
+        assert_eq!(help["activeParameter"], 1);
+        client.shut_down().unwrap();
+        // A client with it: an `InsertReplaceEdit`, from the middle of the
+        // name.
+        let capabilities = json!({
+            "general": { "positionEncodings": ["utf-16"] },
+            "textDocument": { "completion": { "completionItem": { "insertReplaceSupport": true } } },
+        });
+        let (mut client, _) = Client::start_with(&capabilities);
+        client.open(&uri, text);
+        let list = client.ask("textDocument/completion", &uri, (2, 11));
+        let edit: lsp_types::InsertReplaceEdit =
+            serde_json::from_value(item(&list, "libcap-tools")["textEdit"].clone()).unwrap();
+        assert_eq!(edit.insert, range((2, 8), (2, 11)));
+        assert_eq!(edit.replace, range((2, 8), (2, 16)));
+        assert_eq!(edit.new_text, "libcap-tools");
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn inlay_hints_are_of_the_range_asked_for_and_of_the_text_as_it_is() {
+        let scratch = Scratch::workspace("inlay", "");
+        // `é` is two bytes and one UTF-16 unit.
+        let text = "fn f(): Int { 1 }\nlet a = f()\nlet s = \"é\"; let b = f()\nx = f()\n";
+        let uri = scratch.write("app.gcsl", text);
+        let hints = |client: &mut Client, (start, end): ((u32, u32), (u32, u32))| {
+            let params = json!({ "textDocument": { "uri": uri }, "range": range(start, end) });
+            let found = client
+                .request("textDocument/inlayHint", params)
+                .response_result
+                .unwrap();
+            let found: Vec<lsp_types::InlayHint> = serde_json::from_value(found).unwrap();
+            found
+                .into_iter()
+                .map(|hint| {
+                    assert_eq!(hint.kind, Some(lsp_types::InlayHintKind::TYPE));
+                    assert_eq!(hint.padding_left, Some(false));
+                    let lsp_types::InlayHintLabel::String(label) = hint.label else {
+                        panic!("{:?}", hint.label)
+                    };
+                    (hint.position, label)
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut client, _) = Client::start(&["utf-16"]);
+        client.open(&uri, text);
+        let at = |line, character| Position::new(line, character);
+        assert_eq!(
+            hints(&mut client, ((0, 0), (4, 0))),
+            [
+                (at(1, 5), ": Int".to_owned()),
+                (at(2, 18), ": Int".to_owned())
+            ]
+        );
+        assert_eq!(
+            hints(&mut client, ((2, 0), (3, 0))),
+            [(at(2, 18), ": Int".to_owned())]
+        );
+        // Edited: answered from the text as it is now.
+        client.change(&uri, 2, ((0, 8), (0, 11)), "String");
+        client.change(&uri, 3, ((0, 17), (0, 18)), "\"s\"");
+        assert_eq!(
+            hints(&mut client, ((0, 0), (4, 0))),
+            [
+                (at(1, 5), ": String".to_owned()),
+                (at(2, 18), ": String".to_owned())
+            ]
+        );
+        client.shut_down().unwrap();
+    }
+
+    #[test]
     fn whitespace_and_keywords_have_nothing() {
         let scratch = Scratch::workspace("nothing-there", "");
         let text = "fn f(a: Int): Int {  a }\nr = f(1)\n";
@@ -2186,7 +2341,7 @@ mod tests {
     }
 
     #[test]
-    fn a_messy_document_is_formatted_by_lines_and_a_broken_one_not() {
+    fn a_messy_document_is_formatted_by_lines_and_a_broken_one_refused() {
         let scratch = Scratch::workspace("format", "");
         // On disk, the file is formatted: the document's own text is.
         let uri = scratch.write("app.gcsl", "x = 1\n");
@@ -2220,12 +2375,22 @@ mod tests {
             "range": range((0, 0), (1, 3)),
             "options": options,
         });
-        let response = client.request("textDocument/rangeFormatting", ranged);
+        let response = client.request("textDocument/rangeFormatting", ranged.clone());
         assert_eq!(formatting_edits(&response), []);
-        // With a syntax error: no edits.
+        // With a syntax error: refused, saying where the first is, whole or
+        // by a range.
         client.change(&uri, 2, ((9, 4), (9, 5)), "(");
-        let response = client.request("textDocument/formatting", whole);
-        assert_eq!(formatting_edits(&response), []);
+        for (method, params) in [
+            ("textDocument/formatting", whole),
+            ("textDocument/rangeFormatting", ranged),
+        ] {
+            let error = client.request(method, params).response_result.unwrap_err();
+            assert_eq!(error.code, ErrorCode::RequestFailed as i32, "{method}");
+            assert_eq!(
+                error.message, "not formatted: it has a syntax error (10:6)",
+                "{method}"
+            );
+        }
         // A document not open: nothing to say.
         let other = scratch.write("other.gcsl", "y  =  2\n");
         let params = json!({ "textDocument": { "uri": other }, "options": options });

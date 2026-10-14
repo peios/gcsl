@@ -6,8 +6,8 @@
 //! the snapshot of the open documents of one workspace, or of one lone
 //! file, as they are when it is handed over; a [`Query`], a hover, a
 //! definition, references, highlights, a rename or its preparation, a
-//! document's symbols, a completion or signature help asked of an open
-//! document, with such a snapshot; a
+//! document's symbols, a completion, signature help or inlay hints asked of
+//! an open document, with such a snapshot; a
 //! [`Job::Symbols`], `workspace/symbol`, with a snapshot of every
 //! workspace and lone file known; or a [`Job::Clear`] of a workspace or
 //! lone file there is no more to say of. It says on its `done` channel when
@@ -82,11 +82,12 @@ use gcsl_disk::{ReadError, Sources};
 use lsp_server::{ErrorCode, Message, Notification, RequestId, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics, ShowMessage};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionList, DiagnosticRelatedInformation,
-    DiagnosticSeverity, DocumentHighlight, DocumentHighlightKind, Documentation,
-    GotoDefinitionResponse, Hover, HoverContents, Location, MarkupContent, MarkupKind, MessageType,
-    OneOf, ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams,
-    ShowMessageParams, SignatureHelp, SignatureInformation, TextEdit, Uri, WorkspaceSymbol,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionTextEdit,
+    DiagnosticRelatedInformation, DiagnosticSeverity, DocumentHighlight, DocumentHighlightKind,
+    Documentation, GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind,
+    InlayHintLabel, InsertReplaceEdit, Location, MarkupContent, MarkupKind, MessageType, OneOf,
+    ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams, ShowMessageParams,
+    SignatureHelp, SignatureInformation, TextEdit, Uri, WorkspaceSymbol,
 };
 use serde_json::{Map, Value, json};
 
@@ -163,6 +164,9 @@ pub enum Asked {
     Completion,
     /// `textDocument/signatureHelp`.
     SignatureHelp,
+    /// `textDocument/inlayHint`, of the range from the query's position to
+    /// this one.
+    InlayHints(Position),
 }
 
 /// The most symbols a `workspace/symbol` answers with.
@@ -217,8 +221,9 @@ pub enum Job {
 /// when it has done a check or a query, positions counted in `encoding`,
 /// and counts each check it makes in `checks`; it makes a stat pass before
 /// each check of a workspace if `stat`, when the client does not watch
-/// files for the server. Returns where to send it jobs: it stops once that
-/// is dropped, or `done` is.
+/// files for the server, and gives completions `InsertReplaceEdit`s if
+/// `insert_replace`, when the client supports them. Returns where to send
+/// it jobs: it stops once that is dropped, or `done` is.
 ///
 /// Its thread has the stack the `gcsl` library asks for
 /// ([`gcsl::STACK_SIZE`]), since a check recurses once per level of
@@ -229,7 +234,7 @@ pub enum Job {
 /// The thread cannot be started.
 pub fn spawn(
     client: Sender<Message>,
-    (encoding, stat): (Encoding, bool),
+    (encoding, stat, insert_replace): (Encoding, bool, bool),
     checks: Arc<AtomicUsize>,
     done: Sender<()>,
 ) -> io::Result<(Sender<Job>, JoinHandle<()>)> {
@@ -240,6 +245,7 @@ pub fn spawn(
             client,
             encoding,
             stat,
+            insert_replace,
             checks,
             disk: HashMap::new(),
             published: HashMap::new(),
@@ -299,6 +305,9 @@ struct Worker {
     /// Whether a stat pass is made before each check of a workspace: the
     /// client does not watch files for the server.
     stat: bool,
+    /// Whether completions have `InsertReplaceEdit`s, the client supporting
+    /// them; else `TextEdit`s.
+    insert_replace: bool,
     /// How many checks have been made.
     checks: Arc<AtomicUsize>,
     /// Each workspace's files as last read, by root, or why they could not
@@ -417,7 +426,7 @@ impl Worker {
         let key = check.key.clone();
         self.refresh(check);
         let answer = match self.indexes.get_mut(&key) {
-            Some(kept) => kept.answer(asked, &uri, position, self.encoding),
+            Some(kept) => kept.answer(asked, &uri, position, (self.encoding, self.insert_replace)),
             None => Ok(Value::Null),
         };
         let response = match answer {
@@ -777,8 +786,9 @@ impl Kept {
 
     /// The answer to `asked` at `position` of the document `uri`, counted
     /// in `encoding`: a hover, a location or locations, highlights, a
-    /// rename's range or edits, symbols, or JSON's `null` for nothing
-    /// there.
+    /// rename's range or edits, symbols, completions (each with an
+    /// `InsertReplaceEdit` if `insert_replace`, the client supporting them,
+    /// else a `TextEdit`), or JSON's `null` for nothing there.
     ///
     /// # Errors
     ///
@@ -788,7 +798,7 @@ impl Kept {
         asked: Asked,
         uri: &Uri,
         position: Position,
-        encoding: Encoding,
+        (encoding, insert_replace): (Encoding, bool),
     ) -> Result<Value, String> {
         let input = self
             .uris
@@ -845,20 +855,9 @@ impl Kept {
                     .collect();
                 Some(serde_json::to_value(locations))
             }
-            Asked::Highlight => {
-                let highlights: Vec<DocumentHighlight> = index
-                    .highlights(file, offset)
-                    .into_iter()
-                    .map(|found| DocumentHighlight {
-                        range: lines.range(found.span, encoding),
-                        kind: Some(if found.write {
-                            DocumentHighlightKind::WRITE
-                        } else {
-                            DocumentHighlightKind::READ
-                        }),
-                    })
-                    .collect();
-                Some(serde_json::to_value(highlights))
+            Asked::Highlight | Asked::DocumentSymbols | Asked::InlayHints(_) => {
+                let at = (file, offset);
+                Some(of_document(index, &asked, at, (&lines, encoding)))
             }
             Asked::PrepareRename => {
                 let prepared = index.prepare_rename(file, offset)?;
@@ -872,16 +871,14 @@ impl Kept {
                 let edits = index.rename((file, offset), &new, |renamed| again.index(renamed))?;
                 Some(Ok(workspace_edit(edits, &mut places)?))
             }
-            Asked::DocumentSymbols => {
-                let symbols: Vec<Value> = index
-                    .document_symbols(file)
-                    .iter()
-                    .map(|symbol| symbol_json(symbol, &lines, encoding))
-                    .collect();
-                Some(Ok(Value::Array(symbols)))
-            }
             Asked::Completion | Asked::SignatureHelp => {
-                Some(typing(index, &asked, (file, offset), encoding))
+                let typed = Typed {
+                    lines: &lines,
+                    text: source.text(),
+                    encoding,
+                    insert_replace,
+                };
+                Some(typing(index, &asked, (file, offset), &typed, &self.again))
             }
         };
         Ok(answer.and_then(Result::ok).unwrap_or(Value::Null))
@@ -997,26 +994,120 @@ fn symbol_json(symbol: &DocumentSymbol, lines: &LineIndex<'_>, encoding: Encodin
     shown
 }
 
+/// The answer of `index` to `asked`, highlights, a document's symbols or its
+/// inlay hints, of the file of input number `file`, at its byte `offset`
+/// (where the range of the hints starts), whose lines are `lines`,
+/// positions counted in `encoding`. An inlay hint is of kind `Type`, its
+/// label as [`Index::inlay_hints`] makes it, with no padding.
+fn of_document(
+    index: &mut Index,
+    asked: &Asked,
+    (file, offset): (u32, u32),
+    (lines, encoding): (&LineIndex<'_>, Encoding),
+) -> serde_json::Result<Value> {
+    match asked {
+        Asked::InlayHints(end) => {
+            let end = u32::try_from(lines.offset(*end, encoding)).unwrap_or(u32::MAX);
+            let hints: Vec<InlayHint> = index
+                .inlay_hints(file, Span::new(offset, end))
+                .into_iter()
+                .map(|hint| InlayHint {
+                    position: lines
+                        .range(Span::new(hint.offset, hint.offset), encoding)
+                        .start,
+                    label: InlayHintLabel::String(hint.label),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: Some(false),
+                    padding_right: Some(false),
+                    data: None,
+                })
+                .collect();
+            serde_json::to_value(hints)
+        }
+        Asked::Highlight => {
+            let highlights: Vec<DocumentHighlight> = index
+                .highlights(file, offset)
+                .into_iter()
+                .map(|found| DocumentHighlight {
+                    range: lines.range(found.span, encoding),
+                    kind: Some(if found.write {
+                        DocumentHighlightKind::WRITE
+                    } else {
+                        DocumentHighlightKind::READ
+                    }),
+                })
+                .collect();
+            serde_json::to_value(highlights)
+        }
+        _ => {
+            let symbols: Vec<Value> = index
+                .document_symbols(file)
+                .iter()
+                .map(|symbol| symbol_json(symbol, lines, encoding))
+                .collect();
+            Ok(Value::Array(symbols))
+        }
+    }
+}
+
+/// The document a completion or signature help is asked of, as an answer
+/// needs it.
+struct Typed<'a> {
+    /// Its lines.
+    lines: &'a LineIndex<'a>,
+    /// Its text.
+    text: &'a str,
+    /// The encoding positions are counted in.
+    encoding: Encoding,
+    /// Whether the client takes an `InsertReplaceEdit` for a completion.
+    insert_replace: bool,
+}
+
 /// The answer of `index` to `asked`, a completion or signature help, at
-/// byte `offset` of the file of input number `file`, positions counted in
-/// `encoding`: a `CompletionList`, empty for nothing to offer, or a
-/// `SignatureHelp`, `null` for no call there.
+/// byte `offset` of the file of input number `file`, of the document
+/// `typed`: a `CompletionList`, empty for nothing to offer, or a
+/// `SignatureHelp`, `null` for no call there. In a file not indexed, its
+/// braces not matching, signature help is looked for in what is indexed
+/// `again` with them closed at the place, as a trailing block left open
+/// needs ([`Index::signature_closing`]).
 fn typing(
     index: &Index,
     asked: &Asked,
     (file, offset): (u32, u32),
-    encoding: Encoding,
+    typed: &Typed<'_>,
+    again: &Again,
 ) -> serde_json::Result<Value> {
     if *asked == Asked::SignatureHelp {
-        return match index.signature(file, offset) {
-            Some(found) => serde_json::to_value(signature_help(&found, encoding)),
+        return match index.signature_closing(file, offset, |files| again.index(files)) {
+            Some(found) => serde_json::to_value(signature_help(&found, typed.encoding)),
             None => Ok(Value::Null),
         };
     }
+    // What each item's edit writes over: the name typed before the place,
+    // or all of the name the place is in.
+    let name = gcsl::index::name_around(typed.text, offset);
+    let insert = typed
+        .lines
+        .range(Span::new(name.start, offset), typed.encoding);
+    let replace = typed.lines.range(name, typed.encoding);
     let items = index
         .completion(file, offset)
         .into_iter()
-        .map(completion_item)
+        .map(|found| {
+            let new_text = found.insert.clone().unwrap_or_else(|| found.label.clone());
+            let edit = if typed.insert_replace {
+                CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
+                    new_text,
+                    insert,
+                    replace,
+                })
+            } else {
+                CompletionTextEdit::Edit(TextEdit::new(insert, new_text))
+            };
+            completion_item(found, edit)
+        })
         .collect();
     serde_json::to_value(CompletionList {
         is_incomplete: false,
@@ -1025,9 +1116,9 @@ fn typing(
 }
 
 /// `found`, a completion, as LSP's `CompletionItem`: its label, kind,
-/// detail, documentation as Markdown, the text it is ordered by, and what
-/// is written, if that is not its label.
-fn completion_item(found: Completion) -> CompletionItem {
+/// detail, documentation as Markdown, the text it is ordered by, what is
+/// written, if that is not its label, and `edit`, which writes it.
+fn completion_item(found: Completion, edit: CompletionTextEdit) -> CompletionItem {
     let kind = match found.kind {
         CompletionKind::Variable => CompletionItemKind::VARIABLE,
         CompletionKind::Field => CompletionItemKind::FIELD,
@@ -1035,6 +1126,7 @@ fn completion_item(found: Completion) -> CompletionItem {
         CompletionKind::Module => CompletionItemKind::MODULE,
         CompletionKind::Type => CompletionItemKind::STRUCT,
         CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+        CompletionKind::Argument => CompletionItemKind::PROPERTY,
     };
     CompletionItem {
         label: found.label,
@@ -1048,6 +1140,7 @@ fn completion_item(found: Completion) -> CompletionItem {
         }),
         sort_text: Some(found.sort),
         insert_text: found.insert,
+        text_edit: Some(edit),
         ..CompletionItem::default()
     }
 }

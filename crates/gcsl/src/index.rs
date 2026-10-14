@@ -188,10 +188,15 @@
 //! half-typed for it, `a.` and `f(` (see the parser's [Errors and
 //! recovery](crate::parser#errors-and-recovery)), so what is before the
 //! place is checked and indexed. The tokens before the place, the word
-//! being typed at it set aside (the client filters by it), say what the
-//! place is, and so what is offered, each a [`Completion`] with its kind, its
+//! being typed at it set aside (the client filters by it; a name typed up
+//! to a `-`, `libcap-`, which the lexer takes for a `-` that is ambiguous,
+//! is such a word too), say what the place is, and so what is offered, each
+//! a [`Completion`] with its kind, its
 //! type on one line cut to 60 characters, its doc comment (see
-//! "Documentation"), and its name quoted if it is no identifier:
+//! "Documentation"), and its name quoted if it is no identifier. What a
+//! completion writes over is the name the place is in, by GCSL's rules for
+//! names, a `-` between letters part of it ([`name_around`]): from its start
+//! to the place, or to its end, as the client chooses:
 //!
 //! - In a comment or in a string's text, nothing. Nor where a name is
 //!   declared (after `let`, `mut`, `fn`, `def`, `for`, at a function's or a
@@ -220,7 +225,11 @@
 //!   `type` item's `=`: the types of the file's view, then the built-in
 //!   types; after `lib.` there, the types of the module `lib` imports.
 //! - Anywhere else, a name of an expression: everything in scope, each name
-//!   once, the nearest, ordered by group ([`Completion::sort`]): the locals
+//!   once, the nearest, ordered by group ([`Completion::sort`]): where an
+//!   argument of a call starts (after its `(` or a `,` of its argument
+//!   list), first the named arguments, `name = `, of the callee's
+//!   parameters no other argument fills (as signature help counts them;
+//!   none for `len` and `show`); the locals
 //!   (the `let`s, `fn`s and fields of each block around the place before
 //!   the item it is in, the parameters of each function whose body it is
 //!   in, the variable of each `for` whose body or guard it is in), rebuilt
@@ -228,7 +237,34 @@
 //!   the check recorded; then the file's own top-level `let`s before the
 //!   place, `fn`s and fields; its directories' fields; what it imports; the
 //!   standard library's, the prelude's names; and the keywords an
-//!   expression or an item may start with.
+//!   expression or an item may start with. The field being declared, the
+//!   top-level field named by one segment whose value the place is in, is
+//!   not offered, as no block's item is before its own end; a `def` or a
+//!   `fn`, which may call itself, is.
+//!
+//! # Inlay hints
+//!
+//! A file's INLAY HINTS ([`Index::inlay_hints`]) are the types it does not
+//! write, each shown where it would be written, read from what its check
+//! recorded of its declarations: `: Int` after the name of a `let` or a
+//! `let mut` named by one segment and written without a type, and after
+//! the variable of a `for`; and for a definition made with a def-type,
+//! whose parameters are written by name alone and whose result is not
+//! written, `: Int` after each parameter, and its result after its `)` as
+//! GCSL writes one after its marker, `: Int`, ` ->> Int` or ` -> Int`,
+//! as the def-type declares it. GCSL's other functions write their
+//! parameters' and results' types, as must be, so a function expression has
+//! none, and neither has a call's argument: arguments are often named
+//! already. They are conservative: a field has none (a configuration is
+//! mostly fields, `version = "1"`), nor has a `let` whose value spells its
+//! type (a literal, a negated number among them; a list written out; a
+//! record block; a function expression; an ascription or an `as`), nor a
+//! type the check did not find or found erroneous anywhere in it, nor one
+//! longer than [`MAX_HINT`] characters (cut short, a definition's record
+//! result would say nothing useful, and sit on most definitions). A type
+//! is shown as a source writes it, without the either shape (`T |
+//! Future<T>`) or a provisional layer that stands for a `T` written, on one
+//! line. A file not indexed has none.
 //!
 //! # Signature help
 //!
@@ -244,15 +280,22 @@
 //! [`Signature`] is the callee as written, a `def`'s with `def`, each
 //! parameter named as its source names it and typed as written (a
 //! parameter that accepts a future too shows the type it is declared
-//! with), with its doc comment. Its active parameter is the one a named
+//! with), with its default as written, `mid: String = "é"`, where the
+//! source is known (a `def`'s, a local function's), the parameter's offsets
+//! covering it, with its doc comment. Its active parameter is the one a named
 //! argument names, `name = ...`, when the place is in one; else the next one
 //! not yet filled, from the left, by a positional argument before the
 //! place, nor anywhere by a named one, nor, the last, by a trailing block;
 //! in a trailing block, the last. The arguments are counted on the tokens,
-//! so a list half-typed counts as it is written.
+//! so a list half-typed counts as it is written. A trailing block left
+//! open, `pair("a", "b") {` while it is typed, leaves the file's braces
+//! unmatched, so the file has nothing indexed: [`Index::signature_closing`]
+//! then indexes the workspace again with the file's open braces closed at
+//! the place, as an editor closing them would, and answers from that.
 
 mod complete;
 mod docs;
+mod inlay;
 mod rename;
 mod signature;
 mod symbols;
@@ -262,7 +305,8 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-pub use complete::{Completion, CompletionKind};
+pub use complete::{Completion, CompletionKind, name_around};
+pub use inlay::{InlayHint, MAX_HINT};
 pub use rename::{Edit, Prepared};
 pub use signature::Signature;
 pub use symbols::{DocumentSymbol, FoundSymbol, SymbolKind};

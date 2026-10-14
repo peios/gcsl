@@ -233,7 +233,7 @@ fn run_alone(args: &RunArgs, source: &SourceFile) -> ExitCode {
 /// `/` but for `/` itself, and lossily if it is not UTF-8. The working
 /// directory, canonical, when the file's cannot be found, as for a file
 /// that is no file on disk.
-fn file_dir(file: &Path) -> String {
+pub(crate) fn file_dir(file: &Path) -> String {
     fs::canonicalize(file)
         .ok()
         .and_then(|file| file.parent().map(|dir| dir.to_string_lossy().into_owned()))

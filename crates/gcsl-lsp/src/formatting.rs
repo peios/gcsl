@@ -8,7 +8,8 @@
 //! and its cursor on the lines formatting leaves alone. A range is
 //! answered with those of the edits that touch its lines alone: each edit
 //! leaves a document that parses, so any of them may be made without the
-//! others. A document with a lexical or syntax error has no edits; why is
+//! others. A document with a lexical or syntax error is not formatted:
+//! the request fails, saying so and where its first error is, and why is
 //! logged.
 //!
 //! The diff is Myers's, on the lines left once those the two texts start
@@ -30,28 +31,40 @@ pub const MAX_DIFFERENCES: usize = 256;
 
 /// The edits that format `text`, a document's, named `name` for what is
 /// logged, positions counted in `encoding`; with `lines`, only those that
-/// touch those lines, counted from 0. `None`, logged, if it has errors.
-#[must_use]
+/// touch those lines, counted from 0.
+///
+/// # Errors
+///
+/// Why it is not formatted, logged too: it has a lexical or syntax error,
+/// `not formatted: it has a syntax error (LINE:COL)`, at the first one's
+/// place, its line and its column in characters counted from 1; or it is
+/// too long to be a source.
 pub fn edits(
     name: &str,
     text: &str,
     encoding: Encoding,
     lines: Option<&RangeInclusive<usize>>,
-) -> Option<Vec<TextEdit>> {
-    let source = SourceFile::new(name, text).ok()?;
+) -> Result<Vec<TextEdit>, String> {
+    let source = SourceFile::new(name, text).map_err(|error| format!("not formatted: {error}"))?;
     let formatted = match gcsl::fmt::format(&source) {
         Ok(formatted) => formatted,
         Err(diagnostics) => {
-            let first = diagnostics.first().map_or_else(String::new, |diagnostic| {
-                let (line, column) = source.line_col(diagnostic.span.start);
-                format!(", the first at {line}:{column}: {}", diagnostic.message)
+            let first = diagnostics
+                .iter()
+                .min_by_key(|diagnostic| diagnostic.span.start);
+            let at = first.map_or((1, 1), |first| source.line_col(first.span.start));
+            let detail = first.map_or_else(String::new, |first| {
+                format!(", the first at {}:{}: {}", at.0, at.1, first.message)
             });
             let count = match diagnostics.len() {
                 1 => "1 error".to_owned(),
                 count => format!("{count} errors"),
             };
-            crate::log(format_args!("not formatting {name}: {count}{first}"));
-            return None;
+            crate::log(format_args!("not formatting {name}: {count}{detail}"));
+            return Err(format!(
+                "not formatted: it has a syntax error ({}:{})",
+                at.0, at.1
+            ));
         }
     };
     let old: Vec<&str> = text.split_inclusive('\n').collect();
@@ -89,7 +102,7 @@ pub fn edits(
             }
         })
         .collect();
-    Some(edits)
+    Ok(edits)
 }
 
 /// The span from byte `start` to byte `end`, which a document's text, its
@@ -274,12 +287,16 @@ mod tests {
         // Those on the lines of a range alone: the second.
         let ranged = edits("t.gcsl", text, Encoding::Utf16, Some(&(4..=4))).unwrap();
         assert_eq!(ranged, made[1..]);
-        // None for a formatted text; nothing for one with an error.
+        // None for a formatted text; for one with an error, why, at the
+        // first error, in characters.
         assert_eq!(
             edits("t.gcsl", formatted, Encoding::Utf16, None),
-            Some(vec![])
+            Ok(vec![])
         );
-        assert_eq!(edits("t.gcsl", "x = (", Encoding::Utf16, None), None);
+        assert_eq!(
+            edits("t.gcsl", "x = 1\ny = \"é\" (", Encoding::Utf16, None),
+            Err("not formatted: it has a syntax error (2:10)".to_owned())
+        );
         // A text with `\r\n` line breaks has every line edited to `\n`.
         let crlf = "x = 1\r\ny = 2\r\n";
         let made = edits("t.gcsl", crlf, Encoding::Utf16, None).unwrap();

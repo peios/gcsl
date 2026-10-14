@@ -5,10 +5,11 @@
 use crate::ast::{ArgKind, Ast, ExprId, ExprKind};
 use crate::check::Builtin;
 use crate::lexer::TokenKind;
+use crate::source::SourceFile;
 use crate::types::{TyId, TyKind};
 
 use super::complete::{Bracket, Tokens};
-use super::{Index, LocalKind, Symbol, known};
+use super::{Index, Indexed, LocalKind, Symbol, known};
 
 /// A call's signature, as signature help shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,9 +36,32 @@ enum Within {
     Trailing,
 }
 
-/// A parameter as a signature shows it: its name, if it has one, and its
-/// type.
-type Shown = (Option<String>, String);
+/// A parameter as a signature shows it.
+#[derive(Clone, Debug)]
+pub(super) struct Shown {
+    /// Its name, if it has one.
+    pub(super) name: Option<String>,
+    /// Its type, as its source writes it.
+    pub(super) ty: String,
+    /// Its default, as its source writes it, if it has one.
+    pub(super) default: Option<String>,
+}
+
+/// What a signature shows of a callee ([`Index::callee`]).
+#[derive(Clone, Debug)]
+pub(super) struct Callee {
+    /// Its parameters, in order.
+    pub(super) params: Vec<Shown>,
+    /// What its signature ends with after them: `): Int`.
+    pub(super) tail: String,
+    /// Its type's parameters, `<T>` for `len` and `show`, built-ins whose
+    /// arguments are never named; else empty.
+    pub(super) generic: &'static str,
+    /// The symbol the callee is, if it is one.
+    symbol: Option<Symbol>,
+    /// Its name, if it is no path: what the occurrence at its end names.
+    name: Option<String>,
+}
 
 impl Index {
     /// The signature of the innermost call whose argument list, or trailing
@@ -76,6 +100,61 @@ impl Index {
         }
     }
 
+    /// [`Index::signature`], and where it has none because the file is not
+    /// indexed, its braces not matching, and the place is in a block left
+    /// open after a `)`, `pair("a", "b") {`, as a call's trailing block is
+    /// while it is typed (and the place is in no string or comment): the
+    /// signature found in the workspace indexed again
+    /// by `reindex` (given the files after the standard ones, as
+    /// [`Index::rename`] gives them), the file with a `}` for each brace
+    /// left open put at the place, as an editor closing them would.
+    pub fn signature_closing(
+        &self,
+        file: u32,
+        offset: u32,
+        reindex: impl FnOnce(&[SourceFile]) -> Indexed,
+    ) -> Option<Signature> {
+        if self.checked(file) {
+            return self.signature(file, offset);
+        }
+        let source = self.sources.get(file as usize)?.as_ref()?;
+        let tokens = Tokens::new(source);
+        if tokens.in_text(offset) {
+            return None;
+        }
+        let (open, bracket) = tokens.open_before(tokens.starting_before(offset))?;
+        if bracket != Bracket::Brace || tokens.kind(open.checked_sub(1)?) != TokenKind::RParen {
+            return None;
+        }
+        let mut depth = 0usize;
+        for at in 0..tokens.len() {
+            match tokens.kind(at) {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        let mut text = source.text().to_owned();
+        if depth == 0 || !text.is_char_boundary(offset as usize) {
+            return None;
+        }
+        text.insert_str(offset as usize, &"}".repeat(depth));
+        let standard = self.standard() as usize;
+        let mut sources = Vec::new();
+        for (at, other) in self.sources.iter().enumerate().skip(standard) {
+            let other = other.as_ref()?;
+            let closed = if at == file as usize {
+                SourceFile::new(other.name(), text.as_str()).ok()?
+            } else {
+                other.clone()
+            };
+            sources.push(closed);
+        }
+        let index = reindex(&sources).index?;
+        let path = self.path(file)?;
+        index.signature(index.file(path)?, offset)
+    }
+
     /// The signature of the call of `callee`, of file `file`, whose tokens
     /// and tree are these, the place being at `offset` `within` it.
     fn call_signature(
@@ -85,6 +164,57 @@ impl Index {
         callee: ExprId,
         (within, offset): (Within, u32),
     ) -> Option<Signature> {
+        let Callee {
+            params,
+            tail,
+            generic,
+            symbol,
+            name,
+        } = self.callee(file, ast, callee)?;
+        let keyword = match symbol {
+            Some(Symbol::Node(node)) if self.def_of(node).is_some() => "def",
+            _ => "fn",
+        };
+        let written = tokens_text(tokens, ast.get(callee).span);
+        let name = written.or(name).unwrap_or_default();
+        let mut label = format!("{keyword} {name}{generic}(");
+        let mut places = Vec::with_capacity(params.len());
+        for (at, param) in params.iter().enumerate() {
+            if at > 0 {
+                label.push_str(", ");
+            }
+            let start = u32::try_from(label.len()).unwrap_or(u32::MAX);
+            if let Some(name) = &param.name {
+                label.push_str(name);
+                label.push_str(": ");
+            }
+            label.push_str(&param.ty);
+            if let Some(default) = &param.default {
+                label.push_str(" = ");
+                label.push_str(default);
+            }
+            places.push((start, u32::try_from(label.len()).unwrap_or(u32::MAX)));
+        }
+        label.push_str(&tail);
+        let labels: Vec<Option<&str>> = params.iter().map(|param| param.name.as_deref()).collect();
+        let active = match within {
+            Within::Trailing => labels.len().checked_sub(1),
+            Within::Arguments(open) => active_parameter(tokens, open, offset, &labels),
+        };
+        Some(Signature {
+            label,
+            params: places,
+            active: active.and_then(|at| u32::try_from(at).ok()),
+            documentation: symbol.and_then(|symbol| self.documentation_of(symbol)),
+        })
+    }
+
+    /// What a signature shows of `callee`, an expression of file `file`,
+    /// whose tree is `ast`: its parameters, named as its source names them,
+    /// typed as written, each with its default as written (see
+    /// [`Shown`]), and the rest of its signature. `None` if its type is no
+    /// function type the check found.
+    pub(super) fn callee(&self, file: u32, ast: &Ast, callee: ExprId) -> Option<Callee> {
         let span = ast.get(callee).span;
         let found = self
             .at(file, span.end.saturating_sub(1))
@@ -98,17 +228,20 @@ impl Index {
             .or_else(|| self.expr_type(file, callee))
             .or_else(|| found.and_then(|found| known(found.ty)))?;
         let names = &self.scan.names;
-        let (params, tail, generic): (Vec<Shown>, String, &str) = match self.types.kind(ty) {
-            TyKind::Builtin(Builtin::Len) => (
-                vec![(Some("list".to_owned()), "List<T>".to_owned())],
-                "): Int".to_owned(),
-                "<T>",
-            ),
-            TyKind::Builtin(Builtin::Show) => (
-                vec![(Some("value".to_owned()), "T".to_owned())],
-                "): String".to_owned(),
-                "<T>",
-            ),
+        let generic = |name: &str, ty: &str, ret: &str| Callee {
+            params: vec![Shown {
+                name: Some(name.to_owned()),
+                ty: ty.to_owned(),
+                default: None,
+            }],
+            tail: format!("): {ret}"),
+            generic: "<T>",
+            symbol,
+            name: None,
+        };
+        let mut shown = match self.types.kind(ty) {
+            TyKind::Builtin(Builtin::Len) => generic("list", "List<T>", "Int"),
+            TyKind::Builtin(Builtin::Show) => generic("value", "T", "String"),
             _ => {
                 let sig = self.types.fn_sig(self.types.strip(ty))?;
                 let written = self.written_params(symbol);
@@ -117,58 +250,39 @@ impl Index {
                     .iter()
                     .enumerate()
                     .map(|(at, &(label, param))| {
-                        let name = written.get(at).copied().or(label);
-                        let shown = self.types.display(self.as_written(param), names);
-                        let shown = shown.to_string();
-                        (name.map(|name| names.get(name).to_owned()), shown)
+                        let (name, default) = match written.get(at) {
+                            Some((name, default)) => (Some(*name), default.clone()),
+                            None => (label, None),
+                        };
+                        Shown {
+                            name: name.map(|name| names.get(name).to_owned()),
+                            ty: self
+                                .types
+                                .display(self.as_written(param), names)
+                                .to_string(),
+                            default,
+                        }
                     })
                     .collect();
-                (params, self.sig_tail(sig), "")
+                Callee {
+                    params,
+                    tail: self.sig_tail(sig),
+                    generic: "",
+                    symbol,
+                    name: None,
+                }
             }
         };
-        let keyword = match symbol {
-            Some(Symbol::Node(node)) if self.def_of(node).is_some() => "def",
-            _ => "fn",
-        };
-        let written = tokens_text(tokens, span);
-        let name = match written {
-            Some(written) => written,
-            None => found
-                .and_then(|found| found.name)
-                .map_or_else(String::new, |name| names.get(name).to_owned()),
-        };
-        let mut label = format!("{keyword} {name}{generic}(");
-        let mut places = Vec::with_capacity(params.len());
-        for (at, (param, shown)) in params.iter().enumerate() {
-            if at > 0 {
-                label.push_str(", ");
-            }
-            let start = u32::try_from(label.len()).unwrap_or(u32::MAX);
-            if let Some(param) = param {
-                label.push_str(param);
-                label.push_str(": ");
-            }
-            label.push_str(shown);
-            places.push((start, u32::try_from(label.len()).unwrap_or(u32::MAX)));
-        }
-        label.push_str(&tail);
-        let labels: Vec<Option<&str>> = params.iter().map(|(name, _)| name.as_deref()).collect();
-        let active = match within {
-            Within::Trailing => labels.len().checked_sub(1),
-            Within::Arguments(open) => active_parameter(tokens, open, offset, &labels),
-        };
-        Some(Signature {
-            label,
-            params: places,
-            active: active.and_then(|at| u32::try_from(at).ok()),
-            documentation: symbol.and_then(|symbol| self.documentation_of(symbol)),
-        })
+        shown.name = found
+            .and_then(|found| found.name)
+            .map(|name| names.get(name).to_owned());
+        Some(shown)
     }
 
     /// The parameter type `ty` as its source writes it: without the
     /// either shape, `T | Future<T>`, a parameter the function only passes
     /// on accepts, nor a provisional layer, `T?`.
-    fn as_written(&self, mut ty: TyId) -> TyId {
+    pub(super) fn as_written(&self, mut ty: TyId) -> TyId {
         while let TyKind::Either(inner) | TyKind::Provisional { inner, .. } = *self.types.kind(ty) {
             ty = inner;
         }
@@ -202,9 +316,9 @@ impl Index {
     }
 
     /// The names of the parameters of the function `symbol` is, as its
-    /// source writes them: a local function's, a `def`'s; none for
-    /// anything else.
-    fn written_params(&self, symbol: Option<Symbol>) -> Vec<crate::names::Name> {
+    /// source writes them, each with its default as written, if it has one:
+    /// a local function's, a `def`'s; none for anything else.
+    fn written_params(&self, symbol: Option<Symbol>) -> Vec<(crate::names::Name, Option<String>)> {
         let function = match symbol {
             Some(Symbol::Local { file, name }) => {
                 let local = self
@@ -225,11 +339,19 @@ impl Index {
         let Some(ast) = self.scan.files.get(file as usize).map(|f| &f.ast) else {
             return Vec::new();
         };
+        let text = self.text(file);
         match ast.get(function).kind {
             ExprKind::Fn(id) => ast
                 .params(ast.fn_decl(id).params)
                 .iter()
-                .map(|param| param.name)
+                .map(|param| {
+                    let default = param.default.and_then(|default| {
+                        let span = ast.get(default).span;
+                        let written = text.get(span.start as usize..span.end as usize)?;
+                        Some(written.to_owned()).filter(|written| !written.is_empty())
+                    });
+                    (param.name, default)
+                })
                 .collect(),
             _ => Vec::new(),
         }
@@ -238,7 +360,7 @@ impl Index {
 
 /// The callee of the call whose argument list token number `open`, a `(`,
 /// opens: the call of `ast` whose callee ends at the token before it.
-fn call_of_paren(ast: &Ast, tokens: &Tokens, open: usize) -> Option<ExprId> {
+pub(super) fn call_of_paren(ast: &Ast, tokens: &Tokens, open: usize) -> Option<ExprId> {
     let paren = tokens.span(open);
     let end = tokens.span(open.checked_sub(1)?).end;
     ast.expr_ids().find_map(|id| {
@@ -294,85 +416,123 @@ fn active_parameter(
     offset: u32,
     named: &[Option<&str>],
 ) -> Option<usize> {
-    // The arguments: the first and last token of each, at depth 0.
-    let mut arguments: Vec<(usize, usize)> = Vec::new();
-    let mut current = 0;
-    let mut depth = 0usize;
-    let mut start = open + 1;
-    let mut at = open + 1;
-    let mut close = None;
-    loop {
-        let kind = tokens.kind(at);
-        match kind {
-            TokenKind::Eof => {
-                arguments.push((start, at));
-                break;
-            }
-            TokenKind::LParen
-            | TokenKind::LBracket
-            | TokenKind::LBrace
-            | TokenKind::StrStart(_) => depth += 1,
-            TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace | TokenKind::StrEnd(_) => {
-                if depth == 0 {
-                    arguments.push((start, at));
-                    close = (kind == TokenKind::RParen).then_some(at);
-                    break;
-                }
-                depth -= 1;
-            }
-            TokenKind::Comma if depth == 0 => {
-                arguments.push((start, at));
-                if tokens.span(at).end <= offset {
-                    current = arguments.len();
-                }
-                start = at + 1;
-            }
-            _ => {}
-        }
-        at += 1;
-    }
-    let name_of = |(first, end): (usize, usize)| {
-        let named = first + 1 < end
-            && matches!(tokens.kind(first), TokenKind::Ident(_))
-            && tokens.kind(first + 1) == TokenKind::Eq;
-        named.then(|| (tokens.word(first), tokens.span(first + 1).end))
-    };
-    let position = |name: &str| named.iter().position(|&n| n == Some(name));
+    let arguments = Arguments::of(tokens, open, offset);
     // In a named argument, past its `=`: the parameter it names.
-    if let Some(&argument) = arguments.get(current)
-        && let Some((name, after)) = name_of(argument)
+    if let Some(&argument) = arguments.spans.get(arguments.current)
+        && let Some((name, after)) = name_of(tokens, argument)
         && after <= offset
     {
-        return position(name);
+        return named.iter().position(|&n| n == Some(name));
     }
-    let mut filled = vec![false; named.len()];
-    for (at, &argument) in arguments.iter().enumerate() {
-        if at != current
-            && let Some(slot) = name_of(argument).and_then(|(name, _)| position(name))
-            && let Some(slot) = filled.get_mut(slot)
-        {
+    arguments
+        .filled(tokens, named)
+        .iter()
+        .position(|&filled| !filled)
+}
+
+/// The arguments of an argument list, as its tokens have them.
+pub(super) struct Arguments {
+    /// The first token of each argument and the token after its last, at
+    /// depth 0 in the list.
+    spans: Vec<(usize, usize)>,
+    /// The argument the place is in, by its position.
+    current: usize,
+    /// The `)` that closes the list, if one does.
+    close: Option<usize>,
+}
+
+impl Arguments {
+    /// The arguments of the list token number `open`, a `(`, opens, the
+    /// place being at `offset`.
+    pub(super) fn of(tokens: &Tokens, open: usize, offset: u32) -> Self {
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut current = 0;
+        let mut depth = 0usize;
+        let mut start = open + 1;
+        let mut at = open + 1;
+        let mut close = None;
+        loop {
+            let kind = tokens.kind(at);
+            match kind {
+                TokenKind::Eof => {
+                    spans.push((start, at));
+                    break;
+                }
+                TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::LBrace
+                | TokenKind::StrStart(_) => depth += 1,
+                TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+                | TokenKind::StrEnd(_) => {
+                    if depth == 0 {
+                        spans.push((start, at));
+                        close = (kind == TokenKind::RParen).then_some(at);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Comma if depth == 0 => {
+                    spans.push((start, at));
+                    if tokens.span(at).end <= offset {
+                        current = spans.len();
+                    }
+                    start = at + 1;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        Self {
+            spans,
+            current,
+            close,
+        }
+    }
+
+    /// Which of the parameters, named `named`, the arguments but the one the
+    /// place is in fill: each a named argument names, anywhere in the list;
+    /// the last, if a trailing block follows the list; and, from the left,
+    /// those not filled so, one for each positional argument before the
+    /// place.
+    pub(super) fn filled(&self, tokens: &Tokens, named: &[Option<&str>]) -> Vec<bool> {
+        let position = |name: &str| named.iter().position(|&n| n == Some(name));
+        let mut filled = vec![false; named.len()];
+        for (at, &argument) in self.spans.iter().enumerate() {
+            if at != self.current
+                && let Some(slot) = name_of(tokens, argument).and_then(|(name, _)| position(name))
+                && let Some(slot) = filled.get_mut(slot)
+            {
+                *slot = true;
+            }
+        }
+        let trailing = self
+            .close
+            .is_some_and(|close| tokens.kind(close + 1) == TokenKind::LBrace);
+        if trailing && let Some(last) = filled.last_mut() {
+            *last = true;
+        }
+        let positional = self
+            .spans
+            .iter()
+            .take(self.current)
+            .filter(|&&argument| name_of(tokens, argument).is_none())
+            .count();
+        for slot in filled.iter_mut().filter(|done| !**done).take(positional) {
             *slot = true;
         }
+        filled
     }
-    let trailing = close.is_some_and(|close| tokens.kind(close + 1) == TokenKind::LBrace);
-    if trailing && let Some(last) = filled.last_mut() {
-        *last = true;
-    }
-    let mut left = arguments
-        .iter()
-        .take(current)
-        .filter(|&&argument| name_of(argument).is_none())
-        .count();
-    for (at, &done) in filled.iter().enumerate() {
-        if done {
-            continue;
-        }
-        if left == 0 {
-            return Some(at);
-        }
-        left -= 1;
-    }
-    None
+}
+
+/// The name of the argument whose first token and the token after its last
+/// are these, if it is a named one, `name = ...`, with where its `=` ends.
+fn name_of<'s>(tokens: &Tokens<'s>, (first, end): (usize, usize)) -> Option<(&'s str, u32)> {
+    let named = first + 1 < end
+        && matches!(tokens.kind(first), TokenKind::Ident(_))
+        && tokens.kind(first + 1) == TokenKind::Eq;
+    named.then(|| (tokens.word(first), tokens.span(first + 1).end))
 }
 
 #[cfg(test)]
@@ -475,6 +635,59 @@ mod tests {
         assert_eq!(active.as_deref(), Some("list: List<T>"));
         let (label, _, _) = help("import builtins\nr = builtins.int(|1.5)\n", &[]).unwrap();
         assert_eq!(label, "fn builtins.int(x: Float): Int");
+    }
+
+    #[test]
+    fn defaults_are_shown_as_written() {
+        let g = "w = 0\ndef g(a: Int, mid: String = \"é\", last: Bool = 1 > 2): Int { a }\n";
+        let (label, active, _) = help(&format!("{g}r = g(1, |)\n"), &[]).unwrap();
+        assert_eq!(
+            label,
+            "def g(a: Int, mid: String = \"é\", last: Bool = 1 > 2): Int"
+        );
+        assert_eq!(active.as_deref(), Some("mid: String = \"é\""));
+        let (_, active, _) = help(&format!("{g}r = g(1, \"s\", |)\n"), &[]).unwrap();
+        assert_eq!(active.as_deref(), Some("last: Bool = 1 > 2"));
+    }
+
+    #[test]
+    fn a_trailing_block_left_open_has_its_signature() {
+        let pair = "w = 0\ndef pair(a: String, b: String, body: {x: Int}): String { a }\n";
+        for rest in [
+            "",
+            "\n    x = 1\n",
+            "\ny = 2\nz = pair(\"c\", \"d\") {\n    x = 2\n}\n",
+        ] {
+            let text = format!("{pair}r = pair(\"a\", \"b\") {{|{rest}");
+            let at = u32::try_from(text.find('|').unwrap()).unwrap();
+            let sources = vec![
+                SourceFile::new("app.gcsl", text.replacen('|', "", 1)).unwrap(),
+                SourceFile::new("workspace.gcsl", "").unwrap(),
+            ];
+            let index = index_with_standard(&sources, &[], "/").index.unwrap();
+            let file = index.file("app.gcsl").unwrap();
+            // The file's braces do not match: it is not indexed.
+            assert_eq!(index.signature(file, at), None, "{rest:?}");
+            let found = index
+                .signature_closing(file, at, |files| index_with_standard(files, &[], "/"))
+                .unwrap_or_else(|| panic!("{rest:?}"));
+            assert_eq!(
+                found.label,
+                "def pair(a: String, b: String, body: {x: Int}): String"
+            );
+            assert_eq!(found.active, Some(2), "{rest:?}");
+        }
+        // A block that is no trailing block, left open: none.
+        let text = format!("{pair}fn h(): Int {{|\n");
+        let at = u32::try_from(text.find('|').unwrap()).unwrap();
+        let sources = vec![
+            SourceFile::new("app.gcsl", text.replacen('|', "", 1)).unwrap(),
+            SourceFile::new("workspace.gcsl", "").unwrap(),
+        ];
+        let index = index_with_standard(&sources, &[], "/").index.unwrap();
+        let file = index.file("app.gcsl").unwrap();
+        let found = index.signature_closing(file, at, |files| index_with_standard(files, &[], "/"));
+        assert_eq!(found, None);
     }
 
     #[test]

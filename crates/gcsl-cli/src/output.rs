@@ -69,7 +69,7 @@ pub fn diagnostics_in(sources: &[SourceFile], fallback: &SourceFile, diagnostics
 
 /// Styled output when stderr is a terminal and colour has not been disabled
 /// through the `NO_COLOR` convention (any non-empty value disables it).
-fn renderer() -> Renderer {
+pub fn renderer() -> Renderer {
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
     if io::stderr().is_terminal() && !no_color {
         Renderer::styled()

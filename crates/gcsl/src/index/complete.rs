@@ -15,6 +15,7 @@ use crate::strings::FieldName;
 use crate::types::{TyId, TyKind};
 use crate::workspace::{BUILTINS, FileScope, STANDARD_DIR, Target, target_roots};
 
+use super::signature::{Arguments, call_of_paren};
 use super::{Index, LocalKind, Symbol, item_value, known, scope_symbol, standard_stem, unparen};
 
 /// What a completion offers: one thing that may be written at the place.
@@ -31,7 +32,7 @@ pub struct Completion {
     /// What the list is ordered by: its group's number, then its label.
     pub sort: String,
     /// What is written, when it is not the label: a name that is no
-    /// identifier, quoted.
+    /// identifier, quoted; a named argument's `name = `.
     pub insert: Option<String>,
 }
 
@@ -50,22 +51,27 @@ pub enum CompletionKind {
     Type,
     /// A keyword.
     Keyword,
+    /// A named argument of the call whose argument list the place is in,
+    /// `name = `.
+    Argument,
 }
 
-/// The groups a list is ordered by, nearest first: locals, then the file's
-/// own declarations, its directories', what it imports, the standard
-/// library's, and keywords.
-const LOCAL: u8 = 0;
-/// See [`LOCAL`].
-const FILE: u8 = 1;
-/// See [`LOCAL`].
-const DIRECTORY: u8 = 2;
-/// See [`LOCAL`].
-const IMPORTED: u8 = 3;
-/// See [`LOCAL`].
-const STANDARD: u8 = 4;
-/// See [`LOCAL`].
-const KEYWORD: u8 = 5;
+/// The groups a list is ordered by, nearest first: the named arguments of
+/// the call the place is in, locals, then the file's own declarations, its
+/// directories', what it imports, the standard library's, and keywords.
+const NAMED: u8 = 0;
+/// See [`NAMED`].
+const LOCAL: u8 = 1;
+/// See [`NAMED`].
+const FILE: u8 = 2;
+/// See [`NAMED`].
+const DIRECTORY: u8 = 3;
+/// See [`NAMED`].
+const IMPORTED: u8 = 4;
+/// See [`NAMED`].
+const STANDARD: u8 = 5;
+/// See [`NAMED`].
+const KEYWORD: u8 = 6;
 
 /// The keywords an expression may start with, or a block's item.
 const KEYWORDS: [&str; 13] = [
@@ -193,7 +199,7 @@ impl<'s> Tokens<'s> {
     }
 
     /// Whether `offset` is in a comment, or in a string's text.
-    fn in_text(&self, offset: u32) -> bool {
+    pub(super) fn in_text(&self, offset: u32) -> bool {
         let spans = self.comments.spans();
         let after = spans.partition_point(|c| c.end < offset);
         if spans
@@ -288,20 +294,49 @@ impl<'s> Tokens<'s> {
         start
     }
 
+    /// Whether token number `word` is a word directly followed by a `-` of
+    /// its own that ends at `offset`, `libcap-`: a name half-typed up to a
+    /// `-`, which the lexer takes for a `-` that is ambiguous.
+    fn dangling_dash(&self, word: usize, offset: u32) -> bool {
+        let dash = word + 1;
+        self.kind(dash) == TokenKind::Error
+            && self.word(dash) == "-"
+            && self.span(dash).end == offset
+            && self.is_word(word)
+            && self.span(word).end == self.span(dash).start
+    }
+
+    /// The number of the token the place at `offset` is after, the word
+    /// half-typed at it set aside (the client filters by it), `libcap-`
+    /// among them: `Ok(None)` for none, at the start of the file; `Err` for
+    /// a place in a token that is no word, where nothing is completed.
+    pub(super) fn before_word(&self, offset: u32) -> Result<Option<usize>, ()> {
+        let starting = self.starting_before(offset);
+        if let Some(word) = starting.checked_sub(2)
+            && self.dangling_dash(word, offset)
+        {
+            return Ok(word.checked_sub(1));
+        }
+        match starting.checked_sub(1) {
+            Some(last) if self.span(last).end >= offset && self.is_word(last) => {
+                Ok(last.checked_sub(1))
+            }
+            Some(last) if self.span(last).end > offset => Err(()),
+            other => Ok(other),
+        }
+    }
+
     /// What the place at `offset` is (see [`Place`]).
     fn place(&self, offset: u32) -> Place {
-        if self.in_text(offset) {
+        let dashed = self
+            .starting_before(offset)
+            .checked_sub(2)
+            .is_some_and(|word| self.dangling_dash(word, offset));
+        if !dashed && self.in_text(offset) {
             return Place::Nothing;
         }
-        let starting = self.starting_before(offset);
-        // A word half-typed at the place is what is completed: the place is
-        // after the token before it.
-        let previous = match starting.checked_sub(1) {
-            Some(last) if self.span(last).end >= offset && self.is_word(last) => {
-                last.checked_sub(1)
-            }
-            Some(last) if self.span(last).end > offset => return Place::Nothing,
-            other => other,
+        let Ok(previous) = self.before_word(offset) else {
+            return Place::Nothing;
         };
         let Some(previous) = previous else {
             return Place::Name;
@@ -486,10 +521,14 @@ impl Index {
         let Some(source) = self.sources.get(file as usize).and_then(Option::as_ref) else {
             return Vec::new();
         };
-        let place = Tokens::new(source).place(offset);
-        let mut found = match place {
+        let tokens = Tokens::new(source);
+        let mut found = match tokens.place(offset) {
             Place::Nothing => Vec::new(),
-            Place::Name => self.names_at(file, offset),
+            Place::Name => {
+                let mut found = self.named_arguments(file, &tokens, offset);
+                found.extend(self.names_at(file, offset));
+                found
+            }
             Place::Member { dot, chain } => self.members(file, offset, dot, chain.as_deref()),
             Place::Type => self.types_at(file),
             Place::QualifiedType(chain) => self.qualified_types(file, &chain),
@@ -498,6 +537,64 @@ impl Index {
         };
         found.sort_by(|a, b| a.sort.cmp(&b.sort));
         found
+    }
+
+    /// The named arguments that may be written at `offset` of file `file`,
+    /// whose tokens are `tokens`, if an argument starts there, in a call's
+    /// argument list: after its `(` or a `,` of it, the word half-typed set
+    /// aside. One, `name = `, for each parameter of the callee that has a
+    /// name and that no other argument fills (see [`Arguments::filled`]),
+    /// typed as its signature types it; none for `len` and `show`.
+    fn named_arguments(&self, file: u32, tokens: &Tokens<'_>, offset: u32) -> Vec<Completion> {
+        let Some(ast) = self.scan.files.get(file as usize).map(|f| &f.ast) else {
+            return Vec::new();
+        };
+        let Ok(Some(mut previous)) = tokens.before_word(offset) else {
+            return Vec::new();
+        };
+        while tokens.kind(previous) == TokenKind::Newline {
+            let Some(before) = previous.checked_sub(1) else {
+                return Vec::new();
+            };
+            previous = before;
+        }
+        let open = match tokens.kind(previous) {
+            TokenKind::LParen => previous,
+            TokenKind::Comma => match tokens.open_before(previous) {
+                Some((open, Bracket::Paren)) => open,
+                _ => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let Some(callee) = call_of_paren(ast, tokens, open)
+            .and_then(|callee| self.callee(file, ast, callee))
+            .filter(|callee| callee.generic.is_empty())
+        else {
+            return Vec::new();
+        };
+        let named: Vec<Option<&str>> = callee
+            .params
+            .iter()
+            .map(|param| param.name.as_deref())
+            .collect();
+        let filled = Arguments::of(tokens, open, offset).filled(tokens, &named);
+        callee
+            .params
+            .iter()
+            .zip(filled)
+            .filter(|(_, filled)| !filled)
+            .filter_map(|(param, _)| {
+                let name = param.name.as_deref()?;
+                Some(Completion {
+                    label: format!("{name} ="),
+                    kind: CompletionKind::Argument,
+                    detail: Some(param.ty.clone()),
+                    documentation: None,
+                    sort: sort_text(NAMED, name),
+                    insert: Some(format!("{name} = ")),
+                })
+            })
+            .collect()
     }
 
     /// Everything a name may name at `offset` of file `file`, each name
@@ -549,6 +646,11 @@ impl Index {
             (alias.name, group)
         });
         let view: Vec<(Name, u8)> = own.chain(directories).chain(imported).collect();
+        // The top-level field whose value the place is in is being declared:
+        // it is not offered (a `def`, which may call itself, is).
+        if let Some(declaring) = declared_at(ast, offset) {
+            seen.insert(declaring);
+        }
         for (name, group) in view {
             if names::is_namespace_key(self.scan.names.get(name)) || !seen.insert(name) {
                 continue;
@@ -1146,6 +1248,67 @@ fn items_before(ast: &Ast, items: &[crate::ast::ItemId], offset: u32) -> Vec<(Na
     found
 }
 
+/// The name of the top-level field of `ast`, named by one segment and not a
+/// `def`, whose value the place at `offset` is in: the field being
+/// declared there.
+fn declared_at(ast: &Ast, offset: u32) -> Option<Name> {
+    ast.items(ast.root()).iter().find_map(|&item| {
+        let it = ast.item(item);
+        let ItemKind::Field {
+            path,
+            value,
+            function: false,
+            ..
+        } = it.kind
+        else {
+            return None;
+        };
+        let in_value = ast.get(value).span.start <= offset && offset <= it.span.end;
+        match ast.path(path) {
+            [only] if in_value => only.name(),
+            _ => None,
+        }
+    })
+}
+
+/// The span of the name being completed at byte `offset` of `text`, by
+/// GCSL's rules for a name: the run of letters, digits and `_` around the
+/// place, with each `-` between two of them, and a `-` just before the
+/// place after one, `libcap-`, a name half-typed; empty, at the place, if
+/// there is none. What a completion's edit replaces (to its end) or inserts
+/// over (to the place).
+#[must_use]
+pub fn name_around(text: &str, offset: u32) -> Span {
+    let bytes = text.as_bytes();
+    let offset = (offset as usize).min(bytes.len());
+    let is_name = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|&byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let mut start = offset;
+    while let Some(before) = start.checked_sub(1) {
+        let dash = bytes.get(before) == Some(&b'-') && before.checked_sub(1).is_some_and(&is_name);
+        if is_name(before) || dash {
+            start = before;
+        } else {
+            break;
+        }
+    }
+    let mut end = offset;
+    loop {
+        if is_name(end) {
+            end += 1;
+        } else if end > start && bytes.get(end) == Some(&b'-') && is_name(end + 1) {
+            end += 2;
+        } else {
+            break;
+        }
+    }
+    let at = |offset: usize| u32::try_from(offset).unwrap_or(u32::MAX);
+    Span::new(at(start), at(end))
+}
+
 /// The name of the first of `segments`, and where it is.
 fn first_segment(segments: &[PathSegment]) -> Option<(Name, Span)> {
     let first = segments.first()?;
@@ -1309,7 +1472,8 @@ mod tests {
             .iter()
             .map(|label| &named(&found, label).sort[..1])
             .collect();
-        assert_eq!(groups, ["0", "1", "1", "2", "3", "4", "5"]);
+        // (Group 0 is the named arguments of a call.)
+        assert_eq!(groups, ["1", "2", "2", "3", "4", "5", "6"]);
         assert_eq!(
             named(&found, "top").documentation.as_deref(),
             Some("The top.")
@@ -1403,6 +1567,94 @@ mod tests {
         ] {
             let found = complete(&[("app.gcsl", text)], "app.gcsl");
             assert_eq!(labels(&found), Vec::<&str>::new(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_name_completed_is_found_by_gcsl_s_rules_for_names() {
+        let around = |text: &str| {
+            let at = text.find('|').unwrap();
+            let text = text.replacen('|', "", 1);
+            let span = name_around(&text, u32::try_from(at).unwrap());
+            text[span.start as usize..span.end as usize].to_owned()
+        };
+        assert_eq!(around("x = odd.libcap-t|"), "libcap-t");
+        assert_eq!(around("x = odd.libcap-|"), "libcap-");
+        assert_eq!(around("x = odd.lib|cap-tools\n"), "libcap-tools");
+        assert_eq!(around("x = c.|"), "");
+        assert_eq!(around("x = a - b|"), "b");
+        assert_eq!(around("x = |-a"), "");
+        assert_eq!(around("x = dev.1pass|word"), "1password");
+    }
+
+    #[test]
+    fn a_name_typed_up_to_a_dash_is_completed() {
+        let text = "odd.libcap-tools = 1\nodd.other = 2\nr = odd.libcap-|\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(labels(&found), ["libcap-tools", "other"]);
+    }
+
+    #[test]
+    fn the_field_being_declared_is_not_offered() {
+        let found = complete(&[("app.gcsl", "para = 1\nb = p|\n")], "app.gcsl");
+        assert!(labels(&found).contains(&"para"), "{:?}", labels(&found));
+        assert!(!labels(&found).contains(&"b"), "{:?}", labels(&found));
+        // Nor the field whose record block the place is in.
+        let found = complete(
+            &[("app.gcsl", "para = 1\ncfg = {\n    a = |\n}\n")],
+            "app.gcsl",
+        );
+        assert!(!labels(&found).contains(&"cfg"), "{:?}", labels(&found));
+        // A `def` and a `fn` in their own bodies are, and a dotted field's
+        // root.
+        for (text, name) in [
+            ("def f(n: Int): Int { |n }\n", "f"),
+            ("fn g(n: Int): Int { |n }\nr = g(1)\n", "g"),
+            ("a.b = 1\na.c = |\n", "a"),
+        ] {
+            let found = complete(&[("app.gcsl", text)], "app.gcsl");
+            assert!(
+                labels(&found).contains(&name),
+                "{text}: {:?}",
+                labels(&found)
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_s_unfilled_parameters_are_offered_as_named_arguments() {
+        let f = "def f(a: Int, b: String = \"x\", c: Bool = true): Int { a }\n";
+        let found = complete(&[("app.gcsl", &format!("{f}r = f(1, |)\n"))], "app.gcsl");
+        // Before the locals, those not filled by an argument.
+        assert_eq!(labels(&found)[..2], ["b =", "c ="]);
+        let b = named(&found, "b =");
+        assert_eq!(b.kind, CompletionKind::Argument);
+        assert_eq!(b.detail.as_deref(), Some("String"));
+        assert_eq!(b.insert.as_deref(), Some("b = "));
+        assert_eq!(b.sort, "0:b");
+        // A named argument fills its own, anywhere; a word half-typed.
+        for (call, offered) in [
+            ("r = f(c = true, |)", vec!["a =", "b ="]),
+            ("r = f(b = \"y\", |)", vec!["a =", "c ="]),
+            ("r = f(1, c = true, x|", vec!["b ="]),
+            ("r = f(\n    1,\n    |\n)", vec!["b =", "c ="]),
+        ] {
+            let found = complete(&[("app.gcsl", &format!("{f}{call}\n"))], "app.gcsl");
+            let arguments: Vec<&str> = found
+                .iter()
+                .filter(|c| c.kind == CompletionKind::Argument)
+                .map(|c| c.label.as_str())
+                .collect();
+            assert_eq!(arguments, offered, "{call}");
+        }
+        // Only where an argument starts; none for `len`.
+        for call in ["r = f(a = |)", "r = f(1 + |)", "r = len(|)", "r = |"] {
+            let found = complete(&[("app.gcsl", &format!("{f}{call}\n"))], "app.gcsl");
+            assert!(
+                found.iter().all(|c| c.kind != CompletionKind::Argument),
+                "{call}: {:?}",
+                labels(&found)
+            );
         }
     }
 
