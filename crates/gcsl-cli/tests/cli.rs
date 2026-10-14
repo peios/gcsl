@@ -1585,6 +1585,78 @@ fn a_syntax_error_anywhere_runs_nothing() {
     }
 }
 
+/// An error of the scan of a workspace (a field defined in two files, an
+/// import of no module, files that need each other) runs nothing: neither a
+/// file's top-level `sh`, in a file with the error or in another, nor the
+/// file asked for. Every error of the scan is rendered, and a type error of
+/// another file.
+#[test]
+fn a_scan_error_anywhere_runs_nothing() {
+    let dir = std::env::temp_dir().join(format!("gcsl-cli-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("q")).unwrap();
+    std::fs::create_dir_all(dir.join("cy")).unwrap();
+    let marker = |name: &str| dir.join(name).to_str().unwrap().to_owned();
+    let files = [
+        ("workspace.gcsl", String::new()),
+        (
+            "top.gcsl",
+            format!("z = sh(\"touch {}\")\nw: Int = \"s\"", marker("TOP")),
+        ),
+        ("q/a.gcsl", format!("x = sh(\"touch {}\")", marker("A"))),
+        (
+            "q/b.gcsl",
+            format!("import nope\nx = sh(\"touch {}\")", marker("B")),
+        ),
+        (
+            "cy/c.gcsl",
+            format!("c = d\ne = sh(\"touch {}\")", marker("C")),
+        ),
+        ("cy/d.gcsl", "d = c".to_owned()),
+    ];
+    for (path, text) in &files {
+        std::fs::write(dir.join(path), text).unwrap();
+    }
+    let outputs: Vec<Output> = ["top.gcsl", "q/a.gcsl", "q/b.gcsl", "cy/c.gcsl"]
+        .iter()
+        .map(|file| gcsl(&["run", dir.join(file).to_str().unwrap()]))
+        .collect();
+    let markers = ["TOP", "A", "B", "C"].map(|name| dir.join(name).exists());
+    // Without the errors, `top.gcsl` runs.
+    std::fs::write(dir.join("q/b.gcsl"), "y = 1").unwrap();
+    std::fs::write(dir.join("cy/d.gcsl"), "d = 1").unwrap();
+    std::fs::write(
+        dir.join("top.gcsl"),
+        &files[1].1[..files[1].1.find('\n').unwrap()],
+    )
+    .unwrap();
+    let fixed = gcsl(&["run", dir.join("top.gcsl").to_str().unwrap()]);
+    let ran = dir.join("TOP").exists();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(markers, [false; 4]);
+    assert_eq!(stderr(&fixed), "");
+    assert!(ran);
+    for output in &outputs {
+        assert_eq!(stdout(output), "");
+        let errors: Vec<&str> = stderr(output)
+            .lines()
+            .filter(|line| line.starts_with("error"))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "error: `cy/c.gcsl` and `cy/d.gcsl` need each other",
+                "error: no module `nope`",
+                "error: field `x` is defined in two files",
+                "error: mismatched types",
+            ],
+            "{}",
+            stderr(output)
+        );
+        assert_eq!(output.status.code(), Some(1));
+    }
+}
+
 /// `--dump-ast` of a file with syntax errors prints nothing and shows them
 /// all.
 #[test]

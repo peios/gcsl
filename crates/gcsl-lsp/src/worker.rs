@@ -320,7 +320,8 @@ struct Kept {
     /// The version of each open document it was made from, by the text of
     /// its URI.
     versions: HashMap<String, i32>,
-    /// The index; `None` if the check's scan failed.
+    /// The index; `None` if the check made none, as for a lone file given
+    /// no file: a scan's errors leave one (see the library's "Scan errors").
     index: Option<Index>,
     /// Each input of the check, by input number: the standard files', then
     /// the files checked.

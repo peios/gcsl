@@ -155,14 +155,16 @@
 //! KNOWN LIMITS. A file that does not parse no longer hides the rest: its
 //! syntax errors are published with the type errors of every file, its own
 //! where it parses among them (see the library's [Syntax
-//! errors](gcsl::workspace#syntax-errors)). But while the scan of a
-//! workspace fails, an import not resolved or two files declaring one
-//! name, its check reports only those errors, with the syntax errors, so
-//! the other files' type errors disappear until it is fixed: what the check
-//! reports is published, and stale diagnostics are not kept. Nor is a stale
-//! index: while the scan fails nothing is answered, and a file whose braces
-//! do not match has nothing to answer until it is checked again. A file
-//! that needs a file whose check failed is indexed, but what it reads of
+//! errors](gcsl::workspace#syntax-errors)). Nor does an error of the scan of
+//! a workspace, an import not resolved, two files declaring one name, files
+//! that need each other: it is published with every other file's errors and
+//! warnings, and every file it does not concern is indexed and answers (see
+//! the library's [Scan errors](gcsl::workspace#scan-errors)); a read of a
+//! name two files declare has no hover, and goes to both declarations. What
+//! the check reports is published, and stale diagnostics are not kept. Nor
+//! is a stale index: a file whose braces do not match has nothing to answer
+//! until it is checked again. A file that needs a file whose check failed,
+//! or one of files that need each other, is indexed, but what it reads of
 //! that file's own directory has no type (see [`gcsl::index`]). What the
 //! standard library and the built-ins declare has no definition to go to:
 //! their sources are compiled in, with no file on disk. A rename renames
@@ -1471,6 +1473,39 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_error_hides_no_other_files_errors_or_answers() {
+        // clackatoo's minimal case: a field of `q` defined in two files.
+        let scratch = Scratch::workspace("scan-error", "# Root.\n");
+        let text = "h = 1\nk = h\n";
+        let p = scratch.write("p/p.gcsl", text);
+        scratch.write("q/a.gcsl", "x = 1\n");
+        let b = scratch.write("q/b.gcsl", "x = 2\n");
+        let r = scratch.write("r/r.gcsl", "y: Int = \"s\"\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&p, text);
+        let published = client.published(&b);
+        let [conflict] = published.diagnostics.as_slice() else {
+            panic!("{published:?}");
+        };
+        assert_eq!(conflict.message, "field `x` is defined in two files");
+        let published = client.published(&r);
+        let [mismatched] = published.diagnostics.as_slice() else {
+            panic!("{published:?}");
+        };
+        assert_eq!(mismatched.message, "mismatched types");
+        assert_eq!(mismatched.range, range((0, 9), (0, 12)));
+        assert_eq!(client.published(&p).diagnostics, []);
+        // `p` is indexed: its hover and definition answer.
+        let hover = client.hover(&p, (1, 4));
+        let shown = hover["contents"]["value"].as_str().unwrap();
+        assert!(shown.contains("h: Int"), "{shown}");
+        let definition = client.definition(&p, (1, 4));
+        assert_eq!(definition["uri"], p.as_str());
+        assert_eq!(as_range(&definition["range"]), range((0, 0), (0, 1)));
+        client.shut_down().unwrap();
+    }
+
+    #[test]
     fn a_non_ascii_line_is_counted_in_each_encoding() {
         // `é` is two bytes and one UTF-16 unit, `😀` four bytes and two.
         let text = "x = \"é😀\" + 1\n";
@@ -1769,12 +1804,13 @@ mod tests {
     #[test]
     fn signature_help_names_the_active_parameter() {
         let scratch = Scratch::workspace("signature", "");
-        let text = "# Adds.\ndef f(a: Int, b: String): Int { a }\nr = f(1, \"s\")\n";
+        // Below the file's first line, whose comment would be its header.
+        let text = "w = 0\n# Adds.\ndef f(a: Int, b: String): Int { a }\nr = f(1, \"s\")\n";
         let uri = scratch.write("app.gcsl", text);
         for encoding in ["utf-8", "utf-16"] {
             let (mut client, _) = Client::start(&[encoding]);
             client.open(&uri, text);
-            let help = client.ask("textDocument/signatureHelp", &uri, (2, 9));
+            let help = client.ask("textDocument/signatureHelp", &uri, (3, 9));
             let label = "def f(a: Int, b: String): Int";
             assert_eq!(help["signatures"][0]["label"], label, "{encoding}");
             assert_eq!(
@@ -1786,12 +1822,12 @@ mod tests {
             assert_eq!(help["activeSignature"], 0);
             assert_eq!(help["activeParameter"], 1, "{encoding}");
             // Typed: `f(` at the end of the file, unclosed.
-            client.change(&uri, 2, ((3, 0), (3, 0)), "q = f(");
-            let help = client.ask("textDocument/signatureHelp", &uri, (3, 6));
+            client.change(&uri, 2, ((4, 0), (4, 0)), "q = f(");
+            let help = client.ask("textDocument/signatureHelp", &uri, (4, 6));
             assert_eq!(help["activeParameter"], 0, "{encoding}");
             // Outside any call: nothing.
             assert_eq!(
-                client.ask("textDocument/signatureHelp", &uri, (2, 0)),
+                client.ask("textDocument/signatureHelp", &uri, (3, 0)),
                 Value::Null
             );
             client.shut_down().unwrap();

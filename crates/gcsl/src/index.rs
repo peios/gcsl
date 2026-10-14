@@ -78,7 +78,11 @@
 //! name is written as it is declared, not its whole item: a local's name;
 //! for a node, each item at or under it, in whichever files, at the
 //! segment of its path at the node's depth (an interior node, of several
-//! items of one file or of several files, has several); for a node several
+//! items of one file or of several files, has several), and for a node
+//! the scan found conflicting, each declaration it dropped as a later
+//! definition of it too (see [`crate::workspace`], "Scan errors"), so that
+//! a read of it goes to every definition a fix chooses among, while it has
+//! no hover, being erroneous; for a node several
 //! sources of a view share, every part's; for a directory, its first file's
 //! first declaration, and for a file its start; a type's name. A symbol of
 //! the standard library or a built-in has none: the standard files are
@@ -111,7 +115,11 @@
 //! between: each line a comment alone (a trailing comment, on a line with
 //! code, is none, so neither is the declaration's own), shown without its
 //! `#` and one space after it, blank lines at either end left out
-//! ([`Index::documentation`]). The comments are the lexer's
+//! ([`Index::documentation`]). A run that starts on the file's first line,
+//! a shebang's run included, is the file's HEADER, which describes the
+//! file, and is no declaration's doc comment, whatever is below it: a
+//! package's file starts with its description above its imports, and a
+//! lock file with how it was written, above its one field. The comments are the lexer's
 //! ([`crate::lexer::lex_with_comments`]), so an attribute, `#[...]`, is
 //! none, and neither is a `#` in a string. A node declared by several
 //! items is documented by the first of them, in input then source order,
@@ -307,8 +315,8 @@ pub struct Indexed {
     pub diagnostics: Vec<Diagnostic>,
     /// Whether the check succeeded.
     pub succeeded: bool,
-    /// The index, once the scan succeeded; `None` if it failed, which
-    /// leaves nothing to index.
+    /// The index: always one of a workspace or a lone file, whose scan
+    /// recovers from its errors (see [`crate::workspace`], "Scan errors").
     pub index: Option<Index>,
 }
 
@@ -1220,6 +1228,15 @@ impl Index {
                     depth,
                     &mut found,
                 );
+            }
+        }
+        // A conflicted node is declared by the definitions the scan dropped
+        // as later definitions of it too, which a fix may want to keep.
+        for &(owner, item) in self.scan.conflicting(node) {
+            if let Some(file) = self.scan.files.get(owner as usize)
+                && let Some(span) = item_segment(&file.ast, item, depth)
+            {
+                found.push(Location { file: owner, span });
             }
         }
         found
@@ -3163,7 +3180,7 @@ mod tests {
 
     #[test]
     fn a_lone_file_is_documented_and_renamed_and_an_open_field_renamed_whole() {
-        let text = "# Doc.\nx = 1\ny = x\n";
+        let text = "w = 0\n# Doc.\nx = 1\ny = x\n";
         let source = SourceFile::new("/x/lone.gcsl", text).unwrap();
         let Indexed { index, .. } = crate::workspace::index_lone_with_standard(&source, "/x");
         let index = index.unwrap();
@@ -3360,7 +3377,7 @@ mod tests {
 
     #[test]
     fn doc_comments_are_the_comment_lines_directly_above() {
-        let text = "# The answer.\n#   Indented.\n#\nanswer = 42\nx = answer # trailing\n# Not x's: a blank line.\n\ny = x\n\
+        let text = "w = 0\n# The answer.\n#   Indented.\n#\nanswer = 42\nx = answer # trailing\n# Not x's: a blank line.\n\ny = x\n\
                     # Through an attribute.\n#[shadowable]\nq = 1\n\
                     fn f(): Int {\n    # A local.\n    let l = 1\n    l\n}\nr = f() + q + y\n";
         let files = [("app.gcsl", text)];
@@ -3389,13 +3406,64 @@ mod tests {
             ("workspace.gcsl", workspace),
             (
                 "app/a.gcsl",
-                "# The x package.\ndefmeta package dev.x { versions = [] }\n\ndef package dev.x(v) { v }\n",
+                "import fileroot\n# The x package.\ndefmeta package dev.x { versions = [] }\n\n\
+                 def package dev.x(v) { v }\n",
             ),
             ("app/b.gcsl", "r = package dev.x\n"),
         ];
         let (index, file) = index_of(&files, "app/b.gcsl");
         let found = index.documentation(file, offset(files[2].1, "dev.|x"));
         assert_eq!(found.as_deref(), Some("The x package."));
+    }
+
+    #[test]
+    fn a_file_s_header_is_no_doc_comment() {
+        // A run of comments from the file's first line, or a shebang's, is
+        // the file's header: a lock file's, directly above its one field;
+        // one after a shebang; one above a `def`. Anywhere else, the same
+        // run is the doc comment of the item below it.
+        for (text, needle, wanted) in [
+            (
+                "# Written by `pekit lock`. Do not edit.\nlocked = [1]\nr = locked\n",
+                "r = |locked",
+                None,
+            ),
+            (
+                "#!/usr/bin/env gcsl\n# A script.\nx = 1\nr = x\n",
+                "r = |x",
+                None,
+            ),
+            ("# Root.\ndef f(): Int { 1 }\nr = f()\n", "r = |f", None),
+            ("v = 0\n# Doc.\nx = 1\nr = x\n", "r = |x", Some("Doc.")),
+            (
+                "#!/usr/bin/env gcsl\n\n# A script.\nx = 1\nr = x\n",
+                "r = |x",
+                Some("A script."),
+            ),
+        ] {
+            let (index, file) = index_of(&[("app.gcsl", text)], "app.gcsl");
+            let found = index.documentation(file, offset(text, needle));
+            assert_eq!(found.as_deref(), wanted, "{text}");
+        }
+        // A package's header, directly above its meta, describes the file,
+        // not the definition: newpkgs writes its packages' imports between
+        // (see "Documentation").
+        let workspace = "#[def_type]\ndef package(name: String, f: fn(v: String): String META-> \
+                         {versions: List<String>}, version: String) -> String { f(version) }\n";
+        let files = [
+            ("workspace.gcsl", workspace),
+            (
+                "app/a.gcsl",
+                "# The x package.\ndefmeta package dev.x { versions = [] }\n\n\
+                 def package dev.x(v) { v }\n",
+            ),
+            ("app/b.gcsl", "r = package dev.x\n"),
+        ];
+        let (index, file) = index_of(&files, "app/b.gcsl");
+        assert_eq!(
+            index.documentation(file, offset(files[2].1, "dev.|x")),
+            None
+        );
     }
 
     #[test]
@@ -3498,5 +3566,85 @@ mod tests {
         let file = index.file("app.gcsl").unwrap();
         let hover = index.hover(file, offset(text, "    |n\n}")).unwrap();
         assert!(hover.text.contains("mut n: Int"), "{}", hover.text);
+    }
+
+    #[test]
+    fn a_scan_error_leaves_the_rest_of_the_workspace_indexed() {
+        // clackatoo's minimal case: the conflict and `r`'s error are both
+        // reported, and `p` answers a hover.
+        let files = [
+            ("workspace.gcsl", "# Root.\n"),
+            ("p/p.gcsl", "h = 1\nk = h\n"),
+            ("q/a.gcsl", "x = 1\n"),
+            ("q/b.gcsl", "x = 2\n"),
+            ("r/r.gcsl", "y: Int = \"s\"\n"),
+        ];
+        let Indexed {
+            index,
+            diagnostics,
+            succeeded,
+            ..
+        } = indexed(&files);
+        assert!(!succeeded);
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["field `x` is defined in two files", "mismatched types"]
+        );
+        let mut index = index.unwrap();
+        let file = index.file("p/p.gcsl").unwrap();
+        let hover = index.hover(file, offset(files[1].1, "k = |h")).unwrap();
+        assert!(hover.text.contains("h: Int"), "{}", hover.text);
+        assert_eq!(
+            places(&files, &[("p/p.gcsl", "|h = 1")]),
+            index
+                .definition(file, offset(files[1].1, "k = |h"))
+                .iter()
+                .map(|l| (index.path(l.file).unwrap().to_owned(), l.span.start))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_read_of_a_conflicted_field_goes_to_every_definition() {
+        // Through an import, from a file of the directory and from one
+        // below it: each read goes to both definitions, and has no hover.
+        let files = [
+            ("q/a.gcsl", "x = 1\n"),
+            ("q/b.gcsl", "x = 2\n"),
+            ("q/c.gcsl", "w = x\n"),
+            ("q/sub/d.gcsl", "v = x\n"),
+            ("s/s.gcsl", "import x from q\nn = x + 1\n"),
+        ];
+        let (mut index, _) = index_of(&files, "s/s.gcsl");
+        let both = places(&files, &[("q/a.gcsl", "|x = 1"), ("q/b.gcsl", "|x = 2")]);
+        for (path, needle) in [
+            ("s/s.gcsl", "n = |x"),
+            ("q/c.gcsl", "w = |x"),
+            ("q/sub/d.gcsl", "v = |x"),
+            ("q/a.gcsl", "|x = 1"),
+        ] {
+            let file = index.file(path).unwrap();
+            let at = offset(files.iter().find(|(p, _)| *p == path).unwrap().1, needle);
+            let found: Vec<(String, u32)> = index
+                .definition(file, at)
+                .iter()
+                .map(|l| (index.path(l.file).unwrap().to_owned(), l.span.start))
+                .collect();
+            assert_eq!(found, both, "{path}");
+            if path != "q/a.gcsl" {
+                assert_eq!(index.hover(file, at), None, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_rename_that_would_make_a_scan_error_is_refused() {
+        let files = [("a.gcsl", "x = 1\n"), ("b.gcsl", "y = 2\nz = y\n")];
+        let refused = renamed_err(&files, ("b.gcsl", "z = |y"), "x");
+        assert!(
+            refused.contains("field `x` is defined in two files"),
+            "{refused}"
+        );
     }
 }

@@ -252,12 +252,11 @@
 //!   directory or of one above has, or it imports something of one), is no
 //!   error, since it may be declared in source that could not be parsed:
 //!   the file's check fails quietly instead.
-//! - A stage of the scan that finds errors stops it, as it always did, and
-//!   reports them, with the syntax errors, but those of a file that may
-//!   see a file with syntax errors (it has them, a file of its directory or
-//!   of one above has, or it imports anything but `builtins`, `fileroot`
-//!   and the standard files), whose declarations may be missing or
-//!   misplaced.
+//! - The errors of the scan itself (see [Scan errors](#scan-errors)) are
+//!   reported with the syntax errors, but those of a file that sees a file
+//!   with syntax errors, as above, or one of whose imports that failed
+//!   names a module with one, whose declarations may be missing or
+//!   misplaced: the scan recovers from those all the same.
 //!
 //! Files that parse cleanly and see no file with errors are checked as
 //! ever. A session's input with an error is not checked: nothing of it is
@@ -269,6 +268,67 @@
 //! check found, failed or not, for a language server ([`crate::index`]); a
 //! file that is not checked, unbalanced or needing a file whose check
 //! failed, has nothing indexed.
+//!
+//! # Scan errors
+//!
+//! The scan's own errors (two files of a directory defining one field, an
+//! import of no module, a conflict of a view, a cycle of files, ...) do not
+//! stop it either: each stage reports every error it finds, once, and
+//! recovers from it, so that the stages after it, and the check, see a
+//! workspace they can work with, and every file the errors do not concern is
+//! checked as ever ([`Scan::scan_errors`]). Nothing runs: the check fails
+//! with every syntax error, every error of the scan and every error the
+//! check finds, in path then source order. Only a session's input with an
+//! error is not checked at all, as for a syntax error. What may follow from
+//! what the scan dropped or poisoned is not reported: a check that reads it
+//! finds `Error`, silently, and fails quietly, so that a file that needs it
+//! is not checked, as a file that needs one whose check failed is not.
+//!
+//! - A CONFLICTING FIELD, a leaf of two files of a directory, or a leaf and
+//!   an interior node of two (`merge`): the first in path then source order
+//!   stands, and every later one, its file's leaves at or under the node it
+//!   conflicts at, is dropped ([`File::dropped`]), as a shadowed declaration
+//!   is (see [Shadowable declarations](#shadowable-declarations)): in no
+//!   tree, needing nothing, checked as written, its own errors reported.
+//!   The node the dropped declaration meets the tree at is CONFLICTED
+//!   ([`Scan::conflicting`]), and it and each node above it POISONED
+//!   ([`Scan::is_poisoned`]): its cell is read as `Error` through an import
+//!   or a path, and a root over one is committed as `Error`, so that every
+//!   read of it, in any file, is erroneous, and nothing is reported of it
+//!   but the conflict. An index finds the conflicted node declared at each
+//!   of its definitions, the dropped ones included ([`crate::index`]).
+//! - A conflict of a file's view, between directories of its chain or with
+//!   an import, a conflict of its view of types, and an import that clashes
+//!   with a name of the file or its directory chain: the root of the path
+//!   in conflict, or the name, is POISONED IN THE FILE ([`File::poisoned`]):
+//!   a read of it there that no binding of a function or an inner block
+//!   shadows, as a value or as a type, bare or qualified, is `Error`,
+//!   silently. The view keeps what it would otherwise have; the conflicting
+//!   types are left out of the file's view of types.
+//! - An import of no module, or of a member a module lacks, and an import
+//!   from `fileroot` of its members: each name it would bind is poisoned in
+//!   the file. A `*` import that fails binds names the scan cannot know: in
+//!   a file with one, a name that names nothing is no error, as in a file
+//!   that sees a file with syntax errors ([`File::blind`]).
+//! - Two `type` declarations of one name in a directory: the first is the
+//!   directory's, and both are erroneous, a use of either failing quietly. A
+//!   cycle of types makes each of them erroneous, as it always did; the
+//!   files' trees are expanded regardless. An import of a type under a
+//!   built-in type's name binds nothing.
+//! - A meta declared twice in a directory, or with no definition there: it
+//!   is dropped, as a conflicting field is, and is not checked.
+//! - Files that need each other, or a file that needs itself: each file of
+//!   the cycle is not checked ([`Scan::is_cyclic`]), its needs of the other
+//!   files of the cycle are forgotten so that the order has every file, and
+//!   a file that needs one of them is not checked, as for a failed file; an
+//!   index checks them all for their index alone, as it does a file that
+//!   needs a file whose check failed.
+//! - A file or directory of the root named like a module of the standard
+//!   library: reported, and nothing else; an import of the name names the
+//!   module, as it always did.
+//!
+//! Recovery costs nothing on a workspace with no error: the trees are merged
+//! again only when a conflict was found.
 //!
 //! # Imports
 //!
@@ -956,6 +1016,24 @@ pub struct File {
     /// in source order: an error of each whose def-type declares a meta (see
     /// [Def-types](#def-types)).
     pub unpaired: Vec<DefTypeId>,
+    /// The positions among its items of the declarations the scan dropped,
+    /// recovering from an error of the scan: a later definition of a field
+    /// another file defined first, a meta declared twice or with no
+    /// definition. Each is in no tree, as a shadowed declaration is, and
+    /// still checked as written (see [Scan errors](#scan-errors)).
+    pub dropped: Vec<usize>,
+    /// The names it reads as `Error`, silently, recovering from an error of
+    /// the scan: what an import that failed binds, a name an import clashes
+    /// on, and the root of a conflict of its view or its view of types, in
+    /// [`Name`] order (see [Scan errors](#scan-errors)).
+    pub poisoned: Vec<Name>,
+    /// Whether it imports names the scan cannot know, by a `*` import that
+    /// failed, so that a name that names nothing in it is no error (see
+    /// [Scan errors](#scan-errors)).
+    pub blind: bool,
+    /// Its `import` items the scan reported an error of, in source order,
+    /// each with the module its path names, if it names one.
+    pub failed_imports: Vec<(ItemId, Option<Target>)>,
 }
 
 impl File {
@@ -989,6 +1067,34 @@ impl File {
             type_imports: Vec::new(),
             type_view: HashMap::new(),
             unpaired: Vec::new(),
+            dropped: Vec::new(),
+            poisoned: Vec::new(),
+            blind: false,
+            failed_imports: Vec::new(),
+        }
+    }
+
+    /// Drops the declarations at `positions` among its items (see
+    /// [`File::dropped`]): its declarations found again with them shadowed,
+    /// as well as those already are.
+    fn drop_items(&mut self, positions: &[usize]) {
+        self.dropped.extend_from_slice(positions);
+        self.dropped.sort_unstable();
+        self.dropped.dedup();
+        let mut shadowed = self.mentions.shadowed.clone();
+        for &position in &self.dropped {
+            if let Some(entry) = shadowed.get_mut(position) {
+                *entry = true;
+            }
+        }
+        self.mentions = mentions::scan_except(&self.ast, &shadowed);
+    }
+
+    /// Makes reads of `name` in it `Error`, silently (see
+    /// [`File::poisoned`]).
+    fn poison(&mut self, name: Name) {
+        if let Err(at) = self.poisoned.binary_search(&name) {
+            self.poisoned.insert(at, name);
         }
     }
 }
@@ -1301,6 +1407,30 @@ pub struct Scan {
     /// in path then source order (see [Syntax errors](#syntax-errors)): a
     /// file with some is scanned as its parser recovered it.
     syntax_errors: Vec<Diagnostic>,
+    /// The errors of the scan itself, each naming its file, which it
+    /// recovered from (see [Scan errors](#scan-errors)): but those of a file
+    /// that may see a file with syntax errors.
+    recovered: Vec<Diagnostic>,
+    /// The declarations dropped as later definitions of a field defined
+    /// first elsewhere, each by its file and its position among the file's
+    /// items (see [Scan errors](#scan-errors)).
+    conflict_items: Vec<(u32, usize)>,
+    /// The CONFLICTED merged nodes, each with the declarations dropped as
+    /// later definitions of it, by file and item, in path then source order:
+    /// a node at which a dropped declaration's path meets the tree (see
+    /// [Scan errors](#scan-errors)).
+    conflicted: HashMap<u32, Vec<(u32, ItemId)>>,
+    /// The conflicted nodes and every node above one, whose cells are read
+    /// as `Error` (see [Scan errors](#scan-errors)).
+    poisoned_nodes: HashSet<u32>,
+    /// The `type` declarations, by their indices in `types`, that a
+    /// declaration of their name in another file of their directory
+    /// conflicts with: each is erroneous (see [Scan errors](#scan-errors)).
+    poisoned_types: Vec<u32>,
+    /// Whether each file is in a cycle of files that need each other, or
+    /// needs itself: such a file is not checked (see [Scan
+    /// errors](#scan-errors)).
+    cyclic: Vec<bool>,
 }
 
 impl Scan {
@@ -1312,6 +1442,49 @@ impl Scan {
         &self.syntax_errors
     }
 
+    /// The errors of the scan itself, which it recovered from, each naming
+    /// its file by its input number, in path then source order (see [Scan
+    /// errors](#scan-errors)).
+    #[must_use]
+    pub fn scan_errors(&self) -> &[Diagnostic] {
+        &self.recovered
+    }
+
+    /// The syntax errors and the errors of the scan, in path then source
+    /// order: what a scan with either reports, and why nothing of it runs.
+    fn errors(&self) -> Vec<Diagnostic> {
+        merge_files(
+            self.syntax_errors
+                .iter()
+                .chain(&self.recovered)
+                .cloned()
+                .collect(),
+            Vec::new(),
+        )
+    }
+
+    /// Whether the merged node `node` is conflicted, or above a node that
+    /// is, so that it is read as `Error` (see [Scan errors](#scan-errors)).
+    #[must_use]
+    pub fn is_poisoned(&self, node: u32) -> bool {
+        !self.poisoned_nodes.is_empty() && self.poisoned_nodes.contains(&node)
+    }
+
+    /// The declarations the scan dropped as later definitions of the merged
+    /// node `node`, each by its file and item, if it is conflicted (see
+    /// [Scan errors](#scan-errors)).
+    #[must_use]
+    pub fn conflicting(&self, node: u32) -> &[(u32, ItemId)] {
+        self.conflicted.get(&node).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether file `index` is in a cycle of files that need each other, or
+    /// needs itself: it is not checked (see [Scan errors](#scan-errors)).
+    #[must_use]
+    pub fn is_cyclic(&self, index: u32) -> bool {
+        self.cyclic.get(index as usize) == Some(&true)
+    }
+
     /// Whether file `index` has syntax errors, which the scan and the
     /// checker take the tree its parser recovered for.
     #[must_use]
@@ -1321,10 +1494,11 @@ impl Scan {
             .is_some_and(|file| file.ast.syntax() != Syntax::Clean)
     }
 
-    /// Whether each file has syntax errors, by input number.
+    /// Whether each file has syntax errors or is in a cycle, by input
+    /// number: such a file always fails, and is not checked if in a cycle.
     fn broken_files(&self) -> Vec<bool> {
         (0..count(self.files.len()))
-            .map(|index| self.is_broken(index))
+            .map(|index| self.is_broken(index) || self.is_cyclic(index))
             .collect()
     }
 
@@ -1337,6 +1511,12 @@ impl Scan {
             found.retain(|diagnostic| diagnostic.severity == Severity::Error);
         }
         in_file(found, index)
+    }
+
+    /// Whether file `index` is not checked: its tree is unbalanced, or it is
+    /// in a cycle (see [Scan errors](#scan-errors)).
+    fn unchecked(&self, index: u32) -> bool {
+        self.is_unbalanced(index) || self.is_cyclic(index)
     }
 
     /// Whether file `index`'s tree is [`Syntax::Unbalanced`], its braces not
@@ -1352,9 +1532,25 @@ impl Scan {
     /// errors](#syntax-errors)): it has them, a file of its directory or of
     /// one above it has, or it imports a name, a type, a file or a
     /// directory of a file that has. A name it reads that names nothing is
-    /// no error then.
+    /// no error then; nor is it in a file that imports names the scan
+    /// cannot know ([`File::blind`]).
     #[must_use]
     pub fn sees_broken(&self, index: u32) -> bool {
+        if self.syntax_errors.is_empty() && self.recovered.is_empty() {
+            return false;
+        }
+        let Some(file) = self.files.get(index as usize) else {
+            return false;
+        };
+        file.blind || self.sees_syntax_errors(index)
+    }
+
+    /// Whether the view of file `index` sees a file with syntax errors (see
+    /// [`Scan::sees_broken`]), or an import of it that failed names a module
+    /// with one, whose member it lacks may be declared in source that could
+    /// not be parsed: the errors of the scan of such a file are not reported
+    /// (see [Syntax errors](#syntax-errors)).
+    fn sees_syntax_errors(&self, index: u32) -> bool {
         if self.syntax_errors.is_empty() {
             return false;
         }
@@ -1372,12 +1568,17 @@ impl Scan {
                 .get(at as usize)
                 .is_some_and(|declared| self.is_broken(declared.file))
         };
+        let broken_target = |target: Target| {
+            self.target_files(target)
+                .into_iter()
+                .any(|at| self.is_broken(at))
+        };
         in_chain
-            || file.aliases.iter().any(|alias| {
-                self.target_files(alias.target)
-                    .into_iter()
-                    .any(|at| self.is_broken(at))
-            })
+            || file.aliases.iter().any(|alias| broken_target(alias.target))
+            || file
+                .failed_imports
+                .iter()
+                .any(|&(_, target)| target.is_some_and(broken_target))
             || file
                 .type_imports
                 .iter()
@@ -1388,51 +1589,22 @@ impl Scan {
                 .any(|&decl| decl.checked_sub(self.type_base).is_some_and(broken_type))
     }
 
-    /// Whether file `index` may see a file with syntax errors, before its
-    /// imports are resolved: it has them, a file of its directory or of one
-    /// above it has, or it imports anything but `builtins`, `fileroot` and
-    /// the standard files.
-    fn may_see_broken(&self, index: u32) -> bool {
-        let Some(file) = self.files.get(index as usize) else {
-            return true;
-        };
-        let chain: Vec<u32> = self.chain(file.dir).collect();
-        let in_chain = (0u32..)
-            .zip(&self.files)
-            .any(|(at, other)| chain.contains(&other.dir) && self.is_broken(at));
-        in_chain
-            || file.ast.items(file.ast.root()).iter().any(|&item| {
-                let ItemKind::Import(id) = file.ast.item(item).kind else {
-                    return false;
-                };
-                let first = file
-                    .ast
-                    .path(file.ast.import_decl(id).path)
-                    .first()
-                    .and_then(PathSegment::name)
-                    .map_or("", |name| self.names.get(name));
-                first != BUILTINS
-                    && first != Fileroot::MODULE
-                    && !crate::STANDARD.iter().any(|&(stem, _)| stem == first)
-            })
-    }
-
-    /// The errors a stage of the scan that found `errors`, which stop it,
-    /// reports: every syntax error of the files, then those of `errors` of
-    /// files that cannot see a file with one, since in any other a
-    /// declaration of it may be missing or misplaced (see [Syntax
-    /// errors](#syntax-errors)).
+    /// Of `errors`, the errors the stages of the scan found, those it
+    /// reports: those of files that see no file with syntax errors
+    /// ([`Scan::sees_syntax_errors`]), since in any other a declaration may
+    /// be missing or misplaced (see [Syntax errors](#syntax-errors)).
     fn stage_errors(&self, errors: Vec<Diagnostic>) -> Vec<Diagnostic> {
         if self.syntax_errors.is_empty() {
             return errors;
         }
-        let mut all = self.syntax_errors.clone();
-        all.extend(
-            errors
-                .into_iter()
-                .filter(|error| error.input.is_some_and(|input| !self.may_see_broken(input))),
-        );
-        all
+        errors
+            .into_iter()
+            .filter(|error| {
+                error
+                    .input
+                    .is_some_and(|input| !self.sees_syntax_errors(input))
+            })
+            .collect()
     }
     /// The directories from `dir` up to the root, `dir` first.
     pub fn chain(&self, dir: u32) -> impl Iterator<Item = u32> + '_ {
@@ -2352,12 +2524,14 @@ fn parent_path(path: &str) -> &str {
 /// # Errors
 ///
 /// Every lexical and syntax error of every file, the files scanned as their
-/// parser recovered them (see [Syntax errors](#syntax-errors)), with the
-/// errors of a stage below that stops the scan of the files that cannot
-/// see one; else every file or directory of the root named like a module of
-/// the standard library; else every conflict between files' declarations
-/// in a directory; else every conflict of every file's view; else every
-/// cycle of files that need each other. Each names its file in
+/// parser recovered them (see [Syntax errors](#syntax-errors)), and every
+/// error of the scan itself, which it recovered from (see [Scan
+/// errors](#scan-errors)), but those of files that may see a file with
+/// syntax errors: every file or directory of the root named like a module of
+/// the standard library, every conflict between files' declarations in a
+/// directory, every import's error, every conflict of every file's view and
+/// view of types, every cycle of types and every cycle of files that need
+/// each other; in path then source order. Each names its file in
 /// [`Diagnostic::input`], its index among the files.
 pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
     scan_with(sources, &[])
@@ -2369,10 +2543,10 @@ pub fn scan(sources: &[SourceFile]) -> Result<Scan, Vec<Diagnostic>> {
 ///
 /// # Errors
 ///
-/// As [`scan`]; before the view's conflicts, every import that names
-/// nothing or clashes with a name of its file or directory chain, and with
-/// the cycles, every reference through an import that reaches back into
-/// its own file.
+/// As [`scan`]; among the imports' errors, every import that names nothing
+/// or clashes with a name of its file or directory chain, and with the
+/// cycles, every reference through an import that reaches back into its
+/// own file.
 pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<Diagnostic>> {
     let scan = scan_into(
         (sources, Placing::Workspace(nested)),
@@ -2380,10 +2554,10 @@ pub fn scan_with(sources: &[SourceFile], nested: &[String]) -> Result<Scan, Vec<
         &mut Names::new(),
         &mut Vec::new(),
     )?;
-    if scan.syntax_errors.is_empty() {
+    if scan.syntax_errors.is_empty() && scan.recovered.is_empty() {
         Ok(scan)
     } else {
-        Err(scan.syntax_errors)
+        Err(scan.errors())
     }
 }
 
@@ -2404,7 +2578,10 @@ enum Placing<'a> {
 
 /// [`scan_with`] of `sources` placed as `placing` says, beside `library`,
 /// interning into `names`, which the scan holds once it succeeds
-/// ([`Scan::names`]) and which are given back to `names` if it fails. The
+/// ([`Scan::names`]) and which are given back to `names` if it fails. It
+/// fails only for a session's input with a syntax error or an error of the
+/// scan, which is not checked; any other scan recovers from its errors (see
+/// [Scan errors](#scan-errors)). The
 /// indices in the library's table of the standard files it loads, which
 /// are files `0..` [`Scan::standard`], are left in `loaded` whether it
 /// succeeds or fails, so that a caller can render a diagnostic of any file
@@ -2470,6 +2647,12 @@ fn scan_into_with(
         inherited_def_types: def_types.0.to_vec(),
         input_number: def_types.1,
         syntax_errors: Vec::new(),
+        recovered: Vec::new(),
+        conflict_items: Vec::new(),
+        conflicted: HashMap::new(),
+        poisoned_nodes: HashSet::new(),
+        poisoned_types: Vec::new(),
+        cyclic: Vec::new(),
     };
     match scan_files(&mut scan, (sources, placing), library, loaded) {
         Ok(()) => Ok(scan),
@@ -2528,16 +2711,14 @@ fn scan_files(
         };
         scan.files.push(File::new(path, dir, ast, spelled));
     }
+    // Every stage of the scan reports its errors and recovers from them,
+    // so that the next stages, and the check, see a workspace they can
+    // work with (see [Scan errors](#scan-errors)).
     let mut errors = Vec::new();
     match placing {
         Placing::Workspace(_) => reserved(scan, library, &mut errors),
         Placing::Lone(_, true) => no_prelude_in_input(scan, &mut errors),
         Placing::Lone(_, false) => {}
-    }
-    // Each stage that finds errors stops the scan, with the files' syntax
-    // errors (see [Syntax errors](#syntax-errors)).
-    if !errors.is_empty() {
-        return Err(scan.stage_errors(errors));
     }
     // A definition made with a def-type is a leaf of its def-type's
     // namespace, which is known only once the files' views are: the trees
@@ -2545,43 +2726,37 @@ fn scan_files(
     // any definition has one (see [Def-types](#def-types)).
     let mark = scan.type_store.mark();
     for pass in 0..2 {
-        if let Err(errors) = scan_trees(scan, placing, &dirs) {
-            return Err(scan.stage_errors(errors));
-        }
+        let mut found = Vec::new();
+        scan_trees(scan, placing, &dirs, &mut found);
         if !name_namespaces(scan) || pass > 0 {
+            errors.append(&mut found);
             break;
         }
         // A meta declared twice in a directory, or with no definition there,
         // is its own error, before the trees with the metas in them would
-        // report it as a conflict (see [Def-types](#def-types)).
-        let errors = unpaired_metas(scan);
-        if !errors.is_empty() {
-            return Err(scan.stage_errors(errors));
-        }
-        unscan(scan, mark);
+        // report it as a conflict (see [Def-types](#def-types)); it is
+        // dropped. The trees made again find again what these found.
+        let (unpaired, dropped) = unpaired_metas(scan);
+        errors.extend(unpaired);
+        unscan(scan, mark, &dropped);
     }
     mark_unpaired(scan);
     type_views(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(scan.stage_errors(errors));
-    }
     define_types(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(scan.stage_errors(errors));
-    }
     value_cells(scan);
     resolve(scan);
     let mentioned = find_needs(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(scan.stage_errors(errors));
-    }
     report_cycles(scan, &mentioned, &mut errors);
-    if !errors.is_empty() {
-        return Err(scan.stage_errors(errors));
-    }
     scan.order = order(&scan.needs);
     scan.rank = scan.ranks();
     schedule(scan);
+    let errors = scan.stage_errors(errors);
+    scan.recovered = merge_files(errors, Vec::new());
+    // A session's input with an error is not checked, as for a syntax
+    // error.
+    if !scan.recovered.is_empty() && matches!(placing, Placing::Lone(_, true)) {
+        return Err(mem::take(&mut scan.recovered));
+    }
     Ok(())
 }
 
@@ -2590,29 +2765,19 @@ fn scan_files(
 /// `dirs`, by path, and makes their views: the part of [`scan_files`] that
 /// a def-type's namespace needs done before it is known, and done again
 /// once the definitions are under their namespaces' keys (see
-/// [Def-types](#def-types)).
-///
-/// # Errors
-///
-/// The conflicts of the directories' trees, the types declared twice, the
-/// imports' errors and the conflicts of the views, each stage's stopping
-/// the scan.
+/// [Def-types](#def-types)). Adds to `errors` the conflicts of the
+/// directories' trees, the types declared twice, the imports' errors and
+/// the conflicts of the views, recovering from each (see [Scan
+/// errors](#scan-errors)).
 fn scan_trees(
     scan: &mut Scan,
     placing: Placing,
     dirs: &HashMap<String, u32>,
-) -> Result<(), Vec<Diagnostic>> {
-    let mut errors = Vec::new();
+    errors: &mut Vec<Diagnostic>,
+) {
     shadow(scan);
-    scan.roots = vec![Vec::new(); scan.dirs.len()];
-    builtin_nodes(scan);
-    for file in 0..count(scan.files.len()) {
-        merge(scan, file, &mut errors);
-    }
-    declare_types(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
-    }
+    merge_trees(scan, errors);
+    declare_types(scan, errors);
     shadowable_nodes(scan);
     let mut base = 0u32;
     scan.part_base = scan
@@ -2628,27 +2793,117 @@ fn scan_trees(
         Placing::Workspace(nested) => (nested, &[][..]),
         Placing::Lone(inherited, _) => (&[][..], inherited),
     };
-    imports(scan, dirs, (nested, inherited), &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
+    imports(scan, dirs, (nested, inherited), errors);
+    views(scan, errors);
+}
+
+/// Merges the trees of `scan`'s files into their directories' trees,
+/// adding to `errors` each conflict between two files of a directory, and
+/// recovering from them (see [Scan errors](#scan-errors)): the later
+/// declarations of each conflict are dropped from their files
+/// ([`File::drop_items`]) and the trees merged again without them, and the
+/// node each meets the tree at is conflicted ([`Scan::conflicted`]). With
+/// no conflict, the trees are merged once.
+fn merge_trees(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
+    loop {
+        scan.nodes.clear();
+        scan.by_name.clear();
+        scan.functions.clear();
+        scan.defs.clear();
+        scan.roots = vec![Vec::new(); scan.dirs.len()];
+        builtin_nodes(scan);
+        let mut dropped: Vec<(u32, usize)> = Vec::new();
+        for file in 0..count(scan.files.len()) {
+            merge(scan, file, errors, &mut dropped);
+        }
+        dropped.sort_unstable();
+        dropped.dedup();
+        // Each merge again drops what is left of a conflict; one that drops
+        // nothing new is the last.
+        dropped.retain(|item| !scan.conflict_items.contains(item));
+        if dropped.is_empty() {
+            break;
+        }
+        for (index, file) in (0u32..).zip(&mut scan.files) {
+            let mine: Vec<usize> = dropped
+                .iter()
+                .filter(|&&(at, _)| at == index)
+                .map(|&(_, position)| position)
+                .collect();
+            if !mine.is_empty() {
+                file.drop_items(&mine);
+            }
+        }
+        scan.conflict_items.extend(dropped);
     }
-    views(scan, &mut errors);
-    if !errors.is_empty() {
-        return Err(errors);
+    conflicted_nodes(scan);
+}
+
+/// Finds the conflicted nodes of `scan` ([`Scan::conflicted`]) from its
+/// declarations dropped as later definitions of a field: the node of each
+/// one's directory's tree its path meets last, the longest prefix of it the
+/// tree has; and marks each, and every node above it, poisoned.
+fn conflicted_nodes(scan: &mut Scan) {
+    scan.conflicted.clear();
+    scan.poisoned_nodes.clear();
+    let mut items = scan.conflict_items.clone();
+    items.sort_unstable();
+    for (index, position) in items {
+        let Some(file) = scan.files.get(index as usize) else {
+            continue;
+        };
+        let Some(&item) = file.ast.items(file.ast.root()).get(position) else {
+            continue;
+        };
+        let Some((_, names, _)) =
+            mentions::declarations(&file.ast).find(|&(at, _, _)| at == position)
+        else {
+            continue;
+        };
+        let mut parent = ROOT;
+        let mut met = None;
+        for name in names {
+            let Some(&node) = scan.by_name.get(&(file.dir, parent, name)) else {
+                break;
+            };
+            met = Some(node);
+            parent = node;
+        }
+        let Some(node) = met else {
+            continue;
+        };
+        scan.conflicted.entry(node).or_default().push((index, item));
+        let mut at = Some(node);
+        while let Some(up) = at {
+            scan.poisoned_nodes.insert(up);
+            at = scan.nodes.get(up as usize).and_then(|n| n.parent);
+        }
     }
-    Ok(())
 }
 
 /// Forgets what [`scan_trees`] made of `scan`'s files, and their files'
 /// declarations, so that it can make them again from the files' trees,
 /// which have changed: every file's declarations found again, the merged
 /// nodes, functions, views and types gone, the type store put back at
-/// `mark`, where it was before the types were declared.
-fn unscan(scan: &mut Scan, mark: TypeStoreMark) {
+/// `mark`, where it was before the types were declared. Of the declarations
+/// the scan dropped, only `dropped` are, by file and position: the trees
+/// made again find their conflicts again.
+fn unscan(scan: &mut Scan, mark: TypeStoreMark, dropped: &[(u32, usize)]) {
     let files = mem::take(&mut scan.files);
-    scan.files = files
-        .into_iter()
-        .map(|file| File::new(&file.path, file.dir, file.ast, file.spelled))
+    scan.files = (0u32..)
+        .zip(files)
+        .map(|(index, file)| {
+            let mut file = File::new(&file.path, file.dir, file.ast, file.spelled);
+            let mine: Vec<usize> = dropped
+                .iter()
+                .filter(|&&(at, _)| at == index)
+                .map(|&(_, position)| position)
+                .collect();
+            if !mine.is_empty() {
+                file.drop_items(&mine);
+            }
+            file
+        })
         .collect();
     scan.nodes.clear();
     scan.by_name.clear();
@@ -2660,6 +2915,10 @@ fn unscan(scan: &mut Scan, mark: TypeStoreMark) {
     scan.dir_types.clear();
     scan.type_store.truncate(mark);
     scan.type_base = 0;
+    scan.conflict_items.clear();
+    scan.conflicted.clear();
+    scan.poisoned_nodes.clear();
+    scan.poisoned_types.clear();
 }
 
 /// A def-type definition, reference or meta whose def-type
@@ -2734,9 +2993,9 @@ fn name_namespaces(scan: &mut Scan) -> bool {
 
 /// A definition or a meta of a file of a scan by its leaf in the namespace
 /// of the metas of its def-type's definitions in its directory (see
-/// [Def-types](#def-types)): that leaf, its file and its use of its
-/// def-type.
-type MetaLeaf = ((Name, Name), u32, DefTypeId);
+/// [Def-types](#def-types)): that leaf, its file, its use of its def-type
+/// and its item's position among the file's items.
+type MetaLeaf = ((Name, Name), u32, DefTypeId, usize);
 
 /// The definitions and the metas of `scan`'s files whose def-types are
 /// known, each by its leaf in the namespace of the metas of its def-type's
@@ -2747,7 +3006,7 @@ fn meta_leaves(scan: &Scan) -> (Vec<MetaLeaf>, Vec<MetaLeaf>) {
     let (mut definitions, mut metas) = (Vec::new(), Vec::new());
     for (index, file) in (0u32..).zip(&scan.files) {
         let ast = &file.ast;
-        for &item in ast.items(ast.root()) {
+        for (position, &item) in ast.items(ast.root()).iter().enumerate() {
             let (ItemKind::DefTypeDef { def, .. } | ItemKind::DefMeta { def, .. }) =
                 ast.item(item).kind
             else {
@@ -2756,9 +3015,14 @@ fn meta_leaves(scan: &Scan) -> (Vec<MetaLeaf>, Vec<MetaLeaf>) {
             let Some(leaf) = ast.def_type(def).meta else {
                 continue;
             };
+            // A meta the scan dropped is none (see [Scan
+            // errors](#scan-errors)).
+            if file.dropped.binary_search(&position).is_ok() {
+                continue;
+            }
             match ast.item(item).kind {
-                ItemKind::DefMeta { .. } => metas.push((leaf, index, def)),
-                _ => definitions.push((leaf, index, def)),
+                ItemKind::DefMeta { .. } => metas.push((leaf, index, def, position)),
+                _ => definitions.push((leaf, index, def, position)),
             }
         }
     }
@@ -2773,13 +3037,16 @@ fn meta_leaves(scan: &Scan) -> (Vec<MetaLeaf>, Vec<MetaLeaf>) {
 /// declares no definition of its path and def-type, "`defmeta package x`
 /// has no definition `x` in its directory", at it. Each at the meta's
 /// `defmeta`, def-type and path, in path order of their files, then in
-/// source order.
-fn unpaired_metas(scan: &Scan) -> Vec<Diagnostic> {
+/// source order. With them, each such meta, by its file and its position
+/// among the file's items, which the scan drops (see [Scan
+/// errors](#scan-errors)).
+fn unpaired_metas(scan: &Scan) -> (Vec<Diagnostic>, Vec<(u32, usize)>) {
     let (definitions, metas) = meta_leaves(scan);
     let defined: HashSet<(Name, Name)> = definitions.iter().map(|&(leaf, ..)| leaf).collect();
     let mut first: HashMap<(Name, Name), (u32, Span)> = HashMap::new();
     let mut errors = Vec::new();
-    for &(leaf, index, def) in &metas {
+    let mut dropped = Vec::new();
+    for &(leaf, index, def, position) in &metas {
         let Some(file) = scan.files.get(index as usize) else {
             continue;
         };
@@ -2806,6 +3073,7 @@ fn unpaired_metas(scan: &Scan) -> Vec<Diagnostic> {
                 .in_input(index)
                 .with_context_in(first_file, first_at, "first declared here"),
             );
+            dropped.push((index, position));
             continue;
         }
         first.insert(leaf, (index, at));
@@ -2819,9 +3087,10 @@ fn unpaired_metas(scan: &Scan) -> Vec<Diagnostic> {
                 )
                 .in_input(index),
             );
+            dropped.push((index, position));
         }
     }
-    errors
+    (errors, dropped)
 }
 
 /// Records in each file of `scan` its definitions whose directory declares
@@ -2831,7 +3100,7 @@ fn unpaired_metas(scan: &Scan) -> Vec<Diagnostic> {
 fn mark_unpaired(scan: &mut Scan) {
     let (definitions, metas) = meta_leaves(scan);
     let declared: HashSet<(Name, Name)> = metas.iter().map(|&(leaf, ..)| leaf).collect();
-    for (leaf, index, def) in definitions {
+    for (leaf, index, def, _) in definitions {
         if !declared.contains(&leaf)
             && let Some(file) = scan.files.get_mut(index as usize)
         {
@@ -3109,6 +3378,10 @@ fn shadow(scan: &mut Scan) {
         }
         let sweep = sweeps.entry(file.dir).or_default();
         for (position, names, shadowable) in mentions::declarations(&file.ast) {
+            // A declaration the scan dropped stands nowhere.
+            if file.dropped.binary_search(&position).is_ok() {
+                continue;
+            }
             let killed = sweep.declare(&names, (index, position), shadowable);
             for (owner, at) in killed.unwrap_or_default() {
                 let Some(known) = scan.files.get(owner as usize) else {
@@ -3266,9 +3539,34 @@ fn first_leaf(file: &File, own: u32) -> Option<(Span, Span)> {
     }
 }
 
+/// The positions among `file`'s items of its leaves at or under its own
+/// node `own`.
+fn leaves_under(file: &File, own: u32) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut stack = vec![own];
+    while let Some(at) = stack.pop() {
+        let Some(node) = file.mentions.tree.nodes.get(at as usize) else {
+            continue;
+        };
+        if let Some(leaf) = node.leaf {
+            positions.push(leaf.position);
+        }
+        stack.extend(&node.children);
+    }
+    positions
+}
+
 /// Adds `file`'s own tree to its directory's merged tree, reporting the
-/// conflicts with the files before it, and numbers its functions.
-fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
+/// conflicts with the files before it, and numbers its functions. The
+/// declarations of each conflict of the file, its leaves at or under its
+/// node that conflicts, are added to `dropped`, by file and position (see
+/// [`merge_trees`]).
+fn merge(
+    scan: &mut Scan,
+    file: u32,
+    errors: &mut Vec<Diagnostic>,
+    dropped: &mut Vec<(u32, usize)>,
+) {
     let Some(entry) = scan.files.get(file as usize) else {
         return;
     };
@@ -3283,6 +3581,7 @@ fn merge(scan: &mut Scan, file: u32, errors: &mut Vec<Diagnostic>) {
         let merged = if let Some(&existing) = scan.by_name.get(&key) {
             if let Some(clash) = conflict(scan, file, own, existing) {
                 errors.push(clash);
+                dropped.extend(leaves_under(entry, own).into_iter().map(|at| (file, at)));
             }
             existing
         } else {
@@ -3651,9 +3950,12 @@ impl Scan {
 fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     let mut reported: HashSet<(Side, Side)> = HashSet::new();
     let mut found = Vec::with_capacity(scan.files.len());
-    let mut gone_from = Vec::with_capacity(scan.files.len());
+    // Each file's imports gone from its view, and the roots of its
+    // conflicts, which it reads as `Error` (see [Scan errors](#scan-errors)).
+    let mut gone_from: Vec<(Vec<u32>, Vec<Name>)> = Vec::with_capacity(scan.files.len());
     for index in 0..count(scan.files.len()) {
         let (mut nodes, mut merged, conflicts, gone) = file_view(scan, index);
+        let mut roots = Vec::new();
         for (parent, name, parts) in conflicts {
             report_conflicts(
                 scan,
@@ -3663,6 +3965,7 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 &mut reported,
                 errors,
             );
+            roots.push(conflict_root(&nodes, parent, name));
         }
         // The imports gone from the view are no aliases of the file: the
         // others are renumbered.
@@ -3687,7 +3990,7 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 }
             }
         }
-        gone_from.push(gone);
+        gone_from.push((gone, roots));
         // Its own nodes first, each after its parent as before: a node with
         // a leaf of the file under it has only such nodes above it.
         let start = count(scan.views.len());
@@ -3734,7 +4037,10 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             merged,
         });
     }
-    for ((file, view), gone) in scan.files.iter_mut().zip(found).zip(gone_from) {
+    for ((file, view), (gone, roots)) in scan.files.iter_mut().zip(found).zip(gone_from) {
+        for root in roots {
+            file.poison(root);
+        }
         file.view = view;
         if !gone.is_empty() {
             let aliases = mem::take(&mut file.aliases);
@@ -3745,6 +4051,22 @@ fn views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 .collect();
         }
     }
+}
+
+/// The root of the path of a conflict of a file's view at the name `name`
+/// under `parent` ([`ROOT`] for a root, else one of `nodes`, the view's
+/// nodes numbered from 0): what the file reads as `Error` (see [Scan
+/// errors](#scan-errors)).
+fn conflict_root(nodes: &[ViewNode], parent: u32, name: Name) -> Name {
+    let mut root = name;
+    let mut at = (parent != ROOT).then_some(parent);
+    while let Some(view) = at
+        && let Some(node) = nodes.get(view as usize)
+    {
+        root = node.name;
+        at = node.parent;
+    }
+    root
 }
 
 /// A place in the static order of the declarations and imports reaching a
@@ -4247,17 +4569,49 @@ fn imports(
         let mut aliases = Vec::new();
         let mut types = Vec::new();
         let mut own_errors = Vec::new();
-        let mut import = |item: ItemId, bound: (&mut Vec<Alias>, &mut Vec<TypeImport>)| {
-            let ItemKind::Import(id) = file.ast.item(item).kind else {
-                return;
+        // The imports that failed, and what they bind (see [Scan
+        // errors](#scan-errors)).
+        let mut failed_imports: Vec<(ItemId, Option<Target>)> = Vec::new();
+        let mut poisoned: Vec<Name> = Vec::new();
+        let mut blind = false;
+        let mut import =
+            |item: ItemId, (aliases, types): (&mut Vec<Alias>, &mut Vec<TypeImport>)| {
+                let ItemKind::Import(id) = file.ast.item(item).kind else {
+                    return;
+                };
+                let decl = file.ast.import_decl(id);
+                let path = file.ast.path(decl.path);
+                let before = own_errors.len();
+                let resolved = module(scan, &modules, path, &mut both);
+                let module_of = resolved.as_ref().ok().copied();
+                let failed = match resolved {
+                    Ok(target) => {
+                        let bound = (&mut *aliases, &mut *types);
+                        members(scan, (file, item, decl), target, bound, &mut own_errors);
+                        own_errors.len() > before
+                    }
+                    Err(error) => {
+                        // A lone file's import of anything but the standard
+                        // library is the checker's to report.
+                        let failed = error.is_some() || !scan.lone;
+                        own_errors.extend(error);
+                        failed
+                    }
+                };
+                if own_errors.len() > before {
+                    failed_imports.push((item, module_of));
+                }
+                if failed {
+                    let (names, star) = import_binds(&file.ast, decl);
+                    poisoned.extend(names.into_iter().filter(|&name| {
+                        !aliases
+                            .iter()
+                            .any(|a| a.item == Some(item) && a.name == name)
+                            && !types.iter().any(|t| t.name == name)
+                    }));
+                    blind |= star;
+                }
             };
-            let decl = file.ast.import_decl(id);
-            let path = file.ast.path(decl.path);
-            match module(scan, &modules, path, &mut both) {
-                Ok(target) => members(scan, (file, item, decl), target, bound, &mut own_errors),
-                Err(error) => own_errors.extend(error),
-            }
-        };
         for &item in file.ast.items(file.ast.root()) {
             import(item, (&mut aliases, &mut types));
         }
@@ -4270,13 +4624,43 @@ fn imports(
         if let Some(item) = file.ast.implicit_import().filter(|_| prelude) {
             import(item, (&mut aliases, &mut types));
         }
-        clashes(scan, index, &aliases, &mut own_errors);
+        clashes(scan, index, &aliases, (&mut own_errors, &mut poisoned));
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
-        found.push((aliases, types));
+        found.push((aliases, types, (poisoned, blind, failed_imports)));
     }
-    for (file, (aliases, types)) in scan.files.iter_mut().zip(found) {
+    for (file, (aliases, types, (poisoned, blind, failed))) in scan.files.iter_mut().zip(found) {
         file.aliases = aliases;
         file.type_imports = types;
+        file.failed_imports = failed;
+        for name in poisoned {
+            file.poison(name);
+        }
+        file.blind |= blind;
+    }
+}
+
+/// The names the import `decl` of the tree `ast` binds, each member's (or
+/// its alias), or a whole import's, and whether it has a `*`, whose names
+/// are not known from it alone.
+fn import_binds(ast: &Ast, decl: &ImportDecl) -> (Vec<Name>, bool) {
+    match decl.form {
+        ImportForm::Whole(alias) => {
+            let bound = alias
+                .map(|a| a.name)
+                .or_else(|| ast.path(decl.path).last().and_then(PathSegment::name));
+            (bound.into_iter().collect(), false)
+        }
+        ImportForm::Members(range) => {
+            let mut names = Vec::new();
+            let mut star = false;
+            for member in ast.import_members(range) {
+                match *member {
+                    ImportMember::Named { name, alias } => names.push(alias.unwrap_or(name).name),
+                    ImportMember::All(_) => star = true,
+                }
+            }
+            (names, star)
+        }
     }
 }
 
@@ -4700,7 +5084,16 @@ impl Scan {
                         span,
                     ))
                 }
-                TypeRead::Path(path) => self.qualified_type(file, file.ast.path(path), span),
+                TypeRead::Path(path) => {
+                    let path = file.ast.path(path);
+                    // Through a name the file reads as `Error`, the
+                    // checker's, quietly (see [Scan errors](#scan-errors)).
+                    let first = path.first().and_then(PathSegment::name);
+                    if first.is_some_and(|name| file.poisoned.binary_search(&name).is_ok()) {
+                        continue;
+                    }
+                    self.qualified_type(file, path, span)
+                }
             };
             links.push((id, link));
         }
@@ -4793,14 +5186,13 @@ fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     }
     let mut dir_types: Vec<Vec<u32>> = vec![Vec::new(); scan.dirs.len()];
     let mut first: HashMap<(u32, Name), u32> = HashMap::new();
+    let mut poisoned = Vec::new();
     for (at, decl) in (0u32..).zip(&types) {
         let Some(dir) = scan.files.get(decl.file as usize).map(|file| file.dir) else {
             continue;
         };
-        match first
-            .get(&(dir, decl.name))
-            .and_then(|&e| types.get(e as usize))
-        {
+        let earlier_at = first.get(&(dir, decl.name)).copied();
+        match earlier_at.and_then(|e| types.get(e as usize)) {
             None => {
                 first.insert((dir, decl.name), at);
                 if let Some(list) = dir_types.get_mut(dir as usize) {
@@ -4818,12 +5210,18 @@ fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                     .with_context_in(earlier.file, earlier.span, "declared here")
                     .in_input(decl.file),
                 );
+                // Both are erroneous, so nothing that uses either is
+                // checked against the wrong one (see [Scan
+                // errors](#scan-errors)).
+                poisoned.extend(earlier_at);
+                poisoned.push(at);
             }
         }
     }
     for (file, mine) in scan.files.iter_mut().zip(own) {
         file.types = mine;
     }
+    scan.poisoned_types = poisoned;
     scan.type_base = scan.type_store.reserve(types.len());
     scan.types = types;
     scan.dir_types = dir_types;
@@ -4883,6 +5281,9 @@ fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             sources.push((import.name, source));
         }
         let mut view: HashMap<Name, TypeSource> = HashMap::new();
+        // The names two declarations conflict on, which the file reads as
+        // `Error` (see [Scan errors](#scan-errors)).
+        let mut conflicting: Vec<Name> = Vec::new();
         for (name, source) in sources {
             if let Some(at) = source.import
                 && BUILTIN_TYPE_NAMES.contains(&scan.names.get(name))
@@ -4905,8 +5306,12 @@ fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                     {
                         errors.push(error);
                     }
+                    conflicting.push(name);
                 }
             }
+        }
+        for name in &conflicting {
+            view.remove(name);
         }
         let mut numbered: HashMap<Name, u32> = view
             .into_iter()
@@ -4917,10 +5322,13 @@ fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 numbered.entry(name).or_insert(decl);
             }
         }
-        found.push(numbered);
+        found.push((numbered, conflicting));
     }
-    for (file, view) in scan.files.iter_mut().zip(found) {
+    for (file, (view, conflicting)) in scan.files.iter_mut().zip(found) {
         file.type_view = view;
+        for name in conflicting {
+            file.poison(name);
+        }
     }
 }
 
@@ -4963,9 +5371,10 @@ fn type_conflict(
 /// another type, or qualified, as its file's view resolves it
 /// ([`Scan::type_links`]); reports each cycle of types, "type `A` refers to
 /// itself" ([`type_cycle`]); settles every declaration, those it refers to
-/// first, those on a cycle erroneous ([`TypeStore::settle`]); and, if
-/// nothing is wrong, expands each file's tree with them
-/// ([`Ast::expand_types`]). A scan with no type to define and nothing that
+/// first, those on a cycle or poisoned ([`Scan::poisoned_types`]) erroneous
+/// ([`TypeStore::settle`]); and expands each file's tree with them
+/// ([`Ast::expand_types`]), a use of an erroneous one erroneous, its check
+/// failing quietly. A scan with no type to define and nothing that
 /// reads one costs one look at each file's type expressions.
 fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     let links: Vec<Vec<(TypeExprId, TypeLink)>> = (0..count(scan.files.len()))
@@ -5005,12 +5414,14 @@ fn define_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             errors.push(error);
         }
         for &member in component {
-            scan.type_store.settle(base.saturating_add(member), cyclic);
+            let poisoned = scan.poisoned_types.contains(&member);
+            scan.type_store
+                .settle(base.saturating_add(member), cyclic || poisoned);
         }
     }
-    if !errors.is_empty() {
-        return;
-    }
+    // A declaration on a cycle, or poisoned, is erroneous, and so is each
+    // use of it: the trees are expanded whatever was found (see [Scan
+    // errors](#scan-errors)).
     for (file, links) in scan.files.iter_mut().zip(&links) {
         file.ast.expand_types(&scan.type_store, links);
     }
@@ -5083,8 +5494,14 @@ fn type_cycle(scan: &Scan, component: &[u32], edges: &[Vec<u32>]) -> Option<Diag
 /// among them), and those a session's input inherits, clash with nothing,
 /// and a whole import named like a field root of the file or of its
 /// directory chain all of whose leaves are shadowable shadows it silently
-/// ([`whole_imports_shadow`]).
-fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnostic>) {
+/// ([`whole_imports_shadow`]). Each name that clashes is added to
+/// `poisoned`, read as `Error` in the file (see [Scan errors](#scan-errors)).
+fn clashes(
+    scan: &Scan,
+    index: u32,
+    aliases: &[Alias],
+    (errors, poisoned): (&mut Vec<Diagnostic>, &mut Vec<Name>),
+) {
     let Some(file) = scan.files.get(index as usize) else {
         return;
     };
@@ -5164,6 +5581,7 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
             } else {
                 Diagnostic::error(message, span).with_context(alias.span, "imported here")
             });
+            poisoned.push(alias.name);
             continue;
         }
         let above = scan
@@ -5174,6 +5592,7 @@ fn clashes(scan: &Scan, index: u32, aliases: &[Alias], errors: &mut Vec<Diagnost
                 format!("`{shown}` is a field of this directory"),
                 alias.span,
             ));
+            poisoned.push(alias.name);
         }
     }
 }
@@ -5378,6 +5797,9 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
         itselves.push(itself);
     }
     whole_reads_needing_back(scan, whole_dirs, &mut all, &mut itselves, errors);
+    // A file that needs itself is not checked (see [Scan
+    // errors](#scan-errors)).
+    scan.cyclic = itselves;
     scan.needs = all
         .iter()
         .map(|first| {
@@ -5389,12 +5811,35 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
     all
 }
 
-/// Reports each cycle of files that need each other, once.
+/// Reports each cycle of files that need each other, once, and recovers
+/// from it (see [Scan errors](#scan-errors)): each file of it is marked
+/// cyclic ([`Scan::is_cyclic`]), not to be checked, and its needs of the
+/// other files of it are forgotten, so that the order has every file.
 fn report_cycles(
-    scan: &Scan,
+    scan: &mut Scan,
     mentioned: &[HashMap<u32, (Span, String)>],
     errors: &mut Vec<Diagnostic>,
 ) {
+    let groups = cycle_groups(scan, mentioned, errors);
+    for group in groups {
+        for &file in &group {
+            if let Some(entry) = scan.cyclic.get_mut(file as usize) {
+                *entry = true;
+            }
+            if let Some(needs) = scan.needs.get_mut(file as usize) {
+                needs.retain(|need| !group.contains(need));
+            }
+        }
+    }
+}
+
+/// Reports each cycle of `scan`'s files that need each other, once, and
+/// returns the files of each.
+fn cycle_groups(
+    scan: &Scan,
+    mentioned: &[HashMap<u32, (Span, String)>],
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<Vec<u32>> {
     let edges: Vec<&[u32]> = scan.needs.iter().map(Vec::as_slice).collect();
     let (mut groups, _) = mentions::components(&edges);
     for group in &mut groups {
@@ -5438,6 +5883,8 @@ fn report_cycles(
             ));
         }
     }
+    groups.retain(|group| group.len() > 1);
+    groups
 }
 
 /// The files in the order they run: repeatedly the path-smallest file all
@@ -5653,12 +6100,35 @@ impl<'a> Context<'a> {
         self.scan.sees_broken(self.index)
     }
 
+    /// Whether the file reads any name as `Error` ([`File::poisoned`]).
+    pub(crate) fn has_poison(&self) -> bool {
+        !self.file.poisoned.is_empty()
+    }
+
+    /// Whether the file reads the name `name` as `Error`, silently, the
+    /// scan having recovered from an error about it ([`File::poisoned`]; see
+    /// [Scan errors](#scan-errors)).
+    pub(crate) fn poisoned(&self, name: Name) -> bool {
+        self.file.poisoned.binary_search(&name).is_ok()
+    }
+
+    /// Whether the scan of the workspace found errors, its own or syntax
+    /// errors, which it recovered from: nothing runs, so a check that found
+    /// an erroneous type with nothing to report, of a declaration the scan
+    /// poisoned, fails quietly (see [Scan errors](#scan-errors)).
+    pub(crate) fn scan_failed(&self) -> bool {
+        !self.scan.recovered.is_empty() || !self.scan.syntax_errors.is_empty()
+    }
+
     /// Whether the import item `item` of a lone file, or of a session's
     /// input, names nothing it can: a path of anything but `builtins` and
     /// the standard files, which the checker reports as needing a
-    /// workspace (see the module documentation, "The standard library").
+    /// workspace (see the module documentation, "The standard library"); an
+    /// import whose error the scan reported is not reported again.
     pub(crate) fn needs_workspace(&self, item: ItemId) -> bool {
-        self.scan.lone && !self.file.aliases.iter().any(|a| a.item == Some(item))
+        self.scan.lone
+            && !self.file.aliases.iter().any(|a| a.item == Some(item))
+            && !self.file.failed_imports.iter().any(|&(at, _)| at == item)
     }
 
     /// The slot of the cell numbered `cell` (see [`Scan::slot`]).
@@ -6207,7 +6677,10 @@ impl Recorded {
             .get(index as usize)
             .map_or(&[][..], |f| &f.global);
         for (&global, &ty) in global.iter().zip(&found.cells) {
-            if ty != TyId::ERROR && scan.computed_by(global) == Some(index) {
+            if ty != TyId::ERROR
+                && scan.computed_by(global) == Some(index)
+                && !scan.is_poisoned(global)
+            {
                 set(&mut self.cells, global, ty);
             }
         }
@@ -6309,7 +6782,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
     #[cfg(test)]
     let mut view_records: Vec<Vec<ViewRecord>> = vec![Vec::new(); scan.files.len()];
     for index in scan.order.clone() {
-        if blocked(&scan, &mut failed, index) || scan.is_unbalanced(index) {
+        if blocked(&scan, &mut failed, index) || scan.unchecked(index) {
             continue;
         }
         if let Some(file) = scan.files.get_mut(index as usize) {
@@ -6333,6 +6806,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
             _ => Vec::new(),
         };
         let keep = |name: Name| commits(&scan, index, name);
+        let poison = |name: Name| poisoned_root(&scan, index, name);
         #[cfg(test)]
         if let Some(Ok((_, output))) = &compiled {
             let records = output.checked.resolution.view_records();
@@ -6341,7 +6815,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         let result = match compiled {
             Some(Ok((ir, output))) => {
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
-                    dir.commit(&output.scope, start, keep);
+                    dir.commit(&output.scope, start, (keep, poison));
                 }
                 slot_names = output.scope.into_slot_names();
                 Ok((ir, output.checked.types, output.warnings))
@@ -6484,12 +6958,14 @@ pub fn index_lone_with_standard(source: &SourceFile, dir: &str) -> Indexed {
 /// (see [Types](#types)): what is wrong in each declaration is reported
 /// here, once, and every file that uses it fails quietly. Lends each file
 /// `names`, and interns into `types`. Returns the errors, each naming its
-/// file, after the files' syntax errors: the errors found before any file
-/// is checked. A file whose tree is unbalanced is not checked; in one whose
+/// file, after the files' syntax errors and the errors of the scan: the
+/// errors found before any file is checked. A file whose tree is
+/// unbalanced is not checked; in one whose
 /// view sees a file with syntax errors, an unknown type is no error (see
 /// [Syntax errors](#syntax-errors)).
 fn check_type_items(scan: &mut Scan, names: &mut Names, types: &mut TypeTable) -> Vec<Diagnostic> {
     let mut errors = scan.syntax_errors.clone();
+    errors.extend(scan.recovered.iter().cloned());
     let broken: Vec<bool> = (0..count(scan.files.len()))
         .map(|index| scan.sees_broken(index))
         .collect();
@@ -6538,6 +7014,22 @@ fn commits(scan: &Scan, index: u32, name: Name) -> bool {
     })
 }
 
+/// Whether file `index`'s root `name` is poisoned, a conflicted node at or
+/// under it (see [Scan errors](#scan-errors)): it is committed as `Error`.
+fn poisoned_root(scan: &Scan, index: u32, name: Name) -> bool {
+    if scan.poisoned_nodes.is_empty() {
+        return false;
+    }
+    let Some(file) = scan.files.get(index as usize) else {
+        return false;
+    };
+    file.mentions
+        .tree
+        .root(name)
+        .and_then(|root| file.global.get(root as usize))
+        .is_some_and(|&global| scan.is_poisoned(global))
+}
+
 /// The declarations the files of one directory have committed, for the
 /// files checked after them: a scope, with its variables indexed by name,
 /// so that a file is checked from the declarations of the names it spells
@@ -6582,10 +7074,18 @@ impl Committed {
     }
 
     /// Commits the variables of `from` after its first `start` whose names
-    /// `keep` accepts, as [`Scope::commit`] does, and indexes them.
-    fn commit(&mut self, from: &Scope, start: usize, keep: impl Fn(Name) -> bool) {
+    /// `keep` accepts, as [`Scope::commit`] does, and indexes them; each
+    /// whose name `poisoned` accepts as `Error` (see [Scan
+    /// errors](#scan-errors)).
+    fn commit(
+        &mut self,
+        from: &Scope,
+        start: usize,
+        (keep, poisoned): (impl Fn(Name) -> bool, impl Fn(Name) -> bool),
+    ) {
         let before = self.scope.len();
         self.scope.commit(from, start, keep);
+        self.scope.poison_from(before, poisoned);
         for (at, name) in self.scope.names().enumerate().skip(before) {
             self.by_name.entry(name).or_default().push(at);
         }
@@ -6621,7 +7121,13 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
                 let resolution = output.checked.resolution.function(function.function);
                 known = Some(KnownParams::of(resolution));
             }
-            cells.push((global, slot, ty, known));
+            // A poisoned cell is read as `Error` (see [Scan
+            // errors](#scan-errors)).
+            if scan.is_poisoned(global) {
+                cells.push((global, slot, TyId::ERROR, None));
+            } else {
+                cells.push((global, slot, ty, known));
+            }
         }
     }
     // An imported value file's value is a cell of the workspace.
@@ -10156,8 +10662,11 @@ p24 = w.com"#;
             .collect();
         let mut loaded = Vec::new();
         let placed = (&sources[..], Placing::Workspace(&[]));
-        let errors =
-            scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded).unwrap_err();
+        // The scan recovers from its errors (see "Scan errors").
+        let errors = match scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded) {
+            Ok(scan) => scan.errors(),
+            Err(errors) => errors,
+        };
         assert_eq!(errors.len(), 1, "{errors:?}");
         let mut paths: Vec<&str> = files.iter().map(|&(path, _)| path).collect();
         paths.sort_unstable();
@@ -18430,7 +18939,8 @@ p26 = com.x"#;
             ),
         ];
         assert_eq!(value(&files, "app/b.gcsl"), "{r = \"c: second one 1\"}");
-        // A meta in a subdirectory of its definition is no meta of it.
+        // A meta in a subdirectory of its definition is no meta of it: the
+        // definition has none in its own directory either.
         let files = [
             TAGGED,
             ("app/a.gcsl", "def tagged x() { \"x\" }"),
@@ -18438,7 +18948,11 @@ p26 = com.x"#;
         ];
         assert_eq!(
             check_errors(&files),
-            ["`defmeta tagged x` has no definition `x` in its directory at app/sub/b.gcsl"]
+            [
+                "`tagged x` has no `defmeta` in its directory at app/a.gcsl; note: `tagged` \
+                 declares a meta, `META: {tag: String, n: Int}`, for each of its definitions",
+                "`defmeta tagged x` has no definition `x` in its directory at app/sub/b.gcsl"
+            ]
         );
         let files = [TAGGED, ("app/a.gcsl", "def tagged x() { \"x\" }")];
         assert_eq!(
@@ -19857,7 +20371,9 @@ p26 = com.x"#;
     #[test]
     fn scan_errors_beside_a_syntax_error_are_reported_only_where_no_broken_file_is_seen() {
         // Two files of `sub2` define `k`; `sub1/a` has a syntax error and
-        // two definitions of `j`, which may be the recovery's.
+        // two definitions of `j`, which may be the recovery's. The scan
+        // recovers from the conflict, so `sub1/a` is checked as its parser
+        // recovered it, and its check reports its own `j` twice.
         let files = [
             ("workspace.gcsl", ""),
             ("sub1/a.gcsl", "j = 1\nj = 2\nx = 1 1"),
@@ -19867,9 +20383,258 @@ p26 = com.x"#;
         assert_eq!(
             every_error(&files),
             expected_errors(&[
+                ("field `j` is defined twice", "sub1/a.gcsl", "j"),
                 ("expected end of item, found `1`", "sub1/a.gcsl", "1"),
                 ("field `k` is defined in two files", "sub2/c.gcsl", "k"),
             ])
+        );
+    }
+
+    // ----- Scan errors -----
+
+    /// A file with a syntax error, in a directory of its own that nothing
+    /// imports, which each case of the scan's errors is checked with too.
+    const BROKEN: (&str, &str) = ("zz/broken.gcsl", "b = (1 2)");
+
+    /// Asserts that checking the workspace of `files` reports `expected`,
+    /// as [`expected_errors`] takes them, and with [`BROKEN`] added, those
+    /// and its syntax error: a scan error hides no other file's errors.
+    fn scan_case(files: &[(&str, &str)], expected: &[(&str, &str, &str)]) {
+        assert_eq!(every_error(files), expected_errors(expected), "{files:?}");
+        let mut broken = files.to_vec();
+        broken.push(BROKEN);
+        let mut wanted = expected.to_vec();
+        wanted.push(("expected `)`, found `2`", "zz/broken.gcsl", "2"));
+        assert_eq!(every_error(&broken), expected_errors(&wanted), "{broken:?}");
+    }
+
+    #[test]
+    fn a_field_defined_in_two_files_hides_no_other_files_errors() {
+        // clackatoo's minimal case: `r`'s error is reported beside the
+        // conflict, and `p` is checked.
+        let files = [
+            ("workspace.gcsl", "# Root."),
+            ("p/p.gcsl", "h = 1\nk = h"),
+            ("q/a.gcsl", "x = 1"),
+            ("q/b.gcsl", "x = 2"),
+            ("r/r.gcsl", "y: Int = \"s\""),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("field `x` is defined in two files", "q/b.gcsl", "x"),
+                ("mismatched types", "r/r.gcsl", "\"s\""),
+            ],
+        );
+        // The scan alone reports the conflict, and recovers from it.
+        let errors = ws(&files).unwrap_err();
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, ["field `x` is defined in two files"]);
+        // The file asked for does not run.
+        let sources: Vec<SourceFile> = files
+            .iter()
+            .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+            .collect();
+        assert!(check(&sources).is_err());
+    }
+
+    #[test]
+    fn a_conflicting_field_is_dropped_and_read_as_erroneous_everywhere() {
+        // `q/b`'s `x` and `d` are dropped, `x` still checked as written;
+        // every read of the conflicted `x` and `d`, in its directory, in a
+        // directory below, or through an import, is erroneous, silently.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("q/a.gcsl", "x = 1\nd.e = 1"),
+            ("q/b.gcsl", "x: Int = \"s\"\nd = 2\nown: Int = true"),
+            ("q/c.gcsl", "u: String = x\nv: Bool = d"),
+            ("q/sub/s.gcsl", "t: Bool = x + 1"),
+            (
+                "s/s.gcsl",
+                "import x, d from q\nn: String = x\nm: Bool = d\nl: List<Int> = x\nz: Int = true",
+            ),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("field `x` is defined in two files", "q/b.gcsl", "x"),
+                ("mismatched types", "q/b.gcsl", "\"s\""),
+                ("field `d` is already defined", "q/b.gcsl", "d"),
+                ("mismatched types", "q/b.gcsl", "true"),
+                ("mismatched types", "s/s.gcsl", "true"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_call_of_a_conflicting_def_types_nothing_of_its_arguments() {
+        // The `def` would have typed `[]`: an erroneous callee leaves it
+        // untyped, which is no error of its own.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("q/a.gcsl", "def f(xs: List<Int>): Int { 1 }"),
+            ("q/b.gcsl", "def f(xs: List<Int>): Int { 2 }"),
+            (
+                "s/s.gcsl",
+                "import f from q\nr = f([])\nt: List<Int> = f(1)",
+            ),
+            ("q/c.gcsl", "u = f([], [])"),
+        ];
+        scan_case(
+            &files,
+            &[("field `f` is defined in two files", "q/b.gcsl", "f")],
+        );
+    }
+
+    #[test]
+    fn a_three_way_conflict_keeps_the_first() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a.gcsl", "x = 1"),
+            ("b.gcsl", "x = \"b\""),
+            ("c.gcsl", "x = true\ny: Int = x"),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("field `x` is defined in two files", "b.gcsl", "x"),
+                ("field `x` is defined in two files", "c.gcsl", "x"),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_import_of_no_module_binds_erroneous_names() {
+        // What the imports would bind reads as `Error`; everything else of
+        // the file is checked. A `*` of nothing leaves the names it would
+        // bind unknown: a name that names nothing is no error there.
+        let files = [
+            ("workspace.gcsl", ""),
+            (
+                "m/m.gcsl",
+                "import nope.thing\nimport a, b as c from nada\nv = thing.x + 1\n\
+                 w: Bool = c + a\nt: thing.T = 1\nz = zork\ny: Int = \"s\"",
+            ),
+            (
+                "m/n.gcsl",
+                "import * from gone\nk = whatever + 1\nj: Int = \"s\"",
+            ),
+            ("o/o.gcsl", "import f from lib\nr = f + 1"),
+            ("lib/l.gcsl", "g = 1"),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("no module `nope.thing`", "m/m.gcsl", "nope.thing"),
+                ("no module `nada`", "m/m.gcsl", "nada"),
+                ("undefined variable `zork`", "m/m.gcsl", "zork"),
+                ("mismatched types", "m/m.gcsl", "\"s\""),
+                ("no module `gone`", "m/n.gcsl", "gone"),
+                ("mismatched types", "m/n.gcsl", "\"s\""),
+                ("`lib` has no `f`", "o/o.gcsl", "f"),
+            ],
+        );
+    }
+
+    #[test]
+    fn files_that_need_each_other_are_not_checked_and_the_rest_is() {
+        // `d` needs a file of the cycle, and is not checked either.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("cy/a.gcsl", "x = y + 1\nbad: Int = \"a\""),
+            ("cy/b.gcsl", "y = x + 1"),
+            ("d/d.gcsl", "import x from cy\nr = x\nq: Int = \"bad\""),
+            ("e/e.gcsl", "z: Int = \"s\""),
+        ];
+        scan_case(
+            &files,
+            &[
+                (
+                    "`cy/a.gcsl` and `cy/b.gcsl` need each other",
+                    "cy/a.gcsl",
+                    "y",
+                ),
+                ("mismatched types", "e/e.gcsl", "\"s\""),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_type_imported_as_a_built_in_types_name_binds_nothing() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("lib/t.gcsl", "type Foo = {a: Int}"),
+            ("m.gcsl", "import Foo as Int from lib.t\nk: Int = 1"),
+            ("o.gcsl", "z: Int = true"),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("`Int` is a built-in type", "m.gcsl", "Int"),
+                ("mismatched types", "o.gcsl", "true"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_type_declared_in_two_files_is_erroneous_where_used() {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("t/a.gcsl", "type Foo = {a: Int}"),
+            ("t/b.gcsl", "type Foo = String\nv: Foo = 1"),
+            ("t/c.gcsl", "w: Foo = true"),
+            ("o.gcsl", "z: Int = true"),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("mismatched types", "o.gcsl", "true"),
+                ("type `Foo` is declared in two files", "t/b.gcsl", "Foo"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_conflict_of_a_view_is_erroneous_in_the_files_that_see_it() {
+        // `a/b`'s `k` meets the `k` of the directory above, reported at
+        // the directory above's: each file of `a/b` reads `k` as `Error`,
+        // and `a`'s files read their own.
+        let files = [
+            ("workspace.gcsl", ""),
+            ("a/x.gcsl", "k = 1\nm: String = k"),
+            ("a/b/y.gcsl", "k = \"s\"\nu: Int = k"),
+            ("a/b/z.gcsl", "w: Bool = k.f"),
+        ];
+        scan_case(
+            &files,
+            &[
+                ("field `k` is defined in two files", "a/x.gcsl", "k"),
+                ("mismatched types", "a/x.gcsl", "k"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_meta_declared_twice_is_dropped() {
+        let files = [
+            TAGGED,
+            (
+                "app/a.gcsl",
+                "def tagged x() { \"x\" }\ndefmeta tagged x { tag = \"t\"; n = 1 }",
+            ),
+            ("app/b.gcsl", "defmeta tagged x { tag = \"u\"; n = 2 }"),
+            ("o.gcsl", "z: Int = true"),
+        ];
+        let errors: Vec<String> = every_error(&files)
+            .into_iter()
+            .map(|(message, path, _)| format!("{message} at {path}"))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "`defmeta tagged x` is declared twice in this directory at app/b.gcsl",
+                "mismatched types at o.gcsl",
+            ]
         );
     }
 }

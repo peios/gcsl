@@ -69,7 +69,16 @@
 //! a name that names nothing, a variable, a type or a record's field, is no
 //! error, since it may be declared where the source could not be parsed:
 //! the check fails quietly instead (`Checker::unresolved`, and see
-//! [`crate::workspace`], "Syntax errors").
+//! [`crate::workspace`], "Syntax errors"). In a workspace whose scan
+//! recovered from its own errors, a name the scan poisoned in the file (what
+//! an import that failed binds, a name in conflict) is read as `Error`,
+//! silently, as a value or as a type, unless a binding of a function or an
+//! inner block shadows it (`Checker::reads_poisoned`), and a check that
+//! found an erroneous type with nothing to report, a read of what the scan
+//! poisoned, fails quietly, its result never lowered (see
+//! [`crate::workspace`], "Scan errors"). Nor is an empty list an error of
+//! its own where an erroneous expected type, or an erroneous callee's
+//! parameter, would have typed it (`Checker::check_list`).
 //!
 //! In a diagnostic's message and notes, a type written as a name, such as
 //! `Int`, is shown plainly, and a structural type (a record, list,
@@ -4458,6 +4467,12 @@ struct Quiet {
     /// Whether the input's view sees another file with syntax errors (see
     /// [`Checker::sees_broken`]).
     sees_broken: bool,
+    /// How many values being checked, one inside another, are checked
+    /// against an erroneous expected type, one whose error is reported
+    /// elsewhere, or as the arguments of an erroneous callee: in one, an
+    /// empty list, which the expected type would have typed, is no error of
+    /// its own, the check failing quietly (see [`Checker::check_list`]).
+    expecting_error: u32,
 }
 
 /// What a bare type written in a type expression means: see the module
@@ -5292,6 +5307,22 @@ impl Scope {
         }
     }
 
+    /// Makes each variable from the `start`th on whose name `poisoned`
+    /// accepts of type `Error`, with nothing known of a function it holds:
+    /// a declaration of a workspace that the scan found conflicting, which
+    /// the files checked after it read silently as erroneous (see
+    /// [`crate::workspace`], "Scan errors").
+    pub(crate) fn poison_from(&mut self, start: usize, poisoned: impl Fn(Name) -> bool) {
+        let bindings = self.bindings.iter_mut().zip(&mut self.known).skip(start);
+        for (binding, known) in bindings {
+            if poisoned(binding.name) {
+                binding.ty = TyId::ERROR;
+                binding.function = None;
+                *known = None;
+            }
+        }
+    }
+
     /// The names of the scope's slots, `0..n`, `n` being its first free
     /// slot.
     pub(crate) fn into_slot_names(self) -> Vec<Name> {
@@ -5897,6 +5928,12 @@ impl<'a> Checker<'a> {
         };
         let record = self.finish_record(ty);
         if !self.errors.is_empty() || self.quiet.failed {
+            return (Err(diagnostic::merge(self.errors, self.warnings)), record);
+        }
+        // In a workspace whose scan found errors, which never runs, a read
+        // of what the scan poisoned is erroneous, silently: the check fails
+        // quietly (see [`crate::workspace`], "Scan errors").
+        if self.workspace.is_some_and(Context::scan_failed) && !self.settled() {
             return (Err(diagnostic::merge(self.errors, self.warnings)), record);
         }
         if !self.settled() {
@@ -9205,11 +9242,14 @@ impl<'a> Checker<'a> {
         };
         // A root of this file is the clash of one file, its own errors'; a
         // name of the implicit prelude, or of an import a session's input
-        // inherits, yields to the declaration silently.
+        // inherits, yields to the declaration silently; and a name the scan
+        // reported a clash or a conflict of is not reported again (see
+        // [`crate::workspace`], "Scan errors").
         if workspace.scope.root(name).is_none()
             || self.mentions.tree.root(name).is_some()
             || workspace.scope.yields(name)
             || workspace.scope.inherited(name)
+            || workspace.poisoned(name)
         {
             return;
         }
@@ -9645,6 +9685,17 @@ impl<'a> Checker<'a> {
     /// left to the caller as ordinary accesses: this answers only for the
     /// expression that names the node, recording where its value is read.
     fn field_reference(&mut self, id: ExprId) -> Option<TyId> {
+        if self.workspace.is_some_and(Context::has_poison) {
+            let mut base = id;
+            while let ExprKind::Field { expr, .. } = self.ast.get(base).kind {
+                base = expr;
+            }
+            if let ExprKind::Name(name) = self.ast.get(base).kind
+                && self.reads_poisoned(name, self.lookup(name))
+            {
+                return Some(TyId::ERROR);
+            }
+        }
         let (node, at) = match self.workspace {
             Some(workspace) => workspace.scope.reference(self.ast, id)?,
             None => self.mentions.tree.reference(self.ast, id)?,
@@ -11659,7 +11710,7 @@ impl<'a> Checker<'a> {
                     self.errors.push(Diagnostic::error(message, ty.span));
                 } else {
                     let message = format!("unknown type `{text}`");
-                    self.unresolved(Diagnostic::error(message, ty.span));
+                    self.unresolved_name(name, Diagnostic::error(message, ty.span));
                 }
                 TyId::ERROR
             }
@@ -11699,11 +11750,13 @@ impl<'a> Checker<'a> {
             // A qualified name is made what it names by the expansion of
             // the file's types; checked alone, a file names no module.
             TypeExprKind::Path(path) => {
-                let shown = self.ast.show_path(self.ast.path(path)).to_string();
-                self.unresolved(Diagnostic::error(
-                    format!("unknown type `{shown}`"),
-                    ty.span,
-                ));
+                let segments = self.ast.path(path);
+                let shown = self.ast.show_path(segments).to_string();
+                let error = Diagnostic::error(format!("unknown type `{shown}`"), ty.span);
+                match segments.first().and_then(PathSegment::name) {
+                    Some(first) => self.unresolved_name(first, error),
+                    None => self.unresolved(error),
+                }
                 TyId::ERROR
             }
             TypeExprKind::Ref(_) => {
@@ -12026,7 +12079,10 @@ impl<'a> Checker<'a> {
             let message = format!("type `{text}` takes no type argument");
             self.errors.push(Diagnostic::error(message, span));
         } else {
-            self.unresolved(Diagnostic::error(format!("unknown type `{text}`"), span));
+            self.unresolved_name(
+                name,
+                Diagnostic::error(format!("unknown type `{text}`"), span),
+            );
         }
         TyId::ERROR
     }
@@ -12042,6 +12098,35 @@ impl<'a> Checker<'a> {
         } else {
             self.errors.push(error);
         }
+    }
+
+    /// [`Checker::unresolved`] of the error `error` of the name `name`,
+    /// which is no error, the check failing quietly, if the file reads the
+    /// name as `Error` (see [`crate::workspace`], "Scan errors").
+    fn unresolved_name(&mut self, name: Name, error: Diagnostic) {
+        if self
+            .workspace
+            .is_some_and(|workspace| workspace.poisoned(name))
+        {
+            self.quiet.failed = true;
+        } else {
+            self.unresolved(error);
+        }
+    }
+
+    /// Whether a read of the name `name`, whose binding where it is read is
+    /// `found`, is a read of what the file reads as `Error`, silently, the
+    /// scan having recovered from an error about it (see
+    /// [`crate::workspace`], "Scan errors"): a name of the file's view, or
+    /// one that names nothing, not a binding of a function or an inner block
+    /// of it. The check then fails quietly.
+    fn reads_poisoned(&mut self, name: Name, found: Option<(usize, Binding)>) -> bool {
+        let poisoned = self
+            .workspace
+            .is_some_and(|workspace| workspace.has_poison() && workspace.poisoned(name))
+            && found.is_none_or(|(index, _)| index < self.top_end);
+        self.quiet.failed |= poisoned;
+        poisoned
     }
 
     /// Whether the input's view sees a file with syntax errors, its own
@@ -12790,6 +12875,25 @@ impl<'a> Checker<'a> {
     /// argument fills, for the label on a mismatch (see
     /// [`Checker::narrowing_label`]).
     fn check_expr_expecting_at(
+        &mut self,
+        id: ExprId,
+        expected: TyId,
+        stated: (Span, &str),
+        how: (AwaitSite, Option<(FnId, usize)>),
+    ) -> TyId {
+        // An erroneous expected type, its error reported elsewhere, types
+        // nothing in the value: what it would have typed is no error.
+        if expected == TyId::ERROR {
+            self.quiet.expecting_error = self.quiet.expecting_error.saturating_add(1);
+            let found = self.check_expected(id, expected, stated, how);
+            self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(1);
+            return found;
+        }
+        self.check_expected(id, expected, stated, how)
+    }
+
+    /// [`Checker::check_expr_expecting_at`], whatever `expected` is.
+    fn check_expected(
         &mut self,
         id: ExprId,
         expected: TyId,
@@ -14760,9 +14864,15 @@ impl<'a> Checker<'a> {
                 }
                 self.errors.push(error);
             }
+            // An erroneous callee, its error reported where it is, would
+            // have typed its arguments: what it would have typed is no
+            // error of theirs (see [`Checker::check_list`]).
+            let unknown = u32::from(callee_ty == TyId::ERROR);
+            self.quiet.expecting_error = self.quiet.expecting_error.saturating_add(unknown);
             for arg in self.ast.args(args) {
                 self.check_alone(arg.value);
             }
+            self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(unknown);
             return TyId::ERROR;
         };
         let erroneous = self.bind_arguments(id, (callee, callee_ty, callback), args, &sig);
@@ -16499,6 +16609,9 @@ impl<'a> Checker<'a> {
         if self.early.is_some() && self.reads_between(name, found) {
             return (TyId::ERROR, None);
         }
+        if self.reads_poisoned(name, found) {
+            return (TyId::ERROR, None);
+        }
         // An imported name, or a root several sources of the file's view
         // have, that nothing nearer shadows (see [Imports](#imports)); a
         // shadowable one, the implicit prelude's among them, only if no
@@ -17012,10 +17125,16 @@ impl<'a> Checker<'a> {
         let ast = self.ast;
         let list = ast.elements(elements);
         if list.is_empty() {
-            self.errors.push(
-                Diagnostic::error("cannot infer the element type of `[]`", ast.get(id).span)
-                    .with_note("annotate it, as in `let xs: List<Int> = []`"),
-            );
+            // Against an erroneous expected type, which would have typed it,
+            // an empty list is no error of its own.
+            if self.quiet.expecting_error > 0 {
+                self.quiet.failed = true;
+            } else {
+                self.errors.push(
+                    Diagnostic::error("cannot infer the element type of `[]`", ast.get(id).span)
+                        .with_note("annotate it, as in `let xs: List<Int> = []`"),
+                );
+            }
             return TyId::ERROR;
         }
         // Every element is checked, in order, before any is joined.

@@ -2118,6 +2118,22 @@ mod tests {
             .collect();
         assert_eq!(shown, [("`#![no_prelude]` applies only to a file", 0, 14)]);
         assert_eq!(value(&mut session, "len([1])"), Value::Int(1));
+        // Every error of an input's scan is reported, and nothing of it is
+        // kept.
+        assert_eq!(
+            messages(
+                &mut session,
+                "#![no_prelude]\nimport nope from builtins\nkept = 1"
+            ),
+            [
+                "`#![no_prelude]` applies only to a file",
+                "`builtins` has no `nope`"
+            ]
+        );
+        assert_eq!(
+            messages(&mut session, "kept"),
+            ["undefined variable `kept`"]
+        );
         // `#[shadowable]` changes nothing between inputs, which shadow the
         // earlier inputs' names already; within one, it is as in a file.
         value(&mut session, "#[shadowable] a = 1");

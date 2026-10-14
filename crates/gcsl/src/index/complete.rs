@@ -1254,7 +1254,7 @@ mod tests {
             ("app.gcsl", "r = cfg.|\n"),
             (
                 "lib.gcsl",
-                "# The port.\ncfg.port = 1\ncfg.run = fn(): Int { 1 }\n",
+                "w = 0\n# The port.\ncfg.port = 1\ncfg.run = fn(): Int { 1 }\n",
             ),
         ];
         let found = complete(&files, "app.gcsl");
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn a_type_is_completed_from_the_types_in_scope() {
-        let text = "# A version.\ntype V = {version: String}\nx: |V = {version = \"1\"}\n";
+        let text = "w = 0\n# A version.\ntype V = {version: String}\nx: |V = {version = \"1\"}\n";
         let found = complete(&[("app.gcsl", text)], "app.gcsl");
         let v = named(&found, "V");
         assert_eq!(v.kind, CompletionKind::Type);

@@ -7,7 +7,10 @@
 //! records for it, of a rename's check, of a workspace's symbols and of
 //! doc comments, and a hover, a definition, references and a rename's
 //! preparation at every token of newpkgs and of the mutants, with each
-//! file's symbols (the run is still named for its first two).
+//! file's symbols (the run is still named for its first two); and the
+//! scan's recovery from its own errors, over mutants of newpkgs in its
+//! workspace that each make one: a field defined in two files, an import of
+//! no module, files that need each other.
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
@@ -736,4 +739,250 @@ fn hovers_everywhere() {
         }
     }
     asked.report("newpkgs mutants in their workspace");
+}
+
+#[test]
+#[ignore = "a robustness run of minutes, run by hand in release mode"]
+fn every_scan_error_mutant_of_newpkgs_recovers_without_a_panic() {
+    let thread = std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(scan_errors_everywhere)
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// The text of the first top-level declaration of `text` (a field, a `def`,
+/// a definition or a meta), if it has one.
+fn first_declaration(text: &str) -> Option<String> {
+    use gcsl::ast::ItemKind;
+    let source = SourceFile::new("t.gcsl", text).ok()?;
+    let (ast, _) = parser::parse_source(&source);
+    let item = ast.items(ast.root()).iter().find(|&&item| {
+        matches!(
+            ast.item(item).kind,
+            ItemKind::Field { .. } | ItemKind::DefTypeDef { .. } | ItemKind::DefMeta { .. }
+        )
+    })?;
+    Some(source.slice(ast.item(*item).span).to_owned())
+}
+
+/// `text` with the path of its first `import` made one of no module, if it
+/// has one.
+fn import_of_nothing(text: &str) -> Option<String> {
+    use gcsl::ast::ItemKind;
+    let source = SourceFile::new("t.gcsl", text).ok()?;
+    let (ast, _) = parser::parse_source(&source);
+    let path = ast.items(ast.root()).iter().find_map(|&item| {
+        let ItemKind::Import(id) = ast.item(item).kind else {
+            return None;
+        };
+        let path = ast.path(ast.import_decl(id).path);
+        Some((path.first()?.span, path.last()?.span))
+    })?;
+    let (start, end) = (path.0.start as usize, path.1.end as usize);
+    Some(format!("{}zz_no_module{}", &text[..start], &text[end..]))
+}
+
+/// The module path of the workspace's file at `path`, as an import names it.
+fn module_path(path: &str) -> String {
+    path.trim_end_matches(".gcsl").replace('/', ".")
+}
+
+/// What the run of scan errors found.
+#[derive(Debug, Default)]
+struct Scanned {
+    /// Mutants, by kind.
+    mutants: [usize; 3],
+    /// Files with no mutant of a kind, by kind.
+    skipped: [usize; 3],
+    /// Mutants whose check reported a scan error of their kind.
+    reported: [usize; 3],
+    /// Panics, internal errors, and diagnostics that differ between two
+    /// checks or between the check and the index, by what was run.
+    failures: Vec<String>,
+    /// Errors reported in a file the mutant did not touch, which may be
+    /// cascades of its error, and the first few of them.
+    spilled: usize,
+    spills: Vec<String>,
+    /// The slowest mutant and its time.
+    slowest: (Duration, String),
+}
+
+impl Scanned {
+    /// Checks `files`, the mutant `what` of kind `kind` whose scan error's
+    /// message holds `marker`, twice, and indexes it, recording what it
+    /// finds.
+    fn run(
+        &mut self,
+        (what, kind, marker): (&str, usize, &str),
+        (files, touched): (&[SourceFile], &[&str]),
+        nested: &[String],
+    ) {
+        let start = Instant::now();
+        let reported = |checked: Result<workspace::Workspace, Vec<Diagnostic>>| match checked {
+            Ok(checked) => checked.warnings().to_vec(),
+            Err(errors) => errors,
+        };
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let first = reported(workspace::check_with_standard(files, nested, NEWPKGS).1);
+            let second = reported(workspace::check_with_standard(files, nested, NEWPKGS).1);
+            let indexed = workspace::index_with_standard(files, nested, NEWPKGS);
+            (first, second, indexed)
+        }));
+        let took = start.elapsed();
+        if took > self.slowest.0 {
+            self.slowest = (took, what.to_owned());
+        }
+        if let Some(entry) = self.mutants.get_mut(kind) {
+            *entry += 1;
+        }
+        let Ok((first, second, indexed)) = outcome else {
+            self.failures.push(format!("{what}: panicked"));
+            return;
+        };
+        if format!("{first:?}") != format!("{second:?}") {
+            self.failures.push(format!("{what}: two checks differ"));
+        }
+        if format!("{first:?}") != format!("{:?}", indexed.diagnostics) {
+            self.failures
+                .push(format!("{what}: the index's diagnostics differ"));
+        }
+        if indexed.index.is_none() {
+            self.failures.push(format!("{what}: no index"));
+        }
+        if first
+            .iter()
+            .any(|diagnostic| diagnostic.notes.iter().any(|note| note.contains("a bug")))
+        {
+            self.failures.push(format!("{what}: an internal error"));
+        }
+        if first.iter().any(|d| d.message.contains(marker))
+            && let Some(entry) = self.reported.get_mut(kind)
+        {
+            *entry += 1;
+        }
+        // An error in a file the mutant did not touch may be a cascade.
+        let mut sorted: Vec<&str> = files.iter().map(SourceFile::name).collect();
+        sorted.sort_unstable();
+        let standard = indexed.standard.len();
+        for error in first.iter().filter(|d| d.severity == gcsl::Severity::Error) {
+            let path = error
+                .input
+                .and_then(|input| (input as usize).checked_sub(standard))
+                .and_then(|at| sorted.get(at))
+                .copied()
+                .unwrap_or("<stdlib>");
+            if !touched.contains(&path) {
+                self.spilled += 1;
+                if self.spills.len() < 10 {
+                    self.spills
+                        .push(format!("{what}: {} in {path}", error.message));
+                }
+            }
+        }
+    }
+}
+
+/// The robustness run of the scan's recovery: for each file of newpkgs, in
+/// its workspace, in memory, its first declaration copied into a new file
+/// of its directory (a field defined in two files), the path of its first
+/// import made one of no module, and a read of a file that needs it (files
+/// that need each other).
+fn scan_errors_everywhere() {
+    let sources = gcsl_disk::read_workspace(Path::new(NEWPKGS), None).unwrap();
+    let files = &sources.relative;
+    let scan = workspace::scan_with(files, &sources.nested).unwrap();
+    let standard = scan.standard() as usize;
+    let mut found = Scanned::default();
+    for (at, original) in files.iter().enumerate() {
+        let name = original.name();
+        // A field defined in two files.
+        match first_declaration(original.text()) {
+            Some(declaration) => {
+                let dir = name.rsplit_once('/').map_or("", |(dir, _)| dir);
+                let path = if dir.is_empty() {
+                    "zz-mutant-dup.gcsl".to_owned()
+                } else {
+                    format!("{dir}/zz-mutant-dup.gcsl")
+                };
+                let mut changed = files.clone();
+                changed.push(SourceFile::new(path.as_str(), declaration).unwrap());
+                let what = format!("{name}: its first declaration in a sibling");
+                let touched = [path.as_str()];
+                found.run((&what, 0, "defined"), (&changed, &touched), &sources.nested);
+            }
+            None => found.skipped[0] += 1,
+        }
+        // An import of no module.
+        match import_of_nothing(original.text()) {
+            Some(text) => {
+                let mut changed = files.clone();
+                changed[at] = SourceFile::new(name, text).unwrap();
+                let what = format!("{name}: an import of no module");
+                found.run(
+                    (&what, 1, "no module"),
+                    (&changed, &[name]),
+                    &sources.nested,
+                );
+            }
+            None => found.skipped[1] += 1,
+        }
+        // Files that need each other: the file reads a root of a file of its
+        // directory that needs it, or a file that needs it whole.
+        let index = at + standard;
+        let user = scan
+            .needs
+            .iter()
+            .position(|needs| needs.contains(&u32::try_from(index).unwrap()))
+            .and_then(|user| scan.files.get(user))
+            .filter(|user| !user.path.starts_with(workspace::STANDARD_DIR));
+        let read = user.and_then(|user| {
+            let own = scan.files.get(index)?;
+            if user.dir == own.dir {
+                let tree = &user.mentions.tree;
+                let root = tree.roots.iter().find_map(|&root| {
+                    let name = scan.names.get(tree.nodes.get(root as usize)?.name);
+                    lexer::is_identifier(name).then_some(name)
+                })?;
+                return Some(format!("{}\nzz_cycle_read = {root}\n", original.text()));
+            }
+            // A module path names no directory with a `.` in its name.
+            let path = user.path.trim_end_matches(".gcsl");
+            let parts: Vec<&str> = path.split('/').collect();
+            parts.iter().all(|part| !part.contains('.')).then(|| {
+                format!(
+                    "{}\nimport {} as zz_cycle\nzz_cycle_read = zz_cycle\n",
+                    original.text(),
+                    module_path(&user.path)
+                )
+            })
+        });
+        match user.zip(read) {
+            Some((user, text)) => {
+                let mut changed = files.clone();
+                changed[at] = SourceFile::new(name, text).unwrap();
+                let what = format!("{name}: a read of {}", user.path);
+                found.run(
+                    (&what, 2, "need"),
+                    (&changed, &[name, user.path.as_str()]),
+                    &sources.nested,
+                );
+            }
+            None => found.skipped[2] += 1,
+        }
+    }
+    println!(
+        "scan errors of newpkgs ({} files): mutants (duplicate, no module, cycle) {:?}, skipped {:?}, \
+         reporting their error {:?}, slowest {:?} ({}), errors in files not touched {} {:#?}, failures {:?}",
+        files.len(),
+        found.mutants,
+        found.skipped,
+        found.reported,
+        found.slowest.0,
+        found.slowest.1,
+        found.spilled,
+        found.spills,
+        found.failures
+    );
+    assert!(found.failures.is_empty());
 }

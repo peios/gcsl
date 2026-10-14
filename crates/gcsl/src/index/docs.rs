@@ -1,5 +1,7 @@
-//! Doc comments: the run of `#` lines directly above a declaration (see
-//! the documentation of [`crate::index`], "Documentation").
+//! Doc comments: the run of `#` lines directly above a declaration, but a
+//! file's header, a run from its first line (a shebang's included), which
+//! describes the file (see the documentation of [`crate::index`],
+//! "Documentation").
 
 use crate::ast::{ItemKind, PathSegment};
 use crate::lexer::{self, Comments};
@@ -146,7 +148,10 @@ impl Index {
     /// The doc comment of the item that starts at byte `start` of the file
     /// of input number `file`: the run of lines directly above it, its
     /// attributes' lines apart, each of which is a comment alone; `None` if
-    /// there is none, or the item does not start its line.
+    /// there is none, if the item does not start its line, or if the run
+    /// starts on the file's first line, a shebang's included, which makes it
+    /// the file's header (see the module documentation of [`crate::index`],
+    /// "Documentation").
     pub(super) fn doc_comment(&self, file: u32, start: u32) -> Option<String> {
         let text = self.text(file);
         let comments = self.comments(file)?;
@@ -156,6 +161,8 @@ impl Index {
             return None;
         }
         let mut lines: Vec<&str> = Vec::new();
+        // Where the run's first line starts.
+        let mut top = None;
         while below > 0 {
             let end = below - 1;
             let above = text.get(..end)?.rfind('\n').map_or(0, |at| at + 1);
@@ -170,6 +177,7 @@ impl Index {
                     let body = trimmed.strip_prefix('#').unwrap_or(trimmed);
                     let body = body.strip_prefix(' ').unwrap_or(body);
                     lines.push(body.trim_end());
+                    top = Some(above);
                 }
                 // An attribute of the item, between it and its comment.
                 None if lines.is_empty()
@@ -177,6 +185,11 @@ impl Index {
                 _ => break,
             }
             below = above;
+        }
+        // A run from the file's first line, or from a shebang on it, is the
+        // file's header, which describes the file, not the item below it.
+        if top == Some(0) {
+            return None;
         }
         // Blank lines at either end are no part of it.
         while lines.first().is_some_and(|line| line.is_empty()) {

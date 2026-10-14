@@ -406,8 +406,9 @@ mod tests {
         Some((found.label, active, found.documentation))
     }
 
-    /// A `def` of three parameters, documented.
-    const F: &str = "# Makes an f.\ndef f(a: Int, b: String, c: Bool): Int { a }\n";
+    /// A `def` of three parameters, documented, below the file's first line,
+    /// whose comment would be the file's header.
+    const F: &str = "w = 0\n# Makes an f.\ndef f(a: Int, b: String, c: Bool): Int { a }\n";
 
     #[test]
     fn positional_and_named_arguments_fill_their_parameters() {
