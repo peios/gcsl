@@ -2801,7 +2801,9 @@
 //! the input's own top-level field or `def`, whose declarations are nodes
 //! of the view. A name read from the narrowed copy of a variable is read
 //! from the `is` that narrowed it, and a function's name for itself from
-//! the function expression. `Checker::check_recorded` returns the record
+//! the function expression. A `:=` is recorded with the binding it
+//! rebinds: a variable's declares one in its place, which an index takes as
+//! the same variable. `Checker::check_recorded` returns the record
 //! with the type of every expression, of every `type`
 //! item and of every cell of the input's tree as the check left them,
 //! WHETHER IT SUCCEEDED OR FAILED, so that a file with errors is indexed
@@ -4376,6 +4378,11 @@ pub(crate) struct Record {
     /// ([`RecordedDecl::declared`]). A name read through the file's view,
     /// or from a declaration another input committed, has none.
     pub(crate) uses: Vec<(ExprId, Span)>,
+    /// Each `:=` that rebinds a binding declared in this input: its item,
+    /// and where the binding was declared. A variable's `:=` declares a
+    /// binding in its place, at the item, which an index takes as the same
+    /// one; a mutable variable's, or a `for` header's, keeps its binding.
+    pub(crate) rebinds: Vec<(Span, Span)>,
     /// The type of every expression as the check left it, indexed by
     /// [`ExprId`]: `Error` for one that failed, and, after a failed check,
     /// possibly untyped or provisional.
@@ -5833,6 +5840,17 @@ impl<'a> Checker<'a> {
     #[must_use]
     pub(crate) fn recording(mut self) -> Self {
         self.record = Some(Box::default());
+        self
+    }
+
+    /// The checker, taking a name that names nothing as no error, as in an
+    /// input that sees a file with syntax errors (see
+    /// [`Checker::unresolved`]): for a file checked for its index alone,
+    /// which needs a file whose check failed and whose declarations it may
+    /// read.
+    #[must_use]
+    pub(crate) fn blind(mut self) -> Self {
+        self.quiet.sees_broken = true;
         self
     }
 
@@ -7694,10 +7712,12 @@ impl<'a> Checker<'a> {
                 None
             }
             Some((index, binding)) if binding.kind == BindingKind::Mutable => {
+                self.record_rebind(id, binding.declared);
                 self.check_mutable_rebind(id, segments, (index, binding), value);
                 return;
             }
             Some((index, binding)) if binding.kind == BindingKind::Header => {
+                self.record_rebind(id, binding.declared);
                 if self.header_rebind(id, segments, (index, binding), value) {
                     return;
                 }
@@ -7734,6 +7754,7 @@ impl<'a> Checker<'a> {
             self.rejected_rebind(id, (segments, name), value, target.map(|(_, t)| t.ty));
             return;
         };
+        self.record_rebind(id, target.declared);
         // `:=` is assignment-compatible: the value must fit the variable's
         // type (or the path's leaf type), and the binding keeps that type.
         let context = target.declared.unwrap_or(name_span);
@@ -11346,6 +11367,17 @@ impl<'a> Checker<'a> {
         record.cells = self.cell_types();
         record.value = Some(ty);
         Some(record)
+    }
+
+    /// Records that the `:=` item `id` rebinds the binding declared at
+    /// `replaced`, if the check records (see [Recording](#recording)) and
+    /// that was declared in this input.
+    fn record_rebind(&mut self, id: ItemId, replaced: Option<Span>) {
+        if let Some(record) = &mut self.record
+            && let Some(replaced) = replaced
+        {
+            record.rebinds.push((self.ast.item(id).span, replaced));
+        }
     }
 
     /// Records `binding` as declared, if the check records (see

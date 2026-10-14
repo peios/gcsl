@@ -1,6 +1,7 @@
 //! `gcsl lsp`: a language server for GCSL, which reports each file's errors
-//! and warnings as it is edited, and answers what a name is (hover) and
-//! where it is declared (go to definition).
+//! and warnings as it is edited, answers what a name is (hover), where it
+//! is declared (go to definition) and written (references, highlights),
+//! renames it, lists symbols, and formats.
 //!
 //! It speaks LSP through `lsp-server`, synchronously, on stdin and stdout
 //! ([`stdio`]), or on any [`Connection`] ([`serve`]); it logs to stderr
@@ -13,31 +14,58 @@
 //! offers it (`general.positionEncodings`), else in utf-16, LSP's default
 //! (see [`position`]). It offers `textDocumentSync` (open and close,
 //! incremental changes, and saves), `hoverProvider`, `definitionProvider`,
-//! `documentFormattingProvider` and `documentRangeFormattingProvider`. It
-//! answers `shutdown`, and any request after it
-//! with an error; `exit` ends it, cleanly after a `shutdown`, else not
-//! ([`Error::ExitWithoutShutdown`], exit code 1). A
+//! `referencesProvider`, `documentHighlightProvider`, `renameProvider`
+//! (with `prepareProvider`), `documentSymbolProvider`,
+//! `workspaceSymbolProvider`, `documentFormattingProvider` and
+//! `documentRangeFormattingProvider`. It answers `shutdown`, and any
+//! request after it with an error; `exit` ends it, cleanly after a
+//! `shutdown`, else not ([`Error::ExitWithoutShutdown`], exit code 1). A
 //! `workspace/configuration` request is answered with a null for each
 //! item; any other request it does not know with `MethodNotFound`;
 //! notifications it does not know are ignored. If the client can register
 //! for watched files dynamically, the server asks it to watch `**/*.gcsl`.
 //!
-//! QUERIES. `textDocument/hover` and `textDocument/definition` are answered
-//! from the index the latest check of the document's workspace, or lone
-//! file, made (see [`gcsl::index`]): a hover as Markdown, with the range of
-//! the name or segment hovered, a definition as a `Location`, or a
-//! `Location[]` when what is there is declared by several items, and `null`
-//! for nothing there, for what has no type the check found, and for what
-//! the standard library or a built-in declares, which has no file on disk.
-//! A file with errors is indexed for everything that resolved; one whose
-//! braces do not match, or that needs a file whose check failed, has
-//! nothing indexed. A query waits for the worker as a check does, and is
-//! handed over before any check due: if a document of the workspace has
-//! changed since its index was made, the worker checks it at once, skipping
-//! the quiet period, publishes the diagnostics, and answers from the new
-//! index (see the `worker` module), so an answer never points at old text.
-//! A `$/cancelRequest` of a query not handed over yet answers it with
-//! `RequestCancelled`; one handed over is answered anyway.
+//! QUERIES. `textDocument/hover`, `definition`, `references`,
+//! `documentHighlight`, `prepareRename`, `rename` and `documentSymbol`, and
+//! `workspace/symbol`, are answered from the index the latest check of the
+//! document's workspace, or lone file, made (see [`gcsl::index`]):
+//!
+//! - a hover as Markdown, with the range of the name or segment hovered:
+//!   what it is, its doc comment (the `#` lines directly above its
+//!   declaration), and where it comes from;
+//! - a definition as a `Location`, or a `Location[]` when what is there is
+//!   declared by several items;
+//! - references as a `Location[]`, in every file of the workspace, open or
+//!   not, the declarations among them if `context.includeDeclaration`;
+//!   highlights the same in the document alone, each a write (a
+//!   declaration, or a `:=`) or a read;
+//! - a rename's preparation as the range of the name and its text, a
+//!   rename as a `WorkspaceEdit` whose `changes` are each file's edits by
+//!   its URI, open or not; either is refused, with an error saying why
+//!   (`RequestFailed`), for what cannot be renamed (what the standard
+//!   library, a built-in, a directory or a file declares: a rename renames
+//!   no file or directory, though a definition's name often mirrors its
+//!   directory's), for a new name of the wrong kind, and for a rename that
+//!   would add an error or change what any name refers to, which is
+//!   checked by indexing the workspace again with the edits made;
+//! - a document's symbols as `DocumentSymbol`s, nested, and the
+//!   workspace's, matched by a subsequence of the query ignoring case in
+//!   every workspace and lone file the server has indexed, as
+//!   `WorkspaceSymbol`s, 200 at most;
+//!
+//! and `null` for nothing there, for a hover of what has no type the check
+//! found, and for a definition of what the standard library or a built-in
+//! declares, which has no file on disk. A file with errors is indexed for
+//! everything that resolved, and so is one that needs a file whose check
+//! failed; one whose braces do not match has nothing indexed. A query waits
+//! for the worker as a check does, and is handed over before any check
+//! due: if a document of the workspace has changed since its index was
+//! made, the worker checks it at once, skipping the quiet period, publishes
+//! the diagnostics, and answers from the new index (see the `worker`
+//! module), so an answer never points at old text; a `workspace/symbol`
+//! does so for every workspace and lone file. A `$/cancelRequest` of a
+//! query not handed over yet answers it with `RequestCancelled`; one
+//! handed over is answered anyway.
 //!
 //! FORMATTING. `textDocument/formatting` is answered with the edits that
 //! lay the document's text out as `gcsl fmt` does ([`gcsl::fmt`]), each a
@@ -55,11 +83,19 @@
 //! document is checked alone, as `gcsl run FILE` checks a lone file (see
 //! [`place`]). A server serves any number of workspaces, each by its root.
 //! A workspace's files are read from disk once and kept, and read again
-//! when the client reports watched files changed under its root, when one
-//! of its documents is saved, and when one is closed (its file then has its
-//! text on disk again); the open documents' texts stand in for their
-//! files', and those not on disk yet are added in path order. Nothing is
-//! ever written to disk.
+//! when the client reports watched files changed under its root (created,
+//! changed or deleted alike), when one of its documents is saved, and when
+//! one is closed (its file then has its text on disk again); the open
+//! documents' texts stand in for their files', and those not on disk yet
+//! are added in path order. A client that cannot register for watched files
+//! reports none, so then the server looks itself: before each check of a
+//! workspace, and before a query is answered from its index, it stats its
+//! files as last read, reads again those whose modification time or size
+//! changed, and the whole workspace if one is gone (see the `worker`
+//! module). A `.gcsl` file new on disk is found when the workspace is read
+//! whole, on a save or a close: finding it takes a walk of the whole tree,
+//! which is far slower than a stat of its files. Nothing is ever written to
+//! disk.
 //!
 //! CHECKING. A workspace is checked as `gcsl run` and `pekit` check one,
 //! with the same diagnostics, and indexed as it is
@@ -68,8 +104,11 @@
 //! `gcsl run` checks one; nothing is ever run, so opening a file never runs
 //! `sh`, `exec` or any GCSL code. Every file the check reports on, open or
 //! not, has its diagnostics published, with an open document's version as
-//! checked, and a file that had some and has none now gets an empty list
-//! (see the `worker` module).
+//! checked; a file that had some and has none now gets an empty list; a
+//! document's first check after it is opened always publishes for it, an
+//! empty list included; and a publish whose version and list are both
+//! those last published for its URI is skipped, as clients editing in
+//! bursts would see it over and over (see the `worker` module).
 //!
 //! THREADS. Not to lag, the main thread only reads messages, keeps the
 //! documents, schedules checks and queries, and formats; it never checks.
@@ -99,10 +138,14 @@
 //! the other files' type errors disappear until it is fixed: what the check
 //! reports is published, and stale diagnostics are not kept. Nor is a stale
 //! index: while the scan fails nothing is answered, and a file whose braces
-//! do not match, or that needs a file whose check failed, has nothing to
-//! answer until it is checked again. What the standard library and the
-//! built-ins declare has no definition to go to: their sources are
-//! compiled in, with no file on disk.
+//! do not match has nothing to answer until it is checked again. A file
+//! that needs a file whose check failed is indexed, but what it reads of
+//! that file's own directory has no type (see [`gcsl::index`]). What the
+//! standard library and the built-ins declare has no definition to go to:
+//! their sources are compiled in, with no file on disk. A rename renames
+//! no file or directory, so neither a name a directory or a file gives
+//! (`sandbox` of `import _lib.sandbox`) nor `fileroot`'s can be renamed,
+//! and a definition renamed no longer mirrors its directory's name.
 
 #![warn(
     clippy::unwrap_used,
@@ -139,22 +182,26 @@ use lsp_types::notification::{
     DidOpenTextDocument, DidSaveTextDocument, Notification as _,
 };
 use lsp_types::request::{
-    Formatting, GotoDefinition, HoverRequest, RangeFormatting, RegisterCapability, Request as _,
+    DocumentHighlightRequest, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+    PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename, Request as _,
+    WorkspaceSymbolRequest,
 };
 use lsp_types::{
     CancelParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentFormattingParams,
-    DocumentRangeFormattingParams, FileSystemWatcher, GlobPattern, HoverProviderCapability,
-    InitializeResult, NumberOrString, OneOf, Position, Registration, RegistrationParams,
-    ServerCapabilities, ServerInfo, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
+    DocumentHighlightParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    FileSystemWatcher, GlobPattern, HoverProviderCapability, InitializeResult, NumberOrString,
+    OneOf, Position, ReferenceParams, Registration, RegistrationParams, RenameOptions,
+    RenameParams, ServerCapabilities, ServerInfo, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Uri, WorkspaceSymbolParams,
 };
 use serde_json::Value;
 
 use crate::place::{Place, locate, path_of};
 use crate::position::Encoding;
-use crate::worker::{Asked, Check, Job, Key, Query, Snapshot};
+use crate::worker::{Asked, Check, Job, Key, Query, Snapshot, Symbols};
 
 /// How long a workspace must go unchanged before it is checked.
 pub const QUIET: Duration = Duration::from_millis(150);
@@ -254,9 +301,10 @@ fn serve_counting(connection: &Connection, checks: &Arc<AtomicUsize>) -> Result<
         .unwrap_or(false);
     connection.initialize_finish(id, initialize_result(encoding))?;
     let (done, finished) = crossbeam_channel::unbounded();
+    // Without the client watching files, the worker looks at them itself.
     let (jobs, worker) = worker::spawn(
         connection.sender.clone(),
-        encoding,
+        (encoding, !watch),
         Arc::clone(checks),
         done,
     )
@@ -268,7 +316,7 @@ fn serve_counting(connection: &Connection, checks: &Arc<AtomicUsize>) -> Result<
         documents: HashMap::new(),
         due: HashMap::new(),
         queries: VecDeque::new(),
-        busy: None,
+        busy: false,
         shutdown: false,
     };
     let ended = if watch { state.watch() } else { Ok(()) }.and_then(|()| state.run(&finished));
@@ -295,6 +343,14 @@ fn initialize_result(encoding: Encoding) -> Value {
             text_document_sync: Some(TextDocumentSyncCapability::Options(sync)),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             definition_provider: Some(OneOf::Left(true)),
+            references_provider: Some(OneOf::Left(true)),
+            document_highlight_provider: Some(OneOf::Left(true)),
+            rename_provider: Some(OneOf::Right(RenameOptions {
+                prepare_provider: Some(true),
+                work_done_progress_options: lsp_types::WorkDoneProgressOptions::default(),
+            })),
+            document_symbol_provider: Some(OneOf::Left(true)),
+            workspace_symbol_provider: Some(OneOf::Left(true)),
             document_formatting_provider: Some(OneOf::Left(true)),
             document_range_formatting_provider: Some(OneOf::Left(true)),
             ..ServerCapabilities::default()
@@ -318,6 +374,8 @@ struct Document {
     version: i32,
     /// Where it is.
     place: Place,
+    /// Whether a check has been handed over with it since it was opened.
+    handed: bool,
 }
 
 /// A check asked for.
@@ -331,17 +389,36 @@ struct Due {
 
 /// A query asked and not handed to the worker yet.
 #[derive(Debug)]
-struct Pending {
+enum Pending {
+    /// Of a place of a document.
+    Query {
+        /// The request's id.
+        id: RequestId,
+        /// What it asks.
+        asked: Asked,
+        /// The document's URI, as the client gave it.
+        uri: Uri,
+        /// Where in it.
+        position: Position,
+        /// What the document is checked as part of.
+        key: Key,
+    },
+    /// A `workspace/symbol`, of every workspace and lone file.
+    Symbols {
+        /// The request's id.
+        id: RequestId,
+        /// What the names must have as a subsequence.
+        query: String,
+    },
+}
+
+impl Pending {
     /// The request's id.
-    id: RequestId,
-    /// What it asks.
-    asked: Asked,
-    /// The document's URI, as the client gave it.
-    uri: Uri,
-    /// Where in it.
-    position: Position,
-    /// What the document is checked as part of.
-    key: Key,
+    fn id(&self) -> &RequestId {
+        match self {
+            Pending::Query { id, .. } | Pending::Symbols { id, .. } => id,
+        }
+    }
 }
 
 /// What the main loop does after a message.
@@ -369,8 +446,8 @@ struct Server<'c> {
     due: HashMap<Key, Due>,
     /// The queries asked and not handed to the worker yet, in order.
     queries: VecDeque<Pending>,
-    /// What the worker is checking, or answering a query of, if anything.
-    busy: Option<Key>,
+    /// Whether the worker is checking, or answering a query.
+    busy: bool,
     /// Whether the client has said `shutdown`.
     shutdown: bool,
 }
@@ -379,7 +456,7 @@ impl Server<'_> {
     /// Reads messages and schedules checks until the client says `exit`,
     /// handing the worker the next due check whenever it is idle; the
     /// worker says on `finished` when it has done one.
-    fn run(&mut self, finished: &Receiver<Key>) -> Result<(), Error> {
+    fn run(&mut self, finished: &Receiver<()>) -> Result<(), Error> {
         loop {
             self.dispatch()?;
             let wake = match self.next_wake() {
@@ -397,9 +474,9 @@ impl Server<'_> {
                         };
                     }
                 }
-                recv(finished) -> key => {
-                    key.map_err(|_| Error::WorkerStopped)?;
-                    self.busy = None;
+                recv(finished) -> done => {
+                    done.map_err(|_| Error::WorkerStopped)?;
+                    self.busy = false;
                 }
                 recv(wake) -> _ => {}
             }
@@ -408,7 +485,7 @@ impl Server<'_> {
 
     /// When the next check is due, if the worker is idle to make it.
     fn next_wake(&self) -> Option<Instant> {
-        if self.busy.is_some() {
+        if self.busy {
             return None;
         }
         self.due.values().filter_map(|due| due.at).min()
@@ -418,40 +495,33 @@ impl Server<'_> {
     /// check due first, if one is due: with the documents of what it is of
     /// as they are now.
     fn dispatch(&mut self) -> Result<(), Error> {
-        if self.busy.is_some() {
+        if self.busy {
             return Ok(());
         }
-        if let Some(Pending {
-            id,
-            asked,
-            uri,
-            position,
-            key,
-        }) = self.queries.pop_front()
-        {
-            // The query's check, if its index is stale, is the check due:
-            // it takes what is due of it.
-            let reread = self.due.get_mut(&key).is_some_and(|due| {
-                due.at = None;
-                std::mem::take(&mut due.reread)
-            });
-            let check = Check {
-                key: key.clone(),
-                documents: self.snapshot(&key),
-                reread,
-            };
-            let query = Query {
+        match self.queries.pop_front() {
+            Some(Pending::Query {
                 id,
                 asked,
                 uri,
                 position,
-                check,
-            };
-            self.jobs
-                .send(Job::Query(query))
-                .map_err(|_| Error::WorkerStopped)?;
-            self.busy = Some(key);
-            return Ok(());
+                key,
+            }) => {
+                let query = Query {
+                    id,
+                    asked,
+                    uri,
+                    position,
+                    check: self.handed(key),
+                };
+                return self.hand(Job::Query(query));
+            }
+            Some(Pending::Symbols { id, query }) => {
+                let mut keys: Vec<Key> = self.due.keys().cloned().collect();
+                keys.sort_by_key(|key| format!("{key:?}"));
+                let checks = keys.into_iter().map(|key| self.handed(key)).collect();
+                return self.hand(Job::Symbols(Symbols { id, query, checks }));
+            }
+            None => {}
         }
         let now = Instant::now();
         let next = self
@@ -463,34 +533,44 @@ impl Server<'_> {
         let Some(key) = next else {
             return Ok(());
         };
+        let check = self.handed(key);
+        self.hand(Job::Check(check))
+    }
+
+    /// Hands `job` to the worker, which is busy until it says it is done.
+    fn hand(&mut self, job: Job) -> Result<(), Error> {
+        self.jobs.send(job).map_err(|_| Error::WorkerStopped)?;
+        self.busy = true;
+        Ok(())
+    }
+
+    /// The check of `key` with its open documents as they are now, to be
+    /// handed over: it takes what is due of `key`, and each document's
+    /// first check since it was opened is this one.
+    fn handed(&mut self, key: Key) -> Check {
         let reread = self.due.get_mut(&key).is_some_and(|due| {
             due.at = None;
             std::mem::take(&mut due.reread)
         });
-        let check = Check {
-            key: key.clone(),
-            documents: self.snapshot(&key),
-            reread,
-        };
-        self.jobs
-            .send(Job::Check(check))
-            .map_err(|_| Error::WorkerStopped)?;
-        self.busy = Some(key);
-        Ok(())
-    }
-
-    /// The open documents of `key`, as they are now.
-    fn snapshot(&self, key: &Key) -> Vec<Snapshot> {
-        self.documents
-            .values()
-            .filter(|document| Key::of(&document.uri, &document.place) == *key)
-            .map(|document| Snapshot {
+        let mut documents = Vec::new();
+        for document in self.documents.values_mut() {
+            if Key::of(&document.uri, &document.place) != key {
+                continue;
+            }
+            documents.push(Snapshot {
                 uri: document.uri.clone(),
                 version: document.version,
                 text: document.text.clone(),
                 place: document.place.clone(),
-            })
-            .collect()
+                opened: !document.handed,
+            });
+            document.handed = true;
+        }
+        Check {
+            key,
+            documents,
+            reread,
+        }
     }
 
     /// Asks for a check of `key` after the quiet period, reading its files
@@ -578,8 +658,14 @@ impl Server<'_> {
                     .map_or(0, Vec::len);
                 Response::new_ok(request.id, vec![Value::Null; items])
             }
-            HoverRequest::METHOD => return self.ask(request, Asked::Hover),
-            GotoDefinition::METHOD => return self.ask(request, Asked::Definition),
+            HoverRequest::METHOD
+            | GotoDefinition::METHOD
+            | References::METHOD
+            | DocumentHighlightRequest::METHOD
+            | PrepareRenameRequest::METHOD
+            | Rename::METHOD
+            | DocumentSymbolRequest::METHOD
+            | WorkspaceSymbolRequest::METHOD => return self.ask(request),
             Formatting::METHOD | RangeFormatting::METHOD => self.format(request),
             method => Response::new_err(
                 request.id,
@@ -590,14 +676,27 @@ impl Server<'_> {
         Some(response)
     }
 
-    /// Queues `request`, which asks `asked` of a place of a document, for
+    /// Queues `request`, a query of a document, or `workspace/symbol`, for
     /// the worker to answer; `None` once it is. Parameters that cannot be
     /// read are `InvalidParams`, and a document that is not open has
     /// nothing to say: `null`.
-    fn ask(&mut self, request: Request, asked: Asked) -> Option<Response> {
+    fn ask(&mut self, request: Request) -> Option<Response> {
         let Request { id, method, params } = request;
-        let params = match serde_json::from_value::<TextDocumentPositionParams>(params) {
-            Ok(params) => params,
+        let read = match method.as_str() {
+            WorkspaceSymbolRequest::METHOD => {
+                match serde_json::from_value::<WorkspaceSymbolParams>(params) {
+                    Ok(params) => {
+                        let query = params.query;
+                        self.queries.push_back(Pending::Symbols { id, query });
+                        return None;
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => asked(&method, params),
+        };
+        let (uri, position, asked) = match read {
+            Ok(read) => read,
             Err(error) => {
                 let message = format!("cannot read the parameters of `{method}`: {error}");
                 return Some(Response::new_err(
@@ -607,16 +706,15 @@ impl Server<'_> {
                 ));
             }
         };
-        let uri = params.text_document.uri;
         let Some(document) = self.documents.get(uri.as_str()) else {
             return Some(Response::new_ok(id, Value::Null));
         };
         let key = Key::of(&uri, &document.place);
-        self.queries.push_back(Pending {
+        self.queries.push_back(Pending::Query {
             id,
             asked,
             uri,
-            position: params.position,
+            position,
             key,
         });
         None
@@ -671,7 +769,7 @@ impl Server<'_> {
             NumberOrString::Number(number) => RequestId::from(*number),
             NumberOrString::String(text) => RequestId::from(text.clone()),
         };
-        let Some(at) = self.queries.iter().position(|pending| pending.id == id) else {
+        let Some(at) = self.queries.iter().position(|pending| *pending.id() == id) else {
             return Ok(());
         };
         self.queries.remove(at);
@@ -742,6 +840,7 @@ impl Server<'_> {
             text: item.text,
             version: item.version,
             place,
+            handed: false,
         };
         self.documents
             .insert(document.uri.as_str().to_owned(), document);
@@ -860,6 +959,47 @@ impl Server<'_> {
         }
         Ok(())
     }
+}
+
+/// What the query `method` with `params` asks, of which document and where
+/// in it (a document's symbols, of no place in it, at its start).
+///
+/// # Errors
+///
+/// The parameters cannot be read.
+fn asked(method: &str, params: Value) -> serde_json::Result<(Uri, Position, Asked)> {
+    let at = |params: TextDocumentPositionParams, asked| {
+        (params.text_document.uri, params.position, asked)
+    };
+    Ok(match method {
+        GotoDefinition::METHOD => at(serde_json::from_value(params)?, Asked::Definition),
+        References::METHOD => {
+            let params: ReferenceParams = serde_json::from_value(params)?;
+            let declarations = params.context.include_declaration;
+            at(
+                params.text_document_position,
+                Asked::References(declarations),
+            )
+        }
+        DocumentHighlightRequest::METHOD => {
+            let params: DocumentHighlightParams = serde_json::from_value(params)?;
+            at(params.text_document_position_params, Asked::Highlight)
+        }
+        PrepareRenameRequest::METHOD => at(serde_json::from_value(params)?, Asked::PrepareRename),
+        Rename::METHOD => {
+            let params: RenameParams = serde_json::from_value(params)?;
+            at(
+                params.text_document_position,
+                Asked::Rename(params.new_name),
+            )
+        }
+        DocumentSymbolRequest::METHOD => {
+            let params: DocumentSymbolParams = serde_json::from_value(params)?;
+            let start = Position::default();
+            (params.text_document.uri, start, Asked::DocumentSymbols)
+        }
+        _ => at(serde_json::from_value(params)?, Asked::Hover),
+    })
 }
 
 /// The parameters of a notification `method`, as `read` read them; `None`,
@@ -1106,6 +1246,14 @@ mod tests {
         );
         assert_eq!(capabilities["hoverProvider"], true);
         assert_eq!(capabilities["definitionProvider"], true);
+        assert_eq!(capabilities["referencesProvider"], true);
+        assert_eq!(capabilities["documentHighlightProvider"], true);
+        assert_eq!(
+            capabilities["renameProvider"],
+            json!({ "prepareProvider": true })
+        );
+        assert_eq!(capabilities["documentSymbolProvider"], true);
+        assert_eq!(capabilities["workspaceSymbolProvider"], true);
         assert_eq!(capabilities["documentFormattingProvider"], true);
         assert_eq!(capabilities["documentRangeFormattingProvider"], true);
         assert_eq!(result["serverInfo"]["name"], "gcsl");
@@ -1367,13 +1515,9 @@ mod tests {
         let response = Response::new_ok(request.id, Value::Null);
         client.connection.sender.send(response.into()).unwrap();
         client.open(&a, "z = y + 1\n");
+        // Checked, and clean: its first publish says so.
+        assert_eq!(client.published(&a).diagnostics, []);
         // `b` changes on disk, which the client reports.
-        let checks = client.checks();
-        let started = Instant::now();
-        while client.checks() == checks {
-            assert!(started.elapsed() < WAIT, "the server did not check in time");
-            thread::sleep(Duration::from_millis(10));
-        }
         scratch.write("b.gcsl", "y = \"s\"\n");
         let changes = json!({ "changes": [{ "uri": b, "type": 2 }] });
         client.notify("workspace/didChangeWatchedFiles", changes);
@@ -1388,7 +1532,7 @@ mod tests {
         let (mut client, _) = Client::start(&["utf-8"]);
         // Unknown requests are not found; `workspace/configuration` is
         // answered with nulls; unknown notifications are ignored.
-        let response = client.request("textDocument/references", json!({}));
+        let response = client.request("gcsl/noSuchMethod", json!({}));
         let error = response.response_result.unwrap_err();
         assert_eq!(error.code, ErrorCode::MethodNotFound as i32);
         let items = json!({ "items": [{ "section": "gcsl" }, {}] });
@@ -1556,6 +1700,294 @@ mod tests {
         client.change(&uri, 2, ((1, 4), (1, 9)), "len([1]) + twice");
         assert_eq!(client.definition(&uri, (1, 4)), Value::Null);
         client.shut_down().unwrap();
+    }
+
+    /// The `(uri, range)` of each location of `value`, a `Location[]`.
+    fn locations(value: &Value) -> Vec<(String, Range)> {
+        let locations: Vec<lsp_types::Location> = serde_json::from_value(value.clone()).unwrap();
+        locations
+            .into_iter()
+            .map(|location| (location.uri.as_str().to_owned(), location.range))
+            .collect()
+    }
+
+    #[test]
+    fn references_cover_files_not_open() {
+        let scratch = Scratch::workspace("references", "");
+        let text = "z = y + 1\nw = y\n";
+        let a = scratch.write("a.gcsl", text);
+        let b = scratch.write("b.gcsl", "y = 1\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&a, text);
+        let params = |declarations: bool| {
+            json!({
+                "textDocument": { "uri": a },
+                "position": { "line": 1, "character": 4 },
+                "context": { "includeDeclaration": declarations },
+            })
+        };
+        let response = client.request("textDocument/references", params(true));
+        assert_eq!(
+            locations(&response.response_result.unwrap()),
+            [
+                (a.as_str().to_owned(), range((0, 4), (0, 5))),
+                (a.as_str().to_owned(), range((1, 4), (1, 5))),
+                (b.as_str().to_owned(), range((0, 0), (0, 1))),
+            ]
+        );
+        let response = client.request("textDocument/references", params(false));
+        assert_eq!(locations(&response.response_result.unwrap()).len(), 2);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn highlights_tell_writes_from_reads() {
+        let scratch = Scratch::workspace("highlights", "");
+        let text = "fn g(): Int {\n    let mut n = 1\n    n := n + 1\n    n\n}\nr = g()\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-16"]);
+        client.open(&uri, text);
+        let found = client.ask("textDocument/documentHighlight", &uri, (3, 4));
+        let highlights: Vec<lsp_types::DocumentHighlight> = serde_json::from_value(found).unwrap();
+        let shown: Vec<(Range, Option<lsp_types::DocumentHighlightKind>)> =
+            highlights.into_iter().map(|h| (h.range, h.kind)).collect();
+        let (write, read) = (
+            Some(lsp_types::DocumentHighlightKind::WRITE),
+            Some(lsp_types::DocumentHighlightKind::READ),
+        );
+        assert_eq!(
+            shown,
+            [
+                (range((1, 12), (1, 13)), write),
+                (range((2, 4), (2, 5)), write),
+                (range((2, 9), (2, 10)), read),
+                (range((3, 4), (3, 5)), read),
+            ]
+        );
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_rename_edits_files_not_open_and_is_refused_with_a_reason() {
+        let scratch = Scratch::workspace("rename", "");
+        let text = "z = y + len([1])\n";
+        let a = scratch.write("a.gcsl", text);
+        let b = scratch.write("b.gcsl", "y = 1\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&a, text);
+        let prepared = client.ask("textDocument/prepareRename", &a, (0, 4));
+        assert_eq!(as_range(&prepared["range"]), range((0, 4), (0, 5)));
+        assert_eq!(prepared["placeholder"], "y");
+        let position = json!({ "line": 0, "character": 4 });
+        let params =
+            json!({ "textDocument": { "uri": a }, "position": position, "newName": "base" });
+        let edit = client
+            .request("textDocument/rename", params)
+            .response_result
+            .unwrap();
+        let edit_at = |uri: &Uri| {
+            let edits: Vec<lsp_types::TextEdit> =
+                serde_json::from_value(edit["changes"][uri.as_str()].clone()).unwrap();
+            edits
+                .into_iter()
+                .map(|e| (e.range, e.new_text))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(edit_at(&a), [(range((0, 4), (0, 5)), "base".to_owned())]);
+        assert_eq!(edit_at(&b), [(range((0, 0), (0, 1)), "base".to_owned())]);
+        // A standard function's name, and a new name that is none: refused,
+        // with why.
+        let position = json!({ "line": 0, "character": 9 });
+        let params = json!({ "textDocument": { "uri": a }, "position": position });
+        let error = client
+            .request("textDocument/prepareRename", params)
+            .response_result
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestFailed as i32);
+        assert!(
+            error.message.contains("standard library"),
+            "{}",
+            error.message
+        );
+        let position = json!({ "line": 0, "character": 4 });
+        let params = json!({ "textDocument": { "uri": a }, "position": position, "newName": "1y" });
+        let error = client
+            .request("textDocument/rename", params)
+            .response_result
+            .unwrap_err();
+        assert!(error.message.contains("not a name"), "{}", error.message);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn document_symbols_nest_and_workspace_symbols_span_workspaces() {
+        let scratch = Scratch::workspace("symbols", "");
+        let text = "cfg = {\n    a = 1\n}\nfn f(): Int { 1 }\n";
+        let a = scratch.write("a.gcsl", text);
+        let b = scratch.write("b.gcsl", "base_value = 1\n");
+        let lone = Scratch::new("symbols-lone");
+        let lonely = lone.write("lonely.gcsl", "lonely_value = 2\n");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&a, text);
+        client.open(&lonely, "lonely_value = 2\n");
+        let params = json!({ "textDocument": { "uri": a } });
+        let symbols = client
+            .request("textDocument/documentSymbol", params)
+            .response_result
+            .unwrap();
+        assert_eq!(symbols[0]["name"], "cfg");
+        assert_eq!(symbols[0]["kind"], json!(lsp_types::SymbolKind::FIELD));
+        assert_eq!(symbols[0]["detail"], "{a: Int}");
+        assert_eq!(
+            as_range(&symbols[0]["selectionRange"]),
+            range((0, 0), (0, 3))
+        );
+        assert_eq!(as_range(&symbols[0]["range"]), range((0, 0), (2, 1)));
+        assert_eq!(symbols[0]["children"][0]["name"], "a");
+        assert_eq!(symbols[1]["name"], "f");
+        assert_eq!(symbols[1]["kind"], json!(lsp_types::SymbolKind::FUNCTION));
+        let found = client
+            .request("workspace/symbol", json!({ "query": "VALUE" }))
+            .response_result
+            .unwrap();
+        let found: Vec<lsp_types::WorkspaceSymbol> = serde_json::from_value(found).unwrap();
+        let shown: Vec<(String, String)> = found
+            .into_iter()
+            .map(|symbol| {
+                let OneOf::Left(location) = symbol.location else {
+                    panic!()
+                };
+                (symbol.name, location.uri.as_str().to_owned())
+            })
+            .collect();
+        assert!(
+            shown.contains(&("base_value".to_owned(), b.as_str().to_owned())),
+            "{shown:?}"
+        );
+        assert!(
+            shown.contains(&("lonely_value".to_owned(), lonely.as_str().to_owned())),
+            "{shown:?}"
+        );
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_clean_document_s_first_check_is_published_empty() {
+        let scratch = Scratch::workspace("first-publish", "");
+        let text = "x = 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        let published = client.published(&uri);
+        assert_eq!(published.version, Some(1));
+        assert_eq!(published.diagnostics, []);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn an_identical_publish_is_skipped_and_a_new_version_is_not() {
+        let scratch = Scratch::workspace("dedup", "");
+        let other = scratch.write("other.gcsl", "w = 1 + \"a\"\n");
+        let text = "y = 1 + \"a\"\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        assert_eq!(client.published(&other).diagnostics.len(), 1);
+        assert_eq!(client.published(&uri).diagnostics.len(), 1);
+        // A comment added: the same error, at a new version of `app`. The
+        // hover waits for the check its change asks for.
+        client.change(&uri, 2, ((0, 11), (0, 11)), " # c");
+        client.hover(&uri, (0, 0));
+        let published = client.published(&uri);
+        assert_eq!(published.version, Some(2));
+        assert_eq!(published.diagnostics.len(), 1);
+        // `other`'s, as they were and at no version, are not sent again.
+        let again = client.pending.iter().any(|notification| {
+            notification.method == PublishDiagnostics::METHOD
+                && notification.params["uri"] == other.as_str()
+        });
+        assert!(!again, "{:?}", client.pending);
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn without_watching_a_file_changed_on_disk_is_read_again() {
+        let scratch = Scratch::workspace("mtime", "");
+        let a = scratch.write("a.gcsl", "z = y + 1\n");
+        scratch.write("b.gcsl", "y = 1\n");
+        // No dynamic registration: the server stats the files itself.
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&a, "z = y + 1\n");
+        assert_eq!(client.published(&a).diagnostics, []);
+        scratch.write("b.gcsl", "y = \"s\"\n");
+        // Nothing tells the server; its next check finds it.
+        client.change(&a, 2, ((0, 9), (0, 9)), " # c");
+        let published = client.published_at(&a, 2);
+        assert_eq!(published.diagnostics.len(), 1);
+        // A query answered from an index whose files changed on disk since
+        // is answered after a check.
+        scratch.write("b.gcsl", "y = 22\n");
+        let hover = client.hover(&a, (0, 4));
+        let shown = hover["contents"]["value"].as_str().unwrap();
+        assert!(shown.contains("y: Int"), "{shown}");
+        client.shut_down().unwrap();
+    }
+
+    #[test]
+    fn a_file_created_over_a_known_one_is_read_again() {
+        let scratch = Scratch::workspace("created", "");
+        let a = scratch.write("a.gcsl", "z = y + 1\n");
+        let b = scratch.write("b.gcsl", "y = 1\n");
+        let capabilities = json!({
+            "general": { "positionEncodings": ["utf-8"] },
+            "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } },
+        });
+        let (mut client, _) = Client::start_with(&capabilities);
+        let Message::Request(request) = client.receive() else {
+            panic!()
+        };
+        let response = Response::new_ok(request.id, Value::Null);
+        client.connection.sender.send(response.into()).unwrap();
+        client.open(&a, "z = y + 1\n");
+        assert_eq!(client.published(&a).diagnostics, []);
+        // A file renamed over `b`, which inotify reports as created.
+        scratch.write("b.gcsl", "y = \"s\"\n");
+        let changes = json!({ "changes": [{ "uri": b, "type": 1 }] });
+        client.notify("workspace/didChangeWatchedFiles", changes);
+        assert_eq!(client.published(&a).diagnostics.len(), 1);
+        client.shut_down().unwrap();
+    }
+
+    /// The time of a stat pass of the workspace at `$GCSL_LSP_BENCH`: run
+    /// with `--ignored --nocapture` to see it.
+    #[test]
+    #[ignore = "a measurement, not a test"]
+    fn time_of_a_stat_pass() {
+        let Some(root) = std::env::var_os("GCSL_LSP_BENCH") else {
+            return;
+        };
+        let root = fs::canonicalize(root).unwrap();
+        let sources = gcsl_disk::read_workspace(&root, None).unwrap();
+        let files = sources.relative.len();
+        let mut times = Vec::new();
+        for _ in 0..50 {
+            let start = Instant::now();
+            let found = worker::stamps(&root, &sources.relative, None);
+            times.push(start.elapsed());
+            assert!(found.iter().all(Option::is_some));
+        }
+        // The walk that finds the files, which a stat pass does not make.
+        let start = Instant::now();
+        gcsl_disk::workspace_files(&root).unwrap();
+        let walk = start.elapsed();
+        times.sort();
+        let _ = writeln!(
+            io::stderr(),
+            "stat pass of {files} files: median {:?}, min {:?}, max {:?}; a walk of the tree {walk:?}",
+            times[times.len() / 2],
+            times[0],
+            times[times.len() - 1]
+        );
     }
 
     #[test]

@@ -50,8 +50,10 @@ enum Command {
     /// not formatted. A file with a syntax error is left alone.
     Fmt(fmt::FmtArgs),
     /// Serve the Language Server Protocol on stdin and stdout, reporting
-    /// each file's errors and warnings as it is edited, answering hover and
-    /// go-to-definition, and formatting. Checks only: runs nothing.
+    /// each file's errors and warnings as it is edited, answering hover,
+    /// go-to-definition, references, highlights, rename (checked before it
+    /// is offered; it renames no file or directory), document and workspace
+    /// symbols, and formatting. Checks only: runs nothing.
     Lsp,
 }
 

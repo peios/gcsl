@@ -6165,8 +6165,8 @@ fn check_scan_partial(scan: Scan) -> Result<Workspace, Failed> {
 #[derive(Debug, Default)]
 pub(crate) struct Recorded {
     /// What each file's check recorded, by input number; `None` for a file
-    /// not checked, whose tree is unbalanced or which needs a file whose
-    /// check failed.
+    /// not checked, whose tree is unbalanced. (A file that needs one whose
+    /// check failed is checked for this alone: `record_blocked`.)
     pub(crate) files: Vec<Option<Box<Record>>>,
     /// The type of each cell, by its number, as the check of the file that
     /// computes it found it, whether that check succeeded or failed: for
@@ -6234,6 +6234,51 @@ fn check_file<'a>(
     output.and_then(|output| session::lower_checked(ast, output, types, index))
 }
 
+/// If the check of `scan` records (see [`crate::check`], "Recording"),
+/// once every file that could be is checked, checks each file that needs
+/// a file whose check failed, and so was not, for its index alone (see
+/// [`crate::index`]), in the order: from the declarations `scopes` hold,
+/// with the cells' slots and parameters as the checks left them, and their
+/// types as `recorded` has them (those the failed checks found among
+/// them), lent the workspace's `names`, interning into `types`. It keeps
+/// what each records in `recorded`, throws away what each finds, and
+/// commits nothing, a name that names nothing taken as no error, since it
+/// may be declared in the file that failed. A file whose tree is
+/// unbalanced is still not checked.
+fn record_blocked(
+    scan: &mut Scan,
+    (scopes, reads): (&[Committed], CellReads<'_>),
+    (names, types, recorded): (&mut Names, &mut TypeTable, &mut Recorded),
+) {
+    if recorded.files.is_empty() {
+        return;
+    }
+    let cell_types = recorded.cells.clone();
+    for index in scan.order.clone() {
+        let checked = recorded
+            .files
+            .get(index as usize)
+            .is_some_and(Option::is_some);
+        if checked || scan.is_unbalanced(index) {
+            continue;
+        }
+        if let Some(file) = scan.files.get_mut(index as usize) {
+            file.ast.replace_names(mem::take(names));
+        }
+        if let Some(file) = scan.files.get(index as usize)
+            && let Some(context) = Context::new(scan, index, &cell_types, reads)
+        {
+            let scope = Committed::scope(scan, scopes, file, scan.cell_names());
+            let checking = Checker::in_workspace(&file.ast, scope, types, &context);
+            let (_, found) = checking.recording().blind().check_recorded();
+            recorded.keep(scan, index, found);
+        }
+        if let Some(file) = scan.files.get_mut(index as usize) {
+            *names = file.ast.replace_names(Names::new());
+        }
+    }
+}
+
 /// [`check_scan_partial`], each file's check recording what its names refer
 /// to if `record` (see [`crate::check`], "Recording"), with what it
 /// recorded.
@@ -6276,7 +6321,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
             check_file((&scan, index), &context, (scope, &mut types), &mut recorded)
         });
         // What the file declares, committed for the files after it.
-        let committed = match &compiled {
+        let cells = match &compiled {
             Some(Ok((_, output))) => computed_cells(&scan, index, output),
             _ => Vec::new(),
         };
@@ -6306,11 +6351,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         if let Some(file) = scan.files.get_mut(index as usize) {
             names = file.ast.replace_names(Names::new());
         }
-        for (global, slot, ty, known) in committed {
-            set(&mut cell_types, global, ty);
-            set(&mut cell_slots, global, slot);
-            set(&mut cell_known, global, known);
-        }
+        set_cells(&mut cell_types, &mut cell_slots, &mut cell_known, cells);
         match result {
             Ok((mut ir, file_types, found)) => {
                 set(&mut tails, index, own_slot_names(&mut ir, &mut slot_names));
@@ -6324,6 +6365,9 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
             }
         }
     }
+    let tables = (&scopes[..], (&cell_slots[..], &cell_known[..]));
+    let lent = (&mut names, &mut types, &mut recorded);
+    record_blocked(&mut scan, tables, lent);
     scan.names = names;
     if !errors.is_empty() || failed.contains(&true) {
         let failed = Failed::of(scan, (types, checked), (errors, warnings));
@@ -6361,6 +6405,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
 /// succeeded or failed: what [`index_with_standard`] and
 /// [`index_lone_with_standard`] do.
 fn index_in(placed: (&[SourceFile], Placing), root: &str) -> Indexed {
+    let given = placed.0;
     let mut loaded = Vec::new();
     let scanned = scan_into(placed, Library::NEEDED, &mut Names::new(), &mut loaded);
     let standard = Library::NEEDED.sources(&loaded);
@@ -6392,11 +6437,16 @@ fn index_in(placed: (&[SourceFile], Placing), root: &str) -> Indexed {
             partial,
         }) => (diagnostics, false, partial.map(|p| (p.scan, p.types))),
     };
+    let index = parts.map(|(scan, types)| {
+        let mut sources = standard.clone();
+        sources.extend(given.iter().cloned());
+        Index::new(scan, types, recorded, (sources, &diagnostics))
+    });
     Indexed {
         standard,
         diagnostics,
         succeeded,
-        index: parts.map(|(scan, types)| Index::new(scan, types, recorded)),
+        index,
     }
 }
 
@@ -6578,6 +6628,21 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
 /// slot it is read from, its type, and for a `def` what a call of it needs to
 /// know of its parameters.
 type ComputedCell = (u32, Slot, TyId, Option<Rc<KnownParams>>);
+
+/// Sets the type, the slot and the parameters of each of `cells` in the
+/// cells' tables, `types`, `slots` and `known`.
+fn set_cells(
+    types: &mut [TyId],
+    slots: &mut [Slot],
+    known: &mut [Option<Rc<KnownParams>>],
+    cells: Vec<ComputedCell>,
+) {
+    for (global, slot, ty, params) in cells {
+        set(types, global, ty);
+        set(slots, global, slot);
+        set(known, global, params);
+    }
+}
 
 /// Sets the entry `index` of `entries` to `value`, if it has one.
 fn set<T>(entries: &mut [T], index: u32, value: T) {

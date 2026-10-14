@@ -8,31 +8,42 @@
 //! an [`Index`] of what it found, WHETHER THE CHECK SUCCEEDED OR FAILED: in a
 //! file with type errors, or with syntax errors its parser recovered from,
 //! everything that resolved is indexed, an expression that failed (of type
-//! `Error`) answering nothing. A file that was not checked has nothing
-//! indexed: one whose braces do not match ([`crate::ast::Syntax::Unbalanced`])
-//! and one that needs a file whose check failed (see [`crate::workspace`],
-//! "Syntax errors").
+//! `Error`) answering nothing. A file whose braces do not match
+//! ([`crate::ast::Syntax::Unbalanced`]) is not checked, and has nothing
+//! indexed. A file that needs a file whose check failed, which `gcsl run`
+//! does not check (see [`crate::workspace`], "Syntax errors"), is checked
+//! for its index alone once every other file is, a name that names nothing
+//! there no error (it may be declared in the file that failed), and what
+//! its check finds thrown away, so that the diagnostics are still exactly
+//! `gcsl run`'s: it is indexed for what resolved, a name that names nothing
+//! being no occurrence. What it reads of a file that failed through an
+//! import has the type that file's check found; what it reads of one of
+//! its own directory chain, whose declarations were never committed, has
+//! none.
 //!
 //! # Occurrences
 //!
 //! Each file's index is a list of OCCURRENCES ([`Occurrence`]), in source
 //! order: a span written in the file (a name, a segment of a path, a type's
 //! name) and the [`Symbol`] it refers to, if it refers to one that has an
-//! identity, with whether it is the symbol's declaration and the type the
-//! check gave what is written there. Everything a language server answers
-//! is read from them: a hover from the occurrence at a place, the
-//! definition from its symbol's declaration sites, and (slice 60) the
-//! references to a symbol from the occurrences of it, the link table
-//! inverted. They are found once, as the index is built, from the trees,
-//! the scan and what the checks recorded:
+//! identity, with whether it is the symbol's declaration, whether it writes
+//! it (a declaration, or a `:=`), and the type the check gave what is
+//! written there. Everything a language server answers is read from them:
+//! a hover from the occurrence at a place, the definition from its symbol's
+//! declaration sites, and the references to a symbol from the occurrences
+//! of it, the link table inverted (see "References"). They are found once,
+//! as the index is built, from the trees, the scan and what the checks
+//! recorded:
 //!
 //! - A binding declared in a file (a `let`, `let mut`, `fn`, parameter,
-//!   `for` variable, `:=`, or field of a record block) is a
-//!   [`Symbol::Local`], by its file and its name's span; its declaration is
-//!   an occurrence, and so is each `Name` the check read from it, as it
-//!   recorded. A name read from the narrowed copy of a variable (`if x is
-//!   Int { x }`) is the variable's, and a function's name for itself the
-//!   function's.
+//!   `for` variable, or field of a record block) is a [`Symbol::Local`], by
+//!   its file and its name's span; its declaration is an occurrence, and so
+//!   is each `Name` the check read from it, as it recorded. A name read
+//!   from the narrowed copy of a variable (`if x is Int { x }`) is the
+//!   variable's, and a function's name for itself the function's. A `:=`'s
+//!   variable is an occurrence of the variable it rebinds, which writes it:
+//!   a variable's `:=` declares a binding in place of the old one, which is
+//!   taken as the same local, so its reads after it are the old one's.
 //! - Any other `Name`, and each field access directly on it, `a.b.c`, is
 //!   resolved in the file's view ([`FileScope`]) as the check resolves it,
 //!   to the longest prefix the view declares: each segment of it an
@@ -79,19 +90,99 @@
 //! `gcsl` code block, `name: Type`, a function as its signature, `fn
 //! name(a: Int): Int` or `def name(...)`, its parameters named as its source
 //! names them, a mutable variable `mut name: Type`, a type `type Name =
-//! TYPE` with its expansion, a built-in type its name; then, if useful, one
+//! TYPE` with its expansion, a built-in type its name; then its
+//! documentation, if it has any (see "Documentation"); then, if useful, one
 //! line saying where it comes from ("parameter", "field of directory
 //! `pkgs/`", "standard library `path`", "built-in", "imported from `a.b`").
 //! Types are shown by the printer diagnostics use
-//! ([`TypeTable::display`]), a record too wide for a line laid out a field
-//! per line, and anything of more than [`MAX_LINES`] lines cut short with
-//! `…`. An occurrence whose type the check found erroneous, or did not
-//! find, has no hover, but a type's, a module's and a node's whose type
-//! another file gives.
+//! ([`TypeTable::display`]); a line wider than 80 columns, a hover
+//! panel's width, lays its record out a field per line, or its
+//! signature or function type a parameter per line, each indented by 2;
+//! and anything of more than [`MAX_LINES`] lines is cut short with `…`. An
+//! occurrence whose type the check found erroneous, or did not find, has no
+//! hover, but a type's, a module's and a node's whose type another file
+//! gives.
+//!
+//! # Documentation
+//!
+//! The DOC COMMENT of a declaration (a `let`, a field, a `fn`, a `def`, a
+//! `defmeta`, a definition or a `type` item) is the run of comment lines
+//! directly above its item, its attributes' lines apart, with no blank line
+//! between: each line a comment alone (a trailing comment, on a line with
+//! code, is none, so neither is the declaration's own), shown without its
+//! `#` and one space after it, blank lines at either end left out
+//! ([`Index::documentation`]). The comments are the lexer's
+//! ([`crate::lexer::lex_with_comments`]), so an attribute, `#[...]`, is
+//! none, and neither is a `#` in a string. A node declared by several
+//! items is documented by the first of them, in input then source order,
+//! that has a doc comment, and a definition with none by its meta's, since
+//! a package is described above its `defmeta`; an interior node, written by
+//! no item of its own, a parameter and a module have none.
+//!
+//! # References
+//!
+//! The REFERENCES of what is at a place ([`Index::references`]) are the
+//! occurrences of its symbol in every file of the workspace (none in the
+//! standard files'), its declarations among them if asked: a definition's
+//! path counts as the declaration of its node, a reference to it,
+//! `package x.y`, as a use. Occurrences are filed by their symbols once,
+//! the first time references are asked for, in one pass over every file's:
+//! a node several sources of a view share is filed under each node it
+//! merges, and a file's part of a node under the node, so that a read
+//! through a shared root is a reference to each declaration it merges.
+//! What the standard library or a built-in declares has its references in
+//! the workspace, and no declaration. Its HIGHLIGHTS
+//! ([`Index::highlights`]) are its references in the one file, each a
+//! write (a declaration or a `:=`) or a read.
+//!
+//! # Rename
+//!
+//! A RENAME of what is at a place ([`Index::prepare_rename`],
+//! [`Index::rename`]) edits every occurrence of its symbol that is written
+//! with its name, in every file of the workspace, and of every symbol filed
+//! under the same nodes (each node a view's read merges), so that an
+//! import's alias, `import x as y`, keeps its name, only `x` changing; a
+//! qualified type, `lib.T`, has its name changed; and a definition's
+//! segment renames its node everywhere, the references to it and the path
+//! of its meta, `defmeta package x.y`, which is paired with it by path,
+//! included. No file or directory is renamed, so a definition renamed no
+//! longer mirrors its directory's name. It is refused, with why, for
+//! nothing there (a keyword, a literal, what names nothing, a field read of
+//! a record not tracked); for what the standard library or a built-in
+//! declares; for a name a directory or a file gives (`sandbox` of `import
+//! _lib.sandbox`), or `fileroot`'s; for an import's alias; for a name
+//! written somewhere as a string, `"a-b" = 1`; and for a new name that is
+//! not one identifier (a definition's segment: a segment as the parser
+//! takes one). Then it is checked: the files with its edits made are
+//! indexed again, and it is refused, naming the first problem, if that
+//! finds an error this index did not (by message and place, the places
+//! mapped back through the edits), or if any occurrence of any file
+//! refers to something other than it did, its symbol's declarations
+//! mapped back through the edits being elsewhere: a name captured by
+//! another, or one that refers to nothing any more.
+//!
+//! # Symbols
+//!
+//! A file's SYMBOLS ([`Index::document_symbols`]) are its top-level
+//! fields, each with the fields of the record block written as its value as
+//! children, three levels deep at most; its top-level `let`s and `fn`s; its
+//! `def`s, definitions and metas, named by their whole paths, `package
+//! x.y`; its `type` items; and its imports, as one group. Each has its type
+//! on one line, cut to 60 characters. The workspace's
+//! ([`Index::workspace_symbols`]) are every file's but the imports, matched
+//! by a subsequence of a query, ignoring case.
 
+mod docs;
+mod rename;
+mod symbols;
+
+use std::cell::OnceCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+
+pub use rename::{Edit, Prepared};
+pub use symbols::{DocumentSymbol, FoundSymbol, SymbolKind};
 
 use crate::ast::{
     Ast, ExprId, ExprKind, ForHead, ImportForm, ImportMember, ItemId, ItemKind, PathRange,
@@ -100,7 +191,8 @@ use crate::ast::{
 use crate::check::{
     BUILTIN_TYPE_NAMES, BindingKind, Builtin, Constant, Fileroot, Record, RecordedDecl,
 };
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Severity};
+use crate::lexer::Comments;
 use crate::mentions::Resolve;
 use crate::names::{self, Name, Names};
 use crate::source::{SourceFile, Span};
@@ -114,9 +206,10 @@ use crate::workspace::{
 /// last line shown being `…`.
 pub const MAX_LINES: usize = 20;
 
-/// The width beyond which a record type, or a signature, is laid out on
-/// several lines.
-const WIDTH: usize = 72;
+/// The widest line, in columns, a record type or a signature is written
+/// on: a wider one is laid out a field or a parameter per line, indented
+/// by 2. Hover panels are often 80 columns wide.
+const WIDTH: usize = 80;
 
 /// The longest line a hover shows: a longer one is cut short with `…`.
 const MAX_LINE: usize = 200;
@@ -182,6 +275,9 @@ pub struct Occurrence {
     pub symbol: Option<Symbol>,
     /// Whether it is where its symbol is declared.
     pub declaration: bool,
+    /// Whether it writes its symbol: a declaration, or the variable a `:=`
+    /// rebinds.
+    pub write: bool,
     /// Where a definition request at it goes, if not to its symbol's
     /// declarations: a definition's path goes to its def-type.
     pub jump: Option<Symbol>,
@@ -270,12 +366,94 @@ pub struct Index {
     cells: Vec<TyId>,
     /// Each file's index, by input number.
     files: Vec<FileIndex>,
+    /// Each file's source, by input number, if it was given.
+    sources: Vec<Option<SourceFile>>,
+    /// The errors the check reported, which a rename must not add to.
+    errors: Vec<Diagnostic>,
+    /// The occurrences of each symbol, by key, in files of the workspace:
+    /// the link table inverted, made on first use.
+    table: OnceCell<HashMap<Key, Vec<(u32, u32)>>>,
+    /// Each file's comments, by input number, found on first use.
+    comments: Vec<OnceCell<Comments>>,
+    /// Every file's symbols, for [`Index::workspace_symbols`], made on
+    /// first use.
+    flat: OnceCell<Vec<symbols::Flat>>,
+}
+
+/// What occurrences are filed under in the link table: a symbol, a node of
+/// a view by each node it merges (see [`Index::keys`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    /// A local.
+    Local(u32, Span),
+    /// A merged node.
+    Node(u32),
+    /// A module that is no node: a directory, a file, `fileroot`.
+    Module(Target),
+    /// A declared type.
+    Type(u32),
+    /// A built-in type.
+    BuiltinType(Name),
+}
+
+/// A place a symbol is written in a file, as
+/// [`Index::highlights`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Highlight {
+    /// Where.
+    pub span: Span,
+    /// Whether it writes the symbol: a declaration, or a `:=`.
+    pub write: bool,
 }
 
 impl Index {
     /// The index of `scan`, its types interned into `types`, from what its
-    /// files' checks `recorded`.
-    pub(crate) fn new(scan: Scan, types: TypeTable, recorded: Recorded) -> Self {
+    /// files' checks `recorded`; `sources` are its inputs' sources, by
+    /// name, and `diagnostics` what the check reported.
+    pub(crate) fn new(
+        scan: Scan,
+        types: TypeTable,
+        recorded: Recorded,
+        (sources, diagnostics): (Vec<SourceFile>, &[Diagnostic]),
+    ) -> Self {
+        // By name; a lone file, which the scan names by its file name, by
+        // its place among them.
+        let mut by_place: Vec<Option<SourceFile>> = sources.into_iter().map(Some).collect();
+        let aligned = by_place.len() == scan.files.len();
+        let mut by_name: HashMap<String, usize> = (0..)
+            .zip(&by_place)
+            .filter_map(|(at, source)| Some((source.as_ref()?.name().to_owned(), at)))
+            .collect();
+        let sources = (0..)
+            .zip(&scan.files)
+            .map(|(at, file)| {
+                let at = by_name
+                    .remove(&file.path)
+                    .or_else(|| aligned.then_some(at))?;
+                by_place.get_mut(at)?.take()
+            })
+            .collect();
+        let errors = diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .cloned()
+            .collect();
+        let mut index = Self::of(scan, types, recorded);
+        index.sources = sources;
+        index.errors = errors;
+        index
+    }
+
+    /// The text of the file of input number `file`: empty if it has none.
+    fn text(&self, file: u32) -> &str {
+        self.sources
+            .get(file as usize)
+            .and_then(Option::as_ref)
+            .map_or("", SourceFile::text)
+    }
+
+    /// [`Index::new`], without the sources and diagnostics.
+    fn of(scan: Scan, types: TypeTable, recorded: Recorded) -> Self {
         let Recorded { files, cells } = recorded;
         let mut indexed = Vec::with_capacity(scan.files.len());
         let dirs: HashMap<String, u32> = (0u32..)
@@ -294,10 +472,15 @@ impl Index {
             indexed.push(file_index);
         }
         Self {
+            comments: (0..scan.files.len()).map(|_| OnceCell::new()).collect(),
+            sources: Vec::new(),
             scan,
             types,
             cells,
             files: indexed,
+            errors: Vec::new(),
+            table: OnceCell::new(),
+            flat: OnceCell::new(),
         }
     }
 
@@ -325,8 +508,7 @@ impl Index {
     }
 
     /// Whether the file of input number `file` was checked, and so is
-    /// indexed: not one whose braces do not match, nor one that needs a
-    /// file whose check failed.
+    /// indexed: not one whose braces do not match.
     #[must_use]
     pub fn checked(&self, file: u32) -> bool {
         self.files.get(file as usize).is_some_and(|f| f.checked)
@@ -393,6 +575,149 @@ impl Index {
         found
     }
 
+    /// Where what is at byte `offset` of the file of input number `file` is
+    /// written in the files of the workspace, its declarations among them
+    /// if `declarations` (see the module documentation, "References"), in
+    /// input then source order: none for nothing there and for a field read
+    /// of a record whose origin is not tracked.
+    #[must_use]
+    pub fn references(&self, file: u32, offset: u32, declarations: bool) -> Vec<Location> {
+        let Some(symbol) = self.at(file, offset).and_then(|found| found.symbol) else {
+            return Vec::new();
+        };
+        let mut found: Vec<Location> = self
+            .occurrences_of(&self.keys(symbol))
+            .into_iter()
+            .filter(|&(_, occurrence)| declarations || !occurrence.declaration)
+            .map(|(file, occurrence)| Location {
+                file,
+                span: occurrence.span,
+            })
+            .collect();
+        found.sort_by_key(|location| (location.file, location.span.start, location.span.end));
+        found.dedup();
+        found
+    }
+
+    /// Where what is at byte `offset` of the file of input number `file` is
+    /// written in that file, each place with whether it writes it (see the
+    /// module documentation, "References"), in source order.
+    #[must_use]
+    pub fn highlights(&self, file: u32, offset: u32) -> Vec<Highlight> {
+        let Some(symbol) = self.at(file, offset).and_then(|found| found.symbol) else {
+            return Vec::new();
+        };
+        let keys = self.keys(symbol);
+        let mut found: Vec<Highlight> = self
+            .occurrences(file)
+            .iter()
+            .filter(|occurrence| {
+                occurrence
+                    .symbol
+                    .is_some_and(|other| self.keys(other).iter().any(|key| keys.contains(key)))
+            })
+            .map(|occurrence| Highlight {
+                span: occurrence.span,
+                write: occurrence.write,
+            })
+            .collect();
+        found.dedup();
+        found
+    }
+
+    /// The keys the occurrences of `symbol` are filed under: a view's
+    /// node's, each node it merges; a file's part of a node, the node.
+    fn keys(&self, symbol: Symbol) -> Vec<Key> {
+        let mut keys = Vec::new();
+        match symbol {
+            Symbol::Local { file, name } => keys.push(Key::Local(file, name)),
+            Symbol::Node(node) => keys.push(Key::Node(node)),
+            Symbol::View(view) => self.target_keys(Target::View(view), 0, &mut keys),
+            Symbol::Module(target) => self.target_keys(target, 0, &mut keys),
+            Symbol::Type(decl) => keys.push(Key::Type(decl)),
+            Symbol::BuiltinType(name) => keys.push(Key::BuiltinType(name)),
+        }
+        let mut unique = Vec::with_capacity(keys.len());
+        for key in keys {
+            if !unique.contains(&key) {
+                unique.push(key);
+            }
+        }
+        unique
+    }
+
+    /// Adds the keys of `target`, `depth` views in, to `keys`.
+    fn target_keys(&self, target: Target, depth: usize, keys: &mut Vec<Key>) {
+        match target {
+            Target::Node(node) => keys.push(Key::Node(node)),
+            Target::Part { file, node } => {
+                let global = self
+                    .scan
+                    .files
+                    .get(file as usize)
+                    .and_then(|f| f.global.get(node as usize).copied());
+                keys.push(global.map_or(Key::Module(target), Key::Node));
+            }
+            Target::View(view) => {
+                let Some(entry) = self.scan.views.get(view as usize) else {
+                    return;
+                };
+                if depth > MAX_NESTING {
+                    return;
+                }
+                for part in &entry.parts {
+                    self.target_keys(part.target, depth + 1, keys);
+                }
+            }
+            Target::Dir(_) | Target::File(_) | Target::Fileroot(_) => {
+                keys.push(Key::Module(target));
+            }
+        }
+    }
+
+    /// The link table: the occurrences of the files of the workspace, by
+    /// each key of their symbols, each by its file and its index there.
+    fn table(&self) -> &HashMap<Key, Vec<(u32, u32)>> {
+        self.table.get_or_init(|| {
+            let mut table: HashMap<Key, Vec<(u32, u32)>> = HashMap::new();
+            for (file, index) in (0u32..).zip(&self.files).skip(self.standard() as usize) {
+                for (at, occurrence) in (0u32..).zip(&index.occurrences) {
+                    let Some(symbol) = occurrence.symbol else {
+                        continue;
+                    };
+                    for key in self.keys(symbol) {
+                        table.entry(key).or_default().push((file, at));
+                    }
+                }
+            }
+            table
+        })
+    }
+
+    /// The occurrences filed under any of `keys`, each once, by file.
+    fn occurrences_of(&self, keys: &[Key]) -> Vec<(u32, &Occurrence)> {
+        let table = self.table();
+        let mut places: Vec<(u32, u32)> = keys
+            .iter()
+            .filter_map(|key| table.get(key))
+            .flatten()
+            .copied()
+            .collect();
+        places.sort_unstable();
+        places.dedup();
+        places
+            .into_iter()
+            .filter_map(|(file, at)| {
+                let occurrence = self
+                    .files
+                    .get(file as usize)?
+                    .occurrences
+                    .get(at as usize)?;
+                Some((file, occurrence))
+            })
+            .collect()
+    }
+
     /// What is at byte `offset` of the file of input number `file`, as
     /// Markdown (see the module documentation, "Hovers"): `None` for
     /// nothing there, and for what has no type the check found.
@@ -400,6 +725,13 @@ impl Index {
         let found = *self.at(file, offset)?;
         let (code, origin) = self.describe(file, &found)?;
         let mut text = format!("```gcsl\n{}\n```", cut(&code));
+        if let Some(doc) = found
+            .symbol
+            .and_then(|symbol| self.documentation_of(symbol))
+        {
+            text.push_str("\n\n");
+            text.push_str(&doc);
+        }
         if let Some(origin) = origin {
             text.push_str("\n\n");
             text.push_str(&origin);
@@ -421,8 +753,9 @@ impl Index {
                 let ty = self
                     .target_type(Target::View(view), 0)
                     .or_else(|| known(found.ty))?;
+                let prefix = format!("{path}: ");
                 Some((
-                    format!("{path}: {}", self.pretty(ty)),
+                    format!("{prefix}{}", self.pretty(&prefix, ty)),
                     Some("field of several sources of this file's view".to_owned()),
                 ))
             }
@@ -435,8 +768,9 @@ impl Index {
             None => {
                 let ty = known(found.ty)?;
                 let name = self.scan.names.get(found.name?);
+                let prefix = format!("{}: ", FieldName(name));
                 Some((
-                    format!("{}: {}", FieldName(name), self.pretty(ty)),
+                    format!("{prefix}{}", self.pretty(&prefix, ty)),
                     Some("field".to_owned()),
                 ))
             }
@@ -463,7 +797,8 @@ impl Index {
         };
         let Some(local) = local else {
             let ty = known(found.ty)?;
-            return Some((format!("{}: {}", FieldName(&text), self.pretty(ty)), None));
+            let prefix = format!("{}: ", FieldName(&text));
+            return Some((format!("{prefix}{}", self.pretty(&prefix, ty)), None));
         };
         if let LocalKind::Function(function) = local.what {
             // The function expression's type, its binding's at worst.
@@ -488,8 +823,9 @@ impl Index {
             LocalKind::Field => ("", Some("field")),
             LocalKind::Variable | LocalKind::Function(_) => ("", None),
         };
+        let prefix = format!("{prefix}{}: ", FieldName(&text));
         Some((
-            format!("{prefix}{}: {}", FieldName(&text), self.pretty(ty)),
+            format!("{prefix}{}", self.pretty(&prefix, ty)),
             origin.map(str::to_owned),
         ))
     }
@@ -523,7 +859,8 @@ impl Index {
             }
         }
         let ty = ty?;
-        Some((format!("{path}: {}", self.pretty(ty)), origin))
+        let prefix = format!("{path}: ");
+        Some((format!("{prefix}{}", self.pretty(&prefix, ty)), origin))
     }
 
     /// A hover of `found`, an occurrence of the module `target`.
@@ -574,7 +911,10 @@ impl Index {
             _ => self.target_type(target, 0).or_else(|| known(found.ty)),
         };
         let code = match ty {
-            Some(ty) => format!("{path}: {}", self.pretty(ty)),
+            Some(ty) => {
+                let prefix = format!("{path}: ");
+                format!("{prefix}{}", self.pretty(&prefix, ty))
+            }
             None => path,
         };
         (code, Some(origin))
@@ -592,7 +932,7 @@ impl Index {
             .map(|&(_, ty)| ty)
             .and_then(known);
         let shown = match expansion {
-            Some(ty) => self.pretty(ty),
+            Some(ty) => self.pretty(&format!("type {name} = "), ty),
             None => self
                 .scan
                 .files
@@ -646,6 +986,23 @@ impl Index {
                 format!("{param}{}", table.display(ty, &self.scan.names))
             })
             .collect();
+        let tail = self.sig_tail(sig);
+        let one = format!("{keyword} {name}({}{tail}", params.join(", "));
+        if one.chars().count() <= WIDTH || params.is_empty() {
+            return Some(one);
+        }
+        let mut code = format!("{keyword} {name}(\n");
+        for param in &params {
+            let _ = writeln!(code, "  {param},");
+        }
+        code.push_str(&tail);
+        Some(code)
+    }
+
+    /// What a function type's signature ends with after its parameters:
+    /// `): Int`, its marker and its return type, and its meta's.
+    fn sig_tail(&self, sig: &crate::types::FnTy) -> String {
+        let table = &self.types;
         let mut tail = sig.effect.params_end().to_owned();
         let _ = write!(tail, "{}", table.display(sig.ret, &self.scan.names));
         if let Some(meta) = sig.meta {
@@ -656,16 +1013,7 @@ impl Index {
                 table.display(meta.ty, &self.scan.names)
             );
         }
-        let one = format!("{keyword} {name}({}{tail}", params.join(", "));
-        if one.len() <= WIDTH || params.is_empty() {
-            return Some(one);
-        }
-        let mut code = format!("{keyword} {name}(\n");
-        for param in &params {
-            let _ = writeln!(code, "    {param},");
-        }
-        code.push_str(&tail);
-        Some(code)
+        tail
     }
 
     /// The file and function expression of the `def` whose leaf is the node
@@ -896,31 +1244,39 @@ impl Index {
         Some(self.types.record(fields))
     }
 
-    /// `ty` as a hover shows it (see the module documentation, "Hovers").
-    fn pretty(&self, ty: TyId) -> String {
+    /// `ty` as a hover shows it after `prefix` on its first line, `name: `
+    /// (see the module documentation, "Hovers").
+    fn pretty(&self, prefix: &str, ty: TyId) -> String {
         let mut shown = String::new();
-        self.write_pretty(ty, 0, &mut shown);
+        self.write_pretty(ty, (0, prefix.chars().count()), &mut shown);
         shown
     }
 
-    /// Writes `ty` as a hover shows it, its lines after the first indented
-    /// by `indent`, to `out`: on one line if it fits, else, for a record, a
-    /// field per line.
-    fn write_pretty(&self, ty: TyId, indent: usize, out: &mut String) {
-        let table = &self.types;
-        let names = &self.scan.names;
-        if let TyKind::Builtin(builtin) = table.kind(ty) {
-            out.push_str(match builtin {
+    /// `ty` on one line, as the printer diagnostics use shows it, a
+    /// built-in function by its signature.
+    fn one_line(&self, ty: TyId) -> String {
+        match self.types.kind(ty) {
+            TyKind::Builtin(builtin) => match builtin {
                 Builtin::Len => "fn<T>(list: List<T>): Int",
                 Builtin::Show => "fn<T>(value: T): String",
                 _ => builtin.display(),
-            });
-            return;
+            }
+            .to_owned(),
+            _ => self.types.display(ty, &self.scan.names).to_string(),
         }
-        let one = table.display(ty, names).to_string();
+    }
+
+    /// Writes `ty` as a hover shows it, its lines after the first indented
+    /// by `indent`, its first line starting at `column`, to `out`: on one
+    /// line if that is [`WIDTH`] columns at most, else, for a record, a
+    /// field per line.
+    fn write_pretty(&self, ty: TyId, (indent, column): (usize, usize), out: &mut String) {
+        let table = &self.types;
+        let names = &self.scan.names;
+        let one = self.one_line(ty);
         let fields = table.record_fields(ty);
         match fields {
-            Some(fields) if indent + one.len() > WIDTH && !fields.is_empty() => {
+            Some(fields) if column + one.chars().count() > WIDTH && !fields.is_empty() => {
                 let mut sorted: Vec<(&str, Name, TyId)> = fields
                     .iter()
                     .map(|&(name, field)| (names.get(name), name, field))
@@ -935,7 +1291,8 @@ impl Index {
                         FieldName(text),
                         width = indent + 2
                     );
-                    self.write_pretty(field, indent + 2, out);
+                    let column = indent + 2 + FieldName(text).to_string().chars().count() + 2;
+                    self.write_pretty(field, (indent + 2, column), out);
                     if let Some(constant) = table.field_default(ty, name) {
                         out.push_str(" = ");
                         let _ = write!(out, "{}", Shown(constant, names));
@@ -943,6 +1300,26 @@ impl Index {
                     out.push_str(",\n");
                 }
                 let _ = write!(out, "{:width$}}}", "", width = indent);
+            }
+            None if column + one.chars().count() > WIDTH
+                && !matches!(table.kind(ty), TyKind::Builtin(_)) =>
+            {
+                // A function type too wide: a parameter per line.
+                match table.fn_sig(table.strip(ty)) {
+                    Some(sig) if !sig.params.is_empty() => {
+                        out.push_str("fn(\n");
+                        for &(label, param) in &sig.params {
+                            let label = label
+                                .map(|name| format!("{}: ", names.get(name)))
+                                .unwrap_or_default();
+                            let shown = table.display(param, names);
+                            let _ =
+                                writeln!(out, "{:width$}{label}{shown},", "", width = indent + 2);
+                        }
+                        let _ = write!(out, "{:width$}{}", "", self.sig_tail(sig), width = indent);
+                    }
+                    _ => out.push_str(&one),
+                }
             }
             _ => out.push_str(&one),
         }
@@ -1149,6 +1526,14 @@ struct Builder<'s> {
     occurrences: Vec<Occurrence>,
     /// The locals found.
     locals: HashMap<Span, Local>,
+    /// Each `:=` that declared a variable in place of another, by where
+    /// each was declared, as the check recorded them.
+    rebinds: Vec<(Span, Span)>,
+    /// The local each variable a `:=` declared in place of another stands
+    /// for, by where their names are: the variable it replaces.
+    replaced: HashMap<Span, Span>,
+    /// Where each `:=`'s variable is written.
+    writes: HashSet<Span>,
 }
 
 impl<'s> Builder<'s> {
@@ -1199,6 +1584,72 @@ impl<'s> Builder<'s> {
             symbols: HashMap::new(),
             occurrences: Vec::new(),
             locals: HashMap::new(),
+            rebinds: record.rebinds,
+            replaced: HashMap::new(),
+            writes: HashSet::new(),
+        }
+    }
+
+    /// Finds the variable each `:=` stands for, and where each `:=`'s is
+    /// written.
+    fn link_rebinds(&mut self) {
+        let ast = self.ast;
+        for id in ast.item_ids() {
+            if let ItemKind::Rebind { path, .. } = ast.item(id).kind
+                && let Some(first) = ast.path(path).first()
+            {
+                self.writes.insert(first.span);
+            }
+        }
+        for at in 0..self.rebinds.len() {
+            let Some(&(declared, replaced)) = self.rebinds.get(at) else {
+                break;
+            };
+            let Some(&item) = self.sites.items.get(&declared) else {
+                continue;
+            };
+            let ItemKind::Rebind { path, .. } = ast.item(item).kind else {
+                continue;
+            };
+            let Some((first, name)) = ast
+                .path(path)
+                .first()
+                .and_then(|first| Some((first.span, first.name()?)))
+            else {
+                continue;
+            };
+            let Some(Bound::Local(old)) = self.bound(replaced, name) else {
+                continue;
+            };
+            if self.decls.contains_key(&(declared, name)) {
+                // A variable's: the binding it declares is the old one.
+                if old != first {
+                    self.replaced.insert(first, old);
+                }
+            } else {
+                // A mutable variable's: the binding is written there.
+                let ty = self
+                    .decls
+                    .get(&(replaced, name))
+                    .map_or(TyId::ERROR, |decl| decl.ty);
+                let symbol = self.local(old);
+                self.add(first, Some(symbol), Some(name), ty);
+            }
+        }
+    }
+
+    /// The symbol of the local whose name is at `at`: the variable it
+    /// replaces, if a `:=` declared it in place of another.
+    fn local(&self, mut at: Span) -> Symbol {
+        for _ in 0..MAX_NESTING {
+            match self.replaced.get(&at) {
+                Some(&before) => at = before,
+                None => break,
+            }
+        }
+        Symbol::Local {
+            file: self.index,
+            name: at,
         }
     }
 
@@ -1221,6 +1672,7 @@ impl<'s> Builder<'s> {
             span,
             symbol,
             declaration: false,
+            write: false,
             jump: None,
             name,
             ty,
@@ -1241,6 +1693,7 @@ impl<'s> Builder<'s> {
     /// The index of the file.
     fn build(mut self) -> FileIndex {
         self.find_sites();
+        self.link_rebinds();
         self.declarations();
         self.items();
         self.names();
@@ -1251,6 +1704,9 @@ impl<'s> Builder<'s> {
         let mut occurrences = self.occurrences;
         occurrences.sort_by_key(|o| (o.span.start, o.span.end));
         occurrences.dedup_by(|later, earlier| later.span.start < earlier.span.end);
+        for occurrence in &mut occurrences {
+            occurrence.write = occurrence.declaration || self.writes.contains(&occurrence.span);
+        }
         FileIndex {
             checked: true,
             occurrences,
@@ -1386,11 +1842,18 @@ impl<'s> Builder<'s> {
             if item.is_some_and(|item| matches!(self.ast.item(item).kind, ItemKind::Spread(_))) {
                 continue;
             }
-            let symbol = Symbol::Local {
-                file: self.index,
-                name,
-            };
-            self.declare(name, Some(symbol), Some(decl.name), decl.ty);
+            // A `:=`'s variable is the one it replaces, written there.
+            let symbol = self.local(name);
+            if symbol
+                == (Symbol::Local {
+                    file: self.index,
+                    name,
+                })
+            {
+                self.declare(name, Some(symbol), Some(decl.name), decl.ty);
+            } else {
+                self.add(name, Some(symbol), Some(decl.name), decl.ty);
+            }
             self.locals.insert(
                 name,
                 Local {
@@ -1524,10 +1987,7 @@ impl<'s> Builder<'s> {
             }
             match bound {
                 Some(Bound::Local(at)) => {
-                    let symbol = Symbol::Local {
-                        file: self.index,
-                        name: at,
-                    };
+                    let symbol = self.local(at);
                     self.symbols.insert(id, symbol);
                     self.add(expr.span, Some(symbol), Some(name), self.ty(id));
                 }
@@ -2339,6 +2799,594 @@ mod tests {
         // origin.
         assert_eq!(lines, MAX_LINES + 4, "{}", hover.text);
         assert!(hover.text.contains("\n…\n```"), "{}", hover.text);
+    }
+
+    /// The files' index, and the input number of the file at `path`.
+    fn index_of(files: &[(&str, &str)], path: &str) -> (Index, u32) {
+        let Indexed {
+            index, diagnostics, ..
+        } = indexed(files);
+        let index = index.unwrap_or_else(|| panic!("no index: {diagnostics:?}"));
+        let file = index.file(path).unwrap();
+        (index, file)
+    }
+
+    /// `locations` as each file's path and the text at each place.
+    fn shown(
+        index: &Index,
+        files: &[(&str, &str)],
+        locations: &[Location],
+    ) -> Vec<(String, String)> {
+        locations
+            .iter()
+            .map(|location| {
+                let path = index.path(location.file).unwrap();
+                let text = files.iter().find(|(p, _)| *p == path).unwrap().1;
+                let at = &text[location.span.start as usize..location.span.end as usize];
+                (path.to_owned(), format!("{at}@{}", location.span.start))
+            })
+            .collect()
+    }
+
+    /// The places of `locations`, each a file and where in it the name
+    /// starts, as [`offset`] finds it.
+    fn places(files: &[(&str, &str)], wanted: &[(&str, &str)]) -> Vec<(String, u32)> {
+        wanted
+            .iter()
+            .map(|&(path, needle)| {
+                let text = files.iter().find(|(p, _)| *p == path).unwrap().1;
+                (path.to_owned(), offset(text, needle))
+            })
+            .collect()
+    }
+
+    /// The references at `at` of `files`, as files and starts.
+    fn references(
+        files: &[(&str, &str)],
+        at: (&str, &str),
+        declarations: bool,
+    ) -> Vec<(String, u32)> {
+        let (index, file) = index_of(files, at.0);
+        let text = files.iter().find(|(p, _)| *p == at.0).unwrap().1;
+        let found = index.references(file, offset(text, at.1), declarations);
+        // Every place found is the symbol's name or a segment of it.
+        assert!(!shown(&index, files, &found).is_empty() || found.is_empty());
+        found
+            .iter()
+            .map(|l| (index.path(l.file).unwrap().to_owned(), l.span.start))
+            .collect()
+    }
+
+    #[test]
+    fn references_of_a_local_with_and_without_its_declaration() {
+        let files = [("app.gcsl", LOCALS)];
+        let all = places(
+            &files,
+            &[
+                ("app.gcsl", "let |b"),
+                ("app.gcsl", "i * |b"),
+                ("app.gcsl", "    |b + len"),
+            ],
+        );
+        assert_eq!(references(&files, ("app.gcsl", "i * |b"), true), all);
+        assert_eq!(references(&files, ("app.gcsl", "i * |b"), false), all[1..]);
+        // Nothing for a keyword.
+        assert_eq!(references(&files, ("app.gcsl", "|let b"), true), []);
+    }
+
+    #[test]
+    fn references_of_a_node_across_files() {
+        let files = [
+            ("sub/app.gcsl", "x = base + 1\ny = base\n"),
+            ("sub/lib.gcsl", "base = 1\n"),
+        ];
+        let all = places(
+            &files,
+            &[
+                ("sub/app.gcsl", "x = |base"),
+                ("sub/app.gcsl", "y = |base"),
+                ("sub/lib.gcsl", "|base"),
+            ],
+        );
+        assert_eq!(references(&files, ("sub/lib.gcsl", "|base"), true), all);
+        assert_eq!(references(&files, ("sub/app.gcsl", "y = |base"), true), all);
+    }
+
+    #[test]
+    fn references_of_a_definition_include_its_path_and_its_references() {
+        let files = [
+            ("app.gcsl", "r = package dev.x\n"),
+            ("pkg.gcsl", "def package dev.x() { \"hi\" }\n"),
+            ("workspace.gcsl", PACKAGE),
+        ];
+        let all = places(&files, &[("app.gcsl", "dev.|x"), ("pkg.gcsl", "dev.|x")]);
+        assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), true), all);
+        assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), false), all[..1]);
+    }
+
+    #[test]
+    fn references_of_an_imported_name() {
+        let files = [
+            ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+            ("lib/x.gcsl", "v = 1\n"),
+        ];
+        let all = places(
+            &files,
+            &[
+                ("app.gcsl", "import |v"),
+                ("app.gcsl", "r = |v"),
+                ("lib/x.gcsl", "|v"),
+            ],
+        );
+        assert_eq!(references(&files, ("app.gcsl", "r = |v"), true), all);
+        assert_eq!(references(&files, ("lib/x.gcsl", "|v"), true), all);
+        // A standard function's, in the workspace only.
+        let files = [("app.gcsl", "a = len([1])\nb = len([2])\n")];
+        let all = places(
+            &files,
+            &[("app.gcsl", "a = |len"), ("app.gcsl", "b = |len")],
+        );
+        assert_eq!(references(&files, ("app.gcsl", "a = |len"), true), all);
+    }
+
+    #[test]
+    fn a_rebind_is_the_variable_it_rebinds_and_writes_it() {
+        for text in [
+            "fn g(): Int {\n    let n = 1\n    n := n + 1\n    n\n}\nr = g()\n",
+            "fn g(): Int {\n    let mut n = 1\n    n := n + 1\n    n\n}\nr = g()\n",
+        ] {
+            let files = [("app.gcsl", text)];
+            let (index, file) = index_of(&files, "app.gcsl");
+            let found: Vec<(u32, bool)> = index
+                .highlights(file, offset(text, "    |n\n}"))
+                .iter()
+                .map(|h| (h.span.start, h.write))
+                .collect();
+            let wanted = vec![
+                (offset(text, "n = 1"), true),
+                (offset(text, "|n :="), true),
+                (offset(text, ":= |n"), false),
+                (offset(text, "    |n\n}"), false),
+            ];
+            assert_eq!(found, wanted, "{text}");
+            // The declaration is the `let`'s.
+            assert_eq!(index.definition(file, offset(text, "    |n\n}")).len(), 1);
+            assert_eq!(
+                index.definition(file, offset(text, "    |n\n}"))[0]
+                    .span
+                    .start,
+                offset(text, "n = 1")
+            );
+        }
+    }
+
+    /// Renames what is at `at` of `files` to `new`: the files' texts as
+    /// renamed, each changed one with its path, or why not.
+    fn renamed(
+        files: &[(&str, &str)],
+        at: (&str, &str),
+        new: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let (index, file) = index_of(files, at.0);
+        let text = files.iter().find(|(p, _)| *p == at.0).unwrap().1;
+        let edits = index.rename((file, offset(text, at.1)), new, |sources| {
+            index_with_standard(sources, &[], "/")
+        })?;
+        let mut changed: Vec<(String, String)> = Vec::new();
+        for (path, text) in files {
+            let input = index.file(path).unwrap();
+            let mut edited = (*text).to_owned();
+            let mut mine: Vec<&Edit> = edits.iter().filter(|e| e.file == input).collect();
+            mine.sort_by_key(|e| std::cmp::Reverse(e.span.start));
+            if mine.is_empty() {
+                continue;
+            }
+            for edit in mine {
+                edited.replace_range(edit.span.start as usize..edit.span.end as usize, &edit.text);
+            }
+            changed.push(((*path).to_owned(), edited));
+        }
+        Ok(changed)
+    }
+
+    #[test]
+    fn a_rename_renames_every_file_and_keeps_an_import_s_alias() {
+        let files = [
+            ("sub/app.gcsl", "x = base + 1\ny = base\n"),
+            ("sub/lib.gcsl", "base = 1\n"),
+            ("other.gcsl", "import base as b from sub.lib\nz = b\n"),
+        ];
+        let at = index_of(&files, "sub/lib.gcsl");
+        assert_eq!(
+            at.0.prepare_rename(at.1, 0),
+            Ok(Prepared {
+                span: Span::new(0, 4),
+                placeholder: "base".to_owned()
+            })
+        );
+        assert_eq!(
+            renamed(&files, ("sub/app.gcsl", "y = |base"), "root"),
+            Ok(vec![
+                (
+                    "sub/app.gcsl".to_owned(),
+                    "x = root + 1\ny = root\n".to_owned()
+                ),
+                ("sub/lib.gcsl".to_owned(), "root = 1\n".to_owned()),
+                (
+                    "other.gcsl".to_owned(),
+                    "import root as b from sub.lib\nz = b\n".to_owned()
+                ),
+            ])
+        );
+        // The alias itself is not renamed from here.
+        let refused = renamed(&files, ("other.gcsl", "z = |b"), "c").unwrap_err();
+        assert!(refused.contains("alias"), "{refused}");
+    }
+
+    #[test]
+    fn a_rename_of_a_local_and_of_a_type() {
+        let files = [("app.gcsl", LOCALS)];
+        assert_eq!(
+            renamed(&files, ("app.gcsl", "i * |b"), "next"),
+            Ok(vec![(
+                "app.gcsl".to_owned(),
+                LOCALS
+                    .replace("let b", "let next")
+                    .replace("i * b", "i * next")
+                    .replace("    b + len", "    next + len")
+            )])
+        );
+        let text = "type V = {version: String}\nfn f(v: V): String { v.version }\nr = f({version = \"1\"})\n";
+        let files = [("app.gcsl", text)];
+        assert_eq!(
+            renamed(&files, ("app.gcsl", "v: |V"), "Version"),
+            Ok(vec![(
+                "app.gcsl".to_owned(),
+                text.replace("type V", "type Version")
+                    .replace("v: V", "v: Version")
+            )])
+        );
+    }
+
+    #[test]
+    fn a_rename_of_a_definition_s_segment_renames_its_meta_and_its_references() {
+        let workspace = "#[def_type]\ndef package(name: String, f: fn(v: String): String META-> {versions: \
+                         List<String>}, version: String) -> String { f(version) }\n";
+        let files = [
+            ("workspace.gcsl", workspace),
+            (
+                "app/a.gcsl",
+                "defmeta package dev.x { versions = [\"0.1.0\"] }\ndef package dev.x(v) { v }\n",
+            ),
+            ("app/b.gcsl", "r = package dev.x\n"),
+        ];
+        let renamed = renamed(&files, ("app/a.gcsl", "def package dev.|x"), "go-1+").unwrap();
+        assert_eq!(
+            renamed,
+            vec![
+                (
+                    "app/a.gcsl".to_owned(),
+                    "defmeta package dev.go-1+ { versions = [\"0.1.0\"] }\ndef package dev.go-1+(v) { v }\n"
+                        .to_owned()
+                ),
+                ("app/b.gcsl".to_owned(), "r = package dev.go-1+\n".to_owned()),
+            ]
+        );
+        let refused = renamed_err(&files, ("app/a.gcsl", "def package dev.|x"), "a.b");
+        assert!(refused.contains("segment"), "{refused}");
+    }
+
+    /// Why renaming what is at `at` of `files` to `new` is refused.
+    fn renamed_err(files: &[(&str, &str)], at: (&str, &str), new: &str) -> String {
+        renamed(files, at, new).unwrap_err()
+    }
+
+    #[test]
+    fn a_lone_file_is_documented_and_renamed_and_an_open_field_renamed_whole() {
+        let text = "# Doc.\nx = 1\ny = x\n";
+        let source = SourceFile::new("/x/lone.gcsl", text).unwrap();
+        let Indexed { index, .. } = crate::workspace::index_lone_with_standard(&source, "/x");
+        let index = index.unwrap();
+        // The scan names a lone file by its file name.
+        let file = index.file("lone.gcsl").unwrap();
+        let at = offset(text, "y = |x");
+        assert_eq!(index.documentation(file, at).as_deref(), Some("Doc."));
+        assert_eq!(index.prepare_rename(file, at).unwrap().placeholder, "x");
+        let edits = index
+            .rename((file, at), "z", |sources| {
+                crate::workspace::index_lone_with_standard(&sources[0], "/x")
+            })
+            .unwrap();
+        assert_eq!(edits.len(), 2);
+        // The standard files' sources are known too, for their doc comments.
+        let (index, _) = index_of(&[("app.gcsl", "r = len([1])\n")], "app.gcsl");
+        assert!((0..index.standard()).all(|file| !index.text(file).is_empty()));
+        // Every item that defines an open field.
+        let files = [
+            ("app.gcsl", "cfg.a = 1\ncfg.b = 2\nr = cfg\n"),
+            ("b.gcsl", "s = cfg.a\n"),
+        ];
+        assert_eq!(
+            renamed(&files, ("app.gcsl", "r = |cfg"), "conf"),
+            Ok(vec![
+                (
+                    "app.gcsl".to_owned(),
+                    "conf.a = 1\nconf.b = 2\nr = conf\n".to_owned()
+                ),
+                ("b.gcsl".to_owned(), "s = conf.a\n".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_rename_that_would_capture_a_name_is_refused() {
+        let text = "fn g(): Int {\n    let a = 1\n    let b = 2\n    a + b\n}\nr = g()\n";
+        let refused = renamed(&[("app.gcsl", text)], ("app.gcsl", "let |a"), "b").unwrap_err();
+        assert!(refused.contains("refer to something else"), "{refused}");
+        assert!(refused.contains("app.gcsl:4:5"), "{refused}");
+        // A field of the file captured by a local of a function.
+        let text = "top = 1\nfn g(): Int {\n    let inner = 2\n    top + inner\n}\nr = g()\n";
+        let refused =
+            renamed(&[("app.gcsl", text)], ("app.gcsl", "|top = 1"), "inner").unwrap_err();
+        assert!(refused.contains("refer to something else"), "{refused}");
+    }
+
+    #[test]
+    fn a_rename_that_collides_with_a_directory_s_field_is_refused() {
+        let files = [("sub/a.gcsl", "x = 1\n"), ("sub/b.gcsl", "y = 2\n")];
+        let refused = renamed(&files, ("sub/a.gcsl", "|x"), "y").unwrap_err();
+        assert!(refused.contains("be an error"), "{refused}");
+        assert!(refused.contains("`y`"), "{refused}");
+    }
+
+    #[test]
+    fn a_rename_to_what_is_no_name_is_refused() {
+        let files = [("app.gcsl", "a = 1\nb = a\n")];
+        for new in ["1a", "a b", "let", "", "x.y", "\"q\""] {
+            let refused = renamed(&files, ("app.gcsl", "b = |a"), new).unwrap_err();
+            assert!(refused.contains("is not a name"), "{new}: {refused}");
+        }
+        // The same name: nothing to do.
+        assert_eq!(renamed(&files, ("app.gcsl", "b = |a"), "a"), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
+        /// The files, where to rename, and what the refusal says.
+        type Refused<'a> = (&'a [(&'a str, &'a str)], (&'a str, &'a str), &'a str);
+        let cases: [Refused<'_>; 6] = [
+            (
+                &[("app.gcsl", "r = len([1])\n")],
+                ("app.gcsl", "|len"),
+                "standard library",
+            ),
+            (
+                &[("app.gcsl", "r: Int = 1\n")],
+                ("app.gcsl", "|Int"),
+                "built-in type",
+            ),
+            (
+                &[
+                    ("app.gcsl", "import lib.x\nr = x.v\n"),
+                    ("lib/x.gcsl", "v = 1\n"),
+                ],
+                ("app.gcsl", "import |lib"),
+                "directories or files",
+            ),
+            (
+                &[
+                    ("app.gcsl", "import lib.x\nr = x.v\n"),
+                    ("lib/x.gcsl", "v = 1\n"),
+                ],
+                ("app.gcsl", "r = |x"),
+                "directories or files",
+            ),
+            (
+                &[("app.gcsl", "\"a-b\" = 1\nr = a-b\n")],
+                ("app.gcsl", "r = |a-b"),
+                "as a string",
+            ),
+            (
+                &[("app.gcsl", "a = 1 + 2\n")],
+                ("app.gcsl", "1 |+"),
+                "no name here",
+            ),
+        ];
+        for (files, at, why) in cases {
+            let (index, file) = index_of(files, at.0);
+            let text = files.iter().find(|(p, _)| *p == at.0).unwrap().1;
+            let refused = index.prepare_rename(file, offset(text, at.1)).unwrap_err();
+            assert!(refused.contains(why), "{at:?}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_file_s_symbols_nest_record_blocks_three_deep() {
+        let text = "import lib.x\n\
+                    type V = {version: String}\n\
+                    let helper = 1\n\
+                    fn twice(n: Int): Int { n * 2 }\n\
+                    def public(): Int { 1 }\n\
+                    cfg = {\n    a = 1\n    b = {\n        c = {\n            d = {\n                e = 1\n            }\n        }\n    }\n}\n\
+                    path.to = \"s\"\n";
+        let files = [("app.gcsl", text), ("lib/x.gcsl", "v = 1\n")];
+        let (index, file) = index_of(&files, "app.gcsl");
+        let symbols = index.document_symbols(file);
+        let top: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+            .iter()
+            .map(|s| (s.name.as_str(), s.kind, s.detail.as_deref()))
+            .collect();
+        assert_eq!(
+            top,
+            [
+                ("imports", SymbolKind::Module, None),
+                ("V", SymbolKind::Type, Some("{version: String}")),
+                ("helper", SymbolKind::Variable, Some("Int")),
+                ("twice", SymbolKind::Function, Some("fn(n: Int): Int")),
+                ("public", SymbolKind::Function, Some("fn(): Int")),
+                (
+                    "cfg",
+                    SymbolKind::Field,
+                    Some("{a: Int, b: {c: {d: {e: Int}}}}")
+                ),
+                ("path.to", SymbolKind::Field, Some("String")),
+            ]
+        );
+        assert_eq!(symbols[0].children[0].name, "lib.x");
+        let cfg = &symbols[5];
+        assert_eq!(
+            &text[cfg.selection.start as usize..cfg.selection.end as usize],
+            "cfg"
+        );
+        let names: Vec<&str> = cfg.children.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        // Three levels: `cfg`, `b`, `c`; `d` is not listed.
+        let c = &cfg.children[1].children[0];
+        assert_eq!(c.name, "c");
+        assert!(c.children.is_empty());
+        // Across the workspace, by a subsequence of the name, any case.
+        let found: Vec<String> = index
+            .workspace_symbols("TWC", 200)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(found, ["twice"]);
+        let found = index.workspace_symbols("", 200);
+        assert!(
+            found.iter().any(|s| s.name == "v" && s.file != file),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|s| s.name == "c" && s.container.as_deref() == Some("b"))
+        );
+        assert_eq!(index.workspace_symbols("", 3).len(), 3);
+    }
+
+    #[test]
+    fn a_definition_s_symbol_is_named_by_its_path() {
+        let files = [
+            ("pkg.gcsl", "def package dev.x() { \"hi\" }\n"),
+            ("workspace.gcsl", PACKAGE),
+        ];
+        let (index, file) = index_of(&files, "pkg.gcsl");
+        let symbols = index.document_symbols(file);
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "package dev.x");
+        assert_eq!(symbols[0].kind, SymbolKind::Definition);
+        assert_eq!(symbols[0].detail.as_deref(), Some("fn(): String"));
+    }
+
+    #[test]
+    fn doc_comments_are_the_comment_lines_directly_above() {
+        let text = "# The answer.\n#   Indented.\n#\nanswer = 42\nx = answer # trailing\n# Not x's: a blank line.\n\ny = x\n\
+                    # Through an attribute.\n#[shadowable]\nq = 1\n\
+                    fn f(): Int {\n    # A local.\n    let l = 1\n    l\n}\nr = f() + q + y\n";
+        let files = [("app.gcsl", text)];
+        let (mut index, file) = index_of(&files, "app.gcsl");
+        let doc = |index: &Index, needle: &str| index.documentation(file, offset(text, needle));
+        assert_eq!(
+            doc(&index, "x = |answer"),
+            Some("The answer.\n  Indented.".to_owned())
+        );
+        assert_eq!(doc(&index, "y = |x"), None);
+        assert_eq!(doc(&index, "r = f() + q + |y"), None);
+        assert_eq!(
+            doc(&index, "+ |q"),
+            Some("Through an attribute.".to_owned())
+        );
+        assert_eq!(doc(&index, "    |l\n"), Some("A local.".to_owned()));
+        let hover = index.hover(file, offset(text, "x = |answer")).unwrap();
+        assert_eq!(
+            hover.text,
+            "```gcsl\nanswer: Int\n```\n\nThe answer.\n  Indented.\n\nfield of the root directory"
+        );
+        // A definition with none has its meta's.
+        let workspace = "#[def_type]\ndef package(name: String, f: fn(v: String): String META-> \
+                         {versions: List<String>}, version: String) -> String { f(version) }\n";
+        let files = [
+            ("workspace.gcsl", workspace),
+            (
+                "app/a.gcsl",
+                "# The x package.\ndefmeta package dev.x { versions = [] }\n\ndef package dev.x(v) { v }\n",
+            ),
+            ("app/b.gcsl", "r = package dev.x\n"),
+        ];
+        let (index, file) = index_of(&files, "app/b.gcsl");
+        let found = index.documentation(file, offset(files[2].1, "dev.|x"));
+        assert_eq!(found.as_deref(), Some("The x package."));
+    }
+
+    #[test]
+    fn a_file_that_needs_one_that_failed_is_indexed_and_reports_nothing() {
+        let files = [
+            ("a.gcsl", "x = 1\nbad = 1 + \"a\"\n"),
+            (
+                "b.gcsl",
+                "y = x\nz = y + 1\nw = undefined_name\nfn f(n: Int): Int { n }\n",
+            ),
+            ("c.gcsl", "import v from lib.l\nu = v + 1\n"),
+            ("lib/l.gcsl", "v = 1\nworse = 1 + \"a\"\n"),
+        ];
+        let Indexed {
+            index, diagnostics, ..
+        } = indexed(&files);
+        let mut index = index.unwrap();
+        let b = index.file("b.gcsl").unwrap();
+        assert!(index.checked(b));
+        // What `b` declares itself has its type; what `a` does, whose
+        // declarations were never committed, is found but erroneous.
+        let hover = index.hover(b, offset(files[1].1, "{ |n }")).unwrap();
+        assert!(hover.text.contains("n: Int"), "{}", hover.text);
+        assert_eq!(index.definition(b, offset(files[1].1, "y = |x")).len(), 1);
+        // A file that imports from one that failed has the types its check
+        // found.
+        let c = index.file("c.gcsl").unwrap();
+        let hover = index.hover(c, offset(files[2].1, "u = |v")).unwrap();
+        assert!(hover.text.contains("v: Int"), "{}", hover.text);
+        // No occurrence for the name that names nothing.
+        assert!(index.at(b, offset(files[1].1, "|undefined_name")).is_none());
+        // The diagnostics are the check's, nothing of `b` among them.
+        let mut sources: Vec<SourceFile> = files
+            .iter()
+            .chain(&[("workspace.gcsl", "")])
+            .map(|&(p, t)| SourceFile::new(p, t).unwrap())
+            .collect();
+        sources.sort_by(|a, b| a.name().cmp(b.name()));
+        let (_, checked) = crate::workspace::check_with_standard(&sources, &[], "/");
+        let Err(failed) = checked else { panic!() };
+        assert_eq!(format!("{diagnostics:?}"), format!("{failed:?}"));
+        assert_eq!(diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn a_long_signature_breaks_its_parameters_at_80_columns() {
+        let text = "def configure(first_parameter: String, second_parameter: String, third: Int): Int { third }\n\
+                    r = configure(\"a\", \"b\", 1)\n";
+        let files = [("app.gcsl", text)];
+        let (mut index, file) = index_of(&files, "app.gcsl");
+        let hover = index.hover(file, offset(text, "r = |configure")).unwrap();
+        assert!(
+            hover
+                .text
+                .starts_with("```gcsl\ndef configure(\n  first_parameter: String")
+                && hover.text.contains(",\n  second_parameter: String")
+                && hover.text.contains(",\n  third: Int,\n): Int\n```"),
+            "{}",
+            hover.text
+        );
+        // One that fits stays on its line.
+        let text = "def short(a: Int): Int { a }\nr = short(1)\n";
+        let (mut index, file) = index_of(&[("app.gcsl", text)], "app.gcsl");
+        let hover = index.hover(file, offset(text, "r = |short")).unwrap();
+        assert!(
+            hover
+                .text
+                .starts_with("```gcsl\ndef short(a: Int): Int\n```"),
+            "{}",
+            hover.text
+        );
     }
 
     #[test]

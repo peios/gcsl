@@ -3,16 +3,18 @@
 //! --nocapture`): timings of the front end on valid input, and a robustness
 //! run over mutants of every `.gcsl` file of the repository and of Jack's
 //! newpkgs, which is only read; and the same for the index a language
-//! server answers hovers and definitions from (`gcsl::index`): timings of a
-//! check that records for it, and a hover and a definition at every token
-//! of newpkgs and of the mutants.
+//! server answers its queries from (`gcsl::index`): timings of a check that
+//! records for it, of a rename's check, of a workspace's symbols and of
+//! doc comments, and a hover, a definition, references and a rename's
+//! preparation at every token of newpkgs and of the mutants, with each
+//! file's symbols (the run is still named for its first two).
 
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gcsl::index::Index;
+use gcsl::index::{Index, Indexed};
 use gcsl::names::Names;
 use gcsl::workspace;
 use gcsl::{Diagnostic, SourceFile, lexer, parser};
@@ -330,6 +332,136 @@ fn index_timings() {
     thread.join().unwrap();
 }
 
+#[test]
+#[ignore = "a timing, run by hand in release mode"]
+fn rename_symbols_and_doc_comment_numbers() {
+    let thread = std::thread::Builder::new()
+        .stack_size(gcsl::STACK_SIZE)
+        .spawn(slice_60_numbers)
+        .unwrap();
+    thread.join().unwrap();
+}
+
+/// The cost of a rename's check, of `workspace/symbol` and the doc comments
+/// of newpkgs, printed.
+fn slice_60_numbers() {
+    let sources = gcsl_disk::read_workspace(Path::new(NEWPKGS), None).unwrap();
+    let reindex =
+        |files: &[SourceFile]| workspace::index_with_standard(files, &sources.nested, NEWPKGS);
+    let start = Instant::now();
+    let index = reindex(&sources.relative).index.unwrap();
+    println!("newpkgs indexed in {:?}", start.elapsed());
+    let standard = index.standard();
+    let files = u32::try_from(sources.relative.len()).unwrap();
+    // `workspace/symbol`: the first query makes the list, the others match.
+    let start = Instant::now();
+    let all = index.workspace_symbols("", usize::MAX).len();
+    let first = start.elapsed();
+    let mut times = Vec::new();
+    for query in ["pkg", "SANDBOX", "versions", "zzqq", "b", "org.golang"] {
+        let start = Instant::now();
+        let found = index.workspace_symbols(query, 200).len();
+        times.push((query, found, start.elapsed()));
+    }
+    println!("workspace/symbol: {all} symbols, first query {first:?}, then {times:?}");
+    // Doc comments of the top-level declarations.
+    let (mut declarations, mut documented, mut examples) = (0, 0, Vec::new());
+    for file in standard..standard + files {
+        for symbol in index.document_symbols(file) {
+            if symbol.name == "imports" {
+                continue;
+            }
+            declarations += 1;
+            // At the name's last segment, the declaration's own node.
+            if let Some(doc) = index.documentation(file, symbol.selection.end - 1) {
+                documented += 1;
+                if examples.len() < 2
+                    || symbol.kind == gcsl::index::SymbolKind::Definition && examples.len() < 3
+                {
+                    let path = index.path(file).unwrap().to_owned();
+                    examples.push((path, symbol.name.clone(), doc));
+                }
+            }
+        }
+    }
+    println!(
+        "doc comments: {documented} of {declarations} top-level declarations; examples {examples:#?}"
+    );
+    sandbox_broken(&sources.relative, &reindex);
+    // A rename's check: a `def` of `_lib/sandbox`, used across the
+    // packages, and the last segment of a `package` definition (with its
+    // meta) and of a `build` one (referred to by its package).
+    let mut targets: Vec<(u32, u32, &str)> = Vec::new();
+    for file in standard..standard + files {
+        let path = index.path(file).unwrap();
+        for symbol in index.document_symbols(file) {
+            let wanted = match symbol.kind {
+                gcsl::index::SymbolKind::Function if path.starts_with("_lib/sandbox/") => "def",
+                gcsl::index::SymbolKind::Definition if symbol.name.starts_with("package ") => {
+                    "package"
+                }
+                gcsl::index::SymbolKind::Definition if symbol.name.starts_with("build ") => "build",
+                _ => continue,
+            };
+            if targets.iter().all(|&(_, _, kind)| kind != wanted) {
+                let at = symbol.selection.end - 1;
+                targets.push((file, at, wanted));
+            }
+        }
+    }
+    for (file, at, kind) in targets {
+        let references = index.references(file, at, true).len();
+        let prepared = index.prepare_rename(file, at);
+        let new = match &prepared {
+            Ok(prepared) => format!("{}_renamed", prepared.placeholder),
+            Err(_) => "renamed".to_owned(),
+        };
+        let start = Instant::now();
+        let renamed = index.rename((file, at), &new, reindex);
+        let took = start.elapsed();
+        let shown = renamed.as_ref().map(Vec::len);
+        println!(
+            "rename of a {kind} at {}:{at} ({references} references) to {new}: {took:?}, {shown:?}",
+            index.path(file).unwrap()
+        );
+    }
+}
+
+/// Prints what the index of newpkgs, `files`, indexed by `reindex`, is with
+/// `_lib/sandbox` given a type error: the packages that need it are not
+/// checked, but are indexed.
+fn sandbox_broken(files: &[SourceFile], reindex: &dyn Fn(&[SourceFile]) -> Indexed) {
+    let mut broken = files.to_vec();
+    let at = broken
+        .iter()
+        .position(|f| f.name() == "_lib/sandbox/sandbox.gcsl")
+        .unwrap();
+    let text = format!("{}\nbroken_probe = 1 + \"a\"\n", broken[at].text());
+    broken[at] = SourceFile::new(broken[at].name(), text).unwrap();
+    let start = Instant::now();
+    let indexed = reindex(&broken);
+    let took = start.elapsed();
+    let mut index = indexed.index.unwrap();
+    let mut clean = reindex(files).index.unwrap();
+    let (mut checked, mut hovers, mut before, mut places) = (0, 0, 0, 0);
+    for (file, source) in (index.standard()..).zip(&broken) {
+        checked += usize::from(index.checked(file));
+        if source.name().ends_with("com.amd.amd-ucode.gcsl") {
+            let lexed = lexer::lex(source, &mut Names::new());
+            for token in &lexed.tokens {
+                places += 1;
+                hovers += usize::from(index.hover(file, token.span.start).is_some());
+                before += usize::from(clean.hover(file, token.span.start).is_some());
+            }
+        }
+    }
+    println!(
+        "with _lib/sandbox broken: {} errors, indexed in {took:?}, {checked} of {} files checked, {hovers} hovers of {places} tokens of com.amd.amd-ucode.gcsl ({before} unbroken)",
+        indexed.diagnostics.len(),
+        files.len()
+    );
+}
+
 /// What a run of hovers and definitions found.
 #[derive(Debug, Default)]
 struct Asked {
@@ -341,6 +473,12 @@ struct Asked {
     hovers: usize,
     /// Definitions answered with at least one place.
     definitions: usize,
+    /// References answered with at least one place.
+    references: usize,
+    /// Places a rename was prepared at.
+    renamable: usize,
+    /// Symbols of the files.
+    symbols: usize,
     /// Panics, and answers out of their file, by what was asked.
     failures: Vec<String>,
     /// The time spent asking, indexing apart.
@@ -350,9 +488,10 @@ struct Asked {
 }
 
 impl Asked {
-    /// Indexes what `work` checks, `what`, and asks for a hover and a
-    /// definition at every token start of each file of `files`, its index
-    /// among the files after the standard ones with its text, recording
+    /// Indexes what `work` checks, `what`, and asks for a hover, a
+    /// definition, references and a rename's preparation at every token
+    /// start of each file of `files`, its index among the files after the
+    /// standard ones with its text, and for each file's symbols, recording
     /// what it finds.
     fn run(&mut self, what: &str, work: impl FnOnce() -> Option<Index>, files: &[(u32, &str)]) {
         let start = Instant::now();
@@ -370,19 +509,39 @@ impl Asked {
         let start = Instant::now();
         for &(file, text) in files {
             let file = file + index.standard();
+            let symbols = panic::catch_unwind(AssertUnwindSafe(|| index.document_symbols(file)));
+            match symbols {
+                Ok(symbols) => self.symbols += symbols.len(),
+                Err(_) => self
+                    .failures
+                    .push(format!("{what}: file {file}'s symbols panicked")),
+            }
             let source = SourceFile::new("t.gcsl", text).unwrap();
             let lexed = lexer::lex(&source, &mut Names::new());
             for token in &lexed.tokens {
                 let at = token.span.start;
                 self.places += 1;
                 let asked = panic::catch_unwind(AssertUnwindSafe(|| {
-                    (index.hover(file, at), index.definition(file, at))
+                    let references = index.references(file, at, true);
+                    let renamable = index.prepare_rename(file, at).is_ok();
+                    let found = (index.hover(file, at), index.definition(file, at));
+                    (found, references, renamable)
                 }));
-                let Ok((hover, definition)) = asked else {
+                let Ok(((hover, definition), references, renamable)) = asked else {
                     self.failures
                         .push(format!("{what}: file {file} at {at} panicked"));
                     continue;
                 };
+                self.references += usize::from(!references.is_empty());
+                self.renamable += usize::from(renamable);
+                for location in references {
+                    if location.file < index.standard() || location.span.end <= location.span.start
+                    {
+                        self.failures.push(format!(
+                            "{what}: file {file} at {at}: reference {location:?}"
+                        ));
+                    }
+                }
                 if let Some(hover) = hover {
                     self.hovers += 1;
                     if !(hover.span.start <= at && at < hover.span.end) || hover.text.is_empty() {
@@ -409,13 +568,16 @@ impl Asked {
     fn report(&self, set: &str) {
         let per = self.asking / u32::try_from(self.places.max(1)).unwrap_or(u32::MAX);
         println!(
-            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, failures {:?}",
+            "{set}: {} indexed in {:?}, {} places asked in {:?} ({per:?} each), {} hovers, {} definitions, {} with references, {} renamable, {} symbols, failures {:?}",
             self.indexed,
             self.indexing,
             self.places,
             self.asking,
             self.hovers,
             self.definitions,
+            self.references,
+            self.renamable,
+            self.symbols,
             self.failures
         );
         assert!(self.failures.is_empty());
@@ -489,11 +651,29 @@ fn hovers_everywhere() {
             changed[at] = SourceFile::new(original.name(), mutant.as_str()).unwrap();
             let what = format!("{} {kind} in newpkgs", original.name());
             let file = u32::try_from(at).unwrap();
+            let mut diagnostics = Vec::new();
             asked.run(
                 &what,
-                || workspace::index_with_standard(&changed, &sources.nested, NEWPKGS).index,
+                || {
+                    let indexed =
+                        workspace::index_with_standard(&changed, &sources.nested, NEWPKGS);
+                    diagnostics = indexed.diagnostics;
+                    indexed.index
+                },
                 &[(file, mutant.as_str())],
             );
+            // The index's diagnostics are the check's: the files checked
+            // for the index alone report nothing.
+            let (_, checked) = workspace::check_with_standard(&changed, &sources.nested, NEWPKGS);
+            let reported = match &checked {
+                Ok(checked) => checked.warnings(),
+                Err(errors) => errors.as_slice(),
+            };
+            if format!("{diagnostics:?}") != format!("{reported:?}") {
+                asked
+                    .failures
+                    .push(format!("{what}: the index's diagnostics differ"));
+            }
         }
     }
     asked.report("newpkgs mutants in their workspace");
