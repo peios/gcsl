@@ -10,7 +10,9 @@
 //! everything that resolved is indexed, an expression that failed (of type
 //! `Error`) answering nothing. A file whose braces do not match
 //! ([`crate::ast::Syntax::Unbalanced`]) is not checked, and has nothing
-//! indexed. A file that needs a file whose check failed, which `gcsl run`
+//! indexed: a query at a place of it is answered from the workspace
+//! indexed again with its braces balanced virtually (see "Unbalanced
+//! files"). A file that needs a file whose check failed, which `gcsl run`
 //! does not check (see [`crate::workspace`], "Syntax errors"), is checked
 //! for its index alone once every other file is, a name that names nothing
 //! there no error (it may be declared in the file that failed), and what
@@ -264,7 +266,9 @@
 //! result would say nothing useful, and sit on most definitions). A type
 //! is shown as a source writes it, without the either shape (`T |
 //! Future<T>`) or a provisional layer that stands for a `T` written, on one
-//! line. A file not indexed has none.
+//! line. A file not indexed has none, but one whose braces do not match
+//! has those of the workspace indexed again with them balanced (see
+//! "Unbalanced files").
 //!
 //! # Signature help
 //!
@@ -289,10 +293,46 @@
 //! in a trailing block, the last. The arguments are counted on the tokens,
 //! so a list half-typed counts as it is written. A trailing block left
 //! open, `pair("a", "b") {` while it is typed, leaves the file's braces
-//! unmatched, so the file has nothing indexed: [`Index::signature_closing`]
-//! then indexes the workspace again with the file's open braces closed at
-//! the place, as an editor closing them would, and answers from that.
+//! unmatched, so the file has nothing indexed: its signature is found as
+//! any query's is in such a file (see "Unbalanced files").
+//!
+//! # Unbalanced files
+//!
+//! A file whose braces do not match is the normal state of one while a
+//! block is typed, `r = { k = 1; j = k`. It has nothing indexed, so a query
+//! at a place of it (a completion, a hover, a definition, references,
+//! highlights, a rename's preparation, signature help, inlay hints) is
+//! answered from the workspace indexed again with the file's braces
+//! balanced VIRTUALLY, only for the query ([`Index::closing`],
+//! [`Closing::index`], [`Closed`]): each `}` that closes nothing is taken
+//! out, and the `}`s the file lacks are put in, so that the place stays in
+//! the blocks open there. The `}`s of the blocks open at the place that no
+//! `}` after it closes go at the end of the last token of the place's line
+//! (after the name being typed, before any trailing comment; at the place
+//! itself if no token of its line ends at or after it), and any others at
+//! the end of the file, on a line of their own. If the file so balanced
+//! still does not parse with its braces matching, or parses with no fewer
+//! errors than the file as it is, every `}` goes at the end of the file
+//! instead, if that parses with its braces matching and with fewer errors
+//! than the first, or the first did not balance: at most two such texts
+//! are parsed, and the workspace is indexed again once, with the one
+//! chosen. A place before a `}` put in is the same in
+//! both texts; what the query finds is mapped back to the text as it is,
+//! a place after a `}` put in or taken out shifted, and what touches the
+//! text put in dropped. A place of another file is renumbered, by path.
+//!
+//! The index made again answers a query at any place that no `}` put in
+//! is before, so that a burst of queries at one place, a completion, then
+//! signature help, then a hover, indexes the workspace again once; and it
+//! answers inlay hints whatever it closed, a range asked for first being
+//! balanced at its end ([`ClosedCache`]). A document's symbols and code
+//! actions are not answered so, and neither are diagnostics, which are
+//! the check's of the text as it is: its syntax error. A RENAME in such a
+//! file is refused, "the file has an unclosed `{`" (or "a `}` that closes
+//! nothing"), as its check needs the text as it is; its preparation is
+//! answered.
 
+mod closing;
 mod complete;
 mod docs;
 mod inlay;
@@ -305,6 +345,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+pub use closing::{Closed, ClosedCache, Closing};
 pub use complete::{Completion, CompletionKind, name_around};
 pub use inlay::{InlayHint, MAX_HINT};
 pub use rename::{Edit, Prepared};

@@ -83,8 +83,7 @@
 //!   offsets in its label, counted in the negotiated encoding, with the
 //!   active parameter: the one a named argument names, else the next one
 //!   the arguments before the place have not filled; in a trailing block,
-//!   the last, one left open while it is typed included (the workspace is
-//!   indexed again for it with the block closed);
+//!   the last, one left open while it is typed included;
 //! - inlay hints as `InlayHint[]`, those whose positions are in the range
 //!   asked for, its ends included: the types the document does not write
 //!   (a `let`'s, a `for` variable's, a definition's parameters' and
@@ -112,8 +111,17 @@
 //! call. A file with errors is indexed for everything that resolved, and so
 //! is one that needs a file whose check failed, and the parser keeps what
 //! an editor leaves half-typed, `a.` and an unclosed `f(`, so that what is
-//! before them is indexed; one whose braces do not match has nothing
-//! indexed. A query waits
+//! before them is indexed. One whose braces do not match, as one is while
+//! a block is typed, has nothing indexed: a query at a place of it, but a
+//! rename, is answered from the workspace indexed again with the file's
+//! braces balanced for the query, the `}`s it lacks put after the place's
+//! line, or at the end of the file, and any `}` that closes nothing taken
+//! out, the places found mapped back to the text as it is (see the
+//! library's [Unbalanced files](gcsl::index#unbalanced-files)); a rename
+//! there is refused, "the file has an unclosed `{`", as its check needs the
+//! text as it is, and the diagnostics published are the syntax error
+//! alone. The workspace is indexed again once for the queries at a place
+//! of one version of the document, not for each. A query waits
 //! for the worker as a check does, and is handed over before any check
 //! due: if a document of the workspace has changed since its index was
 //! made, the worker checks it at once, skipping the quiet period, publishes
@@ -198,8 +206,9 @@
 //! the library's [Scan errors](gcsl::workspace#scan-errors)); a read of a
 //! name two files declare has no hover, and goes to both declarations. What
 //! the check reports is published, and stale diagnostics are not kept. Nor
-//! is a stale index: a file whose braces do not match has nothing to answer
-//! until it is checked again. A file that needs a file whose check failed,
+//! is a stale index: a file whose braces do not match answers from the
+//! text as it is, balanced for the query, not from the last index that
+//! checked. A file that needs a file whose check failed,
 //! or one of files that need each other, is indexed, but what it reads of
 //! that file's own directory has no type (see [`gcsl::index`]). What the
 //! standard library and the built-ins declare has no definition to go to:
@@ -2136,6 +2145,59 @@ mod tests {
     }
 
     #[test]
+    fn queries_are_answered_in_a_file_whose_braces_do_not_match() {
+        let scratch = Scratch::workspace("unbalanced", "");
+        let text = "base = 1\n";
+        let uri = scratch.write("app.gcsl", text);
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(&uri, text);
+        client.published(&uri);
+        // Typed: `x = {` and a newline, and completion asked at once on the
+        // next line.
+        client.change(&uri, 2, ((1, 0), (1, 0)), "x = {\n");
+        let before = client.checks();
+        let list = client.ask("textDocument/completion", &uri, (2, 0));
+        let labels = completion_labels(&list);
+        assert!(labels.iter().any(|l| l == "base"), "{labels:?}");
+        // The check of the change, and the workspace indexed again with the
+        // block closed.
+        assert_eq!(client.checks() - before, 2);
+        // Typed in the block: a local, and queries of it.
+        client.change(&uri, 3, ((2, 0), (2, 0)), "    k = base\n    j = k");
+        let before = client.checks();
+        let list = client.ask("textDocument/completion", &uri, (3, 9));
+        assert!(completion_labels(&list).iter().any(|l| l == "k"));
+        let shown = client.hover(&uri, (3, 8));
+        let value = shown["contents"]["value"].as_str().unwrap();
+        assert!(value.contains("k: Int"), "{shown}");
+        assert_eq!(as_range(&shown["range"]), range((3, 8), (3, 9)));
+        let definition = client.definition(&uri, (3, 8));
+        assert_eq!(as_range(&definition["range"]), range((2, 4), (2, 5)));
+        let help = client.ask("textDocument/signatureHelp", &uri, (3, 9));
+        assert_eq!(help, Value::Null);
+        let prepared = client.ask("textDocument/prepareRename", &uri, (3, 8));
+        assert_eq!(prepared["placeholder"], "k");
+        let highlights = client.ask("textDocument/documentHighlight", &uri, (3, 8));
+        assert_eq!(highlights.as_array().map(Vec::len), Some(2), "{highlights}");
+        // One check and one indexing again for all of them at one version.
+        assert_eq!(client.checks() - before, 2);
+        // A rename needs the text as it is: refused.
+        let position = json!({ "line": 3, "character": 8 });
+        let params =
+            json!({ "textDocument": { "uri": uri }, "position": position, "newName": "z" });
+        let error = client
+            .request("textDocument/rename", params)
+            .response_result
+            .unwrap_err();
+        assert_eq!(error.message, "the file has an unclosed `{`");
+        // The diagnostics are the syntax error alone.
+        let published = client.published_at(&uri, 3);
+        assert_eq!(published.diagnostics.len(), 1, "{published:?}");
+        assert!(published.diagnostics[0].message.starts_with("expected `}`"));
+        client.shut_down().unwrap();
+    }
+
+    #[test]
     fn inlay_hints_are_of_the_range_asked_for_and_of_the_text_as_it_is() {
         let scratch = Scratch::workspace("inlay", "");
         // `é` is two bytes and one UTF-16 unit.
@@ -2692,6 +2754,68 @@ mod tests {
             let uri = uri_of(&path).unwrap();
             measure_typing("$GCSL_LSP_BENCH", &uri, &text);
         }
+    }
+
+    /// The time of a completion in a block left open, its file's braces not
+    /// matching, on a small workspace, and on the one at `$GCSL_LSP_BENCH`
+    /// if it is set, its `workspace.gcsl` opened with the block at its end,
+    /// in memory only: just after a keystroke, which the query checks and
+    /// indexes again for first, and again at the same version. Run with
+    /// `--ignored --nocapture` to see it.
+    #[test]
+    #[ignore = "a measurement, not a test"]
+    fn time_of_a_completion_in_a_block_left_open() {
+        let scratch = Scratch::workspace("unbalanced-latency", "");
+        let uri = scratch.write("app.gcsl", "x = 1\n");
+        measure_unbalanced("a small workspace", &uri, "x = 1\n");
+        if let Some(root) = std::env::var_os("GCSL_LSP_BENCH") {
+            let path = fs::canonicalize(root).unwrap().join(WORKSPACE);
+            let text = fs::read_to_string(&path).unwrap();
+            let uri = uri_of(&path).unwrap();
+            measure_unbalanced("$GCSL_LSP_BENCH", &uri, &text);
+        }
+    }
+
+    /// Opens the document `uri` as `text` with a block left open after it,
+    /// then twenty times types a key in the block and asks for a completion
+    /// at once, asks again at the same version, and takes the key away; and
+    /// reports the times.
+    fn measure_unbalanced(name: &str, uri: &Uri, text: &str) {
+        let mut text = text.to_owned();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let line = u32::try_from(text.matches('\n').count()).unwrap() + 2;
+        text.push_str("lsp_open = {\n    lsp_k = 1\n    lsp_j = ");
+        let (mut client, _) = Client::start(&["utf-8"]);
+        client.open(uri, &text);
+        client.ask("textDocument/completion", uri, (line, 12));
+        let (mut typed, mut again) = (Vec::new(), Vec::new());
+        let mut version = 1;
+        for _ in 0..20 {
+            version += 1;
+            let start = Instant::now();
+            client.change(uri, version, ((line, 12), (line, 12)), "l");
+            let answer = client.ask("textDocument/completion", uri, (line, 13));
+            typed.push(start.elapsed());
+            assert!(answer.to_string().contains("lsp_k"), "{answer}");
+            let start = Instant::now();
+            client.ask("textDocument/completion", uri, (line, 13));
+            again.push(start.elapsed());
+            version += 1;
+            client.change(uri, version, ((line, 12), (line, 13)), "");
+        }
+        typed.sort();
+        again.sort();
+        let _ = writeln!(
+            io::stderr(),
+            "completion in a block left open, {name}: after a keystroke median {:?} (max {:?}), again at the version median {:?} (max {:?})",
+            typed[typed.len() / 2],
+            typed[typed.len() - 1],
+            again[again.len() / 2],
+            again[again.len() - 1],
+        );
+        client.shut_down().unwrap();
     }
 
     /// Opens the document `uri` as `text` with a record and a probe line

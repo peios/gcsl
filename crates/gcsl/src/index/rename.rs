@@ -84,15 +84,20 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// What [`Index::prepare_rename`] refuses; `new` is not a name of the
-    /// right kind; or the check of the renamed workspace found a problem,
-    /// the first one named.
+    /// The file's braces do not match ("the file has an unclosed `{`"),
+    /// as its check needs the text as it is, not as [`Index::closing`]
+    /// balances it; what [`Index::prepare_rename`] refuses; `new` is not a
+    /// name of the right kind; or the check of the renamed workspace found
+    /// a problem, the first one named.
     pub fn rename(
         &self,
         (file, offset): (u32, u32),
         new: &str,
         reindex: impl FnOnce(&[SourceFile]) -> Indexed,
     ) -> Result<Vec<Edit>, Refusal> {
+        if let Some(why) = self.unbalanced_refusal(file) {
+            return Err(why);
+        }
         let plan = self.plan(file, offset)?;
         let old = self.scan.names.get(plan.name).to_owned();
         let fits = match plan.segment {

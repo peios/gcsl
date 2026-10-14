@@ -40,7 +40,14 @@
 //! check succeeded or failed (see [`gcsl::index`]): a file with errors is
 //! indexed for everything that resolved, and so is one that needs a file
 //! whose check failed; one whose braces do not match is not checked, and
-//! has nothing indexed, not even what the last good index had. A query is
+//! has nothing indexed, not even what the last good index had: a query at
+//! a place of it (but a rename, a document's symbols, code actions) is
+//! answered from the workspace indexed again, as a rename's check indexes
+//! it, with the file's braces balanced virtually (see the library's
+//! "Unbalanced files"), counted as a check. That index is kept with the
+//! index it was made from, for the queries after it at the same versions,
+//! and made again only for a place it does not serve; it never changes
+//! what is published. A rename in such a file is refused. A query is
 //! answered from it only if every open document of what it is of has the
 //! version it was made from, none was opened since, the query's check does
 //! not read the files from disk again, and no stat pass found a file
@@ -75,7 +82,8 @@ use std::time::SystemTime;
 use crossbeam_channel::{Receiver, Sender};
 use gcsl::diagnostic::Renderer;
 use gcsl::index::{
-    Completion, CompletionKind, DocumentSymbol, Edit, Index, Indexed, Signature, SymbolKind,
+    Closed, ClosedCache, Completion, CompletionKind, DocumentSymbol, Edit, Highlight, Index,
+    Indexed, Prepared, Signature, SymbolKind,
 };
 use gcsl::workspace;
 use gcsl::{Diagnostic, Severity, SourceFile, Span, Suggestion};
@@ -352,6 +360,10 @@ struct Kept {
     own: Option<u32>,
     /// How what it is of is indexed again, as a rename's check does.
     again: Again,
+    /// The index made again for the queries of a file whose braces do not
+    /// match, with them balanced, kept for the queries after the first:
+    /// made again only for a place it does not serve.
+    closed: ClosedCache,
 }
 
 /// How a workspace, or a lone file, is indexed again with its files
@@ -438,7 +450,10 @@ impl Worker {
         let key = check.key.clone();
         self.refresh(check);
         let answer = match self.indexes.get_mut(&key) {
-            Some(kept) => kept.answer(asked, &uri, position, (self.encoding, self.insert_replace)),
+            Some(kept) => {
+                let how = (self.encoding, self.insert_replace);
+                kept.answer(asked, &uri, position, (how, &self.checks))
+            }
             None => Ok(Value::Null),
         };
         let response = match answer {
@@ -802,6 +817,7 @@ impl Kept {
             suggested,
             own,
             again,
+            closed: ClosedCache::default(),
         }
     }
 
@@ -892,7 +908,10 @@ impl Kept {
     /// in `encoding`: a hover, a location or locations, highlights, a
     /// rename's range or edits, symbols, completions (each with an
     /// `InsertReplaceEdit` if `insert_replace`, the client supporting them,
-    /// else a `TextEdit`), or JSON's `null` for nothing there.
+    /// else a `TextEdit`), or JSON's `null` for nothing there. A query at a
+    /// place of a file whose braces do not match is answered from the
+    /// workspace indexed again with them balanced (see [`Answerer`]), each
+    /// such indexing counted in `checks`.
     ///
     /// # Errors
     ///
@@ -902,7 +921,7 @@ impl Kept {
         asked: Asked,
         uri: &Uri,
         position: Position,
-        (encoding, insert_replace): (Encoding, bool),
+        ((encoding, insert_replace), checks): ((Encoding, bool), &AtomicUsize),
     ) -> Result<Value, String> {
         let input = self
             .uris
@@ -927,8 +946,18 @@ impl Kept {
             encoding,
             lines: HashMap::new(),
         };
+        let hinted = match &asked {
+            Asked::InlayHints(end) => Some(range_to(&lines, (offset, *end), encoding)),
+            _ => None,
+        };
+        let mut answerer = Answerer::of(
+            (index, &mut self.closed),
+            (&self.again, checks),
+            &asked,
+            (file, offset, hinted),
+        );
         let answer = match asked {
-            Asked::Hover => index.hover(file, offset).map(|hover| {
+            Asked::Hover => answerer.hover(offset).map(|hover| {
                 let hover = Hover {
                     contents: HoverContents::Markup(MarkupContent {
                         kind: MarkupKind::Markdown,
@@ -939,8 +968,8 @@ impl Kept {
                 serde_json::to_value(hover)
             }),
             Asked::Definition => {
-                let mut locations: Vec<Location> = index
-                    .definition(file, offset)
+                let mut locations: Vec<Location> = answerer
+                    .definition(offset)
                     .into_iter()
                     .filter_map(|found| places.location(found.file, found.span))
                     .collect();
@@ -952,31 +981,33 @@ impl Kept {
                 response.map(serde_json::to_value)
             }
             Asked::References(declarations) => {
-                let locations: Vec<Location> = index
-                    .references(file, offset, declarations)
+                let locations: Vec<Location> = answerer
+                    .references(offset, declarations)
                     .into_iter()
                     .filter_map(|found| places.location(found.file, found.span))
                     .collect();
                 Some(serde_json::to_value(locations))
             }
             Asked::Highlight | Asked::DocumentSymbols | Asked::InlayHints(_) => {
-                let at = (file, offset);
-                Some(of_document(index, &asked, at, (&lines, encoding)))
+                let shown = (&lines, encoding);
+                Some(of_document(&mut answerer, &asked, offset, shown))
             }
             Asked::CodeActions(end, context) => {
-                let end = u32::try_from(lines.offset(end, encoding)).unwrap_or(u32::MAX);
-                let asked = Span::new(offset, end.max(offset));
+                let asked = range_to(&lines, (offset, end), encoding);
                 let actions = self.code_actions((uri, input), asked, &context, encoding);
                 Some(Ok(Value::Array(actions)))
             }
             Asked::PrepareRename => {
-                let prepared = index.prepare_rename(file, offset)?;
+                let prepared = answerer.prepare_rename(offset)?;
                 let range = lines.range(prepared.span, encoding);
                 Some(Ok(
                     json!({ "range": range, "placeholder": prepared.placeholder }),
                 ))
             }
             Asked::Rename(new) => {
+                let Answerer::Index(index, _) = answerer else {
+                    return Ok(Value::Null);
+                };
                 let again = &self.again;
                 let edits = index.rename((file, offset), &new, |renamed| again.index(renamed))?;
                 Some(Ok(workspace_edit(edits, &mut places)?))
@@ -988,7 +1019,7 @@ impl Kept {
                     encoding,
                     insert_replace,
                 };
-                Some(typing(index, &asked, (file, offset), &typed, &self.again))
+                Some(typing(&answerer, &asked, offset, &typed))
             }
         };
         Ok(answer.and_then(Result::ok).unwrap_or(Value::Null))
@@ -1142,22 +1173,166 @@ fn symbol_json(symbol: &DocumentSymbol, lines: &LineIndex<'_>, encoding: Encodin
     shown
 }
 
-/// The answer of `index` to `asked`, highlights, a document's symbols or its
-/// inlay hints, of the file of input number `file`, at its byte `offset`
-/// (where the range of the hints starts), whose lines are `lines`,
-/// positions counted in `encoding`. An inlay hint is of kind `Type`, its
-/// label as [`Index::inlay_hints`] makes it, with no padding.
+/// What a query of a document is answered from: the index, or, for a file
+/// whose braces do not match, the workspace indexed again with them
+/// balanced, what it finds mapped back to the text as it is (see the
+/// library's "Unbalanced files").
+enum Answerer<'a> {
+    /// The index, and the file's input number.
+    Index(&'a mut Index, u32),
+    /// The workspace indexed again.
+    Closed(&'a mut Closed),
+}
+
+impl<'a> Answerer<'a> {
+    /// What `asked`, a query at byte `offset` of the file of input number
+    /// `file` (of the inlay hints of `hinted`), is answered from: `index`,
+    /// but for a query at a place of a file whose braces do not match, a
+    /// rename, a document's symbols and code actions apart, the index
+    /// `closed` keeps or makes (by indexing again as `again` says, counted
+    /// in `checks`), if it balances the file.
+    fn of(
+        (index, closed): (&'a mut Index, &'a mut ClosedCache),
+        (again, checks): (&Again, &AtomicUsize),
+        asked: &Asked,
+        (file, offset, hinted): (u32, u32, Option<Span>),
+    ) -> Self {
+        let balanced = !index.unbalanced(file)
+            || matches!(
+                asked,
+                Asked::Rename(_) | Asked::DocumentSymbols | Asked::CodeActions(..)
+            );
+        if balanced {
+            return Answerer::Index(index, file);
+        }
+        let reindex = |files: &[SourceFile]| reindexed(again, files, checks);
+        let found = match hinted {
+            Some(range) => closed.over(index, (file, range), reindex),
+            None => closed.at(index, (file, offset), reindex),
+        };
+        match found {
+            Some(closed) => Answerer::Closed(closed),
+            None => Answerer::Index(index, file),
+        }
+    }
+
+    /// The hover at byte `offset` of the file.
+    fn hover(&mut self, offset: u32) -> Option<gcsl::index::Hover> {
+        match self {
+            Answerer::Index(index, file) => index.hover(*file, offset),
+            Answerer::Closed(closed) => closed.hover(offset),
+        }
+    }
+
+    /// Where what is at byte `offset` of the file is declared.
+    fn definition(&self, offset: u32) -> Vec<gcsl::index::Location> {
+        match self {
+            Answerer::Index(index, file) => index.definition(*file, offset),
+            Answerer::Closed(closed) => closed.definition(offset),
+        }
+    }
+
+    /// The references to what is at byte `offset` of the file, its
+    /// declarations among them if `declarations`.
+    fn references(&self, offset: u32, declarations: bool) -> Vec<gcsl::index::Location> {
+        match self {
+            Answerer::Index(index, file) => index.references(*file, offset, declarations),
+            Answerer::Closed(closed) => closed.references(offset, declarations),
+        }
+    }
+
+    /// The highlights of what is at byte `offset` of the file.
+    fn highlights(&self, offset: u32) -> Vec<Highlight> {
+        match self {
+            Answerer::Index(index, file) => index.highlights(*file, offset),
+            Answerer::Closed(closed) => closed.highlights(offset),
+        }
+    }
+
+    /// The name a rename at byte `offset` of the file renames, or why there
+    /// is none.
+    fn prepare_rename(&self, offset: u32) -> Result<Prepared, String> {
+        match self {
+            Answerer::Index(index, file) => index.prepare_rename(*file, offset),
+            Answerer::Closed(closed) => closed.prepare_rename(offset),
+        }
+    }
+
+    /// What may be written at byte `offset` of the file.
+    fn completion(&self, offset: u32) -> Vec<Completion> {
+        match self {
+            Answerer::Index(index, file) => index.completion(*file, offset),
+            Answerer::Closed(closed) => closed.completion(offset),
+        }
+    }
+
+    /// The signature of the call byte `offset` of the file is in.
+    fn signature(&self, offset: u32) -> Option<Signature> {
+        match self {
+            Answerer::Index(index, file) => index.signature(*file, offset),
+            Answerer::Closed(closed) => closed.signature(offset),
+        }
+    }
+
+    /// The inlay hints of `range` of the file.
+    fn inlay_hints(&mut self, range: Span) -> Vec<gcsl::index::InlayHint> {
+        match self {
+            Answerer::Index(index, file) => index.inlay_hints(*file, range),
+            Answerer::Closed(closed) => closed.inlay_hints(range),
+        }
+    }
+
+    /// The symbols of the file: none of one indexed again, as they are
+    /// never asked of it.
+    fn document_symbols(&self) -> Vec<DocumentSymbol> {
+        match self {
+            Answerer::Index(index, file) => index.document_symbols(*file),
+            Answerer::Closed(_) => Vec::new(),
+        }
+    }
+}
+
+/// The span from byte `offset` of the file whose lines are `lines` to
+/// `end`, counted in `encoding`: empty if `end` is before `offset`.
+fn range_to(lines: &LineIndex<'_>, (offset, end): (u32, Position), encoding: Encoding) -> Span {
+    let end = u32::try_from(lines.offset(end, encoding)).unwrap_or(u32::MAX);
+    Span::new(offset, end.max(offset))
+}
+
+/// `files` indexed again as `again` says, with a file's braces balanced,
+/// counted as a check in `checks`: an index of nothing, logged, if that
+/// panicked, which a bug in GCSL could make it do.
+fn reindexed(again: &Again, files: &[SourceFile], checks: &AtomicUsize) -> Indexed {
+    checks.fetch_add(1, Ordering::SeqCst);
+    panic::catch_unwind(AssertUnwindSafe(|| again.index(files))).unwrap_or_else(|_| {
+        log(format_args!(
+            "internal error: indexing again with a file's braces balanced panicked"
+        ));
+        Indexed {
+            standard: Vec::new(),
+            diagnostics: Vec::new(),
+            succeeded: false,
+            index: None,
+        }
+    })
+}
+
+/// The answer of `answerer` to `asked`, highlights, a document's symbols or
+/// its inlay hints, of its file, at its byte `offset` (where the range of
+/// the hints starts), whose lines are `lines`, positions counted in
+/// `encoding`. An inlay hint is of kind `Type`, its label as
+/// [`Index::inlay_hints`] makes it, with no padding.
 fn of_document(
-    index: &mut Index,
+    answerer: &mut Answerer<'_>,
     asked: &Asked,
-    (file, offset): (u32, u32),
+    offset: u32,
     (lines, encoding): (&LineIndex<'_>, Encoding),
 ) -> serde_json::Result<Value> {
     match asked {
         Asked::InlayHints(end) => {
             let end = u32::try_from(lines.offset(*end, encoding)).unwrap_or(u32::MAX);
-            let hints: Vec<InlayHint> = index
-                .inlay_hints(file, Span::new(offset, end))
+            let hints: Vec<InlayHint> = answerer
+                .inlay_hints(Span::new(offset, end))
                 .into_iter()
                 .map(|hint| InlayHint {
                     position: lines
@@ -1175,8 +1350,8 @@ fn of_document(
             serde_json::to_value(hints)
         }
         Asked::Highlight => {
-            let highlights: Vec<DocumentHighlight> = index
-                .highlights(file, offset)
+            let highlights: Vec<DocumentHighlight> = answerer
+                .highlights(offset)
                 .into_iter()
                 .map(|found| DocumentHighlight {
                     range: lines.range(found.span, encoding),
@@ -1190,8 +1365,8 @@ fn of_document(
             serde_json::to_value(highlights)
         }
         _ => {
-            let symbols: Vec<Value> = index
-                .document_symbols(file)
+            let symbols: Vec<Value> = answerer
+                .document_symbols()
                 .iter()
                 .map(|symbol| symbol_json(symbol, lines, encoding))
                 .collect();
@@ -1213,22 +1388,18 @@ struct Typed<'a> {
     insert_replace: bool,
 }
 
-/// The answer of `index` to `asked`, a completion or signature help, at
-/// byte `offset` of the file of input number `file`, of the document
-/// `typed`: a `CompletionList`, empty for nothing to offer, or a
-/// `SignatureHelp`, `null` for no call there. In a file not indexed, its
-/// braces not matching, signature help is looked for in what is indexed
-/// `again` with them closed at the place, as a trailing block left open
-/// needs ([`Index::signature_closing`]).
+/// The answer of `answerer` to `asked`, a completion or signature help, at
+/// byte `offset` of its file, of the document `typed`: a `CompletionList`,
+/// empty for nothing to offer, or a `SignatureHelp`, `null` for no call
+/// there.
 fn typing(
-    index: &Index,
+    answerer: &Answerer<'_>,
     asked: &Asked,
-    (file, offset): (u32, u32),
+    offset: u32,
     typed: &Typed<'_>,
-    again: &Again,
 ) -> serde_json::Result<Value> {
     if *asked == Asked::SignatureHelp {
-        return match index.signature_closing(file, offset, |files| again.index(files)) {
+        return match answerer.signature(offset) {
             Some(found) => serde_json::to_value(signature_help(&found, typed.encoding)),
             None => Ok(Value::Null),
         };
@@ -1240,8 +1411,8 @@ fn typing(
         .lines
         .range(Span::new(name.start, offset), typed.encoding);
     let replace = typed.lines.range(name, typed.encoding);
-    let items = index
-        .completion(file, offset)
+    let items = answerer
+        .completion(offset)
         .into_iter()
         .map(|found| {
             let new_text = found.insert.clone().unwrap_or_else(|| found.label.clone());

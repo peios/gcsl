@@ -11,7 +11,10 @@
 //! doc comments, and a hover, a definition, references and a rename's
 //! preparation at every token of newpkgs and of the mutants, with each
 //! file's symbols and its inlay hints, asked for whole (the run is still
-//! named for its first two), and the inlay hints of newpkgs, counted, with
+//! named for its first two), those of a mutant whose braces do not match
+//! asked again through the workspace indexed again with them balanced, and
+//! counted against what the index answers, and the inlay hints of newpkgs,
+//! counted, with
 //! examples; and the
 //! scan's recovery from its own errors, over mutants of newpkgs in its
 //! workspace that each make one: a field defined in two files, an import of
@@ -22,7 +25,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gcsl::index::{Index, Indexed};
+use gcsl::index::{Closed, ClosedCache, Index, Indexed};
 use gcsl::names::Names;
 use gcsl::workspace;
 use gcsl::{Diagnostic, SourceFile, Span, lexer, parser};
@@ -567,6 +570,10 @@ fn sandbox_broken(files: &[SourceFile], reindex: &dyn Fn(&[SourceFile]) -> Index
     );
 }
 
+/// How a run indexes a workspace again, given its files after the standard
+/// ones.
+type Reindex<'a> = dyn Fn(&[SourceFile]) -> Indexed + 'a;
+
 /// What a run of hovers and definitions found.
 #[derive(Debug, Default)]
 struct Asked {
@@ -600,6 +607,135 @@ struct Asked {
     completing: Duration,
     /// The time spent indexing.
     indexing: Duration,
+    /// Files whose braces do not match, asked about again through the
+    /// workspace indexed again with them balanced.
+    unbalanced: usize,
+    /// Token starts asked about in them.
+    unbalanced_places: usize,
+    /// Of those, the places a balancing was found for.
+    balanced: usize,
+    /// What the index answered in them.
+    before: Answers,
+    /// What the workspace indexed again with them balanced answered.
+    now: Answers,
+    /// Inlay hints of them, each asked for whole, from the index made again.
+    hints_now: usize,
+    /// How many times a workspace was indexed again for them.
+    reindexed: usize,
+    /// The time spent asking about them, indexing again included.
+    rebalancing: Duration,
+}
+
+/// What queries in files whose braces do not match answered, each counted
+/// when it answered something: at every token start, and a completion and
+/// signature help at every token's start and end.
+#[derive(Clone, Copy, Debug, Default)]
+struct Answers {
+    /// Hovers.
+    hovers: usize,
+    /// Definitions with at least one place.
+    definitions: usize,
+    /// References with at least one place.
+    references: usize,
+    /// Highlights with at least one place.
+    highlights: usize,
+    /// Places a rename was prepared at.
+    renamable: usize,
+    /// Completions offering something.
+    completions: usize,
+    /// Signatures.
+    signatures: usize,
+}
+
+impl Answers {
+    /// Adds `other` to these.
+    fn add(&mut self, other: Answers) {
+        self.hovers += other.hovers;
+        self.definitions += other.definitions;
+        self.references += other.references;
+        self.highlights += other.highlights;
+        self.renamable += other.renamable;
+        self.completions += other.completions;
+        self.signatures += other.signatures;
+    }
+
+    /// What `index` answers at `at`, a token's start, of the file `file`,
+    /// whose token there ends at `end`.
+    fn of_index(index: &mut Index, file: u32, (at, end): (u32, u32)) -> Self {
+        let completions = [at, end]
+            .iter()
+            .filter(|&&place| !index.completion(file, place).is_empty())
+            .count();
+        let signatures = [at, end]
+            .iter()
+            .filter(|&&place| index.signature(file, place).is_some())
+            .count();
+        Self {
+            hovers: usize::from(index.hover(file, at).is_some()),
+            definitions: usize::from(!index.definition(file, at).is_empty()),
+            references: usize::from(!index.references(file, at, true).is_empty()),
+            highlights: usize::from(!index.highlights(file, at).is_empty()),
+            renamable: usize::from(index.prepare_rename(file, at).is_ok()),
+            completions,
+            signatures,
+        }
+    }
+
+    /// What `closed` answers at `at`, a token's start, of its file, whose
+    /// text is `text` and whose token there ends at `end`; with what is
+    /// wrong with it: a place out of the file, or a hover not at `at`.
+    fn of_closed(closed: &mut Closed, (at, end): (u32, u32), text: &str) -> (Self, Vec<String>) {
+        let mut wrong = Vec::new();
+        let len = u32::try_from(text.len()).unwrap();
+        let mut check = |what: &str, span: Span, right: bool| {
+            let fits = span.start <= span.end
+                && span.end <= len
+                && text.is_char_boundary(span.start as usize)
+                && text.is_char_boundary(span.end as usize);
+            if !fits || !right {
+                wrong.push(format!("{what} {span:?}"));
+            }
+        };
+        let hover = closed.hover(at);
+        if let Some(hover) = &hover {
+            let right = hover.span.start <= at && at < hover.span.end && !hover.text.is_empty();
+            check("hover", hover.span, right);
+        }
+        let file = closed.closing().file();
+        let definition = closed.definition(at);
+        let references = closed.references(at, true);
+        for location in definition.iter().chain(&references) {
+            if location.file == file {
+                check("location", location.span, true);
+            }
+        }
+        let highlights = closed.highlights(at);
+        for found in &highlights {
+            check("highlight", found.span, true);
+        }
+        let prepared = closed.prepare_rename(at);
+        if let Ok(prepared) = &prepared {
+            check("rename", prepared.span, true);
+        }
+        let completions = [at, end]
+            .iter()
+            .filter(|&&place| !closed.completion(place).is_empty())
+            .count();
+        let signatures = [at, end]
+            .iter()
+            .filter(|&&place| closed.signature(place).is_some())
+            .count();
+        let answers = Self {
+            hovers: usize::from(hover.is_some()),
+            definitions: usize::from(!definition.is_empty()),
+            references: usize::from(!references.is_empty()),
+            highlights: usize::from(!highlights.is_empty()),
+            renamable: usize::from(prepared.is_ok()),
+            completions,
+            signatures,
+        };
+        (answers, wrong)
+    }
 }
 
 impl Asked {
@@ -609,8 +745,15 @@ impl Asked {
     /// standard ones with its text, for a completion and signature help at
     /// every token's start and end, and for each file's symbols and its
     /// inlay hints (each of which must be at a character of its file, with
-    /// a label), recording what it finds.
-    fn run(&mut self, what: &str, work: impl FnOnce() -> Option<Index>, files: &[(u32, &str)]) {
+    /// a label), recording what it finds; and of a file whose braces do not
+    /// match, the same again through the workspace indexed again by
+    /// `reindex` with them balanced ([`Asked::unbalanced`]).
+    fn run(
+        &mut self,
+        what: &str,
+        (work, reindex): (impl FnOnce() -> Option<Index>, &Reindex<'_>),
+        files: &[(u32, &str)],
+    ) {
         let start = Instant::now();
         let index = panic::catch_unwind(AssertUnwindSafe(work));
         self.indexing += start.elapsed();
@@ -702,9 +845,89 @@ impl Asked {
                 }
             }
             completing += started.elapsed();
+            if index.unbalanced(file) {
+                let started = Instant::now();
+                self.unbalanced(what, &mut index, (file, text), reindex);
+                completing += started.elapsed();
+                self.rebalancing += started.elapsed();
+            }
         }
         self.completing += completing;
         self.asking += start.elapsed().saturating_sub(completing);
+    }
+
+    /// Asks again at every token start of the file `file` of `index`, of
+    /// `what`, whose braces do not match, with its text `text`, what
+    /// [`Asked::run`] asks, of the index and of the workspace indexed again
+    /// by `reindex` with the file balanced (a `ClosedCache`), and for its
+    /// inlay hints, recording what each answers. The tokens are taken from
+    /// the last, so that the index made for the first place asked at
+    /// serves the others; a balancing is looked for at each, too.
+    fn unbalanced(
+        &mut self,
+        what: &str,
+        index: &mut Index,
+        (file, text): (u32, &str),
+        reindex: &Reindex<'_>,
+    ) {
+        self.unbalanced += 1;
+        let source = SourceFile::new("t.gcsl", text).unwrap();
+        let lexed = lexer::lex(&source, &mut Names::new());
+        let mut cache = ClosedCache::default();
+        for token in lexed.tokens.iter().rev() {
+            let at = (token.span.start, token.span.end);
+            self.unbalanced_places += 1;
+            let asked = panic::catch_unwind(AssertUnwindSafe(|| {
+                let before = Answers::of_index(index, file, at);
+                let balanced = index.closing(file, at.0).is_some();
+                let now = cache
+                    .at(index, (file, at.0), reindex)
+                    .map(|closed| Answers::of_closed(closed, at, text));
+                (before, balanced, now)
+            }));
+            let Ok((before, balanced, now)) = asked else {
+                self.failures.push(format!(
+                    "{what}: file {file} at {}: balanced, panicked",
+                    at.0
+                ));
+                continue;
+            };
+            self.before.add(before);
+            self.balanced += usize::from(balanced);
+            if let Some((now, wrong)) = now {
+                self.now.add(now);
+                for wrong in wrong {
+                    self.failures.push(format!(
+                        "{what}: file {file} at {}: balanced, {wrong}",
+                        at.0
+                    ));
+                }
+            }
+        }
+        let whole = Span::new(0, u32::try_from(text.len()).unwrap());
+        let hints = panic::catch_unwind(AssertUnwindSafe(|| {
+            cache
+                .over(index, (file, whole), reindex)
+                .map(|closed| closed.inlay_hints(whole))
+                .unwrap_or_default()
+        }));
+        match hints {
+            Ok(hints) => {
+                self.hints_now += hints.len();
+                for hint in hints {
+                    let at = hint.offset as usize;
+                    if at > text.len() || !text.is_char_boundary(at) || hint.label.len() < 3 {
+                        self.failures.push(format!(
+                            "{what}: file {file}: balanced, inlay hint {hint:?}"
+                        ));
+                    }
+                }
+            }
+            Err(_) => self.failures.push(format!(
+                "{what}: file {file}'s inlay hints, balanced, panicked"
+            )),
+        }
+        self.reindexed += cache.made();
     }
 
     /// Asks `index` for a completion and signature help at byte `at` of
@@ -765,6 +988,33 @@ impl Asked {
             self.signatures,
             self.failures
         );
+        if self.unbalanced > 0 {
+            let (before, now) = (self.before, self.now);
+            println!(
+                "{set}, braces not matching: {} files, {} places, {} balanced, indexed again {} times, in {:?}; answered before / now: {} / {} hovers, {} / {} definitions, {} / {} with references, {} / {} with highlights, {} / {} renamable, {} / {} with completions and {} / {} with a signature (of {} places), 0 / {} inlay hints",
+                self.unbalanced,
+                self.unbalanced_places,
+                self.balanced,
+                self.reindexed,
+                self.rebalancing,
+                before.hovers,
+                now.hovers,
+                before.definitions,
+                now.definitions,
+                before.references,
+                now.references,
+                before.highlights,
+                now.highlights,
+                before.renamable,
+                now.renamable,
+                before.completions,
+                now.completions,
+                before.signatures,
+                now.signatures,
+                self.unbalanced_places * 2,
+                self.hints_now,
+            );
+        }
         assert!(self.failures.is_empty());
     }
 }
@@ -787,9 +1037,15 @@ fn hovers_everywhere() {
     // newpkgs as it is: every token of every file.
     let mut asked = Asked::default();
     let numbered: Vec<(u32, &str)> = (0u32..).zip(files).map(|(at, f)| (at, f.text())).collect();
+    let in_newpkgs =
+        |files: &[SourceFile]| workspace::index_with_standard(files, &sources.nested, NEWPKGS);
+    let alone = |files: &[SourceFile]| workspace::index_lone_with_standard(&files[0], "/");
     asked.run(
         "newpkgs",
-        || workspace::index_with_standard(files, &sources.nested, NEWPKGS).index,
+        (
+            || workspace::index_with_standard(files, &sources.nested, NEWPKGS).index,
+            &in_newpkgs,
+        ),
         &numbered,
     );
     asked.report("newpkgs");
@@ -815,7 +1071,10 @@ fn hovers_everywhere() {
                 let source = SourceFile::new("mutant.gcsl", mutant.as_str()).unwrap();
                 asked.run(
                     &what,
-                    || workspace::index_lone_with_standard(&source, "/").index,
+                    (
+                        || workspace::index_lone_with_standard(&source, "/").index,
+                        &alone,
+                    ),
                     &[(0, mutant.as_str())],
                 );
             }
@@ -837,16 +1096,12 @@ fn hovers_everywhere() {
             let what = format!("{} {kind} in newpkgs", original.name());
             let file = u32::try_from(at).unwrap();
             let mut diagnostics = Vec::new();
-            asked.run(
-                &what,
-                || {
-                    let indexed =
-                        workspace::index_with_standard(&changed, &sources.nested, NEWPKGS);
-                    diagnostics = indexed.diagnostics;
-                    indexed.index
-                },
-                &[(file, mutant.as_str())],
-            );
+            let work = || {
+                let indexed = workspace::index_with_standard(&changed, &sources.nested, NEWPKGS);
+                diagnostics = indexed.diagnostics;
+                indexed.index
+            };
+            asked.run(&what, (work, &in_newpkgs), &[(file, mutant.as_str())]);
             // The index's diagnostics are the check's: the files checked
             // for the index alone report nothing.
             let (_, checked) = workspace::check_with_standard(&changed, &sources.nested, NEWPKGS);

@@ -5,11 +5,10 @@
 use crate::ast::{ArgKind, Ast, ExprId, ExprKind};
 use crate::check::Builtin;
 use crate::lexer::TokenKind;
-use crate::source::SourceFile;
 use crate::types::{TyId, TyKind};
 
 use super::complete::{Bracket, Tokens};
-use super::{Index, Indexed, LocalKind, Symbol, known};
+use super::{Index, LocalKind, Symbol, known};
 
 /// A call's signature, as signature help shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,61 +97,6 @@ impl Index {
                 Bracket::Str => return None,
             }
         }
-    }
-
-    /// [`Index::signature`], and where it has none because the file is not
-    /// indexed, its braces not matching, and the place is in a block left
-    /// open after a `)`, `pair("a", "b") {`, as a call's trailing block is
-    /// while it is typed (and the place is in no string or comment): the
-    /// signature found in the workspace indexed again
-    /// by `reindex` (given the files after the standard ones, as
-    /// [`Index::rename`] gives them), the file with a `}` for each brace
-    /// left open put at the place, as an editor closing them would.
-    pub fn signature_closing(
-        &self,
-        file: u32,
-        offset: u32,
-        reindex: impl FnOnce(&[SourceFile]) -> Indexed,
-    ) -> Option<Signature> {
-        if self.checked(file) {
-            return self.signature(file, offset);
-        }
-        let source = self.sources.get(file as usize)?.as_ref()?;
-        let tokens = Tokens::new(source);
-        if tokens.in_text(offset) {
-            return None;
-        }
-        let (open, bracket) = tokens.open_before(tokens.starting_before(offset))?;
-        if bracket != Bracket::Brace || tokens.kind(open.checked_sub(1)?) != TokenKind::RParen {
-            return None;
-        }
-        let mut depth = 0usize;
-        for at in 0..tokens.len() {
-            match tokens.kind(at) {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        let mut text = source.text().to_owned();
-        if depth == 0 || !text.is_char_boundary(offset as usize) {
-            return None;
-        }
-        text.insert_str(offset as usize, &"}".repeat(depth));
-        let standard = self.standard() as usize;
-        let mut sources = Vec::new();
-        for (at, other) in self.sources.iter().enumerate().skip(standard) {
-            let other = other.as_ref()?;
-            let closed = if at == file as usize {
-                SourceFile::new(other.name(), text.as_str()).ok()?
-            } else {
-                other.clone()
-            };
-            sources.push(closed);
-        }
-        let index = reindex(&sources).index?;
-        let path = self.path(file)?;
-        index.signature(index.file(path)?, offset)
     }
 
     /// The signature of the call of `callee`, of file `file`, whose tokens
@@ -668,8 +612,8 @@ mod tests {
             let file = index.file("app.gcsl").unwrap();
             // The file's braces do not match: it is not indexed.
             assert_eq!(index.signature(file, at), None, "{rest:?}");
-            let found = index
-                .signature_closing(file, at, |files| index_with_standard(files, &[], "/"))
+            let found = closed(&index, file, at)
+                .signature(at)
                 .unwrap_or_else(|| panic!("{rest:?}"));
             assert_eq!(
                 found.label,
@@ -686,8 +630,16 @@ mod tests {
         ];
         let index = index_with_standard(&sources, &[], "/").index.unwrap();
         let file = index.file("app.gcsl").unwrap();
-        let found = index.signature_closing(file, at, |files| index_with_standard(files, &[], "/"));
-        assert_eq!(found, None);
+        assert_eq!(closed(&index, file, at).signature(at), None);
+    }
+
+    /// The workspace of `index` indexed again with the file of input number
+    /// `file` balanced for a query at `at`.
+    fn closed(index: &crate::index::Index, file: u32, at: u32) -> crate::index::Closed {
+        let closing = index.closing(file, at).unwrap();
+        closing
+            .index(index, |files| index_with_standard(files, &[], "/"))
+            .unwrap()
     }
 
     #[test]
