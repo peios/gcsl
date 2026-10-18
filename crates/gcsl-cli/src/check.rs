@@ -57,11 +57,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
+use serde_json::{Value, json};
+
 use gcsl::diagnostic::Renderer;
 use gcsl::workspace;
 use gcsl::{Diagnostic, Severity, SourceFile, Span};
-use serde_json::{Value, json};
-
 use crate::run::file_dir;
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
@@ -365,6 +365,7 @@ impl Found {
                 counted(self.warnings, "warning")
             )
         };
+        // There is no alternate channel for reporting a stderr failure.
         let _ = writeln!(io::stderr().lock(), "{line}");
     }
 }

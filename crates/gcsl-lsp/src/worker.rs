@@ -80,14 +80,6 @@ use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 
 use crossbeam_channel::{Receiver, Sender};
-use gcsl::diagnostic::Renderer;
-use gcsl::index::{
-    Closed, ClosedCache, Completion, CompletionKind, DocumentSymbol, Edit, Highlight, Index,
-    Indexed, Prepared, Signature, SymbolKind,
-};
-use gcsl::workspace;
-use gcsl::{Diagnostic, Severity, SourceFile, Span, Suggestion};
-use gcsl_disk::{ReadError, Sources};
 use lsp_server::{ErrorCode, Message, Notification, RequestId, Response};
 use lsp_types::notification::{Notification as _, PublishDiagnostics, ShowMessage};
 use lsp_types::{
@@ -100,6 +92,14 @@ use lsp_types::{
 };
 use serde_json::{Map, Value, json};
 
+use gcsl::diagnostic::Renderer;
+use gcsl::index::{
+    Closed, ClosedCache, Completion, CompletionKind, DocumentSymbol, Edit, Highlight, Index,
+    Indexed, Prepared, Signature, SymbolKind,
+};
+use gcsl::workspace;
+use gcsl::{Diagnostic, Severity, SourceFile, Span, Suggestion};
+use gcsl_disk::{ReadError, Sources};
 use crate::log;
 use crate::place::{Place, uri_of};
 use crate::position::{Encoding, LineIndex};
@@ -230,6 +230,17 @@ pub enum Job {
     Clear(Key),
 }
 
+/// Negotiated client capabilities and the disk-refresh policy for one worker.
+#[derive(Clone, Copy)]
+pub struct Options {
+    /// Position encoding negotiated with the client.
+    pub encoding: Encoding,
+    /// Refresh known files on disk when the client cannot watch them.
+    pub stat: bool,
+    /// Whether completions may use insert/replace edits.
+    pub insert_replace: bool,
+}
+
 /// Starts the worker, which publishes through `client` and says on `done`
 /// when it has done a check or a query, positions counted in `encoding`,
 /// and counts each check it makes in `checks`; it makes a stat pass before
@@ -247,10 +258,15 @@ pub enum Job {
 /// The thread cannot be started.
 pub fn spawn(
     client: Sender<Message>,
-    (encoding, stat, insert_replace): (Encoding, bool, bool),
+    options: Options,
     checks: Arc<AtomicUsize>,
     done: Sender<()>,
 ) -> io::Result<(Sender<Job>, JoinHandle<()>)> {
+    let Options {
+        encoding,
+        stat,
+        insert_replace,
+    } = options;
     let (jobs, received) = crossbeam_channel::unbounded();
     // Made on its thread: an index is not `Send`, and never leaves it.
     let run = move || {
@@ -460,6 +476,7 @@ impl Worker {
             Ok(answer) => Response::new_ok(id, answer),
             Err(why) => Response::new_err(id, ErrorCode::RequestFailed as i32, why),
         };
+        // A disconnected client has no receiver; the server owns shutdown.
         let _ = self.client.send(Message::Response(response));
     }
 
@@ -510,6 +527,7 @@ impl Worker {
             found.extend(kept.workspace_symbols(&query, left, self.encoding));
         }
         let answer = serde_json::to_value(found).unwrap_or(Value::Null);
+        // A disconnected client has no receiver; the server owns shutdown.
         let _ = self
             .client
             .send(Message::Response(Response::new_ok(id, answer)));

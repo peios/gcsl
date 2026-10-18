@@ -44,7 +44,6 @@
 //! can write.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 /// An interned identifier: an index into the [`Names`] table that produced
 /// it.
@@ -221,12 +220,14 @@ pub fn show_path(names: &Names, path: &[Name]) -> String {
                 continue;
             }
             if let Some(def_type) = key_meta(text) {
-                let _ = write!(shown, "defmeta {def_type}");
+                shown.push_str("defmeta ");
+                shown.push_str(def_type);
                 separator = " ";
                 continue;
             }
         }
-        let _ = write!(shown, "{separator}{text}");
+        shown.push_str(separator);
+        shown.push_str(text);
         separator = ".";
     }
     shown

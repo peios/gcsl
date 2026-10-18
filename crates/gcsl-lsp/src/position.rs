@@ -13,8 +13,9 @@
 //! says; one inside a character, between the two halves of a surrogate
 //! pair, as the start of the character.
 
-use gcsl::Span;
 use lsp_types::{Position, PositionEncodingKind, Range, TextDocumentContentChangeEvent};
+
+use gcsl::Span;
 
 /// The encoding positions are counted in, as negotiated at initialisation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

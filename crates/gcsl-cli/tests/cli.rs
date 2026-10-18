@@ -1,14 +1,23 @@
 //! Tests that run the built `gcsl` binary.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+
+/// Resolve Cargo's absolute executable or Bazel's runfiles-relative executable before
+/// a child changes its working directory for fixture paths.
+fn binary() -> PathBuf {
+    std::env::current_dir()
+        .unwrap()
+        .join(env!("CARGO_BIN_EXE_gcsl"))
+}
 
 /// Runs `gcsl` with `args` from this crate's directory, so fixture paths
 /// (and therefore the file names in diagnostics) are stable.
 fn gcsl(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    Command::new(binary())
         .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(crate_dir())
         .output()
         .unwrap()
 }
@@ -148,9 +157,9 @@ fn a_misspelled_name_is_shown_with_what_it_was_probably_meant_to_be() {
 fn piped_stderr_has_no_escape_codes() {
     let output = gcsl(&["run", "tests/fixtures/type_error.gcsl"]);
     assert!(!stderr(&output).contains("\x1b["));
-    let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    let output = Command::new(binary())
         .args(["run", "tests/fixtures/type_error.gcsl"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(crate_dir())
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
@@ -1711,7 +1720,7 @@ fn dump_ast_shows_every_syntax_error() {
 
 /// Runs the REPL with `input` on stdin until it ends.
 fn repl(input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    let mut child = Command::new(binary())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3455,11 +3464,41 @@ fn repl_keeps_def_types_across_lines() {
 /// The canonical path of this crate's directory, which the `fileroot`
 /// tests' paths start with, whatever directory they run from.
 fn crate_dir() -> String {
-    std::fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
-        .unwrap()
+    static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let Some(temporary) = std::env::var_os("TEST_TMPDIR") else {
+                return std::fs::canonicalize(source).unwrap();
+            };
+            // Bazel's per-file runfiles symlinks otherwise canonicalize outside
+            // the working directory and change the diagnostic path spelling.
+            // TEST_TMPDIR is disposable and owned by this test invocation.
+            let directory = PathBuf::from(temporary).join("cli-fixtures");
+            copy_fixtures(
+                &source.join("tests/fixtures"),
+                &directory.join("tests/fixtures"),
+            );
+            std::fs::canonicalize(directory).unwrap()
+        })
         .to_str()
         .unwrap()
         .to_owned()
+}
+
+/// Copy declared fixture files rather than their runfiles transport symlinks.
+fn copy_fixtures(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        if source.is_dir() {
+            copy_fixtures(&source, &destination);
+        } else {
+            std::fs::copy(source, destination).unwrap();
+        }
+    }
 }
 
 /// A workspace whose library works on its callers' paths, run from another
@@ -3479,9 +3518,9 @@ fn fileroot_paths_do_not_depend_on_the_working_directory() {
         ("tests/fixtures/ws_fileroot/pkg", "test.gcsl"),
         ("tests/fixtures/ws_fileroot/_lib", "../pkg/test.gcsl"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        let output = Command::new(binary())
             .args(["run", file])
-            .current_dir(format!("{}/{cwd}", env!("CARGO_MANIFEST_DIR")))
+            .current_dir(format!("{}/{cwd}", crate_dir()))
             .output()
             .unwrap();
         assert_eq!(stderr(&output), "", "{cwd}");
@@ -3489,9 +3528,9 @@ fn fileroot_paths_do_not_depend_on_the_working_directory() {
         assert_eq!(output.status.code(), Some(0));
     }
     // A lone file is the workspace of its own directory.
-    let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    let output = Command::new(binary())
         .args(["run", "fixtures/lone_fileroot.gcsl"])
-        .current_dir(format!("{}/tests", env!("CARGO_MANIFEST_DIR")))
+        .current_dir(format!("{}/tests", crate_dir()))
         .output()
         .unwrap();
     assert_eq!(
@@ -3504,8 +3543,8 @@ fn fileroot_paths_do_not_depend_on_the_working_directory() {
 /// The REPL's inputs are in its working directory.
 #[test]
 fn repl_inputs_are_in_the_working_directory() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
-        .current_dir(format!("{}/tests", env!("CARGO_MANIFEST_DIR")))
+    let mut child = Command::new(binary())
+        .current_dir(format!("{}/tests", crate_dir()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3893,19 +3932,16 @@ fn assert_temp_dir_gone(dir: &str) {
 /// directory it made, which it prints, is gone once `gcsl` has exited.
 #[test]
 fn fs_works_from_any_directory_and_its_temporary_directory_goes_with_gcsl() {
-    let file = format!("{}/tests/fixtures/files.gcsl", env!("CARGO_MANIFEST_DIR"));
+    let file = format!("{}/tests/fixtures/files.gcsl", crate_dir());
     for (cwd, file) in [
+        (format!("{}/tests", crate_dir()), "fixtures/files.gcsl"),
         (
-            format!("{}/tests", env!("CARGO_MANIFEST_DIR")),
-            "fixtures/files.gcsl",
-        ),
-        (
-            format!("{}/tests/fixtures/ws", env!("CARGO_MANIFEST_DIR")),
+            format!("{}/tests/fixtures/ws", crate_dir()),
             "../files.gcsl",
         ),
         ("/".to_owned(), file.as_str()),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+        let output = Command::new(binary())
             .args(["run", file])
             .current_dir(&cwd)
             .output()
@@ -3976,7 +4012,7 @@ fn a_relative_path_given_to_fs_is_rendered() {
 fn repl_imports_fs_and_reads_a_file() {
     let input = format!(
         "import fs\nfs.read(\"{}/tests/fixtures/fs_input.txt\")\nfs.temp_dir()\n",
-        env!("CARGO_MANIFEST_DIR")
+        crate_dir()
     );
     let output = repl(&input);
     assert_eq!(stderr(&output), "");
@@ -4049,7 +4085,7 @@ fn repl_shows_values_and_sorts_versions() {
 /// Runs `gcsl lsp` with `messages`, each framed as LSP frames a message,
 /// on its stdin until it ends.
 fn lsp(messages: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    let mut child = Command::new(binary())
         .arg("lsp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4164,7 +4200,7 @@ impl Drop for FmtScratch {
 
 /// Runs `gcsl` with `args` in `dir`, with `input` as its standard input.
 fn gcsl_in(dir: &std::path::Path, args: &[&str], input: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gcsl"))
+    let mut child = Command::new(binary())
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())

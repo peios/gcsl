@@ -105,7 +105,8 @@
 //! static order of the workspace. The prelude binds the built-in
 //! functions but the file system's, and `sh`, written
 //! in GCSL on `exec` and `panic`, which runs a shell command and panics
-//! unless it succeeds, and `sh_live`, the same on `exec_live`; `path` (`import path`) joins, normalises and takes
+//! unless it succeeds, and `sh_live`, the same on `exec_live`; `path` (`import path`) joins,
+//! normalises and takes
 //! apart paths, lexically, in GCSL on the string built-ins; and `fs`
 //! (`import fs`) is the file system's built-ins as its members, impure and
 //! taking only absolute paths: `fs.exists`, `fs.read`, `fs.mkdir`,
@@ -229,7 +230,8 @@ pub use value::{Value, ValueKind};
 /// is one level, the update of a dotted `let` or `:=` counting two more for
 /// each segment of its path after the first, as the parser counts it,
 /// although it walks the path without recursing, and each call in progress
-/// costs [`CALL_LEVELS`] more on top of the nesting around it. The iterations of a loop do not nest:
+/// costs [`CALL_LEVELS`] more on top of the nesting around it. The iterations of a loop do not
+/// nest:
 /// its body is one level below it, as an `if`'s branch is, however many
 /// times it runs. A call is made only if the nesting it
 /// would reach, the whole height of its callee's body included, stays
