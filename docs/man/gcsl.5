@@ -1,0 +1,234 @@
+.TH GCSL 5 2026-10-18 "Peios gcsl 0.1.0"
+.SH NAME
+gcsl \- GCSL source syntax and workspace semantics
+.SH DESCRIPTION
+A GCSL source file is UTF-8 text containing a block body.
+Newlines or semicolons separate items.
+A file can return a value or construct a record of public fields.
+All reachable source is checked before execution.
+.SH LEXICAL STRUCTURE
+A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME] and #![NAME].
+Identifiers begin with an ASCII letter or underscore and continue with ASCII letters, digits, underscores, and permitted internal hyphens.
+Write spaces around binary subtraction to distinguish it from a hyphenated identifier.
+Field names can also be plain quoted strings.
+.PP
+Integer values are signed 64-bit integers; arithmetic overflow is an error.
+Float values use IEEE 754 binary64.
+Integer literals adapt to an expected numeric type; a bound Int does not implicitly convert to Float.
+Conditions require Bool.
+.PP
+Strings use one double quote or a matching run of at least three double quotes at each end.
+A leading r makes a string raw, without escapes or interpolation.
+Ordinary strings interpolate expressions in braces; doubled braces represent literal braces.
+Multiline literals support indentation stripping.
+Strings are immutable UTF-8 and are not indexable.
+.PP
+A newline continues an incomplete item after a binary operator, type or result marker, assignment marker, let, mut, or spread marker.
+Newlines directly inside parentheses, brackets, or interpolation do not separate items.
+Blocks inside them retain block separators.
+.SH ITEMS
+The principal item forms are:
+.PP
+.nf
+    let NAME = EXPR
+    let NAME: TYPE = EXPR
+    let mut NAME: TYPE = EXPR
+    NAME := EXPR
+    FIELD = EXPR
+    FIELD: TYPE = EXPR
+    ...RECORD
+    = EXPR
+    fn NAME(PARAMETERS): TYPE { BODY }
+    def PATH(PARAMETERS): TYPE { BODY }
+    type NAME = TYPE
+    import MODULE
+.fi
+.PP
+A block without fields returns its final expression, an explicit result, or {}.
+A record block returns its fields and cannot have an explicit result.
+Other nonempty unused expression values are errors, except where a construct explicitly discards them.
+A bare await item can discard its result.
+.PP
+Let declares a private binding.
+An ordinary binding can be rebound with := in its declaring block.
+Let mut allows rebinding from nested blocks of the same function; its type remains fixed.
+Captured variables cannot be rebound by an inner function or lazy body.
+Dotted and indexed updates replace values along the path, preserving value semantics.
+.PP
+Fields and def functions contribute to the containing record and, at file scope, the directory's public declarations.
+Private let, let mut, and fn names do not become directory declarations.
+Top-level named functions and public fields support forward references subject to dependency checks.
+Inner record blocks retain ordered construction.
+.SH TYPES
+The built-in value types include Int, Float, Bool, String, records, lists, functions, futures, and unions.
+The empty record type is {}.
+List<T> and T[] are equivalent.
+Type aliases are structural and do not create nominal runtime identities.
+.PP
+Record types use commas between fields, unlike record values:
+.PP
+.nf
+    type Install = {from: String, exclude: List<String> = []}
+    let item: Install = {from = "src"}
+.fi
+.PP
+A record type can spread another record type with ...TYPE.
+A record literal checked against an expected type receives missing constant defaults.
+Defaults do not add fields to an already constructed value of another type.
+A value with additional record fields can satisfy a narrower expected shape; a literal's hidden extra fields produce a warning.
+.PP
+An empty list needs an expected element type.
+Function signatures declare parameter and result types.
+General type parameters, intersections, and a None value are not supported.
+.SH RECORD COMPOSITION
+Dotted fields such as server.host and server.port merge into an open nested record.
+A whole-field definition cannot be extended by a later dotted definition.
+Conflicting public leaves are errors unless an earlier declaration is shadowable.
+.PP
+A record spread contributes soft fields from its operand's static type.
+Inside an ordinary record block, later spreads or explicit fields can replace soft fields; a spread cannot replace an earlier explicit field.
+At top level, an explicit declaration overrides a spread's field of the same name regardless of source order.
+.SH OPERATORS
+Arithmetic uses +, -, *, /, //, and %.
+The / operator returns Float, including for integer operands.
+The // and % operators use integer floor division and modulo.
+String + concatenates strings.
+Boolean operations are and, or, and not, with short-circuit evaluation for and and or.
+Comparisons are not associative.
+.PP
+Typed equality, == and !=, requires compatible identical static operand types and compares fields visible through that type.
+Total equality, === and !==, also requires identical static operand types, but compares complete runtime values, including hidden record fields.
+Functions have no language equality; futures require the appropriate resolution before comparisons that measure their contents.
+Union support differs between typed and total equality.
+.PP
+Use EXPR : TYPE for an ascription, EXPR is TYPE for a runtime shape test, and EXPR as TYPE for a checked conversion.
+A failed as conversion is a runtime error.
+Function types cannot be tested with is or as.
+In if NAME is TYPE, the branches receive narrowed copies of NAME.
+The checker does not generalize that narrowing to arbitrary conditions, field paths, or subsequent statements.
+.PP
+Precedence from loosest to tightest is or; and; prefix not; comparisons and is; ranges; addition and subtraction; multiplication and division; ascription and as; prefix negation and await; then fields, calls, and indexes.
+Lazy takes the longest following expression.
+Comparisons and ranges cannot be chained.
+Use parentheses to make a different grouping explicit.
+.SH FUNCTIONS
+Use : for a pure result, -> for an impure result, and ->> for a memoized impure result.
+Pure functions cannot perform effects or await futures.
+The top level and lazy bodies are impure contexts.
+Closures capture values when they are created.
+.PP
+Calls accept positional and named arguments, evaluated in source order.
+A trailing block supplies the final parameter.
+Parameter defaults are constant expressions and belong to a function declaration, not a written function type.
+Memoized calls cache successful results by closure and arguments within the execution context, including supported ambient inputs they read.
+External file or environment changes do not invalidate the cache.
+.SH FUTURES
+The expression lazy EXPR creates deferred work without starting background execution.
+Await resolves its operand fully and is a silent no-op for a present value.
+The checker inserts implicit awaits when an operation needs a value's contents, subject to purity restrictions.
+.PP
+Present<T> requires a present value.
+Future<T> requires deferred work; a present T does not satisfy it.
+T | Future<T> permits either.
+Nested future layers collapse.
+Bare parameter types of impure functions accept either shape recursively through records and lists.
+Pure parameter positions infer whether the body measures them.
+Impure and memoized bare result positions infer from the body.
+Memoized bare parameters are present.
+Explicit wrappers retain the written contract.
+A bare function type is not implicitly wrapped at its own position.
+.SH CONTROL FLOW
+If is an expression with block branches.
+An if without else must have an empty-record or nonreturning branch.
+Incompatible branch results can form a union with a warning.
+.PP
+Lists use commas, zero-based indexes, and ... for list spread.
+Negative or out-of-range indexes are errors.
+Ranges A..B exclude B; A..=B include B.
+Ranges ascend and are empty when their bounds cannot produce an ascending sequence.
+.PP
+Supported loops include:
+.PP
+.nf
+    for NAME in LIST { BODY }
+    for NAME in LIST if CONDITION { BODY }
+    for CONDITION { BODY }
+    for BEFORE; CONDITION; AFTER { BODY }
+    for { BODY }
+    do { BODY } for CONDITION
+.fi
+.PP
+A loop in value position collects body results; one in statement position discards them.
+Break and continue can contribute a value before ending the loop or iteration.
+A plain header variable can be rebound by the header; use let mut when the body must update it.
+.PP
+Labels use for'NAME, do'NAME, or {'NAME ... }.
+Break'NAME and continue'NAME target a loop.
+Return'NAME leaves the named loop or block with a single result, not its accumulated list.
+An unlabeled return leaves a function or lazy body.
+No jump crosses a function boundary.
+.SH WORKSPACES AND IMPORTS
+The file workspace.gcsl marks a root and is ordinary source.
+Each directory shares its public fields, def functions, and types among its files.
+A child sees its own directory and ancestors through the root.
+Imports reach other directories or files by root-relative paths:
+.PP
+.nf
+    import lib.helpers
+    import lib.helpers as helpers
+    import helper from lib.helpers
+    import helper as run_helper from lib.helpers
+    import * from lib.helpers
+.fi
+.PP
+An imported directory exposes its own merged declarations, not an automatic recursive import of its children.
+A file and directory with the same module name are ambiguous.
+A file outside any workspace can import standard modules only.
+Hidden names, symbolic-link directories, and nested workspace trees are excluded from workspace discovery.
+.PP
+Files are checked and run in dependency order, with path order breaking ties.
+A file runs as a whole before a dependent file.
+Cyclic file dependencies are errors.
+Public dotted paths merge across directories and imports when their leaves are compatible.
+.SH ATTRIBUTES
+.TP
+.B #[shadowable]
+Mark a top-level public field, def, definition-type definition, or import as replaceable.
+Order runs from the implicit prelude through root-to-child directories, path-ordered files, and source-ordered declarations and imports.
+A later overlapping declaration replaces an earlier one only when the earlier declaration permits it.
+Distinct interior paths still merge.
+.TP
+.B #![no_prelude]
+Disable the file's implicit shadowable prelude import.
+Place it before all items.
+It is not valid on a REPL input.
+.TP
+.B #[def_type]
+Mark a top-level def as a definition type.
+Its first parameter is String and its second is the function type of definitions it accepts.
+Additional parameters are invocation arguments.
+.SH DEFINITION TYPES AND METADATA
+A definition-type declaration is followed by definitions of this form:
+.PP
+.nf
+    def TYPE_NAME PATH(PARAMETER_NAMES) { BODY }
+    result = TYPE_NAME PATH(ARGUMENTS)
+.fi
+.PP
+Parameter types and the result contract come from the definition type.
+Definitions occupy that type's namespace and do not bind an ordinary value of PATH.
+Declaration does not run the body.
+Definition paths support additional package-name characters and digit-starting segments after the first; ordinary identifiers retain their own rules.
+.PP
+A function type can append META:, META->, or META->> and a record type.
+Metadata reads follow the declared pure, impure, or memoized effect.
+Defmeta TYPE_NAME PATH supplies a definition's metadata in its directory, using a block or = EXPR.
+Metadata follows references to the definition.
+.SH LIMITS
+Expression depth is limited to 10,000 syntax-tree levels, with additional parser recursion accounting.
+Runtime expressions, calls, and awaits share a nesting budget; tail calls are not eliminated.
+Loop iterations reuse the body's nesting depth.
+These limits do not bound total memory or execution time.
+.SH SEE ALSO
+.BR gcsl (1),
+.BR gcsl-stdlib (3)

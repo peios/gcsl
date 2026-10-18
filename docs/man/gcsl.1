@@ -1,0 +1,171 @@
+.TH GCSL 1 2026-10-18 "Peios gcsl 0.1.0"
+.SH NAME
+gcsl \- run, check, and format GCSL programs
+.SH SYNOPSIS
+.B gcsl
+.RI [ COMMAND ]
+.br
+.B gcsl run
+.RI [ OPTIONS ] " FILE"
+.br
+.B gcsl check
+.RB [ --message-format " human|json" ]
+.RI [ PATH ...]
+.br
+.B gcsl fmt
+.RB [ --check ]
+.RI [ PATH ...]
+.br
+.B gcsl lsp
+.SH DESCRIPTION
+GCSL is a statically typed language for configuration and scripting.
+The executable includes the standard library and language server.
+Without a command, it starts an interactive read-evaluate-print loop (REPL).
+.SH COMMANDS
+.SS run
+Check and execute FILE.
+If FILE belongs to a workspace, check the whole workspace before running FILE and the files it depends on.
+Otherwise, check and run FILE alone with the standard library.
+An error anywhere in the checked workspace prevents execution.
+.PP
+Print the result to standard output, followed by a newline, unless it is the empty record {}.
+Print a top-level string as its raw contents; other values use their GCSL representation.
+Diagnostics and warnings go to standard error.
+A requested dump stops execution after the last requested stage; it does not evaluate the program.
+.SS check
+Check files and workspaces without evaluating them.
+A file argument checks its enclosing workspace, or that file alone if it is outside one.
+A file reached through a path excluded from workspace discovery is checked alone.
+A directory argument discovers workspaces at or below it, including nested workspaces, and also checks an enclosing workspace when the directory is inside one.
+Each workspace is checked once.
+Standalone source files under a directory are not checked unless explicitly named.
+With no paths, check the workspace containing the working directory; outside a workspace, report an error.
+.PP
+Human-readable diagnostics go to standard error, followed by a summary.
+Warnings alone do not make checking fail.
+With JSON output, each diagnostic is a separate object on one line of standard output; the summary remains on standard error.
+.SS fmt
+Format named files in place.
+For a directory, format all discovered .gcsl files, including standalone files and nested workspaces.
+Hidden names and symbolic-link directories are excluded from traversal.
+With no paths, format the enclosing workspace, excluding nested workspaces; outside a workspace, report an error.
+The path \- reads standard input and writes formatted source to standard output; it cannot be combined with other paths.
+.PP
+A lexical or syntax error leaves that file unchanged and does not prevent formatting other files.
+Type errors do not prevent formatting.
+An unchanged file keeps its modification time.
+A symbolic-link file argument updates its target and preserves the link.
+Line endings become LF.
+.SS lsp
+Serve the Language Server Protocol on standard input and standard output.
+Logs go to standard error.
+The server checks source and does not execute programs.
+It provides diagnostics, hover, definitions, references, highlights, checked rename, document and workspace symbols, formatting, completion, signature help, inlay hints, and spelling quick fixes.
+.PP
+Positions use UTF-8 when the client offers it; otherwise they use UTF-16.
+Rename does not rename files, directories, built-ins, or standard-library declarations.
+Formatting uses GCSL's fixed style and ignores client formatting preferences.
+.PP
+Send shutdown before exit for a clean protocol shutdown.
+.SS REPL
+Each nonempty input line is a block body in a shared session.
+Declarations remain available to later inputs.
+A value other than {} prints as "value : Type"; strings use quoted GCSL representation.
+Errors are displayed and the session continues.
+A failed input does not commit its new bindings, but external effects already performed are not undone.
+Press Ctrl+C while entering a line to discard it and Ctrl+D to end input.
+History lasts for the session only.
+.SH OPTIONS
+.TP
+.BR -h , " --help"
+Show help for the executable or selected command.
+.TP
+.BR -V , " --version"
+Show the executable's version.
+.TP
+.B --dump-tokens
+For run, print lexical tokens.
+.TP
+.B --dump-ast
+For run, print the parsed syntax tree.
+.TP
+.B --dump-types
+For run, print the syntax tree with inferred types.
+.TP
+.B --dump-ir
+For run, print the lowered intermediate representation.
+.TP
+.B --message-format human|json
+For check, select human-readable or newline-delimited JSON diagnostics.
+The default is human.
+.TP
+.B --check
+For fmt, write nothing and list files that would change on standard output.
+For standard input, list <stdin> if it would change and do not print formatted source.
+.SH DIAGNOSTIC FORMAT
+Each JSON diagnostic has path, severity, message, line, column, end_line, end_column, labels, and notes fields.
+Severity is error or warning.
+Lines and columns are 1-based; columns count characters.
+Each label has path, line, column, end_line, end_column, and text fields.
+Notes are strings.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+Warnings alone are successful.
+A REPL that reaches end of input succeeds even if individual inputs reported language errors.
+.TP
+.B 1
+A program fails checking or evaluation; formatting finds invalid syntax; a formatting check would change a file; or the language server exits without shutdown.
+.TP
+.B 2
+Invalid command usage, an input/output failure, or failure to start the interpreter worker.
+For check and fmt, an input/output failure takes precedence over language or formatting errors.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+A nonempty value disables colored diagnostics.
+.TP
+.B PATH
+Used by process-execution built-ins when a program name has no slash.
+.TP
+.B TMPDIR
+Used by the host's temporary-directory selection for fs.temp_dir, unless an embedding host supplies a temporary root.
+.TP
+.B TERM
+Used by terminal input handling.
+.PP
+Subprocesses inherit the host environment and working directory.
+.SH FILES
+.TP
+.B workspace.gcsl
+Workspace root marker and an ordinary source file.
+The closest enclosing marker determines a file's workspace.
+.TP
+.B *.gcsl
+GCSL source files.
+Hidden names and nested workspace trees are excluded when reading one workspace.
+.TP
+.B <stdlib>/NAME.gcsl
+Diagnostic name for an embedded standard module; not a required installed file.
+.SH SECURITY
+Executing GCSL is not sandboxed.
+Programs can read and write files and start subprocesses with the host process's permissions.
+Checking and language-server analysis do not run program effects.
+Nesting limits do not bound execution time, total allocation, or captured process output.
+.SH EXAMPLES
+Check and run a standalone file:
+.PP
+.nf
+    gcsl check hello.gcsl
+    gcsl run hello.gcsl
+.fi
+.PP
+Check formatting without rewriting a workspace:
+.PP
+.nf
+    gcsl fmt --check
+.fi
+.SH SEE ALSO
+.BR gcsl (5),
+.BR gcsl-stdlib (3)

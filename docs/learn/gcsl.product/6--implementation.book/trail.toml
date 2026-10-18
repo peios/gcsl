@@ -1,0 +1,3 @@
+title = "GCSL Technical Reference Manual"
+short = "gcsl-internals"
+description = "The interpreter pipeline, execution state, and tooling boundaries."

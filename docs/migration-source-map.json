@@ -1,0 +1,642 @@
+{
+  "task": "PEI-1526",
+  "copied_commit": "3a4d6e4155959dbec994c7a03b13355566a726e6",
+  "archive": "/home/jack/projects/peios/.artifacts/PEI-1526-gcsl/design-notes-before.tar.gz",
+  "archive_sha256": "943730637dee975df9eb8a5eac915bd70b0fe6affed537234d520823049a0035",
+  "original_tree": "/home/jack/projects/peios/gcsl",
+  "disposition": "Intentionally untracked design notes preserved outside the repository; originals remain in the old tree. New reader documentation is source-checked against implementation, not a publication of design records.",
+  "learn_staging": {
+    "root": "/home/jack/projects/peios-newtree/learn-staging",
+    "search": "Case-insensitive gcsl filename and Markdown/TOML content search",
+    "matches": [],
+    "removed": []
+  },
+  "sources": [
+    {
+      "path": "docs/DECISIONS.md",
+      "sha256": "f468872da6903ab88ab26c361e880a7602e6faf500ea395d13ed2b3f41bc7373",
+      "bytes": 160478,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/INFERENCE_REQS.md",
+      "sha256": "f0616136120030cd1f822125ff021e8887daaac257155f6fb0e9f4e821eff3b0",
+      "bytes": 8832,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic/900--inference-limits.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-10-dotted-updates-and-capture-hint.md",
+      "sha256": "339e59c34e448e2e139a6e299574fddd9bdc7e86993ec8c813eacc0560fae0ca",
+      "bytes": 7707,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-11-impure-result-inference.md",
+      "sha256": "fc1833bd27eb17862149251777dbd3b6d0cfbc81f6bc40745e471302cc3e6622",
+      "bytes": 9010,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-12-memoised-functions.md",
+      "sha256": "3e86a23700a651d655d6151f517e006eefa34c1cc51d6233d1b5719b7e27efb2",
+      "bytes": 12604,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-13-rough-edges.md",
+      "sha256": "8e8c7f5601fd9038a37a82b181a8b77cd0e0953105f45a247cd00c44a2dfce83",
+      "bytes": 6042,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-14-callback-narrowing.md",
+      "sha256": "f7ae538b0edaa2451ec9217d4764736ba7984ac34c814e72c3041d27ec89cab4",
+      "bytes": 9081,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-15-lists.md",
+      "sha256": "697381bf52ced88401892014eedba7fd28f834da9b4974bb12817b1669a8c14e",
+      "bytes": 14078,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-16-record-spread.md",
+      "sha256": "b20b34f0e14b010ad798157c322112387e5e12ddc2a49f2a59a098819ffda40d",
+      "bytes": 9269,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-17-for-and-ranges.md",
+      "sha256": "ad9d35f2c7999d06b8171da30ab2b821da2b6a8cf6c7a8dd5a74a0d21cd8ff86",
+      "bytes": 9817,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-18-mutable-variables.md",
+      "sha256": "a0a93ae15a7b9e0870409937103d812af60dd3b644ad4660be53109e34a62570",
+      "bytes": 13089,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-19-element-update.md",
+      "sha256": "eaf045dcabb741ec8dba3cb01ec62342817296d0c24ba3e6eae5b85047d3e3ba",
+      "bytes": 12129,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-20-unions-is-as.md",
+      "sha256": "0e5c147d4059a6ee5e5918dd139630e52329fe1330de43f45ebb1414933d118c",
+      "bytes": 18634,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-21-loops-break-continue-never.md",
+      "sha256": "1457fd3ac113ac4f272ace0545b20ca6074cdb5c55194afd423df42544899fa9",
+      "bytes": 18929,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-22-return-and-labelled-blocks.md",
+      "sha256": "6b2cb3b98e2c2b7556297739442eb525bb9fa0f3a257eee94722de3aab081f80",
+      "bytes": 13591,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-23-def-and-order-free-functions.md",
+      "sha256": "0e71d539f53e02d9877f076f785461297e6df8d4477b3a8b0d167e6fe2e49dda",
+      "bytes": 22053,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-24-order-free-fields.md",
+      "sha256": "5507e68413f7ba9bf22bdf525f79b4a59a8d59443ba4dd0b74a53bbbfac0d723",
+      "bytes": 19557,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-25-workspace-and-directory-scope.md",
+      "sha256": "c168c7716f79bf3cde4de676022785fb182942d4142622b4aab3404d353dc38a",
+      "bytes": 16849,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/100--workspaces.md",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-26-imports.md",
+      "sha256": "016646bf6247d4a901c28eac841ba2c5898feb21b4b498cdfda422543fd49bf8",
+      "bytes": 13678,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/100--workspaces.md",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-27-dotted-paths-always-merge.md",
+      "sha256": "c85790648b959668beebdcfb08f0067de7c0867119502f55c2768934f0efda90",
+      "bytes": 10959,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/100--workspaces.md",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-28-builtins-and-prelude.md",
+      "sha256": "8b151a1619653b3d95af12d8f9bb0e6ab7e1ed432a9420f87cf1159e97e6ed47",
+      "bytes": 15412,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-29-exec-and-panic.md",
+      "sha256": "5898e817d87083a94e6a0c9f155de81800fd0772432ed5d41eef393160f2fb85",
+      "bytes": 13826,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-30-strings-and-path.md",
+      "sha256": "41d0479c281d39552252b3d302bb849160319cdad5224b8067b5cce02e49708b",
+      "bytes": 12663,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-31-attributes-and-shadowable.md",
+      "sha256": "87cd36b5792a257f3e378812068a7b17b1c3b50ae3e88d7ca3be3b0ee158293f",
+      "bytes": 13286,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/100--workspaces.md",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-32-fileroot.md",
+      "sha256": "aa27cbab61040ac8d89a7a90f461c103c7a226807003e5bac76ffd93f1780b52",
+      "bytes": 10426,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-33-types-spread-annotated-fields.md",
+      "sha256": "146e09e7da6b2f5b97aa766ee39988baea8d0ca543a2990484c7676374d0c480",
+      "bytes": 11387,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-34-dotted-def-names.md",
+      "sha256": "dcdcbc56658a0f817b0f8f99a1eb3e239ba9a6d0a4138d2508e9b3c17d8d79c5",
+      "bytes": 7440,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-35-def-types.md",
+      "sha256": "c492e0b95fdb4cb133201088457fd46a5dbd3dff8188266a3a40296900fdc878",
+      "bytes": 11038,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-36-embedding.md",
+      "sha256": "a4b7fec2e1d4b3ebcde10b318b78c645bfa8e3903bafede4184321c4dcdff76c",
+      "bytes": 12525,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-37-pekit.md",
+      "sha256": "ae86cb1f7e746efd138c273a80f29803c13553f218c667e0de300ac7a0541eec",
+      "bytes": 8630,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-38-metas.md",
+      "sha256": "b335f45a0287fb3fba2a9d85fafc349663459f8a1f409341d0e5f4170e7ba774",
+      "bytes": 13263,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-39-meta-through-references.md",
+      "sha256": "ef2981db96b37f21777824eeb42df89a4b3338642d538eeb72fc9f809057b0eb",
+      "bytes": 6434,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-40-pekit-arguments.md",
+      "sha256": "a73704f8c7f915be0298d84928c4afd7abd4b26ab6f0458a789502a1e11617ac",
+      "bytes": 3857,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-41-more-strings-and-versions.md",
+      "sha256": "3769a3c0439b80894237d3b0045e64c0b631e8fa8bfcee83e1a0882baa544253",
+      "bytes": 6845,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-42-fs.md",
+      "sha256": "d4d4f5c90788e225011f138fde77976288a958be8139cbe12add3d070aecabff",
+      "bytes": 8580,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-43-locks.md",
+      "sha256": "3ad040301a157389532a0aa60ae294b218f4a70b74516e3528356dba17e370ac",
+      "bytes": 8735,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-44-default-parameters.md",
+      "sha256": "6c845e898955abbd558115bffdce956b95f28555501f5c39fee391b293bbfdb7",
+      "bytes": 9957,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-45-temp-root.md",
+      "sha256": "9520dc5213a0cf652f94d76ba152a09f7a016f326c87a90d3817c54dd07c348a",
+      "bytes": 4842,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-46-exec-live.md",
+      "sha256": "e601307487b0ef3b70aaf4e12881902079040deda526336c3d044d2ffbeaeda5",
+      "bytes": 5079,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/3--working-with-files.topic/300--file-and-process-effects.md",
+        "docs/man/gcsl-stdlib.3"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-47-plus-in-paths.md",
+      "sha256": "de9c12703cf233f1c7745e918f87a686bdcc9a1daa59482b55437bdcce91e3c9",
+      "bytes": 6705,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-48-digit-segments.md",
+      "sha256": "af7250147861b5b79016a6fe3017a4bd61b343bdbb9fed9e2eba5fc01f614b8d",
+      "bytes": 6386,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/5--embedding.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-49-record-field-defaults.md",
+      "sha256": "8e8c50bbda78ed1dab221b2e7389a6313f1a395603ea48ca200fc7f3f8571d29",
+      "bytes": 7856,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-50-pekit-targets.md",
+      "sha256": "9014b664482a4f8b994579e2720412ce45cd9619c4f779490a48814be0d733f5",
+      "bytes": 9405,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-51-pekit-environment.md",
+      "sha256": "c6cd6e18b04a63f96c46c0db7067d516ec68c659646c47313e0b6c26bc8c904b",
+      "bytes": 6503,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-52-expected-type-reach.md",
+      "sha256": "69aa4bbac6ffb36ffd94119d88ed812de266473a5275aa204d119da7c5ae51b7",
+      "bytes": 6268,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-53-memo-empty-keys.md",
+      "sha256": "7cf4b6eb1945d24278059fbaf1355d8cb9ebdbfbd7dc6982801757838e6e7ed3",
+      "bytes": 4095,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-54-spread-reach.md",
+      "sha256": "44e41953819770af4bb779726bbfeee2f7e1be1cfd88c2c5a3e564ca9fdeb886",
+      "bytes": 4164,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/2--language.topic",
+        "docs/man/gcsl.5"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-55-tree-sitter-grammar.md",
+      "sha256": "a16638c132613cbeece2398e98d359077446848255cda00fc9c66fe56ae4e066",
+      "bytes": 8481,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-56-lsp-diagnostics.md",
+      "sha256": "8f191ff0fe7dfbb91ff4991d045f91f8e1148829035215ab4340ee166776a243",
+      "bytes": 8660,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-57-tree-sitter-queries.md",
+      "sha256": "4df33ecfcd671aea3c3cec2cb33b51a760cdd111bacb1d615fffd98e24f9396d",
+      "bytes": 4374,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "scope_note": "Language integration boundary documented; sibling Pekit and Tree-sitter implementation/policy remains owned by its repository.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/1--getting-started.topic/100--gcsl.md",
+        "docs/learn/gcsl.product/5--embedding.topic/200--definition-types.md"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-58-parser-recovery.md",
+      "sha256": "abda54e51dbbf437659413d13e1811377fdcbc667353bc24d8e540cb79389c14",
+      "bytes": 7084,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-59-hover-definition.md",
+      "sha256": "abca8b3b41f5b5722eb29e028a4b208de5ffd3876dbf56168c5dde666857f3e1",
+      "bytes": 9119,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-60-references-rename-symbols.md",
+      "sha256": "678af8b75009258630c2af30d23a6bf821cc5f8c6fcb80702bd48a7005287c78",
+      "bytes": 9635,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-61-formatter.md",
+      "sha256": "6b70972c3ff0963f1ff974842044707496476cdecbfc5dd858f404d55ec09d3f",
+      "bytes": 8377,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-62-completion-signature-help.md",
+      "sha256": "c7216146a077187d0376c3dba70ec88615cc62b6ce9063a651994425fbc4328b",
+      "bytes": 7218,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-63-check-inlay-hints.md",
+      "sha256": "c4c03f7472eb350df66461cd6edd6cab67d79c37964e145e457295e055eb6456",
+      "bytes": 7763,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-64-scan-recovery.md",
+      "sha256": "c35c5e8e9af0286de10c2010b3fe1c579e4c3aaba12c9965705ac6e6ca4e05c7",
+      "bytes": 7313,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-65-suggestions-code-actions.md",
+      "sha256": "7dfca5ce4d02e8d2547eb43e31484707fee758542e7bb6c34e79a9484b4b4e02",
+      "bytes": 5692,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    },
+    {
+      "path": "docs/specs/slice-66-unbalanced-queries.md",
+      "sha256": "bd8a3de8f864b41721a66c2f0df3ad6442b9b8973c4cb5ce0b1b9f9733168a91",
+      "bytes": 4615,
+      "disposition": "Archived outside repository; oldtree original retained; removed from newtree after SHA-256 verification.",
+      "reader_replacements": [
+        "docs/learn/gcsl.product/4--tools.topic",
+        "docs/learn/gcsl.product/6--implementation.book/300--tooling-state.md",
+        "docs/man/gcsl.1"
+      ]
+    }
+  ],
+  "authored_articles": [
+    "1--getting-started.topic/100--gcsl.md",
+    "1--getting-started.topic/200--running-a-first-program.md",
+    "2--language.topic/100--values-and-bindings.md",
+    "2--language.topic/200--records-and-types.md",
+    "2--language.topic/300--functions-and-effects.md",
+    "2--language.topic/400--deferred-work.md",
+    "2--language.topic/500--lists-and-control-flow.md",
+    "2--language.topic/900--inference-limits.md",
+    "3--working-with-files.topic/100--workspaces.md",
+    "3--working-with-files.topic/200--organizing-a-workspace.md",
+    "3--working-with-files.topic/300--file-and-process-effects.md",
+    "4--tools.topic/100--checking-and-formatting.md",
+    "4--tools.topic/200--editor-integration.md",
+    "5--embedding.topic/100--embedding.md",
+    "5--embedding.topic/200--definition-types.md",
+    "6--implementation.book/100--pipeline.md",
+    "6--implementation.book/200--evaluation-state.md",
+    "6--implementation.book/300--tooling-state.md"
+  ]
+}
