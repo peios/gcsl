@@ -1,0 +1,68 @@
+load("@crates//:crates.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_doc_test", "rust_library", "rust_test")
+load("//build:version.bzl", "VERSION")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "BUILD.bazel",
+    "Cargo.toml",
+])
+
+filegroup(
+    name = "sources",
+    srcs = glob(
+        [
+            "src/**",
+            "tests/**",
+        ],
+        allow_empty = True,
+    ),
+)
+
+filegroup(
+    name = "fixtures",
+    srcs = glob(
+        ["tests/fixtures/**"],
+        allow_empty = True,
+    ),
+)
+
+rust_library(
+    name = "gcsl",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = ["//:standard-library"],
+    crate_name = "gcsl",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    version = VERSION,
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "tests",
+    size = "large",
+    crate = ":gcsl",
+    data = ["//:standard-library"],
+    rustc_env = {"CARGO_MANIFEST_DIR": "./crates/gcsl"},
+)
+
+rust_test(
+    name = "end-to-end-test",
+    size = "large",
+    srcs = ["tests/end_to_end.rs"],
+    data = ["//:test-fixtures"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    rustc_env = {
+        "CARGO_MANIFEST_DIR": "./crates/gcsl",
+    },
+    version = VERSION,
+    deps = all_crate_deps(normal = True) + [":gcsl"],
+)
+
+rust_doc_test(
+    name = "doc-tests",
+    crate = ":gcsl",
+)

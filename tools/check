@@ -1,0 +1,10 @@
+#!/bin/sh
+# Bazel builds and tests the programs; Cargo adds lint and rustdoc diagnostics.
+set -eu
+repo=$(CDPATH="" cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+python3 tools/style-check.py
+./bazel build //:build-format-check
+./bazel test //...
+cargo +1.98.1 clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.98.1 test --workspace --doc --locked

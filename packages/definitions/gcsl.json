@@ -1,0 +1,26 @@
+{
+  "side_effects": [
+    "man-db"
+  ],
+  "package": {
+    "name": "dev.peios.gcsl",
+    "description": "GCSL interpreter, formatter and language server",
+    "license": "((MIT OR Apache-2.0) AND Unicode-3.0) AND (Apache-2.0 OR MIT) AND MIT AND (MIT OR Unlicense)",
+    "version": "0.1.0-1",
+    "architecture": "x86_64",
+    "license_class": "free"
+  },
+  "dependencies": {
+    "org.gnu.glibc": "*",
+    "org.gnu.gcc-libgcc": "*"
+  },
+  "files": {
+    "source:LICENSE": "usr/share/licenses/dev.peios.gcsl/LICENSE",
+    "stage:licenses/**": "usr/share/licenses/dev.peios.gcsl/third-party",
+    "stage:usr/bin/**": "usr/bin",
+    "stage:usr/share/man/**": "usr/share/man"
+  },
+  "executables": [
+    "usr/bin/gcsl"
+  ]
+}
