@@ -30,6 +30,8 @@ pub fn diagnostics(source: &SourceFile, diagnostics: &[Diagnostic]) {
 /// diagnostic against the source `source_of` gives for the input it names
 /// (`None` for none), for diagnostics that do not all refer to one source:
 /// a REPL line's, an earlier line's, or a standard file's.
+///
+/// A stderr failure is ignored because there is nowhere left to report it.
 pub fn diagnostics_from<'a>(
     diagnostics: &[Diagnostic],
     source_of: impl Fn(Option<u32>) -> &'a SourceFile,

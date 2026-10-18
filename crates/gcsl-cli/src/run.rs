@@ -116,13 +116,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
+
 use gcsl::ast::Ast;
 use gcsl::lexer::TokenKind;
 use gcsl::strings::Quoted;
 use gcsl::workspace::{self, Workspace};
 use gcsl::{Diagnostic, SourceFile, Value, lexer, parser};
 use gcsl_disk::{Sources, find_workspace};
-
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
 /// Arguments of `gcsl run`.
@@ -285,33 +285,7 @@ fn syntax(
         return Err(Failure::Program(diagnostics));
     }
     if args.dump_tokens {
-        // Names by their text and string pieces by their quoted text, as in
-        // `Ident(x)`, `Label(outer)`, `Attribute(shadowable)` and
-        // `StrStart("a\n")`.
-        for token in &tokens {
-            let span = token.span;
-            match token.kind {
-                TokenKind::Ident(name) => writeln!(out, "Ident({}) @{span}", names.get(name))?,
-                TokenKind::Label(name) => writeln!(out, "Label({}) @{span}", names.get(name))?,
-                TokenKind::Attribute(name) => {
-                    writeln!(out, "Attribute({}) @{span}", names.get(name))?;
-                }
-                TokenKind::InnerAttribute(name) => {
-                    writeln!(out, "InnerAttribute({}) @{span}", names.get(name))?;
-                }
-                TokenKind::Str(id) => writeln!(out, "Str({}) @{span}", Quoted(strings.get(id)))?,
-                TokenKind::StrStart(id) => {
-                    writeln!(out, "StrStart({}) @{span}", Quoted(strings.get(id)))?;
-                }
-                TokenKind::StrMid(id) => {
-                    writeln!(out, "StrMid({}) @{span}", Quoted(strings.get(id)))?;
-                }
-                TokenKind::StrEnd(id) => {
-                    writeln!(out, "StrEnd({}) @{span}", Quoted(strings.get(id)))?;
-                }
-                kind => writeln!(out, "{kind:?} @{span}")?,
-            }
-        }
+        dump_tokens(&tokens, &names, &strings, out)?;
     }
     if last == Some(Stage::Tokens) {
         return Ok(None);
@@ -430,4 +404,41 @@ fn pipeline(
     output::diagnostics_in(shown, file, &outcome.warnings);
     print_value(&outcome.value, &mut out)?;
     Ok(out.flush()?)
+}
+
+/// Prints lexical tokens without losing the original names or string contents.
+fn dump_tokens(
+    tokens: &[gcsl::lexer::Token],
+    names: &gcsl::names::Names,
+    strings: &gcsl::strings::Strings,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    // Names by their text and string pieces by their quoted text, as in
+    // `Ident(x)`, `Label(outer)`, `Attribute(shadowable)` and
+    // `StrStart("a\n")`.
+    for token in tokens {
+        let span = token.span;
+        match token.kind {
+            TokenKind::Ident(name) => writeln!(out, "Ident({}) @{span}", names.get(name))?,
+            TokenKind::Label(name) => writeln!(out, "Label({}) @{span}", names.get(name))?,
+            TokenKind::Attribute(name) => {
+                writeln!(out, "Attribute({}) @{span}", names.get(name))?;
+            }
+            TokenKind::InnerAttribute(name) => {
+                writeln!(out, "InnerAttribute({}) @{span}", names.get(name))?;
+            }
+            TokenKind::Str(id) => writeln!(out, "Str({}) @{span}", Quoted(strings.get(id)))?,
+            TokenKind::StrStart(id) => {
+                writeln!(out, "StrStart({}) @{span}", Quoted(strings.get(id)))?;
+            }
+            TokenKind::StrMid(id) => {
+                writeln!(out, "StrMid({}) @{span}", Quoted(strings.get(id)))?;
+            }
+            TokenKind::StrEnd(id) => {
+                writeln!(out, "StrEnd({}) @{span}", Quoted(strings.get(id)))?;
+            }
+            kind => writeln!(out, "{kind:?} @{span}")?,
+        }
+    }
+    Ok(())
 }

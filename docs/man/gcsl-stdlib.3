@@ -1,0 +1,185 @@
+.TH GCSL-STDLIB 3 2026-10-18 "Peios gcsl 0.1.0"
+.SH NAME
+gcsl-stdlib \- GCSL standard functions and modules
+.SH SYNOPSIS
+.nf
+import path
+import fs
+import fileroot
+.fi
+.SH DESCRIPTION
+The standard library is embedded in GCSL.
+Each file implicitly imports the prelude through a shadowable import unless it begins with #![no_prelude].
+The path, fs, and fileroot modules require explicit imports.
+An import of builtins exposes the Rust-implemented functions directly.
+.PP
+Pure operations use : result signatures.
+Impure operations use -> result signatures and obey GCSL's present-or-future parameter rules.
+The signatures below describe the value shapes the operations consume and return.
+.SH PRELUDE
+.TP
+.B len(list): Int
+Return the number of list elements.
+This operation has special typing and is not a general first-class polymorphic function.
+.TP
+.B show(value): String
+Render a value as GCSL source, quoting strings and field names when needed.
+Values containing functions are not supported.
+Required futures are awaited under the normal purity rules.
+NaN and infinities cannot be rendered as source.
+An empty list still needs an expected type when its rendered text is read back.
+The minimum Int value's rendered digits do not form an accepted positive integer literal before unary negation.
+.TP
+.B int(x: Float): Int
+Truncate toward zero.
+NaN, infinity, and values outside the Int range fail.
+.TP
+.B float(x: Int): Float
+Convert to the nearest representable Float.
+.TP
+.B half(n: Int): Float
+Return float(n) divided by 2.0.
+.TP
+.B split(s: String, sep: String): List<String>
+Split at each occurrence of a nonempty separator, retaining empty pieces.
+An empty separator is an error.
+.TP
+.B join(parts: List<String>, sep: String): String
+Join strings with sep between adjacent parts; an empty list produces an empty string.
+.TP
+.B starts_with(s: String, prefix: String): Bool
+Test whether s starts with prefix, comparing bytes.
+.TP
+.B ends_with(s: String, suffix: String): Bool
+Test whether s ends with suffix, comparing bytes.
+.TP
+.B trim(s: String): String
+Remove leading and trailing Unicode whitespace.
+.TP
+.B strip_prefix(s: String, prefix: String): String
+Remove one matching prefix; otherwise return s unchanged.
+.TP
+.B strip_suffix(s: String, suffix: String): String
+Remove one matching suffix; otherwise return s unchanged.
+.TP
+.B lines(s: String): List<String>
+Split at LF, removing a CR immediately before it.
+A final line ending does not add an empty final element; an empty string produces an empty list.
+.TP
+.B fields(s: String): List<String>
+Split at runs of Unicode whitespace, omitting empty pieces.
+.TP
+.B compare_versions(a: String, b: String): Int
+Return -1, 0, or 1 in version order.
+Digit runs compare numerically without fixed-width parsing.
+For nondigits, tilde precedes the end of a run, then ASCII letters, then other bytes.
+Byte order breaks otherwise equal comparisons, so only identical strings compare equal.
+No epoch, revision, or filename-suffix processing is applied.
+.TP
+.B sort_versions(vs: List<String>): List<String>
+Return a stable ascending sort in compare_versions order, retaining duplicates.
+.SH PROCESS FUNCTIONS
+.TP
+.B exec(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+Run argv[0] with argv[1..] as literal arguments, without a shell.
+Search PATH if the program name contains no slash.
+Inherit the host working directory and environment and supply null standard input.
+Capture standard output and standard error in memory.
+Decode captured bytes as UTF-8, replacing invalid sequences.
+Return a nonzero exit status as data; a signal termination uses 128 plus the signal number.
+An empty argument list or failure to start the program is a runtime error.
+.TP
+.B exec_live(argv: List<String>) -> {status: Int, stdout: String, stderr: String}
+Run as exec does and also copy both output streams to GCSL standard error as complete lines arrive.
+A final unterminated line is copied at end of stream.
+Captured output is still retained in memory.
+.TP
+.B sh(script: String) -> String
+Run /bin/sh -c with script and return its raw standard output, including a trailing newline.
+A nonzero status fails the GCSL run with the script, status, and trimmed standard error.
+.TP
+.B sh_live(script: String) -> String
+Run as sh does with live output copying.
+A failure message omits standard error already copied to the terminal.
+.TP
+.B panic(message: String): Never
+Stop evaluation with a runtime diagnostic containing message.
+No result is returned.
+This pure operation can be called from a pure function.
+Never is the displayed internal nonreturning type; it cannot be written in a source annotation.
+.SH PATH MODULE
+These functions are pure, lexical operations on slash-separated paths.
+They do not access the filesystem or resolve symbolic links.
+.TP
+.B path.is_absolute(p: String): Bool
+Return whether p begins with a slash.
+.TP
+.B path.normalize(p: String): String
+Remove empty and dot segments and collapse a preceding ordinary segment for each parent segment.
+Retain unresolved leading parent segments in a relative path; do not ascend above an absolute root.
+The empty path becomes a dot.
+.TP
+.B path.join(base: String, rel: String): String
+Normalize rel if it is absolute or base is empty; otherwise join with a slash and normalize.
+.TP
+.B path.dirname(p: String): String
+Return the normalized path without its final segment.
+.TP
+.B path.basename(p: String): String
+Return the final normalized segment, or the normalized root or dot when there is none.
+.SH FILESYSTEM MODULE
+All fs operations are impure and require absolute paths, used as supplied without lexical normalization.
+An invalid path or operating-system failure ends the run with a diagnostic.
+.TP
+.B fs.exists(p: String) -> Bool
+Test existence, following symbolic links.
+A broken link returns false; inability to check is an error.
+.TP
+.B fs.read(p: String) -> String
+Read the file as UTF-8 text.
+Invalid UTF-8 is an error.
+.TP
+.B fs.mkdir(p: String) -> {}
+Create the directory and missing parents; an existing directory is accepted.
+.TP
+.B fs.copy(from: String, to: String) -> {}
+Copy one file's contents and permissions, replacing the destination file.
+The destination's parent directory must exist.
+.TP
+.B fs.write(p: String, contents: String) -> {}
+Write through a newly created adjacent temporary file and atomically replace p.
+The parent directory must exist.
+Replacement uses ordinary new-file permissions, 0666 reduced by the process umask, rather than preserving old permissions.
+A symbolic link at p is replaced, not followed.
+Failure removes the temporary file.
+.TP
+.B fs.temp_dir() -> String
+Create a distinct empty directory with mode 0700 and return its absolute path.
+The owning run, workspace, or session removes its temporary directories and contents when dropped.
+An embedding host can choose an absolute temporary root; that root itself is not removed.
+Process termination without normal cleanup can leave temporary directories behind.
+.SH FILEROOT MODULE
+These members identify source locations, not the subprocess working directory.
+.TP
+.B fileroot.this
+Absolute directory of the source file containing the expression.
+.TP
+.B fileroot.workspace
+Absolute root supplied for the workspace, or the standalone file's directory.
+A REPL uses its starting working directory.
+.TP
+.B fileroot.caller
+Absolute source directory of the running function's caller.
+.TP
+.B fileroot.helper()
+Make the running function pass its caller's source directory through to functions it calls.
+This supports helpers whose effects should be relative to the original calling source.
+Memoized functions account for a caller path when they read it.
+.SH SECURITY
+Process and filesystem operations use the embedding process's authority.
+Lexical path normalization is not a filesystem containment check.
+Shell strings are interpreted by /bin/sh; use exec arguments when input must remain literal.
+Captured output, read files, lists, and memoization can consume unbounded application memory.
+.SH SEE ALSO
+.BR gcsl (1),
+.BR gcsl (5)

@@ -22,9 +22,9 @@
 
 use std::ops::{Range, RangeInclusive};
 
-use gcsl::SourceFile;
 use lsp_types::TextEdit;
 
+use gcsl::SourceFile;
 use crate::position::{Encoding, LineIndex};
 
 /// The most lines added and removed that the diff looks for before it

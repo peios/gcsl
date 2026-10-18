@@ -1,1 +1,5 @@
 /target
+/bazel-*
+__pycache__/
+*.pyc
+/.ci-tools

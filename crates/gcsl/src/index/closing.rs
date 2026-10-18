@@ -11,9 +11,7 @@ use crate::parser;
 use crate::source::{SourceFile, Span};
 
 use super::complete::Tokens;
-use super::{
-    Completion, Highlight, Hover, Index, Indexed, InlayHint, Location, Prepared, Signature,
-};
+use super::{Completion, Highlight, Hover, Index, Indexed, InlayHint, Location, Prepared, Signature};
 
 /// A change made to a file's text virtually: the bytes at a place removed,
 /// and text put in their place.

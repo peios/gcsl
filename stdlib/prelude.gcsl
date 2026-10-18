@@ -6,9 +6,9 @@
 # it silently. It binds `builtins`' functions, but `fs`'s, for every file.
 # The bindings of `len` and `show` are the ALIAS RULE's, which is TEMPORARY:
 # neither has a type a GCSL type can write yet, so a name bound directly to
-# one is that built-in, called by the checker's rule (to be replaced when
-# built-ins get real polymorphic types, R11 and R3 of
-# docs/INFERENCE_REQS.md). `int`, `float`, `exec`, `exec_live`, `panic`, the
+# one is that built-in, called by the checker's rule. Generic and call limits:
+# docs/learn/gcsl.product/2--language.topic/900--inference-limits.md.
+# `int`, `float`, `exec`, `exec_live`, `panic`, the
 # string built-ins, `compare_versions` and `sort_versions` are ordinary:
 # values of their function types. `sh` runs a shell command with `exec`, and
 # panics unless it succeeds; `sh_live` does the same with `exec_live`. Like

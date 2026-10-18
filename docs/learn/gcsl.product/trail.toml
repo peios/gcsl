@@ -1,0 +1,4 @@
+title = "GCSL"
+monogram = "Gc"
+color = "#2563eb"
+description = "A statically typed language for configuration and scripting."
