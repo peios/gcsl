@@ -33,6 +33,12 @@ to the session. Effects already performed outside the interpreter are not
 rolled back. A file written or a subprocess started before an error still
 requires the host's ordinary handling.
 
+A workspace remembers the first runtime failure of each file. A later
+request that needs that file receives the original diagnostic without
+rerunning its effects or starting dependent files. Successful prior files
+keep their values, and unrelated files can still run. Create a new
+workspace object when you intentionally need to retry evaluation.
+
 ## Resource limits
 
 The parser's maximum expression depth is `gcsl::MAX_DEPTH`, 10,000 levels.

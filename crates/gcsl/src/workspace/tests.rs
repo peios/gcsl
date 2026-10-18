@@ -259,7 +259,7 @@ fn assert_imports_stored(workspace: &Workspace) {
             }
             let owners = scan.target_files(target);
             let stored = owners.iter().any(|&owner| {
-                let Some(Some(ir)) = workspace.irs.get(owner as usize) else {
+                let Some(FileRun::Pending(ir)) = workspace.runs.get(owner as usize) else {
                     return false;
                 };
                 let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
@@ -282,7 +282,7 @@ fn assert_imports_stored(workspace: &Workspace) {
 /// The slots the top-level block of file `file` of `workspace` stores,
 /// in order.
 fn top_stores(workspace: &Workspace, file: u32) -> Vec<Slot> {
-    let Some(Some(ir)) = workspace.irs.get(file as usize) else {
+    let Some(FileRun::Pending(ir)) = workspace.runs.get(file as usize) else {
         return Vec::new();
     };
     let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
@@ -344,7 +344,7 @@ fn assert_assemblies_stored(workspace: &Workspace) {
                 );
             }
         }
-        let Some(Some(ir)) = workspace.irs.get(index as usize) else {
+        let Some(FileRun::Pending(ir)) = workspace.runs.get(index as usize) else {
             continue;
         };
         let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
@@ -1311,7 +1311,9 @@ fn checked(files: &[(&str, &str)]) -> Workspace {
 /// of `workspace` stores a record: one assembled as the file starts.
 fn assembled_first(workspace: &Workspace, path: &str) -> bool {
     let index = workspace.file(path).unwrap();
-    let ir = workspace.irs[index as usize].as_ref().unwrap();
+    let FileRun::Pending(ir) = &workspace.runs[index as usize] else {
+        panic!("expected pending IR for file {index}");
+    };
     let IrKind::Block { items, .. } = ir.get(ir.root()).kind else {
         panic!("expected a block")
     };
@@ -4078,8 +4080,11 @@ fn temp_dir_in_a_run_without_an_owner_is_an_internal_error() {
     for file in 0..count(loaded.len()) {
         workspace.run(file).unwrap();
     }
-    let ir = workspace.irs[loaded.len()].take().unwrap();
-    let ir = Rc::new(ir);
+    let FileRun::Pending(ir) = mem::replace(&mut workspace.runs[loaded.len()], FileRun::Succeeded)
+    else {
+        panic!("expected pending IR for the lone file");
+    };
+    let ir = Rc::new(*ir);
     let size = ir.frame_size() as usize;
     workspace
         .frame
@@ -5704,7 +5709,9 @@ fn the_fileroot_summary_runs_in_a_workspace() {
         (test, "/scratch/fileroot/pkg"),
         (lib, "/scratch/fileroot/_lib"),
     ] {
-        let ir = workspace.irs[file as usize].as_ref().unwrap();
+        let FileRun::Pending(ir) = &workspace.runs[file as usize] else {
+            panic!("expected pending IR for file {file}");
+        };
         assert_eq!(dirs[ir.dir() as usize], dir);
     }
     // The same, run from a file of the root itself.
@@ -11355,4 +11362,55 @@ fn a_name_of_the_view_is_suggested() {
         suggestion_of(&files, "the meta of `info dev` has no field `pieos`"),
         Some("pieos -> peios".to_owned())
     );
+}
+
+#[test]
+fn a_failed_workspace_file_keeps_its_runtime_diagnostic() {
+    let sources = [SourceFile::new("main.gcsl", "1 // 0").unwrap()];
+    let mut workspace = check(&sources).unwrap();
+    let main = workspace.file("main.gcsl").unwrap();
+    let first = workspace.run(main).unwrap_err();
+    assert_eq!(first[0].message, "division by zero");
+    assert_eq!(first[0].input, Some(main));
+    assert_eq!(workspace.run(main).unwrap_err(), first);
+    assert_eq!(workspace.run(main).unwrap_err(), first);
+}
+
+#[test]
+fn failed_files_do_not_repeat_effects_or_run_dependents() {
+    let dir = fs_scratch("failed-workspace-file");
+    let marker = format!("{dir}/attempts");
+    let dependent_marker = format!("{dir}/dependent");
+    let failed = format!(
+        "import fs\n\
+         let recorded = fs.write({marker:?}, if fs.exists({marker:?}) {{\n\
+             fs.read({marker:?}) + \"x\"\n\
+         }} else {{ \"x\" }})\n\
+         answer = 1 // 0"
+    );
+    let dependent = format!(
+        "import fs\n\
+         let recorded = fs.write({dependent_marker:?}, \"ran\")\n\
+         = answer"
+    );
+    let sources = [
+        SourceFile::new("broken.gcsl", failed).unwrap(),
+        SourceFile::new("dependent.gcsl", dependent).unwrap(),
+        SourceFile::new("unrelated.gcsl", "= 42").unwrap(),
+    ];
+    let mut workspace = check(&sources).unwrap();
+    let broken = workspace.file("broken.gcsl").unwrap();
+    let dependent = workspace.file("dependent.gcsl").unwrap();
+    let unrelated = workspace.file("unrelated.gcsl").unwrap();
+    let first = workspace.run(broken).unwrap_err();
+    assert_eq!(first[0].message, "division by zero");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+    assert_eq!(workspace.run(broken).unwrap_err(), first);
+    assert_eq!(workspace.run(dependent).unwrap_err(), first);
+    assert_eq!(workspace.run(unrelated).unwrap().value, Value::Int(42));
+    assert_eq!(workspace.run(dependent).unwrap_err(), first);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+    assert!(!std::path::Path::new(&dependent_marker).exists());
+    drop(workspace);
+    std::fs::remove_dir_all(dir).unwrap();
 }

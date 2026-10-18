@@ -6446,6 +6446,16 @@ impl<'a> Context<'a> {
     }
 }
 
+/// A file runs at most once. A failed attempt must remain a failure for every
+/// later request that needs it, without repeating any of its earlier effects.
+/// Boxing keeps this state table compact after the large IR is released.
+#[derive(Debug)]
+enum FileRun {
+    Pending(Box<Ir>),
+    Succeeded,
+    Failed(Box<Diagnostic>),
+}
+
 /// A workspace checked and lowered, ready to run any of its files: driven
 /// like a [`crate::session::Session`], one frame and one memo table for
 /// every file, but with each file's declarations committed once it is
@@ -6455,8 +6465,8 @@ impl<'a> Context<'a> {
 pub struct Workspace {
     /// The scanned workspace.
     scan: Scan,
-    /// Each file's IR, by input number, until it runs.
-    irs: Vec<Option<Ir>>,
+    /// Each file's pending IR or completed outcome, by input number.
+    runs: Vec<FileRun>,
     /// The type of every expression of each file, by input number, for
     /// [`Workspace::dump_types`].
     checked: Vec<Option<Types>>,
@@ -6889,7 +6899,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         cell_tables(&scan, &mut types, &mut names);
     let mut slot_names: Vec<Name> = scan.cell_names();
     let mut scopes = vec![Committed::default(); scan.dirs.len()];
-    let mut irs: Vec<Option<Ir>> = (0..scan.files.len()).map(|_| None).collect();
+    let mut runs: Vec<FileRun> = (0..scan.files.len()).map(|_| FileRun::Succeeded).collect();
     let mut tails: Vec<(usize, Vec<Name>)> = vec![(0, Vec::new()); scan.files.len()];
     let mut checked: Vec<Option<Types>> = (0..scan.files.len()).map(|_| None).collect();
     let mut warnings = vec![Vec::new(); scan.files.len()];
@@ -6956,7 +6966,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         match result {
             Ok((mut ir, file_types, found)) => {
                 set(&mut tails, index, own_slot_names(&mut ir, &mut slot_names));
-                set(&mut irs, index, Some(ir));
+                set(&mut runs, index, FileRun::Pending(Box::new(ir)));
                 set(&mut checked, index, Some(file_types));
                 set(&mut warnings, index, in_file(found, index));
             }
@@ -6980,7 +6990,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         exec_result: exec_layout(&mut scan.names),
         temp_dirs: TempDirs::new(),
         scan,
-        irs,
+        runs,
         checked,
         warnings: warnings.into_iter().flatten().collect(),
         // The driver writes the built-in functions' cells, the first slots,
@@ -7380,7 +7390,9 @@ impl Workspace {
     /// prints it, until the file runs.
     #[must_use]
     pub fn dump_ir(&mut self, index: u32) -> Option<String> {
-        let ir = self.irs.get_mut(index as usize)?.as_mut()?;
+        let FileRun::Pending(ir) = self.runs.get_mut(index as usize)? else {
+            return None;
+        };
         // The names of the slots it committed, of which its frame is a
         // prefix, then its own temporaries'.
         let (committed, tail) = self.slot_tails.get(index as usize)?;
@@ -7406,7 +7418,9 @@ impl Workspace {
     /// # Errors
     ///
     /// The runtime error of the first file that fails, naming its file,
-    /// with the workspace's warnings.
+    /// with the workspace's warnings. A failed file retains its diagnostic:
+    /// later requests needing it return that error without running it or its
+    /// dependents again. Requests for unrelated files can still run.
     pub fn run(&mut self, index: u32) -> Result<Outcome, Vec<Diagnostic>> {
         self.run_needed(index)?;
         Ok(Outcome {
@@ -7427,8 +7441,17 @@ impl Workspace {
     /// As [`Workspace::run`].
     fn run_needed(&mut self, index: u32) -> Result<(), Vec<Diagnostic>> {
         for at in self.scan.needed(index) {
-            let Some(mut ir) = self.irs.get_mut(at as usize).and_then(Option::take) else {
+            let Some(state) = self.runs.get_mut(at as usize) else {
                 continue;
+            };
+            let mut ir = match mem::replace(state, FileRun::Succeeded) {
+                FileRun::Pending(ir) => ir,
+                FileRun::Succeeded => continue,
+                FileRun::Failed(error) => {
+                    let diagnostic = (*error).clone();
+                    *state = FileRun::Failed(error);
+                    return Err(merge_files(vec![diagnostic], self.warnings.clone()));
+                }
             };
             // The slots of the files run before it, which may end after its
             // own, are kept (see [`Ir::reserve_frame`]).
@@ -7439,7 +7462,7 @@ impl Workspace {
                 &self.scan.dir_texts[..],
                 &self.temp_dirs,
             );
-            match session::run_input(ir, &mut self.frame, context) {
+            match session::run_input(*ir, &mut self.frame, context) {
                 Ok(value) => {
                     if let Some(entry) = self.values.get_mut(at as usize) {
                         *entry = value;
@@ -7447,6 +7470,7 @@ impl Workspace {
                 }
                 Err(mut error) => {
                     error.input.get_or_insert(at);
+                    *state = FileRun::Failed(Box::new(error.clone()));
                     return Err(merge_files(vec![error], self.warnings.clone()));
                 }
             }
