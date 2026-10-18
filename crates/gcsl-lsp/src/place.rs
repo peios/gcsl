@@ -32,7 +32,8 @@ fn kept(byte: u8) -> bool {
 
 /// The path a `file:` URI names, percent-decoded: `file:///a/b%20c.gcsl` is
 /// `/a/b c.gcsl`, `file://localhost/a` is `/a`. `None` for a URI of
-/// another scheme, or whose path is not UTF-8 once decoded.
+/// another scheme, a remote authority, or whose decoded path is relative
+/// or not UTF-8. Only empty and `localhost` authorities name local files.
 #[must_use]
 pub fn path_of(uri: &Uri) -> Option<PathBuf> {
     let text = uri.as_str();
@@ -43,7 +44,13 @@ pub fn path_of(uri: &Uri) -> Option<PathBuf> {
     let rest = text.get(5..)?;
     // An authority, empty or `localhost`, before the path.
     let path = match rest.strip_prefix("//") {
-        Some(authority) => authority.get(authority.find('/')?..)?,
+        Some(rest) => {
+            let (authority, path) = rest.split_at(rest.find('/')?);
+            if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+                return None;
+            }
+            path
+        }
         None => rest,
     };
     let path = path.split(['?', '#']).next()?;
@@ -58,7 +65,8 @@ pub fn path_of(uri: &Uri) -> Option<PathBuf> {
             bytes.push(byte);
         }
     }
-    String::from_utf8(bytes).ok().map(PathBuf::from)
+    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 /// The value of the hexadecimal digit `digit`.
@@ -170,5 +178,33 @@ mod tests {
         assert_eq!(path_of(&other).unwrap(), Path::new("/tmp/a dir/(x)é.gcsl"));
         let untitled: Uri = "untitled:Untitled-1".parse().unwrap();
         assert_eq!(path_of(&untitled), None);
+    }
+
+    #[test]
+    fn only_local_absolute_file_uris_name_files() {
+        for text in [
+            "file://remote.example/tmp/app.gcsl",
+            "file://user@localhost/tmp/app.gcsl",
+            "file://localhost:80/tmp/app.gcsl",
+            "file:relative.gcsl",
+        ] {
+            let uri: Uri = text.parse().unwrap();
+            assert_eq!(path_of(&uri), None, "{text}");
+            assert_eq!(locate(&uri), Place::Lone { path: None }, "{text}");
+        }
+        for text in [
+            "file:///tmp/app.gcsl",
+            "file:/tmp/app.gcsl",
+            "FILE://LOCALHOST/tmp/app.gcsl",
+        ] {
+            let uri: Uri = text.parse().unwrap();
+            assert_eq!(
+                path_of(&uri),
+                Some(PathBuf::from("/tmp/app.gcsl")),
+                "{text}"
+            );
+        }
+        let non_utf8: Uri = "file:///tmp/%FF.gcsl".parse().unwrap();
+        assert_eq!(path_of(&non_utf8), None);
     }
 }

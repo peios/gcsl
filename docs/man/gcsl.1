@@ -67,6 +67,8 @@ It provides diagnostics, hover, definitions, references, highlights, checked ren
 Positions use UTF-8 when the client offers it; otherwise they use UTF-16.
 Rename does not rename files, directories, built-ins, or standard-library declarations.
 Formatting uses GCSL's fixed style and ignores client formatting preferences.
+Only file URIs with an empty or localhost authority and an absolute decoded path are mapped to local files.
+Other document URIs are handled as standalone documents.
 .PP
 Send shutdown before exit for a clean protocol shutdown.
 .SS REPL

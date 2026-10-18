@@ -31,6 +31,10 @@ them. Standard-library, file, and directory identities are not editable
 through that operation. Formatting returns edits from the language's
 formatter rather than applying the editor's formatting preferences.
 
+Only local `file:` document URIs with an empty or `localhost` authority
+and an absolute decoded path map to disk files. Other URI forms are
+checked as standalone documents, not treated as local workspace paths.
+
 ## Formatter
 
 The formatter works from tokens, comments, and parsed structure. It does
