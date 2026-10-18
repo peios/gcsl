@@ -54,6 +54,8 @@ The path \- reads standard input and writes formatted source to standard output;
 A lexical or syntax error leaves that file unchanged and does not prevent formatting other files.
 Type errors do not prevent formatting.
 An unchanged file keeps its modification time.
+Changed files are replaced through a newly created adjacent temporary file with the original permissions.
+Temporary-name collisions are skipped without modifying the colliding file.
 A symbolic-link file argument updates its target and preserves the link.
 Line endings become LF.
 .SS lsp

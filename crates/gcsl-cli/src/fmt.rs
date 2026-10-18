@@ -14,8 +14,9 @@
 //!
 //! A file is written only if formatting changes it, so a formatted file
 //! keeps its modification time, and then atomically: the text goes to a
-//! temporary file beside it, `.NAME.fmt-PID`, which a workspace's listing
-//! leaves out, with the file's permissions, which is then renamed over it.
+//! exclusively created temporary file beside it, `.NAME.fmt-PID` (with a
+//! numeric suffix on collision), which a workspace's listing leaves out,
+//! with the file's permissions, which is then renamed over it.
 //! For a symbolic link, the file it leads to is written, and the link kept.
 //! A file whose line breaks are `\r\n` is written with `\n`. A file with a
 //! lexical or syntax error is left alone, its errors shown, and the others
@@ -28,13 +29,14 @@
 //! would change; else 0.
 
 use std::fs;
+use std::os::unix::fs::OpenOptionsExt;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Args;
-use gcsl::SourceFile;
 
+use gcsl::SourceFile;
 use crate::{EXIT_PROGRAM_ERROR, EXIT_USAGE_OR_IO, output};
 
 /// Arguments of `gcsl fmt`.
@@ -208,21 +210,65 @@ fn file(shown: &str, path: &Path, check: bool) -> Outcome {
 /// beside it, with its permissions, renamed over it. A symbolic link is
 /// followed, and the file it leads to written, so that the link stays one.
 fn write_atomically(path: &Path, text: &str) -> io::Result<()> {
-    let path = &fs::canonicalize(path)?;
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = path.with_file_name(format!(".{name}.fmt-{}", std::process::id()));
-    let written = fs::metadata(path).and_then(|metadata| {
-        fs::write(&temporary, text)?;
-        fs::set_permissions(&temporary, metadata.permissions())?;
-        fs::rename(&temporary, path)
-    });
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let path = fs::canonicalize(path)?;
+    let permissions = fs::metadata(&path)?.permissions();
+    let mut temporary = TemporaryFile::beside(&path)?;
+    temporary.file.write_all(text.as_bytes())?;
+    temporary.file.set_permissions(permissions)?;
+    fs::rename(&temporary.path, path)?;
+    temporary.pending = false;
+    Ok(())
+}
+
+/// Owns only a temporary file successfully created by this process.
+struct TemporaryFile {
+    path: PathBuf,
+    file: fs::File,
+    pending: bool,
+}
+
+impl TemporaryFile {
+    fn beside(path: &Path) -> io::Result<Self> {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let base = format!(".{name}.fmt-{}", std::process::id());
+        let mut attempt = 0_u64;
+        loop {
+            let name = if attempt == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{attempt}")
+            };
+            let path = path.with_file_name(name);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file,
+                        pending: true,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    attempt = attempt.checked_add(1).ok_or(error)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
-    written
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        // The source is unchanged on failure, or already renamed on success.
+        // Cleanup is best effort; do not obscure the original write/rename error.
+        if self.pending {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Formats standard input to standard output, or with `check` writes
@@ -263,4 +309,88 @@ fn stdin(check: bool) -> Outcome {
             output::error(format_args!("cannot write output: {error}"));
             Outcome::Broken
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("gcsl-fmt-{name}-{}", std::process::id()));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn collision(&self) -> PathBuf {
+            self.0
+                .join(format!(".source.gcsl.fmt-{}", std::process::id()))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Best effort cleanup must not hide a failed test assertion.
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_colliding_symlink_cannot_replace_an_unrelated_file() {
+        let scratch = Scratch::new("symlink-collision");
+        let source = scratch.0.join("source.gcsl");
+        let unrelated = scratch.0.join("unrelated.txt");
+        fs::write(&source, "x=1\n").unwrap();
+        fs::write(&unrelated, "keep me").unwrap();
+        symlink(&unrelated, scratch.collision()).unwrap();
+        write_atomically(&source, "x = 1\n").unwrap();
+        assert_eq!(fs::read_to_string(&unrelated).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "x = 1\n");
+        assert!(!source.is_symlink());
+        assert!(scratch.collision().is_symlink());
+    }
+
+    #[test]
+    fn a_colliding_regular_file_is_preserved() {
+        let scratch = Scratch::new("file-collision");
+        let source = scratch.0.join("source.gcsl");
+        fs::write(&source, "x=1\n").unwrap();
+        fs::write(scratch.collision(), "keep me").unwrap();
+        write_atomically(&source, "x = 1\n").unwrap();
+        assert_eq!(fs::read_to_string(scratch.collision()).unwrap(), "keep me");
+        assert_eq!(fs::read_to_string(source).unwrap(), "x = 1\n");
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn formatting_follows_the_source_symlink_and_preserves_permissions() {
+        let scratch = Scratch::new("source-link");
+        let source = scratch.0.join("source.gcsl");
+        let link = scratch.0.join("link.gcsl");
+        fs::write(&source, "x=1\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&source, &link).unwrap();
+        write_atomically(&link, "x = 1\n").unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(fs::read_to_string(source).unwrap(), "x = 1\n");
+        assert_eq!(
+            fs::metadata(link).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn a_failed_replacement_removes_only_its_owned_temporary_file() {
+        let scratch = Scratch::new("rename-error");
+        let source = scratch.0.join("source.gcsl");
+        fs::create_dir(&source).unwrap();
+        fs::write(scratch.collision(), "keep me").unwrap();
+        assert!(write_atomically(&source, "x = 1\n").is_err());
+        assert!(source.is_dir());
+        assert_eq!(fs::read_to_string(scratch.collision()).unwrap(), "keep me");
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 2);
+    }
 }
