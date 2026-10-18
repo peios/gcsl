@@ -1,12 +1,12 @@
 //! The interactive REPL: one input per line, sharing variables.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
-use gcsl::{Session, SourceFile, Value};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use gcsl::{Session, SourceFile, Value};
 use crate::{EXIT_USAGE_OR_IO, output};
 
 /// Name given to each REPL line in diagnostics.
@@ -52,8 +52,14 @@ pub fn main() -> ExitCode {
         }
     };
     let mut session = Session::new();
+    // Rustyline's unsupported-terminal fallback prints even for piped input.
+    let prompt = if io::stdin().is_terminal() {
+        PROMPT
+    } else {
+        ""
+    };
     loop {
-        match editor.readline(PROMPT) {
+        match editor.readline(prompt) {
             Ok(line) => {
                 if line.trim().is_empty() {
                     continue;

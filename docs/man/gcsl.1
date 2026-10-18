@@ -79,6 +79,7 @@ Errors are displayed and the session continues.
 A failed input does not commit its new bindings, but external effects already performed are not undone.
 Press Ctrl+C while entering a line to discard it and Ctrl+D to end input.
 History lasts for the session only.
+A prompt is shown only when standard input is a terminal; piped input receives no prompt.
 .SH OPTIONS
 .TP
 .BR -h , " --help"

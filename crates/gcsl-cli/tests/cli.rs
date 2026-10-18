@@ -4562,3 +4562,21 @@ fn check_prints_json_lines() {
     assert_eq!(stdout(&output).lines().count(), 1);
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn piped_repl_input_never_prints_terminal_prompts() {
+    for term in ["dumb", "xterm"] {
+        let mut child = Command::new(binary())
+            .env("TERM", term)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"1 + 1\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(stdout(&output), "2 : Int\n", "TERM={term}");
+        assert_eq!(stderr(&output), "", "TERM={term}");
+        assert!(output.status.success(), "TERM={term}");
+    }
+}
