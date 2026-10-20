@@ -1,4 +1,5 @@
 title = "GCSL"
 monogram = "Gc"
-color = "#2563eb"
+icon = "gcsl.svg"
+color = "#06b6d4"
 description = "A statically typed language for configuration and scripting."
