@@ -17,7 +17,7 @@ use gcsl::SourceFile;
 use gcsl::fmt::format;
 
 /// Jack's workspace of packages, read and never written.
-const NEWPKGS: &str = "/home/jack/projects/peios/newpkgs";
+const NEWPKGS: &str = "/home/jack/projects/peios-old/newpkgs";
 
 /// Every `.gcsl` file under `dir`, but in directories whose names start
 /// with `.` or are `target`.

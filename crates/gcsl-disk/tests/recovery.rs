@@ -31,7 +31,7 @@ use gcsl::workspace;
 use gcsl::{Diagnostic, SourceFile, Span, lexer, parser};
 
 /// Jack's workspace of packages, read and never written.
-const NEWPKGS: &str = "/home/jack/projects/peios/newpkgs";
+const NEWPKGS: &str = "/home/jack/projects/peios-old/newpkgs";
 
 /// The fastest of `runs` runs of `work`.
 fn fastest(runs: usize, mut work: impl FnMut()) -> Duration {
