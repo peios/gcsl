@@ -9,7 +9,7 @@ import textwrap
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parent.parent
-LEARN = REPOSITORY / "docs/learn/gcsl.product"
+LEARN = REPOSITORY / "docs/learn/2--developer-tools.shelf/gcsl.product"
 WORKSPACE_PAGE = "200--organizing-a-workspace.md"
 EXPECTED = {
     ("200--running-a-first-program.md", 0): "gcsl 0.1.0\n",
