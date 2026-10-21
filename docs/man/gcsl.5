@@ -128,6 +128,8 @@ Use parentheses to make a different grouping explicit.
 Use : for a pure result, -> for an impure result, and ->> for a memoized impure result.
 Pure functions cannot perform effects or await futures.
 The top level and lazy bodies are impure contexts.
+Outside a pure function, a call of an impure or memoized function may stand alone as a statement: it is awaited deeply, so that nothing it defers is lost, and its value is discarded.
+Any other statement whose value is not {} is an unused value, which is an error.
 Closures capture values when they are created.
 .PP
 Calls accept positional and named arguments, evaluated in source order.

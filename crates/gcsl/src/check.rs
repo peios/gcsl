@@ -1464,7 +1464,10 @@
 //! `List<Future<{}>>`, as `for s in steps { lazy run(s) }` is), is awaited
 //! there, at the top or deeply as its type needs (`Checker::measure`,
 //! `Checker::measure_deep`), subject to the purity rule, so that its
-//! effects are not lost; any other statement is an unused value. A
+//! effects are not lost. A call of a function or built-in that is not pure,
+//! outside a pure function, is run for its effects as a bare `await` is:
+//! awaited deeply, and its value, whatever it is, discarded
+//! ([`Resolution::is_discarded`]). Any other statement is an unused value. A
 //! statement that is directly the empty list literal, `[]`, is a
 //! `List<{}>`, whose element type needs no inferring.
 //!
@@ -3909,6 +3912,9 @@ pub struct Resolution {
     loops: Vec<LoopResolution>,
     /// The labelled blocks that some `return` leaves, by their ids.
     returned_blocks: HashSet<ExprId>,
+    /// The statements whose values are discarded, by their ids: calls of a
+    /// function that is not pure, outside a pure function.
+    discarded: HashSet<ExprId>,
     /// What was decided for each `is` and `as` expression, by its id; only
     /// a program that has one has entries.
     tests: HashMap<ExprId, TestResolution>,
@@ -4200,6 +4206,14 @@ impl Resolution {
         self.returned_blocks.contains(&id)
     }
 
+    /// Whether the statement `id` is a call of a function that is not pure
+    /// whose value, whatever it is, is discarded once awaited, as a bare
+    /// `await`'s is.
+    #[must_use]
+    pub fn is_discarded(&self, id: ExprId) -> bool {
+        self.discarded.contains(&id)
+    }
+
     /// What was decided for the `is` or `as` expression `id`: its test's
     /// plan, and where an `is` that narrows stores the value it tests, or
     /// how an `as` names what it tests. `None` for any other expression.
@@ -4297,6 +4311,7 @@ impl Resolution {
             jumps: vec![None; items],
             loops: Vec::new(),
             returned_blocks: HashSet::new(),
+            discarded: HashSet::new(),
             tests: HashMap::new(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
@@ -5528,6 +5543,12 @@ pub struct Checker<'a> {
     /// The labelled blocks some `return` leaves: see
     /// [`Resolution::is_returned_block`].
     returned_blocks: HashSet<ExprId>,
+    /// The calls of a function or built-in that is not pure, by their ids,
+    /// which a statement may discard the value of.
+    impure_calls: HashSet<ExprId>,
+    /// The statements whose values are discarded: see
+    /// [`Resolution::is_discarded`].
+    discarded: HashSet<ExprId>,
     /// The values of the `return`s for each labelled block that has any,
     /// by the block's id, which an untyped integer pushed into the block
     /// reaches as it reaches the block's result (see
@@ -5838,6 +5859,8 @@ impl<'a> Checker<'a> {
             loops: Vec::new(),
             loop_resolutions: vec![LoopResolution::default(); ast.for_count()],
             returned_blocks: HashSet::new(),
+            impure_calls: HashSet::new(),
+            discarded: HashSet::new(),
             block_returns: HashMap::new(),
             unreached_path: false,
             bindings: scope.bindings,
@@ -6039,6 +6062,7 @@ impl<'a> Checker<'a> {
                 jumps: self.jumps,
                 loops: self.loop_resolutions,
                 returned_blocks: self.returned_blocks,
+                discarded: self.discarded,
                 tests: self.tests,
                 meta_reads: self.meta_reads,
                 metas: self.metas,
@@ -6595,8 +6619,11 @@ impl<'a> Checker<'a> {
     /// unit-like as it is needs nothing; one that is unit-like once awaited,
     /// at the top as a `Future<{}>` is or deeply as a `List<Future<{}>>`
     /// is, is awaited here, so that its effects are not lost, subject to
-    /// the purity rule, a parameter of this function being measured; and
-    /// any other is an unused value.
+    /// the purity rule, a parameter of this function being measured. A call
+    /// of a function that is not pure, outside a pure function, is run for
+    /// its effects, as a bare `await` is: it is awaited deeply, so that no
+    /// effect it defers is lost, and its value discarded, whatever it is.
+    /// Any other is an unused value.
     fn check_statement(&mut self, value: ExprId, ty: TyId) {
         if self.is_await(value) {
             self.settle(value, ty);
@@ -6612,6 +6639,15 @@ impl<'a> Checker<'a> {
         let present = self.types.present(ty);
         if self.types.is_unit_like(present) {
             self.measure_deep(value, ty);
+        } else if self.impure_calls.contains(&value)
+            && self
+                .functions
+                .last()
+                .is_none_or(|function| function.effect != Effect::Pure)
+        {
+            // In a pure function the call is an error already.
+            self.measure_deep(value, ty);
+            self.discarded.insert(value);
         } else {
             self.unused_value(value, ty);
         }
@@ -15107,6 +15143,9 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         };
         let erroneous = self.bind_arguments(id, (callee, callee_ty, callback), args, &sig);
+        if sig.effect != Effect::Pure {
+            self.impure_calls.insert(id);
+        }
         if let Some(function) = self.functions.last()
             && function.effect == Effect::Pure
             && sig.effect != Effect::Pure
@@ -15174,6 +15213,9 @@ impl<'a> Checker<'a> {
                 TyId::ERROR
             }
         };
+        if builtin.effect() != Effect::Pure {
+            self.impure_calls.insert(id);
+        }
         if let Some(function) = self.functions.last()
             && function.effect == Effect::Pure
             && builtin.effect() != Effect::Pure

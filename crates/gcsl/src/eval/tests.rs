@@ -216,6 +216,24 @@ fn a_top_level_field_is_computed_once_with_its_effects_at_its_point() {
     }
 }
 
+#[test]
+fn a_discarded_call_runs_with_what_it_defers() {
+    // The call runs where it stands, failing here before the result.
+    let index = run("[1][5]").unwrap_err().message;
+    for text in [
+        "fn boom() -> Int { [1][5] }\nboom()\nx = 1",
+        "fn boom() -> Int { [1][5] }\nfn f() -> Int {\n    boom()\n    = 1\n}\nx = f()",
+        // What it defers runs too, rather than being lost with its value.
+        "fn later() -> Int { = lazy [1][5] }\nlater()\nx = 1",
+    ] {
+        assert_eq!(run(text).unwrap_err().message, index, "{text}");
+    }
+    assert_eq!(
+        int("fn one() -> Int { 1 }\nfn f() -> Int {\n    one()\n    = 2\n}\nf()"),
+        2
+    );
+}
+
 fn boolean(text: &str) -> bool {
     match run(text).unwrap() {
         Value::Bool(value) => value,

@@ -787,6 +787,34 @@ fn unused_values() {
 }
 
 #[test]
+fn a_call_that_is_not_pure_may_discard_its_value() {
+    for text in [
+        "fn one() -> Int { 1 }\none()\n2",
+        "fn one() -> Int { 1 }\nfn f() -> Int {\n    one()\n    = 2\n}\nf()",
+        "fn one() ->> Int { 1 }\none()\n2",
+        "let one = fn() -> Int { 1 }\none()\n2",
+        "fn later() -> Int { = lazy 1 }\nlater()\n2",
+        "sh(\"true\")\n2",
+    ] {
+        assert_eq!(result_type(text), TyId::INT, "{text}");
+        assert_eq!(warnings(text).len(), 0, "{text}");
+    }
+    // A pure call's value is unused, as any pure value is.
+    assert_eq!(
+        messages("fn one(): Int { 1 }\none()\n2"),
+        vec!["unused value of type Int"]
+    );
+    // In a pure function the call is an error, and its value unused.
+    assert_eq!(
+        messages("fn one() -> Int { 1 }\nfn f(): Int {\n    one()\n    = 2\n}\nf()"),
+        vec![
+            "cannot call an impure function from a pure function",
+            "unused value of type Int"
+        ]
+    );
+}
+
+#[test]
 fn the_result_must_be_the_last_item() {
     let diagnostic = &diagnostics("= 1\nlet y = 2")[0];
     assert_eq!(

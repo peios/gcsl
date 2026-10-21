@@ -35,6 +35,25 @@ Defaults are constants. Positional and named arguments are evaluated in
 source order. A trailing block supplies the last parameter, which is
 useful for functions that accept a configuration record.
 
+## Calling for effects
+
+A call to an impure or memoized function can stand alone as a statement,
+outside a pure function, to run it for its effects. Its value is
+discarded, whatever it is, and anything it defers is awaited first, so no
+effect is lost:
+
+```gcsl
+fn build(source: String) -> String {
+    sh("make -C {source}")
+    sh("make -C {source} install")
+    = source
+}
+```
+
+Any other value standing alone is an error, because discarding it would
+do nothing: a pure expression has no effects to keep. Make it the block's
+result with `= ...`, bind it with `let`, or remove it.
+
 ## Captures and recursion
 
 Closures hold copies of the values they capture. Rebinding a variable
