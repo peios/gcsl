@@ -231,7 +231,10 @@
 //! each as it is used, the body wrapped in an `Await` where the checker
 //! marked it to fit the element type expected of the `for`. A statement,
 //! an expression item that is not its block's result, is `{}` or a
-//! unit-like list (see [`crate::check`]); a `for` statement whose type is
+//! unit-like list (see [`crate::check`]), unless it is a bare `await` or a
+//! call the checker discards
+//! ([`crate::check::Resolution::is_discarded`]), whose value, whatever it
+//! is, is evaluated and dropped; a `for` statement whose type is
 //! unit-like as it is, through any parentheses, discards its body's values
 //! instead of collecting them, since its list would be dropped as soon as
 //! it was built, and any other list statement is evaluated and dropped.
@@ -836,10 +839,11 @@ impl Lowerer<'_> {
                 }
                 ItemKind::Expr(value) => {
                     // Evaluated for effect only, so it must be `{}` or a
-                    // unit-like list, unless it is a bare `await`, whose
-                    // value is discarded whatever it is. A unit-like `for`
-                    // discards its body's values rather than build a list.
-                    let statement = if self.is_await(value) {
+                    // unit-like list, unless it is a bare `await` or a call
+                    // the checker discards, whose value is discarded
+                    // whatever it is. A unit-like `for` discards its body's
+                    // values rather than build a list.
+                    let statement = if self.is_await(value) || self.resolution.is_discarded(value) {
                         self.lower_expr(value)?
                     } else if let Some((for_id, span)) = self.discarded_for(value) {
                         let kind = self.kind(value)?;
