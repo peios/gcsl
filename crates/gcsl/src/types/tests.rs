@@ -25,10 +25,10 @@ fn the_constants_are_pre_interned_in_order() {
 
 #[test]
 fn a_kind_is_small() {
-    // A record type's defaults are behind a thin pointer, which a
-    // record type without any, nearly every one, leaves null: so a
-    // record type is 24 bytes, and a kind no larger than before, a
-    // function type's signature being the largest.
+    // A record type's defaults and rest-field are behind a thin
+    // pointer, which a record type with neither, nearly every one,
+    // leaves null: so a record type is 24 bytes, and a kind no larger
+    // than before, a function type's signature being the largest.
     assert_eq!(size_of::<RecordTy>(), 24);
     assert_eq!(size_of::<TyKind>(), 32);
 }
@@ -179,7 +179,7 @@ fn interning_is_by_structure() {
     assert_eq!(
         table.intern(TyKind::Record(RecordTy {
             fields: Box::new([(b, TyId::STRING), (a, TyId::INT)]),
-            defaults: None,
+            extras: None,
         })),
         ab
     );
@@ -2016,4 +2016,172 @@ fn a_meta_s_provisional_types_are_settled() {
         settled,
         with_meta(&mut table, Effect::Pure, Some((Effect::Pure, present)))
     );
+}
+
+/// The record type of `fields` with the rest-field `rest`.
+fn with_rest(table: &mut TypeTable, fields: &[(Name, TyId)], rest: TyId) -> TyId {
+    table.record_with_rest(fields.iter().copied(), Some(rest), Vec::new())
+}
+
+#[test]
+fn a_rest_field_is_part_of_the_type_and_shown_after_the_named_fields() {
+    let (mut table, names, [a, b, _]) = setup();
+    let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+    let map = with_rest(&mut table, &[], TyId::STRING);
+    assert_eq!(show(&table, map), "{*: String}");
+    let file = with_rest(
+        &mut table,
+        &[(b, TyId::STRING), (a, TyId::STRING)],
+        TyId::INT,
+    );
+    assert_eq!(show(&table, file), "{a: String, b: String, *: Int}");
+    // Without it, or with another, it is another type.
+    let plain = table.record([(a, TyId::STRING), (b, TyId::STRING)]);
+    assert_ne!(file, plain);
+    assert_ne!(map, TyId::EMPTY);
+    assert_ne!(map, with_rest(&mut table, &[], TyId::INT));
+    assert_eq!(table.record_rest(file), Some(TyId::INT));
+    assert_eq!(table.record_rest(plain), None);
+    let again = with_rest(&mut table, &[], TyId::STRING);
+    assert!(table.same(map, again));
+    assert!(!table.same(map, TyId::EMPTY));
+}
+
+#[test]
+fn a_named_field_is_exempt_from_the_rest_field() {
+    let (mut table, _, [a, b, _]) = setup();
+    let file = with_rest(&mut table, &[(a, TyId::STRING)], TyId::INT);
+    assert_eq!(table.field(file, a), Some(TyId::STRING));
+    assert_eq!(table.field(file, b), None);
+    assert_eq!(table.field_or_rest(file, a), Some(TyId::STRING));
+    assert_eq!(table.field_or_rest(file, b), Some(TyId::INT));
+    // A field set by a functional update is named, and the rest-field
+    // stays.
+    let updated = table.with_field(file, b, TyId::BOOL).unwrap();
+    assert_eq!(table.field(updated, b), Some(TyId::BOOL));
+    assert_eq!(table.record_rest(updated), Some(TyId::INT));
+}
+
+#[test]
+fn only_a_type_that_says_what_its_other_fields_are_fits_a_rest_field() {
+    let (mut table, _, [a, b, _]) = setup();
+    let ints = with_rest(&mut table, &[], TyId::INT);
+    let a_int = table.record([(a, TyId::INT)]);
+    // A type without a rest-field says nothing of the fields it hides.
+    assert!(!table.is_subtype(a_int, ints));
+    assert!(!table.is_subtype(TyId::EMPTY, ints));
+    // One with a rest-field fits if it and every field the other does not
+    // name fit.
+    let a_int_ints = with_rest(&mut table, &[(a, TyId::INT)], TyId::INT);
+    assert!(table.is_subtype(a_int_ints, ints));
+    let a_string_ints = with_rest(&mut table, &[(a, TyId::STRING)], TyId::INT);
+    assert!(!table.is_subtype(a_string_ints, ints));
+    let strings = with_rest(&mut table, &[], TyId::STRING);
+    assert!(!table.is_subtype(strings, ints));
+    // A named field required must be named, and fit as ever.
+    let a_string = with_rest(&mut table, &[(a, TyId::STRING)], TyId::INT);
+    assert!(table.is_subtype(a_string_ints, a_string));
+    assert!(!table.is_subtype(ints, a_string));
+    // The rest-field is covariant, and forgotten where none is required.
+    let union = table.union([TyId::INT, TyId::STRING]);
+    let either = with_rest(&mut table, &[], union);
+    assert!(table.is_subtype(ints, either));
+    assert!(!table.is_subtype(either, ints));
+    assert!(table.is_subtype(a_int_ints, a_int));
+    assert!(table.is_subtype(ints, TyId::EMPTY));
+    // A named field the subtype has beyond the required ones is held to
+    // the required rest-field.
+    let b_string = with_rest(&mut table, &[(b, TyId::STRING)], TyId::STRING);
+    let only_strings = with_rest(&mut table, &[], TyId::STRING);
+    assert!(table.is_subtype(b_string, only_strings));
+    assert!(!table.is_subtype(b_string, ints));
+}
+
+#[test]
+fn the_join_of_two_rest_fields_covers_the_fields_it_no_longer_names() {
+    let (mut table, names, [a, b, c]) = setup();
+    let show = |table: &TypeTable, id| table.display(id, &names).to_string();
+    let left = with_rest(&mut table, &[(a, TyId::INT), (b, TyId::STRING)], TyId::INT);
+    let right = with_rest(&mut table, &[(a, TyId::INT), (c, TyId::BOOL)], TyId::INT);
+    let (joined, widened) = table.join(left, right);
+    assert_eq!(show(&table, joined), "{a: Int, *: Int | Bool | String}");
+    assert!(widened);
+    assert!(table.is_subtype(left, joined));
+    assert!(table.is_subtype(right, joined));
+    // One side without a rest-field: the join has none.
+    let plain = table.record([(a, TyId::INT)]);
+    let (joined, widened) = table.join(left, plain);
+    assert_eq!(show(&table, joined), "{a: Int}");
+    assert!(!widened);
+    // Two maps of one type join to it.
+    let ints = with_rest(&mut table, &[], TyId::INT);
+    let more = with_rest(&mut table, &[], TyId::INT);
+    assert_eq!(table.join(ints, more), (ints, false));
+}
+
+#[test]
+fn a_field_one_side_names_overlaps_the_other_s_rest_field() {
+    let (mut table, _, [a, _, _]) = setup();
+    let ints = with_rest(&mut table, &[], TyId::INT);
+    let a_string = table.record([(a, TyId::STRING)]);
+    let a_int = table.record([(a, TyId::INT)]);
+    // Both ways round.
+    assert!(!table.overlaps(a_string, ints));
+    assert!(!table.overlaps(ints, a_string));
+    assert!(table.overlaps(a_int, ints));
+    assert!(table.overlaps(ints, a_int));
+    // Two maps hold at least the empty record in common.
+    let strings = with_rest(&mut table, &[], TyId::STRING);
+    assert!(table.overlaps(ints, strings));
+}
+
+#[test]
+fn a_test_of_a_rest_field_tests_the_fields_the_type_does_not_name() {
+    let (mut table, _, [a, b, _]) = setup();
+    let ints = with_rest(&mut table, &[], TyId::INT);
+    let rest_ints = ValueTest::RecordRest {
+        fields: Box::default(),
+        named: Box::default(),
+        rest: Box::new(ValueTest::Kind(ValueKind::Int)),
+    };
+    // Of any value, or of a record type that hides its other fields.
+    assert_eq!(table.test_plan(None, ints), rest_ints);
+    let a_int = table.record([(a, TyId::INT)]);
+    assert_eq!(table.test_plan(Some(&[a_int]), ints), rest_ints);
+    // A type whose rest-field already fits passes.
+    let a_int_ints = with_rest(&mut table, &[(a, TyId::INT)], TyId::INT);
+    assert_eq!(table.test_plan(Some(&[a_int_ints]), ints), ValueTest::Pass);
+    // Named fields are tested by name and passed over by the rest-field's
+    // test, which looks only where the value's type leaves it in doubt.
+    let file = with_rest(&mut table, &[(a, TyId::STRING)], TyId::INT);
+    let union = table.union([TyId::INT, TyId::STRING]);
+    let mixed = with_rest(&mut table, &[(a, TyId::STRING), (b, union)], TyId::INT);
+    assert_eq!(
+        table.test_plan(Some(&[mixed]), file),
+        ValueTest::RecordRest {
+            fields: Box::default(),
+            named: Box::new([a]),
+            rest: Box::new(ValueTest::Kind(ValueKind::Int)),
+        }
+    );
+    assert!(table.test_plan(None, file).walks());
+}
+
+#[test]
+fn a_rest_field_is_settled_and_made_present_as_a_field_is() {
+    let (mut table, _, [a, _, _]) = setup();
+    let function = FnId::new(1);
+    let provisional = table.provisional(function, 0, TyId::INT);
+    let held = with_rest(&mut table, &[(a, TyId::STRING)], provisional);
+    assert!(table.contains_provisional(held, Some(function)));
+    let settled = table.settle(held, function, &[true]);
+    assert_eq!(
+        settled,
+        with_rest(&mut table, &[(a, TyId::STRING)], TyId::INT)
+    );
+    let lazy = table.future(TyId::INT);
+    let futures = with_rest(&mut table, &[], lazy);
+    assert!(table.contains_future(futures));
+    let present = table.present(futures);
+    assert_eq!(present, with_rest(&mut table, &[], TyId::INT));
 }

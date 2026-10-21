@@ -13753,3 +13753,141 @@ fn an_unknown_argument_suggests_a_parameter_no_other_argument_fills() {
         ("unknown argument `args`".to_owned(), fix("args -> argv"))
     );
 }
+
+#[test]
+fn a_record_literal_where_a_rest_field_is_expected_has_it() {
+    // Each field the type does not name is checked against the
+    // rest-field, and the record has it: no field is extra.
+    let text = "let m: {*: String} = {\"bin/*\" = \"bin/*\"; b = \"x\"}\nm";
+    assert_eq!(warnings(text), []);
+    assert_eq!(shown_result(text), "{*: String}");
+    let text = "let f: {to: String, *: Int} = {to = \"a\"; x = 1}\nf";
+    assert_eq!(shown_result(text), "{to: String, *: Int}");
+    // `{}`, and a literal that a block results in, an `if`'s branches, a
+    // list's elements, a loop's results and an argument alike.
+    for text in [
+        "let e: {*: Int} = {}\ne",
+        "let e: {*: Int} = { let x = 1; {a = x} }\ne",
+        "let e: {*: Int} = if true { {a = 1} } else { {} }\ne",
+        "let e: List<{*: Int}> = [{a = 1}, {}]\ne[0]",
+        "let e: List<{*: Int}> = for n in [1, 2] { {a = n} }\ne[0]",
+        "fn f(r: {*: Int}): {*: Int} { r }\nf({a = 1})",
+    ] {
+        assert_eq!(warnings(text), [], "{text}");
+        assert_eq!(shown_result(text), "{*: Int}", "{text}");
+    }
+    // A nested literal is checked against the rest-field as any field's
+    // value is.
+    let text = "let e: {*: {*: Int}} = {a = {b = 1}}\ne";
+    assert_eq!(warnings(text), []);
+    assert_eq!(shown_result(text), "{*: {*: Int}}");
+}
+
+#[test]
+fn a_field_a_rest_field_covers_must_fit_it() {
+    let found = diagnostics("let m: {*: String} = {a = \"x\"; b = 1}");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].message, "mismatched types");
+    assert_eq!(found[0].span, Span::new(35, 36));
+    assert_eq!(
+        found[0].label.as_deref(),
+        Some("expected String, found Int")
+    );
+    // An annotated field, and a spread's.
+    assert_eq!(
+        messages("let m: {*: String} = {a: Int = 1}"),
+        vec!["mismatched types"]
+    );
+    assert_eq!(
+        messages("let s = {a = 1}\nlet m: {*: String} = {...s}"),
+        vec!["mismatched types"]
+    );
+    // A named field is exempt.
+    assert_eq!(
+        warnings("let f: {to: String, *: Int} = {to = \"a\"}\nf"),
+        []
+    );
+    // A dotted path builds a record without one, which cannot have it.
+    let found = diagnostics("let m: {*: {*: Int}} = {a.b = 1}");
+    assert_eq!(found[0].message, "mismatched types");
+    assert_eq!(
+        found[0].label.as_deref(),
+        Some("expected {*: Int}, found {b: Int}")
+    );
+    assert_eq!(
+        found[0].notes,
+        vec![
+            "dotted paths build a record without a rest-field; define the field whole, as \
+             in `a = {...}`"
+        ]
+    );
+}
+
+#[test]
+fn a_value_whose_type_hides_fields_does_not_fit_a_rest_field() {
+    // `x` may hold fields its type does not show, of any type.
+    assert_eq!(
+        messages("let x = {a = 1}\nlet m: {*: Int} = x"),
+        vec!["mismatched types"]
+    );
+    assert_eq!(
+        messages("fn f(r: {*: Int}): Int { 1 }\nlet x = {a = 1}\nf(x)"),
+        vec!["mismatched types"]
+    );
+    // One whose type has a rest-field that fits does.
+    assert_eq!(
+        shown_result("let x: {a: Int, *: Int} = {a = 1}\nlet m: {*: Int} = x\nm"),
+        "{*: Int}"
+    );
+}
+
+#[test]
+fn rest_field_errors() {
+    assert_eq!(
+        errors("1 : {*: Int, a: Int, *: String}"),
+        vec![(
+            "the rest-field appears twice in this type".to_owned(),
+            Span::new(21, 22)
+        )]
+    );
+    // A spread defines the fields its operand's type names.
+    let found = diagnostics("let m: {*: Int} = {a = 1}\nlet c = {...m}");
+    assert_eq!(
+        found[0].message,
+        "cannot spread a value of type `{*: Int}`: it has a rest-field"
+    );
+    // A field the rest-field covers is not read by name.
+    let found = diagnostics("let m: {*: Int} = {a = 1}\nm.a");
+    assert_eq!(found[0].message, "no field `a` in `{*: Int}`");
+    assert_eq!(
+        found[0].notes,
+        vec!["a field that only the rest-field `*: ...` covers cannot be read by name"]
+    );
+    let found = diagnostics("let f: {to: String, *: Int} = {to = \"a\"}\nf.x");
+    assert_eq!(
+        found[0].notes,
+        vec![
+            "the only named field is `to`",
+            "a field that only the rest-field `*: ...` covers cannot be read by name"
+        ]
+    );
+    // A named field is read as ever.
+    assert_eq!(
+        shown_result("let f: {to: String, *: Int} = {to = \"a\"; x = 1}\nf.to"),
+        "String"
+    );
+}
+
+#[test]
+fn a_rest_field_s_fields_are_tested_by_is_and_as() {
+    // A record whose type hides its fields is tested at runtime; one that
+    // can never be one is an error, as for any type.
+    assert_eq!(
+        shown_result("let x = {a = 1}\nlet y: {} = x\ny as {*: Int}"),
+        "{*: Int}"
+    );
+    assert_eq!(
+        messages("let f: {to: String, *: Int} = {to = \"a\"}\nf is {*: Int}"),
+        vec!["`f` is never a `{*: Int}`"]
+    );
+}

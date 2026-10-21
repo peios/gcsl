@@ -77,6 +77,19 @@ A record literal checked against an expected type receives missing constant defa
 Defaults do not add fields to an already constructed value of another type.
 A value with additional record fields can satisfy a narrower expected shape; a literal's hidden extra fields produce a warning.
 .PP
+A rest-field, *: TYPE, gives the type of every field a record type does not name:
+.PP
+.nf
+    type File = {to: String, from: String, *: Int}
+    let files: {*: String} = {"bin/*" = "bin/*"}
+.fi
+.PP
+Named fields are exempt from the rest-field. A rest-field has no default, and a record type has at most one.
+A record literal checked against an expected type with a rest-field checks each field the type does not name against it, and has the rest-field.
+A value fits a rest-field only if its own type has one that fits, because a record keeps fields its static type hides.
+A field that only the rest-field covers cannot be read by name, and a value whose type has a rest-field cannot be spread.
+Typed equality, is, and as compare and test the fields a rest-field covers.
+.PP
 An empty list needs an expected element type.
 Function signatures declare parameter and result types.
 General type parameters, intersections, and a None value are not supported.

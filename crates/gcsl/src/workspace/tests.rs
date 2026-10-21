@@ -6831,6 +6831,69 @@ fn spread_problems_in_record_types() {
 }
 
 #[test]
+fn a_spread_of_a_record_type_carries_its_rest_field() {
+    let run = |text: &str| value(&[("workspace.gcsl", text)], "workspace.gcsl");
+    // A spread's rest-field joins the record type, softly, as its fields
+    // do: a later one replaces it.
+    assert_eq!(
+        run("type M = {*: Int}\ntype T = {...M, to: String}\nv: T = { to = \"a\"; x = 1 }"),
+        "{v = {to = \"a\"; x = 1}}"
+    );
+    assert_eq!(
+        run("type M = {*: Int}\ntype T = {...M, *: String}\nv: T = { x = \"y\" }"),
+        "{v = {x = \"y\"}}"
+    );
+    let one = |text: &str| check_errors(&[("workspace.gcsl", text)]);
+    // One written before the spread is not replaced.
+    assert_eq!(
+        one("type M = {*: Int}\ntype T = {*: String, ...M}"),
+        [
+            "the rest-field is defined twice at workspace.gcsl (this has a rest-field, of \
+             type Int); workspace.gcsl: first defined here; note: a spread cannot replace a \
+             field defined before it; put the spread first"
+        ]
+    );
+    // Two in a record type written in place and spread.
+    assert_eq!(
+        one("type T = {...{*: Int, *: String}}"),
+        ["the rest-field appears twice in this type at workspace.gcsl"]
+    );
+}
+
+#[test]
+fn a_def_type_s_definitions_can_return_a_record_of_any_fields() {
+    // pekit's packages map paths to paths: `files` is a map, which each
+    // definition writes as a record literal.
+    let types = "type Package = {build: String, files: {*: String}}\n\
+                 #[def_type]\n\
+                 def package(name: String, func: fn(): Package) -> {*: String} {\n\
+                 \x20   func().files\n\
+                 }\n";
+    let busybox = "def package net.busybox.busybox() {\n\
+                   \x20   build = \"busybox\"\n\
+                   \x20   files = {\n\
+                   \x20       \"bin/*\" = \"bin/*\"\n\
+                   \x20       \"sbin/*\" = \"sbin/*\"\n\
+                   \x20   }\n\
+                   }\n\
+                   files = package net.busybox.busybox()\n";
+    let files = [
+        ("workspace.gcsl", types),
+        ("net.busybox.busybox/pekit.gcsl", busybox),
+    ];
+    let sources: Vec<SourceFile> = files
+        .iter()
+        .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+        .collect();
+    let checked = check(&sources).unwrap();
+    assert_eq!(checked.warnings(), []);
+    assert_eq!(
+        value(&files, "net.busybox.busybox/pekit.gcsl"),
+        "{files = {\"bin/*\" = \"bin/*\"; \"sbin/*\" = \"sbin/*\"}}"
+    );
+}
+
+#[test]
 fn type_declaration_errors() {
     let one = |text: &str| check_errors(&[("workspace.gcsl", text)]);
     assert_eq!(

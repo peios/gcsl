@@ -123,7 +123,7 @@
 use std::collections::HashSet;
 use std::mem::{Discriminant, discriminant};
 
-use crate::ast::{Ast, DefTypeRole, ExprKind, ItemKind, SegmentKind, Syntax, TypeExprKind};
+use crate::ast::{Ast, DefTypeRole, ExprKind, FieldTyKind, ItemKind, SegmentKind, Syntax, TypeExprKind};
 use crate::diagnostic::{Diagnostic, InternalError};
 use crate::lexer::{self, Comments, Lexed, Token, TokenKind};
 use crate::names::Names;
@@ -285,6 +285,8 @@ struct Facts {
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
     path_ends: HashSet<usize>,
+    /// The `*` of every rest-field, which is no operator.
+    rests: HashSet<usize>,
 }
 
 impl Facts {
@@ -339,10 +341,17 @@ impl Facts {
         for id in ast.type_ids() {
             let ty = ast.type_expr(id);
             match ty.kind {
-                TypeExprKind::Record(_) => {
+                TypeExprKind::Record(range) => {
                     facts
                         .lists
                         .extend(input.token_at(ty.span.start, TokenKind::LBrace));
+                    for field in ast.field_tys(range) {
+                        if field.kind == FieldTyKind::Rest {
+                            facts
+                                .rests
+                                .extend(input.token_at(field.span.start, TokenKind::Star));
+                        }
+                    }
                 }
                 TypeExprKind::Fn { .. } => {
                     let at = input
@@ -747,8 +756,9 @@ impl<'a> Printer<'a> {
         if is_closer(kind) {
             return self.open.last().map_or(0, |&(_, level)| level);
         }
-        let leads =
-            (is_infix(kind) || kind == TokenKind::Dot) && !self.facts.angles.contains(&next);
+        let leads = (is_infix(kind) || kind == TokenKind::Dot)
+            && !self.facts.angles.contains(&next)
+            && !self.facts.rests.contains(&next);
         self.content_level() + usize::from(leads || self.continues())
     }
 
@@ -1144,6 +1154,28 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(fmt(input), expected, "formatting {input:?}");
         }
+    }
+
+    #[test]
+    fn a_rest_field_s_star_is_no_operator() {
+        check(&[
+            // A line it starts is no continuation of the line before.
+            (
+                "type File = {\nto: String,\n  *: Int,\n}\n",
+                "type File = {\n    to: String,\n    *: Int,\n}\n",
+            ),
+            (
+                "type M = {\n*: String\n}\n",
+                "type M = {\n    *: String,\n}\n",
+            ),
+            // On one line, glued to its `:` and spaced as a field is.
+            (
+                "type T = {a:Int,*:  String}\n",
+                "type T = {a: Int, *: String}\n",
+            ),
+            // An operator still continues its line.
+            ("x = (2\n* 3)\n", "x = (2\n        * 3)\n"),
+        ]);
     }
 
     #[test]

@@ -440,6 +440,39 @@ fn a_long_record_type_is_cut_short() {
     assert!(hover.text.contains("\n…\n```"), "{}", hover.text);
 }
 
+#[test]
+fn a_wide_record_type_shows_its_rest_field_after_its_named_fields() {
+    // Too wide for one line, a field per line, the rest-field last; the
+    // named fields are never lost to it.
+    let text = "type File = {destination_path: String, source_path_in_build: String, \
+                *: {mode: String, owner_principal: String}}\n\
+                f: File = { destination_path = \"a\"; source_path_in_build = \"b\" }\n\
+                r = f\n";
+    let Indexed { index, .. } = indexed(&[("workspace.gcsl", text)]);
+    let mut index = index.unwrap();
+    let file = index.file("workspace.gcsl").unwrap();
+    let hover = index.hover(file, offset(text, "r = |f")).unwrap();
+    assert!(
+        hover.text.contains(
+            "{\n  destination_path: String,\n  source_path_in_build: String,\n  \
+             *: {mode: String, owner_principal: String},\n}"
+        ),
+        "{}",
+        hover.text
+    );
+    // Narrow enough, on one line.
+    let text = "f: {to: String, *: Int} = { to = \"a\" }\nr = f\n";
+    let Indexed { index, .. } = indexed(&[("app.gcsl", text)]);
+    let mut index = index.unwrap();
+    let file = index.file("app.gcsl").unwrap();
+    let hover = index.hover(file, offset(text, "r = |f")).unwrap();
+    assert!(
+        hover.text.contains("{to: String, *: Int}"),
+        "{}",
+        hover.text
+    );
+}
+
 /// The files' index, and the input number of the file at `path`.
 fn index_of(files: &[(&str, &str)], path: &str) -> (Index, u32) {
     let Indexed {

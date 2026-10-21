@@ -162,6 +162,7 @@ fn node_kinds() {
     };
     let shape = builder.push_shape(Shape {
         fields: Box::new([(x, None)]),
+        rest: None,
     });
     let shaped = ShapedOperands {
         shape,
@@ -386,18 +387,22 @@ fn equality_of_bools_and_records_shows_its_operator() {
     // A shape given its id before its fields, as lowering does.
     let outer = builder.push_shape(Shape {
         fields: Box::default(),
+        rest: None,
     });
     let nested = builder.push_shape(Shape {
         fields: Box::new([(n, None), (spaced, None)]),
+        rest: None,
     });
     builder.set_shape(
         outer,
         Shape {
             fields: Box::new([(x, None), (inner, Some(nested))]),
+            rest: None,
         },
     );
     let empty = builder.push_shape(Shape {
         fields: Box::default(),
+        rest: None,
     });
     let shaped = |shape| ShapedOperands {
         shape,
@@ -488,9 +493,11 @@ fn list_program(names: &mut Names) -> (Ir, [IrId; 9]) {
     // A list of records compared over `[x]`, and one of values.
     let record = builder.push_shape(Shape {
         fields: Box::new([(x, None)]),
+        rest: None,
     });
     let records = builder.push_shape(Shape {
         fields: Box::default(),
+        rest: None,
     });
     builder.set_list_shape(
         records,
@@ -500,6 +507,7 @@ fn list_program(names: &mut Names) -> (Ir, [IrId; 9]) {
     );
     let values = builder.push_shape(Shape {
         fields: Box::default(),
+        rest: None,
     });
     builder.set_list_shape(values, ListShape { element: None });
     let shaped = |shape| ShapedOperands {

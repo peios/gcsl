@@ -881,7 +881,7 @@ use crate::check::{Builtin, Slot};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
-    LazyShapeId, ListShape, MetaAt, Operands, ShapeId, ShapedOperands, StepAt, StepMode,
+    LazyShapeId, ListShape, MetaAt, Operands, RestShape, ShapeId, ShapedOperands, StepAt, StepMode,
     UpdatePathId, UpdateStep,
 };
 use crate::names::Name;
@@ -1789,23 +1789,26 @@ impl Evaluator<'_> {
                 }
                 return mistyped(node, "a record lacks a field of its lazy shape");
             };
-            let new = match field {
-                LazyField::Await(inner) => {
-                    let awaited = self.await_fully(old.clone(), depth, level, node)?;
-                    if inner == LazyShapeId::NONE {
-                        awaited
-                    } else {
-                        self.await_deep(awaited, inner, (depth, level + 1, tolerant), node)?
-                    }
-                }
-                LazyField::Within(inner) => {
-                    self.await_deep(old.clone(), inner, (depth, level + 1, tolerant), node)?
-                }
-            };
+            let new = self.await_field(old, field, (depth, level, tolerant), node)?;
             if replaced(old, &new) {
                 let values = changed.get_or_insert_with(|| record.values.to_vec());
                 if let Some(slot) = values.get_mut(index) {
                     *slot = new;
+                }
+            }
+        }
+        // Every field the type does not name, as its rest-field says.
+        if let Some(rest) = &lazy.rest {
+            for (index, (name, old)) in record.layout.names.iter().zip(&record.values).enumerate() {
+                if rest.named.binary_search(name).is_ok() {
+                    continue;
+                }
+                let new = self.await_field(old, rest.field, (depth, level, tolerant), node)?;
+                if replaced(old, &new) {
+                    let values = changed.get_or_insert_with(|| record.values.to_vec());
+                    if let Some(slot) = values.get_mut(index) {
+                        *slot = new;
+                    }
                 }
             }
         }
@@ -1815,6 +1818,33 @@ impl Evaluator<'_> {
                 values: values.into_boxed_slice(),
             }))),
             None => Ok(value),
+        }
+    }
+
+    /// Awaits `old`, a field of a record or an element of a list, as
+    /// `field` says, for the await `node` at depth `depth` in this frame's
+    /// body, `level` levels of record and list nesting below the value the
+    /// await awaits: fully and then, if its shape says so, deeply, or, if
+    /// it is present, deeply (see [`Evaluator::await_deep`]).
+    fn await_field(
+        &mut self,
+        old: &Value,
+        field: LazyField,
+        (depth, level, tolerant): (u16, usize, bool),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        match field {
+            LazyField::Await(inner) => {
+                let awaited = self.await_fully(old.clone(), depth, level, node)?;
+                if inner == LazyShapeId::NONE {
+                    Ok(awaited)
+                } else {
+                    self.await_deep(awaited, inner, (depth, level + 1, tolerant), node)
+                }
+            }
+            LazyField::Within(inner) => {
+                self.await_deep(old.clone(), inner, (depth, level + 1, tolerant), node)
+            }
         }
     }
 
@@ -1846,19 +1876,7 @@ impl Evaluator<'_> {
         };
         let mut changed: Option<Vec<Value>> = None;
         for (index, old) in list.values().iter().enumerate() {
-            let new = match each {
-                LazyField::Await(inner) => {
-                    let awaited = self.await_fully(old.clone(), depth, level, node)?;
-                    if inner == LazyShapeId::NONE {
-                        awaited
-                    } else {
-                        self.await_deep(awaited, inner, (depth, level + 1, tolerant), node)?
-                    }
-                }
-                LazyField::Within(inner) => {
-                    self.await_deep(old.clone(), inner, (depth, level + 1, tolerant), node)?
-                }
-            };
+            let new = self.await_field(old, each, (depth, level, tolerant), node)?;
             if replaced(old, &new) {
                 let values = changed.get_or_insert_with(|| list.values().to_vec());
                 if let Some(slot) = values.get_mut(index) {
@@ -3927,6 +3945,39 @@ fn record_eq_shaped(ir: &Ir, shape: ShapeId, a: &Value, b: &Value) -> Option<boo
                     None => return Some(false),
                 }
             }
+        } else if let Some(RestShape { shape: nested }) = ir.shape(shape).rest {
+            // Both are records, the empty record with no fields to compare.
+            if a.kind() != ValueKind::Record || b.kind() != ValueKind::Record {
+                return None;
+            }
+            let (a, b) = (with_fields(a), with_fields(b));
+            for &(name, nested) in fields {
+                let (mine, theirs) = (a?.get(name)?, b?.get(name)?);
+                match nested {
+                    Some(nested) => pending.push((nested, mine, theirs)),
+                    None if mine == theirs => {}
+                    None => return Some(false),
+                }
+            }
+            // The fields the type does not name: the same names on both
+            // sides, each pair compared through the rest-field's shape.
+            let named: Vec<Name> = fields.iter().map(|&(name, _)| name).collect();
+            let others = |record: Option<&'_ Record>| {
+                record.map_or(0, |record| other_fields(record, &named).count())
+            };
+            if others(a) != others(b) {
+                return Some(false);
+            }
+            for (name, _, mine) in a.into_iter().flat_map(|a| other_fields(a, &named)) {
+                let Some(theirs) = b.and_then(|b| b.get(name)) else {
+                    return Some(false);
+                };
+                match nested {
+                    Some(nested) => pending.push((nested, mine, theirs)),
+                    None if mine == theirs => {}
+                    None => return Some(false),
+                }
+            }
         } else if !fields.is_empty() {
             let (Value::Record(a), Value::Record(b)) = (a, b) else {
                 return None;
@@ -4832,6 +4883,21 @@ fn passes(test: &ValueTest, value: &Value) -> bool {
                 .all(|(name, field)| record.get(*name).is_some_and(|value| passes(field, value))),
             _ => false,
         },
+        ValueTest::RecordRest {
+            fields,
+            named,
+            rest,
+        } => match value {
+            Value::Record(record) => {
+                fields.iter().all(|(name, field)| {
+                    record.get(*name).is_some_and(|value| passes(field, value))
+                }) && other_fields(record, named).all(|(_, _, value)| passes(rest, value))
+            }
+            // The empty record has no field, so no other one: it passes if
+            // there is no named field to test.
+            Value::Empty => fields.is_empty(),
+            _ => false,
+        },
         ValueTest::List(element) => match value {
             Value::List(list) => list.values().iter().all(|value| passes(element, value)),
             _ => false,
@@ -4854,25 +4920,39 @@ fn failure(ir: &Ir, test: &ValueTest, value: &Value) -> String {
         ValueTest::Any(alternatives) => alternatives.iter().find(|alternative| {
             matches!(
                 (alternative, value),
-                (ValueTest::Record(_), Value::Record(_)) | (ValueTest::List(_), Value::List(_))
+                (
+                    ValueTest::Record(_) | ValueTest::RecordRest { .. },
+                    Value::Record(_)
+                ) | (ValueTest::List(_), Value::List(_))
             )
         }),
         _ => Some(test),
     };
     match (inside, value) {
         (Some(ValueTest::Record(fields)), Value::Record(record)) => {
-            for (name, field) in fields {
-                let shown = FieldName(ir.name_text(*name).unwrap_or("?"));
-                match record.get(*name) {
-                    None => return format!("it is a record without a field `{shown}`"),
-                    Some(found) if !passes(field, found) => {
-                        return format!(
-                            "it is a record, and its field `{shown}` is {}",
-                            described(found)
-                        );
-                    }
-                    Some(_) => {}
-                }
+            if let Some(label) = named_failure(ir, fields, record) {
+                return label;
+            }
+        }
+        (
+            Some(ValueTest::RecordRest {
+                fields,
+                named,
+                rest,
+            }),
+            Value::Record(record),
+        ) => {
+            if let Some(label) = named_failure(ir, fields, record) {
+                return label;
+            }
+            if let Some((_, text, found)) =
+                other_fields(record, named).find(|(_, _, found)| !passes(rest, found))
+            {
+                return format!(
+                    "it is a record, and its field `{}` is {}",
+                    FieldName(text),
+                    described(found)
+                );
             }
         }
         (Some(ValueTest::List(element)), Value::List(list)) => {
@@ -4891,6 +4971,54 @@ fn failure(ir: &Ir, test: &ValueTest, value: &Value) -> String {
         _ => {}
     }
     format!("it is {}", described(value))
+}
+
+/// The label on the failure of `record` to pass the tests of its named
+/// fields `fields`, a [`ValueTest::Record`]'s or a
+/// [`ValueTest::RecordRest`]'s, as [`failure`] says it, or `None` if it
+/// passes them.
+fn named_failure(ir: &Ir, fields: &[(Name, ValueTest)], record: &Record) -> Option<String> {
+    for (name, field) in fields {
+        let shown = FieldName(ir.name_text(*name).unwrap_or("?"));
+        match record.get(*name) {
+            None => return Some(format!("it is a record without a field `{shown}`")),
+            Some(found) if !passes(field, found) => {
+                return Some(format!(
+                    "it is a record, and its field `{shown}` is {}",
+                    described(found)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// The fields of `record` that `named`, sorted, does not name, each as its
+/// name, text and value, in the record's order: those a record type's
+/// rest-field covers, which a [`ValueTest::RecordRest`] tests, typed
+/// equality compares and a deep await awaits as the rest-field says.
+fn other_fields<'r, 'n>(
+    record: &'r Record,
+    named: &'n [Name],
+) -> impl Iterator<Item = (Name, &'r str, &'r Value)> + use<'r, 'n> {
+    record
+        .layout
+        .names
+        .iter()
+        .zip(&record.layout.texts)
+        .zip(&record.values)
+        .filter(|((name, _), _)| named.binary_search(name).is_err())
+        .map(|((&name, text), value)| (name, &**text, value))
+}
+
+/// The record `value` is, if it is one with fields: `None` for the empty
+/// record and any other value.
+fn with_fields(value: &Value) -> Option<&Record> {
+    match value {
+        Value::Record(record) => Some(record),
+        _ => None,
+    }
 }
 
 /// What `value` is, after its indefinite article, as a failed test's label
