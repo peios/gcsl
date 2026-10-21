@@ -333,6 +333,10 @@
 //! (`Lowerer::lower_meta_read`): so a read is a call, its caller, its
 //! memoisation and the nesting budget those of any call.
 //!
+//! The program records the function made for every reference
+//! (`Ir::set_references`), so that a host can tell a reference's closure from
+//! any other that captures a definition (`Ir::is_reference`).
+//!
 //! A reference whose def-type declares a meta carries its definition's: the
 //! program records its function too, its meta that of the closure's capture
 //! of the definition (`Ir::set_metas`, [`MetaAt::Capture`]), so that
@@ -438,7 +442,7 @@ use crate::source::Span;
 
 /// The capture of the closure of a def-type reference that holds the
 /// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
-const REFERENCE_DEFINITION: u32 = 1;
+pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 use crate::types::{Laziness, TyId, TypeTable, ValueTest};
 use crate::value::{Layout, ValueKind, int_to_float};
 
@@ -503,6 +507,7 @@ pub fn lower(
         next_catch: 0,
         reads_caller: Vec::new(),
         meta_captures: Vec::new(),
+        references: Vec::new(),
     };
     let root = ast.root();
     let kind = lowerer.body_kind(root)?;
@@ -540,6 +545,7 @@ pub fn lower(
     );
     ir.set_paths(dotted_paths(ast, resolution));
     ir.set_metas(metas);
+    ir.set_references(lowerer.references);
     Ok(ir)
 }
 
@@ -648,6 +654,9 @@ struct Lowerer<'a> {
     /// definitions' metas, whose closures' metas are those of the
     /// definitions they capture (see [`MetaAt::Capture`]).
     meta_captures: Vec<FnId>,
+    /// The functions made for def-type references, every one (see
+    /// [`Ir::is_reference`]).
+    references: Vec<FnId>,
 }
 
 impl Lowerer<'_> {
@@ -2439,6 +2448,7 @@ impl Lowerer<'_> {
         if sig.meta.is_some() {
             self.meta_captures.push(function);
         }
+        self.references.push(function);
         self.functions.push(Some(FnCode {
             body,
             kind: FnKind::Function,
