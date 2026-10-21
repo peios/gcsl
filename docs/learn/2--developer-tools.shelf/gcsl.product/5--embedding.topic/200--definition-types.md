@@ -46,7 +46,10 @@ Use the host's documentation for package or build semantics.
 
 A checked workspace exposes definition types and their definitions. Host
 APIs can invoke a selected definition with named textual arguments parsed
-against its declared parameter types. The `gcsl` executable itself exposes
+against its declared parameter types. When a value the host gets back holds
+a reference, such as `build = build busybox`, the host can ask which
+definition it names and then invoke it, or read its metadata, by name. The
+`gcsl` executable itself exposes
 `run`, `check`, `fmt`, and `lsp`; it does not add a general command for each
 definition type.
 

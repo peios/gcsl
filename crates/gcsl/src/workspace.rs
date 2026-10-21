@@ -625,6 +625,15 @@
 //! def-type's body nested within a few levels of the limit) is located at
 //! the definition's path in its file instead, labelled "invoked here".
 //!
+//! A value a host gets back may hold a reference, `build = build busybox`,
+//! which it can call only by name. [`Workspace::definition_of`] names it:
+//! the closure of a reference is of a function the program records as made
+//! for one (see [`crate::lower`]), which captures the def-type and
+//! then the definition, and the definition is found as the definition whose
+//! cell holds the very closure captured, its def-type by its path as
+//! declared, however the reference names it. Any other value names none,
+//! whatever it captures. It runs nothing.
+//!
 //! # Top-level functions by name
 //!
 //! A host may give a file of the workspace a meaning of its own (`pekit`
@@ -7521,6 +7530,17 @@ pub struct Definition {
     pub span: Span,
 }
 
+/// The definition a def-type reference names, as
+/// [`Workspace::definition_of`] finds it: what [`Workspace::invoke`] and
+/// [`Workspace::meta_field`] take to invoke it, or read its meta, by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Referenced {
+    /// The def-type's path, as it is declared: `build`.
+    pub def_type: String,
+    /// The definition's path, as it writes it: `busybox`.
+    pub path: String,
+}
+
 /// Why [`Workspace::invoke`] could not invoke a definition, or another
 /// call by name could not be made ([`Workspace::call_composed`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8160,6 +8180,49 @@ impl Workspace {
             None,
         )
         .map(Some)
+    }
+
+    /// Which definition `value` names, if it is the closure of a def-type
+    /// reference, `DT PATH` evaluated (see the module documentation,
+    /// "Def-types by name"): its def-type's path as declared, whatever
+    /// import or alias the reference names it by, and the definition's path
+    /// as it writes it, found by the definition the closure captures, which
+    /// is the closure its definition's cell holds. What a host that gets a
+    /// reference back, from an invocation or a meta (a package's `build =
+    /// build busybox`), reads to invoke it or read its meta by name. `None`
+    /// for any other value, a closure that calls a definition included, and
+    /// for a reference to no definition of the workspace's def-types. Runs
+    /// nothing and changes nothing.
+    #[must_use]
+    pub fn definition_of(&self, value: &Value) -> Option<Referenced> {
+        let Value::Fn(closure) = value else {
+            return None;
+        };
+        if !closure.code.is_reference(closure.function) {
+            return None;
+        }
+        let Some(Value::Fn(definition)) = closure
+            .captures
+            .get(crate::lower::REFERENCE_DEFINITION as usize)
+        else {
+            return None;
+        };
+        let holds = |file: u32, item: ItemId| {
+            let cell = self.leaf_cell(file, item);
+            let held = cell.and_then(|(slot, _)| self.frame.get(slot.index()));
+            matches!(held, Some(Value::Fn(held)) if Rc::ptr_eq(held, definition))
+        };
+        self.found_def_types().into_iter().find_map(|found| {
+            let (_, listed) = found
+                .items
+                .iter()
+                .zip(&found.listed.definitions)
+                .find(|&(&item, listed)| holds(listed.file, item))?;
+            Some(Referenced {
+                def_type: found.listed.path.clone(),
+                path: listed.path.clone(),
+            })
+        })
     }
 
     /// The top-level field or `def` of file `file` named `name`, a field of

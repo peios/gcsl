@@ -9371,6 +9371,120 @@ fn a_field_of_a_definition_s_meta_is_read_by_name() {
     assert_eq!(value.unwrap().value.to_string(), "0.1.0");
 }
 
+/// The field of record `value` whose name is `name`.
+fn field_named(value: &Value, name: &str) -> Value {
+    let Value::Record(record) = value else {
+        panic!("{value} is no record");
+    };
+    let at = record.layout.texts.iter().position(|text| &**text == name);
+    record.values[at.unwrap()].clone()
+}
+
+/// [`Workspace::definition_of`] as a pair of the def-type's path and the
+/// definition's.
+fn named_by(workspace: &Workspace, value: &Value) -> Option<(String, String)> {
+    workspace
+        .definition_of(value)
+        .map(|found| (found.def_type, found.path))
+}
+
+/// A `build` def-type whose meta names a `source`, and a `package` one
+/// whose record holds a `build`, as pekit's are: in `lib.types`, which
+/// `app` imports `build` from by another name.
+const BUILDS: [(&str, &str); 3] = [
+    ("workspace.gcsl", "x = 1"),
+    (
+        "lib/types.gcsl",
+        "#[def_type]\n\
+         def source(name: String, f: fn(): String): String { f() }\n\
+         #[def_type]\n\
+         def build(name: String, f: fn(out: String) ->> String META: {source: fn(): String}, \
+         out: String) ->> String { f(out) }\n\
+         #[def_type]\n\
+         def package(name: String, f: fn(): {build: fn(out: String) ->> String}): \
+         {build: fn(out: String) ->> String} { f() }",
+    ),
+    (
+        "app/a.gcsl",
+        "import source, package from lib.types\n\
+         import build as make from lib.types\n\
+         def source up() { \"https://x\" }\n\
+         defmeta make b { source = source up }\n\
+         def make b(out) { out }\n\
+         def package dev.x() { build = make b }\n\
+         n = 1\n\
+         plain = fn(out: String): String { out }\n\
+         calls = fn(out: String) -> String { make b(out) }\n\
+         builtin = len",
+    ),
+];
+
+#[test]
+fn a_reference_names_its_definition() {
+    let mut workspace = rooted(&BUILDS).unwrap();
+    // The reference an invocation returns names its def-type as declared,
+    // not by the alias it is written with.
+    let package = workspace.invoke("package", "dev.x", &[]).unwrap().value;
+    let build = field_named(&package, "build");
+    let named = Some(("build".to_owned(), "b".to_owned()));
+    assert_eq!(named_by(&workspace, &build), named);
+    // So does one read from a meta, which names the definition to read.
+    let source = workspace.meta_field("build", "b", "source").unwrap();
+    let source = source.unwrap().value;
+    let named = Some(("source".to_owned(), "up".to_owned()));
+    assert_eq!(named_by(&workspace, &source), named);
+    // What it names invokes as the reference does.
+    let invoked = workspace.invoke("source", "up", &[]).unwrap().value;
+    assert_eq!(invoked.to_string(), "https://x");
+    // Nothing else names a definition: no other value, no closure that
+    // calls one, no built-in function.
+    let index = workspace.file("app/a.gcsl").unwrap();
+    let file = workspace.run(index).unwrap().value;
+    for name in ["n", "plain", "calls", "builtin"] {
+        let value = field_named(&file, name);
+        assert_eq!(named_by(&workspace, &value), None, "{name}");
+    }
+}
+
+#[test]
+fn a_closure_that_captures_a_definition_names_none() {
+    // The def-type's closure captures `n` and then the definition, as a
+    // reference's captures the def-type and then the definition, but it is
+    // no reference.
+    let files = [(
+        "workspace.gcsl",
+        "#[def_type]\n\
+         def wrap(name: String, f: fn(): Int, n: Int): fn(): Int { fn(): Int { n + f() } }\n\
+         def wrap w() { 1 }",
+    )];
+    let mut workspace = rooted(&files).unwrap();
+    let n = ("n".to_owned(), Given::Int(1));
+    let wrapped = workspace.invoke("wrap", "w", &[n]).unwrap().value;
+    let Value::Fn(closure) = &wrapped else {
+        panic!("{wrapped} is no closure");
+    };
+    assert!(matches!(closure.captures.get(1), Some(Value::Fn(_))));
+    assert_eq!(named_by(&workspace, &wrapped), None);
+}
+
+#[test]
+fn a_reference_made_in_a_child_names_an_ancestor_s_definition() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+             def tool(name: String, f: fn(): Int): Int { f() }\n\
+             def tool t() { 1 }",
+        ),
+        ("app/deep/a.gcsl", "r = tool t"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let index = workspace.file("app/deep/a.gcsl").unwrap();
+    let file = workspace.run(index).unwrap().value;
+    let named = Some(("tool".to_owned(), "t".to_owned()));
+    assert_eq!(named_by(&workspace, &field_named(&file, "r")), named);
+}
+
 const TAGGED: (&str, &str) = (
     "workspace.gcsl",
     "#[def_type]\n\

@@ -1566,6 +1566,10 @@ pub struct Ir {
     /// def-type that has one or a def-type reference that carries it, with
     /// where the meta is (see [`Ir::meta_of`]); usually empty.
     metas: Vec<(FnId, MetaAt)>,
+    /// Each function made for a def-type reference, `DT PATH`, whose
+    /// closures capture the def-type and the definition (see
+    /// [`Ir::is_reference`]); usually empty.
+    references: Vec<FnId>,
 }
 
 /// Where the meta of a function's closures is, for a function that has one
@@ -1825,6 +1829,22 @@ impl Ir {
     /// [`Ir::meta_of`]).
     pub(crate) fn set_metas(&mut self, metas: Vec<(FnId, MetaAt)>) {
         self.metas = metas;
+    }
+
+    /// Sets the program's functions made for def-type references,
+    /// `references` (see [`Ir::is_reference`]).
+    pub(crate) fn set_references(&mut self, references: Vec<FnId>) {
+        self.references = references;
+    }
+
+    /// Whether `function` is one made for a def-type reference, `DT PATH`,
+    /// whose closures capture the def-type first and the definition second:
+    /// what a host asking which definition a value names reads (see
+    /// [`crate::workspace::Workspace::definition_of`]). Linear in the number
+    /// of the program's references.
+    #[must_use]
+    pub(crate) fn is_reference(&self, function: FnId) -> bool {
+        self.references.contains(&function)
     }
 
     /// Where the meta of the closures of `function` is, if they have one:
@@ -2419,6 +2439,7 @@ impl IrBuilder {
             dir,
             paths: Vec::new(),
             metas: Vec::new(),
+            references: Vec::new(),
         }
     }
 }
