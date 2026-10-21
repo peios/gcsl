@@ -357,6 +357,21 @@ impl ShapeId {
 pub struct Shape {
     /// Each field's name and, for a record or list field, its own shape.
     pub fields: Box<[(Name, Option<ShapeId>)]>,
+    /// For a record type with a rest-field, how the fields it does not name
+    /// compare: the two records must have the same such fields, each pair
+    /// compared as the rest-field's type says. `None` for a record type
+    /// without one, whose other fields are ignored, and for a list's shape.
+    pub rest: Option<RestShape>,
+}
+
+/// How the fields of a record that its type does not name compare, where
+/// its type has a rest-field (see [`Shape::rest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RestShape {
+    /// The shape of the rest-field's type, if it is a record or a list
+    /// type, through which each field is compared; `None` if each is
+    /// compared as a value.
+    pub shape: Option<ShapeId>,
 }
 
 /// The static shape of a list type, which typed equality compares over:
@@ -457,6 +472,20 @@ impl LazyShapeId {
 pub struct LazyShape {
     /// Each such field's name and what is done with its value.
     pub fields: Box<[(Name, LazyField)]>,
+    /// For a record type with a rest-field that is lazy or holds lazy values
+    /// somewhere inside, what is done with each field the type does not
+    /// name; `None` otherwise.
+    pub rest: Option<LazyRest>,
+}
+
+/// What a deep await does with the fields of a record that its type does
+/// not name, where its type has a rest-field (see [`LazyShape::rest`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LazyRest {
+    /// Every field the type names, sorted, which this passes over.
+    pub named: Box<[Name]>,
+    /// What is done with each other field's value.
+    pub field: LazyField,
 }
 
 /// What a deep await does with one field of a record, or with each element
@@ -2170,6 +2199,7 @@ impl IrBuilder {
     pub(crate) fn set_list_shape(&mut self, id: ShapeId, shape: ListShape) {
         if let Some(entry) = self.shapes.get_mut(id.index()) {
             entry.fields = Box::default();
+            entry.rest = None;
         }
         if let Some(entry) = self.list_shapes.get_mut(id.index()) {
             *entry = Some(shape);
@@ -2192,6 +2222,7 @@ impl IrBuilder {
     pub(crate) fn push_lazy_list(&mut self, element: LazyField) -> LazyShapeId {
         let id = self.push_lazy_shape(LazyShape {
             fields: Box::default(),
+            rest: None,
         });
         if let Some(entry) = self.lazy_lists.get_mut(id.index()) {
             *entry = Some(element);
@@ -2207,6 +2238,7 @@ impl IrBuilder {
     pub(crate) fn push_lazy_union(&mut self, members: Box<[LazyShapeId]>) -> LazyShapeId {
         let id = self.push_lazy_shape(LazyShape {
             fields: Box::default(),
+            rest: None,
         });
         if let Some(entry) = self.lazy_unions.get_mut(id.index()) {
             *entry = Some(members);
@@ -2401,7 +2433,8 @@ struct Pretty<'a> {
 
 impl Pretty<'_> {
     /// Writes shape `id` as its field names in brackets, each record or
-    /// list field's shape after its name: `[x inner[n]]`; a list's shape is
+    /// list field's shape after its name, and a rest-field as `*:` after
+    /// them: `[x inner[n] *:[y]]`; a list's shape is
     /// `*` followed by its element type's shape, if it has one: `*[x]`,
     /// `**[x]` or `*`. Nested shapes are written through a work list, not
     /// recursion, since a record or list type can be nested as deeply as a
@@ -2411,15 +2444,26 @@ impl Pretty<'_> {
         let mut pending = Vec::new();
         self.open_shape(f, id, &mut pending)?;
         while let Some((shape, index)) = pending.pop() {
-            let fields = self.ir.shapes.get(shape.index()).map(|s| &*s.fields);
-            let Some(&(name, nested)) = fields.unwrap_or_default().get(index) else {
+            let entry = self.ir.shapes.get(shape.index());
+            let fields = entry.map(|s| &*s.fields).unwrap_or_default();
+            // The rest-field, if the shape has one, after the fields.
+            let rest = entry.and_then(|s| s.rest).filter(|_| index == fields.len());
+            let nested = if let Some(&(name, nested)) = fields.get(index) {
+                if index > 0 {
+                    f.write_str(" ")?;
+                }
+                write!(f, "{}", FieldName(self.names.get(name)))?;
+                nested
+            } else if let Some(rest) = rest {
+                if index > 0 {
+                    f.write_str(" ")?;
+                }
+                f.write_str("*:")?;
+                rest.shape
+            } else {
                 f.write_str("]")?;
                 continue;
             };
-            if index > 0 {
-                f.write_str(" ")?;
-            }
-            write!(f, "{}", FieldName(self.names.get(name)))?;
             pending.push((shape, index + 1));
             if let Some(nested) = nested {
                 self.open_shape(f, nested, &mut pending)?;
@@ -2453,7 +2497,8 @@ impl Pretty<'_> {
 
     /// Writes lazy shape `id` as the names of the fields it awaits in
     /// brackets, each followed by `!` if its value is awaited and by its own
-    /// shape if the await descends into it: `[a! b[c!]]`; a list's lazy
+    /// shape if the await descends into it, and a rest-field as `*:` after
+    /// them: `[a! b[c!] *:!]`; a list's lazy
     /// shape is `*`, followed by `!` if each element is awaited and by the
     /// element's own shape if the await descends into it: `*!`, `*[a!]`.
     /// Nested shapes are written through a work list, not recursion, as
@@ -2464,15 +2509,28 @@ impl Pretty<'_> {
         let mut pending = Vec::new();
         self.open_lazy_shape(f, id, &mut pending)?;
         while let Some((shape, index)) = pending.pop() {
-            let fields = self.ir.find_lazy_shape(shape).map(|s| &*s.fields);
-            let Some(&(name, field)) = fields.unwrap_or_default().get(index) else {
+            let entry = self.ir.find_lazy_shape(shape);
+            let fields = entry.map(|s| &*s.fields).unwrap_or_default();
+            // The rest-field, if the shape has one, after the fields.
+            let rest = entry
+                .and_then(|s| s.rest.as_ref())
+                .filter(|_| index == fields.len());
+            let field = if let Some(&(name, field)) = fields.get(index) {
+                if index > 0 {
+                    f.write_str(" ")?;
+                }
+                write!(f, "{}", FieldName(self.names.get(name)))?;
+                field
+            } else if let Some(rest) = rest {
+                if index > 0 {
+                    f.write_str(" ")?;
+                }
+                f.write_str("*:")?;
+                rest.field
+            } else {
                 f.write_str("]")?;
                 continue;
             };
-            if index > 0 {
-                f.write_str(" ")?;
-            }
-            write!(f, "{}", FieldName(self.names.get(name)))?;
             pending.push((shape, index + 1));
             let nested = match field {
                 LazyField::Await(nested) => {
@@ -2585,6 +2643,17 @@ impl Pretty<'_> {
                     write!(f, "{}: ", FieldName(self.names.get(*name)))?;
                     self.test(f, field)?;
                 }
+                f.write_str("}")
+            }
+            ValueTest::RecordRest { fields, rest, .. } => {
+                f.write_str("{")?;
+                for (name, field) in fields {
+                    write!(f, "{}: ", FieldName(self.names.get(*name)))?;
+                    self.test(f, field)?;
+                    f.write_str(", ")?;
+                }
+                f.write_str("*: ")?;
+                self.test(f, rest)?;
                 f.write_str("}")
             }
             ValueTest::List(element) => {

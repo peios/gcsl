@@ -1406,16 +1406,19 @@ fn typed_equality_of_deep_records_does_not_recurse() {
     let mut builder = crate::ir::IrBuilder::with_capacity(1);
     let first = builder.push_shape(crate::ir::Shape {
         fields: Box::default(),
+        rest: None,
     });
     let mut shape = first;
     for _ in 1..DEPTH {
         let next = builder.push_shape(crate::ir::Shape {
             fields: Box::default(),
+            rest: None,
         });
         builder.set_shape(
             shape,
             crate::ir::Shape {
                 fields: Box::new([(inner, Some(next))]),
+                rest: None,
             },
         );
         shape = next;
@@ -1424,6 +1427,7 @@ fn typed_equality_of_deep_records_does_not_recurse() {
         shape,
         crate::ir::Shape {
             fields: Box::new([(inner, None)]),
+            rest: None,
         },
     );
     let root = builder.alloc(IrKind::Empty, Span::new(0, 0));
@@ -1447,6 +1451,7 @@ fn a_record_lacking_a_field_of_its_shape_is_an_internal_error() {
     let mut builder = crate::ir::IrBuilder::with_capacity(3);
     let shape = builder.push_shape(crate::ir::Shape {
         fields: Box::new([(y, None)]),
+        rest: None,
     });
     let load = builder.alloc(
         IrKind::Load(Slot::new(0), ValueKind::Record),
@@ -2629,6 +2634,7 @@ fn mistyped_awaits_are_internal_errors() {
     let mut builder = crate::ir::IrBuilder::with_capacity(2);
     let shape = builder.push_lazy_shape(crate::ir::LazyShape {
         fields: Box::new([(y, crate::ir::LazyField::Await(LazyShapeId::NONE))]),
+        rest: None,
     });
     let load = builder.alloc(
         IrKind::Load(Slot::new(0), ValueKind::Record),
@@ -5148,6 +5154,83 @@ fn dpkg_verrevcmp(a: &[u8], b: &[u8]) -> Ordering {
         }
     }
     a.cmp(b)
+}
+
+#[test]
+fn typed_equality_compares_the_fields_a_rest_field_covers() {
+    let prefix = "let a: {*: Int} = {x = 1; y = 2}\n\
+                  let b: {*: Int} = {y = 2; x = 1}\n\
+                  let c: {*: Int} = {x = 1; y = 3}\n\
+                  let d: {*: Int} = {x = 1}\n\
+                  let e: {*: Int} = {}\n\
+                  let f: {n: String, *: Int} = {n = \"a\"; x = 1}\n\
+                  let g: {n: String, *: Int} = {n = \"a\"; x = 2}\n\
+                  let h: {n: String, *: Int} = {n = \"a\"}\n\
+                  let i: {*: {*: Int}} = {p = {q = 1}}\n\
+                  let j: {*: {*: Int}} = {p = {q = 1; r = 2}}\n";
+    let cases = [
+        // The same fields in another order, a value differing, a field
+        // missing, and the empty record on either side.
+        ("a == b", true),
+        ("a == c", false),
+        ("a == d", false),
+        ("d == a", false),
+        ("e == e", true),
+        ("d == e", false),
+        ("e == d", false),
+        // Named fields and the others together.
+        ("f == g", false),
+        ("f != g", true),
+        ("h == h", true),
+        ("f == h", false),
+        // Through a nested rest-field's shape.
+        ("i == j", false),
+        ("i == i", true),
+    ];
+    for (comparison, expected) in cases {
+        assert_eq!(
+            boolean(&format!("{prefix}{comparison}")),
+            expected,
+            "{comparison}"
+        );
+    }
+}
+
+#[test]
+fn a_deep_await_awaits_the_fields_a_rest_field_covers() {
+    let text = "let l: {n: Future<Int>, *: Future<Int>} = {n = lazy 1; p = lazy 1 + 1; q = lazy 3}\n\
+                let m: {n: Int, *: Int} = l\n\
+                let expected: {n: Int, *: Int} = {n = 1; p = 2; q = 3}\n\
+                m == expected";
+    assert!(boolean(text));
+    let text = "let l: {*: {*: Future<String>}} = {a = {b = lazy \"x\"}}\n\
+                let m: {*: {*: String}} = l\n\
+                show(m)";
+    assert_eq!(string(text), "{a = {b = \"x\"}}");
+}
+
+#[test]
+fn as_tests_each_field_a_rest_field_covers() {
+    let text = "let x = {a = 1; b = 2}\nlet y: {} = x\ny as {*: Int}";
+    assert_eq!(run(text).unwrap().to_string(), "{a = 1; b = 2}");
+    booleans(&[
+        (
+            "let x = {a = 1; b = \"s\"}\nlet y: {} = x\ny is {*: Int}",
+            false,
+        ),
+        (
+            "let x = {a = 1; b = \"s\"}\nlet y: {} = x\ny is {b: String, *: Int}",
+            true,
+        ),
+        ("let y: {} = {}\ny is {*: Int}", true),
+    ]);
+    let text = "let x = {a = 1; \"b c\" = \"s\"}\nlet y: {a: Int} = x\ny as {*: Int}";
+    let diagnostic = run(text).unwrap_err();
+    assert_eq!(diagnostic.message, "`y` is not a `{*: Int}`");
+    assert_eq!(
+        diagnostic.label.as_deref(),
+        Some("it is a record, and its field `\"b c\"` is a String")
+    );
 }
 
 #[test]

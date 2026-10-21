@@ -1480,6 +1480,12 @@ impl Index {
                     }
                     out.push_str(",\n");
                 }
+                // The rest-field after the named ones, as a type shows it.
+                if let Some(rest) = table.record_rest(ty) {
+                    let _ = write!(out, "{:width$}*: ", "", width = indent + 2);
+                    self.write_pretty(rest, (indent + 2, indent + 5), out);
+                    out.push_str(",\n");
+                }
                 let _ = write!(out, "{:width$}}}", "", width = indent);
             }
             None if column + one.chars().count() > WIDTH

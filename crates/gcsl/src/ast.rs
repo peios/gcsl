@@ -149,8 +149,11 @@
 //! variables and fields. Its name is read only in a type position, written
 //! bare, `PackageDef`, or qualified through an import, `t.PackageDef`, a
 //! [`TypeExprKind::Path`] in the path pool. A record type may spread
-//! another, `{...PackageDef, name: String}`: an entry of its fields with no
-//! name ([`FieldTy`]). A field item may be annotated, `x: Int = 1`, as a
+//! another, `{...PackageDef, name: String}`, and may have a rest-field, the
+//! type of every field it does not name, `{to: String, *: Int}`: each an
+//! entry of its fields with no name ([`FieldTy`], [`FieldTyKind`]). A
+//! spread's rest-field merges as its fields do. A field item may be
+//! annotated, `x: Int = 1`, as a
 //! `let` may: the annotation is in its [`ItemKind::Field`], and an [`Item`]
 //! is still 36 bytes.
 //!
@@ -1035,18 +1038,43 @@ impl fmt::Display for PathDisplay<'_> {
 }
 
 /// One entry of a record type expression: a field, `NAME: TYPE` or `NAME:
-/// TYPE = DEFAULT`, or a spread, `...TYPE`, whose fields join the record
-/// type (see [Types](#types)).
+/// TYPE = DEFAULT`, a spread, `...TYPE`, whose fields join the record type,
+/// or a rest-field, `*: TYPE`, the type of every field the record type does
+/// not name (see [Types](#types)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FieldTy {
-    /// The field's name, plain or quoted in source; `None` for a spread.
-    pub name: Option<Name>,
-    /// Where the name is written, or a spread's `...`.
+    /// What the entry is: a field and its name, a spread or a rest-field.
+    pub kind: FieldTyKind,
+    /// Where the name is written, or a spread's `...`, or a rest-field's
+    /// `*`.
     pub span: Span,
-    /// The field's type, or the type a spread spreads.
+    /// The field's type, the type a spread spreads, or the rest-field's.
     pub ty: TypeExprId,
-    /// The field's default, if it has one; a spread never has one.
+    /// The field's default, if it has one; a spread never has one, and a
+    /// rest-field's is reported by the checker.
     pub default: Option<FieldDefault>,
+}
+
+/// What a [`FieldTy`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FieldTyKind {
+    /// A field, its name plain or quoted in source.
+    Field(Name),
+    /// A spread, `...TYPE`.
+    Spread,
+    /// A rest-field, `*: TYPE`.
+    Rest,
+}
+
+impl FieldTy {
+    /// The field's name, or `None` for a spread or a rest-field.
+    #[must_use]
+    pub const fn name(&self) -> Option<Name> {
+        match self.kind {
+            FieldTyKind::Field(name) => Some(name),
+            FieldTyKind::Spread | FieldTyKind::Rest => None,
+        }
+    }
 }
 
 /// What [`TypeArena::copy`] makes a node of a kind of, if anything: the
@@ -2032,7 +2060,9 @@ impl TypeArena {
     /// [`TypeProblem::Erroneous`], and spreads nothing. Two fields written of
     /// one name are both kept, for the checker to report; a spread of a
     /// record type with two of one name spreads the first, the later being
-    /// [`TypeProblem::Repeated`]. The node becomes
+    /// [`TypeProblem::Repeated`]. A rest-field merges as a field of its own
+    /// name would: a spread's is soft, and replaces or is replaced as a
+    /// field is. The node becomes
     /// the record type of the merged fields; one without a spread is left
     /// as it is. Returns the problems, in source order. A spread's operand
     /// must have its own spreads merged already.
@@ -2041,19 +2071,25 @@ impl TypeArena {
             return Vec::new();
         };
         let written = self.fields(range);
-        if written.iter().all(|field| field.name.is_some()) {
+        if written
+            .iter()
+            .all(|field| field.kind != FieldTyKind::Spread)
+        {
             return Vec::new();
         }
         let written = written.to_vec();
         let mut merged: Vec<(FieldTy, bool)> = Vec::with_capacity(written.len());
-        let mut at: HashMap<Name, usize> = HashMap::new();
+        // Where each field is merged, by its name, `None` being the
+        // rest-field's.
+        let mut at: HashMap<Option<Name>, usize> = HashMap::new();
         let mut problems = Vec::new();
         // Whether the field merged at an index is soft.
         let soft = |merged: &[(FieldTy, bool)], index: usize| {
             merged.get(index).is_some_and(|&(_, soft)| soft)
         };
         for entry in written {
-            if let Some(name) = entry.name {
+            if entry.kind != FieldTyKind::Spread {
+                let name = entry.name();
                 match at.get(&name).copied() {
                     Some(index) if soft(&merged, index) => {
                         if let Some(slot) = merged.get_mut(index) {
@@ -2081,16 +2117,17 @@ impl TypeArena {
             };
             // The first field written before the spread, and the number of
             // others.
-            let mut replaced: Option<(Name, TypeExprId, Span)> = None;
+            let mut replaced: Option<(Option<Name>, TypeExprId, Span)> = None;
             let mut others = 0_u32;
             // The names the spread has given so far: one it gives twice, a
             // record type written in place with a name twice, is the
             // repeated-name error it is anywhere else, the later dropped.
-            let mut given: HashSet<Name> = HashSet::new();
+            let mut given: HashSet<Option<Name>> = HashSet::new();
             for field in self.fields(spread) {
-                let Some(name) = field.name else {
+                if field.kind == FieldTyKind::Spread {
                     continue;
-                };
+                }
+                let name = field.name();
                 if !given.insert(name) {
                     problems.push(TypeProblem::Repeated {
                         name,
@@ -2149,12 +2186,14 @@ pub enum TypeProblem {
     /// The record type spreads the type `operand`, which has a field
     /// `name`, of type `ty`, that the record type writes before the spread,
     /// its name at `first`, and `others` more such fields: "field `x` is
-    /// defined twice", at the operand.
+    /// defined twice", at the operand; for the rest-field, "the rest-field
+    /// is defined twice".
     Replaces {
         /// The type spread.
         operand: TypeExprId,
-        /// The first field it has that is written before it.
-        name: Name,
+        /// The first field it has that is written before it: its name, or
+        /// `None` for the rest-field.
+        name: Option<Name>,
         /// The type it has that field of.
         ty: TypeExprId,
         /// Where the field written before it is.
@@ -2167,10 +2206,11 @@ pub enum TypeProblem {
     Erroneous,
     /// The record type spreads a record type written in place that has the
     /// field `name` twice, the later at `at`: "field `x` appears twice in
-    /// this type", at the later, as anywhere else.
+    /// this type", at the later, as anywhere else; for the rest-field, "the
+    /// rest-field appears twice in this type".
     Repeated {
-        /// The name written twice.
-        name: Name,
+        /// The name written twice, or `None` for the rest-field.
+        name: Option<Name>,
         /// Where it is written the second time.
         at: Span,
     },
@@ -3502,7 +3542,13 @@ impl Ast {
         }
         let parsed = self.types.len();
         self.expansion.parsed = Some(next_id(parsed));
-        if links.is_empty() && self.types.fields.iter().all(|field| field.name.is_some()) {
+        if links.is_empty()
+            && self
+                .types
+                .fields
+                .iter()
+                .all(|field| field.kind != FieldTyKind::Spread)
+        {
             return;
         }
         // The height of each node, by id: the parsed ones' as they are
@@ -4207,9 +4253,10 @@ impl WrittenType<'_> {
                     if index > 0 {
                         f.write_str(", ")?;
                     }
-                    match field.name {
-                        Some(name) => write!(f, "{}: ", FieldName(names.get(name)))?,
-                        None => f.write_str("...")?,
+                    match field.kind {
+                        FieldTyKind::Field(name) => write!(f, "{}: ", FieldName(names.get(name)))?,
+                        FieldTyKind::Spread => f.write_str("...")?,
+                        FieldTyKind::Rest => f.write_str("*: ")?,
                     }
                     self.type_expr(f, field.ty)?;
                     match field.default {

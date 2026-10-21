@@ -216,12 +216,13 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
                 if index > 0 {
                     out.push_str(", ");
                 }
-                match field.name {
-                    Some(name) => {
+                match field.kind {
+                    FieldTyKind::Field(name) => {
                         out.push_str(&FieldName(ast.names().get(name)).to_string());
                         out.push_str(": ");
                     }
-                    None => out.push_str("..."),
+                    FieldTyKind::Spread => out.push_str("..."),
+                    FieldTyKind::Rest => out.push_str("*: "),
                 }
                 type_name(ast, field.ty, out);
                 if let Some(FieldDefault::Expr(default)) = field.default {
@@ -1993,7 +1994,10 @@ fn record_types() {
     assert_eq!(fields.len(), 2);
     assert_eq!(fields[0].span, Span::new(5, 6));
     assert_eq!(fields[1].span, Span::new(13, 16));
-    assert_eq!(fields[1].name.map(|name| ast.names().get(name)), Some("b"));
+    assert_eq!(
+        fields[1].name().map(|name| ast.names().get(name)),
+        Some("b")
+    );
     assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(18, 20));
 }
 
@@ -2116,6 +2120,49 @@ fn record_type_errors() {
             "expected a field name in record type".to_owned(),
             Span::new(5, 5)
         )
+    );
+}
+
+#[test]
+fn a_record_type_may_have_a_rest_field() {
+    assert_eq!(shape("1 : {*: String}"), "(1 : {*: String})");
+    // Anywhere among the fields and spreads, and with newlines around its
+    // parts, as a field's; how many it may have is the checker's
+    // business.
+    assert_eq!(
+        shape("let p: {\n  to: String,\n  *\n  :\n  Int,\n  ...T\n} = q"),
+        "let p: {to: String, *: Int, ...T} = q"
+    );
+    assert_eq!(
+        shape("1 : {*: Int, *: String}"),
+        "(1 : {*: Int, *: String})"
+    );
+    let ast = parse_text("1 : {a: Int, *: {}}").unwrap();
+    let ItemKind::Expr(root) = ast.item(ast.items(ast.root())[0]).kind else {
+        panic!("expected an expression item");
+    };
+    let ExprKind::Ascribe { ty, .. } = ast.get(root).kind else {
+        panic!("expected an ascription");
+    };
+    let TypeExprKind::Record(fields) = ast.type_expr(ty).kind else {
+        panic!("expected a record type");
+    };
+    let fields = ast.field_tys(fields);
+    assert_eq!(fields[1].kind, FieldTyKind::Rest);
+    assert_eq!(fields[1].name(), None);
+    assert_eq!(fields[1].span, Span::new(13, 14));
+    assert_eq!(ast.type_expr(fields[1].ty).span, Span::new(16, 18));
+    // It has no default, and needs its `:`.
+    assert_eq!(
+        error("1 : {*: Int = 1}"),
+        (
+            "a rest-field cannot have a default".to_owned(),
+            Span::new(12, 13)
+        )
+    );
+    assert_eq!(
+        error("1 : {* Int}"),
+        ("expected `:` after `*`".to_owned(), Span::new(7, 10))
     );
 }
 

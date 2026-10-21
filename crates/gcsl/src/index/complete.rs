@@ -1447,6 +1447,27 @@ mod tests {
     }
 
     #[test]
+    fn after_a_dot_a_record_with_a_rest_field_offers_its_named_fields() {
+        // The rest-field names no field, and those it covers are not read
+        // by name: the named ones are offered, whatever the rest-field's
+        // type, and never lost to it.
+        for rest in ["String", "Int"] {
+            let text = format!(
+                "fn g(): Int {{\n    let f: {{to: String, from: String, *: {rest}}} = \
+                 {{to = \"a\"; from = \"b\"; x = {value}}}\n    let x = f.|\n    1\n}}\nr = g()\n",
+                value = if rest == "Int" { "1" } else { "\"c\"" },
+            );
+            let found = complete(&[("app.gcsl", &text)], "app.gcsl");
+            assert_eq!(labels(&found), ["from", "to"], "{text}");
+            assert_eq!(named(&found, "to").detail.as_deref(), Some("String"));
+        }
+        // A map names none.
+        let text = "fn g(): Int {\n    let m: {*: String} = {a = \"x\"}\n    let x = m.|\n    1\n}\nr = g()\n";
+        let found = complete(&[("app.gcsl", text)], "app.gcsl");
+        assert_eq!(labels(&found), [] as [&str; 0]);
+    }
+
+    #[test]
     fn a_name_is_completed_from_what_is_in_scope_nearest_first() {
         let text = "import v from lib.x\n# The top.\ntop = 1\nfn helper(n: Int): Int { n }\n\
                     fn g(p: Int): String {\n    let x = 1\n    let x = \"s\"\n    let y = |\n    let later = 2\n    x\n}\n\

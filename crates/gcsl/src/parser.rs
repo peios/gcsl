@@ -374,8 +374,12 @@
 //! the field access `(x : Int).y` and could only be an error, is now the
 //! ascription of a qualified name. A
 //! record type is `{` then `}`, or entries separated by `,`, each `NAME:
-//! TYPE`, `NAME: TYPE = DEFAULT` or a spread, `...TYPE`, whose fields join
-//! the record type, with an optional trailing `,`, then `}`. A field's
+//! TYPE`, `NAME: TYPE = DEFAULT`, a spread, `...TYPE`, whose fields join
+//! the record type, or a rest-field, `*: TYPE`, the type of every field the
+//! record type does not name, with an optional trailing `,`, then `}`. A
+//! rest-field has no default: an `=` after its type is "a rest-field cannot
+//! have a default"; how many a record type has is the checker's business.
+//! A field's
 //! default, [`FieldDefault::Expr`], is any expression, after the `=`, as a
 //! parameter's default is (`Parser::parse_field_default`), wherever the
 //! record type is written: in an annotation, a `type`, a parameter's or a
@@ -884,10 +888,10 @@
 use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, Ast, AstBuilder, BinaryOp, BuilderMark, DefTypeRole, DefTypeUse, Effect, Element,
-    Expr, ExprId, ExprKind, FieldDefault, FieldTy, FnDecl, ForDecl, ForHead, ImportDecl,
-    ImportForm, ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy,
-    Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExpr, TypeExprId,
-    TypeExprKind, UnaryOp, path_span,
+    Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind, FnDecl, ForDecl, ForHead,
+    ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump,
+    Label, MetaTy, Param, ParamTy, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExpr,
+    TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{MAX_ERRORS, Token, TokenKind, lex};
@@ -3793,42 +3797,58 @@ impl Parser<'_> {
     }
 
     /// Parses an entry of a record type, a field, `NAME: TYPE` with its
-    /// default if it has one, or a spread, `...TYPE`, and the `,` or the `}`
-    /// after it, newlines skipped, raising `tallest` to the height of its
-    /// type and its default. Returns the `}` if it ends the type.
+    /// default if it has one, a spread, `...TYPE`, or a rest-field, `*:
+    /// TYPE`, and the `,` or the `}` after it, newlines skipped, raising
+    /// `tallest` to the height of its type and its default. Returns the `}`
+    /// if it ends the type. A rest-field has no default: an `=` after its
+    /// type is "a rest-field cannot have a default".
     fn parse_field_ty(&mut self, tallest: &mut u32) -> ParseResult<Option<Token>> {
         let token = self.peek();
-        // A spread, `...TYPE`.
-        let name = if token.kind == TokenKind::DotDotDot {
-            self.advance();
-            self.skip_newlines();
-            None
-        } else {
-            let Some(name) = self.field_name()? else {
-                return Err(self.error("expected a field name in record type", error_span(token)));
-            };
-            self.skip_newlines();
-            let colon = self.peek();
-            if colon.kind != TokenKind::Colon {
-                return Err(self.error("expected `:` after field name", error_span(colon)));
+        let kind = match token.kind {
+            // A spread, `...TYPE`.
+            TokenKind::DotDotDot => {
+                self.advance();
+                self.skip_newlines();
+                FieldTyKind::Spread
             }
-            self.advance();
-            self.skip_newlines();
-            Some(name)
+            // A rest-field, `*: TYPE`.
+            TokenKind::Star => {
+                self.advance();
+                self.skip_newlines();
+                self.expect_field_colon("expected `:` after `*`")?;
+                FieldTyKind::Rest
+            }
+            _ => {
+                let Some(name) = self.field_name()? else {
+                    return Err(
+                        self.error("expected a field name in record type", error_span(token))
+                    );
+                };
+                self.skip_newlines();
+                self.expect_field_colon("expected `:` after field name")?;
+                FieldTyKind::Field(name)
+            }
         };
         let (ty, height) = self.parse_type()?;
         *tallest = (*tallest).max(height);
         self.skip_newlines();
-        // A field's default; a spread has none.
-        let default = match name {
-            Some(_) => self.parse_field_default()?,
-            None => None,
+        // A field's default; a spread has none, nor may a rest-field.
+        let default = match kind {
+            FieldTyKind::Field(_) => self.parse_field_default()?,
+            FieldTyKind::Rest => {
+                let eq = self.peek();
+                if eq.kind == TokenKind::Eq {
+                    return Err(self.error("a rest-field cannot have a default", error_span(eq)));
+                }
+                None
+            }
+            FieldTyKind::Spread => None,
         };
         if let Some(default) = default {
             *tallest = (*tallest).max(self.height_of(default));
         }
         self.field_ty_stack.push(FieldTy {
-            name,
+            kind,
             span: token.span,
             ty,
             default: default.map(FieldDefault::Expr),
@@ -3847,6 +3867,18 @@ impl Parser<'_> {
             }
             _ => Err(self.error("expected `,` or `}`", error_span(separator))),
         }
+    }
+
+    /// Consumes the `:` after a record type's field name or `*`, and the
+    /// newlines after it; `message` at the current token if it is not one.
+    fn expect_field_colon(&mut self, message: &str) -> ParseResult<()> {
+        let colon = self.peek();
+        if colon.kind != TokenKind::Colon {
+            return Err(self.error(message, error_span(colon)));
+        }
+        self.advance();
+        self.skip_newlines();
+        Ok(())
     }
 
     /// Parses a field's default in a record type, `= EXPR`, if the current

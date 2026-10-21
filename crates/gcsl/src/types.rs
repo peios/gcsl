@@ -58,6 +58,43 @@
 //! the fields it keeps, a field whose type a functional update sets losing
 //! its own.
 //!
+//! # Rest-fields
+//!
+//! A record type may have a *rest-field*, `*: T`, [`RecordTy::rest`]: the
+//! type of every field it does not name. `{*: String}` is the type of a
+//! record of any fields, each a `String`, and `{from: String, to: String,
+//! *: Int}` of a record with a `String` `from` and `to` and any other fields
+//! `Int`s: a named field is exempt from the rest-field, whatever its type.
+//! A rest-field is part of the type as interned and displayed, shown after
+//! the named fields; it has no default.
+//!
+//! A record value keeps the fields its static type hides (see
+//! [Records](#records)), so a type without a rest-field says nothing of
+//! the fields it does not name: a value of type `{a: Int}` may hold `b =
+//! "x"`. A record type `S` is therefore a subtype of `T` with a rest-field
+//! `R` only when `S` has a rest-field that is a subtype of `R` and each
+//! named field of `S` that `T` does not name is of a subtype of `R`, as
+//! well as having every named field of `T` as ever. A type with a
+//! rest-field is a subtype of one without, which forgets it, as width
+//! subtyping forgets a field. The checker gives a record block written
+//! where a type with a rest-field is expected that rest-field, once each
+//! field it does not name is checked against it (see [`crate::check`],
+//! "Records"), so a literal can be one.
+//!
+//! The join of two record types with rest-fields has the rest-field of the
+//! join of the two, and of every named field only one side has, which the
+//! join no longer names; the join of two record types of which one has no
+//! rest-field has none. Two record types overlap when each field one names
+//! overlaps the field of its name on the other side, or else the other's
+//! rest-field. A test of a type with a rest-field, by `is` or `as`, tests
+//! each field of the value that the type does not name against it
+//! ([`ValueTest::RecordRest`]), unless the value's own type already
+//! guarantees it.
+//!
+//! A field the type does not name is not read by name: `r.x` of a type with
+//! a rest-field but no field `x` is an error, as for any type without the
+//! field.
+//!
 //! # Lists
 //!
 //! `List<T>`, [`TyKind::List`], is the type of every list whose elements
@@ -386,21 +423,74 @@ pub enum TyKind {
     Builtin(Builtin),
 }
 
-/// The fields of a record type, and the defaults of those that have one
-/// (see [Defaults](#defaults)).
+/// The fields of a record type, the defaults of those that have one (see
+/// [Defaults](#defaults)), and its rest-field, if it has one (see
+/// [Rest-fields](#rest-fields)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RecordTy {
-    /// Each field's name and type, sorted by name, with no name twice.
+    /// Each field's name and type, sorted by name, with no name twice: its
+    /// *named* fields.
     pub fields: Box<[(Name, TyId)]>,
-    /// Each defaulted field's name and default, sorted by name, each a name
-    /// of `fields`; `None` for a record type without defaults, never an
-    /// empty list. Boxed once more, behind a thin pointer, so that a record
-    /// type, nearly every one of which has none, makes a [`TyKind`] no
-    /// larger than a function type's signature does.
-    pub defaults: Option<Box<Defaults>>,
+    /// Its defaults and its rest-field, if it has either; `None` for a
+    /// record type with neither, never an empty [`RecordExtras`]. Boxed,
+    /// behind a thin pointer, so that a record type, nearly every one of
+    /// which has neither, makes a [`TyKind`] no larger than a function
+    /// type's signature does.
+    pub extras: Option<Box<RecordExtras>>,
 }
 
-/// The defaults of a record type's fields: see [`RecordTy::defaults`].
+/// What few record types have beyond their fields: see
+/// [`RecordTy::extras`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RecordExtras {
+    /// Each defaulted field's name and default, sorted by name, each a name
+    /// of the record type's fields; empty for a record type without
+    /// defaults.
+    pub defaults: Defaults,
+    /// The type of every field that is not a named one, `T` of `*: T`;
+    /// `None` for a record type without a rest-field.
+    pub rest: Option<TyId>,
+}
+
+impl RecordTy {
+    /// The record type of `fields`, the rest-field `rest`, if it is one,
+    /// and `defaults`, as [`TypeTable::intern`] takes it.
+    #[must_use]
+    pub fn new(
+        fields: Box<[(Name, TyId)]>,
+        rest: Option<TyId>,
+        defaults: Vec<(Name, Constant)>,
+    ) -> Self {
+        let extras = (rest.is_some() || !defaults.is_empty()).then(|| {
+            Box::new(RecordExtras {
+                defaults: defaults.into_boxed_slice(),
+                rest,
+            })
+        });
+        Self { fields, extras }
+    }
+
+    /// The type of its rest-field, `T` of `*: T`, if it has one.
+    #[must_use]
+    pub fn rest(&self) -> Option<TyId> {
+        self.extras.as_ref().and_then(|extras| extras.rest)
+    }
+
+    /// Its defaults, sorted by name; empty if it has none.
+    #[must_use]
+    pub fn defaults(&self) -> &[(Name, Constant)] {
+        self.extras.as_ref().map_or(&[], |extras| &extras.defaults)
+    }
+
+    /// The types it holds: each named field's, in order, then its
+    /// rest-field's, if it has one. What a walk that looks into every part
+    /// of a type alike looks into.
+    pub fn types(&self) -> impl Iterator<Item = TyId> + '_ {
+        self.fields.iter().map(|&(_, ty)| ty).chain(self.rest())
+    }
+}
+
+/// The defaults of a record type's fields: see [`RecordExtras::defaults`].
 pub type Defaults = Box<[(Name, Constant)]>;
 
 /// The signature of a function type.
@@ -473,6 +563,20 @@ pub enum ValueTest {
     /// has, the value of each passing the field's test. Never empty: a test
     /// of no field is `Kind(ValueKind::Record)`.
     Record(Box<[(Name, ValueTest)]>),
+    /// Passes for a record that passes the test of its named fields, and
+    /// each of whose other fields passes the test of the rest-field: the
+    /// test of a record type with a rest-field whose values may hold fields
+    /// that do not fit it (see [Rest-fields](#rest-fields)).
+    RecordRest {
+        /// The fields to test by name, as [`ValueTest::Record`] has them;
+        /// possibly none.
+        fields: Box<[(Name, ValueTest)]>,
+        /// Every field the type names, sorted, which the test of the
+        /// rest-field passes over.
+        named: Box<[Name]>,
+        /// The test of every other field. Never [`ValueTest::Pass`].
+        rest: Box<ValueTest>,
+    },
     /// Passes for a list each of whose elements passes the test, the empty
     /// list included. Never of [`ValueTest::Pass`]: that is
     /// `Kind(ValueKind::List)`.
@@ -489,7 +593,7 @@ impl ValueTest {
     pub fn walks(&self) -> bool {
         match self {
             ValueTest::Pass | ValueTest::Kind(_) => false,
-            ValueTest::Record(_) | ValueTest::List(_) => true,
+            ValueTest::Record(_) | ValueTest::RecordRest { .. } | ValueTest::List(_) => true,
             ValueTest::Any(tests) => tests.iter().any(ValueTest::walks),
         }
     }
@@ -535,7 +639,7 @@ impl TypeTable {
             TyKind::String,
             TyKind::Record(RecordTy {
                 fields: Box::default(),
-                defaults: None,
+                extras: None,
             }),
             TyKind::UntypedInt,
             TyKind::Error,
@@ -565,21 +669,18 @@ impl TypeTable {
     /// table; past it, ids would saturate.
     pub fn intern(&mut self, kind: TyKind) -> TyId {
         let kind = match kind {
-            TyKind::Record(RecordTy {
-                mut fields,
-                mut defaults,
-            }) => {
+            TyKind::Record(RecordTy { mut fields, extras }) => {
                 if !fields.is_sorted_by_key(|&(name, _)| name) {
                     fields.sort_unstable_by_key(|&(name, _)| name);
                 }
-                if let Some(defaults) = &mut defaults
-                    && !defaults.is_sorted_by_key(|&(name, _)| name)
-                {
-                    defaults.sort_unstable_by_key(|&(name, _)| name);
-                }
-                // No default is none.
-                let defaults = defaults.filter(|defaults| !defaults.is_empty());
-                TyKind::Record(RecordTy { fields, defaults })
+                let extras = extras.and_then(|mut extras| {
+                    if !extras.defaults.is_sorted_by_key(|&(name, _)| name) {
+                        extras.defaults.sort_unstable_by_key(|&(name, _)| name);
+                    }
+                    // No default and no rest-field is no extras.
+                    (extras.rest.is_some() || !extras.defaults.is_empty()).then_some(extras)
+                });
+                TyKind::Record(RecordTy { fields, extras })
             }
             other => other,
         };
@@ -589,10 +690,7 @@ impl TypeTable {
         let id = TyId(u32::try_from(self.kinds.len()).unwrap_or(u32::MAX));
         let provisional = match &kind {
             TyKind::Provisional { .. } => true,
-            TyKind::Record(record) => record
-                .fields
-                .iter()
-                .any(|&(_, field)| self.has_provisional(field)),
+            TyKind::Record(record) => record.types().any(|field| self.has_provisional(field)),
             TyKind::Fn(sig) => {
                 self.has_provisional(sig.ret)
                     || sig.meta.is_some_and(|meta| self.has_provisional(meta.ty))
@@ -664,10 +762,7 @@ impl TypeTable {
     pub fn special_builtin(&self, id: TyId) -> Option<Builtin> {
         match self.kinds.get(id.index())? {
             TyKind::Builtin(builtin) => Some(*builtin),
-            TyKind::Record(record) => record
-                .fields
-                .iter()
-                .find_map(|&(_, field)| self.special_builtin(field)),
+            TyKind::Record(record) => record.types().find_map(|field| self.special_builtin(field)),
             TyKind::Fn(sig) => sig
                 .params
                 .iter()
@@ -707,18 +802,38 @@ impl TypeTable {
         fields: impl IntoIterator<Item = (Name, TyId)>,
         defaults: Vec<(Name, Constant)>,
     ) -> TyId {
-        self.intern(TyKind::Record(RecordTy {
-            fields: fields.into_iter().collect(),
-            defaults: (!defaults.is_empty()).then(|| Box::new(defaults.into_boxed_slice())),
-        }))
+        self.record_with_rest(fields, None, defaults)
     }
 
-    /// The record type with `fields`, sorted by name, keeping the default
-    /// that the record type `template` has of each of them that it has one
-    /// for, adding it to the table if it is new: a record type rebuilt from
-    /// another's fields, settled or made present, which is still what was
-    /// written (see [Defaults](#defaults)).
-    pub fn record_like(&mut self, template: TyId, fields: Vec<(Name, TyId)>) -> TyId {
+    /// Returns the id of the record type with `fields`, in any order, the
+    /// rest-field `rest`, if it is one (see [Rest-fields](#rest-fields)),
+    /// and the fields named in `defaults` having those defaults, adding it
+    /// to the table if it is new. The fields must not repeat a name, and
+    /// each default must be of one of them.
+    pub fn record_with_rest(
+        &mut self,
+        fields: impl IntoIterator<Item = (Name, TyId)>,
+        rest: Option<TyId>,
+        defaults: Vec<(Name, Constant)>,
+    ) -> TyId {
+        self.intern(TyKind::Record(RecordTy::new(
+            fields.into_iter().collect(),
+            rest,
+            defaults,
+        )))
+    }
+
+    /// The record type with `fields`, sorted by name, and the rest-field
+    /// `rest`, keeping the default that the record type `template` has of
+    /// each of the fields that it has one for, adding it to the table if it
+    /// is new: a record type rebuilt from another's fields, settled or made
+    /// present, which is still what was written (see [Defaults](#defaults)).
+    pub fn record_like(
+        &mut self,
+        template: TyId,
+        fields: Vec<(Name, TyId)>,
+        rest: Option<TyId>,
+    ) -> TyId {
         let defaults: Vec<(Name, Constant)> = self
             .defaults(template)
             .iter()
@@ -729,7 +844,18 @@ impl TypeTable {
             })
             .cloned()
             .collect();
-        self.record_with_defaults(fields, defaults)
+        self.record_with_rest(fields, rest, defaults)
+    }
+
+    /// The type of the rest-field of record type `id`, `T` of `*: T`, or
+    /// `None` if it has none or is not a record type (see
+    /// [Rest-fields](#rest-fields)).
+    #[must_use]
+    pub fn record_rest(&self, id: TyId) -> Option<TyId> {
+        match self.kinds.get(id.index()) {
+            Some(TyKind::Record(record)) => record.rest(),
+            _ => None,
+        }
     }
 
     /// The defaults of the fields of record type `id` that have one, sorted
@@ -738,10 +864,7 @@ impl TypeTable {
     #[must_use]
     pub fn defaults(&self, id: TyId) -> &[(Name, Constant)] {
         match self.kinds.get(id.index()) {
-            Some(TyKind::Record(RecordTy {
-                defaults: Some(defaults),
-                ..
-            })) => defaults,
+            Some(TyKind::Record(record)) => record.defaults(),
             _ => &[],
         }
     }
@@ -1015,8 +1138,11 @@ impl TypeTable {
                     .iter()
                     .map(|&(name, ty)| (name, self.settle(ty, function, decisions)))
                     .collect();
+                let rest = record
+                    .rest()
+                    .map(|rest| self.settle(rest, function, decisions));
                 // Still sorted, so interning does not sort it again.
-                self.record_like(id, fields)
+                self.record_like(id, fields, rest)
             }
             TyKind::Fn(sig) => {
                 let params: Vec<(Option<Name>, TyId)> = sig
@@ -1083,9 +1209,8 @@ impl TypeTable {
         match self.kinds.get(id.index()) {
             Some(TyKind::Provisional { function: of, .. }) => *of == function,
             Some(TyKind::Record(record)) => record
-                .fields
-                .iter()
-                .any(|&(_, field)| self.contains_provisional(field, Some(function))),
+                .types()
+                .any(|field| self.contains_provisional(field, Some(function))),
             Some(TyKind::Fn(sig)) => {
                 self.contains_provisional(sig.ret, Some(function))
                     || sig
@@ -1123,7 +1248,7 @@ impl TypeTable {
                 ..
             }) if *of == function => out.push(*param),
             Some(TyKind::Record(record)) => {
-                for &(_, field) in &record.fields {
+                for field in record.types() {
                     self.provisional_params(field, function, out);
                 }
             }
@@ -1210,10 +1335,16 @@ impl TypeTable {
                     return;
                 }
                 let expected = self.strip(expected);
+                let expected_rest = self.record_rest(expected);
+                // A named field that `expected` does not name is held to
+                // its rest-field, if it has one.
                 for &(name, field) in &record.fields {
-                    if let Some(expected_field) = self.field(expected, name) {
+                    if let Some(expected_field) = self.field(expected, name).or(expected_rest) {
                         self.provisionals_at_present(field, expected_field, function, out);
                     }
+                }
+                if let (Some(rest), Some(expected_rest)) = (record.rest(), expected_rest) {
+                    self.provisionals_at_present(rest, expected_rest, function, out);
                 }
             }
             Some(TyKind::List(element)) => {
@@ -1323,9 +1454,14 @@ impl TypeTable {
             changed |= field != ty;
             presented.push((name, field));
         }
+        let rest = self.record_rest(top).map(|rest| {
+            let field = self.present(rest);
+            changed |= field != rest;
+            field
+        });
         if changed {
             // Still sorted, so interning does not sort it again.
-            self.record_like(top, presented)
+            self.record_like(top, presented, rest)
         } else {
             top
         }
@@ -1372,10 +1508,7 @@ impl TypeTable {
             Some(TyKind::Union(members)) => {
                 members.iter().any(|&member| self.contains_future(member))
             }
-            Some(TyKind::Record(record)) => record
-                .fields
-                .iter()
-                .any(|&(_, field)| self.contains_future(field)),
+            Some(TyKind::Record(record)) => record.types().any(|field| self.contains_future(field)),
             _ => false,
         }
     }
@@ -1385,8 +1518,10 @@ impl TypeTable {
     /// otherwise. `None` if `record` is not a record type. The type of a
     /// functional update that sets one field. The other fields keep their
     /// defaults, if they have any; the field set has none, its type being
-    /// another.
+    /// another. A rest-field is kept: a field added is a named one, which
+    /// the rest-field does not cover.
     pub fn with_field(&mut self, record: TyId, name: Name, ty: TyId) -> Option<TyId> {
+        let rest_field = self.record_rest(record);
         let fields = self.record_fields(record)?;
         let at = fields.partition_point(|&(field, _)| field < name);
         let replaces = fields.get(at).is_some_and(|&(field, _)| field == name);
@@ -1402,7 +1537,7 @@ impl TypeTable {
             .cloned()
             .collect();
         // Still sorted, so interning does not sort it again.
-        Some(self.record_with_defaults(updated, defaults))
+        Some(self.record_with_rest(updated, rest_field, defaults))
     }
 
     /// Whether `a` and `b` are one type once their defaults are forgotten
@@ -1427,7 +1562,13 @@ impl TypeTable {
         };
         match (a_kind, b_kind) {
             (TyKind::Record(a_record), TyKind::Record(b_record)) => {
-                a_record.fields.len() == b_record.fields.len()
+                let rests = match (a_record.rest(), b_record.rest()) {
+                    (None, None) => true,
+                    (Some(a_rest), Some(b_rest)) => self.same(a_rest, b_rest),
+                    _ => false,
+                };
+                rests
+                    && a_record.fields.len() == b_record.fields.len()
                     && a_record.fields.iter().zip(&b_record.fields).all(
                         |(&(a_name, a_ty), &(b_name, b_ty))| {
                             a_name == b_name && self.same(a_ty, b_ty)
@@ -1535,6 +1676,17 @@ impl TypeTable {
         fields.get(index).map(|&(_, ty)| ty)
     }
 
+    /// The type record type `record` holds field `name` to: the type of its
+    /// field of the name, or else of its rest-field (see
+    /// [Rest-fields](#rest-fields)); `None` if it has neither or is not a
+    /// record type. What a field written where `record` is expected is
+    /// checked against.
+    #[must_use]
+    pub fn field_or_rest(&self, record: TyId, name: Name) -> Option<TyId> {
+        self.field(record, name)
+            .or_else(|| self.record_rest(record))
+    }
+
     /// Whether a value of type `sub` may be used where `sup` is expected:
     /// `sub` is `sup`; or both are record types and `sub` has every field
     /// of `sup`, each of a subtype of that field's type in `sup`; or both
@@ -1609,6 +1761,27 @@ impl TypeTable {
         else {
             return false;
         };
+        // A rest-field required covers every field the required type does
+        // not name, so the offered type must say what all of those are: by
+        // a rest-field of its own, and by each named field it has beyond
+        // the required ones (see [Rest-fields](#rest-fields)).
+        if let Some(required_rest) = self.record_rest(sup) {
+            let Some(offered_rest) = self.record_rest(sub) else {
+                return false;
+            };
+            if !self.is_subtype(offered_rest, required_rest) {
+                return false;
+            }
+            let beyond_fit = offered.iter().all(|&(name, offered_ty)| {
+                required
+                    .binary_search_by_key(&name, |&(field, _)| field)
+                    .is_ok()
+                    || self.is_subtype(offered_ty, required_rest)
+            });
+            if !beyond_fit {
+                return false;
+            }
+        }
         // Both lists are sorted by name, so one merge-like walk finds every
         // required field among the offered ones.
         let mut offered = offered.iter();
@@ -1768,10 +1941,15 @@ impl TypeTable {
         // Copies of the two field lists (ids only), since joining a field
         // may intern new types and so needs the table mutably.
         let (a_fields, b_fields) = (a_fields.to_vec(), b_fields.to_vec());
+        let rests = (self.record_rest(a), self.record_rest(b));
         let mut shared = Vec::with_capacity(a_fields.len().min(b_fields.len()));
+        // The types of the named fields only one side has, which a joined
+        // rest-field must cover.
+        let mut unshared = Vec::new();
         let mut widened = false;
         for &(name, a_ty) in &a_fields {
             let Ok(index) = b_fields.binary_search_by_key(&name, |&(field, _)| field) else {
+                unshared.push(a_ty);
                 continue;
             };
             let Some(&(_, b_ty)) = b_fields.get(index) else {
@@ -1781,9 +1959,34 @@ impl TypeTable {
             widened |= field_widened;
             shared.push((name, joined));
         }
+        // The rest-field of the join, if both sides have one: the join of
+        // both, and of every named field only one side has, which the join
+        // no longer names (see [Rest-fields](#rest-fields)).
+        let rest = if let (Some(a_rest), Some(b_rest)) = rests {
+            unshared.extend(
+                b_fields
+                    .iter()
+                    .filter(|&&(name, _)| {
+                        a_fields
+                            .binary_search_by_key(&name, |&(field, _)| field)
+                            .is_err()
+                    })
+                    .map(|&(_, ty)| ty),
+            );
+            let (mut rest, mut rest_widened) = self.join(a_rest, b_rest);
+            for ty in unshared {
+                let (joined, field_widened) = self.join(rest, ty);
+                rest = joined;
+                rest_widened |= field_widened;
+            }
+            widened |= rest_widened;
+            Some(rest)
+        } else {
+            None
+        };
         // `shared` is in `a`'s order, which is sorted, so interning does
         // not sort it again.
-        (self.record(shared), widened)
+        (self.record_with_rest(shared, rest, Vec::new()), widened)
     }
 
     /// The kind of value an expression of type `id` produces at runtime, or
@@ -1848,11 +2051,22 @@ impl TypeTable {
             return members.iter().any(|&member| self.overlaps(a, member));
         }
         match (self.kind(a), self.kind(b)) {
-            (TyKind::Record(a_record), TyKind::Record(_)) => {
-                a_record.fields.iter().all(|&(name, a_field)| {
-                    self.field(b, name)
-                        .is_none_or(|b_field| self.overlaps(a_field, b_field))
-                })
+            (TyKind::Record(a_record), TyKind::Record(b_record)) => {
+                // A field one side names is held, on the other, to the field
+                // of its name, or else to its rest-field, if it has one.
+                let fits = |field: Name, ty: TyId, other: TyId, rest: Option<TyId>| {
+                    self.field(other, field)
+                        .or(rest)
+                        .is_none_or(|other_ty| self.overlaps(ty, other_ty))
+                };
+                a_record
+                    .fields
+                    .iter()
+                    .all(|&(name, a_field)| fits(name, a_field, b, b_record.rest()))
+                    && b_record
+                        .fields
+                        .iter()
+                        .all(|&(name, b_field)| fits(name, b_field, a, a_record.rest()))
             }
             (TyKind::List(a_element), TyKind::List(b_element)) => {
                 self.overlaps(*a_element, *b_element)
@@ -1935,6 +2149,35 @@ impl TypeTable {
                 match self.test_plan(values.as_deref(), field_ty) {
                     ValueTest::Pass => {}
                     test => tests.push((name, test)),
+                }
+            }
+            if let Some(rest) = self.record_rest(ty) {
+                // What the fields `ty` does not name may be, by the record
+                // types of `value`: each one's rest-field, and its named
+                // fields that `ty` does not name; anything at all if one
+                // has no rest-field, since a field its type hides may be
+                // of any type.
+                let others = of_kind.as_ref().and_then(|records| {
+                    let mut found = Vec::new();
+                    for &record in records {
+                        found.push(self.record_rest(record)?);
+                        found.extend(
+                            self.record_fields(record)
+                                .unwrap_or_default()
+                                .iter()
+                                .filter(|&&(name, _)| self.field(ty, name).is_none())
+                                .map(|&(_, field)| field),
+                        );
+                    }
+                    Some(self.flattened(found))
+                });
+                let rest = self.test_plan(others.as_deref(), rest);
+                if rest != ValueTest::Pass {
+                    return ValueTest::RecordRest {
+                        fields: tests.into_boxed_slice(),
+                        named: fields.iter().map(|&(name, _)| name).collect(),
+                        rest: Box::new(rest),
+                    };
                 }
             }
             return if tests.is_empty() {
@@ -2135,6 +2378,13 @@ impl fmt::Display for Display<'_> {
                         f.write_str(" = ")?;
                         write_constant(f, constant, self.names)?;
                     }
+                }
+                // The rest-field after the named ones.
+                if let Some(rest) = record.rest() {
+                    if !fields.is_empty() {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "*: {}", self.nested(rest))?;
                 }
                 f.write_str("}")
             }

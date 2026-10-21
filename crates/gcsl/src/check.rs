@@ -126,6 +126,22 @@
 //! the expected type can see it. Warnings are collected apart from errors
 //! and returned with a successful check.
 //!
+//! An expected record type with a rest-field, `*: T` (see
+//! [`crate::types`], "Rest-fields"), lacks no field: each field item it
+//! does not name is checked against `T` as against a field of the type,
+//! and so is each soft field a spread defines and each dotted path's value,
+//! and an annotated field's annotation must be a subtype of `T`. The
+//! block's record then has the rest-field, which no record built otherwise
+//! has: so a literal can be a value of such a type, and a value whose type
+//! hides fields cannot (`Checker::check_rest_fields`). A field that dotted
+//! paths build is a record without one, which does not fit a `T` that has
+//! one: "mismatched types" at its first definition, noted to define it
+//! whole. A record type with a rest-field reaches `{}` and the record
+//! literals a block or an `if` results in as a record type with defaults
+//! does, to give them the rest-field. A spread of a value whose type has a
+//! rest-field is an error, since a spread defines the fields its operand's
+//! type names; so is reading by name a field only the rest-field covers.
+//!
 //! A field item may be annotated, `PATH: TYPE = EXPR`, in any block, the
 //! top level included, exactly as `let PATH: TYPE = EXPR` is for a `let`
 //! (`Checker::annotated_value`): the annotation is resolved with every bare
@@ -346,7 +362,11 @@
 //! spread cannot replace a field defined before it; put the spread first"
 //! (`Checker::spread_problems`). Only a record type may be spread, written
 //! so or named: anything else is "cannot spread type T: it is not a record
-//! type", at it, `T` shown as what it stands for.
+//! type", at it, `T` shown as what it stands for. A rest-field, `*: T`,
+//! merges as a field would: a spread's is soft, a second written one is
+//! "the rest-field appears twice in this type", and a spread's after a
+//! written one is "the rest-field is defined twice", labelled "this has a
+//! rest-field, of type T".
 //!
 //! What is wrong in a declaration's definition is reported once, where it
 //! is written: the workspace checks every file's `type` items before any
@@ -2854,10 +2874,10 @@ use std::rc::Rc;
 
 use crate::ast::{
     Annotate, ArgKind, ArgRange, Ast, BinaryOp, DefTypeId, DefTypeRole, Effect, Element,
-    ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyRange, FnDecl, FnId,
-    ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy, PartRange,
-    PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExprId, TypeExprKind, TypeProblem,
-    UnaryOp, path_span, symbol_span,
+    ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind, FieldTyRange, FnDecl,
+    FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId, MetaTy,
+    PartRange, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeExprId, TypeExprKind,
+    TypeProblem, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -6738,7 +6758,8 @@ impl<'a> Checker<'a> {
             self.reach_top_field(id, (name, name_span), ty, soft);
             return;
         }
-        let expected = expecting.map(|expecting| (expecting, self.types.field(expecting.ty, name)));
+        let expected =
+            expecting.map(|expecting| (expecting, self.types.field_or_rest(expecting.ty, name)));
         self.name_callee(segments, value);
         let ty = match expected {
             _ if annotation.is_some() => {
@@ -6963,10 +6984,35 @@ impl<'a> Checker<'a> {
             .map(|index| index + self.fields_start)
     }
 
+    /// Whether `ty`, the type of a spread item's operand, written at
+    /// `operand`, has a rest-field, which is reported at the item, at
+    /// `item_span`: a spread defines the fields its type names, and those a
+    /// rest-field covers are known only when it runs.
+    fn rest_spread(&mut self, ty: TyId, item_span: Span, operand: Span) -> bool {
+        if self.types.record_rest(ty).is_none() {
+            return false;
+        }
+        let shown = self.in_message(ty);
+        let label = format!("this is {}", self.in_label(ty));
+        self.errors.push(
+            Diagnostic::error(
+                format!("cannot spread a value of type {shown}: it has a rest-field"),
+                item_span,
+            )
+            .with_context(operand, label)
+            .with_note(SPREAD_REST_NOTE),
+        );
+        true
+    }
+
     /// Checks the spread item `id`, `...VALUE` (see the module
     /// documentation). Its operand is checked on its own and measured at
     /// the top (see [`Checker::measure`]), and must then be a record:
-    /// "cannot spread a value of type T: it is not a record" otherwise.
+    /// "cannot spread a value of type T: it is not a record" otherwise, and
+    /// one whose type has no rest-field, "cannot spread a value of type T:
+    /// it has a rest-field" otherwise, since a spread defines the fields
+    /// its type names, and the fields a rest-field covers are known only at
+    /// runtime.
     /// Each field of the record's type, in the order the type table holds
     /// them, by name, is then softly assigned: declared as a soft field of
     /// the block, with the type the record's type gives it, and bound anew
@@ -6989,7 +7035,7 @@ impl<'a> Checker<'a> {
         let item_span = self.ast.item(id).span;
         let operand = self.ast.get(value).span;
         // An erroneous operand has been reported already.
-        if ty == TyId::ERROR {
+        if ty == TyId::ERROR || self.rest_spread(ty, item_span, operand) {
             self.spreads = BlockSpreads::Rejected;
             return;
         }
@@ -7326,7 +7372,7 @@ impl<'a> Checker<'a> {
             // Not a record: reported when the block ends.
             self.types.record_fields(expected)?;
             let name = segment.name()?;
-            let Some(ty) = self.types.field(expected, name) else {
+            let Some(ty) = self.types.field_or_rest(expected, name) else {
                 if index >= existing {
                     let text = self.ast.names().get(name);
                     let record = self.in_message(expected);
@@ -7501,15 +7547,62 @@ impl<'a> Checker<'a> {
             erroneous |= self.report_missing_fields(base, expecting);
             erroneous |= self.check_open_fields(expecting);
         }
+        let rest = expecting.and_then(|expecting| {
+            let rest = self.types.record_rest(expecting.ty)?;
+            erroneous |= self.check_rest_fields(expecting, rest);
+            Some(rest)
+        });
         let ty = if erroneous {
             TyId::ERROR
         } else {
             let sorted = self.sorted_fields.get(base..).unwrap_or_default();
-            self.types
-                .record(sorted.iter().map(|&(name, _, ty)| (name, ty)))
+            self.types.record_with_rest(
+                sorted.iter().map(|&(name, _, ty)| (name, ty)),
+                rest,
+                Vec::new(),
+            )
         };
         self.sorted_fields.truncate(base);
         ty
+    }
+
+    /// Checks that each field of the innermost block that `expecting`'s
+    /// record type does not name fits its rest-field, `rest`, so that the
+    /// block's record can have it (see [Records](#records)), and returns
+    /// whether one does not. A field item, a spread's field and an
+    /// annotated field were checked against `rest` as they were defined,
+    /// and one that did not fit reported; an open field, whose record its
+    /// dotted paths build has no rest-field of its own, may not fit a
+    /// `rest` that has one, which is "mismatched types" at its first
+    /// definition.
+    fn check_rest_fields(&mut self, expecting: Expecting<'_>, rest: TyId) -> bool {
+        let mut erroneous = false;
+        for index in self.fields_start..self.fields.len() {
+            let field = self.fields[index];
+            if field.ty == TyId::ERROR
+                || rest == TyId::ERROR
+                || self.types.field(expecting.ty, field.name).is_some()
+                || self.types.is_subtype(field.ty, rest)
+            {
+                continue;
+            }
+            erroneous = true;
+            if field.open.is_none() {
+                continue;
+            }
+            let label = format!(
+                "expected {}, found {}",
+                self.in_label(rest),
+                self.in_label(field.ty)
+            );
+            self.errors.push(
+                Diagnostic::error("mismatched types", field.name_span)
+                    .with_label(label)
+                    .with_context(expecting.context, expecting.why)
+                    .with_note(DOTTED_REST_NOTE),
+            );
+        }
+        erroneous
     }
 
     /// Checks each soft field of the innermost block that stands, one that
@@ -7532,7 +7625,7 @@ impl<'a> Checker<'a> {
             let Some(operand) = field.spread else {
                 continue;
             };
-            let Some(expected) = self.types.field(expecting.ty, field.name) else {
+            let Some(expected) = self.types.field_or_rest(expecting.ty, field.name) else {
                 continue;
             };
             // An unknown type has been reported.
@@ -7658,7 +7751,7 @@ impl<'a> Checker<'a> {
             if field.ty == TyId::ERROR {
                 continue;
             }
-            let Some(expected) = self.types.field(expecting.ty, field.name) else {
+            let Some(expected) = self.types.field_or_rest(expecting.ty, field.name) else {
                 continue;
             };
             self.pending.push((open.node, expected));
@@ -7704,6 +7797,17 @@ impl<'a> Checker<'a> {
                     self.pending.push((child, ty));
                 }
                 Some(_) => {}
+            }
+        }
+        // An open child the type does not name is checked against its
+        // rest-field, if it has one.
+        if let Some(rest) = self.types.record_rest(record) {
+            let mut child = entry.first_child;
+            while let Some(&found) = self.nodes.get(child as usize) {
+                if found.kind == NodeKind::Open && self.types.field(record, found.name).is_none() {
+                    self.pending.push((child, rest));
+                }
+                child = found.next_sibling;
             }
         }
         if missing.is_empty() {
@@ -11703,28 +11807,35 @@ impl<'a> Checker<'a> {
                 } => {
                     let ty = self.resolve_type(ty, Bareness::Present);
                     if !self.quiet.types {
-                        let text = FieldName(ast.names().get(name)).to_string();
                         let note = spread_first_note(others as usize);
-                        let label =
-                            format!("`{text}` is a field of this, of type {}", self.in_label(ty));
+                        let (message, label) = match name {
+                            Some(name) => {
+                                let text = FieldName(ast.names().get(name)).to_string();
+                                (
+                                    format!("field `{text}` is defined twice"),
+                                    format!(
+                                        "`{text}` is a field of this, of type {}",
+                                        self.in_label(ty)
+                                    ),
+                                )
+                            }
+                            None => (
+                                "the rest-field is defined twice".to_owned(),
+                                format!("this has a rest-field, of type {}", self.in_label(ty)),
+                            ),
+                        };
                         self.errors.push(
-                            Diagnostic::error(
-                                format!("field `{text}` is defined twice"),
-                                ast.type_expr(operand).span,
-                            )
-                            .with_label(label)
-                            .with_context(first, "first defined here")
-                            .with_note(note),
+                            Diagnostic::error(message, ast.type_expr(operand).span)
+                                .with_label(label)
+                                .with_context(first, "first defined here")
+                                .with_note(note),
                         );
                     }
                 }
                 TypeProblem::Repeated { name, at } => {
                     if !self.quiet.types {
-                        let text = FieldName(ast.names().get(name));
-                        self.errors.push(Diagnostic::error(
-                            format!("field `{text}` appears twice in this type"),
-                            at,
-                        ));
+                        self.errors
+                            .push(Diagnostic::error(appears_twice(ast.names(), name), at));
                     }
                 }
                 TypeProblem::Unresolved(_) | TypeProblem::Erroneous => {}
@@ -11824,29 +11935,46 @@ impl<'a> Checker<'a> {
 
     /// The type the record type `id`, whose fields are `range`, denotes in
     /// `mode` (see [`Checker::resolve_type`]): the record of its fields'
-    /// types, each resolved in `mode` too, written bare in `mode`; or
-    /// `Error` if a field's type is erroneous, a name appears twice, "field
-    /// `x` appears twice in this type", reported at each appearance after
-    /// its first, or a spread of it had a problem
-    /// ([`Checker::spread_problems`]).
+    /// types and its rest-field's, if it has one, each resolved in `mode`
+    /// too, written bare in `mode`; or `Error` if a field's type is
+    /// erroneous, a name appears twice, "field `x` appears twice in this
+    /// type", reported at each appearance after its first, the rest-field
+    /// appears twice, "the rest-field appears twice in this type", at the
+    /// later, or a spread of it had a problem ([`Checker::spread_problems`]).
     fn resolve_record(&mut self, id: TypeExprId, range: FieldTyRange, mode: Bareness) -> TyId {
         let fields = self.ast.field_tys(range);
         let base = self.sorted_fields.len();
         let mut erroneous = false;
         let mut defaults: Vec<(Name, Constant)> = Vec::new();
+        let mut rest: Option<TyId> = None;
         for (index, field) in fields.iter().enumerate() {
-            // A spread is merged into the fields by the expansion of the
-            // file's types, which a workspace does before checking a file.
-            let Some(name) = field.name else {
-                self.errors.push(
-                    InternalError {
-                        message: "a spread in a record type was not expanded",
-                        span: field.span,
+            let name = match field.kind {
+                FieldTyKind::Field(name) => name,
+                FieldTyKind::Rest => {
+                    let rest_ty = self.resolve_type(field.ty, mode);
+                    erroneous |= rest_ty == TyId::ERROR;
+                    if rest.replace(rest_ty).is_some() {
+                        self.errors.push(Diagnostic::error(
+                            appears_twice(self.ast.names(), None),
+                            field.span,
+                        ));
+                        erroneous = true;
                     }
-                    .into(),
-                );
-                erroneous = true;
-                continue;
+                    continue;
+                }
+                // A spread is merged into the fields by the expansion of the
+                // file's types, which a workspace does before checking a file.
+                FieldTyKind::Spread => {
+                    self.errors.push(
+                        InternalError {
+                            message: "a spread in a record type was not expanded",
+                            span: field.span,
+                        }
+                        .into(),
+                    );
+                    erroneous = true;
+                    continue;
+                }
             };
             // Resolving a nested record type uses `sorted_fields` above this
             // one's entries and truncates back.
@@ -11872,9 +12000,8 @@ impl<'a> Checker<'a> {
             let Some(repeat) = fields.get(index as usize) else {
                 continue;
             };
-            let text = self.ast.names().get(name);
             self.errors.push(Diagnostic::error(
-                format!("field `{}` appears twice in this type", FieldName(text)),
+                appears_twice(self.ast.names(), Some(name)),
                 repeat.span,
             ));
             erroneous = true;
@@ -11883,9 +12010,11 @@ impl<'a> Checker<'a> {
             TyId::ERROR
         } else {
             let sorted = self.sorted_fields.get(base..).unwrap_or_default();
-            let record = self
-                .types
-                .record_with_defaults(sorted.iter().map(|&(name, _, ty)| (name, ty)), defaults);
+            let record = self.types.record_with_rest(
+                sorted.iter().map(|&(name, _, ty)| (name, ty)),
+                rest,
+                defaults,
+            );
             self.bare(record, mode)
         };
         self.sorted_fields.truncate(base);
@@ -13189,12 +13318,17 @@ impl<'a> Checker<'a> {
 
     /// Whether the record literal whose items are `items`, a record block's
     /// or `{}`'s, has no spread and lacks a defaulted field of the record
-    /// type `record`, giving it by none of its field items: whether, where
-    /// `record` reaches it only for its defaults ([`Checker::fill_result`]),
-    /// it is given one, and so checked against `record`. One that gives
-    /// every defaulted field, or that has a spread, which may give it one,
-    /// is checked there as it is with nothing expected.
+    /// type `record`, giving it by none of its field items, or `record` has
+    /// a rest-field: whether, where `record` reaches it only for its
+    /// defaults and its rest-field ([`Checker::fill_result`]), it is given
+    /// one, and so checked against `record`. One that gives every defaulted
+    /// field, or that has a spread, which may give it one, is checked there
+    /// as it is with nothing expected, unless `record` has a rest-field,
+    /// which the literal has only once checked against it.
     fn lacks_default(&self, items: ItemRange, record: TyId) -> bool {
+        if self.types.record_rest(record).is_some() {
+            return true;
+        }
         let items = self.ast.items(items);
         let ast = self.ast;
         if items
@@ -13516,23 +13650,29 @@ impl<'a> Checker<'a> {
     }
 
     /// The record type that `expected` is once stripped, if it is not a
-    /// future and the record type has defaults: what `{}` is given the
-    /// defaults of where `expected` is expected (see [Field
-    /// defaults](#field-defaults)). `None` otherwise, a union of record
-    /// types included, where `{}` is checked as ever.
+    /// future and the record type has defaults or a rest-field: what `{}`
+    /// is given the defaults of where `expected` is expected (see [Field
+    /// defaults](#field-defaults)), and its rest-field, which a record
+    /// literal written there has too (see [Records](#records)). `None`
+    /// otherwise, a union of record types included, where `{}` is checked
+    /// as ever.
     fn defaulted_record(&self, expected: TyId) -> Option<TyId> {
         if self.types.laziness(expected) == Laziness::Future {
             return None;
         }
         let record = self.types.strip(expected);
-        (self.types.is_record(record) && !self.types.defaults(record).is_empty()).then_some(record)
+        (self.types.is_record(record)
+            && (!self.types.defaults(record).is_empty()
+                || self.types.record_rest(record).is_some()))
+        .then_some(record)
     }
 
     /// The type of `{}`, the empty record's literal, checked against
-    /// `expecting`'s record type, which has defaults, as a record block is
-    /// ([`Checker::report_missing_fields`]): each defaulted field is given
-    /// it, and the record of those fields is its type; each other field is
-    /// missing, reported, and its type `Error`.
+    /// `expecting`'s record type, which has defaults or a rest-field, as a
+    /// record block is ([`Checker::report_missing_fields`]): each defaulted
+    /// field is given it, and the record of those fields, with the
+    /// rest-field, is its type; each other field is missing, reported, and
+    /// its type `Error`.
     fn empty_record(&mut self, expecting: Expecting<'_>) -> TyId {
         let base = self.sorted_fields.len();
         let missing = self.report_missing_fields(base, expecting);
@@ -13547,7 +13687,8 @@ impl<'a> Checker<'a> {
         if missing {
             TyId::ERROR
         } else {
-            self.types.record(fields)
+            let rest = self.types.record_rest(expecting.ty);
+            self.types.record_with_rest(fields, rest, Vec::new())
         }
     }
 
@@ -14245,7 +14386,8 @@ impl<'a> Checker<'a> {
     }
 
     /// The record constant of `fields` fitted to the record type `record`,
-    /// as [`Checker::fit_constant`] says, each defaulted field it lacks
+    /// as [`Checker::fit_constant`] says, a field `record` does not name
+    /// fitted to its rest-field if it has one, each defaulted field it lacks
     /// given its default if `fills`, after the fields written, in the order
     /// of their names; `None` if `record` is no record type, a field does
     /// not fit, or one it lacks has no default.
@@ -14260,7 +14402,7 @@ impl<'a> Checker<'a> {
         let expected = self.types.record_fields(record)?;
         let mut fitted = Vec::with_capacity(expected.len().max(fields.len()));
         for (name, value) in fields {
-            let value = match self.types.field(record, *name) {
+            let value = match self.types.field_or_rest(record, *name) {
                 Some(ty) => self.fit_constant(value, ty)?,
                 // Checked on its own, an integer settling to `Int`.
                 None => value.clone(),
@@ -14278,6 +14420,11 @@ impl<'a> Checker<'a> {
         let names = self.ast.names();
         filled.sort_unstable_by(|(a, _), (b, _)| names.get(*a).cmp(names.get(*b)));
         fitted.extend(filled);
+        // `{}` where a record type with a rest-field but no defaulted field
+        // is expected is given nothing.
+        if fitted.is_empty() {
+            return Some(Constant::Empty);
+        }
         Some(Constant::Record(fitted.into_boxed_slice()))
     }
 
@@ -14574,8 +14721,9 @@ impl<'a> Checker<'a> {
         let base = self.sorted_fields.len();
         for (index, field) in written.iter().enumerate() {
             // The expansion of the file's types leaves no spread: a type
-            // with one resolves to `Error`, which is not inferred.
-            let Some(name) = field.name else {
+            // with one resolves to `Error`, which is not inferred. A
+            // rest-field is kept as declared.
+            let Some(name) = field.name() else {
                 continue;
             };
             let Some(declared) = self.types.field(present, name) else {
@@ -14635,7 +14783,8 @@ impl<'a> Checker<'a> {
             .collect();
         // Sorted by name, so interning does not sort it again; the declared
         // fields keep their defaults (see [Field defaults](#field-defaults)).
-        let record = self.types.record_like(present, sorted);
+        let rest = self.types.record_rest(present);
+        let record = self.types.record_like(present, sorted, rest);
         self.sorted_fields.truncate(base);
         Some(record)
     }
@@ -16031,16 +16180,22 @@ impl<'a> Checker<'a> {
         let member = expr.member_span(self.ast).unwrap_or(expr.span);
         let text = FieldName(self.ast.names().get(name));
         if let Some(fields) = self.types.record_fields(record_ty) {
-            let note = self.field_list(fields);
+            let rest = self.types.record_rest(record_ty).is_some();
+            // A record type with a rest-field and no named field has fields;
+            // it names none.
+            let note = (!(rest && fields.is_empty())).then(|| self.field_list(fields, rest));
             let suggestion = self.field_suggestion(id, name, fields);
             let message = format!("no field `{text}` in {}", self.in_message(record_ty));
+            let mut error = Diagnostic::error(message, member).with_suggestion(suggestion);
+            if let Some(note) = note {
+                error = error.with_note(note);
+            }
+            if rest {
+                error = error.with_note(REST_READ_NOTE);
+            }
             // A path of the view's names nothing then: its field may be
             // declared in source that could not be parsed.
-            self.unresolved(
-                Diagnostic::error(message, member)
-                    .with_note(note)
-                    .with_suggestion(suggestion),
-            );
+            self.unresolved(error);
             return TyId::ERROR;
         }
         let record_ty = self.settle(record, record_ty);
@@ -16120,7 +16275,8 @@ impl<'a> Checker<'a> {
         let member = expr.member_span(self.ast).unwrap_or(expr.span);
         let text = FieldName(self.ast.names().get(name));
         let fields = self.types.record_fields(ty);
-        let note = fields.map_or_else(String::new, |fields| self.field_list(fields));
+        let rest = self.types.record_rest(ty).is_some();
+        let note = fields.map_or_else(String::new, |fields| self.field_list(fields, rest));
         let suggestion = fields.and_then(|fields| self.field_suggestion(id, name, fields));
         let mut error = Diagnostic::error(format!("{subject} has no field `{text}`"), member)
             .with_note(note)
@@ -16216,21 +16372,24 @@ impl<'a> Checker<'a> {
     }
 
     /// The note listing a record type's `fields`, in alphabetical order:
-    /// "the fields are `x` and `y`".
-    fn field_list(&self, fields: &[(Name, TyId)]) -> String {
+    /// "the fields are `x` and `y`", or for a record type with a
+    /// rest-field, whose other fields it does not name, "the named fields
+    /// are `x` and `y`".
+    fn field_list(&self, fields: &[(Name, TyId)], rest: bool) -> String {
         let names = self.ast.names();
         let mut texts: Vec<&str> = fields.iter().map(|&(name, _)| names.get(name)).collect();
         texts.sort_unstable();
+        let which = if rest { "named " } else { "" };
         match texts.as_slice() {
-            [] => "the record has no fields".to_owned(),
-            [only] => format!("the only field is `{}`", FieldName(only)),
+            [] => format!("the record has no {which}fields"),
+            [only] => format!("the only {which}field is `{}`", FieldName(only)),
             [init @ .., last] => {
                 let init: Vec<String> = init
                     .iter()
                     .map(|text| format!("`{}`", FieldName(text)))
                     .collect();
                 format!(
-                    "the fields are {} and `{}`",
+                    "the {which}fields are {} and `{}`",
                     init.join(", "),
                     FieldName(last)
                 )
@@ -19248,6 +19407,18 @@ const JUXTAPOSED_NOTE: &str = "two names in a row are read as a def-type referen
 /// The note on a field that the expected record type lacks.
 const EXTRA_FIELD_NOTE: &str = "it is allowed, but nothing with this type can see it";
 
+/// The note on a read of a field that a record type's rest-field covers.
+const REST_READ_NOTE: &str =
+    "a field that only the rest-field `*: ...` covers cannot be read by name";
+
+/// The note on a spread of a value whose type has a rest-field.
+const SPREAD_REST_NOTE: &str = "a spread defines the fields its operand's type names, and the fields a rest-field covers are known only when it runs";
+
+/// The note on a field that dotted paths build where a record type with a
+/// rest-field is expected of it.
+const DOTTED_REST_NOTE: &str =
+    "dotted paths build a record without a rest-field; define the field whole, as in `a = {...}`";
+
 /// The label on a pure function's marker, where it does something only an
 /// impure function may.
 const PURE_CONTEXT: &str = "this function is pure, declared with `:`";
@@ -19267,6 +19438,19 @@ fn spread_first_note(others: usize) -> String {
         others => format!(" (it also has {others} other fields defined before it)"),
     };
     format!("a spread cannot replace a field defined before it; put the spread first{also}")
+}
+
+/// The error for a record type that has the field `name`, or the
+/// rest-field for `None`, more than once: "field `x` appears twice in this
+/// type", "the rest-field appears twice in this type".
+fn appears_twice(names: &Names, name: Option<Name>) -> String {
+    match name {
+        Some(name) => format!(
+            "field `{}` appears twice in this type",
+            FieldName(names.get(name))
+        ),
+        None => "the rest-field appears twice in this type".to_owned(),
+    }
 }
 
 /// The error for an explicit `await`, whose keyword is at `keyword`, in a

@@ -171,7 +171,8 @@ impl Index {
                     .iter()
                     .map(|&(name, field)| (name, self.written(field, depth + 1)))
                     .collect();
-                self.types.record_like(ty, fields)
+                let rest = record.rest().map(|rest| self.written(rest, depth + 1));
+                self.types.record_like(ty, fields, rest)
             }
             TyKind::List(element) => {
                 let element = self.written(element, depth + 1);
@@ -202,7 +203,7 @@ fn contains_error(index: &Index, ty: TyId, depth: usize) -> bool {
     }
     let inner = |ty: TyId| contains_error(index, ty, depth + 1);
     match index.types.kind(ty) {
-        TyKind::Record(record) => record.fields.iter().any(|&(_, field)| inner(field)),
+        TyKind::Record(record) => record.types().any(inner),
         &(TyKind::Future(of)
         | TyKind::Either(of)
         | TyKind::List(of)

@@ -430,8 +430,8 @@ enum RootField {
 use crate::diagnostic::InternalError;
 use crate::ir::{
     CatchId, Cmp, FnCode, FnKind, Ir, IrBuilder, IrId, IrKind, IrRange, LayoutId, LazyField,
-    LazyShape, LazyShapeId, ListShape, MetaAt, Operands, Shape, ShapeId, ShapedOperands, StepAt,
-    StepMode, TestCode, TestId, UpdateStep,
+    LazyRest, LazyShape, LazyShapeId, ListShape, MetaAt, Operands, RestShape, Shape, ShapeId,
+    ShapedOperands, StepAt, StepMode, TestCode, TestId, UpdateStep,
 };
 use crate::names::Name;
 use crate::source::Span;
@@ -3138,6 +3138,9 @@ impl Lowerer<'_> {
                 let nested = self.nested_shape(table.strip(field_ty));
                 shaped.push((name, nested));
             }
+            let rest = table.record_rest(ty).map(|rest| RestShape {
+                shape: self.nested_shape(table.strip(rest)),
+            });
             let Some(&shape) = self.shapes.get(&ty) else {
                 continue;
             };
@@ -3145,6 +3148,7 @@ impl Lowerer<'_> {
                 shape,
                 Shape {
                     fields: shaped.into_boxed_slice(),
+                    rest,
                 },
             );
         }
@@ -3175,6 +3179,7 @@ impl Lowerer<'_> {
     fn new_shape(&mut self, ty: TyId) -> ShapeId {
         let id = self.builder.push_shape(Shape {
             fields: Box::default(),
+            rest: None,
         });
         self.shapes.insert(ty, id);
         self.shape_pending.push(ty);
@@ -3184,7 +3189,8 @@ impl Lowerer<'_> {
     /// The lazy shape of `ty`, a type present at its top: for a record type,
     /// each field whose type is a future or an either, with the lazy shape
     /// of its type stripped, and each present record or list field with
-    /// lazy values somewhere inside, with its own; for a list type, what is
+    /// lazy values somewhere inside, with its own, and its rest-field, if it
+    /// has one that is either, for every field it does not name; for a list type, what is
     /// done with each element, in the same way, if its type is lazy or has
     /// lazy values inside; for a union, the lazy shapes of its members that
     /// have one (see [`Ir::lazy_union`]); [`LazyShapeId::NONE`] if it has no
@@ -3204,6 +3210,7 @@ impl Lowerer<'_> {
             }
             let element = table.list_element(container);
             let fields = table.record_fields(container).unwrap_or_default();
+            let rest = table.record_rest(container);
             let members = table.union_members(container).unwrap_or_default();
             if !queued {
                 // The record, list and union types inside it first, then it
@@ -3212,6 +3219,7 @@ impl Lowerer<'_> {
                 let inside = fields
                     .iter()
                     .map(|&(_, field_ty)| field_ty)
+                    .chain(rest)
                     .chain(element)
                     .chain(members.iter().copied());
                 for inner in inside {
@@ -3264,11 +3272,19 @@ impl Lowerer<'_> {
                         action(&self.lazy_shapes, field_ty).map(|field| (name, field))
                     })
                     .collect();
-                if lazy.is_empty() {
+                // The fields a rest-field covers, which a type does not name.
+                let rest = rest
+                    .and_then(|rest| action(&self.lazy_shapes, rest))
+                    .map(|field| LazyRest {
+                        named: fields.iter().map(|&(name, _)| name).collect(),
+                        field,
+                    });
+                if lazy.is_empty() && rest.is_none() {
                     LazyShapeId::NONE
                 } else {
                     self.builder.push_lazy_shape(LazyShape {
                         fields: lazy.into_boxed_slice(),
+                        rest,
                     })
                 }
             };
@@ -3340,6 +3356,14 @@ impl Lowerer<'_> {
                             .add_name_text(*name, self.ast.names().get(*name));
                         pending.push(field);
                     }
+                }
+                ValueTest::RecordRest { fields, rest, .. } => {
+                    for (name, field) in fields {
+                        self.builder
+                            .add_name_text(*name, self.ast.names().get(*name));
+                        pending.push(field);
+                    }
+                    pending.push(rest);
                 }
                 ValueTest::List(element) => pending.push(element),
                 ValueTest::Any(alternatives) => pending.extend(alternatives),

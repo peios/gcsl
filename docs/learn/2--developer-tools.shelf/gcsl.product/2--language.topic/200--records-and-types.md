@@ -28,6 +28,30 @@ An annotation also determines what fields later code can see. Extra
 fields in a record literal produce a warning when an expected type hides
 them. A structural alias does not introduce a distinct runtime identity.
 
+## Records of any fields
+
+A rest-field, `*: T`, gives the type of every field that a record type
+doesn't name. Use it when the field names are data, such as paths. A
+`{*: String}` holds any fields, each a `String`. Named fields keep their
+own types, so `{to: String, *: Int}` holds a `String` field `to`, and any
+other fields are `Int`s:
+
+```gcsl
+let files: {*: String} = {"bin/*" = "bin/*"; "sbin/*" = "sbin/*"}
+files
+```
+
+Write the record literal where the type is expected: in an annotation,
+an argument or a definition's result. There, each field that the type
+doesn't name is checked against the rest-field. A value whose own type
+has no rest-field doesn't fit one, because a record keeps fields that its
+static type hides, and they could be of any type.
+
+Read a named field as usual. A field that only the rest-field covers
+can't be read by name, and a record whose type has a rest-field can't be
+spread. Typed equality compares every field, and `is` and `as` test each
+field that the rest-field covers.
+
 ## Combining fields
 
 Dotted definitions construct nested records. Compatible dotted paths
