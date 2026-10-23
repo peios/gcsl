@@ -558,6 +558,14 @@ fn call_shape(ast: &Ast, callee: ExprId, args: crate::ast::ArgRange, out: &mut S
             }
             ArgKind::Positional | ArgKind::Named { .. } => {}
         }
+        if let ArgKind::Named {
+            shorthand: true, ..
+        } = arg.kind
+        {
+            // Its value is the read of its name: written once.
+            expr(ast, arg.value, out);
+            continue;
+        }
         if let ArgKind::Named { name, .. } = arg.kind {
             out.push_str(ast.names().get(name));
             out.push_str(" = ");
@@ -2905,7 +2913,8 @@ fn calls() {
         args[1].kind,
         ArgKind::Named {
             name: y,
-            span: Span::new(5, 6)
+            span: Span::new(5, 6),
+            shorthand: false,
         }
     );
     assert_eq!(args[2].kind, ArgKind::Trailing);
@@ -5229,6 +5238,59 @@ fn pretty_output_for_returns_and_labelled_blocks() {
         Some(Span::new(1, 3))
     );
     assert_eq!(ast.items(items).len(), 1);
+}
+
+#[test]
+fn a_name_alone_after_a_named_argument_is_shorthand() {
+    let kinds = |text: &str| -> Vec<String> {
+        let ast = parse_text(text).unwrap();
+        let ExprKind::Call { args, .. } = ast.get(only_value(&ast)).kind else {
+            panic!("expected a call");
+        };
+        ast.args(args)
+            .iter()
+            .map(|arg| match arg.kind {
+                ArgKind::Positional => "positional".to_owned(),
+                ArgKind::Named {
+                    name, shorthand, ..
+                } => {
+                    let name = ast.names().get(name);
+                    if shorthand {
+                        format!("shorthand {name}")
+                    } else {
+                        format!("named {name}")
+                    }
+                }
+                ArgKind::Trailing => "trailing".to_owned(),
+            })
+            .collect()
+    };
+    // After a named argument, at the end of the list or before a `,`.
+    assert_eq!(
+        kinds("f(x, out = 1, compiler)"),
+        ["positional", "named out", "shorthand compiler"]
+    );
+    assert_eq!(
+        kinds("f(out = 1, a, b,)"),
+        ["named out", "shorthand a", "shorthand b"]
+    );
+    // Before any named argument, a name alone is positional.
+    assert_eq!(kinds("f(a, b = 1)"), ["positional", "named b"]);
+    // After one, anything else is positional still.
+    assert_eq!(
+        kinds("f(a = 1, b.c, 2, g(b))"),
+        ["named a", "positional", "positional", "positional"]
+    );
+    // Its value is the read of its name, at its name.
+    let ast = parse_text("f(a = 1, compiler)").unwrap();
+    let ExprKind::Call { args, .. } = ast.get(only_value(&ast)).kind else {
+        panic!("expected a call");
+    };
+    let arg = ast.args(args)[1];
+    assert_eq!(ast.get(arg.value).span, Span::new(9, 17));
+    assert!(matches!(ast.get(arg.value).kind, ExprKind::Name(_)));
+    assert_eq!(arg.span(&ast), Span::new(9, 17));
+    assert_eq!(shape("f(a = 1, compiler)"), "f(a = 1, compiler)");
 }
 
 #[test]

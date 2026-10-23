@@ -861,12 +861,17 @@ pub struct FnDecl {
 pub enum ArgKind {
     /// `EXPR`, filling the parameters left to right.
     Positional,
-    /// `NAME = EXPR`, filling the parameter named `NAME`.
+    /// `NAME = EXPR`, filling the parameter named `NAME`; or, after another
+    /// named argument, `NAME` alone, shorthand for `NAME = NAME` (see the
+    /// parser's [Functions and calls](crate::parser#functions-and-calls)).
     Named {
         /// The parameter's name.
         name: Name,
         /// Where the name is written.
         span: Span,
+        /// Whether it is the shorthand, its name alone: its value is then a
+        /// read of the variable of its name, written at the same span.
+        shorthand: bool,
     },
     /// The block after the argument list, or in place of one, filling the
     /// last parameter. Always the call's last argument.
@@ -4470,6 +4475,14 @@ impl<A: Annotate> Pretty<'_, A> {
             f.write_str("\n")?;
             match arg.kind {
                 ArgKind::Positional => self.node(f, arg.value, depth)?,
+                ArgKind::Named {
+                    shorthand: true, ..
+                } => {
+                    // Its value is the read of its name, which says it all.
+                    write!(f, "{:indent$}(shorthand ", "", indent = depth * 2)?;
+                    self.node(f, arg.value, 0)?;
+                    f.write_str(")")?;
+                }
                 ArgKind::Named { name, .. } => {
                     let name = FieldName(self.ast.names().get(name));
                     writeln!(f, "{:indent$}(named {name}", "", indent = depth * 2)?;

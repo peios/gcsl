@@ -15371,11 +15371,11 @@ impl<'a> Checker<'a> {
                     Some(next_positional - 1).filter(|&param| param < count)
                 }
                 ArgKind::Trailing => (positional < count).then(|| count - 1),
-                ArgKind::Named { name, span } => {
+                ArgKind::Named { name, .. } => {
                     let text = ast.names().get(name);
                     let param = params.iter().position(|&param| param == text);
                     if param.is_none() {
-                        let at = ((text, span), (callee_span, label.as_str()));
+                        let at = (*arg, (callee_span, label.as_str()));
                         self.errors
                             .push(unknown_builtin_argument(ast, arg_list, params, at));
                         erroneous = true;
@@ -15539,7 +15539,11 @@ impl<'a> Checker<'a> {
                     Some(next_positional - 1).filter(|&param| param < count)
                 }
                 ArgKind::Trailing => (positional < count).then(|| count - 1),
-                ArgKind::Named { name, span } => {
+                ArgKind::Named {
+                    name,
+                    span,
+                    shorthand,
+                } => {
                     let param = sig
                         .params
                         .iter()
@@ -15551,7 +15555,7 @@ impl<'a> Checker<'a> {
                                 .position(|&(param, _)| param == Some(name))
                         });
                         self.report_unknown_argument(
-                            (name, span),
+                            (name, span, shorthand),
                             (callee, callee_ty),
                             sig,
                             &filled,
@@ -15910,14 +15914,15 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Reports the named argument `name`, written at `span`, that no
-    /// parameter of the callee, of type `callee_ty` with signature `sig`,
-    /// is named: an unknown argument, suggesting the nearest of the named
-    /// parameters that `filled` (by position) shows no argument fills, or,
-    /// if none of its parameters has a name, a function that takes none.
+    /// Reports the named argument `name`, written at `span`, the shorthand
+    /// `name` alone if `shorthand`, that no parameter of the callee, of type
+    /// `callee_ty` with signature `sig`, is named: an unknown argument,
+    /// suggesting the nearest of the named parameters that `filled` (by
+    /// position) shows no argument fills ([`unknown_argument`]), or, if none
+    /// of its parameters has a name, a function that takes none.
     fn report_unknown_argument(
         &mut self,
-        (name, span): (Name, Span),
+        (name, span, shorthand): (Name, Span, bool),
         (callee, callee_ty): (ExprId, TyId),
         sig: &FnTy,
         filled: &[bool],
@@ -15937,10 +15942,8 @@ impl<'a> Checker<'a> {
                 .zip(filled)
                 .filter(|&(_, &filled)| !filled)
                 .filter_map(|(&(param, _), _)| Some((names.get(param?), 0)));
-            let suggestion = suggest::best(text, free).map(|best| (span, best.to_owned()));
-            Diagnostic::error(format!("unknown argument `{text}`"), span)
+            unknown_argument((text, span, shorthand), free)
                 .with_context(callee_span, format!("the function is {shown}"))
-                .with_suggestion(suggestion)
         };
         self.errors.push(error);
     }
@@ -19390,17 +19393,27 @@ fn filled_by(
     filled
 }
 
-/// The error of the named argument `text`, written at `span`, of a call of
-/// `ast` whose arguments are `args`, that no parameter of the built-in
-/// function, named `params`, has: "unknown argument `x`", labelled `label`
-/// at the callee, at `callee`, suggesting the nearest of the parameters that
-/// no other argument fills (see [Suggestions](#suggestions)).
+/// The error of the named argument `arg`, of a call of `ast` whose
+/// arguments are `args`, that no parameter of the built-in function, named
+/// `params`, has: "unknown argument `x`", labelled `label` at the callee,
+/// at `callee`, suggesting the nearest of the parameters that no other
+/// argument fills ([`unknown_argument`]).
 fn unknown_builtin_argument(
     ast: &Ast,
     args: &[crate::ast::Arg],
     params: &[&str],
-    ((text, span), (callee, label)): ((&str, Span), (Span, &str)),
+    (arg, (callee, label)): (crate::ast::Arg, (Span, &str)),
 ) -> Diagnostic {
+    let ArgKind::Named {
+        name,
+        span,
+        shorthand,
+    } = arg.kind
+    else {
+        // Only a named argument can name no parameter: kept for safety.
+        return Diagnostic::error("unknown argument", arg.span(ast));
+    };
+    let text = ast.names().get(name);
     let filled = filled_by(args, params.len(), |name| {
         let text = ast.names().get(name);
         params.iter().position(|&param| param == text)
@@ -19410,10 +19423,32 @@ fn unknown_builtin_argument(
         .zip(&filled)
         .filter(|&(_, &filled)| !filled)
         .map(|(&param, _)| (param, 0));
-    let suggestion = suggest::best(text, free).map(|best| (span, best.to_owned()));
-    Diagnostic::error(format!("unknown argument `{text}`"), span)
-        .with_context(callee, label)
-        .with_suggestion(suggestion)
+    unknown_argument((text, span, shorthand), free).with_context(callee, label)
+}
+
+/// The error of the named argument `text`, written at `span`, the shorthand
+/// `text` alone if `shorthand`, that no parameter has: "unknown argument
+/// `x`", suggesting the nearest of `free`, the named parameters no other
+/// argument fills (see [Suggestions](#suggestions)). For the shorthand, which
+/// reads the variable of its name too, the suggestion names the parameter
+/// and keeps the variable, `best = x`, and a note says what the shorthand
+/// is.
+fn unknown_argument<'a>(
+    (text, span, shorthand): (&str, Span, bool),
+    free: impl Iterator<Item = (&'a str, u8)>,
+) -> Diagnostic {
+    let best = suggest::best(text, free);
+    let error = Diagnostic::error(format!("unknown argument `{text}`"), span);
+    if shorthand {
+        let suggestion = best.map(|best| (span, format!("{best} = {text}")));
+        error
+            .with_note(format!(
+                "`{text}` alone after a named argument is shorthand for `{text} = {text}`"
+            ))
+            .with_suggestion(suggestion)
+    } else {
+        error.with_suggestion(best.map(|best| (span, best.to_owned())))
+    }
 }
 
 /// The error for a `:=`, whose name `text` is at `name_span`, of

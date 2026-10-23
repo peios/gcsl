@@ -742,6 +742,30 @@ fn a_rename_of_a_definition_s_segment_renames_its_meta_and_its_references() {
 }
 
 /// Why renaming what is at `at` of `files` to `new` is refused.
+#[test]
+fn renaming_a_variable_keeps_a_shorthand_argument_naming_its_parameter() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app.gcsl",
+            "fn f(out: Int, compiler: Int): Int { out + compiler }\n\
+             let compiler = 2\n\
+             r = f(out = 1, compiler)\n",
+        ),
+    ];
+    let changed = renamed(&files, ("app.gcsl", "let |compiler"), "cc").unwrap();
+    assert_eq!(
+        changed,
+        [(
+            "app.gcsl".to_owned(),
+            "fn f(out: Int, compiler: Int): Int { out + compiler }\n\
+             let cc = 2\n\
+             r = f(out = 1, compiler = cc)\n"
+                .to_owned()
+        )]
+    );
+}
+
 fn renamed_err(files: &[(&str, &str)], at: (&str, &str), new: &str) -> String {
     renamed(files, at, new).unwrap_err()
 }

@@ -5373,3 +5373,15 @@ fn temporary_directories_are_made_in_the_temp_root() {
     assert!(!Path::new("rel").exists());
     fs::remove_dir_all(&scratch).unwrap();
 }
+
+#[test]
+fn a_shorthand_argument_passes_its_variable_to_its_parameter() {
+    // `1` fills `a`, `c = 3` fills `c`, and `b` alone, after a named
+    // argument, is `b = b`.
+    let value = run(
+        "fn f(a: Int, b: Int, c: Int): Int { a * 100 + b * 10 + c }\n\
+         let b = 2\n= f(1, c = 3, b)",
+    )
+    .unwrap();
+    assert_eq!(value.to_string(), "123");
+}

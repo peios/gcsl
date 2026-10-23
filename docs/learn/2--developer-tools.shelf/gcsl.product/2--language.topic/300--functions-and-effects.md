@@ -35,6 +35,22 @@ Defaults are constants. Positional and named arguments are evaluated in
 source order. A trailing block supplies the last parameter, which is
 useful for functions that accept a configuration record.
 
+After a named argument, a name on its own is shorthand for passing the
+variable of that name to the parameter of that name. These two calls are
+the same:
+
+```gcsl
+fn build(source: String, output: String, compiler: String): String {
+    "{compiler} {source} -o {output}"
+}
+let compiler = "cc"
+short = build("main.c", output = "main.o", compiler)
+long = build("main.c", output = "main.o", compiler = compiler)
+```
+
+Before any named argument, a name on its own is an ordinary positional
+argument.
+
 ## Calling for effects
 
 A call to an impure or memoized function can stand alone as a statement,

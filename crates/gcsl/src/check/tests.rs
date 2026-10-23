@@ -3467,6 +3467,22 @@ fn binding_arguments_to_parameters() {
         vec![0, 2, 1]
     );
     assert_eq!(bound(&format!("{f}f(c = true, 1, \"s\")")), vec![2, 0, 1]);
+    // A name alone after a named argument fills the parameter of its name.
+    assert_eq!(
+        bound(&format!("{f}let b = \"s\"\nf(1, c = true, b)")),
+        vec![0, 2, 1]
+    );
+    // A shorthand of no parameter's name is the unknown name it is.
+    let text = "fn h(alpha: Int, beta: Int): Int { alpha }\nlet betta = 1\nh(alpha = 1, betta)";
+    let error = &diagnostics(text)[0];
+    assert_eq!(error.message, "unknown argument `betta`");
+    assert_eq!(
+        error.notes,
+        ["`betta` alone after a named argument is shorthand for `betta = betta`"]
+    );
+    // The suggestion names the parameter and keeps the variable.
+    let suggestion = error.suggestion.as_deref().unwrap();
+    assert_eq!(suggestion.replacement, "beta = betta");
     // A call with only a trailing block.
     assert_eq!(bound("fn run(body: {}): Int { 1 }\nrun { }"), vec![0]);
     // A trailing block is checked against a record parameter field by

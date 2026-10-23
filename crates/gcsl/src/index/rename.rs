@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use crate::ast::{ArgKind, ExprKind};
 use crate::check::Builtin;
 use crate::diagnostic::Severity;
 use crate::lexer;
@@ -113,13 +114,20 @@ impl Index {
         if new == old {
             return Ok(Vec::new());
         }
+        // A shorthand argument, `f(x = 1, old)`, is a read of the variable
+        // and the name of its parameter at once: renamed, it keeps naming the
+        // parameter, `old = new`.
         let edits: Vec<Edit> = plan
             .places
             .iter()
             .map(|&(file, span)| Edit {
                 file,
                 span,
-                text: new.to_owned(),
+                text: if self.is_shorthand(file, span) {
+                    format!("{old} = {new}")
+                } else {
+                    new.to_owned()
+                },
             })
             .collect();
         let shift = Shift::of(&edits);
@@ -678,6 +686,32 @@ fn is_segment(text: &str, first: bool) -> bool {
         .all(|&b| b.is_ascii_alphanumeric() || b == b'_');
     let keyword = plain && start.is_ascii_alphabetic() && !lexer::is_identifier(text);
     starts && allowed && dashes && !keyword
+}
+
+impl Index {
+    /// Whether `span` of file `file` is the value of a shorthand argument,
+    /// `name` alone after a named argument, which reads the variable `name`
+    /// and names the parameter `name` at once (see the parser's [Functions
+    /// and calls](crate::parser#functions-and-calls)).
+    fn is_shorthand(&self, file: u32, span: Span) -> bool {
+        let Some(ast) = self.scan.files.get(file as usize).map(|f| &f.ast) else {
+            return false;
+        };
+        ast.expr_arena().iter().any(|expr| match expr.kind {
+            ExprKind::Call { args, .. } | ExprKind::Unclosed { args, .. } => {
+                ast.args(args).iter().any(|arg| {
+                    matches!(
+                        arg.kind,
+                        ArgKind::Named {
+                            shorthand: true,
+                            ..
+                        }
+                    ) && ast.get(arg.value).span == span
+                })
+            }
+            _ => false,
+        })
+    }
 }
 
 #[cfg(test)]

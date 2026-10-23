@@ -510,10 +510,20 @@
 //! A call is a postfix operator: after an operand, `(` starts an argument
 //! list, whose arguments are separated by `,` with an optional trailing
 //! `,`, each an expression or `NAME = EXPR` (recognised by an identifier
-//! followed by `=`). After the `)`, or instead of the list, a `{` on the
-//! same line starts a trailing block: an ordinary block, passed as the
-//! call's last argument. The parser accepts arguments in any order; binding
-//! them to parameters is the checker's business.
+//! followed by `=`). After a named argument, an argument that is a name
+//! alone, an identifier directly followed by `,` or `)`, is shorthand for
+//! `NAME = NAME`, as in `gcc.compile(src, output = "a.o", compiler)`: a
+//! named argument ([`ArgKind::Named`], marked `shorthand`) whose value is
+//! the read of the variable of its name, at the same span. Before any named
+//! argument a name alone is positional, as any expression is, and after one
+//! any other expression is positional still (`f(a = 1, 2)`), so only a
+//! program that passed a variable positionally, by its name alone, after a
+//! named argument means something else: now the argument of the parameter
+//! of the variable's name, an error if there is none. After the `)`, or
+//! instead of the list, a `{` on the same line starts a trailing block: an
+//! ordinary block, passed as the call's last argument. The parser accepts
+//! arguments in any order; binding them to parameters is the checker's
+//! business.
 //!
 //! # Lists
 //!
@@ -4511,6 +4521,9 @@ impl Parser<'_> {
     /// arguments parsed pushed.
     fn parse_arguments(&mut self, open: Token, tallest: &mut u32) -> ParseResult<Option<Span>> {
         let mut failed = None;
+        // Whether a named argument has been read: after one, a name alone
+        // is the shorthand, and anything else positional an error.
+        let mut named = false;
         loop {
             let start = self.pos;
             let token = self.peek();
@@ -4519,7 +4532,7 @@ impl Parser<'_> {
                 return failed.map_or(Ok(Some(token.span)), Err);
             }
             let marks = self.marks();
-            let (reported, kept) = match self.parse_argument(open, tallest) {
+            let (reported, kept) = match self.parse_argument(open, tallest, &mut named) {
                 Ok(Some(close)) => return failed.map_or(Ok(Some(close)), Err),
                 Ok(None) => continue,
                 Err(Entry::Separator(reported)) => (reported, true),
@@ -4550,22 +4563,39 @@ impl Parser<'_> {
     }
 
     /// Parses an argument of a call whose argument list `open` opens, and
-    /// the `,` or the `)` after it, raising `tallest` to its height. Returns
-    /// the span of the `)` if it ends the list; if what fails is the
-    /// separator, the argument is pushed.
-    fn parse_argument(&mut self, open: Token, tallest: &mut u32) -> Result<Option<Span>, Entry> {
+    /// the `,` or the `)` after it, raising `tallest` to its height, and
+    /// `named` if it is named. Returns the span of the `)` if it ends the
+    /// list; if what fails is the separator, the argument is pushed. After a
+    /// named argument (`named`), a name alone is the shorthand for `NAME =
+    /// NAME` (see [Functions and calls](#functions-and-calls)).
+    fn parse_argument(
+        &mut self,
+        open: Token,
+        tallest: &mut u32,
+        named: &mut bool,
+    ) -> Result<Option<Span>, Entry> {
         let token = self.peek();
-        let kind = match (token.kind, self.peek_at(1).kind) {
+        let next = self.peek_at(1).kind;
+        let kind = match (token.kind, next) {
             (TokenKind::Ident(name), TokenKind::Eq) => {
                 self.advance();
                 self.advance();
                 ArgKind::Named {
                     name,
                     span: token.span,
+                    shorthand: false,
+                }
+            }
+            (TokenKind::Ident(name), TokenKind::Comma | TokenKind::RParen) if *named => {
+                ArgKind::Named {
+                    name,
+                    span: token.span,
+                    shorthand: true,
                 }
             }
             _ => ArgKind::Positional,
         };
+        *named |= matches!(kind, ArgKind::Named { .. });
         let value = self.parse_expr(0).map_err(Entry::Value)?;
         *tallest = (*tallest).max(self.height_of(value));
         self.arg_stack.push(Arg { kind, value });

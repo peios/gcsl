@@ -9440,6 +9440,7 @@ fn invocation(
             kind: ArgKind::Named {
                 name: names.intern(name),
                 span,
+                shorthand: false,
             },
             value,
         });
