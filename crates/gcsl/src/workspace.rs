@@ -538,33 +538,58 @@
 //! found, and one a later one shadows too; grouped by the def-type its `DT`
 //! names, its namespace's key (see [Def-types](#def-types)), whatever
 //! import or alias names it, so `def pkg x()` after `import package as pkg
-//! from lib` is `package`'s `x`; each by its path as it writes it; all in
-//! path order of their files, then in source order. Invoking by name needs
-//! a name to mean one thing, so the listing fails, and every invocation
-//! with it, if a def-type has two definitions of one path anywhere in the
-//! workspace, "`package dev.peios.x` is defined 2 times in the workspace",
-//! or two def-types are declared of one path, "def-type `package` is
-//! declared 2 times in the workspace", each at the first in path then
-//! source order, labelled "also defined here" (or "also declared here") at
-//! each other. A definition whose path lies under another's of its
-//! def-type anywhere in the workspace, `app.core` under `app`, whether in
-//! sibling directories or in one through `#[shadowable]`, is a duplicate
-//! too: "`package app.core` lies under another `package` definition", one
-//! error for each definition under one or more others, at it, labelled
-//! "`app` is defined here" at each definition above it; a definition both
-//! defined twice and under another has both errors. None of these is an
-//! error of the language, which allows one path in two sibling directories:
-//! the workspace checks and runs regardless. A path above definitions that
-//! is none itself is no duplicate, but names no definition to invoke.
+//! from lib` is `package`'s `x`; each by its path as it writes it and its
+//! directory ([`Definition::dir`]); all in path order of their files, then
+//! in source order.
 //!
-//! A path, as listed and as asked for, is the definition's as it writes it,
-//! its names joined by `.`, a name with `+` in it as written
+//! A definition is named by its path, and where that is not enough, by its
+//! directory too. The language scopes definitions by directory, as it does
+//! fields: two sibling directories, or any two neither of which is above
+//! the other, see nothing of each other's, and each may define one path,
+//! as `pkgs/a` and `pkgs/b` may each define `build main`. So a path is
+//! asked for alone, `main`, which names the only definition of it, or
+//! qualified by its directory, `pkgs/a/main`, which names the definition of
+//! it in that directory, and `/main` the root's ([`Definition::qualified`]);
+//! a path alone that several directories define is
+//! [`RequestError::Ambiguous`], "`build main` is defined in 2 directories,
+//! so it is named with its directory", noting the qualified paths to name
+//! instead, "name one of `pkgs/a/main`, `pkgs/b/main`".
+//!
+//! Within directories that see each other, one or one above another, a name
+//! must still mean one thing, so the listing fails, and every invocation
+//! with it, if a def-type has two definitions of one path in such
+//! directories, "`package dev.peios.x` is defined 2 times in directories
+//! that see each other", as a `#[shadowable]` one and the one that shadows
+//! it are, or two def-types are declared of one path anywhere in the
+//! workspace, "def-type `package` is declared 2 times in the workspace",
+//! each at the first in path then source order, labelled "also defined
+//! here" (or "also declared here") at each other: one error for each chain
+//! of definitions of one path whose directories see each other, one
+//! through another, so the root's one and those of two siblings below it
+//! are one error of three. A definition whose path lies under another's of
+//! its def-type in such a directory, `app.core` under `app`, in one through
+//! `#[shadowable]` or under one it shadows from a directory above, is a
+//! duplicate too: "`package app.core` lies under another `package`
+//! definition", one error for each definition under one or more others, at
+//! it, labelled "`app` is defined here" at each definition above it; a
+//! definition both defined twice and under another has both errors. None
+//! of these is an error of the language: the workspace checks and runs
+//! regardless. A path above definitions that is none itself is no
+//! duplicate, but names no definition to invoke.
+//!
+//! A path, as listed and as asked for, after the directory that qualifies
+//! it, if one does, and its `/`, is the definition's as it writes it, its
+//! names joined by `.`, a name with `+` in it as written
 //! (`org.gnu.gmp-c++`), and one starting with a digit too
 //! (`org.golang.go-stage0-1.24`, `x.1.83.0`, the float `1.83` being the
 //! names `1` and `83`; see the parser's "Def-types"). A path asked for is
-//! not parsed or checked against the rule of names: it is compared with the
-//! definitions' as text, so it names the definition whose path it spells,
-//! or none, the error of a path that names none. One path lies under
+//! not parsed or checked against the rule of names: its directory, the text
+//! before its last `/`, without a leading `/`, is compared with the
+//! definitions' directories, and the rest with their paths, as text, so it
+//! names the definition whose path it spells, in its directory if it gives
+//! one, or none, the error of a path that names none, whose notes list the
+//! definitions by the names that name them: a path alone, and one several
+//! directories define qualified by each. One path lies under
 //! another only at a `.`, so `x.a+b` is not under `x.a`, and `x.a+b.c` is
 //! under `x.a+b`; `x.1.83` is under `x.1`, and `x.10` is not.
 //!
@@ -7560,12 +7585,34 @@ pub struct DefType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Definition {
     /// Its path, as the definition writes it: `dev.peios.testpkg`. It is
-    /// invoked by it.
+    /// invoked by it, alone if no other definition of its def-type has its
+    /// path, else qualified by its directory ([`Definition::qualified`]).
     pub path: String,
+    /// The path of its file's directory relative to the root, as
+    /// [`Dir::path`] gives it, `pkgs/net.busybox.busybox`; empty for the
+    /// root.
+    pub dir: String,
     /// The input number of its file.
     pub file: u32,
     /// Where its path is written in its file.
     pub span: Span,
+}
+
+impl Definition {
+    /// Its path qualified by its directory, as [`Workspace::invoke`] takes
+    /// it to name this definition whatever others have its path:
+    /// `pkgs/net.busybox.busybox/busybox`, and for one of the root,
+    /// `/busybox` (see the module documentation, "Def-types by name").
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        qualified(&self.dir, &self.path)
+    }
+}
+
+/// The path `path` of a definition of the directory `dir` qualified by it:
+/// `dir/path`, and `/path` for the root (see [`Definition::qualified`]).
+fn qualified(dir: &str, path: &str) -> String {
+    format!("{dir}/{path}")
 }
 
 /// The definition a def-type reference names, as
@@ -7577,6 +7624,20 @@ pub struct Referenced {
     pub def_type: String,
     /// The definition's path, as it writes it: `busybox`.
     pub path: String,
+    /// The path of the definition's directory relative to the root, empty
+    /// for the root, as [`Definition::dir`] gives it.
+    pub dir: String,
+}
+
+impl Referenced {
+    /// The definition's path qualified by its directory, as
+    /// [`Definition::qualified`] gives it: what names this very definition
+    /// to [`Workspace::invoke`] and [`Workspace::meta_field`], whatever
+    /// others have its path.
+    #[must_use]
+    pub fn qualified(&self) -> String {
+        qualified(&self.dir, &self.path)
+    }
 }
 
 /// Why [`Workspace::invoke`] could not invoke a definition, or another
@@ -7620,6 +7681,18 @@ pub enum RequestError {
         path: String,
         /// The paths of the def-type's definitions, sorted.
         definitions: Vec<String>,
+    },
+    /// The path asked for, alone, is the path of definitions of the def-type
+    /// in several directories, none of which sees another: "`build main` is
+    /// defined in 2 directories, so it is named with its directory".
+    Ambiguous {
+        /// The def-type's path.
+        def_type: String,
+        /// The path asked for.
+        path: String,
+        /// The path of each definition of it qualified by its directory
+        /// ([`Definition::qualified`]), sorted.
+        candidates: Vec<String>,
     },
     /// The path asked for is a prefix of the paths of definitions of the
     /// def-type, none of which it is: "`dev.peios` is not a `package`
@@ -7716,6 +7789,15 @@ impl RequestError {
             RequestError::NotADefinition { def_type, path, .. } => {
                 format!("`{path}` is not a `{def_type}` definition")
             }
+            RequestError::Ambiguous {
+                def_type,
+                path,
+                candidates,
+            } => format!(
+                "`{def_type} {path}` is defined in {} directories, so it is named with its \
+                 directory",
+                candidates.len()
+            ),
             RequestError::CannotBeGiven {
                 def_type,
                 parameter,
@@ -7790,6 +7872,9 @@ impl RequestError {
                 [only] => vec![format!("its only definition is `{only}`")],
                 _ => vec![format!("its definitions are {}", quoted_list(definitions))],
             },
+            RequestError::Ambiguous { candidates, .. } => {
+                vec![format!("name one of {}", quoted_list(candidates))]
+            }
             RequestError::UnknownParameter { parameters, .. } => match &parameters[..] {
                 [] => vec!["it has no invocation parameters".to_owned()],
                 [only] => vec![format!("its only invocation parameter is `{only}`")],
@@ -8028,19 +8113,21 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// One error for each path of which a def-type has two definitions or
-    /// more anywhere in the workspace, "`package dev.peios.x` is defined 2
-    /// times in the workspace", and each path of which two def-types or
+    /// One error for each chain of definitions of one path of a def-type in
+    /// directories that see each other, one through another, "`package
+    /// dev.peios.x` is defined 2 times in directories that see each other",
+    /// and each path of which two def-types or
     /// more are declared, "def-type `package` is declared 2 times in the
     /// workspace", at the first in path then source order, labelled "also
     /// defined here", or "also declared here", at each other; and one error
     /// for each definition whose path lies under another's of its def-type
-    /// anywhere in the workspace, "`package app.core` lies under another
+    /// in a directory that sees its own, "`package app.core` lies under another
     /// `package` definition", at it, labelled "`app` is defined here" at
     /// each definition above it; all in path order of their files, then in
     /// source order, with the workspace's warnings, as [`Workspace::run`]
     /// returns its errors. None is an error of the language: the workspace
-    /// checks and runs regardless.
+    /// checks and runs regardless. One path in directories that see nothing
+    /// of each other is no error: each is named with its directory.
     pub fn def_types(&self) -> Result<Vec<DefType>, Vec<Diagnostic>> {
         let found = self.found_def_types();
         let duplicates = duplicates(&found);
@@ -8053,7 +8140,9 @@ impl Workspace {
     /// Invokes the definition of path `path` made with the def-type of path
     /// `def_type`, both as written (`"package"`, `"dev.peios.testpkg"`,
     /// `"org.gnu.gmp-c++"`, `"org.golang.go-stage0-1.24"`), compared with
-    /// the listed paths as text,
+    /// the listed paths as text, the definition's alone if it is the only
+    /// one of its path, else qualified by its directory, `"pkgs/a/main"`, or
+    /// `"/main"` for the root's ([`Definition::qualified`]),
     /// with the arguments `args`, each the name of one of its invocation
     /// parameters and the value given for it, as if `DT PATH(NAME = VALUE,
     /// ...)` were called from a file of the definition's directory, each
@@ -8071,8 +8160,9 @@ impl Workspace {
     ///
     /// In this order: the duplicates [`Workspace::def_types`] fails with,
     /// definitions under others among them, with the warnings; no def-type
-    /// of path `def_type`, no definition of it of path `path`, or `path`
-    /// above some, and the errors of the arguments that
+    /// of path `def_type`, no definition of it of path `path`, `path` above
+    /// some, or `path` alone defined in several directories
+    /// ([`RequestError::Ambiguous`]), and the errors of the arguments that
     /// [`Workspace::arguments`] finds, a value of another type than its
     /// parameter's among them, each a [`RequestError`]; and the runtime
     /// error of a file that runs or of the call, as
@@ -8135,7 +8225,8 @@ impl Workspace {
     ///
     /// In this order: the duplicates [`Workspace::def_types`] fails with, with
     /// the warnings; no def-type of path `def_type`, no definition of it of
-    /// path `path`, or `path` above some; an invocation parameter that has
+    /// path `path`, `path` above some, or `path` alone defined in several
+    /// directories; an invocation parameter that has
     /// no default and is not one of the four types, the first; then, for
     /// each argument in order, a name that is no invocation parameter's, a
     /// parameter named twice, a parameter given an argument that is not one
@@ -8259,6 +8350,7 @@ impl Workspace {
             Some(Referenced {
                 def_type: found.listed.path.clone(),
                 path: listed.path.clone(),
+                dir: listed.dir.clone(),
             })
         })
     }
@@ -8527,12 +8619,8 @@ impl Workspace {
         let found = found.swap_remove(at);
         let missing = || InvokeError::Request(missing_definition(&found.listed, path));
         let definitions = &found.listed.definitions;
-        let at = definitions.iter().position(|d| d.path == path);
-        let (Some(at), Some(definition), Some(&item)) = (
-            at,
-            at.and_then(|at| definitions.get(at)),
-            at.and_then(|at| found.items.get(at)),
-        ) else {
+        let at = chosen_definition(&found.listed, path).map_err(InvokeError::Request)?;
+        let (Some(definition), Some(&item)) = (definitions.get(at), found.items.get(at)) else {
             return Err(missing());
         };
         let cells = (
@@ -8624,8 +8712,10 @@ impl Workspace {
                             continue;
                         };
                         let segments = ast.path(def.path);
+                        let dir = self.scan.dirs.get(file.dir as usize);
                         let definition = Definition {
                             path: text(segments),
+                            dir: dir.map(|dir| dir.path.clone()).unwrap_or_default(),
                             file: index,
                             span: span(segments),
                         };
@@ -8994,20 +9084,94 @@ fn composition(names: Names, functions: &[Name], span: Span) -> Ast {
     builder.finish(root, names, Strings::new())
 }
 
-/// The error of `path`, which no definition made with the def-type `listed`
-/// has: "`dev.peios` is not a `package` definition" if it is above some of
-/// them, else "`package` has no definition `dev.peios.nope`".
-fn missing_definition(listed: &DefType, path: &str) -> RequestError {
-    let mut definitions: Vec<String> = listed
-        .definitions
+/// The index among the definitions made with the def-type `listed` of the
+/// one `asked` names (see the module documentation, "Def-types by name"):
+/// a path qualified by a directory, `dir/sub/name` or `/name` for the root,
+/// names the definition of that path in that directory; a path alone, the
+/// definition of that path, if it is the only one.
+///
+/// # Errors
+///
+/// [`missing_definition`]'s, if none is of the path, in the directory if
+/// one is given; and if a path alone is several definitions' path, in
+/// directories that cannot see each other, [`RequestError::Ambiguous`].
+fn chosen_definition(listed: &DefType, asked: &str) -> Result<usize, RequestError> {
+    let (dir, path) = split_qualified(asked);
+    let mut matching = (0usize..)
+        .zip(&listed.definitions)
+        .filter(|(_, definition)| {
+            definition.path == path && dir.is_none_or(|dir| definition.dir == dir)
+        });
+    let first = matching.next();
+    let others: Vec<usize> = matching.map(|(at, _)| at).collect();
+    match first {
+        None => Err(missing_definition(listed, asked)),
+        Some((at, _)) if others.is_empty() => Ok(at),
+        Some((at, _)) => {
+            let mut candidates: Vec<String> = std::iter::once(at)
+                .chain(others)
+                .filter_map(|at| listed.definitions.get(at))
+                .map(Definition::qualified)
+                .collect();
+            candidates.sort_unstable();
+            Err(RequestError::Ambiguous {
+                def_type: listed.path.clone(),
+                path: path.to_owned(),
+                candidates,
+            })
+        }
+    }
+}
+
+/// The directory and the path of `asked`, a definition's path as asked for:
+/// the text before its last `/`, without a leading `/` (so `""`, the root,
+/// for `/name`), and the text after it; `None` and `asked` for a path with
+/// no `/`, which a definition's path never has.
+fn split_qualified(asked: &str) -> (Option<&str>, &str) {
+    match asked.rsplit_once('/') {
+        Some((dir, path)) => (Some(dir.strip_prefix('/').unwrap_or(dir)), path),
+        None => (None, asked),
+    }
+}
+
+/// The names the definitions made with the def-type `listed` are asked for
+/// by, sorted: each path alone, but those several definitions have, each
+/// qualified by its directory ([`Definition::qualified`]).
+fn definition_names(listed: &DefType) -> Vec<String> {
+    let definitions = &listed.definitions;
+    let shared = |definition: &Definition| {
+        definitions
+            .iter()
+            .filter(|other| other.path == definition.path)
+            .count()
+            > 1
+    };
+    let mut names: Vec<String> = definitions
         .iter()
-        .map(|definition| definition.path.clone())
+        .map(|definition| {
+            if shared(definition) {
+                definition.qualified()
+            } else {
+                definition.path.clone()
+            }
+        })
         .collect();
-    definitions.sort_unstable();
-    let above = definitions
-        .iter()
-        .any(|definition| lies_under(definition, path));
-    let (def_type, path) = (listed.path.clone(), path.to_owned());
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// The error of `asked`, which names no definition made with the def-type
+/// `listed` (see [`chosen_definition`]): "`dev.peios` is not a `package`
+/// definition" if it is above some of them, in its directory if it gives
+/// one, else "`package` has no definition `dev.peios.nope`".
+fn missing_definition(listed: &DefType, asked: &str) -> RequestError {
+    let definitions = definition_names(listed);
+    let (dir, path) = split_qualified(asked);
+    let above = listed.definitions.iter().any(|definition| {
+        lies_under(&definition.path, path) && dir.is_none_or(|dir| definition.dir == dir)
+    });
+    let (def_type, path) = (listed.path.clone(), asked.to_owned());
     if above {
         RequestError::NotADefinition {
             def_type,
@@ -9025,9 +9189,10 @@ fn missing_definition(listed: &DefType, path: &str) -> RequestError {
 
 /// The duplicates among `found` (see [`Workspace::def_types`]): an error for
 /// each path of which two def-types or more are declared, for each path of
-/// which a def-type has two definitions or more, and for each definition
-/// that lies under another of its def-type ([`overlaps`]), in path then
-/// source order of the first, or of the definition below.
+/// which a def-type has two definitions or more in directories that see
+/// each other ([`sees`]), and for each definition that lies under another
+/// of its def-type in such a directory ([`overlaps`]), in path then source
+/// order of the first, or of the definition below.
 fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     let declared = found.iter().map(|found| {
@@ -9046,21 +9211,34 @@ fn duplicates(found: &[FoundDefType]) -> Vec<Diagnostic> {
         ));
     }
     for found in found {
-        let defined = found
-            .listed
-            .definitions
+        let definitions = &found.listed.definitions;
+        let defined = definitions
             .iter()
             .map(|definition| (definition.path.as_str(), definition.file, definition.span));
         let def_type = &found.listed.path;
         for group in groups(defined) {
-            errors.extend(duplicate(
-                &group,
-                |path, times| {
-                    format!("`{def_type} {path}` is defined {times} times in the workspace")
-                },
-                "also defined here",
-                "a definition invoked by name must be the only one of its path in the workspace",
-            ));
+            // The group's definitions, by where they are, gathered into those
+            // whose directories see each other, one through another.
+            let dir_of = |(_, file, span): &Declared| {
+                definitions
+                    .iter()
+                    .find(|definition| definition.file == *file && definition.span == *span)
+                    .map_or("", |definition| definition.dir.as_str())
+            };
+            for chain in chains(&group, |a, b| sees(dir_of(a), dir_of(b))) {
+                errors.extend(duplicate(
+                    &chain,
+                    |path, times| {
+                        format!(
+                            "`{def_type} {path}` is defined {times} times in directories that \
+                             see each other"
+                        )
+                    },
+                    "also defined here",
+                    "a definition invoked by name must be the only one of its path in its \
+                     directory, the directories above it and those below it",
+                ));
+            }
         }
         errors.extend(overlaps(&found.listed));
     }
@@ -9081,7 +9259,9 @@ fn overlaps(listed: &DefType) -> Vec<Diagnostic> {
     for definition in definitions {
         let mut above = definitions
             .iter()
-            .filter(|other| lies_under(&definition.path, &other.path))
+            .filter(|other| {
+                lies_under(&definition.path, &other.path) && sees(&definition.dir, &other.dir)
+            })
             .peekable();
         if above.peek().is_none() {
             continue;
@@ -9092,7 +9272,10 @@ fn overlaps(listed: &DefType) -> Vec<Diagnostic> {
             definition.span,
         )
         .in_input(definition.file)
-        .with_note("a definition invoked by name must not lie under another in the workspace");
+        .with_note(
+            "a definition invoked by name must not lie under another in its directory, the \
+             directories above it or those below it",
+        );
         for other in above {
             let text = format!("`{}` is defined here", other.path);
             error = error.with_context_in(other.file, other.span, text);
@@ -9100,6 +9283,45 @@ fn overlaps(listed: &DefType) -> Vec<Diagnostic> {
         errors.push(error);
     }
     errors
+}
+
+/// Whether the directories of root-relative paths `a` and `b` see each
+/// other's definitions, one through another: whether they are one, or one
+/// is above the other (the root, `""`, is above every directory). Two
+/// directories neither of which is above the other, siblings or cousins,
+/// see nothing of each other's.
+fn sees(a: &str, b: &str) -> bool {
+    let above = |upper: &str, lower: &str| {
+        upper.is_empty()
+            || lower
+                .strip_prefix(upper)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || above(a, b) || above(b, a)
+}
+
+/// `group`, the declarations of one path, gathered into the chains of those
+/// `related`, one through others: each chain in the order of `group`, the
+/// chains in the order of their first.
+fn chains<'a>(
+    group: &[Declared<'a>],
+    related: impl Fn(&Declared<'a>, &Declared<'a>) -> bool,
+) -> Vec<Vec<Declared<'a>>> {
+    let mut chains: Vec<Vec<Declared<'a>>> = Vec::new();
+    for &entry in group {
+        let (joined, apart): (Vec<_>, Vec<_>) = chains
+            .into_iter()
+            .partition(|chain| chain.iter().any(|other| related(other, &entry)));
+        let mut merged: Vec<Declared<'a>> = joined.into_iter().flatten().collect();
+        merged.push(entry);
+        chains = apart;
+        chains.push(merged);
+    }
+    chains.sort_by_key(|chain| chain.first().map(|&(_, file, span)| (file, span.start)));
+    for chain in &mut chains {
+        chain.sort_by_key(|&(_, file, span)| (file, span.start));
+    }
+    chains
 }
 
 /// Whether the path `path` lies under the path `above`, its segments

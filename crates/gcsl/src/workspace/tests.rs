@@ -7898,6 +7898,7 @@ fn jacks_package_is_invoked_by_name() {
             optional: Vec::new(),
             definitions: vec![Definition {
                 path: "dev.peios.testpkg".to_owned(),
+                dir: "dev.peios.testpkg".to_owned(),
                 file: package,
                 span: Span::new(12, 29),
             }],
@@ -8021,12 +8022,18 @@ const PACKAGE: (&str, &str) = (
     "#[def_type]\ndef package(name: String, f: fn(): String): String { \"{name} {f()}\" }",
 );
 
+/// The note on a duplicate definition.
+const DEFINED: &str = "note: a definition invoked by name must be the only one of its path in \
+                       its directory, the directories above it and those below it";
+
+/// The note on a definition under another.
+const UNDER: &str = "note: a definition invoked by name must not lie under another in its \
+                     directory, the directories above it or those below it";
+
 #[test]
-fn two_definitions_of_one_path_fail_every_invocation() {
-    let defined = "note: a definition invoked by name must be the only one of its path \
-                       in the workspace";
-    // In two sibling directories, which see neither the other: invoking
-    // another definition, unique, fails, and so does the listing.
+fn one_path_in_directories_apart_is_named_with_its_directory() {
+    // In two sibling directories, which see neither the other: no error.
+    // Another definition, unique, is invoked by its path alone.
     let siblings = [
         PACKAGE,
         ("a/x.gcsl", "def package dup() { \"a\" }"),
@@ -8036,28 +8043,55 @@ fn two_definitions_of_one_path_fail_every_invocation() {
             "def package other() { \"c\" }\nz = package other()",
         ),
     ];
-    let twice = format!(
-        "`package dup` is defined 2 times in the workspace at a/x.gcsl; \
-             b/y.gcsl: also defined here; {defined}"
-    );
+    assert_eq!(invoked_text(&siblings, "package", "other"), "other c");
+    // The shared path alone names neither; each is named with its
+    // directory.
     assert_eq!(
-        invoke_errors(&siblings, "package", "other"),
-        [twice.as_str()]
+        request_error(&siblings, "package", "dup"),
+        "`package dup` is defined in 2 directories, so it is named with its directory; \
+         note: name one of `a/dup`, `b/dup`"
     );
-    assert_eq!(listing_errors(&siblings), [twice.as_str()]);
-    // An ordinary run allows them, and runs.
-    assert_eq!(rooted_text(&siblings, "c/z.gcsl"), "{z = \"other c\"}");
-    assert_eq!(rooted_text(&siblings, "a/x.gcsl"), "{}");
-    // Three, each place labelled.
-    let mut thrice = siblings.to_vec();
-    thrice.push(("d/w.gcsl", "def package dup() { \"d\" }"));
+    assert_eq!(invoked_text(&siblings, "package", "a/dup"), "dup a");
+    assert_eq!(invoked_text(&siblings, "package", "b/dup"), "dup b");
+    // A directory without the definition names none, and the listing
+    // names the shared one qualified.
     assert_eq!(
-        invoke_errors(&thrice, "package", "dup"),
-        [format!(
-            "`package dup` is defined 3 times in the workspace at a/x.gcsl; \
-                 b/y.gcsl: also defined here; d/w.gcsl: also defined here; {defined}"
-        )]
+        request_error(&siblings, "package", "c/dup"),
+        "`package` has no definition `c/dup`; note: its definitions are `a/dup`, `b/dup`, \
+         `other`"
     );
+    // The listing gives each its directory.
+    let workspace = checked(&siblings);
+    let listed = workspace.def_types().unwrap();
+    let dirs: Vec<(&str, &str, String)> = listed[0]
+        .definitions
+        .iter()
+        .map(|d| (d.path.as_str(), d.dir.as_str(), d.qualified()))
+        .collect();
+    assert_eq!(
+        dirs,
+        [
+            ("dup", "a", "a/dup".to_owned()),
+            ("dup", "b", "b/dup".to_owned()),
+            ("other", "c", "c/other".to_owned()),
+        ]
+    );
+    // One of the root is qualified as `/PATH`.
+    let rooted = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+                 def package top() { \"root\" }",
+        ),
+        ("a/x.gcsl", "def package top2() { \"a\" }"),
+    ];
+    assert_eq!(invoked_text(&rooted, "package", "/top"), "top root");
+    assert_eq!(invoked_text(&rooted, "package", "top"), "top root");
+}
+
+#[test]
+fn one_path_in_directories_that_see_each_other_fails_every_invocation() {
     // A `#[shadowable]` one of the root, shadowed in a directory below:
     // both are found, the first in path order first.
     let shadowed = [
@@ -8072,13 +8106,13 @@ fn two_definitions_of_one_path_fail_every_invocation() {
             "def package dup() { \"sub\" }\ny = package dup()",
         ),
     ];
-    assert_eq!(
-        invoke_errors(&shadowed, "package", "dup"),
-        [format!(
-            "`package dup` is defined 2 times in the workspace at sub/s.gcsl; \
-                 workspace.gcsl: also defined here; {defined}"
-        )]
+    let twice = format!(
+        "`package dup` is defined 2 times in directories that see each other at sub/s.gcsl; \
+             workspace.gcsl: also defined here; {DEFINED}"
     );
+    assert_eq!(invoke_errors(&shadowed, "package", "dup"), [twice.as_str()]);
+    assert_eq!(listing_errors(&shadowed), [twice.as_str()]);
+    // An ordinary run allows them, and runs.
     assert_eq!(rooted_text(&shadowed, "sub/s.gcsl"), "{y = \"dup sub\"}");
     // And one shadowed in its own file, which is in no tree.
     let own = [
@@ -8093,11 +8127,31 @@ fn two_definitions_of_one_path_fail_every_invocation() {
     assert_eq!(
         invoke_errors(&own, "package", "dup"),
         [format!(
-            "`package dup` is defined 2 times in the workspace at a.gcsl; \
-                 a.gcsl: also defined here; {defined}"
+            "`package dup` is defined 2 times in directories that see each other at a.gcsl; \
+                 a.gcsl: also defined here; {DEFINED}"
         )]
     );
     assert_eq!(rooted_text(&own, "a.gcsl"), "{y = \"dup two\"}");
+    // Two chains of one path: the root's with one below it, and a pair
+    // apart from it in siblings, each chain one error.
+    let chains = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { f() }\n\
+                 #[shadowable] def package dup() { \"root\" }",
+        ),
+        ("a/x.gcsl", "def package dup() { \"a\" }"),
+        ("b/y.gcsl", "def package dup() { \"b\" }"),
+    ];
+    assert_eq!(
+        listing_errors(&chains),
+        [format!(
+            "`package dup` is defined 3 times in directories that see each other at \
+                 a/x.gcsl; b/y.gcsl: also defined here; workspace.gcsl: also defined here; \
+                 {DEFINED}"
+        )]
+    );
 }
 
 #[test]
@@ -8150,11 +8204,7 @@ fn two_def_types_of_one_path_fail_every_invocation() {
 
 #[test]
 fn a_definition_under_another_fails_every_invocation() {
-    let note = "note: a definition invoked by name must not lie under another in the \
-                    workspace";
-    // In two sibling directories, which see neither the other: invoking
-    // another definition, `apple`, which lies under nothing, fails, and
-    // so does the listing.
+    // In two sibling directories, which see neither the other: no error.
     let siblings = [
         PACKAGE,
         ("a/x.gcsl", "def package app() { \"a\" }"),
@@ -8164,17 +8214,32 @@ fn a_definition_under_another_fails_every_invocation() {
         ),
         ("c/z.gcsl", "def package apple() { \"c\" }"),
     ];
+    assert!(checked(&siblings).def_types().is_ok());
+    assert_eq!(invoked_text(&siblings, "package", "app.core"), "app.core b");
+    // Under one in a directory above it, which it shadows: invoking
+    // another definition, `apple`, which lies under nothing, fails, and so
+    // does the listing.
+    let below = [
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+                 #[shadowable] def package app() { \"root\" }",
+        ),
+        (
+            "b/y.gcsl",
+            "def package app.core() { \"b\" }\ny = package app.core()",
+        ),
+        ("c/z.gcsl", "def package apple() { \"c\" }"),
+    ];
     let under = format!(
         "`package app.core` lies under another `package` definition at b/y.gcsl; \
-             a/x.gcsl: `app` is defined here; {note}"
+             workspace.gcsl: `app` is defined here; {UNDER}"
     );
-    assert_eq!(
-        invoke_errors(&siblings, "package", "apple"),
-        [under.as_str()]
-    );
-    assert_eq!(listing_errors(&siblings), [under.as_str()]);
+    assert_eq!(invoke_errors(&below, "package", "apple"), [under.as_str()]);
+    assert_eq!(listing_errors(&below), [under.as_str()]);
     // An ordinary run allows them, and runs.
-    assert_eq!(rooted_text(&siblings, "b/y.gcsl"), "{y = \"app.core b\"}");
+    assert_eq!(rooted_text(&below, "b/y.gcsl"), "{y = \"app.core b\"}");
     // In one directory, through `#[shadowable]`.
     let shadowed = [
         PACKAGE,
@@ -8189,29 +8254,29 @@ fn a_definition_under_another_fails_every_invocation() {
         listing_errors(&shadowed),
         [format!(
             "`package app.core` lies under another `package` definition at a.gcsl; \
-                 a.gcsl: `app` is defined here; {note}"
+                 a.gcsl: `app` is defined here; {UNDER}"
         )]
     );
     assert_eq!(rooted_text(&shadowed, "a.gcsl"), "{y = \"app app\"}");
-    // Three levels: `a.b` lies under one, `a.b.c` under two, labelled in
-    // path then source order.
+    // Three levels down one chain of directories: `a.b` lies under one,
+    // `a.b.c` under two, labelled in path then source order of their files.
     let levels = [
         PACKAGE,
-        ("a/one.gcsl", "def package a.b.c() { \"c\" }"),
-        ("b/two.gcsl", "def package a.b() { \"b\" }"),
-        ("c/three.gcsl", "def package a() { \"a\" }"),
+        ("x/y/one.gcsl", "def package a.b.c() { \"c\" }"),
+        ("x/two.gcsl", "#[shadowable] def package a.b() { \"b\" }"),
+        ("three.gcsl", "#[shadowable] def package a() { \"a\" }"),
     ];
     assert_eq!(
         listing_errors(&levels),
         [
             format!(
-                "`package a.b.c` lies under another `package` definition at a/one.gcsl; \
-                     b/two.gcsl: `a.b` is defined here; c/three.gcsl: `a` is defined here; \
-                     {note}"
+                "`package a.b` lies under another `package` definition at x/two.gcsl; \
+                     three.gcsl: `a` is defined here; {UNDER}"
             ),
             format!(
-                "`package a.b` lies under another `package` definition at b/two.gcsl; \
-                     c/three.gcsl: `a` is defined here; {note}"
+                "`package a.b.c` lies under another `package` definition at x/y/one.gcsl; \
+                     three.gcsl: `a` is defined here; x/two.gcsl: `a.b` is defined here; \
+                     {UNDER}"
             ),
         ]
     );
@@ -8225,51 +8290,49 @@ fn a_definition_under_another_fails_every_invocation() {
                  #[def_type]\n\
                  def build(name: String, f: fn(): String): String { f() }",
         ),
-        ("a/one.gcsl", "def build a.b.c() { \"c\" }"),
+        ("x/y/one.gcsl", "def build a.b.c() { \"c\" }"),
         levels[2],
         levels[3],
     ];
     assert_eq!(
         listing_errors(&other),
         [format!(
-            "`package a.b` lies under another `package` definition at b/two.gcsl; \
-                 c/three.gcsl: `a` is defined here; {note}"
+            "`package a.b` lies under another `package` definition at x/two.gcsl; \
+                 three.gcsl: `a` is defined here; {UNDER}"
         )]
     );
 }
 
 #[test]
 fn a_definition_both_duplicated_and_under_another_has_both_errors() {
-    let defined = "note: a definition invoked by name must be the only one of its path \
-                       in the workspace";
-    let note = "note: a definition invoked by name must not lie under another in the \
-                    workspace";
-    // `app` twice, and `app.core` twice under it: each `app.core` lies
-    // under both `app`s.
+    // `app` twice in one directory chain, and `app.core` twice under it in
+    // directories below them: each `app.core` lies under both `app`s.
     let files = [
-        PACKAGE,
-        ("a/x.gcsl", "def package app() { \"a\" }"),
-        ("b/y.gcsl", "def package app.core() { \"b\" }"),
-        ("c/z.gcsl", "def package app.core() { \"c\" }"),
-        ("d/w.gcsl", "def package app() { \"d\" }"),
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { f() }\n\
+                 #[shadowable] def package app() { \"root\" }",
+        ),
+        ("a/x.gcsl", "#[shadowable] def package app() { \"a\" }"),
+        ("a/b/y.gcsl", "def package app.core() { \"b\" }"),
+        ("a/c/z.gcsl", "def package app.core() { \"c\" }"),
     ];
     let under = |at: &str| {
         format!(
             "`package app.core` lies under another `package` definition at {at}; \
-                 a/x.gcsl: `app` is defined here; d/w.gcsl: `app` is defined here; {note}"
+                 a/x.gcsl: `app` is defined here; workspace.gcsl: `app` is defined here; \
+                 {UNDER}"
         )
     };
+    // In path order of their files: `a/b/y.gcsl` first.
     let expected = [
+        under("a/b/y.gcsl"),
+        under("a/c/z.gcsl"),
         format!(
-            "`package app` is defined 2 times in the workspace at a/x.gcsl; \
-                 d/w.gcsl: also defined here; {defined}"
+            "`package app` is defined 2 times in directories that see each other at \
+                 a/x.gcsl; workspace.gcsl: also defined here; {DEFINED}"
         ),
-        format!(
-            "`package app.core` is defined 2 times in the workspace at b/y.gcsl; \
-                 c/z.gcsl: also defined here; {defined}"
-        ),
-        under("b/y.gcsl"),
-        under("c/z.gcsl"),
     ];
     assert_eq!(listing_errors(&files), expected);
     assert_eq!(invoke_errors(&files, "package", "app"), expected);
@@ -8340,21 +8403,16 @@ fn what_cannot_be_invoked_is_a_request_error() {
         "`build` has no definition `y`; note: its only definition is `x`"
     );
     // A path that is a definition's, and above another's, in a sibling
-    // directory: the one below lies under it, and neither is invoked.
+    // directory, which sees nothing of it: each is invoked.
     let under = "`package app.core` lies under another `package` definition";
-    let note = "note: a definition invoked by name must not lie under another in the \
-                    workspace";
+    let note = UNDER;
     let files = [
         PACKAGE,
         ("a/x.gcsl", "def package app() { \"a\" }"),
         ("b/y.gcsl", "def package app.core() { \"b\" }"),
     ];
-    let siblings = format!("{under} at b/y.gcsl; a/x.gcsl: `app` is defined here; {note}");
-    assert_eq!(invoke_errors(&files, "package", "app"), [siblings.as_str()]);
-    assert_eq!(
-        invoke_errors(&files, "package", "app.core"),
-        [siblings.as_str()]
-    );
+    assert_eq!(invoked_text(&files, "package", "app"), "app a");
+    assert_eq!(invoked_text(&files, "package", "app.core"), "app.core b");
     // A `#[shadowable]` definition that one of another path, above it,
     // shadows in its own directory, which is in no tree: found, and the
     // one below.
@@ -9479,6 +9537,15 @@ fn a_reference_names_its_definition() {
     // What it names invokes as the reference does.
     let invoked = workspace.invoke("source", "up", &[]).unwrap().value;
     assert_eq!(invoked.to_string(), "https://x");
+    // It knows its directory, and so the path qualified by it, which names
+    // this very definition whatever others share its path.
+    let referenced = workspace.definition_of(&source).unwrap();
+    assert_eq!(referenced.dir, "app");
+    assert_eq!(referenced.qualified(), "app/up");
+    let invoked = workspace.invoke("source", &referenced.qualified(), &[]);
+    assert_eq!(invoked.unwrap().value.to_string(), "https://x");
+    let source = workspace.meta_field("build", "app/b", "source").unwrap();
+    assert_eq!(named_by(&workspace, &source.unwrap().value), named);
     // Nothing else names a definition: no other value, no closure that
     // calls one, no built-in function.
     let index = workspace.file("app/a.gcsl").unwrap();
@@ -10394,33 +10461,35 @@ fn definitions_with_plus_in_their_paths_conflict_as_any_do() {
         check_errors(&one),
         ["field `package x.a+b` is defined twice at a.gcsl; a.gcsl: first defined here"]
     );
-    // In two sibling directories, a duplicate when invoked by name, and
-    // one lying under another.
+    // In two sibling directories, which see neither the other: named with
+    // its directory when invoked by name.
     let siblings = [
         PACKAGE,
         ("a/x.gcsl", "def package x.a+b() { \"a\" }"),
         ("b/y.gcsl", "def package x.a+b() { \"b\" }"),
     ];
     assert_eq!(
-        invoke_errors(&siblings, "package", "x.a+b"),
-        [
-            "`package x.a+b` is defined 2 times in the workspace at a/x.gcsl; \
-                 b/y.gcsl: also defined here; note: a definition invoked by name must be \
-                 the only one of its path in the workspace"
-        ]
+        request_error(&siblings, "package", "x.a+b"),
+        "`package x.a+b` is defined in 2 directories, so it is named with its directory; \
+             note: name one of `a/x.a+b`, `b/x.a+b`"
     );
+    assert_eq!(invoked_text(&siblings, "package", "b/x.a+b"), "x.a+b b");
+    // One lying under another in a directory above, which it shadows.
     let under = [
-        PACKAGE,
-        ("a/x.gcsl", "def package x.a+b() { \"a\" }"),
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+                 #[shadowable] def package x.a+b() { \"a\" }",
+        ),
         ("b/y.gcsl", "def package x.a+b.c() { \"b\" }"),
     ];
     assert_eq!(
         listing_errors(&under),
-        [
+        [format!(
             "`package x.a+b.c` lies under another `package` definition at b/y.gcsl; \
-                 a/x.gcsl: `x.a+b` is defined here; note: a definition invoked by name must \
-                 not lie under another in the workspace"
-        ]
+                 workspace.gcsl: `x.a+b` is defined here; {UNDER}"
+        )]
     );
     // `a+b` is a name of its own, under no `a`.
     let apart = [
@@ -10608,33 +10677,35 @@ fn definitions_with_digits_in_their_paths_conflict_as_any_do() {
         check_errors(&twice),
         ["field `package x.1.83` is defined twice at a.gcsl; a.gcsl: first defined here"]
     );
-    // In two sibling directories, a duplicate when invoked by name, and
-    // one lying under another.
+    // In two sibling directories, which see neither the other: named with
+    // its directory when invoked by name.
     let siblings = [
         PACKAGE,
         ("a/x.gcsl", "def package x.1.83() { \"a\" }"),
         ("b/y.gcsl", "def package x.1.83() { \"b\" }"),
     ];
     assert_eq!(
-        invoke_errors(&siblings, "package", "x.1.83"),
-        [
-            "`package x.1.83` is defined 2 times in the workspace at a/x.gcsl; \
-                 b/y.gcsl: also defined here; note: a definition invoked by name must be \
-                 the only one of its path in the workspace"
-        ]
+        request_error(&siblings, "package", "x.1.83"),
+        "`package x.1.83` is defined in 2 directories, so it is named with its directory; \
+             note: name one of `a/x.1.83`, `b/x.1.83`"
     );
+    assert_eq!(invoked_text(&siblings, "package", "b/x.1.83"), "x.1.83 b");
+    // One lying under another in a directory above, which it shadows.
     let under = [
-        PACKAGE,
-        ("a/x.gcsl", "def package x.1() { \"a\" }"),
+        (
+            "workspace.gcsl",
+            "#[def_type]\n\
+                 def package(name: String, f: fn(): String): String { \"{name} {f()}\" }\n\
+                 #[shadowable] def package x.1() { \"a\" }",
+        ),
         ("b/y.gcsl", "def package x.1.83() { \"b\" }"),
     ];
     assert_eq!(
         listing_errors(&under),
-        [
+        [format!(
             "`package x.1.83` lies under another `package` definition at b/y.gcsl; \
-                 a/x.gcsl: `x.1` is defined here; note: a definition invoked by name must \
-                 not lie under another in the workspace"
-        ]
+                 workspace.gcsl: `x.1` is defined here; {UNDER}"
+        )]
     );
     // `10` is a name of its own, under no `1`.
     let apart = [
