@@ -6502,7 +6502,7 @@ impl<'a> Checker<'a> {
                 format!(
                     "`{}` is not a built-in or standard module, and there is no \
                      `workspace.gcsl` above this file",
-                    path.join(".")
+                    path.join("/")
                 ),
                 span,
             )

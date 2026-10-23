@@ -1,4 +1,4 @@
-import _lib.ppk
+import _lib/ppk
 import fileroot
 
 a = ppk.commit("usr", "dist")

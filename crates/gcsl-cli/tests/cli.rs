@@ -2451,10 +2451,10 @@ fn run_renders_no_module_with_its_note() {
     assert_eq!(stdout(&output), "");
     assert_eq!(
         stderr(&output),
-        "error: no module `vendor.pkg`\n\
+        "error: no module `vendor/pkg`\n\
          \x20--> tests/fixtures/ws_no_module/app.gcsl:1:8\n\
          \x20 |\n\
-         1 | import vendor.pkg\n\
+         1 | import vendor/pkg\n\
          \x20 |        ^^^^^^^^^^\n\
          \x20 |\n\
          \x20 = note: `vendor/` is a workspace of its own\n"
@@ -2494,8 +2494,8 @@ fn dumps_of_an_importing_file() {
     let path = "tests/fixtures/ws_imports/app/main.gcsl";
     let output = gcsl(&["run", path, "--dump-ast"]);
     assert!(stdout(&output).starts_with(
-        "(file\n  (import lib @0..10)\n  (import tools.build as builder @11..40)\n  \
-         (import com as libs from lib @41..68)\n  (import lib.y @69..81)\n"
+        "(file\n  (import lib @0..10)\n  (import tools/build as builder @11..40)\n  \
+         (import com as libs from lib @41..68)\n  (import lib/y @69..81)\n"
     ));
     let output = gcsl(&["run", path, "--dump-types"]);
     let types = stdout(&output);
@@ -3190,7 +3190,7 @@ fn dumps_show_types() {
     assert!(
         stdout(&output).starts_with(
             "(file\n\
-             \x20 (import Package from _lib.types @0..30)\n\
+             \x20 (import Package from _lib/types @0..30)\n\
              \x20 (field p : Package @31..102\n\
              \x20   (block : {arch: String, content: String, name: String, version: String} \
              @44..102\n"
@@ -4140,7 +4140,7 @@ fn lsp_initializes_and_shuts_down() {
     assert_eq!(
         *initialized,
         format!(
-            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"codeActionProvider":{{"codeActionKinds":["quickfix","source.fixAll"],"resolveProvider":false}},"completionProvider":{{"resolveProvider":false,"triggerCharacters":["."]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"inlayHintProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"capabilities":{{"codeActionProvider":{{"codeActionKinds":["quickfix","source.fixAll"],"resolveProvider":false}},"completionProvider":{{"resolveProvider":false,"triggerCharacters":[".","/"]}},"definitionProvider":true,"documentFormattingProvider":true,"documentHighlightProvider":true,"documentRangeFormattingProvider":true,"documentSymbolProvider":true,"hoverProvider":true,"inlayHintProvider":true,"positionEncoding":"utf-8","referencesProvider":true,"renameProvider":{{"prepareProvider":true}},"signatureHelpProvider":{{"retriggerCharacters":[","],"triggerCharacters":["(",","]}},"textDocumentSync":{{"change":2,"openClose":true,"save":true}},"workspaceSymbolProvider":true}},"serverInfo":{{"name":"gcsl","version":"{}"}}}}}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );

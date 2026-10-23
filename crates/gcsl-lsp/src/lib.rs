@@ -214,7 +214,7 @@
 //! standard library and the built-ins declare has no definition to go to:
 //! their sources are compiled in, with no file on disk. A rename renames
 //! no file or directory, so neither a name a directory or a file gives
-//! (`sandbox` of `import _lib.sandbox`) nor `fileroot`'s can be renamed,
+//! (`sandbox` of `import _lib/sandbox`) nor `fileroot`'s can be renamed,
 //! and a definition renamed no longer mirrors its directory's name.
 
 #![warn(
@@ -257,7 +257,7 @@ use lsp_types::request::{
     WorkspaceSymbolRequest,
 };
 use lsp_types::{
-    CancelParams, CodeActionKind, CodeActionOptions, CodeActionParams,
+    CompletionTriggerKind, CancelParams, CodeActionKind, CodeActionOptions, CodeActionParams,
     CodeActionProviderCapability, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
@@ -443,7 +443,7 @@ fn initialize_result(encoding: Encoding) -> Value {
             document_formatting_provider: Some(OneOf::Left(true)),
             document_range_formatting_provider: Some(OneOf::Left(true)),
             completion_provider: Some(CompletionOptions {
-                trigger_characters: Some(vec![".".to_owned()]),
+                trigger_characters: Some(vec![".".to_owned(), "/".to_owned()]),
                 resolve_provider: Some(false),
                 ..CompletionOptions::default()
             }),
@@ -1116,7 +1116,14 @@ fn asked(method: &str, params: Value) -> serde_json::Result<(Uri, Position, Aske
         }
         Completion::METHOD => {
             let params: CompletionParams = serde_json::from_value(params)?;
-            at(params.text_document_position, Asked::Completion)
+            // Only a character the server named as a trigger means anything
+            // to the index: `/` opens a list only in an import's path.
+            let trigger = params
+                .context
+                .filter(|context| context.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER)
+                .and_then(|context| context.trigger_character)
+                .and_then(|text| text.chars().next());
+            at(params.text_document_position, Asked::Completion(trigger))
         }
         SignatureHelpRequest::METHOD => {
             let params: SignatureHelpParams = serde_json::from_value(params)?;

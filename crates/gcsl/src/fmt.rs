@@ -98,7 +98,9 @@
 //!
 //! What the syntax tree says is kept as written, untouched: inside a
 //! def-type's path (`org.gnu.gmp-c++`, `go-stage0-1.24`), whose glued
-//! tokens make one name; and inside the position of an index segment of a
+//! tokens make one name; inside an import's module path
+//! (`pkgs/net.busybox.busybox`), whose glued tokens make its segments; and
+//! inside the position of an index segment of a
 //! `:=` path (`xs[i+1] := v`), whose text the tree keeps, and its printer
 //! shows. So is every string literal's text, its lines and
 //! indentation, a multi-line or raw one's included; and in an
@@ -280,7 +282,7 @@ struct Facts {
     ascriptions: HashSet<usize>,
     /// Each `for` header, by offset: from the `for` to its body's `{`.
     headers: Vec<(usize, usize)>,
-    /// What is kept as written, by offset: def-types' paths and the
+    /// What is kept as written, by offset: def-types' paths, module paths and the
     /// positions of the index segments of `:=` paths, in no order.
     verbatim: Vec<(usize, usize)>,
     /// The last token of each def-type's path.
@@ -382,19 +384,31 @@ impl Facts {
                     .extend(input.token_at(used.span.start, TokenKind::LParen));
             }
         }
+        facts.items_kept(ast);
+        facts
+    }
+
+    /// Records what items of `ast` keep as written: an import's module path,
+    /// whose glued tokens make its segments, and the position of each index
+    /// segment of a `:=` path.
+    fn items_kept(&mut self, ast: &Ast) {
         for item in ast.item_arena() {
-            if let ItemKind::Rebind { path, .. } = item.kind {
-                for segment in ast.path(path) {
-                    if matches!(segment.kind, SegmentKind::Index { .. }) {
-                        let span = segment.span;
-                        facts
-                            .verbatim
-                            .push((span.start as usize, span.end as usize));
+            match item.kind {
+                ItemKind::Import(id) => {
+                    let path = crate::ast::path_span(ast.path(ast.import_decl(id).path));
+                    self.verbatim.push((path.start as usize, path.end as usize));
+                }
+                ItemKind::Rebind { path, .. } => {
+                    for segment in ast.path(path) {
+                        if matches!(segment.kind, SegmentKind::Index { .. }) {
+                            let span = segment.span;
+                            self.verbatim.push((span.start as usize, span.end as usize));
+                        }
                     }
                 }
+                _ => {}
             }
         }
-        facts
     }
 
     /// Whether the gap from `start` to `end` is inside what is kept as
@@ -1363,6 +1377,11 @@ mod tests {
                 "x = build  org.gnu.gcc-libstdc++-devel",
                 "x = build org.gnu.gcc-libstdc++-devel\n",
             ),
+            // An import's module path: its `/`s are no divisions.
+            (
+                "import pkgs/net.busybox.busybox  as  b\nimport x,y from lib/a-b/c",
+                "import pkgs/net.busybox.busybox as b\nimport x, y from lib/a-b/c\n",
+            ),
             // The position of an index segment of a `:=` path.
             (
                 "let mut xs = [1]\nxs[0+0]:=2",
@@ -1476,7 +1495,7 @@ mod tests {
 
     #[test]
     fn a_formatted_file_is_left_as_it_is() {
-        let text = "# A file.\nimport _lib.files\n\ntype T = {\n    a: Int,\n    b: List<String> = [],\n}\n\ndef f(t: T) -> {} {\n    let xs = for i in 0..t.a if i > 1 { i * 2 }\n    g(\n        a = xs, # the list\n        b = \"{t.b}\",\n    )\n}\n";
+        let text = "# A file.\nimport _lib/files\n\ntype T = {\n    a: Int,\n    b: List<String> = [],\n}\n\ndef f(t: T) -> {} {\n    let xs = for i in 0..t.a if i > 1 { i * 2 }\n    g(\n        a = xs, # the list\n        b = \"{t.b}\",\n    )\n}\n";
         assert_eq!(fmt(text), text);
     }
 

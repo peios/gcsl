@@ -3292,6 +3292,20 @@ impl Ast {
         }
     }
 
+    /// Shows `segments`, a module path of an import, as it is written: its
+    /// segments joined by `/`, each as its source spells it, dots and all,
+    /// as in `pkgs/net.busybox.busybox` (see the parser's
+    /// [Imports](crate::parser#imports)).
+    #[must_use]
+    pub fn show_module_path(&self, segments: &[PathSegment]) -> String {
+        segments
+            .iter()
+            .filter_map(PathSegment::name)
+            .map(|name| self.names.get(name))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
     /// Shows `segments`, the path of a definition or a reference made with a
     /// def-type, `PATH`, or a prefix of one, as it is written: its names
     /// joined by `.`, each as its source spells it, `+` and all, as in
@@ -4029,7 +4043,7 @@ impl<A: Annotate> Pretty<'_, A> {
         let ast = self.ast;
         let name = |name: ImportName| ast.names().get(name.name);
         f.write_str("import ")?;
-        let path = ast.show_path(ast.path(decl.path));
+        let path = ast.show_module_path(ast.path(decl.path));
         match decl.form {
             ImportForm::Whole(alias) => {
                 write!(f, "{path}")?;

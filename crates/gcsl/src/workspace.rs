@@ -334,10 +334,10 @@
 //!
 //! An `import` gives a file the rest of the workspace, by name. Its path is
 //! absolute from the root: each segment but the last a directory, the last
-//! a directory or a file's stem (`import lib.x` is `lib/x.gcsl`); the root
+//! a directory or a file's stem (`import lib/x` is `lib/x.gcsl`); the root
 //! directory itself has no path. The scan resolves every import of every
 //! file, mentioned or not ([`scan_with`]): a path that names nothing is "no
-//! module `a.b`", with a note listing what the last directory that exists
+//! module `a/b`", with a note listing what the last directory that exists
 //! has (its subdirectories, with `/`, then its file stems), or saying that
 //! the directory is a workspace of its own. The library cannot see that
 //! from the files alone, so [`scan_with`] and [`check_with`] take the
@@ -345,11 +345,19 @@
 //! [`scan`] and [`check`] pass none. A directory and a file of one name are
 //! an error once per pair, at the first import that names them.
 //!
+//! A segment is a directory's or a file's name as it is, dots and all, so
+//! `pkgs/net.busybox.busybox` names the directory `net.busybox.busybox`
+//! (see the parser's [Imports](crate::parser#imports)). A path whose
+//! segments have dots in them, in the old form of a path, `lib.x`, that
+//! names nothing but would name a module with each `.` a `/`, is "no module
+//! `lib.x`" with a note saying so instead of what the directory has, and the
+//! path with slashes, `lib/x`, as its suggestion.
+//!
 //! An imported name is an [`Alias`] of the file ([`File::aliases`]), naming
 //! a [`Target`]: a directory's merged tree without its subdirectories, a
 //! file's own tree (or, for a value file, its value), or a root of either
 //! (`import x from lib`, and each root of `import * from lib`). A whole
-//! import (`import lib`, `import lib.x as f`) is a private top-level name
+//! import (`import lib`, `import lib/x as f`) is a private top-level name
 //! of its file: in scope throughout it, shadowed by nearer names, never in
 //! its tree or record, never seen by another file; one clashing with
 //! another top-level name of the file, with a member or `*` root of it, or
@@ -421,7 +429,7 @@
 //!   declares none. A type imported as a built-in type's name is "`Int` is a
 //!   built-in type".
 //! - A qualified name, `t.PackageDef` ([`Scan::qualified_type`]), names
-//!   through a whole import of the file (`import lib.types as t`) a type of
+//!   through a whole import of the file (`import lib/types as t`) a type of
 //!   the module it names: "`t` has no type `Foo`", with a note listing its
 //!   types, if it has none of that name; "unknown type `a.b`" if `a` is no
 //!   module the file imports whole; and "`t.Foo` is a type, not a module"
@@ -4791,6 +4799,19 @@ pub(crate) fn module(
                         format!("`{at}/` has {listed}")
                     }
                 };
+                let message = format!("no module `{}`", shown.join("/"));
+                // A path written in the old form, its segments separated by
+                // `.`, names a module once each `.` is a `/`.
+                if let Some(slashed) = slashed_module(modules, &shown) {
+                    let note = format!(
+                        "module paths separate their segments with `/`: `{slashed}` names a module"
+                    );
+                    return Err(Some(
+                        Diagnostic::error(message, written)
+                            .with_note(note)
+                            .with_suggestion(Some((written, slashed))),
+                    ));
+                }
                 let suggestion = named
                     .get(position)
                     .filter(|_| !nested)
@@ -4800,7 +4821,7 @@ pub(crate) fn module(
                         Some((span, best))
                     });
                 return Err(Some(
-                    Diagnostic::error(format!("no module `{}`", shown.join(".")), written)
+                    Diagnostic::error(message, written)
                         .with_note(note)
                         .with_suggestion(suggestion),
                 ));
@@ -4808,6 +4829,23 @@ pub(crate) fn module(
         }
     }
     Err(None)
+}
+
+/// The path `shown`, which names no module, written with each `.` of its
+/// segments a `/` instead, if that names a directory or a file: the module
+/// a path in the old form, `lib.x`, meant (see the parser's
+/// [Imports](crate::parser#imports)).
+fn slashed_module(modules: &Modules<'_>, shown: &[&str]) -> Option<String> {
+    let joined = shown.join("/");
+    if !joined.contains('.') {
+        return None;
+    }
+    let slashed = joined.replace('.', "/");
+    let names = modules.dirs.contains_key(&slashed)
+        || modules
+            .files
+            .contains_key(format!("{slashed}.gcsl").as_str());
+    names.then_some(slashed)
 }
 
 /// The suggestion for `name`, a segment of a module path that names no
@@ -4854,7 +4892,7 @@ fn module_suggestion(
     }
     let usable = candidates
         .iter()
-        .filter(|(text, _)| lexer::is_identifier(text))
+        .filter(|(text, _)| lexer::is_module_segment(text))
         .map(|(text, rank)| (text.as_str(), *rank));
     crate::suggest::best(name, usable).map(str::to_owned)
 }
@@ -5193,7 +5231,7 @@ impl Scan {
 
     /// What the qualified type name `path`, written at `span` in `file`,
     /// names (see [Types](#types)): its first name must be a module the
-    /// file imports whole (`import lib.types as t`), and its second a type
+    /// file imports whole (`import lib/types as t`), and its second a type
     /// of that module, and its last; a path of nothing else is resolved as a
     /// value's reference through an import is, the module's type named by
     /// the name after it. Otherwise the error: "unknown type `a.b`" for a

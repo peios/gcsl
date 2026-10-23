@@ -525,6 +525,22 @@ pub fn is_identifier(text: &str) -> bool {
         && keyword(text).is_none()
 }
 
+/// Whether `text` may be a segment of a module path (see
+/// [Imports](crate::parser#imports)): ASCII letters, digits, `_`, `-`, `+` and `.`,
+/// starting with a letter, a digit or `_` and ending with one or `+`, as
+/// `gmp-c++` does, with no `..`.
+#[must_use]
+pub fn is_module_segment(text: &str) -> bool {
+    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    let bytes = text.as_bytes();
+    bytes.first().is_some_and(word)
+        && bytes.last().is_some_and(|byte| word(byte) || *byte == b'+')
+        && !text.contains("..")
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
+}
+
 /// Lexes the whole of `source`, interning its names into a new table and
 /// storing the text of its string literals in another.
 ///

@@ -23,9 +23,16 @@ conflicting leaf is an error unless an earlier declaration explicitly
 permits shadowing.
 
 Sibling and child directories are not automatically in scope. Imports
-name paths from the workspace root. `import lib.helpers` names
-`lib/helpers.gcsl` or a directory of that path. Use `as` for a local alias,
-or import a named member with `from`.
+name paths from the workspace root, with `/` between directories, as the
+file system does. `import lib/helpers` names `lib/helpers.gcsl` or a
+directory of that path. Use `as` for a local alias, or import a named
+member with `from`.
+
+A directory or file name in a path is written as it is, dots and all, so
+`import pkgs/net.busybox.busybox as busybox` names the directory
+`pkgs/net.busybox.busybox`. An import without `as` is named after the
+path's last part, so that part must be a plain name; give a name such as
+`net.busybox.busybox` one with `as`.
 
 ## Boundaries and evaluation order
 

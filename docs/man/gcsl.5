@@ -189,13 +189,16 @@ A child sees its own directory and ancestors through the root.
 Imports reach other directories or files by root-relative paths:
 .PP
 .nf
-    import lib.helpers
-    import lib.helpers as helpers
-    import helper from lib.helpers
-    import helper as run_helper from lib.helpers
-    import * from lib.helpers
+    import lib/helpers
+    import lib/helpers as helpers
+    import helper from lib/helpers
+    import helper as run_helper from lib/helpers
+    import * from lib/helpers
+    import pkgs/net.busybox.busybox as busybox
 .fi
 .PP
+A path separates directories with /, and names each directory or file as it is, dots included.
+A whole import is named after the path's last part unless it gives a name with as, so a last part that is not a plain name needs one.
 An imported directory exposes its own merged declarations, not an automatic recursive import of its children.
 A file and directory with the same module name are ambiguous.
 A file outside any workspace can import standard modules only.

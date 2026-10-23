@@ -283,10 +283,10 @@ fn an_import_outside_a_workspace_is_an_error_with_the_files_others() {
         )
     };
     assert_eq!(
-        errors("x = 1 + true\nimport a.b as c"),
+        errors("x = 1 + true\nimport a/b as c"),
         vec![
             ("cannot add Int and Bool".to_owned(), Span::new(6, 7)),
-            (message("a.b"), Span::new(13, 28)),
+            (message("a/b"), Span::new(13, 28)),
         ]
     );
     assert_eq!(messages("import x, * from lib"), vec![message("lib")]);

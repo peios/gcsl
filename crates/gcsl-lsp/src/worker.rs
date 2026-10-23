@@ -169,8 +169,9 @@ pub enum Asked {
     Rename(String),
     /// `textDocument/documentSymbol`, which has no position.
     DocumentSymbols,
-    /// `textDocument/completion`.
-    Completion,
+    /// `textDocument/completion`, asked for because this trigger character
+    /// was typed, if one was.
+    Completion(Option<char>),
     /// `textDocument/signatureHelp`.
     SignatureHelp,
     /// `textDocument/inlayHint`, of the range from the query's position to
@@ -1030,7 +1031,7 @@ impl Kept {
                 let edits = index.rename((file, offset), &new, |renamed| again.index(renamed))?;
                 Some(Ok(workspace_edit(edits, &mut places)?))
             }
-            Asked::Completion | Asked::SignatureHelp => {
+            Asked::Completion(_) | Asked::SignatureHelp => {
                 let typed = Typed {
                     lines: &lines,
                     text: source.text(),
@@ -1276,11 +1277,12 @@ impl<'a> Answerer<'a> {
         }
     }
 
-    /// What may be written at byte `offset` of the file.
-    fn completion(&self, offset: u32) -> Vec<Completion> {
+    /// What may be written at byte `offset` of the file, asked for because
+    /// `trigger` was typed, if it was.
+    fn completion(&self, offset: u32, trigger: Option<char>) -> Vec<Completion> {
         match self {
-            Answerer::Index(index, file) => index.completion(*file, offset),
-            Answerer::Closed(closed) => closed.completion(offset),
+            Answerer::Index(index, file) => index.completion_triggered(*file, offset, trigger),
+            Answerer::Closed(closed) => closed.completion_triggered(offset, trigger),
         }
     }
 
@@ -1425,14 +1427,22 @@ fn typing(
     // What each item's edit writes over: the name typed before the place,
     // or all of the name the place is in.
     let name = gcsl::index::name_around(typed.text, offset);
-    let insert = typed
-        .lines
-        .range(Span::new(name.start, offset), typed.encoding);
-    let replace = typed.lines.range(name, typed.encoding);
+    let trigger = match *asked {
+        Asked::Completion(trigger) => trigger,
+        _ => None,
+    };
     let items = answerer
-        .completion(offset)
+        .completion(offset, trigger)
         .into_iter()
         .map(|found| {
+            // A completion that says what it replaces, a module path's
+            // segment, replaces that; any other the name typed.
+            let around = found.range.unwrap_or(name);
+            let insert = typed.lines.range(
+                Span::new(around.start, offset.max(around.start)),
+                typed.encoding,
+            );
+            let replace = typed.lines.range(around, typed.encoding);
             let new_text = found.insert.clone().unwrap_or_else(|| found.label.clone());
             let edit = if typed.insert_replace {
                 CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {

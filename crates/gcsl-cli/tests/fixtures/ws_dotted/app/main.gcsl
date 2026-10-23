@@ -1,4 +1,4 @@
-import dev from pkgs.a
+import dev from pkgs/a
 import pkgs
 hello = dev.peios.hello()
 count = pkgs.dev.peios.count(4)

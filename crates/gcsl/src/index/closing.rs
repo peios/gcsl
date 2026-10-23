@@ -425,8 +425,22 @@ impl Closed {
     /// [`Index::completion`] at byte `offset` of the file.
     #[must_use]
     pub fn completion(&self, offset: u32) -> Vec<Completion> {
-        self.index
-            .completion(self.file, self.closing.forward(offset))
+        self.completion_triggered(offset, None)
+    }
+
+    /// [`Index::completion_triggered`] at byte `offset` of the file, each
+    /// completion's range, if it has one, in the text as it is.
+    #[must_use]
+    pub fn completion_triggered(&self, offset: u32, trigger: Option<char>) -> Vec<Completion> {
+        let mut found =
+            self.index
+                .completion_triggered(self.file, self.closing.forward(offset), trigger);
+        for completion in &mut found {
+            completion.range = completion
+                .range
+                .and_then(|range| self.closing.span_back(range));
+        }
+        found
     }
 
     /// [`Index::signature`] at byte `offset` of the file.

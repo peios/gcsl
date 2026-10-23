@@ -239,20 +239,20 @@ fn field_cases() -> Vec<Case> {
         Case {
             name: "an imported name",
             files: vec![
-                ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+                ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             at: ("app.gcsl", "r = |v"),
-            hover: Some(vec!["v: Int", "imported from `lib.x`"]),
+            hover: Some(vec!["v: Int", "imported from `lib/x`"]),
             definition: vec![("lib/x.gcsl", "|v", 1)],
         },
         Case {
             name: "an import's path",
             files: vec![
-                ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+                ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
-            at: ("app.gcsl", "lib.|x"),
+            at: ("app.gcsl", "lib/|x"),
             hover: Some(vec!["lib.x: {v: Int}", "file `lib/x.gcsl`"]),
             definition: vec![("lib/x.gcsl", "|", 0)],
         },
@@ -571,7 +571,7 @@ fn references_of_a_definition_include_its_path_and_its_references() {
 #[test]
 fn references_of_an_imported_name() {
     let files = [
-        ("app.gcsl", "import v from lib.x\nr = v + 1\n"),
+        ("app.gcsl", "import v from lib/x\nr = v + 1\n"),
         ("lib/x.gcsl", "v = 1\n"),
     ];
     let all = places(
@@ -658,7 +658,7 @@ fn a_rename_renames_every_file_and_keeps_an_import_s_alias() {
     let files = [
         ("sub/app.gcsl", "x = base + 1\ny = base\n"),
         ("sub/lib.gcsl", "base = 1\n"),
-        ("other.gcsl", "import base as b from sub.lib\nz = b\n"),
+        ("other.gcsl", "import base as b from sub/lib\nz = b\n"),
     ];
     let at = index_of(&files, "sub/lib.gcsl");
     assert_eq!(
@@ -678,7 +678,7 @@ fn a_rename_renames_every_file_and_keeps_an_import_s_alias() {
             ("sub/lib.gcsl".to_owned(), "root = 1\n".to_owned()),
             (
                 "other.gcsl".to_owned(),
-                "import root as b from sub.lib\nz = b\n".to_owned()
+                "import root as b from sub/lib\nz = b\n".to_owned()
             ),
         ])
     );
@@ -831,7 +831,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
         ),
         (
             &[
-                ("app.gcsl", "import lib.x\nr = x.v\n"),
+                ("app.gcsl", "import lib/x\nr = x.v\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             ("app.gcsl", "import |lib"),
@@ -839,7 +839,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
         ),
         (
             &[
-                ("app.gcsl", "import lib.x\nr = x.v\n"),
+                ("app.gcsl", "import lib/x\nr = x.v\n"),
                 ("lib/x.gcsl", "v = 1\n"),
             ],
             ("app.gcsl", "r = |x"),
@@ -866,7 +866,7 @@ fn what_the_standard_library_a_directory_or_a_string_declares_is_not_renamed() {
 
 #[test]
 fn a_file_s_symbols_nest_record_blocks_three_deep() {
-    let text = "import lib.x\n\
+    let text = "import lib/x\n\
                     type V = {version: String}\n\
                     let helper = 1\n\
                     fn twice(n: Int): Int { n * 2 }\n\
@@ -1041,7 +1041,7 @@ fn a_file_that_needs_one_that_failed_is_indexed_and_reports_nothing() {
             "b.gcsl",
             "y = x\nz = y + 1\nw = undefined_name\nfn f(n: Int): Int { n }\n",
         ),
-        ("c.gcsl", "import v from lib.l\nu = v + 1\n"),
+        ("c.gcsl", "import v from lib/l\nu = v + 1\n"),
         ("lib/l.gcsl", "v = 1\nworse = 1 + \"a\"\n"),
     ];
     let Indexed {

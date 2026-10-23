@@ -1,2 +1,2 @@
-import vendor.pkg
+import vendor/pkg
 name = "app"

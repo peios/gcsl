@@ -214,10 +214,19 @@
 //!   typed; where the tree has none, a path of names is followed by its
 //!   names.
 //! - In an `import`'s path, after `import` or `from`, the modules under the
-//!   segments before the place: the directories and files of the directory
-//!   they name, and at the start the standard library's modules, every one
-//!   of them whether the scan loaded it or not, `builtins` and `fileroot`
-//!   (only those in a lone file).
+//!   segments before the place, those before its last `/`: the directories
+//!   and files of the directory they name, and at the start the standard
+//!   library's modules, every one of them whether the scan loaded it or
+//!   not, `builtins` and `fileroot` (only those in a lone file). The path
+//!   so far must be one run of glued tokens, as the parser reads it (see
+//!   its [Imports](crate::parser#imports)), the word half-typed directly
+//!   after it. What each writes over is not the name around the place but
+//!   the whole segment around it, dots and all
+//!   ([`module_segment_around`], [`Completion::range`]), so that a
+//!   directory named `net.busybox.busybox` replaces `net.bu`. Asked for
+//!   because a `/` was typed ([`Index::completion_triggered`]), only this
+//!   place offers anything: anywhere else a `/` is a division, after which
+//!   no list should open unasked.
 //! - After a def-type's name, `package dev.`, the children of the node of
 //!   the path in the def-type's namespace: the definitions under it. The
 //!   namespace's key is a reference's or a definition's of the def-type
@@ -346,7 +355,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 pub use closing::{Closed, ClosedCache, Closing};
-pub use complete::{Completion, CompletionKind, name_around};
+pub use complete::{Completion, CompletionKind, module_segment_around, name_around};
 pub use inlay::{InlayHint, MAX_HINT};
 pub use rename::{Edit, Prepared};
 pub use signature::Signature;
@@ -1267,13 +1276,19 @@ impl Index {
     }
 
     /// The path of the `import` item `item` of file `file`, as written:
-    /// `lib.x`.
+    /// `lib/x`.
     fn import_path(&self, file: u32, item: ItemId) -> Option<String> {
         let ast = &self.scan.files.get(file as usize)?.ast;
         let &ItemKind::Import(id) = ast_item(ast, item)? else {
             return None;
         };
-        Some(self.show_segments(ast.path(ast.import_decl(id).path)))
+        let segments = ast.path(ast.import_decl(id).path);
+        let shown: Vec<&str> = segments
+            .iter()
+            .filter_map(PathSegment::name)
+            .map(|name| self.scan.names.get(name))
+            .collect();
+        Some(shown.join("/"))
     }
 
     /// `segments`, names joined by `.`.

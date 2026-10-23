@@ -776,8 +776,8 @@ fn benchmark_a_chain_of_imports() {
 const IMPORTS: [(&str, &str); 6] = [
     (
         "app/main.gcsl",
-        "import lib\nimport tools.build as builder\nimport com as libs from lib\n\
-             import lib.y\ncom.x.app.deps = [lib.com.x.lib, libs.y.lib]\n\
+        "import lib\nimport tools/build as builder\nimport com as libs from lib\n\
+             import lib/y\ncom.x.app.deps = [lib.com.x.lib, libs.y.lib]\n\
              com.x.app.tool = builder\ncom.x.app.all = y.com.y.lib.name",
     ),
     ("common.gcsl", "version = \"1.2\""),
@@ -837,7 +837,7 @@ fn imports_resolve_to_their_targets() {
 #[test]
 fn a_reference_through_an_import_needs_only_its_leaf() {
     let mut files = IMPORTS.to_vec();
-    files[0].1 = "import lib\nimport lib.y\nimport tools\na = lib.com.x.lib.name\nb = y";
+    files[0].1 = "import lib\nimport lib/y\nimport tools\na = lib.com.x.lib.name\nb = y";
     let scan = ws(&files).unwrap();
     // `lib.com.x.lib.name` is x's leaf; `y` whole is y; nothing reads
     // `tools`, so it needs nothing.
@@ -851,7 +851,7 @@ fn a_reference_through_an_import_needs_only_its_leaf() {
 #[test]
 fn a_file_part_and_a_whole_node_are_told_apart() {
     let mut files = IMPORTS.to_vec();
-    files[0].1 = "import lib.y\na = y.com\nb = y.com.y";
+    files[0].1 = "import lib/y\na = y.com\nb = y.com.y";
     let scan = ws(&files).unwrap();
     let main = &scan.files[1];
     let scope = FileScope::new(&scan, main);
@@ -884,15 +884,58 @@ fn no_module_says_what_there_is() {
         note.as_deref(),
         Some("the workspace has `app/`, `lib/`, `tools/`, `common`, `workspace`")
     );
-    files[0].1 = "import lib.z";
+    files[0].1 = "import lib/z";
     let (message, note) = noted(&files, &[]);
-    assert_eq!(message, "no module `lib.z`");
+    assert_eq!(message, "no module `lib/z`");
     assert_eq!(note.as_deref(), Some("`lib/` has `x`, `y`"));
-    files[0].1 = "import lib.x.z";
-    assert_eq!(noted(&files, &[]).0, "no module `lib.x.z`");
-    files[0].1 = "import vendor.pkg";
+    files[0].1 = "import lib/x/z";
+    assert_eq!(noted(&files, &[]).0, "no module `lib/x/z`");
+    files[0].1 = "import vendor/pkg";
     let (_, note) = noted(&files, &["vendor"]);
     assert_eq!(note.as_deref(), Some("`vendor/` is a workspace of its own"));
+}
+
+/// A segment of a module path may have dots in it, as reverse-DNS names
+/// do: it names a directory or a file whose name has them.
+#[test]
+fn a_module_path_segment_may_have_dots_in_it() {
+    let files = [
+        (
+            "app.gcsl",
+            "import pkgs/net.busybox.busybox as busybox
+             import w from pkgs/dev.peios.live-root/root
+= busybox.v + w",
+        ),
+        ("pkgs/net.busybox.busybox/pkg.gcsl", "v = 1"),
+        ("pkgs/dev.peios.live-root/root.gcsl", "w = 2"),
+        ("workspace.gcsl", ""),
+    ];
+    assert_eq!(run_file(&files, "app.gcsl").unwrap(), "3");
+}
+
+/// A path in the old form, its segments separated by `.`, names no module;
+/// when it would with each `.` a `/`, the error says so and suggests it.
+#[test]
+fn a_path_with_dots_for_slashes_is_suggested_the_slashes() {
+    let mut files = IMPORTS.to_vec();
+    files[0].1 = "import lib.x as old";
+    let errors = ws_nested(&files, &[]).unwrap_err();
+    let [error] = errors.as_slice() else {
+        panic!("expected one error: {errors:?}");
+    };
+    assert_eq!(error.message, "no module `lib.x`");
+    assert_eq!(
+        error.notes,
+        ["module paths separate their segments with `/`: `lib/x` names a module"]
+    );
+    let suggestion = error.suggestion.as_deref().unwrap();
+    assert_eq!(suggestion.replacement, "lib/x");
+    assert_eq!(suggestion.span, Span::new(7, 12));
+    // A name of dots that names nothing either way is no module, as any.
+    files[0].1 = "import lib.q as old";
+    let (message, note) = noted(&files, &[]);
+    assert_eq!(message, "no module `lib.q`");
+    assert!(note.unwrap().starts_with("the workspace has"));
 }
 
 /// An import that nothing mentions needs nothing, but is still resolved:
@@ -930,7 +973,7 @@ fn imported_names_clash() {
         ("import lib\nlet lib = 1", imported),
         ("import lib\nlib.a = 1", imported),
         ("import tools as version", "is a field of this directory"),
-        ("import x from lib.x", "has no `x`"),
+        ("import x from lib/x", "has no `x`"),
     ] {
         files[0].1 = text;
         assert!(noted(&files, &[]).0.ends_with(message), "{text}");
@@ -1011,7 +1054,7 @@ fn library(main: &str) -> Vec<(&str, &str)> {
 
 #[test]
 fn every_import_form_binds_its_names() {
-    let files = library("import lib.f as lf\nimport lib.f\na = lf.leafy\nb = f.com.k.v");
+    let files = library("import lib/f as lf\nimport lib/f\na = lf.leafy\nb = f.com.k.v");
     assert_eq!(value(&files, "app/main.gcsl"), "{a = 3; b = 1}");
     let main = "import twice, leafy as l, com from lib\na = twice(l)\nb = com.k\nc = com.k.v";
     let files = library(main);
@@ -1019,7 +1062,7 @@ fn every_import_form_binds_its_names() {
         value(&files, "app/main.gcsl"),
         "{a = 6; b = {v = 1}; c = 1}"
     );
-    let files = library("import * from lib.f\na = twice(leafy)\nb = com");
+    let files = library("import * from lib/f\na = twice(leafy)\nb = com");
     assert_eq!(value(&files, "app/main.gcsl"), "{a = 6; b = {k = {v = 1}}}");
     // Each root of `*` is a member: `lib/bad.gcsl`'s `boom` is not read.
     let files = library("import * from lib\na = twice(leafy)");
@@ -1028,14 +1071,14 @@ fn every_import_form_binds_its_names() {
 
 #[test]
 fn a_def_is_read_from_its_functions_slot() {
-    let files = library("import lib\nimport twice from lib.f\n= lib.twice(1) + twice(2)");
+    let files = library("import lib\nimport twice from lib/f\n= lib.twice(1) + twice(2)");
     assert_eq!(value(&files, "app/main.gcsl"), "6");
-    let main = "import lib.f\nfn g(): Int { let r = f\nr.twice(5) }\nr = f.com\nn = g()";
+    let main = "import lib/f\nfn g(): Int { let r = f\nr.twice(5) }\nr = f.com\nn = g()";
     assert_eq!(
         value(&library(main), "app/main.gcsl"),
         "{r = {k = {v = 1}}; n = 10}"
     );
-    let main = "import lib.f\nlet r = f\n= r.twice(4) + r.leafy";
+    let main = "import lib/f\nlet r = f\n= r.twice(4) + r.leafy";
     assert_eq!(value(&library(main), "app/main.gcsl"), "11");
 }
 
@@ -1090,7 +1133,7 @@ p24 = w.com"#;
 #[test]
 fn records_read_whole_have_the_types_of_their_roots() {
     let files = [
-        ("app/main.gcsl", "import lib\nimport lib.x\nd = lib\nf = x"),
+        ("app/main.gcsl", "import lib\nimport lib/x\nd = lib\nf = x"),
         (
             "lib/x.gcsl",
             "com.x.lib.n = 1\ndef twice(n: Int): Int { n * 2 }",
@@ -1172,7 +1215,7 @@ fn needs_through_an_import_are_per_leaf() {
     assert_eq!(value(&files, "app/main.gcsl"), "{a = {v = 1}}");
     let files = library("import lib\nfn g(): Int { lib.leafy }\na = g()");
     assert_eq!(value(&files, "app/main.gcsl"), "{a = 3}");
-    let main = "import lib.f\ndef d(): Int { f.com.k.v + (fn(): Int { f.twice(1) })() }\na = d()";
+    let main = "import lib/f\ndef d(): Int { f.com.k.v + (fn(): Int { f.twice(1) })() }\na = d()";
     assert_eq!(
         value(&library(main), "app/main.gcsl"),
         "{d = fn(): Int; a = 3}"
@@ -1200,9 +1243,9 @@ fn a_value_file_is_imported_by_its_value() {
 
 #[test]
 fn imported_names_are_the_files_own() {
-    let main = "a = leafy + g(10)\nfn g(leafy: Int): Int { leafy + 1 }\nimport leafy from lib.f";
+    let main = "a = leafy + g(10)\nfn g(leafy: Int): Int { leafy + 1 }\nimport leafy from lib/f";
     assert_eq!(value(&library(main), "app/main.gcsl"), "{a = 14}");
-    let mut files = library("import leafy from lib.f\na = leafy");
+    let mut files = library("import leafy from lib/f\na = leafy");
     files.push(("app/other.gcsl", "b = leafy"));
     assert_eq!(
         messages(&files, "app/main.gcsl"),
@@ -1215,10 +1258,10 @@ fn imported_names_are_the_files_own() {
 #[test]
 fn an_importing_files_items_are_in_any_order() {
     let lines = [
-        "import lib.f",
+        "import lib/f",
         "a = f.leafy + b",
         "b = twice(2)",
-        "import twice from lib.f",
+        "import twice from lib/f",
     ];
     // Every rotation, and (as slice 23's helper in lowering, which runs
     // a file alone, compares) the reverse order.
@@ -1461,7 +1504,7 @@ fn star_and_member_imports_merge_with_the_files_own_root() {
             "{app = 1; x = {lib = {name = \"x\"}}; y = {lib = {name = \"y\"}}}",
         ),
         (
-            "import * from lib.y\ncom.app = 1\nall = com",
+            "import * from lib/y\ncom.app = 1\nall = com",
             "{app = 1; y = {lib = {name = \"y\"}}}",
         ),
         (
@@ -1742,7 +1785,7 @@ fn a_view_is_the_files_own() {
 #[test]
 fn star_from_a_value_file_is_an_error() {
     let files = [
-        ("app/main.gcsl", "import * from tools.build"),
+        ("app/main.gcsl", "import * from tools/build"),
         ("tools/build.gcsl", "= 1"),
         ("workspace.gcsl", ""),
     ];
@@ -1792,8 +1835,8 @@ fn merging_the_same_cell_twice_is_idempotent() {
     // file of it, and from a directory above, with its own leaves.
     for main in [
         "import * from app\ncom.main.v = 1\nall = com",
-        "import * from app.other\ncom.main.v = 1\nall = com",
-        "import * from app.main\ncom.main.v = 1\nall = com",
+        "import * from app/other\ncom.main.v = 1\nall = com",
+        "import * from app/main\ncom.main.v = 1\nall = com",
         "import com from app\ncom.main.v = 1\nall = com",
     ] {
         let mut files = lib.to_vec();
@@ -2338,12 +2381,12 @@ fn the_standard_modules_names_are_reserved() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/prelude.gcsl", "x = 1"),
-        ("main.gcsl", "import lib.prelude\nn = prelude.x + len([1])"),
+        ("main.gcsl", "import lib/prelude\nn = prelude.x + len([1])"),
     ];
     assert_eq!(value(&files, "main.gcsl"), "{n = 2}");
     // A path of more than one segment never names a standard module.
-    let files = [("workspace.gcsl", ""), ("main.gcsl", "import prelude.len")];
-    assert_eq!(error(&files).0, "no module `prelude.len`");
+    let files = [("workspace.gcsl", ""), ("main.gcsl", "import prelude/len")];
+    assert_eq!(error(&files).0, "no module `prelude/len`");
 }
 
 #[test]
@@ -2356,10 +2399,10 @@ fn a_lone_file_imports_only_the_standard_library() {
         ]
     );
     assert_eq!(
-        lone("x = 1 + true\nimport a from c.d").unwrap_err(),
+        lone("x = 1 + true\nimport a from c/d").unwrap_err(),
         [
             "cannot add Int and Bool",
-            "`c.d` is not a built-in or standard module, and there is no \
+            "`c/d` is not a built-in or standard module, and there is no \
                  `workspace.gcsl` above this file"
         ]
     );
@@ -3126,7 +3169,7 @@ fn path_is_not_loaded_when_nobody_imports_it() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/a.gcsl", "x = [1]\ny = len(x)"),
-        ("main.gcsl", "import lib.a\nz = a.y + 1"),
+        ("main.gcsl", "import lib/a\nz = a.y + 1"),
     ];
     let (standard, checked) = checked_beside(&crate::STANDARD, &files);
     assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
@@ -3344,7 +3387,7 @@ fn path_is_a_reserved_name() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/path.gcsl", "x = 1"),
-        ("main.gcsl", "import lib.path\nn = path.x"),
+        ("main.gcsl", "import lib/path\nn = path.x"),
     ];
     assert_eq!(value(&files, "main.gcsl"), "{n = 1}");
 }
@@ -3855,7 +3898,7 @@ fn every_path_given_to_fs_must_be_absolute() {
             "lib/util.gcsl",
             "import fs\ndef load(p: String) -> String { fs.read(p) }",
         ),
-        ("main.gcsl", "import lib.util\nv = util.load(\"x\")"),
+        ("main.gcsl", "import lib/util\nv = util.load(\"x\")"),
     ];
     let error = run_file(&files, "main.gcsl").unwrap_err();
     let util = checked(&files).file("lib/util.gcsl");
@@ -4209,7 +4252,7 @@ fn fs_is_loaded_only_when_imported() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/a.gcsl", "x = [1]\ny = len(x)"),
-        ("main.gcsl", "import lib.a\nz = a.y + 1"),
+        ("main.gcsl", "import lib/a\nz = a.y + 1"),
     ];
     let (standard, checked) = checked_beside(&crate::STANDARD, &files);
     assert_eq!(standard, ["<stdlib>/prelude.gcsl"]);
@@ -4270,7 +4313,7 @@ fn fs_is_a_reserved_name() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/fs.gcsl", "x = 1"),
-        ("main.gcsl", "import lib.fs\nn = fs.x"),
+        ("main.gcsl", "import lib/fs\nn = fs.x"),
     ];
     assert_eq!(value(&files, "main.gcsl"), "{n = 1}");
 }
@@ -4717,7 +4760,7 @@ fn show_gives_the_source_of_a_value() {
         ),
         (
             "main.gcsl",
-            "import lib.render\nv = render.as_text({n = [1]})",
+            "import lib/render\nv = render.as_text({n = [1]})",
         ),
     ];
     assert_eq!(value(&files, "main.gcsl"), "{v = \"{{n = [1]}}\"}");
@@ -5034,7 +5077,7 @@ const DEFAULTS: [(&str, &str); 3] = [
     ),
     (
         "pkg/build.gcsl",
-        "import * from _lib.defaults\narch = \"aarch64\"          # shadows the default\n\
+        "import * from _lib/defaults\narch = \"aarch64\"          # shadows the default\n\
              j = jobs                   # 4",
     ),
     ("workspace.gcsl", ""),
@@ -5053,7 +5096,7 @@ fn the_shadowable_summary_runs() {
     // The implicit prelude is the file's too, and a name of it is
     // shadowed by a declaration as before.
     let mut files = DEFAULTS.to_vec();
-    files[1].1 = "import * from _lib.defaults\narch = \"aarch64\"\nn = len([jobs])\n\
+    files[1].1 = "import * from _lib/defaults\narch = \"aarch64\"\nn = len([jobs])\n\
                       trim = 3";
     assert_eq!(
         value(&files, "pkg/build.gcsl"),
@@ -5133,7 +5176,7 @@ fn a_shadowed_declaration_is_checked_but_never_run() {
     let files = [
         (
             "a.gcsl",
-            "import * from lib.x\n#[shadowable] arch = thing + 1\narch = 2",
+            "import * from lib/x\n#[shadowable] arch = thing + 1\narch = 2",
         ),
         ("lib/x.gcsl", "thing = panic(\"never run\")"),
         ("workspace.gcsl", ""),
@@ -5207,7 +5250,7 @@ fn an_inner_directory_shadows_an_outer_one() {
 fn an_import_and_a_field_shadow_in_their_order() {
     // A field after an import of a shadowable leaf: the field wins.
     let mut files = DEFAULTS.to_vec();
-    files[1].1 = "import arch from _lib.defaults\narch = \"own\"\ngot = arch";
+    files[1].1 = "import arch from _lib/defaults\narch = \"own\"\ngot = arch";
     assert_eq!(
         value(&files, "pkg/build.gcsl"),
         "{arch = \"own\"; got = \"own\"}"
@@ -5219,7 +5262,7 @@ fn an_import_and_a_field_shadow_in_their_order() {
         ("lib/defs.gcsl", "arch = \"lib\""),
         (
             "pkg/a.gcsl",
-            "#[shadowable] arch = \"own\"\nimport arch from lib.defs\ngot = arch",
+            "#[shadowable] arch = \"own\"\nimport arch from lib/defs\ngot = arch",
         ),
         ("pkg/b.gcsl", "seen = arch"),
         ("workspace.gcsl", ""),
@@ -5232,7 +5275,7 @@ fn an_import_and_a_field_shadow_in_their_order() {
     // A plain field before the import conflicts, as it always has.
     let files = [
         ("lib/defs.gcsl", "arch = \"lib\""),
-        ("pkg/a.gcsl", "arch = \"own\"\nimport arch from lib.defs"),
+        ("pkg/a.gcsl", "arch = \"own\"\nimport arch from lib/defs"),
         ("workspace.gcsl", ""),
     ];
     assert_eq!(
@@ -5247,11 +5290,11 @@ fn a_marked_import_brings_shadowable_leaves() {
     let files = [
         (
             "a/a.gcsl",
-            "#[shadowable] import * from lib.defs\narch = \"own\"\nj = jobs",
+            "#[shadowable] import * from lib/defs\narch = \"own\"\nj = jobs",
         ),
         (
             "b/b.gcsl",
-            "#[shadowable] import arch, jobs as n from lib.defs\narch = 1\nn = 3",
+            "#[shadowable] import arch, jobs as n from lib/defs\narch = 1\nn = 3",
         ),
         ("lib/defs.gcsl", "arch = \"lib\"\njobs = 2"),
         ("workspace.gcsl", ""),
@@ -5260,7 +5303,7 @@ fn a_marked_import_brings_shadowable_leaves() {
     assert_eq!(value(&files, "b/b.gcsl"), "{arch = 1; n = 3}");
     // Unmarked, the same is the conflict it always was.
     let files = [
-        ("a/a.gcsl", "import * from lib.defs\narch = \"own\""),
+        ("a/a.gcsl", "import * from lib/defs\narch = \"own\""),
         ("lib/defs.gcsl", "arch = \"lib\""),
         ("workspace.gcsl", ""),
     ];
@@ -5275,7 +5318,7 @@ fn a_marked_import_brings_shadowable_leaves() {
         ("lib/defs.gcsl", "arch = \"lib\"\njobs = 2"),
         (
             "pkg/a.gcsl",
-            "#[shadowable] import * from lib.defs\nbefore = arch\nlet arch = 1\n\
+            "#[shadowable] import * from lib/defs\nbefore = arch\nlet arch = 1\n\
                  after = arch\nfn jobs(): Int { 9 }\nj = jobs()",
         ),
         ("workspace.gcsl", ""),
@@ -5293,8 +5336,8 @@ fn shadowability_travels_with_a_leaf() {
     let files = [
         ("_lib/defaults.gcsl", "#[shadowable] arch = \"x86_64\""),
         ("_lib/more.gcsl", "jobs = 4"),
-        ("a/a.gcsl", "import * from _lib.defaults\narch = \"a\""),
-        ("b/b.gcsl", "import arch from _lib.defaults\narch = \"b\""),
+        ("a/a.gcsl", "import * from _lib/defaults\narch = \"a\""),
+        ("b/b.gcsl", "import arch from _lib/defaults\narch = \"b\""),
         ("c/c.gcsl", "import * from _lib\narch = \"c\"\nj = jobs"),
         ("d/d.gcsl", "import _lib\narch = \"d\"\nx = _lib.arch"),
         ("workspace.gcsl", ""),
@@ -5336,7 +5379,7 @@ fn dotted_leaves_are_shadowed_leaf_by_leaf() {
         ),
         (
             "pkg/a.gcsl",
-            "import * from lib.defs\ncom.x.port = 2\nall = com",
+            "import * from lib/defs\ncom.x.port = 2\nall = com",
         ),
         ("workspace.gcsl", ""),
     ];
@@ -5402,7 +5445,7 @@ fn a_dotted_root_shadows_the_prelude_s_name_as_before() {
         "{len = {x = 1}; y = {x = 1}}"
     );
     let files = [
-        ("app/main.gcsl", "import * from lib.a\ny = len"),
+        ("app/main.gcsl", "import * from lib/a\ny = len"),
         ("lib/a.gcsl", "len.x = 1"),
         ("workspace.gcsl", "x = 1"),
     ];
@@ -5468,7 +5511,7 @@ fn the_clash_family_ignores_shadowable_leaves() {
         ("a/a.gcsl", "let port = 5\nn = port"),
         ("b/b.gcsl", "fn port(): Int { 7 }\nn = port()"),
         ("c/c.gcsl", "def port(): Int { 8 }\nn = port()"),
-        ("d/d.gcsl", "import lib.port\nn = port.x"),
+        ("d/d.gcsl", "import lib/port\nn = port.x"),
         ("e/e.gcsl", "port = 6\nn = port"),
         ("lib/port.gcsl", "x = 9"),
         ("workspace.gcsl", "#[shadowable] port = 1"),
@@ -5673,7 +5716,7 @@ fn the_fileroot_summary_runs_in_a_workspace() {
         ("_lib/ppk.gcsl", PPK),
         (
             "pkg/test.gcsl",
-            "import _lib.ppk\nimport fileroot\n\
+            "import _lib/ppk\nimport fileroot\n\
                  a = ppk.commit(\"usr\", \"dist\")\n\
                  b = ppk.wrapped(\"usr\")\n\
                  here = fileroot.this",
@@ -5720,7 +5763,7 @@ fn the_fileroot_summary_runs_in_a_workspace() {
         ("_lib/ppk.gcsl", PPK),
         (
             "top.gcsl",
-            "import _lib.ppk\na = ppk.commit(\"usr\", \"dist\")",
+            "import _lib/ppk\na = ppk.commit(\"usr\", \"dist\")",
         ),
     ];
     assert_eq!(
@@ -5736,7 +5779,7 @@ fn this_and_caller_through_calls_and_helpers() {
         ("_lib/ppk.gcsl", PPK),
         (
             "pkg/test.gcsl",
-            "import _lib.ppk\nimport fileroot\n\
+            "import _lib/ppk\nimport fileroot\n\
                  top = fileroot.caller\n\
                  this = fileroot.this\n\
                  lib = ppk.here()\n\
@@ -5764,7 +5807,7 @@ fn closures_and_lazies_carry_their_files() {
         ("_lib/ppk.gcsl", PPK),
         (
             "pkg/make.gcsl",
-            "import _lib.ppk\nimport fileroot\n\
+            "import _lib/ppk\nimport fileroot\n\
                  fn mine(): String { fileroot.caller }\n\
                  reads = ppk.reader()()\n\
                  calls = ppk.calling()()\n\
@@ -5774,7 +5817,7 @@ fn closures_and_lazies_carry_their_files() {
         ),
         (
             "other/await.gcsl",
-            "import pkg.make\nimport _lib.ppk\n\
+            "import pkg/make\nimport _lib/ppk\n\
                  made = await make.made.s\n\
                  written = await make.written\n\
                  forced = ppk.force(ppk.step().s)",
@@ -5930,7 +5973,7 @@ fn fileroot_is_read_only_as_its_members() {
         ("_lib/ppk.gcsl", PPK),
         (
             "a.gcsl",
-            "import fileroot\nimport _lib.ppk\nfileroot.helper()\nx = ppk.caller()\n\
+            "import fileroot\nimport _lib/ppk\nfileroot.helper()\nx = ppk.caller()\n\
                  fn pure(): String { fileroot.helper()\nfileroot.caller }\ny = pure()",
         ),
     ];
@@ -6017,19 +6060,19 @@ fn a_memoised_call_depends_on_the_caller_it_reads() {
         ("lib/m.gcsl", MEMO_LIB),
         (
             "p/a.gcsl",
-            "import lib.m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
+            "import lib/m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
         ),
         (
             "p/b.gcsl",
-            "import lib.m\nrb = m.reads(1)\nvb = m.plain(1)\nob = m.outer(1)\nwb = m.awaits(1)",
+            "import lib/m\nrb = m.reads(1)\nvb = m.plain(1)\nob = m.outer(1)\nwb = m.awaits(1)",
         ),
         (
             "q/c.gcsl",
-            "import lib.m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
+            "import lib/m\nr = m.reads(1)\nv = m.plain(1)\no = m.outer(1)\nw = m.awaits(1)",
         ),
         (
             "z/all.gcsl",
-            "import p.a\nimport p.b\nimport q.c\n\
+            "import p/a\nimport p/b\nimport q/c\n\
                  ra = a.r\nrb = b.rb\nrc = c.r\n\
                  va = a.v\nvb = b.vb\nvc = c.v\n\
                  oa = a.o\nob = b.ob\noc = c.o\n\
@@ -6069,12 +6112,12 @@ fn a_memoised_call_found_passes_its_dependencies_on() {
         ("lib/m.gcsl", MEMO_LIB),
         (
             "p/a.gcsl",
-            "import lib.m\nfirst = m.reads(1)\nhit = m.outer_hit(len([first]))",
+            "import lib/m\nfirst = m.reads(1)\nhit = m.outer_hit(len([first]))",
         ),
-        ("q/c.gcsl", "import lib.m\nhit = m.outer_hit(1)"),
+        ("q/c.gcsl", "import lib/m\nhit = m.outer_hit(1)"),
         (
             "z/all.gcsl",
-            "import p.a\nimport q.c\nfirst = a.first\nhit = a.hit\nother = c.hit",
+            "import p/a\nimport q/c\nfirst = a.first\nhit = a.hit\nother = c.hit",
         ),
     ];
     let all = rooted_value(&files, "z/all.gcsl");
@@ -6091,7 +6134,7 @@ fn a_memoised_call_found_passes_its_dependencies_on() {
 fn a_step_that_can_read_its_caller_is_a_dependency_of_its_maker() {
     // Each step is awaited after the memoised call that made it has
     // returned, in a third directory.
-    let made = "import lib.m\nst = m.step(1)\nps = m.plain_step(1)\n\
+    let made = "import lib/m\nst = m.step(1)\nps = m.plain_step(1)\n\
                     hs = m.helped(1)\nns = m.nested(1)\nfs = m.fn_step(1)";
     let files = [
         ("workspace.gcsl", ""),
@@ -6100,7 +6143,7 @@ fn a_step_that_can_read_its_caller_is_a_dependency_of_its_maker() {
         ("q/c.gcsl", made),
         (
             "z/all.gcsl",
-            "import p.a\nimport q.c\n\
+            "import p/a\nimport q/c\n\
                  sa = await a.st.s\nsc = await c.st.s\n\
                  pa = a.ps\npc = c.ps\n\
                  ha = await a.hs.s\nhc = await c.hs.s\n\
@@ -6142,7 +6185,7 @@ fn a_running_memoised_call_is_found_as_a_lookup_finds_it() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/m.gcsl", MEMO_LIB),
-        ("p/a.gcsl", "import lib.m\nr = m.again(1)"),
+        ("p/a.gcsl", "import lib/m\nr = m.again(1)"),
     ];
     assert_eq!(
         rooted_text(&files, "p/a.gcsl"),
@@ -6206,7 +6249,7 @@ const TYPES: [(&str, &str); 3] = [
     ),
     (
         "workspace.gcsl",
-        "import _lib.types as t\n\
+        "import _lib/types as t\n\
              type Steps = List<fn() -> String>\n\
              def make(name: String, f: fn(): t.PackageDef): { pkg: t.Package } {\n\
              \x20   pkg: t.Package = { ...f(); name = name }\n\
@@ -6215,7 +6258,7 @@ const TYPES: [(&str, &str); 3] = [
     ),
     (
         "pkg/app.gcsl",
-        "import Package from _lib.types\n\
+        "import Package from _lib/types\n\
              p: Package = { version = \"1\"; arch = \"x\"; content = \"usr\"; name = \"n\" }\n\
              steps: Steps = []\n\
              n = built.pkg.name",
@@ -6247,7 +6290,7 @@ fn jacks_workspace_checks_with_spread_for_intersection() {
         (
             "workspace.gcsl",
             "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
-                 import _lib.ppk\n\
+                 import _lib/ppk\n\
                  import fileroot\n\
                  \n\
                  type PackageDef = {\n\
@@ -6457,22 +6500,22 @@ fn dotted_defs_through_each_form_of_import() {
     );
     for (text, expected) in [
         (
-            "import dev from pkgs.a\nh = dev.peios.hello()",
+            "import dev from pkgs/a\nh = dev.peios.hello()",
             "{h = \"hello world\"}",
         ),
         (
-            "import dev as d from pkgs.a\nh = d.peios.name()",
+            "import dev as d from pkgs/a\nh = d.peios.name()",
             "{h = \"world\"}",
         ),
         (
-            "import * from pkgs.a\ndef dev.own(): String { dev.peios.name() }\n\
+            "import * from pkgs/a\ndef dev.own(): String { dev.peios.name() }\n\
                  h = dev.peios.hello()\no = dev.own()\nall = dev",
             "{dev = {own = fn(): String}; h = \"hello world\"; o = \"world\"; \
                  all = {own = fn(): String; peios = {hello = fn(): String; \
                  name = fn(): String}}}",
         ),
         (
-            "import pkgs.a\nh = a.dev.peios.hello()\nw = a",
+            "import pkgs/a\nh = a.dev.peios.hello()\nw = a",
             "{h = \"hello world\"; w = {dev = {peios = {hello = fn(): String; \
                  name = fn(): String}}}}",
         ),
@@ -6487,7 +6530,7 @@ fn dotted_defs_through_each_form_of_import() {
         ("lib/x.gcsl", "def dev.inc(n: Int): Int { n + 1 }"),
         (
             "app/main.gcsl",
-            "import dev from lib.x\nimport lib\n\
+            "import dev from lib/x\nimport lib\n\
                  fn p(f: Future<Int>): Int { dev.inc(f) }\n\
                  fn q(f: Future<Int>): Int { lib.dev.inc(f) }",
         ),
@@ -6555,7 +6598,7 @@ fn jacks_package_is_a_dotted_def_given_to_package() {
         (
             "workspace.gcsl",
             "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
-                 import _lib.ppk\n\
+                 import _lib/ppk\n\
                  import fileroot\n\
                  \n\
                  type PackageDef = {\n\
@@ -6648,11 +6691,11 @@ fn types_are_reached_through_every_import_form() {
     };
     // Whole, by its path's last segment and `as`.
     assert_eq!(
-        with("import lib.types\nv: types.P = { x = 1 }"),
+        with("import lib/types\nv: types.P = { x = 1 }"),
         "{v = {x = 1}}"
     );
     assert_eq!(
-        with("import lib.types as t\nv: t.P = { x = 1 }"),
+        with("import lib/types as t\nv: t.P = { x = 1 }"),
         "{v = {x = 1}}"
     );
     // A directory's merged tree has its files' types.
@@ -6662,21 +6705,21 @@ fn types_are_reached_through_every_import_form() {
     );
     // A member, bare or renamed.
     assert_eq!(
-        with("import P from lib.types\nv: P = { x = 2 }"),
+        with("import P from lib/types\nv: P = { x = 2 }"),
         "{v = {x = 2}}"
     );
     assert_eq!(
-        with("import P as R from lib.types\nv: R = { x = 2 }"),
+        with("import P as R from lib/types\nv: R = { x = 2 }"),
         "{v = {x = 2}}"
     );
     // `*`, with the fields.
     assert_eq!(
-        with("import * from lib.types\nv: P = { x = Both }"),
+        with("import * from lib/types\nv: P = { x = Both }"),
         "{v = {x = 7}}"
     );
     // A member that is both a type and a value binds both.
     assert_eq!(
-        with("import Both from lib.types\nv: Both = Both + 1"),
+        with("import Both from lib/types\nv: Both = Both + 1"),
         "{v = 8}"
     );
 }
@@ -6690,11 +6733,11 @@ fn qualified_names_go_two_deep() {
         ("a/b/inner.gcsl", "type Leaf = {v: Int}"),
         (
             "a/b/types.gcsl",
-            "import a.b.inner as i\ntype Node = {leaf: i.Leaf, name: String}",
+            "import a/b/inner as i\ntype Node = {leaf: i.Leaf, name: String}",
         ),
         (
             "app/main.gcsl",
-            "import a.b.types as t\nn: t.Node = { leaf = { v = 1 }; name = \"n\" }\nw = n.leaf.v",
+            "import a/b/types as t\nn: t.Node = { leaf = { v = 1 }; name = \"n\" }\nw = n.leaf.v",
         ),
     ];
     assert_eq!(
@@ -6968,7 +7011,7 @@ fn type_conflicts_are_the_conflicts_of_fields() {
         errors(&[
             ("workspace.gcsl", ""),
             ("lib/t.gcsl", "type Foo = Int"),
-            ("app/m.gcsl", "import Foo from lib.t\ntype Foo = String"),
+            ("app/m.gcsl", "import Foo from lib/t\ntype Foo = String"),
         ]),
         [imported]
     );
@@ -6982,7 +7025,7 @@ fn type_conflicts_are_the_conflicts_of_fields() {
             ("lib/t.gcsl", "type Foo = Int"),
             (
                 "app/m.gcsl",
-                "#[shadowable] import * from lib.t\ntype Foo = String"
+                "#[shadowable] import * from lib/t\ntype Foo = String"
             ),
         ]),
         [star]
@@ -6993,7 +7036,7 @@ fn type_conflicts_are_the_conflicts_of_fields() {
         ("lib/t.gcsl", "type Foo = Int"),
         (
             "lib/m.gcsl",
-            "import * from lib\nimport Foo from lib.t\nx: Foo = 1",
+            "import * from lib\nimport Foo from lib/t\nx: Foo = 1",
         ),
     ];
     assert_eq!(value(&files, "lib/m.gcsl"), "{x = 1}");
@@ -7007,19 +7050,19 @@ fn qualified_names_that_name_no_type() {
         check_errors(&files)
     };
     assert_eq!(
-        with("import lib.types as t\nx: t.Nope = 1"),
+        with("import lib/types as t\nx: t.Nope = 1"),
         ["`t` has no type `Nope` at app/main.gcsl; note: `t` has the types `P`, `Both`"]
     );
     assert_eq!(
-        with("import lib.more as m\nimport builtins\nx: builtins.Int = 1"),
+        with("import lib/more as m\nimport builtins\nx: builtins.Int = 1"),
         ["`builtins` has no type `Int` at app/main.gcsl; note: `builtins` has no types"]
     );
     assert_eq!(
-        with("import lib.types as t\nx: t = 1"),
+        with("import lib/types as t\nx: t = 1"),
         ["`t` is a module, not a type at app/main.gcsl"]
     );
     assert_eq!(
-        with("import lib.types as t\nx: t.P.x = 1"),
+        with("import lib/types as t\nx: t.P.x = 1"),
         ["`t.P` is a type, not a module at app/main.gcsl"]
     );
     assert_eq!(
@@ -7175,7 +7218,7 @@ fn a_value_file_declares_types() {
         ("lib/v.gcsl", "type T = {a: Int}\n= 5"),
         (
             "app.gcsl",
-            "import lib.v\nimport T from lib.v\nx: v.T = { a = v }\ny: T = x",
+            "import lib/v\nimport T from lib/v\nx: v.T = { a = v }\ny: T = x",
         ),
     ];
     assert_eq!(value(&files, "app.gcsl"), "{x = {a = 5}; y = {a = 5}}");
@@ -7223,7 +7266,7 @@ const JACKS_PACKAGE: [(&str, &str); 3] = [
     (
         "workspace.gcsl",
         "# Marks newpkgs/ as a GCSL workspace: imports are absolute from here.\n\
-             import _lib.ppk\n\
+             import _lib/ppk\n\
              import fileroot\n\
              \n\
              type PackageDef = {\n\
@@ -7449,13 +7492,13 @@ fn a_def_type_is_reached_through_its_imports() {
         lib,
         (
             "app/a.gcsl",
-            "import build as b from lib.types\n\
+            "import build as b from lib/types\n\
                  def b x() { \"via b\" }\n\
                  one = b x()",
         ),
         (
             "app/c.gcsl",
-            "import lib.types as t\n\
+            "import lib/types as t\n\
                  two = t.build x()",
         ),
     ];
@@ -7464,7 +7507,7 @@ fn a_def_type_is_reached_through_its_imports() {
     // `*` brings a file's definitions; a whole import of it does not.
     let defs = (
         "lib/defs.gcsl",
-        "import * from lib.types\ndef build x() { \"x\" }",
+        "import * from lib/types\ndef build x() { \"x\" }",
     );
     let files = [
         ("workspace.gcsl", ""),
@@ -7472,9 +7515,9 @@ fn a_def_type_is_reached_through_its_imports() {
         defs,
         (
             "app/a.gcsl",
-            "import * from lib.defs\nimport * from lib.types\na = build x()",
+            "import * from lib/defs\nimport * from lib/types\na = build x()",
         ),
-        ("app/c.gcsl", "import lib.defs\nc = defs"),
+        ("app/c.gcsl", "import lib/defs\nc = defs"),
     ];
     assert_eq!(value(&files, "app/a.gcsl"), "{a = \"x x\"}");
     // Read whole, a file holds no namespace.
@@ -7485,7 +7528,7 @@ fn a_def_type_is_reached_through_its_imports() {
         defs,
         (
             "app/b.gcsl",
-            "import lib.defs\nimport * from lib.types\nb = build x()",
+            "import lib/defs\nimport * from lib/types\nb = build x()",
         ),
     ];
     assert_eq!(
@@ -7524,7 +7567,7 @@ fn a_def_type_s_caller_is_where_its_reference_is_called() {
         ),
         (
             "b/b.gcsl",
-            "import a.a\n\
+            "import a/a\n\
                  there = a.made()()\n\
                  through = a.made_helped()()",
         ),
@@ -7914,14 +7957,14 @@ fn every_definition_is_listed_under_the_def_type_it_names() {
         ),
         (
             "a/one.gcsl",
-            "import * from lib.types\n\
+            "import * from lib/types\n\
                  def package a.one() { \"one\" }\n\
                  def build a.one() { \"a\" }\n\
                  def kinds.tool hammer() { \"hit\" }",
         ),
         (
             "b/two.gcsl",
-            "import package as pkg from lib.types\n\
+            "import package as pkg from lib/types\n\
                  def pkg b.two() { \"two\" }\n\
                  def test b.two() { \"b\" }",
         ),
@@ -9091,8 +9134,8 @@ fn a_def_with_defaults_gives_them_from_another_file() {
         ),
         (
             "app/main.gcsl",
-            "import lib.strings\n\
-                 import shout from lib.strings\n\
+            "import lib/strings\n\
+                 import shout from lib/strings\n\
                  a = greet(\"jack\")\n\
                  b = dev.peios.pad(\"x\")\n\
                  c = dev.peios.pad(\"x\", tail = [\"?\"])\n\
@@ -9112,7 +9155,7 @@ fn a_def_with_defaults_gives_them_from_another_file() {
         files[1],
         (
             "app/main.gcsl",
-            "import shout from lib.strings\nlet s = shout\na = s(\"ho\")",
+            "import shout from lib/strings\nlet s = shout\na = s(\"ho\")",
         ),
     ];
     assert_eq!(rooted_messages(&files), ["expected 2 arguments, found 1"]);
@@ -9140,7 +9183,7 @@ fn a_declared_types_field_defaults_reach_every_file() {
         ),
         (
             "app/main.gcsl",
-            "import lib.types\n\
+            "import lib/types\n\
                  entries: List<Install> = [\n\
                  \x20   { from = \"a\"; to = \"b\" },\n\
                  \x20   { from = \"c\"; to = \"d\"; exclude = [\"x\"] },\n\
@@ -9406,8 +9449,8 @@ const BUILDS: [(&str, &str); 3] = [
     ),
     (
         "app/a.gcsl",
-        "import source, package from lib.types\n\
-         import build as make from lib.types\n\
+        "import source, package from lib/types\n\
+         import build as make from lib/types\n\
          def source up() { \"https://x\" }\n\
          defmeta make b { source = source up }\n\
          def make b(out) { out }\n\
@@ -11057,7 +11100,7 @@ fn a_name_that_names_nothing_is_an_error_where_no_broken_file_is_seen() {
         ("workspace.gcsl", ""),
         ("sub1/a.gcsl", "q . = 1"),
         ("sub2/d.gcsl", "w = nope + 1\nt: Nope = 1"),
-        ("sub3/e.gcsl", "import sub1.a\nw = a.q + nope"),
+        ("sub3/e.gcsl", "import sub1/a\nw = a.q + nope"),
     ];
     assert_eq!(
         every_error(&files),
@@ -11285,7 +11328,7 @@ fn an_import_of_no_module_binds_erroneous_names() {
         ("workspace.gcsl", ""),
         (
             "m/m.gcsl",
-            "import nope.thing\nimport a, b as c from nada\nv = thing.x + 1\n\
+            "import nope/thing\nimport a, b as c from nada\nv = thing.x + 1\n\
                  w: Bool = c + a\nt: thing.T = 1\nz = zork\ny: Int = \"s\"",
         ),
         (
@@ -11298,7 +11341,7 @@ fn an_import_of_no_module_binds_erroneous_names() {
     scan_case(
         &files,
         &[
-            ("no module `nope.thing`", "m/m.gcsl", "nope.thing"),
+            ("no module `nope/thing`", "m/m.gcsl", "nope/thing"),
             ("no module `nada`", "m/m.gcsl", "nada"),
             ("undefined variable `zork`", "m/m.gcsl", "zork"),
             ("mismatched types", "m/m.gcsl", "\"s\""),
@@ -11337,7 +11380,7 @@ fn a_type_imported_as_a_built_in_types_name_binds_nothing() {
     let files = [
         ("workspace.gcsl", ""),
         ("lib/t.gcsl", "type Foo = {a: Int}"),
-        ("m.gcsl", "import Foo as Int from lib.t\nk: Int = 1"),
+        ("m.gcsl", "import Foo as Int from lib/t\nk: Int = 1"),
         ("o.gcsl", "z: Int = true"),
     ];
     scan_case(
@@ -11459,14 +11502,14 @@ fn an_import_of_no_module_suggests_one_at_its_level() {
     let with = |text| [("workspace.gcsl", ""), lib, ("app.gcsl", text)];
     assert_eq!(
         suggestion_of(
-            &with("import lib.utl\nx = 1"),
-            "no module `lib.utl` at app.gcsl"
+            &with("import lib/utl\nx = 1"),
+            "no module `lib/utl` at app.gcsl"
         ),
         Some("utl -> util".to_owned())
     );
     // A segment before the last: a directory.
     assert_eq!(
-        suggestion_of(&with("import lbi.util\nx = 1"), "no module `lbi.util`"),
+        suggestion_of(&with("import lbi/util\nx = 1"), "no module `lbi/util`"),
         Some("lbi -> lib".to_owned())
     );
     // One segment: a standard module too.
@@ -11477,14 +11520,14 @@ fn an_import_of_no_module_suggests_one_at_its_level() {
     // A member: a root or a type of the module.
     assert_eq!(
         suggestion_of(
-            &with("import verison from lib.util\nx = 1"),
+            &with("import verison from lib/util\nx = 1"),
             "`lib.util` has no"
         ),
         Some("verison -> version".to_owned())
     );
     assert_eq!(
         suggestion_of(
-            &with("import Pakage from lib.util\nx = 1"),
+            &with("import Pakage from lib/util\nx = 1"),
             "`lib.util` has no"
         ),
         Some("Pakage -> Package".to_owned())

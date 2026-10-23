@@ -161,7 +161,7 @@ fn import_shape(ast: &Ast, import: ImportId, out: &mut String) {
     let name = |name: ImportName| ast.names().get(name.name).to_owned();
     let as_alias = |alias: Option<ImportName>| alias.map(|a| format!(" as {}", name(a)));
     let decl = ast.import_decl(import);
-    let path = ast.show_path(ast.path(decl.path)).to_string();
+    let path = ast.show_module_path(ast.path(decl.path));
     out.push_str("import ");
     match decl.form {
         ImportForm::Whole(alias) => {
@@ -5235,14 +5235,19 @@ fn pretty_output_for_returns_and_labelled_blocks() {
 fn every_import_form_prints_as_written() {
     for text in [
         "import lib",
-        "import tools.build",
-        "import tools.build as builder",
+        "import tools/build",
+        "import tools/build as builder",
         "import com from lib",
         "import com as libs from lib",
-        "import a, b as c, * from lib.sub",
+        "import a, b as c, * from lib/sub",
         "import * from lib",
         "import *, a from lib",
-        "import lib; x = 1; import lib.y as y",
+        "import lib; x = 1; import lib/y as y",
+        "import pkgs/net.busybox.busybox as busybox",
+        "import pkgs/dev.peios.live-root as live",
+        "import org/gnu/gmp-c++/v6.3/x_1 as gmp",
+        "import kernel from pkgs/dev.peios.kernel",
+        "import 2fa as two",
     ] {
         assert_eq!(shape(text), text, "{text}");
     }
@@ -5252,12 +5257,12 @@ fn every_import_form_prints_as_written() {
 
 #[test]
 fn an_import_item_spans_its_keyword_through_its_path_or_alias() {
-    let ast = parse_text("import a.b as c").unwrap();
+    let ast = parse_text("import a/b as c").unwrap();
     let &[id] = ast.items(ast.root()) else {
         panic!("expected one item");
     };
     assert_eq!(ast.item(id).span, Span::new(0, 15));
-    let ast = parse_text("import x, * from a.b").unwrap();
+    let ast = parse_text("import x, * from a/b").unwrap();
     let &[id] = ast.items(ast.root()) else {
         panic!("expected one item");
     };
@@ -5292,11 +5297,9 @@ fn import_only_at_the_top_level_of_a_file() {
 fn import_path_errors() {
     assert_eq!(
         error("import \"github.com/x\""),
-        (MODULE_PATH.to_owned(), Span::new(7, 21))
+        (QUOTED_MODULE_PATH.to_owned(), Span::new(7, 21))
     );
-    assert_eq!(message("import a.\"b\""), MODULE_PATH);
-    assert_eq!(message("import a.1"), MODULE_PATH);
-    assert_eq!(message("import x from \"lib\""), MODULE_PATH);
+    assert_eq!(message("import x from \"lib\""), QUOTED_MODULE_PATH);
     assert_eq!(
         message("import from as f"),
         "expected a path after `from`, found `as`"
@@ -5313,19 +5316,102 @@ fn import_path_errors() {
         message("import a as"),
         "expected a name after `as`, found end of input"
     );
+    // An empty segment, at its `/`: one that ends the path or follows
+    // another.
+    assert_eq!(
+        error("import lib/ as l"),
+        (EMPTY_MODULE_SEGMENT.to_owned(), Span::new(10, 11))
+    );
+    assert_eq!(
+        error("import lib//x"),
+        (EMPTY_MODULE_SEGMENT.to_owned(), Span::new(11, 12))
+    );
+    // A segment that starts or ends with what only goes inside one, or has
+    // `..` in it.
+    assert_eq!(
+        error("import lib/x. as y"),
+        (
+            format!("`x.` cannot name a module: {MODULE_SEGMENT}"),
+            Span::new(11, 13)
+        )
+    );
+    assert_eq!(
+        message("import a..b as c"),
+        format!("`a..b` cannot name a module: {MODULE_SEGMENT}")
+    );
+    assert_eq!(
+        message("import a/../b"),
+        format!("`..` cannot name a module: {MODULE_SEGMENT}")
+    );
+}
+
+#[test]
+fn a_module_path_is_the_run_of_glued_tokens() {
+    // Each segment is named by its text, whatever its tokens: dots, `-`,
+    // `+` and digits included.
+    let ast = parse_text("import pkgs/net.busybox.busybox/x-1+2 as b").unwrap();
+    let &[id] = ast.items(ast.root()) else {
+        panic!("expected one item");
+    };
+    let ItemKind::Import(import) = ast.item(id).kind else {
+        panic!("expected an import");
+    };
+    let segments = ast.path(ast.import_decl(import).path);
+    let texts: Vec<&str> = segments
+        .iter()
+        .map(|segment| ast.names().get(segment.name().unwrap()))
+        .collect();
+    assert_eq!(texts, ["pkgs", "net.busybox.busybox", "x-1+2"]);
+    let spans: Vec<Span> = segments.iter().map(|segment| segment.span).collect();
+    assert_eq!(
+        spans,
+        [Span::new(7, 11), Span::new(12, 31), Span::new(32, 37)]
+    );
+    // A space ends the path, so what follows is the next token: `as`, or
+    // an error.
+    assert_eq!(message("import lib /x"), "expected end of item, found `/`");
+}
+
+#[test]
+fn a_whole_import_needs_a_name_its_path_does_not_give() {
+    let only = parse_text("import pkgs/net.busybox.busybox").unwrap_err();
+    assert_eq!(
+        only.message,
+        "`net.busybox.busybox` is not a name, so the import needs one"
+    );
+    assert_eq!(only.span, Span::new(12, 31));
+    // A name of identifiers joined by `.` may be the old form of a path.
+    assert!(
+        only.notes
+            .iter()
+            .any(|note| note.contains("write `net/busybox/busybox`"))
+    );
+    // A last segment that is a keyword names nothing either.
+    assert_eq!(
+        message("import lib/for"),
+        "`for` is not a name, so the import needs one"
+    );
+    assert_eq!(
+        message("import 2fa"),
+        "`2fa` is not a name, so the import needs one"
+    );
+    // With `as`, any segment will do.
+    assert!(parse_text("import pkgs/net.busybox.busybox as b").is_ok());
 }
 
 #[test]
 fn import_member_errors() {
     assert_eq!(
-        error("import a.b, c from p"),
+        error("import a/b, c from p"),
         (SINGLE_MEMBER.to_owned(), Span::new(7, 10))
     );
     assert_eq!(
         error("import c, a.b from p"),
         (SINGLE_MEMBER.to_owned(), Span::new(10, 13))
     );
-    assert_eq!(message("import a.b from p"), SINGLE_MEMBER);
+    assert_eq!(message("import a/b from p"), SINGLE_MEMBER);
+    assert_eq!(message("import a/b from p"), SINGLE_MEMBER);
+    assert_eq!(message("import c, a/b from p"), SINGLE_MEMBER);
     assert_eq!(
         error("import *"),
         (
@@ -6648,7 +6734,7 @@ fn attributes_and_misplaced_items_recover() {
 
 #[test]
 fn nothing_hangs_on_any_prefix_of_a_program() {
-    let text = "#![no_prelude]\nimport a.b as c\ntype T = {a: Int, b: String[] = []}\n\
+    let text = "#![no_prelude]\nimport a/b as c\ntype T = {a: Int, b: String[] = []}\n\
                     #[shadowable] def f(x: Int, y: T = {a = 1}): Int -> Int {\n\
                     \x20   let mut z = [x, ...[1, 2]]\n    for i in 0..3 if i > 0 { z := z }\n\
                     \x20   do { break } for false\n    \"s{x}t{y.a}\" \n    = x\n}\n\

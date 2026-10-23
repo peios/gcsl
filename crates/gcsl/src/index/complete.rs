@@ -34,6 +34,10 @@ pub struct Completion {
     /// What is written, when it is not the label: a name that is no
     /// identifier, quoted; a named argument's `name = `.
     pub insert: Option<String>,
+    /// The text it replaces, when that is not the name around the place:
+    /// in an import's path, the whole segment around it, dots and all
+    /// ([`module_segment_around`]).
+    pub range: Option<Span>,
 }
 
 /// What a [`Completion`] is.
@@ -341,7 +345,7 @@ impl<'s> Tokens<'s> {
         let Some(previous) = previous else {
             return Place::Name;
         };
-        if let Some(import) = self.import_place(previous) {
+        if let Some(import) = self.import_place(previous, offset) {
             return import;
         }
         let kind = self.kind(previous);
@@ -391,7 +395,7 @@ impl<'s> Tokens<'s> {
     /// The place after token number `previous` if it is in the path of an
     /// `import`: its segments before it; `None` if it is in no `import`,
     /// and [`Place::Nothing`] where the path is not what is written.
-    fn import_place(&self, previous: usize) -> Option<Place> {
+    fn import_place(&self, previous: usize, offset: u32) -> Option<Place> {
         let mut first = self.line_start(previous);
         while matches!(
             self.kind(first),
@@ -411,14 +415,32 @@ impl<'s> Tokens<'s> {
             Some(from) => written.get(from + 1..).unwrap_or_default(),
             None => written.as_slice(),
         };
-        let mut prefix = Vec::new();
-        for pair in path.chunks(2) {
-            match *pair {
-                [name, dot] if self.is_ident(name) && self.kind(dot) == TokenKind::Dot => {
-                    prefix.push(self.word(name).to_owned());
-                }
-                _ => return Some(Place::Nothing),
-            }
+        // The path so far is one run of glued tokens, through the segment
+        // half-typed at `offset`: the segments before its last `/` are the
+        // prefix (see the parser's [Imports](crate::parser#imports)).
+        let (Some(&start), Some(&end)) = (path.first(), path.last()) else {
+            return Some(Place::Import(Vec::new()));
+        };
+        let glued = path
+            .windows(2)
+            .all(|pair| matches!(*pair, [a, b] if self.span(a).end == self.span(b).start));
+        // The word half-typed, set aside, follows the path directly.
+        if !glued || self.span(end).end != name_around(self.text, offset).start {
+            return Some(Place::Nothing);
+        }
+        let text = self
+            .text
+            .get(self.span(start).start as usize..offset as usize)
+            .unwrap_or_default();
+        let Some((before, _)) = text.rsplit_once('/') else {
+            return Some(Place::Import(Vec::new()));
+        };
+        let prefix: Vec<String> = before.split('/').map(str::to_owned).collect();
+        if !prefix
+            .iter()
+            .all(|segment| lexer::is_module_segment(segment))
+        {
+            return Some(Place::Nothing);
         }
         Some(Place::Import(prefix))
     }
@@ -515,6 +537,20 @@ impl Index {
     /// a name is declared, nor in a file not indexed.
     #[must_use]
     pub fn completion(&self, file: u32, offset: u32) -> Vec<Completion> {
+        self.completion_triggered(file, offset, None)
+    }
+
+    /// [`Index::completion`], asked for because `trigger` was typed, if it
+    /// was: a `/` offers only what an import's path may go on with, since
+    /// anywhere else it is a division, after which the client should not
+    /// open a list unasked.
+    #[must_use]
+    pub fn completion_triggered(
+        &self,
+        file: u32,
+        offset: u32,
+        trigger: Option<char>,
+    ) -> Vec<Completion> {
         if !self.checked(file) {
             return Vec::new();
         }
@@ -522,7 +558,11 @@ impl Index {
             return Vec::new();
         };
         let tokens = Tokens::new(source);
-        let mut found = match tokens.place(offset) {
+        let place = tokens.place(offset);
+        if trigger == Some('/') && !matches!(place, Place::Import(_)) {
+            return Vec::new();
+        }
+        let mut found = match place {
             Place::Nothing => Vec::new(),
             Place::Name => {
                 let mut found = self.named_arguments(file, &tokens, offset);
@@ -532,7 +572,14 @@ impl Index {
             Place::Member { dot, chain } => self.members(file, offset, dot, chain.as_deref()),
             Place::Type => self.types_at(file),
             Place::QualifiedType(chain) => self.qualified_types(file, &chain),
-            Place::Import(prefix) => self.modules_under(file, &prefix),
+            Place::Import(prefix) => {
+                let range = module_segment_around(source.text(), offset);
+                let mut found = self.modules_under(file, &prefix);
+                for completion in &mut found {
+                    completion.range = Some(range);
+                }
+                found
+            }
             Place::Definition { def_type, prefix } => self.definitions(file, &def_type, &prefix),
         };
         found.sort_by(|a, b| a.sort.cmp(&b.sort));
@@ -592,6 +639,7 @@ impl Index {
                     documentation: None,
                     sort: sort_text(NAMED, name),
                     insert: Some(format!("{name} = ")),
+                    range: None,
                 })
             })
             .collect()
@@ -666,6 +714,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(KEYWORD, keyword),
                 insert: None,
+                range: None,
             });
         }
         found
@@ -777,6 +826,7 @@ impl Index {
             documentation: self.documentation_of(Symbol::Local { file, name: at }),
             sort: sort_text(group, text),
             insert: quoted(text),
+            range: None,
         }
     }
 
@@ -824,6 +874,7 @@ impl Index {
             documentation: symbol.and_then(|symbol| self.documentation_of(symbol)),
             sort: sort_text(group, text),
             insert: quoted(text),
+            range: None,
         }
     }
 
@@ -986,6 +1037,7 @@ impl Index {
                     documentation: of.and_then(|of| self.field_doc(of, name)),
                     sort: sort_text(FILE, text),
                     insert: quoted(text),
+                    range: None,
                 }
             })
             .collect()
@@ -1067,6 +1119,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(STANDARD, builtin),
                 insert: None,
+                range: None,
             });
         }
         found
@@ -1119,6 +1172,7 @@ impl Index {
             documentation: self.documentation_of(Symbol::Type(decl)),
             sort: sort_text(group, text),
             insert: None,
+            range: None,
         }
     }
 
@@ -1137,6 +1191,7 @@ impl Index {
                 documentation: None,
                 sort: sort_text(group, label),
                 insert: None,
+                range: None,
             });
         };
         if prefix.is_empty() {
@@ -1269,6 +1324,32 @@ fn declared_at(ast: &Ast, offset: u32) -> Option<Name> {
             _ => None,
         }
     })
+}
+
+/// The segment of an import's module path around byte `offset` of `text`:
+/// the run of letters, digits, `_`, `-`, `+` and `.` either side of it, up
+/// to a `/` or anything else (see the parser's
+/// [Imports](crate::parser#imports)). What a completion of a module there
+/// replaces, as [`name_around`] is elsewhere.
+#[must_use]
+pub fn module_segment_around(text: &str, offset: u32) -> Span {
+    let bytes = text.as_bytes();
+    let offset = (offset as usize).min(bytes.len());
+    let in_segment = |at: usize| {
+        bytes
+            .get(at)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
+    };
+    let mut start = offset;
+    while start.checked_sub(1).is_some_and(in_segment) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while in_segment(end) {
+        end += 1;
+    }
+    let at = |offset: usize| u32::try_from(offset).unwrap_or(u32::MAX);
+    Span::new(at(start), at(end))
 }
 
 /// The span of the name being completed at byte `offset` of `text`, by
@@ -1469,7 +1550,7 @@ mod tests {
 
     #[test]
     fn a_name_is_completed_from_what_is_in_scope_nearest_first() {
-        let text = "import v from lib.x\n# The top.\ntop = 1\nfn helper(n: Int): Int { n }\n\
+        let text = "import v from lib/x\n# The top.\ntop = 1\nfn helper(n: Int): Int { n }\n\
                     fn g(p: Int): String {\n    let x = 1\n    let x = \"s\"\n    let y = |\n    let later = 2\n    x\n}\n\
                     r = g(1)\n";
         let files = [
@@ -1553,12 +1634,30 @@ mod tests {
     #[test]
     fn an_import_s_path_is_completed_by_segment() {
         let files = [
-            ("app.gcsl", "import lib.|\n"),
+            ("app.gcsl", "import lib/|\n"),
             ("lib/x.gcsl", "v = 1\n"),
             ("lib/sub/y.gcsl", "w = 1\n"),
         ];
         let found = complete(&files, "app.gcsl");
         assert_eq!(labels(&found), ["x", "sub"]);
+        // A path of more than one level, and a directory whose name has
+        // dots in it.
+        let files = [
+            ("app.gcsl", "import lib/sub/|\n"),
+            ("lib/sub/y.gcsl", "w = 1\n"),
+            ("lib/sub/net.busybox.busybox/z.gcsl", "w = 1\n"),
+        ];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(labels(&found), ["y", "net.busybox.busybox"]);
+        // Half a segment typed, dots and all: what is offered replaces the
+        // whole segment.
+        let files = [
+            ("app.gcsl", "import pkgs/net.bu|\n"),
+            ("pkgs/net.busybox.busybox/z.gcsl", "w = 1\n"),
+        ];
+        let found = complete(&files, "app.gcsl");
+        assert_eq!(labels(&found), ["net.busybox.busybox"]);
+        assert_eq!(found[0].range, Some(Span::new(12, 18)));
         let files = [("app.gcsl", "import |\n"), ("lib/x.gcsl", "v = 1\n")];
         let found = complete(&files, "app.gcsl");
         for module in ["lib", "path", "fs", "prelude", "builtins", "fileroot"] {
@@ -1569,7 +1668,7 @@ mod tests {
             );
         }
         let files = [
-            ("app.gcsl", "import v from lib.|\n"),
+            ("app.gcsl", "import v from lib/|\n"),
             ("lib/x.gcsl", "v = 1\n"),
         ];
         assert_eq!(labels(&complete(&files, "app.gcsl")), ["x"]);
