@@ -11,7 +11,7 @@ use super::{Flow, mistyped};
 
 /// The pieces of `s` between occurrences of `sep`, in order, as
 /// [`str::split`] gives them, for the call `node` of `split` (see [The
-/// built-in functions](crate::eval#the-built-in-functions)): an empty `s` is one empty
+/// built-in functions](crate::eval::calls#the-built-in-functions)): an empty `s` is one empty
 /// piece, and a `sep` at either end or twice in a row an empty piece there.
 /// Fails with "`split` needs a separator that is not empty" for an empty
 /// `sep`, which `str::split` would match between every two characters.
@@ -26,7 +26,7 @@ pub(super) fn split(s: &str, sep: &str, node: &IrNode) -> Flow<Value> {
 }
 
 /// The strings `parts` with `sep` between each pair, for the call `node` of
-/// `join` (see [The built-in functions](crate::eval#the-built-in-functions)): `""` for
+/// `join` (see [The built-in functions](crate::eval::calls#the-built-in-functions)): `""` for
 /// no parts. An element that is not a string, which the checker rules out,
 /// is an internal error.
 pub(super) fn join(parts: &List, sep: &str, node: &IrNode) -> Flow<Value> {
@@ -75,7 +75,7 @@ pub(super) fn strip_suffix(s: Rc<str>, suffix: &str) -> Rc<str> {
 }
 
 /// The list of the strings `pieces`, in order: what `lines` and `fields`
-/// give (see [The built-in functions](crate::eval#the-built-in-functions)).
+/// give (see [The built-in functions](crate::eval::calls#the-built-in-functions)).
 pub(super) fn string_list<'a>(pieces: impl Iterator<Item = &'a str>) -> Value {
     let pieces = pieces.map(|piece| Value::Str(Rc::from(piece)));
     Value::List(List::from_vec(pieces.collect()))
@@ -83,7 +83,7 @@ pub(super) fn string_list<'a>(pieces: impl Iterator<Item = &'a str>) -> Value {
 
 /// How `a` sorts against `b` in version order, the order of GNU `sort -V`'s
 /// core, dpkg's `verrevcmp` applied to the whole strings (see [The built-in
-/// functions](crate::eval#the-built-in-functions)): alternately a run of non-digits and
+/// functions](crate::eval::calls#the-built-in-functions)): alternately a run of non-digits and
 /// a run of ASCII digits of each, starting with non-digits, either run
 /// perhaps empty; non-digit runs byte by byte by [`version_weight`], the end
 /// of a run weighing as `0`; digit runs as numbers, without their leading
@@ -160,7 +160,7 @@ pub(super) fn version_weight(byte: Option<u8>) -> i32 {
 /// ascending in version order, as [`compare_versions`] orders two, by a
 /// stable sort: since only equal strings compare equal, a string that is
 /// there twice is there twice, side by side (see [The built-in
-/// functions](crate::eval#the-built-in-functions)). An element that is not a string
+/// functions](crate::eval::calls#the-built-in-functions)). An element that is not a string
 /// is an internal error, which the checker rules out.
 pub(super) fn sort_versions(versions: &List, node: &IrNode) -> Flow<Value> {
     if versions

@@ -1,14 +1,18 @@
 use super::*;
-use super::memo::{MIN_SWEEP_THRESHOLD, key_hash};
+use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::CALL_LEVELS;
+use crate::ast::FnId;
 use crate::check::check;
+use crate::ir::{FnKind, LazyShapeId, Operands, ShapedOperands};
 use crate::lexer::tokenize;
 use crate::lower::lower;
 use crate::parser::parse;
 use crate::source::SourceFile;
 use crate::types::TypeTable;
-use crate::value::ValueKind;
+use crate::value::{Future, FutureState, ValueKind};
+use super::memo::{Ambient, Lookup, MIN_SWEEP_THRESHOLD, Mark, Running, key_hash};
 
 fn compile(text: &str) -> Rc<Ir> {
     let source = SourceFile::new("test.gcsl", text).unwrap();

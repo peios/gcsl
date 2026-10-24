@@ -11,7 +11,7 @@ use super::{Flow, mistyped};
 
 /// The call `node` of `builtin`, `secret` or `secret_value`, with the
 /// argument `value` and, for `secret`, the identity `identity` (see
-/// [Secrets](crate::eval#secrets)): `secret` of a secret is its value as a secret of
+/// [Secrets](crate::eval::secrets#secrets)): `secret` of a secret is its value as a secret of
 /// the new identity, and `secret_value` of a plain value, a plain `T`
 /// where a `Secret<T>` is expected, is the value.
 pub(super) fn secret_builtin(

@@ -3,7 +3,7 @@
 //!
 //! # Memoised functions
 //!
-//! A function declared with `->>` is lowered to code of [`FnKind::Memo`](super::FnKind::Memo),
+//! A function declared with `->>` is lowered to code of [`FnKind::Memo`](crate::ir::FnKind::Memo),
 //! and each of its closures runs its body at most once per distinct list of
 //! arguments, and of the values of the ambient inputs it reads (below).
 //! Memoisation belongs to the closure, not to the call site: a
@@ -101,7 +101,7 @@
 //! arguments: on an *ambient input*, a value the call reads without taking
 //! it as an argument. Captures are by value and fields immutable, so today
 //! the one ambient input is the caller, `fileroot.caller` (see [Callers and
-//! helpers](crate::eval#callers-and-helpers)), but the mechanism is general: an entry
+//! helpers](crate::eval::callers#callers-and-helpers)), but the mechanism is general: an entry
 //! records its *dependencies*, each a kind of input with the value read
 //! (`Ambient`), comparing values, so that two files of one directory, whose
 //! callers are equal, share entries. A read of `fileroot.caller` in a frame
@@ -122,7 +122,7 @@
 //! records nothing, and is found from every file.
 //!
 //! A future captures its maker's caller (see [Callers and
-//! helpers](crate::eval#callers-and-helpers)), so a result holding one whose body will
+//! helpers](crate::eval::callers#callers-and-helpers)), so a result holding one whose body will
 //! read it depends on that caller even if the future is awaited only after
 //! the call that made it has returned, when nothing of it runs. So making a
 //! future is itself a read of the making frame's caller, recorded as any
@@ -186,7 +186,7 @@ pub struct MemoTables {
     /// made after (see [`MemoTables::checkpoint`]).
     pub(super) generation: u64,
     /// The last origin given to a caller (see [Callers and
-    /// helpers](crate::eval#callers-and-helpers)): each is new, 0 being no frame's.
+    /// helpers](crate::eval::callers#callers-and-helpers)): each is new, 0 being no frame's.
     pub(super) origins: u64,
     /// The last identity given to an entry: each is new, so that it tells
     /// the entry apart from every other of its bucket, as the address of
@@ -198,12 +198,12 @@ pub struct MemoTables {
     /// between evaluations.
     pub(super) running: Vec<Running>,
     /// The last identity given to a frame of the context (see
-    /// [Context](crate::eval#context)): each is new.
+    /// [Context](crate::eval::context#context)): each is new.
     pub(super) context_frames: u64,
 }
 
 /// The origin of a caller that has none yet (see [Callers and
-/// helpers](crate::eval#callers-and-helpers)): a frame whose caller was set from a file
+/// helpers](crate::eval::callers#callers-and-helpers)): a frame whose caller was set from a file
 /// is given one only when another frame shares it, or when it is a memoised
 /// call's, since no running memoised call can share a caller nothing has
 /// shared. [`MemoTables`] never gives it.
@@ -222,7 +222,7 @@ pub(super) struct Running {
     pub(super) entry: u64,
     /// The origin of the call's caller.
     pub(super) origin: u64,
-    /// The context it runs in (see [Context](crate::eval#context)).
+    /// The context it runs in (see [Context](crate::eval::context#context)).
     pub(super) context: Option<Rc<ContextFrame>>,
 }
 
@@ -245,7 +245,7 @@ pub(super) enum Ambient {
     /// `fileroot.caller`: the caller's directory, by its index in the run's
     /// table, which is its value: two files of one directory have one.
     Caller(u32),
-    /// A read of a context, `^arch` (see [Context](crate::eval#context)): its
+    /// A read of a context, `^arch` (see [Context](crate::eval::context#context)): its
     /// declaration's key, with the value its nearest binding gave it, or
     /// `None` for one read from no binding, whose default's value depends on
     /// what that reads, recorded as its own reads.
@@ -297,7 +297,7 @@ impl MemoTables {
     }
 
     /// A new origin, for a caller set from its calling code's file (see
-    /// [Callers and helpers](crate::eval#callers-and-helpers)): no frame had it before.
+    /// [Callers and helpers](crate::eval::callers#callers-and-helpers)): no frame had it before.
     pub(super) fn new_origin(&mut self) -> u64 {
         self.origins = self.origins.wrapping_add(1);
         self.origins
@@ -332,7 +332,7 @@ impl MemoTables {
     /// context `context` as a dependency of every running memoised call
     /// that shares the read's binding of it: whose context's nearest
     /// binding of it is the same frame's, or, for a read of its default,
-    /// none (see [Context](crate::eval#context)), with the value read, once each.
+    /// none (see [Context](crate::eval::context#context)), with the value read, once each.
     pub(super) fn depend_context(&mut self, key: Name, context: Option<&Rc<ContextFrame>>) {
         if self.running.is_empty() {
             return;
@@ -355,7 +355,7 @@ impl MemoTables {
 
     /// Records, for every running memoised call, every context its own
     /// context binds as a dependency, once each: what a future made in it
-    /// may read after it has returned (see [Context](crate::eval#context)).
+    /// may read after it has returned (see [Context](crate::eval::context#context)).
     pub(super) fn depend_contexts(&mut self) {
         let found: Vec<(RunningAt, Ambient)> = self
             .running
@@ -391,7 +391,7 @@ impl MemoTables {
     }
 
     /// A new identity, for a frame of the context a `with` makes (see
-    /// [Context](crate::eval#context)).
+    /// [Context](crate::eval::context#context)).
     pub(crate) fn new_context_frame(&mut self) -> u64 {
         self.context_frames = self.context_frames.wrapping_add(1);
         self.context_frames
@@ -499,7 +499,7 @@ impl MemoTables {
             EntryState::Done(value) => {
                 // Copied only when they are passed on, which allocates: the
                 // caller only by a helper, and a context always, as a read
-                // of it here would be (see [Context](crate::eval#context)).
+                // of it here would be (see [Context](crate::eval::context#context)).
                 let passed: Vec<Ambient> = entry
                     .deps
                     .iter()
@@ -747,7 +747,7 @@ pub(super) struct Mark {
     /// The nesting at which the body runs (see the module documentation).
     pub(super) entering: usize,
     /// The caller the body runs with (see [Callers and
-    /// helpers](crate::eval#callers-and-helpers)).
+    /// helpers](crate::eval::callers#callers-and-helpers)).
     pub(super) caller: Caller,
 }
 
@@ -836,7 +836,7 @@ pub(super) fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize)
                 hash_value(&variant.payload, state, depth - 1);
             }
         }
-        // By its identity alone, as it is equal (see [Secrets](crate::eval#secrets)).
+        // By its identity alone, as it is equal (see [Secrets](crate::eval::secrets#secrets)).
         Value::Secret(secret) => {
             state.write_u8(13);
             secret.identity.hash(state);

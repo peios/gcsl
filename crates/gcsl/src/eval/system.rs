@@ -23,7 +23,7 @@ use super::{Flow, mistyped};
 
 /// Runs the program `argv` names, for the call `node` of `builtin`, `exec`
 /// or `exec_live`, and returns what it did as a record of the layout
-/// `exec_result` (see [The built-in functions](crate::eval#the-built-in-functions)):
+/// `exec_result` (see [The built-in functions](crate::eval::calls#the-built-in-functions)):
 /// `argv[0]` found through `PATH` as the OS finds it and given the
 /// arguments `argv[1..]`, with no shell, its standard input the null
 /// device, its standard output and standard error captured whole, its
@@ -113,7 +113,7 @@ pub(super) fn exec(
 /// it in turn, at first often and then less, at most every
 /// [`DEADLINE_POLL`], until it ends or the deadline passes, when it is
 /// killed and waited for. `Ok(None)` if it was killed so (see [Retry and
-/// timeout](crate::eval#retry-and-timeout)).
+/// timeout](crate::eval::retry#retry-and-timeout)).
 pub(super) fn run_until(
     command: &mut Command,
     (live, deadline): (bool, Instant),
@@ -283,23 +283,23 @@ pub(super) fn copy_lines(stream: impl Read) -> io::Result<Vec<u8>> {
 }
 
 /// Applies `builtin`, one of the file system's built-in functions but
-/// `fs_temp_dir`, for the call `node`, to the path `p` and, for `fs_copy`,
-/// the path `to` it copies to (see [The built-in functions](crate::eval#the-built-in-functions)):
-/// `fs_exists` whether something is at `p`, symbolic links followed
-/// ([`Path::try_exists`]); `fs_read` the contents of the file at `p`, which
-/// must be UTF-8; `fs_mkdir` makes the directory `p` and any missing parent
-/// ([`fs::create_dir_all`]), `{}`; `fs_copy` copies the file `p` to `to`
-/// ([`fs::copy`]), `{}`. Every path must be absolute, `p` first, and each is
-/// used as it is given, never normalised and never against the working
-/// directory: a relative one is "`fs.read` needs an absolute path, found
-/// `x.txt`", before anything is touched. A failure of the operation is
-/// "`fs.read` could not read `/a`: REASON", the OS's own text, as "No such
-/// file or directory (os error 2)", "could not check", "could not create"
-/// or "could not copy `/a` to `/b`" for the others, and a file that is not
-/// UTF-8 "`fs.read`: `/a` is not UTF-8 text". Every error is at the call,
-/// and names the built-in as the member of `fs` it is, whatever name it was
-/// called by. A `to` that is not a string, or any other built-in, is an
-/// internal error, which the checker rules out.
+/// `fs_temp_dir`, for the call `node`, to the path `p` and, for `fs_copy`, the
+/// path `to` it copies to (see [The built-in
+/// functions](crate::eval::calls#the-built-in-functions)): `fs_exists` whether
+/// something is at `p`, symbolic links followed ([`Path::try_exists`]);
+/// `fs_read` the contents of the file at `p`, which must be UTF-8; `fs_mkdir`
+/// makes the directory `p` and any missing parent ([`fs::create_dir_all`]),
+/// `{}`; `fs_copy` copies the file `p` to `to` ([`fs::copy`]), `{}`. Every path
+/// must be absolute, `p` first, and each is used as it is given, never
+/// normalised and never against the working directory: a relative one is
+/// "`fs.read` needs an absolute path, found `x.txt`", before anything is
+/// touched. A failure of the operation is "`fs.read` could not read `/a`:
+/// REASON", the OS's own text, as "No such file or directory (os error 2)",
+/// "could not check", "could not create" or "could not copy `/a` to `/b`" for
+/// the others, and a file that is not UTF-8 "`fs.read`: `/a` is not UTF-8
+/// text". Every error is at the call, and names the built-in as the member of
+/// `fs` it is, whatever name it was called by. A `to` that is not a string, or
+/// any other built-in, is an internal error, which the checker rules out.
 pub(super) fn file_system(
     builtin: Builtin,
     p: &str,
@@ -349,7 +349,7 @@ pub(super) fn file_system(
 
 /// Applies `fs_write`, `fs.write`, for the call `node`: writes `contents` to
 /// the file at `p`, made or replaced whole, and is `{}` (see [The built-in
-/// functions](crate::eval#the-built-in-functions)). `p` must be absolute, as every
+/// functions](crate::eval::calls#the-built-in-functions)). `p` must be absolute, as every
 /// path of the file system's is, and is used as given: a relative one is
 /// "`fs.write` needs an absolute path, found `x`", before anything is
 /// touched. The write is ATOMIC ([`replace_file`]): a program reading `p`
@@ -439,7 +439,7 @@ pub(super) fn fill(mut file: fs::File, contents: &[u8]) -> io::Result<()> {
 /// The temporary directories `fs.temp_dir` makes for a run, held by the
 /// run's owner, a [`crate::workspace::Workspace`], which a lone file's run is
 /// too, or a [`crate::Session`], and removed, with everything in them, as it
-/// is dropped (see [The built-in functions](crate::eval#the-built-in-functions)).
+/// is dropped (see [The built-in functions](crate::eval::calls#the-built-in-functions)).
 ///
 /// They are the numbered children, `1`, `2` and so on, of one *parent*
 /// directory per owner, made in the system's temporary directory
