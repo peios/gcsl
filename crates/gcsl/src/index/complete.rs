@@ -49,6 +49,8 @@ pub enum CompletionKind {
     Field,
     /// A function, or a field or variable holding one.
     Function,
+    /// A method that applies to the value before the `.`.
+    Method,
     /// A directory, a file, a module of the standard library.
     Module,
     /// A type.
@@ -1023,7 +1025,64 @@ impl Index {
                 Some(Symbol::Node(node)) => self.cells.get(node as usize).copied().and_then(known),
                 _ => None,
             });
-        self.record_members(ty, at_end.and_then(|found| found.symbol))
+        let mut found = self.record_members(ty, at_end.and_then(|found| found.symbol));
+        if let Some(ty) = ty {
+            found.extend(self.method_members(file, ty));
+        }
+        found
+    }
+
+    /// The methods file `file` sees that may apply to a value of type `ty`,
+    /// the value before a `.` (see the checker's "Methods"): its own, and
+    /// the `def` methods of other files it sees, each once.
+    fn method_members(&self, file: u32, ty: TyId) -> Vec<Completion> {
+        let Some(entry) = self.scan.files.get(file as usize) else {
+            return Vec::new();
+        };
+        let own = (0u32..)
+            .zip(entry.ast.methods())
+            .map(|(method, _)| (file, method));
+        let others = entry
+            .method_view
+            .values()
+            .flatten()
+            .map(|found| (found.file, found.method));
+        let mut seen: HashSet<Name> = HashSet::new();
+        let mut found = Vec::new();
+        for (at, method) in own.chain(others) {
+            let Some(owner) = self.scan.files.get(at as usize) else {
+                continue;
+            };
+            let Some(decl) = owner.ast.methods().get(method as usize) else {
+                continue;
+            };
+            let ItemKind::Let { value, .. } = owner.ast.item(decl.item).kind else {
+                continue;
+            };
+            let Some(method_ty) = self.expr_type(at, value) else {
+                continue;
+            };
+            let Some(sig) = self.types.fn_sig(self.types.strip(method_ty)) else {
+                continue;
+            };
+            let Some(&(_, receiver)) = sig.params.first() else {
+                continue;
+            };
+            if !self.types.may_receive(ty, receiver, sig.generic) || !seen.insert(decl.name) {
+                continue;
+            }
+            let text = self.scan.names.get(decl.name);
+            found.push(Completion {
+                label: text.to_owned(),
+                kind: CompletionKind::Method,
+                detail: self.signature_of(at, value, method_ty, "fn", text),
+                documentation: None,
+                sort: sort_text(FILE, text),
+                insert: None,
+                range: None,
+            });
+        }
+        found
     }
 
     /// The type of the field `name` of `ty`, if it is a record type with
@@ -1831,5 +1890,33 @@ mod tests {
             ("workspace.gcsl", workspace),
         ];
         assert_eq!(labels(&complete(&files, "app.gcsl")), ["dev"]);
+    }
+
+    #[test]
+    fn a_dot_offers_the_methods_that_may_apply() {
+        let files = [
+            (
+                "lib/ints.gcsl",
+                "def (x: Int) twice(): Int { x * 2 }\ndef (s: String) loud(): String { s }",
+            ),
+            (
+                "app.gcsl",
+                "import lib/ints\nfn (xs: List<T>) first_or<T>(f: T): T { f }\nlet n = 3\nr = n.|\n",
+            ),
+        ];
+        let labels: Vec<(String, CompletionKind)> = complete(&files, "app.gcsl")
+            .into_iter()
+            .map(|completion| (completion.label, completion.kind))
+            .collect();
+        assert_eq!(labels, [("twice".to_owned(), CompletionKind::Method)]);
+        let files = [(
+            "app.gcsl",
+            "fn (xs: List<T>) first_or<T>(f: T): T { f }\nlet xs = [1]\nr = xs.|\n",
+        )];
+        let labels: Vec<String> = complete(&files, "app.gcsl")
+            .into_iter()
+            .map(|completion| completion.label)
+            .collect();
+        assert_eq!(labels, ["first_or"]);
     }
 }

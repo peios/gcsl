@@ -998,6 +998,47 @@ impl TypeTable {
             .map_or(&[], |names| names)
     }
 
+    /// Whether a value of type `found` may be the receiver of a method whose
+    /// receiver type is `receiver`, a type parameter of `generic`, if the
+    /// method is generic, matching any type, each time it occurs: what a
+    /// language server offers after a `.`, without binding anything. The
+    /// checker's choice of a method binds the parameters
+    /// ([`TypeTable::bind`]); this answers for any `found` the checker could
+    /// choose the method for, and for a few more, a parameter's occurrences
+    /// not being made to agree.
+    ///
+    /// Recurses once per level of nesting in `receiver`.
+    #[must_use]
+    pub fn may_receive(&self, found: TyId, receiver: TyId, generic: Option<GenericId>) -> bool {
+        let (found, receiver) = (self.strip(found), self.strip(receiver));
+        let Some(generic) = generic.filter(|&generic| self.mentions(receiver, generic)) else {
+            return self.is_subtype(found, receiver);
+        };
+        match (self.kind(found), self.kind(receiver)) {
+            (_, &TyKind::Param { generic: of, .. }) if of == generic => true,
+            (&TyKind::List(element), &TyKind::List(pattern)) => {
+                self.may_receive(element, pattern, Some(generic))
+            }
+            (TyKind::Record(record), TyKind::Record(pattern)) => {
+                pattern.fields.iter().all(|&(name, field)| {
+                    record
+                        .fields
+                        .iter()
+                        .find(|&&(own, _)| own == name)
+                        .is_some_and(|&(_, own)| self.may_receive(own, field, Some(generic)))
+                })
+            }
+            (TyKind::Fn(sig), TyKind::Fn(pattern)) => {
+                sig.params.len() == pattern.params.len()
+                    && self.may_receive(sig.ret, pattern.ret, Some(generic))
+            }
+            (_, TyKind::Union(members)) => members
+                .iter()
+                .any(|&member| self.may_receive(found, member, Some(generic))),
+            _ => false,
+        }
+    }
+
     /// Whether `ty` mentions a type parameter of `generic`, at any depth.
     ///
     /// Recurses once per level of nesting in the type.

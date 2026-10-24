@@ -1470,6 +1470,7 @@ fn completion_item(found: Completion, edit: CompletionTextEdit) -> CompletionIte
         CompletionKind::Variable => CompletionItemKind::VARIABLE,
         CompletionKind::Field => CompletionItemKind::FIELD,
         CompletionKind::Function => CompletionItemKind::FUNCTION,
+        CompletionKind::Method => CompletionItemKind::METHOD,
         CompletionKind::Module => CompletionItemKind::MODULE,
         CompletionKind::Type => CompletionItemKind::STRUCT,
         CompletionKind::Keyword => CompletionItemKind::KEYWORD,

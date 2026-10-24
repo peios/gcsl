@@ -55,6 +55,12 @@
 //!   an import, or the `fileroot` module); the field accesses after it are
 //!   accesses of the values' fields. A top-level field item's path is the
 //!   declaration of a node at each of its segments.
+//! - A method (see the checker's "Methods") is the [`Symbol::Local`] of
+//!   its binding, by its file and its name's span, shown by its name, never
+//!   its binding's; the name at each call of it is an occurrence of it, as
+//!   the check recorded which method the call is of, in its own file or
+//!   another, so a method's calls go to its declaration, are its
+//!   references and are renamed with it.
 //! - A field access that no node is, on any value, is an occurrence of the
 //!   field read, of the type the check gave it. It has a symbol only when
 //!   the record's origin is cheap to find (best effort): a record block
@@ -94,7 +100,8 @@
 //!
 //! A hover ([`Index::hover`]) is Markdown: the occurrence as GCSL, in a
 //! `gcsl` code block, `name: Type`, a function as its signature, `fn
-//! name(a: Int): Int` or `def name(...)`, its parameters named as its source
+//! name(a: Int): Int` or `def name(...)`, a method's with its receiver
+//! first, `fn (x: Int) twice(): Int`, its parameters named as its source
 //! names them, a mutable variable `mut name: Type`, a type `type Name =
 //! TYPE` with its expansion, a built-in type its name; then its
 //! documentation, if it has any (see "Documentation"); then, if useful, one
@@ -212,7 +219,9 @@
 //!   value of a local or a node. The access is found in the tree, a
 //!   [`ExprKind::NoField`] or a [`ExprKind::Field`] whose name is being
 //!   typed; where the tree has none, a path of names is followed by its
-//!   names.
+//!   names. And of a value of a known type, the methods the file sees whose
+//!   receiver type it may fit ([`TypeTable::may_receive`]), each name once,
+//!   by its signature.
 //! - In an `import`'s path, after `import` or `from`, the modules under the
 //!   segments before the place, those before its last `/`: the directories
 //!   and files of the directory they name, and at the start the standard
@@ -365,7 +374,9 @@ use crate::ast::{
     Ast, ExprId, ExprKind, ForHead, ImportForm, ImportMember, ItemId, ItemKind, PathRange,
     PathSegment, TypeExprKind, TypeLink,
 };
-use crate::check::{BUILTIN_TYPE_NAMES, BindingKind, Builtin, Constant, Fileroot, Record, RecordedDecl};
+use crate::check::{
+    BUILTIN_TYPE_NAMES, BindingKind, Builtin, Constant, Fileroot, MethodSite, Record, RecordedDecl,
+};
 use crate::diagnostic::{Diagnostic, Severity};
 use crate::lexer::Comments;
 use crate::mentions::Resolve;
@@ -1162,6 +1173,16 @@ impl Index {
             })
             .collect();
         let tail = self.sig_tail(sig);
+        // A method's, its receiver before its name.
+        let method = ast.methods().iter().any(|method| {
+            matches!(ast.item(method.item).kind, ItemKind::Let { value, .. } if value == function)
+        });
+        if method && let Some((receiver, rest)) = params.split_first() {
+            return Some(format!(
+                "{keyword} ({receiver}) {name}({}{tail}",
+                rest.join(", ")
+            ));
+        }
         let one = format!("{keyword} {name}({}{tail}", params.join(", "));
         if one.chars().count() <= WIDTH || params.is_empty() {
             return Some(one);
@@ -1719,6 +1740,10 @@ struct Builder<'s> {
     order: Vec<(Span, Name)>,
     /// Where each name its check read from a binding was declared.
     uses: HashMap<ExprId, Span>,
+    /// The method each call of one is of, by the call's callee, as the
+    /// check recorded it: where the method's name is declared, in this file
+    /// (`None`) or another, if that is known.
+    methods: HashMap<ExprId, MethodSite>,
     /// Where its bindings' declarations are.
     sites: Sites,
     /// The field access directly on each expression that has one.
@@ -1783,6 +1808,7 @@ impl<'s> Builder<'s> {
             decls,
             order,
             uses: record.uses.into_iter().collect(),
+            methods: record.methods.into_iter().collect(),
             sites: Sites::default(),
             parents: HashMap::new(),
             covered: HashSet::new(),
@@ -1873,6 +1899,8 @@ impl<'s> Builder<'s> {
         if span.end <= span.start {
             return;
         }
+        // A method's binding is written as the method's name.
+        let name = name.map(|name| self.method_name(name).unwrap_or(name));
         self.occurrences.push(Occurrence {
             span,
             symbol,
@@ -1883,6 +1911,12 @@ impl<'s> Builder<'s> {
             ty,
             via: None,
         });
+    }
+
+    /// The name of the method whose binding is `name`, if it is one's (see
+    /// [`crate::names`], "Method bindings").
+    fn method_name(&self, name: Name) -> Option<Name> {
+        names::binding_method(self.text(name)).and_then(|method| self.scan.names.lookup(method))
     }
 
     /// Records an occurrence that is its symbol's declaration.
@@ -2059,10 +2093,12 @@ impl<'s> Builder<'s> {
             } else {
                 self.add(name, Some(symbol), Some(decl.name), decl.ty);
             }
+            // A method's binding is the method, by its name.
+            let local_name = self.method_name(decl.name).unwrap_or(decl.name);
             self.locals.insert(
                 name,
                 Local {
-                    name: decl.name,
+                    name: local_name,
                     ty: decl.ty,
                     what,
                     item,
@@ -2293,6 +2329,17 @@ impl<'s> Builder<'s> {
                 continue;
             };
             if self.covered.contains(&id) || self.reads_namespace(id) {
+                continue;
+            }
+            // A method's name at a call of it is the method's, a local
+            // function of the file that declares it.
+            if let Some(&declared) = self.methods.get(&id) {
+                let symbol = declared.map(|(file, at)| Symbol::Local {
+                    file: file.unwrap_or(self.index),
+                    name: at,
+                });
+                let span = member_span(ast, id, self.text(name));
+                self.add(span, symbol, Some(name), self.ty(id));
                 continue;
             }
             let symbol = self

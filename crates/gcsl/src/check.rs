@@ -3975,6 +3975,10 @@ struct ForLowering {
     method_calls: HashMap<ExprId, ExprId>,
 }
 
+/// Where a method's name is declared, in the input checked (`None`) or
+/// another, if that is known (see [Methods](#methods)).
+pub(crate) type MethodSite = Option<(Option<u32>, Span)>;
+
 /// A method a call of its name may mean (see [Methods](#methods)).
 #[derive(Clone, Copy, Debug)]
 struct MethodCandidate {
@@ -3984,7 +3988,7 @@ struct MethodCandidate {
     ty: TyId,
     /// Where its name is declared, in this input (`None`) or another, if
     /// it is known.
-    declared: Option<(Option<u32>, Span)>,
+    declared: MethodSite,
 }
 
 /// How a method's closure is read (see [Methods](#methods)).
@@ -4873,6 +4877,10 @@ pub(crate) struct Record {
     pub(crate) cells: Vec<TyId>,
     /// The type of the input's value, as [`CheckOutput::ty`] has it.
     pub(crate) value: Option<TyId>,
+    /// Each call of a method (see [Methods](#methods)), by its callee, with
+    /// where the method's name is declared, in this input (`None`) or
+    /// another, if that is known.
+    pub(crate) methods: Vec<(ExprId, MethodSite)>,
 }
 
 /// A binding a check declared, as [`Record`] keeps it.
@@ -16821,6 +16829,9 @@ impl<'a> Checker<'a> {
         let bound = Bound { known, offset: 1 };
         let erroneous = self.bind_call(id, (callee, method_ty, None), args, (&rest, bound));
         self.lowering.method_calls.insert(id, receiver);
+        if let Some(record) = &mut self.record {
+            record.methods.push((callee, method.declared));
+        }
         self.call_effect(id, (callee, method_ty), &sig);
         if erroneous { TyId::ERROR } else { sig.ret }
     }

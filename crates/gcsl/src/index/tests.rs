@@ -1341,3 +1341,65 @@ fn a_method_is_a_symbol_of_its_name_and_no_name_to_complete() {
         "{labels:?}"
     );
 }
+
+#[test]
+fn a_method_s_call_goes_to_its_declaration_in_any_file() {
+    let lib = "def (x: Int) twice(): Int { x * 2 }\n";
+    let text =
+        "import lib/ints\nfn (s: String) loud(): String { s }\nr = 3.twice()\nt = \"a\".loud()\n";
+    let files = [("lib/ints.gcsl", lib), ("app.gcsl", text)];
+    let (mut index, file) = index_of(&files, "app.gcsl");
+    let hover = |index: &mut Index, needle: &str| {
+        index
+            .hover(file, offset(text, needle) + 1)
+            .map(|hover| hover.text)
+    };
+    assert_eq!(
+        hover(&mut index, ".twice").as_deref(),
+        Some("```gcsl\nfn (x: Int) twice(): Int\n```")
+    );
+    assert_eq!(
+        hover(&mut index, "loud(): String").as_deref(),
+        Some("```gcsl\nfn (s: String) loud(): String\n```")
+    );
+    let shown_of = |needle: &str| {
+        shown(
+            &index,
+            &files,
+            &index.definition(file, offset(text, needle) + 1),
+        )
+    };
+    assert_eq!(
+        shown_of(".twice"),
+        [("lib/ints.gcsl".to_owned(), "twice@13".to_owned())]
+    );
+    assert_eq!(
+        shown_of(".loud"),
+        [("app.gcsl".to_owned(), "loud@31".to_owned())]
+    );
+}
+
+#[test]
+fn a_method_renames_at_its_declaration_and_every_call() {
+    let files = [
+        ("lib/ints.gcsl", "def (x: Int) twice(): Int { x * 2 }\n"),
+        ("app.gcsl", "import lib/ints\nr = 3.twice()\n"),
+    ];
+    let expected = vec![
+        (
+            "lib/ints.gcsl".to_owned(),
+            "def (x: Int) double(): Int { x * 2 }\n".to_owned(),
+        ),
+        (
+            "app.gcsl".to_owned(),
+            "import lib/ints\nr = 3.double()\n".to_owned(),
+        ),
+    ];
+    for at in [("app.gcsl", "twice()"), ("lib/ints.gcsl", "twice()")] {
+        assert_eq!(
+            renamed(&files, at, "double"),
+            Ok(expected.clone()),
+            "{at:?}"
+        );
+    }
+}
