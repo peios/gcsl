@@ -114,9 +114,13 @@ effects work as a function's do.
 
 A method has no name of its own: `twice` alone is not a variable, and
 `x.twice` without parentheses reads a field. A record field and a method
-with the same name are an error when both could apply. Methods are
-declared at the top level of a file and are visible throughout it. In
-the REPL, they are also visible to later lines.
+with the same name are an error when both could apply.
+
+Methods are declared at the top level of a file. A `fn` method is
+visible only in its own file. A `def` method is also visible to the
+other files of its directory and the directories below it, and to every
+file that imports its module, whatever the form of the import. In the
+REPL, methods are visible to later lines.
 
 ## Calling for effects
 

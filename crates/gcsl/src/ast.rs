@@ -4029,6 +4029,21 @@ impl Ast {
         &self.methods
     }
 
+    /// Every call of a field, `x.NAME(...)`, of the tree, by the name and
+    /// where the callee is written, in id order: the calls that may be of a
+    /// method (see the checker's "Methods").
+    pub fn field_calls(&self) -> impl Iterator<Item = (Name, Span)> + '_ {
+        self.exprs.iter().filter_map(|expr| match expr.kind {
+            ExprKind::Call { callee, .. } | ExprKind::Unclosed { callee, .. } => {
+                match self.get(callee).kind {
+                    ExprKind::Field { name, .. } => Some((name, self.get(callee).span)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
     /// The method whose item is `item`, if it is one.
     #[must_use]
     pub fn method(&self, item: ItemId) -> Option<&MethodDecl> {

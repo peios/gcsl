@@ -476,6 +476,36 @@
 //! a definition is reported once, where it is written, and every file using
 //! it fails quietly (see the checker's "Type declarations").
 //!
+//! # Methods
+//!
+//! A method (see the checker's [Methods](crate::check#methods)) binds no
+//! name, so it is in no tree, no view and no record: a file's methods are
+//! its tree's ([`Ast::methods`]), each a top-level function of its file
+//! under a binding no source can write. A file sees the `def` methods of
+//! other files as a flat view, apart from its fields, as it sees types
+//! ([`File::method_view`], `method_views`): those of the other files of
+//! its directory and of every directory above it, and those of every file
+//! of each module it imports, in any form, whole, by member or by `*`, a
+//! directory's own files or a file ([`File::method_modules`]), the
+//! implicit prelude's among them. A `fn` method is seen by its own file
+//! only. Methods of one name merge, never conflict, in a view: which one a
+//! call means is the checker's to say, by the receiver's type.
+//!
+//! Which method a call `x.m(...)` means is known only once `x` is typed,
+//! after the order is fixed. So a call of a field named `m` makes its file
+//! need the file of every method `m` it sees (`find_needs`):
+//! conservatively, so that a file calling a record's field `get` needs a
+//! file whose `def` method `get` it sees, and two such files that need each
+//! other otherwise too are the usual cycle, labelled "may call the method
+//! `get` of `lib.gcsl` here". Once a file is checked, each of its methods'
+//! binding, by the slot it leaves its closure in, its type and what a call
+//! of it needs to know of its parameters, is recorded
+//! (`CheckedMethod`, `checked_methods`); a later file's context gives
+//! its checker those it sees by name (`Context::methods`), so a call of
+//! another file's method reads its closure from its slot, the other file
+//! having run first, and is of a known callee, its defaults given. A
+//! session keeps the standard files' for its inputs.
+//!
 //! # Def-types
 //!
 //! A def-type, a `def` marked `#[def_type]`, has a *namespace*: the
@@ -1096,6 +1126,51 @@ pub struct File {
     /// Its `import` items the scan reported an error of, in source order,
     /// each with the module its path names, if it names one.
     pub failed_imports: Vec<(ItemId, Option<Target>)>,
+    /// The modules its imports name, a directory or a file each, in source
+    /// order, the implicit prelude's last: whose `def` methods it sees (see
+    /// [Methods](#methods)).
+    pub method_modules: Vec<Target>,
+    /// Its view of methods: the `def` methods of other files it sees, by
+    /// their names (see [Methods](#methods)).
+    pub method_view: HashMap<Name, Vec<MethodRef>>,
+}
+
+/// A method of a file of a scan, by the file and its position among the
+/// file's methods ([`Ast::methods`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MethodRef {
+    /// Its file.
+    pub file: u32,
+    /// Its position among the file's methods.
+    pub method: u32,
+}
+
+/// A method of a file, checked: where another file reads its closure, its
+/// type, and what a call of it needs to know of its parameters (see
+/// [Methods](#methods)).
+#[derive(Clone, Debug)]
+pub(crate) struct CheckedMethod {
+    /// The slot its closure is in once its file has run.
+    pub(crate) slot: Slot,
+    /// Its function's type.
+    pub(crate) ty: TyId,
+    /// What a call of it needs to know of its parameters.
+    pub(crate) known: Option<Rc<KnownParams>>,
+}
+
+/// The checked methods of the files of a workspace, by file and position.
+pub(crate) type CheckedMethods = HashMap<MethodRef, CheckedMethod>;
+
+/// A method of another file that a file sees, checked, as its checker is
+/// given it ([`Context::methods`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ForeignMethod {
+    /// Its file, the input its diagnostics' labels are in.
+    pub(crate) file: u32,
+    /// Where its name is declared, in its file.
+    pub(crate) span: Span,
+    /// What its check found.
+    pub(crate) checked: CheckedMethod,
 }
 
 impl File {
@@ -1133,6 +1208,8 @@ impl File {
             poisoned: Vec::new(),
             blind: false,
             failed_imports: Vec::new(),
+            method_modules: Vec::new(),
+            method_view: HashMap::new(),
         }
     }
 
@@ -2804,6 +2881,7 @@ fn scan_files(
     }
     mark_unpaired(scan);
     type_views(scan, &mut errors);
+    method_views(scan);
     define_types(scan, &mut errors);
     value_cells(scan);
     resolve(scan);
@@ -4636,6 +4714,7 @@ fn imports(
         let mut failed_imports: Vec<(ItemId, Option<Target>)> = Vec::new();
         let mut poisoned: Vec<Name> = Vec::new();
         let mut blind = false;
+        let mut modules_named: Vec<Target> = Vec::new();
         let mut import =
             |item: ItemId, (aliases, types): (&mut Vec<Alias>, &mut Vec<TypeImport>)| {
                 let ItemKind::Import(id) = file.ast.item(item).kind else {
@@ -4646,6 +4725,9 @@ fn imports(
                 let before = own_errors.len();
                 let resolved = module(scan, &modules, path, &mut both);
                 let module_of = resolved.as_ref().ok().copied();
+                if let Some(target @ (Target::Dir(_) | Target::File(_))) = module_of {
+                    modules_named.push(target);
+                }
                 let failed = match resolved {
                     Ok(target) => {
                         let bound = (&mut *aliases, &mut *types);
@@ -4688,12 +4770,20 @@ fn imports(
         }
         clashes(scan, index, &aliases, (&mut own_errors, &mut poisoned));
         errors.extend(own_errors.into_iter().map(|e| e.in_input(index)));
-        found.push((aliases, types, (poisoned, blind, failed_imports)));
+        found.push((
+            aliases,
+            types,
+            (poisoned, blind, failed_imports),
+            modules_named,
+        ));
     }
-    for (file, (aliases, types, (poisoned, blind, failed))) in scan.files.iter_mut().zip(found) {
+    for (file, (aliases, types, (poisoned, blind, failed), modules_named)) in
+        scan.files.iter_mut().zip(found)
+    {
         file.aliases = aliases;
         file.type_imports = types;
         file.failed_imports = failed;
+        file.method_modules = modules_named;
         for name in poisoned {
             file.poison(name);
         }
@@ -5584,6 +5674,53 @@ fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Makes each file's view of methods ([`File::method_view`], see
+/// [Methods](#methods)): the `def` methods of the other files of its
+/// directory and of each directory above it, and of every file of each
+/// module it imports, a directory's own files or a file, each once.
+fn method_views(scan: &mut Scan) {
+    let mut by_dir: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (index, file) in (0u32..).zip(&scan.files) {
+        by_dir.entry(file.dir).or_default().push(index);
+    }
+    let mut views = Vec::with_capacity(scan.files.len());
+    for (index, file) in (0u32..).zip(&scan.files) {
+        let mut sources: Vec<u32> = scan
+            .chain(file.dir)
+            .flat_map(|dir| by_dir.get(&dir).into_iter().flatten().copied())
+            .collect();
+        for &module in &file.method_modules {
+            match module {
+                Target::Dir(dir) => sources.extend(by_dir.get(&dir).into_iter().flatten()),
+                Target::File(other) => sources.push(other),
+                _ => {}
+            }
+        }
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut view: HashMap<Name, Vec<MethodRef>> = HashMap::new();
+        for source in sources {
+            if source == index || !seen.insert(source) {
+                continue;
+            }
+            let Some(other) = scan.files.get(source as usize) else {
+                continue;
+            };
+            for (method, decl) in (0u32..).zip(other.ast.methods()) {
+                if decl.public {
+                    view.entry(decl.name).or_default().push(MethodRef {
+                        file: source,
+                        method,
+                    });
+                }
+            }
+        }
+        views.push(view);
+    }
+    for (file, view) in scan.files.iter_mut().zip(views) {
+        file.method_view = view;
+    }
+}
+
 /// The conflict in file `index`'s view of types of the type `name` between
 /// the later source and the earlier one (see [`type_views`]).
 fn type_conflict(
@@ -5963,7 +6100,7 @@ fn find_needs(scan: &mut Scan, errors: &mut Vec<Diagnostic>) -> Vec<HashMap<u32,
     for (index, file) in (0u32..).zip(&scan.files) {
         let scope = FileScope::new(scan, file);
         let mut itself = false;
-        let mut first: HashMap<u32, (Span, String)> = HashMap::new();
+        let mut first = method_needs(scan, index, file);
         let mut record = |owner: u32, span: Span, shown: &dyn Fn() -> String| {
             if owner == index {
                 return;
@@ -6113,11 +6250,19 @@ fn cycle_groups(
         // Each file's first mention of another file of the cycle.
         let uses = group.iter().filter_map(|&file| {
             let first = mentioned.get(file as usize)?;
-            let (at, what) = group
+            let (other, (at, what)) = group
                 .iter()
-                .filter_map(|other| first.get(other))
-                .min_by_key(|(at, _)| at.start)?;
-            Some((file, *at, format!("{} uses `{what}` here", path(file))))
+                .filter_map(|other| Some((*other, first.get(other)?)))
+                .min_by_key(|(_, (at, _))| at.start)?;
+            let text = match what.strip_prefix(METHOD_NEED) {
+                Some(name) => format!(
+                    "{} may call the method `{name}` of {} here",
+                    path(file),
+                    path(other)
+                ),
+                None => format!("{} uses `{what}` here", path(file)),
+            };
+            Some((file, *at, text))
         });
         let mut diagnostic: Option<Diagnostic> = None;
         for (file, span, text) in uses {
@@ -6138,6 +6283,35 @@ fn cycle_groups(
     groups.retain(|group| group.len() > 1);
     groups
 }
+
+/// The files file `index`, `file`, needs for its calls of fields, each with
+/// its first such call and what it is shown as: those of every method of the
+/// called name it sees, which the call may mean (see [Methods](#methods)).
+fn method_needs(scan: &Scan, index: u32, file: &File) -> HashMap<u32, (Span, String)> {
+    let mut first: HashMap<u32, (Span, String)> = HashMap::new();
+    if file.method_view.is_empty() {
+        return first;
+    }
+    for (name, span) in file.ast.field_calls() {
+        for method in file.method_view.get(&name).into_iter().flatten() {
+            if method.file == index {
+                continue;
+            }
+            let entry = first
+                .entry(method.file)
+                .or_insert_with(|| (span, format!("{METHOD_NEED}{}", scan.names.get(name))));
+            if span.start < entry.0.start {
+                *entry = (span, format!("{METHOD_NEED}{}", scan.names.get(name)));
+            }
+        }
+    }
+    first
+}
+
+/// What a need of the methods of a name is shown as, before the name, among
+/// the needs a cycle of files is reported with (see [Methods](#methods)):
+/// no field's path holds `<`.
+const METHOD_NEED: &str = "<method> ";
 
 /// The files in the order they run: repeatedly the path-smallest file all
 /// of whose needs are placed. `needs` has no cycles.
@@ -6296,6 +6470,8 @@ pub(crate) struct Context<'a> {
     /// and their defaults, which a call of it through an import or by its
     /// path gives the parameters it leaves unfilled.
     cell_known: &'a [Option<Rc<KnownParams>>],
+    /// The methods of the files checked so far (see [Methods](#methods)).
+    methods: &'a CheckedMethods,
     /// Whether the file is a session's input, whose scope is the session's:
     /// its variables are read as a session's input reads them, captured
     /// by a function, not read through the top level's frame as a
@@ -6307,9 +6483,14 @@ pub(crate) struct Context<'a> {
     place: Place,
 }
 
-/// What a [`Context`] reads cells by: the slot each cell is read from, and
-/// for each `def`'s cell what a call of it needs to know of its parameters.
-type CellReads<'a> = (&'a [Slot], &'a [Option<Rc<KnownParams>>]);
+/// What a [`Context`] reads cells by: the slot each cell is read from, for
+/// each `def`'s cell what a call of it needs to know of its parameters, and
+/// the methods of the files checked.
+type CellReads<'a> = (
+    &'a [Slot],
+    &'a [Option<Rc<KnownParams>>],
+    &'a CheckedMethods,
+);
 
 /// What a name read as an attribute's names in a file (see the parser's
 /// [Attributes](crate::parser#attributes)).
@@ -6355,7 +6536,7 @@ impl<'a> Context<'a> {
         scan: &'a Scan,
         index: u32,
         cell_types: &'a [TyId],
-        (cell_slots, cell_known): CellReads<'a>,
+        (cell_slots, cell_known, methods): CellReads<'a>,
     ) -> Option<Self> {
         let file = scan.files.get(index as usize)?;
         Some(Self {
@@ -6366,9 +6547,53 @@ impl<'a> Context<'a> {
             cell_types,
             cell_slots,
             cell_known,
+            methods,
             session: false,
             place: scan.place(index),
         })
+    }
+
+    /// The methods named `name` of other files that the file sees, whose
+    /// files are checked, each by its position among those of the name the
+    /// file sees, which [`Context::method`] reads by (see
+    /// [Methods](#methods)).
+    pub(crate) fn methods(&self, name: Name) -> Vec<(u32, ForeignMethod)> {
+        let Some(found) = self.file.method_view.get(&name) else {
+            return Vec::new();
+        };
+        (0u32..)
+            .zip(found)
+            .filter_map(|(index, &method)| {
+                let checked = self.methods.get(&method)?.clone();
+                let decl = self
+                    .scan
+                    .files
+                    .get(method.file as usize)?
+                    .ast
+                    .methods()
+                    .get(method.method as usize)?;
+                let foreign = ForeignMethod {
+                    file: method.file,
+                    span: decl.name_span,
+                    checked,
+                };
+                Some((index, foreign))
+            })
+            .collect()
+    }
+
+    /// What the check of the method of another file that the file sees as
+    /// the `index`th of those named `name` found, if its file is checked
+    /// (see [Methods](#methods)).
+    pub(crate) fn method(&self, name: Name, index: u32) -> Option<&'a CheckedMethod> {
+        let found = self.file.method_view.get(&name)?.get(index as usize)?;
+        self.methods.get(found)
+    }
+
+    /// Whether the file sees a method named `name` of another file (see
+    /// [Methods](#methods)).
+    pub(crate) fn sees_method(&self, name: Name) -> bool {
+        self.file.method_view.contains_key(&name)
     }
 
     /// Whether the file is a session's input (see [`Context::session`]'s
@@ -6718,6 +6943,9 @@ pub struct Workspace {
     /// its parameters (see [`Context::known`]), kept for a session's inputs
     /// and for the call that invokes a definition by name.
     cell_known: Vec<Option<Rc<KnownParams>>>,
+    /// The methods of the files, checked (see [Methods](#methods)), kept for
+    /// a session's inputs.
+    methods: CheckedMethods,
     /// Each file's records of the nodes of its view with a leaf of it under
     /// them, by input number: kept for the tests' check that each reads
     /// only cells stored before it.
@@ -7111,6 +7339,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
     let mut checked: Vec<Option<Types>> = (0..scan.files.len()).map(|_| None).collect();
     let mut warnings = vec![Vec::new(); scan.files.len()];
     let mut errors = check_type_items(&mut scan, &mut names, &mut types);
+    let mut methods = CheckedMethods::new();
     // The files whose check failed, or that need one that did: those are
     // not checked, since their errors would follow from the first; and
     // those with syntax errors (see [Syntax errors](#syntax-errors)).
@@ -7133,7 +7362,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         // with the file's own slots added.
         let scope = Committed::scope(&scan, &scopes, file, mem::take(&mut slot_names));
         let start = scope.len();
-        let reads = (&cell_slots[..], &cell_known[..]);
+        let reads = (&cell_slots[..], &cell_known[..], &methods);
         let compiled = Context::new(&scan, index, &cell_types, reads).map(|context| {
             check_file((&scan, index), &context, (scope, &mut types), &mut recorded)
         });
@@ -7145,12 +7374,10 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         let keep = |name: Name| commits(&scan, index, name);
         let poison = |name: Name| poisoned_root(&scan, index, name);
         #[cfg(test)]
-        if let Some(Ok((_, output))) = &compiled {
-            let records = output.checked.resolution.view_records();
-            set(&mut view_records, index, records.to_vec());
-        }
+        keep_view_records(&mut view_records, index, compiled.as_ref());
         let result = match compiled {
             Some(Ok((ir, output))) => {
+                methods.extend(checked_methods(&scan, index, &output));
                 if let Some(dir) = scopes.get_mut(file.dir as usize) {
                     dir.commit(&output.scope, start, (keep, poison));
                 }
@@ -7183,7 +7410,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
             }
         }
     }
-    let tables = (&scopes[..], (&cell_slots[..], &cell_known[..]));
+    let tables = (&scopes[..], (&cell_slots[..], &cell_known[..], &methods));
     let lent = (&mut names, &mut types, &mut recorded);
     record_blocked(&mut scan, tables, lent);
     scan.names = names;
@@ -7210,6 +7437,7 @@ fn check_scan_recording(mut scan: Scan, record: bool) -> (Result<Workspace, Fail
         cell_types,
         cell_slots,
         cell_known,
+        methods,
         #[cfg(test)]
         view_records,
     };
@@ -7476,6 +7704,45 @@ fn computed_cells(scan: &Scan, index: u32, output: &CheckOutput) -> Vec<Computed
         cells.push((cell, scan.slot(cell), output.ty, None));
     }
     cells
+}
+
+/// Keeps in `view_records` the records file `index`'s check, `compiled`,
+/// made of the nodes of its view with a leaf of it under them, if it
+/// succeeded: for the tests' check that each reads only cells stored before
+/// it.
+#[cfg(test)]
+fn keep_view_records(
+    view_records: &mut [Vec<ViewRecord>],
+    index: u32,
+    compiled: Option<&Result<(Ir, CheckOutput), Vec<Diagnostic>>>,
+) {
+    if let Some(Ok((_, output))) = compiled {
+        let records = output.checked.resolution.view_records();
+        set(view_records, index, records.to_vec());
+    }
+}
+
+/// The methods of file `index` of `scan` as its check `output` found them
+/// (see [Methods](#methods)): each by its binding in the scope it leaves.
+fn checked_methods(
+    scan: &Scan,
+    index: u32,
+    output: &CheckOutput,
+) -> Vec<(MethodRef, CheckedMethod)> {
+    let Some(file) = scan.files.get(index as usize) else {
+        return Vec::new();
+    };
+    (0u32..)
+        .zip(file.ast.methods())
+        .filter_map(|(method, decl)| {
+            let (slot, ty, known) = output.scope.function_binding(decl.binding)?;
+            let at = MethodRef {
+                file: index,
+                method,
+            };
+            Some((at, CheckedMethod { slot, ty, known }))
+        })
+        .collect()
 }
 
 /// A cell a file computes, as [`computed_cells`] gives it: its number, the
@@ -9733,6 +10000,8 @@ pub(crate) struct Standard {
     /// For each of its cells that is a `def`'s, what a call of it needs to
     /// know of its parameters.
     cell_known: Vec<Option<Rc<KnownParams>>>,
+    /// The methods of the standard files, checked.
+    methods: CheckedMethods,
     /// The table of the directories of the run ([`Scan::locate`]): the
     /// session's root, the working directory it started in, first, at index
     /// 0, where every input is, both its `fileroot.this` and its
@@ -9793,6 +10062,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
         cell_types,
         cell_slots,
         cell_known,
+        methods,
         ..
     } = workspace;
     Ok(Started {
@@ -9801,6 +10071,7 @@ pub(crate) fn start(root: &str) -> Result<Started, Vec<Diagnostic>> {
             cell_types,
             cell_slots,
             cell_known,
+            methods,
             dirs: scan.dir_texts,
         },
         names: scan.names,
@@ -9947,7 +10218,7 @@ fn check_input_then<R>(
     };
     file.ast.replace_names(file_names);
     let finished = scan.files.get(index as usize).and_then(|file| {
-        let reads = (&cell_slots[..], &cell_known[..]);
+        let reads = (&cell_slots[..], &cell_known[..], &standard.methods);
         let context = Context::new(&scan, index, &cell_types, reads)?;
         let context = Context {
             session: true,

@@ -233,7 +233,7 @@ fn assert_imports_stored(workspace: &Workspace) {
     let types = vec![TyId::ERROR; scan.cells()];
     let builtins = assert_builtins_written(workspace);
     for (index, file) in (0u32..).zip(&scan.files) {
-        let reads = (&workspace.cell_slots[..], &[][..]);
+        let reads = (&workspace.cell_slots[..], &[][..], &workspace.methods);
         let context = Context::new(scan, index, &types, reads).unwrap();
         let mut pending: Vec<Target> = file
             .mentions
@@ -11989,4 +11989,104 @@ fn a_generic_type_s_parameters_shadow_declared_types_and_instances_are_fresh() {
         rooted_text(&files, "app/main.gcsl"),
         "{a = {v = \"s\"}; b = {v = {v = true}}; r = \"s\"; s = true}"
     );
+}
+
+#[test]
+fn a_def_method_is_visible_through_every_import_and_the_directory_chain() {
+    let lib = (
+        "lib/ints.gcsl",
+        "def (x: Int) twice(): Int { x * 2 }\ndef (x: Int) add(y: Int = 10): Int { x + y }\n\
+         fn (x: Int) secret(): Int { 0 }\nk = 1",
+    );
+    let files = [
+        ("workspace.gcsl", ""),
+        lib,
+        (
+            "app/helpers.gcsl",
+            "def (s: String) shout(): String { \"{s}!\" }",
+        ),
+        (
+            "app/whole.gcsl",
+            "import lib/ints\nwhole = 3.twice() + 1.add()",
+        ),
+        (
+            "app/member.gcsl",
+            "import k from lib/ints\nmember = 4.twice() + k",
+        ),
+        (
+            "app/star.gcsl",
+            "import * from lib/ints\nstar = 5.add(y = 1)",
+        ),
+        ("app/sub/deep.gcsl", "deep = \"hi\".shout()"),
+    ];
+    for (path, value) in [
+        ("app/whole.gcsl", "{whole = 17}"),
+        ("app/member.gcsl", "{member = 9}"),
+        ("app/star.gcsl", "{star = 6}"),
+        ("app/sub/deep.gcsl", "{deep = \"hi!\"}"),
+    ] {
+        assert_eq!(rooted_text(&files, path), value, "{path}");
+    }
+    // A `fn` method is its file's alone.
+    let files = [
+        ("workspace.gcsl", ""),
+        lib,
+        ("app/main.gcsl", "import lib/ints\nbad = 3.secret()"),
+    ];
+    assert_eq!(
+        rooted_messages(&files),
+        ["cannot access field `secret` of Int"]
+    );
+}
+
+#[test]
+fn methods_of_other_files_are_chosen_and_conflict_as_a_file_s_own() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "lib/any.gcsl",
+            "def (xs: List<T>) size<T>(): String { \"any\" }",
+        ),
+        (
+            "lib/ints.gcsl",
+            "def (xs: List<Int>) size(): String { \"ints\" }",
+        ),
+        (
+            "app/main.gcsl",
+            "import lib/any\nimport lib/ints\na = [1].size()\nb = [true].size()",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = \"ints\"; b = \"any\"}"
+    );
+    let files = [
+        ("workspace.gcsl", ""),
+        ("lib/one.gcsl", "def (x: Int) m(): Int { 1 }"),
+        ("lib/two.gcsl", "def (y: Int) m(): Int { 2 }"),
+        ("app/main.gcsl", "import lib/one\nimport lib/two\nr = 3.m()"),
+    ];
+    assert_eq!(
+        rooted_messages(&files),
+        ["method `m` is declared twice for type Int"]
+    );
+}
+
+#[test]
+fn a_call_of_a_field_needs_the_files_of_the_methods_of_its_name() {
+    // Conservatively: the call is of a record's field, but a method of its
+    // name is visible, so the file needs the method's, which needs it back.
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "lib.gcsl",
+            "import app/main\ndef (x: Int) get(): Int { x }\nseen = main.v",
+        ),
+        (
+            "app/main.gcsl",
+            "v = 1\nrec = { get = fn(): Int { 2 } }\nw = rec.get()",
+        ),
+    ];
+    let messages = rooted_messages(&files);
+    assert_eq!(messages, ["`app/main.gcsl` and `lib.gcsl` need each other"]);
 }

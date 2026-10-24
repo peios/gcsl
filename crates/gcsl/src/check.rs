@@ -1327,9 +1327,12 @@
 //! of its name each fit the other's, the same type, "method `m` is
 //! declared twice for type T".
 //!
-//! A method is *visible* to an input if the input declares it, or, in a
+//! A method is *visible* to an input if the input declares it; or, in a
 //! session, an earlier input did: those are found among the bindings the
-//! input inherits, by their names (`Checker::find_earlier_methods`). A
+//! input inherits, by their names (`Checker::find_earlier_methods`); or, in
+//! a workspace, it is a `def` method of another file the file sees (see
+//! [`crate::workspace`], "Methods"), checked already, whose closure is
+//! read from its slot as an imported cell is. A
 //! call whose callee is a field access, `x.m(...)`, of a name some method
 //! visible has (`Checker::check_field_call`), is a reference to a
 //! top-level field or a member of `fileroot` if it is one, called as any
@@ -3975,12 +3978,24 @@ struct ForLowering {
 /// A method a call of its name may mean (see [Methods](#methods)).
 #[derive(Clone, Copy, Debug)]
 struct MethodCandidate {
-    /// Its binding, read as a top-level function's is.
-    binding: Name,
+    /// How its closure is read.
+    source: MethodSource,
     /// Its function's type, the receiver its first parameter.
     ty: TyId,
-    /// Where its name is declared, if in this input.
-    span: Option<Span>,
+    /// Where its name is declared, in this input (`None`) or another, if
+    /// it is known.
+    declared: Option<(Option<u32>, Span)>,
+}
+
+/// How a method's closure is read (see [Methods](#methods)).
+#[derive(Clone, Copy, Debug)]
+enum MethodSource {
+    /// From its binding, of this input or an earlier one of a session, as a
+    /// top-level function's is.
+    Binding(Name),
+    /// From its slot, as another file's: by its name and its position among
+    /// those of the name the file sees ([`Context::methods`]).
+    Foreign(Name, u32),
 }
 
 /// How a call's arguments bind to its callee's parameters beyond what the
@@ -5235,6 +5250,9 @@ enum KnownCallee {
     /// node in the workspace (see [Imports](#imports)), whose measured
     /// parameters the workspace context carries.
     Imported(u32),
+    /// A method of another file, by its name and its position among those
+    /// of the name the file sees ([`Context::methods`]).
+    Method(Name, u32),
 }
 
 /// One value a function captures.
@@ -5840,6 +5858,22 @@ impl Scope {
             self.known.push(known);
         }
         self
+    }
+
+    /// The slot, the type and what a call of its function needs to know of
+    /// its parameters of the latest binding of `name`, if there is one: a
+    /// method's, which another file calls (see [Methods](#methods)).
+    pub(crate) fn function_binding(
+        &self,
+        name: Name,
+    ) -> Option<(Slot, TyId, Option<Rc<KnownParams>>)> {
+        let (binding, known) = self
+            .bindings
+            .iter()
+            .zip(&self.known)
+            .rev()
+            .find(|(binding, _)| binding.name == name)?;
+        Some((binding.slot, binding.ty, known.clone()))
     }
 
     /// For each slot bound, what a call of the function its latest binding
@@ -10841,7 +10875,8 @@ impl<'a> Checker<'a> {
                 .and_then(|workspace| workspace.known(node))
                 .map(|known| known.attributes.to_vec())
                 .unwrap_or_default(),
-            None => Vec::new(),
+            // A method is never a def-type.
+            Some(KnownCallee::Method(..)) | None => Vec::new(),
         };
         if inherited.is_empty() {
             return;
@@ -16422,6 +16457,9 @@ impl<'a> Checker<'a> {
     fn sees_method(&self, name: Name) -> bool {
         self.ast.methods().iter().any(|method| method.name == name)
             || self.calls.earlier_methods.contains_key(&name)
+            || self
+                .workspace
+                .is_some_and(|workspace| workspace.sees_method(name))
     }
 
     /// The methods named `name` visible to the input (see
@@ -16441,16 +16479,37 @@ impl<'a> Checker<'a> {
             .into_iter()
             .flatten()
             .map(|&binding| (binding, None));
-        own.chain(earlier)
+        let mut candidates: Vec<MethodCandidate> = own
+            .chain(earlier)
             .filter_map(|(binding_name, span)| {
                 let (_, binding) = self.lookup(binding_name)?;
                 Some(MethodCandidate {
-                    binding: binding_name,
+                    source: MethodSource::Binding(binding_name),
                     ty: binding.ty,
-                    span,
+                    declared: span.map(|span| (None, span)),
                 })
             })
-            .collect()
+            .collect();
+        if let Some(workspace) = self.workspace {
+            for (index, method) in workspace.methods(name) {
+                candidates.push(MethodCandidate {
+                    source: MethodSource::Foreign(name, index),
+                    ty: method.checked.ty,
+                    declared: Some((Some(method.file), method.span)),
+                });
+            }
+        }
+        candidates
+    }
+
+    /// `error` with a label of `text` at where `candidate`, a method, is
+    /// declared, if that is known, in its own input.
+    fn label_method(error: Diagnostic, candidate: &MethodCandidate, text: &str) -> Diagnostic {
+        match candidate.declared {
+            Some((None, span)) => error.with_context(span, text),
+            Some((Some(input), span)) => error.with_context_in(input, span, text),
+            None => error,
+        }
     }
 
     /// The methods of the earlier inputs of a session the input inherits,
@@ -16532,8 +16591,8 @@ impl<'a> Checker<'a> {
                 format!("`{text}` is both a field of {shown} and a method"),
                 at,
             );
-            for span in applicable.iter().filter_map(|candidate| candidate.span) {
-                error = error.with_context(span, "the method is declared here");
+            for candidate in &applicable {
+                error = Self::label_method(error, candidate, "the method is declared here");
             }
             self.errors.push(error);
             return self.args_alone(args);
@@ -16635,8 +16694,8 @@ impl<'a> Checker<'a> {
             let mut error =
                 Diagnostic::error(format!("method `{text}` is ambiguous for type {shown}"), at)
                     .with_note("no receiver type of the methods that apply fits all the others");
-            for span in applicable.iter().filter_map(|candidate| candidate.span) {
-                error = error.with_context(span, "this applies");
+            for candidate in applicable {
+                error = Self::label_method(error, candidate, "this applies");
             }
             error
         } else {
@@ -16644,8 +16703,8 @@ impl<'a> Checker<'a> {
                 format!("method `{text}` is declared twice for type {shown}"),
                 at,
             );
-            for span in winners.iter().filter_map(|candidate| candidate.span) {
-                error = error.with_context(span, "declared here");
+            for candidate in &winners {
+                error = Self::label_method(error, candidate, "declared here");
             }
             error
         };
@@ -16709,7 +16768,34 @@ impl<'a> Checker<'a> {
         method: MethodCandidate,
     ) -> TyId {
         let span = self.ast.get(callee).span;
-        let (method_ty, _) = self.use_name(callee, method.binding, span);
+        let (method_ty, known) = match method.source {
+            MethodSource::Binding(binding) => {
+                let (method_ty, _) = self.use_name(callee, binding, span);
+                let known =
+                    self.lookup(binding)
+                        .and_then(|(index, binding)| match binding.function {
+                            Some(function) => Some(KnownCallee::Current(function)),
+                            None => (index < self.scope_known.len())
+                                .then_some(KnownCallee::Earlier(index)),
+                        });
+                (method_ty, known)
+            }
+            // Another file's, checked and run before this one.
+            MethodSource::Foreign(name, index) => {
+                let checked = self
+                    .workspace
+                    .and_then(|workspace| workspace.method(name, index));
+                let Some(checked) = checked else {
+                    return self.args_alone(args);
+                };
+                self.read_import(callee, checked.slot);
+                let known = checked
+                    .known
+                    .is_some()
+                    .then_some(KnownCallee::Method(name, index));
+                (checked.ty, known)
+            }
+        };
         self.expr_types[callee.index()] = method_ty;
         let Some(sig) = self.types.fn_sig(method_ty).cloned() else {
             return self.args_alone(args);
@@ -16724,12 +16810,6 @@ impl<'a> Checker<'a> {
             }
             None => sig,
         };
-        let known =
-            self.lookup(method.binding)
-                .and_then(|(index, binding)| match binding.function {
-                    Some(function) => Some(KnownCallee::Current(function)),
-                    None => (index < self.scope_known.len()).then_some(KnownCallee::Earlier(index)),
-                });
         let label = format!("the method is {}", self.in_label(method_ty));
         let receiver_ty = sig.params.first().map_or(TyId::ERROR, |&(_, ty)| ty);
         let context = self.argument_context(known, 0, (id, callee));
@@ -17550,9 +17630,11 @@ impl<'a> Checker<'a> {
                 self.argument_site(known, param, (call, callee)),
                 Some((function, param)),
             ),
-            Some(known @ (KnownCallee::Earlier(_) | KnownCallee::Imported(_))) => {
-                (self.argument_site(known, param, (call, callee)), None)
-            }
+            Some(
+                known @ (KnownCallee::Earlier(_)
+                | KnownCallee::Imported(_)
+                | KnownCallee::Method(..)),
+            ) => (self.argument_site(known, param, (call, callee)), None),
             None => (AwaitSite::Implicit, None),
         }
     }
@@ -17589,7 +17671,7 @@ impl<'a> Checker<'a> {
                     _ => AwaitSite::Implicit,
                 }
             }
-            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) | KnownCallee::Method(..) => {
                 let measured = self
                     .known_params(known)
                     .is_some_and(|known| known.measured(param));
@@ -17611,6 +17693,9 @@ impl<'a> Checker<'a> {
             KnownCallee::Current(_) => None,
             KnownCallee::Earlier(index) => self.scope_known.get(index)?.as_deref(),
             KnownCallee::Imported(node) => self.workspace?.known(node),
+            KnownCallee::Method(name, index) => {
+                self.workspace?.method(name, index)?.known.as_deref()
+            }
         }
     }
 
@@ -17627,7 +17712,7 @@ impl<'a> Checker<'a> {
                     .get(param)
                     .is_some_and(|param| param.default.is_some())
             }
-            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) | KnownCallee::Method(..) => {
                 self.default_of(known, param).is_some()
             }
         }
@@ -17645,7 +17730,7 @@ impl<'a> Checker<'a> {
                 .defaults
                 .get(param)?
                 .clone(),
-            KnownCallee::Earlier(_) | KnownCallee::Imported(_) => {
+            KnownCallee::Earlier(_) | KnownCallee::Imported(_) | KnownCallee::Method(..) => {
                 self.known_params(known)?.default(param).cloned()
             }
         }
