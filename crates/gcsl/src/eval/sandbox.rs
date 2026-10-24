@@ -77,16 +77,27 @@ impl Evaluator<'_> {
                 return fail(format!("a sandbox could not make its directory: {reason}"));
             }
         };
-        let mut copier = Composer {
-            root: host_root.clone(),
-            placed: HashSet::new(),
-            effects,
-        };
-        if let Err(message) = copier.tree_at(&dir.path, "") {
-            return fail(format!(
-                "a sandbox could not copy `{}`: {message}",
-                dir.path
-            ));
+        match effects.make_sandbox(&dir.path, &root) {
+            Some(Ok(())) => {}
+            Some(Err(reason)) => {
+                return fail(format!(
+                    "a sandbox of `{}` could not be made: {reason}",
+                    dir.path
+                ));
+            }
+            None => {
+                let mut copier = Composer {
+                    root: host_root.clone(),
+                    placed: HashSet::new(),
+                    effects,
+                };
+                if let Err(message) = copier.tree_at(&dir.path, "") {
+                    return fail(format!(
+                        "a sandbox could not copy `{}`: {message}",
+                        dir.path
+                    ));
+                }
+            }
         }
         // Its commands start in its working directory, which is its own to
         // make.

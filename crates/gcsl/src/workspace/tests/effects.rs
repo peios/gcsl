@@ -122,3 +122,88 @@ fn every_effect_goes_through_the_host_s_context() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A host as [`Rooted`] is, which links files into compositions, is told
+/// of each finished one, and makes sandboxes itself, recording each.
+#[derive(Debug)]
+struct Hooked {
+    /// Where paths are rooted, and how programs run.
+    rooted: Rooted,
+    /// The compositions it was told of.
+    composed: RefCell<Vec<String>>,
+    /// The sandboxes it made, each its directory and its copy's root.
+    sandboxes: RefCell<Vec<(String, String)>>,
+}
+
+impl Effects for Hooked {
+    fn command(&self, command: Command) -> Result<Command, String> {
+        self.rooted.command(command)
+    }
+
+    fn place_file(
+        &self,
+        source: &std::path::Path,
+        target: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::fs::hard_link(source, target)
+    }
+
+    fn composed(&self, root: &str) {
+        self.composed.borrow_mut().push(root.to_owned());
+    }
+
+    fn make_sandbox(&self, source: &str, root: &str) -> Option<Result<(), String>> {
+        self.sandboxes
+            .borrow_mut()
+            .push((source.to_owned(), root.to_owned()));
+        Some(Ok(()))
+    }
+
+    fn host_path(&self, path: &str) -> Result<PathBuf, String> {
+        self.rooted.host_path(path)
+    }
+
+    fn working_dir(&self) -> Result<PathBuf, String> {
+        self.rooted.working_dir()
+    }
+
+    fn temp_dir(&self) -> Option<Result<String, String>> {
+        self.rooted.temp_dir()
+    }
+}
+
+#[test]
+fn a_host_can_place_compositions_files_and_make_sandboxes_itself() {
+    use std::os::unix::fs::MetadataExt;
+    let root = PathBuf::from(fs_scratch("effects-hooked"));
+    let effects = Hooked {
+        rooted: Rooted {
+            root: root.clone(),
+            ran: RefCell::new(Vec::new()),
+            temps: Cell::new(0),
+        },
+        composed: RefCell::new(Vec::new()),
+        sandboxes: RefCell::new(Vec::new()),
+    };
+    let text = "import fs\n\
+                fs.mkdir(\"/d\")\n\
+                fs.write(\"/d/x.txt\", \"hi\")\n\
+                let composed = fs.compose_dir({\"out/x.txt\" = file(\"/d/x.txt\")})\n\
+                let s = composed.sandbox(cwd = \"/work\")\n\
+                = [composed.path, \"{fs.exists(\"/tmp/1/out/x.txt\")}\"]";
+    let value = run_through(text, &effects).unwrap();
+    // The composition's file is the host's link, and the host was told of
+    // it once it was done.
+    let source = std::fs::metadata(root.join("d/x.txt")).unwrap();
+    let placed = std::fs::metadata(root.join("tmp/0/out/x.txt")).unwrap();
+    assert_eq!(source.ino(), placed.ino());
+    assert_eq!(*effects.composed.borrow(), ["/tmp/0"]);
+    // The host made the sandbox: GCSL copied nothing into it, but made its
+    // working directory.
+    assert_eq!(
+        *effects.sandboxes.borrow(),
+        [("/tmp/0".to_owned(), "/tmp/1".to_owned())]
+    );
+    assert_eq!(value.to_string(), "[\"/tmp/0\", \"false\"]");
+    assert!(root.join("tmp/1/work").is_dir());
+}

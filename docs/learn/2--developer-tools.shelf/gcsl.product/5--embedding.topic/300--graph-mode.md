@@ -108,6 +108,13 @@ If your sandboxes use bubblewrap, also implement
 starts its own bubblewrap inside yours, which some systems, such as
 Ubuntu, forbid.
 
+Three more hooks let you avoid copying. `Effects::place_file` places each
+file of an `fs.compose_dir`, a copy by default, so you can hard-link a
+file nothing can change. `Effects::composed` tells you when a composition
+is finished, so you can make it read-only. `Effects::make_sandbox` lets
+you make a sandbox yourself, as an overlay over its directory, say; you
+then answer `Effects::host_path` for paths in it, upper layer over lower.
+
 A host decides, per call, whether to take a deferred call as a step, from
 the attribute's arguments. An attribute declared as
 `type step = {on: Bool = true}` lets a function written `#[step(false)]`

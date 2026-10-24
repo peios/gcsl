@@ -15,7 +15,7 @@
 //! system itself: a command as it is, a path as it is, the process's
 //! working directory, and the temporary directories of the run's owner.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::TempDirs;
@@ -44,6 +44,36 @@ pub trait Effects: std::fmt::Debug {
     /// sandboxes cannot always be made.
     fn sandbox_command(&self, root: &str, command: Command) -> Option<Result<Command, String>> {
         let _ = (root, command);
+        None
+    }
+
+    /// Places the file at `source` at `target`, both paths of the host's
+    /// file system, for `fs.compose_dir` or a sandbox's copy: a copy of its
+    /// own, its mode kept, as by default, or what the host makes of it more
+    /// cheaply, such as a hard link to a file that nothing can change.
+    ///
+    /// # Errors
+    ///
+    /// Why it could not be placed.
+    fn place_file(&self, source: &Path, target: &Path) -> std::io::Result<()> {
+        std::fs::copy(source, target).map(|_| ())
+    }
+
+    /// Tells the host that the directory `root`, as GCSL code names it, is a
+    /// finished `fs.compose_dir`, which no GCSL code changes: a host can seal
+    /// it, so that no program changes it either.
+    fn composed(&self, root: &str) {
+        let _ = root;
+    }
+
+    /// Makes the sandbox of the directory `source` whose copy is to be at
+    /// `root`, a new, empty temporary directory, both as GCSL code names
+    /// them, as the host's own, without a copy: as an overlay, say, whose
+    /// writes are in `root` and whose reads ([`Effects::host_path`]) see them
+    /// over `source`. `None`, as by default, for GCSL to copy `source` into
+    /// `root`, as it does for a directory any program might change.
+    fn make_sandbox(&self, source: &str, root: &str) -> Option<Result<(), String>> {
+        let _ = (source, root);
         None
     }
 

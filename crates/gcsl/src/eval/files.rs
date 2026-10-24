@@ -256,6 +256,7 @@ impl Evaluator<'_> {
                 return fail(format!("`fs.compose_dir`: {message}"));
             }
         }
+        effects.composed(&root);
         Ok(entry(true, Rc::from(root)))
     }
 }
@@ -366,7 +367,7 @@ impl Composer<'_> {
             Ok(meta) if meta.file_type().is_symlink() => {
                 fs::read_link(source).and_then(|link| std::os::unix::fs::symlink(link, &target))
             }
-            Ok(_) => fs::copy(source, &target).map(|_| ()),
+            Ok(_) => self.effects.place_file(source, &target),
             Err(error) => Err(error),
         };
         copied.map_err(|error| format!("could not copy `{}`: {error}", source.display()))
