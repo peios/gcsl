@@ -100,51 +100,89 @@ pub(super) fn exec(
     for &(name, value) in &options.env {
         command.env(name, value);
     }
-    let live = builtin == Builtin::ExecLive;
-    let Some(ran) = run(&mut command, (live, deadline), &options, node)? else {
-        return Ok(None);
-    };
-    let (status, stdout, stderr) = match ran {
-        Ok(ran) => ran,
-        Err(error) => {
-            return Err(
-                Diagnostic::error(format!("cannot run `{shown}`"), node.span)
-                    .with_note(error.to_string())
-                    .into(),
-            );
-        }
-    };
-    let text = |bytes: &[u8]| Rc::<str>::from(String::from_utf8_lossy(bytes).as_ref());
-    let (stdout, stderr) = (text(&stdout), text(&stderr));
-    let secret = builtin == Builtin::ExecSecret;
-    if options.panic && status != 0 {
-        // A program given a secret may tell of it in its status and its
-        // output, which are secrets: its failure names neither.
-        if secret {
-            return Err(Diagnostic::error("a program given a secret failed", node.span).into());
-        }
-        let mut failed =
-            Diagnostic::error(format!("`{shown}` exited with status {status}"), node.span);
-        if !live && !stderr.trim().is_empty() {
-            failed = failed.with_note(format!("its standard error: {}", stderr.trim()));
-        }
-        return Err(failed.into());
-    }
-    let result = Value::Record(Rc::new(Record {
-        layout: Rc::clone(layout),
-        values: Box::new([Value::Int(status), Value::Str(stdout), Value::Str(stderr)]),
-    }));
-    if !secret {
-        return Ok(Some(result));
-    }
     // Its identity is what it was given, every secret as its identity, so
     // that two runs are one secret only if they are one run.
-    let given = (token(&Value::List(argv.clone())), token(raw_options));
-    Ok(Some(Value::Secret(Rc::new(Secret {
-        value: result,
-        identity: Rc::from(format!("exec-secret({}, {})", given.0, given.1)),
-        revealed: false,
-    }))))
+    let identity = (builtin == Builtin::ExecSecret).then(|| {
+        let given = (token(&Value::List(argv.clone())), token(raw_options));
+        format!("exec-secret({}, {})", given.0, given.1)
+    });
+    let ran = Program {
+        builtin,
+        shown,
+        identity,
+    };
+    ran.finish(&mut command, &options, (layout, deadline), node)
+}
+
+/// A program [`exec`] or a sandbox's runs, as its result reports it.
+pub(super) struct Program<'a> {
+    /// What runs it: `exec`, `exec_live`, `exec_secret` or `sandbox_exec`.
+    pub(super) builtin: Builtin,
+    /// The program, as its errors name it.
+    pub(super) shown: &'a str,
+    /// The identity of what it reports, a secret, for `exec_secret`.
+    pub(super) identity: Option<String>,
+}
+
+impl Program<'_> {
+    /// Runs `command`, the program, as `options` say, until `deadline` if
+    /// there is one, and gives what it did, a record of `layout`, as
+    /// [`exec`] says: `None` if the deadline passed first.
+    pub(super) fn finish(
+        self,
+        command: &mut Command,
+        options: &ExecOptions<'_>,
+        (layout, deadline): (&Rc<Layout>, Option<Instant>),
+        node: &IrNode,
+    ) -> Flow<Option<Value>> {
+        let Program {
+            builtin,
+            shown,
+            identity,
+        } = self;
+        let live = builtin == Builtin::ExecLive;
+        let Some(ran) = run(command, (live, deadline), options, node)? else {
+            return Ok(None);
+        };
+        let (status, stdout, stderr) = match ran {
+            Ok(ran) => ran,
+            Err(error) => {
+                return Err(
+                    Diagnostic::error(format!("cannot run `{shown}`"), node.span)
+                        .with_note(error.to_string())
+                        .into(),
+                );
+            }
+        };
+        let text = |bytes: &[u8]| Rc::<str>::from(String::from_utf8_lossy(bytes).as_ref());
+        let (stdout, stderr) = (text(&stdout), text(&stderr));
+        let secret = identity.is_some();
+        if options.panic && status != 0 {
+            // A program given a secret may tell of it in its status and its
+            // output, which are secrets: its failure names neither.
+            if secret {
+                return Err(Diagnostic::error("a program given a secret failed", node.span).into());
+            }
+            let mut failed =
+                Diagnostic::error(format!("`{shown}` exited with status {status}"), node.span);
+            if !live && !stderr.trim().is_empty() {
+                failed = failed.with_note(format!("its standard error: {}", stderr.trim()));
+            }
+            return Err(failed.into());
+        }
+        let result = Value::Record(Rc::new(Record {
+            layout: Rc::clone(layout),
+            values: Box::new([Value::Int(status), Value::Str(stdout), Value::Str(stderr)]),
+        }));
+        let Some(identity) = identity else {
+            return Ok(Some(result));
+        };
+        Ok(Some(Value::Secret(Rc::new(Secret {
+            value: result,
+            identity: Rc::from(identity),
+            revealed: false,
+        }))))
+    }
 }
 
 /// What the options record of a call of `exec`, `exec_live` or
@@ -152,12 +190,12 @@ pub(super) fn exec(
 /// types them.
 pub(super) struct ExecOptions<'a> {
     /// The program's working directory, `""` for this process's.
-    cwd: &'a str,
+    pub(super) cwd: &'a str,
     /// The variables set over this process's environment for the program,
     /// and after them, `exec_secret`'s, each of a revealed secret's value.
-    env: Vec<(&'a str, &'a str)>,
+    pub(super) env: Vec<(&'a str, &'a str)>,
     /// Whether the program has this process's terminal.
-    interactive: bool,
+    pub(super) interactive: bool,
     /// Whether a status other than 0 fails the call.
     panic: bool,
     /// The text whose line ends the program, `""` for none.
@@ -165,11 +203,41 @@ pub(super) struct ExecOptions<'a> {
 }
 
 impl<'a> ExecOptions<'a> {
+    /// The defaults of a sandbox's commands, `cwd` and `env`, that the
+    /// record `value` holds; `None` for anything else.
+    pub(super) fn of_defaults(value: &'a Value) -> Option<Self> {
+        let Value::Record(record) = value else {
+            return None;
+        };
+        let field = |name: &str| {
+            record
+                .layout
+                .texts
+                .iter()
+                .position(|text| &**text == name)
+                .and_then(|at| record.values.get(at))
+        };
+        let Some(Value::Str(cwd)) = field("cwd") else {
+            return None;
+        };
+        let env = variables(field("env")?, |value| match value {
+            Value::Str(text) => Some(&**text),
+            _ => None,
+        })?;
+        Some(ExecOptions {
+            cwd,
+            env,
+            interactive: false,
+            panic: false,
+            until: "",
+        })
+    }
+
     /// The options `value` holds, a record of the fields of
     /// [`Builtin::EXEC_OPTIONS`], or of [`Builtin::EXEC_SECRET_OPTIONS`],
     /// whose `secrets` are set over `env` and which have no `interactive`;
     /// `None` for anything else.
-    fn of(value: &'a Value) -> Option<Self> {
+    pub(super) fn of(value: &'a Value) -> Option<Self> {
         let Value::Record(record) = value else {
             return None;
         };

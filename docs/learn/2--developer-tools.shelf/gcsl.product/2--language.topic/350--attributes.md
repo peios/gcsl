@@ -93,7 +93,7 @@ size = positive(4)
 
 A call of `positive(0)` would fail at that call, not at the `panic`. The
 standard library marks `exec`, `exec_live`, `sh`, `sh_live`, and the
-methods of `File` and `Dir` this way.
+methods of `File`, `Dir` and `Sandbox` this way.
 
 Only errors raised in the marked function's own body move. When it calls
 another marked function, that call's error moves to the call in the body,

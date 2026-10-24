@@ -759,6 +759,40 @@ pub enum Value {
     /// host gives it, as a file's (see [Files](crate::eval::files#files)),
     /// compared by both.
     Dir(Rc<File>),
+    /// A sandbox: a live copy of a directory, which commands run in as
+    /// their `/`, with the working directory and environment they are
+    /// given by default (see [Sandboxes](crate::eval::sandbox#sandboxes)),
+    /// compared by its copy alone.
+    Sandbox(Rc<Sandbox>),
+}
+
+/// A sandbox, as values carry it (see
+/// [Sandboxes](crate::eval::sandbox#sandboxes)).
+#[derive(Debug)]
+pub struct Sandbox {
+    /// The copy, its `/`, as an absolute path of the host's: a directory of
+    /// the run's, its own.
+    pub root: Rc<str>,
+    /// The working directory of its commands by default, absolute, inside
+    /// it.
+    pub cwd: Rc<str>,
+    /// The environment of its commands by default, the whole of it.
+    pub env: Box<[(Rc<str>, Rc<str>)]>,
+}
+
+/// Two sandboxes are equal if they are one copy: each has its own.
+impl PartialEq for Sandbox {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for Sandbox {}
+
+impl std::hash::Hash for Sandbox {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.root.hash(state);
+    }
 }
 
 /// A file or a directory, as values carry it (see
@@ -834,9 +868,11 @@ impl Value {
             Value::Future(_) => ValueKind::Deferred,
             // A value of an enum is of no kind of its own: present, of the
             // kind a node of an enum's type has; and so is a secret.
-            Value::Variant(_) | Value::Secret(_) | Value::File(_) | Value::Dir(_) => {
-                ValueKind::Mixed
-            }
+            Value::Variant(_)
+            | Value::Secret(_)
+            | Value::File(_)
+            | Value::Dir(_)
+            | Value::Sandbox(_) => ValueKind::Mixed,
         }
     }
 
@@ -1033,6 +1069,8 @@ impl fmt::Display for Value {
             // As the call that makes it, which reads back as an equal file.
             Value::File(file) => write!(f, "file({})", Quoted(&file.path)),
             Value::Dir(dir) => write!(f, "dir({})", Quoted(&dir.path)),
+            // No call makes one again: it is a live directory, not data.
+            Value::Sandbox(sandbox) => write!(f, "<sandbox {}>", sandbox.root),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;

@@ -1318,6 +1318,13 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             Value::Fn(_) | Value::Builtin(_) => {
                 return mistyped(node, "a function given to `show`");
             }
+            Value::Sandbox(_) => {
+                return Err(Diagnostic::error(
+                    "cannot show a sandbox: it is a live directory, not data",
+                    node.span,
+                )
+                .into());
+            }
             // A variant's source is how it is shown, `Toolchain::C`, and a
             // value of an enum the call of it on its payload's.
             Value::Variant(variant) => pending.push(&variant.payload),
@@ -1349,6 +1356,7 @@ pub(crate) mod builtins;
 pub(crate) mod files;
 pub(crate) mod kinds;
 pub(crate) mod memo;
+pub(crate) mod sandbox;
 pub(crate) mod system;
 pub(crate) mod text;
 pub(crate) mod unions;

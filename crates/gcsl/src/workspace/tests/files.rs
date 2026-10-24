@@ -320,3 +320,125 @@ fn a_value_s_dirs_are_found_apart_from_its_files() {
         .collect();
     assert_eq!(files, ["/c"]);
 }
+
+/// A directory of `test`'s in this process's temporary directory that a
+/// sandbox can run a shell in: the host's `/bin/sh`, and the libraries it
+/// loads, at their own paths in it, as `ldd` names them; and its path.
+fn shell_root(test: &str) -> String {
+    let root = std::env::temp_dir().join(format!("gcsl-14e-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("bin")).unwrap();
+    std::fs::copy(
+        std::fs::canonicalize("/bin/sh").unwrap(),
+        root.join("bin/sh"),
+    )
+    .unwrap();
+    let ldd = std::process::Command::new("ldd")
+        .arg("/bin/sh")
+        .output()
+        .unwrap();
+    for library in String::from_utf8(ldd.stdout)
+        .unwrap()
+        .split_whitespace()
+        .filter(|word| word.starts_with('/'))
+    {
+        let to = root.join(library.trim_start_matches('/'));
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(library, &to).unwrap();
+    }
+    root.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_sandbox_runs_its_commands_with_its_copy_as_their_root() {
+    let root = shell_root("root");
+    let text = format!(
+        "let s = dir(\"{root}\").sandbox(cwd = \"/work\", env = {{GREETING = \"hi\"}})\n\
+         # Its own `/`, its working directory, its environment alone.\n\
+         a = s.exec(\"sh\", \"-c\", \"cd /; echo *; pwd; echo $GREETING x$HOME\", cwd = \"/\").stdout\n\
+         b = s.exec(\"sh\", \"-c\", \"pwd\").stdout\n\
+         c = s.exec(\"sh\", \"-c\", \"echo $GREETING\", env = {{GREETING = \"there\"}}).stdout\n\
+         # What a command writes is there for the next and to read out.\n\
+         d = s.exec(\"sh\", \"-c\", \"echo made > out.txt\").status\n\
+         e = s.exec(\"sh\", \"-c\", \"read line < /work/out.txt; echo $line\").stdout\n\
+         f = s.file(\"out.txt\").read()\n\
+         g = s.file(\"/work/out.txt\") == s.dir(\"/work\").file(\"out.txt\")"
+    );
+    let shown = lone(&text).unwrap();
+    assert!(
+        shown.starts_with("{a = \"bin dev lib64 proc tmp usr work\\n/\\nhi x\\n\"; "),
+        "{shown}"
+    );
+    assert!(
+        shown.ends_with(
+            "b = \"/work\\n\"; c = \"there\\n\"; d = 0; e = \"made\\n\"; f = \"made\\n\"; g = true}"
+        ),
+        "{shown}"
+    );
+    // Nothing of it reaches the directory it was made of.
+    assert!(!std::path::Path::new(&root).join("work").exists());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn every_sandbox_of_one_directory_is_its_own() {
+    let root = shell_root("own");
+    let text = format!(
+        "let d = dir(\"{root}\")\n\
+         let a = d.sandbox()\n\
+         let b = d.sandbox()\n\
+         w = a.exec(\"sh\", \"-c\", \"echo a > /mark\").status\n\
+         x = b.exec(\"sh\", \"-c\", \"test -e /mark\", panic = false).status\n\
+         same = a == b\n\
+         itself = a == a"
+    );
+    assert_eq!(
+        lone(&text).unwrap(),
+        "{w = 0; x = 1; same = false; itself = true}"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_sandbox_s_commands_are_killed_whole_and_its_paths_stay_inside() {
+    let root = shell_root("kill");
+    // `until` and a timeout end what runs in it, at once.
+    let started = std::time::Instant::now();
+    let text = format!(
+        "let s = dir(\"{root}\").sandbox()\n\
+         a = s.exec(\"sh\", \"-c\", \"echo ready; while :; do :; done\", until = \"ready\").stdout\n\
+         #[timeout(200ms)]\n\
+         fn slow() -> Int {{ s.exec(\"sh\", \"-c\", \"while :; do :; done\").status }}\n\
+         b = recover {{ slow() }} else (e) {{ 0 - 1 }}"
+    );
+    assert_eq!(lone(&text).unwrap(), "{a = \"ready\\n\"; b = -1}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // Its failures are its programs', at the call.
+    let text = format!("x = dir(\"{root}\").sandbox().exec(\"sh\", \"-c\", \"exit 3\")");
+    let error = lone_error(&text);
+    assert_eq!(error.message, "`sh` exited with status 3");
+    assert_eq!(at(&text, &error), &text[4..]);
+    let text = format!("x = dir(\"{root}\").sandbox().file(\"../../etc/passwd\")");
+    assert_eq!(
+        lone_error(&text).message,
+        "`../../etc/passwd` is not inside the sandbox"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        lone_error("x = dir(\"/gcsl-no-such-dir-14e\").sandbox()").message,
+        "a sandbox could not copy `/gcsl-no-such-dir-14e`: could not list \
+         `/gcsl-no-such-dir-14e`: No such file or directory (os error 2)"
+    );
+    let empty = std::env::temp_dir().join(format!("gcsl-14e-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&empty).unwrap();
+    let text = format!(
+        "let s = dir(\"{}\").sandbox()\nx = show(s)",
+        empty.display()
+    );
+    let error = lone_error(&text);
+    std::fs::remove_dir_all(&empty).unwrap();
+    assert_eq!(
+        error.message,
+        "cannot show a sandbox: it is a live directory, not data"
+    );
+}

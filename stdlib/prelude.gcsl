@@ -259,6 +259,50 @@ def (d: Dir) exec(
     )
 }
 
+# Sandboxes: `d.sandbox(cwd, env)` is a sandbox of a copy of the directory
+# `d`, whose commands run with the copy as their `/`, in `cwd` and with the
+# environment `env` by default, nothing of gcsl's: `s.exec(...words)` runs
+# one, as `exec` does, and `s.file(path)` and `s.dir(path)` are what it has
+# at `path`, absolute in it or relative to its `cwd`, so far. One directory
+# backs any number of sandboxes, and none changes it. A sandbox needs
+# bubblewrap, `bwrap`. Each fails at its call: they are `#[track_caller]`.
+#[track_caller]
+def (d: Dir) sandbox(cwd: Present<String> = "/", env: Present<{*: String}> = {}) -> Sandbox {
+    builtins.dir_sandbox(d, {cwd = cwd; env = env})
+}
+
+#[track_caller]
+def (s: Sandbox) exec(
+    ...words: Present<String>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.sandbox_exec(
+        s,
+        {
+            argv = words
+            cwd = cwd
+            env = env
+            interactive = interactive
+            panic = panic
+            until = until
+        },
+    )
+}
+
+#[track_caller]
+def (s: Sandbox) file(path: String): File {
+    builtins.sandbox_file(s, path)
+}
+
+#[track_caller]
+def (s: Sandbox) dir(path: String): Dir {
+    builtins.sandbox_dir(s, path)
+}
+
 #[track_caller]
 def (files: List<File>) file(name: String): File {
     let found = for f in files if f.path == name or ends_with(f.path, "/" + name) { f }

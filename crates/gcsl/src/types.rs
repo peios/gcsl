@@ -416,6 +416,9 @@ impl TyId {
     /// A directory, `Dir`: a tree of files, its path and the content
     /// identity a host gives it (see [Files](crate::check::files#files)).
     pub const DIR: TyId = TyId(10);
+    /// A sandbox, `Sandbox`: a live copy of a directory that commands run
+    /// in, its `/` (see [Files](crate::check::files#files)).
+    pub const SANDBOX: TyId = TyId(11);
 
     /// The type of `quantity`: [`TyId::DURATION`] or [`TyId::SIZE`].
     #[must_use]
@@ -548,6 +551,10 @@ pub enum TyKind {
     /// `Dir`, [`TyId::DIR`]: a directory, a tree of files, a type of its
     /// own as `File` is (see [Files](crate::check::files#files)).
     Dir,
+    /// `Sandbox`, [`TyId::SANDBOX`]: a live copy of a directory that
+    /// commands run in, its `/`, a type of its own (see
+    /// [Files](crate::check::files#files)).
+    Sandbox,
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -856,6 +863,7 @@ impl TypeTable {
             TyKind::Quantity(Quantity::Size),
             TyKind::File,
             TyKind::Dir,
+            TyKind::Sandbox,
         ] {
             table.intern(kind);
         }
@@ -923,6 +931,7 @@ impl TypeTable {
             | TyKind::Quantity(_)
             | TyKind::File
             | TyKind::Dir
+            | TyKind::Sandbox
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1007,6 +1016,7 @@ impl TypeTable {
             | TyKind::Quantity(_)
             | TyKind::File
             | TyKind::Dir
+            | TyKind::Sandbox
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1273,6 +1283,7 @@ impl TypeTable {
             | TyKind::Quantity(_)
             | TyKind::File
             | TyKind::Dir
+            | TyKind::Sandbox
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1581,7 +1592,8 @@ impl TypeTable {
             | (TyKind::Bool, Value::Bool(_))
             | (TyKind::String, Value::Str(_))
             | (TyKind::File, Value::File(_))
-            | (TyKind::Dir, Value::Dir(_)) => true,
+            | (TyKind::Dir, Value::Dir(_))
+            | (TyKind::Sandbox, Value::Sandbox(_)) => true,
             (TyKind::Quantity(wanted), Value::Quantity(quantity, _)) => wanted == quantity,
             (TyKind::Record(record), Value::Empty) => record.fields.is_empty(),
             (TyKind::Record(record), Value::Record(fields)) => {
@@ -2113,6 +2125,7 @@ impl TypeTable {
             | TyKind::Quantity(_)
             | TyKind::File
             | TyKind::Dir
+            | TyKind::Sandbox
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -3070,9 +3083,11 @@ impl TypeTable {
             TyKind::List(_) => Some(ValueKind::List),
             // A secret, a file, and a value of an enum, which is present, are
             // of the kind only they say.
-            TyKind::Secret(..) | TyKind::File | TyKind::Dir | TyKind::Enum { .. } => {
-                Some(ValueKind::Mixed)
-            }
+            TyKind::Secret(..)
+            | TyKind::File
+            | TyKind::Dir
+            | TyKind::Sandbox
+            | TyKind::Enum { .. } => Some(ValueKind::Mixed),
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
@@ -3498,6 +3513,7 @@ impl fmt::Display for Display<'_> {
             TyKind::String => f.write_str("String"),
             TyKind::File => f.write_str("File"),
             TyKind::Dir => f.write_str("Dir"),
+            TyKind::Sandbox => f.write_str("Sandbox"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
             &TyKind::Param { generic, index } => {

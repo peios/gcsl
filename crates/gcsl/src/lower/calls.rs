@@ -78,7 +78,11 @@ impl Lowerer<'_> {
             | Builtin::DirFiles
             | Builtin::DirFile
             | Builtin::DirDir
-            | Builtin::FsComposeDir => Err(InternalError {
+            | Builtin::FsComposeDir
+            | Builtin::DirSandbox
+            | Builtin::SandboxExec
+            | Builtin::SandboxFile
+            | Builtin::SandboxDir => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

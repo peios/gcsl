@@ -143,7 +143,7 @@ pub(super) fn inside(builtin: Builtin, dir: &File, path: &str, node: &IrNode) ->
 /// `path` relative, a leading `/` dropped, and normalised lexically: `.`
 /// and repeated `/` dropped and each `..` taking the segment before it;
 /// `None` if a `..` would leave the root. `""` for the root itself.
-fn relative(path: &str) -> Option<String> {
+pub(super) fn relative(path: &str) -> Option<String> {
     let mut kept: Vec<&str> = Vec::new();
     for segment in path.split('/') {
         match segment {
@@ -245,11 +245,11 @@ impl Evaluator<'_> {
 
 /// What [`Evaluator::compose_dir`] has placed so far, in the directory it
 /// is composing.
-struct Composer {
+pub(super) struct Composer {
     /// The directory.
-    root: PathBuf,
+    pub(super) root: PathBuf,
     /// The paths of what has been placed in it, relative, but directories.
-    placed: HashSet<String>,
+    pub(super) placed: HashSet<String>,
 }
 
 impl Composer {
@@ -286,7 +286,7 @@ impl Composer {
 
     /// Copies the tree at `source` under `at`, its directories merged with
     /// any already there, its symbolic links copied as links.
-    fn tree(&mut self, source: &Path, at: &str) -> Result<(), String> {
+    pub(super) fn tree(&mut self, source: &Path, at: &str) -> Result<(), String> {
         let target = self.root.join(at);
         fs::create_dir_all(&target).map_err(|error| format!("could not create `{at}`: {error}"))?;
         let mut entries: Vec<_> = fs::read_dir(source)

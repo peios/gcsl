@@ -146,6 +146,23 @@ pub enum Builtin {
     /// directory of `entries`, each placed at its key, `fs.compose_dir`.
     /// Impure.
     FsComposeDir,
+    /// `dir_sandbox(d: Dir, options: {cwd: String, env: {*: String}}) ->
+    /// Sandbox`: a sandbox of a copy of `d`, its commands run in `cwd` with
+    /// the environment `env` by default, the prelude's `d.sandbox(...)`.
+    /// Impure: it copies `d`.
+    DirSandbox,
+    /// `sandbox_exec(s: Sandbox, request: {argv, cwd, env, interactive,
+    /// panic, until}) -> {status: Int, stderr: String, stdout: String}`:
+    /// runs a program in `s`, as `exec` does but with `s` as its `/`, the
+    /// prelude's `s.exec(...)`. Impure.
+    SandboxExec,
+    /// `sandbox_file(s: Sandbox, path: String): File`: the file at `path`
+    /// in `s`, absolute in it or relative to its working directory, the
+    /// prelude's `s.file(path)`.
+    SandboxFile,
+    /// `sandbox_dir(s: Sandbox, path: String): Dir`: the directory at
+    /// `path` in `s`, as `sandbox_file`, the prelude's `s.dir(path)`.
+    SandboxDir,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -169,7 +186,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 38] = [
+    pub const ALL: [Builtin; 42] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -208,6 +225,10 @@ impl Builtin {
         Builtin::DirFile,
         Builtin::DirDir,
         Builtin::FsComposeDir,
+        Builtin::DirSandbox,
+        Builtin::SandboxExec,
+        Builtin::SandboxFile,
+        Builtin::SandboxDir,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -274,6 +295,10 @@ impl Builtin {
             Builtin::DirFile => "dir_file",
             Builtin::DirDir => "dir_dir",
             Builtin::FsComposeDir => "fs_compose_dir",
+            Builtin::DirSandbox => "dir_sandbox",
+            Builtin::SandboxExec => "sandbox_exec",
+            Builtin::SandboxFile => "sandbox_file",
+            Builtin::SandboxDir => "sandbox_dir",
         }
     }
 
@@ -321,7 +346,11 @@ impl Builtin {
             | Builtin::Dir
             | Builtin::DirFiles
             | Builtin::DirFile
-            | Builtin::DirDir => None,
+            | Builtin::DirDir
+            | Builtin::DirSandbox
+            | Builtin::SandboxExec
+            | Builtin::SandboxFile
+            | Builtin::SandboxDir => None,
         }
     }
 
@@ -339,6 +368,10 @@ impl Builtin {
                 | Builtin::DirFile
                 | Builtin::DirDir
                 | Builtin::FsComposeDir
+                | Builtin::DirSandbox
+                | Builtin::SandboxExec
+                | Builtin::SandboxFile
+                | Builtin::SandboxDir
         )
     }
 
@@ -353,6 +386,9 @@ impl Builtin {
             Builtin::DirFiles => &["d"],
             Builtin::DirFile | Builtin::DirDir => &["d", "path"],
             Builtin::FsComposeDir => &["entries"],
+            Builtin::DirSandbox => &["d", "options"],
+            Builtin::SandboxExec => &["s", "request"],
+            Builtin::SandboxFile | Builtin::SandboxDir => &["s", "path"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -402,7 +438,9 @@ impl Builtin {
             | Builtin::ExecSecret
             | Builtin::Dir
             | Builtin::DirFiles
-            | Builtin::FsComposeDir => Effect::Impure,
+            | Builtin::FsComposeDir
+            | Builtin::DirSandbox
+            | Builtin::SandboxExec => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -426,7 +464,9 @@ impl Builtin {
             | Builtin::SecretValue
             | Builtin::SecretReveal
             | Builtin::DirFile
-            | Builtin::DirDir => Effect::Pure,
+            | Builtin::DirDir
+            | Builtin::SandboxFile
+            | Builtin::SandboxDir => Effect::Pure,
         }
     }
 
@@ -470,7 +510,11 @@ impl Builtin {
             | Builtin::DirFiles
             | Builtin::DirFile
             | Builtin::DirDir
-            | Builtin::FsComposeDir => Typing::Ordinary,
+            | Builtin::FsComposeDir
+            | Builtin::DirSandbox
+            | Builtin::SandboxExec
+            | Builtin::SandboxFile
+            | Builtin::SandboxDir => Typing::Ordinary,
         }
     }
 
@@ -525,6 +569,16 @@ impl Builtin {
             Builtin::DirFile => "fn(d: Dir, path: String): File",
             Builtin::DirDir => "fn(d: Dir, path: String): Dir",
             Builtin::FsComposeDir => "fn(entries: {*: List<File> | Dir | File}) -> Dir",
+            Builtin::DirSandbox => {
+                "fn(d: Dir, options: {cwd: String, env: {*: String}}) -> Sandbox"
+            }
+            Builtin::SandboxExec => {
+                "fn(s: Sandbox, request: {argv: List<String>, cwd: String, env: {*: String}, \
+                 interactive: Bool, panic: Bool, until: String}) -> {status: Int, stderr: String, \
+                 stdout: String}"
+            }
+            Builtin::SandboxFile => "fn(s: Sandbox, path: String): File",
+            Builtin::SandboxDir => "fn(s: Sandbox, path: String): Dir",
         }
     }
 
@@ -593,6 +647,15 @@ impl Builtin {
             Builtin::DirFiles => ([TyId::DIR, UNUSED], types.list(TyId::FILE)),
             Builtin::DirFile => ([TyId::DIR, TyId::STRING], TyId::FILE),
             Builtin::DirDir => ([TyId::DIR, TyId::STRING], TyId::DIR),
+            Builtin::DirSandbox => {
+                let [cwd, env] = ["cwd", "env"].map(|text| names.intern(text));
+                let environment = types.record_with_rest([], Some(TyId::STRING), Vec::new());
+                let options = types.record([(cwd, TyId::STRING), (env, environment)]);
+                ([TyId::DIR, options], TyId::SANDBOX)
+            }
+            Builtin::SandboxExec => return self.sandbox_exec_ty(types, names),
+            Builtin::SandboxFile => ([TyId::SANDBOX, TyId::STRING], TyId::FILE),
+            Builtin::SandboxDir => ([TyId::SANDBOX, TyId::STRING], TyId::DIR),
             Builtin::FsComposeDir => {
                 let files = types.list(TyId::FILE);
                 let entry = types.union([TyId::DIR, TyId::FILE, files]);
@@ -634,6 +697,35 @@ impl Builtin {
 }
 
 impl Builtin {
+    /// The type of `sandbox_exec`'s value, interned into `types`, its
+    /// parameters' and fields' names into `names`: a sandbox, and a request
+    /// of `exec`'s options and the `argv` to run.
+    fn sandbox_exec_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
+        let result = types.record([
+            (status, TyId::INT),
+            (stdout, TyId::STRING),
+            (stderr, TyId::STRING),
+        ]);
+        let [cwd, env, interactive, panic, until] =
+            Builtin::EXEC_OPTIONS.map(|text| names.intern(text));
+        let environment = types.record_with_rest([], Some(TyId::STRING), Vec::new());
+        let argv = (names.intern("argv"), types.list(TyId::STRING));
+        let request = types.record([
+            argv,
+            (cwd, TyId::STRING),
+            (env, environment),
+            (interactive, TyId::BOOL),
+            (panic, TyId::BOOL),
+            (until, TyId::STRING),
+        ]);
+        let params = [
+            (Some(names.intern("s")), TyId::SANDBOX),
+            (Some(names.intern("request")), request),
+        ];
+        types.fn_type(params, result, self.effect())
+    }
+
     /// The type of a generic built-in's value, interned into `types`, its
     /// type parameters' and parameters' names into `names` (see
     /// [Generics](crate::check::methods#generics)): `variant_matches` and `variant_payload` of
@@ -721,5 +813,6 @@ pub(super) fn builtin_types(names: &Names) -> BuiltinTypes {
         (names.lookup("Size"), TyId::SIZE),
         (names.lookup("File"), TyId::FILE),
         (names.lookup("Dir"), TyId::DIR),
+        (names.lookup("Sandbox"), TyId::SANDBOX),
     ]
 }

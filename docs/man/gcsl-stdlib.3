@@ -153,6 +153,20 @@ Return every entry of d's tree that is no directory, symbolic links included and
 .B Dir.exec(...words: String, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
 Run words[0] with words[1..] in d, as exec does with cwd d.path.
 .TP
+.B Dir.sandbox(cwd: String = \(dq/\(dq, env: {*: String} = {}) -> Sandbox
+Copy d's tree into a new directory of the run and return a sandbox of it, its commands run in cwd, made if missing, with the environment env by default.
+.TP
+.B Sandbox.exec(...words: String, cwd, env, interactive, panic, until) -> {status: Int, stdout: String, stderr: String}
+Run words[0] with words[1..] as exec does, under bwrap, with the sandbox's copy bound as /, a /proc, a /dev and a /tmp of its own, in new user and pid namespaces, killed with bwrap.
+Its working directory is cwd, absolute in the sandbox or relative to its own, or the sandbox's for the empty string.
+Its environment is exactly the sandbox's, with env set over it; words[0] is found through that environment's PATH, or the default /bin:/usr/bin.
+The network is not shut off.
+Without bwrap on PATH, the call is the runtime error "a sandbox needs bubblewrap (`bwrap`), which is not installed".
+.TP
+.B Sandbox.file(path: String): File, Sandbox.dir(path: String): Dir
+Return the file or directory at path in the sandbox, absolute in it or relative to its working directory; a path that would leave it is a runtime error.
+Their paths are the host's paths of the copy, and they show what its commands have left so far.
+.TP
 .B panic(message: String): Never
 Stop evaluation with a runtime diagnostic containing message.
 No result is returned.

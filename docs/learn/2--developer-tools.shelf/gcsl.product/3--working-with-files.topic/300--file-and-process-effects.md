@@ -200,4 +200,42 @@ a command that writes in the new directory changes none of the originals.
 Copying a large tree, such as a toolchain, takes time and space; a build
 tool such as pekit mounts the trees instead.
 
+## Sandboxes
+
+An upstream build, such as `./configure && make`, expects its tools at the
+usual places: `/bin/sh`, `/usr/bin/make`, a compiler in a fixed directory.
+A sandbox runs commands with a directory you compose as their `/`, so those
+paths are the ones you put there. `d.sandbox(cwd, env)` makes one from a
+directory, with a working directory and an environment for its commands:
+
+```gcsl
+import fs
+import path
+let root = fs.temp_dir()
+fs.mkdir(path.join(root, "work/src"))
+fs.write(path.join(root, "work/src/config.txt"), "debug = false")
+let box = dir(root).sandbox(cwd = "/work/src", env = {MODE = "release"})
+config = box.file("config.txt").read()
+```
+
+`box.exec(...words)` runs a command in it, as `exec` does: `/` is the
+sandbox's directory, the working directory is the sandbox's unless you
+pass `cwd`, and the environment is exactly the sandbox's with the call's
+`env` set over it, nothing of GCSL's. So a sandbox made with `env = {CC =
+"/opt/cc/bin/cc"}` gives every command the compiler that you composed into
+`/opt/cc`, never the machine's own. The program is found through that
+environment's `PATH`, or `/bin` and `/usr/bin` without one.
+
+A sandbox is live: what one command writes is there for the next, and
+`box.file(path)` and `box.dir(path)` read results out, by a path that's
+absolute in the sandbox or relative to its working directory. A sandbox is
+a copy of its directory, so each sandbox of one directory is its own, and
+none changes the directory. Its commands don't reach the network any less
+than other commands do; a build tool decides that for the steps it
+isolates.
+
+Sandboxes need bubblewrap, `bwrap`. Without it, a sandbox is an error
+rather than a command run against your machine's own `/`, which would find
+the wrong tools.
+
 Consult `gcsl-stdlib(3)` for exact function contracts and error behavior.

@@ -20,6 +20,13 @@
 //! `d.files()` and `d.exec(...words)`; the `fs` module composes one,
 //! `fs.compose_dir(entries)`.
 //!
+//! `Sandbox` ([`TyId::SANDBOX`]) is the type of a sandbox, a live copy of
+//! a directory that commands run in as their `/` (see
+//! [Sandboxes](crate::eval::sandbox#sandboxes)): nominal, of no fields,
+//! equal only to itself, and with no source form, so `show` refuses one.
+//! `d.sandbox(cwd, env)` makes one; `s.exec(...words)`, `s.file(path)`
+//! and `s.dir(path)` are its methods.
+//!
 //! **Its field.** `f.path`, a file's or a directory's one field, is its
 //! path, a `String`,
 //! recorded for lowering ([`Resolution::file_path`](super::Resolution::file_path))

@@ -36,7 +36,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
     assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
     assert_eq!(scan.order[0], 0);
     // The built-in functions' cells are the first.
-    let builtins: Vec<Option<Builtin>> = (0..39).map(|node| scan.builtin(node)).collect();
+    let builtins: Vec<Option<Builtin>> = (0..43).map(|node| scan.builtin(node)).collect();
     assert_eq!(
         builtins,
         [
@@ -78,6 +78,10 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
             Some(Builtin::DirFile),
             Some(Builtin::DirDir),
             Some(Builtin::FsComposeDir),
+            Some(Builtin::DirSandbox),
+            Some(Builtin::SandboxExec),
+            Some(Builtin::SandboxFile),
+            Some(Builtin::SandboxDir),
             None
         ]
     );

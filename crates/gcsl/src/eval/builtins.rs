@@ -126,6 +126,7 @@ pub(super) const fn described(value: &Value) -> &'static str {
         Value::Secret(_) => "a secret",
         Value::File(_) => "a file",
         Value::Dir(_) => "a directory",
+        Value::Sandbox(_) => "a sandbox",
         Value::Future(_) => "a future",
     }
 }

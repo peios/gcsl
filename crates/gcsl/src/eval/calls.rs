@@ -314,6 +314,7 @@ use super::{
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
 use super::files::{dir_files, inside, make_file, read_file};
+use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
 
@@ -398,6 +399,27 @@ impl Evaluator<'_> {
                 inside(builtin, &dir, &path, node)
             }
             (Builtin::FsComposeDir, entries, None) => self.compose_dir(&entries, node),
+            (Builtin::DirSandbox, Value::Dir(dir), Some(options)) => {
+                self.make_sandbox(&dir, &options, node)
+            }
+            (Builtin::SandboxExec, Value::Sandbox(sandbox), Some(request)) => {
+                let deadline = self.shared.earliest.get();
+                let found = sandbox_exec(
+                    &sandbox,
+                    &request,
+                    (self.shared.exec_result, deadline),
+                    node,
+                )?;
+                match found {
+                    Some(value) => Ok(value),
+                    None => self.timed_out(node),
+                }
+            }
+            (
+                Builtin::SandboxFile | Builtin::SandboxDir,
+                Value::Sandbox(sandbox),
+                Some(Value::Str(path)),
+            ) => sandbox_entry(builtin, &sandbox, &path, node),
             _ => mistyped(
                 node,
                 "a built-in of files called with arguments of other kinds",

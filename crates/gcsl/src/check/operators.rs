@@ -395,6 +395,7 @@ impl Checker<'_> {
                 ty == TyId::BOOL
                     || ty == TyId::FILE
                     || ty == TyId::DIR
+                    || ty == TyId::SANDBOX
                     || self.types.is_record(ty)
                     || self.types.list_element(ty).is_some()
                     || self.types.fn_sig(ty).is_some()
@@ -497,6 +498,7 @@ impl Checker<'_> {
                 || lhs_ty == TyId::STRING
                 || lhs_ty == TyId::FILE
                 || lhs_ty == TyId::DIR
+                || lhs_ty == TyId::SANDBOX
                 || is_quantity(lhs_ty)
                 || self.types.is_record(lhs_ty)
                 || self.types.list_element(lhs_ty).is_some()
