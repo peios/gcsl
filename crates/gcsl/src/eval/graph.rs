@@ -266,6 +266,15 @@ impl Graph {
         self.nodes.is_empty()
     }
 
+    /// Every node, with its id, in the order they were made: for each unit,
+    /// the order its code met them, which is the same in every evaluation
+    /// whatever order its steps finish in.
+    pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &Node)> {
+        (0u32..)
+            .zip(&self.nodes)
+            .map(|(number, node)| (NodeId(number), node))
+    }
+
     /// The node `id`, if the graph has it.
     #[must_use]
     pub fn node(&self, id: NodeId) -> Option<&Node> {

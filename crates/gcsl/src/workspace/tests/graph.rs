@@ -665,3 +665,21 @@ fn a_step_s_failure_is_in_the_file_of_the_code_that_raised_it() {
     let at = &text[error.span.start as usize..error.span.end as usize];
     assert_eq!(at, "panic(\"boom in lib\")");
 }
+
+#[test]
+fn a_graph_s_nodes_are_listed_in_the_order_they_were_made() {
+    let (mut workspace, file) = lone_workspace("= [link([compile(\"b\")]), compile(\"a\")]");
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    let listed: Vec<(u32, NodeKind)> = graph
+        .nodes()
+        .map(|(id, node)| (id.number(), node.kind()))
+        .collect();
+    assert_eq!(listed.len(), graph.len());
+    assert!(
+        listed
+            .iter()
+            .enumerate()
+            .all(|(at, (number, _))| *number as usize == at)
+    );
+}
