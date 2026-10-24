@@ -295,7 +295,6 @@
 //!   directory, is "`fs.write` could not write `/a/b`: REASON", and leaves no
 //!   temporary file behind.
 
-use std::cmp::Ordering;
 use std::rc::Rc;
 
 use crate::{CALL_LEVELS, MAX_DEPTH};
@@ -313,6 +312,7 @@ use super::{
 };
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
+use super::elements::element_builtin;
 use super::files::{dir_files, inside, make_file, read_file};
 use super::sandbox::{sandbox_entry, sandbox_exec};
 use super::system::{exec, file_system, write_file};
@@ -613,12 +613,9 @@ impl Evaluator<'_> {
             (Builtin::Fields, Some((Value::Str(s), _)), None) => {
                 Ok(string_list(s.split_whitespace()))
             }
+            // `Ordering` is -1, 0 and 1 as an `i8`.
             (Builtin::CompareVersions, Some((Value::Str(a), _)), Some(Value::Str(b))) => {
-                Ok(Value::Int(match compare_versions(&a, &b) {
-                    Ordering::Less => -1,
-                    Ordering::Equal => 0,
-                    Ordering::Greater => 1,
-                }))
+                Ok(Value::Int(i64::from(compare_versions(&a, &b) as i8)))
             }
             (Builtin::SortVersions, Some((Value::List(versions), _)), None) => {
                 sort_versions(&versions, node)
@@ -627,6 +624,9 @@ impl Evaluator<'_> {
                 write_file(&p, &contents, node)
             }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
+            (_, Some((first, _)), second) if builtin.is_of_elements() => {
+                element_builtin(builtin, &first, second.as_ref(), node)
+            }
             (_, Some((first, _)), second) if builtin.is_of_files() => {
                 self.file_builtin(builtin, first, second, node)
             }

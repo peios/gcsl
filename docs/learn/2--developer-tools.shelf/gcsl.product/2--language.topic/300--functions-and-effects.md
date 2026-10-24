@@ -146,6 +146,35 @@ other files of its directory and the directories below it, and to every
 file that imports its module, whatever the form of the import. In the
 REPL, methods are visible to later lines.
 
+### Methods of strings and lists
+
+The standard functions on strings and lists are also methods, so an
+editor offers them after a `.`:
+
+```gcsl
+words = "a b  c".fields()
+padded = " name ".trim()
+has_space = "hello world".contains(" ")
+csv = ["a", "b"].join(",")
+distinct = [3, 1, 3, 2].unique()
+count = [1, 2, 3].len()
+found = [1, 2, 3].contains(2)
+```
+
+Strings have `split`, `starts_with`, `ends_with`, `trim`, `strip_prefix`,
+`strip_suffix`, `lines`, `fields`, `contains` and `compare_version`.
+Lists of strings have `join` and `sort_versions`, and every list has
+`len`, `unique` and `contains`. `unique` keeps the first of each group of
+equal elements, in order, and `contains` tells whether any element equals
+the value given. Both compare as `===` does: whole values, with every
+field a record has, and secrets by identity. They can't compare functions
+or unawaited `lazy` values, so a list whose elements hold either makes
+them fail.
+
+A method you declare takes the place of a standard one that would apply
+to the same receiver, as your own names take the place of the
+prelude's.
+
 ## Calling for effects
 
 A call to an impure or memoized function can stand alone as a statement,

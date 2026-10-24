@@ -1988,7 +1988,8 @@ mod tests {
             .into_iter()
             .map(|completion| completion.label)
             .collect();
-        assert_eq!(labels, ["first_or"]);
+        // The prelude's methods of every list apply too.
+        assert_eq!(labels, ["contains", "first_or", "len", "unique"]);
     }
 
     #[test]

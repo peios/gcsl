@@ -1353,6 +1353,7 @@ fn mistyped<T>(node: &IrNode, message: &'static str) -> Flow<T> {
 }
 
 pub(crate) mod builtins;
+pub(crate) mod elements;
 pub(crate) mod files;
 pub(crate) mod kinds;
 pub(crate) mod memo;

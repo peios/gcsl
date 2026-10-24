@@ -755,3 +755,106 @@ fn the_more_string_builtins_are_values_of_their_types() {
         runs_to(text, expected);
     }
 }
+
+#[test]
+fn the_prelude_s_functions_are_methods_of_what_they_take_first() {
+    for (text, expected) in [
+        ("= \"a,b,c\".split(\",\")", "[\"a\", \"b\", \"c\"]"),
+        ("= \"lib.rs\".starts_with(\"lib\")", "true"),
+        ("= \"lib.rs\".ends_with(\".gz\")", "false"),
+        ("= \" x \".trim()", "x"),
+        ("= \"v1.2\".strip_prefix(\"v\")", "1.2"),
+        ("= \"a.tar\".strip_suffix(\".tar\")", "a"),
+        ("= \"a\\nb\".lines()", "[\"a\", \"b\"]"),
+        ("= \"a  b\".fields()", "[\"a\", \"b\"]"),
+        ("= \"6.10\".compare_version(\"6.6\")", "1"),
+        ("= [\"a\", \"b\"].join(\"-\")", "a-b"),
+        (
+            "= [\"1.10\", \"1.9\"].sort_versions()",
+            "[\"1.9\", \"1.10\"]",
+        ),
+        ("= [1, 2, 3].len()", "3"),
+        // Only methods: whether a string holds another.
+        ("= \"hello world\".contains(\"o w\")", "true"),
+        ("= \"hello\".contains(\"\")", "true"),
+        ("= \"hello\".contains(\"z\")", "false"),
+    ] {
+        assert_eq!(lone(text).unwrap(), expected, "{text}");
+    }
+    // Each fails at its call.
+    let text = "x = \"a\".split(\"\")";
+    let error = crate::workspace::tests::shell::lone_error(text);
+    assert_eq!(error.message, "`split` needs a separator that is not empty");
+    assert_eq!(error.span, Span::new(4, 17));
+}
+
+#[test]
+fn unique_and_contains_compare_a_list_s_elements() {
+    for (text, expected) in [
+        ("= [3, 1, 3, 2, 1].unique()", "[3, 1, 2]"),
+        ("= [\"b\", \"a\", \"b\"].unique()", "[\"b\", \"a\"]"),
+        // Records by their fields, whatever their order.
+        (
+            "= [{n = 1; m = 2}, {m = 2; n = 1}, {n = 2; m = 2}].unique()",
+            "[{n = 1; m = 2}, {n = 2; m = 2}]",
+        ),
+        ("= [[1], [1], [2]].unique()", "[[1], [2]]"),
+        ("let none: List<Int> = []\n= none.unique()", "[]"),
+        ("= [1, 2].contains(2)", "true"),
+        ("= [{n = 1}].contains({n = 2})", "false"),
+        // Secrets by identity, which tells nothing of a value: a plain answer.
+        (
+            "let a = secret(\"x\", \"id\")\n= [a, secret(\"y\", \"id\"), secret(\"x\", \"other\")].unique().len()",
+            "2",
+        ),
+        (
+            "= [secret(\"x\", \"id\")].contains(secret(\"y\", \"id\"))",
+            "true",
+        ),
+    ] {
+        assert_eq!(lone(text).unwrap(), expected, "{text}");
+    }
+    // A function or a future has no equality, found as it is met.
+    let text = "x = [fn(): Int { 1 }].unique()";
+    let error = crate::workspace::tests::shell::lone_error(text);
+    assert_eq!(
+        error.message,
+        "cannot compare functions: `unique` compares the elements of its list"
+    );
+    assert_eq!(error.span, Span::new(4, 30));
+    assert_eq!(
+        crate::workspace::tests::shell::lone_error(
+            "x = [{f = fn(): Int { 1 }}].contains({f = fn(): Int { 2 }})"
+        )
+        .message,
+        "cannot compare functions: `contains` compares the elements of its list"
+    );
+    assert_eq!(
+        crate::workspace::tests::shell::lone_error("let a = lazy { 1 }\nx = [a, a].unique()")
+            .message,
+        "cannot compare futures: `unique` compares the elements of its list"
+    );
+}
+
+#[test]
+fn a_method_of_a_file_s_own_shadows_the_prelude_s() {
+    // One of the same receiver type, and one of a narrower type, which
+    // applies to fewer receivers.
+    assert_eq!(
+        lone("fn (s: String) trim(): String { \"mine\" }\n= \" a \".trim()").unwrap(),
+        "mine"
+    );
+    assert_eq!(
+        lone("fn (xs: List<Int>) len(): Int { 99 }\n= [[1].len(), [\"a\"].len()]").unwrap(),
+        "[99, 1]"
+    );
+    // In a workspace, a `def` method of another file the file sees too.
+    let files = [
+        (
+            "workspace.gcsl",
+            "def (s: String) trim(): String { \"root's\" }",
+        ),
+        ("app/main.gcsl", "x = \" a \".trim()"),
+    ];
+    assert_eq!(value(&files, "app/main.gcsl"), "{x = \"root's\"}");
+}

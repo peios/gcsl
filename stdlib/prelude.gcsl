@@ -316,3 +316,47 @@ def (files: List<File>) file(name: String): File {
     }
     found[0]
 }
+
+# Methods: the functions above, and three that are methods only, as methods
+# of the value each takes first, so that an editor offers them after a `.`:
+# `s.split(sep)`, `s.starts_with(prefix)`, `s.ends_with(suffix)`, `s.trim()`,
+# `s.strip_prefix(prefix)`, `s.strip_suffix(suffix)`, `s.lines()`,
+# `s.fields()`, `s.contains(part)`, whether `part` is in `s`, and
+# `a.compare_version(b)`, of strings; `parts.join(sep)` and
+# `vs.sort_versions()`, of lists of strings; and `xs.len()`, `xs.unique()`,
+# `xs` without the elements that equal an earlier one, in order, and
+# `xs.contains(x)`, whether an element equals `x`, of any list. `unique` and
+# `contains` compare elements as `===` does, and an element holding a function
+# or a future, which have no equality, fails them. A method of a file's own, or of another
+# file it sees, of a receiver type one of these applies to, is called in its
+# place. Each fails at its call: they are `#[track_caller]`.
+#[track_caller]
+def (s: String) split(sep: String): List<String> { builtins.split(s, sep) }
+#[track_caller]
+def (s: String) starts_with(prefix: String): Bool { builtins.starts_with(s, prefix) }
+#[track_caller]
+def (s: String) ends_with(suffix: String): Bool { builtins.ends_with(s, suffix) }
+#[track_caller]
+def (s: String) trim(): String { builtins.trim(s) }
+#[track_caller]
+def (s: String) strip_prefix(prefix: String): String { builtins.strip_prefix(s, prefix) }
+#[track_caller]
+def (s: String) strip_suffix(suffix: String): String { builtins.strip_suffix(s, suffix) }
+#[track_caller]
+def (s: String) lines(): List<String> { builtins.lines(s) }
+#[track_caller]
+def (s: String) fields(): List<String> { builtins.fields(s) }
+#[track_caller]
+def (s: String) contains(part: String): Bool { builtins.contains(s, part) }
+#[track_caller]
+def (a: String) compare_version(b: String): Int { builtins.compare_versions(a, b) }
+#[track_caller]
+def (parts: List<String>) join(sep: String): String { builtins.join(parts, sep) }
+#[track_caller]
+def (vs: List<String>) sort_versions(): List<String> { builtins.sort_versions(vs) }
+#[track_caller]
+def (xs: List<T>) len<T>(): Int { len(xs) }
+#[track_caller]
+def (xs: List<T>) unique<T>(): List<T> { builtins.list_unique(xs) }
+#[track_caller]
+def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }

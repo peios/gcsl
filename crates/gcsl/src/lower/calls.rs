@@ -82,7 +82,10 @@ impl Lowerer<'_> {
             | Builtin::DirSandbox
             | Builtin::SandboxExec
             | Builtin::SandboxFile
-            | Builtin::SandboxDir => Err(InternalError {
+            | Builtin::SandboxDir
+            | Builtin::Contains
+            | Builtin::ListUnique
+            | Builtin::ListContains => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

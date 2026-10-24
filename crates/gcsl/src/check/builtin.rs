@@ -163,6 +163,18 @@ pub enum Builtin {
     /// `sandbox_dir(s: Sandbox, path: String): Dir`: the directory at
     /// `path` in `s`, as `sandbox_file`, the prelude's `s.dir(path)`.
     SandboxDir,
+    /// `contains(s: String, part: String): Bool`: whether `part` is in `s`,
+    /// byte-wise, the prelude's `s.contains(part)`.
+    Contains,
+    /// `list_unique<T>(xs: List<T>): List<T>`: `xs` with each element but
+    /// the first of those equal to it, by total equality, left out, in
+    /// order, the prelude's `xs.unique()`; an element holding a function or
+    /// a future is a runtime error.
+    ListUnique,
+    /// `list_contains<T>(xs: List<T>, x: T): Bool`: whether an element of
+    /// `xs` equals `x`, by total equality, the prelude's `xs.contains(x)`;
+    /// one holding a function or a future is a runtime error.
+    ListContains,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -186,7 +198,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 42] = [
+    pub const ALL: [Builtin; 45] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -229,6 +241,9 @@ impl Builtin {
         Builtin::SandboxExec,
         Builtin::SandboxFile,
         Builtin::SandboxDir,
+        Builtin::Contains,
+        Builtin::ListUnique,
+        Builtin::ListContains,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -299,6 +314,9 @@ impl Builtin {
             Builtin::SandboxExec => "sandbox_exec",
             Builtin::SandboxFile => "sandbox_file",
             Builtin::SandboxDir => "sandbox_dir",
+            Builtin::Contains => "contains",
+            Builtin::ListUnique => "list_unique",
+            Builtin::ListContains => "list_contains",
         }
     }
 
@@ -350,7 +368,10 @@ impl Builtin {
             | Builtin::DirSandbox
             | Builtin::SandboxExec
             | Builtin::SandboxFile
-            | Builtin::SandboxDir => None,
+            | Builtin::SandboxDir
+            | Builtin::Contains
+            | Builtin::ListUnique
+            | Builtin::ListContains => None,
         }
     }
 
@@ -375,6 +396,16 @@ impl Builtin {
         )
     }
 
+    /// Whether it is one of the built-ins that compare a string's bytes or a
+    /// list's elements: `contains`, `list_unique` and `list_contains`.
+    #[must_use]
+    pub const fn is_of_elements(self) -> bool {
+        matches!(
+            self,
+            Builtin::Contains | Builtin::ListUnique | Builtin::ListContains
+        )
+    }
+
     /// The names of its parameters, in order, which named arguments match.
     /// None has more than [`Builtin::MAX_PARAMS`].
     #[must_use]
@@ -389,6 +420,9 @@ impl Builtin {
             Builtin::DirSandbox => &["d", "options"],
             Builtin::SandboxExec => &["s", "request"],
             Builtin::SandboxFile | Builtin::SandboxDir => &["s", "path"],
+            Builtin::Contains => &["s", "part"],
+            Builtin::ListUnique => &["xs"],
+            Builtin::ListContains => &["xs", "x"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -466,7 +500,10 @@ impl Builtin {
             | Builtin::DirFile
             | Builtin::DirDir
             | Builtin::SandboxFile
-            | Builtin::SandboxDir => Effect::Pure,
+            | Builtin::SandboxDir
+            | Builtin::Contains
+            | Builtin::ListUnique
+            | Builtin::ListContains => Effect::Pure,
         }
     }
 
@@ -514,7 +551,10 @@ impl Builtin {
             | Builtin::DirSandbox
             | Builtin::SandboxExec
             | Builtin::SandboxFile
-            | Builtin::SandboxDir => Typing::Ordinary,
+            | Builtin::SandboxDir
+            | Builtin::Contains
+            | Builtin::ListUnique
+            | Builtin::ListContains => Typing::Ordinary,
         }
     }
 
@@ -579,6 +619,9 @@ impl Builtin {
             }
             Builtin::SandboxFile => "fn(s: Sandbox, path: String): File",
             Builtin::SandboxDir => "fn(s: Sandbox, path: String): Dir",
+            Builtin::Contains => "fn(s: String, part: String): Bool",
+            Builtin::ListUnique => "fn<T>(xs: List<T>): List<T>",
+            Builtin::ListContains => "fn<T>(xs: List<T>, x: T): Bool",
         }
     }
 
@@ -639,7 +682,9 @@ impl Builtin {
             Builtin::Panic => ([TyId::STRING, UNUSED], types.never()),
             Builtin::Split => ([TyId::STRING, TyId::STRING], types.list(TyId::STRING)),
             Builtin::Join => ([types.list(TyId::STRING), TyId::STRING], TyId::STRING),
-            Builtin::StartsWith | Builtin::EndsWith => ([TyId::STRING, TyId::STRING], TyId::BOOL),
+            Builtin::StartsWith | Builtin::EndsWith | Builtin::Contains => {
+                ([TyId::STRING, TyId::STRING], TyId::BOOL)
+            }
             Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
             Builtin::File => ([TyId::STRING, UNUSED], TyId::FILE),
             Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
@@ -656,12 +701,7 @@ impl Builtin {
             Builtin::SandboxExec => return self.sandbox_exec_ty(types, names),
             Builtin::SandboxFile => ([TyId::SANDBOX, TyId::STRING], TyId::FILE),
             Builtin::SandboxDir => ([TyId::SANDBOX, TyId::STRING], TyId::DIR),
-            Builtin::FsComposeDir => {
-                let files = types.list(TyId::FILE);
-                let entry = types.union([TyId::DIR, TyId::FILE, files]);
-                let entries = types.record_with_rest([], Some(entry), Vec::new());
-                ([entries, UNUSED], TyId::DIR)
-            }
+            Builtin::FsComposeDir => ([compose_entries(types), UNUSED], TyId::DIR),
             Builtin::StripPrefix | Builtin::StripSuffix => {
                 ([TyId::STRING, TyId::STRING], TyId::STRING)
             }
@@ -683,7 +723,9 @@ impl Builtin {
             | Builtin::PartialMatches
             | Builtin::Secret
             | Builtin::SecretValue
-            | Builtin::SecretReveal => {
+            | Builtin::SecretReveal
+            | Builtin::ListUnique
+            | Builtin::ListContains => {
                 return self.generic_ty(types, names);
             }
         };
@@ -739,6 +781,9 @@ impl Builtin {
         ) {
             return self.secret_ty(types, names);
         }
+        if matches!(self, Builtin::ListUnique | Builtin::ListContains) {
+            return self.list_ty(types, names);
+        }
         let partial = self == Builtin::PartialMatches;
         let parameters: &[&str] = if partial { &["T"] } else { &["E", "T"] };
         let generic = types.new_generic(parameters.iter().map(|text| names.intern(text)).collect());
@@ -773,6 +818,22 @@ impl Builtin {
 }
 
 impl Builtin {
+    /// The type of `list_unique` or `list_contains`, as
+    /// [`Builtin::generic_ty`] makes it: of a list of `T`.
+    pub(super) fn list_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        let generic = types.new_generic(Box::new([names.intern("T")]));
+        let element = types.param(generic, 0);
+        let list = types.list(element);
+        let xs = Some(names.intern("xs"));
+        let ty = if self == Builtin::ListUnique {
+            types.fn_type([(xs, list)], list, Effect::Pure)
+        } else {
+            let x = Some(names.intern("x"));
+            types.fn_type([(xs, list), (x, element)], TyId::BOOL, Effect::Pure)
+        };
+        types.generic_fn(ty, generic)
+    }
+
     /// The type of `secret`, `secret_value` or `secret_reveal`, as
     /// [`Builtin::generic_ty`]
     /// makes it (see [Secrets](crate::check::secrets#secrets)).
@@ -800,6 +861,14 @@ impl Builtin {
         };
         types.generic_fn(ty, generic)
     }
+}
+
+/// The type of `fs_compose_dir`'s parameter, interned into `types`: a record
+/// of any fields, each a directory, a file or a list of files.
+fn compose_entries(types: &mut TypeTable) -> TyId {
+    let files = types.list(TyId::FILE);
+    let entry = types.union([TyId::DIR, TyId::FILE, files]);
+    types.record_with_rest([], Some(entry), Vec::new())
 }
 
 /// The [`BuiltinTypes`] of a program whose names are `names`.

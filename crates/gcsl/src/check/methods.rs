@@ -70,6 +70,8 @@
 //!   methods;
 //! - a receiver type with neither is "no method `m` for type T", noting
 //!   the receiver types of the visible methods of the name;
+//! - a method of the standard library is set aside if any other applies,
+//!   which shadows it as a declaration shadows a prelude's name, silently;
 //! - of the methods that apply, the one whose receiver type fits every
 //!   other's is called (`Checker::most_specific`): `List<Int>`'s over
 //!   `List<T>`'s for a `List<Int>`; none such is "method `m` is ambiguous
@@ -374,6 +376,18 @@ impl Checker<'_> {
         (found, name): (TyId, Name),
         applicable: &[MethodCandidate],
     ) -> Option<MethodCandidate> {
+        // A method of the standard library is shadowed by any other that
+        // applies, as a prelude's name is by a declaration of its own.
+        let standard = |candidate: &MethodCandidate| {
+            matches!(candidate.declared, Some((Some(file), _))
+                if self.workspace.is_some_and(|workspace| workspace.is_standard(file)))
+        };
+        let own: Vec<MethodCandidate> = applicable
+            .iter()
+            .filter(|candidate| !standard(candidate))
+            .copied()
+            .collect();
+        let applicable = if own.is_empty() { applicable } else { &own[..] };
         let mut winners = Vec::new();
         for (index, candidate) in applicable.iter().enumerate() {
             let receiver = self.receiver_of(candidate.ty);

@@ -78,6 +78,18 @@ No epoch, revision, or filename-suffix processing is applied.
 .TP
 .B sort_versions(vs: List<String>): List<String>
 Return a stable ascending sort in compare_versions order, retaining duplicates.
+.TP
+.B Methods of String: split, starts_with, ends_with, trim, strip_prefix, strip_suffix, lines, fields, contains(part: String): Bool, compare_version(b: String): Int
+Each does what the function of its name does, its receiver the function's first argument; contains tests whether part occurs in the string, comparing bytes, and compare_version is compare_versions.
+.TP
+.B Methods of List<String>: join(sep: String): String, sort_versions(): List<String>
+.TP
+.B Methods of List<T>: len(): Int, unique(): List<T>, contains(x: T): Bool
+unique keeps the first of each group of equal elements, wherever they are, in order; contains tests whether an element equals x.
+Both use total equality, as === does: every field of a record, and secrets by identity.
+An element, or x, that holds a function or a future is a runtime error.
+.PP
+A method a file declares, or sees from another file, takes the place of one of these that applies to the same receiver.
 .SH PROCESS FUNCTIONS
 .TP
 .B exec(argv: List<String>, cwd: String = \(dq\(dq, env: {*: String} = {}, interactive: Bool = false, panic: Bool = true, until: String = \(dq\(dq) -> {status: Int, stdout: String, stderr: String}

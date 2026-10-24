@@ -118,6 +118,11 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// Whether the file numbered `file` is one of the standard library's.
+    pub(crate) fn is_standard(&self, file: u32) -> bool {
+        file < self.scan.standard
+    }
+
     /// The methods named `name` of other files that the file sees, whose
     /// files are checked, each by its position among those of the name the
     /// file sees, which [`Context::method`] reads by (see
