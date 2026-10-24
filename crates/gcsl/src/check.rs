@@ -1553,9 +1553,9 @@ pub(crate) fn check_variant_payloads(
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
-pub(crate) const BUILTIN_TYPE_NAMES: [&str; 13] = [
-    "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present", "Variant",
-    "Partial", "Secret", "Revealed",
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 14] = [
+    "Int", "Float", "Bool", "String", "Duration", "Size", "File", "List", "Future", "Present",
+    "Variant", "Partial", "Secret", "Revealed",
 ];
 
 /// The name of the checker's attribute that retries a call.
@@ -1664,7 +1664,7 @@ pub(crate) const BUILTIN_ATTRIBUTES: [&str; 7] = [
 
 /// The type names every program can use, as `(name, type)` pairs. A name
 /// the program never mentions has no [`Name`].
-type BuiltinTypes = [(Option<Name>, TyId); 6];
+type BuiltinTypes = [(Option<Name>, TyId); 7];
 
 /// A check in progress. See the module documentation.
 pub struct Checker<'a> {
@@ -2763,6 +2763,7 @@ impl<'a> Checker<'a> {
             | TyKind::Bool
             | TyKind::String
             | TyKind::Quantity(_)
+            | TyKind::File
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -3136,6 +3137,7 @@ pub(crate) mod enums;
 pub(crate) mod expect;
 pub(crate) mod failure;
 pub(crate) mod fields;
+pub(crate) mod files;
 pub(crate) mod functions;
 pub(crate) mod futures;
 pub(crate) mod imports;

@@ -1183,6 +1183,9 @@ pub enum IrKind {
         /// Its value.
         value: IrId,
     },
+    /// `f.path`: the path of the file the node, of any kind, is (see
+    /// [`crate::eval`], "Files"). Of kind [`ValueKind::String`].
+    FilePath(IrId),
     /// `fileroot.caller`: yields the text of the running frame's caller, the
     /// directory of the file whose code made the call the frame runs for,
     /// and records it as a dependency of the memoised calls it can affect
@@ -1344,6 +1347,7 @@ impl IrKind {
             | IrKind::SecretValue { value: child, .. }
             | IrKind::SecretWrap(child, _)
             | IrKind::ContextRead { default: child, .. }
+            | IrKind::FilePath(child)
             | IrKind::Meta(child) => (None, [Some(child), None, None]),
             IrKind::Break { value, .. }
             | IrKind::Continue { value, .. }
@@ -1456,7 +1460,8 @@ impl IrKind {
             | IrKind::StrConcat(_)
             | IrKind::Interp(_)
             | IrKind::Show(_)
-            | IrKind::Caller => KindStep::Own(ValueKind::String),
+            | IrKind::Caller
+            | IrKind::FilePath(_) => KindStep::Own(ValueKind::String),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -1592,6 +1597,7 @@ impl IrKind {
             | IrKind::Catch { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::FilePath(_)
             | IrKind::Meta(_) => None,
         }
     }
@@ -1691,6 +1697,7 @@ impl IrKind {
             IrKind::With { .. } => "with",
             IrKind::ContextBind { .. } => "context-bind",
             IrKind::Caller => "caller",
+            IrKind::FilePath(_) => "file-path",
             IrKind::Helper => "helper",
             IrKind::MakeFuture { .. } => "make-future",
             IrKind::Await { .. } => "await",
@@ -1798,6 +1805,7 @@ impl IrNode {
             | IrKind::Await { .. }
             | IrKind::Is { .. }
             | IrKind::As { .. }
+            | IrKind::FilePath(_)
             | IrKind::Meta(_) => return None,
         };
         Some(crate::ast::symbol_span(symbol, start))

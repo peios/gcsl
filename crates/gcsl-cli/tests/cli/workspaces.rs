@@ -140,7 +140,7 @@ fn dumps_in_a_workspace_are_the_files_alone() {
     assert!(!stdout(&output).contains("version"));
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load lib#59 @49..58)"), "{ir}");
+    assert!(ir.contains("(load lib#62 @49..58)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
 }
@@ -232,7 +232,7 @@ fn dumps_of_an_importing_file() {
     );
     let output = gcsl(&["run", path, "--dump-ir"]);
     let ir = stdout(&output);
-    assert!(ir.contains("(load build#66 @144..151)"), "{ir}");
+    assert!(ir.contains("(load build#69 @144..151)"), "{ir}");
     assert!(!ir.contains("store version"), "{ir}");
     assert!(!ir.contains("store name"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -348,10 +348,10 @@ fn run_has_the_standard_library_alone_and_in_a_workspace() {
     let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-ir"]);
     let ir = stdout(&output);
     assert!(
-        ir.contains("  (store n#53 @87..98\n    (list-len @91..98\n      (load xs#52 @95..97)))\n"),
+        ir.contains("  (store n#56 @87..98\n    (list-len @91..98\n      (load xs#55 @95..97)))\n"),
         "{ir}"
     );
-    assert!(ir.contains("(load half#57 @103..107)"), "{ir}");
+    assert!(ir.contains("(load half#60 @103..107)"), "{ir}");
     assert!(!ir.contains("store len"), "{ir}");
     let output = gcsl(&["run", "tests/fixtures/standard.gcsl", "--dump-types"]);
     let types = stdout(&output);

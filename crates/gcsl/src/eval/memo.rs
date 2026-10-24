@@ -842,6 +842,12 @@ pub(super) fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize)
             secret.identity.hash(state);
             secret.revealed.hash(state);
         }
+        // By its path and identity, as it is equal (see
+        // [Files](crate::eval::files#files)).
+        Value::File(file) => {
+            state.write_u8(14);
+            file.hash(state);
+        }
         Value::Record(record) => {
             state.write_u8(5);
             state.write_usize(record.values.len());

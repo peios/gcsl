@@ -31,9 +31,9 @@ def half(n: Int): Float { float(n) / 2.0 }
 # it runs. Each takes, by name, the options of the built-in it calls: `cwd`
 # the program's working directory, `""` for gcsl's own; `env` variables set
 # over gcsl's environment for it; `interactive` to give it gcsl's terminal,
-# capturing nothing; `panic` to make a status other than 0 a failure of the
-# call; and `until`, some text whose line, in either stream, ends the program,
-# with the status 0. Each fails at its call, as `sh` and `sh_live` do: they
+# capturing nothing; `panic`, true unless given false, to make a status other
+# than 0 a failure of the call; and `until`, some text whose line, in either
+# stream, ends the program, with the status 0. Each fails at its call, as `sh` and `sh_live` do: they
 # are `#[track_caller]`. `panic(message)` ends the run with the runtime error
 # `message`, an ordinary built-in, not the alias rule's.
 #[track_caller]
@@ -42,7 +42,7 @@ def exec(
     cwd: Present<String> = "",
     env: Present<{*: Revealed<String>}> = {},
     interactive: Present<Bool> = false,
-    panic: Present<Bool> = false,
+    panic: Present<Bool> = true,
     until: Present<String> = "",
 ) -> {status: Int, stdout: String, stderr: String} {
     builtins.exec(
@@ -57,7 +57,7 @@ def exec_live(
     cwd: Present<String> = "",
     env: Present<{*: Revealed<String>}> = {},
     interactive: Present<Bool> = false,
-    panic: Present<Bool> = false,
+    panic: Present<Bool> = true,
     until: Present<String> = "",
 ) -> {status: Int, stdout: String, stderr: String} {
     builtins.exec_live(
@@ -98,7 +98,7 @@ sort_versions = builtins.sort_versions
 # its standard error, trimmed, unless it exits with status 0.
 #[track_caller]
 def sh(script: String) -> String {
-    let result = exec(["/bin/sh", "-c", script])
+    let result = exec(["/bin/sh", "-c", script], panic = false)
     if result.status != 0 {
         panic("`{script}` exited with status {result.status}: {trim(result.stderr)}")
     }
@@ -111,7 +111,7 @@ def sh(script: String) -> String {
 # has been shown already.
 #[track_caller]
 def sh_live(script: String) -> String {
-    let result = exec_live(["/bin/sh", "-c", script])
+    let result = exec_live(["/bin/sh", "-c", script], panic = false)
     if result.status != 0 {
         panic("`{script}` exited with status {result.status}")
     }
@@ -150,4 +150,56 @@ def (s: Secret<T>) reveal<T>(): Revealed<T> {
 }
 def secret<T>(value: T, identity: String): Secret<T> {
     builtins.secret(value, identity)
+}
+
+# Files: `file(path)` is the file at `path`, a relative one against the
+# working directory, the one `exec` runs a program in unless told otherwise,
+# so that `cc.exec("-o", out)` then `file(out)` finds what the program wrote.
+# Nothing is read until `f.read()`, its contents as text. `f.path` is its
+# path, absolute. `f.exec(...words)` runs the file as a program with the
+# arguments `words`, as `exec` does, with its options. A `List<File>` is a
+# `FileSet`, and `files.file(name)` the one file of it whose path is `name`
+# or ends in `/name`, a panic if none is or several are. Each fails at its
+# call: they are `#[track_caller]`.
+type FilePath = String
+type FileSet = List<File>
+
+file = builtins.file
+
+#[track_caller]
+def (f: File) read() -> String {
+    builtins.file_read(f)
+}
+
+#[track_caller]
+def (f: File) exec(
+    ...words: Revealed<String>,
+    cwd: Present<String> = "",
+    env: Present<{*: Revealed<String>}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    exec(
+        [f.path, ...words],
+        cwd = cwd,
+        env = env,
+        interactive = interactive,
+        panic = panic,
+        until = until,
+    )
+}
+
+#[track_caller]
+def (files: List<File>) file(name: String): File {
+    let found = for f in files if f.path == name or ends_with(f.path, "/" + name) { f }
+    if len(found) == 0 {
+        let among = if len(files) == 1 { "the one file" } else { "{len(files)} files" }
+        panic("no file `{name}` among {among}")
+    }
+    if len(found) > 1 {
+        let paths = join(for f in found { "`{f.path}`" }, ", ")
+        panic("`{name}` names {len(found)} files: {paths}")
+    }
+    found[0]
 }

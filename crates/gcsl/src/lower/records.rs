@@ -285,6 +285,11 @@ impl Lowerer<'_> {
         if let Some(meta) = self.resolution.meta_read(id) {
             return self.lower_meta_read(id, (record, name), meta, kind);
         }
+        if self.resolution.file_path(id) {
+            return Ok(IrKind::FilePath(
+                self.lower_operand(record, ValueKind::Mixed)?,
+            ));
+        }
         Ok(match read(self.resolution.expr_var(id), kind) {
             Some(cell) => cell,
             None => IrKind::Field {

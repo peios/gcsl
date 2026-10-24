@@ -124,6 +124,7 @@ pub(super) const fn described(value: &Value) -> &'static str {
         Value::Tag(_) => "a variant",
         Value::Variant(_) => "a value of an enum",
         Value::Secret(_) => "a secret",
+        Value::File(_) => "a file",
         Value::Future(_) => "a future",
     }
 }

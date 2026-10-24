@@ -115,6 +115,14 @@ pub enum Builtin {
     /// revealed, which a program may be given, the prelude's `s.reveal()`
     /// (see [Secrets](crate::check::secrets#secrets)).
     SecretReveal,
+    /// `file(path: String) -> File`: the file at `path`, made absolute
+    /// against the working directory (see [Files](crate::check::files#files)),
+    /// the prelude's `file(path)`. Impure: what a relative path means
+    /// depends on where it runs.
+    File,
+    /// `file_read(f: File) -> String`: the contents of the file `f`, which
+    /// must be UTF-8, the prelude's `f.read()`. Impure.
+    FileRead,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -138,7 +146,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 30] = [
+    pub const ALL: [Builtin; 32] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -169,6 +177,8 @@ impl Builtin {
         Builtin::Secret,
         Builtin::SecretValue,
         Builtin::SecretReveal,
+        Builtin::File,
+        Builtin::FileRead,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -222,6 +232,8 @@ impl Builtin {
             Builtin::Secret => "secret",
             Builtin::SecretValue => "secret_value",
             Builtin::SecretReveal => "secret_reveal",
+            Builtin::File => "file",
+            Builtin::FileRead => "file_read",
         }
     }
 
@@ -261,7 +273,9 @@ impl Builtin {
             | Builtin::PartialMatches
             | Builtin::Secret
             | Builtin::SecretValue
-            | Builtin::SecretReveal => None,
+            | Builtin::SecretReveal
+            | Builtin::File
+            | Builtin::FileRead => None,
         }
     }
 
@@ -283,6 +297,8 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::SecretValue
             | Builtin::SecretReveal => &["s"],
+            Builtin::File => &["path"],
+            Builtin::FileRead => &["f"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -314,7 +330,9 @@ impl Builtin {
             | Builtin::FsMkdir
             | Builtin::FsCopy
             | Builtin::FsTempDir
-            | Builtin::FsWrite => Effect::Impure,
+            | Builtin::FsWrite
+            | Builtin::File
+            | Builtin::FileRead => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -372,7 +390,9 @@ impl Builtin {
             | Builtin::PartialMatches
             | Builtin::Secret
             | Builtin::SecretValue
-            | Builtin::SecretReveal => Typing::Ordinary,
+            | Builtin::SecretReveal
+            | Builtin::File
+            | Builtin::FileRead => Typing::Ordinary,
         }
     }
 
@@ -416,6 +436,8 @@ impl Builtin {
             Builtin::Secret => "fn<T>(value: T, identity: String): Secret<T>",
             Builtin::SecretValue => "fn<T>(s: Secret<T>): T",
             Builtin::SecretReveal => "fn<T>(s: Secret<T>): Revealed<T>",
+            Builtin::File => "fn(path: String) -> File",
+            Builtin::FileRead => "fn(f: File) -> String",
         }
     }
 
@@ -460,6 +482,8 @@ impl Builtin {
             Builtin::Join => ([types.list(TyId::STRING), TyId::STRING], TyId::STRING),
             Builtin::StartsWith | Builtin::EndsWith => ([TyId::STRING, TyId::STRING], TyId::BOOL),
             Builtin::Trim | Builtin::FsRead => ([TyId::STRING, UNUSED], TyId::STRING),
+            Builtin::File => ([TyId::STRING, UNUSED], TyId::FILE),
+            Builtin::FileRead => ([TyId::FILE, UNUSED], TyId::STRING),
             Builtin::StripPrefix | Builtin::StripSuffix => {
                 ([TyId::STRING, TyId::STRING], TyId::STRING)
             }
@@ -580,5 +604,6 @@ pub(super) fn builtin_types(names: &Names) -> BuiltinTypes {
         (names.lookup("String"), TyId::STRING),
         (names.lookup("Duration"), TyId::DURATION),
         (names.lookup("Size"), TyId::SIZE),
+        (names.lookup("File"), TyId::FILE),
     ]
 }

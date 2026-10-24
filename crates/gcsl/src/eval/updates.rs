@@ -220,6 +220,7 @@ impl Evaluator<'_> {
             | Value::Tag(_)
             | Value::Variant(_)
             | Value::Secret(_)
+            | Value::File(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }

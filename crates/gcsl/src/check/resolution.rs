@@ -179,6 +179,9 @@ pub(super) struct ForLowering {
     /// [Functions](crate::check::functions#functions)); only a program with one
     /// has entries.
     pub(super) record_fills: RecordFills,
+    /// Each read of a file's `path`, `f.path`, by its id (see
+    /// [Files](crate::check::files#files)).
+    pub(super) file_paths: HashSet<ExprId>,
 }
 
 /// The defaults of a function, for [`FnResolution::defaults`]: `constants`,
@@ -531,6 +534,13 @@ impl Resolution {
     #[must_use]
     pub fn call_rest(&self, id: ExprId) -> Option<u32> {
         self.lowered.call_rests.get(&id).copied()
+    }
+
+    /// Whether the field access `id` reads a file's `path` (see
+    /// [Files](crate::check::files#files)).
+    #[must_use]
+    pub fn file_path(&self, id: ExprId) -> bool {
+        self.lowered.file_paths.contains(&id)
     }
 
     /// The parameters that the call `id` gives their defaults, each with its

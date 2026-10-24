@@ -494,9 +494,9 @@ fn a_quantity_is_shown_by_its_type() {
 fn a_wide_record_type_shows_its_rest_field_after_its_named_fields() {
     // Too wide for one line, a field per line, the rest-field last; the
     // named fields are never lost to it.
-    let text = "type File = {destination_path: String, source_path_in_build: String, \
+    let text = "type PackageFile = {destination_path: String, source_path_in_build: String, \
                 *: {mode: String, owner_principal: String}}\n\
-                f: File = { destination_path = \"a\"; source_path_in_build = \"b\" }\n\
+                f: PackageFile = { destination_path = \"a\"; source_path_in_build = \"b\" }\n\
                 r = f\n";
     let Indexed { index, .. } = indexed(&[("workspace.gcsl", text)]);
     let mut index = index.unwrap();

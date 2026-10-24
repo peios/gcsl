@@ -38,7 +38,7 @@ use super::{Flow, mistyped};
 /// `exec_live` the program's standard output and standard error are also
 /// copied, as they arrive, to this process's standard error ([`run_live`]).
 /// With `until`, the program is killed once a line of either stream
-/// contains the text ([`run_watching`]), its output so far the result's,
+/// contains the text ([`run_watched`]), its output so far the result's,
 /// and its status 0. An `interactive` one has this process's standard
 /// input, output and error, and its result's output is empty. With
 /// `panic`, a status other than 0 is a failure of the call, "`cc` exited

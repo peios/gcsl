@@ -56,18 +56,21 @@ fn exec_reports_what_its_program_did() {
             "= exec([\"true\"])",
             "{status = 0; stdout = \"\"; stderr = \"\"}",
         ),
+        // With `panic = false`, a non-zero status is data, not an error.
         (
-            "= exec([\"false\"])",
+            "= exec([\"false\"], panic = false)",
             "{status = 1; stdout = \"\"; stderr = \"\"}",
         ),
         (
-            "= exec([\"sh\", \"-c\", \"echo out; echo err >&2; exit 3\"])",
+            "= exec([\"sh\", \"-c\", \"echo out; echo err >&2; exit 3\"], panic = false)",
             "{status = 3; stdout = \"out\\n\"; stderr = \"err\\n\"}",
         ),
-        // A non-zero status is data, never an error.
-        ("= exec([\"false\"]).status != 0", "true"),
+        ("= exec([\"false\"], panic = false).status != 0", "true"),
         // Killed by a signal: 128 plus its number.
-        ("= exec([\"sh\", \"-c\", \"kill -9 $$\"]).status", "137"),
+        (
+            "= exec([\"sh\", \"-c\", \"kill -9 $$\"], panic = false).status",
+            "137",
+        ),
         // Its standard input is the null device: `cat` ends at once.
         (
             "= exec([\"cat\"])",
@@ -281,7 +284,7 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         ),
         (
             "b.gcsl",
-            "rb = exec([\"false\"])\nlet e = exec\ns = e([\"true\"], \"\", {}, false, false, \"\")\nt = run()",
+            "rb = exec([\"false\"], panic = false)\nlet e = exec\ns = e([\"true\"], \"\", {}, false, false, \"\")\nt = run()",
         ),
     ];
     let sources: Vec<SourceFile> = files
@@ -289,8 +292,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the thirty built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 30);
+    // The driver wrote the thirty-two built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 32);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;
@@ -355,7 +358,7 @@ fn exec_live_gives_the_record_exec_gives() {
         ),
     ] {
         for builtin in ["exec", "exec_live"] {
-            let text = format!("= {builtin}({argv})");
+            let text = format!("= {builtin}({argv}, panic = false)");
             assert_eq!(lone(&text).unwrap(), expected, "{text}");
             let files = [("workspace.gcsl", ""), ("main.gcsl", text.as_str())];
             assert_eq!(value(&files, "main.gcsl"), expected, "{text}");
@@ -516,8 +519,9 @@ fn exec_s_options_set_its_program_s_directory_and_environment() {
 }
 
 #[test]
-fn exec_with_panic_fails_unless_its_program_succeeds() {
-    let text = "r = exec([\"sh\", \"-c\", \"echo bad >&2; exit 3\"], panic = true)";
+fn exec_fails_unless_its_program_succeeds() {
+    // By default, as with `panic = true`.
+    let text = "r = exec([\"sh\", \"-c\", \"echo bad >&2; exit 3\"])";
     let error = lone_error(text);
     assert_eq!(error.message, "`sh` exited with status 3");
     assert_eq!(error.notes, ["its standard error: bad"]);
@@ -568,7 +572,8 @@ fn exec_until_ends_its_program_at_a_line_with_the_text() {
     );
     // Never met, the program ends as it would.
     assert_eq!(
-        lone("= exec([\"sh\", \"-c\", \"echo x; exit 2\"], until = \"ready\")").unwrap(),
+        lone("= exec([\"sh\", \"-c\", \"echo x; exit 2\"], until = \"ready\", panic = false)")
+            .unwrap(),
         "{status = 2; stdout = \"x\\n\"; stderr = \"\"}"
     );
     assert_eq!(
@@ -591,7 +596,8 @@ fn an_interactive_program_has_the_terminal_and_nothing_is_captured() {
         "{status = 0; stdout = \"\"; stderr = \"\"}"
     );
     assert_eq!(
-        lone("= exec([\"sh\", \"-c\", \"exit 2\"], interactive = true).status").unwrap(),
+        lone("= exec([\"sh\", \"-c\", \"exit 2\"], interactive = true, panic = false).status")
+            .unwrap(),
         "2"
     );
 }

@@ -18,7 +18,7 @@
 //! default", noted that given no arguments it is the empty list. A function
 //! type's parameter may be one too, `fn(...words: String): Int`. At a call, an
 //! argument `...EXPR` is a spread argument
-//! ([`ArgKind::Spread`](crate::ast::ArgKind::Spread)), a list whose elements
+//! ([`ArgKind::Spread`]), a list whose elements
 //! fill the rest parameter. That a function has one rest parameter at most, and
 //! what a call gives it, is the checker's.
 //!

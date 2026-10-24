@@ -313,6 +313,7 @@ use super::{
 };
 use super::builtins::{enum_builtin, secret_builtin};
 use super::kinds::{as_function, float_to_int, into_callee, mixed};
+use super::files::{make_file, read_file};
 use super::system::{exec, file_system, write_file};
 use super::text::{join, sort_versions, split, string_list, strip_prefix, strip_suffix, trim};
 
@@ -558,6 +559,8 @@ impl Evaluator<'_> {
                 write_file(&p, &contents, node)
             }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
+            (Builtin::File, Some((Value::Str(path), _)), None) => make_file(&path, node),
+            (Builtin::FileRead, Some((Value::File(file), _)), None) => read_file(&file, node),
             (
                 Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
                 Some((Value::Str(p), _)),

@@ -752,6 +752,19 @@ pub enum Value {
     /// A secret: a value that never leaks, shown as `***` (see
     /// [`crate::eval`], "Secrets"), compared by its identity alone.
     Secret(Rc<Secret>),
+    /// A file: its path and the content identity a host gives it (see
+    /// [Files](crate::eval::files#files)), compared by both.
+    File(Rc<File>),
+}
+
+/// A file, as values carry it (see [Files](crate::eval::files#files)).
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct File {
+    /// Its path, absolute.
+    pub path: Rc<str>,
+    /// The identity of its content, as a host records it: `None` under
+    /// plain GCSL, which never looks at a file's content to make one.
+    pub identity: Option<Rc<str>>,
 }
 
 /// A secret, as values carry it (see [`crate::eval`], "Secrets").
@@ -814,7 +827,7 @@ impl Value {
             Value::Future(_) => ValueKind::Deferred,
             // A value of an enum is of no kind of its own: present, of the
             // kind a node of an enum's type has; and so is a secret.
-            Value::Variant(_) | Value::Secret(_) => ValueKind::Mixed,
+            Value::Variant(_) | Value::Secret(_) | Value::File(_) => ValueKind::Mixed,
         }
     }
 
@@ -839,6 +852,31 @@ impl Value {
                 Value::Secret(secret) => {
                     if !found.contains(&secret.identity) {
                         found.push(Rc::clone(&secret.identity));
+                    }
+                }
+                Value::Record(record) => pending.extend(record.values.iter().rev()),
+                Value::List(list) => pending.extend(list.values().iter().rev()),
+                Value::Variant(variant) => pending.push(&variant.payload),
+                _ => {}
+            }
+        }
+        found
+    }
+
+    /// The files this value holds, in a field, an element or a payload at
+    /// any depth, in the order met, each once: what a host takes into a
+    /// step's sandbox of its arguments, and back out of its result (see
+    /// [Files](crate::eval::files#files)). A closure's or a future's captures are not
+    /// looked into, nor a secret's value.
+    #[must_use]
+    pub fn files(&self) -> Vec<Rc<File>> {
+        let mut found: Vec<Rc<File>> = Vec::new();
+        let mut pending: Vec<&Value> = vec![self];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::File(file) => {
+                    if !found.contains(file) {
+                        found.push(Rc::clone(file));
                     }
                 }
                 Value::Record(record) => pending.extend(record.values.iter().rev()),
@@ -962,6 +1000,8 @@ impl fmt::Display for Value {
             }
             // The one way a secret is shown, wherever it is.
             Value::Secret(_) => f.write_str("***"),
+            // As the call that makes it, which reads back as an equal file.
+            Value::File(file) => write!(f, "file({})", Quoted(&file.path)),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;

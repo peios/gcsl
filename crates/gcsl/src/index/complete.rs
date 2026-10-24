@@ -1104,16 +1104,31 @@ impl Index {
     }
 
     /// The type of the field `name` of `ty`, if it is a record type with
-    /// one.
+    /// one, or a file and `name` is `path`.
     fn field_of(&self, ty: TyId, name: Name) -> Option<TyId> {
+        if self.types.strip(ty) == TyId::FILE {
+            return (self.scan.names.get(name) == "path").then_some(TyId::STRING);
+        }
         let fields = self.types.record_fields(self.types.strip(ty))?;
         fields.iter().find(|&&(f, _)| f == name).map(|&(_, ty)| ty)
     }
 
     /// The fields of `ty`, if it is a record type, each with its doc
     /// comment if `of`, what has it, is a record block written as the
-    /// value of a local or a node.
+    /// value of a local or a node; a file's one field, `path`, if it is a
+    /// file.
     fn record_members(&self, ty: Option<TyId>, of: Option<Symbol>) -> Vec<Completion> {
+        if ty.is_some_and(|ty| self.types.strip(ty) == TyId::FILE) {
+            return vec![Completion {
+                label: "path".to_owned(),
+                kind: CompletionKind::Field,
+                detail: self.short(TyId::STRING),
+                documentation: Some("The file's path, absolute.".to_owned()),
+                sort: sort_text(FILE, "path"),
+                insert: quoted("path"),
+                range: None,
+            }];
+        }
         let Some(fields) = ty.and_then(|ty| self.types.record_fields(self.types.strip(ty))) else {
             return Vec::new();
         };
@@ -1974,5 +1989,41 @@ mod tests {
             .map(|completion| completion.label)
             .collect();
         assert_eq!(labels, ["first_or"]);
+    }
+
+    #[test]
+    fn a_dot_after_a_file_offers_its_path_and_its_methods() {
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {
+    let src = file(\"/a\")
+    src.|
+}
+",
+        )];
+        let found = complete(&files, "app.gcsl");
+        let path = named(&found, "path");
+        assert_eq!(path.kind, CompletionKind::Field);
+        assert_eq!(path.detail.as_deref(), Some("String"));
+        for method in ["read", "exec"] {
+            assert_eq!(
+                named(&found, method).kind,
+                CompletionKind::Method,
+                "{method}"
+            );
+        }
+        // A list of files offers the one that finds a file in it.
+        let files = [(
+            "app.gcsl",
+            "fn f() -> String {
+    let set: FileSet = []
+    set.|
+}
+",
+        )];
+        assert_eq!(
+            named(&complete(&files, "app.gcsl"), "file").kind,
+            CompletionKind::Method
+        );
     }
 }

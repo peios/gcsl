@@ -528,9 +528,11 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => self.bool(id).map(Value::Bool),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Show(_) | IrKind::Caller => {
-                self.string(id).map(Value::Str)
-            }
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Show(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => self.string(id).map(Value::Str),
             IrKind::Helper => self.record(id),
             // Directly rather than through `string`: an interpolation
             // evaluates its parts through `value`, so interpolations nested
@@ -1319,8 +1321,10 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             // A variant's source is how it is shown, `Toolchain::C`, and a
             // value of an enum the call of it on its payload's.
             Value::Variant(variant) => pending.push(&variant.payload),
-            // Shown as `***`, whatever it holds, which is not looked at.
+            // Shown as `***`, whatever it holds, which is not looked at; a
+            // file as the call that makes it.
             Value::Secret(_)
+            | Value::File(_)
             | Value::Tag(_)
             | Value::Int(_)
             | Value::Float(_)
@@ -1341,6 +1345,7 @@ fn mistyped<T>(node: &IrNode, message: &'static str) -> Flow<T> {
 }
 
 pub(crate) mod builtins;
+pub(crate) mod files;
 pub(crate) mod kinds;
 pub(crate) mod memo;
 pub(crate) mod system;

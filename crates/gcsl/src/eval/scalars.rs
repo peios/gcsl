@@ -82,9 +82,11 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where an Int was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
-                mistyped(node, "String node where an Int was expected")
-            }
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Interp(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => mistyped(node, "String node where an Int was expected"),
             IrKind::Show(_) => mistyped(node, "`show` node where an Int was expected"),
             IrKind::Empty
             | IrKind::Store(..)
@@ -269,9 +271,11 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a Float was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
-                mistyped(node, "String node where a Float was expected")
-            }
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Interp(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => mistyped(node, "String node where a Float was expected"),
             IrKind::Show(_) => mistyped(node, "`show` node where a Float was expected"),
             IrKind::Empty
             | IrKind::Store(..)
@@ -377,9 +381,11 @@ impl Evaluator<'_> {
             | IrKind::FloatMul(_)
             | IrKind::FloatDiv(_)
             | IrKind::IntToFloat(_) => mistyped(node, "Float node where a Bool was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
-                mistyped(node, "String node where a Bool was expected")
-            }
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Interp(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => mistyped(node, "String node where a Bool was expected"),
             IrKind::Show(_) => mistyped(node, "`show` node where a Bool was expected"),
             IrKind::Empty
             | IrKind::Store(..)
@@ -481,7 +487,7 @@ impl Evaluator<'_> {
             }
             IrKind::StrConcat(operands) => self.concat(operands),
             IrKind::Interp(items) => self.interpolate(items, node.span),
-            IrKind::Show(_) | IrKind::Caller => self.computed_string(node),
+            IrKind::Show(_) | IrKind::Caller | IrKind::FilePath(_) => self.computed_string(node),
             IrKind::IntConst(_)
             | IrKind::IntNeg(_)
             | IrKind::IntAdd(_)
@@ -585,6 +591,10 @@ impl Evaluator<'_> {
         match node.kind {
             IrKind::Show(operand) => self.show(operand, node),
             IrKind::Caller => self.caller_text(node),
+            IrKind::FilePath(file) => match self.value(file)? {
+                Value::File(file) => Ok(Rc::clone(&file.path)),
+                _ => mistyped(node, "the path of a value that is not a file"),
+            },
             _ => mistyped(node, "a node whose text is not computed"),
         }
     }

@@ -294,6 +294,7 @@ mod arguments;
 mod deftypes;
 mod errors;
 mod fileroot;
+mod files;
 mod fs;
 mod imports;
 mod invoke;

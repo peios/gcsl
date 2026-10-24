@@ -152,9 +152,11 @@ impl Evaluator<'_> {
             | IrKind::And(_)
             | IrKind::Or(_)
             | IrKind::Not(_) => mistyped(node, "Bool node where a record was expected"),
-            IrKind::StrConst(_) | IrKind::StrConcat(_) | IrKind::Interp(_) | IrKind::Caller => {
-                mistyped(node, "String node where a record was expected")
-            }
+            IrKind::StrConst(_)
+            | IrKind::StrConcat(_)
+            | IrKind::Interp(_)
+            | IrKind::Caller
+            | IrKind::FilePath(_) => mistyped(node, "String node where a record was expected"),
             IrKind::Show(_) => mistyped(node, "`show` node where a record was expected"),
             IrKind::For { .. } | IrKind::Loop { .. } => self.record_loop(node),
             IrKind::Break { .. }

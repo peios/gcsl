@@ -70,7 +70,9 @@ impl Lowerer<'_> {
             | Builtin::PartialMatches
             | Builtin::Secret
             | Builtin::SecretValue
-            | Builtin::SecretReveal => Err(InternalError {
+            | Builtin::SecretReveal
+            | Builtin::File
+            | Builtin::FileRead => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

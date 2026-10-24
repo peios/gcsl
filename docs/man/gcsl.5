@@ -66,7 +66,8 @@ Private let, let mut, and fn names do not become directory declarations.
 Top-level named functions and public fields support forward references subject to dependency checks.
 Inner record blocks retain ordered construction.
 .SH TYPES
-The built-in value types include Int, Float, Bool, String, Duration, Size, records, lists, functions, futures, and unions.
+The built-in value types include Int, Float, Bool, String, Duration, Size, File, records, lists, functions, futures, and unions.
+File is nominal: it holds a file's absolute path, read as f.path, and the content identity a host gives it; no record fits it, files compare equal by both and have no order.
 The empty record type is {}.
 List<T> and T[] are equivalent.
 Type aliases are structural and do not create nominal runtime identities.
@@ -86,7 +87,7 @@ A value with additional record fields can satisfy a narrower expected shape; a l
 A rest-field, *: TYPE, gives the type of every field a record type does not name:
 .PP
 .nf
-    type File = {to: String, from: String, *: Int}
+    type Entry = {to: String, from: String, *: Int}
     let files: {*: String} = {"bin/*" = "bin/*"}
 .fi
 .PP

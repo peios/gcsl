@@ -410,6 +410,9 @@ impl TyId {
     pub const DURATION: TyId = TyId(7);
     /// A size, of whole bytes.
     pub const SIZE: TyId = TyId(8);
+    /// A file, `File`: a path and the content identity a host gives it
+    /// (see [Files](crate::check::files#files)).
+    pub const FILE: TyId = TyId(9);
 
     /// The type of `quantity`: [`TyId::DURATION`] or [`TyId::SIZE`].
     #[must_use]
@@ -536,6 +539,9 @@ pub enum TyKind {
     /// (see [Secrets](#secrets)), or, if revealed, `Revealed<T>`, one that a
     /// program may be given. Never of another secret.
     Secret(TyId, bool),
+    /// `File`, [`TyId::FILE`]: a file, a type of its own that no record fits
+    /// (see [Files](crate::check::files#files)).
+    File,
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -842,6 +848,7 @@ impl TypeTable {
             TyKind::Error,
             TyKind::Quantity(Quantity::Duration),
             TyKind::Quantity(Quantity::Size),
+            TyKind::File,
         ] {
             table.intern(kind);
         }
@@ -907,6 +914,7 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::Quantity(_)
+            | TyKind::File
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -989,6 +997,7 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::Quantity(_)
+            | TyKind::File
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1253,6 +1262,7 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::Quantity(_)
+            | TyKind::File
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -1559,7 +1569,8 @@ impl TypeTable {
             (TyKind::Int, Value::Int(_))
             | (TyKind::Float, Value::Float(_))
             | (TyKind::Bool, Value::Bool(_))
-            | (TyKind::String, Value::Str(_)) => true,
+            | (TyKind::String, Value::Str(_))
+            | (TyKind::File, Value::File(_)) => true,
             (TyKind::Quantity(wanted), Value::Quantity(quantity, _)) => wanted == quantity,
             (TyKind::Record(record), Value::Empty) => record.fields.is_empty(),
             (TyKind::Record(record), Value::Record(fields)) => {
@@ -2089,6 +2100,7 @@ impl TypeTable {
             | TyKind::Bool
             | TyKind::String
             | TyKind::Quantity(_)
+            | TyKind::File
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
@@ -3044,9 +3056,9 @@ impl TypeTable {
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) | TyKind::Partial(_) => Some(ValueKind::Record),
             TyKind::List(_) => Some(ValueKind::List),
-            // A secret, and a value of an enum, which is present, are of the
-            // kind only they say.
-            TyKind::Secret(..) | TyKind::Enum { .. } => Some(ValueKind::Mixed),
+            // A secret, a file, and a value of an enum, which is present, are
+            // of the kind only they say.
+            TyKind::Secret(..) | TyKind::File | TyKind::Enum { .. } => Some(ValueKind::Mixed),
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
@@ -3437,6 +3449,7 @@ impl fmt::Display for Display<'_> {
             TyKind::Quantity(quantity) => f.write_str(quantity.type_name()),
             TyKind::Bool => f.write_str("Bool"),
             TyKind::String => f.write_str("String"),
+            TyKind::File => f.write_str("File"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
             &TyKind::Param { generic, index } => {
