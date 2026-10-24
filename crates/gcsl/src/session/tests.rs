@@ -1,6 +1,7 @@
 use super::*;
 use crate::check::Builtin;
 use crate::diagnostic::Severity;
+use crate::source::Span;
 
 fn eval(session: &mut Session, text: &str) -> Result<Outcome, Vec<Diagnostic>> {
     session.eval(&SourceFile::new("<test>", text).unwrap())
@@ -1464,7 +1465,10 @@ fn a_session_runs_exec_panic_and_sh() {
     value(&mut session, "let r = exec([\"cat\"])");
     value(&mut session, "let e = exec");
     assert_eq!(
-        value(&mut session, "e([\"sh\", \"-c\", \"exit 4\"]).status"),
+        value(
+            &mut session,
+            "e([\"sh\", \"-c\", \"exit 4\"], \"\", {}, false, false, \"\").status"
+        ),
         Value::Int(4)
     );
     assert_eq!(value(&mut session, "r.stdout"), Value::Str("".into()));
@@ -1474,7 +1478,8 @@ fn a_session_runs_exec_panic_and_sh() {
     );
     // Every record `exec` builds, in any input, has the session's one
     // layout.
-    let Value::Record(record) = value(&mut session, "e([\"true\"])") else {
+    let Value::Record(record) = value(&mut session, "e([\"true\"], \"\", {}, false, false, \"\")")
+    else {
         panic!("expected a record");
     };
     let layout = Rc::clone(session.exec_result.as_ref().unwrap());
@@ -1484,12 +1489,14 @@ fn a_session_runs_exec_panic_and_sh() {
     };
     assert!(Rc::ptr_eq(&earlier.layout, &layout));
     // A panic fails its input, which the session forgets; a failing `sh`
-    // is the prelude's panic, input 2.
+    // is the prelude's panic, at the input's call: `sh` is
+    // `#[track_caller]`.
     assert_eq!(messages(&mut session, "let x = panic(\"stop\")"), ["stop"]);
     assert_eq!(messages(&mut session, "x"), ["undefined variable `x`"]);
     let failed = eval(&mut session, "sh(\"exit 3\")").unwrap_err();
     assert_eq!(failed[0].message, "`exit 3` exited with status 3: ");
-    assert_eq!(failed[0].input, Some(2));
+    assert_eq!(failed[0].input, None);
+    assert_eq!(failed[0].span, Span::new(0, 12));
     assert_eq!(
         value(&mut session, "exec([\"true\"]).status"),
         Value::Int(0)
@@ -1497,7 +1504,10 @@ fn a_session_runs_exec_panic_and_sh() {
     // A later input shadows them as any earlier name.
     value(&mut session, "let exec = 2");
     assert_eq!(
-        value(&mut session, "exec + e([\"true\"]).status"),
+        value(
+            &mut session,
+            "exec + e([\"true\"], \"\", {}, false, false, \"\").status"
+        ),
         Value::Int(2)
     );
 }

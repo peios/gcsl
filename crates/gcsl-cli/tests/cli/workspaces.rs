@@ -391,9 +391,9 @@ fn run_renders_the_alias_rule_and_the_prelude() {
          \x202 | len = 3\n\
          \x20  | --- defined here\n\
          \x20  |\n\
-         \x20 ::: <stdlib>/prelude.gcsl:22:1\n\
+         \x20 ::: <stdlib>/prelude.gcsl:21:1\n\
          \x20  |\n\
-         22 | len = builtins.len\n\
+         21 | len = builtins.len\n\
          \x20  | --- defined here\n"
     );
     assert_eq!(output.status.code(), Some(1));

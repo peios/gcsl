@@ -290,6 +290,35 @@ fn retry_and_timeout_need_arguments_they_can_mean() {
 }
 
 #[test]
+fn track_caller_is_the_checker_s_own_and_takes_no_arguments() {
+    let text = "#[track_caller]\nfn f() -> Int { 1 }\nf()";
+    let (_, _, output) = check_prelude(text);
+    let output = output.unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(
+        output.checked.resolution.attributes(FnId::new(0)),
+        [Attribute {
+            id: AttributeId::Builtin("track_caller"),
+            args: Box::new([]),
+        }]
+    );
+    // On a pure function too: where an error is reported is no effect.
+    assert!(
+        check_prelude("#[track_caller]\nfn f(): Int { 1 }\nf()")
+            .2
+            .is_ok()
+    );
+    assert!(
+        check_prelude("#[track_caller()]\nfn f(): Int { 1 }\nf()")
+            .2
+            .is_ok()
+    );
+    assert_eq!(
+        messages("#[track_caller(1)]\nfn f(): Int { 1 }\nf()"),
+        ["`#[track_caller]` takes no argument"]
+    );
+}
+
+#[test]
 fn a_call_of_a_generic_function_binds_its_type_parameters() {
     let cases = [
         ("fn id<T>(x: T): T { x }\nid(1)", "Int"),

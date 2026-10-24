@@ -20,9 +20,11 @@ pub enum Builtin {
     Int,
     /// `float(x: Int): Float`: the `Float` nearest `x`.
     Float,
-    /// `exec(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout:
-    /// String}`: runs the program `argv[0]` with the arguments `argv[1..]`
-    /// and reports what it did (see [`crate::eval`]). Impure.
+    /// `exec(argv: List<Revealed<String>>, options: {cwd, env, interactive,
+    /// panic, until}) -> {status: Int, stderr: String, stdout: String}`:
+    /// runs the program `argv[0]` with the arguments `argv[1..]`, as the
+    /// options say, and reports what it did (see [`crate::eval`]). Impure;
+    /// the prelude's `exec` gives the options as named parameters.
     Exec,
     /// `panic(message: String): Never`: ends the run with the runtime error
     /// `message`, at the call.
@@ -84,8 +86,9 @@ pub enum Builtin {
     /// `show(value)`: the GCSL source of a value, as text, which reads back
     /// as an equal value. Its typing is special.
     Show,
-    /// `exec_live(argv: List<Revealed<String>>) -> {status: Int, stderr: String,
-    /// stdout: String}`: `exec`, but the program's standard output and
+    /// `exec_live(argv: List<Revealed<String>>, options) -> {status: Int,
+    /// stderr: String, stdout: String}`: `exec`, but the program's standard
+    /// output and
     /// standard error are also copied, line by line as they arrive, to this
     /// process's standard error (see [`crate::eval`]). Impure.
     ExecLive,
@@ -177,6 +180,14 @@ impl Builtin {
     /// and its standard error.
     pub const EXEC_FIELDS: [&'static str; 3] = ["status", "stdout", "stderr"];
 
+    /// The names of the fields of the options `exec` and `exec_live` take,
+    /// in the order of the record's type (see [Built-in
+    /// functions](crate::check::calls#built-in-functions)): the program's
+    /// working directory, its environment, whether it has the terminal,
+    /// whether a status other than 0 fails the call, and the text whose
+    /// line ends it.
+    pub const EXEC_OPTIONS: [&'static str; 5] = ["cwd", "env", "interactive", "panic", "until"];
+
     /// The name of its member of the `builtins` module.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -261,7 +272,7 @@ impl Builtin {
         match self {
             Builtin::Len => &["list"],
             Builtin::Int | Builtin::Float => &["x"],
-            Builtin::Exec | Builtin::ExecLive => &["argv"],
+            Builtin::Exec | Builtin::ExecLive => &["argv", "options"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -378,7 +389,9 @@ impl Builtin {
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
-                "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}"
+                "fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*: Revealed<String>}, \
+                 interactive: Bool, panic: Bool, until: String}) -> {status: Int, stderr: String, \
+                 stdout: String}"
             }
             Builtin::Panic => "fn(message: String): Never",
             Builtin::Split => "fn(s: String, sep: String): List<String>",
@@ -430,7 +443,17 @@ impl Builtin {
                     (stdout, TyId::STRING),
                     (stderr, TyId::STRING),
                 ]);
-                ([argv, UNUSED], result)
+                let [cwd, env, interactive, panic, until] =
+                    Builtin::EXEC_OPTIONS.map(|text| names.intern(text));
+                let environment = types.record_with_rest([], Some(word), Vec::new());
+                let options = types.record([
+                    (cwd, TyId::STRING),
+                    (env, environment),
+                    (interactive, TyId::BOOL),
+                    (panic, TyId::BOOL),
+                    (until, TyId::STRING),
+                ]);
+                ([argv, options], result)
             }
             Builtin::Panic => ([TyId::STRING, UNUSED], types.never()),
             Builtin::Split => ([TyId::STRING, TyId::STRING], types.list(TyId::STRING)),

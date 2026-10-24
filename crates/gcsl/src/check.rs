@@ -1564,6 +1564,10 @@ const RETRY: &str = "retry";
 /// The name of the checker's attribute that limits a call's time.
 const TIMEOUT: &str = "timeout";
 
+/// The name of the checker's attribute that reports the errors raised in a
+/// function's body at its call.
+pub(crate) const TRACK_CALLER: &str = "track_caller";
+
 /// The error for an `#[attribute]` type that is no record of constants.
 const NOT_CONSTANT_RECORD: &str = "an attribute's arguments are a record of constants";
 
@@ -1648,13 +1652,14 @@ fn item_function(ast: &Ast, item: ItemId) -> Option<FnId> {
 /// `def_type`, `attribute` and `no_prelude`, and the checker's, `retry`
 /// and `timeout` (see [Attributes](crate::check::attributes#attributes)). No `#[attribute]` type
 /// may be named like one: "`retry` is a built-in attribute".
-pub(crate) const BUILTIN_ATTRIBUTES: [&str; 6] = [
+pub(crate) const BUILTIN_ATTRIBUTES: [&str; 7] = [
     "shadowable",
     "def_type",
     "attribute",
     "no_prelude",
     "retry",
     "timeout",
+    "track_caller",
 ];
 
 /// The type names every program can use, as `(name, type)` pairs. A name

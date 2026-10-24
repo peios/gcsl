@@ -527,7 +527,9 @@ fn show_rejects_a_function_anywhere_in_its_argument() {
         (
             "show({e = exec})",
             "{e = exec}",
-            "`{e: fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}}`",
+            "`{e: fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
+             interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: String, \
+             stdout: String}}`",
         ),
         (
             "show(lazy fn(): Int { 1 })",
@@ -573,16 +575,24 @@ fn show_rejects_a_function_anywhere_in_its_argument() {
 /// The type `exec` returns, as the type table shows it.
 pub(super) const EXEC_RESULT: &str = "{status: Int, stderr: String, stdout: String}";
 
+/// The type of the prelude's `exec`, which takes the built-in's options by
+/// name.
+const EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
+                         interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: \
+                         String, stdout: String}";
+
+/// The type of the built-in `exec`, which takes its options as a record.
+const BUILTIN_EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*: \
+                                 Revealed<String>}, interactive: Bool, panic: Bool, until: \
+                                 String}) -> {status: Int, stderr: String, stdout: String}";
+
 #[test]
 fn exec_and_panic_have_function_types() {
-    assert_eq!(
-        shown_result("exec"),
-        "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}"
-    );
+    assert_eq!(shown_result("exec"), EXEC_TYPE);
     assert_eq!(shown_result("panic"), "fn(message: String): Never");
     assert_eq!(
         shown_result("import builtins\nbuiltins.exec"),
-        shown_result("exec")
+        BUILTIN_EXEC_TYPE
     );
     // The summary of slice 29.
     assert_eq!(
@@ -645,15 +655,11 @@ fn exec_is_impure_and_called_as_any_impure_function() {
     assert_eq!(found[0].span, at(text, "exec([\"true\"])"));
     assert_eq!(
         labels(&found[0])[0],
-        (
-            at(text, "exec"),
-            "this is fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: \
-                 String}"
-        )
+        (at(text, "exec"), format!("this is {EXEC_TYPE}").as_str())
     );
     // Through a variable or a parameter, the same.
     assert_eq!(
-        messages("let e = exec\nfn f(): Int { e([\"true\"]).status }"),
+        messages("let e = sh\nfn f(): String { e(\"true\") }"),
         ["cannot call an impure function from a pure function"]
     );
     // From a `lazy` in a pure function, an impure or memoised function,
@@ -676,21 +682,37 @@ fn exec_is_impure_and_called_as_any_impure_function() {
     // it fits a written impure function type whose parameter says
     // `Present`, as an impure function declared so does, and not one
     // whose bare parameter may be a future.
-    let pick = "fn pick(f: fn(argv: Present<List<String>>) -> {status: Int}): \
-                    fn(Present<List<String>>) -> {status: Int} { f }\n";
+    let options = "import builtins\n\
+                   type Options = {cwd: String, env: {*: String}, interactive: Bool, panic: Bool, \
+                   until: String}\n";
+    let given = "{cwd = \"\"; env = {}; interactive = false; panic = false; until = \"\"}";
+    let pick = "fn pick(f: fn(argv: Present<List<String>>, options: Present<Options>) -> \
+                    {status: Int}): fn(Present<List<String>>, Present<Options>) -> {status: Int} \
+                    { f }\n";
     assert_eq!(
-        shown_result(&format!("{pick}let e = pick(exec)\ne([\"true\"]).status")),
+        shown_result(&format!(
+            "{options}{pick}let e = pick(builtins.exec)\ne([\"true\"], {given}).status"
+        )),
         "Int | Future<Int>"
     );
     assert_eq!(
-        messages(
-            "fn pick(f: fn(argv: List<Revealed<String>>) -> {status: Int}): Int { 1 }\npick(exec)"
-        ),
+        messages(&format!(
+            "{options}fn pick(f: fn(argv: List<String>, options: Options) -> {{status: Int}}): \
+             Int {{ 1 }}\npick(builtins.exec)"
+        )),
         ["mismatched types"]
     );
+    // The prelude's `exec`, through a value, is given every argument: only
+    // a call by its own name uses its defaults.
     assert_eq!(
-        shown_result("let r = { e = exec }\nlet e = r.e\ne([\"true\"]).stdout"),
+        shown_result(
+            "let r = { e = exec }\nlet e = r.e\ne([\"true\"], \"\", {}, false, false, \"\").stdout"
+        ),
         "String"
+    );
+    assert_eq!(
+        messages("let e = exec\ne([\"true\"])"),
+        ["expected 6 arguments, found 1"]
     );
     assert_eq!(messages("exec === exec"), ["cannot compare functions"]);
     assert_eq!(messages("panic === panic"), ["cannot compare functions"]);
@@ -701,7 +723,7 @@ fn exec_live_is_typed_as_exec_and_impure() {
     assert_eq!(shown_result("exec_live"), shown_result("exec"));
     assert_eq!(
         shown_result("import builtins\nbuiltins.exec_live"),
-        shown_result("exec")
+        BUILTIN_EXEC_TYPE
     );
     assert_eq!(shown_result("exec_live([\"true\"])"), EXEC_RESULT);
     assert_eq!(shown_result("exec_live(argv = [\"true\"])"), EXEC_RESULT);
@@ -717,7 +739,7 @@ fn exec_live_is_typed_as_exec_and_impure() {
     );
     assert_eq!(found[0].span, at(text, "exec_live([\"true\"])"));
     assert_eq!(
-        messages("let e = exec_live\nfn f(): Int { e([\"true\"]).status }"),
+        messages("let e = sh_live\nfn f(): String { e(\"true\") }"),
         ["cannot call an impure function from a pure function"]
     );
     assert_eq!(

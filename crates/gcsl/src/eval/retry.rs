@@ -25,10 +25,11 @@
 //! enclosing deadline's, which a cell keeps for the innermost so that a check
 //! reads one cell while none runs. The evaluator checks it at every call and
 //! every iteration of a loop, so pure code that runs long is stopped too, and
-//! at every `exec`, which runs its program until the deadline (`run_until`):
+//! at every `exec`, which runs its program until the deadline (`run_watched`):
 //! the program is looked at, at first often and then every
 //! [`DEADLINE_POLL`](super::system::DEADLINE_POLL) at most, and killed when the
-//! deadline passes (the program itself, not its own children). When one has
+//! deadline passes, with what it started: it runs in a process group of its
+//! own, which is killed whole. When one has
 //! passed, the error is the outermost passed deadline's, "`f` timed out after
 //! 30s", where the evaluation was, marked with the deadline's number
 //! ([`ErrorMark`]): every call inside passes it on, unretried, and the call
@@ -44,9 +45,7 @@ use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
 use crate::ir::{FnCode, IrNode};
 use crate::value::{Caller, Closure, Value};
 
-use super::{
-    Deadline, Evaluator, Flow, GUARD_LEVELS, Unwind, mistyped, nested_too_deeply, shown_duration,
-};
+use super::{Deadline, Evaluator, Flow, GUARD_LEVELS, mistyped, nested_too_deeply, shown_duration};
 
 impl Evaluator<'_> {
     /// Finishes the call `node` of `closure`, whose function has `#[retry]`
@@ -69,11 +68,8 @@ impl Evaluator<'_> {
         let result = self.guarded_body((closure, code), base, (caller, levels), node);
         self.stack.truncate(base);
         match result.or_else(|unwind| unwind.returned(node.span)) {
-            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
-                error.input = Some(closure.code.input());
-                Err(error.into())
-            }
-            result => result.map_err(Unwind::from),
+            Err(error) => Err(self.call_error(error, closure, node).into()),
+            Ok(value) => Ok(value),
         }
     }
 

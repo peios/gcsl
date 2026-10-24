@@ -360,10 +360,11 @@ It is declared, imported and named like any type.
 Apply an attribute to the following fn, def or definition.
 Arguments are constants, by name, or by position for an attribute of one field; fields left out take their defaults.
 Attributes on a definition type are defaults for its definitions, and a definition's own attribute of the same name replaces one.
-GCSL's own attributes are retry(times: Int) and timeout(limit: Duration).
+GCSL's own attributes are retry(times: Int), timeout(limit: Duration) and track_caller, which takes no arguments.
 A call with retry that fails, other than by an enclosing call's timeout, runs its body again with the same arguments, up to times more times; its effects repeat.
 A call with timeout that runs longer than limit fails, and a program it is running is killed; its own retry may retry it, each attempt timed afresh.
 Retry on a pure function is a warning.
+A call of a function with track_caller that fails with an error raised in the function's own body, a fn written in it included, reports the error at the call, the error's labels in the body dropped and its notes kept; an error of a function it calls without track_caller, or of a function value it is given, stays where it was raised.
 .SH DEFINITION TYPES AND METADATA
 A definition-type declaration is followed by definitions of this form:
 .PP

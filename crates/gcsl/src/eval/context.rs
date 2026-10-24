@@ -36,7 +36,7 @@ use crate::ir::{IrId, IrKind, IrNode, IrRange};
 use crate::names::Name;
 use crate::value::{ContextFrame, Value};
 
-use super::{Callee, Evaluator, Flow, Unwind, mistyped, nested_too_deeply};
+use super::{Callee, Evaluator, Flow, mistyped, nested_too_deeply};
 
 impl Evaluator<'_> {
     /// The value of the read `node` of the context of the declaration key
@@ -99,11 +99,8 @@ impl Evaluator<'_> {
         .value(code.body);
         self.stack.truncate(base);
         match result.or_else(|unwind| unwind.returned(node.span)) {
-            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
-                error.input = Some(closure.code.input());
-                Err(error.into())
-            }
-            result => result.map_err(Unwind::from),
+            Err(error) => Err(self.call_error(error, &closure, node).into()),
+            Ok(value) => Ok(value),
         }
     }
 

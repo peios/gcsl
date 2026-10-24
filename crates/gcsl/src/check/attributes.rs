@@ -17,8 +17,9 @@
 //! a field may be; and it may not be named like a built-in attribute
 //! ([`BUILTIN_ATTRIBUTES`](super::BUILTIN_ATTRIBUTES)), "`retry` is a built-in attribute".
 //!
-//! `retry`, `{times: Int}`, and `timeout`, `{limit: Duration}`, are the
-//! checker's own, known in every file, whatever its types.
+//! `retry`, `{times: Int}`, `timeout`, `{limit: Duration}`, and
+//! `track_caller`, of no arguments, are the checker's own, known in every
+//! file, whatever its types.
 //!
 //! Each use on a function item (`Checker::check_attribute_uses`), checked
 //! before the file's body, names one of the checker's or a type of the
@@ -50,8 +51,10 @@
 //! of an earlier session input is known by what its cell or binding
 //! carries ([`KnownParams`](super::KnownParams)). Plain GCSL gives a host's attributes no
 //! meaning, and runs `retry` and `timeout` (see [`crate::eval`], "Retry and
-//! timeout"). `#[retry]` needs a `times` of at least 0, "`#[retry]` needs a
-//! `times` of at least 0" otherwise, and `#[timeout]` a positive `limit`,
+//! timeout") and `track_caller` (see [Located at the
+//! call](crate::eval::calls#located-at-the-call)). `#[retry]` needs a
+//! `times` of at least 0, "`#[retry]` needs a `times` of at least 0"
+//! otherwise, and `#[timeout]` a positive `limit`,
 //! "`#[timeout]` needs a positive `limit`" (`Checker::fits_builtin`); and
 //! `#[retry]` on a pure function, a `fn` or `def` declared with `:`, is the
 //! warning "retrying a pure function cannot change its result", noted "a
@@ -177,7 +180,7 @@ use crate::workspace::{AttributeLookup, Context};
 
 use super::{
     Attribute, AttributeFields, AwaitMark, Bareness, CONSTANT_NOTE, Checker, Constant, MetaOf,
-    PURE_CONTEXT, RETRY, TIMEOUT, constant_of, item_function,
+    PURE_CONTEXT, RETRY, TIMEOUT, TRACK_CALLER, constant_of, item_function,
 };
 
 impl Checker<'_> {
@@ -257,7 +260,8 @@ impl Checker<'_> {
     }
 
     /// The attribute `used` names, with its arguments, once checked (see
-    /// [Attributes](#attributes)): `retry` and `timeout` the checker's own,
+    /// [Attributes](#attributes)): `retry`, `timeout` and `track_caller` the
+    /// checker's own,
     /// any other name a type of the file's view marked `#[attribute]`,
     /// whose record type its arguments are checked against. `None`, the
     /// error reported, if it names none, or its arguments do not fit.
@@ -273,6 +277,7 @@ impl Checker<'_> {
                 AttributeId::Builtin(TIMEOUT),
                 vec![(Box::from("limit"), TyId::DURATION, None)],
             ),
+            TRACK_CALLER => (AttributeId::Builtin(TRACK_CALLER), Vec::new()),
             _ => self.declared_attribute(used)?,
         };
         let given = self.attribute_args(used, &fields)?;
@@ -387,8 +392,9 @@ impl Checker<'_> {
     /// attribute's record, by name, in their order: one positional argument
     /// for an attribute of one field, and named arguments for any. `None`,
     /// the error reported, for a positional argument of an attribute of
-    /// another number of fields, a second positional one, a named one that
-    /// names no field or one named twice, or a trailing block.
+    /// another number of fields, "`#[track_caller]` takes no argument" for
+    /// one of none, a second positional one, a named one that names no
+    /// field or one named twice, or a trailing block.
     pub(super) fn attribute_args(
         &mut self,
         used: &AttributeUse,
@@ -401,6 +407,9 @@ impl Checker<'_> {
         for arg in used.args.map_or(&[][..], |args| ast.args(args)) {
             let error = match arg.kind {
                 ArgKind::Spread { .. } => Some(format!("`#[{text}]` takes no spread argument")),
+                ArgKind::Positional if fields.is_empty() => {
+                    Some(format!("`#[{text}]` takes no argument"))
+                }
                 ArgKind::Positional if fields.len() != 1 => Some(format!(
                     "`#[{text}]` takes its arguments by name, as in `#[{text}({} = ...)]`",
                     fields.first().map_or("x", |(name, _, _)| name)

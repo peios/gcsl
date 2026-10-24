@@ -8,9 +8,8 @@
 # neither has a type a GCSL type can write yet, so a name bound directly to
 # one is that built-in, called by the checker's rule. Generic and call limits:
 # docs/learn/2--developer-tools.shelf/gcsl.product/2--language.topic/900--inference-limits.md.
-# `int`, `float`, `exec`, `exec_live`, `panic`, the
-# string built-ins, `compare_versions` and `sort_versions` are ordinary:
-# values of their function types. `sh` runs a shell command with `exec`, and
+# `int`, `float`, `panic`, the string built-ins, `compare_versions` and
+# `sort_versions` are ordinary: values of their function types. `sh` runs a shell command with `exec`, and
 # panics unless it succeeds; `sh_live` does the same with `exec_live`. Like
 # every standard file it is a scope of its own: it sees its own declarations
 # and what it imports, nothing else.
@@ -29,10 +28,44 @@ def half(n: Int): Float { float(n) / 2.0 }
 # returns `{status, stdout, stderr}`; `exec_live(argv)` does the same, and
 # also copies the program's standard output and standard error, line by line
 # as they arrive, to gcsl's standard error, so that a long build is seen as
-# it runs; `panic(message)` ends the run with the runtime error `message`.
-# All three are ordinary built-ins, not the alias rule's.
-exec = builtins.exec
-exec_live = builtins.exec_live
+# it runs. Each takes, by name, the options of the built-in it calls: `cwd`
+# the program's working directory, `""` for gcsl's own; `env` variables set
+# over gcsl's environment for it; `interactive` to give it gcsl's terminal,
+# capturing nothing; `panic` to make a status other than 0 a failure of the
+# call; and `until`, some text whose line, in either stream, ends the program,
+# with the status 0. Each fails at its call, as `sh` and `sh_live` do: they
+# are `#[track_caller]`. `panic(message)` ends the run with the runtime error
+# `message`, an ordinary built-in, not the alias rule's.
+#[track_caller]
+def exec(
+    argv: Present<List<Revealed<String>>>,
+    cwd: Present<String> = "",
+    env: Present<{*: Revealed<String>}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = false,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.exec(
+        argv,
+        {cwd = cwd; env = env; interactive = interactive; panic = panic; until = until},
+    )
+}
+
+#[track_caller]
+def exec_live(
+    argv: Present<List<Revealed<String>>>,
+    cwd: Present<String> = "",
+    env: Present<{*: Revealed<String>}> = {},
+    interactive: Present<Bool> = false,
+    panic: Present<Bool> = false,
+    until: Present<String> = "",
+) -> {status: Int, stdout: String, stderr: String} {
+    builtins.exec_live(
+        argv,
+        {cwd = cwd; env = env; interactive = interactive; panic = panic; until = until},
+    )
+}
+
 panic = builtins.panic
 
 # Strings: `split(s, sep)` the pieces of `s` between occurrences of `sep`,
@@ -63,6 +96,7 @@ sort_versions = builtins.sort_versions
 # Runs `script` with `/bin/sh -c` and returns its standard output, raw, its
 # trailing newline included; panics, with the script, its exit status and
 # its standard error, trimmed, unless it exits with status 0.
+#[track_caller]
 def sh(script: String) -> String {
     let result = exec(["/bin/sh", "-c", script])
     if result.status != 0 {
@@ -75,6 +109,7 @@ def sh(script: String) -> String {
 # standard error as it runs, and its standard output still returned. Its
 # panic has the script and its exit status, without its standard error, which
 # has been shown already.
+#[track_caller]
 def sh_live(script: String) -> String {
     let result = exec_live(["/bin/sh", "-c", script])
     if result.status != 0 {

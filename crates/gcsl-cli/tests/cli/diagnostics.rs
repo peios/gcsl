@@ -107,11 +107,11 @@ fn dumps_show_names_and_slots() {
          Newline @32..33\n\
          Eof @32..32\n\
          (block @0..32\n\
-         \x20 (store count#61 @0..13\n\
+         \x20 (store count#63 @0..13\n\
          \x20   (int 1 @12..13))\n\
-         \x20 (store count#62 @14..32\n\
+         \x20 (store count#64 @14..32\n\
          \x20   (int-add @23..32\n\
-         \x20     (load count#61 @23..28)\n\
+         \x20     (load count#63 @23..28)\n\
          \x20     (int 1 @31..32)))\n\
          \x20 (empty @0..32))\n"
     );

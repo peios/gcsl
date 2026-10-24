@@ -344,22 +344,22 @@ fn dumps_show_top_level_functions_and_where_they_are_made() {
         // Those that copy nothing are made as the input starts, in their
         // own slots, the first of the input's.
         "(block @123..726\n\
-         \x20 (store describe#67 @156..225\n\
+         \x20 (store describe#69 @156..225\n\
          \x20   (make-closure #0 @156..225))\n\
-         \x20 (store even#68 @226..290\n",
+         \x20 (store even#70 @226..290\n",
         // One that copies `rate` just after `rate` is bound.
-        "\n  (store rate#73 @494..506\n\
+        "\n  (store rate#75 @494..506\n\
          \x20   (int 3 @505..506))\n\
-         \x20 (store scale#71 @525..559\n\
+         \x20 (store scale#73 @525..559\n\
          \x20   (make-closure #4 @525..559\n\
-         \x20     (load rate#73 @525..559)))\n\
+         \x20     (load rate#75 @525..559)))\n\
          \x20 (store scaled#55 @507..524\n",
         // One that copies a mutable variable where it is written.
-        "\n  (store counted#72 @643..670\n\
+        "\n  (store counted#74 @643..670\n\
          \x20   (make-closure #5 @643..670\n",
         // A function reads another of the top level from the top level's
         // frame, not by a capture.
-        "\n        (fn top even#68 @190..194)\n",
+        "\n        (fn top even#70 @190..194)\n",
     ] {
         assert!(ir.contains(node), "{node}: {ir}");
     }
@@ -525,7 +525,7 @@ fn dumps_show_returns_and_their_catches() {
         "(catch 0 @384..436\n",
         "(return 0 @403..423\n",
         "\n    (catch 1 @532..582\n\
-         \x20     (for hit#67 @532..582\n",
+         \x20     (for hit#69 @532..582\n",
         // A loop that cannot end collects nothing.
         "\n    (catch 2 @692..759\n\
          \x20     (loop-each @692..759\n",

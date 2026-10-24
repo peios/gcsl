@@ -25,6 +25,14 @@ pub(super) fn lone_error(text: &str) -> Diagnostic {
     errors.remove(0)
 }
 
+/// The input of `main.gcsl` in a workspace of it and `workspace.gcsl`: the
+/// prelude is input 0.
+const MAIN: u32 = 1;
+
+/// The type of the prelude's `exec` and `exec_live`, as a value shows it.
+const EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
+                         interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: \
+                         String, stdout: String}";
 #[test]
 fn the_shell_summary_runs_in_a_workspace_and_alone() {
     let expected = "{r = {status = 0; stdout = \"/\\n\"; stderr = \"\"}; lines = \"/\\n\"; \
@@ -75,11 +83,16 @@ fn exec_reports_what_its_program_did() {
             "= exec([\"printf\", \"%s|\", \"a b\", \"$HOME\", \"*\"]).stdout",
             "a b|$HOME|*|",
         ),
-        // Named, through a variable, a field, a `->` function.
+        // Named, through a variable, a field, a `->` function. A call
+        // through a value gives every argument: only a call by the
+        // function's own name uses its defaults.
         ("= exec(argv = [\"echo\", \"n\"]).stdout", "n\n"),
-        ("let e = exec\n= e([\"echo\", \"v\"]).stdout", "v\n"),
         (
-            "let r = { run = exec }\n= r.run([\"echo\", \"f\"]).stdout",
+            "let e = exec\n= e([\"echo\", \"v\"], \"\", {}, false, false, \"\").stdout",
+            "v\n",
+        ),
+        (
+            "let r = { run = exec }\n= r.run([\"echo\", \"f\"], \"\", {}, false, false, \"\").stdout",
             "f\n",
         ),
         (
@@ -87,13 +100,18 @@ fn exec_reports_what_its_program_did() {
             "i\n",
         ),
         (
-            "fn pick(f: fn(argv: Present<List<String>>) -> {status: Int}): \
-                 fn(Present<List<String>>) -> {status: Int} { f }\n\
-                 = pick(exec)([\"false\"]).status",
+            "import builtins\n\
+                 type Options = {cwd: String, env: {*: String}, interactive: Bool, panic: Bool, \
+                 until: String}\n\
+                 fn pick(f: fn(argv: Present<List<String>>, options: Present<Options>) -> \
+                 {status: Int}): fn(Present<List<String>>, Present<Options>) -> {status: Int} \
+                 { f }\n\
+                 = pick(builtins.exec)([\"false\"], {cwd = \"\"; env = {}; interactive = false; \
+                 panic = false; until = \"\"}).status",
             "1",
         ),
         (
-            "import exec as run from builtins\n= run([\"true\"]).status",
+            "import exec as run from builtins\n= run([\"true\"], {cwd = \"\"; env = {}; interactive = false; panic = false; until = \"\"}).status",
             "0",
         ),
         // A future argument is awaited, as any call's.
@@ -106,10 +124,7 @@ fn exec_reports_what_its_program_did() {
             "deep\n",
         ),
         // The value shows as its type.
-        (
-            "= exec",
-            "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}",
-        ),
+        ("= exec", EXEC_TYPE),
         ("= panic", "fn(message: String): Never"),
     ] {
         assert_eq!(lone(text).unwrap(), expected, "{text}");
@@ -190,20 +205,20 @@ fn panic_ends_the_run_with_its_message_at_the_call() {
 }
 
 #[test]
-fn sh_returns_its_output_or_panics_in_the_prelude() {
+fn sh_returns_its_output_or_panics_at_its_call() {
     assert_eq!(lone("= sh(\"echo hi\")").unwrap(), "hi\n");
     assert_eq!(lone("= sh(\"printf hi\")").unwrap(), "hi");
-    // The panic is the prelude's, located in it: input 0.
-    let error = lone_error("x = sh(\"echo nope >&2; exit 2\")");
+    // The panic is the prelude's, but `sh` is `#[track_caller]`: it is
+    // located at the call, in the file.
+    let text = "x = sh(\"echo nope >&2; exit 2\")";
+    let error = lone_error(text);
     assert_eq!(
         error.message,
         "`echo nope >&2; exit 2` exited with status 2: nope"
     );
-    assert_eq!(error.input, Some(0));
-    let prelude = Library::NEEDED.find("prelude").unwrap();
-    let prelude = crate::STANDARD[prelude].1;
-    let at = u32::try_from(prelude.find("panic(\"`").unwrap()).unwrap();
-    assert_eq!(error.span.start, at);
+    assert_eq!(error.input, None);
+    assert_eq!(error.span, Span::new(4, 31));
+    assert!(error.labels.is_empty());
     // With no standard error, the message ends in ": ".
     assert_eq!(
         lone_error("x = sh(\"exit 2\")").message,
@@ -212,7 +227,7 @@ fn sh_returns_its_output_or_panics_in_the_prelude() {
     let files = [("workspace.gcsl", ""), ("main.gcsl", "x = sh(\"exit 2\")")];
     assert_eq!(
         run_file(&files, "main.gcsl").unwrap_err(),
-        [("`exit 2` exited with status 2: ".to_owned(), Some(0))]
+        [("`exit 2` exited with status 2: ".to_owned(), Some(MAIN))]
     );
 }
 
@@ -266,7 +281,7 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         ),
         (
             "b.gcsl",
-            "rb = exec([\"false\"])\nlet e = exec\ns = e([\"true\"])\nt = run()",
+            "rb = exec([\"false\"])\nlet e = exec\ns = e([\"true\"], \"\", {}, false, false, \"\")\nt = run()",
         ),
     ];
     let sources: Vec<SourceFile> = files
@@ -350,13 +365,17 @@ fn exec_live_gives_the_record_exec_gives() {
     // and a future argument, as `exec`.
     for (text, expected) in [
         ("= exec_live(argv = [\"echo\", \"n\"]).stdout", "n\n"),
-        ("let e = exec_live\n= e([\"echo\", \"v\"]).stdout", "v\n"),
+        (
+            "let e = exec_live\n= e([\"echo\", \"v\"], \"\", {}, false, false, \"\").stdout",
+            "v\n",
+        ),
         (
             "fn run(a: String) -> String { exec_live([\"echo\", a]).stdout }\n= run(\"i\")",
             "i\n",
         ),
         (
-            "import exec_live as run from builtins\n= run([\"true\"]).status",
+            "import exec_live as run from builtins\n\
+             = run([\"true\"], {cwd = \"\"; env = {}; interactive = false; panic = false; until = \"\"}).status",
             "0",
         ),
         (
@@ -364,10 +383,7 @@ fn exec_live_gives_the_record_exec_gives() {
             "later\n",
         ),
         // The value shows as its type, `exec`'s.
-        (
-            "= exec_live",
-            "fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}",
-        ),
+        ("= exec_live", EXEC_TYPE),
     ] {
         assert_eq!(lone(text).unwrap(), expected, "{text}");
     }
@@ -401,7 +417,8 @@ fn every_record_exec_live_builds_shares_the_runs_one_layout() {
         ("workspace.gcsl", ""),
         (
             "a.gcsl",
-            "ra = exec_live([\"true\"])\nlet e = exec_live\ns = e([\"false\"])\nt = exec([\"true\"])",
+            "ra = exec_live([\"true\"])\nlet e = exec_live\ns = e([\"false\"], \"\", {}, false, false, \"\")\nt = \
+             exec([\"true\"])",
         ),
     ];
     let sources: Vec<SourceFile> = files
@@ -436,19 +453,15 @@ fn sh_live_returns_its_output_or_panics_without_its_standard_error() {
         error.message,
         "`echo nope >&2; exit 2` exited with status 2"
     );
-    assert_eq!(error.input, Some(0));
-    let prelude = Library::NEEDED.find("prelude").unwrap();
-    let prelude = crate::STANDARD[prelude].1;
-    let def = prelude.find("def sh_live(").unwrap();
-    let at = def + prelude[def..].find("panic(\"`").unwrap();
-    assert_eq!(error.span.start, u32::try_from(at).unwrap());
+    assert_eq!(error.input, None);
+    assert_eq!(error.span, Span::new(4, 36));
     let files = [
         ("workspace.gcsl", ""),
         ("main.gcsl", "x = sh_live(\"exit 2\")"),
     ];
     assert_eq!(
         run_file(&files, "main.gcsl").unwrap_err(),
-        [("`exit 2` exited with status 2".to_owned(), Some(0))]
+        [("`exit 2` exited with status 2".to_owned(), Some(MAIN))]
     );
     // `sh`'s message is unchanged.
     assert_eq!(
@@ -461,4 +474,136 @@ fn sh_live_returns_its_output_or_panics_without_its_standard_error() {
         found,
         ["cannot call an impure function from a pure function"]
     );
+}
+
+#[test]
+fn exec_s_options_set_its_program_s_directory_and_environment() {
+    assert_eq!(
+        lone("= exec([\"pwd\"], cwd = \"/\").stdout").unwrap(),
+        "/\n"
+    );
+    assert_eq!(
+        lone("= exec([\"pwd\"], cwd = \"/usr\").stdout").unwrap(),
+        "/usr\n"
+    );
+    // The environment is gcsl's own, the options' set over it.
+    assert_eq!(
+        lone("= exec([\"printenv\", \"PATH\"]).status").unwrap(),
+        "0"
+    );
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo $HOME\"], env = {HOME = \"/h\"}).stdout").unwrap(),
+        "/h\n"
+    );
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo $A$B\"], env = {A = \"x\"; B = \"y\"}).stdout")
+            .unwrap(),
+        "xy\n"
+    );
+    // By name in any order, as any named arguments, and through `exec_live`.
+    assert_eq!(
+        lone(
+            "= exec_live([\"sh\", \"-c\", \"pwd; echo $A\"], env = {A = \"l\"}, cwd = \"/\").stdout"
+        )
+        .unwrap(),
+        "/\nl\n"
+    );
+    // A directory that is not there is the program's failure to start.
+    let text = "r = exec([\"true\"], cwd = \"/gcsl-no-such-directory\")";
+    let error = lone_error(text);
+    assert_eq!(error.message, "cannot run `true`");
+    assert_eq!(error.span, Span::new(4, u32::try_from(text.len()).unwrap()));
+}
+
+#[test]
+fn exec_with_panic_fails_unless_its_program_succeeds() {
+    let text = "r = exec([\"sh\", \"-c\", \"echo bad >&2; exit 3\"], panic = true)";
+    let error = lone_error(text);
+    assert_eq!(error.message, "`sh` exited with status 3");
+    assert_eq!(error.notes, ["its standard error: bad"]);
+    assert_eq!(error.span, Span::new(4, u32::try_from(text.len()).unwrap()));
+    // Without standard error, no note; `exec_live` has shown it already.
+    assert!(
+        lone_error("r = exec([\"false\"], panic = true)")
+            .notes
+            .is_empty()
+    );
+    let error =
+        lone_error("r = exec_live([\"sh\", \"-c\", \"echo bad >&2; exit 3\"], panic = true)");
+    assert_eq!(error.message, "`sh` exited with status 3");
+    assert!(error.notes.is_empty());
+    // Success is the record, as without it.
+    assert_eq!(
+        lone("= exec([\"echo\", \"ok\"], panic = true).stdout").unwrap(),
+        "ok\n"
+    );
+    // A secret program is shown as stars.
+    let error =
+        lone_error("let p = secret(\"false\", \"p\")\nr = exec([p.reveal()], panic = true)");
+    assert_eq!(error.message, "`***` exited with status 1");
+}
+
+#[test]
+fn exec_until_ends_its_program_at_a_line_with_the_text() {
+    // Its program, and what it started, killed at once: not 30 seconds.
+    let started = std::time::Instant::now();
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo start; echo ready; sleep 30; echo late\"], until = \"ready\")")
+            .unwrap(),
+        "{status = 0; stdout = \"start\\nready\\n\"; stderr = \"\"}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // In either stream, part of a line.
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo is ready now >&2; sleep 30\"], until = \"ready\").stderr")
+            .unwrap(),
+        "is ready now\n"
+    );
+    // Met, it is 0, whether the program then ends by itself or not, and so
+    // never a failure.
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo ready; exit 4\"], until = \"ready\", panic = true).status")
+            .unwrap(),
+        "0"
+    );
+    // Never met, the program ends as it would.
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"echo x; exit 2\"], until = \"ready\")").unwrap(),
+        "{status = 2; stdout = \"x\\n\"; stderr = \"\"}"
+    );
+    assert_eq!(
+        lone("= exec_live([\"sh\", \"-c\", \"echo ready; sleep 30\"], until = \"ready\").stdout")
+            .unwrap(),
+        "ready\n"
+    );
+    // An interactive program's output is not there to watch.
+    let error = lone_error("r = exec([\"true\"], until = \"x\", interactive = true)");
+    assert_eq!(
+        error.message,
+        "`until` watches a program's output, which an interactive one does not capture"
+    );
+}
+
+#[test]
+fn an_interactive_program_has_the_terminal_and_nothing_is_captured() {
+    assert_eq!(
+        lone("= exec([\"true\"], interactive = true)").unwrap(),
+        "{status = 0; stdout = \"\"; stderr = \"\"}"
+    );
+    assert_eq!(
+        lone("= exec([\"sh\", \"-c\", \"exit 2\"], interactive = true).status").unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn a_timeout_kills_what_its_program_started() {
+    // `sh` waits for the `sleep` it starts, which holds its output open:
+    // both are killed at the deadline, not the shell alone.
+    let text = "#[timeout(200ms)]\n\
+                fn slow() -> Int { exec([\"sh\", \"-c\", \"sleep 30 & wait\"]).status }\n\
+                r = recover { slow() } else (e) { 0 - 1 }";
+    let started = std::time::Instant::now();
+    assert_eq!(lone(text).unwrap(), "{r = -1}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }

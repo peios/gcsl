@@ -351,10 +351,26 @@ fn its_input_numbers_follow_the_standard_files_loaded() {
     let (standard, checked) = checked_beside(&crate::STANDARD, &files);
     assert_eq!(standard, ["<stdlib>/path.gcsl", "<stdlib>/prelude.gcsl"]);
     assert_eq!(checked.unwrap_err()[0].input, Some(2));
-    // Run alone with `path`, the prelude is input 1, and the file's
-    // diagnostics name no input.
+    // A runtime error raised in a standard file names its input: `a`,
+    // loaded before the prelude, is input 0.
+    let table = [
+        ("a", "def fail() -> Int { panic(\"no\") }"),
+        prelude_entry(),
+    ];
+    let files = [
+        ("workspace.gcsl", ""),
+        ("main.gcsl", "import a\nx = a.fail()"),
+    ];
+    let (standard, checked) = checked_beside(&table, &files);
+    assert_eq!(standard, ["<stdlib>/a.gcsl", "<stdlib>/prelude.gcsl"]);
+    let mut workspace = checked.unwrap();
+    let main = workspace.file("main.gcsl").unwrap();
+    let errors = workspace.run(main).unwrap_err();
+    assert_eq!(errors[0].input, Some(0));
+    // Run alone with `path`, the file's diagnostics name no input, and so
+    // do those of `sh`, which reports them at its call.
     let error = lone_error("import path\nx = sh(\"exit 2\")");
-    assert_eq!(error.input, Some(1));
+    assert_eq!(error.input, None);
     let source = SourceFile::new("lone.gcsl", "import path\nx = 1 + true").unwrap();
     assert_eq!(crate::run(&source).unwrap_err()[0].input, None);
 }

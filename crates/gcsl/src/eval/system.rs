@@ -6,13 +6,16 @@ use std::ffi::OsString;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread::{self, ScopedJoinHandle};
 use std::time::{Duration, Instant};
+
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 
 use crate::check::Builtin;
 use crate::diagnostic::Diagnostic;
@@ -22,36 +25,50 @@ use crate::value::{Layout, List, Record, Value};
 use super::{Flow, mistyped};
 
 /// Runs the program `argv` names, for the call `node` of `builtin`, `exec`
-/// or `exec_live`, and returns what it did as a record of the layout
-/// `exec_result` (see [The built-in functions](crate::eval::calls#the-built-in-functions)):
-/// `argv[0]` found through `PATH` as the OS finds it and given the
-/// arguments `argv[1..]`, with no shell, its standard input the null
-/// device, its standard output and standard error captured whole, its
-/// working directory and environment this process's; once it has exited,
-/// its exit status, or 128 plus the number of the signal that killed it,
-/// and its output decoded as UTF-8, each invalid sequence replaced by
-/// U+FFFD. For `exec_live` the program's standard output and standard
-/// error are also copied, as they arrive, to this process's standard error
-/// ([`run_live`]); nothing else differs. Fails with "`exec` needs a
-/// program to run" for an empty `argv` (`exec_live` naming itself), and
-/// with "cannot run `name`", noting the OS's own reason, for a program that
-/// cannot be started, or whose output cannot be read or whose end cannot be
-/// waited for, as [`Command::output`] reports each. A word of `argv` that
-/// is a revealed secret is given to the program as its value, and shown as
-/// `***` (see [Secrets](crate::eval::secrets#secrets)): "cannot run `***`".
-/// A run without the standard library has no `exec` layout, nor any `exec`
-/// to call, so `exec_result` being `None` is an internal error, as is an
-/// element of `argv` that is neither a string nor a revealed one, which the
-/// checker rules out.
+/// or `exec_live`, as `options` says ([`ExecOptions`]), and returns what it
+/// did as a record of the layout `exec_result` (see [The built-in
+/// functions](crate::eval::calls#the-built-in-functions)): `argv[0]` found
+/// through `PATH` as the OS finds it and given the arguments `argv[1..]`,
+/// with no shell, its standard input the null device, its standard output
+/// and standard error captured whole, its working directory the options'
+/// `cwd`, or this process's for `""`, and its environment this process's
+/// with the options' `env` set over it; once it has exited, its exit status,
+/// or 128 plus the number of the signal that killed it, and its output
+/// decoded as UTF-8, each invalid sequence replaced by U+FFFD. For
+/// `exec_live` the program's standard output and standard error are also
+/// copied, as they arrive, to this process's standard error ([`run_live`]).
+/// With `until`, the program is killed once a line of either stream
+/// contains the text ([`run_watching`]), its output so far the result's,
+/// and its status 0. An `interactive` one has this process's standard
+/// input, output and error, and its result's output is empty. With
+/// `panic`, a status other than 0 is a failure of the call, "`cc` exited
+/// with status 1", noted with its standard error unless `exec_live`
+/// showed it already.
+///
+/// Fails with "`exec` needs a program to run" for an empty `argv`
+/// (`exec_live` naming itself), with "cannot run `name`", noting the OS's
+/// own reason, for a program that cannot be started, or whose output cannot
+/// be read or whose end cannot be waited for, as [`Command::output`]
+/// reports each, and with "`until` watches a program's output, which an
+/// interactive one does not capture" for both. A word of `argv` that is a
+/// revealed secret is given to the program as its value, and shown as
+/// `***` (see [Secrets](crate::eval::secrets#secrets)): "cannot run
+/// `***`". A run without the standard library has no `exec` layout, nor
+/// any `exec` to call, so `exec_result` being `None` is an internal error,
+/// as is an element of `argv` that is neither a string nor a revealed one,
+/// or options of another shape, which the checker rules out.
 #[inline(never)]
 pub(super) fn exec(
     builtin: Builtin,
-    argv: &List,
+    (argv, options): (&List, &Value),
     (exec_result, deadline): (Option<&Rc<Layout>>, Option<Instant>),
     node: &IrNode,
 ) -> Flow<Option<Value>> {
     let Some(layout) = exec_result else {
         return mistyped(node, "`exec` called in a run without its result's layout");
+    };
+    let Some(options) = ExecOptions::of(options) else {
+        return mistyped(node, "options of `exec` of another shape");
     };
     let Some((program, arguments)) = argv.values().split_first() else {
         return Err(Diagnostic::error(
@@ -70,19 +87,18 @@ pub(super) fn exec(
         };
         command.arg(&**argument);
     }
-    command.stdin(Stdio::null());
+    if !options.cwd.is_empty() {
+        command.current_dir(options.cwd);
+    }
+    for &(name, value) in &options.env {
+        command.env(name, value);
+    }
     let live = builtin == Builtin::ExecLive;
-    let output = match (live, deadline) {
-        (true, None) => run_live(&mut command, node)?,
-        (false, None) => command.output(),
-        (_, Some(deadline)) => match run_until(&mut command, (live, deadline), node)? {
-            Ok(Some(output)) => Ok(output),
-            Ok(None) => return Ok(None),
-            Err(error) => Err(error),
-        },
+    let Some(ran) = run(&mut command, (live, deadline), &options, node)? else {
+        return Ok(None);
     };
-    let output = match output {
-        Ok(output) => output,
+    let (status, stdout, stderr) = match ran {
+        Ok(ran) => ran,
         Err(error) => {
             return Err(
                 Diagnostic::error(format!("cannot run `{shown}`"), node.span)
@@ -91,23 +107,360 @@ pub(super) fn exec(
             );
         }
     };
-    let status = match (output.status.code(), output.status.signal()) {
-        (Some(code), _) => i64::from(code),
-        (None, Some(signal)) => 128 + i64::from(signal),
-        // A program waited for has exited or been killed.
-        (None, None) => {
-            return mistyped(node, "a program ended neither by exiting nor by a signal");
+    let text = |bytes: &[u8]| Rc::<str>::from(String::from_utf8_lossy(bytes).as_ref());
+    let (stdout, stderr) = (text(&stdout), text(&stderr));
+    if options.panic && status != 0 {
+        let mut failed =
+            Diagnostic::error(format!("`{shown}` exited with status {status}"), node.span);
+        if !live && !stderr.trim().is_empty() {
+            failed = failed.with_note(format!("its standard error: {}", stderr.trim()));
         }
-    };
-    let text = |bytes: &[u8]| Value::Str(Rc::from(String::from_utf8_lossy(bytes).as_ref()));
+        return Err(failed.into());
+    }
     Ok(Some(Value::Record(Rc::new(Record {
         layout: Rc::clone(layout),
-        values: Box::new([
-            Value::Int(status),
-            text(&output.stdout),
-            text(&output.stderr),
-        ]),
+        values: Box::new([Value::Int(status), Value::Str(stdout), Value::Str(stderr)]),
     }))))
+}
+
+/// What the options record of a call of `exec` or `exec_live` says (see
+/// [`exec`]): each of its fields, as the checker types them.
+pub(super) struct ExecOptions<'a> {
+    /// The program's working directory, `""` for this process's.
+    cwd: &'a str,
+    /// The variables set over this process's environment for the program,
+    /// a revealed secret's by its value.
+    env: Vec<(&'a str, &'a str)>,
+    /// Whether the program has this process's terminal.
+    interactive: bool,
+    /// Whether a status other than 0 fails the call.
+    panic: bool,
+    /// The text whose line ends the program, `""` for none.
+    until: &'a str,
+}
+
+impl<'a> ExecOptions<'a> {
+    /// The options `value` holds, a record of the fields of
+    /// [`Builtin::EXEC_OPTIONS`]; `None` for anything else.
+    fn of(value: &'a Value) -> Option<Self> {
+        let Value::Record(record) = value else {
+            return None;
+        };
+        let field = |name: &str| {
+            record
+                .layout
+                .texts
+                .iter()
+                .position(|text| &**text == name)
+                .and_then(|at| record.values.get(at))
+        };
+        let text = |name: &str| match field(name) {
+            Some(Value::Str(text)) => Some(&**text),
+            _ => None,
+        };
+        let flag = |name: &str| match field(name) {
+            Some(&Value::Bool(flag)) => Some(flag),
+            _ => None,
+        };
+        let env = match field("env")? {
+            Value::Empty => Vec::new(),
+            Value::Record(env) => env
+                .layout
+                .texts
+                .iter()
+                .zip(&env.values)
+                .map(|(name, value)| Some((&**name, &**word(value)?.0)))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        Some(ExecOptions {
+            cwd: text("cwd")?,
+            env,
+            interactive: flag("interactive")?,
+            panic: flag("panic")?,
+            until: text("until")?,
+        })
+    }
+}
+
+/// What a program [`run`] runs did: its status, its standard output and its
+/// standard error; or the error of running it.
+type Ran = io::Result<(i64, Vec<u8>, Vec<u8>)>;
+
+/// Runs `command` for [`exec`] as `options` says, copying its output if
+/// `live`, until `deadline` if there is one: what it did, or `None` if the
+/// deadline passed first. `until` with `interactive` is a runtime error at
+/// `node`. A program that may be killed, by its deadline or by `until`, and
+/// does not have the terminal, is run in a process group of its own, so
+/// that what it starts is killed with it ([`run_watched`]).
+fn run(
+    command: &mut Command,
+    (live, deadline): (bool, Option<Instant>),
+    options: &ExecOptions<'_>,
+    node: &IrNode,
+) -> Flow<Option<Ran>> {
+    if options.interactive {
+        if !options.until.is_empty() {
+            return Err(Diagnostic::error(
+                "`until` watches a program's output, which an interactive one does not capture",
+                node.span,
+            )
+            .into());
+        }
+        return Ok(run_interactive(command, deadline));
+    }
+    command.stdin(Stdio::null());
+    let until = Some(options.until).filter(|until| !until.is_empty());
+    if deadline.is_some() || until.is_some() {
+        return run_watched(command, (live, deadline, until), node);
+    }
+    let output = if live {
+        run_live(command, node)?
+    } else {
+        command.output()
+    };
+    Ok(Some(output.and_then(|output| {
+        Ok((status_of(output.status)?, output.stdout, output.stderr))
+    })))
+}
+
+/// The status [`exec`] reports of a program that ended with `status`: its
+/// exit status, or 128 plus the number of the signal that killed it.
+fn status_of(status: ExitStatus) -> io::Result<i64> {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => Ok(i64::from(code)),
+        (None, Some(signal)) => Ok(128 + i64::from(signal)),
+        // A program waited for has exited or been killed.
+        (None, None) => Err(io::Error::other("ended neither by exiting nor by a signal")),
+    }
+}
+
+/// Runs `command` with this process's standard input, output and error,
+/// until `deadline` if there is one: its status and no output, or `None`
+/// if the deadline passed first, when it is killed, alone, as it is in the
+/// terminal's process group.
+fn run_interactive(command: &mut Command, deadline: Option<Instant>) -> Option<Ran> {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Some(Err(error)),
+    };
+    let watch = Watch {
+        deadline,
+        met: None,
+        open: &AtomicUsize::new(0),
+        group: false,
+    };
+    Some(match watch.wait(&mut child) {
+        Ok(Ended::Exited(status)) => {
+            status_of(status).map(|status| (status, Vec::new(), Vec::new()))
+        }
+        Ok(Ended::TimedOut | Ended::Met) => return None,
+        Err(error) => Err(error),
+    })
+}
+
+/// Runs `command`, in a process group of its own, copying its output to
+/// this process's standard error as it runs if `live`, and watching each
+/// line of it, of either stream, for the text `until` if there is one:
+/// its output read by a thread each, and the program waited for by looking
+/// at it in turn, at first often and then less, at most every
+/// [`DEADLINE_POLL`] ([`Watch::wait`]). Once a line contains `until`, the
+/// group is killed, and its output so far given, with the status 0, even
+/// if it had ended by itself; once `deadline` passes, before the program
+/// and its output have ended, the group is killed and `None` given (see
+/// [Retry and timeout](crate::eval::retry#retry-and-timeout)); otherwise
+/// what it did, once it has ended and its output has.
+fn run_watched(
+    command: &mut Command,
+    (live, deadline, until): (bool, Option<Instant>, Option<&str>),
+    node: &IrNode,
+) -> Flow<Option<Ran>> {
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Ok(Some(Err(error))),
+    };
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return mistyped(node, "a program of `exec` without the pipes of its output");
+    };
+    let (met, open) = (AtomicBool::new(false), AtomicUsize::new(2));
+    let (ended, stdout, stderr) = thread::scope(|scope| {
+        let reader = Reader {
+            until,
+            met: &met,
+            open: &open,
+            live,
+        };
+        let stdout = thread::Builder::new().spawn_scoped(scope, move || reader.read(out));
+        let stderr = thread::Builder::new().spawn_scoped(scope, move || reader.read(err));
+        let watch = Watch {
+            deadline,
+            met: Some(&met),
+            open: &open,
+            group: true,
+        };
+        let ended = watch.wait(&mut child);
+        (
+            ended,
+            stdout.map(ScopedJoinHandle::join),
+            stderr.map(ScopedJoinHandle::join),
+        )
+    });
+    let (Some(stdout), Some(stderr)) = (copied(stdout), copied(stderr)) else {
+        return mistyped(node, "a thread reading a program's output panicked");
+    };
+    // The text was seen, whether or not the program ended first.
+    let ended = match ended {
+        Ok(Ended::Exited(_)) if met.load(AtomicOrdering::Acquire) => Ok(Ended::Met),
+        ended => ended,
+    };
+    Ok(match (stdout, stderr, ended) {
+        (_, _, Ok(Ended::TimedOut)) => None,
+        (Ok(stdout), Ok(stderr), Ok(Ended::Met)) => Some(Ok((0, stdout, stderr))),
+        (Ok(stdout), Ok(stderr), Ok(Ended::Exited(status))) => {
+            Some(status_of(status).map(|status| (status, stdout, stderr)))
+        }
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Some(Err(error)),
+    })
+}
+
+/// How a program [`Watch::wait`] waits for ended.
+enum Ended {
+    /// It exited, or a signal killed it, by itself, and its output ended.
+    Exited(ExitStatus),
+    /// A line of its output had the text watched for, and it was killed.
+    Met,
+    /// The deadline passed, and it was killed.
+    TimedOut,
+}
+
+/// What [`Watch::wait`] waits for a program by.
+struct Watch<'a> {
+    /// When it is killed, if it has not ended.
+    deadline: Option<Instant>,
+    /// Set once a line of its output has the text watched for, if any is.
+    met: Option<&'a AtomicBool>,
+    /// How many of its output's streams are still being read.
+    open: &'a AtomicUsize,
+    /// Whether it leads a process group of its own, killed whole.
+    group: bool,
+}
+
+impl Watch<'_> {
+    /// Waits for `child`, looking at it in turn, at first often and then
+    /// less, at most every [`DEADLINE_POLL`], until it has ended and its
+    /// output has, its text is met, or its deadline passes, killing it, and
+    /// its group if it leads one, for either of the last two: so that what
+    /// it started, holding its output open, cannot keep it running.
+    fn wait(&self, child: &mut Child) -> io::Result<Ended> {
+        let mut pause = Duration::from_millis(1);
+        let mut status = None;
+        loop {
+            if self
+                .met
+                .is_some_and(|met| met.load(AtomicOrdering::Acquire))
+            {
+                self.kill(child, status.is_some())?;
+                return Ok(Ended::Met);
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if let Some(status) = status
+                && self.open.load(AtomicOrdering::Acquire) == 0
+            {
+                return Ok(Ended::Exited(status));
+            }
+            let now = Instant::now();
+            if self.deadline.is_some_and(|deadline| now >= deadline) {
+                self.kill(child, status.is_some())?;
+                return Ok(Ended::TimedOut);
+            }
+            let wait = self
+                .deadline
+                .map_or(pause, |deadline| pause.min(deadline - now));
+            thread::sleep(wait);
+            pause = (pause * 2).min(DEADLINE_POLL);
+        }
+    }
+
+    /// Kills `child`, its process group whole if it leads one, and waits
+    /// for it unless it has been already, `reaped`, so that its output's
+    /// pipes close. One that has already ended, or a group already empty,
+    /// cannot be killed, which changes nothing.
+    fn kill(&self, child: &mut Child, reaped: bool) -> io::Result<()> {
+        if self.group {
+            // A program waited for, or not yet, keeps its group's number
+            // while anything is in it.
+            if let Ok(leader) = i32::try_from(child.id()) {
+                let _ = killpg(Pid::from_raw(leader), Signal::SIGKILL);
+            }
+        } else {
+            let _ = child.kill();
+        }
+        if !reaped {
+            child.wait()?;
+        }
+        Ok(())
+    }
+}
+
+/// The longest wait between two looks at a program [`Watch::wait`] waits
+/// for.
+pub(super) const DEADLINE_POLL: Duration = Duration::from_millis(50);
+
+/// How a thread of [`run_watched`] reads a stream of a program's output.
+#[derive(Clone, Copy)]
+struct Reader<'a> {
+    /// The text watched for in each line, if any is.
+    until: Option<&'a str>,
+    /// Set once a line has it.
+    met: &'a AtomicBool,
+    /// How many streams are still being read, made one fewer as this one
+    /// ends.
+    open: &'a AtomicUsize,
+    /// Whether each line is copied to this process's standard error.
+    live: bool,
+}
+
+impl Reader<'_> {
+    /// Reads `stream` to its end, copying each line as [`copy_lines`] does
+    /// if `live`, and setting `met` once a line contains `until`; `open` is
+    /// made one fewer as it ends, read whole or failing.
+    fn read(self, stream: impl Read) -> io::Result<Vec<u8>> {
+        let read = self.lines(stream);
+        self.open.fetch_sub(1, AtomicOrdering::Release);
+        read
+    }
+
+    /// What [`Reader::read`] reads, before it marks its stream ended.
+    fn lines(self, stream: impl Read) -> io::Result<Vec<u8>> {
+        let mut stream = BufReader::new(stream);
+        let mut read = Vec::new();
+        loop {
+            let start = read.len();
+            if stream.read_until(b'\n', &mut read)? == 0 {
+                return Ok(read);
+            }
+            let Some(line) = read.get(start..) else {
+                continue;
+            };
+            if self.live {
+                // A copy that cannot be shown changes nothing else.
+                let _ = io::stderr().lock().write_all(line);
+            }
+            if self
+                .until
+                .is_some_and(|until| String::from_utf8_lossy(line).contains(until))
+            {
+                self.met.store(true, AtomicOrdering::Release);
+            }
+        }
+    }
 }
 
 /// The text of `value`, a word of `exec`'s `argv`, and how it is shown: a
@@ -122,92 +475,6 @@ fn word(value: &Value) -> Option<(&Rc<str>, &str)> {
         },
         _ => None,
     }
-}
-
-/// Runs `command` as [`exec`] does, but only until `deadline`, copying its
-/// output to this process's standard error as it runs if `live`: its
-/// output read by a thread each, and the program waited for by looking at
-/// it in turn, at first often and then less, at most every
-/// [`DEADLINE_POLL`], until it ends or the deadline passes, when it is
-/// killed and waited for. `Ok(None)` if it was killed so (see [Retry and
-/// timeout](crate::eval::retry#retry-and-timeout)).
-pub(super) fn run_until(
-    command: &mut Command,
-    (live, deadline): (bool, Instant),
-    node: &IrNode,
-) -> Flow<io::Result<Option<Output>>> {
-    let mut child = match command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => return Ok(Err(error)),
-    };
-    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
-        return mistyped(node, "a program of `exec` without the pipes of its output");
-    };
-    let read: fn(std::process::ChildStdout) -> io::Result<Vec<u8>> =
-        if live { copy_lines } else { read_all };
-    let read_err: fn(std::process::ChildStderr) -> io::Result<Vec<u8>> =
-        if live { copy_lines } else { read_all };
-    let (status, stdout, stderr) = thread::scope(|scope| {
-        let stdout = thread::Builder::new().spawn_scoped(scope, move || read(out));
-        let stderr = thread::Builder::new().spawn_scoped(scope, move || read_err(err));
-        let status = wait_until(&mut child, deadline);
-        (
-            status,
-            stdout.map(ScopedJoinHandle::join),
-            stderr.map(ScopedJoinHandle::join),
-        )
-    });
-    let (Some(stdout), Some(stderr)) = (copied(stdout), copied(stderr)) else {
-        return mistyped(node, "a thread reading a program's output panicked");
-    };
-    Ok(match (stdout, stderr, status) {
-        (Ok(stdout), Ok(stderr), Ok(Some(status))) => Ok(Some(Output {
-            status,
-            stdout,
-            stderr,
-        })),
-        (_, _, Ok(None)) => Ok(None),
-        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
-    })
-}
-
-/// The longest wait between two looks at a program [`run_until`] runs.
-pub(super) const DEADLINE_POLL: Duration = Duration::from_millis(50);
-
-/// Waits for `child` until `deadline`: its exit status, or `None` if the
-/// deadline passed first, the program then killed and waited for, so that
-/// its output's pipes close.
-pub(super) fn wait_until(
-    child: &mut std::process::Child,
-    deadline: Instant,
-) -> io::Result<Option<std::process::ExitStatus>> {
-    let mut pause = Duration::from_millis(1);
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            // Already ended, it cannot be killed; either way it is waited
-            // for.
-            let _ = child.kill();
-            child.wait()?;
-            return Ok(None);
-        }
-        thread::sleep(pause.min(deadline - now));
-        pause = (pause * 2).min(DEADLINE_POLL);
-    }
-}
-
-/// All that `stream` gives, to its end.
-pub(super) fn read_all(mut stream: impl Read) -> io::Result<Vec<u8>> {
-    let mut read = Vec::new();
-    stream.read_to_end(&mut read)?;
-    Ok(read)
 }
 
 /// Runs `command`, for the call `node` of `exec_live`, as

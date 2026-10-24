@@ -188,6 +188,10 @@ fn a_generic_type_takes_as_many_arguments_as_it_has_parameters() {
             "#[attribute]\ntype Tag<T> = {v: T}",
             "attribute `Tag` takes no type parameters",
         ),
+        (
+            "#[attribute] type track_caller = {}",
+            "`track_caller` is a built-in attribute",
+        ),
     ] {
         let files = [("workspace.gcsl", ""), lib, ("app/main.gcsl", main)];
         assert_eq!(rooted_messages(&files), [message], "{main}");
@@ -1143,4 +1147,58 @@ fn a_revealed_secret_keeps_its_identity_and_is_told_apart_from_the_secret() {
             ("e", "token", true),
         ]
     );
+}
+
+#[test]
+fn a_tracked_function_reports_the_errors_of_its_body_at_its_call() {
+    let error = |text: &str| {
+        let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+        let mut workspace = rooted(&files).unwrap();
+        let app = workspace.file("app.gcsl").unwrap();
+        let error = workspace.run(app).unwrap_err().remove(0);
+        let at = text[error.span.start as usize..error.span.end as usize].to_owned();
+        (error.message, at)
+    };
+    // Raised in its body: at the call.
+    let tracked = "#[track_caller]\ndef fail(n: Int) -> Int { if n > 0 { panic(\"no\") }\nn }\n";
+    assert_eq!(
+        error(&format!("{tracked}x = fail(1)")),
+        ("no".to_owned(), "fail(1)".to_owned())
+    );
+    // A tracked function called from another's body fails at that call, and
+    // the other moves it on to its own call if it is tracked too.
+    let text = format!("#[track_caller]\ndef outer() -> Int {{ fail(2) }}\n{tracked}x = outer()");
+    assert_eq!(error(&text), ("no".to_owned(), "outer()".to_owned()));
+    let text = format!("def outer() -> Int {{ fail(2) }}\n{tracked}x = outer()");
+    assert_eq!(error(&text), ("no".to_owned(), "fail(2)".to_owned()));
+    // An untracked function it calls fails where it raises its error.
+    let text = "def inner() -> Int { panic(\"in\") }\n\
+                #[track_caller]\ndef outer() -> Int { inner() }\nx = outer()";
+    assert_eq!(error(text), ("in".to_owned(), "panic(\"in\")".to_owned()));
+    // So does a callback, whose body is not the tracked function's.
+    let text = "#[track_caller]\ndef call(f: fn() -> Int) -> Int { f() }\n\
+                fn boom() -> Int { panic(\"cb\") }\nx = call(boom)";
+    assert_eq!(error(text), ("cb".to_owned(), "panic(\"cb\")".to_owned()));
+    // A memoised or retried tracked function, the same.
+    let text = "#[track_caller]\ndef once(n: Int) ->> Int { panic(\"m{n}\") }\nx = once(1)";
+    assert_eq!(error(text), ("m1".to_owned(), "once(1)".to_owned()));
+    let text = "#[track_caller] #[retry(1)]\ndef again() -> Int { panic(\"r\") }\nx = again()";
+    assert_eq!(error(text), ("r".to_owned(), "again()".to_owned()));
+}
+
+#[test]
+fn a_revealed_secret_is_given_to_a_program_s_environment() {
+    let text = "let s = secret(\"hunter2\", \"token\")\n\
+                a = exec([\"sh\", \"-c\", \"echo $T\"], env = {T = s.reveal()}).stdout\n\
+                b = exec([\"sh\", \"-c\", \"echo $T\"], env = {T = \"plain\"}).stdout";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{a = \"hunter2\\n\"; b = \"plain\\n\"}"
+    );
+    // A secret not revealed is no value of an environment's.
+    let text = "let s = secret(\"pw\", \"id\")\nr = exec([\"true\"], env = {T = s})";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    let errors = rooted(&files).err().unwrap();
+    assert_eq!(errors[0].message, "mismatched types");
 }

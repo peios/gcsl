@@ -492,10 +492,10 @@ fn meta_errors() {
     assert_eq!(
         errors(
             "def tagged x() { \"x\" }\n\
-                 defmeta tagged x { tag = exec([\"true\"]).stdout; n = 1 }"
+                 defmeta tagged x { tag = sh(\"true\"); n = 1 }"
         ),
         "cannot call an impure function from a pure function at app.gcsl; app.gcsl: this \
-             is fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout: String}; \
+             is fn(script: String | Future<String>) -> String; \
              app.gcsl: this function is pure, declared with `:`; note: a pure function, \
              declared with `:`, may call only pure functions; declare it with `->` to make it \
              impure"

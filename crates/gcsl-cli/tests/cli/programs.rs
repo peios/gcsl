@@ -50,20 +50,20 @@ fn a_panic_is_rendered_with_exit_code_1() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-/// A failing `sh` is the prelude's panic, located where it happens, in
-/// `<stdlib>/prelude.gcsl`, with no trace to the call of `sh`; its standard
-/// error is trimmed, so its trailing newline leaves no empty line.
+/// A failing `sh` is the prelude's panic, located at the call of `sh`,
+/// which is `#[track_caller]`; its standard error is trimmed, so its
+/// trailing newline leaves no empty line.
 #[test]
-fn a_failing_sh_is_rendered_in_the_prelude() {
+fn a_failing_sh_is_rendered_at_its_call() {
     let output = gcsl(&["run", "tests/fixtures/sh_error.gcsl"]);
     assert_eq!(stdout(&output), "");
     assert_eq!(
         stderr(&output),
         "error: `echo nope >&2; exit 2` exited with status 2: nope\n\
-         \x20 --> <stdlib>/prelude.gcsl:69:9\n\
-         \x20  |\n\
-         69 |         panic(\"`{script}` exited with status {result.status}: {trim(result.stderr)}\")\n\
-         \x20  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+         \x20--> tests/fixtures/sh_error.gcsl:1:7\n\
+         \x20 |\n\
+         1 | out = sh(\"echo nope >&2; exit 2\")\n\
+         \x20 |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(1));
 }
@@ -89,7 +89,7 @@ fn run_has_the_string_built_ins_and_path() {
         "{ir}"
     );
     assert!(ir.contains("(load join#44 @32..36)"), "{ir}");
-    assert!(ir.contains("(load join#79 @153..162)"), "{ir}");
+    assert!(ir.contains("(load join#81 @153..162)"), "{ir}");
     // Nothing of `path`'s own code.
     assert!(!ir.contains("segments"), "{ir}");
     assert_eq!(output.status.code(), Some(0));
@@ -247,8 +247,9 @@ fn exec_live_copies_and_captures_more_than_a_pipe_holds() {
     assert_eq!(output.status.code(), Some(0));
 }
 
-/// A failing `sh_live` is the prelude's panic, located in it as `sh`'s is,
-/// its message without the standard error, which was copied as it ran.
+/// A failing `sh_live` is the prelude's panic, located at its call as
+/// `sh`'s is, its message without the standard error, which was copied as
+/// it ran.
 #[test]
 fn a_failing_sh_live_is_rendered_without_its_standard_error() {
     let output = gcsl(&["run", "tests/fixtures/sh_live_error.gcsl"]);
@@ -257,10 +258,10 @@ fn a_failing_sh_live_is_rendered_without_its_standard_error() {
         stderr(&output),
         "nope\n\
          error: `echo nope >&2; exit 2` exited with status 2\n\
-         \x20 --> <stdlib>/prelude.gcsl:81:9\n\
-         \x20  |\n\
-         81 |         panic(\"`{script}` exited with status {result.status}\")\n\
-         \x20  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+         \x20--> tests/fixtures/sh_live_error.gcsl:1:5\n\
+         \x20 |\n\
+         1 | x = sh_live(\"echo nope >&2; exit 2\")\n\
+         \x20 |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(1));
 }
@@ -291,10 +292,10 @@ fn repl_runs_programs_live() {
         "hi\n\
          s\n\
          error: `exit 3` exited with status 3\n\
-         \x20 --> <stdlib>/prelude.gcsl:81:9\n\
-         \x20  |\n\
-         81 |         panic(\"`{script}` exited with status {result.status}\")\n\
-         \x20  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+         \x20--> <repl>:1:1\n\
+         \x20 |\n\
+         1 | sh_live(\"exit 3\")\n\
+         \x20 | ^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

@@ -84,6 +84,23 @@
 //! diagnostic, [`Diagnostic::input`], unless an inner call has already, so
 //! the innermost foreign frame wins.
 //!
+//! # Located at the call
+//!
+//! A function item marked `#[track_caller]` reports the errors raised in
+//! its own body at its call, as Rust's attribute of the name does: a
+//! function of the standard library that wraps a built-in, as the
+//! prelude's `exec` does, fails where it is called, not inside the
+//! library. An error raised in the body, its span inside the body's and
+//! no input recorded on it, is moved to the call that ran the body, the
+//! call's span its own, and the labels inside the body dropped, its notes
+//! kept ([`Evaluator::call_error`]). So a tracked function called from
+//! another's body fails at that call, which the other then moves on to
+//! its own call if it is tracked too; an error of a function the body
+//! calls that is not tracked stays where it was raised, and so does one of
+//! another input's code, a callback's, which has its input recorded.
+//! A `fn` written inside a tracked body is part of it: an error raised in
+//! one is moved too. Checking an error costs nothing until a call fails.
+//!
 //! # The built-in functions
 //!
 //! A call of an ordinary built-in function applies it to its arguments:
@@ -282,7 +299,8 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 use crate::{CALL_LEVELS, MAX_DEPTH};
-use crate::check::Builtin;
+use crate::ast::AttributeId;
+use crate::check::{Builtin, TRACK_CALLER};
 use crate::diagnostic::Diagnostic;
 use crate::ir::{ArgValue, ConstId, FnKind, IrId, IrKind, IrNode, IrRange};
 use crate::names::Name;
@@ -354,13 +372,33 @@ impl Evaluator<'_> {
         self.stack.truncate(base);
         // A `return` for the function is its value; no other stop leaves
         // its body: the checker sees to it.
-        match result.or_else(|unwind| unwind.returned(node.span)) {
-            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
-                error.input = Some(closure.code.input());
-                Err(error.into())
-            }
-            result => result.map_err(Unwind::from),
+        result
+            .or_else(|unwind| unwind.returned(node.span))
+            .map_err(|error| self.call_error(error, &closure, node).into())
+    }
+
+    /// `error`, which came out of a call `node` of `closure`, as the
+    /// calling frame reports it: moved to the call if `closure` is tracked
+    /// and raised it in its own body (see [Located at the
+    /// call](#located-at-the-call)), and otherwise given the input of
+    /// `closure`'s code if that is another input than this frame's and
+    /// none is recorded on it.
+    pub(super) fn call_error(
+        &self,
+        mut error: Diagnostic,
+        closure: &Closure,
+        node: &IrNode,
+    ) -> Diagnostic {
+        if error.input.is_some() {
+            return error;
         }
+        if raised_in_tracked(&error, closure) {
+            error.span = node.span;
+            error.labels.retain(|label| label.input.is_some());
+        } else if closure.code.input() != self.ir.input() {
+            error.input = Some(closure.code.input());
+        }
+        error
     }
 
     /// Evaluates the `Call` `node` of the built-in function `builtin` with
@@ -472,9 +510,10 @@ impl Evaluator<'_> {
                     .into()),
             },
             (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
-            (Builtin::Exec | Builtin::ExecLive, Some((Value::List(words), _)), None) => {
+            (Builtin::Exec | Builtin::ExecLive, Some((Value::List(words), _)), Some(options)) => {
                 let deadline = self.shared.earliest.get();
-                match exec(builtin, &words, (self.shared.exec_result, deadline), node)? {
+                let words = (&words, &options);
+                match exec(builtin, words, (self.shared.exec_result, deadline), node)? {
                     Some(value) => Ok(value),
                     None => self.timed_out(node),
                 }
@@ -723,4 +762,22 @@ impl Evaluator<'_> {
             _ => mistyped(node, "a node of another kind where a function was expected"),
         }
     }
+}
+
+/// Whether `error`, with no input recorded on it, was raised in the body of
+/// `closure`'s function, marked `#[track_caller]` (see [Located at the
+/// call](#located-at-the-call)): its span inside the body's.
+pub(super) fn raised_in_tracked(error: &Diagnostic, closure: &Closure) -> bool {
+    let tracked = closure
+        .attributes()
+        .iter()
+        .any(|attribute| attribute.id == AttributeId::Builtin(TRACK_CALLER));
+    tracked
+        && closure
+            .code
+            .find_function(closure.function)
+            .is_some_and(|code| {
+                let body = closure.code.get(code.body).span;
+                body.start <= error.span.start && error.span.end <= body.end
+            })
 }

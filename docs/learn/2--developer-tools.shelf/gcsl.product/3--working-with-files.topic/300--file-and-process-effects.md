@@ -43,17 +43,58 @@ file's permissions or provide a durable transaction across several files.
 
 `exec` accepts a list whose first element names the program. Later elements
 are passed as arguments without shell interpretation. It returns a record
-with the exit status and captured output. A nonzero exit status is data,
-not a GCSL runtime error.
+with the exit status and captured output. By default, a nonzero exit status
+is data, not a GCSL runtime error.
 
 `sh` instead executes a string through `/bin/sh` and fails the GCSL run
 when the command fails. Don't insert untrusted text into that string.
 Prefer `exec` when values need to become arguments rather than shell code.
 
 `exec_live` and `sh_live` also copy child output to GCSL's standard error
-as lines arrive. They still capture output in memory. All these commands
-inherit the host environment and working directory, and give the child
-null standard input. A source-relative `fileroot` value does not change
-a command's working directory.
+as lines arrive. They still capture output in memory. Each gives the child
+null standard input. A failure of any of them, such as a program that
+can't start, is reported at your call, not inside the standard library.
+
+### The environment
+
+A command inherits GCSL's environment. The `env` option sets variables
+over it, replacing any of the same name:
+
+```gcsl
+exec(["sh", "-c", "echo $GREETING"], env = {GREETING = "hello"}).stdout
+```
+
+The program named first is found through the resulting `PATH`, so setting
+`PATH` in `env` also changes where it's looked for. A value you pass can be
+a revealed secret: the program receives its value, and GCSL never shows it.
+
+A build tool that runs commands in isolation, such as pekit, gives them an
+environment of its own instead of GCSL's.
+
+### Options
+
+`exec` and `exec_live` take these options by name:
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `cwd` | `""` | The working directory. `""` keeps GCSL's own; a relative path is relative to it. |
+| `env` | `{}` | Variables set over the environment, as a record of strings or revealed secrets. |
+| `panic` | `false` | When true, a nonzero exit status fails the call with its standard error. |
+| `until` | `""` | When set, the program is stopped at the first line of output containing this text. |
+| `interactive` | `false` | When true, the program uses GCSL's terminal, and nothing is captured. |
+
+`until` suits a program that keeps running once it's ready, such as a
+server or an emulator. The result holds the output read so far, and its
+status is 0 because the condition was met. The program and anything it
+started are stopped together. `until` can't be combined with
+`interactive`, because an interactive program's output isn't captured.
+
+```gcsl
+let started = exec(["sh", "-c", "echo booting; echo ready; sleep 60"], until = "ready")
+started.stdout
+```
+
+A source-relative `fileroot` value doesn't change a command's working
+directory; pass it as `cwd` instead.
 
 Consult `gcsl-stdlib(3)` for exact function contracts and error behavior.

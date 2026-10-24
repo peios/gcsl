@@ -7,8 +7,8 @@ description: Tell the program that runs a function how to run it.
 An attribute goes before a function and says how to run it, for example
 whether a build step can be cached or how long it can take. GCSL checks
 every attribute. Most are read by the tool that runs the program, such as
-a build system, and GCSL itself acts on its own two, `retry` and
-`timeout`.
+a build system, and GCSL itself acts on its own three, `retry`, `timeout`
+and `track_caller`.
 
 ```gcsl
 #[attribute] type hermetic = {on: Bool = true}
@@ -51,12 +51,13 @@ with one field can take its argument by position, as in `#[timeout(10m)]`;
 one with more fields takes its arguments by name. A misspelt attribute is
 an error, so a mistake isn't silently ignored.
 
-GCSL provides two attributes of its own, `retry` and `timeout`:
+GCSL provides three attributes of its own:
 
 | Attribute | Argument | Meaning |
 |---|---|---|
 | `#[retry(times)]` | `times: Int` | If the call fails, run it again, up to this many more times. |
 | `#[timeout(limit)]` | `limit: Duration` | Fail the call if it runs for longer than this. |
+| `#[track_caller]` | none | Report an error raised in the function's body at its call. |
 
 A retried call runs its whole body again with the same arguments, so any
 effects it has happen again: use `retry` only where that's safe. Retrying a
@@ -72,6 +73,32 @@ fn fetch(url: String) -> String { exec(["echo", "fetched {url}"]).stdout }
 
 page = fetch("https://example.com")
 ```
+
+### Reporting errors at the call
+
+A library function that checks its arguments, or wraps a command, fails
+inside the library, where the reader of the error can do nothing about it.
+Mark it `#[track_caller]`, and an error raised in its body is reported at
+the call instead:
+
+```gcsl
+#[track_caller]
+fn positive(n: Int): Int {
+    if n <= 0 { panic("expected a positive number, got {n}") }
+    n
+}
+
+size = positive(4)
+```
+
+A call of `positive(0)` would fail at that call, not at the `panic`. The
+standard library's `exec`, `sh` and their live forms are marked so.
+
+Only errors raised in the marked function's own body move. When it calls
+another marked function, that call's error moves to the call in the body,
+and then on to the outer call. An error from a function it calls that
+isn't marked, or from a function value it was given, stays where it was
+raised. A `fn` written inside the marked body counts as part of it.
 
 ## Attributes on a definition type
 

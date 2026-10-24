@@ -760,6 +760,49 @@ impl Checker<'_> {
         self.call_of(id, (callee, callee_ty, callback), args)
     }
 
+    /// Types the call `id` of `callee`, of `callee_ty`, which is no
+    /// function type, with the arguments `args`, each checked alone: a
+    /// callee of type `Never` is never there to call, and gives `Never`;
+    /// any other is "cannot call a value of type T", unless it is
+    /// erroneous, its error reported where it is. Apart from
+    /// [`Checker::call_of`], which every nested call passes through, so
+    /// that its frame stays small.
+    fn call_of_no_function(
+        &mut self,
+        id: ExprId,
+        (callee, callee_ty): (ExprId, TyId),
+        args: ArgRange,
+    ) -> TyId {
+        if callee_ty == self.never {
+            for arg in self.ast.args(args) {
+                self.check_alone(arg.value);
+            }
+            return self.never;
+        }
+        if callee_ty != TyId::ERROR {
+            let callee_ty = self.settle(callee, callee_ty);
+            let message = format!("cannot call a value of type {}", self.in_message(callee_ty));
+            let label = format!("this is {}", self.in_label(callee_ty));
+            let mut error = Diagnostic::error(message, self.ast.get(id).span)
+                .with_context(self.ast.get(callee).span, label)
+                .with_note("only functions can be called");
+            if let Some(note) = self.union_note(callee, callee_ty) {
+                error = error.with_note(note);
+            }
+            self.errors.push(error);
+        }
+        // An erroneous callee, its error reported where it is, would have
+        // typed its arguments: what it would have typed is no error of
+        // theirs (see [`Checker::check_list`]).
+        let unknown = u32::from(callee_ty == TyId::ERROR);
+        self.quiet.expecting_error = self.quiet.expecting_error.saturating_add(unknown);
+        for arg in self.ast.args(args) {
+            self.check_alone(arg.value);
+        }
+        self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(unknown);
+        TyId::ERROR
+    }
+
     /// Types the call `id` of `callee`, already checked, of type
     /// `callee_ty`, with the arguments `args`, as [`Checker::check_call`]
     /// does: a call of a built-in by its own rule, a call of anything else
@@ -775,35 +818,7 @@ impl Checker<'_> {
         }
         let callee_ty = self.measure(callee, callee_ty);
         let Some(sig) = self.types.fn_sig(callee_ty).cloned() else {
-            // A callee of type `Never` is never there to call.
-            if callee_ty == self.never {
-                for arg in self.ast.args(args) {
-                    self.check_alone(arg.value);
-                }
-                return self.never;
-            }
-            if callee_ty != TyId::ERROR {
-                let callee_ty = self.settle(callee, callee_ty);
-                let message = format!("cannot call a value of type {}", self.in_message(callee_ty));
-                let label = format!("this is {}", self.in_label(callee_ty));
-                let mut error = Diagnostic::error(message, self.ast.get(id).span)
-                    .with_context(self.ast.get(callee).span, label)
-                    .with_note("only functions can be called");
-                if let Some(note) = self.union_note(callee, callee_ty) {
-                    error = error.with_note(note);
-                }
-                self.errors.push(error);
-            }
-            // An erroneous callee, its error reported where it is, would
-            // have typed its arguments: what it would have typed is no
-            // error of theirs (see [`Checker::check_list`]).
-            let unknown = u32::from(callee_ty == TyId::ERROR);
-            self.quiet.expecting_error = self.quiet.expecting_error.saturating_add(unknown);
-            for arg in self.ast.args(args) {
-                self.check_alone(arg.value);
-            }
-            self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(unknown);
-            return TyId::ERROR;
+            return self.call_of_no_function(id, (callee, callee_ty), args);
         };
         let sig = match sig.generic {
             Some(generic) => match self.instantiate((id, callee), (args, None), &sig, generic) {

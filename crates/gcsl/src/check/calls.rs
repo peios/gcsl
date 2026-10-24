@@ -32,8 +32,11 @@
 //! [`Builtin::ty`] interns with the table in hand (its parameters' and its
 //! result's names into the run's names): `int` (`fn(x: Float): Int`,
 //! truncation toward zero), `float` (`fn(x: Int): Float`), `exec`
-//! (`fn(argv: List<Revealed<String>>) -> {status: Int, stderr: String, stdout:
-//! String}`, which runs a program), `exec_live` (of `exec`'s type, which
+//! (`fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*:
+//! Revealed<String>}, interactive: Bool, panic: Bool, until: String}) ->
+//! {status: Int, stderr: String, stdout: String}`, which runs a program as
+//! its options say, and which the prelude's `exec` calls, taking the
+//! options by name), `exec_live` (of `exec`'s type, which
 //! runs a program as `exec` does, copying its output to standard error as
 //! it runs), `panic` (`fn(message: String):
 //! Never`, which ends the run with a runtime error of the program's own
@@ -141,9 +144,65 @@ use super::{
     position, unknown_argument, unknown_builtin_argument,
 };
 
-/// Where an argument is bound: the call, its callee, the callee if it is
-/// known, and the number of the callee's first parameter the call binds.
-type ArgSite = (ExprId, ExprId, Option<KnownCallee>, usize);
+/// What the binding of a call's arguments knows of the call, once, for
+/// each of its arguments (see [`Checker::bind_call`]).
+struct Binding<'a> {
+    /// The call.
+    id: ExprId,
+    /// Its callee.
+    callee: ExprId,
+    /// The callee's type.
+    callee_ty: TyId,
+    /// The callback the call's arguments are recorded for, if any.
+    callback: Option<usize>,
+    /// The callee, if it is known.
+    known: Option<KnownCallee>,
+    /// The number of the callee's first parameter the call binds.
+    offset: usize,
+    /// Whether the call is of the function it is in, which measures its
+    /// arguments.
+    recursive: bool,
+    /// Where the callee is written.
+    callee_span: Span,
+    /// "the function is ...", the label of an error of an argument.
+    function_label: &'a str,
+    /// Where the call's entries of `filled` begin.
+    base: usize,
+    /// The parameters bound.
+    sig: &'a FnTy,
+    /// The call's arguments.
+    args: ArgRange,
+    /// The call's arguments, as the tree holds them.
+    arg_list: &'a [Arg],
+}
+
+/// How the arguments of a call are written (see [`Checker::bind_call`]).
+#[derive(Clone, Copy)]
+struct ArgShape {
+    /// The positional arguments before the trailing block: the trailing
+    /// block, if any, comes after them all.
+    positional: usize,
+    /// Whether there is a trailing block.
+    trailing: bool,
+    /// Whether any argument is named.
+    named: bool,
+}
+
+impl ArgShape {
+    /// The shape of the arguments `args`.
+    fn of(args: &[Arg]) -> Self {
+        ArgShape {
+            positional: args
+                .iter()
+                .filter(|arg| arg.kind == ArgKind::Positional)
+                .count(),
+            trailing: args.iter().any(|arg| arg.kind == ArgKind::Trailing),
+            named: args
+                .iter()
+                .any(|arg| matches!(arg.kind, ArgKind::Named { .. })),
+        }
+    }
+}
 
 impl Checker<'_> {
     /// TEMPORARY (alias rule): types the call `id` of the built-in function `builtin`, whose typing
@@ -501,40 +560,58 @@ impl Checker<'_> {
         args: ArgRange,
         (sig, bound): (&FnTy, Bound),
     ) -> bool {
-        let ast = self.ast;
-        let call = ast.get(id);
-        let callee_span = ast.get(callee).span;
-        let Bound { known, offset } = bound;
-        let recursive = self.is_recursive(callee);
         let function_label = format!("the function is {}", self.in_label(callee_ty));
-        let arg_list = ast.args(args);
+        let site = Binding {
+            id,
+            callee,
+            callee_ty,
+            callback,
+            known: bound.known,
+            offset: bound.offset,
+            recursive: self.is_recursive(callee),
+            callee_span: self.ast.get(callee).span,
+            function_label: &function_label,
+            base: self.filled.len(),
+            sig,
+            args,
+            arg_list: self.ast.args(args),
+        };
+        let shape = ArgShape::of(site.arg_list);
         let count = sig.params.len();
-        // `positional` counts the positional arguments before the trailing
-        // block; the trailing block, if any, comes after them all.
-        let positional = arg_list
-            .iter()
-            .filter(|arg| arg.kind == ArgKind::Positional)
-            .count();
-        let trailing = arg_list.iter().any(|arg| arg.kind == ArgKind::Trailing);
-        let named = arg_list
-            .iter()
-            .any(|arg| matches!(arg.kind, ArgKind::Named { .. }));
-        let found = positional + usize::from(trailing);
-        let rest = sig.rest.map(usize::from);
-        let mut erroneous = false;
+        let found = shape.positional + usize::from(shape.trailing);
         // A rest parameter takes every positional argument from its place.
-        if found > count && rest.is_none() {
-            self.report_extra_arguments((call, callee_span, &function_label), args, count);
-            erroneous = true;
+        let extra = found > count && sig.rest.is_none();
+        if extra {
+            let call = self.ast.get(id);
+            self.report_extra_arguments((call, site.callee_span, &function_label), args, count);
         }
-        let base = self.filled.len();
-        self.filled.resize(base + count, u32::MAX);
+        self.filled.resize(site.base + count, u32::MAX);
         let rest_base = self.rest_args.len();
-        // Where the rest parameter's arguments are written, and whether a
-        // spread is where there is no rest parameter, which is then the
-        // error to see, not the parameters it leaves unfilled.
-        let (mut next_positional, mut rest_run, mut misplaced_spread) = (0, None, false);
-        for (index, arg) in arg_list.iter().enumerate() {
+        let (bound_badly, misplaced_spread) = self.bind_each(&site, shape);
+        let erroneous = self.finish_call(
+            &site,
+            shape,
+            rest_base,
+            (misplaced_spread, extra | bound_badly),
+        );
+        self.filled.truncate(site.base);
+        erroneous
+    }
+
+    /// Binds each of the arguments of the call `site` is to the parameter it
+    /// fills, as [`Checker::bind_call`] says, the arguments being of the
+    /// shape `shape`: whether any was bound badly, and whether one is a
+    /// spread where there is no rest parameter, which is then the error to
+    /// see, not the parameters it leaves unfilled. On the path of every
+    /// nested call, it keeps few locals of its own.
+    fn bind_each(&mut self, site: &Binding<'_>, shape: ArgShape) -> (bool, bool) {
+        let sig = site.sig;
+        let (count, rest) = (sig.params.len(), sig.rest.map(usize::from));
+        let label = (site.callee_span, site.function_label);
+        let (mut erroneous, mut misplaced_spread) = (false, false);
+        // Where the rest parameter's arguments are written.
+        let (mut next_positional, mut rest_run) = (0, None);
+        for (index, arg) in site.arg_list.iter().enumerate() {
             let target = match arg.kind {
                 ArgKind::Positional => {
                     next_positional += 1;
@@ -542,140 +619,144 @@ impl Checker<'_> {
                 }
                 ArgKind::Spread { span } if rest.is_none() => {
                     misplaced_spread = true;
-                    self.misplaced_spread(span, (callee_span, &function_label), &mut erroneous)
+                    self.misplaced_spread(span, label, &mut erroneous)
                 }
                 ArgKind::Spread { .. } => rest,
-                ArgKind::Trailing => (positional < count).then(|| count - 1),
+                ArgKind::Trailing => (shape.positional < count).then(|| count - 1),
                 ArgKind::Named {
                     name,
                     span,
                     shorthand,
                 } => {
-                    let param = self.named_target(
-                        (name, span, shorthand),
-                        (callee, callee_ty),
-                        sig,
-                        arg_list,
-                    );
+                    let param = self.named_target(site, (name, span, shorthand));
                     erroneous |= param.is_none();
                     param
                 }
             };
-            let Some(param) = target else {
-                self.check_alone(arg.value);
-                continue;
+            erroneous |= match target {
+                None => {
+                    self.check_alone(arg.value);
+                    false
+                }
+                Some(param) if Some(param) == rest => {
+                    self.bind_rest_argument(site, (arg, index, param), &mut rest_run)
+                }
+                Some(param) => self.bind_one_argument(site, (arg, index, param)),
             };
-            if Some(param) == rest {
-                let site = (id, callee, known, offset);
-                erroneous |= self.bind_rest_argument(
-                    (arg, index, param),
-                    (base, &mut rest_run),
-                    (site, sig),
-                    (callee_span, &function_label),
-                );
-                continue;
-            }
-            erroneous |= self.bind_one_argument(
-                (arg, index, param),
-                (base, arg_list),
-                ((id, callee, known, offset), (callback, recursive)),
-                (sig, (callee_span, &function_label)),
-            );
         }
-        // A rest parameter given nothing is the empty list.
+        (erroneous, misplaced_spread)
+    }
+
+    /// Ends the binding of the arguments, of the shape `shape`, of the call
+    /// `site` is, as [`Checker::bind_call`] says: a rest parameter given
+    /// nothing is the empty list, the defaults are given, the parameters
+    /// left unfilled reported unless a spread is `misplaced_spread`, and
+    /// what lowering needs recorded, the rest parameter's arguments from
+    /// `rest_args[rest_base..]`, unless the call is `erroneous` already or
+    /// leaves a parameter unfilled. Whether the call is in error.
+    fn finish_call(
+        &mut self,
+        site: &Binding<'_>,
+        shape: ArgShape,
+        rest_base: usize,
+        (misplaced_spread, erroneous): (bool, bool),
+    ) -> bool {
+        let sig = site.sig;
+        let (base, count, rest) = (site.base, sig.params.len(), sig.rest.map(usize::from));
         if let Some(entry) = rest.and_then(|rest| self.filled.get_mut(base + rest))
             && *entry == u32::MAX
         {
             *entry = DEFAULTED;
         }
-        let defaults = known.map(|known| self.fill_defaults(known, (base, offset), count));
-        if !misplaced_spread {
-            erroneous |= self.report_unfilled(
+        let defaults = site
+            .known
+            .map(|known| self.fill_defaults(known, (base, site.offset), count));
+        let found = shape.positional + usize::from(shape.trailing);
+        let unfilled = !misplaced_spread
+            && self.report_unfilled(
                 base,
-                (call, callee_span, &function_label),
+                (self.ast.get(site.id), site.callee_span, site.function_label),
                 sig,
-                (found, named || rest.is_some(), trailing),
+                (found, shape.named || rest.is_some(), shape.trailing),
             );
-        }
         let rest_args = self.rest_args.split_off(rest_base);
+        let erroneous = erroneous || unfilled;
         if !erroneous {
-            self.record_bound((id, args), (base, offset), defaults);
-            self.record_rest((id, args), &rest_args, (rest, offset));
+            self.record_bound((site.id, site.args), (base, site.offset), defaults);
+            self.record_rest((site.id, site.args), &rest_args, (rest, site.offset));
         }
-        self.filled.truncate(base);
         erroneous
     }
 
-    /// Binds `arg`, number `index` of the call `id`'s arguments
-    /// `arg_list`, to the parameter number `param` of `sig`, no rest one,
-    /// of the callee `callee`, known as `known` if it is, its parameters
-    /// numbered from `offset`: marked filled in `filled[base..]` and checked
-    /// against its type, measured if the call is `recursive`, and recorded
-    /// for the callback `callback`, if any, as [`Checker::bind_call`] says.
-    /// A parameter filled twice is reported: true.
+    /// Binds `arg`, number `index` of the arguments of the call `site` is,
+    /// to its parameter number `param`, no rest one: marked filled in
+    /// `filled[base..]` and checked against its type, measured if the call
+    /// is recursive, and recorded for the callback, if any, as
+    /// [`Checker::bind_call`] says. A parameter filled twice is reported:
+    /// true.
     fn bind_one_argument(
         &mut self,
+        site: &Binding<'_>,
         (arg, index, param): (&Arg, usize, usize),
-        (base, arg_list): (usize, &[Arg]),
-        ((id, callee, known, offset), (callback, recursive)): (ArgSite, (Option<usize>, bool)),
-        (sig, (callee_span, function_label)): (&FnTy, (Span, &str)),
     ) -> bool {
         let ast = self.ast;
-        let first = self.filled.get(base + param).copied().unwrap_or(u32::MAX);
-        if let Some(first) = arg_list.get(first as usize) {
-            let name = sig.params.get(param).and_then(|&(name, _)| name);
+        let first = self
+            .filled
+            .get(site.base + param)
+            .copied()
+            .unwrap_or(u32::MAX);
+        if let Some(first) = site.arg_list.get(first as usize) {
+            let name = site.sig.params.get(param).and_then(|&(name, _)| name);
             self.report_given_twice((param, name), first.span(ast), arg.span(ast));
             self.check_alone(arg.value);
             return true;
         }
-        if let Some(entry) = self.filled.get_mut(base + param) {
+        if let Some(entry) = self.filled.get_mut(site.base + param) {
             *entry = position(index);
         }
-        let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
-        let context = self.argument_context(known, param + offset, (id, callee));
+        let param_ty = site
+            .sig
+            .params
+            .get(param)
+            .map_or(TyId::ERROR, |&(_, ty)| ty);
+        let context =
+            self.argument_context(site.known, param + site.offset, (site.id, site.callee));
         let found = self.check_expr_expecting_at(
             arg.value,
             param_ty,
-            (callee_span, function_label),
+            (site.callee_span, site.function_label),
             context,
         );
         // A recursive call measures every argument that is a parameter
         // of the function, conservatively.
-        if recursive && self.types.laziness(found) == Laziness::Provisional {
+        if site.recursive && self.types.laziness(found) == Laziness::Provisional {
             self.claim_top(ast.get(arg.value).span, found);
         }
-        if let Some(callback) = callback {
+        if let Some(callback) = site.callback {
             self.record_argument(callback, param, arg.value, param_ty);
         }
         false
     }
 
-    /// The parameter of `sig` the named argument `name`, written at `span`,
-    /// shorthand if `shorthand`, of a call of `callee`, of type
-    /// `callee_ty`, among the arguments `arg_list`, fills: the one of its
-    /// name, reported unknown if there is none ([`Checker::report_unknown_argument`]).
+    /// The parameter the named argument `name`, written at `span`,
+    /// shorthand if `shorthand`, of the call `site` is, fills: the one of
+    /// its name, reported unknown if there is none
+    /// ([`Checker::report_unknown_argument`]).
     fn named_target(
         &mut self,
+        site: &Binding<'_>,
         (name, span, shorthand): (Name, Span, bool),
-        (callee, callee_ty): (ExprId, TyId),
-        sig: &FnTy,
-        arg_list: &[Arg],
     ) -> Option<usize> {
-        let count = sig.params.len();
-        let param = sig
-            .params
-            .iter()
-            .position(|&(param, _)| param == Some(name));
+        let params = &site.sig.params;
+        let param = params.iter().position(|&(param, _)| param == Some(name));
         if param.is_none() {
-            let filled = filled_by(arg_list, count, |name| {
-                sig.params
-                    .iter()
-                    .position(|&(param, _)| param == Some(name))
+            let filled = filled_by(site.arg_list, params.len(), |name| {
+                params.iter().position(|&(param, _)| param == Some(name))
             });
             self.report_unknown_argument(
                 (name, span, shorthand),
-                (callee, callee_ty),
-                sig,
+                (site.callee, site.callee_ty),
+                site.sig,
                 &filled,
             );
         }
@@ -701,46 +782,49 @@ impl Checker<'_> {
         None
     }
 
-    /// Binds `arg`, number `index` of the call `id`'s arguments, of the
-    /// callee `callee`, known as `known` if it is, its parameters numbered
-    /// from `offset`, to the rest parameter, number `param` of `sig` (see
-    /// "Rest parameters" under [Functions](crate::check::functions#functions)):
-    /// checked against its elements' type, or a spread against a list of
-    /// them, the parameter marked filled in `filled[base..]` if it was not,
-    /// and kept to record for lowering. A named argument is "a rest
-    /// parameter is given by position", and one apart from the others
-    /// given it, as `run` says, is reported ([`Checker::rest_argument`]):
-    /// true for either.
+    /// Binds `arg`, number `index` of the arguments of the call `site` is,
+    /// to its rest parameter, number `param` (see "Rest parameters" under
+    /// [Functions](crate::check::functions#functions)): checked against its
+    /// elements' type, or a spread against a list of them, the parameter
+    /// marked filled in `filled[base..]` if it was not, and kept to record
+    /// for lowering. A named argument is "a rest parameter is given by
+    /// position", and one apart from the others given it, as `run` says, is
+    /// reported ([`Checker::rest_argument`]): true for either.
     fn bind_rest_argument(
         &mut self,
+        site: &Binding<'_>,
         (arg, index, param): (&Arg, usize, usize),
-        (base, run): (usize, &mut Option<(usize, usize)>),
-        ((id, callee, known, offset), sig): (ArgSite, &FnTy),
-        (callee_span, function_label): (Span, &str),
+        run: &mut Option<(usize, usize)>,
     ) -> bool {
+        let label = (site.callee_span, site.function_label);
         if matches!(arg.kind, ArgKind::Named { .. }) {
             self.errors.push(
                 Diagnostic::error("a rest parameter is given by position", arg.span(self.ast))
-                    .with_context(callee_span, function_label)
+                    .with_context(label.0, label.1)
                     .with_note("`...list` gives it a list's elements"),
             );
             self.check_alone(arg.value);
             return true;
         }
-        let apart = self.rest_argument(arg, (index, run), (callee_span, function_label));
-        if let Some(entry) = self.filled.get_mut(base + param)
+        let apart = self.rest_argument(arg, (index, run), label);
+        if let Some(entry) = self.filled.get_mut(site.base + param)
             && *entry == u32::MAX
         {
             *entry = position(index);
         }
-        let element = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
+        let element = site
+            .sig
+            .params
+            .get(param)
+            .map_or(TyId::ERROR, |&(_, ty)| ty);
         let expected = if matches!(arg.kind, ArgKind::Spread { .. }) {
             self.types.list(element)
         } else {
             element
         };
-        let context = self.argument_context(known, param + offset, (id, callee));
-        self.check_expr_expecting_at(arg.value, expected, (callee_span, function_label), context);
+        let context =
+            self.argument_context(site.known, param + site.offset, (site.id, site.callee));
+        self.check_expr_expecting_at(arg.value, expected, label, context);
         self.rest_args.push((index, param));
         apart
     }

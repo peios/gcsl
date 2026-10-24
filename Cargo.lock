@@ -177,6 +177,7 @@ name = "gcsl"
 version = "0.1.0"
 dependencies = [
  "annotate-snippets",
+ "nix",
 ]
 
 [[package]]

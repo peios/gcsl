@@ -8,6 +8,7 @@ use crate::diagnostic::Diagnostic;
 use crate::ir::{FnCode, IrNode, IrRange};
 use crate::value::{Caller, Closure, Value};
 
+use super::calls::raised_in_tracked;
 use super::{Evaluator, Flow, depends_on_own_result, mistyped, nested_too_deeply};
 use super::memo::{Lookup, Mark, MemoBegin, NO_ORIGIN, Running, key_eq};
 
@@ -193,7 +194,7 @@ impl Evaluator<'_> {
     /// await that ran a future that awaits itself is labelled.
     pub(super) fn memo_error(
         &self,
-        mut error: Diagnostic,
+        error: Diagnostic,
         closure: &Closure,
         reentered: bool,
         node: &IrNode,
@@ -201,9 +202,8 @@ impl Evaluator<'_> {
         if error.input.is_some() {
             return error;
         }
-        if closure.code.input() != self.ir.input() {
-            error.input = Some(closure.code.input());
-            return error;
+        if closure.code.input() != self.ir.input() || raised_in_tracked(&error, closure) {
+            return self.call_error(error, closure, node);
         }
         if reentered {
             error.with_context(node.span, "called here with the same arguments")

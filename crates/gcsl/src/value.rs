@@ -26,9 +26,8 @@
 //! no code or captures, since it is implemented in Rust. It is a function
 //! ([`ValueKind::Fn`]): a call of it through a value, a parameter say, is
 //! applied by the evaluator (see [`crate::eval`]). It shows as its type, as
-//! the type table shows it (`fn(argv: List<Revealed<String>>) -> {status: Int,
-//! stderr: String, stdout: String}` for `exec`, its record's fields by
-//! name, and `fn(message: String): Never` for `panic`), or as `builtin len`
+//! the type table shows it (`fn(x: Float): Int` for `int`, and
+//! `fn(message: String): Never` for `panic`), or as `builtin len`
 //! for one whose typing is special, and two compare equal when they are the
 //! same built-in, which no program can ask, since the checker rejects
 //! comparing functions. The record `exec` returns is an ordinary
