@@ -122,6 +122,12 @@ results = [(check fast)()(), (check online)()()]
 
 Here `fast` is cached and `online` is not.
 
+A deferring attribute (below) on a definition type works the same way:
+it defers each definition, not the definition type itself. The
+definition type's body calls the definition, and a host can run that call
+as a step, while the body stays outside it. So the body can await the
+step's result and recover its failure.
+
 ## Attributes that defer calls
 
 A host such as pekit can run some calls as separate steps, possibly in

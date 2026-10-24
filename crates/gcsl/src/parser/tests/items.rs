@@ -382,8 +382,10 @@ fn def_type_errors() {
     assert_eq!(
         error("def p x(a: Int) { a }"),
         (
-            "the parameter types of a `p` definition come from `p`".to_owned(),
-            Span::new(9, 10)
+            "`a` is a parameter of the definition's own, which `p` calls with none: give it a \
+             default, or leave its type to `p`"
+                .to_owned(),
+            Span::new(8, 14)
         )
     );
     assert_eq!(

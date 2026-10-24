@@ -30,6 +30,29 @@ does. Definitions live in the definition type's namespace, separate from
 ordinary values of the same path. Their public paths merge through
 workspace directories and imports like other public declarations.
 
+## Parameters of a definition's own
+
+A definition's parameters are written by name alone: their types come
+from the definition type's function parameter. After them, a definition
+can declare parameters of its own, each with a type and a default, since
+the definition type calls it with none:
+
+```gcsl
+#[def_type]
+def describe(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+def describe dev.peios.gcsl(version: String = "1.0") { "language tools {version}" }
+result = describe dev.peios.gcsl()
+```
+
+The defaults are evaluated where the definition type calls the
+definition, and the body is then run with what they came to. So a
+deferring attribute on the definition, its own or its definition type's,
+makes the body the step and gives it those values: a test that is given
+its program, `def test runs(prog: File = build app())`, is a step given
+the built program, and reruns only when the program changes.
+
 ## Importing every definition of a type
 
 A definition is visible in its own directory and the directories below

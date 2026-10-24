@@ -231,6 +231,7 @@ fn the_checker_s_own_attributes_are_checked_without_a_workspace() {
             Attribute {
                 id: AttributeId::Builtin("retry"),
                 args: Box::new([(Box::from("times"), Constant::Int(3))]),
+                defers: false,
             },
             Attribute {
                 id: AttributeId::Builtin("timeout"),
@@ -238,6 +239,7 @@ fn the_checker_s_own_attributes_are_checked_without_a_workspace() {
                     Box::from("limit"),
                     Constant::Quantity(Quantity::Duration, 60_000_000_000)
                 )]),
+                defers: false,
             },
         ]
     );
@@ -299,6 +301,7 @@ fn track_caller_is_the_checker_s_own_and_takes_no_arguments() {
         [Attribute {
             id: AttributeId::Builtin("track_caller"),
             args: Box::new([]),
+            defers: false,
         }]
     );
     // On a pure function too: where an error is reported is no effect.

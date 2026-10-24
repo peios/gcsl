@@ -380,6 +380,9 @@ pub struct Attribute {
     pub id: AttributeId,
     /// Its arguments, by field.
     pub args: Box<[(Box<str>, Constant)]>,
+    /// Whether its declaration is `#[defers]`: whether a function it is on
+    /// is one whose calls a host may run as steps.
+    pub defers: bool,
 }
 
 /// How many more times a call of a function with `attributes` runs its body

@@ -490,6 +490,12 @@ pub struct DefTypeUse {
     /// ([`Ast::set_def_type_key`]), outside the item's subtree but before it
     /// in the arena; `None` for a reference and a meta.
     pub meta_read: Option<ExprId>,
+    /// For a definition with parameters of its own, written with a type and
+    /// a default after its def-type's (see the parser's "Def-types"), the
+    /// function of its body, which those parameters are of: the
+    /// definition's own function calls it with their defaults. `None` for
+    /// any other use.
+    pub body: Option<FnId>,
     /// For a definition, its parameter list, `(` through `)`; for a
     /// reference, the whole of it, DT through PATH; for a meta, its
     /// `defmeta` through its PATH.

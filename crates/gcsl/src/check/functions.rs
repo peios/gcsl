@@ -363,6 +363,24 @@ impl Checker<'_> {
         (finished.demanded, finished.needs)
     }
 
+    /// The name, the declaration and the result type, if it is not the
+    /// declaration's, that `function` is checked with: the name the caller
+    /// gave and its declaration, or, for a definition's body with parameters
+    /// of its own, its definition's name, its def-type's effect and its
+    /// def-type's result (see [Def-types](crate::check::deftypes#def-types)).
+    fn fn_as_checked(&mut self, function: FnId) -> (Option<Name>, FnDecl, Option<TyId>) {
+        let body_of = self.def_types.bodies.get(&function).copied();
+        let callee = self
+            .callee_name
+            .take()
+            .or(body_of.and_then(|(_, _, name)| name));
+        let mut decl = *self.ast.fn_decl(function);
+        if let Some((_, effect, _)) = body_of {
+            decl.effect = effect;
+        }
+        (callee, decl, body_of.map(|(ret, ..)| ret))
+    }
+
     /// Types the function expression `id`, whose details are `function`,
     /// and checks its body in a frame of its own (see the module
     /// documentation). Its type is known, and recorded, before the body is
@@ -384,14 +402,13 @@ impl Checker<'_> {
     /// defaults are checked before its body, in its frame (see
     /// [`Checker::check_defaults`]).
     pub(super) fn check_fn(&mut self, id: ExprId, function: FnId) -> TyId {
-        if let Some(&def) = self.definitions.get(&function) {
+        if let Some(&def) = self.def_types.definitions.get(&function) {
             return self.check_definition(id, function, def);
         }
-        if let Some(&def) = self.defmetas.get(&function) {
+        if let Some(&def) = self.def_types.metas.get(&function) {
             return self.check_defmeta(id, function, def);
         }
-        let callee = self.callee_name.take();
-        let decl = *self.ast.fn_decl(function);
+        let (callee, decl, forced_ret) = self.fn_as_checked(function);
         let pure = decl.effect == Effect::Pure;
         let (params_mode, ret_mode) = bareness_of(decl.effect);
         let params = self.ast.params(decl.params);
@@ -416,7 +433,7 @@ impl Checker<'_> {
             }
             self.fn_params.push((Some(param.name), ty));
         }
-        let ret = self.declared_result(id, decl.ret, ret_mode);
+        let ret = forced_ret.unwrap_or_else(|| self.declared_result(id, decl.ret, ret_mode));
         self.check_deferred_result(function, ret, decl.ret);
         let mut ty = self.function_type(function, base, (ret, decl.effect));
         self.expr_types[id.index()] = ty;

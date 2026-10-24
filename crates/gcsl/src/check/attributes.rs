@@ -79,9 +79,15 @@
 //! steps: one is "a pure function cannot defer: its calls are never steps";
 //! and a result type that cannot be a future, `Present<File>`, is "the
 //! result of a deferring function must be able to be a future"
-//! (`Checker::check_deferred_result`). A definition made with a def-type
-//! takes a deferring attribute as it takes any, but its type stays its
-//! def-type's exactly: the def-type's invocation is the step.
+//! (`Checker::check_deferred_result`). A deferring attribute on a def-type
+//! is its definitions' default, as any of its attributes is, and never
+//! defers the def-type itself: each definition whose attributes, its own or
+//! inherited, defer is the step, called by its def-type's body, which is
+//! not, so that a def-type such as `test` awaits its definition's result and
+//! recovers its failure outside the step (`Checker::definition_defers`). A
+//! definition's type stays its def-type's exactly, and one of a pure
+//! function type cannot defer: "a `build` definition cannot defer: its
+//! def-type gives it a pure function type".
 //!
 //! # Metas
 //!
@@ -334,6 +340,7 @@ impl Checker<'_> {
             let attribute = Attribute {
                 id,
                 args: args.into_boxed_slice(),
+                defers,
             };
             (attribute, defers)
         })
@@ -341,12 +348,17 @@ impl Checker<'_> {
 
     /// Records `function`, which the deferring attribute `used` is on, as a
     /// function whose calls a host may run as steps (see [Deferring
-    /// attributes](#deferring-attributes)): but a definition's, whose
-    /// def-type's invocation is the step, and a pure function's, "a pure
+    /// attributes](#deferring-attributes)): but a def-type's, whose
+    /// attributes are its definitions' defaults, so that its own body, which
+    /// calls a definition, is never in the step; a definition's, which its
+    /// check records with the attributes it inherits
+    /// (`Checker::definition_defers`); and a pure function's, "a pure
     /// function cannot defer: its calls are never steps".
     pub(super) fn note_deferring(&mut self, used: &AttributeUse, function: FnId) {
         let ast = self.ast;
-        if matches!(ast.item(used.item).kind, ItemKind::DefTypeDef { .. }) {
+        if ast.is_def_type(used.item)
+            || matches!(ast.item(used.item).kind, ItemKind::DefTypeDef { .. })
+        {
             return;
         }
         if ast.fn_decl(function).effect == Effect::Pure {

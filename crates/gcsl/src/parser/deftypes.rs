@@ -89,9 +89,18 @@
 //! A definition, [`ItemKind::DefTypeDef`], is recognised after `def` and a
 //! name or a path (`Parser::parse_def`): an identifier that follows them on
 //! their line starts its path. Its parameters are written by name alone,
-//! each given a type expression nothing reads ([`TypeExprKind::Invalid`]);
-//! a type written is "the parameter types of a `package` definition come
-//! from `package`", at its `:`, and a return marker after them "the result
+//! each given a type expression nothing reads ([`TypeExprKind::Invalid`]),
+//! its def-type's to give; then any of its own, each `NAME: TYPE = DEFAULT`,
+//! since its def-type calls it with none: one with no default is "`x` is a
+//! parameter of the definition's own, which `package` calls with none: give
+//! it a default, or leave its type to `package`", and one by name alone
+//! after one of its own "the parameters `package` gives a definition come
+//! before its own, which have a type and a default". A definition with any
+//! of its own has as its body a block whose result calls a function of
+//! them, without their defaults, whose body is the body written, with their
+//! defaults ([`DefTypeUse::body`]), so that the definition evaluates them
+//! where its def-type calls it and the function, which the checker types
+//! from the def-type, runs the body. A return marker after them "the result
 //! type of a `package` definition comes from `package`", at the marker,
 //! `package` being its DT as written. Its path is a `def`'s, identifiers
 //! joined by `.`, but that a segment may have `+` in it, and one after the
@@ -152,8 +161,8 @@
 //! a `def`.
 
 use crate::ast::{
-    DefTypeRole, DefTypeUse, Effect, ExprId, ExprKind, FnDecl, Item, ItemId, ItemKind, Param,
-    PathSegment, SegmentKind, TypeExpr, TypeExprKind, path_span,
+    Arg, ArgKind, DefTypeRole, DefTypeUse, Effect, ExprId, ExprKind, FnDecl, FnId, Item, ItemId,
+    ItemKind, Param, PathSegment, SegmentKind, TypeExpr, TypeExprKind, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{Token, TokenKind};
@@ -547,7 +556,7 @@ impl Parser<'_> {
             ));
         }
         self.advance();
-        let (params, close) = self.parse_definition_params(open, &shown)?;
+        let (params, own, close) = self.parse_definition_params(open, &shown)?;
         if self.meta_marker().is_some() {
             let span = Span::join(self.peek().span, self.peek_at(1).span);
             return Err(self.error(MISPLACED_META, span));
@@ -571,6 +580,13 @@ impl Parser<'_> {
             ));
         }
         let body = self.parse_block()?;
+        let (body, inner) = if own.is_empty() {
+            (body, None)
+        } else {
+            let marker = self.span_of(dt_expr);
+            let (block, inner) = self.definition_body(body, &own, marker)?;
+            (block, Some(inner))
+        };
         let height = self.height_of(body).max(LEAF_HEIGHT) + 1;
         // From its path, after its `DT`, whose expression comes before its
         // body's in the arena ([`Ast::subtree`]).
@@ -598,6 +614,7 @@ impl Parser<'_> {
             key: None,
             meta: None,
             meta_read: Some(meta_read),
+            body: inner,
             span: Span::join(open.span, close.span),
         });
         self.finish_item(
@@ -611,15 +628,17 @@ impl Parser<'_> {
     /// Parses the parameters of a definition made with the def-type
     /// `shown`, as it is written, after their `(`, `open`, through their
     /// `)`: names alone, separated by `,`, each with a type expression of
-    /// [`TypeExprKind::Invalid`] that nothing reads, the def-type's to give
-    /// (see [Def-types](#def-types)). Returns them, with the `)`. A
+    /// [`TypeExprKind::Invalid`] that nothing reads, the def-type's to give,
+    /// then the definition's own, each with its type and its default (see
+    /// [Def-types](#def-types)). Returns the def-type's, the definition's
+    /// own, and the `)`. A
     /// parameter that fails is skipped to its `,`, and the list goes on, to
     /// fail at its end (see [Errors and recovery](crate::parser::recovery#errors-and-recovery)).
     pub(super) fn parse_definition_params(
         &mut self,
         open: Token,
         shown: &str,
-    ) -> ParseResult<(crate::ast::ParamRange, Token)> {
+    ) -> ParseResult<(crate::ast::ParamRange, Vec<Param>, Token)> {
         let base = self.param_stack.len();
         let mut failed = None;
         let close = loop {
@@ -643,14 +662,98 @@ impl Parser<'_> {
         if let Some(reported) = failed {
             return Err(reported);
         }
-        let params = self.builder.push_params(&self.param_stack[base..]);
-        self.param_stack.truncate(base);
-        Ok((params, close))
+        // The def-type's, written by name alone, then the definition's own,
+        // each with its type and its default.
+        let written: Vec<Param> = self.param_stack.drain(base..).collect();
+        let given_count = written
+            .iter()
+            .take_while(|param| param.default.is_none())
+            .count();
+        if let Some(late) = written
+            .iter()
+            .skip(given_count)
+            .find(|param| param.default.is_none())
+        {
+            return Err(self.error(
+                format!(
+                    "the parameters `{shown}` gives a definition come before its own, which have a \
+                     type and a default"
+                ),
+                late.span,
+            ));
+        }
+        let params = self.builder.push_params(&written[..given_count]);
+        let own = written.get(given_count..).unwrap_or_default().to_vec();
+        Ok((params, own, close))
+    }
+
+    /// The body of a definition with the parameters `own` of its own, its
+    /// body as written `body` (see [Def-types](#def-types)): a block whose
+    /// result calls a function of `own`, without their defaults, whose body
+    /// is `body`, with their defaults, in order, and that function, its type
+    /// the checker's to give from the def-type's. So the defaults are
+    /// evaluated by the definition, where its def-type calls it, and the
+    /// body by the function, which a deferring attribute of the definition
+    /// makes the step, given what they came to.
+    fn definition_body(
+        &mut self,
+        body: ExprId,
+        own: &[Param],
+        marker: Span,
+    ) -> ParseResult<(ExprId, FnId)> {
+        let defaults: Vec<ExprId> = own.iter().filter_map(|param| param.default).collect();
+        let params: Vec<Param> = own
+            .iter()
+            .map(|param| Param {
+                default: None,
+                ..*param
+            })
+            .collect();
+        let params = self.builder.push_params(&params);
+        let inner = self.builder.push_fn(FnDecl {
+            params,
+            // The def-type's to say, as the definition's own is.
+            ret: None,
+            effect: Effect::Impure,
+            marker,
+            body,
+        });
+        let span = self.span_of(body);
+        let height = self.height_of(body).max(LEAF_HEIGHT) + 1;
+        let function = self.alloc(ExprKind::Fn(inner), span, height)?;
+        let tallest = defaults
+            .iter()
+            .map(|&default| self.height_of(default))
+            .fold(height, u32::max);
+        let args: Vec<Arg> = defaults
+            .iter()
+            .map(|&value| Arg {
+                kind: ArgKind::Positional,
+                value,
+            })
+            .collect();
+        let args = self.builder.push_args(&args);
+        let call = self.alloc(
+            ExprKind::Call {
+                callee: function,
+                args,
+            },
+            span,
+            tallest + 1,
+        )?;
+        let result = self.builder.alloc_item(Item {
+            kind: ItemKind::Result(call),
+            span,
+        });
+        let items = self.builder.push_item_list(&[result]);
+        let block = self.alloc(ExprKind::Block { items, label: None }, span, tallest + 2)?;
+        Ok((block, inner))
     }
 
     /// Parses a parameter of a definition made with the def-type `shown`
-    /// whose parameter list `open` opens, a name alone, and the `,` or the
-    /// `)` after it. Returns the `)` if it ends the list.
+    /// whose parameter list `open` opens, a name alone, or one of the
+    /// definition's own, `NAME: TYPE = DEFAULT`, and the `,` or the `)` after
+    /// it. Returns the `)` if it ends the list.
     pub(super) fn parse_definition_param(
         &mut self,
         open: Token,
@@ -679,10 +782,29 @@ impl Parser<'_> {
         self.advance();
         let colon = self.peek();
         if colon.kind == TokenKind::Colon {
-            return Err(self.error(
-                format!("the parameter types of a `{shown}` definition come from `{shown}`"),
-                colon.span,
-            ));
+            // One of the definition's own, with its type and its default.
+            self.advance();
+            let (ty, _) = self.parse_type()?;
+            let Some(default) = self.parse_default()? else {
+                return Err(self.error(
+                    format!(
+                        "`{}` is a parameter of the definition's own, which `{shown}` calls with \
+                         none: give it a default, or leave its type to `{shown}`",
+                        self.names.get(name)
+                    ),
+                    Span::join(token.span, self.type_span(ty)),
+                ));
+            };
+            self.param_stack.push(Param {
+                name,
+                span: Span::join(token.span, self.type_span(ty)),
+                ty,
+                default: Some(default),
+                default_fn: None,
+                rest: false,
+            });
+            let separator = self.peek();
+            return Ok(self.list_separator(open)?.then_some(separator));
         }
         let ty = self.builder.alloc_type(TypeExpr {
             kind: TypeExprKind::Invalid,
@@ -737,6 +859,7 @@ impl Parser<'_> {
             key: None,
             meta: None,
             meta_read: None,
+            body: None,
             span,
         });
         self.alloc(ExprKind::DefTypeRef(def), span, height)
@@ -887,6 +1010,7 @@ impl Parser<'_> {
             key: None,
             meta: None,
             meta_read: None,
+            body: None,
             span: path_at,
         });
         self.finish_item(keyword, (ItemKind::DefMeta { def, value }, value), 0, shape)

@@ -139,6 +139,73 @@ fn a_step_s_failure_is_raised_where_its_result_is_needed() {
 }
 
 #[test]
+fn a_def_type_s_deferring_attribute_makes_its_definitions_steps_and_not_itself() {
+    // As the prelude's `test` is: the definition a step, the def-type's
+    // own body, which recovers its failure, not.
+    let (mut workspace, file) = lone_workspace(
+        "#[def_type] #[step] def check(name: String, f: fn() -> String) -> String {\n\
+         \x20   = recover { await f() } else (e) { \"{name} failed: {e.message}\" }\n\
+         }\n\
+         def check one() { = \"one passed\" }\n\
+         result = await (check one)()",
+    );
+    let mut graph = Graph::new();
+    assert_eq!(
+        workspace.run_graph(file, &mut graph, every()).unwrap(),
+        Progress::Paused(NodeId::of(0))
+    );
+    assert_eq!(graph.len(), 1);
+    let failure = Diagnostic::error("assertion failed", Span::new(0, 0));
+    assert!(graph.resolve(NodeId::of(0), Err(failure)));
+    let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    assert!(
+        value
+            .to_string()
+            .ends_with("result = \"one failed: assertion failed\"}"),
+        "{value}"
+    );
+}
+
+#[test]
+fn a_definition_s_own_parameters_are_its_step_s_arguments() {
+    // As a test is given its program: the default a step of its own, run
+    // where the def-type calls the definition, and the body a step named
+    // after the definition, given what the default came to.
+    let (mut workspace, file) = lone_workspace(
+        "#[def_type] #[step] def check(name: String, f: fn() -> String) -> String {\n\
+         \x20   = recover { await f() } else (e) { \"{name} failed: {e.message}\" }\n\
+         }\n\
+         def check one(object: String = compile(\"w\")) { = \"{object} checked\" }\n\
+         result = await (check one)()",
+    );
+    let mut graph = Graph::new();
+    assert_eq!(
+        workspace.run_graph(file, &mut graph, every()).unwrap(),
+        Progress::Paused(NodeId::of(1))
+    );
+    assert_eq!(graph.len(), 2);
+    assert!(graph.resolve(NodeId::of(0), Ok(text("w.o"))));
+    let inputs = workspace.step_inputs(&graph, NodeId::of(1)).unwrap();
+    assert_eq!(inputs.args, [Plain::Str("w.o".to_owned())]);
+    let name = graph
+        .node(NodeId::of(1))
+        .and_then(|node| node.closure())
+        .and_then(|closure| closure.code.find_function(closure.function))
+        .and_then(|code| code.name_text.clone());
+    assert_eq!(name.as_deref(), Some("one"));
+    assert!(graph.resolve(NodeId::of(1), Ok(text("w.o checked"))));
+    let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    assert!(
+        value.to_string().ends_with("result = \"w.o checked\"}"),
+        "{value}"
+    );
+}
+
+#[test]
 fn a_call_the_host_does_not_take_as_a_step_runs_as_ever() {
     let (mut workspace, file) = lone_workspace("= link([compile(\"a\")])");
     let mut graph = Graph::new();
@@ -435,7 +502,7 @@ const TARGETS: [(&str, &str); 2] = [
         "#[attribute] #[defers] type step = {}\n\
          context bump: Int\n\
          #[def_type] #[step]\n\
-         def build(name: String, f: fn(): {v: Int}) -> {v: Int} { f() }\n\
+         def build(name: String, f: fn() -> {v: Int}) -> {v: Int} { f() }\n\
          def build main() { v = 1 }\n\
          #[def_type]\n\
          def bumped(name: String, f: fn(): Int) -> Int { f() + ^bump }\n\
@@ -448,7 +515,7 @@ fn a_prepared_invocation_is_a_unit_that_runs_until_it_is_done() {
     let mut workspace = rooted(&TARGETS).unwrap();
     let call = workspace.prepare_call(("build", "main"), &[], &[]).unwrap();
     let mut graph = Graph::new();
-    // The invocation is a step: the def-type defers.
+    // The definition is a step: its def-type's attribute defers it.
     let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, every()).unwrap() else {
         panic!("not done");
     };
@@ -663,9 +730,10 @@ fn a_step_s_failure_is_in_the_file_of_the_code_that_raised_it() {
             "lib.gcsl",
             "#[attribute] #[defers] type step = {}\n\
              #[def_type] #[step]\n\
-             def build(name: String, f: fn(): {v: Int}) -> {v: Int} { panic(\"boom in lib\") }",
+             def build(name: String, f: fn() -> {v: Int}) -> {v: Int} { f() }\n\
+             def boom() -> {v: Int} { panic(\"boom in lib\") }",
         ),
-        ("app.gcsl", "def build main() { v = 1 }"),
+        ("app.gcsl", "def build main() { = boom() }"),
     ];
     let mut workspace = rooted(&files).unwrap();
     let lib = workspace.file("lib.gcsl").unwrap();
@@ -681,7 +749,7 @@ fn a_step_s_failure_is_in_the_file_of_the_code_that_raised_it() {
     };
     let error = workspace.run_step(&mut graph, step, inline).unwrap_err();
     assert_eq!(error.message, "boom in lib");
-    // In the file of the def-type's body, not the invocation's.
+    // In the file of the code that raised it, not the step's own.
     assert_eq!(error.input, Some(lib));
     let text = files[1].1;
     let at = &text[error.span.start as usize..error.span.end as usize];

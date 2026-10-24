@@ -198,6 +198,7 @@ pub use resolution::{
     Resolution, TestResolution, Unnarrowed,
 };
 pub(crate) use resolution::KnownParams;
+use deftypes::DefTypesChecked;
 use needs::ContextsChecked;
 use resolution::{CallsChecked, DefaultFn, ForLowering, merged_defaults};
 
@@ -1854,14 +1855,9 @@ pub struct Checker<'a> {
     /// namespace is no field of the input's record (see
     /// [Def-types](crate::check::deftypes#def-types)).
     def_fields: Vec<FieldDecl>,
-    /// The definition made with a def-type each function expression of the
-    /// input's outermost block is, if it is one.
-    definitions: HashMap<FnId, DefTypeId>,
-    /// The function expressions of the input's `def`s marked `#[def_type]`.
-    def_type_fns: HashSet<FnId>,
-    /// The definition's meta each function expression of the input's
-    /// outermost block is, if it is one (see [Metas](crate::check::attributes#metas)).
-    defmetas: HashMap<FnId, DefTypeId>,
+    /// The definitions made with def-types, their metas and bodies, and the
+    /// def-types' functions, of the input's outermost block.
+    def_types: DefTypesChecked,
     /// See [`Resolution::meta_read`].
     meta_reads: HashMap<ExprId, (TyId, AwaitMark)>,
     /// See [`Resolution::metas`].
@@ -2094,9 +2090,7 @@ impl<'a> Checker<'a> {
             fields: Vec::new(),
             fields_start: 0,
             def_fields: Vec::new(),
-            definitions: HashMap::new(),
-            def_type_fns: HashSet::new(),
-            defmetas: HashMap::new(),
+            def_types: DefTypesChecked::default(),
             meta_reads: HashMap::new(),
             metas: Vec::new(),
             references_past: Vec::new(),

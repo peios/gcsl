@@ -305,6 +305,7 @@ impl Parser<'_> {
             key: None,
             meta: None,
             meta_read: None,
+            body: None,
             span,
         });
         let (path, glob, path_span) = self.parse_from_path()?;

@@ -38,6 +38,15 @@
 //! is F exactly. Parameters not as many as F's are "`package` defines
 //! functions of no parameters" ("of 1 parameter, `x`", "of 2 parameters,
 //! `a` and `b`", naming them if F names them all), at its parameter list.
+//! A definition's parameters of its own, written with a type and a default
+//! after F's (see the parser's "Def-types"), are those of its body's
+//! function, which its own function calls with their defaults, so that its
+//! type is still F's: the body's function is checked with F's result and
+//! F's effect, its parameters typed as written, and known by the
+//! definition's last segment (`Checker::note_definition_body`); and it
+//! takes the definition's attributes, so that a deferring one makes it the
+//! step, given what its defaults came to where the def-type called the
+//! definition.
 //!
 //! When the walk reaches a definition (`Checker::place_definition`), it is
 //! placed in its namespace as the dotted field of its path under the key is
@@ -148,6 +157,8 @@
 //! `Checker::bound_signature`), so `build hello` is called with the
 //! def-type's signature so bound, and gives what its definition does.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::ast::{
     DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, PathSegment,
     SegmentKind, path_span,
@@ -162,6 +173,25 @@ use super::{
     Attribute, Checker, DefinitionAt, Function, JUXTAPOSED_NOTE, KnownCallee, NO_NODE, Slot,
     UseSignature, VarRef, VariantTag,
 };
+
+/// What the checker keeps of the definitions made with def-types, and of
+/// the def-types' own functions, of the input's outermost block (see
+/// [Def-types](#def-types)).
+#[derive(Debug, Default)]
+pub(super) struct DefTypesChecked {
+    /// The definition each function expression is, if it is one.
+    pub(super) definitions: HashMap<FnId, DefTypeId>,
+    /// The function expressions of the `def`s marked `#[def_type]`.
+    pub(super) fns: HashSet<FnId>,
+    /// The function of the body of each definition with parameters of its
+    /// own, as its definition's check finds it, with the result type and the
+    /// effect its def-type gives it and the name it is known by, its
+    /// definition's.
+    pub(super) bodies: HashMap<FnId, (TyId, Effect, Option<Name>)>,
+    /// The definition's meta each function expression is, if it is one (see
+    /// [Metas](crate::check::attributes#metas)).
+    pub(super) metas: HashMap<FnId, DefTypeId>,
+}
 
 impl Checker<'_> {
     /// As the input starts, once the cells are declared: gives the cell of
@@ -181,8 +211,12 @@ impl Checker<'_> {
                 let Some(leaf) = top.leaf else {
                     continue;
                 };
-                let defmeta = self.defmetas.get(&top.function).copied();
-                let ty = match (self.definitions.get(&top.function), defmeta, definitions) {
+                let defmeta = self.def_types.metas.get(&top.function).copied();
+                let ty = match (
+                    self.def_types.definitions.get(&top.function),
+                    defmeta,
+                    definitions,
+                ) {
                     (Some(&def), _, true) => self.definition_type(def),
                     // A meta is the function its def-type's meta makes.
                     (None, Some(def), true) => self.defmeta_type(def),
@@ -206,12 +240,12 @@ impl Checker<'_> {
             match ast.item(id).kind {
                 ItemKind::DefTypeDef { def, value } => {
                     if let ExprKind::Fn(function) = ast.get(value).kind {
-                        self.definitions.insert(function, def);
+                        self.def_types.definitions.insert(function, def);
                     }
                 }
                 ItemKind::DefMeta { def, value } => {
                     if let ExprKind::Fn(function) = ast.get(value).kind {
-                        self.defmetas.insert(function, def);
+                        self.def_types.metas.insert(function, def);
                     }
                 }
                 ItemKind::Field {
@@ -220,7 +254,7 @@ impl Checker<'_> {
                     ..
                 } if ast.is_def_type(id) => {
                     if let ExprKind::Fn(function) = ast.get(value).kind {
-                        self.def_type_fns.insert(function);
+                        self.def_types.fns.insert(function);
                     }
                 }
                 _ => {}
@@ -569,6 +603,9 @@ impl Checker<'_> {
         self.expr_types[id.index()] = ty;
         let span = self.ast.get(id).span;
         let dt_span = self.ast.get(use_.dt).span;
+        if let Some(body) = use_.body {
+            self.note_definition_body(body, (ret, sig.effect), def);
+        }
         self.functions.push(Function {
             fn_id: function,
             bindings_start: self.bindings.len(),
@@ -600,12 +637,75 @@ impl Checker<'_> {
         };
         self.fn_params.truncate(base);
         self.inherit_attributes(function, use_.dt);
+        // A definition with parameters of its own gives its attributes to
+        // its body's function, which is then the step.
+        let deferred = match use_.body {
+            Some(body) => {
+                if let Some(attributes) = self.lowering.fn_attributes.remove(&function) {
+                    self.lowering.fn_attributes.insert(body, attributes);
+                }
+                body
+            }
+            None => function,
+        };
+        self.definition_defers(deferred, sig.effect, def);
         // Its meta's cell, read as its body reads a top-level function.
         self.definition_meta(function, def, sig.meta);
         let (_, needs) = self.finish_function(decl.params.len(), None);
         let allowed = self.types.need_set(sig.needs).to_vec();
         self.definition_needs(&needs, &allowed);
         ty
+    }
+
+    /// Records `body`, the function of the body of the definition `def`,
+    /// which has parameters of its own, as one whose result type is `ret`
+    /// and whose effect is `effect`, its def-type's, and whose name is the
+    /// definition's last segment, for its check (see [Def-types](#def-types)).
+    fn note_definition_body(&mut self, body: FnId, (ret, effect): (TyId, Effect), def: DefTypeId) {
+        let use_ = *self.ast.def_type(def);
+        let name = self.ast.path(use_.path).last().and_then(PathSegment::name);
+        self.def_types.bodies.insert(body, (ret, effect, name));
+    }
+
+    /// Records the definition `def`, of function `function`, whose function
+    /// type's effect is `effect`, as a function whose calls a host may run as
+    /// steps, if an attribute it has, its own or its def-type's, defers (see
+    /// [Deferring attributes](crate::check::attributes#deferring-attributes)):
+    /// the definition, which its def-type's body calls, is the step, and
+    /// that body is not, so a def-type such as `test` awaits its definition's
+    /// result and recovers its failure outside it. A definition of a pure
+    /// function type cannot defer: "a `check` definition cannot defer: its
+    /// def-type gives it a pure function type", at its def-type.
+    fn definition_defers(&mut self, function: FnId, effect: Effect, def: DefTypeId) {
+        let defers = self
+            .lowering
+            .fn_attributes
+            .get(&function)
+            .is_some_and(|attributes| attributes.iter().any(|attribute| attribute.defers));
+        if !defers {
+            return;
+        }
+        if effect == Effect::Pure {
+            let use_ = *self.ast.def_type(def);
+            let span = self.ast.get(use_.dt).span;
+            let (shown, _) = self.ast.show_def_type(def);
+            self.errors.push(
+                Diagnostic::error(
+                    format!(
+                        "a `{shown}` definition cannot defer: its def-type gives it a pure function \
+                         type"
+                    ),
+                    span,
+                )
+                .with_note(
+                    "a deferring attribute lets a host run the definition's calls as steps, \
+                     which only an impure function's can be: declare the def-type's function \
+                     parameter with `->`",
+                ),
+            );
+            return;
+        }
+        self.lowering.deferred.insert(function);
     }
 
     /// Gives the definition of function `function` the attributes of its
@@ -855,7 +955,7 @@ impl Checker<'_> {
     /// `def package(name: String, func: fn(): T)`", at its parameters (see
     /// [Def-types](#def-types)).
     pub(super) fn check_def_type_signature(&mut self, function: FnId, ty: TyId) {
-        if !self.def_type_fns.contains(&function) || ty == TyId::ERROR {
+        if !self.def_types.fns.contains(&function) || ty == TyId::ERROR {
             return;
         }
         if let Some(shape) = self.types.def_type_shape(ty) {

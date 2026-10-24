@@ -224,7 +224,8 @@ fn definitions_and_references_made_with_a_variant_parse() {
         ),
         (
             "def Toolchain::C gcc(x: Int) { 1 }",
-            "the parameter types of a `Toolchain::C` definition come from `Toolchain::C`",
+            "`x` is a parameter of the definition's own, which `Toolchain::C` calls with none: \
+             give it a default, or leave its type to `Toolchain::C`",
         ),
     ] {
         assert_eq!(error(text).0, message, "{text}");
