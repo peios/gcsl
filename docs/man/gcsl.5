@@ -8,6 +8,7 @@ A file can return a value or construct a record of public fields.
 All reachable source is checked before execution.
 .SH LEXICAL STRUCTURE
 A comment begins with # and continues to the end of the line, except for the attribute forms #[NAME], #[NAME(...)] and #![NAME].
+A #[ or #![ followed by a name that is not one of those forms, such as #[x y] or #[a.b], is an error, not a comment.
 Identifiers begin with an ASCII letter or underscore and continue with ASCII letters, digits, underscores, and permitted internal hyphens.
 Write spaces around binary subtraction to distinguish it from a hyphenated identifier.
 Field names can also be plain quoted strings.

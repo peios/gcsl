@@ -103,10 +103,13 @@
 //! `[` the lexer leaves open on its bracket stack, as a list's, so that
 //! newlines in its arguments are not significant and the `]` after them,
 //! an ordinary [`TokenKind::RBracket`], closes it; the arguments are
-//! ordinary tokens. Every other `#` starts a comment to the end of its line,
-//! as it always has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and
-//! so is `# [x]`, with a space, and `#[x y]`, `#[` alone, `#[x` or `#[1]`,
-//! which are not of the shape. The scan of a string literal's interpolations (see [String
+//! ordinary tokens. A `#[` or `#![` and a name that are not of the shape,
+//! `#[x y]`, `#[x` or `#[a.b]`, are an error, "an attribute is named by one
+//! name" for a dotted one, "expected `]` or `(` after the attribute's name"
+//! otherwise, rather than a comment that would hide the code after them on
+//! their line. Every other `#` starts a comment to the end of its line, as
+//! it always has: so a shebang, `#!/usr/bin/env gcsl`, is a comment, and so
+//! are `# [x]`, with a space, `#[` alone, `#[]` and `#[1]`. The scan of a string literal's interpolations (see [String
 //! literals](#string-literals)) tells the two apart by the same rule
 //! (`attribute_at`), so the lexer and the scan always agree on where a
 //! comment ends.
@@ -1154,7 +1157,11 @@ impl<'a> Lexer<'a> {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
                 b'\n' if newlines_are_trivia => self.pos += 1,
                 // An attribute is a token (see [Attributes](#attributes)).
-                b'#' if attribute_at(self.bytes, self.pos).is_some() => break,
+                b'#' if attribute_at(self.bytes, self.pos).is_some()
+                    || attribute_attempt(self.bytes, self.pos).is_some() =>
+                {
+                    break;
+                }
                 // Skip to the newline, which is then either skipped or
                 // emitted like any other.
                 b'#' => {
@@ -1203,7 +1210,7 @@ impl<'a> Lexer<'a> {
     /// is, for the `]` after its arguments to close.
     fn attribute(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         let Some((inner, (from, to), args, end)) = attribute_at(self.bytes, start) else {
-            return Err(self.unexpected_character());
+            return Err(self.malformed_attribute(start));
         };
         let name = self
             .names
@@ -1483,6 +1490,25 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(has_underscore)
+    }
+
+    /// The error for the attribute begun at `start` but not of the shape
+    /// (see [Attributes](#attributes)): "an attribute is named by one name"
+    /// for a dotted one, else "expected `]` or `(` after the attribute's
+    /// name", from its `#` through its name.
+    fn malformed_attribute(&self, start: usize) -> Diagnostic {
+        let Some(end) = attribute_attempt(self.bytes, start) else {
+            return self.unexpected_character();
+        };
+        let at = span(start, end);
+        if self.bytes.get(end) == Some(&b'.') {
+            return Diagnostic::error("an attribute is named by one name", at).with_note(
+                "import the attribute by its name, as in `import step from lib/attrs`, and write \
+                 `#[step]`",
+            );
+        }
+        Diagnostic::error("expected `]` or `(` after the attribute's name", at)
+            .with_note("`#[` before a name starts an attribute; any other `#` starts a comment")
     }
 
     fn unexpected_character(&self) -> Diagnostic {
@@ -2186,6 +2212,26 @@ fn attribute_at(bytes: &[u8], from: usize) -> Option<(bool, (usize, usize), bool
         Some(b'(') => Some((inner, (start, end), true, end)),
         _ => None,
     }
+}
+
+/// Where the name of an attribute begun at `from` ends, if the `#` there
+/// begins one, `#[` or `#![` and, after optional spaces or tabs, a name, but
+/// is not of an attribute's shape, which [`attribute_at`] reads (see
+/// [Attributes](#attributes)): `#[x y]`, `#[x` or `#[a.b]`, which the lexer
+/// reports rather than skipping as a comment, so that no code after it on
+/// its line is lost.
+fn attribute_attempt(bytes: &[u8], from: usize) -> Option<usize> {
+    if attribute_at(bytes, from).is_some() || bytes.get(from) != Some(&b'#') {
+        return None;
+    }
+    let inner = bytes.get(from + 1) == Some(&b'!');
+    let open = from + 1 + usize::from(inner);
+    if bytes.get(open) != Some(&b'[') {
+        return None;
+    }
+    let start = open + 1 + whitespace_len(bytes, open + 1);
+    matches!(bytes.get(start), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        .then(|| identifier_end(bytes, start))
 }
 
 /// The number of spaces and tabs starting at `from`.

@@ -435,15 +435,35 @@ fn attributes_are_tokens_and_every_other_hash_a_comment() {
         "#!/usr/bin/env gcsl",
         "# [x]",
         "#! [x]",
-        "#[x y]",
         "#[1]",
         "#[",
-        "#[x",
         "#[]",
         "#!x",
     ] {
-        let text = format!("{comment} a\n1");
+        // What follows on the line is no name, which `#[` would begin an
+        // attribute with.
+        let text = format!("{comment} 2 a\n1");
         assert_eq!(show(&text), vec!["Newline", "Int(1)", "Eof"], "{comment}");
+    }
+    // A name after `#[` begins an attribute, so one not of the shape is an
+    // error, not a comment hiding the rest of its line.
+    for (text, message) in [
+        (
+            "#[x y] fn f() -> Int { 1 }",
+            "expected `]` or `(` after the attribute's name",
+        ),
+        (
+            "#[x fn f() -> Int { 1 }",
+            "expected `]` or `(` after the attribute's name",
+        ),
+        (
+            "#[attrs.step] fn f() -> Int { 1 }",
+            "an attribute is named by one name",
+        ),
+        ("#![a.b]", "an attribute is named by one name"),
+    ] {
+        let error = tokenize(&SourceFile::new("test.gcsl", text).unwrap()).unwrap_err();
+        assert_eq!(error.message, message, "{text}");
     }
     // An attribute inside an interpolation is skipped by the scan as the
     // lexer lexes it, not as a comment to the end of the line.
@@ -2151,9 +2171,15 @@ fn an_attribute_with_arguments_opens_a_bracket_its_arguments_close() {
         kinds_of("#![x(1)]")[0],
         TokenKind::InnerAttributeArgs(_)
     ));
-    // Without `]` or `(` after its name, it is a comment, as before.
-    assert_eq!(kinds_of("#[retry 3]"), [TokenKind::Eof]);
-    assert_eq!(kinds_of("#[retry"), [TokenKind::Eof]);
+    // Without `]` or `(` after its name, it is an error, not a comment.
+    for text in ["#[retry 3]", "#[retry"] {
+        let error = tokenize(&SourceFile::new("t", text).unwrap()).unwrap_err();
+        assert_eq!(
+            error.message,
+            "expected `]` or `(` after the attribute's name"
+        );
+        assert_eq!(error.span, Span::new(0, 7));
+    }
 }
 
 fn kinds_of(text: &str) -> Vec<TokenKind> {
