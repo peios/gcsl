@@ -266,7 +266,7 @@
 //! # Attributes
 //!
 //! An item of a file's outermost block may be marked `#[shadowable]` or
-//! `#[def_type]` (see the parser's [Attributes](crate::parser#attributes)),
+//! `#[def_type]` (see the parser's [Attributes](crate::parser::attributes#attributes)),
 //! and the file itself `#![no_prelude]`. None fits in an [`Item`], which
 //! stays 36 bytes: the marked items are kept in side tables of the tree
 //! ([`Ast::is_shadowable`], [`Ast::is_def_type`]), and the file's attribute
@@ -439,7 +439,7 @@ impl RecoverId {
 }
 
 /// A `recover` expression, `recover { BODY } else (NAME) { FALLBACK }` (see
-/// the parser's [Failure](crate::parser#failure)).
+/// the parser's [Failure](crate::parser::failure#failure)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecoverDecl {
     /// The body, a block.
@@ -629,7 +629,7 @@ pub enum ImportForm {
     Members(ImportMemberRange),
 }
 
-/// An import item (see the parser's [Imports](crate::parser#imports)):
+/// An import item (see the parser's [Imports](crate::parser::imports#imports)):
 /// held in the [`Ast`]'s import arena; the item is an [`ItemKind::Import`]
 /// with its [`ImportId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -766,7 +766,7 @@ pub struct WithRange {
 }
 
 /// One binding of a `with`, `NAME = VALUE`, `NAME.PATH = VALUE` or the
-/// shorthand `NAME` (see the parser's [Context](crate::parser#context)).
+/// shorthand `NAME` (see the parser's [Context](crate::parser::context#context)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WithBinding {
     /// The context's name.
@@ -873,7 +873,7 @@ impl Element {
 /// A use of an attribute that is none of the parser's built-in ones, `#[NAME]`
 /// or `#[NAME(ARGS)]`, on the item it applies to: a declared attribute,
 /// whose name the workspace resolves as a type's, or one of the checker's
-/// (see the parser's [Attributes](crate::parser#attributes)).
+/// (see the parser's [Attributes](crate::parser::attributes#attributes)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttributeUse {
     /// The item it applies to.
@@ -894,7 +894,7 @@ pub struct AttributeUse {
 }
 
 /// A method, `fn (RECV: TYPE) NAME(...) ...` or `def (RECV: TYPE) NAME(...)
-/// ...` (see the parser's [Methods](crate::parser#methods)): its item is a
+/// ...` (see the parser's [Methods](crate::parser::functions#methods)): its item is a
 /// `let` of its binding, a name no source can write
 /// ([`crate::names::method_binding`]), whose value is its function, the
 /// receiver its first parameter.
@@ -914,7 +914,7 @@ pub struct MethodDecl {
 }
 
 /// A context a file declares, `context NAME: TYPE = DEFAULT` or `context
-/// NAME: TYPE` (see the parser's [Context](crate::parser#context)): with a
+/// NAME: TYPE` (see the parser's [Context](crate::parser::context#context)): with a
 /// default, its item is the `let` of its binding, a name no source can
 /// write ([`crate::names::context_binding`]), whose value is its default's
 /// function, pure and of no parameters, returning its type; without one,
@@ -935,7 +935,7 @@ pub struct ContextDecl {
 
 /// What has type parameters: a generic function item, `fn NAME<T, U>(...)`
 /// or `def NAME<T>(...)` (see the parser's [Functions and
-/// calls](crate::parser#functions-and-calls)), or a generic `type` item,
+/// calls](crate::parser::functions#functions-and-calls)), or a generic `type` item,
 /// `type NAME<T> = TYPE` (see [Types](#types)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GenericOwner {
@@ -974,7 +974,7 @@ pub struct Param {
     /// constant ([`is_constant`]): a function of the parameters before it,
     /// whose body is the default, which a call that leaves the parameter out
     /// calls on its side of the call (see the parser's [Functions and
-    /// calls](crate::parser#functions-and-calls)).
+    /// calls](crate::parser::functions#functions-and-calls)).
     pub default_fn: Option<FnId>,
 }
 
@@ -1064,7 +1064,7 @@ pub enum ArgKind {
     Positional,
     /// `NAME = EXPR`, filling the parameter named `NAME`; or, after another
     /// named argument, `NAME` alone, shorthand for `NAME = NAME` (see the
-    /// parser's [Functions and calls](crate::parser#functions-and-calls)).
+    /// parser's [Functions and calls](crate::parser::functions#functions-and-calls)).
     Named {
         /// The parameter's name.
         name: Name,
@@ -1651,7 +1651,7 @@ pub enum ExprKind {
     /// details are in the def-type arena (see [`Ast::def_type`]).
     DefTypeRef(DefTypeId),
     /// `assert COND` or `assert COND, MESSAGE`, a statement of type `{}`
-    /// (see the parser's [Failure](crate::parser#failure)).
+    /// (see the parser's [Failure](crate::parser::failure#failure)).
     Assert {
         /// The condition.
         cond: ExprId,
@@ -1663,12 +1663,12 @@ pub enum ExprKind {
     /// arena (see [`Ast::recover_decl`]).
     Recover(RecoverId),
     /// A read of a context, `^NAME`, as in `^arch` (see the parser's
-    /// [Context](crate::parser#context)). The name ends the expression's
+    /// [Context](crate::parser::context#context)). The name ends the expression's
     /// span.
     ContextRead(Name),
     /// `BODY with { NAME = VALUE; ... }`, or `with { ... } { BODY }`: the
     /// body evaluated with the contexts the bindings name bound (see the
-    /// parser's [Context](crate::parser#context)).
+    /// parser's [Context](crate::parser::context#context)).
     With {
         /// The bindings, in source order (see [`Ast::with_bindings`]).
         bindings: WithRange,
@@ -1677,7 +1677,7 @@ pub enum ExprKind {
     },
     /// What the parser put in place of source it could not parse, or of a
     /// lexical error's token (see the parser's [Errors and
-    /// recovery](crate::parser#errors-and-recovery)): its error is
+    /// recovery](crate::parser::recovery#errors-and-recovery)): its error is
     /// reported already, so it is of type `Error`, which every use accepts
     /// silently. Only ever in a tree with syntax errors ([`Ast::syntax`]),
     /// which is never lowered.
@@ -1686,7 +1686,7 @@ pub enum ExprKind {
     /// leaves one half-typed: what the parser kept of it, its record,
     /// which is checked as any expression is, the access itself of type
     /// `Error` (see the parser's [Errors and
-    /// recovery](crate::parser#errors-and-recovery)). Only ever in a tree
+    /// recovery](crate::parser::recovery#errors-and-recovery)). Only ever in a tree
     /// with syntax errors, which is never lowered.
     NoField(ExprId),
     /// A call whose `(` is never closed, `callee(ARGS` at the end of the
@@ -1694,7 +1694,7 @@ pub enum ExprKind {
     /// half-typed: what the parser kept of it, its callee and the
     /// arguments it parsed, each checked as any expression is, the call
     /// itself of type `Error` (see the parser's [Errors and
-    /// recovery](crate::parser#errors-and-recovery)). Only ever in a tree
+    /// recovery](crate::parser::recovery#errors-and-recovery)). Only ever in a tree
     /// with syntax errors, which is never lowered.
     Unclosed {
         /// The function called.
@@ -1930,7 +1930,7 @@ pub enum ItemKind {
         bound: Option<TypeExprId>,
     },
     /// `context NAME: TYPE`, a context with no default (see the parser's
-    /// [Context](crate::parser#context)); one with a default is the `let`
+    /// [Context](crate::parser::context#context)); one with a default is the `let`
     /// of its default's function under a binding no source can write
     /// ([`ContextDecl`]). Only ever an item of a file's outermost block. It
     /// has no expression.
@@ -1986,7 +1986,7 @@ pub enum ItemKind {
     },
     /// What the parser put in place of an item it could not parse, its
     /// span the source it skipped (see the parser's [Errors and
-    /// recovery](crate::parser#errors-and-recovery)): its error is
+    /// recovery](crate::parser::recovery#errors-and-recovery)): its error is
     /// reported already. It declares nothing, has no value, and is no
     /// field, result or statement of its block, whose type is `Error`.
     /// Only ever in a tree with syntax errors ([`Ast::syntax`]).
@@ -2121,7 +2121,7 @@ pub enum TypeExprKind {
     },
     /// The declared type of the context `NAME`, of a parameter written
     /// `(^NAME)` with no type (see the parser's
-    /// [Context](crate::parser#context)), which the checker resolves.
+    /// [Context](crate::parser::context#context)), which the checker resolves.
     Context(Name),
     /// A type that names nothing it can, put in place of a written one by
     /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
@@ -2776,7 +2776,7 @@ pub struct TypeStoreMark {
 }
 
 /// What a host knows an attribute by (see the parser's
-/// [Attributes](crate::parser#attributes)): its declaration, by the module
+/// [Attributes](crate::parser::attributes#attributes)): its declaration, by the module
 /// that declares it, the path of its file without `.gcsl`, and its name;
 /// or one of GCSL's own, `retry` and `timeout`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3275,7 +3275,7 @@ pub struct BuilderMark {
 
 /// Whether a tree was parsed from source with syntax errors, and so how far
 /// its shape can be trusted (see the parser's [Errors and
-/// recovery](crate::parser#errors-and-recovery)).
+/// recovery](crate::parser::recovery#errors-and-recovery)).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Syntax {
     /// No error: the tree is the source as written.
@@ -3488,7 +3488,7 @@ impl AstBuilder {
     }
 
     /// Marks the `type` item `id` `#[attribute]` (see the parser's
-    /// [Attributes](crate::parser#attributes)).
+    /// [Attributes](crate::parser::attributes#attributes)).
     pub fn mark_attribute(&mut self, id: ItemId) {
         let at = self
             .attribute_marks
@@ -4176,7 +4176,7 @@ impl Ast {
     }
 
     /// The bindings of a `with` (see the parser's
-    /// [Context](crate::parser#context)).
+    /// [Context](crate::parser::context#context)).
     #[must_use]
     pub fn with_bindings(&self, range: WithRange) -> &[WithBinding] {
         let start = range.start as usize;
@@ -4238,7 +4238,7 @@ impl Ast {
     /// Shows `segments`, a module path of an import, as it is written: its
     /// segments joined by `/`, each as its source spells it, dots and all,
     /// as in `pkgs/net.busybox.busybox` (see the parser's
-    /// [Imports](crate::parser#imports)).
+    /// [Imports](crate::parser::imports#imports)).
     #[must_use]
     pub fn show_module_path(&self, segments: &[PathSegment]) -> String {
         segments
@@ -4279,7 +4279,7 @@ impl Ast {
 
     /// Whether the `type` item `id` is marked `#[attribute]`: a declaration
     /// of an attribute (see the parser's
-    /// [Attributes](crate::parser#attributes)).
+    /// [Attributes](crate::parser::attributes#attributes)).
     #[must_use]
     pub fn is_attribute(&self, id: ItemId) -> bool {
         self.attribute_marks
@@ -4289,7 +4289,7 @@ impl Ast {
 
     /// The uses of attributes that are none of the parser's on the item
     /// `id`, in source order (see the parser's
-    /// [Attributes](crate::parser#attributes)).
+    /// [Attributes](crate::parser::attributes#attributes)).
     #[must_use]
     pub fn attribute_uses(&self, id: ItemId) -> &[AttributeUse] {
         let start = self

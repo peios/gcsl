@@ -19,7 +19,7 @@
 //!
 //! A segment is a directory's or a file's name as it is, dots and all, so
 //! `pkgs/net.busybox.busybox` names the directory `net.busybox.busybox`
-//! (see the parser's [Imports](crate::parser#imports)). A path whose
+//! (see the parser's [Imports](crate::parser::imports#imports)). A path whose
 //! segments have dots in them, in the old form of a path, `lib.x`, that
 //! names nothing but would name a module with each `.` a `/`, is "no module
 //! `lib.x`" with a note saying so instead of what the directory has, and the
@@ -406,7 +406,7 @@ pub(crate) fn module(
 /// The path `shown`, which names no module, written with each `.` of its
 /// segments a `/` instead, if that names a directory or a file: the module
 /// a path in the old form, `lib.x`, meant (see the parser's
-/// [Imports](crate::parser#imports)).
+/// [Imports](crate::parser::imports#imports)).
 pub(super) fn slashed_module(modules: &Modules<'_>, shown: &[&str]) -> Option<String> {
     let joined = shown.join("/");
     if !joined.contains('.') {

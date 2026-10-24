@@ -48,7 +48,7 @@
 //! identifiers, which only the checker gives a meaning, in types. Nor is
 //! `type`: it is an identifier here, which the parser takes as the start of
 //! a `type` item only where an item starts and an identifier follows it on
-//! its line (see the parser's [Types](crate::parser#types)), so a variable
+//! its line (see the parser's [Types](crate::parser::types#types)), so a variable
 //! or field may still be named `type`.
 //!
 //! Operators are lexed greedily: `===` is one token, `==` another and `=`
@@ -96,7 +96,7 @@
 //! interned as an identifier is: `#[NAME]` an outer one,
 //! [`TokenKind::Attribute`], which applies to the item after it, and
 //! `#![NAME]` an inner one, [`TokenKind::InnerAttribute`], which applies to
-//! the whole file (see the parser's [Attributes](crate::parser#attributes)).
+//! the whole file (see the parser's [Attributes](crate::parser::attributes#attributes)).
 //! The name followed, after optional spaces or tabs, by `(` instead of `]`
 //! is an attribute with arguments: one token through its name,
 //! [`TokenKind::AttributeArgs`] or [`TokenKind::InnerAttributeArgs`], whose
@@ -183,7 +183,7 @@
 //! The lexer goes on past every error ([`lex`]), reporting each once, in
 //! source order, and puts a [`TokenKind::Error`] where it is, which the
 //! parser reports nothing at (see the parser's [Errors and
-//! recovery](crate::parser#errors-and-recovery)), so that a mistake is no
+//! recovery](crate::parser::recovery#errors-and-recovery)), so that a mistake is no
 //! other token and nothing is reported of it twice:
 //!
 //! - An unexpected character, a `'` with no name after it, and an
@@ -563,7 +563,7 @@ pub fn is_identifier(text: &str) -> bool {
 }
 
 /// Whether `text` may be a segment of a module path (see
-/// [Imports](crate::parser#imports)): ASCII letters, digits, `_`, `-`, `+` and `.`,
+/// [Imports](crate::parser::imports#imports)): ASCII letters, digits, `_`, `-`, `+` and `.`,
 /// starting with a letter, a digit or `_` and ending with one or `+`, as
 /// `gmp-c++` does, with no `..`.
 #[must_use]
@@ -1281,7 +1281,7 @@ impl<'a> Lexer<'a> {
     /// end the literal, as they always did, and start a name: so a module
     /// path's `pkgs/7zip` is still the number and the name it was, and the
     /// parser reports `30sec` where an expression is expected (see the
-    /// parser's [Expressions](crate::parser#expressions)).
+    /// parser's [Expressions](crate::parser::expressions#expressions)).
     fn number(&mut self, start: usize) -> Result<TokenKind, Diagnostic> {
         let mut has_underscore = self.digits()?;
         let mut is_float = false;

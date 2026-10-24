@@ -423,7 +423,7 @@ impl<'s> Tokens<'s> {
         };
         // The path so far is one run of glued tokens, through the segment
         // half-typed at `offset`: the segments before its last `/` are the
-        // prefix (see the parser's [Imports](crate::parser#imports)).
+        // prefix (see the parser's [Imports](crate::parser::imports#imports)).
         let (Some(&start), Some(&end)) = (path.first(), path.last()) else {
             return Some(Place::Import(Vec::new()));
         };
@@ -1448,7 +1448,7 @@ fn declared_at(ast: &Ast, offset: u32) -> Option<Name> {
 /// The segment of an import's module path around byte `offset` of `text`:
 /// the run of letters, digits, `_`, `-`, `+` and `.` either side of it, up
 /// to a `/` or anything else (see the parser's
-/// [Imports](crate::parser#imports)). What a completion of a module there
+/// [Imports](crate::parser::imports#imports)). What a completion of a module there
 /// replaces, as [`name_around`] is elsewhere.
 #[must_use]
 pub fn module_segment_around(text: &str, offset: u32) -> Span {

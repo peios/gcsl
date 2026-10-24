@@ -4,7 +4,7 @@
 //! # Enums
 //!
 //! An extensible enum, `enum Tool extensible<B>` (see the parser's
-//! [Enums](crate::parser#enums)), is a nominal type, [`TyKind::Enum`], by its
+//! [Enums](crate::parser::enums#enums)), is a nominal type, [`TyKind::Enum`], by its
 //! key, a name no source can write made of its name and of what declares it
 //! ([`crate::names`], "Enum keys"), so that every scan of one file, and every
 //! input of a session, has one enum. Its variants are declared anywhere that

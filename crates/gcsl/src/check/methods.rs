@@ -4,7 +4,7 @@
 //! # Generics
 //!
 //! A generic function item (see the parser's [Functions and
-//! calls](crate::parser#functions-and-calls)) has a type parameter, as a
+//! calls](crate::parser::functions#functions-and-calls)) has a type parameter, as a
 //! [`TyKind::Param`](crate::types::TyKind::Param) of its own [`GenericId`]
 //! (`Checker::generic_of`), for each name written as a type in its scope that
 //! is one of its parameters (`Checker::resolve_written`); no bareness wraps
@@ -38,7 +38,7 @@
 //!
 //! # Methods
 //!
-//! A method (see the parser's [Methods](crate::parser#methods)) is a
+//! A method (see the parser's [Methods](crate::parser::functions#methods)) is a
 //! top-level function of its input under a binding no source can write,
 //! declared, grouped, checked, captured and lowered as a `fn` is (see [Top-level
 //! functions](crate::check::toplevel#top-level-functions)), its receiver its first parameter.

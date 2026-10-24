@@ -195,7 +195,7 @@
 //! file's text as it is, lexed again, and the index of it: while it is
 //! edited it is mostly broken, and the parser keeps what an editor leaves
 //! half-typed for it, `a.` and `f(` (see the parser's [Errors and
-//! recovery](crate::parser#errors-and-recovery)), so what is before the
+//! recovery](crate::parser::recovery#errors-and-recovery)), so what is before the
 //! place is checked and indexed. The tokens before the place, the word
 //! being typed at it set aside (the client filters by it; a name typed up
 //! to a `-`, `libcap-`, which the lexer takes for a `-` that is ambiguous,
@@ -228,7 +228,7 @@
 //!   library's modules, every one of them whether the scan loaded it or
 //!   not, `builtins` and `fileroot` (only those in a lone file). The path
 //!   so far must be one run of glued tokens, as the parser reads it (see
-//!   its [Imports](crate::parser#imports)), the word half-typed directly
+//!   its [Imports](crate::parser::imports#imports)), the word half-typed directly
 //!   after it. What each writes over is not the name around the place but
 //!   the whole segment around it, dots and all
 //!   ([`module_segment_around`], [`Completion::range`]), so that a

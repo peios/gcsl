@@ -58,7 +58,7 @@ pub(crate) struct Context<'a> {
 pub(super) type CellReads<'a> = (&'a [Slot], &'a [Option<Rc<KnownParams>>], &'a ForLater);
 
 /// What a name read as an attribute's names in a file (see the parser's
-/// [Attributes](crate::parser#attributes)).
+/// [Attributes](crate::parser::attributes#attributes)).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AttributeLookup<'a> {
     /// No type of the file's view.

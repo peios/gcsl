@@ -4,7 +4,7 @@
 //! # Def-types
 //!
 //! A `def` marked `#[def_type]` (see the parser's
-//! [Attributes](crate::parser#attributes)) is a *def-type*, as in
+//! [Attributes](crate::parser::attributes#attributes)) is a *def-type*, as in
 //! `#[def_type] def package(name: String, func: fn(): PackageDef) -> R`. Its
 //! first parameter must be a `String` and its second a function, its type
 //! F, present or the either shape of one: the function type of the

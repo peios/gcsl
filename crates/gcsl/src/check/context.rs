@@ -2,7 +2,7 @@
 //!
 //! # Context
 //!
-//! A context (see the parser's [Context](crate::parser#context)) is
+//! A context (see the parser's [Context](crate::parser::context#context)) is
 //! declared once in a workspace, and seen by every file of it, its standard
 //! files' among them, without an import: the workspace gives each file the
 //! one of a name (`Context::context`), its own declaration's first, then,

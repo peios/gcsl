@@ -692,7 +692,7 @@ impl Index {
     /// Whether `span` of file `file` is the value of a shorthand argument,
     /// `name` alone after a named argument, which reads the variable `name`
     /// and names the parameter `name` at once (see the parser's [Functions
-    /// and calls](crate::parser#functions-and-calls)).
+    /// and calls](crate::parser::functions#functions-and-calls)).
     fn is_shorthand(&self, file: u32, span: Span) -> bool {
         let Some(ast) = self.scan.files.get(file as usize).map(|f| &f.ast) else {
             return false;

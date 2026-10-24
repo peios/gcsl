@@ -6,7 +6,7 @@
 //! An attribute says how to run a function, for the host that runs it or
 //! for GCSL: its arguments are a record of constants, and so an attribute
 //! is declared as the record type of its arguments, a `type` marked
-//! `#[attribute]` (see the parser's [Attributes](crate::parser#attributes)),
+//! `#[attribute]` (see the parser's [Attributes](crate::parser::attributes#attributes)),
 //! `#[attribute] type hermetic = {on: Bool = true}`. Being a type, it is
 //! named, imported and reported in conflicts as any type is (see
 //! [`crate::workspace`], "Types"), and is usable as one. Its type must be a

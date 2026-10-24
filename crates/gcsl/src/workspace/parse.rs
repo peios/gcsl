@@ -5,7 +5,7 @@
 //!
 //! A top-level field (a dotted one or a `def` included) or an `import` of
 //! any form may be marked `#[shadowable]` (see the parser's
-//! [Attributes](crate::parser#attributes)): it may then be shadowed by a
+//! [Attributes](crate::parser::attributes#attributes)): it may then be shadowed by a
 //! later declaration of its name. A LEAF is *shadowable* if its declaration
 //! is marked ([`crate::mentions::FieldLeaf::shadowable`],
 //! [`Node::shadowable`]), if it reaches a view through a marked import
@@ -67,7 +67,7 @@
 //!
 //! A file with lexical or syntax errors is scanned and checked as its
 //! parser recovered it (see the parser's [Errors and
-//! recovery](crate::parser#errors-and-recovery)), so that one file's typo
+//! recovery](crate::parser::recovery#errors-and-recovery)), so that one file's typo
 //! hides nothing of the others', but nothing runs: the check fails, with
 //! every file's syntax errors ([`Scan::syntax_errors`]), and with every
 //! other error found that is no cascade of them. Each error is reported

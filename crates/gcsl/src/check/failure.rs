@@ -2,7 +2,7 @@
 //!
 //! # Failure
 //!
-//! `assert COND, MESSAGE` (see the parser's [Failure](crate::parser#failure))
+//! `assert COND, MESSAGE` (see the parser's [Failure](crate::parser::failure#failure))
 //! is `{}`: its condition must be a `Bool`, "an assertion's condition is a
 //! Bool", and its message a `String` (`Checker::check_assert`). `recover { BODY
 //! } else (e) { FALLBACK }` (`Checker::check_recover`) checks its body, then

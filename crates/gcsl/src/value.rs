@@ -419,7 +419,7 @@ impl Closure {
 
     /// The attributes of the closure's function, in source order: what a
     /// host reads of how to run a call of it (see the parser's
-    /// [Attributes](crate::parser#attributes)). Empty for a function that
+    /// [Attributes](crate::parser::attributes#attributes)). Empty for a function that
     /// is no function item, or has none.
     #[must_use]
     pub fn attributes(&self) -> &[crate::check::Attribute] {

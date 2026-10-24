@@ -117,7 +117,7 @@
 //!
 //! Any other default is its parameter's *default function*, which the parser
 //! makes (see the parser's [Functions and
-//! calls](crate::parser#functions-and-calls)): a function of the parameters
+//! calls](crate::parser::functions#functions-and-calls)): a function of the parameters
 //! before it, as they are written, whose result type is the parameter's, whose
 //! effect is the function's (a memoised function's is impure), whose marker is
 //! the function's, and whose body is the default. It is checked

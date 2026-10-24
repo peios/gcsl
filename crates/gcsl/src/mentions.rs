@@ -110,7 +110,7 @@
 //! # Shadowed declarations
 //!
 //! A field item marked `#[shadowable]` (see the parser's
-//! [Attributes](crate::parser#attributes)) may be shadowed by a later one
+//! [Attributes](crate::parser::attributes#attributes)) may be shadowed by a later one
 //! that overlaps it (see [`crate::workspace`], "Shadowable declarations"):
 //! its leaf is shadowable ([`FieldLeaf::shadowable`]), and so is a node all
 //! of whose leaves are ([`FieldNode::shadowable`]). Before the tree is
@@ -213,7 +213,7 @@
 //!
 //! # Methods
 //!
-//! A method (see the parser's [Methods](crate::parser#methods)) is a
+//! A method (see the parser's [Methods](crate::parser::functions#methods)) is a
 //! top-level function of the input, under its binding's name, which no
 //! source can write, so it is found, grouped and scheduled as any `fn` is.
 //! Which method a call `x.m(...)` means depends on `x`'s type, which is not

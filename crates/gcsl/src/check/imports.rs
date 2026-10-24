@@ -168,7 +168,7 @@ use super::{Checker, FILEROOT_MEMBERS, Fileroot, Slot, VarRef};
 
 impl<'a> Checker<'a> {
     /// Checks the import item `id`, spanning `span` (see the parser's
-    /// [Imports](crate::parser#imports)). Checked with no workspace at all,
+    /// [Imports](crate::parser::imports#imports)). Checked with no workspace at all,
     /// as [`check`](super::check) checks a file alone, there is nothing for its path to
     /// name, which is an error at the import, reported here with the
     /// input's other errors. A lone file and a session's input are checked
