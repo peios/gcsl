@@ -103,28 +103,28 @@
 //! TEMPORARY (alias rule): a special built-in has no type the table can hold, so until the
 //! inference engine gives built-in functions real polymorphic types (see the [inference
 //! limits](https://learn.peios.org/gcsl/language/inference-limits/)), its value has an opaque type
-//! of its
-//! own, [`TyKind::Builtin`](crate::types::TyKind::Builtin), shown `builtin len` or `builtin show`, which no type expression can
-//! write, so that no annotation, parameter type, field type or result type accepts it. A reference
-//! whose type is it may stand in two places only (`Checker::alias_site`): the callee of a call,
-//! which is then typed by the built-in's rule as above, and the whole initialiser of a top-level
-//! field or a top-level `let` of one name, neither annotated nor mutable (`len = builtins.len`,
-//! `let l = len`, `m = l`), which makes that name an *alias* of the built-in, of the same opaque
-//! type. A member or `*` import of one is an alias of the same kind, the cell it names being of
-//! that type. The type is the alias's identity: it is what every boundary already carries, the type
-//! of a cell another file reads ([`crate::workspace`]'s cell types), of a root committed to a
-//! directory's scope, of a session's [`Scope`](super::Scope) binding, of an import's target, so a call through an
-//! alias is typed and lowered as a call of the built-in in any file or session input. Any other
-//! reference to one, or to a record holding one (`builtins` or the prelude read whole), is "`len`
-//! is a built-in function and cannot be used as a value yet", with the note "a built-in function
-//! with a type for any list cannot be written as a type yet; call it, or bind it to a name" (for
-//! `show`, "for any value"; `Checker::builtin_use`, the one place that says so): an argument, a
-//! list element, a field of an inner record, a function's result, an operand of `==` or `===`, an
-//! `is`, an `as`, an ascription, a `let` in a block, a `let mut`, a rebind, a branch, a dotted
-//! field, a callee in parentheses. What replaces it: a polymorphic type for `len` (`fn<T>(list:
-//! List<T>): Int`) and for `show` (`fn<T>(value: T): String`, `T` bounded to types without
-//! functions), with which each is a value like `int`, its calls ordinary calls, and the opaque
-//! type, `alias_site`, `builtin_use` and the special path of `Checker::check_call` go.
+//! of its own, [`TyKind::Builtin`](crate::types::TyKind::Builtin), shown `builtin len` or `builtin
+//! show`, which no type expression can write, so that no annotation, parameter type, field type or
+//! result type accepts it. A reference whose type is it may stand in two places only
+//! (`Checker::alias_site`): the callee of a call, which is then typed by the built-in's rule as
+//! above, and the whole initialiser of a top-level field or a top-level `let` of one name, neither
+//! annotated nor mutable (`len = builtins.len`, `let l = len`, `m = l`), which makes that name an
+//! *alias* of the built-in, of the same opaque type. A member or `*` import of one is an alias of
+//! the same kind, the cell it names being of that type. The type is the alias's identity: it is
+//! what every boundary already carries, the type of a cell another file reads
+//! ([`crate::workspace`]'s cell types), of a root committed to a directory's scope, of a session's
+//! [`Scope`](super::Scope) binding, of an import's target, so a call through an alias is typed and
+//! lowered as a call of the built-in in any file or session input. Any other reference to one, or
+//! to a record holding one (`builtins` or the prelude read whole), is "`len` is a built-in function
+//! and cannot be used as a value yet", with the note "a built-in function with a type for any list
+//! cannot be written as a type yet; call it, or bind it to a name" (for `show`, "for any value";
+//! `Checker::builtin_use`, the one place that says so): an argument, a list element, a field of an
+//! inner record, a function's result, an operand of `==` or `===`, an `is`, an `as`, an ascription,
+//! a `let` in a block, a `let mut`, a rebind, a branch, a dotted field, a callee in parentheses.
+//! What replaces it: a polymorphic type for `len` (`fn<T>(list: List<T>): Int`) and for `show`
+//! (`fn<T>(value: T): String`, `T` bounded to types without functions), with which each is a value
+//! like `int`, its calls ordinary calls, and the opaque type, `alias_site`, `builtin_use` and the
+//! special path of `Checker::check_call` go.
 
 use crate::ast::{ArgKind, ArgRange, Effect, Expr, ExprId, ExprKind, FnId, TypeExprId, TypeExprKind};
 use crate::diagnostic::Diagnostic;
@@ -251,16 +251,15 @@ impl Checker<'_> {
 
     /// TEMPORARY (alias rule): `show`'s rule, until its polymorphic type (see the [inference
     /// limits](https://learn.peios.org/gcsl/language/inference-limits/)). Types the call of `show`,
-    /// the
-    /// callee `callee`, whose argument is `value`: the argument may be of any type without a
+    /// the callee `callee`, whose argument is `value`: the argument may be of any type without a
     /// function in it, anywhere, a field, an element, a member of a union, an alias's expansion, at
-    /// any depth ([`TypeTable::contains_fn`](crate::types::TypeTable::contains_fn), which a built-in function's type is too), else
-    /// "cannot show a function: `show` renders data as source", at the argument, its type in a
-    /// note; and it is used as its bits all the way down, as an interpolated expression is
-    /// ([`Checker::measure_deep`]), so one that may be a future, or hold one, is awaited deeply,
-    /// subject to the purity rule. The call is a `String`, and the callee a pure function from the
-    /// argument's type, once awaited, to `String`; `Error` if the argument is erroneous or holds a
-    /// function.
+    /// any depth ([`TypeTable::contains_fn`](crate::types::TypeTable::contains_fn), which a
+    /// built-in function's type is too), else "cannot show a function: `show` renders data as
+    /// source", at the argument, its type in a note; and it is used as its bits all the way down,
+    /// as an interpolated expression is ([`Checker::measure_deep`]), so one that may be a future,
+    /// or hold one, is awaited deeply, subject to the purity rule. The call is a `String`, and the
+    /// callee a pure function from the argument's type, once awaited, to `String`; `Error` if the
+    /// argument is erroneous or holds a function.
     pub(super) fn check_show(&mut self, callee: ExprId, value: ExprId) -> TyId {
         let found = self.check_expr(value);
         let found = self.settle(value, found);
@@ -447,15 +446,15 @@ impl Checker<'_> {
         TyId::ERROR
     }
 
-    /// Binds the arguments `args` of the call `id` to the parameters of
-    /// its callee, of function type `callee_ty` with signature `sig`:
-    /// positional arguments fill parameters left to right, the trailing
-    /// block the last, and named arguments the parameters of their names.
-    /// Checks each argument against its parameter's type, or alone if it
-    /// fills none, and records the parameter each fills. A known callee
-    /// gives each parameter left unfilled that has a default its default,
-    /// which is recorded for the call (see [Calls](#calls)). Reports every
-    /// argument that cannot be bound and every parameter left unfilled
+    /// Binds the arguments `args` of the call `id` to the parameters of its
+    /// callee, of function type `callee_ty` with signature `sig`: positional
+    /// arguments fill parameters left to right, the trailing block the last,
+    /// and named arguments the parameters of their names. Checks each argument
+    /// against its parameter's type, or alone if it fills none, and records the
+    /// parameter each fills. A known callee gives each parameter left unfilled
+    /// that has a default its default, which is recorded for the call (see
+    /// "Calls" under [Functions](crate::check::functions#functions)). Reports
+    /// every argument that cannot be bound and every parameter left unfilled
     /// after that, and returns whether there was any.
     ///
     /// An argument awaited at the top because the parameter it fills is
@@ -602,7 +601,7 @@ impl Checker<'_> {
     /// Records, for lowering, the parameter each of the arguments `args` of
     /// the call `id` fills, as `filled[base..]` shows, numbered from
     /// `offset`, and the defaults the call gives, `defaults`, if it gives
-    /// any (see [Calls](#calls)).
+    /// any (see "Calls" under [Functions](crate::check::functions#functions)).
     pub(super) fn record_bound(
         &mut self,
         (id, args): (ExprId, ArgRange),
@@ -630,10 +629,11 @@ impl Checker<'_> {
 
     /// Gives each of the `count` parameters of `known`, a known callee, from
     /// number `offset` on, that `filled[base..]` shows no argument fills and
-    /// that has a default its default (see [Calls](#calls)): marks it [`DEFAULTED`] there, so that
-    /// it is not unfilled, and returns each with its default, in parameter
-    /// order (a default in error, which fails the check with its own error,
-    /// left out).
+    /// that has a default its default (see "Calls" under
+    /// [Functions](crate::check::functions#functions)): marks it [`DEFAULTED`]
+    /// there, so that it is not unfilled, and returns each with its default, in
+    /// parameter order (a default in error, which fails the check with its own
+    /// error, left out).
     pub(super) fn fill_defaults(
         &mut self,
         known: KnownCallee,
@@ -810,9 +810,10 @@ impl Checker<'_> {
     }
 
     /// Whether parameter number `param` of `known`, a known callee, has a
-    /// default (see [Calls](#calls)): as its function expression declares,
-    /// for a function of this input, and as its [`KnownParams`] say for one
-    /// whose tree is gone.
+    /// default (see "Calls" under
+    /// [Functions](crate::check::functions#functions)): as its function
+    /// expression declares, for a function of this input, and as its
+    /// [`KnownParams`] say for one whose tree is gone.
     pub(super) fn has_default(&self, known: KnownCallee, param: usize) -> bool {
         match known {
             KnownCallee::Current(function) => {
@@ -828,10 +829,11 @@ impl Checker<'_> {
         }
     }
 
-    /// The default of parameter number `param` of `known`, a known callee,
-    /// if it has one that is known (see [Calls](#calls)): a function of
-    /// this input whose default is in error has none, and fails the check
-    /// with that default's error.
+    /// The default of parameter number `param` of `known`, a known callee, if
+    /// it has one that is known (see "Calls" under
+    /// [Functions](crate::check::functions#functions)): a function of this
+    /// input whose default is in error has none, and fails the check with that
+    /// default's error.
     pub(super) fn default_of(&self, known: KnownCallee, param: usize) -> Option<ParamDefault> {
         match known {
             KnownCallee::Current(function) => self

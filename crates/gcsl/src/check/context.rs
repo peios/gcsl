@@ -29,16 +29,17 @@
 //! caller's context. `TypeExprKind::Context`, a `^NAME` parameter's type,
 //! is the context's type exactly, neither bare nor inferred.
 //!
-//! `BODY with { ... }` (`Checker::check_with`) checks each binding against
-//! its context: a plain one's value against its type, a dotted key's
-//! against the type of the field its path names, through present records,
-//! "context `platform` has no field `archx`" otherwise, its read of the
-//! value it updates checked as a read is. A second plain binding of a
-//! context, or one after a dotted key of it, is "context `x` is bound twice
-//! in this `with`". The body is checked with the contexts bound, and its
-//! type is the `with`'s; an untyped integer body is coerced through it.
-//! Each read and `with` is recorded for lowering by its declarations' keys
-//! ([`Resolution::context_read`](super::Resolution::context_read), [`Resolution::with_keys`](super::Resolution::with_keys)).
+//! `BODY with { ... }` (`Checker::check_with`) checks each binding against its
+//! context: a plain one's value against its type, a dotted key's against the
+//! type of the field its path names, through present records, "context
+//! `platform` has no field `archx`" otherwise, its read of the value it updates
+//! checked as a read is. A second plain binding of a context, or one after a
+//! dotted key of it, is "context `x` is bound twice in this `with`". The body
+//! is checked with the contexts bound, and its type is the `with`'s; an untyped
+//! integer body is coerced through it. Each read and `with` is recorded for
+//! lowering by its declarations' keys
+//! ([`Resolution::context_read`](super::Resolution::context_read),
+//! [`Resolution::with_keys`](super::Resolution::with_keys)).
 
 use crate::ast::{ExprId, ExprKind, FnId, ItemKind, WithRange};
 use crate::diagnostic::Diagnostic;

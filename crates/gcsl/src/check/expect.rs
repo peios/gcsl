@@ -12,13 +12,13 @@ use super::{AwaitSite, BodyValue, Branch, Checker, Expecting, NarrowingBlock, Re
 
 impl Checker<'_> {
     /// Checks that `expr`, of type `found`, can have type `expected`: an
-    /// untyped integer is coerced to `Int` or `Float`, the type of the
-    /// `Int` or `Float` expected or of the either shape of one, and any
-    /// other type must be a subtype of `expected`, or become one once
-    /// awaited, in which case `expr` is marked to be awaited (see
-    /// [`TypeTable::needs_await`](crate::types::TypeTable::needs_await)), subject to the purity rule. A mismatch
-    /// is reported at `expr` with a context label on `context`, the source
-    /// of the expectation.
+    /// untyped integer is coerced to `Int` or `Float`, the type of the `Int` or
+    /// `Float` expected or of the either shape of one, and any other type must
+    /// be a subtype of `expected`, or become one once awaited, in which case
+    /// `expr` is marked to be awaited (see
+    /// [`TypeTable::needs_await`](crate::types::TypeTable::needs_await)),
+    /// subject to the purity rule. A mismatch is reported at `expr` with a
+    /// context label on `context`, the source of the expectation.
     ///
     /// Where `found` has a provisional type of the innermost function's at a
     /// position where `expected` is present, that parameter is measured
@@ -102,13 +102,13 @@ impl Checker<'_> {
         start..end
     }
 
-    /// Where `expr`, of type `found`, is expected to have type `expected`,
-    /// and does not as it is: measures each parameter of a claimable
-    /// function (see [`Checker::claimable`]) whose provisional type sits in
-    /// `found` where `expected` is present (see
-    /// [`TypeTable::provisionals_at_present`](crate::types::TypeTable::provisionals_at_present)), and returns `found` with
-    /// every provisional type of those functions made present; or `None` if
-    /// there is no such parameter.
+    /// Where `expr`, of type `found`, is expected to have type `expected`, and
+    /// does not as it is: measures each parameter of a claimable function (see
+    /// [`Checker::claimable`]) whose provisional type sits in `found` where
+    /// `expected` is present (see
+    /// [`TypeTable::provisionals_at_present`](crate::types::TypeTable::provisionals_at_present)),
+    /// and returns `found` with every provisional type of those functions made
+    /// present; or `None` if there is no such parameter.
     pub(super) fn claim_against(
         &mut self,
         expr: ExprId,
@@ -290,13 +290,13 @@ impl Checker<'_> {
         self.errors.push(error);
     }
 
-    /// The note on a mismatch of a value of type `found` with `expected`
-    /// when `found` lacks a defaulted field of a record type of `expected`
-    /// (see [Field defaults](#field-defaults)), which no default fills, the
-    /// value being no record literal written where the record type is
-    /// expected: "a default fills only a record literal written where `T`
-    /// is expected", `T` that record type ([`Checker::lacked_default`]).
-    /// `None` otherwise.
+    /// The note on a mismatch of a value of type `found` with `expected` when
+    /// `found` lacks a defaulted field of a record type of `expected` (see
+    /// "Field defaults" under [Functions](crate::check::functions#functions)),
+    /// which no default fills, the value being no record literal written where
+    /// the record type is expected: "a default fills only a record literal
+    /// written where `T` is expected", `T` that record type
+    /// ([`Checker::lacked_default`]). `None` otherwise.
     pub(super) fn default_note(&mut self, found: TyId, expected: TyId) -> Option<String> {
         let record = self.lacked_default(found, expected)?;
         let shown = self.in_message(record);
@@ -548,19 +548,19 @@ impl Checker<'_> {
     }
 
     /// Checks `id`, of which the record type with defaults `record` is
-    /// expected, as stated at `context`, labelled `why`, for the defaults
-    /// alone (see [Field defaults](#field-defaults)), and returns its type,
-    /// recorded for `id` and every parenthesis around it. A record literal,
-    /// a record block or `{}`, through any parentheses, is checked against
+    /// expected, as stated at `context`, labelled `why`, for the defaults alone
+    /// (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)), and returns its type,
+    /// recorded for `id` and every parenthesis around it. A record literal, a
+    /// record block or `{}`, through any parentheses, is checked against
     /// `record` as any literal is where it is expected
     /// ([`Checker::check_expr_expecting`]), which gives it the defaults it
     /// lacks. A block with a result has its result checked so in turn
-    /// ([`Expecting::literal_only`]), and a labelled one's `return`s as
-    /// ever; an `if` with `else` has each branch checked so, and is their
-    /// join, as ever ([`Checker::check_if`]). Anything else is checked as it
-    /// is with nothing expected, and nothing else of the block or `if`
-    /// changes: what it is must then fit what is expected where it stands,
-    /// as ever.
+    /// ([`Expecting::literal_only`]), and a labelled one's `return`s as ever;
+    /// an `if` with `else` has each branch checked so, and is their join, as
+    /// ever ([`Checker::check_if`]). Anything else is checked as it is with
+    /// nothing expected, and nothing else of the block or `if` changes: what it
+    /// is must then fit what is expected where it stands, as ever.
     ///
     /// Recurses once per level of blocks and branches nested in each other.
     pub(super) fn fill_result(
@@ -606,22 +606,22 @@ impl Checker<'_> {
     }
 
     /// Checks `id`, a list whose elements the record type with defaults
-    /// `record` is expected to be of, as stated at `context`, labelled
-    /// `why`, for the defaults alone (see [Field defaults](#field-defaults)),
-    /// and returns its type, recorded for `id` and every parenthesis around
-    /// it. A list literal, through any parentheses, is checked as it is
-    /// with nothing expected but for its elements: each that is no spread
-    /// as [`Checker::fill_result`] says, so that a record literal lacking a
-    /// defaulted field is given it, and each spread's operand as
-    /// [`Checker::check_spread`] says with `record` ([`Checker::check_list`]).
-    /// A `for` has the record literal its body results in given the
-    /// defaults it lacks, as a spread `for` has ([`Checker::check_for`]). A
-    /// block with a result has its result checked so in turn
-    /// ([`Expecting::elements_only`]), and a labelled one's `return`s as
-    /// ever; an `if` with `else` has each branch checked so, and is their
-    /// join, as ever ([`Checker::check_if`]). Anything else is checked as it
-    /// is with nothing expected, and nothing else of the list, the loop, the
-    /// block or the `if` changes: what it is must then fit what is expected
+    /// `record` is expected to be of, as stated at `context`, labelled `why`,
+    /// for the defaults alone (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)), and returns its type,
+    /// recorded for `id` and every parenthesis around it. A list literal,
+    /// through any parentheses, is checked as it is with nothing expected but
+    /// for its elements: each that is no spread as [`Checker::fill_result`]
+    /// says, so that a record literal lacking a defaulted field is given it,
+    /// and each spread's operand as [`Checker::check_spread`] says with
+    /// `record` ([`Checker::check_list`]). A `for` has the record literal its
+    /// body results in given the defaults it lacks, as a spread `for` has
+    /// ([`Checker::check_for`]). A block with a result has its result checked
+    /// so in turn ([`Expecting::elements_only`]), and a labelled one's
+    /// `return`s as ever; an `if` with `else` has each branch checked so, and
+    /// is their join, as ever ([`Checker::check_if`]). Anything else is checked
+    /// as it is with nothing expected, and nothing else of the list, the loop,
+    /// the block or the `if` changes: what it is must then fit what is expected
     /// where it stands, as ever.
     ///
     /// Recurses once per level of blocks, branches, list literals and
@@ -934,16 +934,16 @@ impl Checker<'_> {
     }
 
     /// What the record block of `items`, checked without an error field by
-    /// field against the record type `record`, which gave it the type
-    /// `found`, holds once the awaits marked on its fields' values have run:
-    /// the record of what each field's value is, found as
-    /// [`Checker::value_of`] finds it, a record block in turn as this finds
-    /// it, a field that `record` lacks as its type says, and a defaulted
-    /// field of `record` that the block lacks, which it was given (see
-    /// [Field defaults](#field-defaults)), as `record` has it. A block with a
-    /// dotted field or a spread keeps `found`, the record of the expected
-    /// fields' types, and of what the soft fields the expected type lacks
-    /// hold, a supertype of what it holds.
+    /// field against the record type `record`, which gave it the type `found`,
+    /// holds once the awaits marked on its fields' values have run: the record
+    /// of what each field's value is, found as [`Checker::value_of`] finds it,
+    /// a record block in turn as this finds it, a field that `record` lacks as
+    /// its type says, and a defaulted field of `record` that the block lacks,
+    /// which it was given (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)), as `record` has it. A
+    /// block with a dotted field or a spread keeps `found`, the record of the
+    /// expected fields' types, and of what the soft fields the expected type
+    /// lacks hold, a supertype of what it holds.
     ///
     /// Recurses once per level of record blocks nested in each other.
     pub(super) fn held_record(&mut self, items: ItemRange, record: TyId, found: TyId) -> TyId {
@@ -979,8 +979,9 @@ impl Checker<'_> {
             };
             self.sorted_fields.push((name, 0, ty));
         }
-        // The defaulted fields the block lacks, which it was given (see
-        // [Field defaults](#field-defaults)), as the type has them.
+        // The defaulted fields the block lacks, which it was given (see "Field
+        // defaults" under [Functions](crate::check::functions#functions)), as
+        // the type has them.
         for &(name, _) in self.types.defaults(record) {
             let written = self
                 .sorted_fields
@@ -1017,8 +1018,8 @@ impl Checker<'_> {
 
     /// The record type that `expected` is once stripped, if it is not a
     /// future and the record type has defaults or a rest-field: what `{}`
-    /// is given the defaults of where `expected` is expected (see [Field
-    /// defaults](#field-defaults)), and its rest-field, which a record
+    /// is given the defaults of where `expected` is expected (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)), and its rest-field, which a record
     /// literal written there has too (see [Records](crate::check::records#records)). `None`
     /// otherwise, a union of record types included, where `{}` is checked
     /// as ever.

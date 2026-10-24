@@ -18,18 +18,19 @@
 //! interpolated list and an operand of an equality are awaited deeply,
 //! element by element.
 //!
-//! **Literals.** A list literal with no expected type is the list of the
-//! join of its elements' types (see [`TypeTable::join`](crate::types::TypeTable::join)), in order, a
-//! spread contributing its list's element type; untyped integers adapt as
-//! an `if`'s branches do, so `[1, 2.5]` is `List<Float>` and `[1, 2]`
-//! `List<Int>`, and two element types that differ measure the provisional
-//! parameters in them, as an `if`'s branches do (see [Inferred
-//! parameters](crate::check::inference#inferred-parameters)). Elements that do not agree make a
-//! union, which is the warning "the elements of this list have different
-//! types", at the first element that widens the join of those before it
-//! (see [Unions](crate::check::narrowing#unions)); `[]` has nothing to join, and is "cannot infer
-//! the element type of `[]`". Nothing is awaited: `[1, lazy 2]` is
-//! `List<Int | Future<Int>>`.
+//! **Literals.** A list literal with no expected type is the list of the join
+//! of its elements' types (see
+//! [`TypeTable::join`](crate::types::TypeTable::join)), in order, a spread
+//! contributing its list's element type; untyped integers adapt as an `if`'s
+//! branches do, so `[1, 2.5]` is `List<Float>` and `[1, 2]` `List<Int>`, and
+//! two element types that differ measure the provisional parameters in them, as
+//! an `if`'s branches do (see [Inferred
+//! parameters](crate::check::inference#inferred-parameters)). Elements that do
+//! not agree make a union, which is the warning "the elements of this list have
+//! different types", at the first element that widens the join of those before
+//! it (see [Unions](crate::check::narrowing#unions)); `[]` has nothing to join,
+//! and is "cannot infer the element type of `[]`". Nothing is awaited: `[1,
+//! lazy 2]` is `List<Int | Future<Int>>`.
 //!
 //! A literal where a list type `List<X>` (or its either shape) is expected
 //! has each element checked against `X` as an argument is against its

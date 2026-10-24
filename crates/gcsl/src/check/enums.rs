@@ -4,37 +4,38 @@
 //! # Enums
 //!
 //! An extensible enum, `enum Tool extensible<B>` (see the parser's
-//! [Enums](crate::parser#enums)), is a nominal type, [`TyKind::Enum`], by
-//! its key, a name no source can write made of its name and of what
-//! declares it ([`crate::names`], "Enum keys"), so that every scan of one
-//! file, and every input of a session, has one enum. Its variants are
-//! declared anywhere that sees it, `enum Tool::C<{cc: File}>`, each with
-//! its payload's type, `{}` without one. Before any file is checked, once
-//! the `type` items are, the enums' bounds are resolved in their files
-//! (`check_enum_bounds`), and then the variants' payloads in theirs
-//! (`check_variant_payloads`), each recorded in the type table by its key:
-//! a payload must fit its enum's bound, as the payload is written, so that
-//! a record type's fields each fit the bound's field of their name or its
-//! rest-field ([`TypeTable::fits_bound`](crate::types::TypeTable::fits_bound)), "the payload of `Tool::C` must
-//! fit `{*: File}`"; two variants of one enum and name in one file are
-//! "variant `Tool::C` is declared twice", and a variant of what is no enum
-//! "`Int` is not an enum". A variant in error is reported there, once, and
-//! a use of it fails the check quietly.
+//! [Enums](crate::parser#enums)), is a nominal type, [`TyKind::Enum`], by its
+//! key, a name no source can write made of its name and of what declares it
+//! ([`crate::names`], "Enum keys"), so that every scan of one file, and every
+//! input of a session, has one enum. Its variants are declared anywhere that
+//! sees it, `enum Tool::C<{cc: File}>`, each with its payload's type, `{}`
+//! without one. Before any file is checked, once the `type` items are, the
+//! enums' bounds are resolved in their files (`check_enum_bounds`), and then
+//! the variants' payloads in theirs (`check_variant_payloads`), each recorded
+//! in the type table by its key: a payload must fit its enum's bound, as the
+//! payload is written, so that a record type's fields each fit the bound's
+//! field of their name or its rest-field
+//! ([`TypeTable::fits_bound`](crate::types::TypeTable::fits_bound)), "the
+//! payload of `Tool::C` must fit `{*: File}`"; two variants of one enum and
+//! name in one file are "variant `Tool::C` is declared twice", and a variant of
+//! what is no enum "`Int` is not an enum". A variant in error is reported
+//! there, once, and a use of it fails the check quietly.
 //!
-//! A variant written as a value, `Tool::C` (`Checker::check_variant`), is
-//! of type `Variant<E, T>` ([`TyKind::Variant`]), its enum and its payload,
-//! of the one variant of the name the file sees (see [`crate::workspace`],
-//! "Enums"): none is "no variant `C` of `Tool`", noting those it sees, and
-//! several "variant `Tool::C` is declared in two files". A variant is a
-//! subtype of its function type, `fn(T): E`, so a call of it makes a value
-//! of the enum, and of no other variant type but one of its enum and
-//! payload. It is recorded for lowering, which makes it a constant tag
-//! ([`Resolution::variant`](super::Resolution::variant)). A value of an enum is of kind `Mixed`: present,
-//! of the kind only it says. `is E` tests a value's variant's enum
-//! ([`ValueTest::Enum`](crate::types::ValueTest::Enum)). `==` compares two values of an enum, whole, as
-//! `===` does, and two variants, but for an enum with no bound, whose
-//! payloads may hold functions: "cannot compare `Tool`: its variants'
-//! payloads are not bounded, so they may hold functions".
+//! A variant written as a value, `Tool::C` (`Checker::check_variant`), is of
+//! type `Variant<E, T>` ([`TyKind::Variant`]), its enum and its payload, of the
+//! one variant of the name the file sees (see [`crate::workspace`], "Enums"):
+//! none is "no variant `C` of `Tool`", noting those it sees, and several
+//! "variant `Tool::C` is declared in two files". A variant is a subtype of its
+//! function type, `fn(T): E`, so a call of it makes a value of the enum, and of
+//! no other variant type but one of its enum and payload. It is recorded for
+//! lowering, which makes it a constant tag
+//! ([`Resolution::variant`](super::Resolution::variant)). A value of an enum is
+//! of kind `Mixed`: present, of the kind only it says. `is E` tests a value's
+//! variant's enum ([`ValueTest::Enum`](crate::types::ValueTest::Enum)). `==`
+//! compares two values of an enum, whole, as `===` does, and two variants, but
+//! for an enum with no bound, whose payloads may hold functions: "cannot
+//! compare `Tool`: its variants' payloads are not bounded, so they may hold
+//! functions".
 //!
 //! `Variant<E, T>` is written as a type of two arguments, `E` an enum or a
 //! type parameter. A variant's payload is taken out by the prelude's

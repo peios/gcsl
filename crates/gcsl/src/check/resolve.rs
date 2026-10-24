@@ -3,26 +3,26 @@
 //!
 //! # Type declarations
 //!
-//! `type NAME = TYPE`, an item of a file's top level, declares a type in
-//! the file's namespace of types, which is not its variables': a type and
-//! a field, `def`, `let` or `fn` of one name coexist, a type's name being
-//! read only in a type position. Types are order-free, public as `def`s
-//! are, and importable; which file's declaration a name or a qualified name
-//! names is the workspace's to say (see [`crate::workspace`], "Types"), and
-//! it is said before any file is checked: the workspace *expands* every
-//! file's types first ([`Ast::expand_types`](crate::ast::Ast::expand_types)), so that each name of a
-//! declared type, wherever it is written (an annotation, an ascription, a
-//! parameter, a function type, another `type`), is what the type's
-//! definition is, as if the definition were written there, and each record
-//! type with spreads is the record of its merged fields. The checker
-//! resolves the expanded types with the rules above, unchanged, and knows
-//! no type's name: so bareness applies where an alias is used, as if its
-//! definition were written there (`type N = Int` used as an impure
-//! function's bare parameter is `Int | Future<Int>` there, and used as a
-//! pure one's is inferred), a union with an alias of `Future<Int>` among its
-//! members is a union with a `Future` member, an alias of a function type
-//! is a callback parameter, and an impure function's result written as an
-//! alias of a record type is inferred field by field.
+//! `type NAME = TYPE`, an item of a file's top level, declares a type in the
+//! file's namespace of types, which is not its variables': a type and a field,
+//! `def`, `let` or `fn` of one name coexist, a type's name being read only in a
+//! type position. Types are order-free, public as `def`s are, and importable;
+//! which file's declaration a name or a qualified name names is the workspace's
+//! to say (see [`crate::workspace`], "Types"), and it is said before any file
+//! is checked: the workspace *expands* every file's types first
+//! ([`Ast::expand_types`](crate::ast::Ast::expand_types)), so that each name of
+//! a declared type, wherever it is written (an annotation, an ascription, a
+//! parameter, a function type, another `type`), is what the type's definition
+//! is, as if the definition were written there, and each record type with
+//! spreads is the record of its merged fields. The checker resolves the
+//! expanded types with the rules above, unchanged, and knows no type's name: so
+//! bareness applies where an alias is used, as if its definition were written
+//! there (`type N = Int` used as an impure function's bare parameter is `Int |
+//! Future<Int>` there, and used as a pure one's is inferred), a union with an
+//! alias of `Future<Int>` among its members is a union with a `Future` member,
+//! an alias of a function type is a callback parameter, and an impure
+//! function's result written as an alias of a record type is inferred field by
+//! field.
 //!
 //! A spread in a record type, `{...PackageDef, name: String}`, merges as
 //! value spread does (see [Spreads and soft
@@ -41,27 +41,27 @@
 //! written one is "the rest-field is defined twice", labelled "this has a
 //! rest-field, of type T".
 //!
-//! What is wrong in a declaration's definition is reported once, where it
-//! is written: the workspace checks every file's `type` items before any
-//! file is checked ([`check_types`](super::check_types), `Checker::type_items`), since a file
-//! may use a type of a file checked after it; there a name of a built-in
-//! type is "`Int` is a built-in type", and a second `type` of one name in
-//! one file "type `Foo` is declared twice", labelled "first declared here".
-//! A copy of a definition in another file, or in its own (a use of the
-//! type), is resolved quietly (`Checker::resolve_quietly`), once per mode
-//! however many uses share it: if anything in it is wrong it is `Error`,
-//! reported nowhere here, and the check fails *quietly*, with no error of
-//! its own (a file's `type` items are resolved quietly too, in its own
-//! check). So a type whose definition has an error is erroneous wherever it
-//! is used, and reports once. A name that names nothing it can (an unknown
-//! qualified name, a module's name, a declared type applied to a type
-//! argument, a type nested too deeply once expanded) is reported where it
-//! is written, from the problems the expansion kept ([`Ast::type_problems`](crate::ast::Ast::type_problems)).
-//! Checked alone, as [`check`](super::check) checks a file, with no workspace to expand
-//! its types, a file knows no declared type: each of its names is "unknown
-//! type", and a spread an internal error. A `type` item has no existence at
-//! runtime: it is never run, nor warned about as never run, and lowers to
-//! nothing; `--dump-types` shows each with its expansion
+//! What is wrong in a declaration's definition is reported once, where it is
+//! written: the workspace checks every file's `type` items before any file is
+//! checked ([`check_types`](super::check_types), `Checker::type_items`), since
+//! a file may use a type of a file checked after it; there a name of a built-in
+//! type is "`Int` is a built-in type", and a second `type` of one name in one
+//! file "type `Foo` is declared twice", labelled "first declared here". A copy
+//! of a definition in another file, or in its own (a use of the type), is
+//! resolved quietly (`Checker::resolve_quietly`), once per mode however many
+//! uses share it: if anything in it is wrong it is `Error`, reported nowhere
+//! here, and the check fails *quietly*, with no error of its own (a file's
+//! `type` items are resolved quietly too, in its own check). So a type whose
+//! definition has an error is erroneous wherever it is used, and reports once.
+//! A name that names nothing it can (an unknown qualified name, a module's
+//! name, a declared type applied to a type argument, a type nested too deeply
+//! once expanded) is reported where it is written, from the problems the
+//! expansion kept ([`Ast::type_problems`](crate::ast::Ast::type_problems)).
+//! Checked alone, as [`check`](super::check) checks a file, with no workspace
+//! to expand its types, a file knows no declared type: each of its names is
+//! "unknown type", and a spread an internal error. A `type` item has no
+//! existence at runtime: it is never run, nor warned about as never run, and
+//! lowers to nothing; `--dump-types` shows each with its expansion
 //! ([`Types::declared`](super::Types::declared)).
 
 use crate::ast::{
@@ -456,8 +456,8 @@ impl Checker<'_> {
     }
 
     /// The constant that `default`, the default of a field of a record type
-    /// whose type is `ty`, written as `written`, is (see [Field
-    /// defaults](#field-defaults)), or `None` if it is in error, which makes
+    /// whose type is `ty`, written as `written`, is (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)), or `None` if it is in error, which makes
     /// the record type erroneous. One the parser made is checked where its
     /// type is resolved, as a parameter's default is (see
     /// [`Checker::check_defaults`]), and as the rest of the type is, so

@@ -338,9 +338,10 @@ struct Binding {
     /// The function expression a single-name `let`, field or named function
     /// item was initialised with directly, for the call-site form of the
     /// implicit-await error (see `Checker::argument_await_error`) and the
-    /// defaults a call of it gives (see [Calls](#calls)); `None` for every
-    /// other binding, and for one declared by an earlier input of a session,
-    /// whose [`FnId`]s belong to another tree.
+    /// defaults a call of it gives (see "Calls" under
+    /// [Functions](crate::check::functions#functions)); `None` for every other
+    /// binding, and for one declared by an earlier input of a session, whose
+    /// [`FnId`]s belong to another tree.
     function: Option<FnId>,
     /// For a callback parameter of an impure or memoised function being
     /// checked, its index in `Checker::callbacks`, where its calls and uses
@@ -675,7 +676,7 @@ struct Function {
 }
 
 /// What the checker keeps while default functions are checked (see
-/// [Calls](#calls)).
+/// "Calls" under [Functions](crate::check::functions#functions)).
 #[derive(Debug, Default)]
 struct DefaultsChecked {
     /// The copies of the default functions of the top-level function being
@@ -733,7 +734,7 @@ struct CallSite {
 
 /// A callee whose function is known well enough to tell which of its
 /// parameters are present because its body measures them, and which have
-/// defaults (see [Calls](#calls)).
+/// defaults (see "Calls" under [Functions](crate::check::functions#functions)).
 #[derive(Clone, Copy, Debug)]
 enum KnownCallee {
     /// A function expression of the input being checked.
@@ -927,8 +928,8 @@ struct Expecting<'w> {
     /// For a record literal, a record block or `{}`, whose expected record
     /// type is what is expected itself, once stripped, and not the one
     /// record member of a union: its id, by which the defaulted fields it
-    /// lacks are recorded as given their defaults (see [Field
-    /// defaults](#field-defaults)).
+    /// lacks are recorded as given their defaults (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)).
     fill: Option<ExprId>,
     /// For the result of a block that is not a record block: what of it
     /// `ty` reaches (see [`Reach`]).
@@ -1039,10 +1040,11 @@ struct Tested {
     unreached: bool,
 }
 
-/// A loop whose body, or a labelled block whose items, are being checked,
-/// in `Checker::loops`, innermost last: what a `break`, `continue` or
-/// `return` in it needs to find it, and what they give it (see [`break`
-/// and `continue`](crate::check::loops#break-and-continue), [Labels](crate::check::loops#labels) and
+/// A loop whose body, or a labelled block whose items, are being checked, in
+/// `Checker::loops`, innermost last: what a `break`, `continue` or `return` in
+/// it needs to find it, and what they give it (see [`break` and
+/// `continue`](crate::check::loops#break-and-continue),
+/// [Labels](crate::check::loops#labels) and
 /// [`return`](crate::check::loops#return)). An unlabelled block has none.
 #[derive(Clone, Debug)]
 struct LoopFrame {
@@ -1606,8 +1608,9 @@ fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize)> {
     targets
 }
 
-/// The function of the item `item`, a function item that attributes apply
-/// to: a named `fn`, a `def` or a definition (see [Attributes](crate::check::attributes#attributes)).
+/// The function of the item `item`, a function item that attributes apply to: a
+/// named `fn`, a `def` or a definition (see
+/// [Attributes](crate::check::attributes#attributes)).
 fn item_function(ast: &Ast, item: ItemId) -> Option<FnId> {
     let (ItemKind::Let {
         value,
@@ -2784,9 +2787,9 @@ impl<'a> Checker<'a> {
 /// fit it: the body's result, or a `return`'s value.
 const RESULT_WHY: &str = "the return type is declared here";
 
-/// What `Checker::filled` holds for a parameter a call gives its default
-/// (see [Calls](#calls)): no argument's index, and not `u32::MAX`, which is
-/// a parameter left unfilled.
+/// What `Checker::filled` holds for a parameter a call gives its default (see
+/// "Calls" under [Functions](crate::check::functions#functions)): no argument's
+/// index, and not `u32::MAX`, which is a parameter left unfilled.
 const DEFAULTED: u32 = u32::MAX - 1;
 
 /// The note on [`FIELD_NOT_CONSTANT`]: what a
@@ -2794,11 +2797,11 @@ const DEFAULTED: u32 = u32::MAX - 1;
 const CONSTANT_NOTE: &str = "a literal, or a list or record of literals";
 
 /// The error for a field's default of a record type that is not a constant,
-/// at the default (see [Field defaults](#field-defaults)).
+/// at the default (see "Field defaults" under [Functions](crate::check::functions#functions)).
 const FIELD_NOT_CONSTANT: &str = "a field's default must be a constant";
 
 /// The constant that `id` of `ast`, a parameter's or a field's default that
-/// [`is_constant`] accepts, is, `types` being the type of each expression,
+/// [`is_constant`](crate::ast::is_constant) accepts, is, `types` being the type of each expression,
 /// as the check found it, and `fills` the fields each record literal was
 /// given ([`Resolution::record_fills`]): an integer literal that is a
 /// `Float` there a `Float`, and an integer otherwise (an untyped one
@@ -2866,13 +2869,13 @@ fn constant_of(ast: &Ast, id: ExprId, (types, fills): (&[TyId], &RecordFills)) -
     })
 }
 
-/// The constant that `id` of `ast`, a field's default of a record type
-/// copied out of its tree into a [`crate::ast::TypeStore`], is written as,
-/// with no type known and nothing filled ([`constant_of`]), if
-/// [`is_constant`] accepts it; `None` if it is not a constant, which the
-/// check of its own tree reports (see [Field defaults](#field-defaults)).
-/// The checker of each tree using the type fits it to its field's type
-/// (`Checker::fit_constant`).
+/// The constant that `id` of `ast`, a field's default of a record type copied
+/// out of its tree into a [`crate::ast::TypeStore`], is written as, with no
+/// type known and nothing filled ([`constant_of`]), if
+/// [`is_constant`](crate::ast::is_constant) accepts it; `None` if it is not a
+/// constant, which the check of its own tree reports (see "Field defaults"
+/// under [Functions](crate::check::functions#functions)). The checker of each
+/// tree using the type fits it to its field's type (`Checker::fit_constant`).
 pub(crate) fn written_constant(ast: &Ast, id: ExprId) -> Option<Constant> {
     if !crate::ast::is_constant(ast, id) {
         return None;

@@ -18,18 +18,19 @@
 //! fields.
 //!
 //! Where a type is *expected* (an annotation or an ascription), a subtype is
-//! accepted (see [`TypeTable::is_subtype`](crate::types::TypeTable::is_subtype)). A record block written where a
-//! record type is expected, through any parentheses, is checked against it
-//! directly by `Checker::check_expr_expecting`: each field's initialiser
-//! is checked against the expected field's type, so literals adapt and
-//! nested record blocks are checked the same way; a missing field is an
-//! error, unless the record type is expected itself (not as a union's
-//! member) and has a default for it, which the block is then given (see
-//! "Field defaults" under [Functions](crate::check::functions#functions); `{}` is checked so too
-//! where such a type is expected), and a field item the
-//! type lacks is a *warning*, since nothing with
-//! the expected type can see it. Warnings are collected apart from errors
-//! and returned with a successful check.
+//! accepted (see
+//! [`TypeTable::is_subtype`](crate::types::TypeTable::is_subtype)). A record
+//! block written where a record type is expected, through any parentheses, is
+//! checked against it directly by `Checker::check_expr_expecting`: each field's
+//! initialiser is checked against the expected field's type, so literals adapt
+//! and nested record blocks are checked the same way; a missing field is an
+//! error, unless the record type is expected itself (not as a union's member)
+//! and has a default for it, which the block is then given (see "Field
+//! defaults" under [Functions](crate::check::functions#functions); `{}` is
+//! checked so too where such a type is expected), and a field item the type
+//! lacks is a *warning*, since nothing with the expected type can see it.
+//! Warnings are collected apart from errors and returned with a successful
+//! check.
 //!
 //! An expected record type with a rest-field, `*: T` (see
 //! [`crate::types`], "Rest-fields"), lacks no field: each field item it
@@ -204,19 +205,19 @@
 //!
 //! An overridden field keeps its place in the record, where it was first
 //! defined, and its one slot, which every definition of it writes, as every
-//! definition of an open field does; the name, as a variable, is bound
-//! anew by each definition, as a `let` shadows, in that slot, so the items
-//! between a spread and an override see the spread's value and those after
-//! it the override's. Only a block that has had a spread looks for a soft
-//! field when a field item defines a name (`BlockSpreads`), so a block
-//! without one does no more work than before. A spread holds its operand's
-//! value in a slot of its own while its fields are read, the next free slot
-//! once they are declared, which it leaves free and no binding owns; where
-//! each field is stored is recorded in [`Resolution::spread_slots`](super::Resolution::spread_slots). A
+//! definition of an open field does; the name, as a variable, is bound anew by
+//! each definition, as a `let` shadows, in that slot, so the items between a
+//! spread and an override see the spread's value and those after it the
+//! override's. Only a block that has had a spread looks for a soft field when a
+//! field item defines a name (`BlockSpreads`), so a block without one does no
+//! more work than before. A spread holds its operand's value in a slot of its
+//! own while its fields are read, the next free slot once they are declared,
+//! which it leaves free and no binding owns; where each field is stored is
+//! recorded in [`Resolution::spread_slots`](super::Resolution::spread_slots). A
 //! dotted path whose first segment is a soft field is "field `a` is already
 //! defined", as for a field defined whole; a dotted `let` of the name is an
-//! ordinary update of the variable. `:=` of a soft field's name is the
-//! error for any field.
+//! ordinary update of the variable. `:=` of a soft field's name is the error
+//! for any field.
 //!
 //! In a record block checked against an expected record type, each soft
 //! field that stands when the block ends, one no later item overrode, is
@@ -310,14 +311,14 @@
 //! v` or `conf.hosts[0].up := true`, which replaces an element of a list:
 //! see "Updating an element" under [Lists](crate::check::lists#lists).
 //!
-//! How a dotted item resolves (the slot of the record or list it updates,
-//! how many of its path's segments name records or lists that already
-//! exist, and which of those are awaited) is recorded for lowering as a
-//! [`PathResolution`].
-//! A path segment is not an expression, which [`Resolution::await_of`](super::Resolution::await_of)
-//! could mark, so the awaited records are listed in a table of their own,
-//! [`Resolution::path_awaits`](super::Resolution::path_awaits), in which only an item that awaits one has
-//! entries.
+//! How a dotted item resolves (the slot of the record or list it updates, how
+//! many of its path's segments name records or lists that already exist, and
+//! which of those are awaited) is recorded for lowering as a
+//! [`PathResolution`]. A path segment is not an expression, which
+//! [`Resolution::await_of`](super::Resolution::await_of) could mark, so the
+//! awaited records are listed in a table of their own,
+//! [`Resolution::path_awaits`](super::Resolution::path_awaits), in which only
+//! an item that awaits one has entries.
 
 use crate::ast::{ExprId, ExprKind, FnId, ItemId, PathRange, PathSegment, TypeExprId, path_span};
 use crate::diagnostic::Diagnostic;
@@ -1383,12 +1384,14 @@ impl Checker<'_> {
     }
 
     /// Reports each field of `expecting`'s record type that is not among the
-    /// block's fields, `sorted_fields[base..]`, in alphabetical order,
-    /// unless the block fills it (see [`Expecting::fill`]) and the type has
-    /// a default for it: such a field is added to the block's fields, at the
-    /// end of `sorted_fields`, with the type's type of it, and recorded,
-    /// with its default, as given it ([`Resolution::record_fills`](super::Resolution::record_fills); see
-    /// [Field defaults](#field-defaults)). Returns whether any was missing.
+    /// block's fields, `sorted_fields[base..]`, in alphabetical order, unless
+    /// the block fills it (see [`Expecting::fill`]) and the type has a default
+    /// for it: such a field is added to the block's fields, at the end of
+    /// `sorted_fields`, with the type's type of it, and recorded, with its
+    /// default, as given it
+    /// ([`Resolution::record_fills`](super::Resolution::record_fills); see
+    /// "Field defaults" under [Functions](crate::check::functions#functions)).
+    /// Returns whether any was missing.
     pub(super) fn report_missing_fields(&mut self, base: usize, expecting: Expecting<'_>) -> bool {
         let names = self.ast.names();
         let present = self.sorted_fields.get(base..).unwrap_or_default();

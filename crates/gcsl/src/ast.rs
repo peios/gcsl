@@ -5050,84 +5050,78 @@ impl Annotate for NoAnnotation {
 ///     (name x @17..18)))
 /// ```
 ///
-/// Items print as `(let x ...)`, `(let x : Type ...)`, `(let mut x ...)`,
-/// `(let mut x : Type ...)`, `(field x ...)`, `(field x : Type ...)`,
-/// `(rebind x ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`,
-/// followed by their span and their expression, a dotted path in full, as
-/// in `(let a.b.c ...)`, and an index segment as it is written, as in
-/// `(rebind xs[i + 1].up ...)`, its position then shown before the value as
-/// `(at EXPR)`, one for each index segment, in order; blocks as
-/// `(block ...)` followed by their items; ascriptions as `(: Type ...)`;
-/// field accesses as `(. x ...)` followed by their record expression. A
-/// field name, or a path segment, that is not a plain identifier is quoted,
-/// as in `(field "a b" ...)`. Types print as written, whatever the
-/// expansion of the tree's types made of them ([`Ast::written_type`]), a
-/// record type's fields and spreads in source order: `{x: Int, "a b": {}}`,
-/// `{...PackageDef, name: String}`, `fn(x: Int) -> String`, and a qualified
-/// name as its path, `t.PackageDef`. A `type` item prints as `(type NAME
-/// TYPE @0..20)`, with the annotation's [`Annotate::annotate_type`] after
-/// its type, which `--dump-types` makes its expansion. A function
-/// expression prints as `(fn ...)` followed by `(params (x Int) (y String))`,
-/// `(ret pure Int)`, `(ret memo Int)` or `(ret impure Int)`, and its body; a
-/// call as
-/// `(call ...)` followed by its callee and its arguments in source order, a
-/// named one as `(named x EXPR)` and the trailing block as
-/// `(trailing BLOCK)`. A named function item is the `let` it is parsed as,
-/// printed as written, `(fn f (fn ...))`, and a `def` the field,
-/// `(def f (fn ...))`; `let f = fn ...` and `f = fn ...` print as `(let f
-/// (fn ...))` and `(field f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its body,
-/// and an `await` as `(await ...)` followed by its operand. A list literal
-/// prints as `(list ...)` followed by its elements in source order, a
-/// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by
-/// its list and its position. A `for` prints as `(for x ...)`, `x` being
-/// its variable, followed by its iterable, its guard as `(guard EXPR)` if
-/// it has one, and its body; a condition loop as `(for ...)` followed by
-/// the items before its condition, its condition as `(cond EXPR)` if it
-/// has one, the items after it and its body; a `do` loop as `(do ...)`
-/// followed by its body and its condition as `(cond EXPR)`. A loop's label
-/// follows its keyword as it is written, as in `(for'rows r ...)`, and a
-/// block's follows `block`, as in `(block'pick @0..30 ...)`. A `break`,
-/// `continue` or `return` item prints as `(break @0..5)`, its label after
-/// its keyword, as in `(continue'rows @0..14)` or `(return'pick @2..16
-/// ...)`, and its value, if it has one, after its span. A range prints as
-/// its operator, `..` or `..=`,
-/// like any binary operator. Applied and
-/// union types print as written, `Future<Int>`, `Present<Int>` and
+/// Items print as `(let x ...)`, `(let x : Type ...)`, `(let mut x ...)`, `(let
+/// mut x : Type ...)`, `(field x ...)`, `(field x : Type ...)`, `(rebind x
+/// ...)`, `(spread ...)`, `(result ...)` and `(expr ...)`, followed by their
+/// span and their expression, a dotted path in full, as in `(let a.b.c ...)`,
+/// and an index segment as it is written, as in `(rebind xs[i + 1].up ...)`,
+/// its position then shown before the value as `(at EXPR)`, one for each index
+/// segment, in order; blocks as `(block ...)` followed by their items;
+/// ascriptions as `(: Type ...)`; field accesses as `(. x ...)` followed by
+/// their record expression. A field name, or a path segment, that is not a
+/// plain identifier is quoted, as in `(field "a b" ...)`. Types print as
+/// written, whatever the expansion of the tree's types made of them
+/// ([`Ast::written_type`]), a record type's fields and spreads in source order:
+/// `{x: Int, "a b": {}}`, `{...PackageDef, name: String}`, `fn(x: Int) ->
+/// String`, and a qualified name as its path, `t.PackageDef`. A `type` item
+/// prints as `(type NAME TYPE @0..20)`, with the annotation's
+/// [`Annotate::annotate_type`] after its type, which `--dump-types` makes its
+/// expansion. A function expression prints as `(fn ...)` followed by `(params
+/// (x Int) (y String))`, `(ret pure Int)`, `(ret memo Int)` or `(ret impure
+/// Int)`, and its body; a call as `(call ...)` followed by its callee and its
+/// arguments in source order, a named one as `(named x EXPR)` and the trailing
+/// block as `(trailing BLOCK)`. A named function item is the `let` it is parsed
+/// as, printed as written, `(fn f (fn ...))`, and a `def` the field, `(def f
+/// (fn ...))`; `let f = fn ...` and `f = fn ...` print as `(let f (fn ...))`
+/// and `(field f (fn ...))`. A `lazy` prints as `(lazy ...)` followed by its
+/// body, and an `await` as `(await ...)` followed by its operand. A list
+/// literal prints as `(list ...)` followed by its elements in source order, a
+/// spread one as `(spread EXPR)`, and an index as `(index ...)` followed by its
+/// list and its position. A `for` prints as `(for x ...)`, `x` being its
+/// variable, followed by its iterable, its guard as `(guard EXPR)` if it has
+/// one, and its body; a condition loop as `(for ...)` followed by the items
+/// before its condition, its condition as `(cond EXPR)` if it has one, the
+/// items after it and its body; a `do` loop as `(do ...)` followed by its body
+/// and its condition as `(cond EXPR)`. A loop's label follows its keyword as it
+/// is written, as in `(for'rows r ...)`, and a block's follows `block`, as in
+/// `(block'pick @0..30 ...)`. A `break`, `continue` or `return` item prints as
+/// `(break @0..5)`, its label after its keyword, as in `(continue'rows @0..14)`
+/// or `(return'pick @2..16 ...)`, and its value, if it has one, after its span.
+/// A range prints as its operator, `..` or `..=`, like any binary operator.
+/// Applied and union types print as written, `Future<Int>`, `Present<Int>` and
 /// `Int | Future<Int>`, a function type that is a member of a union in
-/// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type
-/// would otherwise take the rest of the union; a list type written `T[]`
-/// prints so, its element type in parentheses if it is a function type or
-/// a union, `(fn(): Int)[]`; a function type's meta prints after its return
-/// type as written, `fn(): Int META-> {a: Int}`, the return type in
-/// parentheses if it is a function type; other parentheses in a type
-/// leave no trace in the tree and are not printed.
-/// Booleans print as `(bool true)`, string literals as `(str "text")` with
-/// the text quoted and escaped, and interpolated strings as `(interp ...)`
-/// followed by their parts, literal text as `(lit "text")` (which has no
-/// span) and expressions as their nodes. `(if ...)` is followed by its
-/// condition, its block and its else branch, which for an `if` without
-/// `else` is the parser's empty block. Operators print as their symbol,
-/// except negation, `(neg ...)`. A def-type definition prints as
-/// `(def-type-def package dev.peios.testpkg ...)`, its def-type and its path
-/// as written, followed by its function, whose parameters are their names
-/// alone, as in `(params a b)`, with no `(ret ...)`; a reference to one as
-/// `(def-type-ref package dev.peios.testpkg @0..30)`, with nothing under it,
-/// its whole path as written, unless the annotation says the path goes on
-/// past the definition ([`Annotate::reference_past`]): then as a field access
-/// for each segment past it, `(. versions ...)`, around the reference to the
-/// definition, `(def-type-ref package dev.peios.testpkg ...)`;
-/// a definition's meta as `(defmeta package dev.peios.testpkg ...)`,
-/// followed by its function, of no parameters, with no `(ret ...)`, whose
-/// body is the block written, or for `defmeta DT PATH = EXPR` a block whose
-/// result is the expression.
-/// The file has no span. An item marked `#[shadowable]`, `#[def_type]` or
-/// `#[attribute]` is preceded by the attribute, as in `#[shadowable] (field
-/// arch ...)` or `#[def_type] (def package ...)`, several in that order,
-/// then each use of an attribute on it, in source order, its arguments, if
-/// it has any, shown as `(…)`, as in `#[retry(…)] (fn f ...)`; and a file marked `#![no_prelude]` has it after `file`, as in
-/// `(file #![no_prelude] ...)`; the implicit import a workspace gives a
-/// file is not printed (see [Attributes](crate::ast#attributes)). There is
-/// no trailing newline.
+/// parentheses, `(fn(): Int) | Future<fn(): Int>`, since its return type would
+/// otherwise take the rest of the union; a list type written `T[]` prints so,
+/// its element type in parentheses if it is a function type or a union, `(fn():
+/// Int)[]`; a function type's meta prints after its return type as written,
+/// `fn(): Int META-> {a: Int}`, the return type in parentheses if it is a
+/// function type; other parentheses in a type leave no trace in the tree and
+/// are not printed. Booleans print as `(bool true)`, string literals as `(str
+/// "text")` with the text quoted and escaped, and interpolated strings as
+/// `(interp ...)` followed by their parts, literal text as `(lit "text")`
+/// (which has no span) and expressions as their nodes. `(if ...)` is followed
+/// by its condition, its block and its else branch, which for an `if` without
+/// `else` is the parser's empty block. Operators print as their symbol, except
+/// negation, `(neg ...)`. A def-type definition prints as `(def-type-def
+/// package dev.peios.testpkg ...)`, its def-type and its path as written,
+/// followed by its function, whose parameters are their names alone, as in
+/// `(params a b)`, with no `(ret ...)`; a reference to one as `(def-type-ref
+/// package dev.peios.testpkg @0..30)`, with nothing under it, its whole path as
+/// written, unless the annotation says the path goes on past the definition
+/// ([`Annotate::reference_past`]): then as a field access for each segment past
+/// it, `(. versions ...)`, around the reference to the definition,
+/// `(def-type-ref package dev.peios.testpkg ...)`; a definition's meta as
+/// `(defmeta package dev.peios.testpkg ...)`, followed by its function, of no
+/// parameters, with no `(ret ...)`, whose body is the block written, or for
+/// `defmeta DT PATH = EXPR` a block whose result is the expression. The file
+/// has no span. An item marked `#[shadowable]`, `#[def_type]` or `#[attribute]`
+/// is preceded by the attribute, as in `#[shadowable] (field arch ...)` or
+/// `#[def_type] (def package ...)`, several in that order, then each use of an
+/// attribute on it, in source order, its arguments, if it has any, shown as
+/// `(…)`, as in `#[retry(…)] (fn f ...)`; and a file marked `#![no_prelude]`
+/// has it after `file`, as in `(file #![no_prelude] ...)`; the implicit import
+/// a workspace gives a file is not printed (see
+/// [Attributes](crate::ast#attributes)). There is no trailing newline.
 pub struct Pretty<'a, A> {
     ast: &'a Ast,
     annotation: &'a A,

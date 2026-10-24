@@ -3,15 +3,16 @@
 //!
 //! # Futures
 //!
-//! `lazy e` is checked as the body of an anonymous, parameterless function
-//! (a `Function` of its own on the stack, with a frame of its own, capturing
-//! as a closure does), which is always **impure**, wherever it is written;
-//! its type is `Future<T>`, `T` being the body's type, an untyped integer
-//! settled to `Int`, with every future layer at its top stripped, since
-//! awaiting resolves fully (so `lazy lazy 1` is `Future<Int>`, and so is
-//! `lazy f()` where `f()` is `Int | Future<Int>`; see
-//! [`TypeTable::future`](crate::types::TypeTable::future)). The name a `let` or a field binds is not in scope in
-//! its own `lazy` initialiser, as for any initialiser.
+//! `lazy e` is checked as the body of an anonymous, parameterless function (a
+//! `Function` of its own on the stack, with a frame of its own, capturing as a
+//! closure does), which is always **impure**, wherever it is written; its type
+//! is `Future<T>`, `T` being the body's type, an untyped integer settled to
+//! `Int`, with every future layer at its top stripped, since awaiting resolves
+//! fully (so `lazy lazy 1` is `Future<Int>`, and so is `lazy f()` where `f()`
+//! is `Int | Future<Int>`; see
+//! [`TypeTable::future`](crate::types::TypeTable::future)). The name a `let` or
+//! a field binds is not in scope in its own `lazy` initialiser, as for any
+//! initialiser.
 //!
 //! **Bare types.** In a type expression, a type written as a name, a
 //! record type, a list type (`List<T>` or `T[]`) or a union with no member
@@ -77,47 +78,48 @@
 //! passes it present values: see [Narrowed
 //! callbacks](crate::check::inference#narrowed-callbacks).
 //!
-//! **Awaits.** Every place a value is used as its bits decides whether it
-//! is awaited there, and records it in [`Resolution::await_of`](super::Resolution::await_of) (or, for a
-//! record an update reads, [`Resolution::path_awaits`](super::Resolution::path_awaits)) for lowering, which
-//! inserts the await; nothing is decided at runtime. A measuring operator
-//! (arithmetic, ordering, `and`, `or`, `not`, negation), a call of a value,
-//! a field access into one and a spread of one await it at the top if its
-//! type is a `Future` or an either (`Checker::measure`), and type the
-//! operation on the type it has once awaited, stripped of every future
-//! layer at its top (see [`TypeTable::strip`](crate::types::TypeTable::strip)); so does a dotted `let` or `:=` each record,
-//! or list, along its path that exists (see "Dotted `let` and `:=`" above). An
-//! interpolated expression and an operand of an equality are awaited deeply
-//! (`Checker::measure_deep`): at the top and in every lazy field of the
-//! record it is, or element of the list it is, at any depth (see
+//! **Awaits.** Every place a value is used as its bits decides whether it is
+//! awaited there, and records it in
+//! [`Resolution::await_of`](super::Resolution::await_of) (or, for a record an
+//! update reads, [`Resolution::path_awaits`](super::Resolution::path_awaits))
+//! for lowering, which inserts the await; nothing is decided at runtime. A
+//! measuring operator (arithmetic, ordering, `and`, `or`, `not`, negation), a
+//! call of a value, a field access into one and a spread of one await it at the
+//! top if its type is a `Future` or an either (`Checker::measure`), and type
+//! the operation on the type it has once awaited, stripped of every future
+//! layer at its top (see [`TypeTable::strip`](crate::types::TypeTable::strip));
+//! so does a dotted `let` or `:=` each record, or list, along its path that
+//! exists (see "Dotted `let` and `:=`" above). An interpolated expression and
+//! an operand of an equality are awaited deeply (`Checker::measure_deep`): at
+//! the top and in every lazy field of the record it is, or element of the list
+//! it is, at any depth (see
 //! [`TypeTable::present`](crate::types::TypeTable::present)). Where a type is
-//! expected, as for an argument, an annotated initialiser, a function's body or an `if` condition,
-//! a value
-//! that is not a subtype of it is awaited if it is one once awaited, at the
-//! top or deeply (see [`TypeTable::needs_await`](crate::types::TypeTable::needs_await)); otherwise the mismatch is
-//! reported, with a note when a future is expected and a value that is not
-//! one is found. `await e` awaits `e` fully and has its type stripped; on a
-//! present value it does nothing, silently, since whether a value is
-//! present may be inferred from code elsewhere. A bare `await e` item
-//! is never an unused value. A statement, an expression item that is not
-//! its block's result, is a position expecting a *unit-like* value: `{}`,
-//! a list whose element type is unit-like, or a union all of whose members
-//! are, as the `List<{}> | {}` of a statement loop a bare `return` may
-//! leave is (see [`TypeTable::is_unit_like`](crate::types::TypeTable::is_unit_like)), which holds nothing a
-//! program could use.
-//! A statement that is unit-like as it is, as `{}` is, or the `List<{}>` of
-//! a `for` whose body is `{}`, is fine as it is; one whose value is
-//! unit-like once awaited, at the top (a `Future<{}>`, or the `{}` an
-//! impure function returns, which may be one) or deeply (a
+//! expected, as for an argument, an annotated initialiser, a function's body or
+//! an `if` condition, a value that is not a subtype of it is awaited if it is
+//! one once awaited, at the top or deeply (see
+//! [`TypeTable::needs_await`](crate::types::TypeTable::needs_await)); otherwise
+//! the mismatch is reported, with a note when a future is expected and a value
+//! that is not one is found. `await e` awaits `e` fully and has its type
+//! stripped; on a present value it does nothing, silently, since whether a
+//! value is present may be inferred from code elsewhere. A bare `await e` item
+//! is never an unused value. A statement, an expression item that is not its
+//! block's result, is a position expecting a *unit-like* value: `{}`, a list
+//! whose element type is unit-like, or a union all of whose members are, as the
+//! `List<{}> | {}` of a statement loop a bare `return` may leave is (see
+//! [`TypeTable::is_unit_like`](crate::types::TypeTable::is_unit_like)), which
+//! holds nothing a program could use. A statement that is unit-like as it is,
+//! as `{}` is, or the `List<{}>` of a `for` whose body is `{}`, is fine as it
+//! is; one whose value is unit-like once awaited, at the top (a `Future<{}>`,
+//! or the `{}` an impure function returns, which may be one) or deeply (a
 //! `List<Future<{}>>`, as `for s in steps { lazy run(s) }` is), is awaited
 //! there, at the top or deeply as its type needs (`Checker::measure`,
-//! `Checker::measure_deep`), subject to the purity rule, so that its
-//! effects are not lost. A call of a function or built-in that is not pure,
-//! outside a pure function, is run for its effects as a bare `await` is:
-//! awaited deeply, and its value, whatever it is, discarded
-//! ([`Resolution::is_discarded`](super::Resolution::is_discarded)). Any other statement is an unused value. A
-//! statement that is directly the empty list literal, `[]`, is a
-//! `List<{}>`, whose element type needs no inferring.
+//! `Checker::measure_deep`), subject to the purity rule, so that its effects
+//! are not lost. A call of a function or built-in that is not pure, outside a
+//! pure function, is run for its effects as a bare `await` is: awaited deeply,
+//! and its value, whatever it is, discarded
+//! ([`Resolution::is_discarded`](super::Resolution::is_discarded)). Any other
+//! statement is an unused value. A statement that is directly the empty list
+//! literal, `[]`, is a `List<{}>`, whose element type needs no inferring.
 //!
 //! Futures have no equality: an operand of `==`, `!=`, `===` or `!==` whose
 //! type, once awaited at the top, has a `Future` in a field or as a list's
@@ -451,14 +453,14 @@ impl Checker<'_> {
         Some(text)
     }
 
-    /// Types a `lazy` expression, whose body is function `function`:
-    /// the body is checked as that of an anonymous, parameterless, impure
-    /// function, in a frame of its own, capturing what it uses of the
-    /// enclosing scopes as a closure does, and the expression's type is
-    /// `Future<T>`, `T` being the body's type with an untyped integer
-    /// settled to `Int`, stripped (see [`TypeTable::future`](crate::types::TypeTable::future): `lazy lazy 1`
-    /// is `Future<Int>`); or `Error` if the body is erroneous. The `lazy`
-    /// keyword is at `keyword`.
+    /// Types a `lazy` expression, whose body is function `function`: the body
+    /// is checked as that of an anonymous, parameterless, impure function, in a
+    /// frame of its own, capturing what it uses of the enclosing scopes as a
+    /// closure does, and the expression's type is `Future<T>`, `T` being the
+    /// body's type with an untyped integer settled to `Int`, stripped (see
+    /// [`TypeTable::future`](crate::types::TypeTable::future): `lazy lazy 1` is
+    /// `Future<Int>`); or `Error` if the body is erroneous. The `lazy` keyword
+    /// is at `keyword`.
     pub(super) fn check_lazy(&mut self, function: FnId, keyword: Span) -> TyId {
         // A function in the body must not see a name meant for another.
         self.callee_name = None;

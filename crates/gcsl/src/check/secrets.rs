@@ -11,18 +11,20 @@
 //! record of it; `.unsafe_value()` takes its value, deliberately. Both are
 //! the prelude's, over the built-ins `secret` and `secret_value`.
 //!
-//! What is computed on a secret is a secret. An operator with a secret
-//! operand, `s + "!"` or `-n` (`Checker::secret_binary`), a secret
-//! interpolated, `"--token={s}"` (`Checker::check_interpolation`), a field
-//! of a secret record and an element of a secret list, by a plain index,
-//! are the operation on the values, its type the secret of its result's
-//! (`Checker::secret_operation`): the operation is recorded for lowering
-//! with the type of what it computes ([`Resolution::secret_op`](super::Resolution::secret_op)), and its
-//! operands, each secret with the type of its value, unwrapped
-//! ([`Resolution::secret_operand`](super::Resolution::secret_operand)), and each other one marked
-//! ([`Resolution::is_plain_operand`](super::Resolution::is_plain_operand)), so that a failure of it is told
-//! from the operation's own. A refused operation's errors are of the types
-//! as written, "cannot add `Secret<String>` and Int" (`Checker::secret_plain`).
+//! What is computed on a secret is a secret. An operator with a secret operand,
+//! `s + "!"` or `-n` (`Checker::secret_binary`), a secret interpolated,
+//! `"--token={s}"` (`Checker::check_interpolation`), a field of a secret record
+//! and an element of a secret list, by a plain index, are the operation on the
+//! values, its type the secret of its result's (`Checker::secret_operation`):
+//! the operation is recorded for lowering with the type of what it computes
+//! ([`Resolution::secret_op`](super::Resolution::secret_op)), and its operands,
+//! each secret with the type of its value, unwrapped
+//! ([`Resolution::secret_operand`](super::Resolution::secret_operand)), and
+//! each other one marked
+//! ([`Resolution::is_plain_operand`](super::Resolution::is_plain_operand)), so
+//! that a failure of it is told from the operation's own. A refused operation's
+//! errors are of the types as written, "cannot add `Secret<String>` and Int"
+//! (`Checker::secret_plain`).
 //!
 //! A comparison of values that hold secrets, in a field, an element, a
 //! member or a payload at any depth, a record of a secret included, is the

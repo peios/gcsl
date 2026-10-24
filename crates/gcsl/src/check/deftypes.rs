@@ -89,46 +89,47 @@
 //! # Variant def-types
 //!
 //! A def-type whose second parameter is a variant of an enum, of type
-//! `Variant<E, T>`, and whose third is the definition, makes its
-//! definitions with a variant ([`TypeTable::def_type_shape`](crate::types::TypeTable::def_type_shape)): `#[def_type]
-//! def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn():
-//! ToolchainDef<T>): Registered`. Its further parameters are its invocation
-//! parameters, as a def-type's after its second are. Such a def-type may be
-//! generic: a definition's variant binds its type parameters, so each must
-//! appear in the variant parameter's type, "type parameter `U` of a
-//! def-type must appear in its variant parameter's type"; a generic
-//! def-type of the other shape is "a generic def-type takes its
-//! definitions' variant after the name", both at its parameters
-//! (`Checker::check_generic_def_type`). Its `E` must be an enum, not a type
-//! parameter: the variant's name is looked up in it.
+//! `Variant<E, T>`, and whose third is the definition, makes its definitions
+//! with a variant
+//! ([`TypeTable::def_type_shape`](crate::types::TypeTable::def_type_shape)):
+//! `#[def_type] def Toolchain<T>(name: String, kind: Variant<Toolchain, T>,
+//! func: fn(): ToolchainDef<T>): Registered`. Its further parameters are its
+//! invocation parameters, as a def-type's after its second are. Such a def-type
+//! may be generic: a definition's variant binds its type parameters, so each
+//! must appear in the variant parameter's type, "type parameter `U` of a
+//! def-type must appear in its variant parameter's type"; a generic def-type of
+//! the other shape is "a generic def-type takes its definitions' variant after
+//! the name", both at its parameters (`Checker::check_generic_def_type`). Its
+//! `E` must be an enum, not a type parameter: the variant's name is looked up
+//! in it.
 //!
-//! A definition names its variant after its def-type, `def Toolchain::C
-//! gcc()`, and so does a reference, `Toolchain::C gcc`, and a meta,
-//! `defmeta Toolchain::C gcc`. Each variant has a namespace of its own (see
+//! A definition names its variant after its def-type, `def Toolchain::C gcc()`,
+//! and so does a reference, `Toolchain::C gcc`, and a meta, `defmeta
+//! Toolchain::C gcc`. Each variant has a namespace of its own (see
 //! [`crate::names`], "Namespace keys"), so `Toolchain::C gcc` and
-//! `Toolchain::Rust gcc` are two definitions, each shown with its
-//! variant. For every use (`Checker::use_signature`), the variant is the
-//! one of its name, of the enum `E`, that the input sees, found as a
-//! variant as a value is (see [Enums](crate::check::enums#enums)), "no variant `Nope` of
-//! `Toolchain`" otherwise; its type, `Variant<E, P>` of its payload `P`,
-//! binds the def-type's type parameters ([`TypeTable::bind`](crate::types::TypeTable::bind)), and the
-//! def-type's signature is substituted with them: so the definition's
-//! function type is `fn(): ToolchainDef<P>`, its body checked against it,
-//! and a reference's type is the substituted signature's after its
-//! definition's. The variant's type must fit the variant parameter's,
-//! substituted: "the variant of a `Shape` definition is a `Variant<Tool,
-//! {cc: String}>`, not `Variant<Tool, {rustc: String}>`", at the variant's
-//! name. A variant written for a def-type of the other shape is
-//! "`package` takes no variant", at it; none written for one of this shape
-//! is "def-type `Toolchain` needs a variant: `def Toolchain::V name()`", at
-//! the def-type. Since a reference calls the def-type, its `DT` is read as
-//! a call's callee (`Checker::check_def_type_expr`): a generic def-type is
-//! no generic function read as a value. A reference's variant is recorded
+//! `Toolchain::Rust gcc` are two definitions, each shown with its variant. For
+//! every use (`Checker::use_signature`), the variant is the one of its name, of
+//! the enum `E`, that the input sees, found as a variant as a value is (see
+//! [Enums](crate::check::enums#enums)), "no variant `Nope` of `Toolchain`"
+//! otherwise; its type, `Variant<E, P>` of its payload `P`, binds the
+//! def-type's type parameters
+//! ([`TypeTable::bind`](crate::types::TypeTable::bind)), and the def-type's
+//! signature is substituted with them: so the definition's function type is
+//! `fn(): ToolchainDef<P>`, its body checked against it, and a reference's type
+//! is the substituted signature's after its definition's. The variant's type
+//! must fit the variant parameter's, substituted: "the variant of a `Shape`
+//! definition is a `Variant<Tool, {cc: String}>`, not `Variant<Tool, {rustc:
+//! String}>`", at the variant's name. A variant written for a def-type of the
+//! other shape is "`package` takes no variant", at it; none written for one of
+//! this shape is "def-type `Toolchain` needs a variant: `def Toolchain::V
+//! name()`", at the def-type. Since a reference calls the def-type, its `DT` is
+//! read as a call's callee (`Checker::check_def_type_expr`): a generic def-type
+//! is no generic function read as a value. A reference's variant is recorded
 //! for lowering, which calls the def-type with the definition's path, the
-//! variant's tag, a constant, the definition and the invocation arguments.
-//! A def-type of this shape is not listed to be invoked by name (see
-//! [`crate::workspace`], "Def-types by name"): its definitions are reached
-//! by references alone.
+//! variant's tag, a constant, the definition and the invocation arguments. A
+//! def-type of this shape is not listed to be invoked by name (see
+//! [`crate::workspace`], "Def-types by name"): its definitions are reached by
+//! references alone.
 
 use crate::ast::{
     DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, PathSegment,
@@ -242,17 +243,18 @@ impl Checker<'_> {
         }
     }
 
-    /// What the def-type of type `dt_ty` gives its use `def`, if it is the
-    /// type of a def-type ([`TypeTable::def_type_shape`](crate::types::TypeTable::def_type_shape)): the function type
-    /// of its definitions, present, and its signature, with the variant the
-    /// use names, if its definitions are made with one, and that variant's
-    /// payload binding its type parameters (see [Variant
-    /// def-types](#variant-def-types)). Reports, at the use, a variant
-    /// written for a def-type that takes none, "`package` takes no
-    /// variant", none written for one that does, "`Toolchain` needs a
-    /// variant", what [`Checker::find_variant`] does not find, and a variant
-    /// whose type is not its parameter's. `None` for what is reported, and
-    /// for a `dt_ty` that is no def-type's, which its declaration reports.
+    /// What the def-type of type `dt_ty` gives its use `def`, if it is the type
+    /// of a def-type
+    /// ([`TypeTable::def_type_shape`](crate::types::TypeTable::def_type_shape)):
+    /// the function type of its definitions, present, and its signature, with
+    /// the variant the use names, if its definitions are made with one, and
+    /// that variant's payload binding its type parameters (see [Variant
+    /// def-types](#variant-def-types)). Reports, at the use, a variant written
+    /// for a def-type that takes none, "`package` takes no variant", none
+    /// written for one that does, "`Toolchain` needs a variant", what
+    /// [`Checker::find_variant`] does not find, and a variant whose type is not
+    /// its parameter's. `None` for what is reported, and for a `dt_ty` that is
+    /// no def-type's, which its declaration reports.
     pub(super) fn use_signature(&mut self, def: DefTypeId, dt_ty: TyId) -> Option<UseSignature> {
         let shape = self.types.def_type_shape(dt_ty)?;
         let sig = self.types.fn_sig(self.types.strip(dt_ty))?.clone();

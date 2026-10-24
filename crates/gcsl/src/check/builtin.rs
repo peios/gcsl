@@ -122,8 +122,8 @@ pub enum Typing {
     /// TEMPORARY (alias rule): call by call, by the checker's rule for it, since no function type
     /// the table can hold is its type (`len`: a `List<T>` for any `T` to `Int`; `show`: any `T`
     /// without a function in it to `String`); its value has an opaque type of its own,
-    /// [`TyKind::Builtin`](super::TyKind::Builtin). To be replaced by a real polymorphic type (see the [inference
-    /// limits](https://learn.peios.org/gcsl/language/inference-limits/)).
+    /// [`TyKind::Builtin`](super::TyKind::Builtin). To be replaced by a real polymorphic type (see
+    /// the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
     Special,
 }
 

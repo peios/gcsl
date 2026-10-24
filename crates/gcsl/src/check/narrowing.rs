@@ -40,16 +40,16 @@
 //!
 //! # Unions
 //!
-//! `Int | String` is the type of a value that is an `Int` or a `String`;
-//! any present types may be members (see [`crate::types`]). The checker
-//! does not block where two types merely disagree: it joins the types of
-//! the expressions whose values one expression may have, the branches of
-//! an `if` and the elements of a list literal (and its spreads' elements),
-//! and the join always exists ([`TypeTable::join`](crate::types::TypeTable::join)). Where two types have
-//! no common supertype, at the top or inside a record field, a list's
+//! `Int | String` is the type of a value that is an `Int` or a `String`; any
+//! present types may be members (see [`crate::types`]). The checker does not
+//! block where two types merely disagree: it joins the types of the expressions
+//! whose values one expression may have, the branches of an `if` and the
+//! elements of a list literal (and its spreads' elements), and the join always
+//! exists ([`TypeTable::join`](crate::types::TypeTable::join)). Where two types
+//! have no common supertype, at the top or inside a record field, a list's
 //! element type or a function's return type, the join is their union, and
-//! *widened*; a widened join is a warning, not an error, at the expression
-//! that does not agree with what came before it:
+//! *widened*; a widened join is a warning, not an error, at the expression that
+//! does not agree with what came before it:
 //!
 //! - an `if`'s branches, "the branches of this `if` have different types",
 //!   at the `else` branch's value (a block's result, through blocks and
@@ -106,44 +106,45 @@
 //! # `is`
 //!
 //! `EXPR is TYPE` is a `Bool`: whether the value is a `TYPE`
-//! (`Checker::check_test`). `TYPE` is resolved with every bare type
-//! present, and may hold no future, nor an either shape ("`is` cannot test
-//! a future"), and no function type ("`is` cannot test a function type":
-//! a function's signature is not something a value can be asked for; a
-//! function is told apart by the other members, in the `else` branch). The
-//! operand is checked, an untyped integer settling to `Int`, and measured
-//! at the top, as a measuring operator's operand is: awaited if it may be a
-//! future, subject to the purity rule, a pure function's parameter being
-//! measured. Its type then, `S`, has *members*: its members if it is a
-//! union, and itself otherwise. Each member `M`, made present (a list of
-//! futures being asked about as a list of what they yield), *always
-//! passes* if it is a subtype of `TYPE`, *may pass* if not but it
-//! *overlaps* `TYPE` ([`TypeTable::overlaps`](crate::types::TypeTable::overlaps): a value could be both, as
-//! far as their structure says), and otherwise *cannot pass*. If every
-//! member always passes, the test is `true`, and a warning, "`x` is always
-//! an Int", at the `is`; if none passes or may, it is an error, "`x` is
-//! never a String", at `TYPE`, labelled with the operand's type at the
-//! operand. `x` is the operand as written when it is a name or a dotted
-//! path, and "this value" otherwise.
+//! (`Checker::check_test`). `TYPE` is resolved with every bare type present,
+//! and may hold no future, nor an either shape ("`is` cannot test a future"),
+//! and no function type ("`is` cannot test a function type": a function's
+//! signature is not something a value can be asked for; a function is told
+//! apart by the other members, in the `else` branch). The operand is checked,
+//! an untyped integer settling to `Int`, and measured at the top, as a
+//! measuring operator's operand is: awaited if it may be a future, subject to
+//! the purity rule, a pure function's parameter being measured. Its type then,
+//! `S`, has *members*: its members if it is a union, and itself otherwise. Each
+//! member `M`, made present (a list of futures being asked about as a list of
+//! what they yield), *always passes* if it is a subtype of `TYPE`, *may pass*
+//! if not but it *overlaps* `TYPE`
+//! ([`TypeTable::overlaps`](crate::types::TypeTable::overlaps): a value could
+//! be both, as far as their structure says), and otherwise *cannot pass*. If
+//! every member always passes, the test is `true`, and a warning, "`x` is
+//! always an Int", at the `is`; if none passes or may, it is an error, "`x` is
+//! never a String", at `TYPE`, labelled with the operand's type at the operand.
+//! `x` is the operand as written when it is a name or a dotted path, and "this
+//! value" otherwise.
 //!
 //! The test at runtime is by the value's structure, as its *plan*
-//! ([`TypeTable::test_plan`](crate::types::TypeTable::test_plan)) says, which is recorded for lowering in
-//! [`Resolution::test_of`](super::Resolution::test_of): a scalar type by the value's kind; a record
-//! type by the record's having each field, each passing its own test,
-//! whatever else it has; a list type by each element's passing (the empty
-//! list passes every list type); a union by any member's. The plan looks no
-//! further than `S` leaves in doubt: if every member of `S` of the kind
-//! tested always passes, it tests the value's kind alone (`x is List<Int>`
-//! for `x: Int | List<Int>`), and otherwise it looks inside, applying the
-//! same rule at each field and element, from what `S`'s members of that
-//! kind say of it (or nothing, where one lacks the field). How deeply the
-//! operand is awaited follows the plan: at the top for one that tests the
-//! kind alone, so that `xs is Int` awaits no element of a list of futures,
-//! and deeply, as an operand of an equality is (`Checker::measure_deep`),
-//! for one that looks inside, `S` then being made present for everything
-//! below. Values are immutable and types structural, so a value that
-//! passes the test of a type is of that type, whatever it was built as,
-//! which is what makes narrowing on the test sound.
+//! ([`TypeTable::test_plan`](crate::types::TypeTable::test_plan)) says, which
+//! is recorded for lowering in
+//! [`Resolution::test_of`](super::Resolution::test_of): a scalar type by the
+//! value's kind; a record type by the record's having each field, each passing
+//! its own test, whatever else it has; a list type by each element's passing
+//! (the empty list passes every list type); a union by any member's. The plan
+//! looks no further than `S` leaves in doubt: if every member of `S` of the
+//! kind tested always passes, it tests the value's kind alone (`x is List<Int>`
+//! for `x: Int | List<Int>`), and otherwise it looks inside, applying the same
+//! rule at each field and element, from what `S`'s members of that kind say of
+//! it (or nothing, where one lacks the field). How deeply the operand is
+//! awaited follows the plan: at the top for one that tests the kind alone, so
+//! that `xs is Int` awaits no element of a list of futures, and deeply, as an
+//! operand of an equality is (`Checker::measure_deep`), for one that looks
+//! inside, `S` then being made present for everything below. Values are
+//! immutable and types structural, so a value that passes the test of a type is
+//! of that type, whatever it was built as, which is what makes narrowing on the
+//! test sound.
 //!
 //! The *narrowed type* `N` is the union of each member that always passes,
 //! as it is, and `TYPE`, if any member may pass; the *remainder* `R` is the
@@ -397,19 +398,20 @@ impl Checker<'_> {
 
     /// Types the `is` or `as`, as `keyword` says, expression `id`, testing
     /// whether `operand` is of the type written `ty` (see the module
-    /// documentation): the type is resolved with every bare type present,
-    /// and may contain no future and no function type; the operand is
-    /// checked, an untyped integer settling to `Int`, and measured at the
-    /// top, or deeply if the test's plan walks into it (see
-    /// [`TypeTable::test_plan`](crate::types::TypeTable::test_plan)), subject to the purity rule. Each member of
-    /// the operand's type once measured, made present, *always passes* if
-    /// it is a subtype of the type tested, *may pass* if it does not but
-    /// overlaps it (see [`TypeTable::overlaps`](crate::types::TypeTable::overlaps)), and *cannot pass*
-    /// otherwise. If every member always passes, the test is `true`, which
-    /// is a warning; if none passes or may, it is the error "`x` is never a
-    /// String", at the type. Records the plan for lowering (see
-    /// [`Resolution::test_of`](super::Resolution::test_of)). `None` if the type, the operand or the
-    /// test is erroneous.
+    /// documentation): the type is resolved with every bare type present, and
+    /// may contain no future and no function type; the operand is checked, an
+    /// untyped integer settling to `Int`, and measured at the top, or deeply if
+    /// the test's plan walks into it (see
+    /// [`TypeTable::test_plan`](crate::types::TypeTable::test_plan)), subject
+    /// to the purity rule. Each member of the operand's type once measured,
+    /// made present, *always passes* if it is a subtype of the type tested,
+    /// *may pass* if it does not but overlaps it (see
+    /// [`TypeTable::overlaps`](crate::types::TypeTable::overlaps)), and *cannot
+    /// pass* otherwise. If every member always passes, the test is `true`,
+    /// which is a warning; if none passes or may, it is the error "`x` is never
+    /// a String", at the type. Records the plan for lowering (see
+    /// [`Resolution::test_of`](super::Resolution::test_of)). `None` if the
+    /// type, the operand or the test is erroneous.
     pub(super) fn check_test(
         &mut self,
         id: ExprId,
@@ -608,11 +610,11 @@ impl Checker<'_> {
     }
 
     /// Types the branches of an `if` with `else`: they have their join (see
-    /// [`TypeTable::join`](crate::types::TypeTable::join)), an untyped branch first adapting to the other
-    /// branch's `Int` or `Float` once stripped, or settling to `Int`, and
-    /// two untyped branches leaving the `if` untyped. A join that is widened,
-    /// a union of what the branches are where they do not agree, is a
-    /// warning (see [`Checker::branches_widened`]).
+    /// [`TypeTable::join`](crate::types::TypeTable::join)), an untyped branch
+    /// first adapting to the other branch's `Int` or `Float` once stripped, or
+    /// settling to `Int`, and two untyped branches leaving the `if` untyped. A
+    /// join that is widened, a union of what the branches are where they do not
+    /// agree, is a warning (see [`Checker::branches_widened`]).
     ///
     /// Two branches of the same type have it, a provisional type of the
     /// innermost function's included, so a parameter passes through an

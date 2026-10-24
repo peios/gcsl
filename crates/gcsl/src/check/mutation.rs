@@ -25,23 +25,22 @@
 //! `x := e`, where the innermost binding of `x` (`lookup`) is a mutable
 //! variable, is checked by `Checker::check_mutable_rebind`:
 //!
-//! 1. If the variable is of the function being checked, the rebind is
-//!    allowed from any block, and `e` is checked against the variable's
-//!    type exactly as a `:=` in the declaring block of a variable that is
-//!    not mutable is: "the variable was declared here", literals adapting,
-//!    a value awaited to fit where an await is allowed. Nothing is
-//!    declared: the item writes the variable's own slot (see
-//!    [`Resolution::item_slot`](super::Resolution::item_slot)), and the variable keeps its type, its
-//!    declaration and its place in `bindings`. So in the declaring block
-//!    too, a mutable variable has one slot for its whole life, and a frame
-//!    does not grow with its rebinds.
-//! 2. If it is of an enclosing function or of the top level, and the `:=`
-//!    is in a function expression or a `lazy` nested in that, it is "cannot
-//!    rebind `x` here: it is declared outside this function" (or "this
-//!    `lazy`", for the innermost being one), labelled at the declaration,
-//!    with a note that the function holds its own copy of the variable. The
-//!    value is checked on its own and nothing is declared, so nothing
-//!    cascades.
+//! 1. If the variable is of the function being checked, the rebind is allowed
+//!    from any block, and `e` is checked against the variable's type exactly as
+//!    a `:=` in the declaring block of a variable that is not mutable is: "the
+//!    variable was declared here", literals adapting, a value awaited to fit
+//!    where an await is allowed. Nothing is declared: the item writes the
+//!    variable's own slot (see
+//!    [`Resolution::item_slot`](super::Resolution::item_slot)), and the
+//!    variable keeps its type, its declaration and its place in `bindings`. So
+//!    in the declaring block too, a mutable variable has one slot for its whole
+//!    life, and a frame does not grow with its rebinds.
+//! 2. If it is of an enclosing function or of the top level, and the `:=` is in
+//!    a function expression or a `lazy` nested in that, it is "cannot rebind
+//!    `x` here: it is declared outside this function" (or "this `lazy`", for
+//!    the innermost being one), labelled at the declaration, with a note that
+//!    the function holds its own copy of the variable. The value is checked on
+//!    its own and nothing is declared, so nothing cascades.
 //!
 //! A rebind of a mutable variable that is erroneous already, whose error
 //! has been reported, checks its value on its own and declares nothing too.

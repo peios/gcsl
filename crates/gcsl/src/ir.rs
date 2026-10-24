@@ -1149,11 +1149,12 @@ pub enum IrKind {
     },
     /// The value of `value`, a node of any kind, if it is a secret, and the
     /// value itself if it is not (see [`crate::eval`], "Secrets"): what an
-    /// operation on secrets computes on, each of its operands one of these,
-    /// so that a failure of an operand is told from the operation's own. If `deep`, every secret the value
-    /// holds, in a field, an element or a payload at any depth, is its
-    /// value too, as a comparison compares them. Each secret's identity is
-    /// kept for the innermost [`IrKind::SecretWrap`]. Of kind `kind`.
+    /// operation on secrets computes on, each of its operands one of these, so
+    /// that a failure of an operand is told from the operation's own. If
+    /// `deep`, every secret the value holds, in a field, an element or a
+    /// payload at any depth, is its value too, as a comparison compares them.
+    /// Each secret's identity is kept for the innermost [`IrKind::SecretWrap`].
+    /// Of kind `kind`.
     SecretValue {
         /// The secret, or the value holding secrets.
         value: IrId,

@@ -2,18 +2,17 @@
 //!
 //! # Failure
 //!
-//! `assert COND, MESSAGE` (see the parser's
-//! [Failure](crate::parser#failure)) is `{}`: its condition must be a
-//! `Bool`, "an assertion's condition is a Bool", and its message a
-//! `String` (`Checker::check_assert`). `recover { BODY } else (e) {
-//! FALLBACK }` (`Checker::check_recover`) checks its body, then its
-//! fallback in a scope of its own, where the failure, if it is named, is a
+//! `assert COND, MESSAGE` (see the parser's [Failure](crate::parser#failure))
+//! is `{}`: its condition must be a `Bool`, "an assertion's condition is a
+//! Bool", and its message a `String` (`Checker::check_assert`). `recover { BODY
+//! } else (e) { FALLBACK }` (`Checker::check_recover`) checks its body, then
+//! its fallback in a scope of its own, where the failure, if it is named, is a
 //! variable of type `{message: String}` in a slot of its own, recorded for
-//! lowering ([`Resolution::recover_slot`](super::Resolution::recover_slot)); its type is the join of the
-//! two, as an `if`'s branches', warned of as theirs are when it widens to
-//! a union, "the branches of this `recover` have different types". Its
-//! effect is its blocks': a `recover` catches a failure, it does nothing
-//! of its own.
+//! lowering ([`Resolution::recover_slot`](super::Resolution::recover_slot));
+//! its type is the join of the two, as an `if`'s branches', warned of as theirs
+//! are when it widens to a union, "the branches of this `recover` have
+//! different types". Its effect is its blocks': a `recover` catches a failure,
+//! it does nothing of its own.
 
 use crate::ast::{ExprId, RecoverId};
 use crate::source::Span;

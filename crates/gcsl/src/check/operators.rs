@@ -14,13 +14,15 @@
 //!
 //! Functions have no equality: once the operands are found to have one
 //! identical type, a type that is a function type, or a record or list type
-//! containing one at any depth (see [`TypeTable::contains_fn`](crate::types::TypeTable::contains_fn)), is an
+//! containing one at any depth (see
+//! [`TypeTable::contains_fn`](crate::types::TypeTable::contains_fn)), is an
 //! error. Nor do they have an order. Lists compare as records do, element by
-//! element (see [Lists](crate::check::lists#lists)). A union has no static type to compare
-//! typed by: `==` and `!=` of two operands of one union type are "cannot
-//! compare `Int | String` with `==`", with the note "narrow it, or compare
-//! with `===`", while `===` and `!==` compare their runtime values whole;
-//! nor does a union have an order (see [Unions](crate::check::narrowing#unions)).
+//! element (see [Lists](crate::check::lists#lists)). A union has no static type
+//! to compare typed by: `==` and `!=` of two operands of one union type are
+//! "cannot compare `Int | String` with `==`", with the note "narrow it, or
+//! compare with `===`", while `===` and `!==` compare their runtime values
+//! whole; nor does a union have an order (see
+//! [Unions](crate::check::narrowing#unions)).
 //!
 //! # Quantities
 //!
@@ -487,7 +489,7 @@ impl Checker<'_> {
         (rhs, rhs_ty): (ExprId, TyId),
     ) -> Option<TyId> {
         // Two types that differ only in their fields' defaults are one (see
-        // [Field defaults](#field-defaults)).
+        // "Field defaults" under [Functions](crate::check::functions#functions)).
         if self.types.same(lhs_ty, rhs_ty)
             && (lhs_ty == TyId::BOOL
                 || lhs_ty == TyId::STRING

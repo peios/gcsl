@@ -452,29 +452,28 @@
 //!   `Foo` takes no type argument" ([`Scan::applied_link`]). An attribute's
 //!   type is never generic: "attribute `Tag` takes no type parameters".
 //!
-//! Then the types are defined and the files' trees expanded
-//! ([`define_types`]): each declaration's definition is copied into the
-//! scan's [`TypeStore`], each name in it of another declared type a
-//! reference to it, as the declaring file's view resolves it, an instance
-//! of it if applied to arguments, and each of a generic declaration's own
-//! type parameters a parameter; the references are a graph, whose cycles are each "type `A` refers to
-//! itself", at the first declaration of the cycle in path then source
-//! order, labelled at each step ("`B` uses `A` here", in `B`'s file);
-//! every declaration is settled, those it refers to first, a reference
-//! made what it refers to, an instance what it refers to with its
-//! arguments in place of its parameters, and a spread merged, one on a cycle, with a
-//! spread's problem or nested deeper than [`crate::MAX_DEPTH`] once
-//! expanded erroneous; and each file's tree is expanded
-//! ([`Ast::expand_types`]): each name of a declared type in it made a copy
-//! of the definition, as if written there, a generic one's with the use's
-//! arguments in place of its parameters, each record type with spreads
-//! the record of its merged fields. A session keeps its store, each input's
-//! declarations after the earlier inputs' ([`check_input`]). The checker
-//! then sees no declared type's name; before any file is checked, the
-//! driver checks every file's `type` items ([`check_type_items`]), since a
-//! file may use a type of a file checked after it, so that what is wrong in
-//! a definition is reported once, where it is written, and every file using
-//! it fails quietly (see the checker's "Type declarations").
+//! Then the types are defined and the files' trees expanded ([`define_types`]):
+//! each declaration's definition is copied into the scan's [`TypeStore`], each
+//! name in it of another declared type a reference to it, as the declaring
+//! file's view resolves it, an instance of it if applied to arguments, and each
+//! of a generic declaration's own type parameters a parameter; the references
+//! are a graph, whose cycles are each "type `A` refers to itself", at the first
+//! declaration of the cycle in path then source order, labelled at each step
+//! ("`B` uses `A` here", in `B`'s file); every declaration is settled, those it
+//! refers to first, a reference made what it refers to, an instance what it
+//! refers to with its arguments in place of its parameters, and a spread
+//! merged, one on a cycle, with a spread's problem or nested deeper than
+//! [`crate::MAX_DEPTH`] once expanded erroneous; and each file's tree is
+//! expanded ([`Ast::expand_types`]): each name of a declared type in it made a
+//! copy of the definition, as if written there, a generic one's with the use's
+//! arguments in place of its parameters, each record type with spreads the
+//! record of its merged fields. A session keeps its store, each input's
+//! declarations after the earlier inputs' ([`check_input`]). The checker then
+//! sees no declared type's name; before any file is checked, the driver checks
+//! every file's `type` items ([`check_type_items`]), since a file may use a
+//! type of a file checked after it, so that what is wrong in a definition is
+//! reported once, where it is written, and every file using it fails quietly
+//! (see the checker's "Type declarations").
 //!
 //! # Methods
 //!

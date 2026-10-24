@@ -111,24 +111,24 @@
 //! (`Checker::place_definition`) and typed as the input starts
 //! (`Checker::defmeta_type`).
 //!
-//! **Pairing.** A definition whose def-type declares a meta reads the cell
-//! of its meta, the leaf of its path among its directory's metas, as a
-//! reference to it would, from inside its own function, as its body reads a
-//! top-level function (`Checker::definition_meta`), and the slot that read
-//! reads is what its code names ([`Resolution::metas`](super::Resolution::metas)), which a read of its
-//! closure's meta calls; so the definition needs its meta, as mentions say
-//! ([`crate::mentions`], "Def-types"). One whose directory declares no meta
-//! of its path, which the workspace finds ([`crate::workspace`],
-//! "Def-types"), is "`package dev.peios.x` has no `defmeta` in its
-//! directory", at its def-type and path, noted "`package` declares a meta,
-//! `META-> PackageMeta`, for each of its definitions": the meta as the
-//! def-type's parameter writes it if the workspace has the def-type's tree,
-//! and otherwise as its type shows, present under `META->` and `META->>`,
-//! as a bare type would be written there. A meta declared twice in a
+//! **Pairing.** A definition whose def-type declares a meta reads the cell of
+//! its meta, the leaf of its path among its directory's metas, as a reference
+//! to it would, from inside its own function, as its body reads a top-level
+//! function (`Checker::definition_meta`), and the slot that read reads is what
+//! its code names ([`Resolution::metas`](super::Resolution::metas)), which a
+//! read of its closure's meta calls; so the definition needs its meta, as
+//! mentions say ([`crate::mentions`], "Def-types"). One whose directory
+//! declares no meta of its path, which the workspace finds
+//! ([`crate::workspace`], "Def-types"), is "`package dev.peios.x` has no
+//! `defmeta` in its directory", at its def-type and path, noted "`package`
+//! declares a meta, `META-> PackageMeta`, for each of its definitions": the
+//! meta as the def-type's parameter writes it if the workspace has the
+//! def-type's tree, and otherwise as its type shows, present under `META->` and
+//! `META->>`, as a bare type would be written there. A meta declared twice in a
 //! directory, or with no definition of its path there, is the workspace's
 //! error. A definition reads nothing, its read typed `{}`, when its def-type
-//! declares no meta, when its directory declares none, and when it is
-//! shadowed, since it is never made.
+//! declares no meta, when its directory declares none, and when it is shadowed,
+//! since it is never made.
 //!
 //! **Through a reference.** A reference to a definition, `package
 //! dev.peios.testpkg`, carries the definition's meta: its type is the
@@ -218,8 +218,9 @@ impl Checker<'_> {
     /// Checks every use of an attribute that is none of the parser's, on the
     /// function items they apply to (see [Attributes](#attributes)), and
     /// records each function's, in source order, as
-    /// [`Resolution::attributes`](super::Resolution::attributes) gives them. Its arguments' constants take
-    /// no slot of the frame: what their checks allocate is given back.
+    /// [`Resolution::attributes`](super::Resolution::attributes) gives them.
+    /// Its arguments' constants take no slot of the frame: what their checks
+    /// allocate is given back.
     pub(super) fn check_attribute_uses(&mut self) {
         let ast = self.ast;
         let uses = ast.all_attribute_uses();
@@ -465,18 +466,20 @@ impl Checker<'_> {
         self.constant(value)
     }
 
-    /// Whether the expression `id`, a parameter's or a field's default, is
-    /// a constant (see [Calls](#calls)): [`is_constant`].
+    /// Whether the expression `id`, a parameter's or a field's default, is a
+    /// constant (see "Calls" under
+    /// [Functions](crate::check::functions#functions)):
+    /// [`crate::ast::is_constant`].
     pub(super) fn is_constant(&self, id: ExprId) -> bool {
         crate::ast::is_constant(self.ast, id)
     }
 
     /// The constant that `id`, a parameter's or a field's default that
     /// [`Checker::is_constant`] accepts, is once checked without an error
-    /// ([`constant_of`]): an integer literal that is a `Float` there a
-    /// `Float`, and a record block given fields' defaults with those fields
-    /// (see [Field defaults](#field-defaults)). `None` if it is not one
-    /// after all.
+    /// ([`constant_of`]): an integer literal that is a `Float` there a `Float`,
+    /// and a record block given fields' defaults with those fields (see "Field
+    /// defaults" under [Functions](crate::check::functions#functions)). `None`
+    /// if it is not one after all.
     pub(super) fn constant(&self, id: ExprId) -> Option<Constant> {
         constant_of(
             self.ast,
@@ -485,22 +488,22 @@ impl Checker<'_> {
         )
     }
 
-    /// The constant that `constant`, a field's default of a declared type as
-    /// a copy of its definition holds it, written with no type known (see
-    /// [`written_constant`](super::written_constant)), is where the field is of type
-    /// `expected`, as [`Checker::check_expr_expecting`] would check the
-    /// default it is written as (see [Field defaults](#field-defaults)):
-    /// `None` if it does not fit. An `Int` is the `Int` or `Float` that an
-    /// integer literal adapts to; a `Float`, `Bool` or `String` must be a
-    /// subtype; a list is fitted against the list type expected, or the one
-    /// list member of the union expected, or, for one with several, the
-    /// first of them it fits, as a list literal checked bottom up would
-    /// be; a record likewise against a record type, a field the type lacks
-    /// kept as it is, and, where the record type is expected itself and
-    /// not a union of it, each defaulted field it lacks given its default,
-    /// as a record block is; and `{}` is given every default of a record
-    /// type with defaults expected itself, as a record block is, and must
-    /// be a subtype otherwise. Nothing fits a `Future`.
+    /// The constant that `constant`, a field's default of a declared type as a
+    /// copy of its definition holds it, written with no type known (see
+    /// [`written_constant`](super::written_constant)), is where the field is of
+    /// type `expected`, as [`Checker::check_expr_expecting`] would check the
+    /// default it is written as (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)): `None` if it does not
+    /// fit. An `Int` is the `Int` or `Float` that an integer literal adapts to;
+    /// a `Float`, `Bool` or `String` must be a subtype; a list is fitted
+    /// against the list type expected, or the one list member of the union
+    /// expected, or, for one with several, the first of them it fits, as a list
+    /// literal checked bottom up would be; a record likewise against a record
+    /// type, a field the type lacks kept as it is, and, where the record type
+    /// is expected itself and not a union of it, each defaulted field it lacks
+    /// given its default, as a record block is; and `{}` is given every default
+    /// of a record type with defaults expected itself, as a record block is,
+    /// and must be a subtype otherwise. Nothing fits a `Future`.
     ///
     /// Recurses once per level of list and record nesting.
     pub(super) fn fit_constant(&self, constant: &Constant, expected: TyId) -> Option<Constant> {
@@ -605,21 +608,21 @@ impl Checker<'_> {
         Some(Constant::Record(fitted.into_boxed_slice()))
     }
 
-    /// Types the field access `id`, `func.name`, which reads the meta `meta`
-    /// of `func`, the function `record` evaluates to (see [Metas](#metas)):
-    /// the type of the meta's field `name`. Reading it is calling the meta's
+    /// Types the field access `id`, `func.name`, which reads the meta `meta` of
+    /// `func`, the function `record` evaluates to (see [Metas](#metas)): the
+    /// type of the meta's field `name`. Reading it is calling the meta's
     /// closure, of the meta's effect: from a pure function, a `META->` or
     /// `META->>` meta is "cannot read an impure meta from a pure function",
-    /// labelled "reading the meta of `func` is impure (`META->`)" at `func`
-    /// and at the function's marker, as calling an impure function is. A
-    /// meta that may be a future is awaited at the top, subject to the
-    /// purity rule, as a record a field access reads is, unless the read is
-    /// already that error. A field the meta lacks is "the meta of `func` has
-    /// no field `x`", at the `.NAME`, noted with the meta's fields. Recorded
-    /// for lowering ([`Resolution::meta_read`](super::Resolution::meta_read)). A def-type reference, read
-    /// in parentheses or by a path past its definition, is named as it is
-    /// written, "the meta of `package dev.peios.testpkg`", and a field
-    /// missing past a definition is noted as read from its meta
+    /// labelled "reading the meta of `func` is impure (`META->`)" at `func` and
+    /// at the function's marker, as calling an impure function is. A meta that
+    /// may be a future is awaited at the top, subject to the purity rule, as a
+    /// record a field access reads is, unless the read is already that error. A
+    /// field the meta lacks is "the meta of `func` has no field `x`", at the
+    /// `.NAME`, noted with the meta's fields. Recorded for lowering
+    /// ([`Resolution::meta_read`](super::Resolution::meta_read)). A def-type
+    /// reference, read in parentheses or by a path past its definition, is
+    /// named as it is written, "the meta of `package dev.peios.testpkg`", and a
+    /// field missing past a definition is noted as read from its meta
     /// (`Checker::meta_of`).
     pub(super) fn meta_read(&mut self, id: ExprId, record: ExprId, meta: Meta, name: Name) -> TyId {
         let MetaOf {

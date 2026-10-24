@@ -5,35 +5,36 @@
 //!
 //! A generic function item (see the parser's [Functions and
 //! calls](crate::parser#functions-and-calls)) has a type parameter, as a
-//! [`TyKind::Param`](crate::types::TyKind::Param) of its own [`GenericId`] (`Checker::generic_of`), for
-//! each name written as a type in its scope that is one of its parameters
-//! (`Checker::resolve_written`); no bareness wraps one, and a pure
-//! function's parameter of it is not inferred, since what a call binds it to
-//! may be lazy or not (`Checker::is_bare`). Its function type is generic
-//! (`Checker::function_type`). Its body is checked once, for every binding:
-//! a value of a type parameter can be passed, returned and stored in
-//! records and lists, and every other use is the usual error of a type
-//! that does not fit, as "cannot add T and Int"; interpolating one is
-//! "cannot interpolate a value of type T, of a type parameter", since it may
-//! be a future that nothing awaits.
+//! [`TyKind::Param`](crate::types::TyKind::Param) of its own [`GenericId`]
+//! (`Checker::generic_of`), for each name written as a type in its scope that
+//! is one of its parameters (`Checker::resolve_written`); no bareness wraps
+//! one, and a pure function's parameter of it is not inferred, since what a
+//! call binds it to may be lazy or not (`Checker::is_bare`). Its function type
+//! is generic (`Checker::function_type`). Its body is checked once, for every
+//! binding: a value of a type parameter can be passed, returned and stored in
+//! records and lists, and every other use is the usual error of a type that
+//! does not fit, as "cannot add T and Int"; interpolating one is "cannot
+//! interpolate a value of type T, of a type parameter", since it may be a
+//! future that nothing awaits.
 //!
-//! A call of a generic function infers (`Checker::instantiate`): each
-//! argument that fills a parameter whose type mentions a type parameter, as
-//! the arguments are bound ([`argument_targets`]), is checked with no type
-//! expected, and binds what that type mentions ([`TypeTable::bind`](crate::types::TypeTable::bind)), a
-//! parameter bound twice the join of its bindings, which, widened to a
-//! union, is the warning "the arguments for `T` have different types", as
-//! a list literal's elements are; but `[]` and `{}`, whose types are what
-//! they are expected to be, bind nothing, and an integer literal binds, as
-//! an `Int`, only what nothing else binds or what it does not fit, so that
-//! another argument can make it a `Float`. A type
-//! parameter left unbound is "cannot infer `T` for this call of `f`", noted
-//! "`T` appears in no parameter's type given an argument here". The call is
-//! then bound and checked as any is, with the signature its bindings
-//! substitute ([`TypeTable::substitute`](crate::types::TypeTable::substitute)), an argument checked already only
-//! expected to fit. A generic function read other than as a call's callee,
-//! through any parentheses, is "a generic function must be called"
-//! (`Checker::called_if_generic`): a value of it would bind nothing.
+//! A call of a generic function infers (`Checker::instantiate`): each argument
+//! that fills a parameter whose type mentions a type parameter, as the
+//! arguments are bound ([`argument_targets`]), is checked with no type
+//! expected, and binds what that type mentions
+//! ([`TypeTable::bind`](crate::types::TypeTable::bind)), a parameter bound
+//! twice the join of its bindings, which, widened to a union, is the warning
+//! "the arguments for `T` have different types", as a list literal's elements
+//! are; but `[]` and `{}`, whose types are what they are expected to be, bind
+//! nothing, and an integer literal binds, as an `Int`, only what nothing else
+//! binds or what it does not fit, so that another argument can make it a
+//! `Float`. A type parameter left unbound is "cannot infer `T` for this call of
+//! `f`", noted "`T` appears in no parameter's type given an argument here". The
+//! call is then bound and checked as any is, with the signature its bindings
+//! substitute ([`TypeTable::substitute`](crate::types::TypeTable::substitute)),
+//! an argument checked already only expected to fit. A generic function read
+//! other than as a call's callee, through any parentheses, is "a generic
+//! function must be called" (`Checker::called_if_generic`): a value of it would
+//! bind nothing.
 //!
 //! # Methods
 //!
@@ -75,21 +76,21 @@
 //!   for type T", and several, whose receiver types are one type, "method
 //!   `m` is declared twice for type T".
 //!
-//! The call of the method chosen (`Checker::call_method`) reads its
-//! binding as its callee, as a call of a function by its name does, so a
-//! call of a method of the input is of a known callee, which gives each
-//! parameter left out its default, and of an earlier input's too. A generic
-//! method's type parameters are bound by the receiver first and then the
-//! arguments (`Checker::instantiate`); the receiver is expected to fit
-//! the receiver parameter, its await reported as an argument's is; and the
-//! arguments are bound to the parameters after it
-//! (`Checker::bind_call`), their positions recorded from 1. The call is
-//! recorded for lowering with its receiver
-//! ([`Resolution::method_receiver`](super::Resolution::method_receiver)), which lowers it as a call of the
-//! binding with the receiver its first argument. A method is never a
-//! value: its name alone is no variable, and `x.m` without a call reads a
-//! field. An empty list, `[]`, is no receiver: its type is found before
-//! any method is chosen, so it is "cannot infer the element type of `[]`".
+//! The call of the method chosen (`Checker::call_method`) reads its binding as
+//! its callee, as a call of a function by its name does, so a call of a method
+//! of the input is of a known callee, which gives each parameter left out its
+//! default, and of an earlier input's too. A generic method's type parameters
+//! are bound by the receiver first and then the arguments
+//! (`Checker::instantiate`); the receiver is expected to fit the receiver
+//! parameter, its await reported as an argument's is; and the arguments are
+//! bound to the parameters after it (`Checker::bind_call`), their positions
+//! recorded from 1. The call is recorded for lowering with its receiver
+//! ([`Resolution::method_receiver`](super::Resolution::method_receiver)), which
+//! lowers it as a call of the binding with the receiver its first argument. A
+//! method is never a value: its name alone is no variable, and `x.m` without a
+//! call reads a field. An empty list, `[]`, is no receiver: its type is found
+//! before any method is chosen, so it is "cannot infer the element type of
+//! `[]`".
 
 use std::collections::HashMap;
 
@@ -636,10 +637,10 @@ impl Checker<'_> {
 
     /// Binds what `param_ty`, the type of the parameter that `value` fills,
     /// mentions of `binding`'s type parameters from `found`, `value`'s type
-    /// ([`TypeTable::bind`](crate::types::TypeTable::bind)), noting `value` as the binder of each it binds
-    /// first. One whose binding this widens to a union is the warning "the
-    /// arguments for `T` have different types", as the elements of a list
-    /// literal are.
+    /// ([`TypeTable::bind`](crate::types::TypeTable::bind)), noting `value` as
+    /// the binder of each it binds first. One whose binding this widens to a
+    /// union is the warning "the arguments for `T` have different types", as
+    /// the elements of a list literal are.
     pub(super) fn bind_argument(
         &mut self,
         binding: &mut TypeBinding,

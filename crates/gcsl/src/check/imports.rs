@@ -113,19 +113,19 @@
 //!   record assembled as the file started. Its readiness and cycles are an
 //!   interior node's: "`com` has `com.b.v`, and ...".
 //!
-//! A call of a `def` reached through an import (`f(x)` after `import f
-//! from lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`,
-//! whose measured parameters and defaults the workspace carries
-//! ([`KnownParams`](super::KnownParams)), so its call-site diagnostics are those of a `def` of
-//! the directory, and it is given its defaults (see [Calls](#calls)); the
-//! prelude's `half`
-//! is such a `def`. So is a call of a `def` named by a dotted path, through
-//! an import or by its path from another file of the directory chain
-//! (`dev.peios.f(x)`), which reads the root the chain committed, a record
-//! that knows no function: the reference is resolved in the file's view to
-//! the merged node (`Checker::committed_callee`), whose measured parameters
-//! and defaults the workspace carries as a `def`'s of one name (a dotted one
-//! has no binding: they are its function's).
+//! A call of a `def` reached through an import (`f(x)` after `import f from
+//! lib`, or `lib.f(x)`) is of a known callee, `KnownCallee::Imported`, whose
+//! measured parameters and defaults the workspace carries
+//! ([`KnownParams`](super::KnownParams)), so its call-site diagnostics are
+//! those of a `def` of the directory, and it is given its defaults (see "Calls"
+//! under [Functions](crate::check::functions#functions)); the prelude's `half`
+//! is such a `def`. So is a call of a `def` named by a dotted path, through an
+//! import or by its path from another file of the directory chain
+//! (`dev.peios.f(x)`), which reads the root the chain committed, a record that
+//! knows no function: the reference is resolved in the file's view to the
+//! merged node (`Checker::committed_callee`), whose measured parameters and
+//! defaults the workspace carries as a `def`'s of one name (a dotted one has no
+//! binding: they are its function's).
 //!
 //! The `fileroot` module (see [`crate::workspace`], "The standard library")
 //! is no record: a reference through its whole import resolves, as any

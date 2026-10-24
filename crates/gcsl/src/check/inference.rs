@@ -18,16 +18,17 @@
 //! results](#inferred-results).)
 //!
 //! While the body is checked, such a parameter has a provisional type,
-//! `provisional(function, index, T)` (see [`TypeTable::provisional`](crate::types::TypeTable::provisional)), in
-//! the function's type as first interned, in the callee binding and in the
+//! `provisional(function, index, T)` (see
+//! [`TypeTable::provisional`](crate::types::TypeTable::provisional)), in the
+//! function's type as first interned, in the callee binding and in the
 //! parameter's binding, and the function's entry on the stack
 //! (`Function::demanded`) records, for each parameter, the first place in
 //! source order where it is measured. A value keeps the provisional type
 //! through *blind assignment*, with no code of its own: a `let` without an
 //! annotation binds it, a record field holds it and gives it back when read,
-//! and an `if` both of whose branches have it has it. The parameter is
-//! measured where a value of its provisional type is used as its bits,
-//! which is exactly where a value that may be a future would be awaited:
+//! and an `if` both of whose branches have it has it. The parameter is measured
+//! where a value of its provisional type is used as its bits, which is exactly
+//! where a value that may be a future would be awaited:
 //!
 //! - `Checker::measure` (the operands of the measuring operators, the
 //!   callee of a call, the record of a field access, the list of an index,
@@ -65,19 +66,20 @@
 //! Capturing a parameter in a closure or a `lazy`, and binding it with a
 //! `let` without an annotation, measure nothing.
 //!
-//! When the body's check ends, each parameter is decided: present if it
-//! was measured. [`TypeTable::settle`](crate::types::TypeTable::settle) then replaces the function's
-//! provisional types in the type of every expression of the function, the
-//! ids of its subtree (which the parser allocates contiguously: see
-//! [`Ast`](crate::ast::Ast)), and in what every function and `lazy` nested in it captures,
-//! and the function's own type is its settled type; which parameters were
-//! measured, and where, is recorded in [`FnResolution::param_demands`](super::FnResolution::param_demands). A
+//! When the body's check ends, each parameter is decided: present if it was
+//! measured. [`TypeTable::settle`](crate::types::TypeTable::settle) then
+//! replaces the function's provisional types in the type of every expression of
+//! the function, the ids of its subtree (which the parser allocates
+//! contiguously: see [`Ast`](crate::ast::Ast)), and in what every function and
+//! `lazy` nested in it captures, and the function's own type is its settled
+//! type; which parameters were measured, and where, is recorded in
+//! [`FnResolution::param_demands`](super::FnResolution::param_demands). A
 //! provisional type reaches nothing outside the function but through the
-//! function's type, which is settled with the rest, so this one pass is
-//! enough, and a successful check leaves none (the final invariant check
-//! says so). A nested function is settled when it ends, for its own
-//! parameters, and again when the function enclosing it ends, for that
-//! one's, which is why settling names the function.
+//! function's type, which is settled with the rest, so this one pass is enough,
+//! and a successful check leaves none (the final invariant check says so). A
+//! nested function is settled when it ends, for its own parameters, and again
+//! when the function enclosing it ends, for that one's, which is why settling
+//! names the function.
 //!
 //! **Nested functions.** A provisional type of an *enclosing* function,
 //! seen in a nested body through a capture, is measured for the function it
@@ -97,13 +99,13 @@
 //! impure function awaits when it runs. (An await of a parameter that turns
 //! out present finds a present value, and does nothing.)
 //!
-//! **Where a provisional type is shown.** A diagnostic shows a provisional
-//! type as what it stands for at that point (`Checker::shown`): one of a
-//! function the body being checked may measure (`Checker::claimable`) as
-//! present if its parameter has been measured so far and the either shape
-//! otherwise, and any other enclosing function's as the either shape.
-//! [`TypeTable::display`](crate::types::TypeTable::display) shows one as `Int?`, which nothing the checker
-//! returns holds.
+//! **Where a provisional type is shown.** A diagnostic shows a provisional type
+//! as what it stands for at that point (`Checker::shown`): one of a function
+//! the body being checked may measure (`Checker::claimable`) as present if its
+//! parameter has been measured so far and the either shape otherwise, and any
+//! other enclosing function's as the either shape.
+//! [`TypeTable::display`](crate::types::TypeTable::display) shows one as
+//! `Int?`, which nothing the checker returns holds.
 //!
 //! **The call-site error.** An argument that is awaited at the top, in a
 //! pure caller, because the parameter it fills is present by inference, is
@@ -157,39 +159,39 @@
 //!
 //! What the body returns is the value it has once every await the checker
 //! marked for fitting it to the declared result has run, since the typed
-//! walkers of the evaluator trust the inferred type (`Checker::value_of`):
-//! a body, or a field's value, awaited at the top has its type stripped, and
-//! one awaited deeply its type made present (see [`TypeTable::present`](crate::types::TypeTable::present)),
-//! which is exactly what the deep await's lazy shape resolves; a record block
-//! checked field by field against the declared record type, whose type is
-//! the record of the declared fields' types, is instead the record of what
-//! its fields' values are, each found in the same way; an untyped literal
-//! has been coerced. An open field, one built by dotted paths, is a present
-//! record, built by the block, of what its segments are: a segment that
-//! further paths extend is such a record in turn, and a leaf, `a.b.c = e`,
-//! is what `e` is, found as a field's value is, since it was checked
-//! against the declared type at its path as a field's value is against its
-//! field's type, and lowering stores exactly `e`, with any await marked on
-//! it, into the record (see [Dotted fields](crate::check::records#dotted-fields)). So `fn n() ->
-//! {a: {b: Int}} { a.b = 1 }` is `fn() -> {a: {b: Int}}`, as with `a = { b
-//! = 1 }`. A soft field, one a spread defines (see [Spreads and soft
-//! assignment](crate::check::records#spreads-and-soft-assignment)), is what the type its
-//! spread's operand gives it says, as it is: the spread stores exactly the
-//! value it reads from the operand, once awaited if marked, at that field,
-//! never awaiting it, and the static type is the truth, so the record
-//! really holds a value of that type there. Only the definition of a field
-//! that stands is inferred, a soft one overridden later playing no part.
-//! The block's items are passed over once, rebuilding the segments
-//! of its open fields as a tree (`Built`), which is then inferred against
-//! the declared type level by level; a segment the declared type lacks
-//! plays no part, and a declared field the block does not define, which a
-//! successful check rules out, keeps its declared type. A position whose
-//! value's type is not a subtype of what would be inferred keeps its
-//! declared type. The inferred result
-//! is a subtype of the declared one, so the function's type is one too, by
-//! ordinary result covariance; a written function type is not inferred, so
-//! `fn() -> Int` written means the either shape as before, and accepts
-//! `fn() -> Int { 5 }`, as `fn() -> Present<Int>` now does too.
+//! walkers of the evaluator trust the inferred type (`Checker::value_of`): a
+//! body, or a field's value, awaited at the top has its type stripped, and one
+//! awaited deeply its type made present (see
+//! [`TypeTable::present`](crate::types::TypeTable::present)), which is exactly
+//! what the deep await's lazy shape resolves; a record block checked field by
+//! field against the declared record type, whose type is the record of the
+//! declared fields' types, is instead the record of what its fields' values
+//! are, each found in the same way; an untyped literal has been coerced. An
+//! open field, one built by dotted paths, is a present record, built by the
+//! block, of what its segments are: a segment that further paths extend is such
+//! a record in turn, and a leaf, `a.b.c = e`, is what `e` is, found as a
+//! field's value is, since it was checked against the declared type at its path
+//! as a field's value is against its field's type, and lowering stores exactly
+//! `e`, with any await marked on it, into the record (see [Dotted
+//! fields](crate::check::records#dotted-fields)). So `fn n() -> {a: {b: Int}} {
+//! a.b = 1 }` is `fn() -> {a: {b: Int}}`, as with `a = { b = 1 }`. A soft
+//! field, one a spread defines (see [Spreads and soft
+//! assignment](crate::check::records#spreads-and-soft-assignment)), is what the
+//! type its spread's operand gives it says, as it is: the spread stores exactly
+//! the value it reads from the operand, once awaited if marked, at that field,
+//! never awaiting it, and the static type is the truth, so the record really
+//! holds a value of that type there. Only the definition of a field that stands
+//! is inferred, a soft one overridden later playing no part. The block's items
+//! are passed over once, rebuilding the segments of its open fields as a tree
+//! (`Built`), which is then inferred against the declared type level by level;
+//! a segment the declared type lacks plays no part, and a declared field the
+//! block does not define, which a successful check rules out, keeps its
+//! declared type. A position whose value's type is not a subtype of what would
+//! be inferred keeps its declared type. The inferred result is a subtype of the
+//! declared one, so the function's type is one too, by ordinary result
+//! covariance; a written function type is not inferred, so `fn() -> Int`
+//! written means the either shape as before, and accepts `fn() -> Int { 5 }`,
+//! as `fn() -> Present<Int>` now does too.
 //!
 //! What the body returns is decided from all its *result sites* (see
 //! [`return`](crate::check::loops#return)): its own result and the value of every `return`
@@ -296,20 +298,20 @@
 //! present type: the value can leave the body only through a use of its
 //! name as a value, which keeps every position as written.
 //!
-//! **The call-site label.** When an argument does not fit a callback
-//! parameter of a known callee of this input (see "The call-site error"
-//! under [Inferred parameters](#inferred-parameters)) that was not narrowed
-//! at some position, the mismatch has a label at what kept a position the
-//! argument needs as written, the first in source order: "`f` is given a
-//! value that may be a future here" at the argument of a call, and "`f` is
-//! used as a value here, so it may be given a future" at a use as a value.
-//! A position is needed if the argument's function type does not take the
-//! type the position is written as. The label is added only if the
-//! argument would have fitted, as it is or once awaited, had every
-//! narrowable position been narrowed, so that it never misleads about a
-//! mismatch with another cause ([`FnResolution::unnarrowed`](super::FnResolution::unnarrowed) records what
-//! it needs). A callee of an earlier session input has no label, its
-//! source being gone.
+//! **The call-site label.** When an argument does not fit a callback parameter
+//! of a known callee of this input (see "The call-site error" under [Inferred
+//! parameters](#inferred-parameters)) that was not narrowed at some position,
+//! the mismatch has a label at what kept a position the argument needs as
+//! written, the first in source order: "`f` is given a value that may be a
+//! future here" at the argument of a call, and "`f` is used as a value here, so
+//! it may be given a future" at a use as a value. A position is needed if the
+//! argument's function type does not take the type the position is written as.
+//! The label is added only if the argument would have fitted, as it is or once
+//! awaited, had every narrowable position been narrowed, so that it never
+//! misleads about a mismatch with another cause
+//! ([`FnResolution::unnarrowed`](super::FnResolution::unnarrowed) records what
+//! it needs). A callee of an earlier session input has no label, its source
+//! being gone.
 
 use crate::ast::{
     ExprId, FieldTy, FieldTyRange, ItemKind, ItemRange, PathSegment, TypeExprId, TypeExprKind,
@@ -691,7 +693,8 @@ impl Checker<'_> {
             .map(|&(name, _, ty)| (name, ty))
             .collect();
         // Sorted by name, so interning does not sort it again; the declared
-        // fields keep their defaults (see [Field defaults](#field-defaults)).
+        // fields keep their defaults (see "Field defaults" under
+        // [Functions](crate::check::functions#functions)).
         let rest = self.types.record_rest(present);
         let record = self.types.record_like(present, sorted, rest);
         self.sorted_fields.truncate(base);

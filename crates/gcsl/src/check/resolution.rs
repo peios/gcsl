@@ -70,7 +70,8 @@ pub struct FnResolution {
     pub unnarrowed: Vec<Option<Unnarrowed>>,
     /// For each parameter, in order, its default once checked, a constant or
     /// its default function's place among the closure's captures, if it
-    /// declares one (see [Calls](#calls)); `None` for every other
+    /// declares one (see "Calls" under
+    /// [Functions](crate::check::functions#functions)); `None` for every other
     /// parameter, and one whose default is in error. Empty if no parameter
     /// declares one, as for a `lazy`.
     pub defaults: Vec<Option<ParamDefault>>,
@@ -134,9 +135,10 @@ pub(super) struct CallsChecked {
 /// [`Resolution`] carries it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ForLowering {
-    /// Each call that gives a parameter its default, by its id, with each
-    /// such parameter and its default, in parameter order (see
-    /// [Calls](#calls)); only a program with one has entries.
+    /// Each call that gives a parameter its default, by its id, with each such
+    /// parameter and its default, in parameter order (see "Calls" under
+    /// [Functions](crate::check::functions#functions)); only a program with one
+    /// has entries.
     pub(super) call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
     /// Each call of a method, by its id, with its receiver, its callee's
     /// parameter 0 (see [Methods](crate::check::methods#methods)).
@@ -167,19 +169,20 @@ pub(super) struct ForLowering {
     /// in source order (see [Attributes](crate::check::attributes#attributes)).
     pub(super) fn_attributes: HashMap<FnId, Box<[Attribute]>>,
     /// Each record literal, a record block or `{}`, that the checker gave
-    /// fields their defaults, by its id, with each such field and its
-    /// default, in the order of
-    /// their names' text (see [Field defaults](#field-defaults)); only a
-    /// program with one has entries.
+    /// fields their defaults, by its id, with each such field and its default,
+    /// in the order of their names' text (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)); only a program with one
+    /// has entries.
     pub(super) record_fills: RecordFills,
 }
 
 /// The defaults of a function, for [`FnResolution::defaults`]: `constants`,
 /// each parameter's constant default, if it has one that checked, and
 /// `functions`, each parameter with a default function, in parameter order,
-/// with whether it checked, whose closures follow the function's
-/// `captures` own captures in its closure (see [Calls](#calls)). Empty if no
-/// parameter has a default.
+/// with whether it checked, whose closures follow the function's `captures` own
+/// captures in its closure (see "Calls" under
+/// [Functions](crate::check::functions#functions)). Empty if no parameter has a
+/// default.
 pub(super) fn merged_defaults(
     constants: Vec<Option<Constant>>,
     functions: &[(usize, bool)],
@@ -381,10 +384,11 @@ pub struct Resolution {
     /// starts and the name, cell and type of each field, nested records
     /// before the records that hold them (see [Imports](crate::check::imports#imports)).
     pub(super) imported_records: ImportedRecords,
-    /// For a file of a workspace, the record of each node of its view with
-    /// a leaf of the file under it, by its index among them ([`Mentions::views`](super::Mentions::views)):
-    /// stored at its point in the schedule, after its own children, if the
-    /// file reads it whole (see [Imports](crate::check::imports#imports)).
+    /// For a file of a workspace, the record of each node of its view with a
+    /// leaf of the file under it, by its index among them
+    /// ([`Mentions::views`](super::Mentions::views)): stored at its point in
+    /// the schedule, after its own children, if the file reads it whole (see
+    /// [Imports](crate::check::imports#imports)).
     pub(super) view_records: Vec<ViewRecord>,
     /// For a value file of a workspace that another file imports, the cell
     /// its result is stored in as its block ends; [`Slot::NONE`] otherwise.
@@ -515,10 +519,11 @@ impl Resolution {
         &self.arg_params[args.start()..args.start() + args.count()]
     }
 
-    /// The parameters that the call `id` gives their defaults, each with
-    /// its default, in parameter order: those it leaves unfilled that have
-    /// one, if its callee is known (see [Calls](#calls)); none for any
-    /// other call, and for an expression that is no call.
+    /// The parameters that the call `id` gives their defaults, each with its
+    /// default, in parameter order: those it leaves unfilled that have one, if
+    /// its callee is known (see "Calls" under
+    /// [Functions](crate::check::functions#functions)); none for any other
+    /// call, and for an expression that is no call.
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, ParamDefault)] {
         self.lowered
@@ -602,10 +607,11 @@ impl Resolution {
     }
 
     /// The fields that the record literal `block`, a record block or `{}`,
-    /// lacks and is given, each with its default, in the order of their
-    /// names' text: the defaulted fields of the record type it is written
-    /// where it is expected (see [Field defaults](#field-defaults)); none
-    /// for any other block, and for an expression that is no block.
+    /// lacks and is given, each with its default, in the order of their names'
+    /// text: the defaulted fields of the record type it is written where it is
+    /// expected (see "Field defaults" under
+    /// [Functions](crate::check::functions#functions)); none for any other
+    /// block, and for an expression that is no block.
     #[must_use]
     pub fn record_fills(&self, block: ExprId) -> &[(Name, Constant)] {
         self.lowered

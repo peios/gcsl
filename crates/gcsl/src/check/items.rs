@@ -311,19 +311,19 @@ impl Checker<'_> {
         )
     }
 
-    /// Applies the statement rule to `value`, an expression item that is
-    /// not its block's result, of type `ty` (see the module documentation).
-    /// A bare `await` is run for its effects, and its value discarded,
-    /// whatever it is. Otherwise a statement is a position expecting a
-    /// unit-like value (see [`TypeTable::is_unit_like`](crate::types::TypeTable::is_unit_like)): one that is
-    /// unit-like as it is needs nothing; one that is unit-like once awaited,
-    /// at the top as a `Future<{}>` is or deeply as a `List<Future<{}>>`
-    /// is, is awaited here, so that its effects are not lost, subject to
-    /// the purity rule, a parameter of this function being measured. A call
-    /// of a function that is not pure, outside a pure function, is run for
-    /// its effects, as a bare `await` is: it is awaited deeply, so that no
-    /// effect it defers is lost, and its value discarded, whatever it is.
-    /// Any other is an unused value.
+    /// Applies the statement rule to `value`, an expression item that is not
+    /// its block's result, of type `ty` (see the module documentation). A bare
+    /// `await` is run for its effects, and its value discarded, whatever it is.
+    /// Otherwise a statement is a position expecting a unit-like value (see
+    /// [`TypeTable::is_unit_like`](crate::types::TypeTable::is_unit_like)): one
+    /// that is unit-like as it is needs nothing; one that is unit-like once
+    /// awaited, at the top as a `Future<{}>` is or deeply as a
+    /// `List<Future<{}>>` is, is awaited here, so that its effects are not
+    /// lost, subject to the purity rule, a parameter of this function being
+    /// measured. A call of a function that is not pure, outside a pure
+    /// function, is run for its effects, as a bare `await` is: it is awaited
+    /// deeply, so that no effect it defers is lost, and its value discarded,
+    /// whatever it is. Any other is an unused value.
     pub(super) fn check_statement(&mut self, value: ExprId, ty: TyId) {
         if self.is_await(value) {
             self.settle(value, ty);

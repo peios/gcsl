@@ -2505,22 +2505,22 @@ impl Lowerer<'_> {
     }
 
     /// Lowers the def-type reference `id`, `DT PATH`, of `def` (see the
-    /// checker's "Def-types"), to the `MakeClosure` of a function of its
-    /// own, made here, past the tree's ([`FnId::lowered`]), which captures
-    /// the def-type and the definition, read where the reference is, and
-    /// whose body, run with its parameters, those of the def-type after its
-    /// definition's, sets its helper flag, so that the def-type is called
-    /// with the caller the closure is called with, and calls the def-type
-    /// with the definition's path, as written, the variant the reference
-    /// names, a constant tag, if the def-type's definitions are made with
-    /// one, the definition and its own parameters, in order: so a closure is made each time the reference
-    /// is evaluated. If the reference carries its definition's meta, the
-    /// function's meta is recorded as its capture of the definition's
-    /// ([`MetaAt::Capture`]). It is of kind `kind`, which can only be a
-    /// function's.
-    /// Lowers the `recover` expression `recover`, of kind `kind` (see the
-    /// checker's "Failure"): its body, and its fallback, after storing the
-    /// failure, if the fallback names it, in the slot the check gave it.
+    /// checker's "Def-types"), to the `MakeClosure` of a function of its own,
+    /// made here, past the tree's ([`FnId::lowered`]), which captures the
+    /// def-type and the definition, read where the reference is, and whose
+    /// body, run with its parameters, those of the def-type after its
+    /// definition's, sets its helper flag, so that the def-type is called with
+    /// the caller the closure is called with, and calls the def-type with the
+    /// definition's path, as written, the variant the reference names, a
+    /// constant tag, if the def-type's definitions are made with one, the
+    /// definition and its own parameters, in order: so a closure is made each
+    /// time the reference is evaluated. If the reference carries its
+    /// definition's meta, the function's meta is recorded as its capture of the
+    /// definition's ([`MetaAt::Capture`]). It is of kind `kind`, which can only
+    /// be a function's. Lowers the `recover` expression `recover`, of kind
+    /// `kind` (see the checker's "Failure"): its body, and its fallback, after
+    /// storing the failure, if the fallback names it, in the slot the check
+    /// gave it.
     fn lower_recover(
         &mut self,
         recover: RecoverId,
@@ -3382,12 +3382,12 @@ impl Lowerer<'_> {
         self.table.value_kind(ty)
     }
 
-    /// Lowers `constant`, a parameter's default or a field's (see the
-    /// checker's "Field defaults"), to nodes spanning `span`
-    /// that build it: an `IntConst`, `FloatConst`, `BoolConst` or
-    /// `StrConst`, a `Quantity` of an `IntConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
-    /// fields', in the order they are written, with the layout of their
-    /// names, shared as a record block's is, or `Empty` for `{}`.
+    /// Lowers `constant`, a parameter's default or a field's (see the checker's
+    /// "Field defaults"), to nodes spanning `span` that build it: an
+    /// `IntConst`, `FloatConst`, `BoolConst` or `StrConst`, a `Quantity` of an
+    /// `IntConst`, a `MakeList` of its elements' nodes, a `MakeRecord` of its
+    /// fields', in the order they are written, with the layout of their names,
+    /// shared as a record block's is, or `Empty` for `{}`.
     ///
     /// Recurses once per level of list and record nesting.
     fn lower_constant(&mut self, constant: &Constant, span: Span) -> IrId {

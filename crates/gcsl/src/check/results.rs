@@ -296,15 +296,17 @@ pub struct Place {
     pub workspace: Rc<str>,
 }
 
-/// A parameter's constant default, as its `= DEFAULT` is once checked
-/// against the parameter's type (see [Calls](#calls)), which a call that
-/// leaves the parameter unfilled is given, as [`ParamDefault::Constant`] in
-/// [`FnResolution::defaults`](super::FnResolution::defaults) and [`Resolution::call_defaults`]. It holds no id of a tree, since a call of a
+/// A parameter's constant default, as its `= DEFAULT` is once checked against
+/// the parameter's type (see "Calls" under
+/// [Functions](crate::check::functions#functions)), which a call that leaves
+/// the parameter unfilled is given, as [`ParamDefault::Constant`] in
+/// [`FnResolution::defaults`](super::FnResolution::defaults) and
+/// [`Resolution::call_defaults`]. It holds no id of a tree, since a call of a
 /// `def` of another file, or of a function of an earlier session input, is
-/// given it where that tree is not. A field's default of a record type is
-/// one too, held in the type ([`crate::types::RecordTy::defaults`]), which
-/// a record literal that lacks the field is given, in
-/// [`Resolution::record_fills`] (see [Field defaults](#field-defaults)).
+/// given it where that tree is not. A field's default of a record type is one
+/// too, held in the type ([`crate::types::RecordTy::defaults`]), which a record
+/// literal that lacks the field is given, in [`Resolution::record_fills`] (see
+/// "Field defaults" under [Functions](crate::check::functions#functions)).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Constant {
     /// An `Int`.
@@ -328,14 +330,16 @@ pub enum Constant {
 }
 
 /// What a call that leaves a parameter unfilled gives it, its parameter's
-/// default once checked (see [Calls](#calls)), in [`FnResolution::defaults`](super::FnResolution::defaults)
-/// and [`Resolution::call_defaults`]: a constant, copied in where the call
-/// is, or the default function of a default that is no constant, which the
-/// call calls on its side, with the parameters before it. Neither holds an
-/// id of a tree, since a call of a `def` of another file, or of a function
-/// of an earlier session input, is given it where that tree is not: the
-/// default function is found in the callee's closure, by the index among its
-/// captures that the closure keeps it at.
+/// default once checked (see "Calls" under
+/// [Functions](crate::check::functions#functions)), in
+/// [`FnResolution::defaults`](super::FnResolution::defaults) and
+/// [`Resolution::call_defaults`]: a constant, copied in where the call is, or
+/// the default function of a default that is no constant, which the call calls
+/// on its side, with the parameters before it. Neither holds an id of a tree,
+/// since a call of a `def` of another file, or of a function of an earlier
+/// session input, is given it where that tree is not: the default function is
+/// found in the callee's closure, by the index among its captures that the
+/// closure keeps it at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ParamDefault {
     /// A constant default.
@@ -362,11 +366,11 @@ pub struct VariantTag {
     pub shown: Box<str>,
 }
 
-/// One attribute of a function item, resolved (see [Attributes](crate::check::attributes#attributes)):
-/// what a host knows it by, and its arguments, every field of its record
-/// type by its name, in the type's order, each the constant given or its
-/// default. A constant record among them names its fields by the program's
-/// names, as every [`Constant`] does.
+/// One attribute of a function item, resolved (see
+/// [Attributes](crate::check::attributes#attributes)): what a host knows it by,
+/// and its arguments, every field of its record type by its name, in the type's
+/// order, each the constant given or its default. A constant record among them
+/// names its fields by the program's names, as every [`Constant`] does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
     /// What a host knows it by.

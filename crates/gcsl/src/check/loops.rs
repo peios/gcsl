@@ -12,21 +12,21 @@
 //! iterable. Its elements are not measured.
 //!
 //! The variable is declared in a scope of its own, which holds the guard and
-//! the body and nothing else, as a block's scope holds its items: it takes
-//! the next free slot of the enclosing function's frame (see
-//! [`Resolution::for_slot`](super::Resolution::for_slot)), which the `for` leaves when it ends, and has
-//! the element type as it is, which may be the either shape or a future. It
-//! shadows as a `let` does, and since the body is a block of its own, `:=`
-//! of it there is "declared in an enclosing block". A `for` is not a
-//! function: the guard and the body are checked in the enclosing function,
-//! whose purity governs their awaits and calls and whose captures they use,
-//! so a closure or a `lazy` made in the body captures the variable as it
-//! would any variable of the enclosing function, by value, which is its
+//! the body and nothing else, as a block's scope holds its items: it takes the
+//! next free slot of the enclosing function's frame (see
+//! [`Resolution::for_slot`](super::Resolution::for_slot)), which the `for`
+//! leaves when it ends, and has the element type as it is, which may be the
+//! either shape or a future. It shadows as a `let` does, and since the body is
+//! a block of its own, `:=` of it there is "declared in an enclosing block". A
+//! `for` is not a function: the guard and the body are checked in the enclosing
+//! function, whose purity governs their awaits and calls and whose captures
+//! they use, so a closure or a `lazy` made in the body captures the variable as
+//! it would any variable of the enclosing function, by value, which is its
 //! value in that iteration. The guard is checked as an `if`'s condition is:
-//! measured, and `Bool`. Being blocks of the enclosing function, the guard
-//! and the body may rebind its mutable variables (see [Mutable
-//! variables](crate::check::mutation#mutable-variables)), and the guard for each element reads
-//! what the body wrote for the elements before it.
+//! measured, and `Bool`. Being blocks of the enclosing function, the guard and
+//! the body may rebind its mutable variables (see [Mutable
+//! variables](crate::check::mutation#mutable-variables)), and the guard for
+//! each element reads what the body wrote for the elements before it.
 //!
 //! Every loop, of any form (see [Loops](#loops)), is the list of what its
 //! iterations contribute, `List<E>`, `E` being its *element type*
@@ -104,19 +104,19 @@
 //!
 //! # `break` and `continue`
 //!
-//! `break`, `continue`, each with an optional value and label, are items of
-//! a block, never expressions (see [`crate::parser`]). A block whose last
-//! item is one is of type `Never`. Each is for a *target loop*
-//! (`Checker::jump_target`, recorded for lowering in
-//! [`Resolution::jump_target`](super::Resolution::jump_target)): without a label, the innermost loop of the
-//! function being checked whose *body* holds it, a loop's iterable, guard,
-//! condition and header items being outside its body; with one, the loop of
-//! that label whose body holds it. To find it, the checker keeps the loops
-//! whose bodies are being checked on a stack (`LoopFrame`), with the
-//! labelled blocks whose items are (see [Labels](#labels)), each with the
-//! number of functions being checked when its body began, so that a loop
-//! outside the innermost function or `lazy` is not a target. A `break` for
-//! a loop is recorded on its frame, for [Never-ending
+//! `break`, `continue`, each with an optional value and label, are items of a
+//! block, never expressions (see [`crate::parser`]). A block whose last item is
+//! one is of type `Never`. Each is for a *target loop* (`Checker::jump_target`,
+//! recorded for lowering in
+//! [`Resolution::jump_target`](super::Resolution::jump_target)): without a
+//! label, the innermost loop of the function being checked whose *body* holds
+//! it, a loop's iterable, guard, condition and header items being outside its
+//! body; with one, the loop of that label whose body holds it. To find it, the
+//! checker keeps the loops whose bodies are being checked on a stack
+//! (`LoopFrame`), with the labelled blocks whose items are (see
+//! [Labels](#labels)), each with the number of functions being checked when its
+//! body began, so that a loop outside the innermost function or `lazy` is not a
+//! target. A `break` for a loop is recorded on its frame, for [Never-ending
 //! loops](#never-ending-loops). Errors, each at the keyword and its label:
 //!
 //! - no loop holds it: "`break` outside a loop" (or "`continue`");
@@ -273,18 +273,18 @@
 //!
 //! # Never-ending loops
 //!
-//! A `for BLOCK` loop, written with no condition (not `for true`, nor a
-//! `do` loop), that no `break` is for, its own or a labelled one from a
-//! loop inside it, can never end normally: its ordinary type is `Never`,
-//! not a list, whatever its body's type, and it builds no list
-//! ([`Resolution::loop_of`](super::Resolution::loop_of)). So `let v: Int = for'spin { ... return'spin
-//! r }` is an `Int` with no union and no warning, a bare `for { ... }`
-//! statement with no `break` is `Never`, and what follows it in its block
-//! gets the unreachable warning; a function whose only result site is
-//! such a loop has a body of type `Never`, from which its result is
-//! inferred (a present `T`, honestly: it never returns a future). Its body
-//! and its `continue`s still make an element type, as any loop's, with
-//! the same warning, though no list is ever built.
+//! A `for BLOCK` loop, written with no condition (not `for true`, nor a `do`
+//! loop), that no `break` is for, its own or a labelled one from a loop inside
+//! it, can never end normally: its ordinary type is `Never`, not a list,
+//! whatever its body's type, and it builds no list
+//! ([`Resolution::loop_of`](super::Resolution::loop_of)). So `let v: Int =
+//! for'spin { ... return'spin r }` is an `Int` with no union and no warning, a
+//! bare `for { ... }` statement with no `break` is `Never`, and what follows it
+//! in its block gets the unreachable warning; a function whose only result site
+//! is such a loop has a body of type `Never`, from which its result is inferred
+//! (a present `T`, honestly: it never returns a future). Its body and its
+//! `continue`s still make an element type, as any loop's, with the same
+//! warning, though no list is ever built.
 
 use crate::ast::{ExprId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label, LabelId};
 use crate::diagnostic::{Diagnostic, InternalError};
