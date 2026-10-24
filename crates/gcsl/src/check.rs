@@ -18874,6 +18874,12 @@ impl<'a> Checker<'a> {
                 "names may contain `-`, so `x-1` is one name; write `x - 1` for subtraction",
             );
         }
+        // A method's name is no variable (see [Methods](#methods)).
+        if self.sees_method(name) {
+            error = error.with_note(format!(
+                "`{text}` is a method: call it on a value, as in `x.{text}()`"
+            ));
+        }
         // In a default, its own parameter or a later one.
         if let Some(&(_, written)) = self
             .defaults_checked

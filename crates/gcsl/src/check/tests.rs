@@ -14361,3 +14361,17 @@ fn method_call_errors() {
         "{found:?}"
     );
 }
+
+#[test]
+fn a_method_s_name_alone_notes_how_to_call_it() {
+    let (_, _, output) = check_text("fn (x: Int) twice(): Int { x }\ntwice");
+    let found = output.unwrap_err();
+    let error = found
+        .iter()
+        .find(|d| d.message == "undefined variable `twice`")
+        .unwrap();
+    assert_eq!(
+        error.notes,
+        ["`twice` is a method: call it on a value, as in `x.twice()`"]
+    );
+}
