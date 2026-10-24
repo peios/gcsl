@@ -167,6 +167,20 @@ Plain GCSL runs `curl` to download and `sha256sum` to check, so both must
 be installed. A build tool such as pekit keeps fetched files by their
 digests, and downloads each one only once.
 
+A fetched file is data, never executable. To run a downloaded program,
+copy it and make the copy executable with `fs.set_executable`:
+
+```text
+import fs
+let tool = file("busybox")
+fs.copy(fetched.path, tool.path)
+fs.set_executable(tool.path, true)
+```
+
+`fs.set_executable` refuses a file with several hard links, since they
+share one mode: changing it through one name would change the file
+everywhere else too. That's why the example copies first.
+
 ## Unpacking archives
 
 The `archive` module's `unpack(archive, strip)` makes a directory of what

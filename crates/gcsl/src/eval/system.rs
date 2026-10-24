@@ -704,21 +704,25 @@ pub(super) fn copy_lines(stream: impl Read) -> io::Result<Vec<u8>> {
 
 /// Applies `builtin`, one of the file system's built-in functions but
 /// `fs_temp_dir`, for the call `node`, to the path `p` and, for `fs_copy`, the
-/// path `to` it copies to (see [The built-in
+/// path `to` it copies to, or for `fs_set_executable` the flag (see [The built-in
 /// functions](crate::eval::calls#the-built-in-functions)): `fs_exists` whether
 /// something is at `p`, symbolic links followed ([`Path::try_exists`]);
 /// `fs_read` the contents of the file at `p`, which must be UTF-8; `fs_mkdir`
 /// makes the directory `p` and any missing parent ([`fs::create_dir_all`]),
-/// `{}`; `fs_copy` copies the file `p` to `to` ([`fs::copy`]), `{}`. Every path
+/// `{}`; `fs_copy` copies the file `p` to `to` ([`fs::copy`]), `{}`;
+/// `fs_set_executable` makes the file `p` executable or not, refusing one of
+/// several links (see [`set_executable`]), `{}`. Every path
 /// must be absolute, `p` first, and each is used as it is given, never
 /// normalised and never against the working directory: a relative one is
 /// "`fs.read` needs an absolute path, found `x.txt`", before anything is
 /// touched. A failure of the operation is "`fs.read` could not read `/a`:
 /// REASON", the OS's own text, as "No such file or directory (os error 2)",
-/// "could not check", "could not create" or "could not copy `/a` to `/b`" for
+/// "could not check", "could not create", "could not change" or "could not
+/// copy `/a` to `/b`" for
 /// the others, and a file that is not UTF-8 "`fs.read`: `/a` is not UTF-8
 /// text". Every error is at the call, and names the built-in as the member of
 /// `fs` it is, whatever name it was called by. A `to` that is not a string, or
+/// a flag that is not a `Bool`, or
 /// any other built-in, is an internal error, which the checker rules out.
 pub(super) fn file_system(
     builtin: Builtin,
@@ -730,6 +734,13 @@ pub(super) fn file_system(
         return mistyped(node, "a built-in function that is not the file system's");
     };
     let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
+    let executable = match (builtin, to) {
+        (Builtin::FsSetExecutable, Some(&Value::Bool(executable))) => Some(executable),
+        (Builtin::FsSetExecutable, _) => {
+            return mistyped(node, "a call of `fs.set_executable` with no flag");
+        }
+        _ => None,
+    };
     let to = match (builtin, to) {
         (Builtin::FsCopy, Some(Value::Str(to))) => Some(&**to),
         (Builtin::FsCopy, _) => {
@@ -771,6 +782,10 @@ pub(super) fn file_system(
             Ok(()) => Ok(Value::Empty),
             Err(error) => fail(format!("`{name}` could not create `{p_shown}`: {error}")),
         },
+        (Builtin::FsSetExecutable, None) => match set_executable(&p, executable == Some(true)) {
+            Ok(()) => Ok(Value::Empty),
+            Err(reason) => fail(format!("`{name}` could not change `{p_shown}`: {reason}")),
+        },
         (Builtin::FsCopy, Some((to_shown, to))) => match fs::copy(&p, to) {
             Ok(_) => Ok(Value::Empty),
             Err(error) => fail(format!(
@@ -794,6 +809,31 @@ pub(super) fn file_system(
 /// directory of `p` missing or `p` a directory say, is "`fs.write` could
 /// not write `/a/b`: REASON", the OS's own text, at the call, leaving no
 /// temporary file behind.
+/// Makes the file at `p` executable, by whoever can read it, if
+/// `executable`, else by no one: refused for a file of several links, whose
+/// mode is every link's, so that changing it through one name never changes
+/// a file elsewhere, such as a host's stored copy.
+fn set_executable(p: &Path, executable: bool) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::metadata(p).map_err(|error| error.to_string())?;
+    if !meta.is_file() {
+        return Err("it is not a file".to_owned());
+    }
+    if meta.nlink() > 1 {
+        return Err(format!(
+            "it has {} links, which share its mode; copy it first",
+            meta.nlink()
+        ));
+    }
+    let mode = meta.permissions().mode();
+    let mode = if executable {
+        mode | ((mode & 0o444) >> 2)
+    } else {
+        mode & !0o111
+    };
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).map_err(|error| error.to_string())
+}
+
 pub(super) fn write_file(
     p: &str,
     contents: &str,

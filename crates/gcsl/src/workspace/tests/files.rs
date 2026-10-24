@@ -335,6 +335,59 @@ fn compose_places_each_entry_at_a_computed_path() {
 }
 
 #[test]
+fn set_executable_changes_a_file_s_mode_but_never_a_shared_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_tree("executable");
+    let mode = |path: &str| {
+        std::fs::metadata(format!("{root}/{path}"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    std::fs::set_permissions(
+        format!("{root}/a.txt"),
+        std::fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    // Executable by whoever can read it, and then by no one.
+    let text = format!("import fs\n= fs.set_executable(\"{root}/a.txt\", true)");
+    lone(&text).unwrap();
+    assert_eq!(mode("a.txt"), 0o750);
+    let text = format!("import fs\n= fs.set_executable(\"{root}/a.txt\", false)");
+    lone(&text).unwrap();
+    assert_eq!(mode("a.txt"), 0o640);
+    // A file of two links is refused, and changes neither.
+    std::fs::hard_link(format!("{root}/a.txt"), format!("{root}/twin.txt")).unwrap();
+    let error = lone_error(&format!(
+        "import fs\nx = fs.set_executable(\"{root}/twin.txt\", true)"
+    ));
+    assert_eq!(
+        error.message,
+        format!(
+            "`fs.set_executable` could not change `{root}/twin.txt`: it has 2 links, which \
+             share its mode; copy it first"
+        )
+    );
+    assert_eq!(mode("a.txt"), 0o640);
+    // A directory is no file; a relative path is refused before anything.
+    let error = lone_error(&format!(
+        "import fs\nx = fs.set_executable(\"{root}/sub\", true)"
+    ));
+    assert!(
+        error.message.ends_with("it is not a file"),
+        "{}",
+        error.message
+    );
+    let error = lone_error("import fs\nx = fs.set_executable(\"a.txt\", true)");
+    assert_eq!(
+        error.message,
+        "`fs.set_executable` needs an absolute path, found `a.txt`"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
 fn a_value_s_dirs_are_found_apart_from_its_files() {
     let source = SourceFile::new(
         "lone.gcsl",

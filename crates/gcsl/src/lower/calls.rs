@@ -61,6 +61,7 @@ impl Lowerer<'_> {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
+            | Builtin::FsSetExecutable
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions

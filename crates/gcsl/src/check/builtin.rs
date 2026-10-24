@@ -72,6 +72,10 @@ pub enum Builtin {
     /// `fs_copy(from: String, to: String) -> {}`, `fs.copy`: copies the
     /// file at the absolute path `from` to the absolute path `to`. Impure.
     FsCopy,
+    /// `fs_set_executable(p: String, executable: Bool) -> {}`: makes the file
+    /// at the absolute path `p` executable, or not, the `fs` module's
+    /// `set_executable`. Impure.
+    FsSetExecutable,
     /// `fs_temp_dir() -> String`, `fs.temp_dir`: makes a new empty
     /// directory, removed with everything in it when the run that made it
     /// is dropped, and gives its absolute path. Impure.
@@ -226,7 +230,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 51] = [
+    pub const ALL: [Builtin; 52] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -246,6 +250,7 @@ impl Builtin {
         Builtin::FsRead,
         Builtin::FsMkdir,
         Builtin::FsCopy,
+        Builtin::FsSetExecutable,
         Builtin::FsTempDir,
         Builtin::FsWrite,
         Builtin::SortVersions,
@@ -325,6 +330,7 @@ impl Builtin {
             Builtin::FsRead => "fs_read",
             Builtin::FsMkdir => "fs_mkdir",
             Builtin::FsCopy => "fs_copy",
+            Builtin::FsSetExecutable => "fs_set_executable",
             Builtin::FsTempDir => "fs_temp_dir",
             Builtin::FsWrite => "fs_write",
             Builtin::SortVersions => "sort_versions",
@@ -371,6 +377,7 @@ impl Builtin {
             Builtin::FsRead => Some("fs.read"),
             Builtin::FsMkdir => Some("fs.mkdir"),
             Builtin::FsCopy => Some("fs.copy"),
+            Builtin::FsSetExecutable => Some("fs.set_executable"),
             Builtin::FsTempDir => Some("fs.temp_dir"),
             Builtin::FsWrite => Some("fs.write"),
             Builtin::FsComposeDir => Some("fs.compose_dir"),
@@ -491,6 +498,7 @@ impl Builtin {
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
+            Builtin::FsSetExecutable => &["p", "executable"],
             Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs => &[],
             Builtin::FsWrite => &["p", "contents"],
             Builtin::SortVersions => &["vs"],
@@ -518,6 +526,7 @@ impl Builtin {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
+            | Builtin::FsSetExecutable
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::File
@@ -589,6 +598,7 @@ impl Builtin {
             | Builtin::FsRead
             | Builtin::FsMkdir
             | Builtin::FsCopy
+            | Builtin::FsSetExecutable
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions
@@ -658,6 +668,7 @@ impl Builtin {
             Builtin::FsRead => "fn(p: String) -> String",
             Builtin::FsMkdir => "fn(p: String) -> {}",
             Builtin::FsCopy => "fn(from: String, to: String) -> {}",
+            Builtin::FsSetExecutable => "fn(p: String, executable: Bool) -> {}",
             Builtin::FsTempDir => "fn() -> String",
             Builtin::FsWrite => "fn(p: String, contents: String) -> {}",
             Builtin::SortVersions => "fn(vs: List<String>): List<String>",
@@ -747,6 +758,7 @@ impl Builtin {
             Builtin::FsExists => ([TyId::STRING, UNUSED], TyId::BOOL),
             Builtin::FsMkdir => ([TyId::STRING, UNUSED], TyId::EMPTY),
             Builtin::FsCopy | Builtin::FsWrite => ([TyId::STRING, TyId::STRING], TyId::EMPTY),
+            Builtin::FsSetExecutable => ([TyId::STRING, TyId::BOOL], TyId::EMPTY),
             Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs => {
                 ([UNUSED, UNUSED], TyId::STRING)
             }

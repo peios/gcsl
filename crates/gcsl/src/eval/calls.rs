@@ -670,7 +670,11 @@ impl Evaluator<'_> {
                 self.file_builtin(builtin, first, second, node)
             }
             (
-                Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
+                Builtin::FsExists
+                | Builtin::FsRead
+                | Builtin::FsMkdir
+                | Builtin::FsCopy
+                | Builtin::FsSetExecutable,
                 Some((Value::Str(p), _)),
                 to,
             ) => file_system(builtin, (&p, to.as_ref()), self.shared.effects, node),

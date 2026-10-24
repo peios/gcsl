@@ -16,6 +16,10 @@
 #   `mkdir -p`; one already there is fine;
 # - `copy(from, to)`: copies the file `from`, its contents and permissions,
 #   to `to`, whose directory must exist, replacing a file there;
+# - `set_executable(p, executable)`: makes the file `p` executable by
+#   whoever can read it, or by no one if `executable` is false, as a
+#   downloaded program needs. A file of several hard links shares its mode
+#   with every other, so changing one is an error: copy it first;
 # - `temp_dir()`: makes a new empty directory, mode 0700, and returns its
 #   absolute path. Every directory it makes is removed, with everything in
 #   it, when the run is done, whether it succeeded or failed (but not if
@@ -49,6 +53,7 @@ exists = builtins.fs_exists
 read = builtins.fs_read
 mkdir = builtins.fs_mkdir
 copy = builtins.fs_copy
+set_executable = builtins.fs_set_executable
 temp_dir = builtins.fs_temp_dir
 write = builtins.fs_write
 compose_dir = builtins.fs_compose_dir
