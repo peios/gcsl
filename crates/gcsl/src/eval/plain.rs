@@ -16,6 +16,17 @@
 //! value made a value again ([`from_plain`]) interns its names in the
 //! workspace's table, so that it is the value it was made of: equal to it,
 //! by `===`.
+//!
+//! # Keys of functions
+//!
+//! A host keys a step by what it reads, and what a step's function captures
+//! and the context it runs in can hold functions: the toolchains a workspace
+//! registers are its definitions. So for a key alone ([`to_key_plain`]), a
+//! function is [`Plain::Closure`]: the input of its code's file, its number
+//! among that code's functions, and what it captures, keyed so too, which a
+//! host keys by that file's name and contents. A built-in, or a future that
+//! has not run, is still no data. A closure's key is never a step's argument
+//! or result, and is never made a value again.
 
 use std::rc::Rc;
 
@@ -85,6 +96,16 @@ pub enum Plain {
         /// Its commands' environment.
         env: Vec<(String, String)>,
     },
+    /// A function, by its code, for a host's key alone (see [Keys of
+    /// functions](#keys-of-functions)): never a step's argument or result.
+    Closure {
+        /// The input of the file whose code it is.
+        input: u32,
+        /// Its number among that code's functions.
+        function: u32,
+        /// What it captures, as keys.
+        captures: Vec<Plain>,
+    },
 }
 
 impl Plain {
@@ -108,6 +129,7 @@ impl Plain {
                     ..
                 } => pending.push(payload),
                 Plain::Secret { value, .. } => pending.push(value),
+                Plain::Closure { captures, .. } => pending.extend(captures.iter().rev()),
                 _ => {}
             }
         }
@@ -123,6 +145,24 @@ impl Plain {
 /// What it holds that is no data: "a step's result must be plain data: it
 /// holds a function".
 pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
+    plain_of(value, names, false)
+}
+
+/// `value` as plain data for a host's key (see [Keys of
+/// functions](#keys-of-functions)): as [`to_plain`] makes it, but each
+/// function by its code and what it captures.
+///
+/// # Errors
+///
+/// What it holds that is no data and no function, a future that has not run
+/// say, as [`to_plain`] says.
+pub fn to_key_plain(value: &Value, names: &Names) -> Result<Plain, String> {
+    plain_of(value, names, true)
+}
+
+/// `value` as plain data, its functions by their code if `closures`, else
+/// refused (see [`to_plain`], [`to_key_plain`]).
+fn plain_of(value: &Value, names: &Names, closures: bool) -> Result<Plain, String> {
     let refused = |what: &str| {
         Err(format!(
             "a step's result must be plain data: it holds {what}"
@@ -138,25 +178,25 @@ pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
         Value::Record(record) => {
             let mut fields = Vec::with_capacity(record.values.len());
             for (name, value) in record.layout.texts.iter().zip(record.values.iter()) {
-                fields.push((name.to_string(), to_plain(value, names)?));
+                fields.push((name.to_string(), plain_of(value, names, closures)?));
             }
             Plain::Record(fields)
         }
         Value::List(list) => Plain::List(
             list.values()
                 .iter()
-                .map(|value| to_plain(value, names))
+                .map(|value| plain_of(value, names, closures))
                 .collect::<Result<_, _>>()?,
         ),
         Value::Tag(tag) => plain_variant(tag, None, names),
         Value::Variant(variant) => {
-            let payload = to_plain(&variant.payload, names)?;
+            let payload = plain_of(&variant.payload, names, closures)?;
             plain_variant(&variant.tag, Some(payload), names)
         }
         Value::Secret(secret) => Plain::Secret {
             identity: secret.identity.to_string(),
             revealed: secret.revealed,
-            value: Box::new(to_plain(&secret.value, names)?),
+            value: Box::new(plain_of(&secret.value, names, closures)?),
         },
         Value::File(file) => Plain::File {
             path: file.path.to_string(),
@@ -167,11 +207,20 @@ pub fn to_plain(value: &Value, names: &Names) -> Result<Plain, String> {
             identity: dir.identity.as_deref().map(str::to_owned),
         },
         Value::Future(future) => match future.value() {
-            Some(done) => to_plain(&done, names)?,
+            Some(done) => plain_of(&done, names, closures)?,
             None if future.host_node().is_some() => {
                 return refused("a step's result not given yet");
             }
             None => return refused("a future that has not run"),
+        },
+        Value::Fn(closure) if closures => Plain::Closure {
+            input: closure.code.input(),
+            function: u32::try_from(closure.function.index()).unwrap_or(u32::MAX),
+            captures: closure
+                .captures
+                .iter()
+                .map(|value| plain_of(value, names, closures))
+                .collect::<Result<_, _>>()?,
         },
         Value::Fn(_) | Value::Builtin(_) => return refused("a function"),
         Value::Sandbox(sandbox) => Plain::Sandbox {
@@ -198,7 +247,8 @@ fn plain_variant(tag: &Tag, payload: Option<Plain>, names: &Names) -> Plain {
 }
 
 /// The value `plain` is the plain form of, its names interned in `names`
-/// (see [Plain values](#plain-values)).
+/// (see [Plain values](#plain-values)): `{}` for a closure's key, which is
+/// no value's plain form.
 pub fn from_plain(plain: &Plain, names: &mut Names) -> Value {
     match plain {
         Plain::Int(n) => Value::Int(*n),
@@ -206,7 +256,9 @@ pub fn from_plain(plain: &Plain, names: &mut Names) -> Value {
         Plain::Bool(b) => Value::Bool(*b),
         Plain::Str(s) => Value::Str(Rc::from(s.as_str())),
         Plain::Quantity(quantity, amount) => Value::Quantity(*quantity, *amount),
-        Plain::Empty => Value::Empty,
+        // A closure's is a key's alone, never a step's argument or result,
+        // so never made a value again.
+        Plain::Empty | Plain::Closure { .. } => Value::Empty,
         Plain::Record(fields) if fields.is_empty() => Value::Empty,
         Plain::Record(fields) => {
             let layout = Layout {

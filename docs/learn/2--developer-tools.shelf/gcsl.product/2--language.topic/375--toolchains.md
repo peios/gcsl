@@ -14,7 +14,7 @@ toolchains your workspace registers.
 import toolchain
 import Toolchain from toolchain
 
-def compile(src: File, cchain = toolchain.get(Toolchain::C)) -> File {
+def compile(src: File, cchain: toolchain.CToolchain = toolchain.get(Toolchain::C)) -> File {
     cchain.cc.exec("-c", src.path, "-o", "out.o")
     = file("out.o")
 }
@@ -29,7 +29,8 @@ other input.
 ## Kinds of toolchain
 
 Every kind is a variant of the extensible enum `Toolchain`, whose layout
-holds only files and directories. `Toolchain::C` has:
+holds only files and directories. `Toolchain::C`'s layout is a
+`CToolchain`:
 
 | Field | What it is |
 | --- | --- |

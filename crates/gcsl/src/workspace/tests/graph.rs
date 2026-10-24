@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::eval::graph::{Graph, GraphHost, NodeId, NodeKind, NodeState};
+use crate::eval::plain::Plain;
 use crate::workspace::Progress;
 
 /// A deferring attribute, and two steps that use it.
@@ -737,4 +738,36 @@ fn a_root_context_is_set_from_a_field_its_target_never_reads() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_step_s_context_of_functions_is_keyed_by_their_code() {
+    let (mut workspace, file) = lone_workspace(
+        "context helpers: List<fn(): Int> = []\n\
+         fn one(): Int { 1 }\n\
+         = compile(\"a\") with { helpers = [one] }",
+    );
+    let mut graph = Graph::new();
+    workspace.run_graph(file, &mut graph, every()).unwrap();
+    let inputs = workspace.step_inputs(&graph, NodeId::of(0)).unwrap();
+    let helpers = inputs
+        .context
+        .iter()
+        .find(|(key, _)| key.starts_with("<context helpers@"))
+        .map(|(_, value)| value.clone());
+    let Some(Plain::List(items)) = helpers else {
+        panic!("{:?}", inputs.context);
+    };
+    let [
+        Plain::Closure {
+            input, captures, ..
+        },
+    ] = &items[..]
+    else {
+        panic!("{items:?}");
+    };
+    assert_eq!(*input, file);
+    assert!(captures.is_empty());
+    // Its argument is still data alone.
+    assert_eq!(inputs.args, [Plain::Str("a".to_owned())]);
 }

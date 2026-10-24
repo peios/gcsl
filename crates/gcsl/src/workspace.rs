@@ -244,7 +244,7 @@ use crate::check::ViewRecord;
 use crate::check::{Attribute, Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::{Diagnostic, InternalError, Mark};
 use crate::eval::graph::{Graph, GraphHost, GraphRun, NodeId, NodeKind, run_node};
-use crate::eval::plain::{Plain, from_plain, to_plain};
+use crate::eval::plain::{Plain, from_plain, to_key_plain, to_plain};
 use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
@@ -734,8 +734,10 @@ impl Workspace {
 
     /// What a host needs of the node `id` of `graph` to key, stage and run
     /// it as a step, once its data edges are given (see [Graph
-    /// mode](crate::eval::graph#graph-mode)): its arguments, its callee's
-    /// captures and its context as plain data, its callee's attributes, and
+    /// mode](crate::eval::graph#graph-mode)): its arguments as plain data,
+    /// its callee's captures and its context as keys, functions by their code
+    /// ([Keys of functions](crate::eval::plain#keys-of-functions)), its
+    /// callee's attributes, and
     /// the files whose sources make its code, by number, every file its
     /// callee's file needs and that file, standard ones among them; none for
     /// an effect, a built-in's.
@@ -749,16 +751,22 @@ impl Workspace {
         let plain_all = |values: &[Value]| -> Result<Vec<Plain>, String> {
             values.iter().map(|value| to_plain(value, names)).collect()
         };
+        // What it reads, functions among them, which are keyed by their code.
         let context = node
             .context()
             .iter()
-            .map(|(key, value)| Ok((names.get(*key).to_owned(), to_plain(value, names)?)))
+            .map(|(key, value)| Ok((names.get(*key).to_owned(), to_key_plain(value, names)?)))
             .collect::<Result<Vec<_>, String>>()?;
         let (captures, attributes, code_files) = match node.closure() {
             Some(closure) => {
                 let file = closure.code.input();
+                let captures = closure
+                    .captures
+                    .iter()
+                    .map(|value| to_key_plain(value, names))
+                    .collect::<Result<Vec<_>, String>>()?;
                 (
-                    plain_all(&closure.captures)?,
+                    captures,
                     closure.attributes().to_vec(),
                     self.scan.needed(file),
                 )

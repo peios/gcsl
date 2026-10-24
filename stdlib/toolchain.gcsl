@@ -8,7 +8,7 @@
 # - `Toolchain`: every kind of toolchain is a variant of it, whose layout
 #   holds only files and directories, so a toolchain is plain data that can
 #   be given to a step. A kind is one line, `enum Toolchain::C<{...}>`.
-# - `Toolchain::C`: a C toolchain: `root`, its whole install, which its
+# - `Toolchain::C`: a C toolchain, a `CToolchain`: `root`, its whole install, which its
 #   tools need beside them; `runtime`, a root its tools run on, `/` for the
 #   host's; `cc`, `ar` and `ld`; and `sysroot`, the headers and libraries it
 #   builds against.
@@ -30,7 +30,9 @@ import builtins
 
 enum Toolchain extensible<{*: File | Dir}>
 
-enum Toolchain::C<{root: Dir, runtime: Dir, cc: File, ar: File, ld: File, sysroot: Dir}>
+type CToolchain = {root: Dir, runtime: Dir, cc: File, ar: File, ld: File, sysroot: Dir}
+
+enum Toolchain::C<CToolchain>
 
 type ToolchainDef<T> = {host_platform: Partial<Platform>, platform: Partial<Platform>, provides: T}
 
