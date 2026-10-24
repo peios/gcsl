@@ -382,6 +382,21 @@ def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
 #[attribute] type scratch = {}
 #[def_type] def build<T>(name: String, f: fn() -> T) -> T { f() }
 
+# Packages. A `package` definition, `def package dev.example.greet() {
+# version = "1.0-1"; files = {"bin/greet" = build app()} }`, is a package of
+# any format: its name, the definition's path; its version; and its files,
+# each at its path under `/usr`, as `fs.compose_dir` places them, a
+# directory's tree under its path, a file at it, and a list's files under it
+# by their names. A packager library, such as gcslib's `ppk`, packs one.
+type PackageDef = {version: String, files: {*: Dir | File | List<File>}}
+type Package = {name: String, version: String, files: {*: Dir | File | List<File>}}
+#[def_type] def package(name: String, f: fn() -> PackageDef) -> Package {
+    let made = f()
+    name = name
+    version = made.version
+    files = made.files
+}
+
 # Platforms: an architecture and an operating system, as Rust names them.
 # `^host_platform` is where steps run: in plain GCSL this machine; a build
 # tool sets it to where it runs them. `^platform` is what is being built

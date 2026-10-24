@@ -117,6 +117,22 @@ The prelude's `build` is a definition type of this kind,
 `def build hello() { ... }` with no import, and give whatever it builds.
 A workspace that declares its own `build` uses its own.
 
+The prelude's `package` is one too, for packages of any format. Its body
+gives a version and files, each at its path under `/usr`, placed as
+`fs.compose_dir` places them, and the definition's path is the package's
+name:
+
+```text
+def package dev.example.greet() {
+    version = "1.0-1"
+    files = {"bin/greet" = build app()}
+}
+```
+
+`package dev.example.greet()` is then a `Package` record of the name, the
+version, and the files, which a packager library, such as gcslib's `ppk`,
+packs.
+
 ## Metadata
 
 Function types can carry metadata with `META:`, `META->`, or `META->>`.
