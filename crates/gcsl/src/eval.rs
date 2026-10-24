@@ -701,6 +701,34 @@
 //!   awaited by a build driver elsewhere calls `commit` with `test.gcsl`'s
 //!   directory.
 //!
+//! # Context
+//!
+//! The run's *current context* (see the checker's "Context") is a chain of
+//! frames (`ContextFrame`), innermost first, `None` at the
+//! root, kept where every frame of the run shares it, so a call inherits
+//! its caller's and costs nothing for it. A `with` evaluates its bindings'
+//! values in the current context, then its body in a new frame binding
+//! them, each by its declaration's key, over the current one, which it
+//! restores after, whatever the body does. A frame has an identity, new for
+//! each `with` evaluated. A future captures the current context as it is
+//! made, and its body runs with that context, whoever awaits it.
+//!
+//! A read (`Evaluator::context_read`) takes the nearest frame's binding of
+//! its key; with none, it calls its default's function, as a call of no
+//! arguments at its depth, in the current context, so that a default
+//! reading another context follows it; with no default either, it is
+//! "context `arch` has no value here". A read is an ambient input of the
+//! memoised calls running (see [Memoised functions](#memoised-functions)):
+//! it is recorded on each running call whose own context's nearest binding
+//! of the key is the read's, the same frame's or none, with the value read,
+//! or none for the default, whose value depends only on what it reads in
+//! turn, recorded as it runs (`MemoTables::depend_context`). A call whose
+//! context gives every such key the same value finds the entry. A cache hit
+//! passes the entry's context dependencies on, as reads here would. Making
+//! a future in a memoised call records every context the call's own
+//! context binds, flattened, as one dependency (`MemoTables::depend_contexts`):
+//! the future may read any of them after the call has returned.
+//!
 //! # Metas
 //!
 //! A read of a function's meta, `func.versions` (see the checker's "Metas"),

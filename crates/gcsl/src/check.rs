@@ -1471,6 +1471,46 @@
 //! whether every field the partial record holds equals the full record's of
 //! its name.
 //!
+//! # Context
+//!
+//! A context (see the parser's [Context](crate::parser#context)) is
+//! declared once in a workspace, and seen by every file of it, its standard
+//! files' among them, without an import: the workspace gives each file the
+//! one of a name (`Context::context`), its own declaration's first, then,
+//! for a session's input, an earlier input's, then the first of the
+//! workspace's. A second declaration of a name is "context `arch` is
+//! declared twice" (see [`crate::workspace`], "Context"). Its type is
+//! resolved in its file before any file is checked
+//! (`check_context_types`), present, and recorded by its declaration's key
+//! ([`crate::names::context_key`]). A default is the body of a hidden
+//! function, pure and of no parameters, returning the type, the `let` of a
+//! binding no source can write, checked as any top-level function is; a call
+//! of an impure function in it is "the default of a context must be pure",
+//! noting that a read of a context is pure (`Checker::is_context_default`).
+//!
+//! `^NAME` (`Checker::check_context_read`) is of the declared type; a name
+//! no context has is "no context `arch` is declared", suggesting a close
+//! one (`Checker::context_named`). Its default's function, if it has one,
+//! is the read's own variable: the binding of the input's or an earlier
+//! input's declaration, read as a name is, so that a top-level read is
+//! scheduled after what the default reads, or another file's slot, read as
+//! an import's. A read at the input's top level of a context with no default
+//! that no `with` around it binds is "context `arch` has no value here";
+//! elsewhere that is a runtime error, as the checker cannot know every
+//! caller's context. `TypeExprKind::Context`, a `^NAME` parameter's type,
+//! is the context's type exactly, neither bare nor inferred.
+//!
+//! `BODY with { ... }` (`Checker::check_with`) checks each binding against
+//! its context: a plain one's value against its type, a dotted key's
+//! against the type of the field its path names, through present records,
+//! "context `platform` has no field `archx`" otherwise, its read of the
+//! value it updates checked as a read is. A second plain binding of a
+//! context, or one after a dotted key of it, is "context `x` is bound twice
+//! in this `with`". The body is checked with the contexts bound, and its
+//! type is the `with`'s; an untyped integer body is coerced through it.
+//! Each read and `with` is recorded for lowering by its declarations' keys
+//! ([`Resolution::context_read`], [`Resolution::with_keys`]).
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or

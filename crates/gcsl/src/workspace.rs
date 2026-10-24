@@ -524,6 +524,24 @@
 //! of it is a constant, and makes its file need nothing. The bounds and
 //! payloads are resolved before any file is checked (`check_enum_items`).
 //!
+//! # Context
+//!
+//! A context (see the checker's [Context](crate::check#context)) is in no
+//! tree, no view and no record. The scan finds every file's declarations
+//! (`declare_contexts`), each with its declaration's key, of its name and
+//! of its file's path, or `input N` for a session's input, and its default's
+//! binding; their types are resolved before any file is checked
+//! (`check_context_items`, with the enums', `check_declared_items`), and a
+//! declaration of a name a file of the scan declared before it is "context
+//! `arch` is declared twice", labelled "first declared here". A session's
+//! input inherits the earlier inputs' declarations ([`Earlier`]), and one
+//! of a name it declares shadows theirs. Once a file is checked, the slot
+//! of each of its defaults' closures is recorded (`ForLater`), so a later
+//! file's read of one calls it from there. A file that reads a context
+//! declared, with a default, in another file needs that file
+//! (`context_needs`), the need shown in a cycle as "reads the context `x`
+//! of `lib/a.gcsl` here".
+//!
 //! # Def-types
 //!
 //! A def-type, a `def` marked `#[def_type]`, has a *namespace*: the
