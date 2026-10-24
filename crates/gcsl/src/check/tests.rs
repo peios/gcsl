@@ -1,10 +1,10 @@
 use super::*;
-use crate::ast::{ForHead, StrPart};
+use crate::ast::{AttributeId, ForHead, StrPart};
 use crate::diagnostic::Severity;
 use crate::lexer::{tokenize, tokenize_with};
 use crate::parser::parse;
 use crate::source::SourceFile;
-use crate::types::Laziness;
+use crate::types::{Laziness, ValueTest};
 use crate::value::ValueKind;
 
 fn parse_text(text: &str) -> Ast {
