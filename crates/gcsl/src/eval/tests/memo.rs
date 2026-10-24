@@ -6,7 +6,12 @@ use super::*;
 pub(super) fn run_with(text: &str, memo: &mut MemoTables) -> Result<Value, Diagnostic> {
     let ir = compile(text);
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-    eval_with(&ir, &mut stack, memo, (None, &[], None))
+    eval_with(
+        &ir,
+        &mut stack,
+        memo,
+        (None, &[], &Direct { temp_dirs: None }),
+    )
 }
 
 /// The values of the fields of the record that `text` evaluates to, in
@@ -647,7 +652,13 @@ fn sweeping_frees_what_a_dead_closure_held() {
     let ir = compile(text);
     let mut frame = vec![Value::Empty; ir.frame_size() as usize];
     let mut memo = MemoTables::new();
-    eval_with(&ir, &mut frame, &mut memo, (None, &[], None)).unwrap();
+    eval_with(
+        &ir,
+        &mut frame,
+        &mut memo,
+        (None, &[], &Direct { temp_dirs: None }),
+    )
+    .unwrap();
     // `make`, a top-level function, has slot 0, and `r` slot 1.
     let Value::Record(record) = frame[1].clone() else {
         panic!("expected a record");
@@ -671,8 +682,13 @@ fn a_sweep_during_a_memoised_call_is_harmless() {
     );
     let ir = compile(&text);
     let mut stack = vec![Value::Empty; ir.frame_size() as usize];
-    let Value::Record(record) = eval_with(&ir, &mut stack, &mut memo, (None, &[], None)).unwrap()
-    else {
+    let Value::Record(record) = eval_with(
+        &ir,
+        &mut stack,
+        &mut memo,
+        (None, &[], &Direct { temp_dirs: None }),
+    )
+    .unwrap() else {
         panic!("expected a record");
     };
     // The running call's table survived the sweeps its body caused, and

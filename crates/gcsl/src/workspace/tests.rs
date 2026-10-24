@@ -293,6 +293,7 @@ fn messages(files: &[(&str, &str)], path: &str) -> Vec<String> {
 mod arguments;
 mod defers;
 mod deftypes;
+mod effects;
 mod errors;
 mod fileroot;
 mod files;

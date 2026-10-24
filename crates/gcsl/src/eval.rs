@@ -69,6 +69,7 @@ use memo::NO_ORIGIN;
 use kinds::{Extract, Taken, mixed};
 use unions::{other_fields, with_fields};
 use builtins::described;
+pub use effects::{Direct, Effects};
 pub use system::TempDirs;
 pub use text::compare_versions;
 
@@ -135,7 +136,8 @@ pub fn eval(ir: &Rc<Ir>) -> Result<Value, Diagnostic> {
 ///
 /// As [`eval_with`].
 pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic> {
-    eval_with(ir, stack, &mut MemoTables::new(), (None, &[], None))
+    let direct = Direct { temp_dirs: None };
+    eval_with(ir, stack, &mut MemoTables::new(), (None, &[], &direct))
 }
 
 /// Evaluates `ir` to a value with an existing `stack`, which must hold at
@@ -158,11 +160,12 @@ pub fn eval_in(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> Result<Value, Diagnostic>
 /// `dirs` is the run's table of directories, which the driver built, by
 /// which the code of each file names its directory ([`Ir::dir`]): what
 /// `fileroot.caller` reads (see [Callers and helpers](crate::eval::callers#callers-and-helpers)).
-/// The top level's caller is its own file's directory. `temp_dirs` holds
-/// the temporary directories `fs.temp_dir` makes, which the owner of the
-/// run, a workspace or a session, holds for as long as it lives and removes
-/// as it is dropped (see [The built-in functions](crate::eval::calls#the-built-in-functions)):
-/// `None` for a run without one, in which a call of `fs.temp_dir` is an
+/// The top level's caller is its own file's directory. `effects` is how
+/// the run's effects reach the system (see
+/// [Effects](crate::eval::effects#effects)): [`Direct`] for plain GCSL, whose
+/// temporary directories, which `fs.temp_dir` makes, the owner of the run,
+/// a workspace or a session, holds for as long as it lives and removes as
+/// it is dropped; in a run without an owner, a call of `fs.temp_dir` is an
 /// internal error.
 ///
 /// # Errors
@@ -172,7 +175,7 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
-    extras: (Option<&Rc<Layout>>, &[Rc<str>], Option<&TempDirs>),
+    extras: (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
 ) -> Result<Value, Diagnostic> {
     eval_rooted(ir, (stack, memo), extras, None)
 }
@@ -183,7 +186,7 @@ pub fn eval_with(
 pub(crate) fn eval_rooted(
     ir: &Rc<Ir>,
     (stack, memo): (&mut Vec<Value>, &mut MemoTables),
-    (exec_result, dirs, temp_dirs): (Option<&Rc<Layout>>, &[Rc<str>], Option<&TempDirs>),
+    (exec_result, dirs, effects): (Option<&Rc<Layout>>, &[Rc<str>], &dyn Effects),
     context: Option<Rc<ContextFrame>>,
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
@@ -199,7 +202,7 @@ pub(crate) fn eval_rooted(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let shared = Shared::new(exec_result, dirs, temp_dirs);
+    let shared = Shared::new(exec_result, dirs, effects);
     shared.context.replace(context);
     let result = Evaluator {
         ir,
@@ -334,9 +337,9 @@ struct Shared<'a> {
     /// a run with no workspace's context, whose code cannot read
     /// `fileroot.caller`.
     dirs: &'a [Rc<str>],
-    /// The temporary directories of the run's owner, which `fs.temp_dir`
-    /// makes; `None` in a run without one.
-    temp_dirs: Option<&'a TempDirs>,
+    /// How the run's effects reach the system (see
+    /// [Effects](crate::eval::effects#effects)).
+    effects: &'a dyn Effects,
     /// The deadlines of the calls with `#[timeout]` that are running,
     /// outermost first (see [Retry and timeout](crate::eval::retry#retry-and-timeout)).
     deadlines: RefCell<Vec<Deadline>>,
@@ -361,17 +364,17 @@ struct Shared<'a> {
 
 impl<'a> Shared<'a> {
     /// What the frames of a run with the layout of `exec`'s result
-    /// `exec_result`, the table of directories `dirs` and the temporary
-    /// directories `temp_dirs` share, with no deadline running.
+    /// `exec_result`, the table of directories `dirs` and the effect context
+    /// `effects` share, with no deadline running.
     fn new(
         exec_result: Option<&'a Rc<Layout>>,
         dirs: &'a [Rc<str>],
-        temp_dirs: Option<&'a TempDirs>,
+        effects: &'a dyn Effects,
     ) -> Self {
         Self {
             exec_result,
             dirs,
-            temp_dirs,
+            effects,
             deadlines: RefCell::new(Vec::new()),
             earliest: Cell::new(None),
             deadlines_made: Cell::new(0),
@@ -1353,6 +1356,7 @@ fn mistyped<T>(node: &IrNode, message: &'static str) -> Flow<T> {
 }
 
 pub(crate) mod builtins;
+pub mod effects;
 pub(crate) mod elements;
 pub(crate) mod files;
 pub(crate) mod kinds;

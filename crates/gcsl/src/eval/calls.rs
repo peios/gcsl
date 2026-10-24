@@ -391,10 +391,14 @@ impl Evaluator<'_> {
     ) -> Flow<Value> {
         match (builtin, first, second) {
             (Builtin::File | Builtin::Dir, Value::Str(path), None) => {
-                make_file(builtin, &path, node)
+                make_file(builtin, &path, self.shared.effects, node)
             }
-            (Builtin::FileRead, Value::File(file), None) => read_file(&file, node),
-            (Builtin::DirFiles, Value::Dir(dir), None) => dir_files(&dir, node),
+            (Builtin::FileRead, Value::File(file), None) => {
+                read_file(&file, self.shared.effects, node)
+            }
+            (Builtin::DirFiles, Value::Dir(dir), None) => {
+                dir_files(&dir, self.shared.effects, node)
+            }
             (Builtin::DirFile | Builtin::DirDir, Value::Dir(dir), Some(Value::Str(path))) => {
                 inside(builtin, &dir, &path, node)
             }
@@ -407,7 +411,7 @@ impl Evaluator<'_> {
                 let found = sandbox_exec(
                     &sandbox,
                     &request,
-                    (self.shared.exec_result, deadline),
+                    (self.shared.exec_result, deadline, self.shared.effects),
                     node,
                 )?;
                 match found {
@@ -441,7 +445,7 @@ impl Evaluator<'_> {
         match exec(
             builtin,
             (argv, options),
-            (self.shared.exec_result, deadline),
+            (self.shared.exec_result, deadline, self.shared.effects),
             node,
         )? {
             Some(value) => Ok(value),
@@ -495,10 +499,10 @@ impl Evaluator<'_> {
     /// A new temporary directory, for the call `node` of `fs_temp_dir`:
     /// removed with everything in it when the run's owner drops it.
     pub(super) fn temp_dir(&self, node: &IrNode) -> Flow<Value> {
-        let Some(temp_dirs) = self.shared.temp_dirs else {
+        let Some(made) = self.shared.effects.temp_dir() else {
             return mistyped(node, "`fs.temp_dir` called in a run without an owner");
         };
-        match temp_dirs.make() {
+        match made {
             Ok(dir) => Ok(Value::Str(Rc::from(dir))),
             Err(reason) => Err(Diagnostic::error(
                 format!("`fs.temp_dir` could not create a temporary directory: {reason}"),
@@ -621,7 +625,7 @@ impl Evaluator<'_> {
                 sort_versions(&versions, node)
             }
             (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
-                write_file(&p, &contents, node)
+                write_file(&p, &contents, self.shared.effects, node)
             }
             (Builtin::FsTempDir, None, None) => self.temp_dir(node),
             (_, Some((first, _)), second) if builtin.is_of_elements() => {
@@ -634,7 +638,7 @@ impl Evaluator<'_> {
                 Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir | Builtin::FsCopy,
                 Some((Value::Str(p), _)),
                 to,
-            ) => file_system(builtin, &p, to.as_ref(), node),
+            ) => file_system(builtin, (&p, to.as_ref()), self.shared.effects, node),
             (
                 Builtin::VariantMatches | Builtin::VariantPayload | Builtin::PartialMatches,
                 Some((first, _)),

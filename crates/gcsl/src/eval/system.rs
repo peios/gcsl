@@ -23,6 +23,7 @@ use crate::ir::IrNode;
 use crate::value::{Layout, List, Record, Secret, Value};
 
 use super::secrets::token;
+use super::effects::Effects;
 use super::{Flow, mistyped};
 
 /// Runs the program `argv` names, for the call `node` of `builtin`, `exec`
@@ -67,7 +68,7 @@ use super::{Flow, mistyped};
 pub(super) fn exec(
     builtin: Builtin,
     (argv, options): (&List, &Value),
-    (exec_result, deadline): (Option<&Rc<Layout>>, Option<Instant>),
+    (exec_result, deadline, effects): (Option<&Rc<Layout>>, Option<Instant>, &dyn Effects),
     node: &IrNode,
 ) -> Flow<Option<Value>> {
     let Some(layout) = exec_result else {
@@ -111,6 +112,7 @@ pub(super) fn exec(
         shown,
         identity,
     };
+    let mut command = ran.through(effects, command, node)?;
     ran.finish(&mut command, &options, (layout, deadline), node)
 }
 
@@ -125,6 +127,25 @@ pub(super) struct Program<'a> {
 }
 
 impl Program<'_> {
+    /// The command that runs `command` through `effects`, the run's effect
+    /// context (see [Effects](crate::eval::effects#effects)); "`exec` could
+    /// not run `cc`: REASON", at the call, if it will not run it.
+    pub(super) fn through(
+        &self,
+        effects: &dyn Effects,
+        command: Command,
+        node: &IrNode,
+    ) -> Flow<Command> {
+        effects.command(command).map_err(|reason| {
+            let message = format!(
+                "`{}` could not run `{}`: {reason}",
+                self.builtin.name(),
+                self.shown
+            );
+            Diagnostic::error(message, node.span).into()
+        })
+    }
+
     /// Runs `command`, the program, as `options` say, until `deadline` if
     /// there is one, and gives what it did, a record of `layout`, as
     /// [`exec`] says: `None` if the deadline passed first.
@@ -701,8 +722,8 @@ pub(super) fn copy_lines(stream: impl Read) -> io::Result<Vec<u8>> {
 /// any other built-in, is an internal error, which the checker rules out.
 pub(super) fn file_system(
     builtin: Builtin,
-    p: &str,
-    to: Option<&Value>,
+    (p, to): (&str, Option<&Value>),
+    effects: &dyn Effects,
     node: &IrNode,
 ) -> Flow<Value> {
     let Some(name) = builtin.fs_name() else {
@@ -721,23 +742,40 @@ pub(super) fn file_system(
             return fail(format!("`{name}` needs an absolute path, found `{path}`"));
         }
     }
+    // Where each path is on the host's file system (see
+    // [Effects](crate::eval::effects#effects)).
+    let host = |path: &str| {
+        effects
+            .host_path(path)
+            .map_err(|reason| format!("`{name}` cannot use `{path}`: {reason}"))
+    };
+    let (p_shown, p) = match host(p) {
+        Ok(found) => (p, found),
+        Err(message) => return fail(message),
+    };
+    let to = match to.map(|to| host(to).map(|found| (to, found))).transpose() {
+        Ok(to) => to,
+        Err(message) => return fail(message),
+    };
     match (builtin, to) {
-        (Builtin::FsExists, None) => match Path::new(p).try_exists() {
+        (Builtin::FsExists, None) => match p.try_exists() {
             Ok(exists) => Ok(Value::Bool(exists)),
-            Err(error) => fail(format!("`{name}` could not check `{p}`: {error}")),
+            Err(error) => fail(format!("`{name}` could not check `{p_shown}`: {error}")),
         },
-        (Builtin::FsRead, None) => match fs::read(p).map(String::from_utf8) {
+        (Builtin::FsRead, None) => match fs::read(&p).map(String::from_utf8) {
             Ok(Ok(text)) => Ok(Value::Str(Rc::from(text))),
-            Ok(Err(_)) => fail(format!("`{name}`: `{p}` is not UTF-8 text")),
-            Err(error) => fail(format!("`{name}` could not read `{p}`: {error}")),
+            Ok(Err(_)) => fail(format!("`{name}`: `{p_shown}` is not UTF-8 text")),
+            Err(error) => fail(format!("`{name}` could not read `{p_shown}`: {error}")),
         },
-        (Builtin::FsMkdir, None) => match fs::create_dir_all(p) {
+        (Builtin::FsMkdir, None) => match fs::create_dir_all(&p) {
             Ok(()) => Ok(Value::Empty),
-            Err(error) => fail(format!("`{name}` could not create `{p}`: {error}")),
+            Err(error) => fail(format!("`{name}` could not create `{p_shown}`: {error}")),
         },
-        (Builtin::FsCopy, Some(to)) => match fs::copy(p, to) {
+        (Builtin::FsCopy, Some((to_shown, to))) => match fs::copy(&p, to) {
             Ok(_) => Ok(Value::Empty),
-            Err(error) => fail(format!("`{name}` could not copy `{p}` to `{to}`: {error}")),
+            Err(error) => fail(format!(
+                "`{name}` could not copy `{p_shown}` to `{to_shown}`: {error}"
+            )),
         },
         _ => mistyped(
             node,
@@ -756,14 +794,22 @@ pub(super) fn file_system(
 /// directory of `p` missing or `p` a directory say, is "`fs.write` could
 /// not write `/a/b`: REASON", the OS's own text, at the call, leaving no
 /// temporary file behind.
-pub(super) fn write_file(p: &str, contents: &str, node: &IrNode) -> Flow<Value> {
+pub(super) fn write_file(
+    p: &str,
+    contents: &str,
+    effects: &dyn Effects,
+    node: &IrNode,
+) -> Flow<Value> {
     let name = Builtin::FsWrite.fs_name().unwrap_or_default();
     let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
-    let path = Path::new(p);
-    if !path.is_absolute() {
+    if !Path::new(p).is_absolute() {
         return fail(format!("`{name}` needs an absolute path, found `{p}`"));
     }
-    match replace_file(path, contents.as_bytes()) {
+    let path = match effects.host_path(p) {
+        Ok(path) => path,
+        Err(reason) => return fail(format!("`{name}` cannot use `{p}`: {reason}")),
+    };
+    match replace_file(&path, contents.as_bytes()) {
         Ok(()) => Ok(Value::Empty),
         Err(reason) => fail(format!("`{name}` could not write `{p}`: {reason}")),
     }

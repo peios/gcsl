@@ -66,12 +66,18 @@ use crate::diagnostic::Diagnostic;
 use crate::ir::IrNode;
 use crate::value::{File, List, Value};
 
+use super::effects::Effects;
 use super::{Evaluator, Flow, mistyped};
 
 /// Applies `file`, or `dir` if `builtin` is that, for the call `node`, to
 /// `path` (see [Files](#files)): the file or directory at `path`, made
 /// absolute against the working directory and normalised lexically.
-pub(super) fn make_file(builtin: Builtin, path: &str, node: &IrNode) -> Flow<Value> {
+pub(super) fn make_file(
+    builtin: Builtin,
+    path: &str,
+    effects: &dyn Effects,
+    node: &IrNode,
+) -> Flow<Value> {
     if path.is_empty() {
         let message = format!("`{}` needs a path", builtin.name());
         return Err(Diagnostic::error(message, node.span).into());
@@ -80,12 +86,12 @@ pub(super) fn make_file(builtin: Builtin, path: &str, node: &IrNode) -> Flow<Val
     let absolute = if given.is_absolute() {
         given.to_path_buf()
     } else {
-        match std::env::current_dir() {
+        match effects.working_dir() {
             Ok(cwd) => cwd.join(given),
-            Err(error) => {
+            Err(reason) => {
                 return Err(
                     Diagnostic::error("cannot find the working directory", node.span)
-                        .with_note(error.to_string())
+                        .with_note(reason)
                         .into(),
                 );
             }
@@ -160,9 +166,13 @@ pub(super) fn relative(path: &str) -> Option<String> {
 /// Applies `dir_files`, for the call `node`, to `dir` (see
 /// [Directories](#directories)): every entry of its tree that is no
 /// directory, a symbolic link included and never followed, sorted by path.
-pub(super) fn dir_files(dir: &File, node: &IrNode) -> Flow<Value> {
+pub(super) fn dir_files(dir: &File, effects: &dyn Effects, node: &IrNode) -> Flow<Value> {
     let mut found = Vec::new();
-    if let Err(error) = walk(Path::new(&*dir.path), &mut found) {
+    let walked = effects
+        .host_path(&dir.path)
+        .map_err(io::Error::other)
+        .and_then(|host| walk(&host, (&dir.path, ""), &mut found));
+    if let Err(error) = walked {
         return Err(
             Diagnostic::error(format!("cannot list `{}`", dir.path), node.span)
                 .with_note(error.to_string())
@@ -177,20 +187,24 @@ pub(super) fn dir_files(dir: &File, node: &IrNode) -> Flow<Value> {
     Ok(Value::List(List::from_vec(files)))
 }
 
-/// Pushes the path of every entry under `dir` that is no directory onto
-/// `found`, as text, descending into directories but never through a
-/// symbolic link. A path that is not UTF-8 is an error.
-fn walk(dir: &Path, found: &mut Vec<String>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+/// Pushes the path of every entry under `host`, a directory of the host's
+/// file system, that is no directory onto `found`, as GCSL code names it:
+/// `root`, the directory's own name for it, joined with its path under the
+/// directory, `under` so far. It descends into directories but never
+/// through a symbolic link. A name that is not UTF-8 is an error.
+fn walk(host: &Path, (root, under): (&str, &str), found: &mut Vec<String>) -> io::Result<()> {
+    for entry in fs::read_dir(host)? {
         let entry = entry?;
-        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|name| {
+            io::Error::other(format!("`{}` is not a UTF-8 path", name.display()))
+        })?;
+        let inner = join(under, &name);
         if entry.file_type()?.is_dir() {
-            walk(&path, found)?;
+            walk(&entry.path(), (root, &inner), found)?;
+        } else if root == "/" {
+            found.push(format!("/{inner}"));
         } else {
-            let text = path.into_os_string().into_string().map_err(|path| {
-                io::Error::other(format!("`{}` is not a UTF-8 path", path.display()))
-            })?;
-            found.push(text);
+            found.push(format!("{root}/{inner}"));
         }
     }
     Ok(())
@@ -203,11 +217,13 @@ impl Evaluator<'_> {
     /// returned.
     pub(super) fn compose_dir(&self, entries: &Value, node: &IrNode) -> Flow<Value> {
         let fail = |message: String| Err(Diagnostic::error(message, node.span).into());
-        let Some(temp_dirs) = self.shared.temp_dirs else {
+        let effects = self.shared.effects;
+        let Some(made) = effects.temp_dir() else {
             return mistyped(node, "`fs.compose_dir` called in a run without an owner");
         };
-        let root = match temp_dirs.make() {
-            Ok(root) => root,
+        let made = made.and_then(|root| Ok((effects.host_path(&root)?, root)));
+        let (host_root, root) = match made {
+            Ok(made) => made,
             Err(reason) => {
                 return fail(format!(
                     "`fs.compose_dir` could not create a temporary directory: {reason}"
@@ -215,8 +231,9 @@ impl Evaluator<'_> {
             }
         };
         let mut composer = Composer {
-            root: PathBuf::from(&root),
+            root: host_root,
             placed: HashSet::new(),
+            effects,
         };
         let pairs: Vec<(&str, &Value)> = match entries {
             Value::Empty => Vec::new(),
@@ -245,14 +262,32 @@ impl Evaluator<'_> {
 
 /// What [`Evaluator::compose_dir`] has placed so far, in the directory it
 /// is composing.
-pub(super) struct Composer {
-    /// The directory.
+pub(super) struct Composer<'a> {
+    /// The directory, as the host's file system has it.
     pub(super) root: PathBuf,
     /// The paths of what has been placed in it, relative, but directories.
     pub(super) placed: HashSet<String>,
+    /// The effect context, which says where the entries placed are (see
+    /// [Effects](crate::eval::effects#effects)).
+    pub(super) effects: &'a dyn Effects,
 }
 
-impl Composer {
+impl Composer<'_> {
+    /// The path of the host's file system that `path`, as GCSL code names
+    /// it, is.
+    fn host(&self, path: &str) -> Result<PathBuf, String> {
+        self.effects
+            .host_path(path)
+            .map_err(|reason| format!("cannot use `{path}`: {reason}"))
+    }
+
+    /// Copies the tree of the directory at `path`, as GCSL code names it,
+    /// under `at`, as [`Composer::tree`] does.
+    pub(super) fn tree_at(&mut self, path: &str, at: &str) -> Result<(), String> {
+        let source = self.host(path)?;
+        self.tree(&source, at)
+    }
+
     /// Places `value`, a directory, a file or a list of files, at `at`,
     /// relative to the root (see [Directories](#directories)): a
     /// directory's tree under it, a file at it, and each file of a list
@@ -260,23 +295,26 @@ impl Composer {
     /// path, or a copy fails.
     fn place(&mut self, at: &str, value: &Value) -> Result<(), String> {
         match value {
-            Value::Dir(dir) => self.tree(Path::new(&*dir.path), at),
+            Value::Dir(dir) => self.tree_at(&dir.path, at),
             Value::File(file) if at.is_empty() => Err(format!(
                 "a file cannot be the directory itself, as `{}` is",
                 file.path
             )),
-            Value::File(file) => self.file(Path::new(&*file.path), at),
+            Value::File(file) => {
+                let source = self.host(&file.path)?;
+                self.file(&source, at)
+            }
             Value::List(files) => {
                 for file in files.values() {
                     let Value::File(file) = file else {
                         return Err("a list of entries holds what is no file".to_owned());
                     };
-                    let source = Path::new(&*file.path);
-                    let name = source
+                    let name = Path::new(&*file.path)
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("");
-                    self.file(source, &join(at, name))?;
+                    let source = self.host(&file.path)?;
+                    self.file(&source, &join(at, name))?;
                 }
                 Ok(())
             }
@@ -363,9 +401,13 @@ fn normalised(path: &Path) -> Option<String> {
 
 /// Applies `file_read`, for the call `node`, to `file` (see [Files](#files)):
 /// its contents, which must be UTF-8.
-pub(super) fn read_file(file: &File, node: &IrNode) -> Flow<Value> {
+pub(super) fn read_file(file: &File, effects: &dyn Effects, node: &IrNode) -> Flow<Value> {
     let path = &*file.path;
-    match std::fs::read(path).map(String::from_utf8) {
+    let read = effects
+        .host_path(path)
+        .map_err(io::Error::other)
+        .and_then(std::fs::read);
+    match read.map(String::from_utf8) {
         Ok(Ok(text)) => Ok(Value::Str(Rc::from(text))),
         Ok(Err(_)) => {
             Err(Diagnostic::error(format!("`{path}` is not UTF-8 text"), node.span).into())

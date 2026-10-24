@@ -473,10 +473,11 @@ fn temp_dir_in_a_run_without_an_owner_is_an_internal_error() {
     workspace
         .frame
         .resize(size.max(workspace.frame.len()), Value::Empty);
+    let direct = crate::eval::Direct { temp_dirs: None };
     let context = (
         Some(&workspace.exec_result),
         &workspace.scan.dir_texts[..],
-        None,
+        &direct as &dyn crate::eval::Effects,
     );
     let error = crate::eval::eval_with(&ir, &mut workspace.frame, &mut workspace.memo, context)
         .unwrap_err();

@@ -208,7 +208,7 @@ pub(super) fn run_on(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> (Result<Value, Diag
         captures: &[],
         callee: None,
         memo: &mut MemoTables::new(),
-        shared: &Shared::new(None, &[], None),
+        shared: &Shared::new(None, &[], &Direct { temp_dirs: None }),
         caller: Caller::default(),
         levels: 0,
     }

@@ -238,7 +238,7 @@ use crate::Outcome;
 use crate::ast::{Ast, TypeStore};
 use crate::check::{CheckOutput, Scope};
 use crate::diagnostic::{self, Diagnostic};
-use crate::eval::{self, MemoTables, TempDirs};
+use crate::eval::{self, Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::lower;
 use crate::names::{Name, Names};
@@ -434,11 +434,14 @@ impl Session {
             input,
         )?;
         let committed = self.committed_mutables();
+        let direct = Direct {
+            temp_dirs: Some(&self.temp_dirs),
+        };
         let context = (
             &mut self.memo,
             self.exec_result.as_ref(),
             &standard.dirs[..],
-            &*self.temp_dirs,
+            &direct as &dyn Effects,
         );
         match run_input(ir, &mut self.frame, context) {
             Ok(value) => {
@@ -552,7 +555,7 @@ pub(crate) fn run_input(
 pub(crate) fn run_input_in(
     ir: Ir,
     frame: &mut Vec<Value>,
-    (memo, exec_result, dirs, temp_dirs): RunContext,
+    (memo, exec_result, dirs, effects): RunContext,
     root: Option<Rc<ContextFrame>>,
 ) -> Result<Value, Diagnostic> {
     let ir = Rc::new(ir);
@@ -560,7 +563,7 @@ pub(crate) fn run_input_in(
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    let extras = (exec_result, dirs, Some(temp_dirs));
+    let extras = (exec_result, dirs, effects);
     eval::eval_rooted(&ir, (frame, memo), extras, root)
 }
 
@@ -571,7 +574,7 @@ pub(crate) type RunContext<'a> = (
     &'a mut MemoTables,
     Option<&'a Rc<Layout>>,
     &'a [Rc<str>],
-    &'a TempDirs,
+    &'a dyn Effects,
 );
 
 #[cfg(test)]

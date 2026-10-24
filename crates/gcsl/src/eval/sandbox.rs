@@ -38,7 +38,7 @@
 //! copying it, and gives the paths as the commands see them.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::time::Instant;
@@ -48,6 +48,7 @@ use crate::diagnostic::Diagnostic;
 use crate::ir::IrNode;
 use crate::value::{File, Layout, Sandbox, Value};
 
+use super::effects::Effects;
 use super::files::{Composer, relative};
 use super::system::{ExecOptions, Program};
 use super::{Evaluator, Flow, mistyped};
@@ -57,7 +58,8 @@ impl Evaluator<'_> {
     /// and the record `options` of its commands' default `cwd` and `env`
     /// (see [Sandboxes](#sandboxes)): a sandbox of a new copy of `dir`.
     pub(super) fn make_sandbox(&self, dir: &File, options: &Value, node: &IrNode) -> Flow<Value> {
-        let Some(temp_dirs) = self.shared.temp_dirs else {
+        let effects = self.shared.effects;
+        let Some(made) = effects.temp_dir() else {
             return mistyped(node, "a sandbox made in a run without an owner");
         };
         let Some(defaults) = ExecOptions::of_defaults(options) else {
@@ -67,17 +69,19 @@ impl Evaluator<'_> {
         let Some(cwd) = relative(defaults.cwd) else {
             return fail(format!("`{}` is not inside the sandbox", defaults.cwd));
         };
-        let root = match temp_dirs.make() {
-            Ok(root) => root,
+        let made = made.and_then(|root| Ok((effects.host_path(&root)?, root)));
+        let (host_root, root) = match made {
+            Ok(made) => made,
             Err(reason) => {
                 return fail(format!("a sandbox could not make its directory: {reason}"));
             }
         };
         let mut copier = Composer {
-            root: PathBuf::from(&root),
+            root: host_root.clone(),
             placed: HashSet::new(),
+            effects,
         };
-        if let Err(message) = copier.tree(Path::new(&*dir.path), "") {
+        if let Err(message) = copier.tree_at(&dir.path, "") {
             return fail(format!(
                 "a sandbox could not copy `{}`: {message}",
                 dir.path
@@ -85,7 +89,7 @@ impl Evaluator<'_> {
         }
         // Its commands start in its working directory, which is its own to
         // make.
-        if let Err(error) = std::fs::create_dir_all(Path::new(&root).join(&cwd)) {
+        if let Err(error) = std::fs::create_dir_all(host_root.join(&cwd)) {
             return fail(format!("a sandbox could not make `/{cwd}`: {error}"));
         }
         let env = defaults
@@ -109,7 +113,7 @@ impl Evaluator<'_> {
 pub(super) fn sandbox_exec(
     sandbox: &Sandbox,
     request: &Value,
-    (layout, deadline): (Option<&Rc<Layout>>, Option<Instant>),
+    (layout, deadline, effects): (Option<&Rc<Layout>>, Option<Instant>, &dyn Effects),
     node: &IrNode,
 ) -> Flow<Option<Value>> {
     let (Some(layout), Some(options), Some(words)) =
@@ -134,8 +138,11 @@ pub(super) fn sandbox_exec(
     let Some(cwd) = cwd else {
         return fail(format!("`{}` is not inside the sandbox", options.cwd));
     };
-    // A program expects a `/tmp`; the copy is the sandbox's own to add one.
-    let _ = std::fs::create_dir_all(Path::new(&*sandbox.root).join("tmp"));
+    // A program expects a `/tmp`; the copy is the sandbox's own to add one,
+    // where the host's file system has it.
+    if let Ok(root) = effects.host_path(&sandbox.root) {
+        let _ = std::fs::create_dir_all(root.join("tmp"));
+    }
     let mut command = Command::new(bwrap);
     command.args([
         "--bind",
@@ -164,6 +171,7 @@ pub(super) fn sandbox_exec(
         shown,
         identity: None,
     };
+    let mut command = program.through(effects, command, node)?;
     program.finish(&mut command, &options, (layout, deadline), node)
 }
 

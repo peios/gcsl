@@ -10,6 +10,7 @@ use crate::ast::{
 };
 use crate::check::{Checker, KnownParams, Scope, Slot};
 use crate::diagnostic::Diagnostic;
+use crate::eval::{Direct, Effects};
 use crate::ir::Ir;
 use crate::names::{self, Name, Names};
 use crate::source::Span;
@@ -1027,11 +1028,14 @@ impl Workspace {
         // Numbered after every file, its slots end after theirs; kept
         // nonetheless, as a file's are (see [`Ir::reserve_frame`]).
         ir.reserve_frame(count(self.frame.len()));
+        let direct = Direct {
+            temp_dirs: Some(&self.temp_dirs),
+        };
         let context = (
             &mut self.memo,
             Some(&self.exec_result),
             &self.scan.dir_texts[..],
-            &self.temp_dirs,
+            &direct as &dyn Effects,
         );
         let mut warnings = self.warnings.clone();
         warnings.extend(own);

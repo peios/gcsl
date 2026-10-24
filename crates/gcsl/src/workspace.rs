@@ -221,7 +221,7 @@ use crate::Outcome;
 use crate::check::ViewRecord;
 use crate::check::{Builtin, KnownParams, Slot, Types};
 use crate::diagnostic::Diagnostic;
-use crate::eval::{MemoTables, TempDirs};
+use crate::eval::{Direct, Effects, MemoTables, TempDirs};
 use crate::ir::Ir;
 use crate::names::{Name, Names};
 use crate::session;
@@ -578,11 +578,14 @@ impl Workspace {
             // The slots of the files run before it, which may end after its
             // own, are kept (see [`Ir::reserve_frame`]).
             ir.reserve_frame(count(self.frame.len()));
+            let direct = Direct {
+                temp_dirs: Some(&self.temp_dirs),
+            };
             let context = (
                 &mut self.memo,
                 Some(&self.exec_result),
                 &self.scan.dir_texts[..],
-                &self.temp_dirs,
+                &direct as &dyn Effects,
             );
             match session::run_input(*ir, &mut self.frame, context) {
                 Ok(value) => {
