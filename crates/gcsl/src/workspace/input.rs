@@ -40,8 +40,8 @@ use crate::types::{TyId, TypeTable};
 use crate::value::{Layout, Quantity, Value};
 
 use super::{
-    Alias, Context, File, ForLater, InheritedContext, InheritedVariant, Library, Placing,
-    Workspace, being_run, check_declared_items, check_loading, count, scan_into_with,
+    Alias, Context, File, ForLater, InheritedContext, InheritedDefType, InheritedVariant, Library,
+    Placing, Workspace, being_run, check_declared_items, check_loading, count, scan_into_with,
 };
 
 /// The standard library as a session ran it once, as it started: what each
@@ -202,8 +202,9 @@ pub(crate) struct Earlier<'a> {
     /// The definitions of their types, which the input's are added to.
     pub(crate) store: &'a mut TypeStore,
     /// Their def-types that no later input shadowed, each by its path, with
-    /// its namespace's key (see [Def-types](crate::workspace::declared#def-types)).
-    pub(crate) def_types: &'a [(Vec<Name>, Name)],
+    /// its namespace's key, and each name a later input bound to something
+    /// else, with none (see [Def-types](crate::workspace::declared#def-types)).
+    pub(crate) def_types: &'a [InheritedDefType],
     /// Their variants that no later input shadowed, each by its enum's key
     /// and its name, with its own key (see [Enums](crate::workspace::declared#enums)).
     pub(crate) variants: &'a [(Name, Name, Name)],

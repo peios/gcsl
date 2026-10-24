@@ -360,3 +360,23 @@ def (xs: List<T>) len<T>(): Int { len(xs) }
 def (xs: List<T>) unique<T>(): List<T> { builtins.list_unique(xs) }
 #[track_caller]
 def (xs: List<T>) contains<T>(x: T): Bool { builtins.list_contains(xs, x) }
+
+
+# Building. A build tool, such as pekit, runs the calls of a function marked
+# `#[hermetic]` as cached steps, each in a sandbox holding only its
+# arguments; plain GCSL runs them at once, as any call. `#[scratch]` gives a
+# step a directory of its own kept between its runs, which plain GCSL ignores.
+# A `build` definition, `def build hello() { ... }`, is a target: its body
+# gives whatever it builds, a file or a record of them, which a build tool
+# builds when it is named.
+#[attribute] #[defers] type hermetic = {on: Bool = true}
+#[attribute] type scratch = {}
+#[def_type] def build<T>(name: String, f: fn() -> T) -> T { f() }
+
+# Platforms: an architecture and an operating system, as Rust names them.
+# `^host_platform` is where steps run: in plain GCSL this machine; a build
+# tool sets it to where it runs them. `^platform` is what is being built
+# for, by default where the steps run.
+type Platform = {arch: String, os: String}
+context host_platform: Platform = {arch = builtins.host_arch(); os = builtins.host_os()}
+context platform: Platform = {...^host_platform}

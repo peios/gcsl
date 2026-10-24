@@ -824,21 +824,22 @@ fn type_conflicts_are_the_conflicts_of_fields() {
         ]),
         [imported]
     );
-    // A `#[shadowable]` import brings types as plain ones, which an own
-    // type of their name conflicts with.
-    let star = "type `Foo` is declared in two files at app/m.gcsl (imported here); \
-                    lib/t.gcsl: declared here; app/m.gcsl: declared here";
-    assert_eq!(
-        errors(&[
-            ("workspace.gcsl", ""),
-            ("lib/t.gcsl", "type Foo = Int"),
-            (
-                "app/m.gcsl",
-                "#[shadowable] import * from lib/t\ntype Foo = String"
-            ),
-        ]),
-        [star]
-    );
+    // A `#[shadowable]` import's types are shadowed by any other of their
+    // name, silently, as its fields are: the prelude's `Platform` by a
+    // workspace's own.
+    let sources: Vec<SourceFile> = [
+        ("workspace.gcsl", ""),
+        ("lib/t.gcsl", "type Foo = Int"),
+        (
+            "app/m.gcsl",
+            "#[shadowable] import * from lib/t\ntype Foo = String\nx: Foo = \"own\"",
+        ),
+    ]
+    .iter()
+    .map(|&(path, text)| SourceFile::new(path, text).unwrap())
+    .collect();
+    let (_, checked) = check_with_standard(&sources, &[], "/");
+    assert!(checked.is_ok());
     // One type reached twice is one type.
     let files = [
         ("workspace.gcsl", ""),

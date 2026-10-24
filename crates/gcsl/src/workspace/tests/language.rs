@@ -48,11 +48,11 @@ fn a_function_s_attributes_reach_its_closures_with_their_declarations() {
         ),
         (
             "lib/attrs.gcsl",
-            "#[attribute] type scratch = {keep: Size = 1GiB}",
+            "#[attribute] type kept = {keep: Size = 1GiB}",
         ),
         (
             "app/main.gcsl",
-            "import scratch from lib/attrs\n#[scratch(512MiB)] def go(): Int { 1 }",
+            "import kept from lib/attrs\n#[kept(512MiB)] def go(): Int { 1 }",
         ),
     ];
     let root = rooted_value(&files, "workspace.gcsl");
@@ -67,15 +67,15 @@ fn a_function_s_attributes_reach_its_closures_with_their_declarations() {
     // By the module that declares it, wherever it is used.
     assert_eq!(
         attributes_of(&rooted_value(&files, "app/main.gcsl"), "go"),
-        ["lib/attrs.scratch(keep = Quantity(Size, 536870912))"]
+        ["lib/attrs.kept(keep = Quantity(Size, 536870912))"]
     );
     // One not imported is unknown there.
     let files = [
         files[0],
         files[1],
-        ("app/main.gcsl", "#[scratch] def go(): Int { 1 }"),
+        ("app/main.gcsl", "#[kept] def go(): Int { 1 }"),
     ];
-    assert_eq!(rooted_messages(&files), ["unknown attribute `scratch`"]);
+    assert_eq!(rooted_messages(&files), ["unknown attribute `kept`"]);
 }
 
 #[test]
@@ -477,9 +477,8 @@ fn variant_def_type_errors() {
             "`pk` takes no variant",
         ),
         (
-            "#[def_type]\ndef g<T>(name: String, f: fn(): T): Int { 1 }",
-            "a generic def-type takes its definitions' variant after the name, as in `def \
-             Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn(): T)`",
+            "#[def_type]\ndef g<T, U>(name: String, f: fn(): T): Int { 1 }",
+            "type parameter `U` of a def-type must appear in its definitions' result type",
         ),
         (
             "#[def_type]\ndef g<T, U>(name: String, kind: Variant<Toolchain, T>, f: fn(): U): Int { 1 }",
@@ -503,10 +502,10 @@ pub(super) const PLATFORMS: (&str, &str) = (
     "lib/plat.gcsl",
     "type Platform = {arch: String, os: String}\n\
      context arch: String = \"x86_64\"\n\
-     context host_platform: Platform = { arch = ^arch; os = \"linux\" }\n\
-     context platform: Platform = ^host_platform\n\
+     context exec_platform: Platform = { arch = ^arch; os = \"linux\" }\n\
+     context target_platform: Platform = ^exec_platform\n\
      context required: Int\n\
-     def describe(): String { \"{^platform.arch}-{^platform.os}\" }\n\
+     def describe(): String { \"{^target_platform.arch}-{^target_platform.os}\" }\n\
      def tool(^arch): String { \"cc-{arch}\" }\n\
      def needs(): Int { ^required }",
 );
@@ -520,14 +519,14 @@ fn contexts_are_read_bound_and_defaulted_where_they_are_read() {
             "app/main.gcsl",
             "import lib/plat\n\
              a = plat.describe()\n\
-             b = plat.describe() with { host_platform = { arch = \"aarch64\"; os = \"linux\" } }\n\
-             c = plat.describe() with { platform.arch = \"riscv64\"; platform.os = \"peios\" }\n\
+             b = plat.describe() with { exec_platform = { arch = \"aarch64\"; os = \"linux\" } }\n\
+             c = plat.describe() with { target_platform.arch = \"riscv64\"; target_platform.os = \"peios\" }\n\
              d = with { arch = \"arm\" } { plat.describe() }\n\
              e = plat.tool()\n\
              f = plat.tool() with { arch = \"mips\" }\n\
              g = plat.tool(arch = \"explicit\")\n\
              h = plat.needs() with { required = 3 }\n\
-             i = ^platform.os",
+             i = ^target_platform.os",
         ),
     ];
     assert_eq!(
@@ -654,9 +653,7 @@ fn a_context_s_default_is_scheduled_with_what_it_reads() {
 pub(super) const HOSTED: [(&str, &str); 4] = [
     (
         "workspace.gcsl",
-        "type Platform = {arch: String, os: String}\n\
-         context host_platform: Platform = { arch = \"x86_64\"; os = \"linux\" }\n\
-         context label: String = \"default\"\n\
+        "context label: String = \"default\"\n\
          #[def_type]\n\
          def build(name: String, f: fn() -> String) -> String { f() }\n\
          def tagged(n: Int) ->> String { \"{n}:{^label}\" }\n\
@@ -698,7 +695,11 @@ fn an_invocation_runs_in_the_context_its_host_sets() {
         invoked(&mut workspace, &set("second")),
         "aarch64-1:second-default"
     );
-    assert_eq!(invoked(&mut workspace, &[]), "x86_64-1:default-default");
+    // The prelude's `host_platform`, this machine by default.
+    assert_eq!(
+        invoked(&mut workspace, &[]),
+        format!("{}-1:default-default", std::env::consts::ARCH)
+    );
     let error = |contexts: Vec<(String, Value)>| {
         let mut workspace = rooted(&HOSTED).unwrap();
         match workspace.invoke_with(("build", "x"), &[], &contexts) {
@@ -712,7 +713,7 @@ fn an_invocation_runs_in_the_context_its_host_sets() {
     };
     assert_eq!(
         error(vec![("lable".to_owned(), Value::Int(1))]),
-        "no context `lable` is declared; the contexts are `host_platform`, `label`"
+        "no context `lable` is declared; the contexts are `host_platform`, `label`, `platform`"
     );
     assert_eq!(
         error(vec![("label".to_owned(), Value::Int(1))]),
@@ -1232,4 +1233,90 @@ fn a_program_is_given_a_secret_only_by_exec_secret_and_only_revealed() {
             errors[0].notes
         );
     }
+}
+
+#[test]
+fn the_prelude_declares_builds_steps_and_platforms() {
+    // No import: `def build`, `#[hermetic]` and the platform contexts are
+    // the prelude's, and each definition's result is its own.
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app/build.gcsl",
+            "#[hermetic] fn twice(n: Int) -> Int { n * 2 }\n\
+             def build num() { = twice(21) }\n\
+             def build both() { v = twice(1); arch = ^platform.arch }\n\
+             a: Int = (build num)()\n\
+             b: {v: Int, arch: String} = (build both)()\n\
+             c = (build both)() with { platform.arch = \"riscv64\" }\n\
+             d = ^host_platform.os",
+        ),
+    ];
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    assert_eq!(
+        rooted_text(&files, "app/build.gcsl"),
+        format!(
+            "{{a = 42; b = {{v = 2; arch = \"{arch}\"}}; c = {{v = 2; arch = \"riscv64\"}}; \
+             d = \"{os}\"}}"
+        )
+    );
+    // A workspace's own `build`, `hermetic` and `Platform` are its own.
+    let files = [
+        (
+            "workspace.gcsl",
+            "type Platform = {cpu: Int}\n\
+             #[attribute] type hermetic = {}\n\
+             #[def_type]\n\
+             def build(name: String, f: fn(): Int): String { \"{name}={f()}\" }",
+        ),
+        (
+            "app/build.gcsl",
+            "#[hermetic] fn one(): Int { 1 }\n\
+             def build x() { one() }\n\
+             p: Platform = {cpu = 4}\n\
+             r = (build x)()",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/build.gcsl"),
+        "{p = {cpu = 4}; r = \"x=1\"}"
+    );
+}
+
+#[test]
+fn a_def_type_generic_in_its_result_types_each_definition_by_its_body() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "#[def_type] def made<T>(name: String, f: fn(): T): {name: String, made: T} {\n\
+             \x20   name = name\n\
+             \x20   made = f()\n\
+             }",
+        ),
+        (
+            "app.gcsl",
+            "def made n() { 1 }\n\
+             def made s() { \"s\" }\n\
+             x: {name: String, made: Int} = (made n)()\n\
+             y: {name: String, made: String} = (made s)()",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{x = {name = \"n\"; made = 1}; y = {name = \"s\"; made = \"s\"}}"
+    );
+    // Its result is each definition's own: an Int is no String.
+    let files = [
+        files[0],
+        (
+            "app.gcsl",
+            &format!("{}\nz: String = (made n)().made", files[1].1),
+        ),
+    ];
+    let messages = rooted_messages(&files);
+    assert!(
+        messages.iter().any(|m| m.starts_with("mismatched types")),
+        "{messages:?}"
+    );
 }

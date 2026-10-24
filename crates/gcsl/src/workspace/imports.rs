@@ -632,6 +632,7 @@ pub(super) fn members(
                                 name: bound.name,
                                 span: bound.span,
                                 decl,
+                                shadowable: file.ast.is_shadowable(item),
                             });
                         }
                         if child.is_none() && ty.is_none() {
@@ -649,7 +650,8 @@ pub(super) fn members(
                     }
                     ImportMember::DefType { .. } => {}
                     ImportMember::All(star) => {
-                        let at = (item, star, implicit);
+                        let shadowable = file.ast.is_shadowable(item);
+                        let at = (item, star, implicit, shadowable);
                         star_aliases(scan, target, at, (&mut *aliases, &mut *types), errors);
                     }
                 }
@@ -660,12 +662,12 @@ pub(super) fn members(
 
 /// Binds every root of `target` into `aliases`, and every type of it into
 /// `types`, for the `*`, written at `star`, of the import `item`, implicit
-/// if it is the prelude's: a value file has none, "a value file has no
-/// members to import".
+/// if it is the prelude's, shadowable if it is `#[shadowable]`: a value file
+/// has none, "a value file has no members to import".
 fn star_aliases(
     scan: &Scan,
     target: Target,
-    (item, star, implicit): (ItemId, Span, bool),
+    (item, star, implicit, shadowable): (ItemId, Span, bool, bool),
     (aliases, types): (&mut Vec<Alias>, &mut Vec<TypeImport>),
     errors: &mut Vec<Diagnostic>,
 ) {
@@ -697,6 +699,7 @@ fn star_aliases(
                 name,
                 span: star,
                 decl,
+                shadowable,
             });
         }
     }

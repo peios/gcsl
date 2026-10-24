@@ -73,10 +73,10 @@ use crate::names::{self, Name, Names};
 use crate::source::{SourceFile, Span};
 
 use super::{
-    Alias, BUILTINS, Dir, File, FileScope, Inheriting, Library, ROOT, STANDARD_DIR, Scan,
-    builtin_nodes, declare_types, define_types, find_needs, imports, merge, merge_files,
-    method_views, no_prelude_in_input, order, parse_files, place_dirs, report_cycles, reserved,
-    resolve, schedule, shadow, shadowable_nodes, type_views, value_cells, views,
+    InheritedDefType, Alias, BUILTINS, Dir, File, FileScope, Inheriting, Library, ROOT,
+    STANDARD_DIR, Scan, builtin_nodes, declare_types, define_types, find_needs, imports, merge,
+    merge_files, method_views, no_prelude_in_input, order, parse_files, place_dirs, report_cycles,
+    reserved, resolve, schedule, shadow, shadowable_nodes, type_views, value_cells, views,
 };
 
 /// A count as a `u32`, saturating; a workspace's counts are bounded by its
@@ -196,7 +196,7 @@ pub(super) fn scan_into_with(
     library: Library,
     (names, loaded): (&mut Names, &mut Vec<usize>),
     (store, (inherited, variants, contexts)): (&mut TypeStore, Inheriting<'_>),
-    def_types: (&[(Vec<Name>, Name)], Option<u32>),
+    def_types: (&[InheritedDefType], Option<u32>),
 ) -> Result<Scan, Vec<Diagnostic>> {
     let mut scan = Scan {
         files: Vec::with_capacity(sources.len() + library.table.len()),
@@ -718,8 +718,8 @@ pub(super) fn mark_unpaired(scan: &mut Scan) {
 /// is a `def` marked `#[def_type]`, keyed by its path, its file's number,
 /// or for a session's input the input's, and its item (see
 /// [`crate::names`], "Namespace keys"); or, for a session's input whose
-/// view has nothing of its first name, the def-type of that path of the
-/// earlier inputs.
+/// view has nothing of its first name, or only what a shadowable import
+/// brings, the def-type of that path of the earlier inputs.
 pub(super) fn def_type_key(
     scan: &Scan,
     index: u32,
@@ -727,12 +727,21 @@ pub(super) fn def_type_key(
     names: &[Name],
 ) -> Option<String> {
     let (&first, rest) = names.split_first()?;
+    // What the earlier inputs make of the path: a def-type, by its key, or,
+    // for a name one of them bound to something else, no def-type.
+    let inherited = scan
+        .inherited_def_types
+        .iter()
+        .find(|(path, _)| path.as_slice() == names || path.as_slice() == [first])
+        .map(|&(_, key)| key.map(|key| scan.names.get(key).to_owned()));
+    // Which shadows a shadowable name, the prelude's `build`.
+    if scope.yields(first)
+        && let Some(key) = inherited.clone()
+    {
+        return key;
+    }
     let Some(mut node) = scope.root(first) else {
-        return scan
-            .inherited_def_types
-            .iter()
-            .find(|(path, _)| path.as_slice() == names)
-            .map(|&(_, key)| scan.names.get(key).to_owned());
+        return inherited.flatten();
     };
     for &name in rest {
         node = scope.child(node, name)?;

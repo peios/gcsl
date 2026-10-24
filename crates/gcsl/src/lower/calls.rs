@@ -64,6 +64,8 @@ impl Lowerer<'_> {
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions
+            | Builtin::HostArch
+            | Builtin::HostOs
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload

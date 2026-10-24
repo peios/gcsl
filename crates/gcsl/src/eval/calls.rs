@@ -649,6 +649,8 @@ impl Evaluator<'_> {
             (Builtin::SortVersions, Some((Value::List(versions), _)), None) => {
                 sort_versions(&versions, node)
             }
+            (Builtin::HostArch, None, None) => Ok(Value::Str(Rc::from(std::env::consts::ARCH))),
+            (Builtin::HostOs, None, None) => Ok(Value::Str(Rc::from(std::env::consts::OS))),
             (Builtin::FsWrite, Some((Value::Str(p), _)), Some(Value::Str(contents))) => {
                 write_file(&p, &contents, self.shared.effects, node)
             }

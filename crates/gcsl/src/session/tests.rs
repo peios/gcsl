@@ -1447,9 +1447,9 @@ fn a_union_variable_is_used_by_later_inputs() {
 #[test]
 fn a_session_runs_exec_panic_and_sh() {
     let mut session = Session::new();
-    // The forty-five built-in functions' cells are its first slots.
+    // The forty-seven built-in functions' cells are its first slots.
     assert_eq!(
-        &session.frame[..45],
+        &session.frame[..47],
         Builtin::ALL.map(Value::Builtin).as_slice()
     );
     // On the first input, and on later ones, through a variable.
@@ -1868,4 +1868,27 @@ fn contexts_persist_for_later_inputs_and_a_later_declaration_shadows() {
     value(&mut session, "context n: Int = 5");
     assert_eq!(value(&mut session, "^n"), Value::Int(5));
     assert_eq!(value(&mut session, "f()"), Value::Int(10));
+}
+
+#[test]
+fn an_input_s_def_types_and_names_shadow_the_prelude_s_in_later_inputs() {
+    let mut session = Session::new();
+    // The prelude's `build` until an input declares its own.
+    assert_eq!(
+        value(&mut session, "def build a() { 1 }\nbuild a()").to_string(),
+        "1"
+    );
+    value(
+        &mut session,
+        "#[def_type]\ndef build(name: String, f: fn(): Int): String { \"{name}:{f()}\" }\n\
+         def build b() { 2 }",
+    );
+    assert_eq!(value(&mut session, "build b()").to_string(), "b:2");
+    // A later binding of the name ends every def-type of it, the prelude's
+    // too.
+    value(&mut session, "build = 1");
+    assert_eq!(
+        messages(&mut session, "build b()"),
+        ["`build` is not a def-type"]
+    );
 }

@@ -34,9 +34,12 @@
 //!   name are "type `Foo` is declared in two files", once per pair, at the
 //!   later source, labelled "declared here" at each declaration and "imported
 //!   here" at each import, with the note "one is in a directory above" when one
-//!   is. Types are never shadowable: a `#[shadowable]` import brings them as
-//!   plain types, and the prelude declares none. A type imported as a built-in
-//!   type's name is "`Int` is a built-in type".
+//!   is. A type a `#[shadowable]` import brings, the prelude's implicit one's
+//!   among them, is shadowed by any other source of its name, silently, as a
+//!   shadowable import's fields are: so a workspace's own `Platform` is its
+//!   own, and the prelude's `context host_platform: Platform` keeps the
+//!   prelude's. A type imported as a built-in type's name is "`Int` is a
+//!   built-in type".
 //! - A type marked `#[attribute]` is an attribute's declaration (see the
 //!   checker's [Attributes](crate::check::attributes#attributes)): the store
 //!   records it by its number, with what a host knows it by, its file's path
@@ -644,13 +647,20 @@ pub(super) fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
                 }
             }
         }
+        // A shadowable import's types come last, each only where no other
+        // source has its name.
+        let mut shadowable: Vec<(Name, TypeSource)> = Vec::new();
         for import in &file.type_imports {
             let source = TypeSource {
                 decl: import.decl,
                 import: Some(import.span),
                 above: false,
             };
-            sources.push((import.name, source));
+            if import.shadowable {
+                shadowable.push((import.name, source));
+            } else {
+                sources.push((import.name, source));
+            }
         }
         let mut view: HashMap<Name, TypeSource> = HashMap::new();
         // The names two declarations conflict on, which the file reads as
@@ -692,6 +702,14 @@ pub(super) fn type_views(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
         if index >= scan.standard {
             for &(name, decl) in &scan.inherited_types {
                 numbered.entry(name).or_insert(decl);
+            }
+        }
+        // Last, below a session's earlier inputs' too.
+        for (name, source) in shadowable {
+            if !conflicting.contains(&name) {
+                numbered
+                    .entry(name)
+                    .or_insert(scan.type_base.saturating_add(source.decl));
             }
         }
         found.push((numbered, conflicting));

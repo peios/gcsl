@@ -11,8 +11,8 @@ use crate::names::{self, Name, Names};
 
 use super::{
     DeclaredContext, DeclaredType, DeclaredVariant, Dir, File, Function, InheritedContext,
-    InheritedVariant, Merged, Node, ROOT, STANDARD_DIR, Target, ViewNode, ViewPart, count, in_file,
-    merge_files, target_roots,
+    InheritedDefType, InheritedVariant, Merged, Node, ROOT, STANDARD_DIR, Target, ViewNode,
+    ViewPart, count, in_file, merge_files, target_roots,
 };
 
 /// The scanned workspace: what [`scan`](super::scan) finds before anything is checked.
@@ -112,8 +112,10 @@ pub struct Scan {
     pub(super) inherited_types: Vec<(Name, u32)>,
     /// The def-types a session's input inherits from the earlier inputs,
     /// each by its path, with its namespace's key: what a `DT` names that
-    /// nothing of the input does (see [Def-types](crate::workspace::declared#def-types)).
-    pub(super) inherited_def_types: Vec<(Vec<Name>, Name)>,
+    /// nothing of the input does, or only a shadowable import (see
+    /// [Def-types](crate::workspace::declared#def-types)); and each name an
+    /// earlier input bound to something else, with none.
+    pub(super) inherited_def_types: Vec<InheritedDefType>,
     /// For a session's input, its number among the session's inputs, which
     /// the keys of the def-types it declares are made with, in place of its
     /// index among the scan's files, which every input shares.

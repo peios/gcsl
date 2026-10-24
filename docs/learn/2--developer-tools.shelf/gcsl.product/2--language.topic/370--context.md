@@ -36,11 +36,29 @@ read, in the context of the read. So one context can default to another,
 and follow it:
 
 ```gcsl
-type Platform = {arch: String, os: String}
-context host_platform: Platform = {arch = "x86_64"; os = "linux"}
-context platform: Platform = ^host_platform
+context exec_cpu: String = "x86_64"
+context target_cpu: String = ^exec_cpu
 
-target = ^platform.arch with { host_platform = {arch = "aarch64"; os = "linux"} }
+target = ^target_cpu with { exec_cpu = "aarch64" }
+```
+
+## The platform contexts
+
+The prelude declares two contexts for building, which every file can read:
+
+- `host_platform` is where build steps run: in plain GCSL, the machine
+  you run it on. A build tool such as pekit sets it to where it runs them.
+- `platform` is what you're building for. Its default is
+  `host_platform`.
+
+Both are a `Platform`, `{arch: String, os: String}`, named as Rust names
+them, such as `{arch = "x86_64"; os = "linux"}`:
+
+```gcsl
+fn triple(): String { "{^platform.arch}-{^platform.os}" }
+
+native = triple()
+arm = triple() with { platform.arch = "aarch64" }
 ```
 
 A default must be pure: it can't call an impure function. To use a value
@@ -57,11 +75,11 @@ statements, use the block form, `with { NAME = VALUE } { ... }`.
 A dotted name sets one field of a record context and keeps the others:
 
 ```gcsl
-type Platform = {arch: String, os: String}
-context platform: Platform = {arch = "x86_64"; os = "linux"}
+type Board = {cpu: String, ram: Int}
+context board: Board = {cpu = "x86_64"; ram = 8}
 
-fn triple(): String { "{^platform.arch}-{^platform.os}" }
-riscv = triple() with { platform.arch = "riscv64" }
+fn describe(): String { "{^board.cpu} with {^board.ram} GiB" }
+small = describe() with { board.ram = 1 }
 ```
 
 `with { arch }` is short for `with { arch = arch }`, setting the context

@@ -97,9 +97,9 @@
 //! invocation parameters, as a def-type's after its second are. Such a def-type
 //! may be generic: a definition's variant binds its type parameters, so each
 //! must appear in the variant parameter's type, "type parameter `U` of a
-//! def-type must appear in its variant parameter's type"; a generic def-type of
-//! the other shape is "a generic def-type takes its definitions' variant after
-//! the name", both at its parameters (`Checker::check_generic_def_type`). Its
+//! def-type must appear in its variant parameter's type", at its parameters
+//! (`Checker::check_generic_def_type`); a generic def-type of the other shape
+//! is one of [Generic results](#generic-results). Its
 //! `E` must be an enum, not a type parameter: the variant's name is looked up
 //! in it.
 //!
@@ -130,6 +130,23 @@
 //! def-type of this shape is not listed to be invoked by name (see
 //! [`crate::workspace`], "Def-types by name"): its definitions are reached by
 //! references alone.
+//!
+//! # Generic results
+//!
+//! A generic def-type whose definitions are made with no variant is generic
+//! in its definitions' results: `#[def_type] def build<T>(name: String, f:
+//! fn() -> T) -> T`, the prelude's. Each type parameter must appear in the
+//! result of its definition parameter's function type, "type parameter `U` of
+//! a def-type must appear in its definitions' result type" otherwise, at its
+//! parameters (`Checker::check_result_generic`), since a definition's body
+//! binds them and nothing else. A definition's body is checked against no
+//! result (`Checker::check_definition`), and the definition is a function of
+//! its parameters' types, the def-type's for it, and of the type its body
+//! gives: `def build hello() { out = f }` is a `fn() -> {out: File}`. A
+//! reference binds the def-type's type parameters by its definition's type
+//! against the definition parameter's ([`TypeTable::bind`](crate::types::TypeTable::bind),
+//! `Checker::bound_signature`), so `build hello` is called with the
+//! def-type's signature so bound, and gives what its definition does.
 
 use crate::ast::{
     DefTypeId, DefTypeRole, Effect, ExprId, ExprKind, FnId, ItemId, ItemKind, PathSegment,
@@ -139,7 +156,7 @@ use crate::diagnostic::Diagnostic;
 use crate::mentions::Resolve;
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{DefTypeShape, FnTy, Meta, TyId, TyKind};
+use crate::types::{DefTypeShape, FnTy, GenericId, Meta, TyId, TyKind};
 
 use super::{
     Attribute, Checker, DefinitionAt, Function, JUXTAPOSED_NOTE, KnownCallee, NO_NODE, Slot,
@@ -261,10 +278,9 @@ impl Checker<'_> {
         let use_ = *self.ast.def_type(def);
         let (shown, _) = self.ast.show_def_type(def);
         let (sig, tag) = match (shape.variant, use_.variant) {
-            (None, None) if sig.generic.is_none() => (sig, None),
-            // A generic def-type that takes no variant is reported where it
-            // is declared.
-            (None, None) => return None,
+            // A generic one's definitions bind its type parameters by their
+            // bodies (see [Generic results](#generic-results)).
+            (None, None) => (sig, None),
             (None, Some((_, at))) => {
                 let dt: Vec<&str> = self
                     .ast
@@ -333,32 +349,8 @@ impl Checker<'_> {
         let given = self.types.variant(of, payload);
         let sig = match sig.generic {
             None => sig.clone(),
-            Some(generic) => {
-                let mut bound = vec![None; self.types.generic_names(generic).len()];
-                self.types.bind(param, given, generic, &mut bound);
-                // Each is bound: the def-type's declaration says so.
-                let bindings: Option<Vec<TyId>> = bound.into_iter().collect();
-                let bindings = bindings?;
-                let params = sig
-                    .params
-                    .iter()
-                    .map(|&(name, param)| (name, self.types.substitute(param, generic, &bindings)))
-                    .collect();
-                let ret = self.types.substitute(sig.ret, generic, &bindings);
-                let meta = sig.meta.map(|meta| Meta {
-                    ty: self.types.substitute(meta.ty, generic, &bindings),
-                    ..meta
-                });
-                FnTy {
-                    params,
-                    ret,
-                    effect: sig.effect,
-                    meta,
-                    generic: None,
-                    rest: sig.rest,
-                    needs: sig.needs,
-                }
-            }
+            // Each is bound: the def-type's declaration says so.
+            Some(_) => self.bound_signature(sig, param, given)?,
         };
         let &(_, wanted) = sig.params.get(at)?;
         if !self.types.is_subtype(given, wanted) {
@@ -372,6 +364,49 @@ impl Checker<'_> {
             return None;
         }
         Some((sig, tag))
+    }
+
+    /// The signature `sig` of a generic def-type with its type parameters
+    /// bound by `given`, the type of what is given for its parameter of type
+    /// `param`: `None` if `sig` is not generic or one is left unbound.
+    pub(super) fn bound_signature(&mut self, sig: &FnTy, param: TyId, given: TyId) -> Option<FnTy> {
+        let generic = sig.generic?;
+        let mut bound = vec![None; self.types.generic_names(generic).len()];
+        self.types.bind(param, given, generic, &mut bound);
+        let bindings: Option<Vec<TyId>> = bound.into_iter().collect();
+        let bindings = bindings?;
+        let params = sig
+            .params
+            .iter()
+            .map(|&(name, param)| (name, self.types.substitute(param, generic, &bindings)))
+            .collect();
+        let ret = self.types.substitute(sig.ret, generic, &bindings);
+        let meta = sig.meta.map(|meta| Meta {
+            ty: self.types.substitute(meta.ty, generic, &bindings),
+            ..meta
+        });
+        Some(FnTy {
+            params,
+            ret,
+            effect: sig.effect,
+            meta,
+            generic: None,
+            rest: sig.rest,
+            needs: sig.needs,
+        })
+    }
+
+    /// The signature `sig` of a generic def-type whose parameters are where
+    /// `shape` says, bound by `definition`, the type of one of its
+    /// definitions (see [Generic results](#generic-results)).
+    pub(super) fn bound_by_definition(
+        &mut self,
+        sig: &FnTy,
+        shape: DefTypeShape,
+        definition: TyId,
+    ) -> Option<FnTy> {
+        let &(_, param) = sig.params.get(shape.function)?;
+        self.bound_signature(sig, param, definition)
     }
 
     /// When the walk of the outermost block reaches the item `id`, the
@@ -513,11 +548,15 @@ impl Checker<'_> {
         }
         let signature = self.use_signature(def, dt_ty).and_then(|found| {
             let sig = self.types.fn_sig(found.definition)?.clone();
-            Some((found.definition, sig))
+            let generic = found.sig.generic.is_some();
+            Some((found.definition, sig, generic))
         });
-        let Some((ty, sig)) = signature else {
+        let Some((ty, sig, generic)) = signature else {
             return TyId::ERROR;
         };
+        // A generic def-type's definition gives its own result, whatever its
+        // body is (see [Generic results](#generic-results)).
+        let ret = if generic { TyId::ERROR } else { sig.ret };
         let params = self.ast.params(decl.params);
         if params.len() != sig.params.len() {
             self.definition_arity(def, &sig);
@@ -541,13 +580,24 @@ impl Checker<'_> {
             marker: dt_span,
             keyword: dt_span,
             demanded: vec![None; params.len()],
-            result: Some((sig.ret, dt_span)),
+            result: Some((ret, dt_span)),
             returns: Vec::new(),
             with_depth: self.contexts.bound.len(),
             needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
-        self.check_fn_body(&decl, base, (None, ty, span), sig.ret);
+        self.check_fn_body(&decl, base, (None, ty, span), ret);
+        let ty = if generic {
+            let found = self.expr_types[decl.body.index()];
+            let params = sig.params.iter().copied();
+            let made = self
+                .types
+                .fn_type_with_meta(params, found, sig.effect, sig.meta);
+            self.expr_types[id.index()] = made;
+            made
+        } else {
+            ty
+        };
         self.fn_params.truncate(base);
         self.inherit_attributes(function, use_.dt);
         // Its meta's cell, read as its body reads a top-level function.
@@ -869,11 +919,7 @@ impl Checker<'_> {
             _ => self.ast.get(decl.body).span,
         };
         let Some(variant) = shape.variant.and_then(|at| sig.params.get(at)) else {
-            self.errors.push(Diagnostic::error(
-                "a generic def-type takes its definitions' variant after the name, as in `def \
-                 Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn(): T)`",
-                at,
-            ));
+            self.check_result_generic(&sig, generic, shape, at);
             return;
         };
         let (variant_name, variant_ty) = *variant;
@@ -896,6 +942,49 @@ impl Checker<'_> {
                         "a definition's variant, given as `{kind}`, binds the def-type's type \
                          parameters"
                     )),
+                );
+            }
+        }
+    }
+
+    /// Reports each type parameter of the generic def-type of signature
+    /// `sig` whose definitions are made with no variant that its definition
+    /// parameter's result does not mention, "type parameter `U` of a def-type
+    /// must appear in its definitions' result type", at `at`, its
+    /// parameters: a definition's body binds them, and nothing else (see
+    /// [Generic results](#generic-results)).
+    pub(super) fn check_result_generic(
+        &mut self,
+        sig: &FnTy,
+        generic: GenericId,
+        shape: DefTypeShape,
+        at: Span,
+    ) {
+        let Some(&(_, definition)) = sig.params.get(shape.function) else {
+            return;
+        };
+        let result = self
+            .types
+            .fn_sig(self.types.strip(definition))
+            .map_or(TyId::ERROR, |f| f.ret);
+        let names = self.types.generic_names(generic).to_vec();
+        let mut bound = vec![None; names.len()];
+        self.types.bind(result, result, generic, &mut bound);
+        for (&name, binding) in names.iter().zip(&bound) {
+            if binding.is_none() {
+                self.errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "type parameter `{}` of a def-type must appear in its definitions' \
+                             result type",
+                            self.ast.names().get(name)
+                        ),
+                        at,
+                    )
+                    .with_note(
+                        "a definition's body binds the def-type's type parameters; one written \
+                         with a variant, `def Toolchain::C gcc()`, binds them by the variant",
+                    ),
                 );
             }
         }
@@ -940,13 +1029,14 @@ impl Checker<'_> {
         // it is declared.
         let Some(UseSignature {
             definition,
-            sig,
+            mut sig,
             shape,
             tag,
         }) = self.use_signature(def, dt_ty)
         else {
             return TyId::ERROR;
         };
+        let generic = sig.generic.is_some();
         // The variant the def-type is called with, a constant.
         if let Some(tag) = tag {
             self.lowering.variants.insert(id, tag);
@@ -968,17 +1058,7 @@ impl Checker<'_> {
                 return TyId::ERROR;
             }
             DefinitionAt::Missing(seen) => {
-                let note = match seen.as_slice() {
-                    [] => format!("`{shown}` has no definitions here"),
-                    [only] => format!("the only definition of `{shown}` here is `{only}`"),
-                    [init @ .., last] => {
-                        let init: Vec<String> = init.iter().map(|d| format!("`{d}`")).collect();
-                        format!(
-                            "the definitions of `{shown}` here are {} and `{last}`",
-                            init.join(", ")
-                        )
-                    }
-                };
+                let note = seen_note(&shown, &seen);
                 self.errors.push(
                     Diagnostic::error(format!("`{shown}` has no definition `{path}`"), at)
                         .with_note(note),
@@ -995,6 +1075,14 @@ impl Checker<'_> {
         if read_ty == TyId::ERROR {
             self.unread_past(read, defined);
             return TyId::ERROR;
+        }
+        // A generic def-type's type parameters are bound by the definition's
+        // own type (see [Generic results](#generic-results)).
+        if generic {
+            let Some(bound) = self.bound_by_definition(&sig, shape, read_ty) else {
+                return TyId::ERROR;
+            };
+            sig = bound;
         }
         let ty = self.types.fn_type_with_meta(
             sig.params
@@ -1203,5 +1291,23 @@ impl Checker<'_> {
             }
         }
         found
+    }
+}
+
+/// The note of a def-type reference whose path names nothing, the def-type
+/// shown `shown`, of the definitions the file sees, `seen`: "`package` has
+/// no definitions here", "the only definition of `package` here is `x`",
+/// "the definitions of `package` here are `a` and `b.c`".
+fn seen_note(shown: &str, seen: &[String]) -> String {
+    match seen {
+        [] => format!("`{shown}` has no definitions here"),
+        [only] => format!("the only definition of `{shown}` here is `{only}`"),
+        [init @ .., last] => {
+            let init: Vec<String> = init.iter().map(|d| format!("`{d}`")).collect();
+            format!(
+                "the definitions of `{shown}` here are {} and `{last}`",
+                init.join(", ")
+            )
+        }
     }
 }

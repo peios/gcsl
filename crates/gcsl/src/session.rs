@@ -290,7 +290,7 @@ pub struct Session {
     /// The def-types of the committed inputs that no later one has
     /// shadowed, each by its path, with its namespace's key, which the next
     /// input inherits (see [Def-types](#def-types)).
-    def_types: Vec<(Vec<Name>, Name)>,
+    def_types: Vec<workspace::InheritedDefType>,
     /// The variants of the committed inputs that no later one has shadowed,
     /// each by its enum's key and its name, with its own key, which the next
     /// input inherits.
@@ -459,7 +459,22 @@ impl Session {
                 // it, but a def-type the input declares.
                 self.def_types
                     .retain(|(path, _)| path.first().is_none_or(|name| !declared.contains(name)));
-                self.def_types.extend(inherited.def_types);
+                // Each other name it binds is no def-type of its name for
+                // the later inputs, the prelude's among them.
+                let defined: HashSet<Name> = inherited
+                    .def_types
+                    .iter()
+                    .filter_map(|(path, _)| path.first().copied())
+                    .collect();
+                for &name in declared.iter().filter(|name| !defined.contains(name)) {
+                    self.def_types.push((vec![name], None));
+                }
+                self.def_types.extend(
+                    inherited
+                        .def_types
+                        .into_iter()
+                        .map(|(path, key)| (path, Some(key))),
+                );
                 // A variant the input declares shadows an earlier one of its
                 // enum and name.
                 self.variants.retain(|&(of, name, _)| {

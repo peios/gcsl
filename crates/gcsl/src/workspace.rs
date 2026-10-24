@@ -236,8 +236,8 @@ pub use files::{
     Node, SeenVariant, Target, TypeImport, View, ViewNode, ViewPart,
 };
 pub(crate) use files::{
-    CheckedMethod, ContextDefault, ForLater, ForeignMethod, InheritedContext, InheritedVariant,
-    SeenContext,
+    CheckedMethod, ContextDefault, ForLater, ForeignMethod, InheritedContext, InheritedDefType,
+    InheritedVariant, SeenContext,
 };
 use files::Inheriting;
 pub use scan::Scan;

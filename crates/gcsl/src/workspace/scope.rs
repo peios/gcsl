@@ -53,6 +53,23 @@ impl<'a> FileScope<'a> {
             .zip(&file.global)
             .map(|(own, &global)| (global, own))
             .collect();
+        let yielding =
+            |a: &super::Alias| file.marked(a) || (!a.whole && scan.target_shadowable(a.target));
+        // A shadowable import's name never displaces another import's, an
+        // earlier session input's among them, whatever their order.
+        let mut aliases: HashMap<Name, Target> = file
+            .aliases
+            .iter()
+            .filter(|a| !yielding(a))
+            .map(|a| (a.name, a.target))
+            .collect();
+        let mut shadowable = Vec::new();
+        for alias in file.aliases.iter().filter(|a| yielding(a)) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = aliases.entry(alias.name) {
+                entry.insert(alias.target);
+                shadowable.push(alias.name);
+            }
+        }
         Self {
             scan,
             dir: file.dir,
@@ -60,13 +77,8 @@ impl<'a> FileScope<'a> {
             tree: &file.mentions.tree,
             global: &file.global,
             local,
-            aliases: file.aliases.iter().map(|a| (a.name, a.target)).collect(),
-            shadowable: file
-                .aliases
-                .iter()
-                .filter(|a| file.marked(a) || (!a.whole && scan.target_shadowable(a.target)))
-                .map(|a| a.name)
-                .collect(),
+            aliases,
+            shadowable,
             inherited: file
                 .aliases
                 .iter()

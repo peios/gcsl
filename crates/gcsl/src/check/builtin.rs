@@ -83,6 +83,14 @@ pub enum Builtin {
     /// `sort_versions(vs: List<String>): List<String>`: `vs` sorted in
     /// version order, as `compare_versions` orders two, a stable sort.
     SortVersions,
+    /// `host_arch(): String`: the architecture of the machine GCSL runs on,
+    /// as Rust names it, `x86_64` or `aarch64`, the prelude's default of
+    /// `host_platform.arch`.
+    HostArch,
+    /// `host_os(): String`: the operating system of the machine GCSL runs
+    /// on, as Rust names it, `linux`, the prelude's default of
+    /// `host_platform.os`.
+    HostOs,
     /// `show(value)`: the GCSL source of a value, as text, which reads back
     /// as an equal value. Its typing is special.
     Show,
@@ -198,7 +206,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 45] = [
+    pub const ALL: [Builtin; 47] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -221,6 +229,8 @@ impl Builtin {
         Builtin::FsTempDir,
         Builtin::FsWrite,
         Builtin::SortVersions,
+        Builtin::HostArch,
+        Builtin::HostOs,
         Builtin::Show,
         Builtin::ExecLive,
         Builtin::VariantMatches,
@@ -294,6 +304,8 @@ impl Builtin {
             Builtin::FsTempDir => "fs_temp_dir",
             Builtin::FsWrite => "fs_write",
             Builtin::SortVersions => "sort_versions",
+            Builtin::HostArch => "host_arch",
+            Builtin::HostOs => "host_os",
             Builtin::Show => "show",
             Builtin::ExecLive => "exec_live",
             Builtin::VariantMatches => "variant_matches",
@@ -350,6 +362,8 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::CompareVersions
             | Builtin::SortVersions
+            | Builtin::HostArch
+            | Builtin::HostOs
             | Builtin::Show
             | Builtin::ExecLive
             | Builtin::VariantMatches
@@ -438,7 +452,7 @@ impl Builtin {
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
-            Builtin::FsTempDir => &[],
+            Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs => &[],
             Builtin::FsWrite => &["p", "contents"],
             Builtin::SortVersions => &["vs"],
             Builtin::Show => &["value"],
@@ -490,6 +504,8 @@ impl Builtin {
             | Builtin::Fields
             | Builtin::CompareVersions
             | Builtin::SortVersions
+            | Builtin::HostArch
+            | Builtin::HostOs
             | Builtin::Show
             | Builtin::VariantMatches
             | Builtin::VariantPayload
@@ -533,6 +549,8 @@ impl Builtin {
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::SortVersions
+            | Builtin::HostArch
+            | Builtin::HostOs
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
@@ -596,6 +614,7 @@ impl Builtin {
             Builtin::FsTempDir => "fn() -> String",
             Builtin::FsWrite => "fn(p: String, contents: String) -> {}",
             Builtin::SortVersions => "fn(vs: List<String>): List<String>",
+            Builtin::HostArch | Builtin::HostOs => "fn(): String",
             Builtin::VariantMatches => "fn<E, T>(kind: Variant<E, T>, value: E): Bool",
             Builtin::VariantPayload => "fn<E, T>(kind: Variant<E, T>, value: E): T",
             Builtin::PartialMatches => "fn<T>(partial: Partial<T>, full: T): Bool",
@@ -710,7 +729,9 @@ impl Builtin {
             Builtin::FsExists => ([TyId::STRING, UNUSED], TyId::BOOL),
             Builtin::FsMkdir => ([TyId::STRING, UNUSED], TyId::EMPTY),
             Builtin::FsCopy | Builtin::FsWrite => ([TyId::STRING, TyId::STRING], TyId::EMPTY),
-            Builtin::FsTempDir => ([UNUSED, UNUSED], TyId::STRING),
+            Builtin::FsTempDir | Builtin::HostArch | Builtin::HostOs => {
+                ([UNUSED, UNUSED], TyId::STRING)
+            }
             Builtin::SortVersions => {
                 let list = types.list(TyId::STRING);
                 ([list, UNUSED], list)

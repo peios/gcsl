@@ -91,6 +91,32 @@ type receives the variant as its `kind` argument. Hosts don't invoke these
 definitions by name: programs reach them through references, for example
 in a list of registered toolchains.
 
+## Definitions of any result
+
+A definition type can be generic without a variant. Each definition's
+body then fills in the type parameter, so definitions of one type can
+give different results:
+
+```gcsl
+#[def_type]
+def made<T>(name: String, f: fn(): T): {name: String, made: T} {
+    name = name
+    made = f()
+}
+def made count() { 3 }
+def made label() { "three" }
+n: Int = (made count)().made
+s: String = (made label)().made
+```
+
+The type parameters must appear in the definition parameter's result,
+`fn(): T` here, since that's the only thing that binds them.
+
+The prelude's `build` is a definition type of this kind,
+`def build<T>(name: String, f: fn() -> T) -> T`, so every file can write
+`def build hello() { ... }` with no import, and give whatever it builds.
+A workspace that declares its own `build` uses its own.
+
 ## Metadata
 
 Function types can carry metadata with `META:`, `META->`, or `META->>`.

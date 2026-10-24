@@ -8,11 +8,12 @@ An attribute goes before a function and says how to run it, for example
 whether a build step can be cached or how long it can take. GCSL checks
 every attribute. Most are read by the tool that runs the program, such as
 a build system, and GCSL itself acts on its own three, `retry`, `timeout`
-and `track_caller`.
+and `track_caller`. The prelude declares two for builds: `hermetic`,
+which lets a build tool such as pekit run a function's calls as cached
+steps, and `scratch`, which gives such a step a directory kept between its
+runs. Plain GCSL runs those calls at once, as any call.
 
 ```gcsl
-#[attribute] type hermetic = {on: Bool = true}
-
 #[hermetic]
 fn compile(source: String) -> String { "compiled {source}" }
 
@@ -108,28 +109,28 @@ A definition's own attribute of the same name replaces the definition
 type's:
 
 ```gcsl
-#[attribute] type hermetic = {on: Bool = true}
+#[attribute] type cached = {on: Bool = true}
 
-#[def_type] #[hermetic]
+#[def_type] #[cached]
 def check(name: String, f: fn(): Bool): fn(): Bool { f }
 
 def check fast() { true }
-#[hermetic(false)] def check online() { true }
+#[cached(false)] def check online() { true }
 
 results = [(check fast)()(), (check online)()()]
 ```
 
-Here `fast` is hermetic and `online` is not.
+Here `fast` is cached and `online` is not.
 
 ## Attributes that defer calls
 
 A host such as pekit can run some calls as separate steps, possibly in
 parallel or from a cache, and give their results later. An attribute that
-asks for that is declared with `#[defers]` as well as `#[attribute]`:
+asks for that is declared with `#[defers]` as well as `#[attribute]`, as
+the prelude declares `hermetic`, `#[attribute] #[defers] type hermetic =
+{on: Bool = true}`:
 
 ```gcsl
-#[attribute] #[defers] type hermetic = {on: Bool = true}
-
 #[hermetic]
 fn compile(source: String) -> String { "{source}.o" }
 

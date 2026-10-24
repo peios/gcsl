@@ -156,6 +156,12 @@ pub struct DeclaredContext {
 /// (see [Context](crate::workspace::declared#context)).
 pub(crate) type InheritedContext = (Name, Name, Option<Name>);
 
+/// A def-type a session's input inherits from the earlier inputs, by its
+/// path, with its namespace's key; or a name an earlier input bound to
+/// something else, with none, which no def-type of its name, the prelude's
+/// among them, outlives (see [Def-types](crate::workspace::declared#def-types)).
+pub(crate) type InheritedDefType = (Vec<Name>, Option<Name>);
+
 /// The slot of each context's default's closure, once its file is checked,
 /// by its declaration's key (see [Context](crate::workspace::declared#context)).
 pub(crate) type CheckedContexts = HashMap<Name, Slot>;
@@ -336,6 +342,10 @@ pub struct TypeImport {
     pub span: Span,
     /// Its declaration, by its index in [`Scan::types`].
     pub decl: u32,
+    /// Whether its import is `#[shadowable]`, as the prelude's implicit one
+    /// is: any other type of its name shadows it (see
+    /// [Types](super::declared#types)).
+    pub shadowable: bool,
 }
 
 /// A directory of a workspace.
