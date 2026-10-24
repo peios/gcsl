@@ -339,17 +339,25 @@ pub(crate) fn log(message: impl fmt::Display) {
 pub fn stdio() -> ExitCode {
     let (connection, io_threads) = Connection::stdio();
     let served = serve(&connection);
-    // The writer thread stops once every sender of the connection is gone.
+    // The writer thread stops once every sender of the connection is gone,
+    // having written what was queued. Unless the threads are joined, the
+    // process may end part-way through writing an answer. Once the client
+    // has said `exit`, with or without `shutdown`, or gone away, the reader
+    // has stopped, so joining waits only for the writer. After a protocol
+    // error or a failed worker, the client may still be connected and the
+    // reader still waiting for it, so the threads are left.
     drop(connection);
-    match served {
-        Ok(()) => match io_threads.join() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                log(format_args!("error: {error}"));
-                ExitCode::FAILURE
-            }
-        },
-        Err(error) => {
+    let joined = match &served {
+        Ok(()) | Err(Error::ExitWithoutShutdown | Error::Disconnected) => io_threads.join(),
+        Err(Error::Protocol(_) | Error::Worker(_) | Error::WorkerStopped) => Ok(()),
+    };
+    match (served, joined) {
+        (Ok(()), Ok(())) => ExitCode::SUCCESS,
+        (Err(error), _) => {
+            log(format_args!("error: {error}"));
+            ExitCode::FAILURE
+        }
+        (Ok(()), Err(error)) => {
             log(format_args!("error: {error}"));
             ExitCode::FAILURE
         }
