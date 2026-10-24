@@ -527,9 +527,8 @@ fn show_rejects_a_function_anywhere_in_its_argument() {
         (
             "show({e = exec})",
             "{e = exec}",
-            "`{e: fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
-             interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: String, \
-             stdout: String}}`",
+            "`{e: fn(argv: List<String>, cwd: String, env: {*: String}, interactive: Bool, \
+             panic: Bool, until: String) -> {status: Int, stderr: String, stdout: String}}`",
         ),
         (
             "show(lazy fn(): Int { 1 })",
@@ -577,14 +576,14 @@ pub(super) const EXEC_RESULT: &str = "{status: Int, stderr: String, stdout: Stri
 
 /// The type of the prelude's `exec`, which takes the built-in's options by
 /// name.
-const EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
-                         interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: \
-                         String, stdout: String}";
+const EXEC_TYPE: &str = "fn(argv: List<String>, cwd: String, env: {*: String}, interactive: Bool, \
+                         panic: Bool, until: String) -> {status: Int, stderr: String, stdout: \
+                         String}";
 
 /// The type of the built-in `exec`, which takes its options as a record.
-const BUILTIN_EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*: \
-                                 Revealed<String>}, interactive: Bool, panic: Bool, until: \
-                                 String}) -> {status: Int, stderr: String, stdout: String}";
+const BUILTIN_EXEC_TYPE: &str = "fn(argv: List<String>, options: {cwd: String, env: {*: String}, \
+                                 interactive: Bool, panic: Bool, until: String}) -> {status: Int, \
+                                 stderr: String, stdout: String}";
 
 #[test]
 fn exec_and_panic_have_function_types() {

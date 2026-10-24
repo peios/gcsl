@@ -305,7 +305,7 @@ use crate::diagnostic::Diagnostic;
 use crate::ir::{ArgValue, ConstId, FnKind, IrId, IrKind, IrNode, IrRange};
 use crate::names::Name;
 use crate::source::Span;
-use crate::value::{Closure, Tag, Value, ValueKind, Variant, int_to_float};
+use crate::value::{Closure, List, Tag, Value, ValueKind, Variant, int_to_float};
 
 use super::{
     Callee, DEFERRED_FUNCTION, Evaluator, Flow, MIXED, OVERFLOW, Unwind, compare_versions,
@@ -376,6 +376,28 @@ impl Evaluator<'_> {
         result
             .or_else(|unwind| unwind.returned(node.span))
             .map_err(|error| self.call_error(error, &closure, node).into())
+    }
+
+    /// Applies `builtin`, `exec`, `exec_live` or `exec_secret`, for the call
+    /// `node`, to `argv` and `options` ([`exec`]), until the innermost
+    /// deadline if there is one: a deadline that passes first is the
+    /// call's timing out.
+    fn exec_call(
+        &self,
+        builtin: Builtin,
+        (argv, options): (&List, &Value),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let deadline = self.shared.earliest.get();
+        match exec(
+            builtin,
+            (argv, options),
+            (self.shared.exec_result, deadline),
+            node,
+        )? {
+            Some(value) => Ok(value),
+            None => self.timed_out(node),
+        }
     }
 
     /// `error`, which came out of a call `node` of `closure`, as the
@@ -511,14 +533,11 @@ impl Evaluator<'_> {
                     .into()),
             },
             (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
-            (Builtin::Exec | Builtin::ExecLive, Some((Value::List(words), _)), Some(options)) => {
-                let deadline = self.shared.earliest.get();
-                let words = (&words, &options);
-                match exec(builtin, words, (self.shared.exec_result, deadline), node)? {
-                    Some(value) => Ok(value),
-                    None => self.timed_out(node),
-                }
-            }
+            (
+                Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret,
+                Some((Value::List(words), _)),
+                Some(options),
+            ) => self.exec_call(builtin, (&words, &options), node),
             (Builtin::Panic, Some((Value::Str(message), _)), None) => {
                 Err(Diagnostic::error(&*message, node.span).into())
             }

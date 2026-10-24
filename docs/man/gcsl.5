@@ -246,10 +246,12 @@ takes its value, and
 .B .reveal()
 makes it a
 .BI Revealed< T > ,
-which only
-.BR exec 's
-arguments accept: the program receives the value, and GCSL shows it as
-.BR *** .
+which only the secrets of
+.B exec_secret
+accept, as environment variables: the program receives the value, GCSL shows it as
+.BR *** ,
+and everything the program reports is a secret.
+No argument of a program, and no variable of plain exec, is a secret.
 Computing on revealed secrets alone gives a revealed one.
 An operator with a secret operand, a secret interpolated, a field of a secret record and an element of a secret list are secrets, as is any comparison of values that hold a secret, each identified by its derivation: the operation, the identities of the secrets it used, and its plain operands.
 Elsewhere, in

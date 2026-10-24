@@ -71,8 +71,9 @@ exec(["sh", "-c", "echo $GREETING"], env = {GREETING = "hello"}).stdout
 ```
 
 The program named first is found through the resulting `PATH`, so setting
-`PATH` in `env` also changes where it's looked for. A value you pass can be
-a revealed secret: the program receives its value, and GCSL never shows it.
+`PATH` in `env` also changes where it's looked for. A secret is never
+passed this way: `exec_secret` gives a program secrets, and its result is a
+secret too (see Secrets).
 
 A build tool that runs commands in isolation, such as pekit, gives them an
 environment of its own instead of GCSL's.
@@ -84,7 +85,7 @@ environment of its own instead of GCSL's.
 | Option | Default | Effect |
 | --- | --- | --- |
 | `cwd` | `""` | The working directory. `""` keeps GCSL's own; a relative path is relative to it. |
-| `env` | `{}` | Variables set over the environment, as a record of strings or revealed secrets. |
+| `env` | `{}` | Variables set over the environment, as a record of strings. |
 | `panic` | `true` | A nonzero exit status fails the call with its standard error. When false, the status is data. |
 | `until` | `""` | When set, the program is stopped at the first line of output containing this text. |
 | `interactive` | `false` | When true, the program uses GCSL's terminal, and nothing is captured. |

@@ -57,26 +57,61 @@ it. A failure of anything else in the expression is unchanged: in
 
 ## Giving a secret to a program
 
-A program that needs a secret gets it revealed: `.reveal()` turns a
-`Secret<T>` into a `Revealed<T>`, which `exec` accepts as an argument.
+A program that needs a secret gets it with `exec_secret`, as an
+environment variable. Reveal the secret with `.reveal()`, which turns a
+`Secret<T>` into a `Revealed<T>`, and pass it in `secrets`:
 
 ```gcsl
 let token = secret("abc123", "api token")
 
-# `test -n` exits 0 if the token it is given isn't empty.
-status = exec(["test", "-n", token.reveal()]).status
+# `test -n` exits 0 if the variable it is given isn't empty.
+let run = exec_secret(["sh", "-c", "test -n \"$TOKEN\""], secrets = {TOKEN = token.reveal()})
+status = run.status
 ```
 
-The program receives the value, but GCSL still shows a revealed secret as
-`***`, so it doesn't appear in error messages or anywhere GCSL shows the
-command line. A revealed secret is contagious too:
-`"--token={token.reveal()}"` is a `Revealed<String>`, while mixing in a
-secret that isn't revealed gives a plain `Secret`, which `exec` refuses.
+The program receives the value. Everything it reports is a secret,
+because the program might tell of what it was given: `run` is a
+`Secret<{status: Int, stdout: String, stderr: String}>`, so `run.status`
+and `run.stdout` are secrets too. Files the program writes aren't secrets;
+a key that signs a file doesn't make the signed file secret.
 
-Only `exec` takes a revealed secret, so searching for `.reveal()` finds
-every program that ever receives one. What the program does with it is up
-to the program: if it prints the secret, the output it returns has it in
-plain text.
+A secret is never an argument of the command. Any user on the machine
+can read a running program's arguments, so `exec` refuses a revealed
+secret anywhere in its arguments or its `env`, and points you to
+`exec_secret`. Its arguments and the names of its variables are public.
+
+`exec_secret` fails, as `exec` does, when the program exits with a status
+other than 0, unless you pass `panic = false`. The error says only that "a
+program given a secret failed", without the status or the output. Unlike
+other failures involving a secret, `recover` can catch it and `#[retry]`
+can retry it: it tells only that the program failed. `exec_secret` doesn't
+copy output as it arrives, or give the program the terminal, since either
+would show the output.
+
+A revealed secret is contagious too: `"--token={token.reveal()}"` is a
+`Revealed<String>`, while mixing in a secret that isn't revealed gives a
+plain `Secret`, which `secrets` refuses. Only `exec_secret` takes a
+revealed secret, so searching for `.reveal()` finds every program that
+ever receives one.
+
+The result of a run is identified by everything the program was given:
+its arguments, its options and the identities of its secrets. Two runs of
+one command with the same secrets are one secret wherever secrets compare
+by identity, even if their outputs differ.
+
+## What secrets protect against
+
+Secrets keep a value from leaking by accident: into a log, an error
+message, a cache key, a build record or the output of a command. They
+don't protect a secret from the code that uses it. Anyone who can change
+a build file can take the value with `.unsafe_value()`, or give it to a
+program that writes it somewhere. Review where `.reveal()` and
+`.unsafe_value()` are used, as you'd review any code that handles
+credentials.
+
+GCSL makes no promise about timing. How long an operation on a secret
+takes can depend on its value, but the code that could measure that can
+already read the value directly.
 
 ## Taking the value
 

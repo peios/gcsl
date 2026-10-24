@@ -187,6 +187,7 @@ mod memoised;
 mod mutation;
 mod records;
 mod scalars;
+mod secrets;
 mod suggestions;
 mod toplevel;
 mod unions;

@@ -362,9 +362,8 @@ fn exec_and_panic_show_as_their_types() {
     assert_eq!(exec.kind(), ValueKind::Fn);
     assert_eq!(
         exec.to_string(),
-        "fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*: Revealed<String>}, \
-         interactive: Bool, panic: Bool, until: String}) -> {status: Int, stderr: String, stdout: \
-         String}"
+        "fn(argv: List<String>, options: {cwd: String, env: {*: String}, interactive: Bool, \
+         panic: Bool, until: String}) -> {status: Int, stderr: String, stdout: String}"
     );
     assert_eq!(exec.repr().to_string(), exec.to_string());
     assert_eq!(

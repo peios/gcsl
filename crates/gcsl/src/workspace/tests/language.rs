@@ -1056,64 +1056,6 @@ fn a_secret_is_one_with_another_of_its_identity_where_a_comparison_is_plain() {
 }
 
 #[test]
-fn a_revealed_secret_is_given_to_a_program_and_shown_as_stars() {
-    let text = "let s = secret(\"hunter2\", \"token\")\n\
-                a = exec([\"echo\", s.reveal()]).stdout\n\
-                let flag = \"--token={s.reveal()}\"\n\
-                b = flag\n\
-                c = exec([\"echo\", flag]).stdout\n\
-                fn same<T>(x: T): T { x }\n\
-                d = exec([\"echo\", same(s.reveal())]).stdout\n\
-                let kept: Secret<String> = s.reveal()\n\
-                e = kept";
-    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
-    assert_eq!(
-        rooted_text(&files, "app.gcsl"),
-        "{a = \"hunter2\\n\"; b = ***; c = \"--token=hunter2\\n\"; d = \"hunter2\\n\"; e = ***}"
-    );
-    // A program a revealed secret names is shown as the secret is.
-    let files = [
-        ("workspace.gcsl", ""),
-        (
-            "app.gcsl",
-            "let p = secret(\"/no/such/program\", \"p\")\nr = exec([p.reveal()])",
-        ),
-    ];
-    let mut workspace = rooted(&files).unwrap();
-    let app = workspace.file("app.gcsl").unwrap();
-    let error = workspace.run(app).unwrap_err().remove(0);
-    assert_eq!(error.message, "cannot run `***`");
-}
-
-#[test]
-fn only_a_revealed_secret_is_given_to_a_program() {
-    let prefix = "let s = secret(\"pw\", \"id\")\n";
-    for text in [
-        "r = exec([\"echo\", s])",
-        "r = exec([\"echo\", \"{s.reveal()}{s}\"])",
-        "r = exec([\"echo\", secret(s.reveal(), \"again\")])",
-        "let r: Revealed<String> = s",
-    ] {
-        let files = [
-            ("workspace.gcsl", ""),
-            ("app.gcsl", &format!("{prefix}{text}")),
-        ];
-        let errors = rooted(&files)
-            .err()
-            .unwrap_or_else(|| panic!("{text}: no error"));
-        assert_eq!(errors[0].message, "mismatched types", "{text}");
-        assert!(
-            errors[0]
-                .notes
-                .iter()
-                .any(|note| note.contains("`.reveal()`")),
-            "{text}: {:?}",
-            errors[0].notes
-        );
-    }
-}
-
-#[test]
 fn a_revealed_secret_keeps_its_identity_and_is_told_apart_from_the_secret() {
     let text = "let s = secret(\"pw\", \"token\")\n\
                 a = s.reveal()\n\
@@ -1187,18 +1129,100 @@ fn a_tracked_function_reports_the_errors_of_its_body_at_its_call() {
 }
 
 #[test]
-fn a_revealed_secret_is_given_to_a_program_s_environment() {
+fn a_program_given_a_secret_reports_a_secret() {
     let text = "let s = secret(\"hunter2\", \"token\")\n\
-                a = exec([\"sh\", \"-c\", \"echo $T\"], env = {T = s.reveal()}).stdout\n\
-                b = exec([\"sh\", \"-c\", \"echo $T\"], env = {T = \"plain\"}).stdout";
+                let r = exec_secret([\"sh\", \"-c\", \"echo $T\"], secrets = {T = s.reveal()})\n\
+                a = r\n\
+                b = r.stdout\n\
+                c = r.stdout.unsafe_value()\n\
+                d = r.status.unsafe_value()\n\
+                let flag = \"--token={s.reveal()}\"\n\
+                e = flag\n\
+                f = exec_secret([\"sh\", \"-c\", \"echo $F\"], secrets = {F = flag}).stdout.unsafe_value()\n\
+                let kept: Secret<String> = s.reveal()\n\
+                g = kept";
     let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
     assert_eq!(
         rooted_text(&files, "app.gcsl"),
-        "{a = \"hunter2\\n\"; b = \"plain\\n\"}"
+        "{a = ***; b = ***; c = \"hunter2\\n\"; d = 0; e = ***; f = \"--token=hunter2\\n\"; \
+         g = ***}"
     );
-    // A secret not revealed is no value of an environment's.
-    let text = "let s = secret(\"pw\", \"id\")\nr = exec([\"true\"], env = {T = s})";
-    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
-    let errors = rooted(&files).err().unwrap();
-    assert_eq!(errors[0].message, "mismatched types");
+}
+
+#[test]
+fn a_run_given_a_secret_is_one_secret_with_another_only_if_it_is_the_same_run() {
+    // A memoised function keys its calls by a secret's identity: two runs
+    // of one command are one key, and a run of another command another.
+    let counter = std::env::temp_dir().join(format!("gcsl-12d-memo-{}", std::process::id()));
+    let counter = counter.to_str().unwrap();
+    let _ = std::fs::remove_file(counter);
+    let text = format!(
+        "let s = secret(\"pw\", \"token\")\n\
+         fn run(word: String) -> Secret<{{status: Int, stdout: String, stderr: String}}> {{\n\
+             exec_secret([\"echo\", word], secrets = {{T = s.reveal()}})\n\
+         }}\n\
+         fn mark(r: Secret<{{status: Int, stdout: String, stderr: String}}>) ->> Int {{\n\
+             exec([\"sh\", \"-c\", \"echo x >> {counter}\"]).status\n\
+         }}\n\
+         = [mark(run(\"a\")), mark(run(\"a\")), mark(run(\"b\"))]"
+    );
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text.as_str())];
+    assert_eq!(rooted_text(&files, "app.gcsl"), "[0, 0, 0]");
+    let runs = std::fs::read_to_string(counter).unwrap().lines().count();
+    std::fs::remove_file(counter).unwrap();
+    assert_eq!(runs, 2);
+}
+
+#[test]
+fn a_program_is_given_a_secret_only_by_exec_secret_and_only_revealed() {
+    let prefix = "let s = secret(\"pw\", \"id\")\n";
+    // A word or a variable of `exec`'s, or of a file's, is never a secret.
+    for text in [
+        "r = exec([\"echo\", s.reveal()])",
+        "r = exec([\"true\"], env = {T = s.reveal()})",
+        "r = exec_live([\"echo\", s.reveal()])",
+        "r = file(\"/bin/echo\").exec(s.reveal())",
+        "r = exec_secret([\"echo\", s.reveal()], secrets = {})",
+    ] {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("app.gcsl", &format!("{prefix}{text}")),
+        ];
+        let errors = rooted(&files)
+            .err()
+            .unwrap_or_else(|| panic!("{text}: no error"));
+        assert_eq!(errors[0].message, "mismatched types", "{text}");
+        assert!(
+            errors[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("exec_secret(argv, secrets")),
+            "{text}: {:?}",
+            errors[0].notes
+        );
+    }
+    // A secret given is revealed, whole.
+    for text in [
+        "r = exec_secret([\"true\"], secrets = {T = s})",
+        "r = exec_secret([\"true\"], secrets = {T = \"{s.reveal()}{s}\"})",
+        "r = exec_secret([\"true\"], secrets = {T = secret(s.reveal(), \"again\")})",
+        "let r: Revealed<String> = s",
+    ] {
+        let files = [
+            ("workspace.gcsl", ""),
+            ("app.gcsl", &format!("{prefix}{text}")),
+        ];
+        let errors = rooted(&files)
+            .err()
+            .unwrap_or_else(|| panic!("{text}: no error"));
+        assert_eq!(errors[0].message, "mismatched types", "{text}");
+        assert!(
+            errors[0]
+                .notes
+                .iter()
+                .any(|note| note.contains("`.reveal()`")),
+            "{text}: {:?}",
+            errors[0].notes
+        );
+    }
 }

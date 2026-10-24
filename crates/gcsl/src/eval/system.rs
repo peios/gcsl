@@ -20,8 +20,9 @@ use nix::unistd::Pid;
 use crate::check::Builtin;
 use crate::diagnostic::Diagnostic;
 use crate::ir::IrNode;
-use crate::value::{Layout, List, Record, Value};
+use crate::value::{Layout, List, Record, Secret, Value};
 
+use super::secrets::token;
 use super::{Flow, mistyped};
 
 /// Runs the program `argv` names, for the call `node` of `builtin`, `exec`
@@ -50,13 +51,18 @@ use super::{Flow, mistyped};
 /// own reason, for a program that cannot be started, or whose output cannot
 /// be read or whose end cannot be waited for, as [`Command::output`]
 /// reports each, and with "`until` watches a program's output, which an
-/// interactive one does not capture" for both. A word of `argv` that is a
-/// revealed secret is given to the program as its value, and shown as
-/// `***` (see [Secrets](crate::eval::secrets#secrets)): "cannot run
-/// `***`". A run without the standard library has no `exec` layout, nor
-/// any `exec` to call, so `exec_result` being `None` is an internal error,
-/// as is an element of `argv` that is neither a string nor a revealed one,
-/// or options of another shape, which the checker rules out.
+/// interactive one does not capture" for both. No word of `argv`, nor
+/// variable of `env`, is a secret. `exec_secret`'s `secrets` are set over
+/// `env`, each a revealed secret's value, and what it reports is a secret,
+/// of an identity derived from `argv` and the options, every secret in them
+/// its identity, so that two runs are one secret only if they are given the
+/// same (see [Secrets](crate::eval::secrets#secrets)); its failure on a
+/// status is "a program given a secret failed", naming nothing it did,
+/// unmarked, so that `recover` and `#[retry]` handle it. A run without the
+/// standard library has no `exec` layout, nor any `exec` to call, so
+/// `exec_result` being `None` is an internal error, as is an element of
+/// `argv` that is not a string, or options of another shape, which the
+/// checker rules out.
 #[inline(never)]
 pub(super) fn exec(
     builtin: Builtin,
@@ -67,6 +73,7 @@ pub(super) fn exec(
     let Some(layout) = exec_result else {
         return mistyped(node, "`exec` called in a run without its result's layout");
     };
+    let raw_options = options;
     let Some(options) = ExecOptions::of(options) else {
         return mistyped(node, "options of `exec` of another shape");
     };
@@ -77,15 +84,15 @@ pub(super) fn exec(
         )
         .into());
     };
-    let Some((program, shown)) = word(program) else {
+    let Some(shown) = word(program) else {
         return mistyped(node, "a program of `exec` that is not a string");
     };
-    let mut command = Command::new(&**program);
+    let mut command = Command::new(shown);
     for argument in arguments {
-        let Some((argument, _)) = word(argument) else {
+        let Some(argument) = word(argument) else {
             return mistyped(node, "an argument of `exec` that is not a string");
         };
-        command.arg(&**argument);
+        command.arg(argument);
     }
     if !options.cwd.is_empty() {
         command.current_dir(options.cwd);
@@ -109,7 +116,13 @@ pub(super) fn exec(
     };
     let text = |bytes: &[u8]| Rc::<str>::from(String::from_utf8_lossy(bytes).as_ref());
     let (stdout, stderr) = (text(&stdout), text(&stderr));
+    let secret = builtin == Builtin::ExecSecret;
     if options.panic && status != 0 {
+        // A program given a secret may tell of it in its status and its
+        // output, which are secrets: its failure names neither.
+        if secret {
+            return Err(Diagnostic::error("a program given a secret failed", node.span).into());
+        }
         let mut failed =
             Diagnostic::error(format!("`{shown}` exited with status {status}"), node.span);
         if !live && !stderr.trim().is_empty() {
@@ -117,19 +130,31 @@ pub(super) fn exec(
         }
         return Err(failed.into());
     }
-    Ok(Some(Value::Record(Rc::new(Record {
+    let result = Value::Record(Rc::new(Record {
         layout: Rc::clone(layout),
         values: Box::new([Value::Int(status), Value::Str(stdout), Value::Str(stderr)]),
+    }));
+    if !secret {
+        return Ok(Some(result));
+    }
+    // Its identity is what it was given, every secret as its identity, so
+    // that two runs are one secret only if they are one run.
+    let given = (token(&Value::List(argv.clone())), token(raw_options));
+    Ok(Some(Value::Secret(Rc::new(Secret {
+        value: result,
+        identity: Rc::from(format!("exec-secret({}, {})", given.0, given.1)),
+        revealed: false,
     }))))
 }
 
-/// What the options record of a call of `exec` or `exec_live` says (see
-/// [`exec`]): each of its fields, as the checker types them.
+/// What the options record of a call of `exec`, `exec_live` or
+/// `exec_secret` says (see [`exec`]): each of its fields, as the checker
+/// types them.
 pub(super) struct ExecOptions<'a> {
     /// The program's working directory, `""` for this process's.
     cwd: &'a str,
     /// The variables set over this process's environment for the program,
-    /// a revealed secret's by its value.
+    /// and after them, `exec_secret`'s, each of a revealed secret's value.
     env: Vec<(&'a str, &'a str)>,
     /// Whether the program has this process's terminal.
     interactive: bool,
@@ -141,7 +166,9 @@ pub(super) struct ExecOptions<'a> {
 
 impl<'a> ExecOptions<'a> {
     /// The options `value` holds, a record of the fields of
-    /// [`Builtin::EXEC_OPTIONS`]; `None` for anything else.
+    /// [`Builtin::EXEC_OPTIONS`], or of [`Builtin::EXEC_SECRET_OPTIONS`],
+    /// whose `secrets` are set over `env` and which have no `interactive`;
+    /// `None` for anything else.
     fn of(value: &'a Value) -> Option<Self> {
         let Value::Record(record) = value else {
             return None;
@@ -162,24 +189,49 @@ impl<'a> ExecOptions<'a> {
             Some(&Value::Bool(flag)) => Some(flag),
             _ => None,
         };
-        let env = match field("env")? {
-            Value::Empty => Vec::new(),
-            Value::Record(env) => env
-                .layout
-                .texts
-                .iter()
-                .zip(&env.values)
-                .map(|(name, value)| Some((&**name, &**word(value)?.0)))
-                .collect::<Option<Vec<_>>>()?,
-            _ => return None,
+        let mut env = variables(field("env")?, |value| match value {
+            Value::Str(text) => Some(&**text),
+            _ => None,
+        })?;
+        if let Some(secrets) = field("secrets") {
+            env.extend(variables(secrets, |value| match value {
+                Value::Secret(secret) if secret.revealed => match &secret.value {
+                    Value::Str(text) => Some(&**text),
+                    _ => None,
+                },
+                _ => None,
+            })?);
+        }
+        let interactive = match field("interactive") {
+            Some(_) => flag("interactive")?,
+            None => false,
         };
         Some(ExecOptions {
             cwd: text("cwd")?,
             env,
-            interactive: flag("interactive")?,
+            interactive,
             panic: flag("panic")?,
             until: text("until")?,
         })
+    }
+}
+
+/// The variables of `record`, an environment, each name with the text
+/// `text` takes of its value; `None` if one has none.
+fn variables<'a>(
+    record: &'a Value,
+    text: impl Fn(&'a Value) -> Option<&'a str>,
+) -> Option<Vec<(&'a str, &'a str)>> {
+    match record {
+        Value::Empty => Some(Vec::new()),
+        Value::Record(record) => record
+            .layout
+            .texts
+            .iter()
+            .zip(&record.values)
+            .map(|(name, value)| Some((&**name, text(value)?)))
+            .collect(),
+        _ => None,
     }
 }
 
@@ -463,16 +515,11 @@ impl Reader<'_> {
     }
 }
 
-/// The text of `value`, a word of `exec`'s `argv`, and how it is shown: a
-/// string as itself, a revealed secret's string as `***`; `None` for
-/// anything else.
-fn word(value: &Value) -> Option<(&Rc<str>, &str)> {
+/// The text of `value`, a word of `exec`'s `argv`, always a string, which
+/// is never a secret's; `None` for anything else.
+fn word(value: &Value) -> Option<&str> {
     match value {
-        Value::Str(text) => Some((text, text)),
-        Value::Secret(secret) if secret.revealed => match &secret.value {
-            Value::Str(text) => Some((text, "***")),
-            _ => None,
-        },
+        Value::Str(text) => Some(text),
         _ => None,
     }
 }

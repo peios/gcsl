@@ -33,14 +33,16 @@ def half(n: Int): Float { float(n) / 2.0 }
 # over gcsl's environment for it; `interactive` to give it gcsl's terminal,
 # capturing nothing; `panic`, true unless given false, to make a status other
 # than 0 a failure of the call; and `until`, some text whose line, in either
-# stream, ends the program, with the status 0. Each fails at its call, as `sh` and `sh_live` do: they
-# are `#[track_caller]`. `panic(message)` ends the run with the runtime error
-# `message`, an ordinary built-in, not the alias rule's.
+# stream, ends the program, with the status 0. Neither gives a program a
+# secret: `exec_secret` does, and its result is a secret. Each fails at its
+# call, as `sh` and `sh_live` do: they are `#[track_caller]`.
+# `panic(message)` ends the run with the runtime error `message`, an
+# ordinary built-in, not the alias rule's.
 #[track_caller]
 def exec(
-    argv: Present<List<Revealed<String>>>,
+    argv: Present<List<String>>,
     cwd: Present<String> = "",
-    env: Present<{*: Revealed<String>}> = {},
+    env: Present<{*: String}> = {},
     interactive: Present<Bool> = false,
     panic: Present<Bool> = true,
     until: Present<String> = "",
@@ -53,9 +55,9 @@ def exec(
 
 #[track_caller]
 def exec_live(
-    argv: Present<List<Revealed<String>>>,
+    argv: Present<List<String>>,
     cwd: Present<String> = "",
-    env: Present<{*: Revealed<String>}> = {},
+    env: Present<{*: String}> = {},
     interactive: Present<Bool> = false,
     panic: Present<Bool> = true,
     until: Present<String> = "",
@@ -140,8 +142,8 @@ def (partial: Partial<T>) matches<T>(full: T): Bool {
 # Secrets: `s.unsafe_value()` is the secret's value, the deliberate escape
 # from what keeps it from leaking, for a linter or a strict mode to flag.
 # `s.reveal()` is the secret revealed, which only a program may be given, as
-# a word of `exec`'s `argv`. `secret(value, identity)` makes one; a secret
-# shows as `***`.
+# an environment variable of `exec_secret`'s `secrets`. `secret(value,
+# identity)` makes one; a secret shows as `***`.
 def (s: Secret<T>) unsafe_value<T>(): T {
     builtins.secret_value(s)
 }
@@ -150,6 +152,30 @@ def (s: Secret<T>) reveal<T>(): Revealed<T> {
 }
 def secret<T>(value: T, identity: String): Secret<T> {
     builtins.secret(value, identity)
+}
+
+# `exec_secret(argv, secrets = {TOKEN = token.reveal()})` runs a program as
+# `exec` does, given each revealed secret of `secrets` as an environment
+# variable, never as a word of `argv`, which any user of the machine can
+# read. What it reports is a secret, since the program may tell of what it
+# was given: `r.stdout` is a `Secret<String>`. It fails, unless given
+# `panic = false`, with "a program given a secret failed", naming neither
+# its status nor its output; that failure may be recovered and retried. It
+# copies nothing as it runs and has no terminal, either of which would
+# show its output. Files the program writes are not secrets.
+#[track_caller]
+def exec_secret(
+    argv: Present<List<String>>,
+    secrets: Present<{*: Revealed<String>}>,
+    cwd: Present<String> = "",
+    env: Present<{*: String}> = {},
+    panic: Present<Bool> = true,
+    until: Present<String> = "",
+) -> Secret<{status: Int, stdout: String, stderr: String}> {
+    builtins.exec_secret(
+        argv,
+        {cwd = cwd; env = env; panic = panic; secrets = secrets; until = until},
+    )
 }
 
 # Files: `file(path)` is the file at `path`, a relative one against the
@@ -173,9 +199,9 @@ def (f: File) read() -> String {
 
 #[track_caller]
 def (f: File) exec(
-    ...words: Revealed<String>,
+    ...words: Present<String>,
     cwd: Present<String> = "",
-    env: Present<{*: Revealed<String>}> = {},
+    env: Present<{*: String}> = {},
     interactive: Present<Bool> = false,
     panic: Present<Bool> = true,
     until: Present<String> = "",

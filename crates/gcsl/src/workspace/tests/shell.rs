@@ -30,9 +30,9 @@ pub(super) fn lone_error(text: &str) -> Diagnostic {
 const MAIN: u32 = 1;
 
 /// The type of the prelude's `exec` and `exec_live`, as a value shows it.
-const EXEC_TYPE: &str = "fn(argv: List<Revealed<String>>, cwd: String, env: {*: Revealed<String>}, \
-                         interactive: Bool, panic: Bool, until: String) -> {status: Int, stderr: \
-                         String, stdout: String}";
+const EXEC_TYPE: &str = "fn(argv: List<String>, cwd: String, env: {*: String}, interactive: Bool, \
+                         panic: Bool, until: String) -> {status: Int, stderr: String, stdout: \
+                         String}";
 #[test]
 fn the_shell_summary_runs_in_a_workspace_and_alone() {
     let expected = "{r = {status = 0; stdout = \"/\\n\"; stderr = \"\"}; lines = \"/\\n\"; \
@@ -292,8 +292,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the thirty-two built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 32);
+    // The driver wrote the thirty-three built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 33);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;
@@ -541,10 +541,33 @@ fn exec_fails_unless_its_program_succeeds() {
         lone("= exec([\"echo\", \"ok\"], panic = true).stdout").unwrap(),
         "ok\n"
     );
-    // A secret program is shown as stars.
-    let error =
-        lone_error("let p = secret(\"false\", \"p\")\nr = exec([p.reveal()], panic = true)");
-    assert_eq!(error.message, "`***` exited with status 1");
+    // A program given a secret fails naming neither its status nor its
+    // output, which are secrets; the failure is the call's, recovered and
+    // retried as any.
+    let secret = "let s = secret(\"pw\", \"id\")\n";
+    let text = format!(
+        "{secret}x = exec_secret([\"sh\", \"-c\", \"echo $T >&2; exit 3\"], secrets = {{T = \
+         s.reveal()}})"
+    );
+    let error = lone_error(&text);
+    assert_eq!(error.message, "a program given a secret failed");
+    assert!(error.notes.is_empty());
+    assert_eq!(
+        lone(&format!(
+            "{secret}= recover {{ exec_secret([\"false\"], secrets = {{T = s.reveal()}}).status }} \
+             else (e) {{ secret(0, \"none\") }}"
+        ))
+        .unwrap(),
+        "***"
+    );
+    // A program that cannot start is named: its name is no secret.
+    assert_eq!(
+        lone_error(&format!(
+            "{secret}x = exec_secret([\"gcsl-no-such-program-12d\"], secrets = {{T = s.reveal()}})"
+        ))
+        .message,
+        "cannot run `gcsl-no-such-program-12d`"
+    );
 }
 
 #[test]
@@ -612,4 +635,24 @@ fn a_timeout_kills_what_its_program_started() {
     let started = std::time::Instant::now();
     assert_eq!(lone(text).unwrap(), "{r = -1}");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+#[test]
+fn a_retried_call_runs_its_program_given_a_secret_again() {
+    let counter = std::env::temp_dir().join(format!("gcsl-12d-retry-{}", std::process::id()));
+    let counter = counter.to_str().unwrap();
+    let _ = std::fs::remove_file(counter);
+    let text = format!(
+        "let s = secret(\"pw\", \"id\")\n\
+         #[retry(2)]\n\
+         fn flaky() -> Int {{\n\
+             exec_secret([\"sh\", \"-c\", \"echo x >> {counter}; exit 1\"], secrets = {{T = s.reveal()}})\n\
+             1\n\
+         }}\n\
+         x = flaky()"
+    );
+    assert_eq!(lone_error(&text).message, "a program given a secret failed");
+    let runs = std::fs::read_to_string(counter).unwrap().lines().count();
+    std::fs::remove_file(counter).unwrap();
+    assert_eq!(runs, 3);
 }

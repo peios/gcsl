@@ -44,8 +44,11 @@
 //!
 //! `s.reveal()`, the prelude's over the built-in `secret_reveal`, is
 //! `Revealed<T>`: the secret, revealed, which only a program may be given,
-//! as a word of `exec`'s `argv`, `List<Revealed<String>>`, a plain string
-//! fitting it. A revealed secret is still a secret, contagious and
+//! as a variable of `exec_secret`'s `secrets`, `{*: Revealed<String>}`,
+//! whose result is a secret: no word of a program's `argv`, which any user
+//! can read, nor variable of `exec`'s `env` is one, "mismatched types"
+//! noted that `exec_secret` gives a program a secret. A revealed secret is
+//! still a secret, contagious and
 //! deciding nothing; it fits `Secret<T>`, and no secret that is not
 //! revealed fits `Revealed<T>`. What is computed on secrets is revealed
 //! only if every secret computed on is (`Checker::secret_operation`), so
@@ -231,6 +234,12 @@ impl Checker<'_> {
         let (found, expected) = (self.types.strip(found), self.types.strip(expected));
         if self.types.holds_kept_secret(found) && self.types.holds_revealed(expected) {
             return Some("a program is given a secret only revealed: `.reveal()` reveals it");
+        }
+        if self.types.holds_revealed(found) && !self.types.holds_revealed(expected) {
+            return Some(
+                "a program is given a secret only as an environment variable, by \
+                 `exec_secret(argv, secrets = {NAME = s.reveal()})`",
+            );
         }
         (self.types.secret_value(found).is_some() && self.types.secret_value(expected).is_none())
             .then_some(

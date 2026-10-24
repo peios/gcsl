@@ -24,8 +24,9 @@
 //! makes
 //! it revealed if the checker found every secret computed on revealed, and
 //! only if a secret it computes is revealed too; `secret_reveal` makes a
-//! secret revealed, of its identity, and `exec` gives a revealed word's
-//! value to the program, shown as `***`.
+//! secret revealed, of its identity, and `exec_secret` gives a revealed
+//! secret's value to a program as an environment variable, reporting what
+//! the program did as a secret.
 //!
 //! A failure of the operation itself, a division by zero, an overflow or an
 //! index past the end of a secret list, can tell of the secret: it is "an
@@ -153,7 +154,7 @@ impl Evaluator<'_> {
 /// operation's derivation: its [`Value::derivation`], or, past
 /// [`TOKEN_LIMIT`] bytes, `#` and the hexadecimal FNV-1a-128 digest of it,
 /// so that a derivation stays short whatever its operands are.
-fn token(value: &Value) -> Rc<str> {
+pub(super) fn token(value: &Value) -> Rc<str> {
     let text = value.derivation().to_string();
     if text.len() <= TOKEN_LIMIT {
         return Rc::from(text);

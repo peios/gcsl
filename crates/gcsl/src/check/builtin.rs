@@ -123,6 +123,12 @@ pub enum Builtin {
     /// `file_read(f: File) -> String`: the contents of the file `f`, which
     /// must be UTF-8, the prelude's `f.read()`. Impure.
     FileRead,
+    /// `exec_secret(argv: List<String>, options: {cwd, env, panic, secrets,
+    /// until}) -> Secret<{status: Int, stderr: String, stdout: String}>`:
+    /// runs a program as `exec` does, given the revealed secrets of
+    /// `secrets` as environment variables, and reports what it did as a
+    /// secret (see [Secrets](crate::check::secrets#secrets)). Impure.
+    ExecSecret,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -146,7 +152,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 32] = [
+    pub const ALL: [Builtin; 33] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -179,6 +185,7 @@ impl Builtin {
         Builtin::SecretReveal,
         Builtin::File,
         Builtin::FileRead,
+        Builtin::ExecSecret,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -197,6 +204,11 @@ impl Builtin {
     /// whether a status other than 0 fails the call, and the text whose
     /// line ends it.
     pub const EXEC_OPTIONS: [&'static str; 5] = ["cwd", "env", "interactive", "panic", "until"];
+
+    /// The names of the fields of the options `exec_secret` takes, in the
+    /// order of the record's type: `exec`'s but `interactive`, which would
+    /// show what the program writes, and the revealed secrets it is given.
+    pub const EXEC_SECRET_OPTIONS: [&'static str; 5] = ["cwd", "env", "panic", "secrets", "until"];
 
     /// The name of its member of the `builtins` module.
     #[must_use]
@@ -234,6 +246,7 @@ impl Builtin {
             Builtin::SecretReveal => "secret_reveal",
             Builtin::File => "file",
             Builtin::FileRead => "file_read",
+            Builtin::ExecSecret => "exec_secret",
         }
     }
 
@@ -275,7 +288,8 @@ impl Builtin {
             | Builtin::SecretValue
             | Builtin::SecretReveal
             | Builtin::File
-            | Builtin::FileRead => None,
+            | Builtin::FileRead
+            | Builtin::ExecSecret => None,
         }
     }
 
@@ -286,7 +300,7 @@ impl Builtin {
         match self {
             Builtin::Len => &["list"],
             Builtin::Int | Builtin::Float => &["x"],
-            Builtin::Exec | Builtin::ExecLive => &["argv", "options"],
+            Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => &["argv", "options"],
             Builtin::Panic => &["message"],
             Builtin::Split => &["s", "sep"],
             Builtin::Join => &["parts", "sep"],
@@ -332,7 +346,8 @@ impl Builtin {
             | Builtin::FsTempDir
             | Builtin::FsWrite
             | Builtin::File
-            | Builtin::FileRead => Effect::Impure,
+            | Builtin::FileRead
+            | Builtin::ExecSecret => Effect::Impure,
             Builtin::Len
             | Builtin::Int
             | Builtin::Float
@@ -392,7 +407,8 @@ impl Builtin {
             | Builtin::SecretValue
             | Builtin::SecretReveal
             | Builtin::File
-            | Builtin::FileRead => Typing::Ordinary,
+            | Builtin::FileRead
+            | Builtin::ExecSecret => Typing::Ordinary,
         }
     }
 
@@ -409,9 +425,13 @@ impl Builtin {
             Builtin::Int => "fn(x: Float): Int",
             Builtin::Float => "fn(x: Int): Float",
             Builtin::Exec | Builtin::ExecLive => {
-                "fn(argv: List<Revealed<String>>, options: {cwd: String, env: {*: Revealed<String>}, \
-                 interactive: Bool, panic: Bool, until: String}) -> {status: Int, stderr: String, \
-                 stdout: String}"
+                "fn(argv: List<String>, options: {cwd: String, env: {*: String}, interactive: Bool, \
+                 panic: Bool, until: String}) -> {status: Int, stderr: String, stdout: String}"
+            }
+            Builtin::ExecSecret => {
+                "fn(argv: List<String>, options: {cwd: String, env: {*: String}, panic: Bool, \
+                 secrets: {*: Revealed<String>}, until: String}) -> Secret<{status: Int, stderr: \
+                 String, stdout: String}>"
             }
             Builtin::Panic => "fn(message: String): Never",
             Builtin::Split => "fn(s: String, sep: String): List<String>",
@@ -454,20 +474,38 @@ impl Builtin {
         let (param_types, result): ([TyId; Builtin::MAX_PARAMS], TyId) = match self {
             Builtin::Int => ([TyId::FLOAT, UNUSED], TyId::INT),
             Builtin::Float => ([TyId::INT, UNUSED], TyId::FLOAT),
-            Builtin::Exec | Builtin::ExecLive => {
-                // A word is a string or a secret revealed to the program.
-                let revealed = types.revealed(TyId::STRING);
-                let word = types.union([TyId::STRING, revealed]);
-                let argv = types.list(word);
+            Builtin::Exec | Builtin::ExecLive | Builtin::ExecSecret => {
+                // A program's words and environment are plain: a secret is
+                // given to one only by `exec_secret`'s `secrets`.
+                let argv = types.list(TyId::STRING);
                 let [status, stdout, stderr] = Builtin::EXEC_FIELDS.map(|text| names.intern(text));
                 let result = types.record([
                     (status, TyId::INT),
                     (stdout, TyId::STRING),
                     (stderr, TyId::STRING),
                 ]);
+                let environment = types.record_with_rest([], Some(TyId::STRING), Vec::new());
+                if self == Builtin::ExecSecret {
+                    let [cwd, env, panic, secrets, until] =
+                        Builtin::EXEC_SECRET_OPTIONS.map(|text| names.intern(text));
+                    let revealed = types.revealed(TyId::STRING);
+                    let given = types.record_with_rest([], Some(revealed), Vec::new());
+                    let options = types.record([
+                        (cwd, TyId::STRING),
+                        (env, environment),
+                        (panic, TyId::BOOL),
+                        (secrets, given),
+                        (until, TyId::STRING),
+                    ]);
+                    let secret = types.secret(result);
+                    let params = [
+                        (Some(names.intern("argv")), argv),
+                        (Some(names.intern("options")), options),
+                    ];
+                    return types.fn_type(params, secret, self.effect());
+                }
                 let [cwd, env, interactive, panic, until] =
                     Builtin::EXEC_OPTIONS.map(|text| names.intern(text));
-                let environment = types.record_with_rest([], Some(word), Vec::new());
                 let options = types.record([
                     (cwd, TyId::STRING),
                     (env, environment),
