@@ -6914,3 +6914,55 @@ fn misplaced_and_malformed_attribute_uses_are_errors() {
         errors_of(&[("expected `,` or `)`, found `]`", "]")])
     );
 }
+
+#[test]
+fn a_named_function_takes_type_parameters() {
+    let ast = parse_text("fn id<T>(x: T): T { x }\ndef pair<A, B>(a: A, b: B): A { a }").unwrap();
+    let all: Vec<Vec<&str>> = ast
+        .all_generics()
+        .iter()
+        .map(|generics| {
+            generics
+                .params
+                .iter()
+                .map(|&(name, _)| ast.names().get(name))
+                .collect()
+        })
+        .collect();
+    assert_eq!(all, [vec!["T"], vec!["A", "B"]]);
+    // In scope in the signature and the body only.
+    let text = "fn id<T>(x: T): T { let y: T = x\n y }\nz: T = 1";
+    let ast = parse_text(text).unwrap();
+    let scoped: Vec<bool> = ast
+        .type_ids()
+        .map(|id| match ast.type_expr(id).kind {
+            TypeExprKind::Named(name) => ast.type_param(id, name).is_some(),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(scoped, [true, true, true, false]);
+    for (text, message) in [
+        (
+            "fn f<T, T>(x: T): T { x }",
+            "type parameter `T` is declared twice",
+        ),
+        (
+            "fn f<>(x: Int): Int { x }",
+            "expected a type parameter's name, found `>`",
+        ),
+        (
+            "fn f<T,>(x: T): T { x }",
+            "expected a type parameter's name, found `>`",
+        ),
+        (
+            "fn f<T U>(x: T): T { x }",
+            "expected `,` or `>` after a type parameter, found `U`",
+        ),
+    ] {
+        assert_eq!(message_of(text), message, "{text}");
+    }
+}
+
+fn message_of(text: &str) -> String {
+    parse_text(text).unwrap_err().message
+}

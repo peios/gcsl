@@ -141,6 +141,22 @@
 //! `fn(Int) -> Int`, whose bare parameter is the either shape, but is one of
 //! `fn(Present<Int>) -> Int`. That is the contravariance above, nothing new.
 //!
+//! # Generics
+//!
+//! A generic function's type, `fn<T>(x: T): T`, is a function type whose
+//! [`FnTy::generic`] names what its type parameters belong to, a
+//! [`GenericId`] made for the function once ([`TypeTable::new_generic`]),
+//! and in whose parameters' and result's types each parameter is a
+//! [`TyKind::Param`] of it, shown by its name. The parameters of two generic
+//! functions are never one type, whatever their names and files. A
+//! parameter is opaque: a subtype only of itself, laziness-present to every
+//! check that inserts an await (it is never measured), and of the value kind
+//! that may hold any value ([`ValueKind::Deferred`]). A call binds each
+//! parameter from its arguments' types ([`TypeTable::bind`]) and then uses
+//! the signature with each replaced by its binding
+//! ([`TypeTable::substitute`]); see the checker's "Generics". Two function
+//! types join only if they are of one generic, or neither is generic.
+//!
 //! # Metas
 //!
 //! A function type may have a *meta*, [`Meta`]: a record attached to its
@@ -324,6 +340,7 @@ use crate::check::{Builtin, Constant};
 use crate::names::{Name, Names};
 use crate::strings::{FieldName, Quoted};
 use crate::value::{Quantity, ValueKind, write_quantity};
+use std::num::NonZeroU32;
 
 /// An interned type: an index into the [`TypeTable`] that produced it.
 ///
@@ -446,7 +463,23 @@ pub enum TyKind {
     /// limits](https://learn.peios.org/gcsl/language/inference-limits/)). See [Built-in
     /// functions](#built-in-functions).
     Builtin(Builtin),
+    /// A type parameter of a generic function, `T` in `fn id<T>(x: T): T`:
+    /// the `index`-th of the function type of `generic` (see
+    /// [Generics](#generics)). Opaque: a subtype only of itself.
+    Param {
+        /// The generic function type it belongs to.
+        generic: GenericId,
+        /// Its position among that type's parameters.
+        index: u8,
+    },
 }
+
+/// What a generic function's type parameters belong to: one of its own,
+/// made for it once ([`TypeTable::new_generic`]), so that the parameters of
+/// two generic functions, of any files, are never confused (see
+/// [Generics](#generics)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GenericId(NonZeroU32);
 
 /// The fields of a record type, the defaults of those that have one (see
 /// [Defaults](#defaults)), and its rest-field, if it has one (see
@@ -530,6 +563,10 @@ pub struct FnTy {
     pub effect: Effect,
     /// The function's meta, if the type has one (see [Metas](#metas)).
     pub meta: Option<Meta>,
+    /// What its type parameters belong to, if it is generic: the
+    /// [`TyKind::Param`]s of it in its parameters' and result's types stand
+    /// for whatever each call binds them to (see [Generics](#generics)).
+    pub generic: Option<GenericId>,
 }
 
 /// The meta of a function type, `META-> PackageMeta` in `fn(v: Version):
@@ -638,6 +675,9 @@ pub struct TypeTable {
     /// that the types without one, nearly all of them, are passed over in
     /// constant time.
     provisional: Vec<bool>,
+    /// The names of the type parameters of each generic function type, by
+    /// its [`GenericId`]: what a [`TyKind::Param`] is shown as.
+    generics: Vec<Box<[Name]>>,
 }
 
 impl Default for TypeTable {
@@ -655,6 +695,7 @@ impl TypeTable {
             kinds: Vec::new(),
             lookup: HashMap::new(),
             provisional: Vec::new(),
+            generics: Vec::new(),
         };
         // In the order of the constants' numbers.
         for kind in [
@@ -735,7 +776,8 @@ impl TypeTable {
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
-            | TyKind::Builtin(_) => false,
+            | TyKind::Builtin(_)
+            | TyKind::Param { .. } => false,
         };
         self.provisional.push(provisional);
         self.kinds.push(kind.clone());
@@ -811,7 +853,8 @@ impl TypeTable {
             | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
-            | TyKind::Never => None,
+            | TyKind::Never
+            | TyKind::Param { .. } => None,
         }
     }
 
@@ -935,6 +978,217 @@ impl TypeTable {
             ret,
             effect,
             meta,
+            generic: None,
+        }))
+    }
+
+    /// A new generic function type's own [`GenericId`], whose type
+    /// parameters are named `names`, in order (see [Generics](#generics)).
+    pub fn new_generic(&mut self, names: Box<[Name]>) -> GenericId {
+        let number = u32::try_from(self.generics.len()).unwrap_or(u32::MAX - 1);
+        self.generics.push(names);
+        GenericId(NonZeroU32::MIN.saturating_add(number))
+    }
+
+    /// The names of the type parameters of `generic`, in order.
+    #[must_use]
+    pub fn generic_names(&self, generic: GenericId) -> &[Name] {
+        self.generics
+            .get(generic.0.get() as usize - 1)
+            .map_or(&[], |names| names)
+    }
+
+    /// Whether `ty` mentions a type parameter of `generic`, at any depth.
+    ///
+    /// Recurses once per level of nesting in the type.
+    #[must_use]
+    pub fn mentions(&self, ty: TyId, generic: GenericId) -> bool {
+        self.any_param(ty, &|of| of == generic)
+    }
+
+    /// Whether `ty` mentions any type parameter, at any depth.
+    #[must_use]
+    pub fn has_param(&self, ty: TyId) -> bool {
+        self.any_param(ty, &|_| true)
+    }
+
+    /// Whether `ty` mentions a type parameter of a generic that `of` accepts.
+    ///
+    /// Recurses once per level of nesting in the type.
+    fn any_param(&self, ty: TyId, of: &dyn Fn(GenericId) -> bool) -> bool {
+        match self.kind(ty) {
+            &TyKind::Param { generic, .. } => of(generic),
+            TyKind::Record(record) => record.types().any(|field| self.any_param(field, of)),
+            TyKind::Fn(sig) => {
+                sig.params
+                    .iter()
+                    .any(|&(_, param)| self.any_param(param, of))
+                    || self.any_param(sig.ret, of)
+                    || sig.meta.is_some_and(|meta| self.any_param(meta.ty, of))
+            }
+            &(TyKind::Future(inner)
+            | TyKind::Either(inner)
+            | TyKind::List(inner)
+            | TyKind::Provisional { inner, .. }) => self.any_param(inner, of),
+            TyKind::Union(members) => members.iter().any(|&member| self.any_param(member, of)),
+            TyKind::Int
+            | TyKind::Float
+            | TyKind::Bool
+            | TyKind::String
+            | TyKind::Quantity(_)
+            | TyKind::UntypedInt
+            | TyKind::Error
+            | TyKind::Never
+            | TyKind::Builtin(_) => false,
+        }
+    }
+
+    /// `ty` with each type parameter of `generic` replaced by its binding,
+    /// `args[index]` (see [Generics](#generics)): every other type rebuilt
+    /// as it is, a future's or an either shape's inner type stripped as their
+    /// constructors strip it, so that a parameter bound to a lazy type makes
+    /// a lazy type of the usual shape, and a union made again.
+    ///
+    /// Recurses once per level of nesting in the type.
+    pub fn substitute(&mut self, ty: TyId, generic: GenericId, args: &[TyId]) -> TyId {
+        if !self.mentions(ty, generic) {
+            return ty;
+        }
+        match self.kind(ty).clone() {
+            TyKind::Param { generic: of, index } if of == generic => {
+                args.get(usize::from(index)).copied().unwrap_or(TyId::ERROR)
+            }
+            TyKind::Record(record) => {
+                let fields: Vec<(Name, TyId)> = record
+                    .fields
+                    .iter()
+                    .map(|&(name, field)| (name, self.substitute(field, generic, args)))
+                    .collect();
+                let rest = record
+                    .rest()
+                    .map(|rest| self.substitute(rest, generic, args));
+                let defaults = record.defaults().to_vec();
+                self.intern(TyKind::Record(RecordTy::new(fields.into(), rest, defaults)))
+            }
+            TyKind::List(element) => {
+                let element = self.substitute(element, generic, args);
+                self.list(element)
+            }
+            TyKind::Future(inner) => {
+                let inner = self.substitute(inner, generic, args);
+                self.future(inner)
+            }
+            TyKind::Either(inner) => {
+                let inner = self.substitute(inner, generic, args);
+                self.deferrable(inner)
+            }
+            TyKind::Union(members) => {
+                let members: Vec<TyId> = members
+                    .iter()
+                    .map(|&member| self.substitute(member, generic, args))
+                    .collect();
+                self.union(members)
+            }
+            TyKind::Fn(sig) => {
+                let params: Vec<(Option<Name>, TyId)> = sig
+                    .params
+                    .iter()
+                    .map(|&(name, param)| (name, self.substitute(param, generic, args)))
+                    .collect();
+                let ret = self.substitute(sig.ret, generic, args);
+                let meta = sig.meta.map(|meta| Meta {
+                    ty: self.substitute(meta.ty, generic, args),
+                    ..meta
+                });
+                let made = self.fn_type_with_meta(params, ret, sig.effect, meta);
+                match sig.generic {
+                    Some(own) => self.generic_fn(made, own),
+                    None => made,
+                }
+            }
+            TyKind::Provisional {
+                function,
+                param,
+                inner,
+            } => {
+                let inner = self.substitute(inner, generic, args);
+                self.provisional(function, param, inner)
+            }
+            _ => ty,
+        }
+    }
+
+    /// Binds the type parameters of `generic` that `param`, a parameter's
+    /// type, mentions from `arg`, the type of the argument given it, into
+    /// `bound`, by their positions (see [Generics](#generics)): a parameter
+    /// where `param` is it binds it to `arg`, the join with what it was
+    /// bound to already if it was; and inside, a list's element, a record's
+    /// field of each name both have, a function's parameters and result, and
+    /// what a future or an either shape holds, each against the same of
+    /// `arg`'s, its lazy layers stripped, bind what they mention. Nothing
+    /// else binds: what does not match is the argument's mismatch, which its
+    /// check against the substituted type reports.
+    ///
+    /// Recurses once per level of nesting in `param`.
+    pub fn bind(&mut self, param: TyId, arg: TyId, generic: GenericId, bound: &mut [Option<TyId>]) {
+        if !self.mentions(param, generic) || arg == TyId::ERROR {
+            return;
+        }
+        let present = self.strip(arg);
+        match self.kind(param).clone() {
+            TyKind::Param { generic: of, index } if of == generic => {
+                if let Some(slot) = bound.get_mut(usize::from(index)) {
+                    *slot = Some(match *slot {
+                        Some(earlier) => self.join(earlier, arg).0,
+                        None => arg,
+                    });
+                }
+            }
+            TyKind::List(element) => {
+                if let TyKind::List(given) = *self.kind(present) {
+                    self.bind(element, given, generic, bound);
+                }
+            }
+            TyKind::Record(record) => {
+                let TyKind::Record(given) = self.kind(present).clone() else {
+                    return;
+                };
+                for &(name, field) in &record.fields {
+                    if let Some(&(_, of)) = given.fields.iter().find(|&&(given, _)| given == name) {
+                        self.bind(field, of, generic, bound);
+                    }
+                }
+            }
+            TyKind::Fn(sig) => {
+                let Some(given) = self.fn_sig(present).cloned() else {
+                    return;
+                };
+                for (&(_, param), &(_, of)) in sig.params.iter().zip(given.params.iter()) {
+                    self.bind(param, of, generic, bound);
+                }
+                self.bind(sig.ret, given.ret, generic, bound);
+            }
+            TyKind::Future(inner) | TyKind::Either(inner) | TyKind::Provisional { inner, .. } => {
+                self.bind(inner, present, generic, bound);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type parameter number `index` of `generic`.
+    pub fn param(&mut self, generic: GenericId, index: u8) -> TyId {
+        self.intern(TyKind::Param { generic, index })
+    }
+
+    /// The function type `ty`, made generic, its type parameters
+    /// belonging to `generic`; `ty` itself if it is no function type.
+    pub fn generic_fn(&mut self, ty: TyId, generic: GenericId) -> TyId {
+        let Some(TyKind::Fn(sig)) = self.kinds.get(ty.index()).cloned() else {
+            return ty;
+        };
+        self.intern(TyKind::Fn(FnTy {
+            generic: Some(generic),
+            ..sig
         }))
     }
 
@@ -1184,7 +1438,11 @@ impl TypeTable {
                     ty: self.settle(meta.ty, function, decisions),
                     ..meta
                 });
-                self.fn_type_with_meta(params, ret, sig.effect, meta)
+                let settled = self.fn_type_with_meta(params, ret, sig.effect, meta);
+                match sig.generic {
+                    Some(generic) => self.generic_fn(settled, generic),
+                    None => settled,
+                }
             }
             TyKind::Future(inner) => {
                 let inner = self.settle(inner, function, decisions);
@@ -1216,7 +1474,8 @@ impl TypeTable {
             | TyKind::UntypedInt
             | TyKind::Error
             | TyKind::Never
-            | TyKind::Builtin(_) => id,
+            | TyKind::Builtin(_)
+            | TyKind::Param { .. } => id,
         }
     }
 
@@ -1915,6 +2174,7 @@ impl TypeTable {
         let (Some(a_sig), Some(b_sig)) = (self.fn_sig(a), self.fn_sig(b)) else {
             return (self.union([a, b]), true);
         };
+        let generics = (a_sig.generic, b_sig.generic);
         // Parameters are contravariant, so each is the narrower of the two,
         // which both functions accept: one of them, if it is a subtype of
         // the other. A copy, since joining the return types may intern new
@@ -1939,7 +2199,8 @@ impl TypeTable {
         } else {
             None
         };
-        let Some(params) = params else {
+        // Function types of two generics share no parameters to join.
+        let Some(params) = params.filter(|_| generics.0 == generics.1) else {
             return (self.union([a, b]), true);
         };
         let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
@@ -1958,7 +2219,12 @@ impl TypeTable {
             }
             _ => None,
         };
-        (self.fn_type_with_meta(params, ret, effect, meta), widened)
+        let joined = self.fn_type_with_meta(params, ret, effect, meta);
+        let joined = match generics.0 {
+            Some(generic) => self.generic_fn(joined, generic),
+            None => joined,
+        };
+        (joined, widened)
     }
 
     /// The join of the record types `a` and `b`, and whether it is widened,
@@ -2044,7 +2310,10 @@ impl TypeTable {
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             TyKind::Fn(_) | TyKind::Builtin(_) => Some(ValueKind::Fn),
-            TyKind::Future(_) | TyKind::Either(_) => Some(ValueKind::Deferred),
+            // A type parameter's: any value at all, what a call binds it to.
+            TyKind::Future(_) | TyKind::Either(_) | TyKind::Param { .. } => {
+                Some(ValueKind::Deferred)
+            }
             TyKind::Union(members) => {
                 let mut kinds = members.iter().map(|&member| self.value_kind(member));
                 let first = kinds.next()??;
@@ -2367,6 +2636,10 @@ impl fmt::Display for Display<'_> {
             TyKind::String => f.write_str("String"),
             TyKind::Error => f.write_str("<error>"),
             TyKind::Never => f.write_str("Never"),
+            &TyKind::Param { generic, index } => {
+                let name = self.table.generic_names(generic).get(usize::from(index));
+                f.write_str(name.map_or("?", |&name| self.names.get(name)))
+            }
             // TEMPORARY (alias rule): the opaque type of a special built-in (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             TyKind::Builtin(builtin) => write!(f, "builtin {}", builtin.name()),
@@ -2423,7 +2696,17 @@ impl fmt::Display for Display<'_> {
                 f.write_str("}")
             }
             TyKind::Fn(sig) => {
-                f.write_str("fn(")?;
+                f.write_str("fn")?;
+                if let Some(generic) = sig.generic {
+                    let names: Vec<&str> = self
+                        .table
+                        .generic_names(generic)
+                        .iter()
+                        .map(|&name| self.names.get(name))
+                        .collect();
+                    write!(f, "<{}>", names.join(", "))?;
+                }
+                f.write_str("(")?;
                 for (index, &(name, ty)) in sig.params.iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;

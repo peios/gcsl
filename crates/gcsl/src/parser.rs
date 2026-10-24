@@ -514,6 +514,15 @@
 //!
 //! # Functions and calls
 //!
+//! A named function item, `fn NAME` or `def NAME`, may be generic: type
+//! parameters, `<T, U>`, directly after its name, names separated by `,`,
+//! each once, "type parameter `T` is declared twice" otherwise
+//! (`Parser::parse_type_params`). They are recorded with the function
+//! ([`Ast::generics`]), with the type expressions its signature and body
+//! are made of, where they are in scope ([`Ast::type_param`]): a name
+//! written as a type there that is one of them is the parameter, whatever
+//! type of its name is declared.
+//!
 //! A function expression is `fn`, `(`, parameters `NAME: TYPE` separated by
 //! `,` with an optional trailing `,`, `)`, the return marker, the return
 //! type, and the body, a block whose `{` must follow the return type
@@ -971,9 +980,9 @@ use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, ArgRange, Ast, AstBuilder, AttributeUse, BinaryOp, BuilderMark, DefTypeRole,
     DefTypeUse, Effect, Element, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
-    FnDecl, ForDecl, ForHead, ImportDecl, ImportForm, ImportMember, ImportName, Item, ItemId,
-    ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange, PathSegment, SegmentKind,
-    StrPart, Syntax, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    FnDecl, ForDecl, ForHead, Generics, ImportDecl, ImportForm, ImportMember, ImportName, Item,
+    ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange, PathSegment,
+    SegmentKind, StrPart, Syntax, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, MAX_ERRORS, Token, TokenKind, lex};
@@ -3045,7 +3054,22 @@ impl Parser<'_> {
     ) -> ParseResult<(ItemId, u32)> {
         self.advance();
         self.advance();
+        let params = if self.peek().kind == TokenKind::Lt {
+            Some(self.parse_type_params()?)
+        } else {
+            None
+        };
+        let types = self.builder.type_count();
         let value = self.parse_fn(keyword)?;
+        if let Some(params) = params
+            && let ExprKind::Fn(function) = self.builder.get(value).kind
+        {
+            self.builder.push_generics(Generics {
+                function,
+                params,
+                types: (types, self.builder.type_count()),
+            });
+        }
         let base = self.path.len();
         self.path.push(PathSegment {
             kind: SegmentKind::Name(name),
@@ -3069,6 +3093,48 @@ impl Parser<'_> {
             }
         };
         self.finish_item(keyword, (kind, value), 0, shape)
+    }
+
+    /// Parses the type parameters of a generic function item, `<T, U>`, at
+    /// its `<`: one name or more, separated by `,`, as type arguments are,
+    /// each once, "type parameter `T` is declared twice" otherwise.
+    fn parse_type_params(&mut self) -> ParseResult<Box<[(Name, Span)]>> {
+        self.advance();
+        let mut params: Vec<(Name, Span)> = Vec::new();
+        loop {
+            let token = self.peek();
+            let TokenKind::Ident(name) = token.kind else {
+                let found = self.describe(token);
+                return Err(self.error(
+                    format!("expected a type parameter's name, found {found}"),
+                    token.span,
+                ));
+            };
+            if params.iter().any(|&(param, _)| param == name) {
+                let text = self.names.get(name).to_owned();
+                return Err(self.error(
+                    format!("type parameter `{text}` is declared twice"),
+                    token.span,
+                ));
+            }
+            self.advance();
+            params.push((name, token.span));
+            let next = self.peek();
+            match next.kind {
+                TokenKind::Comma => self.advance(),
+                TokenKind::Gt => {
+                    self.advance();
+                    return Ok(params.into_boxed_slice());
+                }
+                _ => {
+                    let found = self.describe(next);
+                    return Err(self.error(
+                        format!("expected `,` or `>` after a type parameter, found {found}"),
+                        next.span,
+                    ));
+                }
+            }
+        }
     }
 
     /// Parses an import item of the file's body, starting at its keyword,

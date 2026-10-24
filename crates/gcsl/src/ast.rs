@@ -793,6 +793,21 @@ pub struct AttributeUse {
     pub ty: TypeExprId,
 }
 
+/// The type parameters of a generic function item, `fn NAME<T, U>(...)` or
+/// `def NAME<T>(...)` (see the parser's [Functions and
+/// calls](crate::parser#functions-and-calls)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Generics {
+    /// The function.
+    pub function: FnId,
+    /// Each type parameter's name and where it is written, in order.
+    pub params: Box<[(Name, Span)]>,
+    /// The type expressions the parser made of the function's signature and
+    /// body, by their numbers, from the first to the one after the last:
+    /// where its type parameters are in scope.
+    pub types: (u32, u32),
+}
+
 /// One parameter of a function expression, `NAME: TYPE`, or `NAME: TYPE =
 /// DEFAULT` (see [Functions](#functions)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2549,6 +2564,7 @@ pub struct AstBuilder {
     def_type_marks: Vec<ItemId>,
     attribute_marks: Vec<ItemId>,
     attribute_uses: Vec<AttributeUse>,
+    generics: Vec<Generics>,
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
     syntax: Syntax,
@@ -2881,6 +2897,17 @@ impl AstBuilder {
         }
     }
 
+    /// Records the type parameters of a generic function item.
+    pub fn push_generics(&mut self, generics: Generics) {
+        self.generics.push(generics);
+    }
+
+    /// The number of type expressions made so far: the number of the next.
+    #[must_use]
+    pub fn type_count(&self) -> u32 {
+        next_id(self.types.len())
+    }
+
     /// Records `used`, a use of an attribute that is none of the parser's,
     /// on the item it applies to, after the item's earlier ones.
     pub fn push_attribute_use(&mut self, used: AttributeUse) {
@@ -2997,6 +3024,8 @@ impl AstBuilder {
         self.def_type_marks.retain(|item| item.0 < items);
         self.attribute_marks.retain(|item| item.0 < items);
         self.attribute_uses.retain(|used| used.item.0 < items);
+        let fns = next_id(mark.fns);
+        self.generics.retain(|generics| generics.function.0 < fns);
     }
 
     /// Returns the node `id`.
@@ -3068,6 +3097,7 @@ impl AstBuilder {
             def_type_marks: self.def_type_marks,
             attribute_marks: self.attribute_marks,
             attribute_uses: self.attribute_uses,
+            generics: self.generics,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
             syntax: self.syntax,
@@ -3107,6 +3137,9 @@ pub struct Ast {
     /// The uses of attributes that are none of the parser's, by the items
     /// they apply to, in id order, and on each item in source order.
     attribute_uses: Vec<AttributeUse>,
+    /// The type parameters of the generic function items, in the order
+    /// their functions were made.
+    generics: Vec<Generics>,
     /// The def-type definitions and references, in the order they were
     /// parsed (see [Def-types](#def-types)).
     def_types: Vec<DefTypeUse>,
@@ -3583,6 +3616,41 @@ impl Ast {
             .attribute_uses
             .partition_point(|used| used.item.0 <= id.0);
         self.attribute_uses.get(start..end).unwrap_or_default()
+    }
+
+    /// The type parameters of every generic function item, in the order
+    /// their functions were made.
+    #[must_use]
+    pub fn all_generics(&self) -> &[Generics] {
+        &self.generics
+    }
+
+    /// The type parameters of `function`, if it is a generic function item.
+    #[must_use]
+    pub fn generics(&self, function: FnId) -> Option<&Generics> {
+        self.generics
+            .iter()
+            .find(|generics| generics.function == function)
+    }
+
+    /// The function and the number of the type parameter that the name
+    /// `name`, written as the type expression `id`, is, if one is in scope
+    /// there: that of the innermost generic function whose signature or body
+    /// `id` is part of that has a type parameter of the name.
+    #[must_use]
+    pub fn type_param(&self, id: TypeExprId, name: Name) -> Option<(FnId, u8)> {
+        self.generics
+            .iter()
+            .filter(|generics| generics.types.0 <= id.0 && id.0 < generics.types.1)
+            .filter_map(|generics| {
+                let index = generics
+                    .params
+                    .iter()
+                    .position(|&(param, _)| param == name)?;
+                Some((generics, u8::try_from(index).ok()?))
+            })
+            .min_by_key(|(generics, _)| generics.types.1 - generics.types.0)
+            .map(|(generics, index)| (generics.function, index))
     }
 
     /// Every use of an attribute that is none of the parser's, by the items

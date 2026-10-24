@@ -37,10 +37,13 @@ fn the_constants_are_pre_interned_in_order() {
 fn a_kind_is_small() {
     // A record type's defaults and rest-field are behind a thin
     // pointer, which a record type with neither, nearly every one,
-    // leaves null: so a record type is 24 bytes, and a kind no larger
-    // than before, a function type's signature being the largest.
+    // leaves null: so a record type is 24 bytes. A function type's
+    // signature is the largest kind: its parameters' box, its result, its
+    // meta, its effect and its generic's 4-byte id, which a 16-bit id
+    // would fit in 32 bytes only by limiting a table to 65535 generic
+    // functions.
     assert_eq!(size_of::<RecordTy>(), 24);
-    assert_eq!(size_of::<TyKind>(), 32);
+    assert_eq!(size_of::<TyKind>(), 40);
 }
 
 #[test]

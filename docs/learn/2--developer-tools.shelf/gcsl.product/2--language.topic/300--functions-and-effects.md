@@ -71,6 +71,26 @@ long = build("main.c", output = "main.o", compiler = compiler)
 Before any named argument, a name on its own is an ordinary positional
 argument.
 
+## Generic functions
+
+A function can work on values of any type. Name its type parameters in
+angle brackets after its name, and use them as types in its signature and
+body:
+
+```gcsl
+fn first<T>(items: List<T>, fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+port = first([8080, 9090], 80)
+name = first([], "none")
+```
+
+Each call works out the type parameters from its arguments: here `T` is
+`Int` in the first call and `String` in the second. Inside the function, a
+value of type `T` can be passed on, returned, or put in a list or record,
+but nothing else, because `T` could be anything. A call where nothing binds
+a type parameter, such as one that only returns a `List<T>`, is an error.
+
 ## Calling for effects
 
 A call to an impure or memoized function can stand alone as a statement,

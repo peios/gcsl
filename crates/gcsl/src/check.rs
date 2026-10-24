@@ -1280,6 +1280,37 @@
 //! from a pure function is the purity error. A record read whole through
 //! an import holds no namespace (`Checker::imported_record`).
 //!
+//! # Generics
+//!
+//! A generic function item (see the parser's [Functions and
+//! calls](crate::parser#functions-and-calls)) has a type parameter, as a
+//! [`TyKind::Param`] of its own [`GenericId`] (`Checker::generic_of`), for
+//! each name written as a type in its scope that is one of its parameters
+//! (`Checker::resolve_written`); no bareness wraps one, and a pure
+//! function's parameter of it is not inferred, since what a call binds it to
+//! may be lazy or not (`Checker::is_bare`). Its function type is generic
+//! (`Checker::function_type`). Its body is checked once, for every binding:
+//! a value of a type parameter can be passed, returned and stored in
+//! records and lists, and every other use is the usual error of a type
+//! that does not fit, as "cannot add T and Int"; interpolating one is
+//! "cannot interpolate a value of type T, of a type parameter", since it may
+//! be a future that nothing awaits.
+//!
+//! A call of a generic function infers (`Checker::instantiate`): each
+//! argument that fills a parameter whose type mentions a type parameter, as
+//! the arguments are bound ([`argument_targets`]), is checked with no type
+//! expected, and binds what that type mentions ([`TypeTable::bind`]), a
+//! parameter bound twice the join of its bindings; but `[]` and `{}`,
+//! whose types are what they are expected to be, bind nothing, and an
+//! integer literal binds only what nothing else binds, as an `Int`. A type
+//! parameter left unbound is "cannot infer `T` for this call of `f`", noted
+//! "`T` appears in no parameter's type given an argument here". The call is
+//! then bound and checked as any is, with the signature its bindings
+//! substitute ([`TypeTable::substitute`]), an argument checked already only
+//! expected to fit. A generic function read other than as a call's callee,
+//! through any parentheses, is "a generic function must be called"
+//! (`Checker::called_if_generic`): a value of it would bind nothing.
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or
@@ -3004,11 +3035,11 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ast::{
-    Annotate, ArgKind, ArgRange, Ast, AttributeId, AttributeUse, BinaryOp, DefTypeId, DefTypeRole,
-    Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
-    FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange, Jump, Label,
-    LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind, StrPart, Syntax,
-    TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
+    Annotate, Arg, ArgKind, ArgRange, Ast, AttributeId, AttributeUse, BinaryOp, DefTypeId,
+    DefTypeRole, Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy,
+    FieldTyKind, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange,
+    Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
+    Syntax, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -3016,7 +3047,7 @@ use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::suggest;
-use crate::types::{AwaitKind, FnTy, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
+use crate::types::{AwaitKind, FnTy, GenericId, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
 use crate::value::{Quantity, ValueKind, int_to_float};
 use crate::workspace::{AttributeLookup, Context, Target};
 
@@ -3835,6 +3866,22 @@ pub enum ParamDefault {
         /// closure's captures, after the function's own.
         capture: u32,
     },
+}
+
+/// What the checker keeps of generic functions and their calls (see
+/// [Generics](#generics)).
+#[derive(Debug, Default)]
+struct GenericsChecked {
+    /// What the type parameters of each generic function belong to, made
+    /// once for it.
+    ids: HashMap<FnId, GenericId>,
+    /// The arguments of the call being bound that were checked to infer its
+    /// type parameters, each with its type: checked once, then only
+    /// expected to fit its substituted parameter.
+    prechecked: HashMap<ExprId, TyId>,
+    /// The callee of the call being checked, through any parentheses: the
+    /// one place a generic function's name may be read.
+    callee: Option<ExprId>,
 }
 
 /// What the check gives lowering besides types and slots, as
@@ -5760,6 +5807,42 @@ const CONSTANT_FIELDS_NOTE: &str = "each field must be an `Int`, `Float`, `Bool`
 /// its type and default, if it has one (see [Attributes](#attributes)).
 type AttributeFields = Vec<(Box<str>, TyId, Option<Constant>)>;
 
+/// The arguments of `args`, by their values, each with the parameter of
+/// `sig` it fills, as [`Checker::bind_arguments`] binds them: positional
+/// ones left to right, the trailing block the last, and named ones the
+/// parameters of their names; only the first that fills a parameter, and
+/// none that fills nothing.
+fn argument_targets(args: &[Arg], sig: &FnTy) -> Vec<(ExprId, usize)> {
+    let count = sig.params.len();
+    let positional = args
+        .iter()
+        .filter(|arg| arg.kind == ArgKind::Positional)
+        .count();
+    let mut next = 0;
+    let mut taken = vec![false; count];
+    let mut targets = Vec::new();
+    for arg in args {
+        let param = match arg.kind {
+            ArgKind::Positional => {
+                next += 1;
+                Some(next - 1)
+            }
+            ArgKind::Trailing => (positional < count).then(|| count - 1),
+            ArgKind::Named { name, .. } => sig
+                .params
+                .iter()
+                .position(|&(param, _)| param == Some(name)),
+        };
+        if let Some(param) = param.filter(|&param| param < count)
+            && let Some(slot @ false) = taken.get_mut(param)
+        {
+            *slot = true;
+            targets.push((arg.value, param));
+        }
+    }
+    targets
+}
+
 /// The function of the item `item`, a function item that attributes apply
 /// to: a named `fn`, a `def` or a definition (see [Attributes](#attributes)).
 fn item_function(ast: &Ast, item: ItemId) -> Option<FnId> {
@@ -5874,6 +5957,8 @@ pub struct Checker<'a> {
     scope_known: Vec<Option<Rc<KnownParams>>>,
     /// What the check gives lowering besides types and slots.
     lowering: ForLowering,
+    /// What the check keeps of generic functions and their calls.
+    generics: GenericsChecked,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -6170,6 +6255,7 @@ impl<'a> Checker<'a> {
             bindings: scope.bindings,
             scope_known: scope.known,
             lowering: ForLowering::default(),
+            generics: GenericsChecked::default(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -10361,7 +10447,7 @@ impl<'a> Checker<'a> {
         let ret = decl
             .ret
             .map_or(TyId::ERROR, |ret| self.resolve_type(ret, ret_mode));
-        let ty = self.intern_fn_type(base, ret, decl.effect);
+        let ty = self.function_type(function, base, (ret, decl.effect));
         self.fn_params.truncate(base);
         let clean = self.errors.len() == errors && ret != TyId::ERROR;
         self.errors.truncate(errors);
@@ -12259,6 +12345,13 @@ impl<'a> Checker<'a> {
     fn resolve_written(&mut self, id: TypeExprId, mode: Bareness) -> TyId {
         let ty = *self.ast.type_expr(id);
         match ty.kind {
+            // A type parameter in scope, which no bareness wraps.
+            TypeExprKind::Named(name)
+                if let Some((function, index)) = self.ast.type_param(id, name) =>
+            {
+                let generic = self.generic_of(function);
+                self.types.param(generic, index)
+            }
             TypeExprKind::Named(name) => {
                 if let Some(&(_, builtin)) = self
                     .builtin_types
@@ -12618,6 +12711,8 @@ impl<'a> Checker<'a> {
     /// function type, which say what they are.
     fn is_bare(&self, ty: TypeExprId) -> bool {
         match self.ast.type_expr(ty).kind {
+            // A type parameter is what it is bound to, lazy or not.
+            TypeExprKind::Named(name) if self.ast.type_param(ty, name).is_some() => false,
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
             | TypeExprKind::Record(_)
@@ -12759,6 +12854,40 @@ impl<'a> Checker<'a> {
     /// Interns the function type whose parameters are `fn_params[base..]`
     /// and whose return type is `ret`, of effect `effect`, or returns
     /// `Error` if any of them is erroneous, having been reported.
+    /// The type of `function`, whose parameters' types are `fn_params[base..]`
+    /// and whose result is `ret`, of `effect`: [`Checker::intern_fn_type`]'s,
+    /// made generic if the function has type parameters (see
+    /// [Generics](#generics)).
+    fn function_type(
+        &mut self,
+        function: FnId,
+        base: usize,
+        (ret, effect): (TyId, Effect),
+    ) -> TyId {
+        let ty = self.intern_fn_type(base, ret, effect);
+        if ty == TyId::ERROR || self.ast.generics(function).is_none() {
+            return ty;
+        }
+        let generic = self.generic_of(function);
+        self.types.generic_fn(ty, generic)
+    }
+
+    /// What the type parameters of the generic function `function` belong
+    /// to, made the first time it is asked for.
+    fn generic_of(&mut self, function: FnId) -> GenericId {
+        if let Some(&generic) = self.generics.ids.get(&function) {
+            return generic;
+        }
+        let names: Box<[Name]> = self
+            .ast
+            .generics(function)
+            .map(|generics| generics.params.iter().map(|&(name, _)| name).collect())
+            .unwrap_or_default();
+        let generic = self.types.new_generic(names);
+        self.generics.ids.insert(function, generic);
+        generic
+    }
+
     fn intern_fn_type(&mut self, base: usize, ret: TyId, effect: Effect) -> TyId {
         self.intern_fn_type_with_meta(base, ret, effect, None)
     }
@@ -13519,6 +13648,11 @@ impl<'a> Checker<'a> {
         (context, why): (Span, &str),
         (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) -> TyId {
+        // Checked already, to infer a call's type parameters.
+        if let Some(found) = self.generics.prechecked.remove(&id) {
+            self.expect_at(id, found, expected, (context, why), (site, filling));
+            return found;
+        }
         if let Some(found) = self.loop_within(id) {
             return self.check_loop_expecting(id, found, expected, (context, why), (site, filling));
         }
@@ -14248,8 +14382,31 @@ impl<'a> Checker<'a> {
                 TyId::ERROR
             }
         };
+        let ty = self.called_if_generic(id, ty);
         self.expr_types[id.index()] = ty;
         ty
+    }
+
+    /// `ty`, the type of `id`, unless it is a generic function's and `id`, a
+    /// name or a field access, is no call's callee: "a generic function must
+    /// be called", and `Error` (see [Generics](#generics)).
+    fn called_if_generic(&mut self, id: ExprId, ty: TyId) -> TyId {
+        let named = matches!(
+            self.ast.get(id).kind,
+            ExprKind::Name(_) | ExprKind::Field { .. }
+        );
+        let generic = self
+            .types
+            .fn_sig(ty)
+            .is_some_and(|sig| sig.generic.is_some());
+        if !named || !generic || self.generics.callee == Some(id) {
+            return ty;
+        }
+        self.errors.push(
+            Diagnostic::error("a generic function must be called", self.ast.get(id).span)
+                .with_note("each call binds its type parameters; a value of it would bind none"),
+        );
+        TyId::ERROR
     }
 
     /// Checks `parts`, what the parser kept of an expression it could not
@@ -14601,7 +14758,7 @@ impl<'a> Checker<'a> {
             );
             TyId::ERROR
         };
-        let mut ty = self.intern_fn_type(base, ret, decl.effect);
+        let mut ty = self.function_type(function, base, (ret, decl.effect));
         self.expr_types[id.index()] = ty;
         self.check_def_type_signature(function, ty);
         let ret_span = decl.ret.map_or(self.ast.get(decl.body).span, |ret| {
@@ -14645,7 +14802,7 @@ impl<'a> Checker<'a> {
             }
             let narrowed = self.narrow_callbacks(base, callbacks.0, &mut unnarrowed);
             if result != ret || narrowed {
-                ty = self.intern_fn_type(base, result, decl.effect);
+                ty = self.function_type(function, base, (result, decl.effect));
                 self.expr_types[id.index()] = ty;
             }
         }
@@ -15933,7 +16090,13 @@ impl<'a> Checker<'a> {
         // rule.
         let outer = self.alias_site.replace(callee);
         let outer_call = self.call_site.replace(callee);
+        let mut unparened = callee;
+        while let ExprKind::Paren(inner) = self.ast.get(unparened).kind {
+            unparened = inner;
+        }
+        let outer_generic = self.generics.callee.replace(unparened);
         let (callee_ty, callback) = self.check_callee(callee);
+        self.generics.callee = outer_generic;
         (self.alias_site, self.call_site) = (outer, outer_call);
         if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
@@ -15970,6 +16133,13 @@ impl<'a> Checker<'a> {
             self.quiet.expecting_error = self.quiet.expecting_error.saturating_sub(unknown);
             return TyId::ERROR;
         };
+        let sig = match sig.generic {
+            Some(generic) => match self.instantiate((id, callee), args, &sig, generic) {
+                Some(sig) => sig,
+                None => return TyId::ERROR,
+            },
+            None => sig,
+        };
         let erroneous = self.bind_arguments(id, (callee, callee_ty, callback), args, &sig);
         if sig.effect != Effect::Pure {
             self.impure_calls.insert(id);
@@ -15994,6 +16164,127 @@ impl<'a> Checker<'a> {
             );
         }
         if erroneous { TyId::ERROR } else { sig.ret }
+    }
+
+    /// The signature `sig` of the generic callee `callee` of the call `id`,
+    /// whose type parameters belong to `generic`, with each bound as the
+    /// arguments `args` bind it (see [Generics](#generics)): each argument
+    /// that fills a parameter whose type mentions one is checked, with no
+    /// expected type, and kept for its binding ([`GenericsChecked`]), and
+    /// binds what that type mentions ([`TypeTable::bind`]). A type parameter
+    /// left unbound is "cannot infer `T` for this call of `f`", and then
+    /// `None`, every argument checked.
+    fn instantiate(
+        &mut self,
+        (id, callee): (ExprId, ExprId),
+        args: ArgRange,
+        sig: &FnTy,
+        generic: GenericId,
+    ) -> Option<FnTy> {
+        let ast = self.ast;
+        let names = self.types.generic_names(generic).to_vec();
+        let mut bound: Vec<Option<TyId>> = vec![None; names.len()];
+        let mut untyped: Vec<(ExprId, TyId)> = Vec::new();
+        for (value, param) in argument_targets(ast.args(args), sig) {
+            let Some(&(_, param_ty)) = sig.params.get(param) else {
+                continue;
+            };
+            if !self.types.mentions(param_ty, generic) || self.expects_its_type(value) {
+                continue;
+            }
+            let found = self.check_expr(value);
+            self.generics.prechecked.insert(value, found);
+            // An integer literal binds last, if nothing else binds what it
+            // fills, so that it can be a `Float` by another argument.
+            if found == TyId::UNTYPED_INT {
+                untyped.push((value, param_ty));
+                continue;
+            }
+            self.types.bind(param_ty, found, generic, &mut bound);
+        }
+        for (value, param_ty) in untyped {
+            let found = self
+                .generics
+                .prechecked
+                .get(&value)
+                .copied()
+                .unwrap_or(TyId::ERROR);
+            let would_bind = {
+                let mut trial = bound.clone();
+                self.types.bind(param_ty, TyId::INT, generic, &mut trial);
+                trial
+            };
+            if bound
+                .iter()
+                .zip(&would_bind)
+                .any(|(was, is)| was.is_none() && is.is_some())
+            {
+                let found = if found == TyId::UNTYPED_INT {
+                    self.settle(value, found)
+                } else {
+                    found
+                };
+                self.generics.prechecked.insert(value, found);
+                self.types.bind(param_ty, found, generic, &mut bound);
+            }
+        }
+        if let Some(unbound) = bound.iter().position(Option::is_none) {
+            let name = names
+                .get(unbound)
+                .map_or("?", |&name| ast.names().get(name));
+            let callee_text = match ast.get(callee).kind {
+                ExprKind::Name(callee) => format!(" of `{}`", ast.names().get(callee)),
+                _ => String::new(),
+            };
+            self.errors.push(
+                Diagnostic::error(
+                    format!("cannot infer `{name}` for this call{callee_text}"),
+                    ast.get(id).span,
+                )
+                .with_note(format!(
+                    "`{name}` appears in no parameter's type given an argument here"
+                )),
+            );
+            for arg in ast.args(args) {
+                if self.generics.prechecked.remove(&arg.value).is_none() {
+                    self.check_alone(arg.value);
+                }
+            }
+            return None;
+        }
+        let bindings: Vec<TyId> = bound.into_iter().flatten().collect();
+        let params = sig
+            .params
+            .iter()
+            .map(|&(name, param)| (name, self.types.substitute(param, generic, &bindings)))
+            .collect();
+        let ret = self.types.substitute(sig.ret, generic, &bindings);
+        let meta = sig.meta.map(|meta| Meta {
+            ty: self.types.substitute(meta.ty, generic, &bindings),
+            ..meta
+        });
+        Some(FnTy {
+            params,
+            ret,
+            effect: sig.effect,
+            meta,
+            generic: None,
+        })
+    }
+
+    /// Whether `value`, through any parentheses, is a literal whose type is
+    /// what it is expected to be, `[]` or `{}`: an argument that binds no
+    /// type parameter, but is checked against what the others bind.
+    fn expects_its_type(&self, value: ExprId) -> bool {
+        let mut node = value;
+        loop {
+            match self.ast.get(node).kind {
+                ExprKind::Paren(inner) => node = inner,
+                ExprKind::List(elements) => return self.ast.elements(elements).is_empty(),
+                ExprKind::Block { items, label: None } => return self.ast.items(items).is_empty(),
+                _ => return false,
+            }
+        }
     }
 
     /// TEMPORARY (alias rule): types the call `id` of the built-in function `builtin`, whose typing
@@ -18358,10 +18649,19 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let found = self.check_expr(expr);
-            // A value of every type can be shown as text today, a record in
-            // its `repr` form. Once some type's values cannot be, it is
-            // reported here as "cannot display".
+            // A value of every type can be shown as text, a record in its
+            // `repr` form, but one of a type parameter, which may be a
+            // future that nothing awaits (see [Generics](#generics)).
             let found = self.settle(expr, found);
+            if self.types.has_param(found) {
+                let shown = self.in_message(found);
+                self.errors.push(Diagnostic::error(
+                    format!("cannot interpolate a value of type {shown}, of a type parameter"),
+                    self.ast.get(expr).span,
+                ));
+                ty = TyId::ERROR;
+                continue;
+            }
             match self.measure_deep(expr, found) {
                 TyId::ERROR => ty = TyId::ERROR,
                 // A value of type `Never` is never there to show.
@@ -20064,7 +20364,8 @@ impl<'a> Checker<'a> {
             | TyKind::Quantity(_)
             | TyKind::UntypedInt
             | TyKind::Error
-            | TyKind::Never => shown.to_string(),
+            | TyKind::Never
+            | TyKind::Param { .. } => shown.to_string(),
         }
     }
 

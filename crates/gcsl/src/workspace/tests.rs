@@ -11892,3 +11892,17 @@ fn a_def_type_s_attributes_are_defaults_for_its_definitions() {
         ]
     );
 }
+
+#[test]
+fn a_generic_def_is_called_from_another_file_and_its_parameters_shadow_types() {
+    let files = [
+        ("workspace.gcsl", "type T = Int"),
+        ("lib/box.gcsl", "def wrap<T>(x: T): {v: T} { v = x }"),
+        (
+            "app/main.gcsl",
+            "import wrap from lib/box\nr = wrap(5).v + 1\ns = wrap(\"a\").v",
+        ),
+    ];
+    // `T` in `wrap` is its parameter, not the root's `type T = Int`.
+    assert_eq!(rooted_text(&files, "app/main.gcsl"), "{r = 6; s = \"a\"}");
+}

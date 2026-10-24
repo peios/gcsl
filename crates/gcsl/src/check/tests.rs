@@ -14161,3 +14161,75 @@ fn retry_and_timeout_need_arguments_they_can_mean() {
     );
     assert!(warnings("#[retry(2)]\nfn f() -> Int { 1 }\nf()").is_empty());
 }
+
+// ----- Generics -----
+
+#[test]
+fn a_call_of_a_generic_function_binds_its_type_parameters() {
+    let cases = [
+        ("fn id<T>(x: T): T { x }\nid(1)", "Int"),
+        ("fn id<T>(x: T): T { x }\nid(\"a\")", "String"),
+        ("fn id<T>(x: T): T { x }\nid([1.5])", "List<Float>"),
+        (
+            "fn pair<A, B>(a: A, b: B): {first: A, second: B} { { first = a; second = b } }\n\
+             pair(1, \"x\")",
+            "{first: Int, second: String}",
+        ),
+        (
+            "fn first<T>(xs: List<T>, fallback: T): T { fallback }\nfirst([], \"none\")",
+            "String",
+        ),
+        // An integer literal adapts to what another argument binds.
+        (
+            "fn first<T>(xs: List<T>, fallback: T): T { fallback }\nfirst([1.5], 0)",
+            "Float",
+        ),
+        (
+            "fn apply<T, U>(f: fn(x: T): U, x: T): U { f(x) }\n\
+             fn double(n: Int): Int { n * 2 }\napply(double, 21)",
+            "Int",
+        ),
+    ];
+    for (text, ty) in cases {
+        assert_eq!(file_type(text), ty, "{text}");
+    }
+    // A generic function's type shows its type parameters.
+    let (ast, types, output) = check_prelude("def keep<T>(x: T): {v: T} { v = x }");
+    let output = output.unwrap();
+    assert_eq!(
+        types.display(output.ty, ast.names()).to_string(),
+        "{keep: fn<T>(x: T): {v: T}}"
+    );
+}
+
+#[test]
+fn a_generic_body_holds_its_type_parameters_opaque() {
+    let cases = [
+        ("fn f<T>(x: T): T { x + 1 }", "cannot add T and Int"),
+        (
+            "fn f<T>(x: T): String { \"{x}\" }",
+            "cannot interpolate a value of type T, of a type parameter",
+        ),
+        ("fn f<T>(x: T): Int { x }", "mismatched types"),
+        ("fn f<T>(x: T): Bool { x == x }", "cannot compare T and T"),
+        (
+            "fn id<T>(x: T): T { x }\nlet g = id",
+            "a generic function must be called",
+        ),
+        (
+            "fn none<T>(): List<T> { [] }\nnone()",
+            "cannot infer `T` for this call of `none`",
+        ),
+        (
+            "fn id<T>(x: T): T { x }\nlet x: Int = id(\"s\")\nx",
+            "mismatched types",
+        ),
+    ];
+    for (text, message) in cases {
+        assert_eq!(
+            messages(text).first().map(String::as_str),
+            Some(message),
+            "{text}"
+        );
+    }
+}

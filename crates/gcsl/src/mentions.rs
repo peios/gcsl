@@ -783,14 +783,17 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
 /// Every type expression of `ast` that reads a type by its name, in order
 /// (by id), as it is written (see [Types](#types)): a name written bare, a
 /// qualified name and a name applied to a type argument, in annotations,
-/// ascriptions, parameters, function types and `type` items alike. Which
-/// are of declared types, and which of those it can name, is the
-/// workspace's to say.
+/// ascriptions, parameters, function types and `type` items alike, but a
+/// name that is a type parameter in scope there ([`Ast::type_param`]),
+/// which no declared type can be. Which are of declared types, and which
+/// of those it can name, is the workspace's to say.
 #[must_use]
 pub fn type_reads(ast: &Ast) -> Vec<(TypeExprId, TypeRead)> {
     ast.type_ids()
         .filter_map(|id| {
             let read = match ast.written_type(id) {
+                // A type parameter in scope is no declared type's name.
+                TypeExprKind::Named(name) if ast.type_param(id, name).is_some() => return None,
                 TypeExprKind::Named(name) => TypeRead::Named(name),
                 TypeExprKind::Path(path) => TypeRead::Path(path),
                 TypeExprKind::Applied { name, .. } => TypeRead::Applied(name),

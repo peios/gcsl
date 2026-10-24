@@ -5539,3 +5539,22 @@ fn quantities_are_memo_keys_and_tell_apart_with_is() {
         r#"["time 1s", "data 1B", "1"]"#
     );
 }
+
+#[test]
+fn a_generic_function_passes_any_value_through() {
+    let text = "fn id<T>(x: T): T { x }\n\
+                fn wrap<T>(x: T): {v: T} { v = x }\n\
+                fn twice<T>(x: T): List<T> { [x, x] }\n\
+                a = id(1) + 1\nb = id(\"s\")\nc = wrap([1, 2]).v\nd = twice(2.5)\n\
+                e = id({ n = 3 }).n";
+    let shown: Vec<String> = fields(text).iter().map(ToString::to_string).collect();
+    assert_eq!(shown, ["2", "s", "[1, 2]", "[2.5, 2.5]", "3"]);
+    // A lazy value too, which the caller awaits.
+    let text = "fn id<T>(x: T) -> T { x }\nfn later() -> Int { 5 }\nr = await id(lazy later())";
+    assert_eq!(fields(text)[0].to_string(), "5");
+    // Recursion binds its own parameters.
+    let text = "fn last<T>(xs: List<T>, at: Int, fallback: T): T {\n\
+                \x20   if at >= len(xs) { fallback } else if at == len(xs) - 1 { xs[at] } else { last(xs, at + 1, fallback) }\n\
+                }\nr = last([1, 2, 3], 0, 0)";
+    assert_eq!(fields(text)[0].to_string(), "3");
+}

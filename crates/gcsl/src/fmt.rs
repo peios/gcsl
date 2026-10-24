@@ -370,6 +370,7 @@ impl Facts {
                 _ => {}
             }
         }
+        generic_angles(ast, input, &mut facts.angles);
         for (_, used) in ast.def_types() {
             let path = crate::ast::path_span(ast.path(used.path));
             facts
@@ -1153,6 +1154,27 @@ fn internal(message: &'static str) -> Diagnostic {
     .into()
 }
 
+/// Adds to `angles` the brackets of each generic function's type
+/// parameters in `ast`, `<T, U>`, which are bracketed as type arguments
+/// are: the token before its first parameter and the first `>` after its
+/// last.
+fn generic_angles(ast: &Ast, input: &Input<'_>, angles: &mut HashSet<usize>) {
+    for generics in ast.all_generics() {
+        let (Some(first), Some(last)) = (generics.params.first(), generics.params.last()) else {
+            continue;
+        };
+        if let Some(open) = input.first_from(first.1.start).checked_sub(1)
+            && input.kind(open) == TokenKind::Lt
+        {
+            angles.insert(open);
+        }
+        let close = input.first_from(last.1.end);
+        if input.kind(close) == TokenKind::Gt {
+            angles.insert(close);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,6 +1198,18 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(fmt(input), expected, "formatting {input:?}");
         }
+    }
+
+    #[test]
+    fn type_parameters_are_bracketed_as_type_arguments() {
+        check(&[
+            ("fn id< T >(x: T): T { x }\n", "fn id<T>(x: T): T { x }\n"),
+            (
+                "def pair<A,B>(a: A, b: B): A { a }\n",
+                "def pair<A, B>(a: A, b: B): A { a }\n",
+            ),
+            ("x = 1<2\n", "x = 1 < 2\n"),
+        ]);
     }
 
     #[test]
