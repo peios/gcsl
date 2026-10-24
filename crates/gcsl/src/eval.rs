@@ -1146,7 +1146,7 @@ enum Selected {
 fn selected(container: &Value, at: Selected, node: &IrNode) -> Flow<Value> {
     let found = match (container, at) {
         (Value::Record(record), Selected::Field(name)) => record.get(name),
-        (Value::List(list), Selected::Element(index)) => list.values().get(index),
+        (Value::List(list), Selected::Element(index)) => list.get(index),
         _ => None,
     };
     match found {
@@ -1156,17 +1156,11 @@ fn selected(container: &Value, at: Selected, node: &IrNode) -> Flow<Value> {
 }
 
 /// `list` with its element at `index`, which lies in it, replaced by
-/// `value`: a new list, in one allocation, sharing every other element, and
-/// `list` unchanged, so that whatever else holds it still sees its old
-/// elements.
+/// `value`: a new list sharing every other element, the path to it copied
+/// ([`List::with`]), and `list` unchanged, so that whatever else holds it
+/// still sees its old elements.
 fn with_element(list: &List, index: usize, value: Value) -> List {
-    let mut value = Some(value);
-    List::from_exact(list.values().iter().enumerate().map(|(at, element)| {
-        match value.take_if(|_| at == index) {
-            Some(value) => value,
-            None => element.clone(),
-        }
-    }))
+    list.with(index, value).unwrap_or_else(|| list.clone())
 }
 
 /// The number of integers from `start` up to `end`, `end` included if

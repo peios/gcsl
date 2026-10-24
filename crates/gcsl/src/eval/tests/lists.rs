@@ -123,6 +123,37 @@ fn a_spread_shares_the_elements_of_its_list() {
 }
 
 #[test]
+fn a_list_grown_by_spreads_shares_and_keeps_its_order() {
+    // A chain of spreads, as transitive file sets are built: each step joins
+    // the list so far, sharing it, rather than copying it.
+    let frame = frame_after(
+        "let mut xs: List<Int> = []\n\
+         for i in 0..3000 { xs := [...xs, i] }\n\
+         let ys = [...xs, ...xs]\n\
+         let n = xs[2999] + ys[5999]",
+    );
+    let [Value::List(xs), .., Value::List(ys), Value::Int(n)] = &frame[..] else {
+        panic!("unexpected frame {frame:?}");
+    };
+    assert_eq!(xs.len(), 3000);
+    assert_eq!(*n, 2999 + 2999);
+    let expected: Vec<Value> = (0..3000).chain(0..3000).map(Value::Int).collect();
+    assert_eq!(ys.values(), &expected[..]);
+    // An update replaces one element of the rope and leaves the old list.
+    let frame = frame_after(
+        "let mut xs: List<Int> = []\n\
+         for i in 0..100 { xs := [...xs, i] }\n\
+         let old = xs\n\
+         xs[50] := -1\n\
+         let r = old[50] + xs[50]",
+    );
+    let [.., Value::Int(r)] = &frame[..] else {
+        panic!("unexpected frame {frame:?}");
+    };
+    assert_eq!(*r, 49);
+}
+
+#[test]
 fn a_deep_await_of_a_list_runs_each_future_once() {
     let frame = frame_after(
         "let a = lazy { n = 1 }\n\

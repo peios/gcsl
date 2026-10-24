@@ -161,20 +161,28 @@ impl Evaluator<'_> {
     }
 
     /// Builds a list of the values of `items`, in order, of which some are
-    /// `Spread`s, whose lists' elements are put in their places: collected
-    /// in a vector, which grows by amortised doubling, so that the whole
-    /// takes time linear in the list's length, and then copied into the
-    /// list's one allocation.
+    /// `Spread`s, whose lists' elements are put in their places: each run
+    /// of elements a leaf, and each spread list joined in as it is, sharing
+    /// its elements (see [`List::concat`]), so that spreading a long list
+    /// costs a walk down a tree, not a copy of its elements.
     pub(super) fn make_spread_list(&mut self, items: &[IrId]) -> Flow<Value> {
-        let mut values = Vec::with_capacity(items.len());
+        let mut list = List::EMPTY;
+        let mut run = Vec::new();
         for &item in items {
-            if let IrKind::Spread(list) = self.ir.get(item).kind {
-                values.extend_from_slice(self.list(list)?.values());
+            if let IrKind::Spread(spread) = self.ir.get(item).kind {
+                let spread = self.list(spread)?;
+                if !run.is_empty() {
+                    list = list.concat(&List::from_vec(std::mem::take(&mut run)));
+                }
+                list = list.concat(&spread);
             } else {
-                values.push(self.value(item)?);
+                run.push(self.value(item)?);
             }
         }
-        Ok(Value::List(List::from_vec(values)))
+        if !run.is_empty() {
+            list = list.concat(&List::from_vec(run));
+        }
+        Ok(Value::List(list))
     }
 
     /// Evaluates `list` and then `index`, and returns the element at the
@@ -185,7 +193,7 @@ impl Evaluator<'_> {
         let at = self.int(index)?;
         match usize::try_from(at)
             .ok()
-            .and_then(|position| list.values().get(position))
+            .and_then(|position| list.get(position))
         {
             Some(value) => Ok(value.clone()),
             None => Err(out_of_range(node.span, at, list.len()).into()),

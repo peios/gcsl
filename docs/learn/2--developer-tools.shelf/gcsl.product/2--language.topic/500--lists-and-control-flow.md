@@ -20,6 +20,12 @@ let values = [...empty, 3, 8, 5]
 values[1]
 ```
 
+A spread shares the other list's elements instead of copying them, so
+building a list from others, such as a package's files from those of its
+dependencies, costs time in proportion to what is added, not to everything
+spread. Reading a list's length is immediate, and an index or an update of
+one element takes time in proportion to the logarithm of its length.
+
 `0..3` produces `[0, 1, 2]`; `0..=3` includes `3`. Bounds are integers and
 ranges run upward. A range used directly as a loop's iterable is counted
 without first allocating the list of all its integers.

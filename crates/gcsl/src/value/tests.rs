@@ -387,7 +387,7 @@ fn list(values: Vec<Value>) -> Value {
 
 #[test]
 fn lists_are_small_and_the_empty_list_allocates_nothing() {
-    assert_eq!(size_of::<List>(), 2 * size_of::<usize>());
+    assert_eq!(size_of::<List>(), size_of::<usize>());
     assert_eq!(size_of::<Value>(), 24);
     let empty = List::from_vec(Vec::new());
     assert!(empty.is_empty());

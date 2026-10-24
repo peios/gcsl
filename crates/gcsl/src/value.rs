@@ -45,6 +45,8 @@ use crate::ir::Ir;
 use crate::names::Name;
 use crate::strings::{FieldName, Quoted};
 
+pub use list::List;
+
 /// The kind of value an expression produces: all that the IR and the
 /// evaluator need to know of its type. Every record, the empty record
 /// included, is [`ValueKind::Record`]. See
@@ -228,98 +230,6 @@ impl Drop for Record {
     }
 }
 
-/// A list: its elements, in order, in one reference-counted slice, or
-/// nothing for the empty list, which therefore needs no allocation. Cloning
-/// a list shares its elements. See the module documentation.
-#[derive(Clone, Debug, Default)]
-pub struct List(Option<Rc<[Value]>>);
-
-impl List {
-    /// The empty list.
-    pub const EMPTY: List = List(None);
-
-    /// The list of `values`, in order: one allocation, which copies them
-    /// out of the vector, or none if there are none.
-    #[must_use]
-    pub fn from_vec(values: Vec<Value>) -> Self {
-        if values.is_empty() {
-            List::EMPTY
-        } else {
-            List(Some(Rc::from(values)))
-        }
-    }
-
-    /// The list of the values `values` yields, in order, which must be an
-    /// iterator of exactly known length, such as a map over a range, so
-    /// that the slice is allocated once, at its size, and filled in place;
-    /// no allocation if it yields none.
-    #[must_use]
-    pub fn from_exact(values: impl ExactSizeIterator<Item = Value>) -> Self {
-        if values.len() == 0 {
-            List::EMPTY
-        } else {
-            List(Some(values.collect()))
-        }
-    }
-
-    /// The elements, in order.
-    #[must_use]
-    pub fn values(&self) -> &[Value] {
-        self.0.as_deref().unwrap_or_default()
-    }
-
-    /// The number of elements.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.values().len()
-    }
-
-    /// Whether the list has no elements.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_none()
-    }
-
-    /// Whether this list and `other` are the same list, sharing their
-    /// elements, as a clone does: two empty lists always are.
-    #[must_use]
-    pub fn shares(&self, other: &List) -> bool {
-        match (&self.0, &other.0) {
-            (Some(mine), Some(theirs)) => Rc::ptr_eq(mine, theirs),
-            (None, None) => true,
-            _ => false,
-        }
-    }
-
-    /// The elements, if nothing else holds them, for dropping them.
-    fn unique_mut(&mut self) -> Option<&mut [Value]> {
-        self.0.as_mut().and_then(Rc::get_mut)
-    }
-}
-
-/// Dropping a list frees its nested records, lists, closures and futures
-/// iteratively, as dropping a record does, so a list nested in a list as
-/// deeply as a program runs is freed without recursion. A list whose
-/// elements are shared elsewhere is merely released.
-impl Drop for List {
-    fn drop(&mut self) {
-        if let Some(values) = self.unique_mut() {
-            drop_nested(values);
-        }
-    }
-}
-
-/// Lists compare element by element, in order, deeply, as [`Value`]'s
-/// equality compares each: two lists are equal when they have the same
-/// length and equal elements at every index. Nested records and lists are
-/// compared through a work list, as a record's fields are (see [`Record`]'s
-/// equality).
-impl PartialEq for List {
-    fn eq(&self, other: &Self) -> bool {
-        deep_equal(Pair::Lists(self.values(), other.values()))
-    }
-}
-
 /// A uniquely owned value that holds other values: what the iterative drop
 /// of records, lists, closures and futures frees level by level.
 enum Nested {
@@ -341,6 +251,12 @@ enum Nested {
 fn drop_nested(values: &mut [Value]) {
     let mut pending = Vec::new();
     take_nested(values, &mut pending);
+    free_nested(pending);
+}
+
+/// Frees what is on `pending`, and all it holds in turn, through the work
+/// list [`drop_nested`] starts from: what a list's drop starts from too.
+fn free_nested(mut pending: Vec<Nested>) {
     while let Some(nested) = pending.pop() {
         match nested {
             Nested::Record(record) => {
@@ -352,9 +268,7 @@ fn drop_nested(values: &mut [Value]) {
             }
             Nested::List(mut list) => {
                 // Emptied, its own drop finds nothing left to free.
-                if let Some(values) = list.unique_mut() {
-                    take_nested(values, &mut pending);
-                }
+                list.take_held(&mut pending);
             }
             Nested::Closure(closure) => {
                 if let Ok(mut closure) = Rc::try_unwrap(closure) {
@@ -1155,6 +1069,8 @@ impl fmt::Display for Repr<'_> {
 pub(crate) const fn int_to_float(value: i64) -> f64 {
     value as f64
 }
+
+mod list;
 
 #[cfg(test)]
 #[expect(
