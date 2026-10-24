@@ -16,7 +16,8 @@
 //! but with the copy as its `/`: under bubblewrap, `bwrap`, in user and pid
 //! namespaces of their own, the copy bound as `/`, a `/proc` and a `/dev`
 //! of their own, a `/tmp` made in the copy if it has none, killed with
-//! `bwrap` if it is killed. Its working directory is the sandbox's, or the
+//! `bwrap` if it is killed, unless the host runs it itself
+//! ([`Effects::sandbox_command`]). Its working directory is the sandbox's, or the
 //! call's `cwd`, absolute in the copy or relative to the sandbox's; its
 //! environment is exactly the sandbox's with the call's `env` set over it,
 //! nothing of this process's, since the sandbox is the program's host, so
@@ -125,9 +126,6 @@ pub(super) fn sandbox_exec(
     let Some(&shown) = words.first() else {
         return fail("`s.exec` needs a program to run".to_owned());
     };
-    let Some(bwrap) = on_path("bwrap") else {
-        return fail("a sandbox needs bubblewrap (`bwrap`), which is not installed".to_owned());
-    };
     let cwd = if options.cwd.is_empty() {
         Some(sandbox.cwd.trim_start_matches('/').to_owned())
     } else if options.cwd.starts_with('/') {
@@ -143,18 +141,6 @@ pub(super) fn sandbox_exec(
     if let Ok(root) = effects.host_path(&sandbox.root) {
         let _ = std::fs::create_dir_all(root.join("tmp"));
     }
-    let mut command = Command::new(bwrap);
-    command.args([
-        "--bind",
-        &sandbox.root,
-        "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-    ]);
-    command.args(["--unshare-user", "--unshare-pid", "--die-with-parent"]);
-    command.args(["--chdir", &format!("/{cwd}"), "--clearenv"]);
     // The sandbox's environment, each variable the call sets replaced.
     let given = &options.env;
     let kept = sandbox
@@ -162,16 +148,48 @@ pub(super) fn sandbox_exec(
         .iter()
         .map(|(name, value)| (&**name, &**value))
         .filter(|&(name, _)| !given.iter().any(|&(other, _)| other == name));
-    for (name, value) in kept.chain(given.iter().copied()) {
-        command.args(["--setenv", name, value]);
-    }
-    command.arg("--").args(&words);
+    let env: Vec<(&str, &str)> = kept.chain(given.iter().copied()).collect();
+    let mut inner = Command::new(shown);
+    inner
+        .args(&words[1..])
+        .current_dir(format!("/{cwd}"))
+        .env_clear()
+        .envs(env.iter().copied());
     let program = Program {
         builtin: Builtin::SandboxExec,
         shown,
         identity: None,
     };
-    let mut command = program.through(effects, command, node)?;
+    let mut command = match effects.sandbox_command(&sandbox.root, inner) {
+        Some(Ok(command)) => command,
+        Some(Err(reason)) => {
+            return fail(format!("`sandbox_exec` could not run `{shown}`: {reason}"));
+        }
+        None => {
+            let Some(bwrap) = on_path("bwrap") else {
+                return fail(
+                    "a sandbox needs bubblewrap (`bwrap`), which is not installed".to_owned(),
+                );
+            };
+            let mut command = Command::new(bwrap);
+            command.args([
+                "--bind",
+                &sandbox.root,
+                "/",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+            ]);
+            command.args(["--unshare-user", "--unshare-pid", "--die-with-parent"]);
+            command.args(["--chdir", &format!("/{cwd}"), "--clearenv"]);
+            for (name, value) in &env {
+                command.args(["--setenv", name, value]);
+            }
+            command.arg("--").args(&words);
+            program.through(effects, command, node)?
+        }
+    };
     program.finish(&mut command, &options, (layout, deadline), node)
 }
 

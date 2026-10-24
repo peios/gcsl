@@ -34,6 +34,19 @@ pub trait Effects: std::fmt::Debug {
         Ok(command)
     }
 
+    /// The command that runs `command` in the sandbox whose copy is at
+    /// `root`, as GCSL code names it, with the copy as its `/`: `command`'s
+    /// program and arguments, its working directory absolute in the copy, and
+    /// exactly the sandbox's environment, as `s.exec` gives them (see
+    /// [Sandboxes](crate::eval::sandbox#sandboxes)). `None`, as by default,
+    /// for GCSL's own, under bubblewrap; a host that runs programs in
+    /// sandboxes of its own gives one, since a sandbox in one of its
+    /// sandboxes cannot always be made.
+    fn sandbox_command(&self, root: &str, command: Command) -> Option<Result<Command, String>> {
+        let _ = (root, command);
+        None
+    }
+
     /// The path of the host's file system that `path`, an absolute path as
     /// GCSL code names it, is: what GCSL reads, writes, copies or lists
     /// there.

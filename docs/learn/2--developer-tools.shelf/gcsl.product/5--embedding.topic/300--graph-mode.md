@@ -102,6 +102,12 @@ own implementation can run each program in a sandbox, through
 `Effects::command`, and root file paths there, through
 `Effects::host_path`; GCSL's values keep the paths the code wrote.
 
+If your sandboxes use bubblewrap, also implement
+`Effects::sandbox_command`, which runs the commands of a GCSL
+`Dir.sandbox` with the sandbox's copy as their root. Without it, GCSL
+starts its own bubblewrap inside yours, which some systems, such as
+Ubuntu, forbid.
+
 A host decides, per call, whether to take a deferred call as a step, from
 the attribute's arguments. An attribute declared as
 `type step = {on: Bool = true}` lets a function written `#[step(false)]`
