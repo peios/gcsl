@@ -837,17 +837,28 @@ pub enum Value {
     /// A value of an enum: a variant and its payload, compared by both.
     Variant(Rc<Variant>),
     /// A secret: a value that never leaks, shown as `***` (see
-    /// [`crate::eval`], "Secrets"), compared by its value and identity.
+    /// [`crate::eval`], "Secrets"), compared by its identity alone.
     Secret(Rc<Secret>),
 }
 
 /// A secret, as values carry it (see [`crate::eval`], "Secrets").
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub struct Secret {
     /// Its value, never a secret itself.
     pub value: Value,
     /// Its public identity, what a host's receipts record of it.
     pub identity: Rc<str>,
+}
+
+/// Two secrets are equal if their identities are, whatever their values:
+/// a comparison that is not itself a secret, total equality's of fields a
+/// type does not name or a memoised call's of its arguments, must not tell
+/// of a secret's value (see [`crate::eval`], "Secrets"). A comparison of
+/// secrets' values is the checker's, of their values, into a secret.
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
 }
 
 /// A variant of an enum, as values carry it (see the checker's "Enums").

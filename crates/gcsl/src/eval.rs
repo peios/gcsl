@@ -774,6 +774,15 @@
 //! an enclosing call's deadline, which that call turns into its own error
 //! as ever.
 //!
+//! Anywhere else two secrets are compared, they are equal if their
+//! identities are, whatever their values ([`crate::value::Secret`]), and a
+//! memoised call's arguments hash a secret by its identity alone: total
+//! equality, `===`, compares fields a value's type does not name, which may
+//! hold a secret the checker cannot see, and a memoised call's cache hit is
+//! seen in whether it runs, so neither may depend on a secret's value.
+//! Two secrets of one identity are one secret to them: an identity names
+//! its value, as a key's fingerprint does.
+//!
 //! # Metas
 //!
 //! A read of a function's meta, `func.versions` (see the checker's "Metas"),
@@ -5659,13 +5668,10 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
                 hash_value(&variant.payload, state, depth - 1);
             }
         }
-        // In memory only: a memo table never leaves the run.
+        // By its identity alone, as it is equal (see [Secrets](#secrets)).
         Value::Secret(secret) => {
             state.write_u8(13);
             secret.identity.hash(state);
-            if depth > 0 {
-                hash_value(&secret.value, state, depth - 1);
-            }
         }
         Value::Record(record) => {
             state.write_u8(5);

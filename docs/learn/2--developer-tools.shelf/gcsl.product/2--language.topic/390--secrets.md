@@ -30,6 +30,13 @@ any values that hold a secret, such as two records with a secret field.
 A secret computed from other secrets is identified by theirs: `login`
 above is identified as `database password`.
 
+Give each secret an identity of its own. Where GCSL compares values
+without making the result a secret, it compares secrets by identity
+alone. That covers `===`, which compares even fields a value's type
+doesn't name, and the arguments of a memoised call. Two secrets with one
+identity are one secret to them, whatever their values, so neither can
+tell anything about a value.
+
 ## A secret decides nothing
 
 What a program does never depends on a secret, because whoever can see

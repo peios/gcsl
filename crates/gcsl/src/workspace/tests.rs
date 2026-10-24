@@ -12777,3 +12777,24 @@ fn a_timeout_inside_an_operation_on_a_secret_is_its_call_s() {
         "{r = \"`slow` timed out after 200ms\"}"
     );
 }
+
+#[test]
+fn a_secret_is_one_with_another_of_its_identity_where_a_comparison_is_plain() {
+    // Total equality compares fields the type does not name, and a cache
+    // hit is seen in whether a call runs: neither tells of the value.
+    let text = "let s = secret(\"pw\", \"id\")\n\
+                let q: {x: Int} = {x = 1; y = s}\n\
+                let wrong: {x: Int} = {x = 1; y = secret(\"guess\", \"id\")}\n\
+                let other: {x: Int} = {x = 1; y = secret(\"pw\", \"other\")}\n\
+                a = q === wrong\n\
+                b = q === other\n\
+                fn f(x: Secret<String>) ->> Secret<String> { x }\n\
+                let first = f(s)\n\
+                c = f(secret(\"guess\", \"id\")).unsafe_value()\n\
+                d = (s == secret(\"guess\", \"id\")).unsafe_value()";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{a = true; b = false; c = \"pw\"; d = false}"
+    );
+}

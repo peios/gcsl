@@ -235,6 +235,9 @@ makes one, with a public identity;
 .B .unsafe_value()
 takes its value.
 An operator with a secret operand, a secret interpolated, a field of a secret record and an element of a secret list are secrets, identified by the secrets computed on, as is any comparison of values that hold a secret.
+Elsewhere, in
+.B ===
+of fields a type does not name and in a memoised call's arguments, secrets compare by identity alone.
 A secret decides nothing: it is no condition, no operand of
 .B and
 or
