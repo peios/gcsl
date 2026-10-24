@@ -78,6 +78,11 @@ APIs can invoke a selected definition with named textual arguments parsed
 against its declared parameter types. When a value the host gets back holds
 a reference, such as `build = build busybox`, the host can ask which
 definition it names and then invoke it, or read its metadata, by name. The
+host can also invoke a definition in a [context](~gcsl/context) of its
+choosing, such as the platform a build step runs on, by giving each
+context a value of its declared type, for example one it got back from
+an earlier run. Only that invocation sees those values: what each file
+computes as it runs uses the declared defaults. The
 `gcsl` executable itself exposes
 `run`, `check`, `fmt`, and `lsp`; it does not add a general command for each
 definition type.

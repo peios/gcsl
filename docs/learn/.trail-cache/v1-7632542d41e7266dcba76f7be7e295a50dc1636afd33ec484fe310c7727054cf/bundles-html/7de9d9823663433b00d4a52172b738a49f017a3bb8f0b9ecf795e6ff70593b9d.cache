@@ -1,0 +1,541 @@
+ˆ,N§ðþû>9»[ÓöLd1ã îÙÍ´¤ÖëØ°ZÒü¡<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embedding GCSL â€” Peios Learn</title>
+<script>
+// What this build knows about itself, for the scripts below and for
+// search.js: `base` is the path prefix every link on this page carries
+// ("" on the site itself, "/<cbpath>" inside the cache-busting copy),
+// and `cachebust` is the copy's path when one was published.
+window.trail = {"base":"","cachebust":null};
+// Apply the saved theme choice before first paint (no flash).
+try {
+    const theme = localStorage.getItem("trail-theme");
+    if (theme === "light" || theme === "dark") {
+        document.documentElement.dataset.theme = theme;
+    }
+} catch {
+    // Storage can be unavailable; keep this page's default or in-memory state.
+}
+</script>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="alternate" type="text/markdown" href="/gcsl/embedding/print.md">
+<meta property="og:title" content="Embedding GCSL">
+<meta property="og:site_name" content="Peios Learn">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="/gcsl/embedding/print/">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="wordmark" href="/">Peios&nbsp;<span>Learn</span></a>
+  <nav class="site-nav" aria-label="Site navigation">
+    <details class="nav-dropdown">
+      <summary>Documentation</summary>
+      <div class="menu">
+        <p class="menu-heading">Developer Tools</p>
+        <a class="menu-item" href="/gcsl" style="--pc: #06b6d4; --tile-chars: 2"><svg class="tile tile-menu tile-icon" aria-hidden="true"><use href="/assets/icons/gcsl.svg#trail-icon" width="100%" height="100%"/></svg>GCSL</a>
+      </div>
+    </details>
+  </nav>
+  <button class="theme-toggle" type="button" data-theme-toggle data-theme-state="system" aria-label="Theme: system">
+    <svg data-theme-icon="system" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>
+    <svg data-theme-icon="light" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.6m0 13.8v2.6M2.5 12h2.6m13.8 0h2.6M5.2 5.2l1.9 1.9m9.8 9.8 1.9 1.9m0-13.6-1.9 1.9M7.1 16.9l-1.9 1.9"/></svg>
+    <svg data-theme-icon="dark" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>
+  </button>
+  <button class="search search-small" type="button" data-search-open aria-label="Search">
+    <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4.2-4.2"/></svg>
+    <span class="search-placeholder">Searchâ€¦</span>
+    <kbd data-search-kbd>âŒ˜K</kbd>
+  </button>
+</header>
+
+<main>
+
+<div class="print-page" style="--pc: #06b6d4">
+  <header class="print-header">
+    <nav class="crumbs" aria-label="Breadcrumbs">
+      <a href="/gcsl">GCSL</a>
+    </nav>
+    <h1>Embedding GCSL</h1>
+    <p class="print-note">Single-page view Â· <a href="/gcsl/embedding/print.md">as markdown</a></p>
+  </header>
+  <section class="print-article">
+    <header>
+      <h2 id="embedding">Embedding GCSL</h2>
+      <p class="print-crumbs">GCSL / Embedding GCSL</p>
+    </header>
+    <p>The <code>gcsl</code> Rust crate exposes the language pipeline without requiring the
+command-line program. You can evaluate one source, retain an interactive
+session, or load a workspace supplied by your application.</p>
+<h2 id="embedding--choosing-the-boundary">Choosing the boundary <a class="heading-anchor" href="#embedding--choosing-the-boundary" aria-label="Link to this section">#</a></h2>
+<p>The repository separates four responsibilities:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Crate</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>gcsl</code></td><td>Syntax, types, evaluation, formatting, and semantic indexing</td></tr>
+<tr><td><code>gcsl-disk</code></td><td>Finding workspace roots and reading source trees</td></tr>
+<tr><td><code>gcsl-lsp</code></td><td>Editor protocol, document state, and request handling</td></tr>
+<tr><td><code>gcsl-cli</code></td><td>Command arguments, terminal interaction, and output</td></tr>
+</tbody></table>
+</div>
+<p><code>gcsl::run</code> evaluates a <code>SourceFile</code> as a standalone program. A <code>Session</code>
+retains names and values across inputs. <code>workspace::Workspace</code> evaluates
+selected files after a workspace check. The lower-level lexer, parser,
+checker, and index are available when you only need a particular stage.
+Consult the Rust API documentation for exact signatures and ownership.</p>
+<h2 id="embedding--stack-and-lifetime">Stack and lifetime <a class="heading-anchor" href="#embedding--stack-and-lifetime" aria-label="Link to this section">#</a></h2>
+<p>Run the language pipeline on a thread with at least <code>gcsl::STACK_SIZE</code>
+bytes of stack, as the CLI does. Its configured size is 64 MiB. Parsing,
+checking, lowering, and evaluation share documented nesting limits; a host
+thread's default stack is not a substitute for the required reservation.</p>
+<p>Keep the source collection and diagnostic input numbering together.
+Standard-library files participate in the source list, so diagnostics can
+point into a helper as well as into user text. The library returns
+warnings with successful results instead of printing them.</p>
+<p>A workspace or session owns memoization state and temporary directories.
+Dropping it performs normal temporary-directory cleanup. Do not return a
+path to such a directory and then destroy its owner before a consumer has
+used it.</p>
+<h2 id="embedding--effects-are-host-effects">Effects are host effects <a class="heading-anchor" href="#embedding--effects-are-host-effects" aria-label="Link to this section">#</a></h2>
+<p>The standard library is embedded in the binary. Its process and file
+operations still run with the embedding process's permissions and
+resources. The library does not impose a wall-clock limit or turn pure
+checking into an execution sandbox. A host that accepts untrusted programs
+needs an external isolation and resource policy.</p>
+<p>Use <code>gcsl-disk</code> when you want the CLI's workspace-discovery behavior.
+Supply sources yourself when your host has a different storage model;
+keep the language's dependency and scope rules intact.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="definition-types">Definition Types and Metadata</h2>
+      <p class="print-crumbs">GCSL / Embedding GCSL</p>
+    </header>
+    <p>A definition type lets a host or library describe a family of named
+functions. The language checks each definition against a shared signature,
+while the host can discover and invoke definitions by name. This is the
+mechanism used by integrations such as Pekit.</p>
+<h2 id="definition-types--a-family-of-definitions">A family of definitions <a class="heading-anchor" href="#definition-types--a-family-of-definitions" aria-label="Link to this section">#</a></h2>
+<p>Mark a public function with <code>#[def_type]</code>. Its first parameter receives the
+definition's path as a string; its second receives the definition function.
+Further parameters become invocation arguments. This example wraps a
+pure string-producing definition:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[def_type]
+def describe(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+def describe dev.peios.gcsl() { "language tools" }
+result = describe dev.peios.gcsl()
+</code></pre></div>
+<p>Declaring the definition does not execute its body. Calling its reference
+does. Definitions live in the definition type's namespace, separate from
+ordinary values of the same path. Their public paths merge through
+workspace directories and imports like other public declarations.</p>
+<h2 id="definition-types--definitions-made-with-a-variant">Definitions made with a variant <a class="heading-anchor" href="#definition-types--definitions-made-with-a-variant" aria-label="Link to this section">#</a></h2>
+<p>A definition type can take a variant of an <a href="/gcsl/language/records-and-types">enum</a>
+after the name, and the definition after that. Each definition then
+names a variant, and each variant has its own definitions. When the
+definition type is generic, the variant's payload type fills in its type
+parameter, so each definition's body is checked against its own
+variant's payload:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>enum Tool extensible&lt;{*: String}&gt;
+enum Tool::C&lt;{cc: String}&gt;
+enum Tool::Rust&lt;{rustc: String}&gt;
+#[def_type]
+def Tool&lt;T&gt;(name: String, kind: Variant&lt;Tool, T&gt;, body: fn(): T): Tool {
+    kind(body())
+}
+def Tool::C gcc() { cc = "gcc" }
+def Tool::Rust gcc() { rustc = "rustc" }
+c = Tool::C gcc()
+rust = Tool::Rust gcc()
+</code></pre></div>
+<p><code>Tool::C gcc</code> and <code>Tool::Rust gcc</code> are separate definitions. A reference
+names the variant in the same way as the definition, and the definition
+type receives the variant as its <code>kind</code> argument. Hosts don't invoke these
+definitions by name: programs reach them through references, for example
+in a list of registered toolchains.</p>
+<h2 id="definition-types--metadata">Metadata <a class="heading-anchor" href="#definition-types--metadata" aria-label="Link to this section">#</a></h2>
+<p>Function types can carry metadata with <code>META:</code>, <code>META-&gt;</code>, or <code>META-&gt;&gt;</code>.
+These distinguish pure reads, impure reads, and memoized reads. A
+<code>defmeta</code> declaration supplies the metadata of a definition in its
+directory. Reading a field through the function reference reads that
+metadata according to its effect.</p>
+<p>Metadata is not a separate package-format contract. The definition type
+chooses its shape, and the host integration owns what those fields mean.
+Use the host's documentation for package or build semantics.</p>
+<h2 id="definition-types--host-invocation">Host invocation <a class="heading-anchor" href="#definition-types--host-invocation" aria-label="Link to this section">#</a></h2>
+<p>A checked workspace exposes definition types and their definitions. Host
+APIs can invoke a selected definition with named textual arguments parsed
+against its declared parameter types. When a value the host gets back holds
+a reference, such as <code>build = build busybox</code>, the host can ask which
+definition it names and then invoke it, or read its metadata, by name. The
+host can also invoke a definition in a <a href="/gcsl/language/context">context</a> of its
+choosing, such as the platform a build step runs on, by giving each
+context a value of its declared type, for example one it got back from
+an earlier run. Only that invocation sees those values: what each file
+computes as it runs uses the declared defaults. The
+<code>gcsl</code> executable itself exposes
+<code>run</code>, <code>check</code>, <code>fmt</code>, and <code>lsp</code>; it does not add a general command for each
+definition type.</p>
+<p>Keep protocol or package policy in the integration repository. Keep
+language syntax, type checking, and discovery semantics in GCSL. This
+separation lets other hosts use the same language without inheriting
+Pekit's packaging model.</p>
+
+  </section>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <p>Peios Learn</p>
+  <p class="colophon">Built with Trail.</p>
+</footer>
+
+<button class="back-to-top" type="button" data-back-to-top aria-label="Back to top">
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
+
+<dialog class="search-modal" id="search-modal" aria-label="Search Peios Learn">
+  <div class="search-panel">
+    <div class="search-box">
+      <input type="search" placeholder="Search Peios Learn, or / for commandsâ€¦" autocomplete="off" aria-label="Search query">
+      <button class="search-close" type="button" data-search-close aria-label="Close search"><kbd>Esc</kbd></button>
+    </div>
+    <ul class="search-results" role="listbox"></ul>
+    <p class="search-status" role="status"></p>
+  </div>
+</dialog>
+<script src="/assets/search.js" defer></script>
+
+<script>
+// Theme toggle: cycles system â†’ light â†’ dark, persisted per browser.
+(() => {
+    const button = document.querySelector("[data-theme-toggle]");
+    if (!button) {
+        return;
+    }
+    const apply = (state) => {
+        if (state === "system") {
+            delete document.documentElement.dataset.theme;
+            try {
+                localStorage.removeItem("trail-theme");
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        } else {
+            document.documentElement.dataset.theme = state;
+            try {
+                localStorage.setItem("trail-theme", state);
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        }
+        button.dataset.themeState = state;
+        button.setAttribute("aria-label", "Theme: " + state);
+        button.title = "Theme: " + state;
+    };
+    apply(document.documentElement.dataset.theme || "system");
+    const order = ["system", "light", "dark"];
+    const cycle = () => apply(order[(order.indexOf(button.dataset.themeState) + 1) % order.length]);
+    button.addEventListener("click", cycle);
+    // The /theme command in the search box drives the same state as the
+    // button, so the two can never disagree.
+    window.trail.themes = order;
+    window.trail.setTheme = (state) => {
+        if (!order.includes(state)) {
+            return null;
+        }
+        apply(state);
+        return state;
+    };
+    window.trail.cycleTheme = () => {
+        cycle();
+        return button.dataset.themeState;
+    };
+})();
+
+// Book tree: chapters expanded by hand stay expanded while moving
+// between the book's pages (per tab, via sessionStorage). The server
+// opens the trail to the current page; this only adds to it.
+(() => {
+    const tree = document.querySelector("[data-book-nav]");
+    if (!tree) {
+        return;
+    }
+    const key = "trail-open-chapters:" + tree.dataset.bookNav;
+    let stored = [];
+    try {
+        stored = JSON.parse(sessionStorage.getItem(key)) || [];
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    for (const details of tree.querySelectorAll("details[data-chapter]")) {
+        if (stored.includes(details.dataset.chapter)) {
+            details.open = true;
+        }
+    }
+    // "toggle" doesn't bubble; listen in the capture phase.
+    tree.addEventListener(
+        "toggle",
+        () => {
+            const open = [...tree.querySelectorAll("details[open]")].map(
+                (details) => details.dataset.chapter,
+            );
+            sessionStorage.setItem(key, JSON.stringify(open));
+        },
+        true,
+    );
+})();
+
+// Copy buttons on code blocks: the code's own text is the source of
+// truth, so nothing is duplicated into the markup.
+(() => {
+    document.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-copy-code]");
+        if (!button) {
+            return;
+        }
+        const code = button.parentElement.querySelector("code");
+        if (!code) {
+            return;
+        }
+        const label = button.querySelector(".copy-label");
+        try {
+            await navigator.clipboard.writeText(code.textContent);
+            label.textContent = "Copied";
+        } catch {
+            label.textContent = "Press âŒ˜C";
+        }
+        button.dataset.copied = "";
+        setTimeout(() => {
+            label.textContent = "Copy";
+            delete button.dataset.copied;
+        }, 1500);
+    });
+})();
+
+// Tab groups: one panel visible at a time, scoped per group so
+// several groups on a page stay independent.
+(() => {
+    for (const group of document.querySelectorAll("[data-tabs]")) {
+        const buttons = [...group.querySelectorAll(".tab-button")];
+        const panels = [...group.querySelectorAll(".tab-panel")];
+        // Print needs each panel labelled, since the buttons are hidden.
+        panels.forEach((panel, index) => {
+            panel.dataset.tabLabel = buttons[index]?.textContent ?? "";
+        });
+        group.addEventListener("click", (event) => {
+            const button = event.target.closest(".tab-button");
+            if (!button) {
+                return;
+            }
+            const chosen = Number(button.dataset.tab);
+            buttons.forEach((other, index) =>
+                other.setAttribute("aria-selected", String(index === chosen)),
+            );
+            panels.forEach((panel, index) => (panel.hidden = index !== chosen));
+        });
+    }
+})();
+
+// Back to top: appears once there's a page worth returning up.
+(() => {
+    const button = document.querySelector("[data-back-to-top]");
+    if (!button) {
+        return;
+    }
+    const sync = () => {
+        if (scrollY > 600) {
+            button.dataset.visible = "";
+        } else {
+            delete button.dataset.visible;
+        }
+    };
+    addEventListener("scroll", sync, { passive: true });
+    button.addEventListener("click", () => scrollTo({ top: 0, behavior: "smooth" }));
+    sync();
+})();
+
+// Search landing: ?q= marks the terms that brought the reader here
+// and scrolls the first one into view.
+(() => {
+    const query = new URLSearchParams(location.search).get("q");
+    const body = document.querySelector(".article-body");
+    if (!query || !body) {
+        return;
+    }
+    const terms = [
+        ...new Set(
+            query
+                .toLowerCase()
+                .split(/\s+/)
+                .filter((t) => t.length > 1),
+        ),
+    ];
+    if (terms.length === 0) {
+        return;
+    }
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) =>
+            node.parentElement.closest("code, pre, .crumbs, script, style")
+                ? NodeFilter.FILTER_REJECT
+                : NodeFilter.FILTER_ACCEPT,
+    });
+    const texts = [];
+    while (walker.nextNode()) {
+        texts.push(walker.currentNode);
+    }
+    let first = null;
+    for (const node of texts) {
+        // Walk the node, marking every occurrence, not just the first.
+        let current = node;
+        while (current) {
+            const lower = current.textContent.toLowerCase();
+            let at = -1;
+            let term = null;
+            for (const candidate of terms) {
+                const index = lower.indexOf(candidate);
+                if (index !== -1 && (at === -1 || index < at)) {
+                    at = index;
+                    term = candidate;
+                }
+            }
+            if (at === -1) {
+                break;
+            }
+            const hit = current.splitText(at);
+            const rest = hit.splitText(term.length);
+            const mark = document.createElement("mark");
+            mark.className = "search-hit";
+            mark.textContent = hit.textContent;
+            hit.replaceWith(mark);
+            first ??= mark;
+            current = rest;
+        }
+    }
+    first?.scrollIntoView({ block: "center" });
+})();
+
+// Reading size: scales the prose only, remembered per browser.
+(() => {
+    const controls = document.querySelector("[data-reading-size]");
+    const scales = { sm: "0.94", md: "1", lg: "1.12" };
+    const apply = (size) => {
+        document.documentElement.style.setProperty("--reading-scale", scales[size] ?? "1");
+        controls
+            ?.querySelectorAll("button")
+            .forEach((button) =>
+                button.setAttribute("aria-pressed", String(button.dataset.size === size)),
+            );
+    };
+    let saved = "md";
+    try {
+        saved = localStorage.getItem("trail-reading-size") || "md";
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    apply(saved in scales ? saved : "md");
+    controls?.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button) {
+            return;
+        }
+        apply(button.dataset.size);
+        try {
+            localStorage.setItem("trail-reading-size", button.dataset.size);
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+    });
+})();
+
+// Mobile drawer: on narrow screens the sidebar slides in over the page.
+// Pages without a sidebar render no toggle, so this does nothing there.
+(() => {
+    const toggle = document.querySelector("[data-drawer-toggle]");
+    if (!toggle) {
+        return;
+    }
+    const set = (open) => {
+        document.body.classList.toggle("drawer-open", open);
+        toggle.setAttribute("aria-expanded", open);
+    };
+    toggle.addEventListener("click", () => set(!document.body.classList.contains("drawer-open")));
+    document.querySelector("[data-drawer-close]")?.addEventListener("click", () => set(false));
+    // Following a link (a page, or an anchor on this one) closes the drawer.
+    document.querySelector(".sidebar")?.addEventListener("click", (event) => {
+        if (event.target.closest("a")) {
+            set(false);
+        }
+    });
+    addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && document.body.classList.contains("drawer-open")) {
+            set(false);
+        }
+    });
+})();
+</script>
+
+<script>
+// Citation anchors: clicking one copies the full citation string
+// ("Kernel TRM *copy-up.preserves-ownership") rather than navigating,
+// because copying it into a test is the whole reason it is there. The
+// href still points at the anchor, so middle-click and "copy link"
+// behave normally and the page is usable without JS.
+(() => {
+    const KEY = "trail:citations-hidden";
+    const body = document.body;
+    try {
+        if (localStorage.getItem(KEY) === "1") {
+            body.classList.add("citations-hidden");
+        }
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+
+    document.addEventListener("click", (event) => {
+        const anchor = event.target.closest(".citation-anchor");
+        if (!anchor) {
+            return;
+        }
+        const citation = anchor.dataset.citation;
+        if (!citation) {
+            return;
+        }
+        event.preventDefault();
+        history.replaceState(null, "", anchor.getAttribute("href"));
+        const done = () => {
+            anchor.classList.add("copied");
+            setTimeout(() => anchor.classList.remove("copied"), 1400);
+        };
+        const failed = () => {
+            anchor.title = "Copy failed. Copy the citation from the link title: " + citation;
+        };
+        if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(citation).then(done, failed);
+        } else {
+            failed();
+        }
+    });
+
+    // Exposed for a future settings control; usable from the console
+    // meanwhile. Persisted per reader, per origin.
+    window.trailToggleCitations = () => {
+        const hidden = body.classList.toggle("citations-hidden");
+        try {
+            localStorage.setItem(KEY, hidden ? "1" : "0");
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+        return hidden;
+    };
+})();
+</script>
+</body>
+</html>

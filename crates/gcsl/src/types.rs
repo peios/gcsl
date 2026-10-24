@@ -358,7 +358,7 @@ use crate::ast::{Effect, FnId};
 use crate::check::{Builtin, Constant};
 use crate::names::{Name, Names};
 use crate::strings::{FieldName, Quoted};
-use crate::value::{Quantity, ValueKind, write_quantity};
+use crate::value::{Quantity, Value, ValueKind, write_quantity};
 use std::num::NonZeroU32;
 
 /// An interned type: an index into the [`TypeTable`] that produced it.
@@ -1452,6 +1452,86 @@ impl TypeTable {
                 variant: None,
                 function: 1,
             }),
+        }
+    }
+
+    /// Whether `value`, data a host gives, is a value of type `ty` (see the
+    /// checker's "Context"): of its kind, a record with each named field
+    /// fitting, and each other fitting its rest-field if it has one, a
+    /// list whose every element fits, a member of a union, a value of an
+    /// enum's variant whose payload fits the variant's, a variant of it
+    /// whose payload's type is the one written, a partial record whose
+    /// fields fit. A function, a future, or anything nested deeper than
+    /// [`crate::MAX_DEPTH`] levels is none: the evaluator trusts every value
+    /// to be of its node's type, which no host's function or future can be
+    /// shown to be.
+    ///
+    /// Recurses once per level of record, list or payload nesting in
+    /// `value`.
+    #[must_use]
+    pub fn holds(&self, value: &Value, ty: TyId) -> bool {
+        self.holds_within(value, ty, crate::MAX_DEPTH)
+    }
+
+    /// [`TypeTable::holds`], `depth` more levels allowed.
+    fn holds_within(&self, value: &Value, ty: TyId, depth: usize) -> bool {
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        match (self.kind(self.strip(ty)), value) {
+            (TyKind::Int, Value::Int(_))
+            | (TyKind::Float, Value::Float(_))
+            | (TyKind::Bool, Value::Bool(_))
+            | (TyKind::String, Value::Str(_)) => true,
+            (TyKind::Quantity(wanted), Value::Quantity(quantity, _)) => wanted == quantity,
+            (TyKind::Record(record), Value::Empty) => record.fields.is_empty(),
+            (TyKind::Record(record), Value::Record(fields)) => {
+                let named = record.fields.iter().all(|&(name, field)| {
+                    fields
+                        .get(name)
+                        .is_some_and(|found| self.holds_within(found, field, depth))
+                });
+                let rest = record.rest().is_none_or(|rest| {
+                    fields
+                        .layout
+                        .names
+                        .iter()
+                        .zip(&fields.values)
+                        .all(|(name, found)| {
+                            record.fields.iter().any(|&(field, _)| field == *name)
+                                || self.holds_within(found, rest, depth)
+                        })
+                });
+                named && rest
+            }
+            (TyKind::List(element), Value::List(list)) => list
+                .values()
+                .iter()
+                .all(|found| self.holds_within(found, *element, depth)),
+            (TyKind::Union(members), _) => members
+                .iter()
+                .any(|&member| self.holds_within(value, member, depth)),
+            (TyKind::Enum { key, .. }, Value::Variant(variant)) => {
+                variant.tag.of == *key
+                    && self
+                        .variant_payload(variant.tag.key)
+                        .is_some_and(|payload| self.holds_within(&variant.payload, payload, depth))
+            }
+            (TyKind::Variant { of, payload, .. }, Value::Tag(tag)) => {
+                matches!(self.kind(*of), TyKind::Enum { key, .. } if *key == tag.of)
+                    && self.variant_payload(tag.key) == Some(*payload)
+            }
+            (TyKind::Partial(full), Value::Empty) => self.is_record(*full),
+            (TyKind::Partial(full), Value::Record(fields)) => fields
+                .layout
+                .names
+                .iter()
+                .zip(&fields.values)
+                .all(|(name, found)| {
+                    self.field(*full, *name)
+                        .is_some_and(|field| self.holds_within(found, field, depth))
+                }),
+            _ => false,
         }
     }
 

@@ -12426,3 +12426,86 @@ fn a_context_s_default_is_scheduled_with_what_it_reads() {
     ];
     assert_eq!(rooted_text(&files, "app.gcsl"), "{r = 4; b = 3; s = 4}");
 }
+
+/// A def-type whose definitions read contexts, and a file of a platform's
+/// record, to give an invocation its context with.
+const HOSTED: [(&str, &str); 4] = [
+    (
+        "workspace.gcsl",
+        "type Platform = {arch: String, os: String}\n\
+         context host_platform: Platform = { arch = \"x86_64\"; os = \"linux\" }\n\
+         context label: String = \"default\"\n\
+         #[def_type]\n\
+         def build(name: String, f: fn() -> String) -> String { f() }\n\
+         def tagged(n: Int) ->> String { \"{n}:{^label}\" }\n\
+         top = ^label",
+    ),
+    (
+        "app.gcsl",
+        "def build x() { \"{^host_platform.arch}-{tagged(1)}-{top}\" }",
+    ),
+    ("plat.gcsl", "arch = \"aarch64\"\nos = \"linux\""),
+    ("other.gcsl", "n = 1"),
+];
+
+#[test]
+fn an_invocation_runs_in_the_context_its_host_sets() {
+    let mut workspace = rooted(&HOSTED).unwrap();
+    let plat = workspace.file("plat.gcsl").unwrap();
+    let platform = workspace.run(plat).unwrap().value;
+    let set = |label: &str| {
+        vec![
+            ("host_platform".to_owned(), platform.clone()),
+            ("label".to_owned(), Value::Str(Rc::from(label))),
+        ]
+    };
+    let invoked = |workspace: &mut Workspace, contexts: &[(String, Value)]| {
+        let outcome = workspace.invoke_with(("build", "x"), &[], contexts);
+        outcome.unwrap().value.to_string()
+    };
+    // What a file computes reads the defaults, whatever the invocation.
+    assert_eq!(
+        invoked(&mut workspace, &set("first")),
+        "aarch64-1:first-default"
+    );
+    // A memoised call is not found from another context.
+    assert_eq!(
+        invoked(&mut workspace, &set("second")),
+        "aarch64-1:second-default"
+    );
+    assert_eq!(invoked(&mut workspace, &[]), "x86_64-1:default-default");
+    let error = |contexts: Vec<(String, Value)>| {
+        let mut workspace = rooted(&HOSTED).unwrap();
+        match workspace.invoke_with(("build", "x"), &[], &contexts) {
+            Err(InvokeError::Request(error)) => {
+                let mut shown = vec![error.message()];
+                shown.extend(error.notes());
+                shown.join("; ")
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        error(vec![("lable".to_owned(), Value::Int(1))]),
+        "no context `lable` is declared; the contexts are `host_platform`, `label`"
+    );
+    assert_eq!(
+        error(vec![("label".to_owned(), Value::Int(1))]),
+        "the value given for context `label` is not a `String`; a context is given data of \
+         its type: no function or future"
+    );
+    let twice = vec![
+        ("label".to_owned(), Value::Str(Rc::from("a"))),
+        ("label".to_owned(), Value::Str(Rc::from("b"))),
+    ];
+    assert_eq!(error(twice), "context `label` is given more than once");
+    // A record lacking a field of the type is not of it.
+    let mut workspace = rooted(&HOSTED).unwrap();
+    let other = workspace.file("other.gcsl").unwrap();
+    let wrong = workspace.run(other).unwrap().value;
+    assert_eq!(
+        error(vec![("host_platform".to_owned(), wrong)]),
+        "the value given for context `host_platform` is not a `{arch: String, os: String}`; a \
+         context is given data of its type: no function or future"
+    );
+}

@@ -244,7 +244,7 @@ use crate::lower;
 use crate::names::{Name, Names};
 use crate::source::SourceFile;
 use crate::types::{TyId, TypeTable};
-use crate::value::{Layout, Value};
+use crate::value::{Layout, Value, ContextFrame};
 use crate::workspace::{self, Alias, Earlier, Standard};
 
 /// A sequence of inputs sharing their top-level variables. See the module
@@ -542,14 +542,26 @@ pub(crate) fn lower_checked(
 pub(crate) fn run_input(
     ir: Ir,
     frame: &mut Vec<Value>,
+    context: RunContext,
+) -> Result<Value, Diagnostic> {
+    run_input_in(ir, frame, context, None)
+}
+
+/// [`run_input`], in the root context `root`, the frame of the contexts a
+/// host sets for the run (see [`eval::eval_rooted`]).
+pub(crate) fn run_input_in(
+    ir: Ir,
+    frame: &mut Vec<Value>,
     (memo, exec_result, dirs, temp_dirs): RunContext,
+    root: Option<Rc<ContextFrame>>,
 ) -> Result<Value, Diagnostic> {
     let ir = Rc::new(ir);
     let frame_size = ir.frame_size() as usize;
     if frame.len() < frame_size {
         frame.resize(frame_size, Value::Empty);
     }
-    eval::eval_with(&ir, frame, memo, (exec_result, dirs, Some(temp_dirs)))
+    let extras = (exec_result, dirs, Some(temp_dirs));
+    eval::eval_rooted(&ir, (frame, memo), extras, root)
 }
 
 /// What [`run_input`] runs an input with besides its frame: the memo tables

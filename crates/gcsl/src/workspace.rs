@@ -679,6 +679,16 @@
 //! another only at a `.`, so `x.a+b` is not under `x.a`, and `x.a+b.c` is
 //! under `x.a+b`; `x.1.83` is under `x.1`, and `x.10` is not.
 //!
+//! [`Workspace::invoke_with`] invokes a definition as [`Workspace::invoke`]
+//! does, in a context the host sets (see the checker's
+//! [Context](crate::check#context)): each a context's name and a value of
+//! its declared type, data the host has from an earlier run, bound around
+//! the call as a `with` binds it. What a file computes as it runs reads the
+//! declared defaults, whatever invokes it, so a file's cells never depend
+//! on an invocation's context, and a memoised call is found only from a
+//! context giving every context it read the same value. Pekit sets
+//! `host_platform` so for each target it evaluates.
+//!
 //! [`Workspace::invoke`] calls the definition as `DT PATH(NAME = VALUE, ...)`
 //! would be called from a file of the definition's directory, with its
 //! arguments BY NAME, each the name of one of the def-type's invocation
@@ -995,7 +1005,7 @@ use crate::session;
 use crate::source::{SourceFile, Span};
 use crate::strings::Strings;
 use crate::types::{Laziness, TyId, TypeTable};
-use crate::value::{Layout, Quantity, Value};
+use crate::value::{ContextFrame, Layout, Quantity, Value};
 
 /// The key of a root in [`Scan`]'s index of nodes by parent and name.
 const ROOT: u32 = u32::MAX;
@@ -8832,6 +8842,29 @@ pub enum RequestError {
         /// The name asked for.
         name: String,
     },
+    /// A context a host sets for an invocation is declared nowhere in the
+    /// workspace ([`Workspace::invoke_with`]): "no context `arhc` is
+    /// declared".
+    NoContext {
+        /// The name given.
+        name: String,
+        /// The names of the workspace's contexts, sorted.
+        contexts: Vec<String>,
+    },
+    /// A value a host sets a context to for an invocation is not of its
+    /// type ([`TypeTable::holds`]): "the value given for context `arch` is
+    /// not a `String`".
+    ContextValue {
+        /// The context's name.
+        name: String,
+        /// Its declared type, shown.
+        ty: String,
+    },
+    /// A context a host sets for an invocation is given more than once.
+    DuplicateContext {
+        /// The context's name.
+        name: String,
+    },
 }
 
 impl RequestError {
@@ -8897,6 +8930,13 @@ impl RequestError {
             }
             RequestError::NoFunction { file, name } => {
                 format!("`{file}` has no top-level function `{name}`")
+            }
+            RequestError::NoContext { name, .. } => format!("no context `{name}` is declared"),
+            RequestError::ContextValue { name, ty } => {
+                format!("the value given for context `{name}` is not a `{ty}`")
+            }
+            RequestError::DuplicateContext { name } => {
+                format!("context `{name}` is given more than once")
             }
         }
     }
@@ -8964,10 +9004,19 @@ impl RequestError {
                 ],
                 _ => Vec::new(),
             },
+            RequestError::NoContext { contexts, .. } => match &contexts[..] {
+                [] => vec!["this workspace declares no contexts".to_owned()],
+                [only] => vec![format!("the only context is `{only}`")],
+                _ => vec![format!("the contexts are {}", quoted_list(contexts))],
+            },
+            RequestError::ContextValue { .. } => {
+                vec!["a context is given data of its type: no function or future".to_owned()]
+            }
             RequestError::CannotBeGiven { .. }
             | RequestError::DuplicateArgument { .. }
             | RequestError::MissingArguments { .. }
-            | RequestError::NoFunction { .. } => Vec::new(),
+            | RequestError::NoFunction { .. }
+            | RequestError::DuplicateContext { .. } => Vec::new(),
         }
     }
 }
@@ -9264,6 +9313,17 @@ impl Workspace {
         path: &str,
         args: &[(String, Given)],
     ) -> Result<Outcome, InvokeError> {
+        self.invoke_in((def_type, path), args, None)
+    }
+
+    /// [`Workspace::invoke`], the call in the root context `root`, the
+    /// frame of the contexts the host sets ([`Workspace::invoke_with`]).
+    fn invoke_in(
+        &mut self,
+        (def_type, path): (&str, &str),
+        args: &[(String, Given)],
+        root: Option<Rc<ContextFrame>>,
+    ) -> Result<Outcome, InvokeError> {
         let ResolvedDefinition {
             def_type: found,
             definition_index: at,
@@ -9291,8 +9351,85 @@ impl Workspace {
         self.call_definition(
             (definition, Invocation::Call(&args)),
             (def_type_cell, definition_cell),
-            known,
+            (known, root),
         )
+    }
+
+    /// [`Workspace::invoke`], in a context the host sets: each of
+    /// `contexts` a context's name and its value, data of its declared type
+    /// ([`TypeTable::holds`]), bound around the call, as a `with` would
+    /// bind it, for every call the definition makes (see the checker's
+    /// "Context"). The files the invocation runs, each as a whole, run in
+    /// the declared defaults, as they always do, so what a file computes
+    /// never depends on an invocation's context. Pekit sets
+    /// `host_platform` so for each target it evaluates.
+    ///
+    /// # Errors
+    ///
+    /// Before anything else, for each of `contexts` in order: a name no
+    /// context of the workspace has ([`RequestError::NoContext`]), one given
+    /// twice ([`RequestError::DuplicateContext`]), or a value not of its
+    /// context's type ([`RequestError::ContextValue`]); then those of
+    /// [`Workspace::invoke`].
+    pub fn invoke_with(
+        &mut self,
+        (def_type, path): (&str, &str),
+        args: &[(String, Given)],
+        contexts: &[(String, Value)],
+    ) -> Result<Outcome, InvokeError> {
+        let root = self.root_frame(contexts).map_err(InvokeError::Request)?;
+        self.invoke_in((def_type, path), args, root)
+    }
+
+    /// The root frame of the context a host sets for an invocation, each of
+    /// `contexts` a context's name and its value, checked as
+    /// [`Workspace::invoke_with`] says; `None` for none.
+    fn root_frame(
+        &mut self,
+        contexts: &[(String, Value)],
+    ) -> Result<Option<Rc<ContextFrame>>, RequestError> {
+        if contexts.is_empty() {
+            return Ok(None);
+        }
+        let mut binds: Vec<(Name, Value)> = Vec::with_capacity(contexts.len());
+        for (name, value) in contexts {
+            let found = self
+                .scan
+                .names
+                .lookup(name)
+                .and_then(|name| self.scan.contexts.iter().find(|c| c.name == name));
+            let Some(declared) = found else {
+                let mut names: Vec<String> = self
+                    .scan
+                    .contexts
+                    .iter()
+                    .map(|c| self.scan.names.get(c.name).to_owned())
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                return Err(RequestError::NoContext {
+                    name: name.clone(),
+                    contexts: names,
+                });
+            };
+            if binds.iter().any(|&(key, _)| key == declared.key) {
+                return Err(RequestError::DuplicateContext { name: name.clone() });
+            }
+            let ty = self.types.context_type(declared.key).unwrap_or(TyId::ERROR);
+            if !self.types.holds(value, ty) {
+                let ty = self.types.display(ty, &self.scan.names).to_string();
+                return Err(RequestError::ContextValue {
+                    name: name.clone(),
+                    ty,
+                });
+            }
+            binds.push((declared.key, value.clone()));
+        }
+        Ok(Some(Rc::new(ContextFrame {
+            id: self.memo.new_context_frame(),
+            binds: binds.into_boxed_slice(),
+            outer: None,
+        })))
     }
 
     /// Reads the arguments `args` for the invocation parameters of the
@@ -9395,7 +9532,7 @@ impl Workspace {
         self.call_definition(
             (definition, Invocation::MetaField(field)),
             (def_type_cell, (definition_cell.0, func)),
-            None,
+            (None, None),
         )
         .map(Some)
     }
@@ -9539,7 +9676,7 @@ impl Workspace {
         };
         self.run_needed(file).map_err(InvokeError::Diagnostics)?;
         let lowered = self.lower_composed(&cells, at)?;
-        self.run_built(lowered, at)
+        self.run_built(lowered, at, None)
     }
 
     /// The cells of `functions`, top-level functions of file `file`, as
@@ -10002,12 +10139,13 @@ impl Workspace {
     /// an invocation parameter it leaves out its default, checked from the
     /// workspace's slots, as an input of no workspace, and lowered as one
     /// placed in the definition's directory, its caller, numbered after
-    /// every file (see [Def-types by name](#def-types-by-name)).
+    /// every file (see [Def-types by name](#def-types-by-name)); run in the
+    /// root context `root`, if the host sets one.
     fn call_definition(
         &mut self,
         (definition, invoked): (&Definition, Invocation),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
-        known: Option<Rc<KnownParams>>,
+        (known, root): (Option<Rc<KnownParams>>, Option<Rc<ContextFrame>>),
     ) -> Result<Outcome, InvokeError> {
         let at = (definition.file, definition.span);
         let bound = (
@@ -10021,7 +10159,7 @@ impl Workspace {
             |names| invocation(names, (path, invoked), bound, at.1),
             at,
         )?;
-        self.run_built(lowered, at)
+        self.run_built(lowered, at, root)
     }
 
     /// Checks and lowers a call built rather than parsed, the input `build`
@@ -10078,8 +10216,9 @@ impl Workspace {
     /// Runs `ir`, a call [`Workspace::lower_built`] lowered, whose own
     /// warnings are `own`, on the workspace's frame and memo tables, as
     /// [`Workspace::run`] runs a file, and returns its value, with the
-    /// warnings of the whole workspace and its own. Run again, it runs
-    /// again, a call like any other.
+    /// warnings of the whole workspace and its own, in the root context
+    /// `root`, if the host sets one. Run again, it runs again, a call like
+    /// any other.
     ///
     /// # Errors
     ///
@@ -10090,6 +10229,7 @@ impl Workspace {
         &mut self,
         (mut ir, own): (Ir, Vec<Diagnostic>),
         at: (u32, Span),
+        root: Option<Rc<ContextFrame>>,
     ) -> Result<Outcome, InvokeError> {
         let call = count(self.scan.files.len());
         // Numbered after every file, its slots end after theirs; kept
@@ -10103,7 +10243,7 @@ impl Workspace {
         );
         let mut warnings = self.warnings.clone();
         warnings.extend(own);
-        match session::run_input(ir, &mut self.frame, context) {
+        match session::run_input_in(ir, &mut self.frame, context, root) {
             Ok(value) => Ok(Outcome { value, warnings }),
             Err(error) => {
                 let errors = invoked_here(vec![error], call, at);

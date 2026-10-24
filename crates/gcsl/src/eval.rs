@@ -1074,7 +1074,19 @@ pub fn eval_with(
     ir: &Rc<Ir>,
     stack: &mut Vec<Value>,
     memo: &mut MemoTables,
+    extras: (Option<&Rc<Layout>>, &[Rc<str>], Option<&TempDirs>),
+) -> Result<Value, Diagnostic> {
+    eval_rooted(ir, (stack, memo), extras, None)
+}
+
+/// [`eval_with`], in the root context `context`, the frame of the contexts
+/// a host sets for the evaluation, which every frame of it inherits (see
+/// [Context](#context)); `None` for none.
+pub(crate) fn eval_rooted(
+    ir: &Rc<Ir>,
+    (stack, memo): (&mut Vec<Value>, &mut MemoTables),
     (exec_result, dirs, temp_dirs): (Option<&Rc<Layout>>, &[Rc<str>], Option<&TempDirs>),
+    context: Option<Rc<ContextFrame>>,
 ) -> Result<Value, Diagnostic> {
     let root = ir.root();
     let frame_size = ir.frame_size() as usize;
@@ -1090,6 +1102,7 @@ pub fn eval_with(
         origin: NO_ORIGIN,
     };
     let shared = Shared::new(exec_result, dirs, temp_dirs);
+    shared.context.replace(context);
     let result = Evaluator {
         ir,
         stack,
@@ -4852,7 +4865,7 @@ impl MemoTables {
 
     /// A new identity, for a frame of the context a `with` makes (see
     /// [Context](#context)).
-    fn new_context_frame(&mut self) -> u64 {
+    pub(crate) fn new_context_frame(&mut self) -> u64 {
         self.context_frames = self.context_frames.wrapping_add(1);
         self.context_frames
     }
