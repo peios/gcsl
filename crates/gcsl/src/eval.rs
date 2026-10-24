@@ -933,40 +933,36 @@ fn floor_mod(a: i64, b: NonZeroI64) -> i64 {
 }
 
 /// `value` with every secret in it its value, in a field, an element or a
-/// payload at any depth, each secret's identity pushed onto `identities`
-/// in the order met (see [Secrets](crate::eval::secrets#secrets)): what a comparison of values
-/// holding secrets compares. A value holding none is returned as it is,
+/// payload at any depth (see [Secrets](crate::eval::secrets#secrets)):
+/// what a comparison of values holding secrets compares. A value holding none is returned as it is,
 /// sharing what it shares.
 ///
 /// Recurses once per level of nesting in `value`, which is nested no
 /// deeper than its type, which the checker recursed through already.
-fn unsealed(value: Value, identities: &mut Vec<Rc<str>>) -> Value {
+fn unsealed(value: Value) -> Value {
     if !holds_secret(&value) {
         return value;
     }
     match value {
         // A secret's value, never a secret, may hold one.
-        Value::Secret(secret) => {
-            identities.push(Rc::clone(&secret.identity));
-            unsealed(secret.value.clone(), identities)
-        }
+        Value::Secret(secret) => unsealed(secret.value.clone()),
         Value::Record(record) => Value::Record(Rc::new(Record {
             layout: Rc::clone(&record.layout),
             values: record
                 .values
                 .iter()
-                .map(|field| unsealed(field.clone(), identities))
+                .map(|field| unsealed(field.clone()))
                 .collect(),
         })),
         Value::List(list) => Value::List(List::from_vec(
             list.values()
                 .iter()
-                .map(|element| unsealed(element.clone(), identities))
+                .map(|element| unsealed(element.clone()))
                 .collect(),
         )),
         Value::Variant(variant) => Value::Variant(Rc::new(Variant {
             tag: Rc::clone(&variant.tag),
-            payload: unsealed(variant.payload.clone(), identities),
+            payload: unsealed(variant.payload.clone()),
         })),
         value => value,
     }

@@ -905,6 +905,38 @@ impl Value {
         }
     }
 
+    /// This value written as the derivation of a secret computed on it,
+    /// every secret in it as its identity (see [`Derivation`]).
+    #[must_use]
+    pub fn derivation(&self) -> Derivation<'_> {
+        Derivation(self)
+    }
+
+    /// The identities of the secrets this value holds, in a field, an
+    /// element or a payload at any depth, in the order met, each once:
+    /// what a host records of a value's secrets, never their values (see
+    /// [`crate::eval`], "Secrets"). A closure's or a future's captures are
+    /// not looked into.
+    #[must_use]
+    pub fn secret_identities(&self) -> Vec<Rc<str>> {
+        let mut found: Vec<Rc<str>> = Vec::new();
+        let mut pending: Vec<&Value> = vec![self];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Secret(secret) => {
+                    if !found.contains(&secret.identity) {
+                        found.push(Rc::clone(&secret.identity));
+                    }
+                }
+                Value::Record(record) => pending.extend(record.values.iter().rev()),
+                Value::List(list) => pending.extend(list.values().iter().rev()),
+                Value::Variant(variant) => pending.push(&variant.payload),
+                _ => {}
+            }
+        }
+        found
+    }
+
     /// The value as it would be written in a program, for the REPL and the
     /// built-in `show` (see [`crate::eval`], "The built-in functions"): a
     /// string double-quoted with its special characters escaped (see
@@ -1045,6 +1077,57 @@ impl fmt::Display for Value {
             // `{:?}` on f64 is the shortest round-trip representation and
             // always includes `.` or `e`; it shows infinities as `inf`/`-inf`.
             Value::Float(value) => write!(f, "{value:?}"),
+        }
+    }
+}
+
+/// A [`Value`] written as the derivation of a secret computed on it (see
+/// [`crate::eval`], "Secrets"): as [`Repr`] writes it, but every secret in
+/// it as `$(identity)`, its identity with `\` and `)` escaped, so that two
+/// derivations are written alike only if they are alike. Returned by
+/// [`Value::derivation`].
+#[derive(Clone, Copy, Debug)]
+pub struct Derivation<'a>(&'a Value);
+
+impl fmt::Display for Derivation<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Value::Secret(secret) => {
+                f.write_str("$(")?;
+                for c in secret.identity.chars() {
+                    if c == '\\' || c == ')' {
+                        f.write_str("\\")?;
+                    }
+                    write!(f, "{c}")?;
+                }
+                f.write_str(")")
+            }
+            Value::Record(record) => {
+                f.write_str("{")?;
+                for (index, (text, value)) in
+                    record.layout.texts.iter().zip(&record.values).enumerate()
+                {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{} = {}", FieldName(text), Derivation(value))?;
+                }
+                f.write_str("}")
+            }
+            Value::List(list) => {
+                f.write_str("[")?;
+                for (index, value) in list.values().iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    Derivation(value).fmt(f)?;
+                }
+                f.write_str("]")
+            }
+            Value::Variant(variant) => {
+                write!(f, "{}({})", variant.tag.shown, Derivation(&variant.payload))
+            }
+            value => value.repr().fmt(f),
         }
     }
 }

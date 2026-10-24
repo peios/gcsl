@@ -27,8 +27,11 @@ secret record and indexing a secret list. A comparison is too:
 answer would tell you about the password. The same goes for comparing
 any values that hold a secret, such as two records with a secret field.
 
-A secret computed from other secrets is identified by theirs: `login`
-above is identified as `database password`.
+A secret computed from others is identified by how it was computed: the
+operation, the identities of the secrets it used, and the plain values it
+used, which aren't secret. `login` above is identified as
+`interp("admin", ":", $(database password))`, so equal computations have
+equal identities and different ones different.
 
 Give each secret an identity of its own. Where GCSL compares values
 without making the result a secret, it compares secrets by identity

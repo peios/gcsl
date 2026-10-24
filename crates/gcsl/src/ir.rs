@@ -1597,7 +1597,7 @@ impl IrKind {
     }
 
     /// The node's name in [`Ir::pretty`] output.
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             IrKind::IntConst(_) => "int",
             IrKind::FloatConst(_) => "float",
@@ -2109,9 +2109,10 @@ impl Ir {
     }
 
     /// The text of `name`, if it is the name of an [`IrKind::UpdateField`],
-    /// of a field an [`IrKind::Update`]'s path steps to, or of a field a
-    /// test looks at: what the evaluator shows a field it adds to a record,
-    /// or that fails a test, as.
+    /// of a field an [`IrKind::Update`]'s path steps to, of a field a test
+    /// looks at, or of a field an operation on a secret reads: what the
+    /// evaluator shows a field it adds to a record, or that fails a test,
+    /// as, and names a secret's field in its derivation.
     #[must_use]
     pub fn name_text(&self, name: Name) -> Option<&str> {
         self.name_texts.get(&name).map(AsRef::as_ref)

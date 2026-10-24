@@ -879,6 +879,10 @@ impl Lowerer<'_> {
         };
         let kind = self.kind_of_type(id, value)?;
         let computed = self.lower_plain(id, kind)?;
+        // A field read of a secret names its field in the derivation.
+        if let ExprKind::Field { name, .. } = self.ast.get(id).kind {
+            self.builder.add_name_text(name, self.ast.names().get(name));
+        }
         Ok(self.builder.alloc(
             IrKind::SecretWrap(computed, revealed),
             self.ast.get(id).span,
@@ -948,7 +952,7 @@ impl Lowerer<'_> {
                 IrKind::StrConst(self.builder.push_string(self.ast.strings().get(text)))
             }
             (ExprKind::Interp(parts), ValueKind::String) => {
-                self.lower_interpolation(parts, span)?
+                self.lower_interpolation(id, parts, span)?
             }
             (
                 ExprKind::If {

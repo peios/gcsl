@@ -865,13 +865,54 @@ fn a_secret_computed_on_secrets_is_identified_by_theirs() {
         identities,
         [
             ("a", "password"),
-            ("b", "user + password"),
-            ("c", "user + password"),
-            ("d", "password"),
-            ("e", "login + password"),
+            (
+                "b",
+                "str-concat($(str-concat($(user\\), \":\"\\)), $(password))"
+            ),
+            ("c", "interp($(user), \":\", $(password))"),
+            ("d", "record-eq({k = $(password)}, {k = \"pw\"})"),
+            ("e", "field.k($(login))"),
             ("f", "again"),
         ]
     );
+}
+
+#[test]
+fn a_derived_secret_s_identity_is_its_derivation_so_it_names_one_value() {
+    // Two secrets of one identity are one secret to memoisation and to
+    // total equality: secrets derived differently must not share one.
+    let text = "let s = secret(\"pw\", \"password\")\n\
+                let o = secret({user = \"jack\"; pass = \"pw\"}, \"login\")\n\
+                fn f(x: Secret<String>) ->> Secret<String> { x }\n\
+                a = f(s + \"a\").unsafe_value()\n\
+                b = f(s + \"b\").unsafe_value()\n\
+                c = f(\"x{s}\").unsafe_value()\n\
+                d = f(\"y{s}\").unsafe_value()\n\
+                e = f(o.user).unsafe_value()\n\
+                g = f(o.pass).unsafe_value()\n\
+                let p: {n: Int} = {n = 1; hidden = s + \"a\"}\n\
+                let q: {n: Int} = {n = 1; hidden = s + \"b\"}\n\
+                h = p === q";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{a = \"pwa\"; b = \"pwb\"; c = \"xpw\"; d = \"ypw\"; e = \"jack\"; g = \"pw\"; h = false}"
+    );
+}
+
+#[test]
+fn a_host_reads_the_identities_of_the_secrets_a_value_holds() {
+    let text = "let s = secret(\"pw\", \"password\")\n\
+                let u = secret(\"jack\", \"user\")\n\
+                step = {argv = [\"sign\", s.reveal()]; who = u; again = [s]; plain = 1}";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    let value = rooted_value(&files, "app.gcsl");
+    let identities: Vec<String> = value
+        .secret_identities()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(identities, ["password", "user"]);
 }
 
 #[test]
@@ -1096,8 +1137,8 @@ fn a_revealed_secret_keeps_its_identity_and_is_told_apart_from_the_secret() {
         secrets,
         [
             ("a", "token", true),
-            ("b", "token", true),
-            ("c", "token + token", false),
+            ("b", "str-concat($(token), \"!\")", true),
+            ("c", "interp($(token), $(token))", false),
             ("d", "token", false),
             ("e", "token", true),
         ]

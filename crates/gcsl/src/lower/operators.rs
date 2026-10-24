@@ -93,15 +93,32 @@ impl Lowerer<'_> {
     /// lowered expressions, in order.
     pub(super) fn lower_interpolation(
         &mut self,
+        id: ExprId,
         parts: PartRange,
         span: Span,
     ) -> Result<IrKind, InternalError> {
         let base = self.item_stack.len();
+        // An interpolation of a secret derives its text from its literal
+        // parts too, so each but an empty one is one of its operands (see
+        // the checker's "Secrets").
+        let secret = self.resolution.secret_op(id).is_some();
         for &part in self.ast.parts(parts) {
             let item = match part {
                 StrPart::Lit(text) => {
-                    let text = self.builder.push_string(self.ast.strings().get(text));
-                    self.builder.alloc(IrKind::StrConst(text), span)
+                    let text = self.ast.strings().get(text);
+                    let empty = text.is_empty();
+                    let text = self.builder.push_string(text);
+                    let literal = self.builder.alloc(IrKind::StrConst(text), span);
+                    if secret && !empty {
+                        let operand = IrKind::SecretValue {
+                            value: literal,
+                            kind: ValueKind::String,
+                            deep: false,
+                        };
+                        self.builder.alloc(operand, span)
+                    } else {
+                        literal
+                    }
                 }
                 StrPart::Expr(expr) => self.lower_expr(expr)?,
             };
