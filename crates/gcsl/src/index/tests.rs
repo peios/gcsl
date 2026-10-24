@@ -127,6 +127,11 @@ const LOCALS: &str = "fn f(a: Int): Int {\n    let b = a + 1\n    let xs = for i
 const PACKAGE: &str = "#[def_type]\ndef package(name: String, func: fn(): String): String { \
                            func() }\n";
 
+/// An enum and a generic def-type whose definitions are made with its
+/// variants.
+const TOOL: &str = "enum Tool extensible\nenum Tool::C<Int>\n#[def_type]\ndef Tool<T>(name: \
+                        String, kind: Variant<Tool, T>, func: fn(): T): T { func() }\n";
+
 /// The cases of the index's answers.
 fn cases() -> Vec<Case> {
     let mut cases = local_cases();
@@ -284,6 +289,39 @@ fn other_cases() -> Vec<Case> {
             at: ("pkg.gcsl", "dev.|x"),
             hover: Some(vec!["def package dev.x(): String"]),
             definition: vec![("workspace.gcsl", "def |package", 7)],
+        },
+        Case {
+            name: "a reference made with a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("app.gcsl", "C |gcc"),
+            hover: Some(vec!["Tool::C gcc", "definition of def-type `Tool::C`"]),
+            definition: vec![("pkg.gcsl", "C |gcc", 3)],
+        },
+        Case {
+            name: "a definition's path after a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("pkg.gcsl", "C |gcc"),
+            hover: Some(vec!["def Tool::C gcc(): Int"]),
+            definition: vec![("workspace.gcsl", "def |Tool<", 4)],
+        },
+        Case {
+            name: "the def-type of a reference made with a variant",
+            files: vec![
+                ("app.gcsl", "r = Tool::C gcc()\n"),
+                ("pkg.gcsl", "def Tool::C gcc() { 1 }\n"),
+                ("workspace.gcsl", TOOL),
+            ],
+            at: ("app.gcsl", "|Tool::C gcc"),
+            hover: Some(vec!["def Tool<T>"]),
+            definition: vec![("workspace.gcsl", "def |Tool<", 4)],
         },
         Case {
             name: "a type's name",
@@ -578,6 +616,18 @@ fn references_of_a_definition_include_its_path_and_its_references() {
     let all = places(&files, &[("app.gcsl", "dev.|x"), ("pkg.gcsl", "dev.|x")]);
     assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), true), all);
     assert_eq!(references(&files, ("pkg.gcsl", "dev.|x"), false), all[..1]);
+    // One variant's definition is not another's of its path.
+    let files = [
+        ("app.gcsl", "r = Tool::C gcc()\ns = Tool::D gcc()\n"),
+        (
+            "pkg.gcsl",
+            "def Tool::C gcc() { 1 }\ndef Tool::D gcc() { 2 }\n",
+        ),
+        ("workspace.gcsl", "enum Tool::D<Int>\n"),
+        ("tool.gcsl", TOOL),
+    ];
+    let c = places(&files, &[("app.gcsl", "C |gcc"), ("pkg.gcsl", "C |gcc")]);
+    assert_eq!(references(&files, ("pkg.gcsl", "C |gcc"), true), c);
 }
 
 #[test]

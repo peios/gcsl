@@ -58,6 +58,13 @@
 //! none holds `<`, `#`, `@` or `>`, and a key holds only the def-type's
 //! path, made of identifiers, so no key reads differently for them.
 //!
+//! A def-type whose definitions are made with a variant (see the checker's
+//! "Def-types", "Variant def-types"), `def Toolchain::C gcc()`, has a
+//! namespace for each variant: its key's path is the def-type's, `::` and
+//! the variant's name, `<Toolchain::C#3.17>` ([`variant_namespace_key`]),
+//! so that `Toolchain::C gcc` and `Toolchain::Rust gcc` are two
+//! definitions, and a path under it is shown `Toolchain::C gcc`.
+//!
 //! The metas of a def-type's definitions (`defmeta package x { ... }`) are
 //! kept apart, one namespace per def-type and DIRECTORY, since a meta
 //! belongs to the definition of its path in its own directory: a *meta key*,
@@ -169,6 +176,28 @@ pub fn namespace_key(path: &str, number: u32, item: u32) -> String {
     format!("<{path}#{number}.{item}>")
 }
 
+/// The text of the namespace key of the definitions made with the variant
+/// `variant` of the def-type whose namespace key is `key`:
+/// `<Toolchain::C#3.17>` for `<Toolchain#3.17>` and `C` (see [Namespace
+/// keys](#namespace-keys)). `None` if `key` is no namespace key.
+#[must_use]
+pub fn variant_namespace_key(key: &str, variant: &str) -> Option<String> {
+    let path = key_def_type(key)?;
+    let (number, item) = key_numbers(key)?;
+    Some(namespace_key(&format!("{path}::{variant}"), number, item))
+}
+
+/// Whether `path` could be the path of a def-type in a key: identifiers,
+/// which may hold `-`, joined by `.`, then optionally `::` and a variant's
+/// name. So no other key, an enum's or a method binding's, whose origin may
+/// hold `#`, is one.
+fn key_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 /// The path of the def-type whose namespace key is `text`, as its
 /// declaration writes it, if `text` is a namespace key: `package` for
 /// `<package#3.17>` (see [Namespace keys](#namespace-keys)).
@@ -178,7 +207,7 @@ pub fn key_def_type(text: &str) -> Option<&str> {
     let (path, numbers) = inner.rsplit_once('#')?;
     let (number, item) = numbers.split_once('.')?;
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    (digits(number) && digits(item)).then_some(path)
+    (key_path(path) && digits(number) && digits(item)).then_some(path)
 }
 
 /// The number of the file or session input that declares the def-type
@@ -219,7 +248,7 @@ pub fn key_meta(text: &str) -> Option<&str> {
     let (path, numbers) = key.rsplit_once('#')?;
     let (number, item) = numbers.split_once('.')?;
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    (digits(number) && digits(item)).then_some(path)
+    (key_path(path) && digits(number) && digits(item)).then_some(path)
 }
 
 /// Whether `text` is a namespace key, a def-type's or the meta key of a
@@ -325,6 +354,12 @@ mod tests {
         let key = namespace_key("t.package", 3, 17);
         assert_eq!(key_numbers(&key), Some((3, 17)));
         assert_eq!(key_numbers("package"), None);
+        let variant = variant_namespace_key(&key, "C").unwrap();
+        assert_eq!(variant, "<t.package::C#3.17>");
+        assert_eq!(key_def_type(&variant), Some("t.package::C"));
+        assert_eq!(key_numbers(&variant), Some((3, 17)));
+        // Other keys whose origin holds `#` are none.
+        assert_eq!(key_def_type(&enum_key("S", "a#1.2")), None);
         let text = meta_key(&key, 2).unwrap();
         assert_eq!(text, "<defmeta t.package#3.17@2>");
         assert_eq!(key_meta(&text), Some("t.package"));

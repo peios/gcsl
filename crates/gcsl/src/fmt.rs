@@ -1283,6 +1283,11 @@ mod tests {
                 "let k: Variant< Shape,Int > = y\n",
                 "let k: Variant<Shape, Int> = y\n",
             ),
+            (
+                "def  Tool :: C   gcc() {\n    1\n}\n",
+                "def Tool::C gcc() {\n    1\n}\n",
+            ),
+            ("r = t.Tool :: C  gcc()\n", "r = t.Tool::C gcc()\n"),
         ]);
     }
 

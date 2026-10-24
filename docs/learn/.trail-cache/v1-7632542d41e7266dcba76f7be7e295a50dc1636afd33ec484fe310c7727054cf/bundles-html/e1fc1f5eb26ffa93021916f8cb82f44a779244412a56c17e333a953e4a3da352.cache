@@ -1,0 +1,1537 @@
+Ý,ÔÅ®g™²Ñ)[½“r¸Ùwè>^H“:Ë¾‰IŽ—ƒC<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GCSL â€” Peios Learn</title>
+<script>
+// What this build knows about itself, for the scripts below and for
+// search.js: `base` is the path prefix every link on this page carries
+// ("" on the site itself, "/<cbpath>" inside the cache-busting copy),
+// and `cachebust` is the copy's path when one was published.
+window.trail = {"base":"","cachebust":null};
+// Apply the saved theme choice before first paint (no flash).
+try {
+    const theme = localStorage.getItem("trail-theme");
+    if (theme === "light" || theme === "dark") {
+        document.documentElement.dataset.theme = theme;
+    }
+} catch {
+    // Storage can be unavailable; keep this page's default or in-memory state.
+}
+</script>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="alternate" type="text/markdown" href="/gcsl/print.md">
+<meta name="description" content="A statically typed language for configuration and scripting.">
+<meta property="og:description" content="A statically typed language for configuration and scripting.">
+<meta property="og:title" content="GCSL">
+<meta property="og:site_name" content="Peios Learn">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="/gcsl/print/">
+</head>
+<body>
+
+<header class="site-header">
+  <a class="wordmark" href="/">Peios&nbsp;<span>Learn</span></a>
+  <nav class="site-nav" aria-label="Site navigation">
+    <details class="nav-dropdown">
+      <summary>Documentation</summary>
+      <div class="menu">
+        <p class="menu-heading">Developer Tools</p>
+        <a class="menu-item" href="/gcsl" style="--pc: #06b6d4; --tile-chars: 2"><svg class="tile tile-menu tile-icon" aria-hidden="true"><use href="/assets/icons/gcsl.svg#trail-icon" width="100%" height="100%"/></svg>GCSL</a>
+      </div>
+    </details>
+  </nav>
+  <button class="theme-toggle" type="button" data-theme-toggle data-theme-state="system" aria-label="Theme: system">
+    <svg data-theme-icon="system" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>
+    <svg data-theme-icon="light" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.6m0 13.8v2.6M2.5 12h2.6m13.8 0h2.6M5.2 5.2l1.9 1.9m9.8 9.8 1.9 1.9m0-13.6-1.9 1.9M7.1 16.9l-1.9 1.9"/></svg>
+    <svg data-theme-icon="dark" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>
+  </button>
+  <button class="search search-small" type="button" data-search-open aria-label="Search">
+    <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4.2-4.2"/></svg>
+    <span class="search-placeholder">Searchâ€¦</span>
+    <kbd data-search-kbd>âŒ˜K</kbd>
+  </button>
+</header>
+
+<main>
+
+<div class="print-page" style="--pc: #06b6d4">
+  <header class="print-header">
+    <nav class="crumbs" aria-label="Breadcrumbs">
+      <a href="/gcsl">GCSL</a>
+    </nav>
+    <h1>GCSL</h1>
+    <p class="book-lede">A statically typed language for configuration and scripting.</p>
+    <p class="print-note">Single-page view Â· <a href="/gcsl/print.md">as markdown</a></p>
+  </header>
+  <section class="print-article">
+    <header>
+      <h2 id="getting-started-gcsl">GCSL</h2>
+      <p class="print-crumbs">GCSL / Getting Started</p>
+    </header>
+    <p>GCSL is a statically typed scripting language. A program can describe a
+configuration record, compute a value, or run commands. You use the same
+expressions for all three, with function types separating pure computation
+from operations that can change the outside world.</p>
+<p>The <code>gcsl</code> command runs programs, checks them without execution, formats
+source files, and serves editor requests. Starting it without a command
+opens an interactive read-evaluate-print loop (REPL).</p>
+<h2 id="getting-started-gcsl--values-first">Values first <a class="heading-anchor" href="#getting-started-gcsl--values-first" aria-label="Link to this section">#</a></h2>
+<p>A file is a block of declarations and expressions. Named fields form its
+resulting record. This configuration computes one field from another:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>name = "gcsl"
+version = "0.1.0"
+archive = "{name}-{version}.tar.gz"
+</code></pre></div>
+<p>A file can instead return one expression. Use <code>let</code> for private values that
+don't become fields of a record. The checker catches incompatible types and
+unresolved names before any part of the program runs.</p>
+<h2 id="getting-started-gcsl--execution-and-trust">Execution and trust <a class="heading-anchor" href="#getting-started-gcsl--execution-and-trust" aria-label="Link to this section">#</a></h2>
+<p>Pure functions use <code>:</code> before their result type. Impure functions use
+<code>-&gt;</code>; they can run processes, access files, and await deferred work.
+Memoized functions use <code>-&gt;&gt;</code> and reuse results within an execution context.
+A <code>lazy</code> expression delays work until it is awaited. It doesn't start a
+background task.</p>
+<p>GCSL's type system is not a sandbox. Running a script gives its process and
+file operations the permissions of the process running GCSL. Check an
+unfamiliar program with <code>gcsl check</code> before deciding whether to run it.
+Checking does not establish that executing it is safe.</p>
+<h2 id="getting-started-gcsl--where-to-go-next">Where to go next <a class="heading-anchor" href="#getting-started-gcsl--where-to-go-next" aria-label="Link to this section">#</a></h2>
+<p>Start with <a href="#getting-started-running-a-first-program">Running a First Program</a>, then
+read <a href="#language-values-and-bindings">Values and Bindings</a>. Use <code>gcsl(1)</code> for the
+command interface, <code>gcsl(5)</code> for language rules, and <code>gcsl-stdlib(3)</code> for
+standard functions.</p>
+<p>Pekit embeds GCSL to provide its own build interface. Its definitions and
+commands belong to Pekit. The separate <code>tree-sitter-gcsl</code> repository owns
+its editor grammar and queries; the compiler parser in this repository is
+the authority for whether a GCSL program is accepted.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="getting-started-running-a-first-program">Running a First Program</h2>
+      <p class="print-crumbs">GCSL / Getting Started</p>
+    </header>
+    <p>You can run a single GCSL file without creating a workspace. This example
+checks a small configuration and prints its computed description.</p>
+<h2 id="getting-started-running-a-first-program--before-you-start">Before you start <a class="heading-anchor" href="#getting-started-running-a-first-program--before-you-start" aria-label="Link to this section">#</a></h2>
+<p>You need the following:</p>
+<ul>
+<li>The <code>gcsl</code> executable on your command search path.</li>
+<li>A writable directory for the example file.</li>
+</ul>
+<h2 id="getting-started-running-a-first-program--create-and-run-the-file">Create and run the file <a class="heading-anchor" href="#getting-started-running-a-first-program--create-and-run-the-file" aria-label="Link to this section">#</a></h2>
+<ol>
+<li>
+<p>Save the following text as <code>hello.gcsl</code>:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let component = {name = "gcsl"; version = "0.1.0"}
+"{component.name} {component.version}"
+</code></pre></div>
+</li>
+<li>
+<p>Check the file without running it:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> check hello.gcsl</span>
+</span></code></pre></div>
+</li>
+<li>
+<p>Run the file:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> run hello.gcsl</span>
+</span></code></pre></div>
+</li>
+</ol>
+<h2 id="getting-started-running-a-first-program--check-the-result">Check the result <a class="heading-anchor" href="#getting-started-running-a-first-program--check-the-result" aria-label="Link to this section">#</a></h2>
+<p>The check reports <code>no problems in 1 file checked</code> on standard error. The
+run prints the string contents on standard output:</p>
+<div class="code-block" data-language="text"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>gcsl 0.1.0
+</code></pre></div>
+<p>A file whose result is <code>{}</code>, the empty record, prints nothing. Diagnostics
+go to standard error. See <code>gcsl(1)</code> for exit statuses and output modes.</p>
+<h2 id="getting-started-running-a-first-program--trying-expressions-interactively">Trying expressions interactively <a class="heading-anchor" href="#getting-started-running-a-first-program--trying-expressions-interactively" aria-label="Link to this section">#</a></h2>
+<p>Run <code>gcsl</code> without arguments to open the REPL. Enter <code>let n = 21</code>, then
+<code>n * 2</code> on the next line. The second line prints <code>42 : Int</code>. Each input is
+one line; separate several items on that line with semicolons. Press
+<strong>Ctrl+D</strong> to leave the session.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-values-and-bindings">Values and Bindings</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>GCSL programs compute values. A block can return one value or construct a
+record of named fields, so you can use configuration data inside ordinary
+expressions without a separate data format.</p>
+<h2 id="language-values-and-bindings--blocks-and-records">Blocks and records <a class="heading-anchor" href="#language-values-and-bindings--blocks-and-records" aria-label="Link to this section">#</a></h2>
+<p>Newlines or semicolons separate items inside a file or <code>{ ... }</code> block.
+A block without fields returns its final expression, or an explicit
+<code>= expression</code> result. A block with fields returns their record instead;
+it cannot also have an explicit result. The empty record <code>{}</code> represents
+an operation with no useful result.</p>
+<p>A field is a public part of the resulting record. A <code>let</code> binding is local
+to its scope. This block keeps the intermediate name private:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let release = "0.1.0"
+name = "gcsl"
+archive = "{name}-{release}.tar.gz"
+</code></pre></div>
+<p>Top-level fields and named functions can refer to declarations written
+later. Inner blocks evaluate their ordinary fields in order. Private
+<code>let</code> bindings become available after their declaration.</p>
+<h2 id="language-values-and-bindings--updating-a-binding">Updating a binding <a class="heading-anchor" href="#language-values-and-bindings--updating-a-binding" aria-label="Link to this section">#</a></h2>
+<p><code>:=</code> replaces the value associated with a local name. For an ordinary
+<code>let</code>, this is restricted to the block that declares it. Use <code>let mut</code>
+when an inner block of the same function needs to update the variable:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let mut total = 0
+for cost in [3, 8, 5] {
+    total := total + cost
+}
+total
+</code></pre></div>
+<p>The variable keeps its declared or inferred type. Values themselves do not
+change: replacing a record field or list element constructs an updated
+value for the binding. Other bindings and previously created closures
+keep the values they already held.</p>
+<p>A closure captures values when it is created. It cannot update a mutable
+variable belonging to its enclosing function. Pass in a value and return
+an updated value when you need that communication.</p>
+<h2 id="language-values-and-bindings--names-and-arithmetic">Names and arithmetic <a class="heading-anchor" href="#language-values-and-bindings--names-and-arithmetic" aria-label="Link to this section">#</a></h2>
+<p>Names can contain hyphens. Write spaces around subtraction so that
+<code>left - right</code> is an operation rather than a name. Integer arithmetic uses
+signed 64-bit values with checked overflow. Floating-point values use
+64-bit precision. <code>/</code> produces a floating-point result; <code>//</code> and <code>%</code> are
+integer floor division and modulo.</p>
+<p>Integer literals adapt to an expected numeric type. A bound <code>Int</code> does
+not silently become a <code>Float</code>; use <code>float(value)</code> when that conversion is
+intended. Conditions require <code>Bool</code>, not a nonzero integer or a nonempty
+string. See <code>gcsl(5)</code> for syntax and operator rules.</p>
+<h2 id="language-values-and-bindings--durations-and-sizes">Durations and sizes <a class="heading-anchor" href="#language-values-and-bindings--durations-and-sizes" aria-label="Link to this section">#</a></h2>
+<p><code>Duration</code> and <code>Size</code> hold amounts with units. Write a duration as a
+number followed by units from largest to smallest: <code>30s</code>, <code>500ms</code>,
+<code>1h30m</code>, <code>2d</code>. The units are <code>d</code>, <code>h</code>, <code>m</code>, <code>s</code>, <code>ms</code>, <code>us</code> and <code>ns</code>, and a
+day is exactly 24 hours. Write a size with one unit: <code>512B</code>, the decimal
+<code>KB</code> to <code>PB</code>, or the binary <code>KiB</code> to <code>PiB</code>, as in <code>2GiB</code>. The last part of
+a literal can have a fraction if the result is a whole number of
+nanoseconds or bytes, so <code>1.5s</code> and <code>0.5KiB</code> are allowed but <code>1.5ns</code> is
+not. Units are case-sensitive.</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let timeout = 1m30s
+retry_after = timeout // 3
+budget = 2 * timeout
+memory = 2GiB + 512MiB
+long = timeout &gt; 1m
+message = "giving up after {timeout}"
+</code></pre></div>
+<p>Add or subtract two values of the same kind, multiply one by an <code>Int</code>,
+and use <code>//</code> to divide by an <code>Int</code> or by another value of the same kind.
+Dividing by the same kind gives an <code>Int</code>. <code>%</code> gives the remainder of one
+value by another of the same kind. Values of the same kind can be
+compared. Durations and sizes never mix with each other, with <code>Int</code> or
+with <code>Float</code>, and an integer is never a duration, so write <code>0s</code> rather
+than <code>0</code>. <code>/</code> is not available, because the result would not be a whole
+number of the smallest unit.</p>
+<p>A value is shown as its simplest literal: <code>retry_after</code> above is <code>30s</code>,
+<code>budget</code> is <code>3m</code>, and <code>memory</code> is <code>2560MiB</code>.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-records-and-types">Records and Types</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>A record type describes the fields a value supplies. GCSL uses structural
+types: two declarations with the same structure describe the same type,
+and a record can be used where fewer of its fields are required.</p>
+<h2 id="language-records-and-types--declaring-a-shape">Declaring a shape <a class="heading-anchor" href="#language-records-and-types--declaring-a-shape" aria-label="Link to this section">#</a></h2>
+<p>Use <code>type</code> to give a structure a reusable name. An annotation checks a
+value against that structure. Defaults supply omitted fields in a record
+literal checked against the type:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>type Install = {from: String, exclude: List&lt;String&gt; = []}
+let item: Install = {from = "src"}
+item.exclude
+</code></pre></div>
+<p>Defaults are constant expressions, not arbitrary function calls. They are
+applied where a record literal has the expected type; they don't add
+fields to an already constructed variable with a smaller type.</p>
+<p>An annotation also determines what fields later code can see. Extra
+fields in a record literal produce a warning when an expected type hides
+them. A structural alias does not introduce a distinct runtime identity.</p>
+<h2 id="language-records-and-types--generic-types">Generic types <a class="heading-anchor" href="#language-records-and-types--generic-types" aria-label="Link to this section">#</a></h2>
+<p>A type can take type parameters, named in angle brackets after its name.
+Each use names the types to put in their place:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>type Pair&lt;A, B&gt; = {first: A, second: B}
+let entry: Pair&lt;String, Int&gt; = {first = "port"; second = 8080}
+entry.second
+</code></pre></div>
+<p>A use must give as many type arguments as the type has parameters, and a
+type without parameters takes none. Because types are structural,
+<code>Pair&lt;String, Int&gt;</code> is the same type as <code>{first: String, second: Int}</code>. A
+generic type can be built from another, as in
+<code>type Named&lt;T&gt; = Pair&lt;String, T&gt;</code>. It can't refer to itself, and it can't
+spread one of its parameters, because the parameter might not be a record.</p>
+<h2 id="language-records-and-types--enums">Enums <a class="heading-anchor" href="#language-records-and-types--enums" aria-label="Link to this section">#</a></h2>
+<p>An extensible enum is a type whose variants any module can add. Declare
+the enum, with an optional bound that every variant's payload must fit,
+and then its variants, each with a payload type:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>enum Shape extensible&lt;{*: Int}&gt;
+enum Shape::Square&lt;{side: Int}&gt;
+enum Shape::Point
+square = Shape::Square({side = 3})
+</code></pre></div>
+<p>A variant is also a value: <code>Shape::Square</code> on its own has the type
+<code>Variant&lt;Shape, {side: Int}&gt;</code>. Calling it makes a value of the enum,
+and you can pass it to a function as a key. <code>kind.matches(value)</code> tests
+whether a value is of that variant, and <code>kind.payload(value)</code> takes out
+its payload:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>enum Tool extensible
+enum Tool::C&lt;{cc: String}&gt;
+fn find&lt;T&gt;(kind: Variant&lt;Tool, T&gt;, tools: List&lt;Tool&gt;, fallback: T): T {
+    for t in tools { if kind.matches(t) { return kind.payload(t) } }
+    fallback
+}
+cc = find(Tool::C, [Tool::C({cc = "gcc"})], {cc = "cc"}).cc
+</code></pre></div>
+<p>Unlike records, enums are nominal: two enums are different types even
+if they look alike. <code>value is Tool</code> tests whether a value is of the enum.
+Values of an enum are compared with <code>==</code> only when the enum has a bound,
+because an unbounded payload might hold a function. A variant is visible
+in its own file, to the other files of its directory and the directories
+below it, and to every file that imports its module.</p>
+<h2 id="language-records-and-types--partial-records">Partial records <a class="heading-anchor" href="#language-records-and-types--partial-records" aria-label="Link to this section">#</a></h2>
+<p><code>Partial&lt;T&gt;</code> holds any of the fields of the record type <code>T</code>. Use it to
+describe a record by only some of its fields, and <code>.matches()</code> to test
+a whole record against it:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>type Platform = {arch: String, os: String}
+let wanted: Partial&lt;Platform&gt; = {arch = "x86_64"}
+fits = wanted.matches({arch = "x86_64"; os = "linux"})
+</code></pre></div>
+<p>A field of a partial record can't be read by name, because it may be
+absent.</p>
+<h2 id="language-records-and-types--records-of-any-fields">Records of any fields <a class="heading-anchor" href="#language-records-and-types--records-of-any-fields" aria-label="Link to this section">#</a></h2>
+<p>A rest-field, <code>*: T</code>, gives the type of every field that a record type
+doesn't name. Use it when the field names are data, such as paths. A
+<code>{*: String}</code> holds any fields, each a <code>String</code>. Named fields keep their
+own types, so <code>{to: String, *: Int}</code> holds a <code>String</code> field <code>to</code>, and any
+other fields are <code>Int</code>s:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let files: {*: String} = {"bin/*" = "bin/*"; "sbin/*" = "sbin/*"}
+files
+</code></pre></div>
+<p>Write the record literal where the type is expected: in an annotation,
+an argument or a definition's result. There, each field that the type
+doesn't name is checked against the rest-field. A value whose own type
+has no rest-field doesn't fit one, because a record keeps fields that its
+static type hides, and they could be of any type.</p>
+<p>Read a named field as usual. A field that only the rest-field covers
+can't be read by name, and a record whose type has a rest-field can't be
+spread. Typed equality compares every field, and <code>is</code> and <code>as</code> test each
+field that the rest-field covers.</p>
+<h2 id="language-records-and-types--combining-fields">Combining fields <a class="heading-anchor" href="#language-records-and-types--combining-fields" aria-label="Link to this section">#</a></h2>
+<p>Dotted definitions construct nested records. Compatible dotted paths
+merge, including across files in a workspace:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>server.host = "localhost"
+server.port = 8080
+server.tls.enabled = true
+</code></pre></div>
+<p>A whole-field definition such as <code>server = {...}</code> closes that field to
+further dotted extensions. Define the individual dotted leaves when you
+want several files to contribute to a shared structure.</p>
+<p>A spread starts from another record's visible fields. Inside an ordinary
+record block, put defaults first and explicit overrides afterward:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let defaults = {host = "localhost"; port = 80}
+let config = {
+    ...defaults
+    port = 8080
+}
+config.port
+</code></pre></div>
+<p>A spread copies only fields visible through its operand's static type.
+It cannot replace an earlier explicit field inside an ordinary block.
+Top-level declarations are resolved across the whole input and take
+precedence over a spread of the same name regardless of textual order.</p>
+<h2 id="language-records-and-types--unions-and-narrowing">Unions and narrowing <a class="heading-anchor" href="#language-records-and-types--unions-and-narrowing" aria-label="Link to this section">#</a></h2>
+<p>A union, such as <code>Int | String</code>, allows more than one shape. Use <code>is</code> to
+test a value and <code>as</code> for a checked conversion that fails at runtime if
+the value doesn't fit. In <code>if name is Type</code>, the branches see narrowed
+copies of the named value. This does not perform general flow analysis of
+later statements or dotted field paths.</p>
+<p>Typed equality <code>==</code> compares operands of the same static type. Total
+equality <code>===</code> compares complete runtime records, including fields hidden by
+their shared static type. Both require the same static operand type. The
+language's
+restrictions on unions, functions, and futures are described in
+<code>gcsl(5)</code> and <a href="#language-inference-limits">Inference Limits</a>.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-functions-and-effects">Functions and Effects</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>A function's signature says what it accepts, what it returns, and whether
+calling it can perform effects. This makes executable configuration
+reviewable: a pure calculation cannot silently run a process or read a
+file.</p>
+<h2 id="language-functions-and-effects--choosing-a-function-form">Choosing a function form <a class="heading-anchor" href="#language-functions-and-effects--choosing-a-function-form" aria-label="Link to this section">#</a></h2>
+<p>Use <code>fn</code> for a private function and <code>def</code> for a function exposed as a
+field. Both forms declare parameter and result types. A function
+expression can also be assigned to a variable or passed to another
+function.</p>
+<p>The marker before the result type selects the effect:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Marker</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>:</code></td><td>Pure computation; no effects or awaiting</td></tr>
+<tr><td><code>-&gt;</code></td><td>Impure computation; effects and awaiting are allowed</td></tr>
+<tr><td><code>-&gt;&gt;</code></td><td>Impure computation memoized by its arguments</td></tr>
+</tbody></table>
+</div>
+<p>This private pure function accepts a named argument and a default:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>fn scale(value: Int, factor: Int = 2): Int { value * factor }
+scale(value = 21)
+</code></pre></div>
+<p>Positional and named arguments are evaluated in source order. A trailing
+block supplies the last parameter, which is useful for functions that
+accept a configuration record.</p>
+<p>A default can be any expression. It can use the parameters before it and
+anything visible where the function is written:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let suffix = ".o"
+fn object(source: String, output: String = "{source}{suffix}"): String {
+    output
+}
+main = object("main.c")
+lib = object("lib.c", output = "lib.a")
+</code></pre></div>
+<p>A default is evaluated each time a call leaves its parameter out, after
+the arguments that are written and before the function's body runs. It
+has the function's effect, so a pure function's default cannot call an
+impure function. A default cannot use its own parameter or a later one.
+Only a call by the function's own name uses its defaults. A call through
+a copy, such as <code>g</code> after <code>let g = object</code>, or through a parameter must
+supply every argument.</p>
+<p>After a named argument, a name on its own is shorthand for passing the
+variable of that name to the parameter of that name. These two calls are
+the same:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>fn build(source: String, output: String, compiler: String): String {
+    "{compiler} {source} -o {output}"
+}
+let compiler = "cc"
+short = build("main.c", output = "main.o", compiler)
+long = build("main.c", output = "main.o", compiler = compiler)
+</code></pre></div>
+<p>Before any named argument, a name on its own is an ordinary positional
+argument.</p>
+<h2 id="language-functions-and-effects--generic-functions">Generic functions <a class="heading-anchor" href="#language-functions-and-effects--generic-functions" aria-label="Link to this section">#</a></h2>
+<p>A function can work on values of any type. Name its type parameters in
+angle brackets after its name, and use them as types in its signature and
+body:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>fn first&lt;T&gt;(items: List&lt;T&gt;, fallback: T): T {
+    if len(items) &gt; 0 { items[0] } else { fallback }
+}
+port = first([8080, 9090], 80)
+name = first([], "none")
+</code></pre></div>
+<p>Each call works out the type parameters from its arguments: here <code>T</code> is
+<code>Int</code> in the first call and <code>String</code> in the second. Inside the function, a
+value of type <code>T</code> can be passed on, returned, or put in a list or record,
+but nothing else, because <code>T</code> could be anything. A call where nothing binds
+a type parameter, such as one that only returns a <code>List&lt;T&gt;</code>, is an error.</p>
+<h2 id="language-functions-and-effects--methods">Methods <a class="heading-anchor" href="#language-functions-and-effects--methods" aria-label="Link to this section">#</a></h2>
+<p>A method is a function you call on a value with a dot. Write its
+receiver in parentheses before its name:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>fn (n: Int) twice(): Int { n * 2 }
+fn (items: List&lt;T&gt;) first_or&lt;T&gt;(fallback: T): T {
+    if len(items) &gt; 0 { items[0] } else { fallback }
+}
+doubled = 21.twice()
+port = [8080].first_or(80)
+</code></pre></div>
+<p>The value before the dot is the receiver. GCSL chooses the method by
+the receiver's type, so methods with the same name can serve different
+types. When more than one fits, the one for the more specific type is
+used: a method for <code>List&lt;Int&gt;</code> is chosen over one for <code>List&lt;T&gt;</code> when
+the receiver is a <code>List&lt;Int&gt;</code>. A method's other parameters, defaults and
+effects work as a function's do.</p>
+<p>A method has no name of its own: <code>twice</code> alone is not a variable, and
+<code>x.twice</code> without parentheses reads a field. A record field and a method
+with the same name are an error when both could apply.</p>
+<p>Methods are declared at the top level of a file. A <code>fn</code> method is
+visible only in its own file. A <code>def</code> method is also visible to the
+other files of its directory and the directories below it, and to every
+file that imports its module, whatever the form of the import. In the
+REPL, methods are visible to later lines.</p>
+<h2 id="language-functions-and-effects--calling-for-effects">Calling for effects <a class="heading-anchor" href="#language-functions-and-effects--calling-for-effects" aria-label="Link to this section">#</a></h2>
+<p>A call to an impure or memoized function can stand alone as a statement,
+outside a pure function, to run it for its effects. Its value is
+discarded, whatever it is, and anything it defers is awaited first, so no
+effect is lost:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>fn build(source: String) -&gt; String {
+    sh("make -C {source}")
+    sh("make -C {source} install")
+    = source
+}
+</code></pre></div>
+<p>Any other value standing alone is an error, because discarding it would
+do nothing: a pure expression has no effects to keep. Make it the block's
+result with <code>= ...</code>, bind it with <code>let</code>, or remove it.</p>
+<h2 id="language-functions-and-effects--captures-and-recursion">Captures and recursion <a class="heading-anchor" href="#language-functions-and-effects--captures-and-recursion" aria-label="Link to this section">#</a></h2>
+<p>Closures hold copies of the values they capture. Rebinding a variable
+later doesn't change an existing closure. An inner function cannot rebind
+an outer function's variable.</p>
+<p>Top-level named functions are available regardless of textual order and
+can refer to each other within the file. Workspace files still need an
+acyclic dependency order: functions in two files cannot make those files
+need each other. Put mutually dependent definitions together or extract
+their shared dependencies.</p>
+<h2 id="language-functions-and-effects--memoization">Memoization <a class="heading-anchor" href="#language-functions-and-effects--memoization" aria-label="Link to this section">#</a></h2>
+<p>A memoized function reuses a successful result for the same arguments in
+the same execution context. The cache belongs to the closure, so two
+closures created from one function expression have separate entries.
+Memoization also accounts for supported ambient inputs such as a caller
+path when the function reads it.</p>
+<p>This is not a persistent build cache. External changes to files or a
+command's environment do not invalidate a stored result. Use <code>-&gt;&gt;</code> only
+when reusing the first result within that run is correct. Cached keys and
+results consume memory for the lifetime of their execution context.</p>
+<p>Read <a href="#language-deferred-work">Deferred Work</a> before using futures in function
+signatures; a bare type's present-or-future meaning depends on its
+position and the function's effect.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-attributes">Attributes</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>An attribute goes before a function and says how to run it, for example
+whether a build step may be cached or how long it may take. GCSL checks
+every attribute. Most are read by the tool that runs the program, such as
+a build system, and GCSL itself acts on its own two, <code>retry</code> and
+<code>timeout</code>.</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[attribute] type hermetic = {on: Bool = true}
+
+#[hermetic]
+fn compile(source: String) -&gt; String { "compiled {source}" }
+
+#[hermetic(false)] #[timeout(10m)]
+fn deploy(target: String) -&gt; String { "deployed {target}" }
+
+result = deploy(compile("main.c"))
+</code></pre></div>
+<h2 id="language-attributes--declaring-an-attribute">Declaring an attribute <a class="heading-anchor" href="#language-attributes--declaring-an-attribute" aria-label="Link to this section">#</a></h2>
+<p>An attribute's arguments form a record, so you declare an attribute as a
+record type marked <code>#[attribute]</code>. Each field is an argument, and a field
+with a default is an argument you can leave out:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[attribute] type device = {name: String, count: Int = 1}
+
+#[device(name = "kvm")]
+fn boot() -&gt; String { "booted" }
+
+booted = boot()
+</code></pre></div>
+<p>Arguments must be constants: literals, or lists and records of them. A
+field may be an <code>Int</code>, <code>Float</code>, <code>Bool</code>, <code>String</code>, <code>Duration</code> or <code>Size</code>, or
+a list or record of those. An attribute is declared, imported and named in
+the same way as any other type, so a tool usually provides its attributes
+in a module that you import.</p>
+<h2 id="language-attributes--using-an-attribute">Using an attribute <a class="heading-anchor" href="#language-attributes--using-an-attribute" aria-label="Link to this section">#</a></h2>
+<p>Write <code>#[NAME]</code>, or <code>#[NAME(ARGUMENTS)]</code>, on the line before a function: a
+<code>fn</code>, a <code>def</code>, or a definition made with a definition type. An attribute
+with one field can take its argument by position, as in <code>#[timeout(10m)]</code>;
+one with more fields takes its arguments by name. A misspelt attribute is
+an error, so a mistake isn't silently ignored.</p>
+<p>GCSL provides two attributes of its own, <code>retry</code> and <code>timeout</code>:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Attribute</th><th>Argument</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>#[retry(times)]</code></td><td><code>times: Int</code></td><td>If the call fails, run it again, up to this many more times.</td></tr>
+<tr><td><code>#[timeout(limit)]</code></td><td><code>limit: Duration</code></td><td>Fail the call if it runs for longer than this.</td></tr>
+</tbody></table>
+</div>
+<p>A retried call runs its whole body again with the same arguments, so any
+effects it has happen again: use <code>retry</code> only where that's safe. Retrying a
+pure function can't change its result, so GCSL warns about it. When a call
+times out, a program it's running is stopped. A function's own timeout
+counts as a failure that its <code>retry</code> can retry, and each attempt gets the
+full time. A timeout of an enclosing call is never retried by a call inside
+it.</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[retry(2)] #[timeout(30s)]
+fn fetch(url: String) -&gt; String { exec(["echo", "fetched {url}"]).stdout }
+
+page = fetch("https://example.com")
+</code></pre></div>
+<h2 id="language-attributes--attributes-on-a-definition-type">Attributes on a definition type <a class="heading-anchor" href="#language-attributes--attributes-on-a-definition-type" aria-label="Link to this section">#</a></h2>
+<p>Attributes on a definition type apply to every definition made with it.
+A definition's own attribute of the same name replaces the definition
+type's:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[attribute] type hermetic = {on: Bool = true}
+
+#[def_type] #[hermetic]
+def check(name: String, f: fn(): Bool): fn(): Bool { f }
+
+def check fast() { true }
+#[hermetic(false)] def check online() { true }
+
+results = [(check fast)()(), (check online)()()]
+</code></pre></div>
+<p>Here <code>fast</code> is hermetic and <code>online</code> is not.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-deferred-work">Deferred Work</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>A future represents a calculation whose result is needed later. <code>lazy</code>
+creates that calculation without running it. Awaiting it evaluates the
+body and remembers the successful result. Futures are deferred work, not
+concurrent tasks.</p>
+<p>This program creates one future and then reads its result:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let answer = lazy 21 * 2
+await answer
+</code></pre></div>
+<h2 id="language-deferred-work--where-work-happens">Where work happens <a class="heading-anchor" href="#language-deferred-work--where-work-happens" aria-label="Link to this section">#</a></h2>
+<p>A <code>lazy</code> body is an impure context, even when a pure function creates it.
+That lets a pure function plan effects without performing them. A pure
+function cannot await a future. Resolve the value in an impure caller
+before passing it into a pure calculation that needs the value itself.</p>
+<p>The checker inserts implicit awaits at uses that need a value's contents,
+such as arithmetic or a required present argument. It applies the same
+purity restriction to explicit and implicit awaits. A call to a pure
+function never secretly starts deferred work inside that function.</p>
+<h2 id="language-deferred-work--writing-contracts">Writing contracts <a class="heading-anchor" href="#language-deferred-work--writing-contracts" aria-label="Link to this section">#</a></h2>
+<p>Use explicit wrappers when the distinction is part of an interface:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Type</th><th>Contract</th></tr></thead><tbody>
+<tr><td><code>Present&lt;Int&gt;</code></td><td>A present integer, equivalent to <code>Int</code> in an ordinary annotation</td></tr>
+<tr><td><code>Future&lt;Int&gt;</code></td><td>Deferred work yielding an integer</td></tr>
+<tr><td>`Int</td><td>Future<Int>`</td></tr>
+</tbody></table>
+</div>
+<p>A present value does not satisfy an explicitly required <code>Future&lt;T&gt;</code>.
+Nested future layers collapse: awaiting a future resolves it fully.
+Awaiting an already present value is a silent no-op.</p>
+<p>Bare types in impure parameters accept present or deferred values,
+including bare positions inside records and lists. Pure parameters infer
+whether their bodies need the value's contents. Impure and memoized
+results infer their present-or-future shape from the body. Explicit
+wrappers keep the contract you wrote.</p>
+<h2 id="language-deferred-work--avoiding-surprising-inference">Avoiding surprising inference <a class="heading-anchor" href="#language-deferred-work--avoiding-surprising-inference" aria-label="Link to this section">#</a></h2>
+<p>A pure function with result <code>Int</code> requires a present result, even if it
+only returns its argument. It does not preserve a future's shape
+polymorphically. Recursive result inference also retains conservative
+parts of the declared signature. Use <code>Present&lt;T&gt;</code> or an explicit future
+contract where an API needs a stable distinction, and consult
+<a href="#language-inference-limits">Inference Limits</a> when an inferred type is wider
+than expected.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-lists-and-control-flow">Lists and Control Flow</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>Lists hold ordered values of one element type. GCSL's loops are
+expressions, so a loop can collect results into a list or run only for its
+effects. This avoids a separate collection-building language.</p>
+<h2 id="language-lists-and-control-flow--lists-and-ranges">Lists and ranges <a class="heading-anchor" href="#language-lists-and-control-flow--lists-and-ranges" aria-label="Link to this section">#</a></h2>
+<p><code>List&lt;Int&gt;</code> and <code>Int[]</code> name the same type. Indexes start at zero; a
+negative or out-of-range index is a runtime error. A spread inserts
+another list's elements. An empty list needs an expected element type:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let empty: List&lt;Int&gt; = []
+let values = [...empty, 3, 8, 5]
+values[1]
+</code></pre></div>
+<p><code>0..3</code> produces <code>[0, 1, 2]</code>; <code>0..=3</code> includes <code>3</code>. Bounds are integers and
+ranges run upward. A range used directly as a loop's iterable is counted
+without first allocating the list of all its integers.</p>
+<h2 id="language-lists-and-control-flow--collecting-and-repeating">Collecting and repeating <a class="heading-anchor" href="#language-lists-and-control-flow--collecting-and-repeating" aria-label="Link to this section">#</a></h2>
+<p>A loop used as a value collects each iteration's result. A guard skips
+iterations that don't match:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let doubled = for n in [1, 2, 3] if n &gt; 1 { n * 2 }
+doubled
+</code></pre></div>
+<p>A loop used as a statement discards its results. Use <code>for condition</code> for
+repetition while a condition holds, <code>for { ... }</code> without a condition,
+or <code>do { ... } for condition</code> to test after the body. A header can contain
+initialization and an update:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>let values = for let i = 0; i &lt; 3; i := i + 1 { i * 2 }
+values
+</code></pre></div>
+<p>A plain header variable can be rebound by the header. Write <code>let mut</code> if
+the body must also update it.</p>
+<h2 id="language-lists-and-control-flow--leaving-a-computation">Leaving a computation <a class="heading-anchor" href="#language-lists-and-control-flow--leaving-a-computation" aria-label="Link to this section">#</a></h2>
+<p><code>break</code> ends the enclosing loop and <code>continue</code> skips to its next
+iteration. Either can supply a value to the collecting loop before
+leaving that iteration. An unlabeled <code>return</code> returns from the enclosing
+function or <code>lazy</code> body.</p>
+<p>Labels identify an outer loop or a block. A labeled <code>return</code> leaves that
+target with one value; it does not append to a loop's accumulated list.
+Control flow cannot jump out through a function boundary. See <code>gcsl(5)</code>
+for label syntax and the distinction between collected and returned
+values.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="language-inference-limits">Inference Limits</h2>
+      <p class="print-crumbs">GCSL / The Language</p>
+    </header>
+    <p>GCSL infers local values and selected present-or-future positions. It does
+not infer every relationship between types. Explicit annotations help you
+state an intended interface when a program reaches one of these limits.</p>
+<p>The following boundaries affect ordinary programs:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Boundary</th><th>What to write</th></tr></thead><tbody>
+<tr><td>An empty list has no independent element type</td><td>Give it an annotation or an expected <code>List&lt;T&gt;</code> type</td></tr>
+<tr><td>A pure function does not preserve arbitrary future shapes</td><td>Write the present or future contract explicitly</td></tr>
+<tr><td>Recursive impure results can retain a deferred possibility</td><td>Use <code>Present&lt;T&gt;</code> when the result must be present</td></tr>
+<tr><td>General type parameters and intersections are unsupported</td><td>Write concrete structural types</td></tr>
+<tr><td>There is no <code>None</code> value or optional-type shorthand</td><td>Represent alternatives using supported union members</td></tr>
+<tr><td>Narrowing recognizes a plain name tested directly by <code>if</code></td><td>Bind a field to a name before testing it</td></tr>
+<tr><td>Narrowing does not establish facts after an early return</td><td>Keep uses inside the narrowed branch</td></tr>
+<tr><td>A narrowed mutable name is a branch-local copy</td><td>Don't try to update the original through that copy</td></tr>
+<tr><td><code>len</code> and <code>show</code> use special call rules</td><td>Call them directly or through supported aliases, rather than storing them as ordinary function values</td></tr>
+</tbody></table>
+</div>
+<p>Expected types reach record fields, call arguments, and other supported
+literal contexts. An unrelated sibling expression is not a general
+constraint-solving mechanism. For example, annotate an empty list before
+combining it with independently inferred values.</p>
+<p>Warnings do not prevent execution. A union inferred from unlike branch
+results can produce a warning while the program remains valid. Use
+<code>gcsl check</code> to inspect the full set of errors and warnings, and
+<code>gcsl run --dump-types FILE</code> when the inferred shape is unclear.</p>
+<p>These are supported-language boundaries, not promises about a future
+inference engine. The checker implementation and its regression tests
+are the source for the behavior described here.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="working-with-files-workspaces">Workspaces</h2>
+      <p class="print-crumbs">GCSL / Files and Workspaces</p>
+    </header>
+    <p>A GCSL workspace is a directory tree rooted at <code>workspace.gcsl</code>. Files in
+one directory share public declarations. Child directories inherit the
+public declarations above them, so common types and helpers can live at
+the root without repeated imports.</p>
+<p>The marker is an ordinary GCSL source file. It can be empty or declare
+shared values and functions. The disk loader finds the nearest enclosing
+marker when you run a file, reads the workspace, and checks every source
+before executing the selected file and its dependencies.</p>
+<h2 id="working-with-files-workspaces--public-and-private-names">Public and private names <a class="heading-anchor" href="#working-with-files-workspaces--public-and-private-names" aria-label="Link to this section">#</a></h2>
+<p>Fields, <code>def</code> functions, and declared types contribute to a directory's
+public scope. <code>let</code>, <code>let mut</code>, and <code>fn</code> bindings remain private to their
+file. Dotted public paths merge when they define distinct leaves; a
+conflicting leaf is an error unless an earlier declaration explicitly
+permits shadowing.</p>
+<p>Sibling and child directories are not automatically in scope. Imports
+name paths from the workspace root, with <code>/</code> between directories, as the
+file system does. <code>import lib/helpers</code> names <code>lib/helpers.gcsl</code> or a
+directory of that path. Use <code>as</code> for a local alias, or import a named
+member with <code>from</code>.</p>
+<p>A directory or file name in a path is written as it is, dots and all, so
+<code>import pkgs/net.busybox.busybox as busybox</code> names the directory
+<code>pkgs/net.busybox.busybox</code>. An import without <code>as</code> is named after the
+path's last part, so that part must be a plain name; give a name such as
+<code>net.busybox.busybox</code> one with <code>as</code>.</p>
+<h2 id="working-with-files-workspaces--boundaries-and-evaluation-order">Boundaries and evaluation order <a class="heading-anchor" href="#working-with-files-workspaces--boundaries-and-evaluation-order" aria-label="Link to this section">#</a></h2>
+<p>Hidden names and nested directories containing their own <code>workspace.gcsl</code>
+are excluded from an enclosing workspace's source discovery. A nested
+workspace is independent, not an importable child module of the outer
+workspace. Symbolic-link directory traversal is not a mechanism for
+extending the source tree.</p>
+<p>Dependencies determine file order; path order breaks ties. A file runs
+as a whole before a file that depends on it. Cyclic file dependencies are
+errors, including cycles introduced through function bodies or imports.</p>
+<p>A standalone file outside any workspace can import standard modules but
+cannot import arbitrary neighboring source files. Create a workspace
+marker when several files need to cooperate.</p>
+<h2 id="working-with-files-workspaces--deliberate-overrides">Deliberate overrides <a class="heading-anchor" href="#working-with-files-workspaces--deliberate-overrides" aria-label="Link to this section">#</a></h2>
+<p><code>#[shadowable]</code> marks a public declaration or import as replaceable by a
+later declaration in the workspace's defined order. The implicit prelude
+import is shadowable, so your own declarations can use its names.</p>
+<p>Use this attribute for intentional defaults. It is not an escape from
+all conflicts: an ordinary public leaf still cannot be defined twice.
+Whole-value overrides replace the old value, while distinct dotted
+leaves can merge. See <code>gcsl(5)</code> for ordering and import syntax.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="working-with-files-organizing-a-workspace">Organizing a Workspace</h2>
+      <p class="print-crumbs">GCSL / Files and Workspaces</p>
+    </header>
+    <p>You can share a type and helper across files by putting them in a
+workspace. This example gives the entry file access to root declarations
+without an import.</p>
+<h2 id="working-with-files-organizing-a-workspace--before-you-start">Before you start <a class="heading-anchor" href="#working-with-files-organizing-a-workspace--before-you-start" aria-label="Link to this section">#</a></h2>
+<p>You need <code>gcsl</code> on your command search path and an empty writable directory.</p>
+<h2 id="working-with-files-organizing-a-workspace--create-the-workspace">Create the workspace <a class="heading-anchor" href="#working-with-files-organizing-a-workspace--create-the-workspace" aria-label="Link to this section">#</a></h2>
+<ol>
+<li>
+<p>Save these declarations as <code>workspace.gcsl</code>:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>type Component = {name: String, version: String}
+def describe(item: Component): String {
+    "{item.name} {item.version}"
+}
+</code></pre></div>
+</li>
+<li>
+<p>Save the entry program as <code>main.gcsl</code> beside it:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>describe({name = "gcsl"; version = "0.1.0"})
+</code></pre></div>
+</li>
+<li>
+<p>From that directory, check the workspace and run the entry file:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> check</span>
+<span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> run main.gcsl</span>
+</span></code></pre></div>
+</li>
+</ol>
+<h2 id="working-with-files-organizing-a-workspace--check-the-result">Check the result <a class="heading-anchor" href="#working-with-files-organizing-a-workspace--check-the-result" aria-label="Link to this section">#</a></h2>
+<p>The check reports <code>no problems in 2 files checked</code>. The run prints
+<code>gcsl 0.1.0</code>. The helper is visible because <code>def</code> contributes to the
+shared directory scope. Replacing <code>def</code> with <code>fn</code> makes it private to
+<code>workspace.gcsl</code>, so the entry file cannot resolve it.</p>
+<p>When adding a child library directory, import its public fields or
+functions by its root-relative path. Keep independent projects behind
+their own workspace markers rather than relying on hidden files to
+separate their scopes.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="working-with-files-file-and-process-effects">File and Process Effects</h2>
+      <p class="print-crumbs">GCSL / Files and Workspaces</p>
+    </header>
+    <p>GCSL provides standard functions for files and subprocesses. Their effects
+use the host process's authority. Absolute paths and explicit command
+arguments make those effects easier to inspect, but don't restrict what
+a program can access.</p>
+<h2 id="working-with-files-file-and-process-effects--locating-files">Locating files <a class="heading-anchor" href="#working-with-files-file-and-process-effects--locating-files" aria-label="Link to this section">#</a></h2>
+<p>Import <code>fileroot</code> to locate source directories and <code>path</code> to compose paths.
+<code>fileroot.this</code> is the directory of the file containing the expression;
+<code>fileroot.workspace</code> is the workspace root. <code>fileroot.caller</code> identifies
+the source directory of the running function's caller.</p>
+<p><code>path.join</code>, <code>path.normalize</code>, <code>path.dirname</code>, and <code>path.basename</code> operate
+lexically. They don't resolve symbolic links or prove that a path stays
+inside a directory. Use them for path construction, not access control.</p>
+<p>File operations under <code>fs</code> require absolute paths. The following program
+writes and reads a temporary file, then removes its temporary directory
+when the run ends:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>import fs
+import path
+let directory = fs.temp_dir()
+let file = path.join(directory, "message.txt")
+fs.write(file, "GCSL")
+fs.read(file)
+</code></pre></div>
+<p>Temporary directories last for the owning run, workspace, or REPL session.
+Normal cleanup also runs after an evaluation error. Killing the process
+can leave temporary directories behind. Atomic replacement by <code>fs.write</code>
+protects readers from partial contents; it does not preserve a replaced
+file's permissions or provide a durable transaction across several files.</p>
+<h2 id="working-with-files-file-and-process-effects--running-a-process">Running a process <a class="heading-anchor" href="#working-with-files-file-and-process-effects--running-a-process" aria-label="Link to this section">#</a></h2>
+<p><code>exec</code> accepts a list whose first element names the program. Later elements
+are passed as arguments without shell interpretation. It returns a record
+with the exit status and captured output. A nonzero exit status is data,
+not a GCSL runtime error.</p>
+<p><code>sh</code> instead executes a string through <code>/bin/sh</code> and fails the GCSL run
+when the command fails. Don't insert untrusted text into that string.
+Prefer <code>exec</code> when values need to become arguments rather than shell code.</p>
+<p><code>exec_live</code> and <code>sh_live</code> also copy child output to GCSL's standard error
+as lines arrive. They still capture output in memory. All these commands
+inherit the host environment and working directory, and give the child
+null standard input. A source-relative <code>fileroot</code> value does not change
+a command's working directory.</p>
+<p>Consult <code>gcsl-stdlib(3)</code> for exact function contracts and error behavior.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="tools-checking-and-formatting">Checking and Formatting Programs</h2>
+      <p class="print-crumbs">GCSL / Development Tools</p>
+    </header>
+    <p>You can check a GCSL program without running its effects, then format its
+source consistently. The checker and formatter deliberately have different
+scopes: checking needs workspace relationships; formatting only needs
+source text that parses.</p>
+<h2 id="tools-checking-and-formatting--before-you-start">Before you start <a class="heading-anchor" href="#tools-checking-and-formatting--before-you-start" aria-label="Link to this section">#</a></h2>
+<p>You need <code>gcsl</code> and an existing source file or workspace. Commit or save
+your changes before rewriting files so you can review the formatting diff.</p>
+<h2 id="tools-checking-and-formatting--check-and-format">Check and format <a class="heading-anchor" href="#tools-checking-and-formatting--check-and-format" aria-label="Link to this section">#</a></h2>
+<ol>
+<li>
+<p>Check a file, including its enclosing workspace if it has one:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> check main.gcsl</span>
+</span></code></pre></div>
+</li>
+<li>
+<p>Preview whether formatting would change that file:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> fmt<span class="hl-variable hl-parameter hl-option hl-shell"><span class="hl-punctuation hl-definition hl-parameter hl-shell"> --</span>check</span> main.gcsl</span>
+</span></code></pre></div>
+</li>
+<li>
+<p>Apply the formatter and repeat the check:</p>
+<div class="code-block" data-language="sh"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code><span class="hl-source hl-shell hl-bash"><span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> fmt main.gcsl</span>
+<span class="hl-meta hl-function-call hl-shell"><span class="hl-variable hl-function hl-shell">gcsl</span></span><span class="hl-meta hl-function-call hl-arguments hl-shell"> fmt<span class="hl-variable hl-parameter hl-option hl-shell"><span class="hl-punctuation hl-definition hl-parameter hl-shell"> --</span>check</span> main.gcsl</span>
+</span></code></pre></div>
+</li>
+</ol>
+<h2 id="tools-checking-and-formatting--check-the-result">Check the result <a class="heading-anchor" href="#tools-checking-and-formatting--check-the-result" aria-label="Link to this section">#</a></h2>
+<p>The checker reports its summary on standard error. Warnings alone do not
+make it fail. The final formatting check succeeds without listing the
+file when it is already formatted.</p>
+<p>A file with lexical or syntax errors is left untouched by the formatter;
+fix those diagnostics and retry. Formatting does not require a successful
+type check. It uses one language style rather than editor-specific indent
+settings.</p>
+<h2 id="tools-checking-and-formatting--checking-a-tree">Checking a tree <a class="heading-anchor" href="#tools-checking-and-formatting--checking-a-tree" aria-label="Link to this section">#</a></h2>
+<p>With no paths, both commands use the enclosing workspace and exclude
+nested workspaces. An explicit directory makes them discover nested
+workspaces too. However, <code>gcsl check DIRECTORY</code> checks workspaces, not
+unattached <code>.gcsl</code> files under that directory. Pass each standalone file
+explicitly when it also needs checking.</p>
+<p>For automation, <code>gcsl check --message-format json main.gcsl</code> writes one
+JSON diagnostic per line to standard output and keeps the summary on
+standard error. See <code>gcsl(1)</code> for the schema and exit statuses.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="tools-editor-integration">Configuring an Editor</h2>
+      <p class="print-crumbs">GCSL / Development Tools</p>
+    </header>
+    <p>The GCSL language server supplies diagnostics and navigation from the same
+checker that runs programs. You can use it in an editor that supports the
+Language Server Protocol (LSP) over standard input and standard output.</p>
+<h2 id="tools-editor-integration--before-you-start">Before you start <a class="heading-anchor" href="#tools-editor-integration--before-you-start" aria-label="Link to this section">#</a></h2>
+<p>You need the following:</p>
+<ul>
+<li>An editor with configurable LSP support.</li>
+<li>The <code>gcsl</code> executable on the editor's command search path.</li>
+<li>A GCSL file or workspace to open.</li>
+</ul>
+<h2 id="tools-editor-integration--connect-the-server">Connect the server <a class="heading-anchor" href="#tools-editor-integration--connect-the-server" aria-label="Link to this section">#</a></h2>
+<ol>
+<li>Associate files ending in <code>.gcsl</code> with a GCSL language entry in your
+editor.</li>
+<li>Set the server command to <code>gcsl</code> and its argument list to <code>["lsp"]</code>.
+Use standard input and standard output for transport.</li>
+<li>Open a GCSL file. For a multifile project, open the workspace directory
+so the editor can supply file changes and watch notifications.</li>
+</ol>
+<h2 id="tools-editor-integration--check-the-result">Check the result <a class="heading-anchor" href="#tools-editor-integration--check-the-result" aria-label="Link to this section">#</a></h2>
+<p>Hover over a declared name to see its type. Introduce a misspelled name and
+confirm that the editor displays a diagnostic. When an unambiguous
+spelling suggestion is available, a quick fix offers the replacement.</p>
+<p>The server checks source but does not evaluate programs. It supports
+completion, signature help, inlay hints, formatting, symbol search, and
+references. Rename checks the proposed edits before returning them and
+refuses changes that introduce errors or change name resolution. It does
+not rename files, directories, or standard-library declarations.</p>
+<h2 id="tools-editor-integration--incomplete-source">Incomplete source <a class="heading-anchor" href="#tools-editor-integration--incomplete-source" aria-label="Link to this section">#</a></h2>
+<p>The index retains useful information around many syntax errors. For an
+unbalanced block, a query can use a repaired copy to answer navigation or
+completion while diagnostics still describe the real text. Rename needs
+the real source to be valid enough to verify and can be refused instead.</p>
+<p>Editor syntax highlighting is a separate integration. The grammar and
+queries in <code>tree-sitter-gcsl</code> are maintained in their own repository; they
+are not required for the <code>gcsl lsp</code> process to check your code.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="embedding-embedding">Embedding GCSL</h2>
+      <p class="print-crumbs">GCSL / Embedding GCSL</p>
+    </header>
+    <p>The <code>gcsl</code> Rust crate exposes the language pipeline without requiring the
+command-line program. You can evaluate one source, retain an interactive
+session, or load a workspace supplied by your application.</p>
+<h2 id="embedding-embedding--choosing-the-boundary">Choosing the boundary <a class="heading-anchor" href="#embedding-embedding--choosing-the-boundary" aria-label="Link to this section">#</a></h2>
+<p>The repository separates four responsibilities:</p>
+<div class="table-scroll">
+<table><thead><tr><th>Crate</th><th>Responsibility</th></tr></thead><tbody>
+<tr><td><code>gcsl</code></td><td>Syntax, types, evaluation, formatting, and semantic indexing</td></tr>
+<tr><td><code>gcsl-disk</code></td><td>Finding workspace roots and reading source trees</td></tr>
+<tr><td><code>gcsl-lsp</code></td><td>Editor protocol, document state, and request handling</td></tr>
+<tr><td><code>gcsl-cli</code></td><td>Command arguments, terminal interaction, and output</td></tr>
+</tbody></table>
+</div>
+<p><code>gcsl::run</code> evaluates a <code>SourceFile</code> as a standalone program. A <code>Session</code>
+retains names and values across inputs. <code>workspace::Workspace</code> evaluates
+selected files after a workspace check. The lower-level lexer, parser,
+checker, and index are available when you only need a particular stage.
+Consult the Rust API documentation for exact signatures and ownership.</p>
+<h2 id="embedding-embedding--stack-and-lifetime">Stack and lifetime <a class="heading-anchor" href="#embedding-embedding--stack-and-lifetime" aria-label="Link to this section">#</a></h2>
+<p>Run the language pipeline on a thread with at least <code>gcsl::STACK_SIZE</code>
+bytes of stack, as the CLI does. Its configured size is 64 MiB. Parsing,
+checking, lowering, and evaluation share documented nesting limits; a host
+thread's default stack is not a substitute for the required reservation.</p>
+<p>Keep the source collection and diagnostic input numbering together.
+Standard-library files participate in the source list, so diagnostics can
+point into a helper as well as into user text. The library returns
+warnings with successful results instead of printing them.</p>
+<p>A workspace or session owns memoization state and temporary directories.
+Dropping it performs normal temporary-directory cleanup. Do not return a
+path to such a directory and then destroy its owner before a consumer has
+used it.</p>
+<h2 id="embedding-embedding--effects-are-host-effects">Effects are host effects <a class="heading-anchor" href="#embedding-embedding--effects-are-host-effects" aria-label="Link to this section">#</a></h2>
+<p>The standard library is embedded in the binary. Its process and file
+operations still run with the embedding process's permissions and
+resources. The library does not impose a wall-clock limit or turn pure
+checking into an execution sandbox. A host that accepts untrusted programs
+needs an external isolation and resource policy.</p>
+<p>Use <code>gcsl-disk</code> when you want the CLI's workspace-discovery behavior.
+Supply sources yourself when your host has a different storage model;
+keep the language's dependency and scope rules intact.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="embedding-definition-types">Definition Types and Metadata</h2>
+      <p class="print-crumbs">GCSL / Embedding GCSL</p>
+    </header>
+    <p>A definition type lets a host or library describe a family of named
+functions. The language checks each definition against a shared signature,
+while the host can discover and invoke definitions by name. This is the
+mechanism used by integrations such as Pekit.</p>
+<h2 id="embedding-definition-types--a-family-of-definitions">A family of definitions <a class="heading-anchor" href="#embedding-definition-types--a-family-of-definitions" aria-label="Link to this section">#</a></h2>
+<p>Mark a public function with <code>#[def_type]</code>. Its first parameter receives the
+definition's path as a string; its second receives the definition function.
+Further parameters become invocation arguments. This example wraps a
+pure string-producing definition:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>#[def_type]
+def describe(name: String, body: fn(): String): String {
+    "{name}: {body()}"
+}
+def describe dev.peios.gcsl() { "language tools" }
+result = describe dev.peios.gcsl()
+</code></pre></div>
+<p>Declaring the definition does not execute its body. Calling its reference
+does. Definitions live in the definition type's namespace, separate from
+ordinary values of the same path. Their public paths merge through
+workspace directories and imports like other public declarations.</p>
+<h2 id="embedding-definition-types--definitions-made-with-a-variant">Definitions made with a variant <a class="heading-anchor" href="#embedding-definition-types--definitions-made-with-a-variant" aria-label="Link to this section">#</a></h2>
+<p>A definition type can take a variant of an <a href="#language-records-and-types">enum</a>
+after the name, and the definition after that. Each definition then
+names a variant, and each variant has its own definitions. When the
+definition type is generic, the variant's payload type fills in its type
+parameter, so each definition's body is checked against its own
+variant's payload:</p>
+<div class="code-block" data-language="gcsl"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>enum Tool extensible&lt;{*: String}&gt;
+enum Tool::C&lt;{cc: String}&gt;
+enum Tool::Rust&lt;{rustc: String}&gt;
+#[def_type]
+def Tool&lt;T&gt;(name: String, kind: Variant&lt;Tool, T&gt;, body: fn(): T): Tool {
+    kind(body())
+}
+def Tool::C gcc() { cc = "gcc" }
+def Tool::Rust gcc() { rustc = "rustc" }
+c = Tool::C gcc()
+rust = Tool::Rust gcc()
+</code></pre></div>
+<p><code>Tool::C gcc</code> and <code>Tool::Rust gcc</code> are separate definitions. A reference
+names the variant in the same way as the definition, and the definition
+type receives the variant as its <code>kind</code> argument. Hosts don't invoke these
+definitions by name: programs reach them through references, for example
+in a list of registered toolchains.</p>
+<h2 id="embedding-definition-types--metadata">Metadata <a class="heading-anchor" href="#embedding-definition-types--metadata" aria-label="Link to this section">#</a></h2>
+<p>Function types can carry metadata with <code>META:</code>, <code>META-&gt;</code>, or <code>META-&gt;&gt;</code>.
+These distinguish pure reads, impure reads, and memoized reads. A
+<code>defmeta</code> declaration supplies the metadata of a definition in its
+directory. Reading a field through the function reference reads that
+metadata according to its effect.</p>
+<p>Metadata is not a separate package-format contract. The definition type
+chooses its shape, and the host integration owns what those fields mean.
+Use the host's documentation for package or build semantics.</p>
+<h2 id="embedding-definition-types--host-invocation">Host invocation <a class="heading-anchor" href="#embedding-definition-types--host-invocation" aria-label="Link to this section">#</a></h2>
+<p>A checked workspace exposes definition types and their definitions. Host
+APIs can invoke a selected definition with named textual arguments parsed
+against its declared parameter types. When a value the host gets back holds
+a reference, such as <code>build = build busybox</code>, the host can ask which
+definition it names and then invoke it, or read its metadata, by name. The
+<code>gcsl</code> executable itself exposes
+<code>run</code>, <code>check</code>, <code>fmt</code>, and <code>lsp</code>; it does not add a general command for each
+definition type.</p>
+<p>Keep protocol or package policy in the integration repository. Keep
+language syntax, type checking, and discovery semantics in GCSL. This
+separation lets other hosts use the same language without inheriting
+Pekit's packaging model.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="implementation-pipeline"><span class="heading-number">100</span> The Language Pipeline</h2>
+      <p class="print-crumbs">GCSL / gcsl-internals</p>
+    </header>
+    <p>GCSL is a tree-walking interpreter with a typed intermediate
+representation. The stages are separate so a formatter or editor can stop
+before execution while using the same syntax and type rules as the CLI.</p>
+<p>The main pipeline is:</p>
+<div class="code-block" data-language="text"><button class="copy-code" type="button" data-copy-code><span class="copy-label">Copy</span></button><pre><code>SourceFile
+    -&gt; lexer and interned names/strings
+    -&gt; parser and arena-based syntax tree
+    -&gt; workspace resolution and type-check side tables
+    -&gt; type-specialized intermediate representation
+    -&gt; evaluation and a value with warnings
+</code></pre></div>
+<p>The lexer and parser can recover enough structure to report multiple
+errors. A failed check is never lowered into executable code. Recovery
+supports diagnostics and editor queries; it does not make a partially
+valid program executable.</p>
+<p>The checker resolves names and types expressions, recording captures,
+slots, argument destinations, and required awaits in side tables.
+Lowering makes those awaits explicit. Evaluation dispatches through
+specialized operations whose types have already been checked, rather than
+repeating the type system at each operation.</p>
+<h2 id="implementation-pipeline--workspace-scheduling"><span class="heading-number">100.1</span> Workspace scheduling <a class="heading-anchor" href="#implementation-pipeline--workspace-scheduling" aria-label="Link to this section">#</a></h2>
+<p>The workspace scanner merges public field paths, resolves imports, and
+orders source files by dependencies. Each public leaf has an owner and a
+cell. Reading an interior record can require all its contributing owners.
+A cycle is a diagnostic, not an order selected at runtime.</p>
+<p>Top-level field scheduling differs from ordinary block order. It supports
+forward references while ensuring dependencies are initialized before a
+read. Shadowed declarations are still checked even when they do not
+contribute a runtime value.</p>
+<h2 id="implementation-pipeline--sources"><span class="heading-number">100.2</span> Sources <a class="heading-anchor" href="#implementation-pipeline--sources" aria-label="Link to this section">#</a></h2>
+<p>The principal implementation is in <code>crates/gcsl/src/lexer.rs</code>,
+<code>parser.rs</code>, <code>workspace.rs</code>, <code>check.rs</code>, <code>lower.rs</code>, and <code>eval.rs</code>.
+Each module documents its internal invariants. The implementation here is
+not the separate Tree-sitter grammar used for highlighting.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="implementation-evaluation-state"><span class="heading-number">200</span> Evaluation State</h2>
+      <p class="print-crumbs">GCSL / gcsl-internals</p>
+    </header>
+    <p>GCSL evaluation uses reference-counted values and explicit execution
+contexts. A closure captures values; a frame holds the current call's
+slots. This supports value semantics without exposing shared mutable
+variables to programs.</p>
+<h2 id="implementation-evaluation-state--futures-and-memo-tables"><span class="heading-number">200.1</span> Futures and memo tables <a class="heading-anchor" href="#implementation-evaluation-state--futures-and-memo-tables" aria-label="Link to this section">#</a></h2>
+<p>A future begins pending, becomes running during evaluation, and records a
+successful result. Reentering running work is an error rather than an
+infinite cycle through the same pending computation. A failed evaluation
+does not become a cached success.</p>
+<p>Memo tables belong to the execution context and are keyed by closure
+identity and argument values, with supported ambient inputs included when
+used. Keeping tables outside closures avoids introducing reference cycles
+through cached keys and results. Successful entries for live closures
+remain until their context ends; they are not an eviction-based cache.</p>
+<h2 id="implementation-evaluation-state--exits-and-cleanup"><span class="heading-number">200.2</span> Exits and cleanup <a class="heading-anchor" href="#implementation-evaluation-state--exits-and-cleanup" aria-label="Link to this section">#</a></h2>
+<p>Runtime errors and language control flow share an unwinding path through
+the evaluator. A loop handles its own <code>break</code> or <code>continue</code>; a function,
+future, or labeled block handles a matching <code>return</code>. Intermediate
+operations restore stack and evaluation state before propagating an exit.</p>
+<p>A failed REPL input does not commit its new bindings or memo-table changes
+to the session. Effects already performed outside the interpreter are not
+rolled back. A file written or a subprocess started before an error still
+requires the host's ordinary handling.</p>
+<p>A workspace remembers the first runtime failure of each file. A later
+request that needs that file receives the original diagnostic without
+rerunning its effects or starting dependent files. Successful prior files
+keep their values, and unrelated files can still run. Create a new
+workspace object when you intentionally need to retry evaluation.</p>
+<h2 id="implementation-evaluation-state--resource-limits"><span class="heading-number">200.3</span> Resource limits <a class="heading-anchor" href="#implementation-evaluation-state--resource-limits" aria-label="Link to this section">#</a></h2>
+<p>The parser's maximum expression depth is <code>gcsl::MAX_DEPTH</code>, 10,000 levels.
+Runtime expressions, calls, and awaits share a nesting budget; calls cost
+additional levels. Iterations reuse their body's depth rather than adding
+one level per iteration. Tail calls are not eliminated.</p>
+<p>These limits protect the recursive implementation, not total computation.
+A program can still loop indefinitely, allocate large values, capture
+large process output, or retain many memoized results. The embedding host
+owns any execution timeout and memory limit.</p>
+<p>The main implementation lives in <code>eval.rs</code>, <code>value.rs</code>, and <code>session.rs</code>.</p>
+
+  </section>
+  <section class="print-article">
+    <header>
+      <h2 id="implementation-tooling-state"><span class="heading-number">300</span> Tooling State</h2>
+      <p class="print-crumbs">GCSL / gcsl-internals</p>
+    </header>
+    <p>GCSL tooling shares language analysis while keeping disk access and editor
+protocol handling outside the core. This prevents checking and formatting
+from depending on an evaluator run.</p>
+<h2 id="implementation-tooling-state--source-discovery"><span class="heading-number">300.1</span> Source discovery <a class="heading-anchor" href="#implementation-tooling-state--source-discovery" aria-label="Link to this section">#</a></h2>
+<p><code>gcsl-disk</code> finds workspace markers and returns a source collection with
+stable path and diagnostic mappings. It excludes hidden names and nested
+workspace trees when reading one workspace. The CLI and language server
+use this shared layer rather than implementing separate import rules.</p>
+<p>A check of a directory discovers workspaces. A format of a directory
+finds source files, including standalone files. Their traversal results
+are therefore intentionally different.</p>
+<h2 id="implementation-tooling-state--editor-snapshots"><span class="heading-number">300.2</span> Editor snapshots <a class="heading-anchor" href="#implementation-tooling-state--editor-snapshots" aria-label="Link to this section">#</a></h2>
+<p><code>gcsl-lsp</code> overlays open document text on disk sources and asks a worker to
+check the affected workspace. Queries use an up-to-date semantic index;
+they can force a pending check before answering. Diagnostics continue to
+refer to actual source even when a query temporarily repairs unmatched
+braces to find usable names.</p>
+<p>Rename computes proposed edits and checks their effect before offering
+them. Standard-library, file, and directory identities are not editable
+through that operation. Formatting returns edits from the language's
+formatter rather than applying the editor's formatting preferences.</p>
+<p>Only local <code>file:</code> document URIs with an empty or <code>localhost</code> authority
+and an absolute decoded path map to disk files. Other URI forms are
+checked as standalone documents, not treated as local workspace paths.</p>
+<h2 id="implementation-tooling-state--formatter"><span class="heading-number">300.3</span> Formatter <a class="heading-anchor" href="#implementation-tooling-state--formatter" aria-label="Link to this section">#</a></h2>
+<p>The formatter works from tokens, comments, and parsed structure. It does
+not need evaluation or successful type inference. Syntax errors prevent a
+rewrite of that file. The CLI uses a temporary file and replacement so
+readers don't observe a partially written formatted file.</p>
+<p>The principal code is in <code>crates/gcsl-disk/src/lib.rs</code>,
+<code>crates/gcsl-lsp/src/</code>, <code>crates/gcsl/src/index/</code>, and
+<code>crates/gcsl/src/fmt.rs</code>. The CLI adapters live in
+<code>crates/gcsl-cli/src/</code>.</p>
+
+  </section>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <p>Peios Learn</p>
+  <p class="colophon">Built with Trail.</p>
+</footer>
+
+<button class="back-to-top" type="button" data-back-to-top aria-label="Back to top">
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
+
+<dialog class="search-modal" id="search-modal" aria-label="Search Peios Learn">
+  <div class="search-panel">
+    <div class="search-box">
+      <input type="search" placeholder="Search Peios Learn, or / for commandsâ€¦" autocomplete="off" aria-label="Search query">
+      <button class="search-close" type="button" data-search-close aria-label="Close search"><kbd>Esc</kbd></button>
+    </div>
+    <ul class="search-results" role="listbox"></ul>
+    <p class="search-status" role="status"></p>
+  </div>
+</dialog>
+<script src="/assets/search.js" defer></script>
+
+<script>
+// Theme toggle: cycles system â†’ light â†’ dark, persisted per browser.
+(() => {
+    const button = document.querySelector("[data-theme-toggle]");
+    if (!button) {
+        return;
+    }
+    const apply = (state) => {
+        if (state === "system") {
+            delete document.documentElement.dataset.theme;
+            try {
+                localStorage.removeItem("trail-theme");
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        } else {
+            document.documentElement.dataset.theme = state;
+            try {
+                localStorage.setItem("trail-theme", state);
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        }
+        button.dataset.themeState = state;
+        button.setAttribute("aria-label", "Theme: " + state);
+        button.title = "Theme: " + state;
+    };
+    apply(document.documentElement.dataset.theme || "system");
+    const order = ["system", "light", "dark"];
+    const cycle = () => apply(order[(order.indexOf(button.dataset.themeState) + 1) % order.length]);
+    button.addEventListener("click", cycle);
+    // The /theme command in the search box drives the same state as the
+    // button, so the two can never disagree.
+    window.trail.themes = order;
+    window.trail.setTheme = (state) => {
+        if (!order.includes(state)) {
+            return null;
+        }
+        apply(state);
+        return state;
+    };
+    window.trail.cycleTheme = () => {
+        cycle();
+        return button.dataset.themeState;
+    };
+})();
+
+// Book tree: chapters expanded by hand stay expanded while moving
+// between the book's pages (per tab, via sessionStorage). The server
+// opens the trail to the current page; this only adds to it.
+(() => {
+    const tree = document.querySelector("[data-book-nav]");
+    if (!tree) {
+        return;
+    }
+    const key = "trail-open-chapters:" + tree.dataset.bookNav;
+    let stored = [];
+    try {
+        stored = JSON.parse(sessionStorage.getItem(key)) || [];
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    for (const details of tree.querySelectorAll("details[data-chapter]")) {
+        if (stored.includes(details.dataset.chapter)) {
+            details.open = true;
+        }
+    }
+    // "toggle" doesn't bubble; listen in the capture phase.
+    tree.addEventListener(
+        "toggle",
+        () => {
+            const open = [...tree.querySelectorAll("details[open]")].map(
+                (details) => details.dataset.chapter,
+            );
+            sessionStorage.setItem(key, JSON.stringify(open));
+        },
+        true,
+    );
+})();
+
+// Copy buttons on code blocks: the code's own text is the source of
+// truth, so nothing is duplicated into the markup.
+(() => {
+    document.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-copy-code]");
+        if (!button) {
+            return;
+        }
+        const code = button.parentElement.querySelector("code");
+        if (!code) {
+            return;
+        }
+        const label = button.querySelector(".copy-label");
+        try {
+            await navigator.clipboard.writeText(code.textContent);
+            label.textContent = "Copied";
+        } catch {
+            label.textContent = "Press âŒ˜C";
+        }
+        button.dataset.copied = "";
+        setTimeout(() => {
+            label.textContent = "Copy";
+            delete button.dataset.copied;
+        }, 1500);
+    });
+})();
+
+// Tab groups: one panel visible at a time, scoped per group so
+// several groups on a page stay independent.
+(() => {
+    for (const group of document.querySelectorAll("[data-tabs]")) {
+        const buttons = [...group.querySelectorAll(".tab-button")];
+        const panels = [...group.querySelectorAll(".tab-panel")];
+        // Print needs each panel labelled, since the buttons are hidden.
+        panels.forEach((panel, index) => {
+            panel.dataset.tabLabel = buttons[index]?.textContent ?? "";
+        });
+        group.addEventListener("click", (event) => {
+            const button = event.target.closest(".tab-button");
+            if (!button) {
+                return;
+            }
+            const chosen = Number(button.dataset.tab);
+            buttons.forEach((other, index) =>
+                other.setAttribute("aria-selected", String(index === chosen)),
+            );
+            panels.forEach((panel, index) => (panel.hidden = index !== chosen));
+        });
+    }
+})();
+
+// Back to top: appears once there's a page worth returning up.
+(() => {
+    const button = document.querySelector("[data-back-to-top]");
+    if (!button) {
+        return;
+    }
+    const sync = () => {
+        if (scrollY > 600) {
+            button.dataset.visible = "";
+        } else {
+            delete button.dataset.visible;
+        }
+    };
+    addEventListener("scroll", sync, { passive: true });
+    button.addEventListener("click", () => scrollTo({ top: 0, behavior: "smooth" }));
+    sync();
+})();
+
+// Search landing: ?q= marks the terms that brought the reader here
+// and scrolls the first one into view.
+(() => {
+    const query = new URLSearchParams(location.search).get("q");
+    const body = document.querySelector(".article-body");
+    if (!query || !body) {
+        return;
+    }
+    const terms = [
+        ...new Set(
+            query
+                .toLowerCase()
+                .split(/\s+/)
+                .filter((t) => t.length > 1),
+        ),
+    ];
+    if (terms.length === 0) {
+        return;
+    }
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) =>
+            node.parentElement.closest("code, pre, .crumbs, script, style")
+                ? NodeFilter.FILTER_REJECT
+                : NodeFilter.FILTER_ACCEPT,
+    });
+    const texts = [];
+    while (walker.nextNode()) {
+        texts.push(walker.currentNode);
+    }
+    let first = null;
+    for (const node of texts) {
+        // Walk the node, marking every occurrence, not just the first.
+        let current = node;
+        while (current) {
+            const lower = current.textContent.toLowerCase();
+            let at = -1;
+            let term = null;
+            for (const candidate of terms) {
+                const index = lower.indexOf(candidate);
+                if (index !== -1 && (at === -1 || index < at)) {
+                    at = index;
+                    term = candidate;
+                }
+            }
+            if (at === -1) {
+                break;
+            }
+            const hit = current.splitText(at);
+            const rest = hit.splitText(term.length);
+            const mark = document.createElement("mark");
+            mark.className = "search-hit";
+            mark.textContent = hit.textContent;
+            hit.replaceWith(mark);
+            first ??= mark;
+            current = rest;
+        }
+    }
+    first?.scrollIntoView({ block: "center" });
+})();
+
+// Reading size: scales the prose only, remembered per browser.
+(() => {
+    const controls = document.querySelector("[data-reading-size]");
+    const scales = { sm: "0.94", md: "1", lg: "1.12" };
+    const apply = (size) => {
+        document.documentElement.style.setProperty("--reading-scale", scales[size] ?? "1");
+        controls
+            ?.querySelectorAll("button")
+            .forEach((button) =>
+                button.setAttribute("aria-pressed", String(button.dataset.size === size)),
+            );
+    };
+    let saved = "md";
+    try {
+        saved = localStorage.getItem("trail-reading-size") || "md";
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    apply(saved in scales ? saved : "md");
+    controls?.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button) {
+            return;
+        }
+        apply(button.dataset.size);
+        try {
+            localStorage.setItem("trail-reading-size", button.dataset.size);
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+    });
+})();
+
+// Mobile drawer: on narrow screens the sidebar slides in over the page.
+// Pages without a sidebar render no toggle, so this does nothing there.
+(() => {
+    const toggle = document.querySelector("[data-drawer-toggle]");
+    if (!toggle) {
+        return;
+    }
+    const set = (open) => {
+        document.body.classList.toggle("drawer-open", open);
+        toggle.setAttribute("aria-expanded", open);
+    };
+    toggle.addEventListener("click", () => set(!document.body.classList.contains("drawer-open")));
+    document.querySelector("[data-drawer-close]")?.addEventListener("click", () => set(false));
+    // Following a link (a page, or an anchor on this one) closes the drawer.
+    document.querySelector(".sidebar")?.addEventListener("click", (event) => {
+        if (event.target.closest("a")) {
+            set(false);
+        }
+    });
+    addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && document.body.classList.contains("drawer-open")) {
+            set(false);
+        }
+    });
+})();
+</script>
+
+<script>
+// Citation anchors: clicking one copies the full citation string
+// ("Kernel TRM *copy-up.preserves-ownership") rather than navigating,
+// because copying it into a test is the whole reason it is there. The
+// href still points at the anchor, so middle-click and "copy link"
+// behave normally and the page is usable without JS.
+(() => {
+    const KEY = "trail:citations-hidden";
+    const body = document.body;
+    try {
+        if (localStorage.getItem(KEY) === "1") {
+            body.classList.add("citations-hidden");
+        }
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+
+    document.addEventListener("click", (event) => {
+        const anchor = event.target.closest(".citation-anchor");
+        if (!anchor) {
+            return;
+        }
+        const citation = anchor.dataset.citation;
+        if (!citation) {
+            return;
+        }
+        event.preventDefault();
+        history.replaceState(null, "", anchor.getAttribute("href"));
+        const done = () => {
+            anchor.classList.add("copied");
+            setTimeout(() => anchor.classList.remove("copied"), 1400);
+        };
+        const failed = () => {
+            anchor.title = "Copy failed. Copy the citation from the link title: " + citation;
+        };
+        if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(citation).then(done, failed);
+        } else {
+            failed();
+        }
+    });
+
+    // Exposed for a future settings control; usable from the console
+    // meanwhile. Persisted per reader, per origin.
+    window.trailToggleCitations = () => {
+        const hidden = body.classList.toggle("citations-hidden");
+        try {
+            localStorage.setItem(KEY, hidden ? "1" : "0");
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+        return hidden;
+    };
+})();
+</script>
+</body>
+</html>

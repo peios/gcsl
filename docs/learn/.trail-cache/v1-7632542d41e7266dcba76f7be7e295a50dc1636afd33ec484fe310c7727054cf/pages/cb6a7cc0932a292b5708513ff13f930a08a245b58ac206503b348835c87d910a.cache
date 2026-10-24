@@ -1,0 +1,575 @@
+¿ÝfË&ä´:j‹L4¬B¡ƒ¢e¶ÓË9á¦ z´)sý<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evaluation State â€” Peios Learn</title>
+<script>
+// What this build knows about itself, for the scripts below and for
+// search.js: `base` is the path prefix every link on this page carries
+// ("" on the site itself, "/<cbpath>" inside the cache-busting copy),
+// and `cachebust` is the copy's path when one was published.
+window.trail = {"base":"","cachebust":null};
+// Apply the saved theme choice before first paint (no flash).
+try {
+    const theme = localStorage.getItem("trail-theme");
+    if (theme === "light" || theme === "dark") {
+        document.documentElement.dataset.theme = theme;
+    }
+} catch {
+    // Storage can be unavailable; keep this page's default or in-memory state.
+}
+</script>
+<link rel="stylesheet" href="/assets/style.css">
+<link rel="alternate" type="text/markdown" href="/gcsl/implementation/evaluation-state.md">
+<meta name="description" content="Understand values, futures, memo tables, and failure cleanup.">
+<meta property="og:description" content="Understand values, futures, memo tables, and failure cleanup.">
+<meta property="og:title" content="Evaluation State">
+<meta property="og:site_name" content="Peios Learn">
+<meta property="og:type" content="article">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="/gcsl/implementation/evaluation-state/">
+</head>
+<body>
+
+<header class="site-header">
+<button class="menu-toggle" type="button" data-drawer-toggle aria-expanded="false" aria-label="Open navigation">
+  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+</button>
+
+  <a class="wordmark" href="/">Peios&nbsp;<span>Learn</span></a>
+  <nav class="site-nav" aria-label="Site navigation">
+    <details class="nav-dropdown">
+      <summary>Documentation</summary>
+      <div class="menu">
+        <p class="menu-heading">Developer Tools</p>
+        <a class="menu-item" href="/gcsl" style="--pc: #06b6d4; --tile-chars: 2"><svg class="tile tile-menu tile-icon" aria-hidden="true"><use href="/assets/icons/gcsl.svg#trail-icon" width="100%" height="100%"/></svg>GCSL</a>
+      </div>
+    </details>
+  </nav>
+  <button class="theme-toggle" type="button" data-theme-toggle data-theme-state="system" aria-label="Theme: system">
+    <svg data-theme-icon="system" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>
+    <svg data-theme-icon="light" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2.6m0 13.8v2.6M2.5 12h2.6m13.8 0h2.6M5.2 5.2l1.9 1.9m9.8 9.8 1.9 1.9m0-13.6-1.9 1.9M7.1 16.9l-1.9 1.9"/></svg>
+    <svg data-theme-icon="dark" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M20.5 14.5A8.5 8.5 0 0 1 9.5 3.5a8.5 8.5 0 1 0 11 11z"/></svg>
+  </button>
+  <button class="search search-small" type="button" data-search-open aria-label="Search">
+    <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4.2-4.2"/></svg>
+    <span class="search-placeholder">Searchâ€¦</span>
+    <kbd data-search-kbd>âŒ˜K</kbd>
+  </button>
+</header>
+
+<main>
+
+<div class="drawer-overlay" data-drawer-close></div>
+<div class="article-layout" style="--pc: #06b6d4">
+  <aside class="sidebar" aria-label="Book navigation">
+    <a class="wordmark drawer-wordmark" href="/">Peios&nbsp;<span>Learn</span></a>
+<p class="sidebar-topic"><a href="/gcsl/implementation">gcsl-internals</a></p>
+<nav data-book-nav="/gcsl/implementation" aria-label="Book chapters">
+  
+<ul class="sidebar-list">
+  <li><a href="/gcsl/implementation/pipeline"><span class="section-number">100</span>The Language Pipeline</a></li>
+  <li><a href="/gcsl/implementation/evaluation-state" class="current" aria-current="page"><span class="section-number">200</span>Evaluation State</a></li>
+  <li><a href="/gcsl/implementation/tooling-state"><span class="section-number">300</span>Tooling State</a></li>
+</ul>
+
+</nav>
+
+    <div class="sidebar-toc">
+      <p class="toc-label">On this page</p>
+      <ul>
+        <li class="toc-2"><a href="#futures-and-memo-tables"><span class="section-number">200.1</span>Futures and memo tables</a></li>
+        <li class="toc-2"><a href="#exits-and-cleanup"><span class="section-number">200.2</span>Exits and cleanup</a></li>
+        <li class="toc-2"><a href="#resource-limits"><span class="section-number">200.3</span>Resource limits</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <article class="article-body" data-pagefind-body data-pagefind-meta="crumbs:GCSL / gcsl-internals">
+    <nav class="crumbs" data-pagefind-ignore aria-label="Breadcrumbs">
+<a href="/gcsl">GCSL</a>
+<span>/</span>
+<a href="/gcsl/implementation">gcsl-internals</a>
+
+      <a class="print-link" href="/gcsl/implementation/print#evaluation-state" title="Everything here on one page, opened at this article">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9V3h12v6M6 18H4v-6h16v6h-2M8 14h8v7H8z"/></svg>
+        <span>Single page</span>
+      </a>
+    </nav>
+    <h1><span class="heading-number">200</span> Evaluation State</h1>
+    <p class="article-meta" data-pagefind-ignore>
+      <span>2 min read</span>
+    </p>
+    <p>GCSL evaluation uses reference-counted values and explicit execution
+contexts. A closure captures values; a frame holds the current call's
+slots. This supports value semantics without exposing shared mutable
+variables to programs.</p>
+<h2 id="futures-and-memo-tables"><span class="heading-number">200.1</span> Futures and memo tables <a class="heading-anchor" href="#futures-and-memo-tables" aria-label="Link to this section">#</a></h2>
+<p>A future begins pending, becomes running during evaluation, and records a
+successful result. Reentering running work is an error rather than an
+infinite cycle through the same pending computation. A failed evaluation
+does not become a cached success.</p>
+<p>Memo tables belong to the execution context and are keyed by closure
+identity and argument values, with supported ambient inputs included when
+used. Keeping tables outside closures avoids introducing reference cycles
+through cached keys and results. Successful entries for live closures
+remain until their context ends; they are not an eviction-based cache.</p>
+<h2 id="exits-and-cleanup"><span class="heading-number">200.2</span> Exits and cleanup <a class="heading-anchor" href="#exits-and-cleanup" aria-label="Link to this section">#</a></h2>
+<p>Runtime errors and language control flow share an unwinding path through
+the evaluator. A loop handles its own <code>break</code> or <code>continue</code>; a function,
+future, or labeled block handles a matching <code>return</code>. Intermediate
+operations restore stack and evaluation state before propagating an exit.</p>
+<p>A failed REPL input does not commit its new bindings or memo-table changes
+to the session. Effects already performed outside the interpreter are not
+rolled back. A file written or a subprocess started before an error still
+requires the host's ordinary handling.</p>
+<p>A workspace remembers the first runtime failure of each file. A later
+request that needs that file receives the original diagnostic without
+rerunning its effects or starting dependent files. Successful prior files
+keep their values, and unrelated files can still run. Create a new
+workspace object when you intentionally need to retry evaluation.</p>
+<h2 id="resource-limits"><span class="heading-number">200.3</span> Resource limits <a class="heading-anchor" href="#resource-limits" aria-label="Link to this section">#</a></h2>
+<p>The parser's maximum expression depth is <code>gcsl::MAX_DEPTH</code>, 10,000 levels.
+Runtime expressions, calls, and awaits share a nesting budget; calls cost
+additional levels. Iterations reuse their body's depth rather than adding
+one level per iteration. Tail calls are not eliminated.</p>
+<p>These limits protect the recursive implementation, not total computation.
+A program can still loop indefinitely, allocate large values, capture
+large process output, or retain many memoized results. The embedding host
+owns any execution timeout and memory limit.</p>
+<p>The main implementation lives in <code>eval.rs</code>, <code>value.rs</code>, and <code>session.rs</code>.</p>
+
+    <nav class="pager" data-pagefind-ignore aria-label="Nearby pages">
+      <a class="pager-previous" href="/gcsl/implementation/pipeline">
+        <span class="pager-label">Previous</span>
+        <span class="pager-title">The Language Pipeline</span>
+      </a>
+      <a class="pager-next" href="/gcsl/implementation/tooling-state">
+        <span class="pager-label">Next</span>
+        <span class="pager-title">Tooling State</span>
+      </a>
+    </nav>
+  </article>
+
+  <aside class="toc" aria-label="On this page">
+    <div class="reading-size" data-reading-size role="group" aria-label="Text size">
+      <button type="button" data-size="sm" aria-pressed="false" aria-label="Small text">A</button>
+      <button type="button" data-size="md" aria-pressed="true" aria-label="Medium text">A</button>
+      <button type="button" data-size="lg" aria-pressed="false" aria-label="Large text">A</button>
+    </div>
+    <p class="toc-label">On this page</p>
+    <ul>
+      <li class="toc-2"><a href="#futures-and-memo-tables"><span class="section-number">200.1</span>Futures and memo tables</a></li>
+      <li class="toc-2"><a href="#exits-and-cleanup"><span class="section-number">200.2</span>Exits and cleanup</a></li>
+      <li class="toc-2"><a href="#resource-limits"><span class="section-number">200.3</span>Resource limits</a></li>
+    </ul>
+  </aside>
+</div>
+<script>
+// Scroll-spy: highlight the ToC entry for the section in view.
+(() => {
+    const links = Array.from(document.querySelectorAll(".toc a"));
+    const headings = links
+        .map((link) => document.getElementById(link.hash.slice(1)))
+        .filter(Boolean);
+    if (headings.length === 0) {
+        return;
+    }
+
+    let activeLink = null;
+    const update = () => {
+        let current = headings[0];
+        for (const heading of headings) {
+            if (heading.getBoundingClientRect().top <= 96) {
+                current = heading;
+            }
+        }
+        if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 2) {
+            current = headings[headings.length - 1];
+        }
+        const link = links.find((l) => l.hash === "#" + current.id) || null;
+        if (link === activeLink) {
+            return;
+        }
+        if (activeLink) {
+            activeLink.classList.remove("active");
+            activeLink.removeAttribute("aria-current");
+        }
+        activeLink = link;
+        if (activeLink) {
+            activeLink.classList.add("active");
+            activeLink.setAttribute("aria-current", "location");
+        }
+    };
+
+    let scheduled = false;
+    addEventListener(
+        "scroll",
+        () => {
+            if (scheduled) {
+                return;
+            }
+            scheduled = true;
+            requestAnimationFrame(() => {
+                scheduled = false;
+                update();
+            });
+        },
+        { passive: true },
+    );
+    addEventListener("resize", update, { passive: true });
+    update();
+})();
+</script>
+
+
+</main>
+
+<footer class="site-footer">
+  <p>Peios Learn</p>
+  <p class="colophon">Built with Trail.</p>
+</footer>
+
+<button class="back-to-top" type="button" data-back-to-top aria-label="Back to top">
+  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
+
+<dialog class="search-modal" id="search-modal" aria-label="Search Peios Learn">
+  <div class="search-panel">
+    <div class="search-box">
+      <input type="search" placeholder="Search Peios Learn, or / for commandsâ€¦" autocomplete="off" aria-label="Search query">
+      <button class="search-close" type="button" data-search-close aria-label="Close search"><kbd>Esc</kbd></button>
+    </div>
+    <ul class="search-results" role="listbox"></ul>
+    <p class="search-status" role="status"></p>
+  </div>
+</dialog>
+<script src="/assets/search.js" defer></script>
+
+<script>
+// Theme toggle: cycles system â†’ light â†’ dark, persisted per browser.
+(() => {
+    const button = document.querySelector("[data-theme-toggle]");
+    if (!button) {
+        return;
+    }
+    const apply = (state) => {
+        if (state === "system") {
+            delete document.documentElement.dataset.theme;
+            try {
+                localStorage.removeItem("trail-theme");
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        } else {
+            document.documentElement.dataset.theme = state;
+            try {
+                localStorage.setItem("trail-theme", state);
+            } catch {
+                // Storage can be unavailable; keep this page's default or in-memory state.
+            }
+        }
+        button.dataset.themeState = state;
+        button.setAttribute("aria-label", "Theme: " + state);
+        button.title = "Theme: " + state;
+    };
+    apply(document.documentElement.dataset.theme || "system");
+    const order = ["system", "light", "dark"];
+    const cycle = () => apply(order[(order.indexOf(button.dataset.themeState) + 1) % order.length]);
+    button.addEventListener("click", cycle);
+    // The /theme command in the search box drives the same state as the
+    // button, so the two can never disagree.
+    window.trail.themes = order;
+    window.trail.setTheme = (state) => {
+        if (!order.includes(state)) {
+            return null;
+        }
+        apply(state);
+        return state;
+    };
+    window.trail.cycleTheme = () => {
+        cycle();
+        return button.dataset.themeState;
+    };
+})();
+
+// Book tree: chapters expanded by hand stay expanded while moving
+// between the book's pages (per tab, via sessionStorage). The server
+// opens the trail to the current page; this only adds to it.
+(() => {
+    const tree = document.querySelector("[data-book-nav]");
+    if (!tree) {
+        return;
+    }
+    const key = "trail-open-chapters:" + tree.dataset.bookNav;
+    let stored = [];
+    try {
+        stored = JSON.parse(sessionStorage.getItem(key)) || [];
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    for (const details of tree.querySelectorAll("details[data-chapter]")) {
+        if (stored.includes(details.dataset.chapter)) {
+            details.open = true;
+        }
+    }
+    // "toggle" doesn't bubble; listen in the capture phase.
+    tree.addEventListener(
+        "toggle",
+        () => {
+            const open = [...tree.querySelectorAll("details[open]")].map(
+                (details) => details.dataset.chapter,
+            );
+            sessionStorage.setItem(key, JSON.stringify(open));
+        },
+        true,
+    );
+})();
+
+// Copy buttons on code blocks: the code's own text is the source of
+// truth, so nothing is duplicated into the markup.
+(() => {
+    document.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-copy-code]");
+        if (!button) {
+            return;
+        }
+        const code = button.parentElement.querySelector("code");
+        if (!code) {
+            return;
+        }
+        const label = button.querySelector(".copy-label");
+        try {
+            await navigator.clipboard.writeText(code.textContent);
+            label.textContent = "Copied";
+        } catch {
+            label.textContent = "Press âŒ˜C";
+        }
+        button.dataset.copied = "";
+        setTimeout(() => {
+            label.textContent = "Copy";
+            delete button.dataset.copied;
+        }, 1500);
+    });
+})();
+
+// Tab groups: one panel visible at a time, scoped per group so
+// several groups on a page stay independent.
+(() => {
+    for (const group of document.querySelectorAll("[data-tabs]")) {
+        const buttons = [...group.querySelectorAll(".tab-button")];
+        const panels = [...group.querySelectorAll(".tab-panel")];
+        // Print needs each panel labelled, since the buttons are hidden.
+        panels.forEach((panel, index) => {
+            panel.dataset.tabLabel = buttons[index]?.textContent ?? "";
+        });
+        group.addEventListener("click", (event) => {
+            const button = event.target.closest(".tab-button");
+            if (!button) {
+                return;
+            }
+            const chosen = Number(button.dataset.tab);
+            buttons.forEach((other, index) =>
+                other.setAttribute("aria-selected", String(index === chosen)),
+            );
+            panels.forEach((panel, index) => (panel.hidden = index !== chosen));
+        });
+    }
+})();
+
+// Back to top: appears once there's a page worth returning up.
+(() => {
+    const button = document.querySelector("[data-back-to-top]");
+    if (!button) {
+        return;
+    }
+    const sync = () => {
+        if (scrollY > 600) {
+            button.dataset.visible = "";
+        } else {
+            delete button.dataset.visible;
+        }
+    };
+    addEventListener("scroll", sync, { passive: true });
+    button.addEventListener("click", () => scrollTo({ top: 0, behavior: "smooth" }));
+    sync();
+})();
+
+// Search landing: ?q= marks the terms that brought the reader here
+// and scrolls the first one into view.
+(() => {
+    const query = new URLSearchParams(location.search).get("q");
+    const body = document.querySelector(".article-body");
+    if (!query || !body) {
+        return;
+    }
+    const terms = [
+        ...new Set(
+            query
+                .toLowerCase()
+                .split(/\s+/)
+                .filter((t) => t.length > 1),
+        ),
+    ];
+    if (terms.length === 0) {
+        return;
+    }
+    const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+        acceptNode: (node) =>
+            node.parentElement.closest("code, pre, .crumbs, script, style")
+                ? NodeFilter.FILTER_REJECT
+                : NodeFilter.FILTER_ACCEPT,
+    });
+    const texts = [];
+    while (walker.nextNode()) {
+        texts.push(walker.currentNode);
+    }
+    let first = null;
+    for (const node of texts) {
+        // Walk the node, marking every occurrence, not just the first.
+        let current = node;
+        while (current) {
+            const lower = current.textContent.toLowerCase();
+            let at = -1;
+            let term = null;
+            for (const candidate of terms) {
+                const index = lower.indexOf(candidate);
+                if (index !== -1 && (at === -1 || index < at)) {
+                    at = index;
+                    term = candidate;
+                }
+            }
+            if (at === -1) {
+                break;
+            }
+            const hit = current.splitText(at);
+            const rest = hit.splitText(term.length);
+            const mark = document.createElement("mark");
+            mark.className = "search-hit";
+            mark.textContent = hit.textContent;
+            hit.replaceWith(mark);
+            first ??= mark;
+            current = rest;
+        }
+    }
+    first?.scrollIntoView({ block: "center" });
+})();
+
+// Reading size: scales the prose only, remembered per browser.
+(() => {
+    const controls = document.querySelector("[data-reading-size]");
+    const scales = { sm: "0.94", md: "1", lg: "1.12" };
+    const apply = (size) => {
+        document.documentElement.style.setProperty("--reading-scale", scales[size] ?? "1");
+        controls
+            ?.querySelectorAll("button")
+            .forEach((button) =>
+                button.setAttribute("aria-pressed", String(button.dataset.size === size)),
+            );
+    };
+    let saved = "md";
+    try {
+        saved = localStorage.getItem("trail-reading-size") || "md";
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+    apply(saved in scales ? saved : "md");
+    controls?.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button) {
+            return;
+        }
+        apply(button.dataset.size);
+        try {
+            localStorage.setItem("trail-reading-size", button.dataset.size);
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+    });
+})();
+
+// Mobile drawer: on narrow screens the sidebar slides in over the page.
+// Pages without a sidebar render no toggle, so this does nothing there.
+(() => {
+    const toggle = document.querySelector("[data-drawer-toggle]");
+    if (!toggle) {
+        return;
+    }
+    const set = (open) => {
+        document.body.classList.toggle("drawer-open", open);
+        toggle.setAttribute("aria-expanded", open);
+    };
+    toggle.addEventListener("click", () => set(!document.body.classList.contains("drawer-open")));
+    document.querySelector("[data-drawer-close]")?.addEventListener("click", () => set(false));
+    // Following a link (a page, or an anchor on this one) closes the drawer.
+    document.querySelector(".sidebar")?.addEventListener("click", (event) => {
+        if (event.target.closest("a")) {
+            set(false);
+        }
+    });
+    addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && document.body.classList.contains("drawer-open")) {
+            set(false);
+        }
+    });
+})();
+</script>
+
+<script>
+// Citation anchors: clicking one copies the full citation string
+// ("Kernel TRM *copy-up.preserves-ownership") rather than navigating,
+// because copying it into a test is the whole reason it is there. The
+// href still points at the anchor, so middle-click and "copy link"
+// behave normally and the page is usable without JS.
+(() => {
+    const KEY = "trail:citations-hidden";
+    const body = document.body;
+    try {
+        if (localStorage.getItem(KEY) === "1") {
+            body.classList.add("citations-hidden");
+        }
+    } catch {
+        // Storage can be unavailable; keep this page's default or in-memory state.
+    }
+
+    document.addEventListener("click", (event) => {
+        const anchor = event.target.closest(".citation-anchor");
+        if (!anchor) {
+            return;
+        }
+        const citation = anchor.dataset.citation;
+        if (!citation) {
+            return;
+        }
+        event.preventDefault();
+        history.replaceState(null, "", anchor.getAttribute("href"));
+        const done = () => {
+            anchor.classList.add("copied");
+            setTimeout(() => anchor.classList.remove("copied"), 1400);
+        };
+        const failed = () => {
+            anchor.title = "Copy failed. Copy the citation from the link title: " + citation;
+        };
+        if (navigator.clipboard?.writeText) {
+            navigator.clipboard.writeText(citation).then(done, failed);
+        } else {
+            failed();
+        }
+    });
+
+    // Exposed for a future settings control; usable from the console
+    // meanwhile. Persisted per reader, per origin.
+    window.trailToggleCitations = () => {
+        const hidden = body.classList.toggle("citations-hidden");
+        try {
+            localStorage.setItem(KEY, hidden ? "1" : "0");
+        } catch {
+            // Storage can be unavailable; keep this page's default or in-memory state.
+        }
+        return hidden;
+    };
+})();
+</script>
+</body>
+</html>

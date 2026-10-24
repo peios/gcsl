@@ -1209,7 +1209,9 @@
 //! is "a def-type takes the name as a `String` and then the definition as a
 //! function, as in `def package(name: String, func: fn(): T)`", the
 //! def-type's own name in place of `package`, at its parameters
-//! (`Checker::check_def_type_signature`). It is still an ordinary `def`,
+//! (`Checker::check_def_type_signature`), noting the shape of a def-type
+//! whose definitions are made with a variant (see [Variant
+//! def-types](#variant-def-types)). It is still an ordinary `def`,
 //! called as any is.
 //!
 //! **Definitions.** `def DT PATH(PARAMS) BODY` ([`ItemKind::DefTypeDef`])
@@ -1279,6 +1281,50 @@
 //! function value, of no known callee: calling one of an impure def-type
 //! from a pure function is the purity error. A record read whole through
 //! an import holds no namespace (`Checker::imported_record`).
+//!
+//! # Variant def-types
+//!
+//! A def-type whose second parameter is a variant of an enum, of type
+//! `Variant<E, T>`, and whose third is the definition, makes its
+//! definitions with a variant ([`TypeTable::def_type_shape`]): `#[def_type]
+//! def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn():
+//! ToolchainDef<T>): Registered`. Its further parameters are its invocation
+//! parameters, as a def-type's after its second are. Such a def-type may be
+//! generic: a definition's variant binds its type parameters, so each must
+//! appear in the variant parameter's type, "type parameter `U` of a
+//! def-type must appear in its variant parameter's type"; a generic
+//! def-type of the other shape is "a generic def-type takes its
+//! definitions' variant after the name", both at its parameters
+//! (`Checker::check_generic_def_type`). Its `E` must be an enum, not a type
+//! parameter: the variant's name is looked up in it.
+//!
+//! A definition names its variant after its def-type, `def Toolchain::C
+//! gcc()`, and so does a reference, `Toolchain::C gcc`, and a meta,
+//! `defmeta Toolchain::C gcc`. Each variant has a namespace of its own (see
+//! [`crate::names`], "Namespace keys"), so `Toolchain::C gcc` and
+//! `Toolchain::Rust gcc` are two definitions, each shown with its
+//! variant. For every use (`Checker::use_signature`), the variant is the
+//! one of its name, of the enum `E`, that the input sees, found as a
+//! variant as a value is (see [Enums](#enums)), "no variant `Nope` of
+//! `Toolchain`" otherwise; its type, `Variant<E, P>` of its payload `P`,
+//! binds the def-type's type parameters ([`TypeTable::bind`]), and the
+//! def-type's signature is substituted with them: so the definition's
+//! function type is `fn(): ToolchainDef<P>`, its body checked against it,
+//! and a reference's type is the substituted signature's after its
+//! definition's. The variant's type must fit the variant parameter's,
+//! substituted: "the variant of a `Shape` definition is a `Variant<Tool,
+//! {cc: String}>`, not `Variant<Tool, {rustc: String}>`", at the variant's
+//! name. A variant written for a def-type of the other shape is
+//! "`package` takes no variant", at it; none written for one of this shape
+//! is "def-type `Toolchain` needs a variant: `def Toolchain::V name()`", at
+//! the def-type. Since a reference calls the def-type, its `DT` is read as
+//! a call's callee (`Checker::check_def_type_expr`): a generic def-type is
+//! no generic function read as a value. A reference's variant is recorded
+//! for lowering, which calls the def-type with the definition's path, the
+//! variant's tag, a constant, the definition and the invocation arguments.
+//! A def-type of this shape is not listed to be invoked by name (see
+//! [`crate::workspace`], "Def-types by name"): its definitions are reached
+//! by references alone.
 //!
 //! # Generics
 //!
@@ -3162,7 +3208,9 @@ use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::suggest;
-use crate::types::{AwaitKind, FnTy, GenericId, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest};
+use crate::types::{
+    AwaitKind, DefTypeShape, FnTy, GenericId, Laziness, Meta, TyId, TyKind, TypeTable, ValueTest,
+};
 use crate::value::{Quantity, ValueKind, int_to_float};
 use crate::workspace::{AttributeLookup, Context, Target};
 
@@ -4117,6 +4165,17 @@ pub struct VariantTag {
     pub of: Name,
     /// How it is shown, its enum's name and its own.
     pub shown: Box<str>,
+}
+
+/// What a def-type gives one of its uses (see [Def-types](#def-types),
+/// `Checker::use_signature`): the function type of its definitions, its
+/// signature, with what the use's variant binds bound, where its parameters
+/// are, and the use's variant, if its definitions are made with one.
+struct UseSignature {
+    definition: TyId,
+    sig: FnTy,
+    shape: DefTypeShape,
+    tag: Option<VariantTag>,
 }
 
 /// Where a method's name is declared, in the input checked (`None`) or
@@ -9646,11 +9705,13 @@ impl<'a> Checker<'a> {
     fn definition_type(&mut self, def: DefTypeId) -> TyId {
         let (errors, warnings) = (self.errors.len(), self.warnings.len());
         let dt = self.ast.def_type(def).dt;
-        let ty = self.check_expr(dt);
+        let ty = self.check_def_type_expr(dt);
+        let definition = self
+            .use_signature(def, ty)
+            .map_or(TyId::ERROR, |found| found.definition);
         self.errors.truncate(errors);
         self.warnings.truncate(warnings);
-        self.def_type_signature(ty)
-            .map_or(TyId::ERROR, |(function, _)| function)
+        definition
     }
 
     /// The type of the definition's meta `def`, before its body is checked:
@@ -9669,17 +9730,132 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The function type of the definitions a def-type of type `ty` makes,
-    /// its second parameter's, present, and its own signature, if it is the
-    /// type of a def-type: a function whose first parameter is a `String`
-    /// and whose second is a function, present or not (see
-    /// [Def-types](#def-types)).
-    fn def_type_signature(&self, ty: TyId) -> Option<(TyId, FnTy)> {
-        let sig = self.types.fn_sig(self.types.strip(ty))?.clone();
-        let (&(_, name), &(_, function)) = (sig.params.first()?, sig.params.get(1)?);
-        let function = self.types.strip(function);
-        (self.types.strip(name) == TyId::STRING && self.types.fn_sig(function).is_some())
-            .then_some((function, sig))
+    /// What the def-type of type `dt_ty` gives its use `def`, if it is the
+    /// type of a def-type ([`TypeTable::def_type_shape`]): the function type
+    /// of its definitions, present, and its signature, with the variant the
+    /// use names, if its definitions are made with one, and that variant's
+    /// payload binding its type parameters (see [Variant
+    /// def-types](#variant-def-types)). Reports, at the use, a variant
+    /// written for a def-type that takes none, "`package` takes no
+    /// variant", none written for one that does, "`Toolchain` needs a
+    /// variant", what [`Checker::find_variant`] does not find, and a variant
+    /// whose type is not its parameter's. `None` for what is reported, and
+    /// for a `dt_ty` that is no def-type's, which its declaration reports.
+    fn use_signature(&mut self, def: DefTypeId, dt_ty: TyId) -> Option<UseSignature> {
+        let shape = self.types.def_type_shape(dt_ty)?;
+        let sig = self.types.fn_sig(self.types.strip(dt_ty))?.clone();
+        let use_ = *self.ast.def_type(def);
+        let (shown, _) = self.ast.show_def_type(def);
+        let (sig, tag) = match (shape.variant, use_.variant) {
+            (None, None) if sig.generic.is_none() => (sig, None),
+            // A generic def-type that takes no variant is reported where it
+            // is declared.
+            (None, None) => return None,
+            (None, Some((_, at))) => {
+                let dt: Vec<&str> = self
+                    .ast
+                    .def_type_names(def)
+                    .into_iter()
+                    .map(|name| self.ast.names().get(name))
+                    .collect();
+                self.errors.push(
+                    Diagnostic::error(format!("`{}` takes no variant", dt.join(".")), at)
+                        .with_note(format!(
+                            "its definitions are written `def {} NAME()`",
+                            dt.join(".")
+                        )),
+                );
+                return None;
+            }
+            (Some(_), None) => {
+                self.errors.push(Diagnostic::error(
+                    format!("def-type `{shown}` needs a variant: `def {shown}::V name()`"),
+                    self.ast.get(use_.dt).span,
+                ));
+                return None;
+            }
+            (Some(at), Some((name, name_span))) => {
+                let (sig, tag) = self.variant_signature(&sig, at, (name, name_span), &shown)?;
+                (sig, Some(tag))
+            }
+        };
+        let &(_, definition) = sig.params.get(shape.function)?;
+        Some(UseSignature {
+            definition: self.types.strip(definition),
+            sig,
+            shape,
+            tag,
+        })
+    }
+
+    /// The signature `sig` of a def-type whose definitions are made with a
+    /// variant, shown `shown`, its parameter at `at` the variant's, for a
+    /// use that names the variant `name`, at `name_span`: the variant of the
+    /// enum of that parameter's type the input sees, and `sig` with the type
+    /// parameters it mentions bound by the variant's type, if the def-type
+    /// is generic. Reports, at the name, the variant not found and a variant
+    /// whose type is not the parameter's, "the variant of a `Shape`
+    /// definition is a `Variant<Tool, {cc: String}>`, not
+    /// `Variant<Tool, {rustc: String}>`".
+    fn variant_signature(
+        &mut self,
+        sig: &FnTy,
+        at: usize,
+        (name, name_span): (Name, Span),
+        shown: &str,
+    ) -> Option<(FnTy, VariantTag)> {
+        let &(_, param) = sig.params.get(at)?;
+        let TyKind::Variant { of, .. } = *self.types.kind(self.types.strip(param)) else {
+            return None;
+        };
+        let TyKind::Enum {
+            key,
+            name: enum_name,
+        } = *self.types.kind(of)
+        else {
+            return None;
+        };
+        let (payload, tag) = self.find_variant((key, enum_name), name, name_span)?;
+        let given = self.types.variant(of, payload);
+        let sig = match sig.generic {
+            None => sig.clone(),
+            Some(generic) => {
+                let mut bound = vec![None; self.types.generic_names(generic).len()];
+                self.types.bind(param, given, generic, &mut bound);
+                // Each is bound: the def-type's declaration says so.
+                let bindings: Option<Vec<TyId>> = bound.into_iter().collect();
+                let bindings = bindings?;
+                let params = sig
+                    .params
+                    .iter()
+                    .map(|&(name, param)| (name, self.types.substitute(param, generic, &bindings)))
+                    .collect();
+                let ret = self.types.substitute(sig.ret, generic, &bindings);
+                let meta = sig.meta.map(|meta| Meta {
+                    ty: self.types.substitute(meta.ty, generic, &bindings),
+                    ..meta
+                });
+                FnTy {
+                    params,
+                    ret,
+                    effect: sig.effect,
+                    meta,
+                    generic: None,
+                }
+            }
+        };
+        let &(_, wanted) = sig.params.get(at)?;
+        if !self.types.is_subtype(given, wanted) {
+            let shown_variant = self.in_message(given);
+            let wanted = self.in_message(wanted);
+            let dt = shown.rsplit_once("::").map_or(shown, |(dt, _)| dt);
+            self.errors.push(Diagnostic::error(
+                format!("the variant of a `{dt}` definition is a {wanted}, not {shown_variant}"),
+                name_span,
+            ));
+            return None;
+        }
+        Some((sig, tag))
     }
 
     /// Whether `name` is the root of a top-level field of the input all of
@@ -11013,7 +11189,7 @@ impl<'a> Checker<'a> {
     fn place_definition(&mut self, id: ItemId, def: DefTypeId, value: ExprId) {
         let Some(segments) = self.definition_path(def) else {
             let dt = self.ast.def_type(def).dt;
-            if self.check_expr(dt) != TyId::ERROR {
+            if self.check_def_type_expr(dt) != TyId::ERROR {
                 self.not_a_def_type(def);
             }
             return;
@@ -11090,7 +11266,7 @@ impl<'a> Checker<'a> {
         let decl = *self.ast.fn_decl(function);
         let use_ = *self.ast.def_type(def);
         let errors = self.errors.len();
-        let dt_ty = self.check_expr(use_.dt);
+        let dt_ty = self.check_def_type_expr(use_.dt);
         // A shadowed definition needs nothing, so its def-type, read where
         // its file does not otherwise need the def-type's, may not be had:
         // then it is not checked, its types being the def-type's to give
@@ -11099,9 +11275,9 @@ impl<'a> Checker<'a> {
             self.errors.truncate(errors);
             return TyId::ERROR;
         }
-        let signature = self.def_type_signature(dt_ty).and_then(|(ty, _)| {
-            let sig = self.types.fn_sig(ty)?.clone();
-            Some((ty, sig))
+        let signature = self.use_signature(def, dt_ty).and_then(|found| {
+            let sig = self.types.fn_sig(found.definition)?.clone();
+            Some((found.definition, sig))
         });
         let Some((ty, sig)) = signature else {
             return TyId::ERROR;
@@ -11306,8 +11482,8 @@ impl<'a> Checker<'a> {
         self.callee_name = None;
         let decl = *self.ast.fn_decl(function);
         let use_ = *self.ast.def_type(def);
-        let dt_ty = self.check_expr(use_.dt);
-        let Some((definition, _)) = self.def_type_signature(dt_ty) else {
+        let dt_ty = self.check_def_type_expr(use_.dt);
+        let Some(UseSignature { definition, .. }) = self.use_signature(def, dt_ty) else {
             return TyId::ERROR;
         };
         let Some(meta) = self.types.fn_sig(definition).and_then(|sig| sig.meta) else {
@@ -11386,10 +11562,11 @@ impl<'a> Checker<'a> {
     /// `def package(name: String, func: fn(): T)`", at its parameters (see
     /// [Def-types](#def-types)).
     fn check_def_type_signature(&mut self, function: FnId, ty: TyId) {
-        if !self.def_type_fns.contains(&function)
-            || ty == TyId::ERROR
-            || self.def_type_signature(ty).is_some()
-        {
+        if !self.def_type_fns.contains(&function) || ty == TyId::ERROR {
+            return;
+        }
+        if let Some(shape) = self.types.def_type_shape(ty) {
+            self.check_generic_def_type(function, ty, shape);
             return;
         }
         let decl = *self.ast.fn_decl(function);
@@ -11411,13 +11588,74 @@ impl<'a> Checker<'a> {
                 _ => None,
             })
             .unwrap_or_default();
-        self.errors.push(Diagnostic::error(
-            format!(
-                "a def-type takes the name as a `String` and then the definition as a \
-                 function, as in `def {name}(name: String, func: fn(): T)`"
+        self.errors.push(
+            Diagnostic::error(
+                format!(
+                    "a def-type takes the name as a `String` and then the definition as a \
+                     function, as in `def {name}(name: String, func: fn(): T)`"
+                ),
+                at,
+            )
+            .with_note(
+                "or, for definitions made with a variant, the name, the variant and the \
+                 definition, as in `def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, \
+                 func: fn(): T)`",
             ),
-            at,
-        ));
+        );
+    }
+
+    /// Reports the def-type of function `function`, of type `ty`, whose
+    /// parameters are where `shape` says, if it is generic and its
+    /// definitions are made with no variant, "a generic def-type takes its
+    /// definitions' variant after the name", or a type parameter of it is
+    /// one its variant parameter's type does not mention, "type parameter
+    /// `U` of a def-type must appear in its variant parameter's type", at
+    /// its type parameters: a definition's variant binds them, and nothing
+    /// else (see [Variant def-types](#variant-def-types)).
+    fn check_generic_def_type(&mut self, function: FnId, ty: TyId, shape: DefTypeShape) {
+        let Some(sig) = self.types.fn_sig(self.types.strip(ty)).cloned() else {
+            return;
+        };
+        let Some(generic) = sig.generic else {
+            return;
+        };
+        let decl = *self.ast.fn_decl(function);
+        let params = self.ast.params(decl.params);
+        let at = match (params.first(), params.last()) {
+            (Some(first), Some(last)) => Span::join(first.span, last.span),
+            _ => self.ast.get(decl.body).span,
+        };
+        let Some(variant) = shape.variant.and_then(|at| sig.params.get(at)) else {
+            self.errors.push(Diagnostic::error(
+                "a generic def-type takes its definitions' variant after the name, as in `def \
+                 Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn(): T)`",
+                at,
+            ));
+            return;
+        };
+        let (variant_name, variant_ty) = *variant;
+        let names = self.types.generic_names(generic).to_vec();
+        let mut bound = vec![None; names.len()];
+        self.types.bind(variant_ty, variant_ty, generic, &mut bound);
+        let kind = variant_name.map_or("kind", |name| self.ast.names().get(name));
+        for (&name, binding) in names.iter().zip(&bound) {
+            if binding.is_none() {
+                self.errors.push(
+                    Diagnostic::error(
+                        format!(
+                            "type parameter `{}` of a def-type must appear in its variant \
+                             parameter's type",
+                            self.ast.names().get(name)
+                        ),
+                        at,
+                    )
+                    .with_note(format!(
+                        "a definition's variant, given as `{kind}`, binds the def-type's type \
+                         parameters"
+                    )),
+                );
+            }
+        }
     }
 
     /// Types the def-type reference `id`, `DT PATH`, of `def` (see
@@ -11432,7 +11670,7 @@ impl<'a> Checker<'a> {
     fn check_def_type_ref(&mut self, id: ExprId, def: DefTypeId) -> TyId {
         let use_ = *self.ast.def_type(def);
         let errors = self.errors.len();
-        let dt_ty = self.check_expr(use_.dt);
+        let dt_ty = self.check_def_type_expr(use_.dt);
         if dt_ty == TyId::ERROR {
             // Two names in a row, the first undefined, may have meant
             // something else.
@@ -11457,9 +11695,19 @@ impl<'a> Checker<'a> {
         }
         // What is wrong with a def-type's own parameters is reported where
         // it is declared.
-        let Some((definition, sig)) = self.def_type_signature(dt_ty) else {
+        let Some(UseSignature {
+            definition,
+            sig,
+            shape,
+            tag,
+        }) = self.use_signature(def, dt_ty)
+        else {
             return TyId::ERROR;
         };
+        // The variant the def-type is called with, a constant.
+        if let Some(tag) = tag {
+            self.lowering.variants.insert(id, tag);
+        }
         // The meta the def-type declares for its definitions, which a
         // reference carries, and which a path past its definition reads.
         let meta = self.types.fn_sig(definition).and_then(|f| f.meta);
@@ -11506,7 +11754,11 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         }
         let ty = self.types.fn_type_with_meta(
-            sig.params.get(2..).unwrap_or_default().iter().copied(),
+            sig.params
+                .get(shape.invocation()..)
+                .unwrap_or_default()
+                .iter()
+                .copied(),
             sig.ret,
             sig.effect,
             meta,
@@ -14964,6 +15216,17 @@ impl<'a> Checker<'a> {
         ty
     }
 
+    /// Types `dt`, the def-type of a definition, a reference or a meta, as
+    /// the callee it is: a reference calls it, so a generic def-type is read
+    /// as a generic function called (see [Variant
+    /// def-types](#variant-def-types)).
+    fn check_def_type_expr(&mut self, dt: ExprId) -> TyId {
+        let outer = self.calls.callee.replace(dt);
+        let ty = self.check_expr(dt);
+        self.calls.callee = outer;
+        ty
+    }
+
     /// `ty`, the type of `id`, unless it is a generic function's and `id`, a
     /// name or a field access, is no call's callee: "a generic function must
     /// be called", and `Error` (see [Generics](#generics)).
@@ -16855,7 +17118,6 @@ impl<'a> Checker<'a> {
         if enum_ty == TyId::ERROR {
             return TyId::ERROR;
         }
-        let names = self.ast.names();
         let TyKind::Enum {
             key,
             name: enum_name,
@@ -16868,6 +17130,27 @@ impl<'a> Checker<'a> {
             ));
             return TyId::ERROR;
         };
+        let Some((payload, tag)) = self.find_variant((key, enum_name), name, name_span) else {
+            return TyId::ERROR;
+        };
+        self.lowering.variants.insert(id, tag);
+        self.types.variant(enum_ty, payload)
+    }
+
+    /// The payload and the tag of the variant `name` of the enum of key
+    /// `key` and name `enum_name` that the input sees, the one there is (see
+    /// [Enums](#enums)); `None` (reported at `name_span`) if it sees none,
+    /// "no variant `C` of `Toolchain`", noting those it sees, or several,
+    /// "variant `Toolchain::C` is declared in two files", labelled at each,
+    /// and (quietly) if the variant is in error, which is reported where it
+    /// is declared.
+    fn find_variant(
+        &mut self,
+        (key, enum_name): (Name, Name),
+        name: Name,
+        name_span: Span,
+    ) -> Option<(TyId, VariantTag)> {
+        let names = self.ast.names();
         let shown = format!("{}::{}", names.get(enum_name), names.get(name));
         let found = self
             .workspace
@@ -16902,7 +17185,7 @@ impl<'a> Checker<'a> {
                     )
                     .with_note(note),
                 );
-                TyId::ERROR
+                None
             }
             [one] => {
                 let payload = self.types.variant_payload(one.key).unwrap_or(TyId::ERROR);
@@ -16910,15 +17193,14 @@ impl<'a> Checker<'a> {
                 // check fails quietly.
                 if payload == TyId::ERROR {
                     self.quiet.failed = true;
-                    return TyId::ERROR;
+                    return None;
                 }
                 let tag = VariantTag {
                     key: one.key,
                     of: key,
                     shown: shown.into(),
                 };
-                self.lowering.variants.insert(id, tag);
-                self.types.variant(enum_ty, payload)
+                Some((payload, tag))
             }
             several => {
                 let mut error = Diagnostic::error(
@@ -16934,7 +17216,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.errors.push(error);
-                TyId::ERROR
+                None
             }
         }
     }

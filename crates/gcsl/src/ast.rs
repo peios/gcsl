@@ -492,6 +492,11 @@ pub struct DefTypeUse {
     /// is, which is not among the expressions of the item or the reference
     /// it belongs to but before them in the arena.
     pub dt: ExprId,
+    /// The variant written after DT, `::C` in `def Toolchain::C gcc()`, by
+    /// its name and the name's span, for a def-type whose definitions are
+    /// made with a variant (see the checker's "Def-types"); `None` if none
+    /// is written.
+    pub variant: Option<(Name, Span)>,
     /// The definition's path, `PATH`, as it is written: identifiers, or
     /// names with `+` in them, `gmp-c++`, or, after the first, starting with
     /// a digit, `24` or `24rc1`, each one name (see the parser's
@@ -4241,9 +4246,10 @@ impl Ast {
         names
     }
 
-    /// The def-type, `DT`, of the definition or reference `id`, and its
-    /// path, `PATH`, each as it is written, as in `t.package` and
-    /// `dev.peios.testpkg` ([`Ast::show_definition_path`]).
+    /// The def-type, `DT`, of the definition or reference `id`, with its
+    /// variant if one is written, and its path, `PATH`, each as it is
+    /// written, as in `t.package`, `Toolchain::C` and `dev.peios.testpkg`
+    /// ([`Ast::show_definition_path`]).
     #[must_use]
     pub fn show_def_type(&self, id: DefTypeId) -> (String, String) {
         let names: Vec<&str> = self
@@ -4251,10 +4257,15 @@ impl Ast {
             .into_iter()
             .map(|name| self.names.get(name))
             .collect();
+        let mut shown = names.join(".");
+        if let Some((variant, _)) = self.def_type(id).variant {
+            shown.push_str("::");
+            shown.push_str(self.names.get(variant));
+        }
         let path = self
             .show_definition_path(self.path(self.def_type(id).path))
             .to_string();
-        (names.join("."), path)
+        (shown, path)
     }
 
     /// Gives the def-type definition, reference or meta `id` `key`, the key

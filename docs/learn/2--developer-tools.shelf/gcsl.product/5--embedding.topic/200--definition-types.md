@@ -30,6 +30,35 @@ does. Definitions live in the definition type's namespace, separate from
 ordinary values of the same path. Their public paths merge through
 workspace directories and imports like other public declarations.
 
+## Definitions made with a variant
+
+A definition type can take a variant of an [enum](~gcsl/records-and-types)
+after the name, and the definition after that. Each definition then
+names a variant, and each variant has its own definitions. When the
+definition type is generic, the variant's payload type fills in its type
+parameter, so each definition's body is checked against its own
+variant's payload:
+
+```gcsl
+enum Tool extensible<{*: String}>
+enum Tool::C<{cc: String}>
+enum Tool::Rust<{rustc: String}>
+#[def_type]
+def Tool<T>(name: String, kind: Variant<Tool, T>, body: fn(): T): Tool {
+    kind(body())
+}
+def Tool::C gcc() { cc = "gcc" }
+def Tool::Rust gcc() { rustc = "rustc" }
+c = Tool::C gcc()
+rust = Tool::Rust gcc()
+```
+
+`Tool::C gcc` and `Tool::Rust gcc` are separate definitions. A reference
+names the variant in the same way as the definition, and the definition
+type receives the variant as its `kind` argument. Hosts don't invoke these
+definitions by name: programs reach them through references, for example
+in a list of registered toolchains.
+
 ## Metadata
 
 Function types can carry metadata with `META:`, `META->`, or `META->>`.

@@ -388,7 +388,7 @@ impl<'s> Tokens<'s> {
             }
             // A name, then on its line another: a def-type reference.
             TokenKind::Ident(_) => Place::Definition {
-                def_type: (self.word(previous).to_owned(), self.span(previous)),
+                def_type: self.def_type_at(previous),
                 prefix: Vec::new(),
             },
             TokenKind::LParen | TokenKind::Comma if self.declares_parameters(previous) => {
@@ -478,7 +478,7 @@ impl<'s> Tokens<'s> {
         match before {
             Some(before) if self.is_type_place(before) => Place::QualifiedType(chain),
             Some(before) if self.is_ident(before) => Place::Definition {
-                def_type: (self.word(before).to_owned(), self.span(before)),
+                def_type: self.def_type_at(before),
                 prefix: chain,
             },
             _ => Place::Member {
@@ -486,6 +486,22 @@ impl<'s> Tokens<'s> {
                 chain: Some(chain),
             },
         }
+    }
+
+    /// The def-type written ending at token number `at`, a name: `package`,
+    /// or with the def-type's name and `::` before it, a variant,
+    /// `Toolchain::C`; with where it is written.
+    fn def_type_at(&self, at: usize) -> (String, Span) {
+        let word = self.word(at);
+        if let Some(colons) = at.checked_sub(1)
+            && self.kind(colons) == TokenKind::ColonColon
+            && let Some(dt) = colons.checked_sub(1)
+            && self.is_ident(dt)
+        {
+            let span = Span::join(self.span(dt), self.span(at));
+            return (format!("{}::{word}", self.word(dt)), span);
+        }
+        (word.to_owned(), self.span(at))
     }
 
     /// Whether a type is written after token number `at`: after a `:`, a
@@ -1337,10 +1353,35 @@ impl Index {
     }
 
     /// The key of the namespace of the def-type named as `def_type` is,
-    /// written where it is, in file `file`: of a reference to or a
-    /// definition made with it in the file, or else in any file, the
-    /// def-type it names resolving to what the name does here.
+    /// written where it is, in file `file`, with its variant if it names
+    /// one, `Toolchain::C`: of a reference to or a definition made with it
+    /// in the file, or else in any file, the def-type it names resolving to
+    /// what the name does here.
     fn namespace_key(&self, file: u32, (text, _): &(String, Span)) -> Option<Name> {
+        let (dt, variant) = match text.split_once("::") {
+            Some((dt, variant)) => (dt, Some(variant)),
+            None => (text.as_str(), None),
+        };
+        let key = self.def_type_key(file, dt)?;
+        // The key of the namespace of the variant named, or of none, from
+        // the key of any of the def-type's.
+        let key = self.scan.names.get(key);
+        let path = names::key_def_type(key)?;
+        let (number, item) = names::key_numbers(key)?;
+        let base = path.split_once("::").map_or(path, |(base, _)| base);
+        let wanted = match variant {
+            Some(variant) => format!("{base}::{variant}"),
+            None => base.to_owned(),
+        };
+        self.scan
+            .names
+            .lookup(&names::namespace_key(&wanted, number, item))
+    }
+
+    /// The key of a namespace of the def-type named `text`, written in file
+    /// `file`, as the namespace's key is found, of its definitions
+    /// made with a variant or not.
+    fn def_type_key(&self, file: u32, text: &str) -> Option<Name> {
         let name = self.scan.names.lookup(text)?;
         let entry = self.scan.files.get(file as usize)?;
         let named = |ast: &Ast, dt| matches!(ast.get(dt).kind, ExprKind::Name(n) if n == name);
@@ -1890,6 +1931,19 @@ mod tests {
             ("workspace.gcsl", workspace),
         ];
         assert_eq!(labels(&complete(&files, "app.gcsl")), ["dev"]);
+        // A variant's definitions, apart from another's.
+        let workspace = "enum Tool extensible\nenum Tool::C<Int>\nenum Tool::D<Int>\n\
+                         #[def_type]\ndef Tool<T>(name: String, kind: Variant<Tool, T>, func: \
+                         fn(): T): T { func() }\n";
+        let files = [
+            ("app.gcsl", "r = Tool::C |\n"),
+            (
+                "pkg.gcsl",
+                "def Tool::C gcc() { 1 }\ndef Tool::D other() { 2 }\n",
+            ),
+            ("workspace.gcsl", workspace),
+        ];
+        assert_eq!(labels(&complete(&files, "app.gcsl")), ["gcc"]);
     }
 
     #[test]

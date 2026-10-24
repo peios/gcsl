@@ -246,6 +246,9 @@ It is not valid on a REPL input.
 Mark a top-level def as a definition type.
 Its first parameter is String and its second is the function type of definitions it accepts.
 Additional parameters are invocation arguments.
+Alternatively its second parameter is Variant<E, T> and its third the function type: each definition then names a variant of E, def DT::V PATH(), and so does each reference, DT::V PATH.
+The variant's payload binds T, and each variant has its own definitions.
+Such a definition type may be generic, and is not invoked by name.
 .TP
 .B #[attribute]
 Mark a top-level type as an attribute whose arguments are that record type.

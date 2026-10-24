@@ -7166,3 +7166,45 @@ fn enum_items_and_variants_parse() {
         assert_eq!(error(text).0, message, "{text}");
     }
 }
+
+#[test]
+fn definitions_and_references_made_with_a_variant_parse() {
+    assert_eq!(
+        shape("def Toolchain::C gcc() { 1 }"),
+        "def Toolchain::C gcc() {1}"
+    );
+    assert_eq!(
+        shape("def t.Toolchain::C dev.gcc(x) { x }"),
+        "def t.Toolchain::C dev.gcc(x) {x}"
+    );
+    assert_eq!(shape("r = Toolchain::C gcc()"), "r = (Toolchain::C gcc)()");
+    assert_eq!(
+        shape("r = t.Toolchain::C gcc.meta"),
+        "r = (t.Toolchain::C gcc.meta)"
+    );
+    assert_eq!(
+        shape("defmeta Toolchain::C gcc = 1"),
+        "defmeta Toolchain::C gcc {= 1}"
+    );
+    // A variant followed by no name on its line is a variant as a value.
+    assert_eq!(
+        shape("r = Toolchain::C\ngcc = 1"),
+        "r = Toolchain::C; gcc = 1"
+    );
+    for (text, message) in [
+        (
+            "def Toolchain::C() { 1 }",
+            "expected the definition's path after `Toolchain::C`, found `(`",
+        ),
+        (
+            "def Toolchain::(x) { 1 }",
+            "expected the variant's name after `::`, found `(`",
+        ),
+        (
+            "def Toolchain::C gcc(x: Int) { 1 }",
+            "the parameter types of a `Toolchain::C` definition come from `Toolchain::C`",
+        ),
+    ] {
+        assert_eq!(error(text).0, message, "{text}");
+    }
+}

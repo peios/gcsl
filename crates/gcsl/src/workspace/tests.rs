@@ -7622,7 +7622,10 @@ fn def_type_errors() {
         check_errors(&files).join("\n")
     };
     let signature = "a def-type takes the name as a `String` and then the definition as a \
-                         function, as in `def bad(name: String, func: fn(): T)` at app.gcsl";
+                         function, as in `def bad(name: String, func: fn(): T)` at app.gcsl; \
+                     note: or, for definitions made with a variant, the name, the variant and \
+                     the definition, as in `def Toolchain<T>(name: String, kind: \
+                     Variant<Toolchain, T>, func: fn(): T)`";
     assert_eq!(
         errors("#[def_type]\ndef bad(name: Int, f: fn(): Int): Int { 1 }"),
         signature
@@ -12181,4 +12184,96 @@ fn values_of_enums_are_made_compared_tested_and_unwrapped() {
     let main = workspace.file("app/main.gcsl").unwrap();
     let error = workspace.run(main).unwrap_err().remove(0);
     assert_eq!(error.message, "the value is `T::B`, not `T::A`");
+}
+
+/// An enum of toolchains and a generic def-type whose definitions are made
+/// with its variants, as a workspace's root declares them.
+const TOOLCHAIN: (&str, &str) = (
+    "workspace.gcsl",
+    "enum Toolchain extensible<{*: String}>\n\
+     enum Toolchain::C<{cc: String}>\n\
+     enum Toolchain::Rust<{rustc: String}>\n\
+     type Def<T> = {arch: String, provides: T}\n\
+     type Registered = {arch: String, provides: Toolchain}\n\
+     #[def_type]\n\
+     def Toolchain<T>(name: String, kind: Variant<Toolchain, T>, f: fn(): Def<T>): Registered {\n\
+     \x20   let d = f()\n\
+     \x20   arch = d.arch\n\
+     \x20   provides = kind(d.provides)\n\
+     }",
+);
+
+#[test]
+fn a_definition_made_with_a_variant_binds_its_def_type_s_type_parameters() {
+    let files = [
+        TOOLCHAIN,
+        (
+            "tools.gcsl",
+            "def Toolchain::C gcc() {\n    arch = \"x86_64\"\n    provides = { cc = \"gcc\" }\n}\n\
+             def Toolchain::Rust gcc() {\n    arch = \"aarch64\"\n    provides = { rustc = \"rustc\" }\n}",
+        ),
+        (
+            "app/main.gcsl",
+            "import Toolchain from workspace\nimport workspace as w\n\
+             let c = Toolchain::C gcc()\nlet rust = w.Toolchain::Rust gcc()\n\
+             cc = Toolchain::C.payload(c.provides).cc\nrustc = Toolchain::Rust.payload(rust.provides).rustc\n\
+             arches = [c.arch, rust.arch]",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{cc = \"gcc\"; rustc = \"rustc\"; arches = [\"x86_64\", \"aarch64\"]}"
+    );
+    // Not listed to be invoked by name: its definitions are reached by
+    // references alone.
+    let workspace = rooted(&files).unwrap();
+    assert!(workspace.def_types().unwrap().is_empty());
+}
+
+#[test]
+fn variant_def_type_errors() {
+    let errors = |text: &str| {
+        let files = [TOOLCHAIN, ("app.gcsl", text)];
+        check_errors(&files).join("\n")
+    };
+    for (text, message) in [
+        (
+            "def Toolchain::C x() {\n    arch = \"a\"\n    provides = { cc = 1 }\n}",
+            "mismatched types",
+        ),
+        (
+            "def Toolchain x() { 1 }",
+            "def-type `Toolchain` needs a variant: `def Toolchain::V name()`",
+        ),
+        (
+            "def Toolchain::Nope x() { 1 }",
+            "no variant `Nope` of `Toolchain`",
+        ),
+        (
+            "r = Toolchain::C nope()",
+            "`Toolchain::C` has no definition `nope`",
+        ),
+        (
+            "#[def_type]\ndef pk(name: String, f: fn(): Int): Int { f() }\ndef pk::C x() { 1 }",
+            "`pk` takes no variant",
+        ),
+        (
+            "#[def_type]\ndef g<T>(name: String, f: fn(): T): Int { 1 }",
+            "a generic def-type takes its definitions' variant after the name, as in `def \
+             Toolchain<T>(name: String, kind: Variant<Toolchain, T>, func: fn(): T)`",
+        ),
+        (
+            "#[def_type]\ndef g<T, U>(name: String, kind: Variant<Toolchain, T>, f: fn(): U): Int { 1 }",
+            "type parameter `U` of a def-type must appear in its variant parameter's type",
+        ),
+        (
+            "#[def_type]\ndef s(name: String, kind: Variant<Toolchain, {cc: String}>, f: fn(): Int): \
+             Int { f() }\ndef s::Rust x() { 1 }",
+            "the variant of a `s` definition is a `Variant<Toolchain, {cc: String}>`, not \
+             `Variant<Toolchain, {rustc: String}>`",
+        ),
+    ] {
+        let found = errors(text);
+        assert!(found.starts_with(message), "{text}: {found}");
+    }
 }

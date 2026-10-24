@@ -596,6 +596,8 @@
 //! written in any source, and nothing of it changes what a file, a run or a
 //! dump does. [`Workspace::def_types`] lists every `def` marked
 //! `#[def_type]` of the workspace's own files (not the standard files'),
+//! but one whose definitions are made with a variant (see the checker's
+//! "Variant def-types"), which are reached by references alone,
 //! each by its path as declared ([`DefType`]), with the names of its
 //! invocation parameters, as it declares them, and which of them are
 //! optional, having a default (`version: String = ""`), and every definition made
@@ -3167,9 +3169,18 @@ fn name_namespaces(scan: &mut Scan) -> bool {
         let scope = FileScope::new(scan, file);
         for (id, def) in unknown {
             let names = file.ast.def_type_names(id);
-            let Some(key) = def_type_key(scan, index, &scope, &names) else {
+            let Some(mut key) = def_type_key(scan, index, &scope, &names) else {
                 continue;
             };
+            // A use with a variant, `Toolchain::C gcc`, is of the variant's
+            // own namespace.
+            if let Some((variant, _)) = def.variant {
+                let Some(variant_key) = names::variant_namespace_key(&key, scan.names.get(variant))
+                else {
+                    continue;
+                };
+                key = variant_key;
+            }
             // A definition's and a meta's leaf in the namespace of the metas
             // of the def-type's definitions in its directory.
             let meta = match def.role {
@@ -7035,13 +7046,19 @@ impl<'a> Context<'a> {
         let ExprKind::Fn(function) = ast.get(value).kind else {
             return None;
         };
-        let param = ast.params(ast.fn_decl(function).params).get(1)?;
-        let TypeExprKind::Fn {
-            meta: Some(meta), ..
-        } = ast.written_type(param.ty)
-        else {
-            return None;
-        };
+        // The definition's parameter, the second, or the third after a
+        // variant's.
+        let meta = ast
+            .params(ast.fn_decl(function).params)
+            .iter()
+            .skip(1)
+            .take(2)
+            .find_map(|param| match ast.written_type(param.ty) {
+                TypeExprKind::Fn {
+                    meta: Some(meta), ..
+                } => Some(meta),
+                _ => None,
+            })?;
         Some(format!(
             "{} {}",
             meta.effect.meta_marker(),
@@ -9427,6 +9444,15 @@ impl Workspace {
                         function: true,
                         ..
                     } if ast.is_def_type(item) => {
+                        // One whose definitions are made with a variant is
+                        // none: they are reached by references alone.
+                        let variant = self
+                            .leaf_cell(index, item)
+                            .and_then(|(_, ty)| self.types.def_type_shape(ty))
+                            .is_some_and(|shape| shape.variant.is_some());
+                        if variant {
+                            continue;
+                        }
                         let segments = ast.path(path);
                         let path = text(segments);
                         let number = u32::try_from(item.index()).unwrap_or(u32::MAX);

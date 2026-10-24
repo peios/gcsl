@@ -453,7 +453,7 @@ use crate::source::Span;
 /// The capture of the closure of a def-type reference that holds the
 /// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
 pub(crate) const REFERENCE_DEFINITION: u32 = 1;
-use crate::types::{Laziness, TyId, TypeTable, ValueTest};
+use crate::types::{FnTy, Laziness, TyId, TypeTable, ValueTest};
 use crate::value::{Layout, Quantity, ValueKind, int_to_float};
 use std::time::Duration;
 
@@ -2469,14 +2469,70 @@ impl Lowerer<'_> {
     /// own, made here, past the tree's ([`FnId::lowered`]), which captures
     /// the def-type and the definition, read where the reference is, and
     /// whose body, run with its parameters, those of the def-type after its
-    /// second, sets its helper flag, so that the def-type is called with the
-    /// caller the closure is called with, and calls the def-type with the
-    /// definition's path, as written, the definition and its own
-    /// parameters, in order: so a closure is made each time the reference
+    /// definition's, sets its helper flag, so that the def-type is called
+    /// with the caller the closure is called with, and calls the def-type
+    /// with the definition's path, as written, the variant the reference
+    /// names, a constant tag, if the def-type's definitions are made with
+    /// one, the definition and its own parameters, in order: so a closure is made each time the reference
     /// is evaluated. If the reference carries its definition's meta, the
     /// function's meta is recorded as its capture of the definition's
     /// ([`MetaAt::Capture`]). It is of kind `kind`, which can only be a
     /// function's.
+    /// The arguments with which the closure of the def-type reference `id`,
+    /// of def-type `dt`, its own signature `sig`, calls the def-type
+    /// ([`Lowerer::lower_def_type_ref`]): the definition's path, `name`, the
+    /// variant the reference names, a constant tag, if the def-type's
+    /// definitions are made with one, before the definition, `definition`,
+    /// as the def-type's parameters are placed, then the closure's own
+    /// parameters, the def-type's invocation parameters.
+    fn reference_args(
+        &mut self,
+        (id, dt): (ExprId, ExprId),
+        sig: &FnTy,
+        (name, definition): (IrId, IrId),
+    ) -> Result<IrRange, InternalError> {
+        let span = self.ast.get(id).span;
+        let mistyped = InternalError {
+            message: "a def-type reference without a def-type of a def-type's type",
+            span,
+        };
+        let shape = self
+            .table
+            .def_type_shape(self.expr_types.get(dt))
+            .ok_or(mistyped)?;
+        let variant = match shape.variant {
+            Some(_) => {
+                let tag = self.resolution.variant(id).ok_or(InternalError {
+                    message: "a def-type reference whose variant the check did not resolve",
+                    span,
+                })?;
+                let kind = IrKind::Tag {
+                    key: tag.key,
+                    of: tag.of,
+                    shown: self.builder.push_string(&tag.shown),
+                };
+                Some(self.builder.alloc(kind, span))
+            }
+            None => None,
+        };
+        let position = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
+        let base = self.item_stack.len();
+        self.push_arg(0, ArgValue::Node(name), span);
+        if let (Some(at), Some(tag)) = (shape.variant, variant) {
+            self.push_arg(position(at), ArgValue::Node(tag), span);
+        }
+        self.push_arg(position(shape.function), ArgValue::Node(definition), span);
+        let invocation = position(shape.invocation());
+        for (at, &(_, ty)) in (0u32..).zip(sig.params.iter()) {
+            let kind = self.table.value_kind(ty).ok_or(mistyped)?;
+            let value = self.builder.alloc(IrKind::Load(Slot::at(at), kind), span);
+            self.push_arg(at.saturating_add(invocation), ArgValue::Node(value), span);
+        }
+        let args = self.builder.push_item_list(&self.item_stack[base..]);
+        self.item_stack.truncate(base);
+        Ok(args)
+    }
+
     fn lower_def_type_ref(
         &mut self,
         id: ExprId,
@@ -2519,17 +2575,7 @@ impl Lowerer<'_> {
             IrKind::LoadCapture(REFERENCE_DEFINITION, ValueKind::Fn),
             span,
         );
-        let base = self.item_stack.len();
-        for (param, value) in [(0, name), (1, definition)] {
-            self.push_arg(param, ArgValue::Node(value), span);
-        }
-        for (at, &(_, ty)) in (0u32..).zip(sig.params.iter()) {
-            let kind = self.table.value_kind(ty).ok_or(mistyped)?;
-            let value = self.builder.alloc(IrKind::Load(Slot::at(at), kind), span);
-            self.push_arg(at.saturating_add(2), ArgValue::Node(value), span);
-        }
-        let args = self.builder.push_item_list(&self.item_stack[base..]);
-        self.item_stack.truncate(base);
+        let args = self.reference_args((id, def.dt), &sig, (name, definition))?;
         let kind = self.table.value_kind(sig.ret).ok_or(mistyped)?;
         let call = self.builder.alloc(
             IrKind::Call {

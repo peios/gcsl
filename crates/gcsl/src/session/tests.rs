@@ -1828,3 +1828,21 @@ fn enums_and_variants_persist_for_later_inputs() {
     assert_eq!(value(&mut session, "enum Shape::A<Int>"), Value::Empty);
     assert_eq!(value(&mut session, "Shape::A(1) == a"), Value::Bool(false));
 }
+
+#[test]
+fn definitions_made_with_a_variant_persist_for_later_inputs() {
+    let mut session = Session::new();
+    for input in [
+        "enum K extensible",
+        "enum K::A<Int>",
+        "#[def_type] def K<T>(name: String, kind: Variant<K, T>, f: fn(): T): T { f() }",
+        "def K::A x() { 1 }",
+    ] {
+        value(&mut session, input);
+    }
+    assert_eq!(value(&mut session, "K::A x()"), Value::Int(1));
+    // A later input's definitions are its namespace, as a later input's
+    // fields of a root are, so `x` is no longer seen.
+    value(&mut session, "def K::A y() { 2 }");
+    assert_eq!(value(&mut session, "K::A y()"), Value::Int(2));
+}

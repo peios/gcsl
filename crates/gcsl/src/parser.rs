@@ -131,14 +131,24 @@
 //! reference calls one (see the checker's "Def-types"):
 //!
 //! ```text
-//! DEFINITION = "def" DT PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
-//! REFERENCE  = DT PATH
-//! META       = "defmeta" DT PATH (BLOCK | "=" EXPR)
+//! DEFINITION = "def" DT VARIANT? PATH "(" (NAME ("," NAME)* ","?)? ")" BLOCK
+//! REFERENCE  = DT VARIANT? PATH
+//! META       = "defmeta" DT VARIANT? PATH (BLOCK | "=" EXPR)
 //! DT         = IDENT ("." IDENT)*
+//! VARIANT    = "::" IDENT
 //! PATH       = SEGMENT ("." (SEGMENT | NUMBER))*
 //! SEGMENT    = IDENT | IDENT "+" ...      (the run glued to it, below)
 //! NUMBER     = INT ...  | FLOAT ...       (from a digit, below)
 //! ```
+//!
+//! VARIANT names the variant a definition is made with, for a def-type
+//! whose definitions are made with one (see the checker's "Variant
+//! def-types"): `def Toolchain::C gcc()`, `Toolchain::C gcc`
+//! (`Parser::parse_variant_def`, `Parser::parse_variant_ref`). In an
+//! expression, a variant as a value with a name on its line after it is a
+//! reference, as two names in a row are. A definition's variant with no
+//! path on its line after it is "expected the definition's path after
+//! `Toolchain::C`".
 //!
 //! A segment of PATH, and only of PATH, may have `+` in its name after its
 //! first character, as real packages' names do, `org.gnu.gmp-c++`, whose
@@ -2471,12 +2481,18 @@ impl Parser<'_> {
             kind: SegmentKind::Name(name),
             span: name_token.span,
         };
+        // `def Toolchain::C gcc`: a definition made with a variant.
+        if self.peek_at(2).kind == TokenKind::ColonColon {
+            self.advance();
+            self.advance();
+            return self.parse_variant_def(keyword, &[first]);
+        }
         // A name on its line after a name, `def package x`: the definition
         // of `x` made with the def-type `package`.
         if self.is_name_after(name_token.span, self.peek_at(2)) {
             self.advance();
             self.advance();
-            return self.parse_def_type_def(keyword, &[first]);
+            return self.parse_def_type_def(keyword, (&[first], None));
         }
         if !matches!(self.peek_at(2).kind, TokenKind::Dot | TokenKind::LBracket) {
             return self.parse_named_fn(keyword, (name, name_token.span));
@@ -2518,13 +2534,14 @@ impl Parser<'_> {
                     let (_, span) = self.parse_position()?;
                     return Err(self.error(DEF_PATH, span));
                 }
+                TokenKind::ColonColon => return self.parse_variant_def(keyword, &segments),
                 _ => break,
             }
         }
         if let Some(last) = segments.last()
             && self.is_name_after(last.span, self.peek())
         {
-            return self.parse_def_type_def(keyword, &segments);
+            return self.parse_def_type_def(keyword, (&segments, None));
         }
         let value = self.parse_fn(keyword)?;
         let base = self.path.len();
@@ -2739,6 +2756,53 @@ impl Parser<'_> {
         }
     }
 
+    /// Parses a definition made with a variant of a def-type, `def DT::V
+    /// PATH(PARAMS) BODY`, at the `::` after its def-type, `dt`, read, its
+    /// `def` `keyword` (see [Def-types](#def-types)): the variant, then the
+    /// definition as [`Parser::parse_def_type_def`] parses it. Anything but
+    /// a path on the variant's line after it is "expected the definition's
+    /// path after `Toolchain::C`".
+    fn parse_variant_def(
+        &mut self,
+        keyword: Token,
+        dt: &[PathSegment],
+    ) -> ParseResult<(ItemId, u32)> {
+        let variant = self.parse_def_type_variant()?;
+        if let Some((name, span)) = variant
+            && !self.is_name_after(span, self.peek())
+        {
+            let shown = format!("{}::{}", self.show_segments(dt), self.names.get(name));
+            let token = self.peek();
+            let found = self.describe(token);
+            return Err(self.error(
+                format!("expected the definition's path after `{shown}`, found {found}"),
+                error_span(token),
+            ));
+        }
+        self.parse_def_type_def(keyword, (dt, variant))
+    }
+
+    /// The variant written after a def-type, `::C` in `def Toolchain::C
+    /// gcc()`, by its name and the name's span, if the current token is
+    /// `::` (see [Def-types](#def-types)). Anything but a name after `::` is
+    /// "expected the variant's name after `::`".
+    fn parse_def_type_variant(&mut self) -> ParseResult<Option<(Name, Span)>> {
+        if self.peek().kind != TokenKind::ColonColon {
+            return Ok(None);
+        }
+        self.advance();
+        let token = self.peek();
+        let TokenKind::Ident(name) = token.kind else {
+            let found = self.describe(token);
+            return Err(self.error(
+                format!("expected the variant's name after `::`, found {found}"),
+                error_span(token),
+            ));
+        };
+        self.advance();
+        Ok(Some((name, token.span)))
+    }
+
     /// Parses a definition made with a def-type, `def DT PATH(PARAMS)
     /// BODY`, starting at its path, its `def`, `keyword`, and its def-type,
     /// `dt`, read (see [Def-types](#def-types)): the parameters by name
@@ -2750,9 +2814,12 @@ impl Parser<'_> {
     fn parse_def_type_def(
         &mut self,
         keyword: Token,
-        dt: &[PathSegment],
+        (dt, variant): (&[PathSegment], Option<(Name, Span)>),
     ) -> ParseResult<(ItemId, u32)> {
-        let shown = self.show_segments(dt);
+        let mut shown = self.show_segments(dt);
+        if let Some((name, _)) = variant {
+            shown = format!("{shown}::{}", self.names.get(name));
+        }
         let dt_expr = self.path_expr(dt)?;
         let segments = self.parse_def_type_path(false)?;
         // The read of its meta, outside its function's subtree as its `DT`'s
@@ -2812,6 +2879,7 @@ impl Parser<'_> {
         let def = self.builder.push_def_type(DefTypeUse {
             role: DefTypeRole::Definition,
             dt: dt_expr,
+            variant,
             path,
             read: None,
             key: None,
@@ -2919,7 +2987,11 @@ impl Parser<'_> {
     /// on its line (see [Def-types](#def-types)): the path, and the read of
     /// the definition, a name standing for the def-type's namespace until
     /// the workspace names it, with a field access for each segment.
-    fn parse_def_type_ref(&mut self, dt: ExprId) -> ParseResult<ExprId> {
+    fn parse_def_type_ref(
+        &mut self,
+        dt: ExprId,
+        variant: Option<(Name, Span)>,
+    ) -> ParseResult<ExprId> {
         let segments = self.parse_def_type_path(true)?;
         let base = self.path.len();
         self.path.extend(segments.iter().copied());
@@ -2941,6 +3013,7 @@ impl Parser<'_> {
         let def = self.builder.push_def_type(DefTypeUse {
             role: DefTypeRole::Reference,
             dt,
+            variant,
             path,
             read: Some(read),
             key: None,
@@ -2987,9 +3060,15 @@ impl Parser<'_> {
         if !self.is_name_after(keyword.span, self.peek_at(1)) {
             return false;
         }
-        // The def-type's path: identifiers joined by `.`.
+        // The def-type's path: identifiers joined by `.`, then perhaps `::`
+        // and a variant.
         let mut last = 1;
         while self.peek_at(last + 1).kind == TokenKind::Dot
+            && matches!(self.peek_at(last + 2).kind, TokenKind::Ident(_))
+        {
+            last += 2;
+        }
+        if self.peek_at(last + 1).kind == TokenKind::ColonColon
             && matches!(self.peek_at(last + 2).kind, TokenKind::Ident(_))
         {
             last += 2;
@@ -3024,6 +3103,7 @@ impl Parser<'_> {
             self.advance();
         }
         let dt_expr = self.path_expr(&dt)?;
+        let variant = self.parse_def_type_variant()?;
         let segments = self.parse_def_type_path(false)?;
         let token = self.peek();
         let body = match token.kind {
@@ -3079,6 +3159,7 @@ impl Parser<'_> {
         let def = self.builder.push_def_type(DefTypeUse {
             role: DefTypeRole::Meta,
             dt: dt_expr,
+            variant,
             path,
             read: None,
             key: None,
@@ -3539,9 +3620,51 @@ impl Parser<'_> {
         }
     }
 
+    /// Whether the tokens here, which [`Parser::starts_variant`] has found
+    /// to start `DT::V`, go on with a name on the variant's line: a
+    /// reference to a definition made with the variant, `Toolchain::C gcc`
+    /// (see [Def-types](#def-types)).
+    fn starts_variant_ref(&self) -> bool {
+        let mut at = 0;
+        while self.peek_at(at + 1).kind == TokenKind::Dot {
+            at += 2;
+        }
+        let variant = self.peek_at(at + 2);
+        matches!(variant.kind, TokenKind::Ident(_))
+            && self.is_name_after(variant.span, self.peek_at(at + 3))
+    }
+
+    /// Parses a reference to a definition made with a variant, `DT::V
+    /// PATH`, which [`Parser::starts_variant_ref`] has found here (see
+    /// [Def-types](#def-types)): its def-type, a name or a dotted path read
+    /// as a value, then the variant and the reference.
+    fn parse_variant_ref(&mut self) -> ParseResult<ExprId> {
+        let mut dt = Vec::new();
+        while let token = self.peek()
+            && let TokenKind::Ident(name) = token.kind
+        {
+            dt.push(PathSegment {
+                kind: SegmentKind::Name(name),
+                span: token.span,
+            });
+            self.advance();
+            if self.peek().kind != TokenKind::Dot {
+                break;
+            }
+            self.advance();
+        }
+        let dt_expr = self.path_expr(&dt)?;
+        let variant = self.parse_def_type_variant()?;
+        self.parse_def_type_ref(dt_expr, variant)
+    }
+
     /// Parses a variant as a value, `ENUM::NAME`, which
-    /// [`Parser::starts_variant`] has found here (see [Enums](#enums)).
+    /// [`Parser::starts_variant`] has found here (see [Enums](#enums)), or a
+    /// reference made with one, `ENUM::NAME PATH`.
     fn parse_variant_expr(&mut self) -> ParseResult<ExprId> {
+        if self.starts_variant_ref() {
+            return self.parse_variant_ref();
+        }
         let first = self.peek();
         let of = if self.peek_at(1).kind == TokenKind::Dot {
             self.parse_type_path()?.0
@@ -4868,7 +4991,7 @@ impl Parser<'_> {
                 if FIELD_BP < min_bp {
                     break;
                 }
-                lhs = self.parse_def_type_ref(lhs)?;
+                lhs = self.parse_def_type_ref(lhs, None)?;
                 continue;
             }
             let Some(op) = binary_op(token.kind) else {

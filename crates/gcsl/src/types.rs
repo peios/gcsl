@@ -595,6 +595,29 @@ impl RecordTy {
 /// The defaults of a record type's fields: see [`RecordExtras::defaults`].
 pub type Defaults = Box<[(Name, Constant)]>;
 
+/// Where a def-type's parameters are, by their positions (see the
+/// checker's "Def-types"): after the definition's path, the variant its
+/// definitions are made with, if they are, and then the definition; its
+/// invocation parameters after that ([`TypeTable::def_type_shape`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefTypeShape {
+    /// The position of the parameter of the variant, `Variant<E, T>` of an
+    /// enum, that a definition's header names, `def Toolchain::C gcc()`:
+    /// 1, if the def-type's definitions are made with a variant.
+    pub variant: Option<usize>,
+    /// The position of the parameter of the definition, a function.
+    pub function: usize,
+}
+
+impl DefTypeShape {
+    /// The position of the def-type's first invocation parameter, after
+    /// its definition's.
+    #[must_use]
+    pub const fn invocation(self) -> usize {
+        self.function + 1
+    }
+}
+
 /// The signature of a function type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FnTy {
@@ -1391,6 +1414,40 @@ impl TypeTable {
                 Some(element) => id = element,
                 None => return false,
             }
+        }
+    }
+
+    /// Where the parameters of a def-type of type `ty` are, if it is the
+    /// type of one (see the checker's "Def-types"): a function whose first
+    /// parameter is a `String` and whose second is the definition, a
+    /// function, present or not; or whose second is a variant of an enum,
+    /// `Variant<E, T>`, and third the definition. A variant is callable, so
+    /// it is taken for the variant first.
+    #[must_use]
+    pub fn def_type_shape(&self, ty: TyId) -> Option<DefTypeShape> {
+        let sig = self.fn_sig(self.strip(ty))?;
+        let &(_, name) = sig.params.first()?;
+        if self.strip(name) != TyId::STRING {
+            return None;
+        }
+        let function = |at: usize| {
+            sig.params.get(at).is_some_and(|&(_, param)| {
+                let param = self.strip(param);
+                !matches!(self.kind(param), TyKind::Variant { .. }) && self.fn_sig(param).is_some()
+            })
+        };
+        let &(_, second) = sig.params.get(1)?;
+        match *self.kind(self.strip(second)) {
+            TyKind::Variant { of, .. } => (matches!(self.kind(of), TyKind::Enum { .. })
+                && function(2))
+            .then_some(DefTypeShape {
+                variant: Some(1),
+                function: 2,
+            }),
+            _ => function(1).then_some(DefTypeShape {
+                variant: None,
+                function: 1,
+            }),
         }
     }
 

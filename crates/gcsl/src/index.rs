@@ -1142,9 +1142,9 @@ impl Index {
 
     /// The signature of the function expression `function` of file `file`,
     /// of type `ty`, declared with `keyword` and named `name`: `fn name(a:
-    /// Int): Int`, each parameter named as the source names it, laid out a
-    /// parameter per line if it is too wide for one. `None` if `ty` is no
-    /// function's type.
+    /// Int): Int`, or `fn name<T>(a: T): T` for a generic one, each
+    /// parameter named as the source names it, laid out a parameter per line
+    /// if it is too wide for one. `None` if `ty` is no function's type.
     fn signature_of(
         &self,
         file: u32,
@@ -1175,6 +1175,17 @@ impl Index {
             })
             .collect();
         let tail = self.sig_tail(sig);
+        let name = match sig.generic {
+            Some(generic) => {
+                let params: Vec<&str> = table
+                    .generic_names(generic)
+                    .iter()
+                    .map(|&param| self.scan.names.get(param))
+                    .collect();
+                format!("{name}<{}>", params.join(", "))
+            }
+            None => name.to_owned(),
+        };
         // A method's, its receiver before its name.
         let method = ast.methods().iter().any(|method| {
             matches!(ast.item(method.item).kind, ItemKind::Let { value, .. } if value == function)
