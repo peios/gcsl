@@ -590,3 +590,30 @@ fn a_sandbox_is_plain_data_a_step_s_body_passes_on() {
         (&original.root, &original.cwd, &original.env)
     );
 }
+
+#[test]
+fn a_step_s_unit_forgotten_runs_afresh_with_new_effects() {
+    let (mut workspace, file) =
+        lone_workspace("#[step] fn s() -> String { exec([\"echo\", \"x\"]).stdout }\n= s()");
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_graph(file, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    let step = graph.holes(&value)[0];
+    let inline = GraphHost {
+        defers: &|_: &[crate::check::Attribute]| false,
+        effects: &crate::eval::Direct { temp_dirs: None },
+    };
+    let Progress::Paused(first) = workspace.run_step(&mut graph, step, inline).unwrap() else {
+        panic!("not paused");
+    };
+    let failure = Diagnostic::error("echo crashed", Span::new(0, 0));
+    assert!(graph.resolve(first, Err(failure)));
+    assert!(workspace.run_step(&mut graph, step, inline).is_err());
+    // Retried afresh: a new effect, not the failed one.
+    graph.forget_unit(crate::eval::graph::STEP_UNITS + step.number());
+    let Progress::Paused(second) = workspace.run_step(&mut graph, step, inline).unwrap() else {
+        panic!("not paused");
+    };
+    assert_ne!(first, second);
+}

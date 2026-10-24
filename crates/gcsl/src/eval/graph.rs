@@ -292,6 +292,14 @@ impl Graph {
         true
     }
 
+    /// Forgets every node the unit `unit` met, by where it met it, so that
+    /// its next run makes each again, a new node: what a host does to run a
+    /// step's unit afresh, for a retry. The nodes stay, as they were, for
+    /// whatever already holds them.
+    pub fn forget_unit(&mut self, unit: u32) {
+        self.positions.retain(|&(met_in, _), _| met_in != unit);
+    }
+
     /// The nodes whose results `value` holds and that are waiting: its holes,
     /// in the order they are found, each once (see [Graph mode](#graph-mode)).
     #[must_use]
