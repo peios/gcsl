@@ -506,6 +506,24 @@
 //! having run first, and is of a known callee, its defaults given. A
 //! session keeps the standard files' for its inputs.
 //!
+//! # Enums
+//!
+//! An enum is a `type` declaration defined by no type expression (see the
+//! checker's [Enums](crate::check#enums)): its declaration in the store is
+//! a leaf, [`TypeExprKind::Enum`], of its key, a name of its name and of
+//! its file's path, or `input N` for a session's input (`Scan::origin`,
+//! [`names::enum_key`]), so it is seen, imported and qualified as any type
+//! is, and every use of it is the one nominal type. A variant binds no
+//! name: once the types are defined, each variant is found with its enum,
+//! by the declaration its file's view of types names by what it writes,
+//! and given a key of its own ([`DeclaredVariant`], `declare_variants`).
+//! Variants are seen as `def` methods are, by a flat view of each file
+//! ([`File::variant_view`]): the variants of the files it sees, its own
+//! included, and of a session's input, the earlier inputs' that it does not
+//! shadow, by its enum's key and its name. A variant is static data: a use
+//! of it is a constant, and makes its file need nothing. The bounds and
+//! payloads are resolved before any file is checked (`check_enum_items`).
+//!
 //! # Def-types
 //!
 //! A def-type, a `def` marked `#[def_type]`, has a *namespace*: the

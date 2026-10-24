@@ -157,6 +157,25 @@
 //! ([`TypeTable::substitute`]); see the checker's "Generics". Two function
 //! types join only if they are of one generic, or neither is generic.
 //!
+//! # Enums
+//!
+//! An enum, [`TyKind::Enum`], is nominal, by its key, a name no source can
+//! write (see [`crate::names`], "Enum keys"), and shown by its name; it is
+//! a subtype only of itself, and contains a function as far as equality
+//! knows unless its bound holds none ([`TypeTable::set_enum_bound`]). A
+//! variant as a value, `Variant<E, T>` ([`TyKind::Variant`]), is called as
+//! its function type, `fn(T): E` ([`TypeTable::fn_sig`]), which it is a
+//! subtype of; of other variant types, only of one of its enum and an
+//! equivalent payload. Each variant's payload is recorded by its key
+//! ([`TypeTable::set_variant_payload`]). See the checker's "Enums".
+//!
+//! # Partial records
+//!
+//! `Partial<T>` ([`TyKind::Partial`]) holds any of `T`'s fields: a record or
+//! another partial record fits it if each of its fields `T` names fits
+//! `T`'s; it fits a record type only if that requires no field. See the
+//! checker's "Partial records".
+//!
 //! # Metas
 //!
 //! A function type may have a *meta*, [`Meta`]: a record attached to its

@@ -1370,6 +1370,61 @@
 //! field. An empty list, `[]`, is no receiver: its type is found before
 //! any method is chosen, so it is "cannot infer the element type of `[]`".
 //!
+//! # Enums
+//!
+//! An extensible enum, `enum Tool extensible<B>` (see the parser's
+//! [Enums](crate::parser#enums)), is a nominal type, [`TyKind::Enum`], by
+//! its key, a name no source can write made of its name and of what
+//! declares it ([`crate::names`], "Enum keys"), so that every scan of one
+//! file, and every input of a session, has one enum. Its variants are
+//! declared anywhere that sees it, `enum Tool::C<{cc: File}>`, each with
+//! its payload's type, `{}` without one. Before any file is checked, once
+//! the `type` items are, the enums' bounds are resolved in their files
+//! (`check_enum_bounds`), and then the variants' payloads in theirs
+//! (`check_variant_payloads`), each recorded in the type table by its key:
+//! a payload must fit its enum's bound, as the payload is written, so that
+//! a record type's fields each fit the bound's field of their name or its
+//! rest-field ([`TypeTable::fits_bound`]), "the payload of `Tool::C` must
+//! fit `{*: File}`"; two variants of one enum and name in one file are
+//! "variant `Tool::C` is declared twice", and a variant of what is no enum
+//! "`Int` is not an enum". A variant in error is reported there, once, and
+//! a use of it fails the check quietly.
+//!
+//! A variant written as a value, `Tool::C` (`Checker::check_variant`), is
+//! of type `Variant<E, T>` ([`TyKind::Variant`]), its enum and its payload,
+//! of the one variant of the name the file sees (see [`crate::workspace`],
+//! "Enums"): none is "no variant `C` of `Tool`", noting those it sees, and
+//! several "variant `Tool::C` is declared in two files". A variant is a
+//! subtype of its function type, `fn(T): E`, so a call of it makes a value
+//! of the enum, and of no other variant type but one of its enum and
+//! payload. It is recorded for lowering, which makes it a constant tag
+//! ([`Resolution::variant`]). A value of an enum is of kind `Mixed`: present,
+//! of the kind only it says. `is E` tests a value's variant's enum
+//! ([`ValueTest::Enum`]). `==` compares two values of an enum, whole, as
+//! `===` does, and two variants, but for an enum with no bound, whose
+//! payloads may hold functions: "cannot compare `Tool`: its variants'
+//! payloads are not bounded, so they may hold functions".
+//!
+//! `Variant<E, T>` is written as a type of two arguments, `E` an enum or a
+//! type parameter. A variant's payload is taken out by the prelude's
+//! methods, `kind.matches(value)` and `kind.payload(value)`, which call the
+//! generic built-ins `variant_matches` and `variant_payload`; so
+//! `get<T>(kind: Variant<Tool, T>)` finds a value of a variant passed to it
+//! and unwraps its `T`.
+//!
+//! # Partial records
+//!
+//! `Partial<T>`, of a record type `T` with no rest-field (or of a type
+//! parameter a call binds to one), is [`TyKind::Partial`]: the records
+//! holding any of `T`'s fields, each of its type. A record type, or a
+//! partial record of another, fits it if each field of it `T` names fits
+//! `T`'s; a partial record fits only a record type that requires no field.
+//! A field of a partial record is not read by name: "field `arch` of
+//! `Partial<Platform>` may be absent". The prelude's
+//! `partial.matches(full)`, of the generic built-in `partial_matches`, is
+//! whether every field the partial record holds equals the full record's of
+//! its name.
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or
@@ -18565,6 +18620,18 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         }
         let record_ty = self.settle(record, record_ty);
+        // A partial record's field may be absent (see [Partial
+        // records](#partial-records)).
+        if let &TyKind::Partial(full) = self.types.kind(self.types.strip(record_ty))
+            && self.types.field(full, name).is_some()
+        {
+            let shown = self.in_message(record_ty);
+            self.errors.push(
+                Diagnostic::error(format!("field `{text}` of {shown} may be absent"), member)
+                    .with_note("match a whole record against it with `.matches(...)`"),
+            );
+            return TyId::ERROR;
+        }
         let message = format!(
             "cannot access field `{text}` of {}",
             self.in_message(record_ty)

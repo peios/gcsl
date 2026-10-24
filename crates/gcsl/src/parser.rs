@@ -576,6 +576,21 @@
 //! arguments in any order; binding them to parameters is the checker's
 //! business.
 //!
+//! # Enums
+//!
+//! `enum`, which is no keyword, starts an item when a name follows it
+//! (`Parser::parse_enum_item`): `enum NAME extensible`, the word
+//! `extensible` (no keyword either) and optionally the bound in angle
+//! brackets, `<TYPE>`, declares an enum ([`ItemKind::Enum`]); `enum
+//! ENUM::NAME`, the enum a name or a qualified one, then `::` and a name,
+//! and optionally the payload, `<TYPE>`, a variant ([`ItemKind::Variant`]).
+//! Anything but `extensible` after an enum's name is "expected `extensible`
+//! after the enum's name", noting that only extensible enums are
+//! declared. Like a `type`, an `enum` is an item of a file's outermost
+//! body only: "`enum` is declared only at the top level of a file". In an
+//! expression, names joined by `.` and then `::` and a name are a variant
+//! as a value ([`ExprKind::Variant`]), its enum a type expression.
+//!
 //! # Methods
 //!
 //! A method, `fn (RECV: TYPE) NAME(PARAMS) MARKER RET { BODY }` or the

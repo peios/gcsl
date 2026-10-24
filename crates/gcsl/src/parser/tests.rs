@@ -7129,3 +7129,40 @@ fn method_errors() {
         assert_eq!(error(text).0, message, "{text}");
     }
 }
+
+#[test]
+fn enum_items_and_variants_parse() {
+    assert_eq!(
+        shape(
+            "enum Shape extensible<{*: Int}>\nenum Shape::Square<{side: Int}>\nenum t.Shape::Dot"
+        ),
+        "enum Shape extensible<{*: Int}>; enum Shape::Square<{side: Int}>; enum t.Shape::Dot"
+    );
+    assert_eq!(shape("x = Shape::Square"), "x = Shape::Square");
+    assert_eq!(
+        shape("x = t.Shape::Square({ side = 1 })"),
+        "x = t.Shape::Square({side = 1})"
+    );
+    // `enum` is a field's name elsewhere.
+    assert_eq!(shape("enum = 1"), "enum = 1");
+    for (text, message) in [
+        (
+            "x = { enum Shape extensible }",
+            "`enum` is declared only at the top level of a file",
+        ),
+        (
+            "enum Shape",
+            "expected `extensible` after the enum's name, found end of input",
+        ),
+        (
+            "enum Shape::",
+            "expected the variant's name after `::`, found end of input",
+        ),
+        (
+            "enum Shape extensible<Int",
+            "expected `>` to close the type",
+        ),
+    ] {
+        assert_eq!(error(text).0, message, "{text}");
+    }
+}

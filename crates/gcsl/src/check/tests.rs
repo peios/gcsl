@@ -14378,3 +14378,84 @@ fn a_method_s_name_alone_notes_how_to_call_it() {
         ["`twice` is a method: call it on a value, as in `x.twice()`"]
     );
 }
+
+// ----- Enums and partial records -----
+
+#[test]
+fn a_variant_is_a_callable_value_of_its_enum() {
+    let cases = [
+        ("enum S extensible\nenum S::A<Int>\nS::A", "Variant<S, Int>"),
+        ("enum S extensible\nenum S::A<Int>\nS::A(1)", "S"),
+        ("enum S extensible\nenum S::B\nS::B({})", "S"),
+        (
+            "enum S extensible\nenum S::A<Int>\nfn make(k: Variant<S, Int>): S { k(2) }\nmake(S::A)",
+            "S",
+        ),
+        (
+            "enum S extensible<Int>\nenum S::A<Int>\nS::A(1) == S::A(2)",
+            "Bool",
+        ),
+        (
+            "enum S extensible\nenum S::A<Int>\nlet v: S | Int = 3\nv is S",
+            "Bool",
+        ),
+        (
+            "enum S extensible\nenum S::A<Int>\nS::A.payload(S::A(4))",
+            "Int",
+        ),
+        (
+            "type P = {a: Int, b: Int}\nlet p: Partial<P> = { a = 1 }\np.matches({ a = 1; b = 2 })",
+            "Bool",
+        ),
+    ];
+    for (text, ty) in cases {
+        assert_eq!(file_type(text), ty, "{text}");
+    }
+}
+
+#[test]
+fn enum_errors() {
+    for (text, message) in [
+        ("type T = Int\nenum T::V\n1", "Int is not an enum"),
+        ("enum S extensible\nS::Nope", "no variant `Nope` of `S`"),
+        (
+            "enum S extensible<{*: Int}>\nenum S::A<{x: String}>\n1",
+            "the payload of `S::A` must fit `{*: Int}`",
+        ),
+        (
+            "enum S extensible\nenum S::A\nenum S::A\n1",
+            "variant `S::A` is declared twice",
+        ),
+        (
+            "enum S extensible\nenum S::A<Int>\nS::A(1) == S::A(1)",
+            "cannot compare S: its variants' payloads are not bounded, so they may hold functions",
+        ),
+        (
+            "let k: Variant<Int, Int> = 1\nk",
+            "`Variant`'s first type argument must be an enum, not Int",
+        ),
+        (
+            "let k: Variant<Int> = 1\nk",
+            "type `Variant` takes 2 type arguments, given 1",
+        ),
+        (
+            "let p: Partial<Int> = 1\np",
+            "`Partial` takes a record type with no rest-field, not Int",
+        ),
+        (
+            "type P = {a: Int}\nlet p: Partial<P> = { a = 1 }\np.a",
+            "field `a` of `Partial<{a: Int}>` may be absent",
+        ),
+        (
+            "type P = {a: Int}\nlet p: Partial<P> = { a = \"x\" }\np",
+            "mismatched types",
+        ),
+        ("type Variant = Int\n1", "`Variant` is a built-in type"),
+    ] {
+        assert_eq!(
+            messages(text).first().map(String::as_str),
+            Some(message),
+            "{text}"
+        );
+    }
+}

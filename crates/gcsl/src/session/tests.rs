@@ -1806,3 +1806,25 @@ fn a_method_persists_for_later_inputs() {
     );
     assert_eq!(value(&mut session, "1.add()"), Value::Int(11));
 }
+
+#[test]
+fn enums_and_variants_persist_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(
+        value(&mut session, "enum Shape extensible<Int>"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "enum Shape::A<Int>"), Value::Empty);
+    assert_eq!(
+        value(&mut session, "let a = Shape::A(1)\na").to_string(),
+        "Shape::A(1)"
+    );
+    assert_eq!(value(&mut session, "Shape::A(1) == a"), Value::Bool(true));
+    assert_eq!(
+        value(&mut session, "Shape::A.matches(a)"),
+        Value::Bool(true)
+    );
+    // A later input's variant of the name shadows the earlier one.
+    assert_eq!(value(&mut session, "enum Shape::A<Int>"), Value::Empty);
+    assert_eq!(value(&mut session, "Shape::A(1) == a"), Value::Bool(false));
+}

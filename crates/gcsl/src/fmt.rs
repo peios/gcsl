@@ -1265,6 +1265,28 @@ mod tests {
     }
 
     #[test]
+    fn enums_glue_their_colons_and_bracket_their_types() {
+        check(&[
+            (
+                "enum  Shape   extensible< {*: Int} >\n",
+                "enum Shape extensible<{*: Int}>\n",
+            ),
+            (
+                "enum Shape :: Sq< {side: Int} >\n",
+                "enum Shape::Sq<{side: Int}>\n",
+            ),
+            (
+                "x = Shape :: Sq({ side = 1 })\n",
+                "x = Shape::Sq({ side = 1 })\n",
+            ),
+            (
+                "let k: Variant< Shape,Int > = y\n",
+                "let k: Variant<Shape, Int> = y\n",
+            ),
+        ]);
+    }
+
+    #[test]
     fn type_parameters_are_bracketed_as_type_arguments() {
         check(&[
             ("fn id< T >(x: T): T { x }\n", "fn id<T>(x: T): T { x }\n"),

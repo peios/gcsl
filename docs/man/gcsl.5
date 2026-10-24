@@ -100,6 +100,10 @@ An empty list needs an expected element type.
 Function signatures declare parameter and result types.
 A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.
 A type without parameters takes no type arguments, a generic type cannot refer to itself, and a type parameter cannot be spread.
+An extensible enum is declared as enum NAME extensible<BOUND>, and each variant as enum NAME::VARIANT<PAYLOAD>; the payload must fit the bound.
+NAME::VARIANT is a value of type Variant<NAME, PAYLOAD>; calling it makes a value of the enum, and kind.matches(value) and kind.payload(value) test and unwrap a value of the variant kind.
+Enums are nominal; value is NAME tests a value's enum, and == compares values of an enum that has a bound.
+Partial<T> holds any of the fields of the record type T; partial.matches(full) tests whether every field it holds equals full's, and its fields are not read by name.
 Intersections and a None value are not supported.
 .SH RECORD COMPOSITION
 Dotted fields such as server.host and server.port merge into an open nested record.

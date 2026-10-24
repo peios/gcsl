@@ -46,6 +46,57 @@ generic type can be built from another, as in
 `type Named<T> = Pair<String, T>`. It can't refer to itself, and it can't
 spread one of its parameters, because the parameter might not be a record.
 
+## Enums
+
+An extensible enum is a type whose variants any module can add. Declare
+the enum, with an optional bound that every variant's payload must fit,
+and then its variants, each with a payload type:
+
+```gcsl
+enum Shape extensible<{*: Int}>
+enum Shape::Square<{side: Int}>
+enum Shape::Point
+square = Shape::Square({side = 3})
+```
+
+A variant is also a value: `Shape::Square` on its own has the type
+`Variant<Shape, {side: Int}>`. Calling it makes a value of the enum,
+and you can pass it to a function as a key. `kind.matches(value)` tests
+whether a value is of that variant, and `kind.payload(value)` takes out
+its payload:
+
+```gcsl
+enum Tool extensible
+enum Tool::C<{cc: String}>
+fn find<T>(kind: Variant<Tool, T>, tools: List<Tool>, fallback: T): T {
+    for t in tools { if kind.matches(t) { return kind.payload(t) } }
+    fallback
+}
+cc = find(Tool::C, [Tool::C({cc = "gcc"})], {cc = "cc"}).cc
+```
+
+Unlike records, enums are nominal: two enums are different types even
+if they look alike. `value is Tool` tests whether a value is of the enum.
+Values of an enum are compared with `==` only when the enum has a bound,
+because an unbounded payload might hold a function. A variant is visible
+in its own file, to the other files of its directory and the directories
+below it, and to every file that imports its module.
+
+## Partial records
+
+`Partial<T>` holds any of the fields of the record type `T`. Use it to
+describe a record by only some of its fields, and `.matches()` to test
+a whole record against it:
+
+```gcsl
+type Platform = {arch: String, os: String}
+let wanted: Partial<Platform> = {arch = "x86_64"}
+fits = wanted.matches({arch = "x86_64"; os = "linux"})
+```
+
+A field of a partial record can't be read by name, because it may be
+absent.
+
 ## Records of any fields
 
 A rest-field, `*: T`, gives the type of every field that a record type

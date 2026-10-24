@@ -12094,3 +12094,91 @@ fn a_call_of_a_field_needs_the_files_of_the_methods_of_its_name() {
     let messages = rooted_messages(&files);
     assert_eq!(messages, ["`app/main.gcsl` and `lib.gcsl` need each other"]);
 }
+
+#[test]
+fn variants_are_visible_where_def_methods_are_and_conflict_at_a_use() {
+    let files = [
+        ("workspace.gcsl", ""),
+        ("lib/tool.gcsl", "enum Tool extensible<{*: String}>"),
+        (
+            "lib/c.gcsl",
+            "import Tool from lib/tool\nenum Tool::C<{cc: String}>",
+        ),
+        (
+            "app/main.gcsl",
+            "import Tool from lib/tool\nimport lib/c\nt = Tool::C({ cc = \"gcc\" })\nok = Tool::C.matches(t)",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{t = Tool::C({cc = \"gcc\"}); ok = true}"
+    );
+    // Without the import of the variant's module, it is not seen.
+    let files = [
+        ("workspace.gcsl", ""),
+        ("lib/tool.gcsl", "enum Tool extensible"),
+        ("lib/c.gcsl", "import Tool from lib/tool\nenum Tool::C"),
+        (
+            "app/main.gcsl",
+            "import Tool from lib/tool\nt = Tool::C({})",
+        ),
+    ];
+    assert_eq!(rooted_messages(&files), ["no variant `C` of `Tool`"]);
+    // Two files' variants of one name are one name too many.
+    let files = [
+        ("workspace.gcsl", ""),
+        ("lib/tool.gcsl", "enum Tool extensible"),
+        ("lib/a.gcsl", "import Tool from lib/tool\nenum Tool::C"),
+        ("lib/b.gcsl", "import Tool from lib/tool\nenum Tool::C"),
+        (
+            "app/main.gcsl",
+            "import Tool from lib/tool\nimport lib/a\nimport lib/b\nt = Tool::C({})",
+        ),
+    ];
+    assert_eq!(
+        rooted_messages(&files),
+        ["variant `Tool::C` is declared in two files"]
+    );
+}
+
+#[test]
+fn values_of_enums_are_made_compared_tested_and_unwrapped() {
+    let text = "enum Tool extensible<{*: String}>\n\
+                enum Tool::C<{cc: String}>\n\
+                enum Tool::Rust<{rustc: String}>\n\
+                fn get<T>(kind: Variant<Tool, T>, tools: List<Tool>, fallback: T): T {\n\
+                \x20   for t in tools { if kind.matches(t) { return kind.payload(t) } }\n\
+                \x20   fallback\n\
+                }\n\
+                let tools = [Tool::Rust({ rustc = \"rustc\" }), Tool::C({ cc = \"gcc\" })]\n\
+                a = get(Tool::C, tools, { cc = \"none\" }).cc\n\
+                b = get(Tool::Rust, tools, { rustc = \"none\" }).rustc\n\
+                c = Tool::C({ cc = \"x\" }) == Tool::C({ cc = \"x\" })\n\
+                d = Tool::C({ cc = \"x\" }) == Tool::Rust({ rustc = \"x\" })\n\
+                e = Tool::C == Tool::C\n\
+                f = Tool::C\n\
+                g = tools[1]\n\
+                let v: Tool | Int = 3\n\
+                h = v is Tool\n\
+                type P = {arch: String, os: String}\n\
+                let p: Partial<P> = { arch = \"x86_64\" }\n\
+                i = p.matches({ arch = \"x86_64\"; os = \"linux\" })\n\
+                j = p.matches({ arch = \"arm\"; os = \"linux\" })";
+    let files = [("workspace.gcsl", ""), ("app/main.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = \"gcc\"; b = \"rustc\"; c = true; d = false; e = true; f = Tool::C; \
+         g = Tool::C({cc = \"gcc\"}); h = false; i = true; j = false}"
+    );
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "app/main.gcsl",
+            "enum T extensible\nenum T::A<Int>\nenum T::B<Int>\nr = T::A.payload(T::B(1))",
+        ),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let main = workspace.file("app/main.gcsl").unwrap();
+    let error = workspace.run(main).unwrap_err().remove(0);
+    assert_eq!(error.message, "the value is `T::B`, not `T::A`");
+}
