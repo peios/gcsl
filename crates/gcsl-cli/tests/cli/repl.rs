@@ -582,3 +582,24 @@ fn repl_calls_the_prelude_s_methods_unless_a_line_shadows_one() {
     assert_eq!(stderr(&output), "");
     assert_eq!(output.status.code(), Some(0));
 }
+
+#[test]
+fn repl_checks_what_an_earlier_line_s_function_needs() {
+    let output = repl(
+        "context arch: String\n\
+         fn f(): String { ^arch }\n\
+         f\n\
+         f() with { arch = \"x86\" }\n\
+         f()\n",
+    );
+    assert_eq!(
+        stdout(&output),
+        "fn(^arch): String : fn(^arch): String\n\
+         \"x86\" : String\n"
+    );
+    assert!(
+        stderr(&output).contains("error: context `arch` has no value here"),
+        "{}",
+        stderr(&output)
+    );
+}

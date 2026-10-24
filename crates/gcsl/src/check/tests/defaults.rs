@@ -186,7 +186,10 @@ fn a_default_that_is_no_constant_is_a_default_function() {
         let capture = u32::try_from(resolution.captures.len()).unwrap();
         assert_eq!(
             resolution.defaults,
-            [Some(ParamDefault::Function { capture })],
+            [Some(ParamDefault::Function {
+                capture,
+                needs: Box::default()
+            })],
             "{text}"
         );
     }

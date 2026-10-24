@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::check::Constant;
-use crate::names::{Name, Names};
+use crate::names::{Name, Names, key_context};
 use crate::strings::{FieldName, Quoted};
 use crate::value::write_quantity;
 
@@ -177,6 +177,28 @@ impl fmt::Display for Display<'_> {
                         write!(f, "{}: ", FieldName(self.names.get(name)))?;
                     }
                     self.nested(ty).fmt(f)?;
+                }
+                // What it needs, after its parameters: `^arch`, or `^arch |
+                // ^target` for a need read through a default.
+                let mut needs: Vec<String> = self
+                    .table
+                    .need_set(sig.needs)
+                    .iter()
+                    .map(|need| {
+                        let shown: Vec<String> = need
+                            .iter()
+                            .map(|&key| self.names.get(key))
+                            .map(|key| format!("^{}", key_context(key).unwrap_or(key)))
+                            .collect();
+                        shown.join(" | ")
+                    })
+                    .collect();
+                needs.sort_unstable();
+                for (index, need) in needs.into_iter().enumerate() {
+                    if index > 0 || !sig.params.is_empty() {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(&need)?;
                 }
                 f.write_str(sig.effect.params_end())?;
                 let Some(meta) = sig.meta else {

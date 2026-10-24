@@ -1085,6 +1085,9 @@ impl<'a> Checker<'a> {
         };
         // The reference reads the node's cell; its variable, the root's.
         self.expr_vars[id.index()] = source;
+        if let VarRef::Fn(slot) = source {
+            self.note_member_use(id, slot);
+        }
         self.expr_vars[base.index()] = root_source;
         let ty = cell.ty.unwrap_or(TyId::ERROR);
         // The prefixes inside the reference are not read: each is typed as

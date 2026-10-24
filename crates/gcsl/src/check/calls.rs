@@ -136,8 +136,9 @@ use crate::diagnostic::Diagnostic;
 use crate::mentions::Resolve;
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{FnTy, Laziness, TyId};
+use crate::types::{FnTy, Laziness, Need, TyId};
 
+use super::needs::NeedWhy;
 use super::{
     AwaitSite, Bareness, BodyState, Bound, Builtin, CallSite, Callback, CallbackPosition, Checker,
     DEFAULTED, KnownCallee, KnownParams, PURE_CONTEXT, ParamDefault, Typing, VarRef, filled_by,
@@ -900,6 +901,18 @@ impl Checker<'_> {
             }
         }
         if let Some(defaults) = defaults.filter(|defaults| !defaults.is_empty()) {
+            // A default is evaluated on the caller's side, so what one the
+            // call leaves out needs, the call needs (see
+            // [Needs](crate::check::needs#needs)).
+            let needs: Vec<Need> = defaults
+                .iter()
+                .flat_map(|(_, default)| match default {
+                    ParamDefault::Function { needs, .. } => &needs[..],
+                    ParamDefault::Constant(_) => &[],
+                })
+                .cloned()
+                .collect();
+            self.charge_needs(&needs, self.ast.get(id).span, NeedWhy::Defaults);
             self.lowering.call_defaults.insert(id, defaults.into());
         }
     }

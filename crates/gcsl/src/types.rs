@@ -134,6 +134,15 @@
 //! effect is the greater of the two. Any other two function types join to
 //! their union.
 //!
+//! A function type also carries its *needs* ([`FnTy::needs`]): the contexts
+//! with no default that a call of it may read, which the caller must bind
+//! (see [Needs](crate::types::needs#needs) and the checker's
+//! [Needs](crate::check::needs#needs)). They are shown after its
+//! parameters, `fn(x: Int, ^arch): String`. One that needs less stands in
+//! for one that needs more, as a pure function for an impure one, never the
+//! reverse; two function types join to one needing what either needs.
+//! Instantiating or settling a function type keeps its needs.
+//!
 //! What a memoised function's bare parameter types mean is the checker's
 //! business (see [`crate::check`]): they are present, since its arguments
 //! are the key its results are memoised by, so the checker interns `fn(x:
@@ -677,6 +686,10 @@ pub struct FnTy {
     /// arguments from that position on fill it, a `List<T>` in the body,
     /// and the parameters after it are given by name only.
     pub rest: Option<u8>,
+    /// What a call of it needs: the contexts with no default it may read with
+    /// no `with` of its own around the read (see
+    /// [Needs](crate::types::needs#needs)).
+    pub needs: NeedsId,
 }
 
 impl FnTy {
@@ -824,6 +837,9 @@ pub struct TypeTable {
     /// The declared type of each context, by its declaration's key (see
     /// the checker's "Context").
     context_types: HashMap<Name, TyId>,
+    /// The sets of needs of function types, and what contexts' defaults
+    /// need (see [Needs](crate::types::needs#needs)).
+    need_table: needs::NeedTable,
 }
 
 impl Default for TypeTable {
@@ -845,6 +861,7 @@ impl TypeTable {
             enum_bounds: HashMap::new(),
             variant_payloads: HashMap::new(),
             context_types: HashMap::new(),
+            need_table: needs::NeedTable::default(),
         };
         // In the order of the constants' numbers.
         for kind in [
@@ -1159,6 +1176,7 @@ impl TypeTable {
             meta,
             generic: None,
             rest: rest_param,
+            needs: NeedsId::NONE,
         }))
     }
 
@@ -1349,6 +1367,7 @@ impl TypeTable {
                     ..meta
                 });
                 let made = self.fn_type_with_rest(params, (ret, sig.effect), meta, sig.rest);
+                let made = self.with_need_set(made, sig.needs);
                 match sig.generic {
                     Some(own) => self.generic_fn(made, own),
                     None => made,
@@ -2078,6 +2097,7 @@ impl TypeTable {
                     ..meta
                 });
                 let settled = self.fn_type_with_rest(params, (ret, sig.effect), meta, sig.rest);
+                let settled = self.with_need_set(settled, sig.needs);
                 match sig.generic {
                     Some(generic) => self.generic_fn(settled, generic),
                     None => settled,
@@ -2543,6 +2563,7 @@ impl TypeTable {
                     _ => false,
                 };
                 a_sig.effect == b_sig.effect
+                    && a_sig.needs == b_sig.needs
                     && metas
                     && self.same(a_sig.ret, b_sig.ret)
                     && a_sig.params.len() == b_sig.params.len()
@@ -2727,27 +2748,7 @@ impl TypeTable {
             _ => {}
         }
         if let (Some(offered), Some(required)) = (self.fn_sig(sub), self.fn_sig(sup)) {
-            // A meta is purely additive: one required must be offered, as a
-            // result is, and one offered may be forgotten.
-            let meta = match (offered.meta, required.meta) {
-                (_, None) => true,
-                (None, Some(_)) => false,
-                (Some(offered), Some(required)) => {
-                    offered.effect <= required.effect && self.is_subtype(offered.ty, required.ty)
-                }
-            };
-            // A rest parameter, in the same place, of elements the offered
-            // accepts, as any parameter is.
-            return offered.params.len() == required.params.len()
-                && offered.rest == required.rest
-                && offered.effect <= required.effect
-                && meta
-                && self.is_subtype(offered.ret, required.ret)
-                && offered
-                    .params
-                    .iter()
-                    .zip(&required.params)
-                    .all(|(&(_, accepted), &(_, passed))| self.is_subtype(passed, accepted));
+            return self.fn_fits(offered, required);
         }
         let (Some(offered), Some(required)) = (self.record_fields(sub), self.record_fields(sup))
         else {
@@ -2820,6 +2821,34 @@ impl TypeTable {
             && offered
                 .rest()
                 .is_none_or(|own| rest.is_some_and(|rest| self.is_subtype(own, rest)))
+    }
+
+    /// Whether a function of the signature `offered` fits where one of
+    /// `required` is expected, as [`TypeTable::is_subtype`] says of function
+    /// types (see [Functions](#functions)).
+    fn fn_fits(&self, offered: &FnTy, required: &FnTy) -> bool {
+        // A meta is purely additive: one required must be offered, as a
+        // result is, and one offered may be forgotten.
+        let meta = match (offered.meta, required.meta) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(offered), Some(required)) => {
+                offered.effect <= required.effect && self.is_subtype(offered.ty, required.ty)
+            }
+        };
+        // A rest parameter, in the same place, of elements the offered
+        // accepts, as any parameter is.
+        offered.params.len() == required.params.len()
+            && offered.rest == required.rest
+            && offered.effect <= required.effect
+            && self.needs_fit(offered.needs, required.needs)
+            && meta
+            && self.is_subtype(offered.ret, required.ret)
+            && offered
+                .params
+                .iter()
+                .zip(&required.params)
+                .all(|(&(_, accepted), &(_, passed))| self.is_subtype(passed, accepted))
     }
 
     /// Whether a value of type `sub`, present, fits `Partial<R>` of the
@@ -2976,8 +3005,10 @@ impl TypeTable {
             return (self.union([a, b]), true);
         };
         let (a_ret, b_ret, effect) = (a_sig.ret, b_sig.ret, a_sig.effect.max(b_sig.effect));
+        let (a_needs, b_needs) = (a_sig.needs, b_sig.needs);
         let rest_param = a_sig.rest;
         let metas = (a_sig.meta, b_sig.meta);
+        let needs = self.joined_needs(a_needs, b_needs);
         let (ret, mut widened) = self.join(a_ret, b_ret);
         // Metas join as results do; one side's alone is forgotten (see
         // [Metas](#metas)).
@@ -2993,6 +3024,7 @@ impl TypeTable {
             _ => None,
         };
         let joined = self.fn_type_with_rest(params, (ret, effect), meta, rest_param);
+        let joined = self.with_need_set(joined, needs);
         let joined = match generics.0 {
             Some(generic) => self.generic_fn(joined, generic),
             None => joined,
@@ -3406,9 +3438,11 @@ impl TypeTable {
 }
 
 mod display;
+mod needs;
 
 pub(crate) use display::write_constant;
 use display::Display;
+pub use needs::{Need, NeedsId, implies, met, through};
 
 #[cfg(test)]
 mod tests;

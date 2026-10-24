@@ -16,7 +16,9 @@
 //! its key; with none, it calls its default's function, as a call of no
 //! arguments at its depth, in the current context, so that a default
 //! reading another context follows it; with no default either, it is
-//! "context `arch` has no value here". A read is an ambient input of the
+//! "context `arch` has no value here", which the checker's needs make
+//! unreachable but for a host's own calls (see
+//! [Needs](crate::check::needs#needs)). A read is an ambient input of the
 //! memoised calls running (see [Memoised functions](crate::eval::memo#memoised-functions)):
 //! it is recorded on each running call whose own context's nearest binding
 //! of the key is the read's, the same frame's or none, with the value read,

@@ -395,6 +395,7 @@ impl Checker<'_> {
                 field.ty = binding.ty;
             }
         }
+        self.record_context_needs();
     }
 
     /// Checks the bodies of the group `group` of top-level functions, if
@@ -476,6 +477,7 @@ impl Checker<'_> {
         for &member in &members {
             self.check_top_body(member as usize);
         }
+        self.resolve_group_needs(&members);
         for &member in &members {
             let Some(top) = self.top_fns.get_mut(member as usize) else {
                 continue;
@@ -612,13 +614,18 @@ impl Checker<'_> {
     /// dotted path whose leaf's cell, is in `slot`, if one of this input's
     /// is.
     pub(super) fn top_fn_in(&self, slot: Slot) -> Option<&TopFn> {
-        self.top_fns.iter().find(|top| {
-            let cell = top
-                .leaf
-                .and_then(|leaf| self.field_cells.get(leaf as usize))
-                .map(|cell| cell.slot);
-            cell.or_else(|| self.bindings.get(top.binding).map(|binding| binding.slot))
-                == Some(slot)
-        })
+        self.top_fns
+            .iter()
+            .find(|top| self.top_slot(top) == Some(slot))
+    }
+
+    /// The slot the top-level function `top`'s closure is read from: its
+    /// leaf's cell's, for a `def` named by a dotted path, or its binding's.
+    pub(super) fn top_slot(&self, top: &TopFn) -> Option<Slot> {
+        let cell = top
+            .leaf
+            .and_then(|leaf| self.field_cells.get(leaf as usize))
+            .map(|cell| cell.slot);
+        cell.or_else(|| self.bindings.get(top.binding).map(|binding| binding.slot))
     }
 }

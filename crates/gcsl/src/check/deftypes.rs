@@ -356,6 +356,7 @@ impl Checker<'_> {
                     meta,
                     generic: None,
                     rest: sig.rest,
+                    needs: sig.needs,
                 }
             }
         };
@@ -542,6 +543,8 @@ impl Checker<'_> {
             demanded: vec![None; params.len()],
             result: Some((sig.ret, dt_span)),
             returns: Vec::new(),
+            with_depth: self.contexts.bound.len(),
+            needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         self.check_fn_body(&decl, base, (None, ty, span), sig.ret);
@@ -549,7 +552,9 @@ impl Checker<'_> {
         self.inherit_attributes(function, use_.dt);
         // Its meta's cell, read as its body reads a top-level function.
         self.definition_meta(function, def, sig.meta);
-        self.finish_function(decl.params.len(), None);
+        let (_, needs) = self.finish_function(decl.params.len(), None);
+        let allowed = self.types.need_set(sig.needs).to_vec();
+        self.definition_needs(&needs, &allowed);
         ty
     }
 
@@ -753,11 +758,14 @@ impl Checker<'_> {
             demanded: Vec::new(),
             result: Some((meta.ty, dt_span)),
             returns: Vec::new(),
+            with_depth: self.contexts.bound.len(),
+            needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let base = self.fn_params.len();
         self.check_fn_body(&decl, base, (None, ty, span), meta.ty);
-        self.finish_function(0, None);
+        let (_, needs) = self.finish_function(0, None);
+        self.definition_needs(&needs, &[]);
         ty
     }
 
@@ -998,6 +1006,8 @@ impl Checker<'_> {
             sig.effect,
             meta,
         );
+        // A reference calls the def-type, so it needs what the def-type does.
+        let ty = self.types.with_need_set(ty, sig.needs);
         if defined == read {
             self.expr_types[id.index()] = ty;
             return ty;

@@ -227,7 +227,7 @@ impl Lowerer<'_> {
                 ParamDefault::Constant(constant) => {
                     ArgValue::Node(self.lower_constant(constant, close))
                 }
-                &ParamDefault::Function { capture } => {
+                &ParamDefault::Function { capture, .. } => {
                     let kind = self.param_kind(id, *param).ok_or(InternalError {
                         message: "a call's default is for a parameter its callee lacks",
                         span,

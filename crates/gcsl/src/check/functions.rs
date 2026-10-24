@@ -308,11 +308,12 @@ use crate::ast::{
 use crate::diagnostic::{Diagnostic, InternalError};
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{FnTy, Laziness, TyId, TyKind};
+use crate::types::{FnTy, Laziness, Need, TyId, TyKind};
 
+use super::needs::NeedWhy;
 use super::{
-    Binding, BindingKind, Checker, Constant, Expecting, FnResolution, Function, PURE_CONTEXT,
-    RESULT_WHY, Reach, Slot, bareness_of, merged_defaults, position,
+    Bareness, Binding, BindingKind, Checker, Constant, DefaultFn, Expecting, FnResolution,
+    Function, PURE_CONTEXT, RESULT_WHY, Reach, Slot, bareness_of, merged_defaults, position,
 };
 
 impl Checker<'_> {
@@ -320,14 +321,15 @@ impl Checker<'_> {
     /// checked, recording what was found for it, with `param_count`
     /// parameters and the callee name `callee`, and restores the enclosing
     /// frame's slot allocation. Returns which of its parameters its body
-    /// measures: where it first does, for each.
+    /// measures, where it first does, for each, and the contexts it needs,
+    /// each with where it first needs it (see [Needs](crate::check::needs#needs)).
     pub(super) fn finish_function(
         &mut self,
         param_count: u32,
         callee: Option<Name>,
-    ) -> Vec<Option<Span>> {
+    ) -> (Vec<Option<Span>>, Vec<(Need, Span)>) {
         let Some(finished) = self.functions.pop() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let slot_names = std::mem::replace(&mut self.slot_names, finished.outer_slot_names);
         self.fn_resolutions[finished.fn_id.index()] = FnResolution {
@@ -358,7 +360,7 @@ impl Checker<'_> {
                 .collect();
         }
         (self.next_slot, self.frame_size) = (finished.outer_next_slot, finished.outer_frame_size);
-        finished.demanded
+        (finished.demanded, finished.needs)
     }
 
     /// Types the function expression `id`, whose details are `function`,
@@ -414,19 +416,7 @@ impl Checker<'_> {
             }
             self.fn_params.push((Some(param.name), ty));
         }
-        let ret = if let Some(ret) = decl.ret {
-            self.resolve_type(ret, ret_mode)
-        } else {
-            // The parser gives every function expression a return type.
-            self.errors.push(
-                InternalError {
-                    message: "a function expression has no return type",
-                    span: self.ast.get(id).span,
-                }
-                .into(),
-            );
-            TyId::ERROR
-        };
+        let ret = self.declared_result(id, decl.ret, ret_mode);
         let mut ty = self.function_type(function, base, (ret, decl.effect));
         self.expr_types[id.index()] = ty;
         self.check_def_type_signature(function, ty);
@@ -448,6 +438,8 @@ impl Checker<'_> {
             demanded: measured,
             result: Some((ret, ret_span)),
             returns: Vec::new(),
+            with_depth: self.contexts.bound.len(),
+            needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let defaults = self.check_defaults(&defaults, params.len());
@@ -478,7 +470,8 @@ impl Checker<'_> {
         self.callbacks.truncate(callbacks.0);
         self.callback_positions.truncate(callbacks.1);
         self.fn_params.truncate(base);
-        let demanded = self.finish_function(decl.params.len(), callee);
+        let (demanded, needs) = self.finish_function(decl.params.len(), callee);
+        ty = self.give_fn_needs((id, function), ty, needs);
         self.add_default_copies();
         if let Some(resolution) = self.fn_resolutions.get_mut(function.index()) {
             resolution.unnarrowed = unnarrowed;
@@ -491,6 +484,28 @@ impl Checker<'_> {
         let decisions: Vec<bool> = demanded.iter().map(Option::is_some).collect();
         self.settle_function(id, function, &decisions);
         self.expr_types[id.index()]
+    }
+
+    /// The result type the function expression `id` declares, `ret`,
+    /// resolved as `mode` says; `Error` with an internal error if it declares
+    /// none, as the parser gives every function expression one.
+    pub(super) fn declared_result(
+        &mut self,
+        id: ExprId,
+        ret: Option<TypeExprId>,
+        mode: Bareness,
+    ) -> TyId {
+        if let Some(ret) = ret {
+            return self.resolve_type(ret, mode);
+        }
+        self.errors.push(
+            InternalError {
+                message: "a function expression has no return type",
+                span: self.ast.get(id).span,
+            }
+            .into(),
+        );
+        TyId::ERROR
     }
 
     /// Checks each default of `defaults`, the defaults of a function whose
@@ -506,7 +521,7 @@ impl Checker<'_> {
         &mut self,
         (params, resolved): (&[Param], &[TyId]),
         defaults: &mut Vec<(usize, ExprId, (TyId, TypeExprId))>,
-    ) -> (Vec<(usize, bool)>, Vec<Option<Span>>) {
+    ) -> (Vec<DefaultFn>, Vec<Option<Span>>) {
         let mut default_fns = Vec::new();
         let mut measured = vec![None; params.len()];
         for &(index, _, expected) in defaults.iter() {
@@ -519,9 +534,13 @@ impl Checker<'_> {
             let unseen = unseen.iter().map(|param| (param.name, param.span));
             self.defaults_checked.unseen.extend(unseen);
             let earlier = resolved.get(..index).unwrap_or_default();
-            let (checked, demanded) = self.check_default_fn(default_fn, (earlier, expected));
+            let (checked, demanded, needs) = self.check_default_fn(default_fn, (earlier, expected));
             self.defaults_checked.unseen.truncate(outer);
-            default_fns.push((index, checked));
+            default_fns.push(DefaultFn {
+                param: index,
+                checked,
+                needs,
+            });
             for (first, found) in measured.iter_mut().zip(demanded) {
                 *first = first.or(found);
             }
@@ -575,7 +594,7 @@ impl Checker<'_> {
         &mut self,
         function: FnId,
         (earlier, (expected, written)): (&[TyId], (TyId, TypeExprId)),
-    ) -> (bool, Vec<Option<Span>>) {
+    ) -> (bool, Vec<Option<Span>>, Box<[Need]>) {
         // A function in the body must not see a name meant for another.
         self.callee_name = None;
         let decl = *self.ast.fn_decl(function);
@@ -605,6 +624,8 @@ impl Checker<'_> {
             demanded: vec![None; params.len()],
             result: Some((expected, context)),
             returns: Vec::new(),
+            with_depth: self.contexts.bound.len(),
+            needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let outer = (self.block_start, self.fields_start);
@@ -630,7 +651,7 @@ impl Checker<'_> {
         (self.block_start, self.fields_start) = outer;
         self.fn_params.truncate(base);
         let top = self.functions.len() == 1;
-        let demanded = self.finish_function(decl.params.len(), None);
+        let (demanded, needs) = self.finish_function(decl.params.len(), None);
         if provisional {
             let decisions: Vec<bool> = demanded.iter().map(Option::is_some).collect();
             self.settle_function(decl.body, function, &decisions);
@@ -647,6 +668,7 @@ impl Checker<'_> {
         (
             found != TyId::ERROR && self.errors.len() == errors,
             demanded,
+            needs.into_iter().map(|(need, _)| need).collect(),
         )
     }
 
@@ -844,6 +866,11 @@ impl Checker<'_> {
         if sig.effect != Effect::Pure {
             self.impure_calls.insert(id);
         }
+        // What the callee needs, the call needs (see [Needs](crate::check::needs#needs)).
+        self.note_member_call(callee);
+        let why = NeedWhy::Call(self.callee_written_name(callee));
+        let needs = self.types.need_set(sig.needs).to_vec();
+        self.charge_needs(&needs, self.ast.get(id).span, why);
         if let Some(function) = self.functions.last()
             && function.effect == Effect::Pure
             && sig.effect != Effect::Pure

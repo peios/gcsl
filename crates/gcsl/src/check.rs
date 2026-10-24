@@ -182,7 +182,7 @@ use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::FieldName;
 use crate::suggest;
-use crate::types::{DefTypeShape, FnTy, GenericId, TyId, TyKind, TypeTable};
+use crate::types::{DefTypeShape, FnTy, GenericId, Need, TyId, TyKind, TypeTable};
 use crate::value::{Quantity, int_to_float};
 use crate::workspace::{Context, Target};
 
@@ -198,7 +198,8 @@ pub use resolution::{
     Resolution, TestResolution, Unnarrowed,
 };
 pub(crate) use resolution::KnownParams;
-use resolution::{CallsChecked, ForLowering, merged_defaults};
+use needs::ContextsChecked;
+use resolution::{CallsChecked, DefaultFn, ForLowering, merged_defaults};
 
 /// What a call of a generic function has bound of its type parameters so
 /// far, as [`Checker::instantiate`] binds them.
@@ -676,6 +677,14 @@ struct Function {
     /// result sites besides the body's own result (see
     /// [`return`](crate::check::loops#return)).
     returns: Vec<Site>,
+    /// How many contexts `ContextsChecked::bound` held as it was entered:
+    /// those past it are bound by `with`s inside it (see
+    /// [Needs](crate::check::needs#needs)).
+    with_depth: usize,
+    /// The contexts it needs so far, by their keys, each with where it was
+    /// first needed; always empty for a `lazy`, whose needs are charged
+    /// where it is made.
+    needs: Vec<(Need, Span)>,
 }
 
 /// What the checker keeps while default functions are checked (see
@@ -1730,9 +1739,10 @@ pub struct Checker<'a> {
     lowering: ForLowering,
     /// What the check keeps of generic functions, methods and their calls.
     calls: CallsChecked,
-    /// The contexts the `with`s around the expression being checked bind,
-    /// by their declarations' keys, innermost last (see [Context](crate::check::context#context)).
-    with_bound: Vec<Name>,
+    /// The contexts bound around the expression being checked, and the uses
+    /// of functions whose needs are not known yet (see
+    /// [Needs](crate::check::needs#needs)).
+    contexts: ContextsChecked,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -2027,7 +2037,7 @@ impl<'a> Checker<'a> {
             scope_known: scope.known,
             lowering: ForLowering::default(),
             calls: CallsChecked::default(),
-            with_bound: Vec::new(),
+            contexts: ContextsChecked::default(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -3151,6 +3161,7 @@ pub(crate) mod methods;
 pub(crate) mod mutation;
 pub(crate) mod names;
 pub(crate) mod narrowing;
+pub(crate) mod needs;
 pub(crate) mod operators;
 pub(crate) mod records;
 pub(crate) mod resolution;

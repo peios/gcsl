@@ -37,7 +37,7 @@ use crate::suggest;
 use crate::types::TyId;
 use crate::workspace::Context;
 
-use super::{Binding, BindingKind, Blocker, BlockerKind, Checker, root_declares};
+use super::{Binding, BindingKind, Blocker, BlockerKind, Checker, VarRef, root_declares};
 
 impl Checker<'_> {
     /// Resolves a use of the variable `name` at expression `id`, recording
@@ -130,7 +130,15 @@ impl Checker<'_> {
             {
                 record.uses.push((id, declared));
             }
-            self.expr_vars[id.index()] = self.resolve(index, binding);
+            let source = self.resolve(index, binding);
+            self.expr_vars[id.index()] = source;
+            // A use of a function whose needs are not known yet (see
+            // [Needs](crate::check::needs#needs)).
+            if let VarRef::Fn(slot) = source {
+                self.note_member_use(id, slot);
+            } else if binding.kind == BindingKind::Callee {
+                self.note_callee_use(id, (index, binding.name));
+            }
             return (self.builtin_use(id, binding.ty, span), binding.callback);
         }
         let suggestion = self.variable_suggestion(name, span);

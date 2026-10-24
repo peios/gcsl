@@ -23,11 +23,13 @@
 //! is the read's own variable: the binding of the input's or an earlier
 //! input's declaration, read as a name is, so that a top-level read is
 //! scheduled after what the default reads, or another file's slot, read as
-//! an import's. A read at the input's top level of a context with no default
-//! that no `with` around it binds is "context `arch` has no value here";
-//! elsewhere that is a runtime error, as the checker cannot know every
-//! caller's context. `TypeExprKind::Context`, a `^NAME` parameter's type,
-//! is the context's type exactly, neither bare nor inferred.
+//! an import's. What the read needs, unless a `with` binds the context
+//! where its needs are charged, is charged as
+//! [Needs](crate::check::needs#needs) says: the context, if it has no
+//! default, or what its default needs, each need met by binding the context
+//! too; at the input's top level, a need nothing meets is "context `arch` has
+//! no value here". `TypeExprKind::Context`, a `^NAME` parameter's type, is
+//! the context's type exactly, neither bare nor inferred.
 //!
 //! `BODY with { ... }` (`Checker::check_with`) checks each binding against its
 //! context: a plain one's value against its type, a dotted key's against the
@@ -46,9 +48,10 @@ use crate::diagnostic::Diagnostic;
 use crate::names::Name;
 use crate::source::Span;
 use crate::suggest;
-use crate::types::TyId;
+use crate::types::{Need, TyId, through};
 use crate::workspace::{Context, ContextDefault, SeenContext};
 
+use super::needs::NeedWhy;
 use super::{AwaitSite, Checker};
 
 impl Checker<'_> {
@@ -108,27 +111,47 @@ impl Checker<'_> {
             self.quiet.failed = true;
             return TyId::ERROR;
         }
+        // What the read needs, unless a `with` binds the context where its
+        // needs are charged (see [Needs](crate::check::needs#needs)).
+        let bound = self.is_covered(context.key);
         match context.default {
             ContextDefault::Binding(binding) => {
-                if self.use_name(id, binding, span).0 == TyId::ERROR {
+                let default_ty = self.use_name(id, binding, span).0;
+                if default_ty == TyId::ERROR {
                     return TyId::ERROR;
                 }
+                // The read calls the default where nothing binds it.
+                self.note_member_call(id);
+                if !bound {
+                    let needs: Vec<Need> = self
+                        .types
+                        .needs(default_ty)
+                        .iter()
+                        .map(|need| through(need, context.key))
+                        .collect();
+                    self.charge_needs(&needs, span, NeedWhy::Default(name));
+                }
             }
-            ContextDefault::Foreign(Some(slot)) => self.read_import(id, slot),
+            ContextDefault::Foreign(Some(slot)) => {
+                self.read_import(id, slot);
+                if !bound {
+                    let needs: Vec<Need> = self
+                        .types
+                        .context_needs(context.key)
+                        .iter()
+                        .map(|need| through(need, context.key))
+                        .collect();
+                    self.charge_needs(&needs, span, NeedWhy::Default(name));
+                }
+            }
             // Its file failed its check, which is reported.
             ContextDefault::Foreign(None) => {
                 self.quiet.failed = true;
                 return TyId::ERROR;
             }
             ContextDefault::None => {
-                if self.functions.is_empty() && !self.with_bound.contains(&context.key) {
-                    let text = self.ast.names().get(name);
-                    self.errors.push(
-                        Diagnostic::error(format!("context `{text}` has no value here"), span)
-                            .with_note("no `with` sets it, and it declares no default"),
-                    );
-                    return TyId::ERROR;
-                }
+                let need: Need = Box::new([context.key]);
+                self.charge_needs(&[need], span, NeedWhy::Read);
             }
         }
         self.lowering.context_reads.insert(id, context.key);
@@ -214,10 +237,10 @@ impl Checker<'_> {
             }
             keys.push(context.key);
         }
-        let outer = self.with_bound.len();
-        self.with_bound.extend(keys.iter().copied());
+        let outer = self.contexts.bound.len();
+        self.contexts.bound.extend(keys.iter().copied());
         let ty = self.check_expr(body);
-        self.with_bound.truncate(outer);
+        self.contexts.bound.truncate(outer);
         self.lowering.withs.insert(id, keys.into());
         if erroneous { TyId::ERROR } else { ty }
     }

@@ -535,16 +535,20 @@ fn contexts_are_read_bound_and_defaulted_where_they_are_read() {
         "{a = \"x86_64-linux\"; b = \"aarch64-linux\"; c = \"riscv64-peios\"; d = \"arm-linux\"; \
          e = \"cc-x86_64\"; f = \"cc-mips\"; g = \"cc-explicit\"; h = 3; i = \"linux\"}"
     );
-    // A read of one with no value is a runtime error.
+    // A call of a function of another file that reads one no `with` binds,
+    // with no default, is an error where it is called.
     let files = [
         ("workspace.gcsl", ""),
         PLATFORMS,
         ("app/main.gcsl", "import lib/plat\nr = plat.needs()"),
     ];
-    let mut workspace = rooted(&files).unwrap();
-    let main = workspace.file("app/main.gcsl").unwrap();
-    let error = workspace.run(main).unwrap_err().remove(0);
-    assert_eq!(error.message, "context `required` has no value here");
+    assert_eq!(
+        check_errors(&files),
+        [
+            "context `required` has no value here at app/main.gcsl; note: `needs` needs it, and no \
+          `with` around this call sets it"
+        ]
+    );
 }
 
 #[test]

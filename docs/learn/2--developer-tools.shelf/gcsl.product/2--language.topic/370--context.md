@@ -29,7 +29,7 @@ the `with` reaches every call made inside it.
 top level of a file. Every file of the workspace can read it without an
 import, so a name is declared only once. A context can leave out its
 default, `context toolchains: List<Toolchain>`; reading it then needs a
-`with` that sets it, and reading it without one is an error.
+`with` that sets it (see [What a function needs](#what-a-function-needs)).
 
 A default is an expression, and it is evaluated where the context is
 read, in the context of the read. So one context can default to another,
@@ -81,6 +81,58 @@ fn compiler(^arch): String { "gcc-{arch}" }
 usual = compiler()
 explicit = compiler(arch = "mips")
 ```
+
+## What a function needs
+
+A function that reads a context with no default, with no `with` of its
+own around the read, *needs* that context: whoever calls it must set it.
+GCSL works this out for you, through every function in between, and
+checks each call before the program runs:
+
+```gcsl
+context arch: String
+
+fn compiler(): String { "gcc-{^arch}" }
+fn build(): String { "built with {compiler()}" }
+
+cross = build() with { arch = "aarch64" }
+```
+
+Here `build` needs `arch` because `compiler` does. Calling `build()`
+where no `with` sets `arch` is an error: "context `arch` has no value
+here". A `with` inside a function sets the context for what it calls, so
+that function needs nothing.
+
+A function's type shows what it needs after its parameters:
+`compiler` is a `fn(^arch): String`. A function passed as a value keeps
+its needs, so calling it needs them too. A function type you write needs
+nothing, so a function that needs a context can't be passed where one is
+expected. Set the context inside the function instead:
+
+```gcsl
+context arch: String
+
+fn twice(f: fn(): String): String { "{f()} {f()}" }
+both = twice(fn(): String { ^arch with { arch = "x86_64" } })
+```
+
+A context with a default needs nothing, but its default can read another
+context that has none. Then the function needs that one, unless the
+caller sets the context with the default, which is then never evaluated.
+Its type shows both: `fn(^host | ^target): String`.
+
+What a call needs is what runs where it is called. A `^NAME` parameter's
+default is evaluated by the caller, so `fn compiler(^arch)` needs
+nothing itself: `compiler()` needs `arch`, and `compiler(arch = "mips")`
+doesn't. A `with` around where a function is written doesn't count,
+because the function runs in the context of each call. A `lazy` is the
+other way round: it needs what its body needs where it is made.
+
+A definition is called by its def-type, which sets no context, so a
+definition can't need one. A function used inside its own recursion
+before GCSL knows what it needs, from a function nested in it or as a
+value, is an error if it turns out to need a context there. Call it
+directly, or set the context around the call.
 
 ## Context and deferred work
 

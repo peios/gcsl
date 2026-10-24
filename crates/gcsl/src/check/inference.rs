@@ -389,6 +389,7 @@ impl Checker<'_> {
             let ty =
                 self.types
                     .fn_type_with_rest(params, (sig.ret, sig.effect), sig.meta, sig.rest);
+            let ty = self.types.with_need_set(ty, sig.needs);
             if ty != declared {
                 if let Some(entry) = self.fn_params.get_mut(base + callback.param) {
                     entry.1 = ty;
@@ -399,6 +400,7 @@ impl Checker<'_> {
                 let every =
                     self.types
                         .fn_type_with_rest(every, (sig.ret, sig.effect), sig.meta, sig.rest);
+                let every = self.types.with_need_set(every, sig.needs);
                 if unnarrowed.is_empty() {
                     unnarrowed.resize(count, None);
                 }

@@ -303,9 +303,20 @@ A parameter written
 .BI ^ NAME
 defaults to the context of that name, and takes its type if none is written.
 A default is pure and is evaluated where the context is read, in the context of the read.
-Reading a context with no default that no
+A function that reads a context with no default, with no
 .B with
-sets is an error.
+of its own around the read, needs it, and so does every call of it; its type shows it,
+.BR "fn(^arch): String" ,
+and a written function type needs nothing.
+A call whose needs no
+.B with
+around it sets is the check-time error "context `arch` has no value here".
+A context read through another's default is needed unless the caller sets that one,
+.BR "fn(^arch | ^target): String" .
+A
+.BI ^ NAME
+parameter's default is the caller's, so it needs nothing of the function.
+A definition cannot need a context.
 A
 .B lazy
 keeps the context it was made in.

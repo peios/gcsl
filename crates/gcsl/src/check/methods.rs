@@ -647,6 +647,7 @@ impl Checker<'_> {
             meta,
             generic: None,
             rest: sig.rest,
+            needs: sig.needs,
         })
     }
 

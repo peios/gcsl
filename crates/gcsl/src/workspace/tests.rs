@@ -303,6 +303,7 @@ mod locks;
 mod memo;
 mod merging;
 mod metas;
+mod needs;
 mod shadowing;
 mod shell;
 mod standard;

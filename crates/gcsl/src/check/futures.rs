@@ -478,6 +478,8 @@ impl Checker<'_> {
             demanded: Vec::new(),
             result: None,
             returns: Vec::new(),
+            with_depth: self.contexts.bound.len(),
+            needs: Vec::new(),
         });
         (self.next_slot, self.frame_size) = (0, 0);
         let found = self.check_expr(decl.body);

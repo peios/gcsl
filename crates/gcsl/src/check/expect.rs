@@ -227,9 +227,11 @@ impl Checker<'_> {
     /// [`Checker::narrowing_label`]); with a note when a future is expected
     /// and what is found is not one; with the note saying to tell a
     /// union's members apart when what is found is one (see
-    /// [`Checker::union_note`]); and with the note saying that a default
+    /// [`Checker::union_note`]); with the note saying that a default
     /// fills only a record literal when what is found lacks a defaulted
-    /// field (see [`Checker::default_note`]).
+    /// field (see [`Checker::default_note`]); and with the note on a function
+    /// that needs a context the expected type does not list (see
+    /// [`Checker::needs_note`]).
     pub(super) fn mismatch(
         &mut self,
         expr: ExprId,
@@ -257,6 +259,9 @@ impl Checker<'_> {
             error = error.with_note(note);
         }
         if let Some(note) = self.secret_note(found, expected) {
+            error = error.with_note(note);
+        }
+        if let Some(note) = self.needs_note(found, expected) {
             error = error.with_note(note);
         }
         if self.types.laziness(expected) == Laziness::Future {

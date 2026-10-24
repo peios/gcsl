@@ -8,7 +8,7 @@ use std::rc::Rc;
 use crate::ast::{ArgRange, ExprId, FnId, ForId, GenericOwner, ItemId, RecoverId};
 use crate::names::Name;
 use crate::source::Span;
-use crate::types::{AwaitKind, GenericId, TyId, ValueTest};
+use crate::types::{AwaitKind, GenericId, Need, TyId, ValueTest};
 
 use super::{
     Attribute, Constant, FieldSchedule, ImportedRecord, ImportedRecords, MadeAt, ParamDefault,
@@ -184,21 +184,32 @@ pub(super) struct ForLowering {
     pub(super) file_paths: HashSet<ExprId>,
 }
 
+/// A parameter's default function, as its check found it (see "Calls"
+/// under [Functions](crate::check::functions#functions)).
+#[derive(Clone, Debug)]
+pub(super) struct DefaultFn {
+    /// The parameter's number.
+    pub(super) param: usize,
+    /// Whether it checked without an error.
+    pub(super) checked: bool,
+    /// What it needs (see [Needs](crate::check::needs#needs)).
+    pub(super) needs: Box<[Need]>,
+}
+
 /// The defaults of a function, for [`FnResolution::defaults`]: `constants`,
 /// each parameter's constant default, if it has one that checked, and
-/// `functions`, each parameter with a default function, in parameter order,
-/// with whether it checked, whose closures follow the function's `captures` own
-/// captures in its closure (see "Calls" under
-/// [Functions](crate::check::functions#functions)). Empty if no parameter has a
-/// default.
+/// `functions`, each parameter's default function, in parameter order, whose
+/// closures follow the function's `captures` own captures in its closure (see
+/// "Calls" under [Functions](crate::check::functions#functions)). Empty if no
+/// parameter has a default.
 pub(super) fn merged_defaults(
     constants: Vec<Option<Constant>>,
-    functions: &[(usize, bool)],
+    functions: &[DefaultFn],
     captures: usize,
 ) -> Vec<Option<ParamDefault>> {
     let count = functions
         .iter()
-        .map(|&(param, _)| param + 1)
+        .map(|default| default.param + 1)
         .max()
         .unwrap_or(0)
         .max(constants.len());
@@ -210,10 +221,13 @@ pub(super) fn merged_defaults(
         .map(|constant| constant.map(ParamDefault::Constant))
         .collect();
     merged.resize(count, None);
-    for (at, &(param, checked)) in functions.iter().enumerate() {
-        if let (true, Some(entry)) = (checked, merged.get_mut(param)) {
+    for (at, default) in functions.iter().enumerate() {
+        if let (true, Some(entry)) = (default.checked, merged.get_mut(default.param)) {
             let capture = u32::try_from(captures + at).unwrap_or(u32::MAX);
-            *entry = Some(ParamDefault::Function { capture });
+            *entry = Some(ParamDefault::Function {
+                capture,
+                needs: default.needs.clone(),
+            });
         }
     }
     merged

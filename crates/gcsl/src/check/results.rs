@@ -9,7 +9,7 @@ use crate::ast::{Annotate, AttributeId, ExprId, ItemId};
 use crate::diagnostic::Diagnostic;
 use crate::mentions::{FieldTree, Schedule};
 use crate::names::{Name, Names};
-use crate::types::{TyId, TypeTable};
+use crate::types::{Need, TyId, TypeTable};
 use crate::value::Quantity;
 
 use super::{Builtin, Resolution, Scope};
@@ -350,6 +350,9 @@ pub enum ParamDefault {
         /// The index of the default function's closure among the callee
         /// closure's captures, after the function's own.
         capture: u32,
+        /// What the default needs, which a call that leaves the parameter
+        /// out needs (see [Needs](crate::check::needs#needs)).
+        needs: Box<[Need]>,
     },
 }
 
