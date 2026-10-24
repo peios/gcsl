@@ -1300,9 +1300,12 @@
 //! argument that fills a parameter whose type mentions a type parameter, as
 //! the arguments are bound ([`argument_targets`]), is checked with no type
 //! expected, and binds what that type mentions ([`TypeTable::bind`]), a
-//! parameter bound twice the join of its bindings; but `[]` and `{}`,
-//! whose types are what they are expected to be, bind nothing, and an
-//! integer literal binds only what nothing else binds, as an `Int`. A type
+//! parameter bound twice the join of its bindings, which, widened to a
+//! union, is the warning "the arguments for `T` have different types", as
+//! a list literal's elements are; but `[]` and `{}`, whose types are what
+//! they are expected to be, bind nothing, and an integer literal binds, as
+//! an `Int`, only what nothing else binds or what it does not fit, so that
+//! another argument can make it a `Float`. A type
 //! parameter left unbound is "cannot infer `T` for this call of `f`", noted
 //! "`T` appears in no parameter's type given an argument here". The call is
 //! then bound and checked as any is, with the signature its bindings
@@ -3882,6 +3885,17 @@ struct GenericsChecked {
     /// The callee of the call being checked, through any parentheses: the
     /// one place a generic function's name may be read.
     callee: Option<ExprId>,
+}
+
+/// What a call of a generic function has bound of its type parameters so
+/// far, as [`Checker::instantiate`] binds them.
+struct TypeBinding {
+    /// What the type parameters belong to.
+    generic: GenericId,
+    /// Each type parameter's binding, by its position, once one is made.
+    bound: Vec<Option<TyId>>,
+    /// The argument that bound each first.
+    binders: Vec<Option<ExprId>>,
 }
 
 /// What the check gives lowering besides types and slots, as
@@ -12973,14 +12987,7 @@ impl<'a> Checker<'a> {
                 self.settle(expr, found);
             }
             (TyId::UNTYPED_INT, TyId::INT | TyId::FLOAT) => self.coerce(expr, expected),
-            // A literal is present, so it satisfies the either shape of its
-            // type, `Int | Future<Int>`, as it would `Int`, and a provisional
-            // one, which stands for its present type as a supertype; and a
-            // union with a numeric member, as that member.
-            (TyId::UNTYPED_INT, _)
-                if self.types.laziness(expected) != Laziness::Future
-                    && self.numeric_member(self.types.strip(expected)).is_some() =>
-            {
+            (TyId::UNTYPED_INT, _) if self.untyped_fits(expected) => {
                 let present = self.numeric_target(expected);
                 self.coerce(expr, present);
             }
@@ -16171,9 +16178,11 @@ impl<'a> Checker<'a> {
     /// arguments `args` bind it (see [Generics](#generics)): each argument
     /// that fills a parameter whose type mentions one is checked, with no
     /// expected type, and kept for its binding ([`GenericsChecked`]), and
-    /// binds what that type mentions ([`TypeTable::bind`]). A type parameter
-    /// left unbound is "cannot infer `T` for this call of `f`", and then
-    /// `None`, every argument checked.
+    /// binds what that type mentions ([`Checker::bind_argument`]); an
+    /// integer literal binds only once the others have, and only what they
+    /// leave unbound or what it does not fit. A type parameter left unbound
+    /// is "cannot infer `T` for this call of `f`", and then `None`, every
+    /// argument checked.
     fn instantiate(
         &mut self,
         (id, callee): (ExprId, ExprId),
@@ -16182,8 +16191,11 @@ impl<'a> Checker<'a> {
         generic: GenericId,
     ) -> Option<FnTy> {
         let ast = self.ast;
-        let names = self.types.generic_names(generic).to_vec();
-        let mut bound: Vec<Option<TyId>> = vec![None; names.len()];
+        let mut binding = TypeBinding {
+            generic,
+            bound: vec![None; self.types.generic_names(generic).len()],
+            binders: vec![None; self.types.generic_names(generic).len()],
+        };
         let mut untyped: Vec<(ExprId, TyId)> = Vec::new();
         for (value, param) in argument_targets(ast.args(args), sig) {
             let Some(&(_, param_ty)) = sig.params.get(param) else {
@@ -16194,65 +16206,39 @@ impl<'a> Checker<'a> {
             }
             let found = self.check_expr(value);
             self.generics.prechecked.insert(value, found);
-            // An integer literal binds last, if nothing else binds what it
-            // fills, so that it can be a `Float` by another argument.
             if found == TyId::UNTYPED_INT {
                 untyped.push((value, param_ty));
-                continue;
+            } else {
+                self.bind_argument(&mut binding, (value, param_ty), found);
             }
-            self.types.bind(param_ty, found, generic, &mut bound);
         }
+        // An integer literal binds last, so that another argument can make
+        // it a `Float`.
         for (value, param_ty) in untyped {
-            let found = self
-                .generics
-                .prechecked
-                .get(&value)
-                .copied()
-                .unwrap_or(TyId::ERROR);
-            let would_bind = {
-                let mut trial = bound.clone();
-                self.types.bind(param_ty, TyId::INT, generic, &mut trial);
-                trial
-            };
-            if bound
+            let mut trial = binding.bound.clone();
+            self.types.bind(param_ty, TyId::INT, generic, &mut trial);
+            let binds_new = binding
+                .bound
                 .iter()
-                .zip(&would_bind)
-                .any(|(was, is)| was.is_none() && is.is_some())
-            {
-                let found = if found == TyId::UNTYPED_INT {
-                    self.settle(value, found)
-                } else {
-                    found
-                };
+                .zip(&trial)
+                .any(|(was, is)| was.is_none() && is.is_some());
+            let bindings: Vec<TyId> = binding
+                .bound
+                .iter()
+                .map(|ty| ty.unwrap_or(TyId::ERROR))
+                .collect();
+            let expected = self.types.substitute(param_ty, generic, &bindings);
+            if binds_new || !self.untyped_fits(expected) {
+                let found = self.settle(value, TyId::UNTYPED_INT);
                 self.generics.prechecked.insert(value, found);
-                self.types.bind(param_ty, found, generic, &mut bound);
+                self.bind_argument(&mut binding, (value, param_ty), found);
             }
         }
-        if let Some(unbound) = bound.iter().position(Option::is_none) {
-            let name = names
-                .get(unbound)
-                .map_or("?", |&name| ast.names().get(name));
-            let callee_text = match ast.get(callee).kind {
-                ExprKind::Name(callee) => format!(" of `{}`", ast.names().get(callee)),
-                _ => String::new(),
-            };
-            self.errors.push(
-                Diagnostic::error(
-                    format!("cannot infer `{name}` for this call{callee_text}"),
-                    ast.get(id).span,
-                )
-                .with_note(format!(
-                    "`{name}` appears in no parameter's type given an argument here"
-                )),
-            );
-            for arg in ast.args(args) {
-                if self.generics.prechecked.remove(&arg.value).is_none() {
-                    self.check_alone(arg.value);
-                }
-            }
+        if let Some(unbound) = binding.bound.iter().position(Option::is_none) {
+            self.not_inferred((id, callee), args, (generic, unbound));
             return None;
         }
-        let bindings: Vec<TyId> = bound.into_iter().flatten().collect();
+        let bindings: Vec<TyId> = binding.bound.into_iter().flatten().collect();
         let params = sig
             .params
             .iter()
@@ -16270,6 +16256,96 @@ impl<'a> Checker<'a> {
             meta,
             generic: None,
         })
+    }
+
+    /// Binds what `param_ty`, the type of the parameter that `value` fills,
+    /// mentions of `binding`'s type parameters from `found`, `value`'s type
+    /// ([`TypeTable::bind`]), noting `value` as the binder of each it binds
+    /// first. One whose binding this widens to a union is the warning "the
+    /// arguments for `T` have different types", as the elements of a list
+    /// literal are.
+    fn bind_argument(
+        &mut self,
+        binding: &mut TypeBinding,
+        (value, param_ty): (ExprId, TyId),
+        found: TyId,
+    ) {
+        let before = binding.bound.clone();
+        let widened = self
+            .types
+            .bind(param_ty, found, binding.generic, &mut binding.bound);
+        for ((binder, was), is) in binding.binders.iter_mut().zip(&before).zip(&binding.bound) {
+            if was.is_none() && is.is_some() {
+                *binder = Some(value);
+            }
+        }
+        let Some(index) = widened else {
+            return;
+        };
+        let at = usize::from(index);
+        let name = self
+            .types
+            .generic_names(binding.generic)
+            .get(at)
+            .map_or("?", |&name| self.ast.names().get(name))
+            .to_owned();
+        let (Some(Some(so_far)), Some(Some(joined))) = (before.get(at), binding.bound.get(at))
+        else {
+            return;
+        };
+        let (so_far, joined) = (*so_far, *joined);
+        let mut warning = Diagnostic::warning(
+            format!("the arguments for `{name}` have different types"),
+            self.ast.get(value).span,
+        )
+        .with_label(format!("this is {}", self.in_label(found)))
+        .with_note(format!(
+            "`{name}` is {} for this call; ascribe an argument that type, as in `(x : {})`, if \
+             both are meant",
+            self.in_message(joined),
+            self.in_label(joined)
+        ));
+        if let Some(Some(binder)) = binding.binders.get(at) {
+            let context = format!("`{name}` is {} by this", self.in_label(so_far));
+            warning = warning.with_context(self.ast.get(*binder).span, context);
+        }
+        self.warnings.push(warning);
+    }
+
+    /// Reports that the type parameter number `unbound` of `generic` is
+    /// bound by no argument of the call `id` of `callee`, the arguments
+    /// `args`: "cannot infer `T` for this call of `f`"; and checks each
+    /// argument not checked to bind another.
+    fn not_inferred(
+        &mut self,
+        (id, callee): (ExprId, ExprId),
+        args: ArgRange,
+        (generic, unbound): (GenericId, usize),
+    ) {
+        let ast = self.ast;
+        let name = self
+            .types
+            .generic_names(generic)
+            .get(unbound)
+            .map_or("?", |&name| ast.names().get(name));
+        let callee_text = match ast.get(callee).kind {
+            ExprKind::Name(callee) => format!(" of `{}`", ast.names().get(callee)),
+            _ => String::new(),
+        };
+        self.errors.push(
+            Diagnostic::error(
+                format!("cannot infer `{name}` for this call{callee_text}"),
+                ast.get(id).span,
+            )
+            .with_note(format!(
+                "`{name}` appears in no parameter's type given an argument here"
+            )),
+        );
+        for arg in ast.args(args) {
+            if self.generics.prechecked.remove(&arg.value).is_none() {
+                self.check_alone(arg.value);
+            }
+        }
     }
 
     /// Whether `value`, through any parentheses, is a literal whose type is
@@ -18601,6 +18677,17 @@ impl<'a> Checker<'a> {
                 _ => return node,
             }
         }
+    }
+
+    /// Whether an integer literal, of the untyped integer type, fits
+    /// `expected`: if it is `Int` or `Float`; and since a literal is present,
+    /// the either shape of one, `Int | Future<Int>`, as it would `Int`, and a
+    /// provisional one, which stands for its present type as a supertype;
+    /// and a union with a numeric member, as that member.
+    fn untyped_fits(&self, expected: TyId) -> bool {
+        matches!(expected, TyId::INT | TyId::FLOAT)
+            || (self.types.laziness(expected) != Laziness::Future
+                && self.numeric_member(self.types.strip(expected)).is_some())
     }
 
     /// The type of `expr`, of type `ty`, once an untyped integer in it

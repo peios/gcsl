@@ -1127,51 +1127,59 @@ impl TypeTable {
     /// what a future or an either shape holds, each against the same of
     /// `arg`'s, its lazy layers stripped, bind what they mention. Nothing
     /// else binds: what does not match is the argument's mismatch, which its
-    /// check against the substituted type reports.
+    /// check against the substituted type reports. Returns the position of
+    /// the first parameter whose binding this widened to a union, if any.
     ///
     /// Recurses once per level of nesting in `param`.
-    pub fn bind(&mut self, param: TyId, arg: TyId, generic: GenericId, bound: &mut [Option<TyId>]) {
+    pub fn bind(
+        &mut self,
+        param: TyId,
+        arg: TyId,
+        generic: GenericId,
+        bound: &mut [Option<TyId>],
+    ) -> Option<u8> {
         if !self.mentions(param, generic) || arg == TyId::ERROR {
-            return;
+            return None;
         }
         let present = self.strip(arg);
         match self.kind(param).clone() {
             TyKind::Param { generic: of, index } if of == generic => {
-                if let Some(slot) = bound.get_mut(usize::from(index)) {
-                    *slot = Some(match *slot {
-                        Some(earlier) => self.join(earlier, arg).0,
-                        None => arg,
-                    });
-                }
+                let slot = bound.get_mut(usize::from(index))?;
+                let (joined, widened) = match *slot {
+                    Some(earlier) => self.join(earlier, arg),
+                    None => (arg, false),
+                };
+                *slot = Some(joined);
+                widened.then_some(index)
             }
-            TyKind::List(element) => {
-                if let TyKind::List(given) = *self.kind(present) {
-                    self.bind(element, given, generic, bound);
-                }
-            }
+            TyKind::List(element) => match *self.kind(present) {
+                TyKind::List(given) => self.bind(element, given, generic, bound),
+                _ => None,
+            },
             TyKind::Record(record) => {
                 let TyKind::Record(given) = self.kind(present).clone() else {
-                    return;
+                    return None;
                 };
+                let mut widened = None;
                 for &(name, field) in &record.fields {
                     if let Some(&(_, of)) = given.fields.iter().find(|&&(given, _)| given == name) {
-                        self.bind(field, of, generic, bound);
+                        widened = widened.or(self.bind(field, of, generic, bound));
                     }
                 }
+                widened
             }
             TyKind::Fn(sig) => {
-                let Some(given) = self.fn_sig(present).cloned() else {
-                    return;
-                };
+                let given = self.fn_sig(present).cloned()?;
+                let mut widened = None;
                 for (&(_, param), &(_, of)) in sig.params.iter().zip(given.params.iter()) {
-                    self.bind(param, of, generic, bound);
+                    widened = widened.or(self.bind(param, of, generic, bound));
                 }
-                self.bind(sig.ret, given.ret, generic, bound);
+                widened.or(self.bind(sig.ret, given.ret, generic, bound))
             }
             TyKind::Future(inner) | TyKind::Either(inner) | TyKind::Provisional { inner, .. } => {
-                self.bind(inner, present, generic, bound);
+                self.bind(inner, present, generic, bound)
             }
-            _ => {}
+            _ => None,
         }
     }
 

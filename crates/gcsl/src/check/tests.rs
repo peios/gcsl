@@ -14233,3 +14233,27 @@ fn a_generic_body_holds_its_type_parameters_opaque() {
         );
     }
 }
+
+#[test]
+fn arguments_binding_a_type_parameter_differently_widen_it_with_a_warning() {
+    let pick = "fn pick<T>(a: T, b: T): T { a }\n";
+    for (call, ty, warned) in [
+        ("let a = 1\npick(a, \"s\")", "Int | String", true),
+        ("pick(1, \"s\")", "Int | String", true),
+        // A literal adapts to what the other argument binds.
+        ("pick(2.5, 1)", "Float", false),
+        ("pick(1, 2)", "Int", false),
+        ("pick((1 : Int | String), \"s\")", "Int | String", false),
+    ] {
+        let text = format!("{pick}{call}");
+        assert_eq!(file_type(&text), ty, "{text}");
+        let messages = warning_messages(&text);
+        assert_eq!(
+            messages
+                .iter()
+                .any(|m| m == "the arguments for `T` have different types"),
+            warned,
+            "{text}: {messages:?}"
+        );
+    }
+}
