@@ -45,6 +45,17 @@ pub struct RootField<'a> {
     pub path: &'a [&'a str],
 }
 
+/// A top-level function a prepared call gives its invocation to
+/// ([`Workspace::prepare_call_wrapped`]): the function `function` of file
+/// `file`.
+#[derive(Clone, Copy, Debug)]
+pub struct RootWrap<'a> {
+    /// The file, by its number.
+    pub file: u32,
+    /// Its top-level function's name.
+    pub function: &'a str,
+}
+
 /// An invocation of a definition, prepared to run in graph mode, as many
 /// times as it takes (see [Prepared calls](#prepared-calls)).
 #[derive(Debug)]
@@ -176,24 +187,56 @@ impl Workspace {
     /// top-level field of its file, [`RequestError::NoField`](super::RequestError::NoField).
     pub fn prepare_call_with(
         &mut self,
-        (def_type, path): (&str, &str),
+        call: (&str, &str),
         args: &[(String, Given)],
         contexts: &[(String, crate::Value)],
         fields: &[RootField<'_>],
     ) -> Result<PreparedCall, InvokeError> {
+        self.prepare_call_wrapped(call, args, contexts, (fields, None))
+    }
+
+    /// [`Workspace::prepare_call_with`], the invocation given, if `wrap`
+    /// says so, to a top-level function of a file as its one argument, as if
+    /// the call were written `FUNCTION(DT PATH(...))`, in the root contexts
+    /// too: as pekit packs a package, `packaging.pack(package NAME())`.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`Workspace::prepare_call_with`], and a function that is no
+    /// top-level field of its file, [`RequestError::NoField`](super::RequestError::NoField), or
+    /// one the invocation's value does not fit, its check's.
+    pub fn prepare_call_wrapped(
+        &mut self,
+        (def_type, path): (&str, &str),
+        args: &[(String, Given)],
+        contexts: &[(String, crate::Value)],
+        (fields, wrap): (&[RootField<'_>], Option<RootWrap<'_>>),
+    ) -> Result<PreparedCall, InvokeError> {
+        let no_field = |workspace: &Self, file: u32, name: &str| {
+            let file = workspace
+                .scan
+                .files
+                .get(file as usize)
+                .map(|file| file.path.clone())
+                .unwrap_or_default();
+            InvokeError::Request(super::RequestError::NoField {
+                file,
+                name: name.to_owned(),
+            })
+        };
+        let wrapper = match wrap {
+            None => None,
+            Some(wrap) => {
+                let Some((_, (cell, known))) = self.top_level_cell(wrap.file, wrap.function) else {
+                    return Err(no_field(self, wrap.file, wrap.function));
+                };
+                Some((self.scan.names.intern("<root wrapper>"), cell, known))
+            }
+        };
         let mut cells = Vec::with_capacity(fields.len());
         for (number, field) in fields.iter().enumerate() {
             let Some((_, (cell, _))) = self.top_level_cell(field.file, field.field) else {
-                let file = self
-                    .scan
-                    .files
-                    .get(field.file as usize)
-                    .map(|file| file.path.clone())
-                    .unwrap_or_default();
-                return Err(InvokeError::Request(super::RequestError::NoField {
-                    file,
-                    name: field.field.to_owned(),
-                }));
+                return Err(no_field(self, field.file, field.field));
             };
             cells.push(FieldCell {
                 context: self.scan.names.intern(field.context),
@@ -224,12 +267,13 @@ impl Workspace {
         let definition = definition.clone();
         let mut files = vec![definition.file, found.listed.file];
         files.extend(fields.iter().map(|field| field.file));
+        files.extend(wrap.map(|wrap| wrap.file));
         let known = self.def_type_known(found);
         let (mut ir, warnings) = self.lower_definition_call(
             (&definition, Invocation::Call(&args)),
             (resolved.def_type_cell, resolved.definition_cell),
             (known, root.as_ref()),
-            &cells,
+            (&cells, wrapper),
         )?;
         ir.reserve_frame(count(self.frame.len()));
         let unit = count(self.scan.files.len()).saturating_add(self.calls_prepared);

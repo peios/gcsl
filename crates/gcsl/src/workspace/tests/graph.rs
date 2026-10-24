@@ -836,6 +836,53 @@ fn a_root_context_is_set_from_a_field_its_target_never_reads() {
 }
 
 #[test]
+fn a_prepared_call_can_be_given_to_a_top_level_function() {
+    let files = [
+        (
+            "workspace.gcsl",
+            "context factor: Int = 1\nconf = {factor = 3}\n\
+             def scaled(n: Int, ^factor) -> Int { n * factor }",
+        ),
+        ("app/build.gcsl", "def build x() { = 7 }"),
+    ];
+    let mut workspace = rooted(&files).unwrap();
+    let root = workspace.file("workspace.gcsl").unwrap();
+    let field = crate::workspace::graph::RootField {
+        context: "factor",
+        file: root,
+        field: "conf",
+        path: &["factor"],
+    };
+    let wrap = crate::workspace::graph::RootWrap {
+        file: root,
+        function: "scaled",
+    };
+    // `scaled(build x())`, in the root contexts too.
+    let call = workspace
+        .prepare_call_wrapped(("build", "x"), &[], &[], (&[field], Some(wrap)))
+        .unwrap();
+    let mut graph = Graph::new();
+    let Progress::Done(value) = workspace.run_prepared(&call, &mut graph, every()).unwrap() else {
+        panic!("not done");
+    };
+    assert_eq!(value, Value::Int(21));
+    // A function there is not.
+    let missing = crate::workspace::graph::RootWrap {
+        function: "nope",
+        ..wrap
+    };
+    match workspace.prepare_call_wrapped(("build", "x"), &[], &[], (&[], Some(missing))) {
+        Err(InvokeError::Request(error)) => {
+            assert_eq!(
+                error.message(),
+                "`workspace.gcsl` has no top-level field `nope`"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_step_s_context_of_functions_is_keyed_by_their_code() {
     let (mut workspace, file) = lone_workspace(
         "context helpers: List<fn(): Int> = []\n\

@@ -1027,7 +1027,7 @@ impl Workspace {
             (definition, invoked),
             (def_type, definition_cell),
             (known, root.as_ref()),
-            &[],
+            (&[], None),
         )?;
         self.run_built(lowered, at, root)
     }
@@ -1044,7 +1044,7 @@ impl Workspace {
         (definition, invoked): (&Definition, Invocation),
         (def_type, definition_cell): ((Slot, TyId), (Slot, TyId)),
         (known, root): (Option<Rc<KnownParams>>, Option<&Rc<ContextFrame>>),
-        fields: &[FieldCell],
+        (fields, wrap): (&[FieldCell], Option<BoundCell>),
     ) -> Result<(Ir, Vec<Diagnostic>), InvokeError> {
         let at = (definition.file, definition.span);
         let bound = (
@@ -1053,11 +1053,13 @@ impl Workspace {
         );
         let mut cells = vec![(bound.0, def_type, known), (bound.1, definition_cell, None)];
         cells.extend(fields.iter().map(|field| (field.bound, field.cell, None)));
+        let wrapper = wrap.as_ref().map(|(name, ..)| *name);
+        cells.extend(wrap);
         let path = &definition.path;
         let contexts: Vec<Name> = fields.iter().map(|field| field.context).collect();
         self.lower_built(
             &cells,
-            |names| invocation(names, (path, invoked), (bound, fields), at.1),
+            |names| invocation(names, (path, invoked), (bound, fields, wrapper), at.1),
             (at, root),
             &contexts,
         )
@@ -1556,12 +1558,14 @@ pub(super) fn invocation_params(ast: &Ast, item: ItemId) -> &[Param] {
 /// `<def-type>("PATH", <definition>, NAME = VALUE, ...)`, its result, PATH
 /// `path`, each named argument one of `args`, in order, its value a literal
 /// of its kind, the two names those of `bound`, each node at `span`; with
-/// `fields`, wrapped in `with { CONTEXT = BOUND.PATH, ... } { ... }`, each
-/// field's cell read by its name.
+/// `wrap`, the name a top-level function's cell is bound by, given that as
+/// its one argument, `<wrap>(<def-type>(...))`; and with `fields`, wrapped
+/// in `with { CONTEXT = BOUND.PATH, ... } { ... }`, each field's cell read
+/// by its name.
 pub(super) fn invocation(
     mut names: Names,
     (path, invoked): (&str, Invocation),
-    (bound, fields): ((Name, Name), &[FieldCell]),
+    (bound, fields, wrap): ((Name, Name), &[FieldCell], Option<Name>),
     span: Span,
 ) -> Ast {
     let args = match invoked {
@@ -1619,35 +1623,22 @@ pub(super) fn invocation(
         kind: ExprKind::Call { callee, args },
         span,
     });
-    if !fields.is_empty() {
-        let mut bindings = Vec::with_capacity(fields.len());
-        for field in fields {
-            let mut value = builder.alloc(Expr {
-                kind: ExprKind::Name(field.bound),
-                span,
-            });
-            for &name in &field.path {
-                value = builder.alloc(Expr {
-                    kind: ExprKind::Field { expr: value, name },
-                    span,
-                });
-            }
-            bindings.push(ast::WithBinding {
-                name: field.context,
-                name_span: span,
-                path: builder.push_path(&[]),
-                value,
-                current: None,
-            });
-        }
-        let bindings = builder.push_with_bindings(&bindings);
-        call = builder.alloc(Expr {
-            kind: ExprKind::With {
-                bindings,
-                body: call,
-            },
+    if let Some(wrap) = wrap {
+        let callee = builder.alloc(Expr {
+            kind: ExprKind::Name(wrap),
             span,
         });
+        let args = builder.push_args(&[Arg {
+            kind: ArgKind::Positional,
+            value: call,
+        }]);
+        call = builder.alloc(Expr {
+            kind: ExprKind::Call { callee, args },
+            span,
+        });
+    }
+    if !fields.is_empty() {
+        call = with_fields(&mut builder, fields, call, span);
     }
     let item = builder.alloc_item(Item {
         kind: ItemKind::Result(call),
@@ -1655,6 +1646,45 @@ pub(super) fn invocation(
     });
     let root = builder.push_item_list(&[item]);
     builder.finish(root, names, strings)
+}
+
+/// `call` wrapped in `with { CONTEXT = BOUND.PATH, ... } { ... }`, built in
+/// `builder`, a binding for each of `fields`, each field's cell read by its
+/// name, each node at `span` (see [`invocation`]).
+fn with_fields(
+    builder: &mut AstBuilder,
+    fields: &[FieldCell],
+    call: ast::ExprId,
+    span: Span,
+) -> ast::ExprId {
+    let mut bindings = Vec::with_capacity(fields.len());
+    for field in fields {
+        let mut value = builder.alloc(Expr {
+            kind: ExprKind::Name(field.bound),
+            span,
+        });
+        for &name in &field.path {
+            value = builder.alloc(Expr {
+                kind: ExprKind::Field { expr: value, name },
+                span,
+            });
+        }
+        bindings.push(ast::WithBinding {
+            name: field.context,
+            name_span: span,
+            path: builder.push_path(&[]),
+            value,
+            current: None,
+        });
+    }
+    let bindings = builder.push_with_bindings(&bindings);
+    builder.alloc(Expr {
+        kind: ExprKind::With {
+            bindings,
+            body: call,
+        },
+        span,
+    })
 }
 
 /// A root context a host sets from a top-level field of the workspace, as
