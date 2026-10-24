@@ -858,3 +858,20 @@ fn a_method_of_a_file_s_own_shadows_the_prelude_s() {
     ];
     assert_eq!(value(&files, "app/main.gcsl"), "{x = \"root's\"}");
 }
+
+#[test]
+fn a_method_applies_to_a_receiver_whose_elements_may_be_futures() {
+    // An impure function's `List<String>` parameter holds what may be
+    // futures: awaited deeply, as an argument would be, it is a list of
+    // strings.
+    assert_eq!(
+        lone("fn f(words: List<String>) -> String { words.join(\"+\") }\n= f([\"a\", \"b\"])")
+            .unwrap(),
+        "a+b"
+    );
+    assert_eq!(
+        lone("fn f(words: List<String>) -> Int { words.unique().len() }\n= f([\"a\", \"a\"])")
+            .unwrap(),
+        "1"
+    );
+}

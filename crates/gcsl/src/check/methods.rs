@@ -60,9 +60,12 @@
 //! top-level field or a member of `fileroot` if it is one, called as any
 //! callee is. Otherwise its receiver `x` is checked first, measured, an
 //! integer literal settled to `Int`; a method *applies* if the receiver's
-//! type, stripped of its lazy layers, fits the method's receiver type,
-//! stripped too, once each type parameter that type mentions is bound by
-//! the receiver's as a call binds it (`Checker::method_applies`). Then:
+//! type, stripped of its lazy layers, or else awaited deeply, as an
+//! argument would be, fits the method's receiver type, stripped too, once
+//! each type parameter that type mentions is bound by the receiver's as a
+//! call binds it (`Checker::method_applies`): so `words.join(",")` applies
+//! to an impure function's parameter `words: List<String>`, whose elements
+//! may be futures. Then:
 //!
 //! - a receiver type with a field `m` (or a meta, which has fields) and a
 //!   method that applies is "`m` is both a field of T and a method";
@@ -336,13 +339,26 @@ impl Checker<'_> {
     /// parameter that type mentions is bound by `found`, as a call binds it
     /// ([`TypeTable::bind`](crate::types::TypeTable::bind)); one it leaves unbound, and so no fit.
     pub(super) fn method_applies(&mut self, found: TyId, method: TyId) -> bool {
+        let stripped = self.types.strip(found);
+        if self.method_applies_to(stripped, method) {
+            return true;
+        }
+        // Awaited deeply, as an argument would be: a list whose elements may
+        // be futures, as an impure function's parameter's are, is a list of
+        // what they yield.
+        let present = self.types.present(found);
+        present != stripped && self.method_applies_to(present, method)
+    }
+
+    /// Whether `method` applies to a receiver of type `present`, stripped of
+    /// its lazy layers, as [`Checker::method_applies`] says.
+    fn method_applies_to(&mut self, present: TyId, method: TyId) -> bool {
         let Some(sig) = self.types.fn_sig(method).cloned() else {
             return false;
         };
         let Some(&(_, receiver)) = sig.params.first() else {
             return false;
         };
-        let present = self.types.strip(found);
         let expected = match sig.generic {
             Some(generic) => {
                 let count = self.types.generic_names(generic).len();
