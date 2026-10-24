@@ -169,6 +169,16 @@
 //! equivalent payload. Each variant's payload is recorded by its key
 //! ([`TypeTable::set_variant_payload`]). See the checker's "Enums".
 //!
+//! # Secrets
+//!
+//! `Secret<T>` ([`TyKind::Secret`]) is a value of the present type `T` that
+//! never leaks (see the checker's "Secrets"). A plain `T` fits it, and a
+//! secret fits another if its value's type fits the other's; a secret fits
+//! no plain type. A join of a secret and a value of its type is the
+//! secret ([`TypeTable::join`]). Whether a type holds one anywhere, a
+//! field's, an element's, a member's or a payload's at any depth, is what
+//! makes a comparison of it secret ([`TypeTable::holds_secret`]).
+//!
 //! # Partial records
 //!
 //! `Partial<T>` ([`TyKind::Partial`]) holds any of `T`'s fields: a record or
@@ -516,6 +526,9 @@ pub enum TyKind {
     /// holding any of `T`'s fields, each of its type (see [Partial
     /// records](#partial-records)).
     Partial(TyId),
+    /// `Secret<T>` of a present type `T`: a value of `T` that never leaks
+    /// (see [Secrets](#secrets)). Never of another secret.
+    Secret(TyId),
 }
 
 /// What a generic function's type parameters belong to: one of its own,
@@ -849,7 +862,8 @@ impl TypeTable {
             | TyKind::Either(inner)
             | TyKind::List(inner)
             | TyKind::Variant { payload: inner, .. }
-            | TyKind::Partial(inner) => self.has_provisional(*inner),
+            | TyKind::Partial(inner)
+            | TyKind::Secret(inner) => self.has_provisional(*inner),
             TyKind::Union(members) => members.iter().any(|&member| self.has_provisional(member)),
             TyKind::Int
             | TyKind::Float
@@ -926,13 +940,13 @@ impl TypeTable {
             TyKind::Future(inner)
             | TyKind::Either(inner)
             | TyKind::List(inner)
+            | TyKind::Variant { payload: inner, .. }
+            | TyKind::Partial(inner)
+            | TyKind::Secret(inner)
             | TyKind::Provisional { inner, .. } => self.special_builtin(*inner),
             TyKind::Union(members) => members
                 .iter()
                 .find_map(|&member| self.special_builtin(member)),
-            TyKind::Variant { payload: inner, .. } | TyKind::Partial(inner) => {
-                self.special_builtin(*inner)
-            }
             TyKind::Int
             | TyKind::Float
             | TyKind::Bool
@@ -1134,7 +1148,8 @@ impl TypeTable {
                 self.may_receive(of, of_pattern, Some(generic))
                     && self.may_receive(payload, pattern, Some(generic))
             }
-            (&TyKind::Partial(record), &TyKind::Partial(pattern)) => {
+            (&TyKind::Partial(record), &TyKind::Partial(pattern))
+            | (&TyKind::Secret(record), &TyKind::Secret(pattern)) => {
                 self.may_receive(record, pattern, Some(generic))
             }
             _ => false,
@@ -1173,6 +1188,7 @@ impl TypeTable {
             | TyKind::Either(inner)
             | TyKind::List(inner)
             | TyKind::Partial(inner)
+            | TyKind::Secret(inner)
             | TyKind::Provisional { inner, .. }) => self.any_param(inner, of),
             TyKind::Union(members) => members.iter().any(|&member| self.any_param(member, of)),
             &TyKind::Variant {
@@ -1273,6 +1289,10 @@ impl TypeTable {
                 let record = self.substitute(record, generic, args);
                 self.partial(record)
             }
+            TyKind::Secret(inner) => {
+                let inner = self.substitute(inner, generic, args);
+                self.secret(inner)
+            }
             _ => ty,
         }
     }
@@ -1357,6 +1377,11 @@ impl TypeTable {
                     _ => present,
                 };
                 self.bind(record, given, generic, bound)
+            }
+            // A secret binds from a secret's value or a plain value.
+            TyKind::Secret(inner) => {
+                let given = self.secret_value(present).unwrap_or(present);
+                self.bind(inner, given, generic, bound)
             }
             _ => None,
         }
@@ -1605,6 +1630,89 @@ impl TypeTable {
         self.intern(TyKind::Partial(record))
     }
 
+    /// `Secret<T>` of `value`, `T` (see [Secrets](#secrets)), adding it to
+    /// the table if it is new: `value` itself if it is a secret already, and
+    /// `Error` for an erroneous one.
+    pub fn secret(&mut self, value: TyId) -> TyId {
+        if value == TyId::ERROR || self.secret_value(value).is_some() {
+            return value;
+        }
+        self.intern(TyKind::Secret(value))
+    }
+
+    /// The type of the value of the secret type `id`, if it is one.
+    #[must_use]
+    pub fn secret_value(&self, id: TyId) -> Option<TyId> {
+        match self.kind(id) {
+            &TyKind::Secret(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// `id` with every secret in it its value's type, at any depth: what
+    /// a comparison of values holding secrets compares them as (see
+    /// [Secrets](#secrets)). A record's defaults are kept.
+    ///
+    /// Recurses once per level of nesting in `id`.
+    pub fn without_secrets(&mut self, id: TyId) -> TyId {
+        if !self.holds_secret(id) {
+            return id;
+        }
+        match self.kind(id).clone() {
+            TyKind::Secret(value) => self.without_secrets(value),
+            TyKind::List(element) => {
+                let element = self.without_secrets(element);
+                self.list(element)
+            }
+            TyKind::Union(members) => {
+                let members: Vec<TyId> = members.iter().map(|&m| self.without_secrets(m)).collect();
+                self.union(members)
+            }
+            TyKind::Record(record) => {
+                let fields: Vec<(Name, TyId)> = record
+                    .fields
+                    .iter()
+                    .map(|&(name, field)| (name, self.without_secrets(field)))
+                    .collect();
+                let rest = record.rest().map(|rest| self.without_secrets(rest));
+                self.record_with_rest(fields, rest, record.defaults().to_vec())
+            }
+            _ => id,
+        }
+    }
+
+    /// Whether `id` holds a secret anywhere: is one, or is a record type,
+    /// a partial one, a list type, a union, a future or an enum's variant
+    /// whose field, element, member, value or payload does, at any depth
+    /// (see [Secrets](#secrets)). An enum, whose variants' payloads are of
+    /// any type its bound allows, holds one if its bound may.
+    ///
+    /// Recurses once per level of nesting in `id`.
+    #[must_use]
+    pub fn holds_secret(&self, id: TyId) -> bool {
+        match self.kind(id) {
+            TyKind::Secret(_) => true,
+            TyKind::Record(record) => {
+                record
+                    .fields
+                    .iter()
+                    .any(|&(_, field)| self.holds_secret(field))
+                    || record.rest().is_some_and(|rest| self.holds_secret(rest))
+            }
+            &(TyKind::Future(inner)
+            | TyKind::Either(inner)
+            | TyKind::List(inner)
+            | TyKind::Partial(inner)
+            | TyKind::Provisional { inner, .. }
+            | TyKind::Variant { payload: inner, .. }) => self.holds_secret(inner),
+            TyKind::Union(members) => members.iter().any(|&member| self.holds_secret(member)),
+            &TyKind::Enum { key, .. } => self
+                .enum_bound(key)
+                .is_none_or(|bound| self.holds_secret(bound)),
+            _ => false,
+        }
+    }
+
     /// Whether `id` is a function type (or the opaque type of a special
     /// built-in function, which is one too), or a record type with a field of a
     /// type that is or contains one, or a list type whose element type is or
@@ -1636,7 +1744,7 @@ impl TypeTable {
             Some(&TyKind::Enum { key, .. }) => self
                 .enum_bound(key)
                 .is_none_or(|bound| self.contains_fn(bound)),
-            Some(&TyKind::Partial(record)) => self.contains_fn(record),
+            Some(&TyKind::Partial(record) | &TyKind::Secret(record)) => self.contains_fn(record),
             _ => false,
         }
     }
@@ -1839,6 +1947,10 @@ impl TypeTable {
             TyKind::Partial(record) => {
                 let record = self.settle(record, function, decisions);
                 self.partial(record)
+            }
+            TyKind::Secret(value) => {
+                let value = self.settle(value, function, decisions);
+                self.secret(value)
             }
             TyKind::Provisional { .. }
             | TyKind::Int
@@ -2352,6 +2464,21 @@ impl TypeTable {
             .or_else(|| self.record_rest(record))
     }
 
+    /// Whether `sub` is a subtype of `sup` where either is a secret (see
+    /// [Secrets](#secrets)): a plain value fits a secret of its type, and
+    /// a secret only a secret whose value's type its value's fits. `None`
+    /// if neither is a secret.
+    fn secret_subtype(&self, sub: TyId, sup: TyId) -> Option<bool> {
+        match (self.kind(sub), self.kind(sup)) {
+            (&TyKind::Secret(offered), &TyKind::Secret(required)) => {
+                Some(self.is_subtype(offered, required))
+            }
+            (TyKind::Secret(_), _) => Some(false),
+            (_, &TyKind::Secret(required)) => Some(self.is_subtype(sub, required)),
+            _ => None,
+        }
+    }
+
     /// Whether a value of type `sub` may be used where `sup` is expected:
     /// `sub` is `sup`; or both are record types and `sub` has every field
     /// of `sup`, each of a subtype of that field's type in `sup`; or both
@@ -2401,6 +2528,9 @@ impl TypeTable {
         }
         if let (Some(offered), Some(required)) = (self.list_element(sub), self.list_element(sup)) {
             return self.is_subtype(offered, required);
+        }
+        if let Some(fits) = self.secret_subtype(sub, sup) {
+            return fits;
         }
         match (self.kind(sub), self.kind(sup)) {
             // A variant fits only a variant of its enum whose payload is
@@ -2614,6 +2744,13 @@ impl TypeTable {
                 (self.union([a, b]), true)
             };
         }
+        // A secret's join with a value of its type, or with another secret,
+        // is the secret of the join of their values.
+        let values = (self.secret_value(a), self.secret_value(b));
+        if values.0.is_some() || values.1.is_some() {
+            let (joined, widened) = self.join(values.0.unwrap_or(a), values.1.unwrap_or(b));
+            return (self.secret(joined), widened);
+        }
         if let (Some(a_element), Some(b_element)) = (self.list_element(a), self.list_element(b)) {
             let (joined, widened) = self.join(a_element, b_element);
             return (self.list(joined), widened);
@@ -2766,8 +2903,9 @@ impl TypeTable {
             TyKind::String => Some(ValueKind::String),
             TyKind::Record(_) | TyKind::Partial(_) => Some(ValueKind::Record),
             TyKind::List(_) => Some(ValueKind::List),
-            // A value of an enum is present, of the kind only it says.
-            TyKind::Enum { .. } => Some(ValueKind::Mixed),
+            // A secret, and a value of an enum, which is present, are of the
+            // kind only they say.
+            TyKind::Secret(_) | TyKind::Enum { .. } => Some(ValueKind::Mixed),
             // TEMPORARY (alias rule): a special built-in's opaque type is a function's kind (see
             // the [inference limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             // A variant is called as a function is.
@@ -2837,8 +2975,8 @@ impl TypeTable {
                 true
             }
             // A partial record is a record whose fields may be absent.
-            (&TyKind::Partial(record), _) => self.overlaps(record, b),
-            (_, &TyKind::Partial(record)) => self.overlaps(a, record),
+            (&TyKind::Partial(record) | &TyKind::Secret(record), _) => self.overlaps(record, b),
+            (_, &TyKind::Partial(record) | &TyKind::Secret(record)) => self.overlaps(a, record),
             _ => false,
         }
     }
@@ -2864,6 +3002,7 @@ impl TypeTable {
                 | TyKind::Either(inner)
                 | TyKind::List(inner)
                 | TyKind::Partial(inner)
+                | TyKind::Secret(inner)
                 | TyKind::Provisional { inner, .. },
             ) => self.holds_untestable(*inner),
             Some(TyKind::Union(members)) => {
@@ -3142,6 +3281,7 @@ impl Display<'_> {
                 )
             }
             TyKind::Partial(record) => write!(f, "Partial<{}>", self.nested(*record)),
+            TyKind::Secret(value) => write!(f, "Secret<{}>", self.nested(*value)),
             _ => Ok(()),
         }
     }
@@ -3166,7 +3306,10 @@ impl fmt::Display for Display<'_> {
             TyKind::Builtin(builtin) => write!(f, "builtin {}", builtin.name()),
             TyKind::Future(inner) => write!(f, "Future<{}>", self.nested(*inner)),
             TyKind::List(element) => write!(f, "List<{}>", self.nested(*element)),
-            TyKind::Enum { .. } | TyKind::Variant { .. } | TyKind::Partial(_) => self.enum_like(f),
+            TyKind::Enum { .. }
+            | TyKind::Variant { .. }
+            | TyKind::Partial(_)
+            | TyKind::Secret(_) => self.enum_like(f),
             TyKind::Provisional { inner, .. } => {
                 let shown = self.nested(*inner);
                 // A function type's return type, or a union's last member,

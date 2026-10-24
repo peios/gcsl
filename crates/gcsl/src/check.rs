@@ -1526,6 +1526,45 @@
 //! effect is its blocks': a `recover` catches a failure, it does nothing
 //! of its own.
 //!
+//! # Secrets
+//!
+//! `Secret<T>` (see the types' [Secrets](crate::types#secrets)) is a value
+//! of the present type `T` that never leaks: shown, it is `***`, and
+//! nothing that runs or fails tells anything of it. `T` must be present, "a
+//! secret's value is present, not `Future<Int>`". `secret(value, identity)`
+//! makes one, of a value and a public identity, what a host's receipts
+//! record of it; `.unsafe_value()` takes its value, deliberately. Both are
+//! the prelude's, over the built-ins `secret` and `secret_value`.
+//!
+//! What is computed on a secret is a secret. An operator with a secret
+//! operand, `s + "!"` or `-n` (`Checker::secret_binary`), a secret
+//! interpolated, `"--token={s}"` (`Checker::check_interpolation`), a field
+//! of a secret record and an element of a secret list, by a plain index,
+//! are the operation on the values, its type the secret of its result's
+//! (`Checker::secret_operation`): the operation is recorded for lowering
+//! with the type of what it computes ([`Resolution::secret_op`]), and its
+//! operands, each secret with the type of its value, unwrapped
+//! ([`Resolution::secret_operand`]), and each other one marked
+//! ([`Resolution::is_plain_operand`]), so that a failure of it is told
+//! from the operation's own. A refused operation's errors are of the types
+//! as written, "cannot add `Secret<String>` and Int" (`Checker::secret_plain`).
+//!
+//! A comparison of values that hold secrets, in a field, an element, a
+//! member or a payload at any depth, a record of a secret included, is the
+//! comparison of what they hold, every secret its value
+//! ([`TypeTable::without_secrets`]), and a secret, its operands that hold
+//! one unwrapped deeply: whether two values are equal tells of the secrets
+//! in them just as a comparison of the secrets would.
+//!
+//! A secret decides nothing: what runs never depends on one. `and` and
+//! `or`, which decide whether their right side runs, and `is` and `as`, of a
+//! value whose members include a secret, refuse one, "a secret cannot
+//! decide what runs" (`Checker::no_branching`); a condition of `if`, a
+//! guard and an assertion's condition are `Bool`s, which a secret is not,
+//! and a `for` iterates over a list, which a secret is not either. A
+//! secret where its value's type is expected is "mismatched types", noted
+//! that a secret is not its value and that `.unsafe_value()` takes it.
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or
@@ -3644,6 +3683,13 @@ pub enum Builtin {
     /// every field `partial` holds equals `full`'s of its name (see [Partial
     /// records](#partial-records)), the prelude's `partial.matches(full)`.
     PartialMatches,
+    /// `secret<T>(value: T, identity: String): Secret<T>`: `value` as a
+    /// secret, of the public identity `identity` (see [Secrets](#secrets)).
+    Secret,
+    /// `secret_value<T>(s: Secret<T>): T`: the value of the secret `s`, the
+    /// prelude's `s.unsafe_value()`, the deliberate escape (see
+    /// [Secrets](#secrets)).
+    SecretValue,
 }
 
 /// How a built-in function is typed (see [Built-in
@@ -3667,7 +3713,7 @@ impl Builtin {
     /// Every built-in function, in the order of the `builtins` module, which
     /// is also the order of their cells, the first slots of a workspace's
     /// frame (see [`crate::workspace`]).
-    pub const ALL: [Builtin; 27] = [
+    pub const ALL: [Builtin; 29] = [
         Builtin::Len,
         Builtin::Int,
         Builtin::Float,
@@ -3695,6 +3741,8 @@ impl Builtin {
         Builtin::VariantMatches,
         Builtin::VariantPayload,
         Builtin::PartialMatches,
+        Builtin::Secret,
+        Builtin::SecretValue,
     ];
 
     /// The most parameters any built-in function has: what a call of one
@@ -3737,6 +3785,8 @@ impl Builtin {
             Builtin::VariantMatches => "variant_matches",
             Builtin::VariantPayload => "variant_payload",
             Builtin::PartialMatches => "partial_matches",
+            Builtin::Secret => "secret",
+            Builtin::SecretValue => "secret_value",
         }
     }
 
@@ -3773,7 +3823,9 @@ impl Builtin {
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
-            | Builtin::PartialMatches => None,
+            | Builtin::PartialMatches
+            | Builtin::Secret
+            | Builtin::SecretValue => None,
         }
     }
 
@@ -3790,7 +3842,7 @@ impl Builtin {
             Builtin::Join => &["parts", "sep"],
             Builtin::StartsWith | Builtin::StripPrefix => &["s", "prefix"],
             Builtin::EndsWith | Builtin::StripSuffix => &["s", "suffix"],
-            Builtin::Trim | Builtin::Lines | Builtin::Fields => &["s"],
+            Builtin::Trim | Builtin::Lines | Builtin::Fields | Builtin::SecretValue => &["s"],
             Builtin::CompareVersions => &["a", "b"],
             Builtin::FsExists | Builtin::FsRead | Builtin::FsMkdir => &["p"],
             Builtin::FsCopy => &["from", "to"],
@@ -3800,6 +3852,7 @@ impl Builtin {
             Builtin::Show => &["value"],
             Builtin::VariantMatches | Builtin::VariantPayload => &["kind", "value"],
             Builtin::PartialMatches => &["partial", "full"],
+            Builtin::Secret => &["value", "identity"],
         }
     }
 
@@ -3840,7 +3893,9 @@ impl Builtin {
             | Builtin::Show
             | Builtin::VariantMatches
             | Builtin::VariantPayload
-            | Builtin::PartialMatches => Effect::Pure,
+            | Builtin::PartialMatches
+            | Builtin::Secret
+            | Builtin::SecretValue => Effect::Pure,
         }
     }
 
@@ -3873,7 +3928,9 @@ impl Builtin {
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
-            | Builtin::PartialMatches => Typing::Ordinary,
+            | Builtin::PartialMatches
+            | Builtin::Secret
+            | Builtin::SecretValue => Typing::Ordinary,
         }
     }
 
@@ -3912,6 +3969,8 @@ impl Builtin {
             Builtin::VariantMatches => "fn<E, T>(kind: Variant<E, T>, value: E): Bool",
             Builtin::VariantPayload => "fn<E, T>(kind: Variant<E, T>, value: E): T",
             Builtin::PartialMatches => "fn<T>(partial: Partial<T>, full: T): Bool",
+            Builtin::Secret => "fn<T>(value: T, identity: String): Secret<T>",
+            Builtin::SecretValue => "fn<T>(s: Secret<T>): T",
         }
     }
 
@@ -3959,7 +4018,11 @@ impl Builtin {
             // TEMPORARY (alias rule): the opaque type, until a polymorphic one (see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/)).
             Builtin::Len | Builtin::Show => return types.builtin(self),
-            Builtin::VariantMatches | Builtin::VariantPayload | Builtin::PartialMatches => {
+            Builtin::VariantMatches
+            | Builtin::VariantPayload
+            | Builtin::PartialMatches
+            | Builtin::Secret
+            | Builtin::SecretValue => {
                 return self.generic_ty(types, names);
             }
         };
@@ -3976,8 +4039,12 @@ impl Builtin {
     /// The type of a generic built-in's value, interned into `types`, its
     /// type parameters' and parameters' names into `names` (see
     /// [Generics](#generics)): `variant_matches` and `variant_payload` of
-    /// `E` and `T`, `partial_matches` of `T`; `Error` for any other.
+    /// `E` and `T`, `partial_matches`, `secret` and `secret_value` of `T`;
+    /// `Error` for any other.
     fn generic_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        if matches!(self, Builtin::Secret | Builtin::SecretValue) {
+            return self.secret_ty(types, names);
+        }
         let partial = self == Builtin::PartialMatches;
         let parameters: &[&str] = if partial { &["T"] } else { &["E", "T"] };
         let generic = types.new_generic(parameters.iter().map(|text| names.intern(text)).collect());
@@ -4006,6 +4073,31 @@ impl Builtin {
                 result,
                 Effect::Pure,
             )
+        };
+        types.generic_fn(ty, generic)
+    }
+}
+
+impl Builtin {
+    /// The type of `secret` or `secret_value`, as [`Builtin::generic_ty`]
+    /// makes it (see [Secrets](#secrets)).
+    fn secret_ty(self, types: &mut TypeTable, names: &mut Names) -> TyId {
+        let generic = types.new_generic(Box::new([names.intern("T")]));
+        let value = types.param(generic, 0);
+        let secret = types.secret(value);
+        let params: Vec<Name> = self
+            .params()
+            .iter()
+            .map(|text| names.intern(text))
+            .collect();
+        let ty = match (self, params.as_slice()) {
+            (Builtin::Secret, &[first, second]) => types.fn_type(
+                [(Some(first), value), (Some(second), TyId::STRING)],
+                secret,
+                Effect::Pure,
+            ),
+            (_, &[only]) => types.fn_type([(Some(only), secret)], value, Effect::Pure),
+            _ => return TyId::ERROR,
         };
         types.generic_fn(ty, generic)
     }
@@ -4212,6 +4304,17 @@ struct ForLowering {
     /// The slot each `recover` whose fallback names its failure stores the
     /// failure in (see [Failure](#failure)).
     recover_slots: HashMap<RecoverId, Slot>,
+    /// Each operation on a secret, by its id, with the type of the value it
+    /// computes, which lowering makes a secret (see [Secrets](#secrets)).
+    secret_ops: HashMap<ExprId, TyId>,
+    /// Each operand of an operation on secrets that is or holds a secret,
+    /// by its id, with the type of what it is unwrapped to and whether that
+    /// is deeply, every secret it holds its value (see [Secrets](#secrets)).
+    secret_operands: HashMap<ExprId, (TyId, bool)>,
+    /// Each operand of an operation on secrets that neither is nor holds
+    /// one, which lowering marks as an operand, so that its failure is not
+    /// the operation's (see [Secrets](#secrets)).
+    plain_operands: HashSet<ExprId>,
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](#attributes)).
     fn_attributes: HashMap<FnId, Box<[Attribute]>>,
@@ -4266,6 +4369,8 @@ struct Constructors {
     variant: Option<Name>,
     /// `Partial`, for `Partial<T>` (see [Partial records](#partial-records)).
     partial: Option<Name>,
+    /// `Secret`, for `Secret<T>` (see [Secrets](#secrets)).
+    secret: Option<Name>,
 }
 
 impl Constructors {
@@ -4277,6 +4382,7 @@ impl Constructors {
             list: names.lookup("List"),
             variant: names.lookup("Variant"),
             partial: names.lookup("Partial"),
+            secret: names.lookup("Secret"),
         }
     }
 }
@@ -4723,6 +4829,31 @@ impl Resolution {
     #[must_use]
     pub fn context_read(&self, id: ExprId) -> Option<Name> {
         self.lowered.context_reads.get(&id).copied()
+    }
+
+    /// The type of the value the expression `id` computes, if it is an
+    /// operation on a secret, whose result lowering makes a secret (see
+    /// [Secrets](#secrets)).
+    #[must_use]
+    pub fn secret_op(&self, id: ExprId) -> Option<TyId> {
+        self.lowered.secret_ops.get(&id).copied()
+    }
+
+    /// The type of what the expression `id` is unwrapped to, and whether
+    /// deeply, every secret it holds its value, if it is an operand of an
+    /// operation on secrets that is or holds a secret, which lowering
+    /// unwraps (see [Secrets](#secrets)).
+    #[must_use]
+    pub fn secret_operand(&self, id: ExprId) -> Option<(TyId, bool)> {
+        self.lowered.secret_operands.get(&id).copied()
+    }
+
+    /// Whether the expression `id` is an operand of an operation on secrets
+    /// that neither is nor holds one, which lowering marks as an operand,
+    /// so that its failure is not the operation's (see [Secrets](#secrets)).
+    #[must_use]
+    pub fn is_plain_operand(&self, id: ExprId) -> bool {
+        self.lowered.plain_operands.contains(&id)
     }
 
     /// The slot the `recover` `id` stores its failure in for its fallback,
@@ -6386,9 +6517,9 @@ pub(crate) fn check_variant_payloads(
 /// The names of the built-in types: those of [`BuiltinTypes`], and the
 /// type constructors, `List`, `Future` and `Present`. A `type` may not be
 /// named like one: "`Int` is a built-in type".
-pub(crate) const BUILTIN_TYPE_NAMES: [&str; 11] = [
+pub(crate) const BUILTIN_TYPE_NAMES: [&str; 12] = [
     "Int", "Float", "Bool", "String", "Duration", "Size", "List", "Future", "Present", "Variant",
-    "Partial",
+    "Partial", "Secret",
 ];
 
 /// The name of the checker's attribute that retries a call.
@@ -13539,6 +13670,7 @@ impl<'a> Checker<'a> {
             || Some(name) == self.constructors.list
             || Some(name) == self.constructors.variant
             || Some(name) == self.constructors.partial
+            || Some(name) == self.constructors.secret
     }
 
     /// Whether a type written as `ty` is *bare*, so that the bare type rule
@@ -13556,9 +13688,12 @@ impl<'a> Checker<'a> {
             | TypeExprKind::Enum { .. }
             | TypeExprKind::Record(_)
             | TypeExprKind::List(_) => true,
-            TypeExprKind::Applied { name, .. } => {
-                Some(name) == self.constructors.list || Some(name) == self.constructors.partial
-            }
+            TypeExprKind::Applied { name, .. } => [
+                self.constructors.list,
+                self.constructors.partial,
+                self.constructors.secret,
+            ]
+            .contains(&Some(name)),
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
             // A context's type is what it is declared to be.
             TypeExprKind::Fn { .. }
@@ -13596,6 +13731,7 @@ impl<'a> Checker<'a> {
             self.constructors.future,
             self.constructors.present,
             self.constructors.partial,
+            self.constructors.secret,
         ]
         .contains(&Some(name));
         let &[arg] = self.ast.type_args(args) else {
@@ -13628,8 +13764,30 @@ impl<'a> Checker<'a> {
         if Some(name) == self.constructors.present {
             return arg;
         }
+        if Some(name) == self.constructors.secret {
+            return self.secret_type(arg, span);
+        }
         self.unknown_applied(name, span);
         TyId::ERROR
+    }
+
+    /// `Secret<T>` of `value`, `T` resolved present, written at `span` (see
+    /// [Secrets](#secrets)): `Error` for an erroneous one, and (reported)
+    /// for one that may be a future, "a secret's value is present, not
+    /// `Future<String>`".
+    fn secret_type(&mut self, value: TyId, span: Span) -> TyId {
+        if value == TyId::ERROR {
+            return TyId::ERROR;
+        }
+        if self.types.laziness(value) != Laziness::Present {
+            let shown = self.in_message(value);
+            self.errors.push(Diagnostic::error(
+                format!("a secret's value is present, not {shown}"),
+                span,
+            ));
+            return TyId::ERROR;
+        }
+        self.types.secret(value)
     }
 
     /// `Variant<E, T>`, written at `span` with the type arguments `args`
@@ -14107,6 +14265,17 @@ impl<'a> Checker<'a> {
         }
         if let Some(note) = self.default_note(found, expected) {
             error = error.with_note(note);
+        }
+        if self.types.secret_value(self.types.strip(found)).is_some()
+            && self
+                .types
+                .secret_value(self.types.strip(expected))
+                .is_none()
+        {
+            error = error.with_note(
+                "a secret is not its value, which it keeps from leaking; `.unsafe_value()` takes \
+                 the value, deliberately",
+            );
         }
         if self.types.laziness(expected) == Laziness::Future {
             let shown = self.in_message(expected);
@@ -15245,7 +15414,7 @@ impl<'a> Checker<'a> {
             ExprKind::Size(_) => TyId::SIZE,
             ExprKind::Bool(_) => TyId::BOOL,
             ExprKind::Str(_) => TyId::STRING,
-            ExprKind::Interp(parts) => self.check_interpolation(parts),
+            ExprKind::Interp(parts) => self.check_interpolation(id, parts),
             ExprKind::If {
                 cond,
                 then,
@@ -15259,7 +15428,7 @@ impl<'a> Checker<'a> {
             ExprKind::Unary { op, operand } => {
                 let operand_ty = self.check_expr(operand);
                 let op_span = expr.operator_span().unwrap_or(expr.span);
-                self.unary(op, op_span, (operand, operand_ty))
+                self.unary((id, op), op_span, (operand, operand_ty))
             }
             ExprKind::Binary { op, lhs, rhs, .. } => {
                 let lhs_ty = self.check_expr(lhs);
@@ -15390,6 +15559,166 @@ impl<'a> Checker<'a> {
     /// at the top if it may be a future, or deeply for an equality, and the
     /// operator typed on what they are once awaited.
     fn binary(
+        &mut self,
+        id: ExprId,
+        op: BinaryOp,
+        (lhs, lhs_ty): (ExprId, TyId),
+        (rhs, rhs_ty): (ExprId, TyId),
+    ) -> TyId {
+        if let Some(found) = self.secret_binary(id, op, (lhs, lhs_ty), (rhs, rhs_ty)) {
+            return found;
+        }
+        self.plain_binary(id, op, (lhs, lhs_ty), (rhs, rhs_ty))
+    }
+
+    /// Types the binary operator `op` of `id`, `lhs` of type `lhs_ty` and
+    /// `rhs` of type `rhs_ty`, if either is a secret, or, for a comparison,
+    /// holds one (see [Secrets](#secrets)): the operator on the values, its
+    /// result a secret, the operation and its secret operands recorded for
+    /// lowering. A comparison compares what its operands hold with every
+    /// secret its value, so an operand holding one is unwrapped deeply.
+    /// `&&` and `||`, which decide whether their right side runs, refuse
+    /// one. `None` if neither is a secret, nor for a comparison holds one.
+    fn secret_binary(
+        &mut self,
+        id: ExprId,
+        op: BinaryOp,
+        (lhs, lhs_ty): (ExprId, TyId),
+        (rhs, rhs_ty): (ExprId, TyId),
+    ) -> Option<TyId> {
+        let compares = op.is_equality() || op.is_comparison();
+        let holds = |types: &TypeTable, ty: TyId| {
+            types.secret_value(types.strip(ty)).is_some()
+                || (compares && types.holds_secret(types.strip(ty)))
+        };
+        if !holds(self.types, lhs_ty) && !holds(self.types, rhs_ty) {
+            return None;
+        }
+        let (lhs_ty, rhs_ty) = (self.measure(lhs, lhs_ty), self.measure(rhs, rhs_ty));
+        let values = (
+            self.types.secret_value(lhs_ty),
+            self.types.secret_value(rhs_ty),
+        );
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let secret = if values.0.is_some() { lhs } else { rhs };
+            self.no_branching(secret, &format!("`{}`", op.verb()));
+            return Some(TyId::ERROR);
+        }
+        if !compares {
+            let unwrapped = (values.0.unwrap_or(lhs_ty), values.1.unwrap_or(rhs_ty));
+            let found = self.secret_plain(
+                id,
+                op,
+                (lhs, lhs_ty, unwrapped.0),
+                (rhs, rhs_ty, unwrapped.1),
+            );
+            return Some(self.secret_result(id, found, [(lhs, values.0), (rhs, values.1)]));
+        }
+        // Values holding secrets compare as the values they hold.
+        let [lhs_value, rhs_value] = [lhs_ty, rhs_ty].map(|ty| self.types.without_secrets(ty));
+        let found = self.secret_plain(id, op, (lhs, lhs_ty, lhs_value), (rhs, rhs_ty, rhs_value));
+        let held = |ty: TyId, value: TyId| self.types.holds_secret(ty).then_some(value);
+        let operands = [
+            (lhs, held(lhs_ty, lhs_value)),
+            (rhs, held(rhs_ty, rhs_value)),
+        ];
+        Some(self.secret_result_deep(id, found, operands))
+    }
+
+    /// [`Checker::plain_binary`] of `id`'s `op` on what `lhs` and `rhs`,
+    /// each with its type and the type it is unwrapped to, hold once
+    /// unwrapped; if that is refused, its errors are of the types as
+    /// written, `Secret<String>` where a secret is, rather than of what
+    /// they hold, as long as those are refused too.
+    fn secret_plain(
+        &mut self,
+        id: ExprId,
+        op: BinaryOp,
+        (lhs, lhs_ty, lhs_value): (ExprId, TyId, TyId),
+        (rhs, rhs_ty, rhs_value): (ExprId, TyId, TyId),
+    ) -> TyId {
+        let before = self.errors.len();
+        let found = self.plain_binary(id, op, (lhs, lhs_value), (rhs, rhs_value));
+        if found != TyId::ERROR || self.errors.len() == before {
+            return found;
+        }
+        let unwrapped = self.errors.split_off(before);
+        if self.plain_binary(id, op, (lhs, lhs_ty), (rhs, rhs_ty)) != TyId::ERROR {
+            self.errors.truncate(before);
+            self.errors.extend(unwrapped);
+        }
+        TyId::ERROR
+    }
+
+    /// The type of `id`, an operation on secrets whose value is of type
+    /// `found` (see [Secrets](#secrets)): its secret, recorded for lowering
+    /// with its operands that are secrets, each with its value's type;
+    /// `found` itself if it is erroneous or `Never`.
+    fn secret_result<const N: usize>(
+        &mut self,
+        id: ExprId,
+        found: TyId,
+        operands: [(ExprId, Option<TyId>); N],
+    ) -> TyId {
+        let operands =
+            operands.map(|(operand, value)| (operand, value.map(|value| (value, false))));
+        self.secret_operation(id, found, &operands)
+    }
+
+    /// [`Checker::secret_result`], for a comparison: each operand that is
+    /// or holds a secret, with the type of what it holds once every secret
+    /// in it is its value, unwrapped deeply.
+    fn secret_result_deep(
+        &mut self,
+        id: ExprId,
+        found: TyId,
+        operands: [(ExprId, Option<TyId>); 2],
+    ) -> TyId {
+        let operands = operands.map(|(operand, value)| (operand, value.map(|value| (value, true))));
+        self.secret_operation(id, found, &operands)
+    }
+
+    /// Records `id`, an operation on secrets whose value is of type
+    /// `found`, and its `operands`, each that is or holds a secret with the
+    /// type it is unwrapped to and whether deeply, for lowering; its type,
+    /// the secret of `found`, or `found` itself if it is erroneous or
+    /// `Never` (see [Secrets](#secrets)).
+    fn secret_operation(
+        &mut self,
+        id: ExprId,
+        found: TyId,
+        operands: &[(ExprId, Option<(TyId, bool)>)],
+    ) -> TyId {
+        if found == TyId::ERROR || found == self.never {
+            return found;
+        }
+        self.lowering.secret_ops.insert(id, found);
+        for &(operand, unwrapped) in operands {
+            if let Some(unwrapped) = unwrapped {
+                self.lowering.secret_operands.insert(operand, unwrapped);
+            } else {
+                self.lowering.plain_operands.insert(operand);
+            }
+        }
+        self.types.secret(found)
+    }
+
+    /// Reports `operand`, a secret, where it would decide what runs, by
+    /// `what`: "a secret cannot decide what runs" (see [Secrets](#secrets)).
+    fn no_branching(&mut self, operand: ExprId, what: &str) {
+        self.errors.push(
+            Diagnostic::error(
+                "a secret cannot decide what runs",
+                self.ast.get(operand).span,
+            )
+            .with_note(format!(
+                "what {what} does would tell the secret to whoever sees what runs"
+            )),
+        );
+    }
+
+    /// [`Checker::binary`], where neither operand is a secret.
+    fn plain_binary(
         &mut self,
         id: ExprId,
         op: BinaryOp,
@@ -19231,6 +19560,11 @@ impl<'a> Checker<'a> {
         if record_ty == TyId::ERROR || record_ty == self.never {
             return record_ty;
         }
+        // A secret record's field is a secret (see [Secrets](#secrets)).
+        if let Some(value) = self.types.secret_value(record_ty) {
+            let found = self.field_access(id, (record, value), name);
+            return self.secret_result(id, found, [(record, Some(value))]);
+        }
         // A field of a function with a meta is the meta's.
         if let Some(meta) = self.types.fn_sig(record_ty).and_then(|sig| sig.meta) {
             return self.meta_read(id, record, meta, name);
@@ -19692,6 +20026,14 @@ impl<'a> Checker<'a> {
         }
         let present = self.types.present(found);
         let present_members = self.flat_members(present);
+        // What a secret is decides nothing (see [Secrets](#secrets)).
+        if present_members
+            .iter()
+            .any(|&member| self.types.secret_value(member).is_some())
+        {
+            self.no_branching(operand, &format!("`{keyword}`"));
+            return None;
+        }
         let plan = self.types.test_plan(Some(&present_members), target);
         let awaits = self.awaits[operand.index()];
         let used = if plan.walks() {
@@ -19851,7 +20193,12 @@ impl<'a> Checker<'a> {
     /// a future first. `await` awaits its operand fully, and its type is
     /// the operand's stripped of every future layer at its top; on an
     /// operand that is present it does nothing.
-    fn unary(&mut self, op: UnaryOp, op_span: Span, (operand, operand_ty): (ExprId, TyId)) -> TyId {
+    fn unary(
+        &mut self,
+        (id, op): (ExprId, UnaryOp),
+        op_span: Span,
+        (operand, operand_ty): (ExprId, TyId),
+    ) -> TyId {
         // An operand of type `Never` never gives the operator a value.
         if operand_ty == TyId::ERROR || operand_ty == self.never {
             return operand_ty;
@@ -19860,6 +20207,11 @@ impl<'a> Checker<'a> {
             return self.explicit_await(op_span, operand, operand_ty);
         }
         let operand_ty = self.measure(operand, operand_ty);
+        // A secret's negation is a secret (see [Secrets](#secrets)).
+        if let Some(value) = self.types.secret_value(operand_ty) {
+            let found = self.unary((id, op), op_span, (operand, value));
+            return self.secret_result(id, found, [(operand, Some(value))]);
+        }
         match op {
             UnaryOp::Neg if is_numeric(operand_ty) || is_quantity(operand_ty) => operand_ty,
             UnaryOp::Neg => {
@@ -20580,8 +20932,11 @@ impl<'a> Checker<'a> {
     /// checked, an untyped one settles to `Int`, and one that may be a
     /// future, or hold one in a field, is awaited deeply. The result is a
     /// `String`, or an error, without a further report, if a part is one.
-    fn check_interpolation(&mut self, parts: PartRange) -> TyId {
+    fn check_interpolation(&mut self, id: ExprId, parts: PartRange) -> TyId {
         let mut ty = TyId::STRING;
+        // The expressions interpolated, each secret with its value's type:
+        // if one is a secret, the text is (see [Secrets](#secrets)).
+        let mut operands: Vec<(ExprId, Option<(TyId, bool)>)> = Vec::new();
         for &part in self.ast.parts(parts) {
             let StrPart::Expr(expr) = part else {
                 continue;
@@ -20604,10 +20959,16 @@ impl<'a> Checker<'a> {
                 TyId::ERROR => ty = TyId::ERROR,
                 // A value of type `Never` is never there to show.
                 found if found == self.never && ty != TyId::ERROR => ty = self.never,
-                _ => {}
+                found => {
+                    let value = self.types.secret_value(found);
+                    operands.push((expr, value.map(|value| (value, false))));
+                }
             }
         }
-        ty
+        if ty != TyId::STRING || operands.iter().all(|&(_, value)| value.is_none()) {
+            return ty;
+        }
+        self.secret_operation(id, TyId::STRING, &operands)
     }
 
     /// Types the list literal `id`, whose elements are `elements`, with no
@@ -21000,6 +21361,13 @@ impl<'a> Checker<'a> {
         }
         if self.expr_types[index.index()] == self.never {
             return self.never;
+        }
+        // A secret list's element is a secret (see [Secrets](#secrets)).
+        if let Some(value) = self.types.secret_value(list_ty)
+            && let Some(element) = self.element_of(value)
+        {
+            let found = if index_fits { element } else { TyId::ERROR };
+            return self.secret_result(id, found, [(list, Some(value)), (index, None)]);
         }
         let Some(element) = self.element_of(list_ty) else {
             let expr = self.ast.get(id);
@@ -22309,6 +22677,7 @@ impl<'a> Checker<'a> {
             | TyKind::Provisional { .. }
             | TyKind::Variant { .. }
             | TyKind::Partial(_)
+            | TyKind::Secret(_)
             // TEMPORARY (alias rule): see the [inference
             // limits](https://learn.peios.org/gcsl/language/inference-limits/).
             | TyKind::Builtin(_) => {

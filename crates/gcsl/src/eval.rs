@@ -747,6 +747,33 @@
 //! that call, its own failure, so it is caught; `break`, `continue` and
 //! `return` are no failures, and pass through. What the body ran stays run.
 //!
+//! # Secrets
+//!
+//! A secret, [`Value::Secret`], is a value and its public identity, shown
+//! as `***` (see the checker's "Secrets"); it is never the value of another
+//! secret. An operation on secrets is lowered as a `SecretWrap` of the
+//! operation, each of whose operands is a `SecretValue`: one that is a
+//! secret evaluates to its value, its identity pushed onto a stack in the
+//! run's shared state (`Evaluator::secret_value`), and, for a comparison of
+//! values holding secrets, every secret it holds is its value, their
+//! identities pushed in the order met (`unsealed`). The wrap
+//! (`Evaluator::secret_wrap`) makes what the operation computes a secret,
+//! its identity the identities pushed while it ran, joined by plus signs,
+//! as in `user + password`; a secret it computes, a secret's field that is
+//! one, is its value, the identities joined with its own.
+//!
+//! A failure of the operation itself, a division by zero, an overflow or an
+//! index past the end of a secret list, can tell of the secret: it is "an
+//! operation on a secret failed", where it failed, naming nothing else, and
+//! marked so that no `recover` catches and no `#[retry]` retries it
+//! ([`crate::diagnostic`]'s `Mark::SECRET`). A failure of an operand is the
+//! operand's, and passes through as it is: the operand's `SecretValue`
+//! flags it, and the wrap clears the flag. An operand that is a secret
+//! computed on secrets failed in a wrap of its own, already redacted. An
+//! error with a mark passes through too: a bug in GCSL, and the passing of
+//! an enclosing call's deadline, which that call turns into its own error
+//! as ever.
+//!
 //! # Metas
 //!
 //! A read of a function's meta, `func.versions` (see the checker's "Metas"),
@@ -987,8 +1014,8 @@ use crate::source::Span;
 use crate::strings::FieldName;
 use crate::types::ValueTest;
 use crate::value::{
-    Begin, Caller, Closure, ContextFrame, Future, FutureState, Layout, List, Quantity, Record, Tag,
-    Value, ValueKind, Variant, int_to_float,
+    Begin, Caller, Closure, ContextFrame, Future, FutureState, Layout, List, Quantity, Record,
+    Secret, Tag, Value, ValueKind, Variant, int_to_float,
 };
 use crate::{CALL_LEVELS, MAX_DEPTH};
 
@@ -1271,6 +1298,12 @@ struct Shared<'a> {
     /// The message of the failure each `recover` running its fallback
     /// caught, innermost last (see [Failure](#failure)).
     failures: RefCell<Vec<Rc<str>>>,
+    /// The identities of the secrets the operations on secrets running have
+    /// computed on so far, innermost last (see [Secrets](#secrets)).
+    identities: RefCell<Vec<Rc<str>>>,
+    /// Whether the failure unwinding to the innermost operation on secrets
+    /// is one of its operands', not its own (see [Secrets](#secrets)).
+    operand_failed: Cell<bool>,
 }
 
 impl<'a> Shared<'a> {
@@ -1291,6 +1324,8 @@ impl<'a> Shared<'a> {
             deadlines_made: Cell::new(0),
             context: RefCell::new(None),
             failures: RefCell::new(Vec::new()),
+            identities: RefCell::new(Vec::new()),
+            operand_failed: Cell::new(false),
         }
     }
 }
@@ -1377,7 +1412,9 @@ impl Evaluator<'_> {
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
-            | IrKind::Failure(_) => self.whole_node(node),
+            | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_) => self.whole_node(node),
             IrKind::ContextBind { .. } => mistyped(node, CONTEXT_BIND),
             IrKind::Meta(function) => self.meta_value(function, node),
             IrKind::Call {
@@ -1738,6 +1775,8 @@ impl Evaluator<'_> {
             IrKind::Assert { cond, message } => self.assert((cond, message), node),
             IrKind::Recover { body, fallback, .. } => self.recover(body, fallback),
             IrKind::Failure(layout) => self.failure(layout, node),
+            IrKind::SecretValue { value, deep, .. } => self.secret_value(value, deep),
+            IrKind::SecretWrap(computed) => self.secret_wrap(computed, node),
             _ => mistyped(node, "a node evaluated whole that is none"),
         }
     }
@@ -1822,6 +1861,78 @@ impl Evaluator<'_> {
                 result
             }
             result => result,
+        }
+    }
+
+    /// The value of `secret`'s value, if it is a secret, its identity kept
+    /// for the innermost operation on secrets, or the value itself; if
+    /// `deep`, with every secret it holds its value, and their identities
+    /// kept too, in order (see [Secrets](#secrets)).
+    fn secret_value(&mut self, secret: IrId, deep: bool) -> Flow<Value> {
+        let value = match self.value(secret) {
+            Ok(value) => value,
+            Err(unwind) => {
+                // A failure of an operand, none of the operation's own.
+                self.shared.operand_failed.set(true);
+                return Err(unwind);
+            }
+        };
+        let mut identities = self.shared.identities.borrow_mut();
+        if deep {
+            return Ok(unsealed(value, &mut identities));
+        }
+        match value {
+            Value::Secret(secret) => {
+                identities.push(Rc::clone(&secret.identity));
+                Ok(secret.value.clone())
+            }
+            value => Ok(value),
+        }
+    }
+
+    /// Evaluates `computed`, an operation on the values of secrets, for the
+    /// `SecretWrap` `node` (see [Secrets](#secrets)): its value as a secret
+    /// whose identity is the identities of the secrets it computed on,
+    /// joined by ` + ` in order; a failure of it is "an operation on a
+    /// secret failed", where it failed, naming nothing else, which nothing
+    /// recovers or retries, since whether it fails can depend on a secret.
+    /// A failure of one of its operands is that operand's, and passes
+    /// through as it is: an operand that is a secret computed on secrets
+    /// failed in an operation of its own. So does an error with a mark: a
+    /// bug in GCSL, the
+    /// passing of an enclosing call's deadline, which that call turns into
+    /// its own error as ever, and the failure of an operation on a secret
+    /// inside this one, already redacted where it failed.
+    #[inline(never)]
+    fn secret_wrap(&mut self, computed: IrId, node: &IrNode) -> Flow<Value> {
+        let depth = self.shared.identities.borrow().len();
+        let result = self.value(computed);
+        let identities: Vec<Rc<str>> = self.shared.identities.borrow_mut().split_off(depth);
+        let of_operand = self.shared.operand_failed.replace(false);
+        match result {
+            Ok(value) => {
+                // A value that is a secret already, a secret's field that
+                // is one, is its value: a secret's value is never a secret.
+                let (value, inner) = match value {
+                    Value::Secret(secret) => {
+                        (secret.value.clone(), Some(Rc::clone(&secret.identity)))
+                    }
+                    value => (value, None),
+                };
+                let identity: Vec<&str> =
+                    identities.iter().chain(&inner).map(AsRef::as_ref).collect();
+                Ok(Value::Secret(Rc::new(Secret {
+                    value,
+                    identity: Rc::from(identity.join(" + ")),
+                })))
+            }
+            Err(Unwind::Error(error)) if error.mark == ErrorMark::NONE && !of_operand => {
+                let mut failed = Diagnostic::error("an operation on a secret failed", node.span);
+                failed.mark = ErrorMark::SECRET;
+                failed.input = error.input;
+                Err(failed.into())
+            }
+            Err(unwind) => Err(unwind),
         }
     }
 
@@ -2757,6 +2868,9 @@ impl Evaluator<'_> {
                 Some((first, _)),
                 Some(second),
             ) => enum_builtin(builtin, (&first, &second), node),
+            (Builtin::Secret | Builtin::SecretValue, Some((value, _)), identity) => {
+                secret_builtin(builtin, value, identity, node)
+            }
             _ => mistyped(
                 node,
                 "a built-in function called through a value with an argument of another kind",
@@ -3598,6 +3712,8 @@ impl Evaluator<'_> {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::MakeFuture { .. } => self.shared_amount(id, node),
             IrKind::ListLen(list) => self.list_len(list),
             IrKind::Block { items, result } => {
@@ -3707,14 +3823,20 @@ impl Evaluator<'_> {
                 kind: ValueKind::Deferred,
                 ..
             }
+            | IrKind::SecretValue {
+                kind: ValueKind::Deferred,
+                ..
+            }
             | IrKind::MakeFuture { .. } => mistyped(node, taken.deferred),
             IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
-            | IrKind::Failure(_) => match (taken.owned)(self.whole_node(node)?) {
+            | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_) => match (taken.owned)(self.whole_node(node)?) {
                 Some(value) => Ok(value),
-                None => mistyped(node, "a context's value of another kind than its node"),
+                None => mistyped(node, "a value of another kind than its node"),
             },
             IrKind::Load(slot, _) => self.slot_as(slot, node, taken.borrowed),
             IrKind::LoadCapture(index, _) => self.capture_as(index, node, taken.borrowed),
@@ -3848,6 +3970,8 @@ impl Evaluator<'_> {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &FLOAT),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Float was expected"),
             IrKind::Block { items, result } => {
@@ -3950,6 +4074,8 @@ impl Evaluator<'_> {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &BOOL),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a Bool was expected"),
             IrKind::Is { .. } => self.is_test(node),
@@ -4104,6 +4230,8 @@ impl Evaluator<'_> {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &STRING),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a String was expected"),
             IrKind::Block { items, result } => {
@@ -4193,6 +4321,8 @@ impl Evaluator<'_> {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::MakeFuture { .. } => self.shared_as(node, &RECORD),
             IrKind::Quantity(..) => mistyped(node, "quantity node where a record was expected"),
             IrKind::Store(slot, value) => self.store(slot, value, node),
@@ -4429,6 +4559,7 @@ impl Evaluator<'_> {
             | Value::Builtin(_)
             | Value::Tag(_)
             | Value::Variant(_)
+            | Value::Secret(_)
             | Value::Future(_) => {
                 return mistyped(node, "an update of a value that is not a record");
             }
@@ -4706,6 +4837,58 @@ fn floor_mod(a: i64, b: NonZeroI64) -> i64 {
         r + b
     } else {
         r
+    }
+}
+
+/// `value` with every secret in it its value, in a field, an element or a
+/// payload at any depth, each secret's identity pushed onto `identities`
+/// in the order met (see [Secrets](#secrets)): what a comparison of values
+/// holding secrets compares. A value holding none is returned as it is,
+/// sharing what it shares.
+///
+/// Recurses once per level of nesting in `value`, which is nested no
+/// deeper than its type, which the checker recursed through already.
+fn unsealed(value: Value, identities: &mut Vec<Rc<str>>) -> Value {
+    if !holds_secret(&value) {
+        return value;
+    }
+    match value {
+        // A secret's value, never a secret, may hold one.
+        Value::Secret(secret) => {
+            identities.push(Rc::clone(&secret.identity));
+            unsealed(secret.value.clone(), identities)
+        }
+        Value::Record(record) => Value::Record(Rc::new(Record {
+            layout: Rc::clone(&record.layout),
+            values: record
+                .values
+                .iter()
+                .map(|field| unsealed(field.clone(), identities))
+                .collect(),
+        })),
+        Value::List(list) => Value::List(List::from_vec(
+            list.values()
+                .iter()
+                .map(|element| unsealed(element.clone(), identities))
+                .collect(),
+        )),
+        Value::Variant(variant) => Value::Variant(Rc::new(Variant {
+            tag: Rc::clone(&variant.tag),
+            payload: unsealed(variant.payload.clone(), identities),
+        })),
+        value => value,
+    }
+}
+
+/// Whether `value` is or holds a secret, in a field, an element or a
+/// payload at any depth.
+fn holds_secret(value: &Value) -> bool {
+    match value {
+        Value::Secret(_) => true,
+        Value::Record(record) => record.values.iter().any(holds_secret),
+        Value::List(list) => list.values().iter().any(holds_secret),
+        Value::Variant(variant) => holds_secret(&variant.payload),
+        _ => false,
     }
 }
 
@@ -5476,6 +5659,14 @@ fn hash_value(value: &Value, state: &mut DefaultHasher, depth: usize) {
                 hash_value(&variant.payload, state, depth - 1);
             }
         }
+        // In memory only: a memo table never leaves the run.
+        Value::Secret(secret) => {
+            state.write_u8(13);
+            secret.identity.hash(state);
+            if depth > 0 {
+                hash_value(&secret.value, state, depth - 1);
+            }
+        }
         Value::Record(record) => {
             state.write_u8(5);
             state.write_usize(record.values.len());
@@ -6009,6 +6200,30 @@ fn with_fields(value: &Value) -> Option<&Record> {
     }
 }
 
+/// The call `node` of `builtin`, `secret` or `secret_value`, with the
+/// argument `value` and, for `secret`, the identity `identity` (see
+/// [Secrets](#secrets)): `secret` of a secret is its value as a secret of
+/// the new identity, and `secret_value` of a plain value, a plain `T`
+/// where a `Secret<T>` is expected, is the value.
+fn secret_builtin(
+    builtin: Builtin,
+    value: Value,
+    identity: Option<Value>,
+    node: &IrNode,
+) -> Flow<Value> {
+    let value = match value {
+        Value::Secret(secret) => secret.value.clone(),
+        value => value,
+    };
+    match (builtin, identity) {
+        (Builtin::Secret, Some(Value::Str(identity))) => {
+            Ok(Value::Secret(Rc::new(Secret { value, identity })))
+        }
+        (Builtin::SecretValue, None) => Ok(value),
+        _ => mistyped(node, "a secret's built-in with an argument of another kind"),
+    }
+}
+
 /// The call `node` of `builtin`, `variant_matches`, `variant_payload` or
 /// `partial_matches`, with the arguments `first` and `second` (see the
 /// checker's "Enums" and "Partial records"): `variant_payload` of a value
@@ -6081,6 +6296,7 @@ const fn described(value: &Value) -> &'static str {
         Value::Fn(_) | Value::Builtin(_) => "a function",
         Value::Tag(_) => "a variant",
         Value::Variant(_) => "a value of an enum",
+        Value::Secret(_) => "a secret",
         Value::Future(_) => "a future",
     }
 }
@@ -6959,7 +7175,9 @@ fn source_of(value: &Value, node: &IrNode) -> Flow<Rc<str>> {
             // A variant's source is how it is shown, `Toolchain::C`, and a
             // value of an enum the call of it on its payload's.
             Value::Variant(variant) => pending.push(&variant.payload),
-            Value::Tag(_)
+            // Shown as `***`, whatever it holds, which is not looked at.
+            Value::Secret(_)
+            | Value::Tag(_)
             | Value::Int(_)
             | Value::Float(_)
             | Value::Quantity(..)

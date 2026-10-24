@@ -413,14 +413,14 @@
 
 use std::collections::HashMap;
 
+use crate::ast::AttributeId;
 use crate::ast::{
     ArgRange, Ast, BinaryOp, DefTypeId, Effect, ElementRange, ExprId, ExprKind, FnId, ForHead,
     ForId, ItemId, ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment,
     RecoverId, SegmentKind, StrPart, UnaryOp, WithRange, path_span, symbol_span,
 };
-use crate::ast::AttributeId;
 use crate::check::{
-    FAILURE_MESSAGE, Attribute, AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot,
+    Attribute, AwaitMark, Builtin, Checked, Constant, FAILURE_MESSAGE, FieldSchedule, Fileroot,
     JumpTarget, MadeAt, ParamDefault, PathResolution, Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
@@ -674,6 +674,16 @@ impl Lowerer<'_> {
     /// The type of expression `id` where it is used: its type once awaited
     /// at the top, if it is awaited, and its type otherwise.
     fn used_type(&self, id: ExprId) -> TyId {
+        // A secret an operation on secrets takes is used as its value.
+        if let Some((value, _)) = self.resolution.secret_operand(id) {
+            return value;
+        }
+        self.awaited_type(id)
+    }
+
+    /// The type of expression `id` once awaited, if it is awaited where it
+    /// is used, whether or not it is a secret's that is unwrapped there.
+    fn awaited_type(&self, id: ExprId) -> TyId {
         let ty = self.expr_types.get(id);
         match self.resolution.await_of(id) {
             AwaitMark::None => ty,
@@ -1854,18 +1864,47 @@ impl Lowerer<'_> {
     /// because what it asks of an operand that always runs is `Never`,
     /// which nothing awaits, is lowered by [`Lowerer::lower_unreached`].
     fn lower_expr(&mut self, id: ExprId) -> Result<IrId, InternalError> {
-        match self.resolution.await_of(id) {
+        let node = match self.resolution.await_of(id) {
             AwaitMark::None => {
-                let kind = self.kind(id)?;
+                let kind = self.kind_of_type(id, self.awaited_type(id))?;
                 if kind == ValueKind::Never
                     && let Some(unreached) = self.lower_unreached(id)?
                 {
                     return Ok(self.builder.alloc(unreached, self.ast.get(id).span));
                 }
-                self.lower_plain(id, kind)
+                self.lower_computed(id, kind)?
             }
-            mark => self.lower_awaited(id, mark, self.ast.get(id).span),
-        }
+            mark => self.lower_awaited(id, mark, self.ast.get(id).span)?,
+        };
+        // An operand of an operation on secrets: a secret unwrapped to its
+        // value, and any marked as an operand, so that its failure is not
+        // the operation's.
+        let deep = match self.resolution.secret_operand(id) {
+            Some((_, deep)) => deep,
+            None if self.resolution.is_plain_operand(id) => false,
+            None => return Ok(node),
+        };
+        let kind = self.kind(id)?;
+        let value = IrKind::SecretValue {
+            value: node,
+            kind,
+            deep,
+        };
+        Ok(self.builder.alloc(value, self.ast.get(id).span))
+    }
+
+    /// Lowers expression `id`, of kind `kind`, as [`Lowerer::lower_plain`]
+    /// does, but an operation on secrets: the operation on their values, of
+    /// its value's kind, made a secret (see the checker's "Secrets").
+    fn lower_computed(&mut self, id: ExprId, kind: ValueKind) -> Result<IrId, InternalError> {
+        let Some(value) = self.resolution.secret_op(id) else {
+            return self.lower_plain(id, kind);
+        };
+        let kind = self.kind_of_type(id, value)?;
+        let computed = self.lower_plain(id, kind)?;
+        Ok(self
+            .builder
+            .alloc(IrKind::SecretWrap(computed), self.ast.get(id).span))
     }
 
     /// Lowers expression `id`, which the checker marked to be awaited as
@@ -3015,7 +3054,9 @@ impl Lowerer<'_> {
             | Builtin::ExecLive
             | Builtin::VariantMatches
             | Builtin::VariantPayload
-            | Builtin::PartialMatches => Err(InternalError {
+            | Builtin::PartialMatches
+            | Builtin::Secret
+            | Builtin::SecretValue => Err(InternalError {
                 message: "a call of a built-in function of a function type resolved as special",
                 span,
             }),

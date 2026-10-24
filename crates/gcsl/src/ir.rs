@@ -300,12 +300,12 @@ use std::rc::Rc;
 
 use crate::ast::FnId;
 use crate::check::{Attribute, Slot};
-use std::time::Duration;
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
 use crate::types::ValueTest;
 use crate::value::{Layout, Quantity, ValueKind};
+use std::time::Duration;
 
 /// What a node's kind is, as [`IrKind::kind_step`] finds it.
 #[derive(Clone, Copy)]
@@ -1147,6 +1147,27 @@ pub enum IrKind {
         /// The kind of both, and of the node.
         kind: ValueKind,
     },
+    /// The value of `value`, a node of any kind, if it is a secret, and the
+    /// value itself if it is not (see [`crate::eval`], "Secrets"): what an
+    /// operation on secrets computes on, each of its operands one of these,
+    /// so that a failure of an operand is told from the operation's own. If `deep`, every secret the value
+    /// holds, in a field, an element or a payload at any depth, is its
+    /// value too, as a comparison compares them. Each secret's identity is
+    /// kept for the innermost [`IrKind::SecretWrap`]. Of kind `kind`.
+    SecretValue {
+        /// The secret, or the value holding secrets.
+        value: IrId,
+        /// The kind of what it is unwrapped to.
+        kind: ValueKind,
+        /// Whether every secret it holds is unwrapped too.
+        deep: bool,
+    },
+    /// An operation on secrets (see [`crate::eval`], "Secrets"): the value
+    /// of the node, of any kind, which computes on the values of secrets,
+    /// as a secret, its identity derived from theirs; a failure of it names
+    /// none of them, and nothing recovers or retries it. Of kind
+    /// [`ValueKind::Mixed`].
+    SecretWrap(IrId),
     /// The failure the innermost `recover` running its fallback caught, a
     /// record `{message: String}` of the layout it names. Of kind
     /// [`ValueKind::Record`].
@@ -1299,31 +1320,29 @@ impl IrKind {
             | IrKind::With { .. }
             | IrKind::MakeClosure { .. }
             | IrKind::MakeFuture { .. } => (None, NONE),
-            IrKind::IntNeg(operand)
-            | IrKind::FloatNeg(operand)
-            | IrKind::IntToFloat(operand)
-            | IrKind::Quantity(_, operand)
-            | IrKind::Not(operand)
-            | IrKind::Field {
-                record: operand, ..
-            }
-            | IrKind::Store(_, operand)
+            IrKind::IntNeg(child)
+            | IrKind::FloatNeg(child)
+            | IrKind::IntToFloat(child)
+            | IrKind::Quantity(_, child)
+            | IrKind::Not(child)
+            | IrKind::Field { record: child, .. }
+            | IrKind::Store(_, child)
             | IrKind::Arg {
-                value: ArgValue::Node(operand),
+                value: ArgValue::Node(child),
                 ..
             }
-            | IrKind::Spread(operand)
-            | IrKind::ListLen(operand)
-            | IrKind::Show(operand)
-            | IrKind::Is { value: operand, .. }
-            | IrKind::As { value: operand, .. }
-            | IrKind::Await { value: operand, .. }
-            | IrKind::Catch { body: operand, .. }
-            | IrKind::ContextBind { value: operand, .. }
-            | IrKind::ContextRead {
-                default: operand, ..
-            }
-            | IrKind::Meta(operand) => (None, [Some(operand), None, None]),
+            | IrKind::Spread(child)
+            | IrKind::ListLen(child)
+            | IrKind::Show(child)
+            | IrKind::Is { value: child, .. }
+            | IrKind::As { value: child, .. }
+            | IrKind::Await { value: child, .. }
+            | IrKind::Catch { body: child, .. }
+            | IrKind::ContextBind { value: child, .. }
+            | IrKind::SecretValue { value: child, .. }
+            | IrKind::SecretWrap(child)
+            | IrKind::ContextRead { default: child, .. }
+            | IrKind::Meta(child) => (None, [Some(child), None, None]),
             IrKind::Break { value, .. }
             | IrKind::Continue { value, .. }
             | IrKind::Return { value, .. } => (None, [value, None, None]),
@@ -1483,6 +1502,7 @@ impl IrKind {
             | IrKind::As { kind, .. }
             | IrKind::Catch { kind, .. }
             | IrKind::ContextRead { kind, .. }
+            | IrKind::SecretValue { kind, .. }
             | IrKind::Recover { kind, .. }
             | IrKind::With { kind, .. }
             | IrKind::Top(_, kind) => KindStep::Own(kind),
@@ -1490,6 +1510,7 @@ impl IrKind {
             | IrKind::LoadCallee
             | IrKind::Meta(_)
             | IrKind::Tag { .. } => KindStep::Own(ValueKind::Fn),
+            IrKind::SecretWrap(_) => KindStep::Own(ValueKind::Mixed),
             IrKind::MakeFuture { .. } => KindStep::Own(ValueKind::Deferred),
         }
     }
@@ -1546,6 +1567,8 @@ impl IrKind {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }
@@ -1661,6 +1684,8 @@ impl IrKind {
             IrKind::Assert { .. } => "assert",
             IrKind::Recover { .. } => "recover",
             IrKind::Failure(_) => "failure",
+            IrKind::SecretValue { .. } => "secret-value",
+            IrKind::SecretWrap(_) => "secret-wrap",
             IrKind::With { .. } => "with",
             IrKind::ContextBind { .. } => "context-bind",
             IrKind::Caller => "caller",
@@ -1759,6 +1784,8 @@ impl IrNode {
             | IrKind::Assert { .. }
             | IrKind::Recover { .. }
             | IrKind::Failure(_)
+            | IrKind::SecretValue { .. }
+            | IrKind::SecretWrap(_)
             | IrKind::ContextRead { .. }
             | IrKind::With { .. }
             | IrKind::ContextBind { .. }

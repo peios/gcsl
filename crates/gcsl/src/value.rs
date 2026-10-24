@@ -836,6 +836,18 @@ pub enum Value {
     Tag(Rc<Tag>),
     /// A value of an enum: a variant and its payload, compared by both.
     Variant(Rc<Variant>),
+    /// A secret: a value that never leaks, shown as `***` (see
+    /// [`crate::eval`], "Secrets"), compared by its value and identity.
+    Secret(Rc<Secret>),
+}
+
+/// A secret, as values carry it (see [`crate::eval`], "Secrets").
+#[derive(Debug, PartialEq)]
+pub struct Secret {
+    /// Its value, never a secret itself.
+    pub value: Value,
+    /// Its public identity, what a host's receipts record of it.
+    pub identity: Rc<str>,
 }
 
 /// A variant of an enum, as values carry it (see the checker's "Enums").
@@ -873,8 +885,8 @@ impl Value {
             Value::Fn(_) | Value::Builtin(_) | Value::Tag(_) => ValueKind::Fn,
             Value::Future(_) => ValueKind::Deferred,
             // A value of an enum is of no kind of its own: present, of the
-            // kind a node of an enum's type has.
-            Value::Variant(_) => ValueKind::Mixed,
+            // kind a node of an enum's type has; and so is a secret.
+            Value::Variant(_) | Value::Secret(_) => ValueKind::Mixed,
         }
     }
 
@@ -988,6 +1000,8 @@ impl fmt::Display for Value {
             Value::Variant(variant) => {
                 write!(f, "{}({})", variant.tag.shown, variant.payload.repr())
             }
+            // The one way a secret is shown, wherever it is.
+            Value::Secret(_) => f.write_str("***"),
             Value::Future(future) => f.write_str(future.display()),
             Value::Record(record) => {
                 f.write_str("{")?;

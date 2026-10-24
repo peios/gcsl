@@ -112,11 +112,13 @@ pub struct Diagnostic {
 }
 
 /// What the evaluator knows of where a runtime error came from that its
-/// message does not say: nothing, a bug in GCSL, which nothing retries, or
-/// the passing of the deadline of a call with `#[timeout]`, by the
-/// deadline's number, which only that call turns into its own error (see
-/// [`crate::eval`], "Retry and timeout"). One `u32`, which a diagnostic
-/// keeps within the size it had.
+/// message does not say: nothing, a bug in GCSL, which nothing retries, a
+/// failure of an operation on a secret, which nothing retries or recovers
+/// either, since whether it fails depends on the secret (see
+/// [`crate::eval`], "Secrets"), or the passing of the deadline of a call
+/// with `#[timeout]`, by the deadline's number, which only that call turns
+/// into its own error (see [`crate::eval`], "Retry and timeout"). One
+/// `u32`, which a diagnostic keeps within the size it had.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Mark(u32);
 
@@ -125,16 +127,18 @@ impl Mark {
     pub(crate) const NONE: Mark = Mark(0);
     /// A bug in GCSL.
     pub(crate) const INTERNAL: Mark = Mark(u32::MAX);
+    /// A failure of an operation on a secret.
+    pub(crate) const SECRET: Mark = Mark(u32::MAX - 1);
 
-    /// The passing of deadline number `number`, which is neither 0 nor
-    /// `u32::MAX`.
+    /// The passing of deadline number `number`, which is neither 0 nor one
+    /// of the last two `u32`s.
     pub(crate) const fn deadline(number: u32) -> Mark {
         Mark(number)
     }
 
     /// The number of the deadline whose passing the error is, if it is one.
     pub(crate) const fn deadline_number(self) -> Option<u32> {
-        if self.0 == 0 || self.0 == u32::MAX {
+        if self.0 == 0 || self.0 >= u32::MAX - 1 {
             None
         } else {
             Some(self.0)

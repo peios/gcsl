@@ -101,3 +101,13 @@ def (kind: Variant<E, T>) payload<E, T>(value: E): T {
 def (partial: Partial<T>) matches<T>(full: T): Bool {
     builtins.partial_matches(partial, full)
 }
+
+# Secrets: `s.unsafe_value()` is the secret's value, the deliberate escape
+# from what keeps it from leaking, for a linter or a strict mode to flag.
+# `secret(value, identity)` makes one; a secret shows as `***`.
+def (s: Secret<T>) unsafe_value<T>(): T {
+    builtins.secret_value(s)
+}
+def secret<T>(value: T, identity: String): Secret<T> {
+    builtins.secret(value, identity)
+}

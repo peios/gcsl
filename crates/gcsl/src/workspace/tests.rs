@@ -2103,7 +2103,7 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
     assert_eq!(scan.dirs[scan.files[0].dir as usize].parent, None);
     assert_eq!(scan.order[0], 0);
     // The built-in functions' cells are the first.
-    let builtins: Vec<Option<Builtin>> = (0..28).map(|node| scan.builtin(node)).collect();
+    let builtins: Vec<Option<Builtin>> = (0..30).map(|node| scan.builtin(node)).collect();
     assert_eq!(
         builtins,
         [
@@ -2134,6 +2134,8 @@ fn the_standard_summary_runs_in_a_workspace_and_alone() {
             Some(Builtin::VariantMatches),
             Some(Builtin::VariantPayload),
             Some(Builtin::PartialMatches),
+            Some(Builtin::Secret),
+            Some(Builtin::SecretValue),
             None
         ]
     );
@@ -2314,7 +2316,8 @@ fn a_file_s_own_names_shadow_the_prelude_s_silently() {
             "compare_versions",
             "sort_versions",
             "sh",
-            "sh_live"
+            "sh_live",
+            "secret"
         ]
     );
     assert!(scan.files[2].aliases.iter().all(|alias| alias.implicit));
@@ -2725,8 +2728,8 @@ fn every_record_exec_builds_shares_the_runs_one_layout() {
         .map(|&(path, text)| SourceFile::new(path, text).unwrap())
         .collect();
     let mut workspace = check(&sources).unwrap();
-    // The driver wrote the twenty-seven built-in functions' cells.
-    assert_eq!(assert_builtins_written(&workspace).len(), 27);
+    // The driver wrote the twenty-nine built-in functions' cells.
+    assert_eq!(assert_builtins_written(&workspace).len(), 29);
     let a = workspace.file("a.gcsl").unwrap();
     let b = workspace.file("b.gcsl").unwrap();
     let first = workspace.run(a).unwrap().value;
@@ -12590,4 +12593,187 @@ fn assertion_and_recover_errors() {
         let found = errors(text);
         assert!(found.starts_with(message), "{text}: {found}");
     }
+}
+
+#[test]
+fn what_is_computed_on_a_secret_is_a_secret_and_unsafe_value_takes_its_value() {
+    let text = "let s = secret(\"hunter2\", \"password\")\n\
+                let n = secret(41, \"answer\")\n\
+                a = s + \"!\"\n\
+                b = (s + \"!\").unsafe_value()\n\
+                c = (n + 1).unsafe_value()\n\
+                d = \"--token={s}\".unsafe_value()\n\
+                e = (s == \"hunter2\").unsafe_value()\n\
+                f = (-n).unsafe_value()\n\
+                let o = secret({k = s; n = 1}, \"login\")\n\
+                g = o.k.unsafe_value()\n\
+                h = (o == {k = \"hunter2\"; n = 1}).unsafe_value()\n\
+                i = ({k = s} == {k = \"guess\"}).unsafe_value()\n\
+                j = ([s, s] == [\"hunter2\", \"hunter2\"]).unsafe_value()\n\
+                k = secret([1, 2], \"list\")[1].unsafe_value()\n\
+                l = show({k = s})\n\
+                fn same<T>(x: T): T { x }\n\
+                m = same(s)\n\
+                enum B extensible<{*: Secret<String>}>\n\
+                enum B::X<{a: Secret<String>}>\n\
+                p = (B::X({a = s}) == B::X({a = secret(\"hunter2\", \"other\")})).unsafe_value()";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        value(&files, "app.gcsl"),
+        "{a = ***; b = \"hunter2!\"; c = 42; d = \"--token=hunter2\"; e = true; f = -41; \
+         g = \"hunter2\"; h = true; i = false; j = true; k = 2; l = \"{{k = ***}}\"; m = ***; \
+         p = true}"
+    );
+}
+
+#[test]
+fn a_secret_computed_on_secrets_is_identified_by_theirs() {
+    let text = "let s = secret(\"pw\", \"password\")\n\
+                let u = secret(\"jack\", \"user\")\n\
+                a = s\n\
+                b = u + \":\" + s\n\
+                c = \"{u}:{s}\"\n\
+                d = {k = s} == {k = \"pw\"}\n\
+                e = secret({k = s}, \"login\").k\n\
+                f = secret(s, \"again\")";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    let Value::Record(record) = rooted_value(&files, "app.gcsl") else {
+        panic!("not a record");
+    };
+    let identities: Vec<(&str, &str)> = record
+        .layout
+        .texts
+        .iter()
+        .zip(&record.values)
+        .map(|(name, value)| match value {
+            Value::Secret(secret) => (name.as_ref(), secret.identity.as_ref()),
+            value => panic!("{name} is {value}, not a secret"),
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            ("a", "password"),
+            ("b", "user + password"),
+            ("c", "user + password"),
+            ("d", "password"),
+            ("e", "login + password"),
+            ("f", "again"),
+        ]
+    );
+}
+
+#[test]
+fn a_secret_decides_nothing_and_is_not_its_value() {
+    let errors = |text: &str| {
+        let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+        let error = rooted(&files)
+            .err()
+            .unwrap_or_else(|| panic!("{text}: no error"));
+        (error[0].message.clone(), error[0].notes.clone())
+    };
+    let prefix = "let s = secret(\"pw\", \"id\")\n";
+    for (text, message) in [
+        ("r = if s == \"pw\" { 1 } else { 2 }", "mismatched types"),
+        (
+            "r = s == \"pw\" and true",
+            "a secret cannot decide what runs",
+        ),
+        (
+            "r = true or s == \"pw\"",
+            "a secret cannot decide what runs",
+        ),
+        (
+            "let v: Secret<String> | Int = s\nr = v is Int",
+            "a secret cannot decide what runs",
+        ),
+        (
+            "let v: Secret<String> | Int = s\nr = v as Int",
+            "a secret cannot decide what runs",
+        ),
+        (
+            "r = for c in secret([1], \"l\") { c }",
+            "cannot iterate over a value",
+        ),
+        ("assert s == \"pw\"", "mismatched types"),
+        (
+            "r = [1, 2][secret(0, \"i\")]",
+            "a list index must be an Int",
+        ),
+        ("r = trim(s)", "mismatched types"),
+        ("r = s + 1", "cannot add `Secret<String>` and Int"),
+        (
+            "r = {...secret({k = 1}, \"r\")}",
+            "cannot spread a value of type",
+        ),
+        (
+            "let r: Secret<Future<Int>> = secret(1, \"f\")",
+            "a secret's value is present",
+        ),
+    ] {
+        let (found, notes) = errors(&format!("{prefix}{text}"));
+        assert!(found.starts_with(message), "{text}: {found}");
+        if found == "mismatched types" {
+            assert!(
+                notes.iter().any(|note| note.contains("`.unsafe_value()`")),
+                "{text}: {notes:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_failure_on_a_secret_names_nothing_and_nothing_recovers_it() {
+    for text in [
+        "let n = secret(0, \"zero\")\nr = recover { 1 // n } else (e) { e.message }",
+        "let l = secret([1, 2], \"l\")\nr = recover { l[5] } else { 0 }",
+        "let n = secret(9223372036854775807, \"big\")\nr = recover { n + 1 } else { 0 }",
+        "let n = secret(0, \"zero\")\nr = recover { (n + 1) // (n * 2) } else { 0 }",
+    ] {
+        let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+        let mut workspace = rooted(&files).unwrap();
+        let app = workspace.file("app.gcsl").unwrap();
+        let error = workspace.run(app).unwrap_err().remove(0);
+        assert_eq!(error.message, "an operation on a secret failed", "{text}");
+        assert!(error.labels.is_empty(), "{text}: {:?}", error.labels);
+        assert!(error.notes.is_empty(), "{text}: {:?}", error.notes);
+    }
+}
+
+#[test]
+fn a_failure_of_an_operand_of_an_operation_on_a_secret_is_the_operand_s() {
+    let text = "let s = secret(\"pw\", \"id\")\n\
+                a = recover { s + panic(\"boom\") } else (e) { e.message }\n\
+                b = recover { \"{s}{[\"x\"][3]}\" } else (e) { e.message }\n\
+                let n = secret(0, \"zero\")\n\
+                c = recover { (1 // n) + 1 } else { 0 }";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    let mut workspace = rooted(&files).unwrap();
+    let app = workspace.file("app.gcsl").unwrap();
+    // The operand's own failures are recovered; the failure of an operand
+    // that is itself an operation on a secret is that operation's, which
+    // nothing recovers, wherever it reaches.
+    let error = workspace.run(app).unwrap_err().remove(0);
+    assert_eq!(error.message, "an operation on a secret failed");
+    let files = [
+        ("workspace.gcsl", ""),
+        ("app.gcsl", &text[..text.find("let n").unwrap()]),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{a = \"boom\"; b = \"index out of range\"}"
+    );
+}
+
+#[test]
+fn a_timeout_inside_an_operation_on_a_secret_is_its_call_s() {
+    let text = "let s = secret(\"pw\", \"id\")\n\
+                #[timeout(200ms)]\n\
+                fn slow() -> Secret<String> { s + exec([\"sleep\", \"3\"]).stdout }\n\
+                r = recover { slow().unsafe_value() } else (e) { e.message }";
+    let files = [("workspace.gcsl", ""), ("app.gcsl", text)];
+    assert_eq!(
+        rooted_text(&files, "app.gcsl"),
+        "{r = \"`slow` timed out after 200ms\"}"
+    );
 }
