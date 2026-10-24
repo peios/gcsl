@@ -726,6 +726,40 @@
 //! checker rules out. A function with a meta is a closure like any other:
 //! equality, `is` and the keys of memoised calls see nothing of its meta.
 //!
+//! # Retry and timeout
+//!
+//! A call of a function with `#[retry]` or `#[timeout]` (see the checker's
+//! [Attributes](crate::check#attributes)), whose code says so
+//! ([`FnCode::retry`], [`FnCode::timeout`]), runs its body through
+//! `Evaluator::guarded_body`, a frame between the call and the body that
+//! costs [`GUARD_LEVELS`] more of the nesting budget; every other call runs
+//! as it did. Each attempt runs the body once.
+//!
+//! **Retry.** An attempt that fails with an error that is neither a bug in
+//! GCSL ([`ErrorMark::INTERNAL`]) nor the passing of an enclosing call's
+//! deadline is run again, while retries are left: the frame's variables
+//! emptied and its arguments, defaults included, kept, so the body starts
+//! afresh, with its effects repeated. The last attempt's error is noted
+//! "`f` was tried 3 times". A memoised call retries inside its memoisation,
+//! which records only a success.
+//!
+//! **Timeout.** An attempt of a function with a timeout runs under a
+//! *deadline*, kept in a stack in the run's shared state ([`Shared`]),
+//! outermost first: its own instant, the attempt's start plus the limit,
+//! and its effective one, the earlier of its own and the enclosing
+//! deadline's, which a cell keeps for the innermost so that a check reads
+//! one cell while none runs. The evaluator checks it at every call and every
+//! iteration of a loop, so pure code that runs long is stopped too, and at
+//! every `exec`, which runs its program until the deadline (`run_until`):
+//! the program is looked at, at first often and then every
+//! [`DEADLINE_POLL`] at most, and killed when the deadline passes (the
+//! program itself, not its own children). When one has passed, the error is
+//! the outermost passed deadline's, "`f` timed out after 30s", where the
+//! evaluation was, marked with the deadline's number ([`ErrorMark`]): every
+//! call inside passes it on, unretried, and the call that set the deadline
+//! clears the mark, which makes it that call's own failure, which its own
+//! `#[retry]` may retry, timed afresh, and any call around it too.
+//!
 //! # Memoised functions
 //!
 //! A function declared with `->>` is lowered to code of [`FnKind::Memo`],
@@ -875,7 +909,7 @@
 //! at the operator and labels each operand with the value it had, so the
 //! user sees what actually overflowed or divided by zero.
 
-use std::cell::{Cell, OnceCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
@@ -892,10 +926,11 @@ use std::process::{Command, Output, Stdio};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::thread::{self, ScopedJoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::ast::FnId;
 use crate::check::{Builtin, Slot};
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, Mark as ErrorMark};
 use crate::ir::{
     ArgValue, CatchId, Cmp, FnCode, FnKind, Ir, IrId, IrKind, IrNode, IrRange, LayoutId, LazyField,
     LazyShapeId, ListShape, MetaAt, Operands, RestShape, ShapeId, ShapedOperands, StepAt, StepMode,
@@ -1026,11 +1061,7 @@ pub fn eval_with(
         helper: false,
         origin: NO_ORIGIN,
     };
-    let shared = Shared {
-        exec_result,
-        dirs,
-        temp_dirs,
-    };
+    let shared = Shared::new(exec_result, dirs, temp_dirs);
     let result = Evaluator {
         ir,
         stack,
@@ -1151,7 +1182,7 @@ enum Callee {
 
 /// What every frame of an evaluation shares besides the value stack and the
 /// memo tables, which the driver of the run built once (see [`eval_with`]).
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Shared<'a> {
     /// The layout of the record `exec` returns; `None` in a run without
     /// the standard library.
@@ -1164,6 +1195,49 @@ struct Shared<'a> {
     /// The temporary directories of the run's owner, which `fs.temp_dir`
     /// makes; `None` in a run without one.
     temp_dirs: Option<&'a TempDirs>,
+    /// The deadlines of the calls with `#[timeout]` that are running,
+    /// outermost first (see [Retry and timeout](#retry-and-timeout)).
+    deadlines: RefCell<Vec<Deadline>>,
+    /// The innermost deadline's effective instant, the earliest of all,
+    /// while one is running: what every check reads first.
+    earliest: Cell<Option<Instant>>,
+    /// The number of the last deadline made.
+    deadlines_made: Cell<u32>,
+}
+
+impl<'a> Shared<'a> {
+    /// What the frames of a run with the layout of `exec`'s result
+    /// `exec_result`, the table of directories `dirs` and the temporary
+    /// directories `temp_dirs` share, with no deadline running.
+    fn new(
+        exec_result: Option<&'a Rc<Layout>>,
+        dirs: &'a [Rc<str>],
+        temp_dirs: Option<&'a TempDirs>,
+    ) -> Self {
+        Self {
+            exec_result,
+            dirs,
+            temp_dirs,
+            deadlines: RefCell::new(Vec::new()),
+            earliest: Cell::new(None),
+            deadlines_made: Cell::new(0),
+        }
+    }
+}
+
+/// The deadline of a running call of a function with `#[timeout]` (see
+/// [Retry and timeout](#retry-and-timeout)).
+#[derive(Debug)]
+struct Deadline {
+    /// Its number, unique in the run: what the error of its passing is
+    /// marked with ([`ErrorMark::deadline`]).
+    number: u32,
+    /// When its own limit passes.
+    own: Instant,
+    /// When it or an enclosing one passes, whichever is first.
+    effective: Instant,
+    /// The error of its passing: "`f` timed out after 30s".
+    message: Rc<str>,
 }
 
 /// The state of one frame's evaluation: the top level's, or a call's.
@@ -2006,6 +2080,9 @@ impl Evaluator<'_> {
         let Some(code) = closure.code.find_function(closure.function) else {
             return mistyped(node, "a closure of a function its IR lacks");
         };
+        if self.past_deadline() {
+            return self.timed_out(node);
+        }
         if code.kind == FnKind::Memo {
             return self.memo_call((&closure, code), (args, depth), node);
         }
@@ -2023,6 +2100,9 @@ impl Evaluator<'_> {
             return Err(unwind);
         }
         let passed = self.callee_caller();
+        if code.retry > 0 || code.timeout.is_some() {
+            return self.guarded_call(&closure, base, (passed, entering), node);
+        }
         let result = Evaluator {
             ir: &closure.code,
             stack: self.stack,
@@ -2045,6 +2125,177 @@ impl Evaluator<'_> {
             }
             result => result.map_err(Unwind::from),
         }
+    }
+
+    /// Finishes the call `node` of `closure`, whose function has `#[retry]`
+    /// or `#[timeout]`, its frame at `base` holding its arguments, with the
+    /// caller `caller`, at `levels` of nesting: runs its body as
+    /// [`Evaluator::guarded_body`] does, then truncates the stack back and
+    /// gives the result, as [`Evaluator::call`] does for any other call.
+    #[inline(never)]
+    fn guarded_call(
+        &mut self,
+        closure: &Rc<Closure>,
+        base: usize,
+        (caller, levels): (Caller, usize),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let Some(code) = closure.code.find_function(closure.function) else {
+            self.stack.truncate(base);
+            return mistyped(node, "a closure of a function its IR lacks");
+        };
+        let result = self.guarded_body((closure, code), base, (caller, levels), node);
+        self.stack.truncate(base);
+        match result.or_else(|unwind| unwind.returned(node.span)) {
+            Err(mut error) if error.input.is_none() && closure.code.input() != self.ir.input() => {
+                error.input = Some(closure.code.input());
+                Err(error.into())
+            }
+            result => result.map_err(Unwind::from),
+        }
+    }
+
+    /// Runs the body of `closure`, whose code `code` has `#[retry]` or
+    /// `#[timeout]`, in the frame at `base`, which holds its arguments, with
+    /// the caller `caller`, at `levels` of nesting and one more for this
+    /// frame (see [Retry and timeout](#retry-and-timeout)). Each attempt
+    /// runs under the function's own deadline, if it has a timeout, and an
+    /// error of its passing is turned into the call's own error, its mark
+    /// cleared. An attempt that fails with an error that is neither a bug
+    /// in GCSL nor an enclosing call's timeout is run again, its frame's
+    /// variables emptied and its arguments kept, while retries are left;
+    /// the last error is noted with how many times the call was tried. A
+    /// `return` for the function is its value, as for any call.
+    #[inline(never)]
+    fn guarded_body(
+        &mut self,
+        (closure, code): (&Rc<Closure>, &FnCode),
+        base: usize,
+        (caller, levels): (Caller, usize),
+        node: &IrNode,
+    ) -> Flow<Value> {
+        let levels = levels + GUARD_LEVELS;
+        if levels + code.height as usize > MAX_DEPTH {
+            return Err(nested_too_deeply(node).into());
+        }
+        let shown = code
+            .name_text
+            .as_deref()
+            .map_or_else(|| "the call".to_owned(), |name| format!("`{name}`"));
+        let mut tried: u32 = 0;
+        loop {
+            tried = tried.saturating_add(1);
+            if tried > 1 {
+                let locals = base + code.param_count as usize..base + code.frame_size as usize;
+                for slot in self.stack.get_mut(locals).into_iter().flatten() {
+                    *slot = Value::Empty;
+                }
+            }
+            let deadline = code.timeout.map(|limit| {
+                self.push_deadline(
+                    limit,
+                    &format!("{shown} timed out after {}", shown_duration(limit)),
+                )
+            });
+            let result = Evaluator {
+                ir: &closure.code,
+                stack: self.stack,
+                base,
+                captures: &closure.captures,
+                callee: Some(closure),
+                memo: self.memo,
+                shared: self.shared,
+                caller,
+                levels,
+            }
+            .value(code.body);
+            if let Some(number) = deadline {
+                self.pop_deadline(number);
+            }
+            let mut error = match result.or_else(|unwind| unwind.returned(node.span)) {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+            // Its own deadline's passing is its own error.
+            if deadline.is_some() && error.mark.deadline_number() == deadline {
+                error.mark = ErrorMark::NONE;
+            }
+            if error.mark == ErrorMark::NONE && tried <= code.retry {
+                continue;
+            }
+            if tried > 1 && error.mark == ErrorMark::NONE {
+                error.notes.push(format!("{shown} was tried {tried} times"));
+            }
+            return Err(error.into());
+        }
+    }
+
+    /// Starts a deadline of `limit` from now, inside the running ones, its
+    /// passing the error `message`: the effective instant is the earlier of
+    /// its own and the enclosing one's. Returns its number.
+    fn push_deadline(&self, limit: Duration, message: &str) -> u32 {
+        let now = Instant::now();
+        let own = now
+            .checked_add(limit)
+            .unwrap_or(now + Duration::from_secs(u32::MAX.into()));
+        let mut number = self.shared.deadlines_made.get().wrapping_add(1);
+        if number == 0 || number == u32::MAX {
+            number = 1;
+        }
+        self.shared.deadlines_made.set(number);
+        let effective = self
+            .shared
+            .earliest
+            .get()
+            .map_or(own, |earliest| earliest.min(own));
+        self.shared.deadlines.borrow_mut().push(Deadline {
+            number,
+            own,
+            effective,
+            message: Rc::from(message),
+        });
+        self.shared.earliest.set(Some(effective));
+        number
+    }
+
+    /// Ends the innermost deadline, number `number`.
+    fn pop_deadline(&self, number: u32) {
+        let mut deadlines = self.shared.deadlines.borrow_mut();
+        if deadlines
+            .last()
+            .is_some_and(|deadline| deadline.number == number)
+        {
+            deadlines.pop();
+        }
+        self.shared
+            .earliest
+            .set(deadlines.last().map(|deadline| deadline.effective));
+    }
+
+    /// Whether a running deadline has passed: one look at a cell while none
+    /// runs, and the clock's while one does.
+    fn past_deadline(&self) -> bool {
+        self.shared
+            .earliest
+            .get()
+            .is_some_and(|earliest| Instant::now() >= earliest)
+    }
+
+    /// The error of the passing of the outermost running deadline that has
+    /// passed, at `node`, where the evaluation was when it passed: its
+    /// message, marked with its number, so that only its call turns it into
+    /// its own error and no call inside retries it.
+    #[cold]
+    #[inline(never)]
+    fn timed_out<T>(&self, node: &IrNode) -> Flow<T> {
+        let now = Instant::now();
+        let deadlines = self.shared.deadlines.borrow();
+        let Some(passed) = deadlines.iter().find(|deadline| deadline.own <= now) else {
+            return mistyped(node, "a deadline passed that no running call has");
+        };
+        let mut error = Diagnostic::error(&*passed.message, node.span);
+        error.mark = ErrorMark::deadline(passed.number);
+        Err(error.into())
     }
 
     /// Evaluates the `Call` `node` of the built-in function `builtin` with
@@ -2108,7 +2359,11 @@ impl Evaluator<'_> {
             },
             (Builtin::Float, Some((Value::Int(x), _)), None) => Ok(Value::Float(int_to_float(x))),
             (Builtin::Exec | Builtin::ExecLive, Some((Value::List(words), _)), None) => {
-                exec(builtin, &words, self.shared.exec_result, node)
+                let deadline = self.shared.earliest.get();
+                match exec(builtin, &words, (self.shared.exec_result, deadline), node)? {
+                    Some(value) => Ok(value),
+                    None => self.timed_out(node),
+                }
             }
             (Builtin::Panic, Some((Value::Str(message), _)), None) => {
                 Err(Diagnostic::error(&*message, node.span).into())
@@ -2196,18 +2451,22 @@ impl Evaluator<'_> {
                 MemoBegin::Started(mark) => (Some(mark), mark.entering, mark.caller),
                 MemoBegin::Unkeyed(entering, caller) => (None, entering, caller),
             };
-        let result = Evaluator {
-            ir: &closure.code,
-            stack: self.stack,
-            base,
-            captures: &closure.captures,
-            callee: Some(closure),
-            memo: self.memo,
-            shared: self.shared,
-            caller,
-            levels: entering,
-        }
-        .value(code.body);
+        let result = if code.retry > 0 || code.timeout.is_some() {
+            self.guarded_body((closure, code), base, (caller, entering), node)
+        } else {
+            Evaluator {
+                ir: &closure.code,
+                stack: self.stack,
+                base,
+                captures: &closure.captures,
+                callee: Some(closure),
+                memo: self.memo,
+                shared: self.shared,
+                caller,
+                levels: entering,
+            }
+            .value(code.body)
+        };
         self.stack.truncate(base);
         // The call is no longer running: nothing more depends on it.
         if mark.is_some() {
@@ -2679,6 +2938,9 @@ impl Evaluator<'_> {
         }
         let at = self.base + slot.index();
         for element in elements {
+            if self.past_deadline() {
+                return self.timed_out(node);
+            }
             let Some(variable) = self.stack.get_mut(at) else {
                 return Err(internal("a `for`'s variable is outside the frame", node.span).into());
             };
@@ -2750,6 +3012,9 @@ impl Evaluator<'_> {
         let mut values = Vec::new();
         let mut test = test_first;
         loop {
+            if self.past_deadline() {
+                return self.timed_out(node);
+            }
             if test && !self.bool(cond)? {
                 break;
             }
@@ -3888,6 +4153,17 @@ impl Evaluator<'_> {
 }
 
 const OVERFLOW: &str = "integer overflow";
+
+/// The levels of [`MAX_DEPTH`]'s budget that a call of a function with
+/// `#[retry]` or `#[timeout]` costs beyond any call: the frame of
+/// [`Evaluator::guarded_body`] between the call and its body.
+const GUARD_LEVELS: usize = 1;
+
+/// The time `limit`, shown as the duration literal of it, `30s`.
+fn shown_duration(limit: Duration) -> String {
+    let nanoseconds = i64::try_from(limit.as_nanos()).unwrap_or(i64::MAX);
+    Value::Quantity(Quantity::Duration, nanoseconds).to_string()
+}
 const DIVISION_BY_ZERO: &str = "division by zero";
 
 // The internal errors of a typed walker meeting a node whose value may be a
@@ -5346,9 +5622,9 @@ fn float_to_int(x: f64) -> Option<i64> {
 fn exec(
     builtin: Builtin,
     argv: &List,
-    exec_result: Option<&Rc<Layout>>,
+    (exec_result, deadline): (Option<&Rc<Layout>>, Option<Instant>),
     node: &IrNode,
-) -> Flow<Value> {
+) -> Flow<Option<Value>> {
     let Some(layout) = exec_result else {
         return mistyped(node, "`exec` called in a run without its result's layout");
     };
@@ -5370,10 +5646,15 @@ fn exec(
         command.arg(&**argument);
     }
     command.stdin(Stdio::null());
-    let output = if builtin == Builtin::ExecLive {
-        run_live(&mut command, node)?
-    } else {
-        command.output()
+    let live = builtin == Builtin::ExecLive;
+    let output = match (live, deadline) {
+        (true, None) => run_live(&mut command, node)?,
+        (false, None) => command.output(),
+        (_, Some(deadline)) => match run_until(&mut command, (live, deadline), node)? {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => return Ok(None),
+            Err(error) => Err(error),
+        },
     };
     let output = match output {
         Ok(output) => output,
@@ -5394,14 +5675,100 @@ fn exec(
         }
     };
     let text = |bytes: &[u8]| Value::Str(Rc::from(String::from_utf8_lossy(bytes).as_ref()));
-    Ok(Value::Record(Rc::new(Record {
+    Ok(Some(Value::Record(Rc::new(Record {
         layout: Rc::clone(layout),
         values: Box::new([
             Value::Int(status),
             text(&output.stdout),
             text(&output.stderr),
         ]),
-    })))
+    }))))
+}
+
+/// Runs `command` as [`exec`] does, but only until `deadline`, copying its
+/// output to this process's standard error as it runs if `live`: its
+/// output read by a thread each, and the program waited for by looking at
+/// it in turn, at first often and then less, at most every
+/// [`DEADLINE_POLL`], until it ends or the deadline passes, when it is
+/// killed and waited for. `Ok(None)` if it was killed so (see [Retry and
+/// timeout](#retry-and-timeout)).
+fn run_until(
+    command: &mut Command,
+    (live, deadline): (bool, Instant),
+    node: &IrNode,
+) -> Flow<io::Result<Option<Output>>> {
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return Ok(Err(error)),
+    };
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return mistyped(node, "a program of `exec` without the pipes of its output");
+    };
+    let read: fn(std::process::ChildStdout) -> io::Result<Vec<u8>> =
+        if live { copy_lines } else { read_all };
+    let read_err: fn(std::process::ChildStderr) -> io::Result<Vec<u8>> =
+        if live { copy_lines } else { read_all };
+    let (status, stdout, stderr) = thread::scope(|scope| {
+        let stdout = thread::Builder::new().spawn_scoped(scope, move || read(out));
+        let stderr = thread::Builder::new().spawn_scoped(scope, move || read_err(err));
+        let status = wait_until(&mut child, deadline);
+        (
+            status,
+            stdout.map(ScopedJoinHandle::join),
+            stderr.map(ScopedJoinHandle::join),
+        )
+    });
+    let (Some(stdout), Some(stderr)) = (copied(stdout), copied(stderr)) else {
+        return mistyped(node, "a thread reading a program's output panicked");
+    };
+    Ok(match (stdout, stderr, status) {
+        (Ok(stdout), Ok(stderr), Ok(Some(status))) => Ok(Some(Output {
+            status,
+            stdout,
+            stderr,
+        })),
+        (_, _, Ok(None)) => Ok(None),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+    })
+}
+
+/// The longest wait between two looks at a program [`run_until`] runs.
+const DEADLINE_POLL: Duration = Duration::from_millis(50);
+
+/// Waits for `child` until `deadline`: its exit status, or `None` if the
+/// deadline passed first, the program then killed and waited for, so that
+/// its output's pipes close.
+fn wait_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let mut pause = Duration::from_millis(1);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            // Already ended, it cannot be killed; either way it is waited
+            // for.
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(DEADLINE_POLL);
+    }
+}
+
+/// All that `stream` gives, to its end.
+fn read_all(mut stream: impl Read) -> io::Result<Vec<u8>> {
+    let mut read = Vec::new();
+    stream.read_to_end(&mut read)?;
+    Ok(read)
 }
 
 /// Runs `command`, for the call `node` of `exec_live`, as

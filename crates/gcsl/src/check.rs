@@ -1328,8 +1328,13 @@
 //! attribute, then the definition's others; a def-type of another file or
 //! of an earlier session input is known by what its cell or binding
 //! carries ([`KnownParams`]). Plain GCSL gives a host's attributes no
-//! meaning; `retry` and `timeout` are checked and carried, and run as yet as
-//! any function is.
+//! meaning, and runs `retry` and `timeout` (see [`crate::eval`], "Retry and
+//! timeout"). `#[retry]` needs a `times` of at least 0, "`#[retry]` needs a
+//! `times` of at least 0" otherwise, and `#[timeout]` a positive `limit`,
+//! "`#[timeout]` needs a positive `limit`" (`Checker::fits_builtin`); and
+//! `#[retry]` on a pure function, a `fn` or `def` declared with `:`, is the
+//! warning "retrying a pure function cannot change its result", noted "a
+//! pure function's result depends only on its arguments".
 //!
 //! # Metas
 //!
@@ -14910,7 +14915,20 @@ impl<'a> Checker<'a> {
         let mut found: HashMap<FnId, Vec<Attribute>> = HashMap::new();
         for used in uses {
             let attribute = self.check_attribute_use(used);
+            let attribute = attribute.filter(|attribute| self.fits_builtin(attribute, used));
             if let (Some(attribute), Some(function)) = (attribute, item_function(ast, used.item)) {
+                if attribute.id == AttributeId::Builtin(RETRY)
+                    && !matches!(ast.item(used.item).kind, ItemKind::DefTypeDef { .. })
+                    && ast.fn_decl(function).effect == Effect::Pure
+                {
+                    self.warnings.push(
+                        Diagnostic::warning(
+                            "retrying a pure function cannot change its result",
+                            used.span,
+                        )
+                        .with_note("a pure function's result depends only on its arguments"),
+                    );
+                }
                 found.entry(function).or_default().push(attribute);
             }
         }
@@ -14963,6 +14981,26 @@ impl<'a> Checker<'a> {
             id,
             args: args.into_boxed_slice(),
         })
+    }
+
+    /// Whether `attribute`, written as `used`, has arguments its meaning
+    /// allows, if it is one of the checker's (see [Attributes](#attributes)):
+    /// `#[retry]` a `times` of at least 0, "`#[retry]` needs a `times` of
+    /// at least 0" otherwise, and `#[timeout]` a positive `limit`,
+    /// "`#[timeout]` needs a positive `limit`", each at the attribute.
+    fn fits_builtin(&mut self, attribute: &Attribute, used: &AttributeUse) -> bool {
+        let message = match (&attribute.id, attribute.args.first()) {
+            (AttributeId::Builtin(RETRY), Some((_, Constant::Int(times)))) if *times < 0 => {
+                "`#[retry]` needs a `times` of at least 0"
+            }
+            (
+                AttributeId::Builtin(TIMEOUT),
+                Some((_, Constant::Quantity(Quantity::Duration, limit))),
+            ) if *limit <= 0 => "`#[timeout]` needs a positive `limit`",
+            _ => return true,
+        };
+        self.errors.push(Diagnostic::error(message, used.span));
+        false
     }
 
     /// The attribute of the file's view of types that `used` names, and its

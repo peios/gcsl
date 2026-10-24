@@ -300,6 +300,7 @@ use std::rc::Rc;
 
 use crate::ast::FnId;
 use crate::check::{Attribute, Slot};
+use std::time::Duration;
 use crate::names::{Name, Names};
 use crate::source::Span;
 use crate::strings::{FieldName, Quoted};
@@ -1573,6 +1574,15 @@ pub struct FnCode {
     /// how to run it, through any of its closures
     /// ([`crate::value::Closure::attributes`]).
     pub attributes: Box<[Attribute]>,
+    /// How many more times a call that fails runs its body, by the
+    /// function's `#[retry]`: 0 without one.
+    pub retry: u32,
+    /// How long a call may run, by the function's `#[timeout]`, if it has
+    /// one.
+    pub timeout: Option<Duration>,
+    /// The text of [`FnCode::name`], for the errors of `#[retry]` and
+    /// `#[timeout]`; `None` for a function without either, or without a name.
+    pub name_text: Option<Box<str>>,
 }
 
 /// A lowered program: an arena of [`IrNode`]s, the item pool, the string

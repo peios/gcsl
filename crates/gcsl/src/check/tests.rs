@@ -14139,3 +14139,25 @@ fn the_checker_s_own_attributes_are_checked_without_a_workspace() {
         Some("retry")
     );
 }
+
+#[test]
+fn retry_and_timeout_need_arguments_they_can_mean() {
+    let cases = [
+        ("#[retry(-1)]", "`#[retry]` needs a `times` of at least 0"),
+        ("#[timeout(0s)]", "`#[timeout]` needs a positive `limit`"),
+        ("#[timeout(-1s)]", "`#[timeout]` needs a positive `limit`"),
+    ];
+    for (attribute, message) in cases {
+        let text = format!("{attribute}\nfn f() -> Int {{ 1 }}\nf()");
+        assert_eq!(messages(&text), [message], "{attribute}");
+    }
+    // Retrying a pure function is a warning.
+    assert_eq!(
+        warnings("#[retry(2)]\nfn f(): Int { 1 }\nf()")
+            .iter()
+            .map(|warning| warning.message.as_str())
+            .collect::<Vec<_>>(),
+        ["retrying a pure function cannot change its result"]
+    );
+    assert!(warnings("#[retry(2)]\nfn f() -> Int { 1 }\nf()").is_empty());
+}

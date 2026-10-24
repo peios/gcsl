@@ -418,8 +418,9 @@ use crate::ast::{
     ForId, ItemId, ItemKind, ItemRange, Jump, LabelId, PartRange, PathRange, PathSegment,
     SegmentKind, StrPart, UnaryOp, path_span, symbol_span,
 };
+use crate::ast::AttributeId;
 use crate::check::{
-    AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot, JumpTarget, MadeAt,
+    Attribute, AwaitMark, Builtin, Checked, Constant, FieldSchedule, Fileroot, JumpTarget, MadeAt,
     ParamDefault, PathResolution, Resolution, Slot, Types, VarRef,
 };
 use crate::mentions::{self, FieldNode};
@@ -453,7 +454,8 @@ use crate::source::Span;
 /// definition, after the def-type's (`Lowerer::lower_def_type_ref`).
 pub(crate) const REFERENCE_DEFINITION: u32 = 1;
 use crate::types::{Laziness, TyId, TypeTable, ValueTest};
-use crate::value::{Layout, ValueKind, int_to_float};
+use crate::value::{Layout, Quantity, ValueKind, int_to_float};
+use std::time::Duration;
 
 /// Lowers `ast`, whose types and resolution are `checked`, with its types
 /// interned into `types`, to IR, recording that it is session input number
@@ -951,6 +953,9 @@ impl Lowerer<'_> {
                 display: Box::from(""),
                 slot_names: Box::from([]),
                 attributes: Box::default(),
+                retry: 0,
+                timeout: None,
+                name_text: None,
             });
         }
     }
@@ -2547,6 +2552,9 @@ impl Lowerer<'_> {
                 .unwrap_or_default(),
             // A reference's function is no function item.
             attributes: Box::default(),
+            retry: 0,
+            timeout: None,
+            name_text: None,
         }));
         Ok(IrKind::MakeClosure { function, captures })
     }
@@ -2661,6 +2669,12 @@ impl Lowerer<'_> {
             display,
             slot_names: resolution.slot_names.clone().into_boxed_slice(),
             attributes: self.resolution.attributes(function).into(),
+            retry: retry_of(self.resolution.attributes(function)),
+            timeout: timeout_of(self.resolution.attributes(function)),
+            name_text: resolution
+                .callee
+                .filter(|_| !self.resolution.attributes(function).is_empty())
+                .map(|name| Box::from(self.ast.names().get(name))),
         };
         let Some(entry) = self.functions.get_mut(function.index()) else {
             return Err(InternalError {
@@ -3648,4 +3662,32 @@ fn integer_operator(op: BinaryOp) -> Option<fn(Operands) -> IrKind> {
         BinaryOp::Rem => IrKind::IntRem,
         _ => return None,
     })
+}
+
+/// How many more times a call of a function with `attributes` runs its body
+/// once it fails, by its `#[retry]`: 0 without one (see the checker's
+/// "Attributes").
+fn retry_of(attributes: &[Attribute]) -> u32 {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.id == AttributeId::Builtin("retry"))
+        .find_map(|attribute| match attribute.args.first() {
+            Some((_, Constant::Int(times))) => u32::try_from(*times).ok(),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// How long a call of a function with `attributes` may run, by its
+/// `#[timeout]`, if it has one (see the checker's "Attributes").
+fn timeout_of(attributes: &[Attribute]) -> Option<Duration> {
+    attributes
+        .iter()
+        .filter(|attribute| attribute.id == AttributeId::Builtin("timeout"))
+        .find_map(|attribute| match attribute.args.first() {
+            Some((_, Constant::Quantity(Quantity::Duration, nanoseconds))) => {
+                u64::try_from(*nanoseconds).ok().map(Duration::from_nanos)
+            }
+            _ => None,
+        })
 }

@@ -1775,11 +1775,7 @@ fn run_on(ir: &Rc<Ir>, stack: &mut Vec<Value>) -> (Result<Value, Diagnostic>, us
         captures: &[],
         callee: None,
         memo: &mut MemoTables::new(),
-        shared: &Shared {
-            exec_result: None,
-            dirs: &[],
-            temp_dirs: None,
-        },
+        shared: &Shared::new(None, &[], None),
         caller: Caller::default(),
         levels: 0,
     }
@@ -2319,6 +2315,9 @@ fn a_future_that_depends_on_itself_is_an_error() {
         display: Box::from("Future<Int>"),
         slot_names: Box::default(),
         attributes: Box::default(),
+        retry: 0,
+        timeout: None,
+        name_text: None,
     }];
     builder.measure(root, &mut functions);
     let ir = Rc::new(builder.finish_program(root, (1, Vec::new()), functions, (0, 0)));

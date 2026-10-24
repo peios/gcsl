@@ -11821,7 +11821,7 @@ fn a_function_s_attributes_reach_its_closures_with_their_declarations() {
             "workspace.gcsl",
             "#[attribute] type hermetic = {on: Bool = true}\n\
              #[hermetic] #[retry(2)]\n\
-             def build(): Int { 1 }\n\
+             def build() -> Int { 1 }\n\
              def plain(): Int { 2 }",
         ),
         (

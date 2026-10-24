@@ -241,6 +241,9 @@ fn one_function(display: &str) -> Rc<Ir> {
         display: Box::from(display),
         slot_names: Box::default(),
         attributes: Box::default(),
+        retry: 0,
+        timeout: None,
+        name_text: None,
     };
     Rc::new(builder.finish_program(root, (0, Vec::new()), vec![code], (0, 0)))
 }

@@ -106,6 +106,40 @@ pub struct Diagnostic {
     /// the label is, to keep a diagnostic small: every walker of the
     /// evaluator returns room for one.
     pub suggestion: Option<Box<Suggestion>>,
+    /// What the evaluator knows of where a runtime error came from that its
+    /// message does not say.
+    pub(crate) mark: Mark,
+}
+
+/// What the evaluator knows of where a runtime error came from that its
+/// message does not say: nothing, a bug in GCSL, which nothing retries, or
+/// the passing of the deadline of a call with `#[timeout]`, by the
+/// deadline's number, which only that call turns into its own error (see
+/// [`crate::eval`], "Retry and timeout"). One `u32`, which a diagnostic
+/// keeps within the size it had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Mark(u32);
+
+impl Mark {
+    /// Nothing is known.
+    pub(crate) const NONE: Mark = Mark(0);
+    /// A bug in GCSL.
+    pub(crate) const INTERNAL: Mark = Mark(u32::MAX);
+
+    /// The passing of deadline number `number`, which is neither 0 nor
+    /// `u32::MAX`.
+    pub(crate) const fn deadline(number: u32) -> Mark {
+        Mark(number)
+    }
+
+    /// The number of the deadline whose passing the error is, if it is one.
+    pub(crate) const fn deadline_number(self) -> Option<u32> {
+        if self.0 == 0 || self.0 == u32::MAX {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
 }
 
 /// A fix a diagnostic suggests: replace the text at `span`, of the
@@ -141,6 +175,7 @@ impl Diagnostic {
             notes: Vec::new(),
             input: None,
             suggestion: None,
+            mark: Mark::NONE,
         }
     }
 
@@ -396,8 +431,10 @@ impl std::error::Error for InternalError {}
 
 impl From<InternalError> for Diagnostic {
     fn from(error: InternalError) -> Self {
-        Diagnostic::error(error.to_string(), error.span)
-            .with_note("this is a bug in GCSL, not in the program being run")
+        let mut diagnostic = Diagnostic::error(error.to_string(), error.span)
+            .with_note("this is a bug in GCSL, not in the program being run");
+        diagnostic.mark = Mark::INTERNAL;
+        diagnostic
     }
 }
 

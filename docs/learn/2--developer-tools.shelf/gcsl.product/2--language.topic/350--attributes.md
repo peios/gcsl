@@ -6,8 +6,9 @@ description: Tell the program that runs a function how to run it.
 
 An attribute goes before a function and says how to run it, for example
 whether a build step may be cached or how long it may take. GCSL checks
-attributes but doesn't act on them itself: they're read by the tool that
-runs the program, such as a build system.
+every attribute. Most are read by the tool that runs the program, such as
+a build system, and GCSL itself acts on its own two, `retry` and
+`timeout`.
 
 ```gcsl
 #[attribute] type hermetic = {on: Bool = true}
@@ -54,10 +55,23 @@ GCSL provides two attributes of its own, `retry` and `timeout`:
 
 | Attribute | Argument | Meaning |
 |---|---|---|
-| `#[retry(times)]` | `times: Int` | The call may be run again this many times if it fails. |
-| `#[timeout(limit)]` | `limit: Duration` | The call fails if it runs for longer than this. |
+| `#[retry(times)]` | `times: Int` | If the call fails, run it again, up to this many more times. |
+| `#[timeout(limit)]` | `limit: Duration` | Fail the call if it runs for longer than this. |
 
-GCSL checks and records them, and doesn't act on them yet.
+A retried call runs its whole body again with the same arguments, so any
+effects it has happen again: use `retry` only where that's safe. Retrying a
+pure function can't change its result, so GCSL warns about it. When a call
+times out, a program it's running is stopped. A function's own timeout
+counts as a failure that its `retry` can retry, and each attempt gets the
+full time. A timeout of an enclosing call is never retried by a call inside
+it.
+
+```gcsl
+#[retry(2)] #[timeout(30s)]
+fn fetch(url: String) -> String { exec(["echo", "fetched {url}"]).stdout }
+
+page = fetch("https://example.com")
+```
 
 ## Attributes on a definition type
 
