@@ -3291,8 +3291,8 @@ fn run_renders_a_dotted_def_not_ready() {
     assert_eq!(output.status.code(), Some(1));
 }
 
-/// The REPL: a line may declare a type, which later lines see, and a later
-/// line's declaration of its name shadows it.
+/// The REPL: a line may declare a type, a generic one too, which later
+/// lines see, and a later line's declaration of its name shadows it.
 #[test]
 fn repl_keeps_types_across_lines() {
     let output = repl(
@@ -3301,19 +3301,24 @@ fn repl_keeps_types_across_lines() {
          p\n\
          type Point = {x: Int}\n\
          p2: Point = { x = 3 }\n\
-         type Box<T> = {v: T}\n",
+         type Box<T> = {v: T}\n\
+         b: Box<String> = { v = \"s\" }\n\
+         c: Box = { v = 1 }\n",
     );
     assert_eq!(
         stdout(&output),
-        "{x = 1; y = 2} : {x: Int, y: Int}\n{p2 = {x = 3}} : {p2: {x: Int}}\n"
+        "{x = 1; y = 2} : {x: Int, y: Int}\n{p2 = {x = 3}} : {p2: {x: Int}}\n\
+         {b = {v = \"s\"}} : {b: {v: String}}\n"
     );
     assert_eq!(
         stderr(&output),
-        "error: a `type` takes no type parameters\n\
-         \x20--> <repl>:1:9\n\
+        "error: type `Box` needs its type arguments\n\
+         \x20--> <repl>:1:4\n\
          \x20 |\n\
-         1 | type Box<T> = {v: T}\n\
-         \x20 |         ^\n"
+         1 | c: Box = { v = 1 }\n\
+         \x20 |    ^^^\n\
+         \x20 |\n\
+         \x20 = note: `Box` takes 1 type argument\n"
     );
     assert_eq!(output.status.code(), Some(0));
 }

@@ -14257,3 +14257,28 @@ fn arguments_binding_a_type_parameter_differently_widen_it_with_a_warning() {
         );
     }
 }
+
+#[test]
+fn a_built_in_type_takes_one_type_argument() {
+    for (text, message) in [
+        (
+            "let x: List<Int, Int> = []\nx",
+            "type `List` takes 1 type argument, given 2",
+        ),
+        (
+            "let x: Future<Int, Int> = 1\nx",
+            "type `Future` takes 1 type argument, given 2",
+        ),
+        (
+            "let x: Int<String> = 1\nx",
+            "type `Int` takes no type argument",
+        ),
+        ("let x: Nope<Int, Int> = 1\nx", "unknown type `Nope`"),
+    ] {
+        assert_eq!(
+            messages(text).first().map(String::as_str),
+            Some(message),
+            "{text}"
+        );
+    }
+}

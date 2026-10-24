@@ -2427,6 +2427,8 @@ impl<'s> Builder<'s> {
         for id in ast.type_ids() {
             let span = ast.type_expr(id).span;
             match ast.written_type(id) {
+                // A type parameter is no declared type, whatever its name.
+                TypeExprKind::Named(name) if ast.type_param(id, name).is_some() => {}
                 TypeExprKind::Named(name) => {
                     let symbol = match self.file.type_view.get(&name) {
                         Some(&number) => decl_index(number).map(Symbol::Type),
@@ -2439,16 +2441,23 @@ impl<'s> Builder<'s> {
                     }
                 }
                 TypeExprKind::Applied { name, span: at, .. } => {
-                    if BUILTIN_TYPE_NAMES.contains(&self.text(name)) {
-                        self.add(at, Some(Symbol::BuiltinType(name)), Some(name), TyId::ERROR);
+                    let symbol = match self.file.type_view.get(&name) {
+                        Some(&number) => decl_index(number).map(Symbol::Type),
+                        None => BUILTIN_TYPE_NAMES
+                            .contains(&self.text(name))
+                            .then_some(Symbol::BuiltinType(name)),
+                    };
+                    if symbol.is_some() {
+                        self.add(at, symbol, Some(name), TyId::ERROR);
                     }
                 }
-                TypeExprKind::Path(path) => {
-                    let link = self.scan.qualified_type(self.file, ast.path(path), span);
+                TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
+                    let at = path_span(ast.path(path)).unwrap_or(span);
+                    let link = self.scan.qualified_type(self.file, ast.path(path), at);
                     if let TypeLink::Decl(number) = link
                         && let Some(decl) = decl_index(number)
                     {
-                        self.add(span, Some(Symbol::Type(decl)), None, TyId::ERROR);
+                        self.add(at, Some(Symbol::Type(decl)), None, TyId::ERROR);
                     }
                 }
                 _ => {}

@@ -1759,3 +1759,25 @@ fn attributes_and_def_type_defaults_reach_later_inputs() {
     let definition = value(&mut session, "def test a() { 1 }\n(test a)()");
     assert_eq!(shown(&definition), [r#"hermetic[("on", Bool(true))]"#]);
 }
+
+#[test]
+fn a_generic_type_persists_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(value(&mut session, "type Box<T> = {v: T}"), Value::Empty);
+    assert_eq!(
+        value(&mut session, "type Two<T> = Box<Box<T>>"),
+        Value::Empty
+    );
+    assert_eq!(
+        value(&mut session, "let b: Two<Int> = { v = { v = 3 } }\nb.v.v"),
+        Value::Int(3)
+    );
+    assert_eq!(
+        messages(&mut session, "let c: Box = { v = 1 }"),
+        ["type `Box` needs its type arguments"]
+    );
+    assert_eq!(
+        messages(&mut session, "let c: Box<Int, Int> = { v = 1 }"),
+        ["type `Box` takes 1 type argument, given 2"]
+    );
+}

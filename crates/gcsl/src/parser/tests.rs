@@ -208,6 +208,17 @@ fn path_shape(ast: &Ast, path: PathRange, out: &mut String) {
     }
 }
 
+fn type_args(ast: &Ast, args: TypeArgRange, out: &mut String) {
+    out.push('<');
+    for (index, &arg) in ast.type_args(args).iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        type_name(ast, arg, out);
+    }
+    out.push('>');
+}
+
 fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
     match ast.type_expr(id).kind {
         TypeExprKind::Named(name) => out.push_str(ast.names().get(name)),
@@ -234,7 +245,10 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
             }
             out.push('}');
         }
-        TypeExprKind::Ref(_) | TypeExprKind::Invalid => out.push('?'),
+        TypeExprKind::Ref(_)
+        | TypeExprKind::Instance { .. }
+        | TypeExprKind::Param(_)
+        | TypeExprKind::Invalid => out.push('?'),
         TypeExprKind::Fn {
             params,
             ret,
@@ -261,11 +275,13 @@ fn type_name(ast: &Ast, id: TypeExprId, out: &mut String) {
                 type_name(ast, meta.ty, out);
             }
         }
-        TypeExprKind::Applied { name, arg, .. } => {
+        TypeExprKind::Applied { name, args, .. } => {
             out.push_str(ast.names().get(name));
-            out.push('<');
-            type_name(ast, arg, out);
-            out.push('>');
+            type_args(ast, args, out);
+        }
+        TypeExprKind::PathApplied { path, args } => {
+            out.push_str(&ast.show_path(ast.path(path)).to_string());
+            type_args(ast, args, out);
         }
         TypeExprKind::Union { lhs, rhs, .. } => {
             out.push('(');
@@ -3321,11 +3337,14 @@ fn applied_and_union_types() {
     assert_eq!(ast.type_expr(lhs).span, Span::new(4, 7));
     let applied = ast.type_expr(rhs);
     assert_eq!(applied.span, Span::new(10, 21));
-    let TypeExprKind::Applied { name, span, arg } = applied.kind else {
+    let TypeExprKind::Applied { name, span, args } = applied.kind else {
         panic!("expected an applied type, got {applied:?}");
     };
     assert_eq!(ast.names().get(name), "Future");
     assert_eq!(span, Span::new(10, 16));
+    let &[arg] = ast.type_args(args) else {
+        panic!("expected one type argument");
+    };
     assert_eq!(ast.type_expr(arg).span, Span::new(17, 20));
 }
 
@@ -3407,7 +3426,7 @@ fn applied_type_errors() {
     let diagnostic = parse_text("let x: Future<Int = 1").unwrap_err();
     assert_eq!(
         diagnostic.message,
-        "expected `>` to close the type argument"
+        "expected `>` to close the type arguments"
     );
     assert_eq!(diagnostic.span, Span::new(18, 19));
     assert_eq!(
@@ -3418,7 +3437,7 @@ fn applied_type_errors() {
     assert_eq!(
         error("let x: Future<Int\n> = 1"),
         (
-            "expected `>` to close the type argument".to_owned(),
+            "expected `>` to close the type arguments".to_owned(),
             Span::new(17, 18)
         )
     );
@@ -5715,8 +5734,11 @@ fn type_item_errors() {
         assert_eq!(error(text), (MISPLACED_TYPE.to_owned(), at), "{text}");
     }
     assert_eq!(
-        error("type Box<T> = {v: T}"),
-        (TYPE_PARAMETERS.to_owned(), Span::new(8, 9))
+        error("type Box<T, T> = {v: T}"),
+        (
+            "type parameter `T` is declared twice".to_owned(),
+            Span::new(12, 13)
+        )
     );
     assert_eq!(
         error("type T Int"),
@@ -6965,4 +6987,35 @@ fn a_named_function_takes_type_parameters() {
 
 fn message_of(text: &str) -> String {
     parse_text(text).unwrap_err().message
+}
+
+#[test]
+fn applied_types_take_argument_lists_and_qualified_names() {
+    assert_eq!(
+        shape("let x: Pair<Int, String> = y"),
+        "let x: Pair<Int, String> = y"
+    );
+    assert_eq!(
+        shape("let x: t.Pair<Int,\n String> = y"),
+        "let x: t.Pair<Int, String> = y"
+    );
+    assert_eq!(
+        shape("let x: Box<Box<Int>[]> = y"),
+        "let x: Box<(Box<Int>)[]> = y"
+    );
+    let ast = parse_text("type Pair<A, B> = {first: A, second: B}").unwrap();
+    let item = ast.items(ast.root())[0];
+    assert_eq!(ast.type_arity(item), 2);
+    let scoped: Vec<bool> = ast
+        .type_ids()
+        .filter_map(|id| match ast.type_expr(id).kind {
+            TypeExprKind::Named(name) => Some(ast.type_param(id, name).is_some()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scoped, [true, true]);
+    assert_eq!(
+        error("let x: Pair<Int String> = y").0,
+        "expected `>` to close the type arguments"
+    );
 }

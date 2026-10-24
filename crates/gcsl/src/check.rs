@@ -3040,9 +3040,10 @@ use std::rc::Rc;
 use crate::ast::{
     Annotate, Arg, ArgKind, ArgRange, Ast, AttributeId, AttributeUse, BinaryOp, DefTypeId,
     DefTypeRole, Effect, Element, ElementRange, Expr, ExprId, ExprKind, FieldDefault, FieldTy,
-    FieldTyKind, FieldTyRange, FnDecl, FnId, ForHead, ForId, Item, ItemId, ItemKind, ItemRange,
-    Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind, StrPart,
-    Syntax, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span, symbol_span,
+    FieldTyKind, FieldTyRange, FnDecl, FnId, ForHead, ForId, GenericOwner, Item, ItemId, ItemKind,
+    ItemRange, Jump, Label, LabelId, MetaTy, Param, PartRange, PathRange, PathSegment, SegmentKind,
+    StrPart, Syntax, TypeArgRange, TypeExprId, TypeExprKind, TypeProblem, UnaryOp, path_span,
+    symbol_span,
 };
 use crate::diagnostic::{self, Diagnostic, InternalError};
 use crate::mentions::{self, FieldLeaf, FieldTree, Mentions, Need, Resolve, Schedule};
@@ -3875,9 +3876,9 @@ pub enum ParamDefault {
 /// [Generics](#generics)).
 #[derive(Debug, Default)]
 struct GenericsChecked {
-    /// What the type parameters of each generic function belong to, made
-    /// once for it.
-    ids: HashMap<FnId, GenericId>,
+    /// What the type parameters of each generic function and `type` item
+    /// belong to, made once for it.
+    ids: HashMap<GenericOwner, GenericId>,
     /// The arguments of the call being bound that were checked to infer its
     /// type parameters, each with its type: checked once, then only
     /// expected to fit its substituted parameter.
@@ -6961,7 +6962,9 @@ impl<'a> Checker<'a> {
             }
             let errors = self.errors.len();
             let resolved = self.resolve_type(ty, Bareness::Present);
+            // A generic attribute is the workspace's error.
             if ast.is_attribute(id)
+                && ast.type_arity(id) == 0
                 && resolved != TyId::ERROR
                 && !self.holds_constants(resolved, true)
             {
@@ -12300,10 +12303,19 @@ impl<'a> Checker<'a> {
                     let ty = self.resolve_type(operand, Bareness::Present);
                     if ty != TyId::ERROR && !self.quiet.types {
                         let shown = self.in_message(ty);
-                        self.errors.push(Diagnostic::error(
+                        let mut error = Diagnostic::error(
                             format!("cannot spread type {shown}: it is not a record type"),
                             ast.type_expr(operand).span,
-                        ));
+                        );
+                        // A type parameter may be bound to a record type,
+                        // but its definition is merged before any is.
+                        if self.types.has_param(ty) {
+                            error = error.with_note(
+                                "a type parameter is not known to be a record type where the \
+                                 definition is merged",
+                            );
+                        }
+                        self.errors.push(error);
                     }
                 }
                 TypeProblem::Replaces {
@@ -12361,9 +12373,9 @@ impl<'a> Checker<'a> {
         match ty.kind {
             // A type parameter in scope, which no bareness wraps.
             TypeExprKind::Named(name)
-                if let Some((function, index)) = self.ast.type_param(id, name) =>
+                if let Some((owner, index)) = self.ast.type_param(id, name) =>
             {
-                let generic = self.generic_of(function);
+                let generic = self.generic_of(owner);
                 self.types.param(generic, index)
             }
             TypeExprKind::Named(name) => {
@@ -12390,8 +12402,8 @@ impl<'a> Checker<'a> {
                 TyId::ERROR
             }
             TypeExprKind::List(element) => self.resolve_list(element, mode),
-            TypeExprKind::Applied { name, span, arg } => {
-                self.resolve_applied((name, span), arg, mode)
+            TypeExprKind::Applied { name, span, args } => {
+                self.resolve_applied((name, span), args, mode)
             }
             TypeExprKind::Union { bar, .. } => self.resolve_union(id, bar, mode),
             TypeExprKind::Record(range) => self.resolve_record(id, range, mode),
@@ -12424,7 +12436,7 @@ impl<'a> Checker<'a> {
             }
             // A qualified name is made what it names by the expansion of
             // the file's types; checked alone, a file names no module.
-            TypeExprKind::Path(path) => {
+            TypeExprKind::Path(path) | TypeExprKind::PathApplied { path, .. } => {
                 let segments = self.ast.path(path);
                 let shown = self.ast.show_path(segments).to_string();
                 let error = Diagnostic::error(format!("unknown type `{shown}`"), ty.span);
@@ -12434,10 +12446,22 @@ impl<'a> Checker<'a> {
                 }
                 TyId::ERROR
             }
-            TypeExprKind::Ref(_) => {
+            TypeExprKind::Ref(_) | TypeExprKind::Instance { .. } => {
                 self.errors.push(
                     InternalError {
                         message: "a reference to a declared type is in a tree",
+                        span: ty.span,
+                    }
+                    .into(),
+                );
+                TyId::ERROR
+            }
+            // Each use of a generic type substitutes its arguments for its
+            // parameters; the copy of its definition left is no type of any.
+            TypeExprKind::Param(_) => {
+                self.errors.push(
+                    InternalError {
+                        message: "a generic type's parameter is reachable in a tree",
                         span: ty.span,
                     }
                     .into(),
@@ -12729,33 +12753,55 @@ impl<'a> Checker<'a> {
             TypeExprKind::Named(name) if self.ast.type_param(ty, name).is_some() => false,
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
+            | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Record(_)
             | TypeExprKind::List(_) => true,
             TypeExprKind::Applied { name, .. } => Some(name) == self.list_name,
             TypeExprKind::Union { .. } => !self.has_future_member(ty),
-            TypeExprKind::Fn { .. } | TypeExprKind::Ref(_) | TypeExprKind::Invalid => false,
+            TypeExprKind::Fn { .. }
+            | TypeExprKind::Ref(_)
+            | TypeExprKind::Instance { .. }
+            | TypeExprKind::Param(_)
+            | TypeExprKind::Invalid => false,
         }
     }
 
     /// The type the applied type `NAME<ARG>` denotes, the name `name`
-    /// written at `span`, in `mode`: `Future<T>` for `Future` (`T` stripped,
-    /// as [`TypeTable::future`] does, so `Future<Future<Int>>` is
-    /// `Future<Int>`), and `T` for `Present`, where `T` is the argument
-    /// resolved with every bare type present; the list type of the argument
-    /// for `List`, written bare in `mode` (see [`Checker::resolve_list`]);
-    /// or `Error` (reported) for any other name, or an erroneous argument.
-    /// The argument is resolved, and its errors reported, whatever the name.
+    /// written at `span`, its arguments `args`, in `mode`: `Future<T>` for
+    /// `Future` (`T` stripped, as [`TypeTable::future`] does, so
+    /// `Future<Future<Int>>` is `Future<Int>`), and `T` for `Present`, where
+    /// `T` is the argument resolved with every bare type present; the list
+    /// type of the argument for `List`, written bare in `mode` (see
+    /// [`Checker::resolve_list`]); or `Error` (reported) for any other name,
+    /// an erroneous argument, or a built-in given other than one argument,
+    /// "type `List` takes 1 type argument, given 2". Every argument is
+    /// resolved, and its errors reported, whatever the name; a declared
+    /// type's application never reaches the checker, the expansion of the
+    /// tree's types having made it its definition.
     fn resolve_applied(
         &mut self,
         (name, span): (Name, Span),
-        arg: TypeExprId,
+        args: TypeArgRange,
         mode: Bareness,
     ) -> TyId {
+        let builtin = [self.list_name, self.future_name, self.present_name].contains(&Some(name));
+        let &[arg] = self.ast.type_args(args) else {
+            for &arg in self.ast.type_args(args) {
+                self.resolve_type(arg, Bareness::Present);
+            }
+            let text = self.ast.names().get(name);
+            if builtin {
+                let message = format!("type `{text}` takes 1 type argument, given {}", args.len());
+                self.errors.push(Diagnostic::error(message, span));
+            } else {
+                self.unknown_applied(name, span);
+            }
+            return TyId::ERROR;
+        };
         if Some(name) == self.list_name {
             return self.resolve_list(arg, mode);
         }
         let arg = self.resolve_type(arg, Bareness::Present);
-        let text = self.ast.names().get(name);
         if Some(name) == self.future_name {
             return if arg == TyId::ERROR {
                 TyId::ERROR
@@ -12766,6 +12812,16 @@ impl<'a> Checker<'a> {
         if Some(name) == self.present_name {
             return arg;
         }
+        self.unknown_applied(name, span);
+        TyId::ERROR
+    }
+
+    /// Reports the applied type of the name `name`, written at `span`, that
+    /// is not built in taking a type argument: "type `Int` takes no type
+    /// argument" for another built-in type, "unknown type `Foo`" for any
+    /// other name.
+    fn unknown_applied(&mut self, name: Name, span: Span) {
+        let text = self.ast.names().get(name);
         let builtin = self
             .builtin_types
             .iter()
@@ -12781,7 +12837,6 @@ impl<'a> Checker<'a> {
                     .with_suggestion(suggestion),
             );
         }
-        TyId::ERROR
     }
 
     /// The suggestion for the unknown type `name`, written at `span`, with a
@@ -12882,23 +12937,23 @@ impl<'a> Checker<'a> {
         if ty == TyId::ERROR || self.ast.generics(function).is_none() {
             return ty;
         }
-        let generic = self.generic_of(function);
+        let generic = self.generic_of(GenericOwner::Fn(function));
         self.types.generic_fn(ty, generic)
     }
 
-    /// What the type parameters of the generic function `function` belong
-    /// to, made the first time it is asked for.
-    fn generic_of(&mut self, function: FnId) -> GenericId {
-        if let Some(&generic) = self.generics.ids.get(&function) {
+    /// What the type parameters of the generic function or `type` item
+    /// `owner` belong to, made the first time it is asked for.
+    fn generic_of(&mut self, owner: GenericOwner) -> GenericId {
+        if let Some(&generic) = self.generics.ids.get(&owner) {
             return generic;
         }
         let names: Box<[Name]> = self
             .ast
-            .generics(function)
+            .generics_of(owner)
             .map(|generics| generics.params.iter().map(|&(name, _)| name).collect())
             .unwrap_or_default();
         let generic = self.types.new_generic(names);
-        self.generics.ids.insert(function, generic);
+        self.generics.ids.insert(owner, generic);
         generic
     }
 
@@ -15658,8 +15713,11 @@ impl<'a> Checker<'a> {
             TypeExprKind::Union { .. } if self.is_bare(ty) => (None, None),
             TypeExprKind::Record(fields) => (Some(fields), None),
             TypeExprKind::List(element) => (None, Some(element)),
-            TypeExprKind::Applied { name, arg, .. } if Some(name) == self.list_name => {
-                (None, Some(arg))
+            TypeExprKind::Applied { name, args, .. }
+                if Some(name) == self.list_name
+                    && let &[element] = self.ast.type_args(args) =>
+            {
+                (None, Some(element))
             }
             // They say what they are, a function type at its own position
             // included; and a type that names nothing is erroneous.
@@ -15667,7 +15725,10 @@ impl<'a> Checker<'a> {
             | TypeExprKind::Union { .. }
             | TypeExprKind::Fn { .. }
             | TypeExprKind::Path(_)
+            | TypeExprKind::PathApplied { .. }
             | TypeExprKind::Ref(_)
+            | TypeExprKind::Instance { .. }
+            | TypeExprKind::Param(_)
             | TypeExprKind::Invalid => {
                 return declared;
             }

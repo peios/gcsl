@@ -181,6 +181,24 @@
 //! definition used twice shares its nodes, so a tree's type expressions may
 //! share children; the parser's are still allocated children first.
 //!
+//! A `type` item may be generic, `type Pair<A, B> = {first: A, second: B}`,
+//! its type parameters recorded as a function item's are ([`Generics`],
+//! [`GenericOwner::Type`]), and is then used applied to its type arguments,
+//! `Pair<Int, String>` ([`TypeExprKind::Applied`], or
+//! [`TypeExprKind::PathApplied`] qualified). In the store, its definition
+//! holds each of its type parameters as a [`TypeExprKind::Param`], and a
+//! use of it in another definition is an [`TypeExprKind::Instance`] of it,
+//! its arguments; settling makes an instance the definition with each
+//! parameter the argument of its number (`TypeArena::substitute`), and
+//! expanding a tree does the same at each use. Substituting makes new nodes
+//! only above a parameter, sharing the rest and each argument, so an
+//! instance costs no more nodes than its definition has, however deeply
+//! its arguments nest. A generic type is its definition, as any declared
+//! type is: types are structural, and `Pair<Int, String>` is
+//! `{first: Int, second: String}`. A spread of a type parameter is the
+//! problem a spread of anything but a record type is, the definition being
+//! merged before any argument is known.
+//!
 //! A field of a record type may have a default, `{exclude: List<String> =
 //! [], from: String}` (see the checker's "Field defaults"): its
 //! [`FieldTy::default`], a [`FieldDefault`]. As the parser writes it, it is
@@ -737,6 +755,29 @@ pub struct ParamTyRange {
     len: u32,
 }
 
+/// The type arguments of an applied type, `<Int, String>`: a contiguous
+/// range of the type-argument pool of the arena that allocated it. Resolve
+/// it with [`Ast::type_args`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TypeArgRange {
+    start: u32,
+    len: u32,
+}
+
+impl TypeArgRange {
+    /// The number of type arguments.
+    #[must_use]
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Whether there are none, which no applied type the parser makes has.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 /// The elements of a list literal: a contiguous range of the element pool
 /// of the [`Ast`] that allocated it. Resolve it with [`Ast::elements`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -793,18 +834,28 @@ pub struct AttributeUse {
     pub ty: TypeExprId,
 }
 
-/// The type parameters of a generic function item, `fn NAME<T, U>(...)` or
-/// `def NAME<T>(...)` (see the parser's [Functions and
-/// calls](crate::parser#functions-and-calls)).
+/// What has type parameters: a generic function item, `fn NAME<T, U>(...)`
+/// or `def NAME<T>(...)` (see the parser's [Functions and
+/// calls](crate::parser#functions-and-calls)), or a generic `type` item,
+/// `type NAME<T> = TYPE` (see [Types](#types)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GenericOwner {
+    /// A generic function item's function.
+    Fn(FnId),
+    /// A generic `type` item.
+    Type(ItemId),
+}
+
+/// The type parameters of a generic function or `type` item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generics {
-    /// The function.
-    pub function: FnId,
+    /// What has them.
+    pub owner: GenericOwner,
     /// Each type parameter's name and where it is written, in order.
     pub params: Box<[(Name, Span)]>,
     /// The type expressions the parser made of the function's signature and
-    /// body, by their numbers, from the first to the one after the last:
-    /// where its type parameters are in scope.
+    /// body, or of the type's definition, by their numbers, from the first
+    /// to the one after the last: where its type parameters are in scope.
     pub types: (u32, u32),
 }
 
@@ -1821,16 +1872,26 @@ pub enum TypeExprKind {
         /// Its meta, if it has one.
         meta: Option<MetaTy>,
     },
-    /// A name applied to a type argument, `NAME<TYPE>`, as in
-    /// `Future<Int>`. The parser accepts any name; the checker knows which
-    /// take an argument.
+    /// A name applied to type arguments, `NAME<TYPE, ...>`, as in
+    /// `Future<Int>` or `Pair<Int, String>`. The parser accepts any name and
+    /// one argument or more; the checker knows how many each built-in type
+    /// takes, and the workspace each declared type.
     Applied {
         /// The name.
         name: Name,
         /// Where the name is written.
         span: Span,
-        /// The type argument.
-        arg: TypeExprId,
+        /// The type arguments, in order.
+        args: TypeArgRange,
+    },
+    /// A qualified name applied to type arguments, `t.Pair<Int, String>`:
+    /// its path in the path pool, which the expansion of a tree's types
+    /// resolves as it does a [`TypeExprKind::Path`], and its arguments.
+    PathApplied {
+        /// The qualified name.
+        path: PathRange,
+        /// The type arguments, in order.
+        args: TypeArgRange,
     },
     /// `TYPE[]`, the sugar for the list type `List<TYPE>`: its element
     /// type. `List<TYPE>` written out is an [`TypeExprKind::Applied`].
@@ -1848,6 +1909,20 @@ pub enum TypeExprKind {
     /// The definition of the declared type numbered so in a [`TypeStore`],
     /// which a type expression there refers to by name. Never in a tree.
     Ref(u32),
+    /// The definition of the generic declared type numbered `decl` in a
+    /// [`TypeStore`] applied to the type arguments `args`, which a type
+    /// expression there applies it to by name. Never in a tree.
+    Instance {
+        /// The declaration.
+        decl: u32,
+        /// The type arguments, in order.
+        args: TypeArgRange,
+    },
+    /// The type parameter numbered so of the generic declared type whose
+    /// definition it is part of: in a [`TypeStore`], and in the copies of
+    /// definitions in a tree, which each use of the type substitutes its
+    /// arguments in (see [Types](#types)). Never written.
+    Param(u8),
     /// A type that names nothing it can, put in place of a written one by
     /// the expansion of a tree's types ([`Ast::expand_types`]): its error,
     /// if it is this one's to report, is among the tree's problems
@@ -1886,6 +1961,7 @@ pub struct TypeArena {
     exprs: Vec<TypeExpr>,
     fields: Vec<FieldTy>,
     params: Vec<ParamTy>,
+    args: Vec<TypeExprId>,
     constants: Vec<Option<Constant>>,
 }
 
@@ -1917,6 +1993,27 @@ impl TypeArena {
             start,
             len: next_id(params.len()),
         }
+    }
+
+    /// Appends `args` to the type-argument pool as one applied type's and
+    /// returns their range.
+    fn push_args(&mut self, args: &[TypeExprId]) -> TypeArgRange {
+        let start = next_id(self.args.len());
+        self.args.extend_from_slice(args);
+        TypeArgRange {
+            start,
+            len: next_id(args.len()),
+        }
+    }
+
+    /// The type arguments of the applied type whose arguments are `range`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is not of the arena.
+    fn args(&self, range: TypeArgRange) -> &[TypeExprId] {
+        let start = range.start as usize;
+        &self.args[start..start + range.len as usize]
     }
 
     /// The node `id`.
@@ -1977,7 +2074,9 @@ impl TypeArena {
     /// arena, children first, and returns the copy of `root`: a node `memo`
     /// has a copy of already is that copy, shared, and every node copied is
     /// added to it; a node `replace` gives a kind is a node of that kind, of
-    /// its span, with nothing under it; every other node is a node of its
+    /// its span, with nothing under it, but an applied type it makes a
+    /// [`TypeExprKind::Ref`], which is an [`TypeExprKind::Instance`] of its
+    /// arguments, copied; every other node is a node of its
     /// kind and span, its children copied. A qualified name `replace` gives
     /// no kind is [`TypeExprKind::Invalid`], its path being of `from`'s tree.
     /// A field's default is copied into this arena's pool of constants: one
@@ -1998,9 +2097,18 @@ impl TypeArena {
             kind: TypeExprKind::Invalid,
             span: Span::new(0, 0),
         });
-        let kind = match replace(root) {
-            Some(kind) => kind,
-            None => match kind {
+        let kind = match (replace(root), kind) {
+            // A declared type applied to arguments, whose arguments are
+            // copied as its instance's.
+            (
+                Some(TypeExprKind::Ref(decl)),
+                TypeExprKind::Applied { args, .. } | TypeExprKind::PathApplied { args, .. },
+            ) => TypeExprKind::Instance {
+                decl,
+                args: self.copy_args(from, args, memo, (replace, constant)),
+            },
+            (Some(kind), _) => kind,
+            (None, kind) => match kind {
                 TypeExprKind::Record(range) => {
                     let fields: Vec<FieldTy> = from
                         .fields(range)
@@ -2052,10 +2160,10 @@ impl TypeArena {
                         meta,
                     }
                 }
-                TypeExprKind::Applied { name, span, arg } => TypeExprKind::Applied {
+                TypeExprKind::Applied { name, span, args } => TypeExprKind::Applied {
                     name,
                     span,
-                    arg: self.copy(from, arg, memo, (replace, constant)),
+                    args: self.copy_args(from, args, memo, (replace, constant)),
                 },
                 TypeExprKind::List(element) => {
                     TypeExprKind::List(self.copy(from, element, memo, (replace, constant)))
@@ -2065,15 +2173,171 @@ impl TypeArena {
                     let rhs = self.copy(from, rhs, memo, (replace, constant));
                     TypeExprKind::Union { lhs, rhs, bar }
                 }
-                TypeExprKind::Path(_) => TypeExprKind::Invalid,
-                kind @ (TypeExprKind::Named(_) | TypeExprKind::Ref(_) | TypeExprKind::Invalid) => {
-                    kind
-                }
+                TypeExprKind::Instance { decl, args } => TypeExprKind::Instance {
+                    decl,
+                    args: self.copy_args(from, args, memo, (replace, constant)),
+                },
+                TypeExprKind::Path(_) | TypeExprKind::PathApplied { .. } => TypeExprKind::Invalid,
+                kind @ (TypeExprKind::Named(_)
+                | TypeExprKind::Ref(_)
+                | TypeExprKind::Param(_)
+                | TypeExprKind::Invalid) => kind,
             },
         };
         let id = self.alloc(TypeExpr { kind, span });
         memo.insert(root, id);
         id
+    }
+
+    /// The node `root` with the type argument `args[i]` in place of each
+    /// [`TypeExprKind::Param`] `i` under it: an argument the arena has no
+    /// node for, `args` lacking it, a node `Invalid`. A node with no
+    /// parameter under it is itself, shared, and so is a parameter's
+    /// argument; every other is a new node of its kind and span, its
+    /// children substituted, made children first, with the defaults of a
+    /// record type's fields as they are. `memo` holds what each node
+    /// substituted is, so that a node shared under `root` is substituted
+    /// once.
+    ///
+    /// Recurses once per level of nesting under `root`.
+    fn substitute(
+        &mut self,
+        root: TypeExprId,
+        args: &[TypeExprId],
+        memo: &mut HashMap<TypeExprId, TypeExprId>,
+    ) -> TypeExprId {
+        if let Some(&done) = memo.get(&root) {
+            return done;
+        }
+        let Some(&TypeExpr { kind, span }) = self.exprs.get(root.index()) else {
+            return root;
+        };
+        let kind = match kind {
+            TypeExprKind::Param(index) => {
+                let done = match args.get(usize::from(index)) {
+                    Some(&arg) => arg,
+                    None => self.alloc(TypeExpr {
+                        kind: TypeExprKind::Invalid,
+                        span,
+                    }),
+                };
+                memo.insert(root, done);
+                return done;
+            }
+            TypeExprKind::Record(range) => {
+                let fields = self.fields(range).to_vec();
+                let substituted: Vec<FieldTy> = fields
+                    .iter()
+                    .map(|field| FieldTy {
+                        ty: self.substitute(field.ty, args, memo),
+                        ..*field
+                    })
+                    .collect();
+                (substituted != fields)
+                    .then(|| TypeExprKind::Record(self.push_fields(&substituted)))
+            }
+            TypeExprKind::Fn {
+                params,
+                ret,
+                effect,
+                meta,
+            } => {
+                let written = self.params(params).to_vec();
+                let substituted: Vec<ParamTy> = written
+                    .iter()
+                    .map(|param| ParamTy {
+                        ty: self.substitute(param.ty, args, memo),
+                        ..*param
+                    })
+                    .collect();
+                let new_ret = self.substitute(ret, args, memo);
+                let new_meta = meta.map(|meta| MetaTy {
+                    ty: self.substitute(meta.ty, args, memo),
+                    ..meta
+                });
+                (substituted != written || new_ret != ret || new_meta != meta).then(|| {
+                    TypeExprKind::Fn {
+                        params: self.push_params(&substituted),
+                        ret: new_ret,
+                        effect,
+                        meta: new_meta,
+                    }
+                })
+            }
+            TypeExprKind::Applied {
+                args: given,
+                name,
+                span,
+            } => self
+                .substitute_args(given, args, memo)
+                .map(|given| TypeExprKind::Applied {
+                    name,
+                    span,
+                    args: given,
+                }),
+            TypeExprKind::Instance { decl, args: given } => self
+                .substitute_args(given, args, memo)
+                .map(|given| TypeExprKind::Instance { decl, args: given }),
+            TypeExprKind::List(element) => {
+                let new = self.substitute(element, args, memo);
+                (new != element).then_some(TypeExprKind::List(new))
+            }
+            TypeExprKind::Union { lhs, rhs, bar } => {
+                let (new_lhs, new_rhs) = (
+                    self.substitute(lhs, args, memo),
+                    self.substitute(rhs, args, memo),
+                );
+                (new_lhs != lhs || new_rhs != rhs).then_some(TypeExprKind::Union {
+                    lhs: new_lhs,
+                    rhs: new_rhs,
+                    bar,
+                })
+            }
+            TypeExprKind::Named(_)
+            | TypeExprKind::Path(_)
+            | TypeExprKind::PathApplied { .. }
+            | TypeExprKind::Ref(_)
+            | TypeExprKind::Invalid => None,
+        };
+        let done = match kind {
+            Some(kind) => self.alloc(TypeExpr { kind, span }),
+            None => root,
+        };
+        memo.insert(root, done);
+        done
+    }
+
+    /// The type arguments `given` with [`TypeArena::substitute`]'s
+    /// substitution of `args` made in each, if that changes any.
+    fn substitute_args(
+        &mut self,
+        given: TypeArgRange,
+        args: &[TypeExprId],
+        memo: &mut HashMap<TypeExprId, TypeExprId>,
+    ) -> Option<TypeArgRange> {
+        let written = self.args(given).to_vec();
+        let substituted: Vec<TypeExprId> = written
+            .iter()
+            .map(|&arg| self.substitute(arg, args, memo))
+            .collect();
+        (substituted != written).then(|| self.push_args(&substituted))
+    }
+
+    /// Copies the type arguments `args` of `from` into this arena, as
+    /// [`TypeArena::copy`] copies each, and returns their range here.
+    fn copy_args(
+        &mut self,
+        from: &TypeArena,
+        args: TypeArgRange,
+        memo: &mut HashMap<TypeExprId, TypeExprId>,
+        (replace, constant): (Replace<'_>, ToConstant<'_>),
+    ) -> TypeArgRange {
+        let copied: Vec<TypeExprId> = from
+            .args(args)
+            .iter()
+            .map(|&arg| self.copy(from, arg, memo, (replace, constant)))
+            .collect();
+        self.push_args(&copied)
     }
 
     /// The height of the node `id` as it is now, its children's being in
@@ -2089,7 +2353,7 @@ impl TypeArena {
 
     /// The children of the node `id`, as they are now: a record type's
     /// fields' types, a function type's parameters', return type and meta's,
-    /// an applied or list type's argument, a union's sides.
+    /// an applied type's arguments, a list type's element, a union's sides.
     fn children(&self, id: TypeExprId) -> Vec<TypeExprId> {
         match self.kind(id) {
             TypeExprKind::Record(range) => self.fields(range).iter().map(|f| f.ty).collect(),
@@ -2102,11 +2366,15 @@ impl TypeArena {
                 .chain([ret])
                 .chain(meta.map(|meta| meta.ty))
                 .collect(),
-            TypeExprKind::Applied { arg, .. } | TypeExprKind::List(arg) => vec![arg],
+            TypeExprKind::Applied { args, .. }
+            | TypeExprKind::PathApplied { args, .. }
+            | TypeExprKind::Instance { args, .. } => self.args(args).to_vec(),
+            TypeExprKind::List(element) => vec![element],
             TypeExprKind::Union { lhs, rhs, .. } => vec![lhs, rhs],
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
             | TypeExprKind::Ref(_)
+            | TypeExprKind::Param(_)
             | TypeExprKind::Invalid => Vec::new(),
         }
     }
@@ -2297,6 +2565,7 @@ pub struct TypeStoreMark {
     exprs: usize,
     fields: usize,
     params: usize,
+    args: usize,
     constants: usize,
     decls: usize,
 }
@@ -2349,6 +2618,9 @@ pub struct TypeStore {
     /// The declarations marked `#[attribute]`, by their numbers, each with
     /// what a host knows it by.
     attributes: HashMap<u32, AttributeId>,
+    /// How many type parameters each declaration has, by number: none but
+    /// for a generic one.
+    arities: Vec<u32>,
 }
 
 impl TypeStore {
@@ -2377,6 +2649,7 @@ impl TypeStore {
             exprs: self.arena.exprs.len(),
             fields: self.arena.fields.len(),
             params: self.arena.params.len(),
+            args: self.arena.args.len(),
             constants: self.arena.constants.len(),
             decls: self.decls.len(),
         }
@@ -2387,9 +2660,11 @@ impl TypeStore {
         self.arena.exprs.truncate(mark.exprs);
         self.arena.fields.truncate(mark.fields);
         self.arena.params.truncate(mark.params);
+        self.arena.args.truncate(mark.args);
         self.arena.constants.truncate(mark.constants);
         self.heights.truncate(mark.exprs);
         self.decls.truncate(mark.decls);
+        self.arities.truncate(mark.decls);
         let decls = u32::try_from(mark.decls).unwrap_or(u32::MAX);
         self.attributes.retain(|&decl, _| decl < decls);
     }
@@ -2415,13 +2690,32 @@ impl TypeStore {
         let nothing = TypeExprId(u32::MAX);
         self.decls
             .extend(std::iter::repeat_n((u32::MAX, nothing), count));
+        self.arities.resize(self.decls.len(), 0);
         first
+    }
+
+    /// Records that the declaration numbered `decl` has `arity` type
+    /// parameters, as [`Ast::type_arity`] says of its item.
+    pub fn set_arity(&mut self, decl: u32, arity: u32) {
+        if let Some(entry) = self.arities.get_mut(decl as usize) {
+            *entry = arity;
+        }
+    }
+
+    /// How many type parameters the declaration numbered `decl` has: none
+    /// unless it is generic.
+    #[must_use]
+    pub fn arity(&self, decl: u32) -> u32 {
+        self.arities.get(decl as usize).copied().unwrap_or(0)
     }
 
     /// Defines the declaration `decl` as the type expression `root` of
     /// `ast`, copied out of it, with each node `links` has an entry for (by
-    /// id, in order) a [`TypeExprKind::Ref`] to the declaration it names, or
-    /// [`TypeExprKind::Invalid`] if it names none it can. Spreads are
+    /// id, in order) a [`TypeExprKind::Ref`] to the declaration it names, an
+    /// [`TypeExprKind::Instance`] of it if it applies it to arguments, or
+    /// [`TypeExprKind::Invalid`] if it names none it can; and each name that
+    /// is a type parameter of the declaration's own, a generic one's, the
+    /// [`TypeExprKind::Param`] of its number. Spreads are
     /// copied as they are written, until it is settled. A field's default
     /// is copied as the constant it is written as, if it is one
     /// (`check::written_constant`), which the checker of each tree using
@@ -2435,6 +2729,11 @@ impl TypeStore {
     ) {
         let first = next_id(self.arena.len());
         let replace = |id: TypeExprId| {
+            if let TypeExprKind::Named(name) = ast.types.kind(id)
+                && let Some((GenericOwner::Type(_), index)) = ast.type_param(id, name)
+            {
+                return Some(TypeExprKind::Param(index));
+            }
             let at = links.binary_search_by_key(&id.0, |&(at, _)| at.0).ok()?;
             Some(match links.get(at).map(|(_, link)| link) {
                 Some(TypeLink::Decl(decl)) => TypeExprKind::Ref(*decl),
@@ -2462,7 +2761,9 @@ impl TypeStore {
             .filter_map(|at| {
                 let ty = self.arena.exprs.get(at as usize)?;
                 match ty.kind {
-                    TypeExprKind::Ref(to) => Some((to, ty.span)),
+                    TypeExprKind::Ref(to) | TypeExprKind::Instance { decl: to, .. } => {
+                        Some((to, ty.span))
+                    }
                     _ => None,
                 }
             })
@@ -2505,6 +2806,11 @@ impl TypeStore {
                     }
                     continue;
                 }
+                TypeExprKind::Instance { decl: to, args } => {
+                    let height = self.instantiate(id, to, args);
+                    erroneous |= height as usize > MAX_DEPTH;
+                    continue;
+                }
                 TypeExprKind::Record(_) => {
                     erroneous |= !self.arena.merge_record(id).is_empty();
                 }
@@ -2522,6 +2828,39 @@ impl TypeStore {
                 *entry = 1;
             }
         }
+    }
+
+    /// Makes the node `id`, an instance of the declaration `decl` applied to
+    /// `args`, what `decl`'s settled definition is with `args` substituted
+    /// for its type parameters (`TypeArena::substitute`), the nodes made
+    /// shared as a reference's are, or `Invalid` if `decl` is erroneous.
+    /// Returns its height.
+    fn instantiate(&mut self, id: TypeExprId, decl: u32, args: TypeArgRange) -> u32 {
+        let args = self.arena.args(args).to_vec();
+        let target = self
+            .root(decl)
+            .filter(|&root| self.arena.kind(root) != TypeExprKind::Invalid);
+        let (kind, height) = match target {
+            Some(root) => {
+                let start = self.arena.len();
+                let made = self.arena.substitute(root, &args, &mut HashMap::new());
+                self.heights.resize(self.arena.len(), 1);
+                for new in self.arena.ids_from(start) {
+                    let height = self.arena.height(new, &self.heights);
+                    if let Some(entry) = self.heights.get_mut(new.index()) {
+                        *entry = height;
+                    }
+                }
+                let height = self.heights.get(made.index()).copied().unwrap_or(1);
+                (self.arena.kind(made), height)
+            }
+            None => (TypeExprKind::Invalid, 1),
+        };
+        self.arena.set_kind(id, kind);
+        if let Some(entry) = self.heights.get_mut(id.index()) {
+            *entry = height;
+        }
+        height
     }
 
     /// The root of the definition of `decl`, if it is defined.
@@ -2685,6 +3024,7 @@ pub struct BuilderMark {
     types: usize,
     fields: usize,
     param_tys: usize,
+    type_args: usize,
     paths: usize,
     fns: usize,
     params: usize,
@@ -2867,6 +3207,12 @@ impl AstBuilder {
         self.types.push_params(params)
     }
 
+    /// Appends `args` to the type-argument pool as one applied type's
+    /// arguments and returns their range.
+    pub fn push_type_args(&mut self, args: &[TypeExprId]) -> TypeArgRange {
+        self.types.push_args(args)
+    }
+
     /// Appends `elements` to the element pool as one list literal's
     /// elements and returns their range.
     pub fn push_elements(&mut self, elements: &[Element]) -> ElementRange {
@@ -2984,6 +3330,7 @@ impl AstBuilder {
             types: self.types.exprs.len(),
             fields: self.types.fields.len(),
             param_tys: self.types.params.len(),
+            type_args: self.types.args.len(),
             paths: self.paths.len(),
             fns: self.fns.len(),
             params: self.params.len(),
@@ -3009,6 +3356,7 @@ impl AstBuilder {
         self.types.exprs.truncate(mark.types);
         self.types.fields.truncate(mark.fields);
         self.types.params.truncate(mark.param_tys);
+        self.types.args.truncate(mark.type_args);
         self.paths.truncate(mark.paths);
         self.fns.truncate(mark.fns);
         self.params.truncate(mark.params);
@@ -3025,7 +3373,10 @@ impl AstBuilder {
         self.attribute_marks.retain(|item| item.0 < items);
         self.attribute_uses.retain(|used| used.item.0 < items);
         let fns = next_id(mark.fns);
-        self.generics.retain(|generics| generics.function.0 < fns);
+        self.generics.retain(|generics| match generics.owner {
+            GenericOwner::Fn(function) => function.0 < fns,
+            GenericOwner::Type(item) => item.0 < items,
+        });
     }
 
     /// Returns the node `id`.
@@ -3267,7 +3618,12 @@ impl Ast {
         id.0 >= parsed
             || matches!(
                 self.rewritten(id),
-                Some(TypeExprKind::Named(_) | TypeExprKind::Path(_) | TypeExprKind::Applied { .. })
+                Some(
+                    TypeExprKind::Named(_)
+                        | TypeExprKind::Path(_)
+                        | TypeExprKind::Applied { .. }
+                        | TypeExprKind::PathApplied { .. }
+                )
             )
     }
 
@@ -3383,8 +3739,15 @@ impl Ast {
                     take(self.first_default(meta.ty));
                 }
             }
-            TypeExprKind::Applied { arg, .. } | TypeExprKind::List(arg) => {
-                take(self.first_default(arg));
+            TypeExprKind::Applied { args, .. }
+            | TypeExprKind::PathApplied { args, .. }
+            | TypeExprKind::Instance { args, .. } => {
+                for &arg in self.types.args(args) {
+                    take(self.first_default(arg));
+                }
+            }
+            TypeExprKind::List(element) => {
+                take(self.first_default(element));
             }
             TypeExprKind::Union { lhs, rhs, .. } => {
                 take(self.first_default(lhs));
@@ -3393,6 +3756,7 @@ impl Ast {
             TypeExprKind::Named(_)
             | TypeExprKind::Path(_)
             | TypeExprKind::Ref(_)
+            | TypeExprKind::Param(_)
             | TypeExprKind::Invalid => {}
         }
         first
@@ -3528,6 +3892,17 @@ impl Ast {
         self.types.params(range)
     }
 
+    /// Returns the type arguments of the applied type whose arguments are
+    /// `range`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` does not belong to this tree.
+    #[must_use]
+    pub fn type_args(&self, range: TypeArgRange) -> &[TypeExprId] {
+        self.types.args(range)
+    }
+
     /// Returns the elements of the list literal whose elements are `range`,
     /// in source order.
     ///
@@ -3618,27 +3993,42 @@ impl Ast {
         self.attribute_uses.get(start..end).unwrap_or_default()
     }
 
-    /// The type parameters of every generic function item, in the order
-    /// their functions were made.
+    /// The type parameters of every generic function and `type` item, in the
+    /// order the parser finished them.
     #[must_use]
     pub fn all_generics(&self) -> &[Generics] {
         &self.generics
     }
 
+    /// The type parameters of `owner`, if it is generic.
+    #[must_use]
+    pub fn generics_of(&self, owner: GenericOwner) -> Option<&Generics> {
+        self.generics
+            .iter()
+            .find(|generics| generics.owner == owner)
+    }
+
     /// The type parameters of `function`, if it is a generic function item.
     #[must_use]
     pub fn generics(&self, function: FnId) -> Option<&Generics> {
-        self.generics
-            .iter()
-            .find(|generics| generics.function == function)
+        self.generics_of(GenericOwner::Fn(function))
     }
 
-    /// The function and the number of the type parameter that the name
-    /// `name`, written as the type expression `id`, is, if one is in scope
-    /// there: that of the innermost generic function whose signature or body
-    /// `id` is part of that has a type parameter of the name.
+    /// How many type parameters the `type` item `item` has: none unless it
+    /// is generic.
     #[must_use]
-    pub fn type_param(&self, id: TypeExprId, name: Name) -> Option<(FnId, u8)> {
+    pub fn type_arity(&self, item: ItemId) -> u32 {
+        self.generics_of(GenericOwner::Type(item))
+            .map_or(0, |generics| next_id(generics.params.len()))
+    }
+
+    /// What has the type parameter that the name `name`, written as the type
+    /// expression `id`, is, and its number, if one is in scope there: that
+    /// of the innermost generic function whose signature or body `id` is
+    /// part of, or the generic `type` item whose definition it is part of,
+    /// that has a type parameter of the name.
+    #[must_use]
+    pub fn type_param(&self, id: TypeExprId, name: Name) -> Option<(GenericOwner, u8)> {
         self.generics
             .iter()
             .filter(|generics| generics.types.0 <= id.0 && id.0 < generics.types.1)
@@ -3650,7 +4040,7 @@ impl Ast {
                 Some((generics, u8::try_from(index).ok()?))
             })
             .min_by_key(|(generics, _)| generics.types.1 - generics.types.0)
-            .map(|(generics, index)| (generics.function, index))
+            .map(|(generics, index)| (generics.owner, index))
     }
 
     /// Every use of an attribute that is none of the parser's, by the items
@@ -3863,8 +4253,10 @@ impl Ast {
     ///   of a declared type, written bare or qualified, becomes what that
     ///   declaration's settled definition in `store` is, its nodes copied
     ///   into the tree's arena after the parsed ones, each once, shared by
-    ///   every use; or [`TypeExprKind::Invalid`] if the declaration is
-    ///   erroneous, which its own file reports;
+    ///   every use; a generic one's, applied to its arguments, with them in
+    ///   place of its parameters, the nodes above a parameter made for the
+    ///   use (`TypeArena::substitute`); or [`TypeExprKind::Invalid`] if
+    ///   the declaration is erroneous, which its own file reports;
     /// - one that `links` has an error for becomes `Invalid`, with the
     ///   problem [`TypeProblem::Unresolved`];
     /// - a record type with spreads becomes the record type of its merged
@@ -3913,12 +4305,20 @@ impl Ast {
                         Some(root) => {
                             let start = self.types.len();
                             // A store holds no expression of a tree.
-                            let copy = self.types.copy(
+                            let mut copy = self.types.copy(
                                 &store.arena,
                                 root,
                                 &mut memo,
                                 (&|_| None, &|_| None),
                             );
+                            // A generic type's use, its arity checked, has
+                            // its arguments in place of its parameters.
+                            if let TypeExprKind::Applied { args, .. }
+                            | TypeExprKind::PathApplied { args, .. } = kind
+                            {
+                                let args = self.types.args(args).to_vec();
+                                copy = self.types.substitute(copy, &args, &mut HashMap::new());
+                            }
                             // The copies are children first, so each one's
                             // height follows from its children's.
                             for new in self.types.ids_from(start) {
@@ -4588,6 +4988,29 @@ struct WrittenType<'a> {
 }
 
 impl WrittenType<'_> {
+    /// Writes the qualified type name `path` as it is written.
+    fn path(&self, f: &mut fmt::Formatter<'_>, path: PathRange) -> fmt::Result {
+        let shown = PathDisplay {
+            names: self.names,
+            strings: &self.ast.strings,
+            segments: self.ast.path(path),
+            definition: false,
+        };
+        write!(f, "{shown}")
+    }
+
+    /// Writes the type arguments `args` as they are written, `<A, B>`.
+    fn type_args(&self, f: &mut fmt::Formatter<'_>, args: TypeArgRange) -> fmt::Result {
+        f.write_str("<")?;
+        for (index, &arg) in self.ast.type_args(args).iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            self.type_expr(f, arg)?;
+        }
+        f.write_str(">")
+    }
+
     /// Writes a type expression as it is written in source: as the parser
     /// made it, whatever the expansion of the tree's types made of it
     /// ([`Ast::written_type`]).
@@ -4595,15 +5018,7 @@ impl WrittenType<'_> {
         let names = self.names;
         match self.ast.written_type(id) {
             TypeExprKind::Named(name) => f.write_str(names.get(name)),
-            TypeExprKind::Path(path) => {
-                let shown = PathDisplay {
-                    names,
-                    strings: &self.ast.strings,
-                    segments: self.ast.path(path),
-                    definition: false,
-                };
-                write!(f, "{shown}")
-            }
+            TypeExprKind::Path(path) => self.path(f, path),
             TypeExprKind::Record(fields) => {
                 f.write_str("{")?;
                 for (index, field) in self.ast.field_tys(fields).iter().enumerate() {
@@ -4658,10 +5073,13 @@ impl WrittenType<'_> {
                 write!(f, " {} ", meta.effect.meta_marker())?;
                 self.type_expr(f, meta.ty)
             }
-            TypeExprKind::Applied { name, arg, .. } => {
-                write!(f, "{}<", names.get(name))?;
-                self.type_expr(f, arg)?;
-                f.write_str(">")
+            TypeExprKind::Applied { name, args, .. } => {
+                f.write_str(names.get(name))?;
+                self.type_args(f, args)
+            }
+            TypeExprKind::PathApplied { path, args } => {
+                self.path(f, path)?;
+                self.type_args(f, args)
             }
             TypeExprKind::Union { lhs, rhs, .. } => {
                 self.union_member(f, lhs)?;
@@ -4685,7 +5103,10 @@ impl WrittenType<'_> {
             }
             // Never written: the store's references and the expansion's
             // errors are kept apart from what a tree prints.
-            TypeExprKind::Ref(_) | TypeExprKind::Invalid => f.write_str("<invalid>"),
+            TypeExprKind::Ref(_)
+            | TypeExprKind::Instance { .. }
+            | TypeExprKind::Param(_)
+            | TypeExprKind::Invalid => f.write_str("<invalid>"),
         }
     }
 

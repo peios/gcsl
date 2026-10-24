@@ -442,22 +442,32 @@
 //!   types, if it has none of that name; "unknown type `a.b`" if `a` is no
 //!   module the file imports whole; and "`t.Foo` is a type, not a module"
 //!   for a path that goes on after a type. A module's name written as a
-//!   type, `t`, is "`t` is a module, not a type", and a type applied to a
-//!   type argument "type `Foo` takes no type argument" ([`Scan::type_links`]).
+//!   type, `t`, is "`t` is a module, not a type" ([`Scan::type_links`]).
+//! - A generic type, `type Pair<A, B> = ...`, is used applied to as many
+//!   type arguments as it has type parameters, `Pair<Int, String>` or
+//!   `t.Pair<Int, String>`, which the store records of each declaration
+//!   ([`TypeStore::set_arity`]); used bare it is "type `Pair` needs its type
+//!   arguments", with too few or too many "type `Pair` takes 2 type
+//!   arguments, given 1", and a type that is not generic, applied, "type
+//!   `Foo` takes no type argument" ([`Scan::applied_link`]). An attribute's
+//!   type is never generic: "attribute `Tag` takes no type parameters".
 //!
 //! Then the types are defined and the files' trees expanded
 //! ([`define_types`]): each declaration's definition is copied into the
 //! scan's [`TypeStore`], each name in it of another declared type a
-//! reference to it, as the declaring file's view resolves it; the
-//! references are a graph, whose cycles are each "type `A` refers to
+//! reference to it, as the declaring file's view resolves it, an instance
+//! of it if applied to arguments, and each of a generic declaration's own
+//! type parameters a parameter; the references are a graph, whose cycles are each "type `A` refers to
 //! itself", at the first declaration of the cycle in path then source
 //! order, labelled at each step ("`B` uses `A` here", in `B`'s file);
 //! every declaration is settled, those it refers to first, a reference
-//! made what it refers to and a spread merged, one on a cycle, with a
+//! made what it refers to, an instance what it refers to with its
+//! arguments in place of its parameters, and a spread merged, one on a cycle, with a
 //! spread's problem or nested deeper than [`crate::MAX_DEPTH`] once
 //! expanded erroneous; and each file's tree is expanded
 //! ([`Ast::expand_types`]): each name of a declared type in it made a copy
-//! of the definition, as if written there, each record type with spreads
+//! of the definition, as if written there, a generic one's with the use's
+//! arguments in place of its parameters, each record type with spreads
 //! the record of its merged fields. A session keeps its store, each input's
 //! declarations after the earlier inputs' ([`check_input`]). The checker
 //! then sees no declared type's name; before any file is checked, the
@@ -5214,8 +5224,9 @@ impl Scan {
     /// its view, that type's declaration, by its number in
     /// [`Scan::type_store`]; a qualified name, the type it names through a
     /// whole import, or the error that it names none
-    /// ([`Scan::qualified_type`]); a name of a type applied to a type
-    /// argument, "type `Foo` takes no type argument"; a name of a module the
+    /// ([`Scan::qualified_type`]); either with as many type arguments as the
+    /// type has type parameters, none for one that is not generic, or else
+    /// the error ([`Scan::applied_link`]); a name of a module the
     /// file imports whole that names no type, "`t` is a module, not a type".
     /// A name of no type, a built-in type's or an unknown one, has none:
     /// the checker reads it.
@@ -5228,7 +5239,7 @@ impl Scan {
             let span = file.ast.type_expr(id).span;
             let link = match read {
                 TypeRead::Named(name) => match file.type_view.get(&name) {
-                    Some(&decl) => TypeLink::Decl(decl),
+                    Some(&decl) => self.applied_link(decl, (self.names.get(name), 0), span),
                     None if file.aliases.iter().any(|a| a.whole && a.name == name) => {
                         let text = self.names.get(name);
                         TypeLink::Error(Diagnostic::error(
@@ -5238,17 +5249,15 @@ impl Scan {
                     }
                     None => continue,
                 },
-                TypeRead::Applied(name) => {
-                    if !file.type_view.contains_key(&name) {
-                        continue;
-                    }
-                    let text = self.names.get(name);
-                    TypeLink::Error(Diagnostic::error(
-                        format!("type `{text}` takes no type argument"),
-                        span,
-                    ))
-                }
-                TypeRead::Path(path) => {
+                TypeRead::Applied(name, given) => match file.type_view.get(&name) {
+                    Some(&decl) => self.applied_link(decl, (self.names.get(name), given), span),
+                    None => continue,
+                },
+                TypeRead::Path(path) | TypeRead::PathApplied(path, _) => {
+                    let given = match read {
+                        TypeRead::PathApplied(_, given) => given,
+                        _ => 0,
+                    };
                     let path = file.ast.path(path);
                     // Through a name the file reads as `Error`, the
                     // checker's, quietly (see [Scan errors](#scan-errors)).
@@ -5256,12 +5265,49 @@ impl Scan {
                     if first.is_some_and(|name| file.poisoned.binary_search(&name).is_ok()) {
                         continue;
                     }
-                    self.qualified_type(file, path, span)
+                    match self.qualified_type(file, path, span) {
+                        TypeLink::Decl(decl) => {
+                            let shown: Vec<&str> = path
+                                .iter()
+                                .filter_map(PathSegment::name)
+                                .map(|name| self.names.get(name))
+                                .collect();
+                            let shown = shown.join(".");
+                            self.applied_link(decl, (&shown, given), span)
+                        }
+                        error @ TypeLink::Error(_) => error,
+                    }
                 }
             };
             links.push((id, link));
         }
         links
+    }
+
+    /// The link of a type expression, written at `span`, that names the
+    /// declaration numbered `decl`, written `shown`, with `given` type
+    /// arguments, none for a name written bare (see [Types](#types)): the declaration, if it has
+    /// that many type parameters; otherwise the error, "type `Pair` needs
+    /// its type arguments" for a generic one used bare, "type `Foo` takes no
+    /// type argument" for another applied, and "type `Pair` takes 2 type
+    /// arguments, given 1".
+    fn applied_link(&self, decl: u32, (shown, given): (&str, u32), span: Span) -> TypeLink {
+        let arity = self.type_store.arity(decl);
+        if arity == given {
+            return TypeLink::Decl(decl);
+        }
+        let message = match (arity, given) {
+            (_, 0) => format!("type `{shown}` needs its type arguments"),
+            (0, _) => format!("type `{shown}` takes no type argument"),
+            (1, _) => format!("type `{shown}` takes 1 type argument, given {given}"),
+            _ => format!("type `{shown}` takes {arity} type arguments, given {given}"),
+        };
+        let mut error = Diagnostic::error(message, span);
+        if given == 0 {
+            let plural = if arity == 1 { "" } else { "s" };
+            error = error.with_note(format!("`{shown}` takes {arity} type argument{plural}"));
+        }
+        TypeLink::Error(error)
     }
 
     /// What the qualified type name `path`, written at `span` in `file`,
@@ -5387,6 +5433,13 @@ fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
     }
     scan.poisoned_types = poisoned;
     scan.type_base = scan.type_store.reserve(types.len());
+    for (at, decl) in (0u32..).zip(&types) {
+        if let Some(file) = scan.files.get(decl.file as usize) {
+            let arity = file.ast.type_arity(decl.item);
+            scan.type_store
+                .set_arity(scan.type_base.saturating_add(at), arity);
+        }
+    }
     // Those marked `#[attribute]`, by their numbers, but one named like a
     // built-in attribute.
     for (at, decl) in (0u32..).zip(&types) {
@@ -5397,6 +5450,16 @@ fn declare_types(scan: &mut Scan, errors: &mut Vec<Diagnostic>) {
             continue;
         }
         let name = scan.names.get(decl.name);
+        if file.ast.type_arity(decl.item) > 0 {
+            errors.push(
+                Diagnostic::error(
+                    format!("attribute `{name}` takes no type parameters"),
+                    decl.span,
+                )
+                .in_input(decl.file),
+            );
+            continue;
+        }
         if BUILTIN_ATTRIBUTES.contains(&name) {
             errors.push(
                 Diagnostic::error(format!("`{name}` is a built-in attribute"), decl.span)

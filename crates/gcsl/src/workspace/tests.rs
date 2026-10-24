@@ -11906,3 +11906,87 @@ fn a_generic_def_is_called_from_another_file_and_its_parameters_shadow_types() {
     // `T` in `wrap` is its parameter, not the root's `type T = Int`.
     assert_eq!(rooted_text(&files, "app/main.gcsl"), "{r = 6; s = \"a\"}");
 }
+
+#[test]
+fn a_generic_type_is_its_definition_with_its_arguments_substituted() {
+    let files = [
+        ("workspace.gcsl", ""),
+        (
+            "lib/types.gcsl",
+            "type Pair<A, B> = {first: A, second: B}\ntype Named<T> = Pair<String, T>\n\
+             type Id<T> = T\ntype F<T> = fn(x: T): T",
+        ),
+        (
+            "app/main.gcsl",
+            "import lib/types as t\nimport Named, Id, F from lib/types\n\
+             p: t.Pair<Int, Bool> = { first = 1; second = true }\n\
+             n: Named<List<Int>> = { first = \"a\"; second = [2] }\n\
+             i: Id<Int> = 3\n\
+             fn twice(x: Int): Int { x * 2 }\nf: F<Int> = twice\n\
+             r = p.first + n.second[0] + i + f(1)",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{p = {first = 1; second = true}; n = {first = \"a\"; second = [2]}; i = 3; \
+         f = fn(x: Int): Int; r = 8}"
+    );
+}
+
+#[test]
+fn a_generic_type_takes_as_many_arguments_as_it_has_parameters() {
+    let lib = (
+        "lib/types.gcsl",
+        "type Pair<A, B> = {first: A, second: B}\ntype Box = {v: Int}",
+    );
+    for (main, message) in [
+        (
+            "import Pair from lib/types\nx: Pair = { first = 1 }",
+            "type `Pair` needs its type arguments",
+        ),
+        (
+            "import Pair from lib/types\nx: Pair<Int> = { first = 1 }",
+            "type `Pair` takes 2 type arguments, given 1",
+        ),
+        (
+            "import lib/types as t\nx: t.Pair<Int, Int, Int> = { first = 1 }",
+            "type `t.Pair` takes 2 type arguments, given 3",
+        ),
+        (
+            "import lib/types as t\nx: t.Pair = { first = 1 }",
+            "type `t.Pair` needs its type arguments",
+        ),
+        (
+            "import Box from lib/types\nx: Box<Int> = { v = 1 }",
+            "type `Box` takes no type argument",
+        ),
+        // A type refers to itself through its own instance.
+        ("type L<T> = {next: L<T>}", "type `L` refers to itself"),
+        (
+            "#[attribute]\ntype Tag<T> = {v: T}",
+            "attribute `Tag` takes no type parameters",
+        ),
+    ] {
+        let files = [("workspace.gcsl", ""), lib, ("app/main.gcsl", main)];
+        assert_eq!(rooted_messages(&files), [message], "{main}");
+    }
+}
+
+#[test]
+fn a_generic_type_s_parameters_shadow_declared_types_and_instances_are_fresh() {
+    let files = [
+        ("workspace.gcsl", "type T = Int"),
+        (
+            "app/main.gcsl",
+            "type Box<T> = {v: T}\n\
+             a: Box<String> = { v = \"s\" }\n\
+             b: Box<Box<Bool>> = { v = { v = true } }\n\
+             fn get<U>(box: Box<U>): U { box.v }\n\
+             r = get(a)\ns = get(b).v",
+        ),
+    ];
+    assert_eq!(
+        rooted_text(&files, "app/main.gcsl"),
+        "{a = {v = \"s\"}; b = {v = {v = true}}; r = \"s\"; s = true}"
+    );
+}

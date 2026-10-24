@@ -296,8 +296,11 @@ pub enum TypeRead {
     Named(Name),
     /// A qualified name, its path in the tree's path pool.
     Path(PathRange),
-    /// A name applied to a type argument, `NAME<TYPE>`.
-    Applied(Name),
+    /// A name applied to type arguments, `NAME<TYPE, ...>`, and how many.
+    Applied(Name, u32),
+    /// A qualified name applied to type arguments, `t.NAME<TYPE, ...>`, and
+    /// how many.
+    PathApplied(PathRange, u32),
 }
 
 /// A node of a file's view that other sources share and that has a leaf of
@@ -782,7 +785,7 @@ pub fn scan_except(ast: &Ast, shadowed: &[bool]) -> Mentions {
 
 /// Every type expression of `ast` that reads a type by its name, in order
 /// (by id), as it is written (see [Types](#types)): a name written bare, a
-/// qualified name and a name applied to a type argument, in annotations,
+/// qualified name and either applied to type arguments, in annotations,
 /// ascriptions, parameters, function types and `type` items alike, but a
 /// name that is a type parameter in scope there ([`Ast::type_param`]),
 /// which no declared type can be. Which are of declared types, and which
@@ -796,7 +799,8 @@ pub fn type_reads(ast: &Ast) -> Vec<(TypeExprId, TypeRead)> {
                 TypeExprKind::Named(name) if ast.type_param(id, name).is_some() => return None,
                 TypeExprKind::Named(name) => TypeRead::Named(name),
                 TypeExprKind::Path(path) => TypeRead::Path(path),
-                TypeExprKind::Applied { name, .. } => TypeRead::Applied(name),
+                TypeExprKind::Applied { name, args, .. } => TypeRead::Applied(name, args.len()),
+                TypeExprKind::PathApplied { path, args } => TypeRead::PathApplied(path, args.len()),
                 _ => return None,
             };
             Some((id, read))

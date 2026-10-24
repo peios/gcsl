@@ -362,9 +362,22 @@ impl Facts {
                         .filter(|&at| input.kind(at) == TokenKind::LParen);
                     facts.lists.extend(at);
                 }
+                // The `<` is the first token after the name, whatever space
+                // is between them.
                 TypeExprKind::Applied { span, .. } => {
+                    let open = input.first_from(span.end);
+                    if input.kind(open) == TokenKind::Lt {
+                        facts.angles.insert(open);
+                    }
                     let close = ty.span.end.saturating_sub(1);
-                    facts.angles.extend(input.token_at(span.end, TokenKind::Lt));
+                    facts.angles.extend(input.token_at(close, TokenKind::Gt));
+                }
+                TypeExprKind::PathApplied { path, .. } => {
+                    let open = input.first_from(crate::ast::path_span(ast.path(path)).end);
+                    if input.kind(open) == TokenKind::Lt {
+                        facts.angles.insert(open);
+                    }
+                    let close = ty.span.end.saturating_sub(1);
                     facts.angles.extend(input.token_at(close, TokenKind::Gt));
                 }
                 _ => {}
@@ -1209,6 +1222,19 @@ mod tests {
                 "def pair<A, B>(a: A, b: B): A { a }\n",
             ),
             ("x = 1<2\n", "x = 1 < 2\n"),
+            (
+                "type Pair< A,B > = {first: A, second: B}\n",
+                "type Pair<A, B> = {first: A, second: B}\n",
+            ),
+            (
+                "x: t.Pair< Int,String > = y\n",
+                "x: t.Pair<Int, String> = y\n",
+            ),
+            (
+                "x: t.Pair <Int, String> = y\n",
+                "x: t.Pair<Int, String> = y\n",
+            ),
+            ("x: List <Int> = y\n", "x: List<Int> = y\n"),
         ]);
     }
 

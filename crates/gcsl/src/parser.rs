@@ -496,6 +496,13 @@
 //! follows it directly; in `fn(): Int[]` it belongs to the return type,
 //! which is parsed first.
 //!
+//! A named type may be applied to type arguments, `NAME<TYPE, ...>` or
+//! `a.NAME<TYPE, ...>` (`Parser::parse_type_args`): one argument or more,
+//! separated by `,`, newlines allowed after the `<` and each `,`, and the
+//! `>` directly after the last ("expected `>` to close the type
+//! arguments" otherwise), whatever the name; how many each type takes is
+//! the checker's and the workspace's business.
+//!
 //! A `type` item, `type NAME = TYPE` ([`ItemKind::Type`]), declares a type
 //! (`Parser::parse_type_item`), its name a single identifier, newlines
 //! skipped after its `=`. `type` is no keyword of the lexer: it is
@@ -506,9 +513,11 @@
 //! 2`, `type.x = 3`, `type: Int = 4`). A `type` item is an item of a file's
 //! outermost body only: anywhere else, a block's, a function's or a
 //! `lazy`'s, it is "`type` is declared only at the top level of a file", at
-//! the `type`. Type parameters, `type Box<T> = ...`, are "a `type` takes no
-//! type parameters", at the `<`; anything else after the name is "expected
-//! `=` after the type's name". `#[shadowable]` before one is the error it is
+//! the `type`. A `type` may be generic: type parameters after its name,
+//! `type Pair<A, B> = {first: A, second: B}`, as a function item's are
+//! (`Parser::parse_type_params`), in scope in its definition
+//! ([`Ast::type_param`]). Anything else after the name is "expected `=`
+//! after the type's name". `#[shadowable]` before one is the error it is
 //! before anything but a field, a `def` or an import. Whether a name is
 //! some built-in type's, or declared twice, is the checker's business.
 //!
@@ -980,9 +989,10 @@ use crate::MAX_DEPTH;
 use crate::ast::{
     Arg, ArgKind, ArgRange, Ast, AstBuilder, AttributeUse, BinaryOp, BuilderMark, DefTypeRole,
     DefTypeUse, Effect, Element, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
-    FnDecl, ForDecl, ForHead, Generics, ImportDecl, ImportForm, ImportMember, ImportName, Item,
-    ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange, PathSegment,
-    SegmentKind, StrPart, Syntax, TypeExpr, TypeExprId, TypeExprKind, UnaryOp, path_span,
+    FnDecl, ForDecl, ForHead, GenericOwner, Generics, ImportDecl, ImportForm, ImportMember,
+    ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange,
+    PathSegment, SegmentKind, StrPart, Syntax, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind,
+    UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, MAX_ERRORS, Token, TokenKind, lex};
@@ -1045,9 +1055,6 @@ const TYPE: &str = "type";
 
 /// The error for a `type` item anywhere but in a file's outermost body.
 const MISPLACED_TYPE: &str = "`type` is declared only at the top level of a file";
-
-/// The error for type parameters after a `type` item's name, at their `<`.
-const TYPE_PARAMETERS: &str = "a `type` takes no type parameters";
 
 /// The name of the outer attribute that marks a declaration shadowable.
 const SHADOWABLE: &str = "shadowable";
@@ -3065,7 +3072,7 @@ impl Parser<'_> {
             && let ExprKind::Fn(function) = self.builder.get(value).kind
         {
             self.builder.push_generics(Generics {
-                function,
+                owner: GenericOwner::Fn(function),
                 params,
                 types: (types, self.builder.type_count()),
             });
@@ -3233,20 +3240,21 @@ impl Parser<'_> {
             return Err(self.error("expected the type's name after `type`", name_token.span));
         };
         self.advance();
+        let params = match self.peek().kind {
+            TokenKind::Lt => Some(self.parse_type_params()?),
+            _ => None,
+        };
         let eq = self.peek();
-        match eq.kind {
-            TokenKind::Eq => {}
-            TokenKind::Lt => return Err(self.error(TYPE_PARAMETERS, eq.span)),
-            _ => {
-                let found = self.describe(eq);
-                return Err(self.error(
-                    format!("expected `=` after the type's name, found {found}"),
-                    error_span(eq),
-                ));
-            }
+        if eq.kind != TokenKind::Eq {
+            let found = self.describe(eq);
+            return Err(self.error(
+                format!("expected `=` after the type's name, found {found}"),
+                error_span(eq),
+            ));
         }
         self.advance();
         self.skip_newlines();
+        let first = self.builder.type_count();
         let (ty, height) = self.parse_type()?;
         let span = Span::join(keyword.span, self.type_span(ty));
         let item = self.builder.alloc_item(Item {
@@ -3257,6 +3265,13 @@ impl Parser<'_> {
             },
             span,
         });
+        if let Some(params) = params {
+            self.builder.push_generics(Generics {
+                owner: GenericOwner::Type(item),
+                params,
+                types: (first, self.builder.type_count()),
+            });
+        }
         Ok((item, height))
     }
 
@@ -3914,7 +3929,9 @@ impl Parser<'_> {
     /// Parses a qualified type name, `a.b` or `a.b.c`, starting at its first
     /// name, an identifier directly followed by `.`: identifiers separated by
     /// `.`, each `.` followed by an identifier ("expected a type's name after
-    /// `.`" otherwise). Returns it, a leaf one level tall.
+    /// `.`" otherwise), and, after a `<`, its type arguments
+    /// ([`Parser::parse_type_args`]). Returns it, a leaf one level tall
+    /// without arguments.
     fn parse_type_path(&mut self) -> ParseResult<(TypeExprId, u32)> {
         let base = self.path.len();
         let mut token = self.peek();
@@ -3936,6 +3953,18 @@ impl Parser<'_> {
         }
         let span = path_span(self.path.get(base..).unwrap_or_default());
         let (path, _) = self.finish_path(base);
+        if self.peek().kind == TokenKind::Lt {
+            // Applied types nest by recursion, so they count their depth.
+            self.enter()?;
+            let applied = self.parse_type_args(span);
+            self.depth -= 1;
+            let (args, close, height) = applied?;
+            let id = self.builder.alloc_type(TypeExpr {
+                kind: TypeExprKind::PathApplied { path, args },
+                span: Span::join(span, close),
+            });
+            return Ok((id, height));
+        }
         let id = self.builder.alloc_type(TypeExpr {
             kind: TypeExprKind::Path(path),
             span,
@@ -3968,40 +3997,67 @@ impl Parser<'_> {
     }
 
     /// Parses the applied type whose name, `name` at `name_span`, is the
-    /// current token and is followed by `<`: the `<`, newlines, the type
-    /// argument, and the `>`, which must follow the argument directly.
+    /// current token and is followed by `<`: the name, then its type
+    /// arguments ([`Parser::parse_type_args`]).
     fn parse_applied_type(
         &mut self,
         name: Name,
         name_span: Span,
     ) -> ParseResult<(TypeExprId, u32)> {
         self.advance();
-        let open = self.peek();
-        self.advance();
-        self.skip_newlines();
-        let (arg, arg_height) = self.parse_type()?;
-        let close = self.peek();
-        if close.kind != TokenKind::Gt {
-            return Err(self.report(
-                Diagnostic::error("expected `>` to close the type argument", error_span(close))
-                    .with_context(open.span, "unclosed `<`"),
-            ));
-        }
-        self.advance();
-        let span = Span::join(name_span, close.span);
-        let height = arg_height.saturating_add(1);
-        if height as usize > MAX_DEPTH {
-            return Err(self.too_deep(span));
-        }
+        let (args, close, height) = self.parse_type_args(name_span)?;
+        let span = Span::join(name_span, close);
         let id = self.builder.alloc_type(TypeExpr {
             kind: TypeExprKind::Applied {
                 name,
                 span: name_span,
-                arg,
+                args,
             },
             span,
         });
         Ok((id, height))
+    }
+
+    /// Parses the type arguments of an applied type, at their `<`, whose
+    /// name starts at `start`: the `<`, newlines, one type argument or more
+    /// separated by `,`, newlines allowed after each `,`, and the `>`, which
+    /// must follow the last argument directly. Returns the arguments, where
+    /// the `>` is, and the applied type's height, one more than its tallest
+    /// argument's.
+    fn parse_type_args(&mut self, start: Span) -> ParseResult<(TypeArgRange, Span, u32)> {
+        let open = self.peek();
+        self.advance();
+        self.skip_newlines();
+        let mut args = Vec::new();
+        let mut tallest = 0;
+        let close = loop {
+            let (arg, arg_height) = self.parse_type()?;
+            args.push(arg);
+            tallest = tallest.max(arg_height);
+            let next = self.peek();
+            match next.kind {
+                TokenKind::Comma => {
+                    self.advance();
+                    self.skip_newlines();
+                }
+                TokenKind::Gt => break next,
+                _ => {
+                    return Err(self.report(
+                        Diagnostic::error(
+                            "expected `>` to close the type arguments",
+                            error_span(next),
+                        )
+                        .with_context(open.span, "unclosed `<`"),
+                    ));
+                }
+            }
+        };
+        self.advance();
+        let height = tallest.saturating_add(1);
+        if height as usize > MAX_DEPTH {
+            return Err(self.too_deep(Span::join(start, close.span)));
+        }
+        Ok((self.builder.push_type_args(&args), close.span, height))
     }
 
     /// Parses a function type, starting at its `fn`: `(`, parameter types

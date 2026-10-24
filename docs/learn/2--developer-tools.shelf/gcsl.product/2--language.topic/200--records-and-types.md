@@ -28,6 +28,24 @@ An annotation also determines what fields later code can see. Extra
 fields in a record literal produce a warning when an expected type hides
 them. A structural alias does not introduce a distinct runtime identity.
 
+## Generic types
+
+A type can take type parameters, named in angle brackets after its name.
+Each use names the types to put in their place:
+
+```gcsl
+type Pair<A, B> = {first: A, second: B}
+let entry: Pair<String, Int> = {first = "port"; second = 8080}
+entry.second
+```
+
+A use must give as many type arguments as the type has parameters, and a
+type without parameters takes none. Because types are structural,
+`Pair<String, Int>` is the same type as `{first: String, second: Int}`. A
+generic type can be built from another, as in
+`type Named<T> = Pair<String, T>`. It can't refer to itself, and it can't
+spread one of its parameters, because the parameter might not be a record.
+
 ## Records of any fields
 
 A rest-field, `*: T`, gives the type of every field that a record type

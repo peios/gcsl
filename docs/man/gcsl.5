@@ -98,7 +98,9 @@ Typed equality, is, and as compare and test the fields a rest-field covers.
 .PP
 An empty list needs an expected element type.
 Function signatures declare parameter and result types.
-General type parameters, intersections, and a None value are not supported.
+A type may declare type parameters, as in type Pair<A, B> = {first: A, second: B}; each use gives as many type arguments, as in Pair<Int, String>, and is the definition with them in place of the parameters.
+A type without parameters takes no type arguments, a generic type cannot refer to itself, and a type parameter cannot be spread.
+Intersections and a None value are not supported.
 .SH RECORD COMPOSITION
 Dotted fields such as server.host and server.port merge into an open nested record.
 A whole-field definition cannot be extended by a later dotted definition.
