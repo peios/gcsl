@@ -576,6 +576,27 @@
 //! arguments in any order; binding them to parameters is the checker's
 //! business.
 //!
+//! # Methods
+//!
+//! A method, `fn (RECV: TYPE) NAME(PARAMS) MARKER RET { BODY }` or the
+//! same with `def` (`Parser::parse_method`), is a function called on a value
+//! of its receiver's type, `xs.unique()`, rather than by a name: `fn` or
+//! `def`, the receiver in parentheses, one parameter written as any is but
+//! with no default, the method's name, its type parameters if it is
+//! generic, and then a function expression's parameters, marker, return
+//! type and body. Its item is a `let` of a name no source can write
+//! ([`crate::names::method_binding`]), its value the function, whose first
+//! parameter is the receiver, and the tree records it as a method
+//! ([`MethodDecl`], [`Ast::methods`]); a type parameter is in scope in the
+//! receiver too. `fn (` or `def (` starts a method when the token after
+//! the matching `)` is a name, so `fn (x: Int): Int { x }` is still a
+//! function expression. A method is an item of a file's outermost body only:
+//! elsewhere it is "a method is declared only at the top level of a file",
+//! at its keyword. A receiver list of no parameter is "expected the
+//! method's receiver", one of more than one "a method has one receiver",
+//! at the second, and a receiver with a default "a receiver takes no
+//! default", at the `=`.
+//!
 //! # Lists
 //!
 //! A list literal is `[`, elements separated by `,` with an optional
@@ -987,12 +1008,12 @@
 
 use crate::MAX_DEPTH;
 use crate::ast::{
-    Arg, ArgKind, ArgRange, Ast, AstBuilder, AttributeUse, BinaryOp, BuilderMark, DefTypeRole,
-    DefTypeUse, Effect, Element, Expr, ExprId, ExprKind, FieldDefault, FieldTy, FieldTyKind,
-    FnDecl, ForDecl, ForHead, GenericOwner, Generics, ImportDecl, ImportForm, ImportMember,
-    ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param, ParamTy, PathRange,
-    PathSegment, SegmentKind, StrPart, Syntax, TypeArgRange, TypeExpr, TypeExprId, TypeExprKind,
-    UnaryOp, path_span,
+    MethodDecl, Arg, ArgKind, ArgRange, Ast, AstBuilder, AttributeUse, BinaryOp, BuilderMark,
+    DefTypeRole, DefTypeUse, Effect, Element, Expr, ExprId, ExprKind, FieldDefault, FieldTy,
+    FieldTyKind, FnDecl, ForDecl, ForHead, GenericOwner, Generics, ImportDecl, ImportForm,
+    ImportMember, ImportName, Item, ItemId, ItemKind, ItemRange, Jump, Label, MetaTy, Param,
+    ParamTy, PathRange, PathSegment, SegmentKind, StrPart, Syntax, TypeArgRange, TypeExpr,
+    TypeExprId, TypeExprKind, UnaryOp, path_span,
 };
 use crate::diagnostic::Diagnostic;
 use crate::lexer::{self, MAX_ERRORS, Token, TokenKind, lex};
@@ -1055,6 +1076,10 @@ const TYPE: &str = "type";
 
 /// The error for a `type` item anywhere but in a file's outermost body.
 const MISPLACED_TYPE: &str = "`type` is declared only at the top level of a file";
+
+/// The error for a method anywhere but at a file's top level, at its
+/// keyword.
+const MISPLACED_METHOD: &str = "a method is declared only at the top level of a file";
 
 /// The name of the outer attribute that marks a declaration shadowable.
 const SHADOWABLE: &str = "shadowable";
@@ -1770,6 +1795,12 @@ impl Parser<'_> {
                     return Err(self.error(MISPLACED_TYPE, token.span));
                 }
                 self.parse_type_item(token)?
+            }
+            _ if self.starts_method(self.pos) => {
+                if inner {
+                    return Err(self.error(MISPLACED_METHOD, token.span));
+                }
+                self.parse_method(token)?
             }
             _ if self.starts_defmeta() => {
                 if inner {
@@ -3100,6 +3131,126 @@ impl Parser<'_> {
             }
         };
         self.finish_item(keyword, (kind, value), 0, shape)
+    }
+
+    /// Whether the tokens from `index` start a method (see
+    /// [Methods](#methods)): `fn` or `def`, `(`, and, after the `)` that
+    /// closes it, a name.
+    fn starts_method(&self, index: usize) -> bool {
+        if !matches!(self.token_at(index).kind, TokenKind::Fn | TokenKind::Def)
+            || self.token_at(index + 1).kind != TokenKind::LParen
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut at = index + 1;
+        loop {
+            match self.token_at(at).kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(self.token_at(at + 1).kind, TokenKind::Ident(_));
+                    }
+                }
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+
+    /// Parses a method, starting at its keyword, `keyword`, `fn` or `def`
+    /// (see [Methods](#methods)): its receiver, its name, its type
+    /// parameters and the rest of its function.
+    fn parse_method(&mut self, keyword: Token) -> ParseResult<(ItemId, u32)> {
+        self.advance();
+        // The type parameters are in scope from the receiver on.
+        let types = self.builder.type_count();
+        let receiver = self.parse_receiver()?;
+        let name_token = self.peek();
+        let TokenKind::Ident(name) = name_token.kind else {
+            let found = self.describe(name_token);
+            return Err(self.error(
+                format!("expected the method's name after its receiver, found {found}"),
+                error_span(name_token),
+            ));
+        };
+        self.advance();
+        let params = if self.peek().kind == TokenKind::Lt {
+            Some(self.parse_type_params()?)
+        } else {
+            None
+        };
+        let value = self.parse_fn_with(keyword, Some(receiver))?;
+        if let Some(params) = params
+            && let ExprKind::Fn(function) = self.builder.get(value).kind
+        {
+            self.builder.push_generics(Generics {
+                owner: GenericOwner::Fn(function),
+                params,
+                types: (types, self.builder.type_count()),
+            });
+        }
+        // The first ordinal of the name no method has yet, of this input or
+        // of an earlier one sharing the table.
+        let method = self.names.get(name).to_owned();
+        let mut ordinal = 0;
+        let text = loop {
+            let text = crate::names::method_binding(&method, ordinal);
+            if self.names.lookup(&text).is_none() {
+                break text;
+            }
+            ordinal += 1;
+        };
+        let binding = self.names.intern(&text);
+        let base = self.path.len();
+        self.path.push(PathSegment {
+            kind: SegmentKind::Name(binding),
+            span: name_token.span,
+        });
+        let (path, shape) = self.finish_path(base);
+        let kind = ItemKind::Let {
+            path,
+            ty: None,
+            value,
+            mutable: false,
+            function: true,
+        };
+        let (item, height) = self.finish_item(keyword, (kind, value), 0, shape)?;
+        self.builder.push_method(MethodDecl {
+            item,
+            name,
+            name_span: name_token.span,
+            binding,
+            public: keyword.kind == TokenKind::Def,
+        });
+        Ok((item, height))
+    }
+
+    /// Parses a method's receiver, at its `(`: one parameter, with no
+    /// default, and the `)` (see [Methods](#methods)).
+    fn parse_receiver(&mut self) -> ParseResult<Param> {
+        let open = self.peek();
+        self.advance();
+        if self.peek().kind == TokenKind::RParen {
+            return Err(self.error("expected the method's receiver", self.peek().span));
+        }
+        let base = self.param_stack.len();
+        let mut tallest = 0;
+        let closed = self.parse_param(open, &mut tallest)?;
+        let receiver = self.param_stack.drain(base..).next();
+        let Some(receiver) = receiver else {
+            return Err(self.error("expected the method's receiver", open.span));
+        };
+        if !closed {
+            let next = self.peek();
+            return Err(self.error("a method has one receiver", error_span(next)));
+        }
+        if let Some(default) = receiver.default {
+            return Err(self.error("a receiver takes no default", self.span_of(default)));
+        }
+        Ok(receiver)
     }
 
     /// Parses the type parameters of a generic function item, `<T, U>`, at
@@ -4734,8 +4885,15 @@ impl Parser<'_> {
     /// after the return type. The expression spans `keyword` through the
     /// body.
     fn parse_fn(&mut self, keyword: Token) -> ParseResult<ExprId> {
+        self.parse_fn_with(keyword, None)
+    }
+
+    /// As [`Parser::parse_fn`], with a method's `receiver`, if it is one's,
+    /// its first parameter (see [Methods](#methods)).
+    fn parse_fn_with(&mut self, keyword: Token, receiver: Option<Param>) -> ParseResult<ExprId> {
         let open = self.expect_fn_paren()?;
         let base = self.param_stack.len();
+        self.param_stack.extend(receiver);
         let mut tallest = 0;
         // A parameter that fails is skipped to its `,`, and the list goes
         // on, to fail at its end (see [Errors and
@@ -5966,7 +6124,10 @@ impl Parser<'_> {
             | TokenKind::Continue
             | TokenKind::Attribute(_)
             | TokenKind::InnerAttribute(_) => true,
-            TokenKind::Fn => matches!(self.token_at(index + 1).kind, TokenKind::Ident(_)),
+            TokenKind::Fn => {
+                matches!(self.token_at(index + 1).kind, TokenKind::Ident(_))
+                    || self.starts_method(index)
+            }
             _ => {
                 let at = std::mem::replace(&mut self.pos, index);
                 let item =

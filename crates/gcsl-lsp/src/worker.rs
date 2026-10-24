@@ -1535,6 +1535,7 @@ fn symbol_kind(kind: SymbolKind) -> lsp_types::SymbolKind {
         SymbolKind::Field => lsp_types::SymbolKind::FIELD,
         SymbolKind::Variable => lsp_types::SymbolKind::VARIABLE,
         SymbolKind::Function => lsp_types::SymbolKind::FUNCTION,
+        SymbolKind::Method => lsp_types::SymbolKind::METHOD,
         SymbolKind::Type => lsp_types::SymbolKind::STRUCT,
         SymbolKind::Module => lsp_types::SymbolKind::MODULE,
         SymbolKind::Definition => lsp_types::SymbolKind::OBJECT,

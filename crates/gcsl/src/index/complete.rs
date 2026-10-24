@@ -671,7 +671,8 @@ impl Index {
             let ItemKind::Let { path, function, .. } = it.kind else {
                 continue;
             };
-            if !function && it.span.end >= offset {
+            // A method is named by no variable.
+            if (!function && it.span.end >= offset) || ast.method(item).is_some() {
                 continue;
             }
             let Some((name, at)) = first_segment(ast.path(path)) else {

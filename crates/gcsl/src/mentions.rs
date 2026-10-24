@@ -210,6 +210,15 @@
 //! to it. The reads of types by name, in annotations, ascriptions,
 //! parameters, function types and `type` items alike, are listed apart
 //! ([`type_reads`]), for the workspace to resolve and expand.
+//!
+//! # Methods
+//!
+//! A method (see the parser's [Methods](crate::parser#methods)) is a
+//! top-level function of the input, under its binding's name, which no
+//! source can write, so it is found, grouped and scheduled as any `fn` is.
+//! Which method a call `x.m(...)` means depends on `x`'s type, which is not
+//! known here, so a call of a field named `m`, of whatever, mentions every
+//! method of the input named `m`: conservatively, as a call of each.
 
 use std::collections::HashMap;
 use std::mem;
@@ -1631,6 +1640,16 @@ impl Walker<'_> {
             .dotted_defs_under(node, &mut |function| found.push((function, span)));
     }
 
+    /// Records, as mentioned at `span`, the binding of every method of the
+    /// file named `name`, which a call of a field of the name may mean (see
+    /// [Methods](#methods)).
+    fn method_calls(&mut self, name: Name, span: Span) {
+        let ast = self.ast;
+        for method in ast.methods().iter().filter(|method| method.name == name) {
+            self.function_name(method.binding, span);
+        }
+    }
+
     /// Records `name`, read as a variable at `span`, if it is a top-level
     /// function's and nothing shadows it.
     fn function_name(&mut self, name: Name, span: Span) {
@@ -1845,6 +1864,11 @@ impl Walker<'_> {
             ExprKind::Lazy(function) => self.expr(ast.fn_decl(function).body),
             ExprKind::Call { callee, args } | ExprKind::Unclosed { callee, args } => {
                 self.expr(callee);
+                // A call of a field may be a method's: it mentions every
+                // method of the file of the name (see [Methods](#methods)).
+                if let ExprKind::Field { name, .. } = ast.get(callee).kind {
+                    self.method_calls(name, ast.get(callee).span);
+                }
                 for arg in ast.args(args) {
                     self.expr(arg.value);
                 }

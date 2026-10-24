@@ -146,6 +146,8 @@ After a named argument, a name alone, as in f(x, out = 1, compiler), is shorthan
 A trailing block supplies the final parameter.
 A named function may declare type parameters after its name, as in fn first<T>(items: List<T>, fallback: T): T; each call infers them from its arguments' types.
 A value of a type parameter can be passed, returned and stored, and nothing else; a generic function must be called, not used as a value.
+A method is declared at the top level with its receiver before its name, as in fn (n: Int) twice(): Int, and called on a value, as in 21.twice(); the method whose receiver type fits the value's type is chosen, the most specific when several fit.
+A method has no name of its own; a field and a method of one name that both apply are an error.
 Parameter defaults belong to a function declaration, not a written function type.
 A default may be any expression; it sees the parameters before it and the scope the function is written in, has the function's effect, and is evaluated for each call that leaves its parameter out, after the written arguments and before the body.
 Only a call that names the function directly gives defaults.

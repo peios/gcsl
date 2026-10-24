@@ -5558,3 +5558,17 @@ fn a_generic_function_passes_any_value_through() {
                 }\nr = last([1, 2, 3], 0, 0)";
     assert_eq!(fields(text)[0].to_string(), "3");
 }
+
+#[test]
+fn a_method_call_passes_its_receiver_first() {
+    let text = "fn (x: Int) add(y: Int = 10, z: Int = x * 2): Int { x + y + z }\n\
+                fn (x: Int) fact(): Int { if x <= 1 { 1 } else { x * (x - 1).fact() } }\n\
+                fn (xs: List<T>) first<T>(fallback: T): T { if len(xs) > 0 { xs[0] } else { fallback } }\n\
+                fn later() -> Int { 5 }\n\
+                def (x: Int) inc() -> Int { x + 1 }\n\
+                fn outer(n: Int): Int { n.add(0, 0) }\n\
+                a = 3.add()\nb = 3.add(1)\nc = 3.add(y = 5)\nd = 5.fact()\n\
+                e = [4, 5].first(0)\nf = [\"x\"].first(\"none\")\ng = await (lazy later()).inc()\nh = outer(7)";
+    let shown: Vec<String> = fields(text).iter().map(ToString::to_string).collect();
+    assert_eq!(shown, ["19", "10", "14", "120", "4", "x", "6", "7"]);
+}

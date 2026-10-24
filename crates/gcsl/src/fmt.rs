@@ -289,6 +289,9 @@ struct Facts {
     path_ends: HashSet<usize>,
     /// The `*` of every rest-field, which is no operator.
     rests: HashSet<usize>,
+    /// The keyword of every method, `fn` or `def`, spaced from its
+    /// receiver's `(` as no function expression's `fn` is.
+    methods: HashSet<usize>,
 }
 
 impl Facts {
@@ -383,7 +386,7 @@ impl Facts {
                 _ => {}
             }
         }
-        generic_angles(ast, input, &mut facts.angles);
+        declaration_facts(input, &mut facts);
         for (_, used) in ast.def_types() {
             let path = crate::ast::path_span(ast.path(used.path));
             facts
@@ -896,10 +899,9 @@ impl<'a> Printer<'a> {
                     K::Ident(_)
                         | K::RParen
                         | K::RBracket
-                        | K::Fn
                         | K::AttributeArgs(_)
                         | K::InnerAttributeArgs(_)
-                )
+                ) || (p == K::Fn && !self.facts.methods.contains(&prev))
             } else {
                 matches!(
                     p,
@@ -1167,11 +1169,18 @@ fn internal(message: &'static str) -> Diagnostic {
     .into()
 }
 
-/// Adds to `angles` the brackets of each generic function's type
-/// parameters in `ast`, `<T, U>`, which are bracketed as type arguments
-/// are: the token before its first parameter and the first `>` after its
-/// last.
-fn generic_angles(ast: &Ast, input: &Input<'_>, angles: &mut HashSet<usize>) {
+/// Adds to `facts` what the declarations of `input`'s tree say: the
+/// brackets of each generic function's or type's parameters, `<T, U>`,
+/// which are bracketed as type arguments are, the token before its first
+/// parameter and the first `>` after its last; and the keyword of each
+/// method.
+fn declaration_facts(input: &Input<'_>, facts: &mut Facts) {
+    let ast = &input.ast;
+    for method in ast.methods() {
+        let start = ast.item(method.item).span.start;
+        facts.methods.extend(input.token_at(start, TokenKind::Fn));
+    }
+    let angles = &mut facts.angles;
     for generics in ast.all_generics() {
         let (Some(first), Some(last)) = (generics.params.first(), generics.params.last()) else {
             continue;
@@ -1211,6 +1220,24 @@ mod tests {
         for &(input, expected) in cases {
             assert_eq!(fmt(input), expected, "formatting {input:?}");
         }
+    }
+
+    #[test]
+    fn a_method_s_keyword_is_spaced_from_its_receiver() {
+        check(&[
+            (
+                "fn (x:Int)twice():Int { x*2 }\n",
+                "fn (x: Int) twice(): Int { x * 2 }\n",
+            ),
+            (
+                "def ( xs: List<T> ) first<T>( fallback: T ): T { fallback }\n",
+                "def (xs: List<T>) first<T>(fallback: T): T { fallback }\n",
+            ),
+            (
+                "f = fn (x: Int): Int { x }\n",
+                "f = fn(x: Int): Int { x }\n",
+            ),
+        ]);
     }
 
     #[test]

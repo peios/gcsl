@@ -11,6 +11,20 @@
 //! one table for its whole lifetime and lends it to each input, so equal
 //! names in different inputs are equal `Name`s.
 //!
+//! # Method bindings
+//!
+//! A method (`def (xs: List<T>) unique<T>(): List<T>`) binds no name a
+//! source can read: it is called on a value of its receiver type, never
+//! named. Its function is still a binding of its file, so that it is
+//! declared, checked, captured and lowered as a top-level `fn` is, of a
+//! name no source can write, `<method unique@0>` ([`method_binding`]): its
+//! name and an ordinal, the first that makes a name the table does not
+//! hold yet. A session's inputs share one table, so no two methods of a
+//! session have one binding, and a later input finds an earlier one's
+//! methods among the bindings it inherits ([`binding_method`]). A name
+//! holding `<` and `@` but no `#` is neither kind of namespace key, so a
+//! method's binding is never mistaken for one.
+//!
 //! # Namespace keys
 //!
 //! The definitions made with a def-type (`def package x() { ... }`) are kept
@@ -200,6 +214,30 @@ pub fn key_meta(text: &str) -> Option<&str> {
 #[must_use]
 pub fn is_namespace_key(text: &str) -> bool {
     key_def_type(text).is_some() || key_meta(text).is_some()
+}
+
+/// The text of the name of the binding of the method `name` of a file or
+/// session input, its `ordinal`-th method (see [Method
+/// bindings](#method-bindings)): `<method name@ordinal>`.
+#[must_use]
+pub fn method_binding(name: &str, ordinal: u32) -> String {
+    format!("<method {name}@{ordinal}>")
+}
+
+/// Whether `text` is the name of a method's binding (see [Method
+/// bindings](#method-bindings)).
+#[must_use]
+pub fn is_method_binding(text: &str) -> bool {
+    binding_method(text).is_some()
+}
+
+/// The name of the method whose binding's name is `text`, if it is one's:
+/// `unique` for `<method unique@0>` (see [Method bindings](#method-bindings)).
+#[must_use]
+pub fn binding_method(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix("<method ")?.strip_suffix('>')?;
+    let (name, ordinal) = inner.rsplit_once('@')?;
+    (!ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit())).then_some(name)
 }
 
 /// The path of names `path`, as a diagnostic shows it: joined by `.`, but a

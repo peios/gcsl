@@ -1314,6 +1314,59 @@
 //! through any parentheses, is "a generic function must be called"
 //! (`Checker::called_if_generic`): a value of it would bind nothing.
 //!
+//! # Methods
+//!
+//! A method (see the parser's [Methods](crate::parser#methods)) is a
+//! top-level function of its input under a binding no source can write,
+//! declared, grouped, checked, captured and lowered as a `fn` is (see [Top-level
+//! functions](#top-level-functions)), its receiver its first parameter.
+//! As the input starts, once its functions are declared, its methods are
+//! checked (`Checker::check_methods`): one whose receiver type is a record
+//! type with a field of its name is "method `m` has the name of a field of
+//! its receiver type T", and one whose receiver type and an earlier one's
+//! of its name each fit the other's, the same type, "method `m` is
+//! declared twice for type T".
+//!
+//! A method is *visible* to an input if the input declares it, or, in a
+//! session, an earlier input did: those are found among the bindings the
+//! input inherits, by their names (`Checker::find_earlier_methods`). A
+//! call whose callee is a field access, `x.m(...)`, of a name some method
+//! visible has (`Checker::check_field_call`), is a reference to a
+//! top-level field or a member of `fileroot` if it is one, called as any
+//! callee is. Otherwise its receiver `x` is checked first, measured, an
+//! integer literal settled to `Int`; a method *applies* if the receiver's
+//! type, stripped of its lazy layers, fits the method's receiver type,
+//! stripped too, once each type parameter that type mentions is bound by
+//! the receiver's as a call binds it (`Checker::method_applies`). Then:
+//!
+//! - a receiver type with a field `m` (or a meta, which has fields) and a
+//!   method that applies is "`m` is both a field of T and a method";
+//! - a receiver type with a field `m` is a call of the field, as without
+//!   methods;
+//! - a receiver type with neither is "no method `m` for type T", noting
+//!   the receiver types of the visible methods of the name;
+//! - of the methods that apply, the one whose receiver type fits every
+//!   other's is called (`Checker::most_specific`): `List<Int>`'s over
+//!   `List<T>`'s for a `List<Int>`; none such is "method `m` is ambiguous
+//!   for type T", and several, whose receiver types are one type, "method
+//!   `m` is declared twice for type T".
+//!
+//! The call of the method chosen (`Checker::call_method`) reads its
+//! binding as its callee, as a call of a function by its name does, so a
+//! call of a method of the input is of a known callee, which gives each
+//! parameter left out its default, and of an earlier input's too. A generic
+//! method's type parameters are bound by the receiver first and then the
+//! arguments (`Checker::instantiate`); the receiver is expected to fit
+//! the receiver parameter, its await reported as an argument's is; and the
+//! arguments are bound to the parameters after it
+//! (`Checker::bind_call`), their positions recorded from 1. The call is
+//! recorded for lowering with its receiver
+//! ([`Resolution::method_receiver`]), which lowers it as a call of the
+//! binding with the receiver its first argument. A method is never a
+//! value: its name alone is no variable, and `x.m` without a call reads a
+//! field. An empty list, `[]`, is no receiver: its type is found before
+//! any method is chosen, so it is "cannot infer the element type of `[]`".
+//!
 //! # Attributes
 //!
 //! An attribute says how to run a function, for the host that runs it or
@@ -3872,10 +3925,10 @@ pub enum ParamDefault {
     },
 }
 
-/// What the checker keeps of generic functions and their calls (see
-/// [Generics](#generics)).
+/// What the checker keeps of generic functions, methods and their calls
+/// (see [Generics](#generics) and [Methods](#methods)).
 #[derive(Debug, Default)]
-struct GenericsChecked {
+struct CallsChecked {
     /// What the type parameters of each generic function and `type` item
     /// belong to, made once for it.
     ids: HashMap<GenericOwner, GenericId>,
@@ -3886,6 +3939,9 @@ struct GenericsChecked {
     /// The callee of the call being checked, through any parentheses: the
     /// one place a generic function's name may be read.
     callee: Option<ExprId>,
+    /// The methods of the earlier inputs of a session, by their names, each
+    /// with its binding's.
+    earlier_methods: HashMap<Name, Vec<Name>>,
 }
 
 /// What a call of a generic function has bound of its type parameters so
@@ -3911,6 +3967,32 @@ struct ForLowering {
     /// Each record literal given fields' defaults, by its id: see
     /// [`Resolution::record_fills`].
     record_fills: RecordFills,
+    /// Each call of a method, by its id, with its receiver: see
+    /// [`Resolution::method_receiver`].
+    method_calls: HashMap<ExprId, ExprId>,
+}
+
+/// A method a call of its name may mean (see [Methods](#methods)).
+#[derive(Clone, Copy, Debug)]
+struct MethodCandidate {
+    /// Its binding, read as a top-level function's is.
+    binding: Name,
+    /// Its function's type, the receiver its first parameter.
+    ty: TyId,
+    /// Where its name is declared, if in this input.
+    span: Option<Span>,
+}
+
+/// How a call's arguments bind to its callee's parameters beyond what the
+/// call shows (see [`Checker::bind_call`]): the callee, if it is known, and
+/// how many of its first parameters the call fills apart from its argument
+/// list, a method's receiver.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    /// The callee, if it is known.
+    known: Option<KnownCallee>,
+    /// The number of the parameter the signature bound starts at.
+    offset: usize,
 }
 
 /// One attribute of a function item, resolved (see [Attributes](#attributes)):
@@ -4215,6 +4297,9 @@ pub struct Resolution {
     /// such parameter and its default, in parameter order (see
     /// [Calls](#calls)); only a program with one has entries.
     call_defaults: HashMap<ExprId, Box<[(u32, ParamDefault)]>>,
+    /// Each call of a method, by its id, with its receiver, its callee's
+    /// parameter 0 (see [Methods](#methods)).
+    method_calls: HashMap<ExprId, ExprId>,
     /// The attributes of each function item that has any, by its function,
     /// in source order (see [Attributes](#attributes)).
     fn_attributes: HashMap<FnId, Box<[Attribute]>>,
@@ -4308,6 +4393,15 @@ impl Resolution {
     #[must_use]
     pub fn call_defaults(&self, id: ExprId) -> &[(u32, ParamDefault)] {
         self.call_defaults.get(&id).map_or(&[], |defaults| defaults)
+    }
+
+    /// The receiver of the call `id`, if it is a method's (see
+    /// [Methods](#methods)): its callee's parameter 0, the callee itself
+    /// read as its method's binding, not as the field access it is written
+    /// as.
+    #[must_use]
+    pub fn method_receiver(&self, id: ExprId) -> Option<ExprId> {
+        self.method_calls.get(&id).copied()
     }
 
     /// The attributes of function `function`, in source order: none for a
@@ -4613,6 +4707,7 @@ impl Resolution {
             meta_reads: HashMap::new(),
             metas: Vec::new(),
             call_defaults: HashMap::new(),
+            method_calls: HashMap::new(),
             fn_attributes: HashMap::new(),
             record_fills: HashMap::new(),
         }
@@ -5972,8 +6067,8 @@ pub struct Checker<'a> {
     scope_known: Vec<Option<Rc<KnownParams>>>,
     /// What the check gives lowering besides types and slots.
     lowering: ForLowering,
-    /// What the check keeps of generic functions and their calls.
-    generics: GenericsChecked,
+    /// What the check keeps of generic functions, methods and their calls.
+    calls: CallsChecked,
     /// What the input's top-level items mention, and the groups of its
     /// top-level functions (see [`crate::mentions`]).
     mentions: Mentions,
@@ -6270,7 +6365,7 @@ impl<'a> Checker<'a> {
             bindings: scope.bindings,
             scope_known: scope.known,
             lowering: ForLowering::default(),
-            generics: GenericsChecked::default(),
+            calls: CallsChecked::default(),
             mentions: Mentions::default(),
             workspace: None,
             imported_callees: HashMap::new(),
@@ -6388,7 +6483,7 @@ impl<'a> Checker<'a> {
         // A workspace has checked the file's `type` items already, before
         // any file's check ([`check_types`]): they are resolved quietly.
         self.check_declarations();
-        self.declare_top_fns();
+        self.declare_top_level();
         let ty = self.check_body(root, None);
         // Finalisation: an integer result with no context defaults to Int.
         self.coerce_result(root, TyId::INT);
@@ -6470,6 +6565,7 @@ impl<'a> Checker<'a> {
                 meta_reads: self.meta_reads,
                 metas: self.metas,
                 call_defaults: self.lowering.call_defaults,
+                method_calls: self.lowering.method_calls,
                 fn_attributes: self.lowering.fn_attributes,
                 record_fills: self.lowering.record_fills,
             },
@@ -12944,7 +13040,7 @@ impl<'a> Checker<'a> {
     /// What the type parameters of the generic function or `type` item
     /// `owner` belong to, made the first time it is asked for.
     fn generic_of(&mut self, owner: GenericOwner) -> GenericId {
-        if let Some(&generic) = self.generics.ids.get(&owner) {
+        if let Some(&generic) = self.calls.ids.get(&owner) {
             return generic;
         }
         let names: Box<[Name]> = self
@@ -12953,7 +13049,7 @@ impl<'a> Checker<'a> {
             .map(|generics| generics.params.iter().map(|&(name, _)| name).collect())
             .unwrap_or_default();
         let generic = self.types.new_generic(names);
-        self.generics.ids.insert(owner, generic);
+        self.calls.ids.insert(owner, generic);
         generic
     }
 
@@ -13711,7 +13807,7 @@ impl<'a> Checker<'a> {
         (site, filling): (AwaitSite, Option<(FnId, usize)>),
     ) -> TyId {
         // Checked already, to infer a call's type parameters.
-        if let Some(found) = self.generics.prechecked.remove(&id) {
+        if let Some(found) = self.calls.prechecked.remove(&id) {
             self.expect_at(id, found, expected, (context, why), (site, filling));
             return found;
         }
@@ -14461,7 +14557,7 @@ impl<'a> Checker<'a> {
             .types
             .fn_sig(ty)
             .is_some_and(|sig| sig.generic.is_some());
-        if !named || !generic || self.generics.callee == Some(id) {
+        if !named || !generic || self.calls.callee == Some(id) {
             return ty;
         }
         self.errors.push(
@@ -16151,6 +16247,14 @@ impl<'a> Checker<'a> {
     /// records what it gives each position (see
     /// [`Checker::record_argument`]), and is not a use of it as a value.
     fn check_call(&mut self, id: ExprId, callee: ExprId, args: ArgRange) -> TyId {
+        if let ExprKind::Field {
+            expr: receiver,
+            name,
+        } = self.ast.get(callee).kind
+            && self.sees_method(name)
+        {
+            return self.check_field_call(id, (callee, receiver, name), args);
+        }
         // TEMPORARY (alias rule): the callee of a call may be a built-in whose typing is special,
         // or an alias of one (see the [inference
         // limits](https://learn.peios.org/gcsl/language/inference-limits/)); the call is then typed
@@ -16162,10 +16266,23 @@ impl<'a> Checker<'a> {
         while let ExprKind::Paren(inner) = self.ast.get(unparened).kind {
             unparened = inner;
         }
-        let outer_generic = self.generics.callee.replace(unparened);
+        let outer_generic = self.calls.callee.replace(unparened);
         let (callee_ty, callback) = self.check_callee(callee);
-        self.generics.callee = outer_generic;
+        self.calls.callee = outer_generic;
         (self.alias_site, self.call_site) = (outer, outer_call);
+        self.call_of(id, (callee, callee_ty, callback), args)
+    }
+
+    /// Types the call `id` of `callee`, already checked, of type
+    /// `callee_ty`, with the arguments `args`, as [`Checker::check_call`]
+    /// does: a call of a built-in by its own rule, a call of anything else
+    /// by its function type.
+    fn call_of(
+        &mut self,
+        id: ExprId,
+        (callee, callee_ty, callback): (ExprId, TyId, Option<usize>),
+        args: ArgRange,
+    ) -> TyId {
         if let TyKind::Builtin(builtin) = *self.types.kind(callee_ty) {
             return self.check_builtin_call(id, (callee, builtin), args);
         }
@@ -16202,13 +16319,21 @@ impl<'a> Checker<'a> {
             return TyId::ERROR;
         };
         let sig = match sig.generic {
-            Some(generic) => match self.instantiate((id, callee), args, &sig, generic) {
+            Some(generic) => match self.instantiate((id, callee), (args, None), &sig, generic) {
                 Some(sig) => sig,
                 None => return TyId::ERROR,
             },
             None => sig,
         };
         let erroneous = self.bind_arguments(id, (callee, callee_ty, callback), args, &sig);
+        self.call_effect(id, (callee, callee_ty), &sig);
+        if erroneous { TyId::ERROR } else { sig.ret }
+    }
+
+    /// Records that the call `id` of `callee`, of type `callee_ty` and
+    /// signature `sig`, is impure if its callee is, and reports it in a pure
+    /// function: "cannot call an impure function from a pure function".
+    fn call_effect(&mut self, id: ExprId, (callee, callee_ty): (ExprId, TyId), sig: &FnTy) {
         if sig.effect != Effect::Pure {
             self.impure_calls.insert(id);
         }
@@ -16231,14 +16356,402 @@ impl<'a> Checker<'a> {
                 ),
             );
         }
+    }
+
+    /// Declares the input's top-level functions, its methods among them,
+    /// as it starts, and checks its methods' declarations.
+    fn declare_top_level(&mut self) {
+        self.declare_top_fns();
+        self.calls.earlier_methods = self.find_earlier_methods();
+        self.check_methods();
+    }
+
+    /// Checks the input's methods as their bindings are declared (see
+    /// [Methods](#methods)): one whose receiver type is a record type with a
+    /// field of its name is "method `m` has the name of a field of its
+    /// receiver type", and one whose receiver type is the same type as an
+    /// earlier one's of its name, each fitting the other's, "method `m` is
+    /// declared twice for type T", labelled "first declared here".
+    fn check_methods(&mut self) {
+        let methods = self.ast.methods();
+        for (index, method) in methods.iter().enumerate() {
+            let Some((_, binding)) = self.lookup(method.binding) else {
+                continue;
+            };
+            let receiver = self.receiver_of(binding.ty);
+            if receiver == TyId::ERROR {
+                continue;
+            }
+            if self.types.is_record(receiver) && self.types.field(receiver, method.name).is_some() {
+                let text = FieldName(self.ast.names().get(method.name));
+                let shown = self.in_message(receiver);
+                self.errors.push(Diagnostic::error(
+                    format!("method `{text}` has the name of a field of its receiver type {shown}"),
+                    method.name_span,
+                ));
+            }
+            for earlier in methods
+                .iter()
+                .take(index)
+                .filter(|earlier| earlier.name == method.name)
+            {
+                let Some((_, earlier_binding)) = self.lookup(earlier.binding) else {
+                    continue;
+                };
+                let earlier_receiver = self.receiver_of(earlier_binding.ty);
+                if self.method_applies(receiver, earlier_binding.ty)
+                    && self.method_applies(earlier_receiver, binding.ty)
+                {
+                    let text = self.ast.names().get(method.name);
+                    let shown = self.in_message(receiver);
+                    self.errors.push(
+                        Diagnostic::error(
+                            format!("method `{text}` is declared twice for type {shown}"),
+                            method.name_span,
+                        )
+                        .with_context(earlier.name_span, "first declared here"),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Whether a method named `name` is visible to the input (see
+    /// [Methods](#methods)).
+    fn sees_method(&self, name: Name) -> bool {
+        self.ast.methods().iter().any(|method| method.name == name)
+            || self.calls.earlier_methods.contains_key(&name)
+    }
+
+    /// The methods named `name` visible to the input (see
+    /// [Methods](#methods)): its own, whose bindings are declared, and an
+    /// earlier session input's.
+    fn method_candidates(&self, name: Name) -> Vec<MethodCandidate> {
+        let own = self
+            .ast
+            .methods()
+            .iter()
+            .filter(|method| method.name == name)
+            .map(|method| (method.binding, Some(method.name_span)));
+        let earlier = self
+            .calls
+            .earlier_methods
+            .get(&name)
+            .into_iter()
+            .flatten()
+            .map(|&binding| (binding, None));
+        own.chain(earlier)
+            .filter_map(|(binding_name, span)| {
+                let (_, binding) = self.lookup(binding_name)?;
+                Some(MethodCandidate {
+                    binding: binding_name,
+                    ty: binding.ty,
+                    span,
+                })
+            })
+            .collect()
+    }
+
+    /// The methods of the earlier inputs of a session the input inherits,
+    /// by their names, each with its binding's (see [Methods](#methods)):
+    /// its bindings before its own top-level ones are those it inherits.
+    fn find_earlier_methods(&self) -> HashMap<Name, Vec<Name>> {
+        let names = self.ast.names();
+        let mut found: HashMap<Name, Vec<Name>> = HashMap::new();
+        for binding in self.bindings.iter().take(self.top_start) {
+            let Some(method) = crate::names::binding_method(names.get(binding.name)) else {
+                continue;
+            };
+            if let Some(name) = names.lookup(method) {
+                found.entry(name).or_default().push(binding.name);
+            }
+        }
+        found
+    }
+
+    /// Types the call `id` of `callee`, `receiver.name`, with the arguments
+    /// `args`, a method of the name being visible (see [Methods](#methods)):
+    /// a reference to a top-level field, or a member of `fileroot`, is
+    /// called as any callee is; otherwise the receiver is checked, and the
+    /// call is of the field of its type if it has one, or of the method of
+    /// the name that applies to it, the most specific of those that do.
+    fn check_field_call(
+        &mut self,
+        id: ExprId,
+        (callee, receiver, name): (ExprId, ExprId, Name),
+        args: ArgRange,
+    ) -> TyId {
+        let span = self.ast.get(callee).span;
+        let outer = self.alias_site.replace(callee);
+        let outer_call = self.call_site.replace(callee);
+        let imports = self.workspace.is_some_and(Context::has_view);
+        let reference = if self.mentions.tree.nodes.is_empty() && !imports {
+            None
+        } else {
+            self.field_reference(callee)
+        };
+        let early = match reference {
+            Some(ty) => Some(self.builtin_use(callee, ty, span)),
+            None => self.fileroot_lacks(callee, receiver, name),
+        };
+        (self.alias_site, self.call_site) = (outer, outer_call);
+        if let Some(ty) = early {
+            self.expr_types[callee.index()] = ty;
+            return self.call_of(id, (callee, ty, None), args);
+        }
+        let found = self.check_expr(receiver);
+        let found = self.measure(receiver, found);
+        let found = if found == TyId::UNTYPED_INT {
+            self.settle(receiver, found)
+        } else {
+            found
+        };
+        let candidates = if found == TyId::ERROR || found == self.never {
+            Vec::new()
+        } else {
+            self.method_candidates(name)
+        };
+        let applicable: Vec<MethodCandidate> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| self.method_applies(found, candidate.ty))
+            .collect();
+        let present = self.types.strip(found);
+        let has_field = self
+            .types
+            .fn_sig(present)
+            .and_then(|sig| sig.meta)
+            .is_some()
+            || self.field_of(present, name).is_some();
+        if has_field && !applicable.is_empty() {
+            let shown = self.in_message(found);
+            let text = FieldName(self.ast.names().get(name));
+            let at = self.ast.get(callee).member_span(self.ast).unwrap_or(span);
+            let mut error = Diagnostic::error(
+                format!("`{text}` is both a field of {shown} and a method"),
+                at,
+            );
+            for span in applicable.iter().filter_map(|candidate| candidate.span) {
+                error = error.with_context(span, "the method is declared here");
+            }
+            self.errors.push(error);
+            return self.args_alone(args);
+        }
+        if has_field || candidates.is_empty() {
+            let ty = self.field_access(callee, (receiver, found), name);
+            self.expr_types[callee.index()] = ty;
+            return self.call_of(id, (callee, ty, None), args);
+        }
+        if applicable.is_empty() {
+            self.no_method(callee, (found, name), &candidates);
+            return self.args_alone(args);
+        }
+        match self.most_specific(callee, (found, name), &applicable) {
+            Some(method) => self.call_method(id, (callee, receiver, found), args, method),
+            None => self.args_alone(args),
+        }
+    }
+
+    /// Checks each of the arguments `args` alone, as a call that fails
+    /// before binding them does, and returns `Error`.
+    fn args_alone(&mut self, args: ArgRange) -> TyId {
+        for arg in self.ast.args(args) {
+            self.check_alone(arg.value);
+        }
+        TyId::ERROR
+    }
+
+    /// Whether the method of type `method` applies to a receiver of type
+    /// `found` (see [Methods](#methods)): `found`, its lazy layers stripped,
+    /// fits the method's receiver type, stripped too, once each type
+    /// parameter that type mentions is bound by `found`, as a call binds it
+    /// ([`TypeTable::bind`]); one it leaves unbound, and so no fit.
+    fn method_applies(&mut self, found: TyId, method: TyId) -> bool {
+        let Some(sig) = self.types.fn_sig(method).cloned() else {
+            return false;
+        };
+        let Some(&(_, receiver)) = sig.params.first() else {
+            return false;
+        };
+        let present = self.types.strip(found);
+        let expected = match sig.generic {
+            Some(generic) => {
+                let count = self.types.generic_names(generic).len();
+                let mut bound = vec![None; count];
+                self.types.bind(receiver, present, generic, &mut bound);
+                let mut args = Vec::with_capacity(count);
+                for (index, binding) in (0u8..).zip(bound) {
+                    args.push(binding.unwrap_or_else(|| self.types.param(generic, index)));
+                }
+                let substituted = self.types.substitute(receiver, generic, &args);
+                if self.types.mentions(substituted, generic) {
+                    return false;
+                }
+                substituted
+            }
+            None => receiver,
+        };
+        let expected = self.types.strip(expected);
+        expected != TyId::ERROR && self.types.is_subtype(present, expected)
+    }
+
+    /// The method of `applicable`, those named `name` that apply to a
+    /// receiver of type `found`, that a call through `callee` means (see
+    /// [Methods](#methods)): the one whose receiver type fits every other's.
+    /// None is "method `m` is ambiguous for type T", several, whose receiver
+    /// types fit each other's and so are one type, "method `m` is declared
+    /// twice for type T"; both reported, and then `None`.
+    fn most_specific(
+        &mut self,
+        callee: ExprId,
+        (found, name): (TyId, Name),
+        applicable: &[MethodCandidate],
+    ) -> Option<MethodCandidate> {
+        let mut winners = Vec::new();
+        for (index, candidate) in applicable.iter().enumerate() {
+            let receiver = self.receiver_of(candidate.ty);
+            let mut fits_all = true;
+            for (other, method) in applicable.iter().enumerate() {
+                if other != index && !self.method_applies(receiver, method.ty) {
+                    fits_all = false;
+                    break;
+                }
+            }
+            if fits_all {
+                winners.push(*candidate);
+            }
+        }
+        if let [only] = winners[..] {
+            return Some(only);
+        }
+        let shown = self.in_message(found);
+        let text = self.ast.names().get(name);
+        let callee_expr = self.ast.get(callee);
+        let at = callee_expr
+            .member_span(self.ast)
+            .unwrap_or(callee_expr.span);
+        let error = if winners.is_empty() {
+            let mut error =
+                Diagnostic::error(format!("method `{text}` is ambiguous for type {shown}"), at)
+                    .with_note("no receiver type of the methods that apply fits all the others");
+            for span in applicable.iter().filter_map(|candidate| candidate.span) {
+                error = error.with_context(span, "this applies");
+            }
+            error
+        } else {
+            let mut error = Diagnostic::error(
+                format!("method `{text}` is declared twice for type {shown}"),
+                at,
+            );
+            for span in winners.iter().filter_map(|candidate| candidate.span) {
+                error = error.with_context(span, "declared here");
+            }
+            error
+        };
+        self.errors.push(error);
+        None
+    }
+
+    /// The receiver type of the method of type `method`, its first
+    /// parameter's, stripped; `Error` if it has none.
+    fn receiver_of(&self, method: TyId) -> TyId {
+        self.types
+            .fn_sig(method)
+            .and_then(|sig| sig.params.first())
+            .map_or(TyId::ERROR, |&(_, receiver)| self.types.strip(receiver))
+    }
+
+    /// Reports the call through `callee` of the method `name` on a receiver
+    /// of type `found`, to which none of `candidates`, the visible methods
+    /// of the name, applies: "no method `m` for type T", noting their
+    /// receiver types.
+    fn no_method(
+        &mut self,
+        callee: ExprId,
+        (found, name): (TyId, Name),
+        candidates: &[MethodCandidate],
+    ) {
+        let shown = self.in_message(found);
+        let text = self.ast.names().get(name);
+        let callee_expr = self.ast.get(callee);
+        let at = callee_expr
+            .member_span(self.ast)
+            .unwrap_or(callee_expr.span);
+        let receivers: Vec<String> = candidates
+            .iter()
+            .map(|candidate| {
+                let receiver = self.receiver_of(candidate.ty);
+                self.in_message(receiver)
+            })
+            .collect();
+        let note = match &receivers[..] {
+            [one] => format!("the visible method `{text}` is for {one}"),
+            many => format!("the visible methods `{text}` are for {}", many.join(", ")),
+        };
+        self.errors.push(
+            Diagnostic::error(format!("no method `{text}` for type {shown}"), at).with_note(note),
+        );
+    }
+
+    /// Types the call `id` of `callee`, `receiver.NAME`, the receiver of
+    /// type `found`, as a call of `method` with the receiver its first
+    /// argument and `args` the rest (see [Methods](#methods)): the callee
+    /// read as the method's binding, a generic method's type parameters
+    /// bound by the receiver and then the arguments, the receiver expected
+    /// to fit its parameter, and the arguments bound to the parameters
+    /// after it, defaults included, as a call by the function's own name.
+    fn call_method(
+        &mut self,
+        id: ExprId,
+        (callee, receiver, found): (ExprId, ExprId, TyId),
+        args: ArgRange,
+        method: MethodCandidate,
+    ) -> TyId {
+        let span = self.ast.get(callee).span;
+        let (method_ty, _) = self.use_name(callee, method.binding, span);
+        self.expr_types[callee.index()] = method_ty;
+        let Some(sig) = self.types.fn_sig(method_ty).cloned() else {
+            return self.args_alone(args);
+        };
+        let sig = match sig.generic {
+            Some(generic) => {
+                let receiver = Some((receiver, found));
+                match self.instantiate((id, callee), (args, receiver), &sig, generic) {
+                    Some(sig) => sig,
+                    None => return TyId::ERROR,
+                }
+            }
+            None => sig,
+        };
+        let known =
+            self.lookup(method.binding)
+                .and_then(|(index, binding)| match binding.function {
+                    Some(function) => Some(KnownCallee::Current(function)),
+                    None => (index < self.scope_known.len()).then_some(KnownCallee::Earlier(index)),
+                });
+        let label = format!("the method is {}", self.in_label(method_ty));
+        let receiver_ty = sig.params.first().map_or(TyId::ERROR, |&(_, ty)| ty);
+        let context = self.argument_context(known, 0, (id, callee));
+        self.expect_at(receiver, found, receiver_ty, (span, &label), context);
+        let rest = FnTy {
+            params: sig.params.get(1..).unwrap_or_default().into(),
+            ..sig.clone()
+        };
+        let bound = Bound { known, offset: 1 };
+        let erroneous = self.bind_call(id, (callee, method_ty, None), args, (&rest, bound));
+        self.lowering.method_calls.insert(id, receiver);
+        self.call_effect(id, (callee, method_ty), &sig);
         if erroneous { TyId::ERROR } else { sig.ret }
     }
 
     /// The signature `sig` of the generic callee `callee` of the call `id`,
     /// whose type parameters belong to `generic`, with each bound as the
-    /// arguments `args` bind it (see [Generics](#generics)): each argument
+    /// arguments `args` bind it, after a method's `receiver`, checked
+    /// already, with its type, if the call is a method's (see
+    /// [Generics](#generics)): each argument
     /// that fills a parameter whose type mentions one is checked, with no
-    /// expected type, and kept for its binding ([`GenericsChecked`]), and
+    /// expected type, and kept for its binding ([`CallsChecked`]), and
     /// binds what that type mentions ([`Checker::bind_argument`]); an
     /// integer literal binds only once the others have, and only what they
     /// leave unbound or what it does not fit. A type parameter left unbound
@@ -16247,7 +16760,7 @@ impl<'a> Checker<'a> {
     fn instantiate(
         &mut self,
         (id, callee): (ExprId, ExprId),
-        args: ArgRange,
+        (args, receiver): (ArgRange, Option<(ExprId, TyId)>),
         sig: &FnTy,
         generic: GenericId,
     ) -> Option<FnTy> {
@@ -16257,16 +16770,29 @@ impl<'a> Checker<'a> {
             bound: vec![None; self.types.generic_names(generic).len()],
             binders: vec![None; self.types.generic_names(generic).len()],
         };
+        // A method's receiver, checked already, binds first, as its first
+        // argument.
+        let offset = usize::from(receiver.is_some());
+        if let Some((value, found)) = receiver
+            && let Some(&(_, param_ty)) = sig.params.first()
+        {
+            let present = self.types.strip(found);
+            self.bind_argument(&mut binding, (value, param_ty), present);
+        }
+        let after_receiver = FnTy {
+            params: sig.params.get(offset..).unwrap_or_default().into(),
+            ..sig.clone()
+        };
         let mut untyped: Vec<(ExprId, TyId)> = Vec::new();
-        for (value, param) in argument_targets(ast.args(args), sig) {
-            let Some(&(_, param_ty)) = sig.params.get(param) else {
+        for (value, param) in argument_targets(ast.args(args), &after_receiver) {
+            let Some(&(_, param_ty)) = sig.params.get(param + offset) else {
                 continue;
             };
             if !self.types.mentions(param_ty, generic) || self.expects_its_type(value) {
                 continue;
             }
             let found = self.check_expr(value);
-            self.generics.prechecked.insert(value, found);
+            self.calls.prechecked.insert(value, found);
             if found == TyId::UNTYPED_INT {
                 untyped.push((value, param_ty));
             } else {
@@ -16291,7 +16817,7 @@ impl<'a> Checker<'a> {
             let expected = self.types.substitute(param_ty, generic, &bindings);
             if binds_new || !self.untyped_fits(expected) {
                 let found = self.settle(value, TyId::UNTYPED_INT);
-                self.generics.prechecked.insert(value, found);
+                self.calls.prechecked.insert(value, found);
                 self.bind_argument(&mut binding, (value, param_ty), found);
             }
         }
@@ -16403,7 +16929,7 @@ impl<'a> Checker<'a> {
             )),
         );
         for arg in ast.args(args) {
-            if self.generics.prechecked.remove(&arg.value).is_none() {
+            if self.calls.prechecked.remove(&arg.value).is_none() {
                 self.check_alone(arg.value);
             }
         }
@@ -16761,10 +17287,26 @@ impl<'a> Checker<'a> {
         args: ArgRange,
         sig: &FnTy,
     ) -> bool {
+        let bound = Bound {
+            known: self.known_callee(callee),
+            offset: 0,
+        };
+        self.bind_call(id, (callee, callee_ty, callback), args, (sig, bound))
+    }
+
+    /// As [`Checker::bind_arguments`], the callee and the parameters `sig`
+    /// is of, those from number `bound.offset` on, as `bound` says.
+    fn bind_call(
+        &mut self,
+        id: ExprId,
+        (callee, callee_ty, callback): (ExprId, TyId, Option<usize>),
+        args: ArgRange,
+        (sig, bound): (&FnTy, Bound),
+    ) -> bool {
         let ast = self.ast;
         let call = ast.get(id);
         let callee_span = ast.get(callee).span;
-        let known = self.known_callee(callee);
+        let Bound { known, offset } = bound;
         let recursive = self.is_recursive(callee);
         let function_label = format!("the function is {}", self.in_label(callee_ty));
         let arg_list = ast.args(args);
@@ -16837,7 +17379,7 @@ impl<'a> Checker<'a> {
                 *entry = position(index);
             }
             let param_ty = sig.params.get(param).map_or(TyId::ERROR, |&(_, ty)| ty);
-            let context = self.argument_context(known, param, (id, callee));
+            let context = self.argument_context(known, param + offset, (id, callee));
             let found = self.check_expr_expecting_at(
                 arg.value,
                 param_ty,
@@ -16853,7 +17395,7 @@ impl<'a> Checker<'a> {
                 self.record_argument(callback, param, arg.value, param_ty);
             }
         }
-        let defaults = known.map(|known| self.fill_defaults(known, base, count));
+        let defaults = known.map(|known| self.fill_defaults(known, (base, offset), count));
         erroneous |= self.report_unfilled(
             base,
             (call, callee_span, &function_label),
@@ -16861,19 +17403,20 @@ impl<'a> Checker<'a> {
             (found, named, trailing),
         );
         if !erroneous {
-            self.record_bound((id, args), base, defaults);
+            self.record_bound((id, args), (base, offset), defaults);
         }
         self.filled.truncate(base);
         erroneous
     }
 
     /// Records, for lowering, the parameter each of the arguments `args` of
-    /// the call `id` fills, as `filled[base..]` shows, and the defaults the
-    /// call gives, `defaults`, if it gives any (see [Calls](#calls)).
+    /// the call `id` fills, as `filled[base..]` shows, numbered from
+    /// `offset`, and the defaults the call gives, `defaults`, if it gives
+    /// any (see [Calls](#calls)).
     fn record_bound(
         &mut self,
         (id, args): (ExprId, ArgRange),
-        base: usize,
+        (base, offset): (usize, usize),
         defaults: Option<Vec<(u32, ParamDefault)>>,
     ) {
         for (param, &arg) in self
@@ -16887,7 +17430,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(entry) = self.arg_params.get_mut(args.start() + arg as usize) {
-                *entry = position(param);
+                *entry = position(param + offset);
             }
         }
         if let Some(defaults) = defaults.filter(|defaults| !defaults.is_empty()) {
@@ -16895,28 +17438,30 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Gives each of the `count` parameters of `known`, a known callee, that
-    /// `filled[base..]` shows no argument fills and that has a default its
-    /// default (see [Calls](#calls)): marks it [`DEFAULTED`] there, so that
+    /// Gives each of the `count` parameters of `known`, a known callee, from
+    /// number `offset` on, that `filled[base..]` shows no argument fills and
+    /// that has a default its default (see [Calls](#calls)): marks it [`DEFAULTED`] there, so that
     /// it is not unfilled, and returns each with its default, in parameter
     /// order (a default in error, which fails the check with its own error,
     /// left out).
     fn fill_defaults(
         &mut self,
         known: KnownCallee,
-        base: usize,
+        (base, offset): (usize, usize),
         count: usize,
     ) -> Vec<(u32, ParamDefault)> {
         let mut defaults = Vec::new();
         for param in 0..count {
-            if self.filled.get(base + param) != Some(&u32::MAX) || !self.has_default(known, param) {
+            if self.filled.get(base + param) != Some(&u32::MAX)
+                || !self.has_default(known, param + offset)
+            {
                 continue;
             }
             if let Some(entry) = self.filled.get_mut(base + param) {
                 *entry = DEFAULTED;
             }
-            if let Some(default) = self.default_of(known, param) {
-                defaults.push((position(param), default));
+            if let Some(default) = self.default_of(known, param + offset) {
+                defaults.push((position(param + offset), default));
             }
         }
         defaults

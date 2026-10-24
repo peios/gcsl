@@ -1312,3 +1312,32 @@ fn an_attribute_s_uses_are_references_of_its_type() {
         )])
     );
 }
+
+#[test]
+fn a_method_is_a_symbol_of_its_name_and_no_name_to_complete() {
+    let text = "fn (x: Int) twice(): Int { x * 2 }\nr = 3.twice()\n";
+    let files = [("app.gcsl", text)];
+    let (index, file) = index_of(&files, "app.gcsl");
+    let symbols = index.document_symbols(file);
+    let top: Vec<(&str, SymbolKind, Option<&str>)> = symbols
+        .iter()
+        .map(|s| (s.name.as_str(), s.kind, s.detail.as_deref()))
+        .collect();
+    assert_eq!(
+        top,
+        [
+            ("twice", SymbolKind::Method, Some("fn(x: Int): Int")),
+            ("r", SymbolKind::Field, Some("Int")),
+        ]
+    );
+    let at = offset(text, "r = ") + 4;
+    let labels: Vec<String> = index
+        .completion(file, at)
+        .into_iter()
+        .map(|completion| completion.label)
+        .collect();
+    assert!(
+        labels.iter().all(|label| !label.contains('<')),
+        "{labels:?}"
+    );
+}

@@ -2171,9 +2171,15 @@ impl Lowerer<'_> {
             }
             ExprKind::Call { callee, args } => {
                 let values = self.ast.args(args).iter().map(|arg| arg.value);
-                match self.resolution.expr_var(callee) {
-                    VarRef::Builtin(_) | VarRef::Fileroot(_) => values.collect(),
-                    _ => std::iter::once(callee).chain(values).collect(),
+                // A method's callee is a read of its binding, after its
+                // receiver.
+                if let Some(receiver) = self.resolution.method_receiver(id) {
+                    std::iter::once(receiver).chain(values).collect()
+                } else {
+                    match self.resolution.expr_var(callee) {
+                        VarRef::Builtin(_) | VarRef::Fileroot(_) => values.collect(),
+                        _ => std::iter::once(callee).chain(values).collect(),
+                    }
                 }
             }
             ExprKind::Interp(parts) => self
@@ -2330,6 +2336,7 @@ impl Lowerer<'_> {
                               other than a record's",
                     span: expr.span,
                 }),
+                _ if self.resolution.method_receiver(id).is_some() => self.lower_method_call(id),
                 _ => Ok(IrKind::Call {
                     callee: self.lower_operand(callee, ValueKind::Fn)?,
                     args: self.lower_args(id, args, expr.span)?,
@@ -2961,6 +2968,42 @@ impl Lowerer<'_> {
         }
     }
 
+    /// Lowers the call `id` of a method (see the checker's "Methods"): a
+    /// `Call` of a read of the method's binding, the variable the checker
+    /// resolved its callee to, whose first argument is the receiver,
+    /// evaluated before the call's own arguments.
+    fn lower_method_call(&mut self, id: ExprId) -> Result<IrKind, InternalError> {
+        let expr = *self.ast.get(id);
+        let (ExprKind::Call { callee, args }, Some(receiver)) =
+            (expr.kind, self.resolution.method_receiver(id))
+        else {
+            return Err(InternalError {
+                message: "a method call is no call",
+                span: expr.span,
+            });
+        };
+        let kind = self.kind(id)?;
+        let read_kind =
+            read(self.resolution.expr_var(callee), ValueKind::Fn).ok_or(InternalError {
+                message: "a method's binding has no slot",
+                span: expr.span,
+            })?;
+        let callee_node = self.builder.alloc(read_kind, self.ast.get(callee).span);
+        let receiver_span = self.ast.get(receiver).span;
+        let value = ArgValue::Node(self.lower_expr(receiver)?);
+        let receiver_arg = self
+            .builder
+            .alloc(IrKind::Arg { param: 0, value }, receiver_span);
+        let args = self.lower_args_after(id, args, (expr.span, Some(receiver_arg)))?;
+        Ok(IrKind::Call {
+            callee: callee_node,
+            args,
+            kind,
+            // Set by `IrBuilder::measure` once every node is built.
+            depth: 0,
+        })
+    }
+
     /// Lowers the arguments `args` of the call `id` spanning `span` to `Arg`
     /// nodes in source order, each with the parameter the checker bound it
     /// to, followed by one for each parameter the call gives its default
@@ -2973,9 +3016,21 @@ impl Lowerer<'_> {
         args: ArgRange,
         span: Span,
     ) -> Result<IrRange, InternalError> {
+        self.lower_args_after(id, args, (span, None))
+    }
+
+    /// As [`Lowerer::lower_args`], after `first`, a method's receiver's
+    /// `Arg`, if the call is a method's.
+    fn lower_args_after(
+        &mut self,
+        id: ExprId,
+        args: ArgRange,
+        (span, first): (Span, Option<IrId>),
+    ) -> Result<IrRange, InternalError> {
         let (ast, resolution) = (self.ast, self.resolution);
         let params = resolution.arg_params(args);
         let base = self.item_stack.len();
+        self.item_stack.extend(first);
         for (arg, &param) in ast.args(args).iter().zip(params) {
             if param == u32::MAX {
                 return Err(InternalError {

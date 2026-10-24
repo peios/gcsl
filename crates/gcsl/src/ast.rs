@@ -834,6 +834,26 @@ pub struct AttributeUse {
     pub ty: TypeExprId,
 }
 
+/// A method, `fn (RECV: TYPE) NAME(...) ...` or `def (RECV: TYPE) NAME(...)
+/// ...` (see the parser's [Methods](crate::parser#methods)): its item is a
+/// `let` of its binding, a name no source can write
+/// ([`crate::names::method_binding`]), whose value is its function, the
+/// receiver its first parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MethodDecl {
+    /// Its item.
+    pub item: ItemId,
+    /// The name it is called by.
+    pub name: Name,
+    /// Where the name is written.
+    pub name_span: Span,
+    /// Its binding's name.
+    pub binding: Name,
+    /// Whether it is declared with `def`, visible beyond its file, rather
+    /// than with `fn`.
+    pub public: bool,
+}
+
 /// What has type parameters: a generic function item, `fn NAME<T, U>(...)`
 /// or `def NAME<T>(...)` (see the parser's [Functions and
 /// calls](crate::parser#functions-and-calls)), or a generic `type` item,
@@ -2904,6 +2924,7 @@ pub struct AstBuilder {
     attribute_marks: Vec<ItemId>,
     attribute_uses: Vec<AttributeUse>,
     generics: Vec<Generics>,
+    methods: Vec<MethodDecl>,
     def_types: Vec<DefTypeUse>,
     no_prelude: Option<Span>,
     syntax: Syntax,
@@ -3248,6 +3269,11 @@ impl AstBuilder {
         self.generics.push(generics);
     }
 
+    /// Records a method of the outermost block.
+    pub fn push_method(&mut self, method: MethodDecl) {
+        self.methods.push(method);
+    }
+
     /// The number of type expressions made so far: the number of the next.
     #[must_use]
     pub fn type_count(&self) -> u32 {
@@ -3377,6 +3403,7 @@ impl AstBuilder {
             GenericOwner::Fn(function) => function.0 < fns,
             GenericOwner::Type(item) => item.0 < items,
         });
+        self.methods.retain(|method| method.item.0 < items);
     }
 
     /// Returns the node `id`.
@@ -3449,6 +3476,7 @@ impl AstBuilder {
             attribute_marks: self.attribute_marks,
             attribute_uses: self.attribute_uses,
             generics: self.generics,
+            methods: self.methods,
             def_types: self.def_types,
             no_prelude: self.no_prelude,
             syntax: self.syntax,
@@ -3491,6 +3519,8 @@ pub struct Ast {
     /// The type parameters of the generic function items, in the order
     /// their functions were made.
     generics: Vec<Generics>,
+    /// The methods of the outermost block, in source order.
+    methods: Vec<MethodDecl>,
     /// The def-type definitions and references, in the order they were
     /// parsed (see [Def-types](#def-types)).
     def_types: Vec<DefTypeUse>,
@@ -3991,6 +4021,18 @@ impl Ast {
             .attribute_uses
             .partition_point(|used| used.item.0 <= id.0);
         self.attribute_uses.get(start..end).unwrap_or_default()
+    }
+
+    /// The methods of the file's outermost block, in source order.
+    #[must_use]
+    pub fn methods(&self) -> &[MethodDecl] {
+        &self.methods
+    }
+
+    /// The method whose item is `item`, if it is one.
+    #[must_use]
+    pub fn method(&self, item: ItemId) -> Option<&MethodDecl> {
+        self.methods.iter().find(|method| method.item == item)
     }
 
     /// The type parameters of every generic function and `type` item, in the
@@ -4845,7 +4887,14 @@ impl<A: Annotate> Pretty<'_, A> {
                     (true, false) => "let mut",
                     (false, false) => "let",
                 };
-                write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?;
+                // A method is shown by its name, not its binding's.
+                match ast.method(id) {
+                    Some(method) => {
+                        let keyword = if method.public { "def" } else { "fn" };
+                        write!(f, "{keyword} method {}", ast.names().get(method.name))?;
+                    }
+                    None => write!(f, "{keyword} {}", ast.show_path(ast.path(path)))?,
+                }
                 if let Some(ty) = ty {
                     f.write_str(" : ")?;
                     self.type_expr(f, ty)?;

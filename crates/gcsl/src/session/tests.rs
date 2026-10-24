@@ -1781,3 +1781,28 @@ fn a_generic_type_persists_for_later_inputs() {
         ["type `Box` takes 1 type argument, given 2"]
     );
 }
+
+#[test]
+fn a_method_persists_for_later_inputs() {
+    let mut session = Session::new();
+    assert_eq!(
+        value(&mut session, "fn (x: Int) twice(): Int { x * 2 }"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "3.twice()"), Value::Int(6));
+    // A later input's method of the name, for another type, adds to it.
+    assert_eq!(
+        value(
+            &mut session,
+            "fn (x: String) twice(): String { \"{x}{x}\" }"
+        ),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "\"a\".twice()").to_string(), "aa");
+    assert_eq!(value(&mut session, "4.twice()"), Value::Int(8));
+    assert_eq!(
+        value(&mut session, "fn (x: Int) add(y: Int = 10): Int { x + y }"),
+        Value::Empty
+    );
+    assert_eq!(value(&mut session, "1.add()"), Value::Int(11));
+}

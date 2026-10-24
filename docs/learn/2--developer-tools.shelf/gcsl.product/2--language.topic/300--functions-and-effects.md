@@ -91,6 +91,33 @@ value of type `T` can be passed on, returned, or put in a list or record,
 but nothing else, because `T` could be anything. A call where nothing binds
 a type parameter, such as one that only returns a `List<T>`, is an error.
 
+## Methods
+
+A method is a function you call on a value with a dot. Write its
+receiver in parentheses before its name:
+
+```gcsl
+fn (n: Int) twice(): Int { n * 2 }
+fn (items: List<T>) first_or<T>(fallback: T): T {
+    if len(items) > 0 { items[0] } else { fallback }
+}
+doubled = 21.twice()
+port = [8080].first_or(80)
+```
+
+The value before the dot is the receiver. GCSL chooses the method by
+the receiver's type, so methods with the same name can serve different
+types. When more than one fits, the one for the more specific type is
+used: a method for `List<Int>` is chosen over one for `List<T>` when
+the receiver is a `List<Int>`. A method's other parameters, defaults and
+effects work as a function's do.
+
+A method has no name of its own: `twice` alone is not a variable, and
+`x.twice` without parentheses reads a field. A record field and a method
+with the same name are an error when both could apply. Methods are
+declared at the top level of a file and are visible throughout it. In
+the REPL, they are also visible to later lines.
+
 ## Calling for effects
 
 A call to an impure or memoized function can stand alone as a statement,

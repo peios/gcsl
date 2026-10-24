@@ -7019,3 +7019,69 @@ fn applied_types_take_argument_lists_and_qualified_names() {
         "expected `>` to close the type arguments"
     );
 }
+
+#[test]
+fn a_method_is_a_function_binding_with_its_receiver_first() {
+    let ast =
+        parse_text("fn (x: Int) twice(): Int { x * 2 }\ndef (xs: List<T>) first<T>(f: T): T { f }")
+            .unwrap();
+    let methods: Vec<(&str, bool)> = ast
+        .methods()
+        .iter()
+        .map(|method| (ast.names().get(method.name), method.public))
+        .collect();
+    assert_eq!(methods, [("twice", false), ("first", true)]);
+    let method = ast.methods()[1];
+    assert_eq!(ast.names().get(method.binding), "<method first@0>");
+    let ItemKind::Let {
+        value,
+        function: true,
+        ..
+    } = ast.item(method.item).kind
+    else {
+        panic!("expected a function binding");
+    };
+    let ExprKind::Fn(function) = ast.get(value).kind else {
+        panic!("expected a function");
+    };
+    let params: Vec<&str> = ast
+        .params(ast.fn_decl(function).params)
+        .iter()
+        .map(|param| ast.names().get(param.name))
+        .collect();
+    assert_eq!(params, ["xs", "f"]);
+    // The type parameter is in scope in the receiver.
+    let scoped = ast
+        .type_ids()
+        .filter(|&id| matches!(ast.type_expr(id).kind, TypeExprKind::Named(name) if ast.type_param(id, name).is_some()))
+        .count();
+    assert_eq!(scoped, 3);
+    // A function expression is still one.
+    assert!(
+        parse_text("f = fn (x: Int): Int { x }")
+            .unwrap()
+            .methods()
+            .is_empty()
+    );
+}
+
+#[test]
+fn method_errors() {
+    for (text, message) in [
+        (
+            "x = { fn (y: Int) m(): Int { y } }",
+            "a method is declared only at the top level of a file",
+        ),
+        ("fn () m(): Int { 1 }", "expected the method's receiver"),
+        (
+            "fn (x: Int, y: Int) m(): Int { y }",
+            "a method has one receiver",
+        ),
+        (
+            "fn (x: Int = 1) m(): Int { x }",
+            "a receiver takes no default",
+        ),
+    ] {
+        assert_eq!(error(text).0, message, "{text}");
+    }
+}

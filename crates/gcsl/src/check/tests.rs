@@ -14282,3 +14282,82 @@ fn a_built_in_type_takes_one_type_argument() {
         );
     }
 }
+
+// ----- Methods -----
+
+#[test]
+fn a_method_is_chosen_by_its_receiver_type() {
+    let cases = [
+        ("fn (x: Int) twice(): Int { x * 2 }\n3.twice()", "Int"),
+        (
+            "fn (x: Int) twice(): Int { x * 2 }\nlet a = 3\na.twice()",
+            "Int",
+        ),
+        (
+            "fn (xs: List<T>) first<T>(f: T): T { f }\n[\"a\"].first(\"b\")",
+            "String",
+        ),
+        // The most specific receiver wins.
+        (
+            "fn (xs: List<T>) size<T>(): String { \"any\" }\nfn (xs: List<Int>) size(): Int { 1 }\n[1].size()",
+            "Int",
+        ),
+        (
+            "fn (xs: List<T>) size<T>(): String { \"any\" }\nfn (xs: List<Int>) size(): Int { 1 }\n[true].size()",
+            "String",
+        ),
+        // A record with more fields than the receiver's has.
+        (
+            "fn (r: {a: Int}) get(): Int { r.a }\n{ a = 1; b = 2 }.get()",
+            "Int",
+        ),
+    ];
+    for (text, ty) in cases {
+        assert_eq!(file_type(text), ty, "{text}");
+    }
+}
+
+#[test]
+fn method_call_errors() {
+    for (text, message) in [
+        (
+            "fn (x: String) shout(): String { x }\n3.shout()",
+            "no method `shout` for type Int",
+        ),
+        (
+            "fn (r: {a: Int}) b(): Int { r.a }\nlet v = { a = 1; b = 2 }\nv.b()",
+            "`b` is both a field of `{a: Int, b: Int}` and a method",
+        ),
+        (
+            "fn (r: {a: Int}) m(): Int { 1 }\nfn (r: {b: Int}) m(): Int { 2 }\n{ a = 1; b = 2 }.m()",
+            "method `m` is ambiguous for type `{a: Int, b: Int}`",
+        ),
+        (
+            "fn (x: Int) m(): Int { 1 }\nfn (y: Int) m(): Int { 2 }\n1",
+            "method `m` is declared twice for type Int",
+        ),
+        (
+            "fn (r: {a: Int}) a(): Int { 1 }\n1",
+            "method `a` has the name of a field of its receiver type `{a: Int}`",
+        ),
+        (
+            "fn (x: Int) m(y: Int): Int { y }\n3.m(\"s\")",
+            "mismatched types",
+        ),
+        ("fn (x: Int) m(): Int { x }\nm", "undefined variable `m`"),
+    ] {
+        assert_eq!(
+            messages(text).first().map(String::as_str),
+            Some(message),
+            "{text}"
+        );
+    }
+    let text = "def (x: Int) loud() -> Int { x }\nfn quiet(): Int { 3.loud() }\n1";
+    let found = messages(text);
+    assert!(
+        found
+            .iter()
+            .any(|m| m == "cannot call an impure function from a pure function"),
+        "{found:?}"
+    );
+}
