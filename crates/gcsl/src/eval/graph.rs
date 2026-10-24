@@ -1054,8 +1054,8 @@ fn encode_context(context: Option<&Rc<ContextFrame>>, out: &mut Vec<u8>) {
 /// apart, whatever the attempt. A `Float` by its bits, every NaN one and
 /// `-0.0` as `0.0`, so that the equality is reflexive; a record's fields
 /// sorted by name; a closure by its code, the IR's address and the
-/// function's number, and its captures; a future a host has yet to give by
-/// its node, one run by its value, one not run by its code and captures; a
+/// function's number, and its captures; a step's future by its node, given
+/// or not, one run by its value, one not run by its code and captures; a
 /// secret by its identity, as secrets compare.
 pub(crate) fn encode(value: &Value, out: &mut Vec<u8>) {
     let mut pending: Vec<Value> = vec![value.clone()];
@@ -1174,10 +1174,12 @@ fn encode_record(record: &crate::value::Record, out: &mut Vec<u8>, pending: &mut
 }
 
 /// Appends a future's part of the encoding to `out`, and pushes what it
-/// holds onto `pending`, for [`encode`]: one a host has yet to give by its
-/// node, one run by its value, one not run by its code and captures.
+/// holds onto `pending`, for [`encode`]: a step's by its node, whether the
+/// host has given it or not, so that a call given it keys the same on an
+/// attempt after the host gave it as before; one run by its value; one not
+/// run by its code and captures.
 fn encode_future(future: &Future, out: &mut Vec<u8>, pending: &mut Vec<Value>) {
-    if let Some(node) = future.host_node() {
+    if let Some(node) = future.step_node() {
         out.push(b'H');
         out.extend_from_slice(&node.to_le_bytes());
     } else if let Some(done) = future.value() {

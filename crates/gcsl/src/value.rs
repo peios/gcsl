@@ -428,6 +428,10 @@ pub struct Future {
     /// The context it was made in, which its body runs with, whoever awaits
     /// it (see [`crate::eval`], "Context").
     pub(crate) context: Option<Rc<ContextFrame>>,
+    /// The node of an action graph whose result it stands for, if it is a
+    /// step's, kept once the host has given it, so that a key it is in is
+    /// the same on every attempt (see [Graph mode](crate::eval::graph#graph-mode)).
+    node: Option<u32>,
 }
 
 /// A frame of the context, what one `with` binds (see [`crate::eval`],
@@ -520,6 +524,7 @@ impl Future {
             state: RefCell::new(FutureState::Pending(captures)),
             made,
             context,
+            node: None,
         }
     }
 
@@ -539,7 +544,15 @@ impl Future {
             state: RefCell::new(FutureState::Host(node)),
             made,
             context,
+            node: Some(node),
         }
+    }
+
+    /// The number of the node of an action graph whose result the future
+    /// stands for, if it is a step's, given or not.
+    #[must_use]
+    pub(crate) fn step_node(&self) -> Option<u32> {
+        self.node
     }
 
     /// The number of the node of an action graph whose result the future

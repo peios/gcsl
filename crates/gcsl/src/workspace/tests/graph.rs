@@ -216,6 +216,27 @@ fn a_unit_waiting_for_a_step_is_never_retried() {
 }
 
 #[test]
+fn a_step_given_another_s_result_keys_the_same_once_it_is_given() {
+    // `link` is given `compile`'s result before it is given; the unit then
+    // needs `link`'s, so it runs again with both given.
+    let (mut workspace, file) =
+        lone_workspace("let o = compile(\"a\")\nlet app = link([o])\n= \"{app}!\"");
+    let mut graph = Graph::new();
+    assert_eq!(
+        workspace.run_graph(file, &mut graph, every()).unwrap(),
+        Progress::Paused(NodeId::of(1))
+    );
+    assert!(graph.resolve(NodeId::of(0), Ok(text("a.o"))));
+    assert!(graph.resolve(NodeId::of(1), Ok(text("app"))));
+    // The same two nodes, `link`'s found by the key it had.
+    assert_eq!(
+        workspace.run_graph(file, &mut graph, every()).unwrap(),
+        Progress::Done(text("app!"))
+    );
+    assert_eq!(graph.len(), 2);
+}
+
+#[test]
 fn a_step_whose_key_changes_between_attempts_is_an_error_not_a_loop() {
     let (mut workspace, file) = lone_workspace("let a = compile(\"a\")\n= \"{a}!\"");
     let mut graph = Graph::new();
